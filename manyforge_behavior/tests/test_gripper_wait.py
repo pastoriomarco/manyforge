@@ -37,7 +37,7 @@ def _waiter(clock=None, program_clock=None, timeout_while_held="pause", **adapte
     port.invoke = invoke
     parameters = {
         "target_role": "gripper",
-        "expected_state": "grasp_confirmed",
+        "expected_state": "reached",
         "timeout_s": 1.0,
         # The resolver supplies the catalog default `pause` when omitted.
         "timeout_while_held": timeout_while_held,
@@ -105,16 +105,12 @@ def test_timeout_does_not_do_another_read_and_cancelling_wait_is_only_local():
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize(
-    "reason,state",
-    [("grasp_not_confirmed", "completed"), ("gripper_status_not_matched", "failed")],
-)
-def test_denied_grasp_or_failed_command_is_not_hidden_as_waiting(reason, state):
+def test_failed_command_is_not_hidden_as_waiting():
     node, _, port, _, scope = _waiter()
     port.result = OwnerInvocationResult(
         False,
-        reason_code=reason,
-        metadata={"command_scope": scope, "command_state": state},
+        reason_code="gripper_status_not_matched",
+        metadata={"command_scope": scope, "command_state": "failed"},
     )
     node.tick_once()
     assert node.status is py_trees.common.Status.FAILURE

@@ -32,7 +32,7 @@ describe('document action prerequisites shared by controls and handlers', () => 
   it('disables Deployment Revert while Saved equals Applied and keeps the admission reason', () => {
     const workspace = {
       savedScenarioCandidates: [{}], saved: { deploymentRevision: 'saved' },
-      managerApplied: { deploymentRevision: 'saved' }, draft: { differsFromSaved: true },
+      managerApplied: { activationOrder: null, deploymentRevision: 'saved' }, draft: { differsFromSaved: true },
     } as DeploymentWorkspaceResponse;
     expect(deploymentActionUnavailableReason(workspace, 'revert', null))
       .toBe('Nothing to revert: the Saved Deployment matches Manager Applied.');

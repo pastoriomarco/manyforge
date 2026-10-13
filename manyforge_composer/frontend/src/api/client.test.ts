@@ -1266,3 +1266,43 @@ it('accepts an authorization-only incident Recover only for the requested compon
   await expect(api.cclc.submitLifecycle(request('component.gripper')))
     .rejects.toThrow('incident recovery does not match its request');
 });
+
+
+describe('exact lifecycle request-result read', () => {
+  const request: Parameters<typeof api.cclc.lifecycleRequestResult>[0] = {
+    request_context: { request_id: 'sent.request', request_owner_epoch: 'owner.1',
+      source_label: 'manyforge_composer', correlation_id: null },
+    controllable_component_id: 'component.arm', intent: 'prepare',
+    expected_graph_revision: 'graph.1', expected_component_lifecycle_generation: 4,
+    expected_admission_generation: 7, expected_control_domains: [],
+    reason: 'operator-confirmed Composer request', confirmed: true,
+  };
+  const result = {
+    acceptance: { accepted_at_ns: 1, component_lifecycle_generation: 4,
+      lifecycle_transaction_generation: 1, lifecycle_transaction_id: 'transaction.1',
+      request_id: request.request_context.request_id, timeout_duration_ns: 100 },
+    replay_status: 'replayed_exact', status: null,
+  };
+  it('posts the exact retained request to the read route and accepts null only as unresolved', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({ result: null }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.cclc.lifecycleRequestResult(request)).resolves.toBeNull();
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/cclc/lifecycle/requests/result');
+    const options = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(options.method).toBe('POST');
+    expect(JSON.parse(options.body as string)).toEqual(request);
+    fetchMock.mockResolvedValue(response({ result }));
+    await expect(api.cclc.lifecycleRequestResult(request)).resolves.toMatchObject({ transactionId: 'transaction.1' });
+  });
+  it('rejects a foreign request acceptance and nonclosed result envelopes', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({ result: {
+      ...result, acceptance: { ...result.acceptance, request_id: 'another.request' },
+    } }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow('does not match its request');
+    for (const payload of [{}, { result: null, fabricated: true }]) {
+      fetchMock.mockResolvedValue(response(payload));
+      await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow('must contain only result');
+    }
+  });
+});

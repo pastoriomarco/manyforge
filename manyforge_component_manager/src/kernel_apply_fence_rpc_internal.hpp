@@ -11,26 +11,34 @@ namespace manyforge::component_manager::detail {
 inline constexpr std::size_t kMaximumKernelApplyFenceRpcPacketBytes =
     256U * 1024U;
 
-using KernelApplyFenceRpcRequest =
-    std::variant<manyforge::core::ConfigurationFenceAdmissionQueryDTO,
-                 manyforge::core::ApplyConfigurationFenceIntentDTO,
-                 manyforge::core::ApplyFenceAcquireAttemptQueryDTO,
-                 manyforge::core::ApplyFenceRehydrateDTO,
-                 manyforge::core::ConfigurationFenceStatusQueryDTO,
-                 manyforge::core::ConfigurationFenceReleaseDTO>;
+using KernelApplyFenceRpcRequest = std::variant<
+    manyforge::core::ConfigurationFenceAdmissionQueryDTO,
+    manyforge::core::ApplyConfigurationFenceIntentDTO,
+    manyforge::core::ApplyFenceAcquireAttemptQueryDTO,
+    manyforge::core::ApplyFenceRehydrateDTO,
+    manyforge::core::ConfigurationFenceStatusQueryDTO,
+    manyforge::core::ConfigurationFenceReleaseDTO,
+    manyforge::core::SelectedBringUpConfigurationFenceIntentDTO,
+    manyforge::core::SelectedBringUpFenceAcquireAttemptQueryDTO,
+    manyforge::core::SelectedBringUpConfigurationFenceStatusQueryDTO,
+    manyforge::core::SelectedBringUpConfigurationFenceReleaseDTO,
+    manyforge::core::SelectedBringUpFenceReleaseAttemptQueryDTO>;
 
 struct KernelApplyFenceRpcFailure final {
   manyforge::core::ErrorDTO error;
 };
 
-using KernelApplyFenceRpcResponse =
-    std::variant<manyforge::core::ConfigurationFenceAdmissionSnapshotDTO,
-                 manyforge::core::ConfigurationFenceAcceptedDTO,
-                 manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO,
-                 manyforge::core::ApplyFenceReconcileResultDTO,
-                 manyforge::core::ConfigurationFenceStatusDTO,
-                 manyforge::core::ConfigurationFenceReleasedDTO,
-                 KernelApplyFenceRpcFailure>;
+using KernelApplyFenceRpcResponse = std::variant<
+    manyforge::core::ConfigurationFenceAdmissionSnapshotDTO,
+    manyforge::core::ConfigurationFenceAcceptedDTO,
+    manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO,
+    manyforge::core::ApplyFenceReconcileResultDTO,
+    manyforge::core::ConfigurationFenceStatusDTO,
+    manyforge::core::ConfigurationFenceReleasedDTO, KernelApplyFenceRpcFailure,
+    manyforge::core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO,
+    manyforge::core::SelectedBringUpConfigurationFenceStatusDTO,
+    manyforge::core::SelectedBringUpConfigurationFenceReleasedDTO,
+    manyforge::core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO>;
 
 [[nodiscard]] bool IsKernelApplyFenceRpcPacket(std::string_view bytes) noexcept;
 

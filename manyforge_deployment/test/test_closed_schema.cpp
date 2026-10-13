@@ -687,9 +687,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   EXPECT_NE(
       registry.find_qualified_value_schema(
           core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
-          core::SchemaRevision("sha256:"
-                               "6b540dac39434e05a2cb5da209206e2105b824b9f56704a7"
-                               "4f0d88f327944689")),
+          core::SchemaRevision("sha256:97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48")),
       nullptr);
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
@@ -755,7 +753,7 @@ TEST(ClosedSchema,
       core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "6b540dac39434e05a2cb5da209206e2105b824b9f56704a74f0d88f327944689"));
+          "97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48"));
   ASSERT_NE(schema, nullptr);
 
   const CanonicalValue valid = value_object({
@@ -816,35 +814,21 @@ TEST(ClosedSchema,
       validate_and_normalize_build_qualified_value(*schema, valid);
   EXPECT_EQ(normalized.normalized_value(), valid);
 
-  const auto with_confirmation_validity = [&](CanonicalValue duration) {
-    auto root = valid.as_object();
-    for (auto &[name, value] : root) {
-      if (name != "gripper_target_configurations")
-        continue;
-      auto targets = value.as_array();
-      auto target = targets.front().as_object();
-      target.emplace_back("operator_confirmation_validity_ns",
-                          std::move(duration));
-      targets.front() = CanonicalValue(std::move(target));
-      value = CanonicalValue(std::move(targets));
-    }
-    return CanonicalValue(std::move(root));
-  };
-  for (const double duration : {1.0, 3'600'000'000'000.0}) {
-    const auto configured =
-        with_confirmation_validity(CanonicalValue(duration));
-    EXPECT_EQ(validate_and_normalize_build_qualified_value(*schema, configured)
-                  .normalized_value(),
-              configured);
+  auto retired_operator_field = valid.as_object();
+  for (auto &[name, value] : retired_operator_field) {
+    if (name != "gripper_target_configurations")
+      continue;
+    auto targets = value.as_array();
+    auto target = targets.front().as_object();
+    target.emplace_back("operator_confirmation_validity_ns",
+                        CanonicalValue(30'000'000'000.0));
+    targets.front() = CanonicalValue(std::move(target));
+    value = CanonicalValue(std::move(targets));
   }
-  for (const auto &invalid :
-       {CanonicalValue(nullptr), CanonicalValue(true), CanonicalValue(0.0),
-        CanonicalValue(-1.0), CanonicalValue(1.5), CanonicalValue("1000"),
-        CanonicalValue(3'600'000'000'001.0)}) {
-    EXPECT_THROW(validate_and_normalize_build_qualified_value(
-                     *schema, with_confirmation_validity(invalid)),
-                 ClosedSchemaError);
-  }
+  EXPECT_THROW(
+      validate_and_normalize_build_qualified_value(
+          *schema, CanonicalValue(std::move(retired_operator_field))),
+      ClosedSchemaError);
 
   EXPECT_THROW(
       validate_and_normalize_build_qualified_value(
@@ -872,7 +856,7 @@ TEST(ClosedSchema,
 }
 
 TEST(ClosedSchema, QualifiesEveryAndOnlyTheExactBuiltinCapabilityDefinition) {
-  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 68U);
+  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 67U);
   CanonicalValue::Array registry_projection;
   registry_projection.reserve(
       core::kBuiltinCapabilityDefinitionRegistry.size());

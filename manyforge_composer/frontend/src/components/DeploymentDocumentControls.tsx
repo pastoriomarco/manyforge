@@ -12,7 +12,7 @@ type Action = 'discard' | 'revert' | 'apply';
 const DISPOSITION_LABEL = {
   add: 'Added',
   remove: 'Removed',
-  replace: 'Restarted',
+  replace: 'Replaced',
 } as const;
 
 /** The Manager's authoritative impact, presented as-is; never re-derived. */
@@ -22,7 +22,7 @@ export function DeploymentApplyImpactSummary({
   impact: ManagerDeploymentImpact;
 }) {
   const changed = impact.components.filter((row) => row.disposition !== 'retain');
-  const retained = impact.components.length - changed.length;
+  const retained = impact.components.filter((row) => row.disposition === 'retain').length;
   return (
     <div className="deployment-apply-impact" aria-label="Deployment Apply impact">
       <ul>
@@ -36,7 +36,7 @@ export function DeploymentApplyImpactSummary({
           </li>
         ))}
         {retained > 0 && (
-          <li>{retained} component{retained === 1 ? '' : 's'} keep running unchanged</li>
+          <li>{retained} component{retained === 1 ? '' : 's'} keep their state unchanged</li>
         )}
         {impact.detachedComponents.map((id) => (
           <li key={`detached-${id}`}>
@@ -230,7 +230,7 @@ export function DeploymentDocumentControls({
       {pendingConfirmation !== null && (
         <OverlayPanel
           open
-          title="Apply disruptive Deployment change?"
+          title="Apply Deployment configuration change?"
           titleId="deployment-apply-confirmation-title"
           onClose={controller.cancelApplyConfirmation}
           compact
@@ -238,8 +238,8 @@ export function DeploymentDocumentControls({
           <div className="dialog-copy compact-confirmation">
             {reasons.apply !== null && <p role="status">{reasons.apply}</p>}
             <p>
-              Applying this exact Deployment Draft will reconfigure active runtime
-              components. Running operations remain protected by Manager admission.
+              Applying this exact Deployment Draft changes the cell configuration. New and changed components remain inactive; activate them separately.
+              {' '}Running operations remain protected by Manager admission.
             </p>
             {pendingConfirmation.result.candidatePreview !== null && (
               <DeploymentApplyImpactSummary
@@ -257,7 +257,8 @@ export function DeploymentDocumentControls({
               disabled={reasons.apply !== null}
               title={applyReason ?? 'Apply the validated Deployment to runtime.'}
               onClick={() => { void controller.confirmApply(); }}
-            >{controller.applying ? 'Applying Deployment' : 'Confirm apply'}</button>
+            >{controller.applying ? 'Applying Deployment'
+              : 'Confirm apply'}</button>
           </div>
         </OverlayPanel>
       )}

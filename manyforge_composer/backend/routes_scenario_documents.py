@@ -633,9 +633,10 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     }
                 )
             )
-            bundle, graph, _epoch = state._manager_current(
-                state.headless_client.manager_status()
-            )
+            manager_status = state.headless_client.manager_status()
+            if not creating:
+                _require_scenario_load_identity(state, scenario_document_id, manager_status)
+            bundle, graph, _epoch = state._manager_current(manager_status)
             if creating and (body.expected_retained_bundle_id != bundle or body.expected_graph_revision != graph):
                 raise ScenarioArtifactError("scenario_activation_preview_changed",
                     "Applied Deployment changed since New was opened; review the choice again", status_code=409)
@@ -946,6 +947,38 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             raise_operation_failure(error, effects, _raise)
 
     return router
+
+
+def _require_scenario_load_identity(
+    state: ComposerState, scenario_id: str, manager_status: dict[str, Any]
+) -> None:
+    """Close-first proof from the same current Manager head used for preview."""
+    state._manager_current(manager_status)  # Existing freshness/identity checks.
+    active = manager_status["status"]["active"]
+    canonical_empty = active.get("canonical_empty")
+    if type(canonical_empty) is not bool:
+        raise ScenarioArtifactError(
+            "scenario_load_current_configuration_unavailable",
+            "Scenario Load requires the Manager's current canonical-empty proof",
+            status_code=409,
+        )
+    if canonical_empty:
+        return
+    publication = state.published_scenario().get("published_scenario")
+    if not isinstance(publication, dict) or not state._manager_published_matches_scenario(
+        manager_status, publication
+    ):
+        raise ScenarioArtifactError(
+            "scenario_load_current_configuration_unavailable",
+            "Scenario Load requires the exact current published scenario identity",
+            status_code=409,
+        )
+    if publication.get("scenario_id") != scenario_id:
+        raise ScenarioArtifactError(
+            "scenario_close_required",
+            "Close first before loading a different scenario",
+            status_code=409,
+        )
 
 
 def load_exact_scenario_document(

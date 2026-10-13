@@ -86,6 +86,12 @@ public:
   void ReleaseFence(const manyforge::core::ConfigurationFenceId &fence_id,
                     const manyforge::core::ConfigurationFenceScopeDTO &scope);
 
+  /// Selected release checks the effect pin before committing its ledger row.
+  void
+  ReleaseFenceDurably(const manyforge::core::ConfigurationFenceId &fence_id,
+                      const manyforge::core::ConfigurationFenceScopeDTO &scope,
+                      const std::function<void()> &commit_durable_release);
+
   /// Execute one bounded in-process installation step only while the exact
   /// durable fence remains held. This is an Apply interlock, not caller
   /// authorization; the fence owner separately validates its generation.
@@ -126,11 +132,16 @@ struct ManagedKernelApplyFenceOwnerConfig final {
   // exact retained bundle during that transition.  Standalone owners leave
   // this empty.
   std::filesystem::path candidate_retained_package_root{};
+  // The current composed Kernel owns this lookup and its lifetime. Absence
+  // refuses selected effects; a generation alone is never held-claim proof.
+  std::function<
+      manyforge::core::Result<manyforge::core::CellAdmissionRecoveryReceiptDTO>(
+          const manyforge::core::CellAdmissionRecoveryReceiptQueryDTO &)>
+      selected_claim_recovery_receipt{};
 };
 
-/// Durable Kernel-owned Apply and route-configuration fence lifecycle for the
-/// selected managed native execution host. Both surfaces share one generation,
-/// request ledger, and admission gate.
+/// Durable Kernel-owned Apply, route and selected bring-up fence lifecycle.
+/// These typed owners share one generation, request ledger and admission gate.
 class ManagedKernelApplyFenceOwner final
     : public manyforge::core::IManagerKernelApplyFencePort,
       public manyforge::core::ICCLCKernelRouteConfigurationFencePort {
@@ -177,6 +188,22 @@ public:
       const manyforge::core::ActiveBundlePublicationReceiptDTO &successor,
       const std::function<void()> &effect) const;
 
+  /// Callback-local positive readback for private cross-owner operations.
+  /// Keeps the same actual interlock as the existing operations and avoids
+  /// recursively querying this owner's nonrecursive mutex.
+  /// Candidate control configurations must already be installed. Use the
+  /// no-readback predecessor overload for preparation/installation itself;
+  /// this readback is for Scene adoption after child Holding, before publish.
+  void RunWithExactHeldPredecessorReadback(
+      const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
+      const manyforge::core::ActiveBundlePublicationGeneration &expected_predecessor_publication_generation,
+      const manyforge::core::ContentDigest &expected_predecessor_public_pointer_digest,
+      const std::function<void(const HeldStatusView&)> &effect) const;
+  void RunWithExactHeldSuccessorReadback(
+      const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
+      const manyforge::core::ActiveBundlePublicationReceiptDTO &successor,
+      const std::function<void(const HeldStatusView&)> &effect) const;
+
   [[nodiscard]] manyforge::core::ConfigurationFenceReleasedDTO Release(
       const manyforge::core::ConfigurationFenceReleaseDTO &request) override;
 
@@ -209,6 +236,36 @@ public:
   ReconcileRouteConfigurationFenceReleaseAttempt(
       const manyforge::core::RouteConfigurationFenceReleaseRequestDTO &request)
       const override;
+
+  [[nodiscard]] manyforge::core::Result<
+      manyforge::core::ConfigurationFenceAcceptedDTO>
+  AcquireSelectedBringUpFence(
+      const manyforge::core::SelectedBringUpConfigurationFenceIntentDTO
+          &intent);
+  [[nodiscard]] manyforge::core::Result<
+      manyforge::core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO>
+  ReconcileSelectedBringUpFenceAcquireAttempt(
+      const manyforge::core::SelectedBringUpFenceAcquireAttemptQueryDTO &query)
+      const;
+  [[nodiscard]] manyforge::core::Result<
+      manyforge::core::SelectedBringUpConfigurationFenceStatusDTO>
+  ObserveSelectedBringUpFenceStatus(
+      const manyforge::core::SelectedBringUpConfigurationFenceStatusQueryDTO
+          &query) const;
+  [[nodiscard]] manyforge::core::Result<
+      manyforge::core::SelectedBringUpConfigurationFenceReleasedDTO>
+  ReleaseSelectedBringUpFence(
+      const manyforge::core::SelectedBringUpConfigurationFenceReleaseDTO
+          &request);
+  [[nodiscard]] manyforge::core::Result<
+      manyforge::core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO>
+  ReconcileSelectedBringUpFenceReleaseAttempt(
+      const manyforge::core::SelectedBringUpFenceReleaseAttemptQueryDTO &query)
+      const;
+  void RunWithExactHeldSelectedPredecessor(
+      const manyforge::core::SelectedBringUpConfigurationFenceStatusQueryDTO
+          &query,
+      const std::function<void()> &effect) const;
 
   ManagedKernelApplyFenceOwner(const ManagedKernelApplyFenceOwner &) = delete;
   ManagedKernelApplyFenceOwner &

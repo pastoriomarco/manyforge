@@ -18,10 +18,12 @@ constexpr std::size_t kMaximumBlockingReasonBytes = 1024U;
   return {std::move(code), std::move(message), {{"reason", std::move(reason)}}};
 }
 
+}  // namespace
+
 /// The next intent toward `target` from the achieved CCLC state, or nullopt
 /// when the target is satisfied. There is no intent that lowers Active to
 /// Prepared, so Active satisfies a `prepared` target.
-[[nodiscard]] std::optional<ComponentLifecycleIntentKindDTO> NextIntent(
+[[nodiscard]] std::optional<ComponentLifecycleIntentKindDTO> NextLifecycleIntentTowardTarget(
     const ComponentLifecycleStateDTO achieved, const LifecycleTargetStateDTO target) {
   using State = ComponentLifecycleStateDTO;
   using Intent = ComponentLifecycleIntentKindDTO;
@@ -48,7 +50,7 @@ constexpr std::size_t kMaximumBlockingReasonBytes = 1024U;
 }
 
 /// The intent a target names before any achieved state is known.
-[[nodiscard]] ComponentLifecycleIntentKindDTO NominalIntent(const LifecycleTargetStateDTO target) {
+[[nodiscard]] ComponentLifecycleIntentKindDTO NominalLifecycleIntentForTarget(const LifecycleTargetStateDTO target) {
   switch (target) {
     case LifecycleTargetStateDTO::kActive:
       return ComponentLifecycleIntentKindDTO::kEnable;
@@ -59,6 +61,8 @@ constexpr std::size_t kMaximumBlockingReasonBytes = 1024U;
   }
   return ComponentLifecycleIntentKindDTO::kEnable;
 }
+
+namespace {
 
 [[nodiscard]] ComponentLifecycleStateDTO RequestedStateOf(const ComponentLifecycleIntentKindDTO intent) {
   switch (intent) {
@@ -133,6 +137,12 @@ struct DomainObservation final {
 
 [[nodiscard]] bool Stale(const ErrorDTO& error) {
   return error.code == kLifecycleFactsStaleErrorCode;
+}
+
+[[nodiscard]] bool ReachedTargetRetired(const ErrorDTO& error) {
+  const auto reason = error.details.find("reason");
+  return Stale(error) && reason != error.details.end() &&
+         reason->second == "target_retired_or_superseded";
 }
 
 /// Observes one occurrence and keeps the retained intervention cause of its
@@ -287,11 +297,36 @@ CoordinatorLifecycleTargetDriverPorts::CoordinatorLifecycleTargetDriverPorts(
     IKernelCellAdmissionPort& kernel_cell_admission_port,
     std::function<Result<std::vector<ControllableComponentId>>()> unsettled_components) noexcept
     : coordinator_(coordinator),
-      snapshot_source_(snapshot_source),
-      catalog_source_(catalog_source),
-      port_resolver_(port_resolver),
+      snapshot_source_(&snapshot_source),
+      catalog_source_(&catalog_source),
+      port_resolver_(&port_resolver),
       kernel_cell_admission_port_(kernel_cell_admission_port),
       unsettled_components_(std::move(unsettled_components)) {}
+
+CoordinatorLifecycleTargetDriverPorts::CoordinatorLifecycleTargetDriverPorts(
+    ComponentLifecycleCoordinator& coordinator,
+    IKernelCellAdmissionPort& kernel_cell_admission_port,
+    std::function<Result<std::vector<ControllableComponentId>>()> unsettled_components) noexcept
+    : coordinator_(coordinator),
+      kernel_cell_admission_port_(kernel_cell_admission_port),
+      unsettled_components_(std::move(unsettled_components)) {}
+
+Result<void> CoordinatorLifecycleTargetDriverPorts::WithPinnedProduct(
+    const std::function<void(ICCLCLifecycleTargetDriverPorts&)>& pass) {
+  if (snapshot_source_ != nullptr) {
+    pass(*this);
+    return Result<void>::Ok();
+  }
+  auto acquired = coordinator_.AcquireProductPin();
+  if (!acquired.ok()) return Result<void>::Err(acquired.error());
+  const auto& context = acquired.value().context();
+  CoordinatorLifecycleTargetDriverPorts bound(
+      coordinator_, context.current_snapshot_source, context.lifecycle_plan_catalog_source,
+      context.lifecycle_port_resolver, kernel_cell_admission_port_, unsettled_components_);
+  bound.product_pin_ = &acquired.value();
+  pass(bound);
+  return Result<void>::Ok();
+}
 
 bool CoordinatorLifecycleTargetDriverPorts::AcceptingLifecycleRequests() {
   return coordinator_.accepting_new_requests();
@@ -306,10 +341,28 @@ bool CoordinatorLifecycleTargetDriverPorts::ComponentLifecycleSettling(
                                       component) != unsettled.value().end();
 }
 
+bool CoordinatorLifecycleTargetDriverPorts::RetiredTargetWorkSettled(
+    const ControllableComponentId& component) {
+  try {
+    return !ComponentLifecycleSettling(component) && coordinator_.ReadLifecycleOwnerSettlement().ok();
+  } catch (...) {
+    return false;
+  }
+}
+
 Result<ComponentLifecycleCurrentSnapshotDTO>
 CoordinatorLifecycleTargetDriverPorts::ReadCurrentComponent(
     const ControllableComponentId& component) {
-  auto snapshot = snapshot_source_.ReadCurrentComponentSnapshot(component);
+  if (snapshot_source_ == nullptr) {
+    auto result = Result<ComponentLifecycleCurrentSnapshotDTO>::Err(
+        driver_error("cclc_product_read_unavailable", "the product read did not run",
+                     "product_read_unavailable"));
+    const auto pinned = WithPinnedProduct([&](ICCLCLifecycleTargetDriverPorts& ports) {
+      result = ports.ReadCurrentComponent(component);
+    });
+    return pinned.ok() ? result : Result<ComponentLifecycleCurrentSnapshotDTO>::Err(pinned.error());
+  }
+  auto snapshot = snapshot_source_->ReadCurrentComponentSnapshot(component);
   if (!snapshot.ok()) return snapshot;
   const auto verified = VerifyComponentLifecycleCurrentSnapshot(snapshot.value());
   if (!verified.ok()) return Result<ComponentLifecycleCurrentSnapshotDTO>::Err(verified.error());
@@ -318,15 +371,32 @@ CoordinatorLifecycleTargetDriverPorts::ReadCurrentComponent(
 
 Result<BrandLifecyclePlanCatalogDTO> CoordinatorLifecycleTargetDriverPorts::LoadLifecyclePlanCatalog(
     const ResolvedLifecycleProviderOccurrenceDTO& occurrence) {
-  return catalog_source_.LoadExactLifecyclePlanCatalog(occurrence.provider_manifest_id,
-                                                       occurrence.provider_manifest_revision,
-                                                       occurrence.lifecycle_plan_catalog_digest);
+  if (catalog_source_ == nullptr) {
+    auto result = Result<BrandLifecyclePlanCatalogDTO>::Err(
+        driver_error("cclc_product_read_unavailable", "the product read did not run",
+                     "product_read_unavailable"));
+    const auto pinned = WithPinnedProduct([&](ICCLCLifecycleTargetDriverPorts& ports) {
+      result = ports.LoadLifecyclePlanCatalog(occurrence);
+    });
+    return pinned.ok() ? result : Result<BrandLifecyclePlanCatalogDTO>::Err(pinned.error());
+  }
+  return catalog_source_->LoadExactLifecyclePlanCatalog(occurrence.provider_manifest_id,
+                                                        occurrence.provider_manifest_revision,
+                                                        occurrence.lifecycle_plan_catalog_digest);
 }
 
 Result<BrandLifecycleObservationDTO> CoordinatorLifecycleTargetDriverPorts::Observe(
     const ResolvedLifecycleProviderOccurrenceDTO& occurrence,
     const BrandLifecycleObservationQueryDTO& query) {
-  auto port = port_resolver_.ResolveExactLifecyclePort(occurrence);
+  if (port_resolver_ == nullptr) {
+    auto result = Result<BrandLifecycleObservationDTO>::Err(
+        driver_error("cclc_product_read_unavailable", "the product read did not run",
+                     "product_read_unavailable"));
+    const auto pinned = WithPinnedProduct(
+        [&](ICCLCLifecycleTargetDriverPorts& ports) { result = ports.Observe(occurrence, query); });
+    return pinned.ok() ? result : Result<BrandLifecycleObservationDTO>::Err(pinned.error());
+  }
+  auto port = port_resolver_->ResolveExactLifecyclePort(occurrence);
   if (!port.ok()) return Result<BrandLifecycleObservationDTO>::Err(port.error());
   if (!port.value()) {
     return Result<BrandLifecycleObservationDTO>::Err(driver_error(
@@ -346,8 +416,29 @@ RequestOwnerEpoch CoordinatorLifecycleTargetDriverPorts::ReadRequestOwnerEpoch()
 
 Result<CCLCLifecycleRequestResultDTO> CoordinatorLifecycleTargetDriverPorts::SubmitLifecycle(
     const ComponentLifecycleIntentDTO& intent) {
-  return coordinator_.SubmitLifecycle(intent);
+  return product_pin_ ? coordinator_.SubmitLifecycle(intent, *product_pin_)
+                      : coordinator_.SubmitLifecycle(intent);
 }
+
+Result<CCLCLifecycleRequestResultDTO> CoordinatorLifecycleTargetDriverPorts::SubmitTargetLifecycle(
+    const ComponentLifecycleIntentDTO& intent,
+    const ComponentLifecycleTargetExpectationDTO& expected_target) {
+  return product_pin_ ? coordinator_.SubmitTargetLifecycle(intent, expected_target, *product_pin_)
+                      : coordinator_.SubmitTargetLifecycle(intent, expected_target);
+}
+
+Result<std::optional<CCLCLifecycleRequestResultDTO>>
+CoordinatorLifecycleTargetDriverPorts::ReadLifecycleRequestResult(const ComponentLifecycleIntentDTO& intent) {
+  return coordinator_.ReadLifecycleRequestResult(intent);
+}
+
+std::optional<bool> CoordinatorLifecycleTargetDriverPorts::ConfiguredComponentMembership(
+    const ControllableComponentId& component) const {
+  if (product_pin_ == nullptr || !product_pin_->context().identity) return std::nullopt;
+  const auto& configured = product_pin_->context().identity->configured_components;
+  return std::find(configured.begin(), configured.end(), component) != configured.end();
+}
+
 
 Result<std::optional<ComponentLifecycleStatusDTO>>
 CoordinatorLifecycleTargetDriverPorts::LoadLifecycleStatus(
@@ -469,6 +560,28 @@ void CCLCLifecycleTargetDriver::WorkerLoop() {
 
 void CCLCLifecycleTargetDriver::RunOnce() {
   std::lock_guard run_lock(run_mutex_);
+  const auto pinned = ports_.WithPinnedProduct(
+      [&](ICCLCLifecycleTargetDriverPorts& ports) { RunOncePinned(ports); });
+  if (pinned.ok()) return;
+  const auto now = clock_.now();
+  std::lock_guard lock(state_mutex_);
+  // Preserve in-flight and unrecorded facts. Pending product exchange grants
+  // no new step; journal/status ports remain available independently.
+  for (auto& [component, state] : components_) {
+    std::optional<ComponentLifecycleIntentKindDTO> next_intent;
+    if (state.progress) next_intent = state.progress->next_intent;
+    if (!next_intent && state.requested_state)
+      next_intent = NominalLifecycleIntentForTarget(*state.requested_state);
+    if (next_intent)
+      Publish(state, state.pending_intent || state.in_flight
+                  ? LifecycleProgressPhaseDTO::kOutcomeUncertain : LifecycleProgressPhaseDTO::kBlocked, next_intent,
+              state.progress ? state.progress->blocking_cause_class
+                             : LifecycleBlockingCauseClassDTO::kNone,
+              ReasonOf("lifecycle_product_unavailable", pinned.error()), now);
+  }
+}
+
+void CCLCLifecycleTargetDriver::RunOncePinned(ICCLCLifecycleTargetDriverPorts& ports) {
   const std::int64_t now = clock_.now();
   auto targets = store_.LoadLifecycleTargets();
   if (!targets.ok()) {
@@ -482,10 +595,11 @@ void CCLCLifecycleTargetDriver::RunOnce() {
       std::optional<ComponentLifecycleIntentKindDTO> next_intent;
       if (state.progress) next_intent = state.progress->next_intent;
       if (!next_intent && state.requested_state) {
-        next_intent = NominalIntent(*state.requested_state);
+        next_intent = NominalLifecycleIntentForTarget(*state.requested_state);
       }
       if (!next_intent) continue;
-      Publish(state, LifecycleProgressPhaseDTO::kBlocked, next_intent,
+      Publish(state, state.pending_intent || state.in_flight
+                  ? LifecycleProgressPhaseDTO::kOutcomeUncertain : LifecycleProgressPhaseDTO::kBlocked, next_intent,
               state.progress ? state.progress->blocking_cause_class
                              : LifecycleBlockingCauseClassDTO::kNone,
               ReasonOf("lifecycle_targets_unavailable", targets.error()), now);
@@ -500,12 +614,17 @@ void CCLCLifecycleTargetDriver::RunOnce() {
   std::map<ControllableComponentId, ComponentState> next;
   bool in_flight = false;
   for (const auto& target : targets.value()) {
-    auto found = states.find(target.controllable_component_id);
-    ComponentState state = found == states.end() ? ComponentState{} : std::move(found->second);
-    // A target cancelled after the list was read is no longer followed.
-    if (!EvaluateComponent(target, state, now)) continue;
+    auto [found, inserted] = states.try_emplace(target.controllable_component_id);
+    if (inserted) {
+      found->second.target_generation = target.target_generation;
+      found->second.requested_state = target.requested_state;
+    }
+  }
+  // The same map also owns absent/superseded original work and evidence.
+  for (auto& [component, state] : states) {
+    if (!EvaluateComponent(ports, component, state, now)) continue;
     in_flight = in_flight || state.in_flight.has_value() || state.pending_intent.has_value();
-    next.emplace(target.controllable_component_id, std::move(state));
+    next.emplace(component, std::move(state));
   }
   std::lock_guard lock(state_mutex_);
   components_ = std::move(next);
@@ -565,9 +684,10 @@ void CCLCLifecycleTargetDriver::PublishIncident(ComponentState& state,
   state.progress->incident = std::move(visible);
 }
 
-std::vector<CCLCLifecycleTargetDriver::DomainCondition> CCLCLifecycleTargetDriver::ObserveAllDomains(
-    const ComponentLifecycleTargetDTO& target, ComponentState& state,
-    const ComponentLifecycleCurrentSnapshotDTO& current,
+std::vector<CCLCLifecycleTargetDriver::DomainCondition>
+CCLCLifecycleTargetDriver::ObserveAllDomains(
+    ICCLCLifecycleTargetDriverPorts& ports, const ComponentLifecycleTargetDTO& target,
+    ComponentState& state, const ComponentLifecycleCurrentSnapshotDTO& current,
     const std::map<ControlDomainId, LifecycleBlockingCauseClassDTO>& retained,
     const bool record_causes) {
   // Each domain judges freshness on the clock read after its own observation.
@@ -576,7 +696,7 @@ std::vector<CCLCLifecycleTargetDriver::DomainCondition> CCLCLifecycleTargetDrive
   for (const auto& occurrence : current.provider_occurrences) {
     const auto stored = retained.find(occurrence.control_domain_id);
     auto observed = ObserveDomain(
-        ports_, target.controllable_component_id, occurrence, target.target_generation,
+        ports, target.controllable_component_id, occurrence, target.target_generation,
         stored == retained.end() ? LifecycleBlockingCauseClassDTO::kNone : stored->second,
         target.recovered_cause, record_causes, clock_);
     if (observed.retain) {
@@ -648,10 +768,11 @@ void CCLCLifecycleTargetDriver::RetryUnrecordedCauses(
   }
 }
 
-Result<bool> CCLCLifecycleTargetDriver::WriteReached(const ControllableComponentId& component,
-                                                     const std::uint64_t recovery_generation) {
+Result<bool> CCLCLifecycleTargetDriver::WriteReached(
+    const ComponentLifecycleTargetExpectationDTO& expected_target,
+    const std::uint64_t recovery_generation) {
   try {
-    return store_.RecordLifecycleTargetReached(component, true, recovery_generation);
+    return store_.RecordLifecycleTargetReached(expected_target, true, recovery_generation);
   } catch (const std::exception& exception) {
     return Result<bool>::Err(driver_error("lifecycle_reached_record_failed", exception.what(),
                                           "reached_record_failed"));
@@ -663,7 +784,7 @@ Result<bool> CCLCLifecycleTargetDriver::WriteReached(const ControllableComponent
 }
 
 const CCLCLifecycleTargetDriver::ContainmentOutcome& CCLCLifecycleTargetDriver::Contain(
-    const ComponentLifecycleIncidentDTO& incident) {
+    ICCLCLifecycleTargetDriverPorts& ports, const ComponentLifecycleIncidentDTO& incident) {
   // At most once per incident from this driver. A replacement driver that
   // finds the record still pending repeats the request, which the Kernel
   // replays exactly from the incident identity.
@@ -677,7 +798,7 @@ const CCLCLifecycleTargetDriver::ContainmentOutcome& CCLCLifecycleTargetDriver::
           "lifecycle_incident_containment_failed", "containment raised an exception",
           "containment_exception"));
   try {
-    contained = ports_.RequestIncidentContainment(
+    contained = ports.RequestIncidentContainment(
         {incident.incident_id, incident.controllable_component_id, incident.cause_class});
   } catch (...) {
   }
@@ -690,11 +811,12 @@ const CCLCLifecycleTargetDriver::ContainmentOutcome& CCLCLifecycleTargetDriver::
   return containments_.insert_or_assign(incident.incident_id, std::move(outcome)).first->second;
 }
 
-void CCLCLifecycleTargetDriver::RecordContainment(const ComponentIncidentRecordDTO& record,
+void CCLCLifecycleTargetDriver::RecordContainment(ICCLCLifecycleTargetDriverPorts& ports,
+                                                  const ComponentIncidentRecordDTO& record,
                                                   const std::int64_t now_ns) {
   const auto& incident = record.incident;
   if (incident.containment_state != ComponentIncidentContainmentStateDTO::kPending) return;
-  const auto& outcome = Contain(incident);
+  const auto& outcome = Contain(ports, incident);
   const auto state = outcome.receipt ? ComponentIncidentContainmentStateDTO::kRequested
                                      : ComponentIncidentContainmentStateDTO::kFailed;
   try {
@@ -719,12 +841,13 @@ bool CCLCLifecycleTargetDriver::ApplyReplacesComponent(const ControllableCompone
   return replaced.ok() && replaced.value();
 }
 
-void CCLCLifecycleTargetDriver::ContainAndRecordIncident(ComponentState& state,
+void CCLCLifecycleTargetDriver::ContainAndRecordIncident(ICCLCLifecycleTargetDriverPorts& ports,
+                                                         ComponentState& state,
                                                          const std::int64_t now_ns) {
   auto incident = *state.unrecorded_incident;
   // Containment never depends on, waits for or is delayed by the record. Its
   // outcome is remembered and written into the record by RecordContainment.
-  static_cast<void>(Contain(incident));
+  static_cast<void>(Contain(ports, incident));
   // Malformed optional text never prevents the original fault record.
   if (incident.diagnostic && !ComponentIncidentDiagnosticIsValid(*incident.diagnostic))
     incident.diagnostic.reset();
@@ -769,13 +892,13 @@ void CCLCLifecycleTargetDriver::ContainAndRecordIncident(ComponentState& state,
     return;
   }
   state.unrecorded_incident.reset();
-  RecordContainment(stored.value(), now_ns);
+  RecordContainment(ports, stored.value(), now_ns);
   PublishIncident(state, stored.value().incident, now_ns, stored.value().diagnostic);
 }
 
 bool CCLCLifecycleTargetDriver::EvaluateIncident(
-    const ComponentLifecycleTargetDTO& target, ComponentState& state,
-    const ComponentLifecycleCurrentSnapshotDTO& current,
+    ICCLCLifecycleTargetDriverPorts& ports, const ComponentLifecycleTargetDTO& target,
+    ComponentState& state, const ComponentLifecycleCurrentSnapshotDTO& current,
     const std::vector<DomainCondition>& conditions, std::optional<ComponentIncidentRecordDTO> open,
     const IncidentDetection detection,
     const std::optional<ComponentLifecycleIntentKindDTO> next_intent, const std::int64_t now_ns,
@@ -866,7 +989,7 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
         (diagnostic_snapshot ? !already_enriched : !already_has_error)) {
       // A replacement owner may find pending containment. Request it before
       // any new diagnostic read/write; auxiliary IO never gates the Stop.
-      RecordContainment(*open, now_ns);
+      RecordContainment(ports, *open, now_ns);
       try {
         const auto appended = store_.AppendComponentIncidentDiagnostic(
             open->incident.incident_id, now_ns, *diagnostic, diagnostic_snapshot);
@@ -904,7 +1027,7 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
       } catch (...) {
       }
     }
-    RecordContainment(*open, now_ns);
+    RecordContainment(ports, *open, now_ns);
     PublishIncident(state, open->incident, now_ns, open->diagnostic, open->diagnostic_loaded);
     return true;
   }
@@ -913,7 +1036,7 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
     // unavailable behind the Apply. The readiness expectation only marks the
     // wait as delayed. Adoption of the Apply ends this window.
     Publish(state, LifecycleProgressPhaseDTO::kWaitingForPrerequisites,
-            next_intent ? next_intent : std::optional(NominalIntent(target.requested_state)),
+            next_intent ? next_intent : std::optional(NominalLifecycleIntentForTarget(target.requested_state)),
             LifecycleBlockingCauseClassDTO::kAvailability,
             std::string("apply_replacement_in_progress"), now_ns);
     return true;
@@ -952,24 +1075,47 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
   incident.diagnostic = diagnostic;
   state.unrecorded_incident = std::move(incident);
   state.unrecorded_incident_generation = state.recovery_generation;
-  ContainAndRecordIncident(state, now_ns);
+  ContainAndRecordIncident(ports, state, now_ns);
   return true;
 }
 
-bool CCLCLifecycleTargetDriver::FollowInFlight(const ComponentLifecycleTargetDTO& target,
+bool CCLCLifecycleTargetDriver::FollowInFlight(ICCLCLifecycleTargetDriverPorts& ports,
+                                               const std::optional<ComponentLifecycleTargetDTO>& target,
                                                ComponentState& state, const std::int64_t now_ns) {
   if (state.pending_intent) {
-    // Exact replay of the unknown submission before anything else.
     const auto pending = *state.pending_intent;
-    SubmitIntent(state, pending, now_ns);
-    return true;
+    const auto expected = state.pending_target;
+    const bool current = target && expected &&
+        target->controllable_component_id == expected->controllable_component_id &&
+        target->target_generation == expected->target_generation;
+    if (current) {
+      SubmitIntent(ports, state, pending, *expected, now_ns);
+      return true;
+    }
+    // Absence/supersession never grants an effect replay, even on a lost reply.
+    Result<std::optional<CCLCLifecycleRequestResultDTO>> observed =
+        Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
+            driver_error("lifecycle_request_observation_failed", "request observation raised an exception",
+                         "request_observation_exception"));
+    try { observed = ports.ReadLifecycleRequestResult(pending); } catch (...) {}
+    if (!observed.ok() || !observed.value() || !expected ||
+        (observed.value()->replay_status != RequestReplayStatusDTO::kAcceptedNew &&
+         observed.value()->replay_status != RequestReplayStatusDTO::kReplayedExact) ||
+        (observed.value()->acceptance.has_value() == observed.value()->rejection.has_value())) {
+      Publish(state, LifecycleProgressPhaseDTO::kOutcomeUncertain, pending.intent,
+              LifecycleBlockingCauseClassDTO::kNone,
+              observed.ok() ? std::string("retired_request_outcome_unavailable")
+                            : ReasonOf("retired_request_outcome_unavailable", observed.error()), now_ns);
+      return true;
+    }
+    ConsumeSubmissionResult(state, pending, *expected, *observed.value(), now_ns);
   }
   if (!state.in_flight) return false;
   const auto& in_flight = *state.in_flight;
   // Not observed while open: the last known class stays presented.
   const auto known_cause =
       state.progress ? state.progress->blocking_cause_class : LifecycleBlockingCauseClassDTO::kNone;
-  const auto status = ports_.LoadLifecycleStatus(in_flight.lifecycle_transaction_id);
+  const auto status = ports.LoadLifecycleStatus(in_flight.lifecycle_transaction_id);
   if (!status.ok() || !status.value()) {
     Publish(state, LifecycleProgressPhaseDTO::kOutcomeUncertain, in_flight.intent, known_cause,
             status.ok() ? std::string("transaction_status_unavailable")
@@ -986,7 +1132,8 @@ bool CCLCLifecycleTargetDriver::FollowInFlight(const ComponentLifecycleTargetDTO
             uncertain ? LifecycleProgressPhaseDTO::kOutcomeUncertain
                       : LifecycleProgressPhaseDTO::kTransitionInProgress,
             in_flight.intent, known_cause,
-            in_flight.target_generation == target.target_generation
+            target && in_flight.expected_target.controllable_component_id == target->controllable_component_id &&
+                in_flight.expected_target.target_generation == target->target_generation
                 ? (uncertain ? std::optional<std::string>("reconciling_from_fresh_observation")
                              : std::nullopt)
                 : std::optional<std::string>("superseded_step_settling"),
@@ -994,7 +1141,8 @@ bool CCLCLifecycleTargetDriver::FollowInFlight(const ComponentLifecycleTargetDTO
     return true;
   }
   // CCLC has recorded a known outcome (after reconciliation when needed).
-  const bool current = in_flight.target_generation == target.target_generation;
+  const bool current = target && in_flight.expected_target.controllable_component_id == target->controllable_component_id &&
+                in_flight.expected_target.target_generation == target->target_generation;
   const bool succeeded = *value.terminal_result == ComponentLifecycleTerminalResultDTO::kSucceeded;
   state.in_flight.reset();
   if (!current) return false;
@@ -1016,33 +1164,45 @@ bool CCLCLifecycleTargetDriver::FollowInFlight(const ComponentLifecycleTargetDTO
   return false;
 }
 
-void CCLCLifecycleTargetDriver::SubmitIntent(ComponentState& state,
+void CCLCLifecycleTargetDriver::SubmitIntent(ICCLCLifecycleTargetDriverPorts& ports,
+                                             ComponentState& state,
                                              const ComponentLifecycleIntentDTO& intent,
+                                             const ComponentLifecycleTargetExpectationDTO& expected_target,
                                              const std::int64_t now_ns) {
   state.pending_intent.reset();
+  state.pending_target.reset();
   Result<CCLCLifecycleRequestResultDTO> result =
       Result<CCLCLifecycleRequestResultDTO>::Err(driver_error(
           "lifecycle_target_submit_failed", "lifecycle submission raised an exception",
           "submit_exception"));
   try {
-    result = ports_.SubmitLifecycle(intent);
+    result = ports.SubmitTargetLifecycle(intent, expected_target);
   } catch (...) {
   }
   if (!result.ok()) {
-    // Unknown whether CCLC admitted it: only the exact same request may be
-    // sent again, which CCLC classifies as replay.
+    // Unknown whether CCLC admitted it: retain both original identities.
+    // Exact effect replay is allowed only while that target remains current.
     state.pending_intent = intent;
+    state.pending_target = expected_target;
     Publish(state, LifecycleProgressPhaseDTO::kOutcomeUncertain, intent.intent,
             LifecycleBlockingCauseClassDTO::kNone,
             ReasonOf("submission_outcome_unknown", result.error()), now_ns);
     return;
   }
-  const auto& value = result.value();
+  ConsumeSubmissionResult(state, intent, expected_target, result.value(), now_ns);
+}
+
+void CCLCLifecycleTargetDriver::ConsumeSubmissionResult(
+    ComponentState& state, const ComponentLifecycleIntentDTO& intent,
+    const ComponentLifecycleTargetExpectationDTO& expected_target,
+    const CCLCLifecycleRequestResultDTO& value, const std::int64_t now_ns) {
+  state.pending_intent.reset();
+  state.pending_target.reset();
   if (value.acceptance && !value.rejection &&
       (value.replay_status == RequestReplayStatusDTO::kAcceptedNew ||
        value.replay_status == RequestReplayStatusDTO::kReplayedExact)) {
     state.in_flight = InFlight{value.acceptance->lifecycle_transaction_id, intent.intent,
-                               state.target_generation};
+                               expected_target};
     Publish(state, LifecycleProgressPhaseDTO::kTransitionInProgress, intent.intent,
             LifecycleBlockingCauseClassDTO::kNone, std::nullopt, now_ns);
     return;
@@ -1071,10 +1231,10 @@ void CCLCLifecycleTargetDriver::SubmitIntent(ComponentState& state,
           LifecycleBlockingCauseClassDTO::kNone, reason, now_ns);
 }
 
-bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTargetDTO& listed,
+bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPorts& ports,
+                                                  const ControllableComponentId& component,
                                                   ComponentState& state,
                                                   const std::int64_t now_ns) {
-  const auto& component = listed.controllable_component_id;
   // One consistent read of every durable fact this pass decides from, with
   // the recovery generation that fences this pass's writes against a
   // concurrent operator Recover. Unreadable facts never read as "nothing
@@ -1092,35 +1252,16 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
     for (const auto& [domain, pending] : state.unrecorded_causes) {
       known = Worst(known, pending.cause_class);
     }
-    Publish(state, LifecycleProgressPhaseDTO::kBlocked, NominalIntent(listed.requested_state),
+    Publish(state, state.pending_intent || state.in_flight
+                ? LifecycleProgressPhaseDTO::kOutcomeUncertain : LifecycleProgressPhaseDTO::kBlocked,
+            state.progress && state.progress->next_intent ? state.progress->next_intent
+                : std::optional(NominalLifecycleIntentForTarget(*state.requested_state)),
             known, ReasonOf("lifecycle_facts_unavailable", facts.error()), now_ns);
     return true;
   }
-  if (!facts.value().target) return false;
-  // The target read with the generation, never the (older) listed one.
-  auto target = *facts.value().target;
+  const auto& actual_target = facts.value().target;
+  const bool retired = !actual_target || actual_target->target_generation != state.target_generation;
   state.recovery_generation = facts.value().recovery_generation;
-  state.requested_state = target.requested_state;
-
-  if (state.target_generation != target.target_generation) {
-    // A new target (operator, superseding Apply) restarts progression; an
-    // open transaction of the old one is still followed until terminal.
-    state.target_generation = target.target_generation;
-    state.step = 0U;
-    state.attempt = 1U;
-    state.failures = 0U;
-    state.failed_basis.reset();
-    state.failure_reason.reset();
-    state.rejected_at_ns.reset();
-    state.waiting_since_ns.reset();
-    // Waiting is cancelled at once. An unknown submission of the old target
-    // is not re-sent; if CCLC accepted it, it completes under its deadline
-    // and the component stays busy for any new request until then.
-    state.pending_intent.reset();
-    // The old target's unrecorded reached marker does not carry over; an
-    // unrecorded intervention cause does (only Recover clears it).
-    state.unrecorded_reached.reset();
-  }
 
   // Retry what earlier passes observed but could not record (fail closed).
   // An intervention class keeps blocking from memory until it is durable; a
@@ -1130,23 +1271,76 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
     retained[cause.control_domain_id] = cause.cause_class;
   }
   RetryUnrecordedCauses(state, component, retained);
+  bool reached_observed = !retired && state.unrecorded_reached.has_value();
   if (state.unrecorded_reached) {
     // While the marker is not durable the component is classified as having
     // reached its target: a later loss is then an incident (contained, and
     // only the operator's Recover proceeds) rather than ordinary waiting
     // that would progress on its own. A Recover since (stale) reset it.
-    const auto written = WriteReached(component, *state.unrecorded_reached);
+    const auto written = WriteReached({component, state.target_generation}, *state.unrecorded_reached);
     if (!written.ok() && Stale(written.error())) {
+      const bool target_retired = ReachedTargetRetired(written.error());
       state.unrecorded_reached.reset();
+      if (target_retired) state.retired_reached_observation = true;
+      reached_observed = false;
       Wake();
-    } else {
-      target.reached = true;
-      target.recovered_cause.reset();
-      if (written.ok()) state.unrecorded_reached.reset();
+      if (target_retired && !retired) {
+        // The atomic writer proves these earlier target facts are obsolete.
+        // Stop this pass before provider observation or old-target pursuit.
+        Publish(state, LifecycleProgressPhaseDTO::kOutcomeUncertain,
+                NominalLifecycleIntentForTarget(*state.requested_state),
+                state.progress ? state.progress->blocking_cause_class : LifecycleBlockingCauseClassDTO::kNone,
+                "target_retired:retired_target_reached_observation_not_applied", now_ns);
+        return true;
+      }
+    } else if (written.ok()) {
+      state.unrecorded_reached.reset();
     }
   }
 
-  if (FollowInFlight(target, state, now_ns)) return true;
+  if (FollowInFlight(ports, actual_target, state, now_ns)) return true;
+  if (retired) {
+    if (state.unrecorded_incident) {
+      ContainAndRecordIncident(ports, state, now_ns);
+      return true;
+    }
+    if (facts.value().open_incident) {
+      PublishIncident(state, facts.value().open_incident->incident, now_ns,
+                      facts.value().open_incident->diagnostic,
+                      facts.value().open_incident->diagnostic_loaded);
+      return true;
+    }
+    if (!state.unrecorded_causes.empty() || state.unrecorded_reached ||
+        !ports.RetiredTargetWorkSettled(component)) {
+      const auto intent = state.progress && state.progress->next_intent ? state.progress->next_intent
+          : std::optional(NominalLifecycleIntentForTarget(*state.requested_state));
+      Publish(state, LifecycleProgressPhaseDTO::kOutcomeUncertain, intent,
+              state.progress ? state.progress->blocking_cause_class : LifecycleBlockingCauseClassDTO::kNone,
+              state.cause_record_error.value_or("retired_target_evidence_settling"), now_ns);
+      return true;
+    }
+    // Cancelled here means retirement of target pursuit, never robot work.
+    if (!actual_target) {
+      Publish(state, LifecycleProgressPhaseDTO::kCancelled, std::nullopt,
+              LifecycleBlockingCauseClassDTO::kNone,
+              state.retired_reached_observation
+                  ? "target_retired:retired_target_reached_observation_not_applied"
+                  : "target_retired:original_work_settled", now_ns);
+      std::optional<bool> configured;
+      try { configured = ports.ConfiguredComponentMembership(component); } catch (...) {}
+      return !configured.has_value() || *configured;
+    }
+    // The successor gets fresh pursuit state only after the original settles.
+    state = ComponentState{};
+    state.target_generation = actual_target->target_generation;
+    state.recovery_generation = facts.value().recovery_generation;
+  }
+  auto target = *actual_target;
+  state.requested_state = target.requested_state;
+  if (reached_observed) {
+    target.reached = true;
+    target.recovered_cause.reset();
+  }
 
   auto retained_worst = LifecycleBlockingCauseClassDTO::kNone;
   for (const auto& [domain, cause] : retained) retained_worst = Worst(retained_worst, cause);
@@ -1156,29 +1350,29 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
   if (state.unrecorded_incident) {
     if (!open) {
       // A detected incident is already contained; only its record is retried.
-      ContainAndRecordIncident(state, now_ns);
+      ContainAndRecordIncident(ports, state, now_ns);
       return true;
     }
     // Another record is open for the component; the open incident governs.
     state.unrecorded_incident.reset();
   }
-  const auto snapshot = ports_.ReadCurrentComponent(component);
+  const auto snapshot = ports.ReadCurrentComponent(component);
   if (!snapshot.ok()) {
     if (open) {
       PublishIncident(state, open->incident, now_ns, open->diagnostic, open->diagnostic_loaded);
       return true;
     }
     Publish(state, LifecycleProgressPhaseDTO::kWaitingForPrerequisites,
-            NominalIntent(target.requested_state), retained_worst,
+            NominalLifecycleIntentForTarget(target.requested_state), retained_worst,
             ReasonOf("component_snapshot_unavailable", snapshot.error()), now_ns);
     return true;
   }
   const auto& current = snapshot.value();
   const auto achieved = current.component_lifecycle_state;
-  const auto next = NextIntent(achieved, target.requested_state);
+  const auto next = NextLifecycleIntentTowardTarget(achieved, target.requested_state);
   // While any CCLC transaction of the component is unsettled no newly
   // reported class is retained (see ObserveDomain) and no step is submitted.
-  const bool settling = ports_.ComponentLifecycleSettling(component);
+  const bool settling = ports.ComponentLifecycleSettling(component);
   // Losses are incidents only after the component reached its target on
   // fresh status in this session (the durable marker, kept across in-session
   // owner replacement and for a component an Apply retains unchanged); while
@@ -1191,9 +1385,10 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
                                                   : IncidentDetection::kNone;
   if (open) {
     // Always true with an open incident: it published the incident.
-    static_cast<void>(EvaluateIncident(
-        target, state, current, ObserveAllDomains(target, state, current, retained, !settling),
-        open, detection, next, now_ns));
+    static_cast<void>(
+        EvaluateIncident(ports, target, state, current,
+                         ObserveAllDomains(ports, target, state, current, retained, !settling),
+                         open, detection, next, now_ns));
     return true;
   }
   if (!next) {
@@ -1203,9 +1398,9 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
     // safety stop, fault or lost controller after it became ready stays
     // visible in its progress (spec 530 lifecycle blocking causes). Nothing
     // is submitted; an unchanged class writes nothing.
-    const auto conditions = ObserveAllDomains(target, state, current, retained, !settling);
-    if (EvaluateIncident(target, state, current, conditions, std::nullopt, detection, std::nullopt,
-                         now_ns)) {
+    const auto conditions = ObserveAllDomains(ports, target, state, current, retained, !settling);
+    if (EvaluateIncident(ports, target, state, current, conditions, std::nullopt, detection,
+                         std::nullopt, now_ns)) {
       return true;
     }
     auto cause = current.provider_occurrences.empty() ? retained_worst
@@ -1223,8 +1418,14 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
     // incident (and a recovered incident is over).
     std::optional<std::string> reached_reason;
     if (following && !target.reached && all_fresh_without_cause) {
-      const auto written = WriteReached(component, state.recovery_generation);
-      if (!written.ok() && Stale(written.error())) {
+      const auto written = WriteReached({component, target.target_generation}, state.recovery_generation);
+      if (!written.ok() && ReachedTargetRetired(written.error())) {
+        state.retired_reached_observation = true;
+        Publish(state, LifecycleProgressPhaseDTO::kOutcomeUncertain, std::nullopt, cause,
+                "target_retired:retired_target_reached_observation_not_applied", now_ns);
+        Wake();
+        return true;
+      } else if (!written.ok() && Stale(written.error())) {
         // Reached on facts a Recover has since replaced: re-evaluate.
         Wake();
       } else if (!written.ok()) {
@@ -1259,7 +1460,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
   std::optional<std::string> unavailable_reason;
   std::vector<DomainCondition> conditions;
   for (const auto& occurrence : current.provider_occurrences) {
-    auto catalog = ports_.LoadLifecyclePlanCatalog(occurrence);
+    auto catalog = ports.LoadLifecyclePlanCatalog(occurrence);
     if (!catalog.ok()) {
       Publish(state, LifecycleProgressPhaseDTO::kBlocked, *next,
               LifecycleBlockingCauseClassDTO::kConfiguration,
@@ -1269,7 +1470,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
     catalogs.push_back(std::move(catalog.value()));
     const auto stored = retained.find(occurrence.control_domain_id);
     auto observed = ObserveDomain(
-        ports_, component, occurrence, target.target_generation,
+        ports, component, occurrence, target.target_generation,
         stored == retained.end() ? LifecycleBlockingCauseClassDTO::kNone : stored->second,
         target.recovered_cause, !settling, clock_);
     if (observed.retain) {
@@ -1291,7 +1492,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
                              achieved == ComponentLifecycleStateDTO::kFaulted;
   if ((detection == IncidentDetection::kNewCause ||
        (detection == IncidentDetection::kAny && verified_loss)) &&
-      EvaluateIncident(target, state, current, conditions, std::nullopt,
+      EvaluateIncident(ports, target, state, current, conditions, std::nullopt,
                        verified_loss ? detection : IncidentDetection::kNewCause, next, now_ns,
                        LifecycleBlockingCauseClassDTO::kUnknown)) {
     return true;
@@ -1315,7 +1516,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
     return true;
   }
 
-  const auto admission = ports_.ReadCellAdmission();
+  const auto admission = ports.ReadCellAdmission();
   basis.admission_generation = admission.admission_generation.value();
   if (state.failures >= config_.maximum_attempts_per_step) {
     Publish(state, LifecycleProgressPhaseDTO::kBlocked, *next, cause,
@@ -1368,7 +1569,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
             std::string("cell_admission_closed"), now_ns);
     return true;
   }
-  if (!ports_.AcceptingLifecycleRequests()) {
+  if (!ports.AcceptingLifecycleRequests()) {
     Publish(state, LifecycleProgressPhaseDTO::kWaitingForPrerequisites, *next, cause,
             std::string("cclc_admission_closed"), now_ns);
     return true;
@@ -1396,7 +1597,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
   ComponentLifecycleIntentDTO intent{
       {LifecycleTargetRequestId(component, target.target_generation, state.step, *next,
                                 state.attempt),
-       ports_.ReadRequestOwnerEpoch(), std::string(kLifecycleTargetSourceLabel),
+       ports.ReadRequestOwnerEpoch(), std::string(kLifecycleTargetSourceLabel),
        "lifecycle_target.g" + std::to_string(target.target_generation)},
       component,
       *next,
@@ -1410,7 +1611,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(const ComponentLifecycleTarget
       admission.admission_generation,
       std::nullopt};
   state.attempt_basis = basis;
-  SubmitIntent(state, intent, now_ns);
+  SubmitIntent(ports, state, intent, {component, target.target_generation}, now_ns);
   if (state.progress && state.progress->phase == LifecycleProgressPhaseDTO::kTransitionInProgress) {
     state.progress->blocking_cause_class = cause;
   }
@@ -1439,14 +1640,13 @@ Result<ComponentLifecycleTargetViewDTO> CCLCLifecycleTargetDriver::ReadTargetVie
       // Optional observation never breaks lifecycle or control status.
     }
   }
-  if (!target.value()) return Result<ComponentLifecycleTargetViewDTO>::Ok(view);
   view.target = target.value();
   {
     std::lock_guard lock(state_mutex_);
     const auto found = components_.find(component);
-    if (found != components_.end() &&
-        found->second.target_generation == view.target->target_generation &&
-        found->second.progress) {
+    // The original pursuit's actual progress stays visible while its work
+    // settles, including after a target is absent or superseded.
+    if (found != components_.end() && found->second.progress) {
       view.progress = found->second.progress;
       // `delayed` is a function of the owner clock; reads never publish.
       if (view.progress->waiting_since_ns) {
@@ -1455,11 +1655,11 @@ Result<ComponentLifecycleTargetViewDTO> CCLCLifecycleTargetDriver::ReadTargetVie
       }
     }
   }
-  if (!view.progress) {
+  if (!view.progress && view.target) {
     // Recorded but not yet evaluated: waiting from now on.
     view.progress = ComponentLifecycleProgressDTO{
         LifecycleProgressPhaseDTO::kWaitingForPrerequisites,
-        NominalIntent(view.target->requested_state),
+        NominalLifecycleIntentForTarget(view.target->requested_state),
         LifecycleBlockingCauseClassDTO::kNone,
         std::string("not_yet_evaluated"),
         now,
@@ -1477,6 +1677,11 @@ Result<ComponentLifecycleTargetViewDTO> CCLCLifecycleTargetDriver::ReadTargetVie
           driver_error("lifecycle_incident_record_invalid",
                        "the open incident has a negative detection time", "incident_time_invalid"));
     }
+    if (!view.progress) {
+      view.progress = ComponentLifecycleProgressDTO{
+          LifecycleProgressPhaseDTO::kBlocked, ComponentLifecycleIntentKindDTO::kRecover,
+          incident.cause_class, std::nullopt, incident.detected_at_ns, false, std::nullopt};
+    }
     view.progress->phase = LifecycleProgressPhaseDTO::kBlocked;
     view.progress->next_intent = ComponentLifecycleIntentKindDTO::kRecover;
     view.progress->blocking_cause_class = incident.cause_class;
@@ -1487,7 +1692,7 @@ Result<ComponentLifecycleTargetViewDTO> CCLCLifecycleTargetDriver::ReadTargetVie
       view.progress->waiting_since_ns = incident.detected_at_ns;
     }
     view.progress->incident = incident;
-  } else if (view.progress->incident) {
+  } else if (view.progress && view.progress->incident) {
     // Recovered since the last pass: the driver re-evaluates next.
     view.progress->incident.reset();
     view.progress->phase = LifecycleProgressPhaseDTO::kWaitingForPrerequisites;
@@ -1512,20 +1717,28 @@ Result<std::optional<CCLCLifecycleRequestResultDTO>> CCLCLifecycleTargetDriver::
     // Ordinary CCLC admission decides (and rejects an invalid one).
     return Result<Value>::Ok(std::nullopt);
   }
-  const auto now = clock_.now();
-  if (now < 0) {
-    return Result<Value>::Err(driver_error("lifecycle_incident_clock_invalid",
-                                           "the owner clock is negative", "incident_clock_invalid"));
-  }
-  // Authorization only: the journal checks the request identity, owner epoch
-  // and replay, records the Recover and closes the incident; no vendor
-  // primitive is dispatched here, so it is admissible while the cell is
-  // latched. The policy-permitted steps follow through ordinary admission.
-  auto recovered = store_.RecoverComponentIncident(
-      ports_.ReadRequestOwnerEpoch(), intent,
-      intent.attribution.principal_id.value_or(intent.request_context.source_label), now);
-  if (recovered.ok() && recovered.value()) Wake();
-  return recovered;
+  auto result = Result<Value>::Ok(std::nullopt);
+  const auto pinned = ports_.WithPinnedProduct([&](ICCLCLifecycleTargetDriverPorts& ports) {
+    const auto recover = [&]() -> Result<Value> {
+      const auto now = clock_.now();
+      if (now < 0) {
+        return Result<Value>::Err(driver_error("lifecycle_incident_clock_invalid",
+                                               "the owner clock is negative",
+                                               "incident_clock_invalid"));
+      }
+      // Authorization only: the journal checks the request identity, owner epoch
+      // and replay, records the Recover and closes the incident; no vendor
+      // primitive is dispatched here, so it is admissible while the cell is
+      // latched. The policy-permitted steps follow through ordinary admission.
+      auto recovered = store_.RecoverComponentIncident(
+          ports.ReadRequestOwnerEpoch(), intent,
+          intent.attribution.principal_id.value_or(intent.request_context.source_label), now);
+      if (recovered.ok() && recovered.value()) Wake();
+      return recovered;
+    };
+    result = recover();
+  });
+  return pinned.ok() ? result : Result<Value>::Err(pinned.error());
 }
 
 Result<std::vector<ComponentIncidentEventDTO>> CCLCLifecycleTargetDriver::LoadIncidentEvents(

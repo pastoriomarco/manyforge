@@ -82,16 +82,6 @@ public:
         std::memory_order_acquire);
   }
 
-  // Exercise the real worker rendezvous without claiming canonical prepared
-  // product/admission qualification. The public path binds this same clock
-  // only after verifying exact prepared membership.
-  static core::ExecutionHandle execute_with_clock(
-      RoboPlanExecutionBackend &backend, const core::TrajectoryDTO &trajectory,
-      std::shared_ptr<core::detail::CoordinatedExecutionClock> clock,
-      core::OperationParticipantId participant) {
-    return backend.execute_with_clock(trajectory, std::move(clock), std::move(participant));
-  }
-
   [[nodiscard]] static std::unique_lock<std::mutex>
   lock_nominal_adapter(RoboPlanExecutionBackend &backend) {
     return std::unique_lock<std::mutex>(backend.state_mutex_);

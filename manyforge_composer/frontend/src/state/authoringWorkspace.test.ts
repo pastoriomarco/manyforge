@@ -405,7 +405,7 @@ describe('authoringWorkspace', () => {
         differsFromSaved: false,
       },
       saved: { path: null, deploymentRevision: null },
-      managerApplied: { deploymentRevision: null, scenarioId: null },
+      managerApplied: { activationOrder: null, deploymentRevision: null, scenarioId: null },
       runAdmission: { ready: true, reason: null },
       binding: null,
       scenarioCandidates: [],

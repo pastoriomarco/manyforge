@@ -91,7 +91,7 @@ function controller(): DeploymentWorkspaceController {
         differsFromSaved: false,
       },
       saved: { path: '/workspace/cell-a.deployment.yaml', deploymentRevision: digest },
-      managerApplied: { deploymentRevision: digest, scenarioId: 'cell-a' },
+      managerApplied: { activationOrder: null, deploymentRevision: digest, scenarioId: 'cell-a' },
       runAdmission: { ready: true, reason: null },
       binding: null,
       scenarioCandidates: [],

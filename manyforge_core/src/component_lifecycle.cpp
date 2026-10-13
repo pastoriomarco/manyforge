@@ -1,8 +1,12 @@
 #include <algorithm>
+#include <functional>
 #include <limits>
+#include <map>
+#include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <set>
+#include <stdexcept>
 #include <tuple>
 #include <utility>
 
@@ -253,6 +257,310 @@ template <typename Value, typename Less>
               LifecyclePostconditionResultDTO::kSatisfied);
 }
 
+// These joins establish durable data consistency only. The original live
+// private offer and independently qualified retained bundle own effect entry;
+// replay/owner replacement must remain observation and reconciliation only.
+[[nodiscard]] bool selected_status_evidence_valid(const ComponentLifecycleStatusDTO& status) {
+  const auto& evidence = *status.selected_bring_up;
+  const auto& claim = evidence.selected_claim;
+  const auto& intent = claim.intent;
+  const auto& scope = evidence.accepted_fence.captured_scope;
+  const auto& accepted = status.acceptance;
+  const auto& request = status.accepted_intent.request_context;
+  if (status.accepted_intent.intent != ComponentLifecycleIntentKindDTO::kEnable ||
+      status.accepted_intent.program_node_evidence ||
+      !IsExactLowercaseSha256Digest(evidence.offer_digest.value()) ||
+      !IsExactLowercaseSha256Digest(evidence.original_request_payload_digest.value()) ||
+      !IsExactLowercaseSha256Digest(evidence.predecessor_snapshot_digest.value()) ||
+      evidence.incident_id.empty() || evidence.incident_id.size() > kMaxLifecycleIdentityBytes ||
+      !bounded_identity(evidence.containment_stop_id) ||
+      !evidence.containment_stop_generation.nonzero() ||
+      !evidence.candidate_projection_revision.valid() ||
+      !bounded_identity(evidence.candidate_projection_revision.retained_bundle_id) ||
+      !bounded_identity(evidence.candidate_projection_revision.graph_revision) ||
+      !IsExactLowercaseSha256Digest(evidence.candidate_retained_bundle_digest.value()) ||
+      evidence.candidate_retained_bundle_bytes == 0U ||
+      !evidence.predecessor_occurrence.locally_valid() ||
+      !evidence.successor_occurrence.locally_valid() ||
+      !ValidateCellAdmissionRecoveryReceiptQuery({intent, claim, std::nullopt}).ok() ||
+      intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
+      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
+      intent.owner_epoch != request.request_owner_epoch || intent.request_id != request.request_id ||
+      intent.owner_transaction_id != accepted.lifecycle_transaction_id.value() ||
+      intent.owner_transaction_id !=
+          "selected-lifecycle." + std::to_string(accepted.lifecycle_transaction_generation.value()) ||
+      intent.request_payload_digest != evidence.offer_digest ||
+      intent.expected_admission_generation != status.accepted_intent.expected_admission_generation ||
+      intent.scope.resources.empty() || intent.scope.configurations.empty() ||
+      intent.program_cycle_evidence || intent.program_node_evidence ||
+      !intent.intervention_evidence ||
+      intent.intervention_evidence->parent_program_cycle_claim_generation ||
+      !evidence.accepted_fence.valid() ||
+      !bounded_identity(evidence.accepted_fence.configuration_fence_id) ||
+      scope.controllable_component_ids !=
+          std::vector<ControllableComponentId>{status.accepted_intent.controllable_component_id} ||
+      scope.resources != intent.scope.resources ||
+      scope.domains.size() != status.domains.size() ||
+      scope.domains.size() > kMaxLifecycleDisableDomainUnion ||
+      scope.bindings.size() > kMaxLifecycleStatusBindingUnion ||
+      scope.resources.size() > kMaximumCellAdmissionScopeEntries ||
+      evidence.successor_occurrence.domains.size() !=
+          status.accepted_intent.expected_control_domains.size()) return false;
+
+  std::vector<ControlDomainId> candidate_domains;
+  for (const auto& domain : status.accepted_intent.expected_control_domains)
+    candidate_domains.push_back(domain.control_domain_id);
+  const auto successor = ComputeSelectedControllerSuccessorOccurrence(
+      evidence.predecessor_occurrence, candidate_domains,
+      evidence.successor_occurrence.arm_binding_epoch.has_value());
+  if (!successor.ok() || successor.value() != evidence.successor_occurrence) return false;
+
+  const bool accepted_phase = status.phase == ComponentLifecycleTransactionPhaseDTO::kAccepted;
+  std::size_t predecessor_index = 0U;
+  std::size_t candidate_index = 0U;
+  std::map<ControlBindingId, ControlBindingRevision> candidate_bindings;
+  for (std::size_t index = 0U; index < scope.domains.size(); ++index) {
+    const auto& fenced = scope.domains[index];
+    const auto& domain = status.domains[index];
+    if (fenced.control_domain_id != domain.control_domain_id) return false;
+    if (fenced.predecessor_control_domain_revision) {
+      if (predecessor_index >= evidence.predecessor_occurrence.domains.size() ||
+          evidence.predecessor_occurrence.domains[predecessor_index++].control_domain_id !=
+              fenced.control_domain_id) return false;
+    }
+    if (fenced.candidate_control_domain_revision) {
+      if (candidate_index >= status.accepted_intent.expected_control_domains.size()) return false;
+      const auto& expected = status.accepted_intent.expected_control_domains[candidate_index++];
+      if (expected.control_domain_id != fenced.control_domain_id ||
+          expected.control_domain_revision != *fenced.candidate_control_domain_revision ||
+          !domain.expected_domain || *domain.expected_domain != expected) return false;
+      for (const auto& binding : expected.expected_control_bindings) {
+        const auto [entry, inserted] = candidate_bindings.emplace(
+            binding.control_binding_id, binding.control_binding_revision);
+        if (!inserted && entry->second != binding.control_binding_revision) return false;
+      }
+    } else if (domain.expected_domain) return false;
+
+    // Accepted records precede installation: every predecessor is observed,
+    // and a new-only domain has no fabricated current observation.
+    if (accepted_phase && domain.current_scope.has_value() !=
+                              fenced.predecessor_control_domain_revision.has_value()) return false;
+    if (!domain.current_scope) continue;  // No fabricated observation for a newcomer.
+    const auto& current = *domain.current_scope;
+    const bool predecessor = fenced.predecessor_control_domain_revision ==
+                             current.control_domain_revision;
+    const bool candidate = !accepted_phase &&
+                           fenced.candidate_control_domain_revision == current.control_domain_revision;
+    if (!predecessor && !candidate) return false;
+    for (const auto& binding : current.current_control_bindings) {
+      const auto entry = std::lower_bound(scope.bindings.begin(), scope.bindings.end(),
+          binding.control_binding_id, [](const auto& row, const auto& id) {
+            return row.control_binding_id < id;
+          });
+      if (entry == scope.bindings.end() || entry->control_binding_id != binding.control_binding_id ||
+          !((predecessor && entry->predecessor_control_binding_revision ==
+                                binding.control_binding_revision) ||
+            (candidate && entry->candidate_control_binding_revision ==
+                              binding.control_binding_revision))) return false;
+    }
+    for (const auto& resource : current.current_resources)
+      if (!std::binary_search(scope.resources.begin(), scope.resources.end(), resource)) return false;
+
+    // Configurations in the selected claim are the adopted predecessor facts.
+    // Accepted records compare them even when both revisions are unchanged.
+    // A later successor status cannot reconstruct or replace those facts.
+    if (predecessor && !candidate) {
+      const auto configured = std::lower_bound(intent.scope.configurations.begin(),
+          intent.scope.configurations.end(), domain.control_domain_id,
+          [](const auto& row, const auto& id) { return row.control_domain_id < id; });
+      const bool claimed = configured != intent.scope.configurations.end() &&
+                           configured->control_domain_id == domain.control_domain_id;
+      if (claimed != current.active_control_configuration.has_value()) return false;
+      if (claimed && (configured->active_configuration_id !=
+                         current.active_control_configuration->active_control_configuration_id ||
+                     configured->active_configuration_generation !=
+                         current.active_control_configuration->active_control_configuration_generation))
+        return false;
+    }
+  }
+  if (predecessor_index != evidence.predecessor_occurrence.domains.size() ||
+      candidate_index != status.accepted_intent.expected_control_domains.size()) return false;
+  for (const auto& configured : intent.scope.configurations) {
+    const auto predecessor = std::lower_bound(evidence.predecessor_occurrence.domains.begin(),
+        evidence.predecessor_occurrence.domains.end(), configured.control_domain_id,
+        [](const auto& row, const auto& id) { return row.control_domain_id < id; });
+    if (predecessor == evidence.predecessor_occurrence.domains.end() ||
+        predecessor->control_domain_id != configured.control_domain_id) return false;
+  }
+  std::size_t candidate_binding_count = 0U;
+  for (const auto& fenced : scope.bindings) {
+    if (!fenced.candidate_control_binding_revision) continue;
+    ++candidate_binding_count;
+    const auto binding = candidate_bindings.find(fenced.control_binding_id);
+    if (binding == candidate_bindings.end() ||
+        binding->second != *fenced.candidate_control_binding_revision) return false;
+  }
+  return candidate_binding_count == candidate_bindings.size();
+}
+
+// Q91 data closure only. A decoded reference/floor never proves that the
+// parent claim/fence remains held, nor installs a successor or grants motion.
+[[nodiscard]] bool apply_status_evidence_valid(const ComponentLifecycleStatusDTO& status) try {
+  const auto& evidence = *status.apply_bring_up;
+  const auto& authority = evidence.parent_authority;
+  const auto& scope = evidence.selected_scope;
+  const auto& parent_scope = authority.held_fence_query.expected_scope;
+  const auto& intent = status.accepted_intent;
+  if (status.selected_bring_up ||
+      (intent.intent != ComponentLifecycleIntentKindDTO::kPrepare &&
+       intent.intent != ComponentLifecycleIntentKindDTO::kEnable &&
+       intent.intent != ComponentLifecycleIntentKindDTO::kDisable) || intent.program_node_evidence ||
+      !authority.valid() || !ValidateCellAdmissionRecoveryReceiptQuery(
+          {authority.parent_claim.intent, authority.parent_claim, std::nullopt}).ok() ||
+      !IsExactLowercaseSha256Digest(authority.parent.plan_digest.value()) ||
+      !IsExactLowercaseSha256Digest(evidence.original_request_payload_digest.value()) ||
+      !evidence.candidate_projection_revision.valid() ||
+      !IsExactLowercaseSha256Digest(evidence.candidate_retained_bundle_digest.value()) ||
+      evidence.candidate_retained_bundle_bytes == 0U ||
+      !bounded_identity(evidence.original_execution_host.runtime_unit_id) ||
+      !bounded_identity(evidence.original_execution_host.runtime_epoch) ||
+      evidence.predecessor_occurrence.has_value() != evidence.successor_occurrence_floor.has_value() ||
+      !scope.valid() || scope.controllable_component_ids !=
+          std::vector<ControllableComponentId>{intent.controllable_component_id} ||
+      scope.domains.size() != status.domains.size() ||
+      scope.domains.size() > kMaxLifecycleDisableDomainUnion ||
+      scope.bindings.size() > kMaxLifecycleStatusBindingUnion ||
+      scope.resources.size() > kMaximumCellAdmissionScopeEntries ||
+      !std::binary_search(parent_scope.controllable_component_ids.begin(),
+                          parent_scope.controllable_component_ids.end(),
+                          intent.controllable_component_id)) return false;
+
+  for (const auto& resource : scope.resources)
+    if (!std::binary_search(parent_scope.resources.begin(), parent_scope.resources.end(), resource))
+      return false;
+  for (const auto& binding : scope.bindings) {
+    const auto parent = std::lower_bound(parent_scope.bindings.begin(), parent_scope.bindings.end(),
+        binding.control_binding_id, [](const auto& row, const auto& id) {
+          return row.control_binding_id < id;
+        });
+    if (parent == parent_scope.bindings.end() || parent->control_binding_id != binding.control_binding_id ||
+        (binding.predecessor_control_binding_revision && binding.predecessor_control_binding_revision !=
+                                                       parent->predecessor_control_binding_revision) ||
+        (binding.candidate_control_binding_revision && binding.candidate_control_binding_revision !=
+                                                     parent->candidate_control_binding_revision)) return false;
+  }
+
+  const bool accepted_phase = status.phase == ComponentLifecycleTransactionPhaseDTO::kAccepted;
+  std::size_t candidate_index = 0U;
+  std::vector<ControlDomainId> predecessor_domains;
+  std::vector<ControlDomainId> candidate_domains;
+  std::map<ControlBindingId, ControlBindingRevision> candidate_bindings;
+  for (std::size_t index = 0U; index < scope.domains.size(); ++index) {
+    const auto& fenced = scope.domains[index];
+    const auto& domain = status.domains[index];
+    const auto parent = std::lower_bound(parent_scope.domains.begin(), parent_scope.domains.end(),
+        fenced.control_domain_id, [](const auto& row, const auto& id) {
+          return row.control_domain_id < id;
+        });
+    if (fenced.control_domain_id != domain.control_domain_id || parent == parent_scope.domains.end() ||
+        parent->control_domain_id != fenced.control_domain_id ||
+        (fenced.predecessor_control_domain_revision && fenced.predecessor_control_domain_revision !=
+                                                     parent->predecessor_control_domain_revision) ||
+        (fenced.candidate_control_domain_revision && fenced.candidate_control_domain_revision !=
+                                                   parent->candidate_control_domain_revision)) return false;
+    if (fenced.predecessor_control_domain_revision) predecessor_domains.push_back(fenced.control_domain_id);
+    if (fenced.candidate_control_domain_revision) {
+      candidate_domains.push_back(fenced.control_domain_id);
+      if (candidate_index >= intent.expected_control_domains.size()) return false;
+      const auto& expected = intent.expected_control_domains[candidate_index++];
+      if (expected.control_domain_id != fenced.control_domain_id ||
+          expected.control_domain_revision != *fenced.candidate_control_domain_revision ||
+          !domain.expected_domain || *domain.expected_domain != expected) return false;
+      for (const auto& binding : expected.expected_control_bindings) {
+        const auto [entry, inserted] = candidate_bindings.emplace(
+            binding.control_binding_id, binding.control_binding_revision);
+        if (!inserted && entry->second != binding.control_binding_revision) return false;
+      }
+    } else if (domain.expected_domain) return false;
+    if (accepted_phase && domain.current_scope.has_value() !=
+                              fenced.predecessor_control_domain_revision.has_value()) return false;
+    if (!domain.current_scope) continue;
+    const auto& current = *domain.current_scope;
+    const bool predecessor = fenced.predecessor_control_domain_revision == current.control_domain_revision;
+    const bool candidate = !accepted_phase &&
+                          fenced.candidate_control_domain_revision == current.control_domain_revision;
+    if (!predecessor && !candidate) return false;
+    for (const auto& binding : current.current_control_bindings) {
+      const auto entry = std::lower_bound(scope.bindings.begin(), scope.bindings.end(),
+          binding.control_binding_id, [](const auto& row, const auto& id) {
+            return row.control_binding_id < id;
+          });
+      if (entry == scope.bindings.end() || entry->control_binding_id != binding.control_binding_id ||
+          !((predecessor && entry->predecessor_control_binding_revision ==
+                                binding.control_binding_revision) ||
+            (candidate && entry->candidate_control_binding_revision ==
+                              binding.control_binding_revision))) return false;
+    }
+    for (const auto& resource : current.current_resources)
+      if (!std::binary_search(scope.resources.begin(), scope.resources.end(), resource)) return false;
+    if (accepted_phase && domain.expected_domain &&
+        fenced.predecessor_control_domain_revision == fenced.candidate_control_domain_revision) {
+      const auto& expected = domain.expected_domain->expected_active_control_configuration;
+      const bool present = expected.presence == ExpectedActiveControlConfigurationPresenceDTO::kPresent;
+      if (present != current.active_control_configuration.has_value()) return false;
+      if (present && (expected.active_control_configuration_id !=
+                         current.active_control_configuration->active_control_configuration_id ||
+                     expected.active_control_configuration_generation !=
+                         current.active_control_configuration->active_control_configuration_generation))
+        return false;
+    }
+  }
+  if (candidate_index != intent.expected_control_domains.size()) return false;
+  std::size_t candidate_binding_count = 0U;
+  for (const auto& binding : scope.bindings) {
+    if (!binding.candidate_control_binding_revision) continue;
+    ++candidate_binding_count;
+    const auto expected = candidate_bindings.find(binding.control_binding_id);
+    if (expected == candidate_bindings.end() ||
+        expected->second != *binding.candidate_control_binding_revision) return false;
+  }
+  if (candidate_binding_count != candidate_bindings.size()) return false;
+
+  if (evidence.recovery &&
+      (!IsExactLowercaseSha256Digest(evidence.recovery->predecessor_snapshot_digest.value()) ||
+       evidence.recovery->incident_id.empty() ||
+       evidence.recovery->incident_id.size() > kMaxLifecycleIdentityBytes ||
+       !bounded_identity(evidence.recovery->containment_stop_id) ||
+       !evidence.recovery->containment_stop_generation.nonzero() ||
+       !evidence.predecessor_occurrence || !evidence.successor_occurrence_floor)) return false;
+  if (evidence.predecessor_occurrence) {
+    if (!evidence.predecessor_occurrence->locally_valid() ||
+        evidence.predecessor_occurrence->domains.size() != predecessor_domains.size()) return false;
+    for (std::size_t index = 0U; index < predecessor_domains.size(); ++index)
+      if (evidence.predecessor_occurrence->domains[index].control_domain_id != predecessor_domains[index])
+        return false;
+  }
+  if (evidence.successor_occurrence_floor) {
+    if (!evidence.successor_occurrence_floor->locally_valid() ||
+        evidence.successor_occurrence_floor->domains.size() != candidate_domains.size()) return false;
+    for (std::size_t index = 0U; index < candidate_domains.size(); ++index)
+      if (evidence.successor_occurrence_floor->domains[index].control_domain_id != candidate_domains[index] ||
+          evidence.successor_occurrence_floor->domains[index].observation_generation == 0U) return false;
+  }
+  if (evidence.predecessor_occurrence && evidence.successor_occurrence_floor) {
+    const auto expected = ComputeSelectedControllerSuccessorOccurrence(*evidence.predecessor_occurrence,
+        candidate_domains, evidence.successor_occurrence_floor->arm_binding_epoch.has_value());
+    if (!expected.ok() || expected.value() != *evidence.successor_occurrence_floor) return false;
+  }
+  return evidence.original_request_payload_digest == ApplyDelegatedComponentLifecycleSemanticRequestDigest(
+      intent, evidence.candidate_projection_revision, evidence.candidate_retained_bundle_digest,
+      evidence.candidate_retained_bundle_bytes, evidence.original_execution_host.runtime_unit_id,
+      evidence.original_execution_host.runtime_epoch, authority.held_fence_query.manager_runtime_epoch,
+      authority.parent);
+} catch (...) {
+  return false;
+}
+
 }  // namespace
 
 bool CCLCEffectAttemptDTO::locally_valid() const noexcept {
@@ -352,7 +660,14 @@ bool CCLCJournalRecoveryDTO::locally_valid() const noexcept {
     return false;
   }
   for (const auto& row : cell_claims) {
-    if (!ValidateCellAdmissionClaimIntent(row.intent).ok() ||
+    const bool selected =
+        row.intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery &&
+        row.intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner &&
+        row.intent.owner_transaction_id.starts_with("selected-lifecycle.");
+    if (selected != row.original_request_payload_digest.has_value() ||
+        (row.original_request_payload_digest &&
+         !IsExactLowercaseSha256Digest(row.original_request_payload_digest->value())) ||
+        !ValidateCellAdmissionClaimIntent(row.intent).ok() ||
         (row.claim.has_value() &&
          (!ValidateCellAdmissionClaimIntent(row.claim->intent).ok() ||
           row.claim->intent != row.intent)) ||
@@ -383,6 +698,21 @@ bool CCLCJournalRecoveryDTO::locally_valid() const noexcept {
         generation <= prior_transaction_generation ||
         generation > highest_lifecycle_transaction_generation) {
       return false;
+    }
+    if (status.selected_bring_up) {
+      const auto& selected_claim = status.selected_bring_up->selected_claim;
+      const auto row = std::find_if(cell_claims.begin(), cell_claims.end(), [&](const auto& item) {
+        return item.intent.owner_transaction_id ==
+               status.acceptance.lifecycle_transaction_id.value();
+      });
+      if (row == cell_claims.end() || !row->transaction_accepted ||
+          row->intent != selected_claim.intent || row->claim != selected_claim ||
+          row->original_request_payload_digest !=
+              status.selected_bring_up->original_request_payload_digest ||
+          std::count_if(cell_claims.begin(), cell_claims.end(), [&](const auto& item) {
+            return item.intent.owner_transaction_id ==
+                   status.acceptance.lifecycle_transaction_id.value();
+          }) != 1) return false;
     }
     const auto& watermark = effect_sequence_watermarks[index];
     if (!watermark.locally_valid() ||
@@ -601,10 +931,41 @@ bool ExpectedControlDomainRevisionDTO::locally_valid() const noexcept {
                      });
 }
 
+bool ApplyComponentQualifiedPredecessorDTO::locally_valid() const noexcept {
+  return generation.nonzero() &&
+      generation.value() <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) &&
+      IsExactLowercaseSha256Digest(snapshot_digest.value());
+}
+
+bool ApplyComponentGenerationSelectionDTO::locally_valid() const noexcept {
+  const auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+  if ((predecessor_generation && (!predecessor_generation->nonzero() ||
+                                predecessor_generation->value() > limit)) ||
+      (owner_qualified_predecessor && (!owner_qualified_predecessor->locally_valid() ||
+          (predecessor_generation && *predecessor_generation != owner_qualified_predecessor->generation))) ||
+      prior_reservation_generation > limit) return false;
+  const auto predecessor = predecessor_generation ? predecessor_generation->value()
+      : owner_qualified_predecessor ? owner_qualified_predecessor->generation.value() : 0U;
+  const auto floor = std::max(predecessor, prior_reservation_generation);
+  return floor < limit && candidate_generation.value() == floor + 1U;
+}
+
 bool ComponentLifecycleIntentDTO::locally_valid() const noexcept {
+  const bool apply_generation_valid = apply_generation_selection &&
+      apply_generation_selection->locally_valid() && !program_node_evidence &&
+      (intent == ComponentLifecycleIntentKindDTO::kPrepare ||
+       intent == ComponentLifecycleIntentKindDTO::kEnable ||
+       intent == ComponentLifecycleIntentKindDTO::kDisable) &&
+      expected_component_lifecycle_generation.value() ==
+          (apply_generation_selection->predecessor_generation
+               ? apply_generation_selection->predecessor_generation->value()
+               : apply_generation_selection->owner_qualified_predecessor
+                   ? apply_generation_selection->owner_qualified_predecessor->generation.value() : 0U);
   if (!context_valid(request_context) || !bounded_identity(controllable_component_id) ||
       !known(intent) || !bounded_identity(expected_graph_revision) ||
-      !expected_component_lifecycle_generation.nonzero() || expected_control_domains.empty() ||
+      (apply_generation_selection ? !apply_generation_valid
+                                  : !expected_component_lifecycle_generation.nonzero()) ||
+      expected_control_domains.empty() ||
       !expected_admission_generation.nonzero() ||
       (program_node_evidence.has_value() &&
        (!program_node_evidence->locally_valid() ||
@@ -642,7 +1003,8 @@ bool ComponentLifecycleIntentDTO::replay_equal(
          expected_component_lifecycle_generation == other.expected_component_lifecycle_generation &&
          expected_control_domains == other.expected_control_domains && reason == other.reason &&
          expected_admission_generation == other.expected_admission_generation &&
-         program_node_evidence == other.program_node_evidence;
+         program_node_evidence == other.program_node_evidence &&
+         apply_generation_selection == other.apply_generation_selection;
 }
 
 bool ComponentLifecycleAcceptedDTO::locally_valid() const noexcept {
@@ -652,23 +1014,36 @@ bool ComponentLifecycleAcceptedDTO::locally_valid() const noexcept {
          timeout_duration_ns > 0 && timeout_duration_ns <= kMaxLifecycleTransactionTimeoutNs;
 }
 
-LifecyclePostconditionResultDTO EvaluateLifecyclePredicate(
-    const LifecyclePredicateDTO& predicate,
-    const BrandLifecycleObservationDTO& observation) noexcept {
-  if (!predicate.locally_valid() || !observation.locally_valid()) {
-    return LifecyclePostconditionResultDTO::kInconclusive;
+namespace {
+
+[[nodiscard]] bool normalized_health_valid(
+    ComponentLifecycleStateDTO state, const std::vector<LifecycleFactDTO>& facts,
+    const std::optional<ErrorDTO>& diagnostic) noexcept {
+  if (!known(state) || facts.size() > kMaxLifecycleFacts || !error_valid(diagnostic)) {
+    return false;
   }
+  const auto less = [](const LifecycleFactDTO& left, const LifecycleFactDTO& right) {
+    return left.lifecycle_fact_id < right.lifecycle_fact_id;
+  };
+  return sorted_unique(facts, less) &&
+         std::all_of(facts.begin(), facts.end(),
+                     [](const LifecycleFactDTO& fact) { return fact.locally_valid(); });
+}
+
+[[nodiscard]] LifecyclePostconditionResultDTO evaluate_normalized_predicate(
+    const LifecyclePredicateDTO& predicate, ComponentLifecycleStateDTO observed_state,
+    const std::vector<LifecycleFactDTO>& facts) noexcept {
   if (!std::binary_search(predicate.allowed_states.begin(), predicate.allowed_states.end(),
-                          observation.observed_state)) {
+                          observed_state)) {
     return LifecyclePostconditionResultDTO::kNotSatisfied;
   }
   for (const auto& expected : predicate.fact_predicates) {
     const auto fact = std::lower_bound(
-        observation.facts.begin(), observation.facts.end(), expected.lifecycle_fact_id,
+        facts.begin(), facts.end(), expected.lifecycle_fact_id,
         [](const LifecycleFactDTO& candidate, const LifecycleFactId& id) {
           return candidate.lifecycle_fact_id < id;
         });
-    if (fact == observation.facts.end() || fact->lifecycle_fact_id != expected.lifecycle_fact_id ||
+    if (fact == facts.end() || fact->lifecycle_fact_id != expected.lifecycle_fact_id ||
         fact->value.kind == LifecycleFactValueKindDTO::kUnknown) {
       return LifecyclePostconditionResultDTO::kInconclusive;
     }
@@ -677,6 +1052,29 @@ LifecyclePostconditionResultDTO EvaluateLifecyclePredicate(
     }
   }
   return LifecyclePostconditionResultDTO::kSatisfied;
+}
+
+}  // namespace
+
+bool LifecycleDomainHealthDTO::locally_valid() const noexcept {
+  return normalized_health_valid(observed_state, facts, diagnostic);
+}
+
+LifecyclePostconditionResultDTO EvaluateLifecyclePredicate(
+    const LifecyclePredicateDTO& predicate,
+    const BrandLifecycleObservationDTO& observation) noexcept {
+  if (!predicate.locally_valid() || !observation.locally_valid()) {
+    return LifecyclePostconditionResultDTO::kInconclusive;
+  }
+  return evaluate_normalized_predicate(predicate, observation.observed_state, observation.facts);
+}
+
+LifecyclePostconditionResultDTO EvaluateLifecyclePredicate(
+    const LifecyclePredicateDTO& predicate, const LifecycleDomainHealthDTO& health) noexcept {
+  if (!predicate.locally_valid() || !health.locally_valid()) {
+    return LifecyclePostconditionResultDTO::kInconclusive;
+  }
+  return evaluate_normalized_predicate(predicate, health.observed_state, health.facts);
 }
 
 bool BrandLifecycleObservationQueryDTO::locally_valid() const noexcept {
@@ -696,15 +1094,10 @@ bool BrandLifecycleObservationDTO::locally_valid() const noexcept {
       source_sequence == 0U || observation_generation == 0U || source_timestamp_ns < 0 ||
       received_timestamp_ns < 0 || fresh_until_ns < 0 ||
       source_timestamp_ns > received_timestamp_ns || received_timestamp_ns >= fresh_until_ns ||
-      !known(observed_state) || facts.size() > kMaxLifecycleFacts || !error_valid(diagnostic)) {
+      !normalized_health_valid(observed_state, facts, diagnostic)) {
     return false;
   }
-  const auto less = [](const LifecycleFactDTO& left, const LifecycleFactDTO& right) {
-    return left.lifecycle_fact_id < right.lifecycle_fact_id;
-  };
-  return sorted_unique(facts, less) &&
-         std::all_of(facts.begin(), facts.end(),
-                     [](const LifecycleFactDTO& fact) { return fact.locally_valid(); });
+  return true;
 }
 
 bool BrandLifecycleObservationDTO::matches(
@@ -841,6 +1234,52 @@ bool ResolvedLifecycleProviderOccurrenceDTO::locally_valid() const noexcept {
          bounded_identity(provider_manifest_revision) &&
          bounded_identity(provider_runtime_unit_id) && bounded_identity(provider_runtime_epoch) &&
          bounded_identity(lifecycle_plan_catalog_digest);
+}
+
+bool SelectedControllerOccurrenceDTO::locally_valid() const noexcept {
+  if ((arm_binding_epoch && !arm_binding_epoch->nonzero()) || domains.empty() ||
+      domains.size() > kMaxLifecycleResolvedDomains) return false;
+  return sorted_unique(domains, [](const auto& lhs, const auto& rhs) {
+           return lhs.control_domain_id < rhs.control_domain_id;
+         }) && std::all_of(domains.begin(), domains.end(), [](const auto& domain) {
+           return bounded_identity(domain.control_domain_id);
+         });
+}
+
+Result<SelectedControllerOccurrenceDTO> ComputeSelectedControllerSuccessorOccurrence(
+    const SelectedControllerOccurrenceDTO& predecessor,
+    const std::vector<ControlDomainId>& candidate_domains, bool candidate_has_arm) {
+  const auto invalid = [](std::string reason) {
+    return Result<SelectedControllerOccurrenceDTO>::Err(
+        ErrorDTO{"selected_controller_occurrence_invalid",
+                 "selected controller occurrence cannot advance", {{"reason", std::move(reason)}}});
+  };
+  if (!predecessor.locally_valid() || candidate_domains.empty() ||
+      candidate_domains.size() > kMaxLifecycleResolvedDomains ||
+      !sorted_unique(candidate_domains, std::less<ControlDomainId>{}) ||
+      !std::all_of(candidate_domains.begin(), candidate_domains.end(), [](const auto& domain) {
+        return bounded_identity(domain);
+      })) return invalid("predecessor_or_candidate_domains_invalid");
+  SelectedControllerOccurrenceDTO successor{std::nullopt, {}};
+  if (candidate_has_arm) {
+    const auto previous = predecessor.arm_binding_epoch
+                              ? predecessor.arm_binding_epoch->value() : 0U;
+    if (previous == std::numeric_limits<std::uint64_t>::max())
+      return invalid("arm_binding_epoch_exhausted");
+    successor.arm_binding_epoch = ExecutionBindingEpoch(previous + 1U);
+  }
+  for (const auto& domain : candidate_domains) {
+    const auto prior = std::lower_bound(predecessor.domains.begin(), predecessor.domains.end(), domain,
+                                       [](const auto& row, const auto& id) {
+                                         return row.control_domain_id < id;
+                                       });
+    const auto previous = prior != predecessor.domains.end() && prior->control_domain_id == domain
+                              ? prior->observation_generation : 0U;
+    if (previous == std::numeric_limits<std::uint64_t>::max())
+      return invalid("domain_observation_generation_exhausted");
+    successor.domains.push_back({domain, previous + 1U});
+  }
+  return Result<SelectedControllerOccurrenceDTO>::Ok(std::move(successor));
 }
 
 bool ComponentLifecycleCurrentSnapshotDTO::locally_valid() const noexcept {
@@ -992,23 +1431,39 @@ bool ComponentLifecycleDomainStatusDTO::locally_valid() const noexcept {
 }
 
 bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
+  const bool selected = selected_bring_up.has_value();
+  const bool delegated = apply_bring_up.has_value();
+  // A genuinely initial delegated operation has no predecessor aggregate.
+  // Installed domains still report their own observed states independently.
+  const bool initial_delegated = delegated && !apply_bring_up->recovery &&
+      !apply_bring_up->predecessor_occurrence &&
+      !apply_bring_up->successor_occurrence_floor &&
+      std::none_of(apply_bring_up->selected_scope.domains.begin(),
+                   apply_bring_up->selected_scope.domains.end(), [](const auto& domain) {
+        return domain.predecessor_control_domain_revision.has_value();
+      });
   const auto expected_component_generation =
       accepted_intent.expected_component_lifecycle_generation.value();
   const auto accepted_component_generation = acceptance.component_lifecycle_generation.value();
   const bool component_generation_relation_valid =
-      expected_component_generation != std::numeric_limits<std::uint64_t>::max() &&
+      accepted_intent.apply_generation_selection
+          ? delegated && !selected &&
+                accepted_component_generation ==
+                    accepted_intent.apply_generation_selection->candidate_generation.value()
+          : expected_component_generation != std::numeric_limits<std::uint64_t>::max() &&
       (accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable
            ? accepted_component_generation > expected_component_generation
            : accepted_component_generation == expected_component_generation + 1U);
   if (!acceptance.locally_valid() || !accepted_intent.locally_valid() ||
       acceptance.request_id != accepted_intent.request_context.request_id ||
       status_sequence == 0U || !bounded_identity(status_owner_epoch) ||
-      previous_state.has_value() != current_state.has_value() ||
+      (initial_delegated ? previous_state.has_value()
+                         : previous_state.has_value() != current_state.has_value()) ||
       (previous_state.has_value() && !known(*previous_state)) ||
       (current_state.has_value() && !known(*current_state)) ||
       !component_requested_state_matches_intent(requested_state, accepted_intent.intent) ||
       !known(phase) || domains.empty() ||
-      domains.size() > (accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable
+      domains.size() > (selected || delegated || accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable
                             ? kMaxLifecycleDisableDomainUnion
                             : kMaxLifecycleResolvedDomains) ||
       !error_valid(error) || accepted_at_ns != acceptance.accepted_at_ns || accepted_at_ns < 0 ||
@@ -1018,7 +1473,13 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
       (status_owner_epoch != accepted_intent.request_context.request_owner_epoch &&
        remaining_duration_ns != 0) ||
       remaining_duration_ns < 0 || remaining_duration_ns > acceptance.timeout_duration_ns ||
-      !component_generation_relation_valid) {
+      !component_generation_relation_valid ||
+      (selected && !selected_status_evidence_valid(*this)) ||
+      (delegated && (!apply_status_evidence_valid(*this) ||
+          (accepted_intent.apply_generation_selection &&
+           accepted_intent.apply_generation_selection->owner_qualified_predecessor && apply_bring_up->recovery &&
+           accepted_intent.apply_generation_selection->owner_qualified_predecessor->snapshot_digest !=
+               apply_bring_up->recovery->predecessor_snapshot_digest)))) {
     return false;
   }
 
@@ -1105,7 +1566,7 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
       return false;
     }
 
-    if (accepted_intent.intent != ComponentLifecycleIntentKindDTO::kDisable &&
+    if (!selected && !delegated && accepted_intent.intent != ComponentLifecycleIntentKindDTO::kDisable &&
         (!domain.expected_domain.has_value() || !domain.current_scope.has_value() ||
          !ExpectedDomainMatchesResolvedScope(*domain.expected_domain, *domain.current_scope))) {
       return false;
@@ -1120,18 +1581,30 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
     all_known_no_effect =
         all_known_no_effect && (domain.effect == ComponentLifecycleDomainEffectDTO::kNone ||
                                 domain.effect == ComponentLifecycleDomainEffectDTO::kKnownNoEffect);
+    const bool retired_selected_domain =
+        (selected || delegated) && !domain.expected_domain.has_value() && !domain.error.has_value() &&
+        domain.effect == ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
     all_succeeded = all_succeeded &&
-                    domain.action_state == ComponentLifecycleDomainActionStateDTO::kSucceeded &&
-                    !domain.error.has_value();
+                    (retired_selected_domain ||
+                     (domain.action_state == ComponentLifecycleDomainActionStateDTO::kSucceeded &&
+                      !domain.error.has_value()));
   }
 
   if (expected_index != accepted_intent.expected_control_domains.size() ||
-      current_domain_count > kMaxLifecycleResolvedDomains ||
+      current_domain_count > (selected || delegated ? kMaxLifecycleDisableDomainUnion :
+                                          kMaxLifecycleResolvedDomains) ||
       expected_binding_count + current_binding_count > kMaxLifecycleStatusBindingUnion) {
     return false;
   }
 
-  if ((current_domain_count != 0U) != current_state.has_value()) {
+  if (initial_delegated) {
+    if ((phase == ComponentLifecycleTransactionPhaseDTO::kSucceeded &&
+         current_state != requested_state.state) ||
+        (current_state && (current_domain_count != domains.size() ||
+        std::any_of(domains.begin(), domains.end(), [&](const auto& domain) {
+          return domain.current_state != current_state;
+        })))) return false;
+  } else if ((current_domain_count != 0U) != current_state.has_value()) {
     return false;
   }
 

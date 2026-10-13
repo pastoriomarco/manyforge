@@ -59,14 +59,14 @@ def test_gripper_evidence_preserves_provenance_and_pure_expiry():
     observation.command_id = 7
     observation.generation = 9
     observation.expected_status_revision = 3
-    observation.observation_id = "operator-press"
+    observation.observation_id = "sensor-sample"
     observation.confirmed = True
     observation.observed_at_ns = 31 * 365 * 24 * 60 * 60 * 1_000_000_000
-    observation.attribution = "operator:station-a"
+    observation.attribution = "sensor:station-a"
     evidence = core.GripperGraspEvidenceDTO(
-        source_kind=core.GraspConfirmationSourceKind.kOperator,
-        source_id=core.ControlBindingId("binding.operator"),
-        source_revision=core.ControlBindingRevision("revision.operator"),
+        source_kind=core.GraspConfirmationSourceKind.kDiscreteInput,
+        source_id=core.ControlBindingId("binding.sensor"),
+        source_revision=core.ControlBindingRevision("revision.sensor"),
         source_epoch=core.RuntimeEpoch("owner.1"),
         observation=observation,
         expires_at_ns=observation.observed_at_ns + 100,
@@ -78,7 +78,8 @@ def test_gripper_evidence_preserves_provenance_and_pure_expiry():
     assert not core.gripper_grasp_evidence_is_fresh(evidence, evidence.expires_at_ns)
     assert evidence.observation.observed_at_ns == observation.observed_at_ns
     assert evidence.observation.expected_status_revision == 3
-    assert evidence.source_id == core.ControlBindingId("binding.operator")
+    assert evidence.source_id == core.ControlBindingId("binding.sensor")
+    assert not hasattr(core.GraspConfirmationSourceKind, "kOperator")
     assert evidence.source_epoch == core.RuntimeEpoch("owner.1")
 
 
@@ -884,10 +885,10 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     )
     registry = core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY
     assert isinstance(registry, tuple)
-    assert len(registry) == 68
-    assert len({row.capability_id for row in registry}) == 68
+    assert len(registry) == 67
+    assert len({row.capability_id for row in registry}) == 67
     assert (
-        sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 32
+        sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 31
     )
     assert sum(row.scope == core.CapabilityScope.kCellGlobal for row in registry) == 28
     assert (
@@ -907,11 +908,11 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
             == core.CapabilityProviderBindingKind.kControlBinding
             for row in registry
         )
-        == 21
+        == 20
     )
     assert all(row.requirement_parameters_schema_ref is None for row in registry)
     assert core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST == (
-        "sha256:ee78bb448062b0c4784697b876fa37653ed56402887488b108deb72a0b163ea3"
+        "sha256:ae8aae9ef416f40457225858d8d56829dce5c512cb842b803393bfaa24741e22"
     )
     assert core.find_builtin_capability_definition("context.state.current") is None
 
@@ -1850,11 +1851,11 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.native_execution.v1",
-            "sha256:6b540dac39434e05a2cb5da209206e2105b824b9f56704a74f0d88f327944689",
+            "sha256:97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48",
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:f927705d80b40e266f3c62341911a223de2a3811188a2c4656d4bee98f81c30b",
+            "sha256:c4e6e1a1418852f773520a2c3c02ffde66883e2dca3963a218bf28e2356ca16c",
         ),
     }
     assert (

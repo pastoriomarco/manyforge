@@ -1871,6 +1871,12 @@ if(BUILD_TESTING)
       manyforge_deployment
       manyforge_deployment_component_lifecycle_current_snapshot_source
       GTest::gtest_main)
+    if(TARGET manyforge_core_sqlite_cclc_journal)
+      target_link_libraries(test_component_lifecycle_current_snapshot_source PRIVATE
+        manyforge_core_sqlite_cclc_journal)
+      target_compile_definitions(test_component_lifecycle_current_snapshot_source PRIVATE
+        MANYFORGE_SNAPSHOT_TEST_HAS_SQLITE_CCLC=1)
+    endif()
     gtest_discover_tests(test_component_lifecycle_current_snapshot_source
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
   endif()
@@ -1895,6 +1901,8 @@ if(BUILD_TESTING)
     target_link_libraries(test_cclc_runtime_composition PRIVATE
       manyforge_deployment
       manyforge_deployment_cclc_runtime_composition
+      manyforge_deployment_admission
+      manyforge_deployment_canonical_package_generator
       GTest::gtest_main)
     gtest_discover_tests(test_cclc_runtime_composition
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

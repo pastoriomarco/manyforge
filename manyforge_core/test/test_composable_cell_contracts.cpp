@@ -5,6 +5,7 @@
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/runtime_profile.hpp>
 #include <manyforge_core/types/stop_evidence_policy.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -443,7 +444,7 @@ TEST(ComposableCellContracts, StopEvidencePolicyTypesPreserveTheClosedDeclarativ
 
 TEST(ComposableCellContracts, CapabilityDefinitionRegistryIsExactTypedAndCodeOwned) {
   EXPECT_EQ(kCapabilityDefinitionApiVersion, "manyforge.capability_definition.v1");
-  ASSERT_EQ(kBuiltinCapabilityDefinitionRegistry.size(), 68U);
+  ASSERT_EQ(kBuiltinCapabilityDefinitionRegistry.size(), 67U);
 
   std::set<std::string_view> capability_ids;
   std::size_t target_binding_count = 0U;
@@ -478,10 +479,10 @@ TEST(ComposableCellContracts, CapabilityDefinitionRegistryIsExactTypedAndCodeOwn
     EXPECT_EQ(materialized.provider_binding_kind, descriptor.provider_binding_kind);
     EXPECT_FALSE(materialized.requirement_parameters_schema_ref.has_value());
   }
-  EXPECT_EQ(target_binding_count, 32U);
+  EXPECT_EQ(target_binding_count, 31U);
   EXPECT_EQ(cell_global_count, 28U);
   EXPECT_EQ(control_domain_count, 8U);
-  EXPECT_EQ(control_binding_count, 21U);
+  EXPECT_EQ(control_binding_count, 20U);
   EXPECT_EQ(capability_provider_binding_count, 47U);
   EXPECT_EQ(find_builtin_capability_definition("context.state.current"), nullptr);
   EXPECT_EQ(find_builtin_capability_definition("unknown.capability"), nullptr);
@@ -522,6 +523,26 @@ TEST(ComposableCellContracts, CapabilityDefinitionRegistryPinsRepresentativeSema
   EXPECT_EQ(bridge->scope, CapabilityScope::kCellGlobal);
   EXPECT_EQ(bridge->provider_binding_kind,
             CapabilityProviderBindingKind::kCapabilityProviderBinding);
+}
+
+TEST(ComposableCellContracts, RemovedOperatorSourceCannotProduceFreshEvidence) {
+  EXPECT_EQ(find_builtin_capability_definition("tool.gripper.confirmation.operator"),
+            nullptr);
+  GripperGraspObservationDTO observation;
+  observation.observed_at_ns = 10;
+  GripperGraspEvidenceDTO evidence{
+      {}, ControlBindingId("sensor"), ControlBindingRevision("sensor.revision"),
+      RuntimeEpoch("sensor.epoch"), observation, 20};
+  EXPECT_FALSE(gripper_grasp_evidence_is_fresh(evidence, 15));
+  evidence.source_kind = static_cast<GraspConfirmationSourceKind>(4);
+  EXPECT_FALSE(gripper_grasp_evidence_is_fresh(evidence, 15));
+  for (const auto kind : {GraspConfirmationSourceKind::kDiscreteInput,
+                         GraspConfirmationSourceKind::kPerception,
+                         GraspConfirmationSourceKind::kForceCurrent}) {
+    evidence.source_kind = kind;
+    EXPECT_TRUE(gripper_grasp_evidence_is_fresh(evidence, 15));
+    EXPECT_FALSE(gripper_grasp_evidence_is_fresh(evidence, 20));
+  }
 }
 
 }  // namespace

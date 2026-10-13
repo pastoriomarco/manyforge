@@ -109,7 +109,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
   // ========================================================================
 
   py::enum_<manyforge::core::GraspConfirmationSourceKind>(m, "GraspConfirmationSourceKind")
-      .value("kOperator", manyforge::core::GraspConfirmationSourceKind::kOperator)
       .value("kDiscreteInput", manyforge::core::GraspConfirmationSourceKind::kDiscreteInput)
       .value("kPerception", manyforge::core::GraspConfirmationSourceKind::kPerception)
       .value("kForceCurrent", manyforge::core::GraspConfirmationSourceKind::kForceCurrent);

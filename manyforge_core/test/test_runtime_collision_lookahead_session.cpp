@@ -1347,6 +1347,20 @@ TEST(RuntimeCollisionLookaheadSessionTest,
               RuntimeCollisionLookaheadResultStatus::kInconclusive);
     EXPECT_EQ(result.reason, "runtime_lookahead_projection_revision_mismatch");
     EXPECT_FALSE(result.projection_revision.has_value());
+    EXPECT_TRUE(result.job_context_observed);
+    EXPECT_FALSE(result.selection_computed);
+    EXPECT_FALSE(result.validation_completed);
+    EXPECT_EQ(result.checked_input_details.at("runtime_bundle_epoch"), "1");
+    EXPECT_EQ(result.checked_input_details.at("collision_world_revision_id"), "10");
+    EXPECT_EQ(result.checked_input_details.at("lookahead_admission_projection_scene_revision_id"), "10");
+    EXPECT_EQ(result.checked_input_details.at("lookahead_observed_projection_present"),
+              label == "missing" ? "false" : "true");
+    if (label != "missing") {
+      EXPECT_EQ(result.checked_input_details.at("lookahead_observed_projection_retained_bundle_id"),
+                invalid_bundle->projection_revision->retained_bundle_id.value());
+      EXPECT_EQ(result.checked_input_details.at("lookahead_observed_projection_scene_content_hash"),
+                invalid_bundle->projection_revision->scene_revision.content_hash.value());
+    }
   }
 }
 
@@ -2056,4 +2070,106 @@ TEST(RuntimeCollisionLookaheadSessionTest,
 }
 
 }  // namespace
+TEST(RuntimeCollisionLookaheadSessionTest, EarlyFailureDiagnosticsDoNotInventWorldOrSelection) {
+  for (const auto& reason : {"runtime_lookahead_deadline_exceeded", "progress_cursor_invalid",
+                             "progress_generation_mismatch", "progress_cursor_stale"}) {
+    SCOPED_TRACE(reason);
+    FakeClock clock;
+    clock.set(1'000'000'000);
+    ManualScheduler scheduler;
+    TestPublisher publisher;
+    publisher.bundle = make_bundle(71, 42);  // Present, but not read before these failures.
+    ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
+                                          ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                          "isaac", 100'000'000);
+    const auto expected_reason = std::string(reason);
+    if (expected_reason != "progress_cursor_invalid") {
+      const auto generation = expected_reason == "progress_generation_mismatch" ? 8U : 9U;
+      const auto received = expected_reason == "progress_cursor_stale" ? 700'000'000 : clock.now();
+      ASSERT_TRUE(progress.publish(generation, 30'000'000, received, received).published);
+    }
+    auto engine = std::make_shared<TestLookaheadEngine>("early-diagnostics");
+    ResultSink sink;
+    RuntimeCollisionLookaheadSession::Config config;
+    config.workers = 1;
+    RuntimeCollisionLookaheadSession session(
+        config, clock, scheduler, publisher, progress, {engine},
+        [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
+          sink.push(std::move(result));
+        }, accept_test_authority());
+    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+    const auto requested_at = expected_reason == "runtime_lookahead_deadline_exceeded"
+                                  ? clock.now() - config.cycle_budget_ns : clock.now();
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (session.status().jobs_started_total == 0 && std::chrono::steady_clock::now() < limit) {
+      session.request(requested_at, publisher.bundle, {});
+      std::this_thread::yield();
+    }
+    ASSERT_GT(session.status().jobs_started_total, 0U);
+    const auto result = sink.wait();
+    EXPECT_EQ(result.reason, expected_reason);
+    EXPECT_TRUE(result.job_context_observed);
+    EXPECT_FALSE(result.selection_computed);
+    EXPECT_FALSE(result.validation_completed);
+    EXPECT_EQ(result.requested_at_ns, requested_at);
+    EXPECT_EQ(result.cycle_deadline_ns, requested_at + config.cycle_budget_ns);
+    EXPECT_FALSE(result.checked_input_details.contains("runtime_bundle_epoch"));
+    EXPECT_FALSE(result.checked_input_details.contains("collision_world_revision_id"));
+    EXPECT_FALSE(result.checked_input_details.contains("lookahead_bundle_present"));
+    if (expected_reason == "runtime_lookahead_deadline_exceeded") {
+      EXPECT_EQ(result.checked_input_details.at("lookahead_deadline_checked_at_ns"),
+                std::to_string(clock.now()));
+      EXPECT_FALSE(result.checked_input_details.contains("lookahead_cursor_valid"));
+    } else {
+      EXPECT_EQ(result.checked_input_details.at("lookahead_cursor_valid"),
+                expected_reason == "progress_cursor_invalid" ? "false" : "true");
+      if (expected_reason == "progress_cursor_stale") {
+        EXPECT_EQ(result.checked_input_details.at("lookahead_cursor_received_timestamp_ns"),
+                  "700000000");
+        EXPECT_EQ(result.checked_input_details.at("lookahead_cursor_freshness_checked_at_ns"),
+                  "1000000000");
+        EXPECT_EQ(result.checked_input_details.at("lookahead_cursor_freshness_budget_ns"),
+                  "100000000");
+      }
+    }
+    EXPECT_EQ(engine->check_calls.load(), 0U);
+  }
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest, BundleRefusalRetainsOnlyObservedBundleContext) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  auto invalid_bundle = std::make_shared<RuntimeCollisionQueryBundle>(*make_bundle(71, 42));
+  invalid_bundle->policy.reset();
+  publisher.bundle = invalid_bundle;
+  ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
+                                        ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                        "isaac", 0);
+  ASSERT_TRUE(progress.publish(9, 30'000'000, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>("bundle-diagnostics");
+  ResultSink sink;
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
+        sink.push(std::move(result));
+      }, accept_test_authority());
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  ASSERT_TRUE(request_until_started(session, clock, publisher));
+  const auto result = sink.wait();
+  EXPECT_EQ(result.reason, "runtime_lookahead_bundle_invalid");
+  EXPECT_EQ(result.checked_input_details.at("runtime_bundle_epoch"), "71");
+  EXPECT_EQ(result.checked_input_details.at("collision_world_revision_id"), "42");
+  EXPECT_EQ(result.checked_input_details.at("collision_world_content_hash"), "world-42");
+  EXPECT_EQ(result.checked_input_details.at("lookahead_world_present"), "true");
+  EXPECT_EQ(result.checked_input_details.at("lookahead_policy_present"), "false");
+  EXPECT_FALSE(result.checked_input_details.contains("lookahead_observed_projection_present"));
+  EXPECT_FALSE(result.selection_computed);
+  EXPECT_FALSE(result.validation_completed);
+  EXPECT_EQ(engine->check_calls.load(), 0U);
+}
+
 }  // namespace manyforge::core

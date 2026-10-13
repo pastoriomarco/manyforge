@@ -35,11 +35,13 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <new>
 #include <set>
 #include <sstream>
 #include <string>
 #include <system_error>
 #include <utility>
+#include <variant>
 
 namespace manyforge::scene {
 namespace {
@@ -3246,7 +3248,8 @@ NativeSceneProviderBindings(const RetainedBundleDTO &bundle) {
 
 [[nodiscard]] RequiredSceneProjection ResolveRequiredProjection(
     const core::ProjectionNativeRuntimeBindingDTO &binding,
-    const core::IPlannerSceneProjectionResolver *resolver) {
+    const core::IPlannerSceneProjectionResolver *resolver,
+    const ProjectionRevisionDTO &selected_revision) {
   if (resolver == nullptr) {
     throw CanonicalEmptySceneOwnerConflictError(
         "native projection requires an installed projection resolver");
@@ -3275,7 +3278,16 @@ NativeSceneProviderBindings(const RetainedBundleDTO &bundle) {
         "native projection is unavailable: " + detail);
   }
   auto projection = std::move(resolved.value());
-  auto health = projection->ProjectionHealth();
+  const auto health = [&]() {
+    try {
+      return projection->ProjectionHealthForRevision(selected_revision);
+    } catch (const std::bad_alloc &) {
+      throw;
+    } catch (const std::exception &error) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "native projection is unavailable: " + std::string(error.what()));
+    }
+  }();
   if (!health.valid() || health.source_sequence == 0U) {
     throw CanonicalEmptySceneOwnerConflictError(
         "native projection returned malformed health");
@@ -5858,6 +5870,12 @@ public:
   const deployment::IVerifiedRetainedBundleSource *retained_bundle_source_;
   const core::IPlannerSceneProjectionResolver *projection_resolver_;
   core::IKernelCellAdmissionPort *cell_admission_;
+  // Only the original live continuation can complete a pending private
+  // adoption. Durable rows are evidence, not a replacement for that request.
+  // Historical ordinary maintenance also preserved Scene revisions, so the
+  // revision shape cannot distinguish a private operation from those rows.
+  std::optional<std::variant<QualifiedSceneProductAdoptionRequest,
+                             QualifiedSceneConfigurationAdoptionRequest>> live_product_adoption_;
   mutable std::mutex maintenance_operation_mutex_;
   mutable std::mutex mutex_;
   sqlite3 *database_{};
@@ -6442,6 +6460,267 @@ bool CandidateBindingsMatch(
   return true;
 }
 
+const core::ApplyFenceOwnerDTO &AdoptionOwner(const QualifiedSceneProductAdoptionRequest &request) {
+  return request.parent_authority.parent.owner;
+}
+const core::ApplyFenceOwnerDTO &AdoptionOwner(const QualifiedSceneConfigurationAdoptionRequest &request) {
+  return request.authority.owner;
+}
+const core::CellAdmissionClaimDTO &AdoptionClaim(const QualifiedSceneProductAdoptionRequest &request) {
+  return request.parent_authority.parent_claim;
+}
+const core::CellAdmissionClaimDTO &AdoptionClaim(const QualifiedSceneConfigurationAdoptionRequest &request) {
+  return request.authority.held_cell_claim;
+}
+const core::ConfigurationFenceStatusQueryDTO &AdoptionFence(
+    const QualifiedSceneProductAdoptionRequest &request) {
+  return request.parent_authority.held_fence_query;
+}
+const core::ConfigurationFenceStatusQueryDTO &AdoptionFence(
+    const QualifiedSceneConfigurationAdoptionRequest &request) {
+  return request.authority.held_fence_query;
+}
+bool AdoptionAuthorityValid(const QualifiedSceneProductAdoptionRequest &request) {
+  return request.parent_authority.valid();
+}
+bool AdoptionAuthorityValid(const QualifiedSceneConfigurationAdoptionRequest &request) {
+  const auto &authority = request.authority;
+  const auto &claim = authority.held_cell_claim;
+  const auto &intent = claim.intent;
+  if (!authority.owner.valid() ||
+      !core::IsExactLowercaseSha256Digest(authority.persisted_manager_intent_digest.value()) ||
+      !authority.held_fence_query.valid() ||
+      authority.held_fence_query.owner_transaction != authority.owner ||
+      !core::ValidateCellAdmissionRecoveryReceiptQuery({intent, claim, std::nullopt}).ok()) {
+    return false;
+  }
+  if (intent.claim_kind == core::CellAdmissionClaimKindDTO::kManagerApply &&
+      intent.owner_role == core::CellAdmissionOwnerRoleDTO::kManager) {
+    return intent.owner_transaction_id == authority.owner.apply_id.value() &&
+           intent.request_payload_digest == authority.persisted_manager_intent_digest &&
+           intent.scope.resources.empty() && intent.scope.configurations.empty() &&
+           !intent.program_cycle_evidence && !intent.intervention_evidence && !intent.program_node_evidence;
+  }
+  // Composer's complete actual stored authoring parent is a different request.
+  // Its identity/payload are not fabricated to match Manager's intent digest.
+  return intent.claim_kind == core::CellAdmissionClaimKindDTO::kAuthoringMutation &&
+         intent.owner_role == core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+}
+
+bool AdoptionReceiptValid(const QualifiedSceneProductAdoptionRequest &,
+                          const core::CellAdmissionRecoveryReceiptDTO &) {
+  return true; // Preserve the old qualified entry's existing checks.
+}
+bool AdoptionReceiptValid(const QualifiedSceneConfigurationAdoptionRequest &,
+                          const core::CellAdmissionRecoveryReceiptDTO &receipt) {
+  return core::ValidateCellAdmissionRecoveryReceipt(receipt).ok();
+}
+
+using ProductAdoptionRequest = std::variant<QualifiedSceneProductAdoptionRequest,
+                                           QualifiedSceneConfigurationAdoptionRequest>;
+template <typename Request>
+bool LiveAdoptionMatches(const std::optional<ProductAdoptionRequest> &live, const Request &request) {
+  const auto *actual = live ? std::get_if<Request>(&*live) : nullptr;
+  return actual != nullptr && *actual == request;
+}
+
+template <typename Request>
+ProjectionRevisionDTO AdoptionTarget(
+    const Request &request) {
+  return {request.candidate_retained_bundle.retained_bundle_id,
+          request.candidate_retained_bundle.cell_graph.graph_revision,
+          request.expected_snapshot_identity.revision};
+}
+
+template <typename Request>
+void ValidateAdoptionRequest(const Request &request,
+                             const CellId &cell_id) {
+  const auto &predecessor = request.expected_predecessor_publication;
+  const char *failed_guard = nullptr;
+  const auto invalid = [&](bool condition, const char *guard) {
+    if (condition) {
+      failed_guard = guard;
+    }
+    return condition;
+  };
+  if (invalid(!AdoptionAuthorityValid(request), "parent_authority") ||
+      invalid(!predecessor.valid(), "predecessor_publication") ||
+      invalid(!request.expected_active_projection_revision.valid(),
+              "active_projection") ||
+      invalid(!request.expected_snapshot_identity.valid(), "snapshot_identity") ||
+      invalid(request.expected_snapshot_identity.cell_id != cell_id,
+              "snapshot_cell") ||
+      invalid(request.expected_active_projection_revision.scene_revision !=
+                  request.expected_snapshot_identity.revision,
+              "snapshot_revision") ||
+      invalid(predecessor.request.candidate_retained_bundle_id !=
+                  request.expected_active_projection_revision.retained_bundle_id,
+              "predecessor_bundle") ||
+      invalid(predecessor.request.candidate_graph_revision !=
+                  request.expected_active_projection_revision.graph_revision,
+              "predecessor_graph") ||
+      invalid(request.candidate_retained_bundle.cell_graph.cell_id != cell_id,
+              "candidate_cell") ||
+      invalid(!AdoptionTarget(request).valid(), "target_projection") ||
+      invalid(std::is_same_v<Request, QualifiedSceneProductAdoptionRequest> &&
+                  AdoptionTarget(request) == request.expected_active_projection_revision,
+              "legacy_projection_unchanged") ||
+      invalid(request.native_runtime_bindings.size() > kMaximumNativeProjectionBindings,
+              "native_bindings_limit")) {
+    throw std::invalid_argument(
+        std::string("qualified Scene product adoption is invalid: ") + failed_guard);
+  }
+  for (std::size_t index = 0U;
+       index < request.native_runtime_bindings.size(); ++index) {
+    if (!request.native_runtime_bindings[index].valid() ||
+        (index != 0U && !core::CanonicalProjectionNativeBindingLess(
+                           request.native_runtime_bindings[index - 1U],
+                           request.native_runtime_bindings[index]))) {
+      throw std::invalid_argument("qualified Scene adoption bindings are invalid");
+    }
+  }
+}
+
+template <typename Request>
+void RequireHeldAdoptionParent(
+    const Request &request,
+    core::IKernelCellAdmissionPort *admission,
+    const core::IManagerKernelApplyFencePort::HeldStatusView *held_fence,
+    const core::IManagerKernelApplyFencePort *original_parent_fence,
+    const core::ApplyFenceAcquireAttemptQueryDTO *original_fence_attempt = nullptr) {
+  if (admission == nullptr) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption held-parent dependencies are unavailable");
+  }
+  const auto &claim = AdoptionClaim(request);
+  const auto &held_fence_query = AdoptionFence(request);
+  const auto receipt = admission->GetCellAdmissionRecoveryReceipt(
+      {claim.intent, claim, std::nullopt});
+  if (!receipt.ok() || !AdoptionReceiptValid(request, receipt.value()) ||
+      receipt.value().status !=
+          core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact ||
+      receipt.value().matched_claim != claim ||
+      receipt.value().matched_release.has_value() ||
+      receipt.value().matched_reconcile_settlement.has_value()) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption requires the exact still-held Apply claim");
+  }
+  if (original_fence_attempt != nullptr) {
+    const auto &query = *original_fence_attempt;
+    const auto &intent = query.persisted_intent;
+    const auto &held = held_fence_query;
+    const auto &predecessor = request.expected_predecessor_publication;
+    if (original_parent_fence == nullptr || !query.valid() ||
+        query.manager_runtime_epoch != held.manager_runtime_epoch ||
+        intent.owner_transaction != held.owner_transaction ||
+        intent.scope != held.expected_scope ||
+        intent.expected_retained_bundle_id != predecessor.request.candidate_retained_bundle_id ||
+        intent.expected_graph_revision != predecessor.request.candidate_graph_revision) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "qualified Scene staging requires the exact original fence attempt");
+    }
+    // This read proves held presence without inventing candidate configuration
+    // rows. It is not an interlock; only the original Manager operation may
+    // continue, after joining its own stored attempt and complete acceptance.
+    const auto presence = original_parent_fence->ReconcileAcquireAttempt(query);
+    if (!presence.matches(query) ||
+        presence.state != core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact ||
+        !presence.admission_fenced || !presence.accepted_fence.has_value() ||
+        presence.accepted_fence->configuration_fence_id != held.configuration_fence_id ||
+        presence.accepted_fence->configuration_fence_generation != held.configuration_fence_generation ||
+        presence.accepted_fence->captured_scope != held.expected_scope ||
+        presence.execution_host_epoch.publication_generation != predecessor.publication_generation) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "qualified Scene staging requires the exact still-held Apply fence");
+    }
+    return;
+  }
+  // The remote variant relies on the original sole Manager producer's live
+  // operation and durable exclusion. QueryStatus is not an interlock or a view.
+  const auto remote_status = original_parent_fence != nullptr
+                                 ? std::optional{original_parent_fence->QueryStatus(
+                                       held_fence_query)}
+                                 : std::nullopt;
+  const auto &status = remote_status.has_value() ? *remote_status : held_fence->status();
+  if (!status.matches(held_fence_query) ||
+      status.state != core::ConfigurationFenceState::kHeld ||
+      !status.admission_fenced) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption requires the exact still-held Apply fence");
+  }
+}
+
+template <typename Request>
+void RequireVerifiedAdoptionCandidate(
+    const Request &request,
+    const deployment::IVerifiedRetainedBundleSource *source,
+    const core::IPlannerSceneProjectionResolver *resolver) {
+  if (source == nullptr || resolver == nullptr) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption candidate dependencies are unavailable");
+  }
+  const auto candidate = source->get_verified(
+      request.candidate_retained_bundle.retained_bundle_id);
+  std::set<std::pair<core::CapabilityProviderBindingId,
+                     core::CapabilityProviderBindingRevision>> supplied;
+  for (const auto &binding : request.native_runtime_bindings) {
+    if (!supplied.emplace(binding.provider_binding_id,
+                          binding.provider_binding_revision).second) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "qualified Scene adoption repeats a required provider binding");
+    }
+  }
+  if (candidate == nullptr ||
+      !deployment::verify_retained_bundle_identity(*candidate) ||
+      candidate->value() != request.candidate_retained_bundle ||
+      !CandidateBindingsMatch(candidate->value(), request.native_runtime_bindings)) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption candidate or binding set is not exact");
+  }
+}
+
+template <typename Request>
+void RequireAdoptionCurrentScene(
+    const DurableState &state,
+    const Request &request,
+    const bool completed = false) {
+  if (state.projection_desynchronized || state.unresolved_scene_transaction ||
+      state.legacy_native_effects_uncertain ||
+      !state.active_projection.has_value() ||
+      *state.active_projection != (completed ? AdoptionTarget(request)
+                                            : request.expected_active_projection_revision) ||
+      !state.active_scene_snapshot.has_value() ||
+      state.active_scene_snapshot->identity() != request.expected_snapshot_identity) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption requires the exact synchronized current Scene");
+  }
+}
+
+template <typename Request>
+void RequireAdoptionRow(
+    const MaintenanceInitializationState &row,
+    const Request &request) {
+  if (row.predecessor != request.expected_active_projection_revision ||
+      row.target != AdoptionTarget(request) ||
+      row.authoritative_snapshot.identity() != request.expected_snapshot_identity ||
+      row.bindings != request.native_runtime_bindings ||
+      row.initial_baseline_request_digest.has_value() ||
+      row.repaired_transaction_sequence.has_value()) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption identity is already bound differently");
+  }
+}
+
+void RequireCurrentPublication(
+    const core::IActiveBundlePublicationReader &reader,
+    const ActiveBundlePublicationReceiptDTO &expected) {
+  const auto current = reader.ReadActiveBundlePublication(expected.publication_generation);
+  if (!current.ok() || current.value() != expected) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption publication is not the exact current head");
+  }
+}
+
 } // namespace
 
 std::optional<ProjectionMaintenanceInitializationStatusDTO>
@@ -6463,6 +6742,281 @@ CanonicalEmptySceneOwner::ReadMaintenanceInitialization(
     return std::nullopt;
   }
   return MaintenanceStatus(*found);
+}
+
+std::vector<core::ProjectionHealthDTO>
+CanonicalEmptySceneOwner::StageOriginalManagerProductAdoption(
+    const QualifiedSceneProductAdoptionRequest &request,
+    const core::IManagerKernelApplyFencePort &original_parent_fence,
+    const core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt) {
+  return OriginalManagerProductAdoptionProjectionHealthImpl(
+      request, original_parent_fence, original_fence_attempt, true);
+}
+
+std::vector<core::ProjectionHealthDTO>
+CanonicalEmptySceneOwner::ReadOriginalManagerProductAdoptionProjectionHealth(
+    const QualifiedSceneProductAdoptionRequest &request,
+    const core::IManagerKernelApplyFencePort &original_parent_fence,
+    const core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt) {
+  return OriginalManagerProductAdoptionProjectionHealthImpl(
+      request, original_parent_fence, original_fence_attempt, false);
+}
+
+std::vector<core::ProjectionHealthDTO>
+CanonicalEmptySceneOwner::StageOriginalManagerConfigurationAdoption(
+    const QualifiedSceneConfigurationAdoptionRequest &request,
+    const core::IManagerKernelApplyFencePort &original_parent_fence,
+    const core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt) {
+  return OriginalManagerProductAdoptionProjectionHealthImpl(
+      request, original_parent_fence, original_fence_attempt, true);
+}
+std::vector<core::ProjectionHealthDTO>
+CanonicalEmptySceneOwner::ReadOriginalManagerConfigurationAdoptionProjectionHealth(
+    const QualifiedSceneConfigurationAdoptionRequest &request,
+    const core::IManagerKernelApplyFencePort &original_parent_fence,
+    const core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt) {
+  return OriginalManagerProductAdoptionProjectionHealthImpl(
+      request, original_parent_fence, original_fence_attempt, false);
+}
+
+template <typename Request>
+std::vector<core::ProjectionHealthDTO>
+CanonicalEmptySceneOwner::OriginalManagerProductAdoptionProjectionHealthImpl(
+    const Request &request,
+    const core::IManagerKernelApplyFencePort &original_parent_fence,
+    const core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt,
+    const bool stage) {
+  ValidateAdoptionRequest(request, impl_->fixed_query_.cell_id);
+  std::lock_guard operation_lock(impl_->maintenance_operation_mutex_);
+  RequireVerifiedAdoptionCandidate(request, impl_->retained_bundle_source_,
+                                  impl_->projection_resolver_);
+  RequireHeldAdoptionParent(request, impl_->cell_admission_, nullptr, &original_parent_fence,
+                            &original_fence_attempt);
+  RequireCurrentPublication(impl_->publication_reader_, request.expected_predecessor_publication);
+  std::unique_lock lock(impl_->mutex_);
+  const auto state = impl_->ReadStateTransaction();
+  RequireAdoptionCurrentScene(state, request);
+  if (impl_->live_product_adoption_.has_value() || !AccessStatus(state).scene_writes_open) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "candidate projection staging has no open original Scene window");
+  }
+  const auto snapshot = std::make_shared<const LogicalSceneSnapshotDTO>(*state.active_scene_snapshot);
+  const auto target = AdoptionTarget(request);
+  lock.unlock();
+
+  // Registry preparation already owns each uninitialized candidate model and
+  // its exact predecessor. Rebuild uses that same owner/job; it does not select
+  // a public planner, change the logical Scene or retire a surviving projection.
+  std::vector<core::ProjectionHealthDTO> health;
+  health.reserve(request.native_runtime_bindings.size());
+  for (const auto &binding : request.native_runtime_bindings) {
+    auto projection = ResolveRequiredProjection(
+            binding, impl_->projection_resolver_, target);
+    auto observed = projection.preflight_health;
+    if (observed.native_runtime_binding != binding ||
+        (observed.state == ProjectionHealthState::kHealthy &&
+         !observed.healthy_for_target(target))) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "candidate projection staging requires its exact binding and target");
+    }
+    if (stage && !observed.healthy_for_target(target)) {
+      const core::NativeProjectionRebuildDTO rebuild{
+          binding, target,
+          request.candidate_retained_bundle.compiled_products.planning_collision_model,
+          snapshot, std::nullopt, std::nullopt};
+      const auto rebuilt = projection.projection->RebuildProjection(rebuild);
+      const bool accepted = rebuilt.result == core::ProjectionCommitResultStateDTO::kAccepted &&
+                            !rebuilt.acknowledged_projection_revision.has_value() &&
+                            rebuilt.resulting_health.state == ProjectionHealthState::kRebuilding;
+      const bool committed = rebuilt.result == core::ProjectionCommitResultStateDTO::kCommitted &&
+                             rebuilt.acknowledged_projection_revision == target &&
+                             rebuilt.resulting_health.healthy_for_target(target);
+      if (!rebuilt.presence_valid() || rebuilt.transaction_sequence.has_value() ||
+          rebuilt.proposed_projection_revision != target ||
+          rebuilt.resulting_health.native_runtime_binding != binding ||
+          (!accepted && !committed)) {
+        const auto detail = rebuilt.error.has_value() ? ": " + rebuilt.error->message : std::string{};
+        throw CanonicalEmptySceneOwnerConflictError(
+            "candidate native projection did not accept the exact preserved snapshot" + detail);
+      }
+      observed = rebuilt.resulting_health;
+    }
+    health.push_back(std::move(observed));
+  }
+
+  // These remote observations detect uncertainty, never roll back native work.
+  // Manager retains its original operation/claim/fence and candidate owners on
+  // failure. The existing published-head route remains the ordinary selector.
+  RequireHeldAdoptionParent(request, impl_->cell_admission_, nullptr, &original_parent_fence,
+                            &original_fence_attempt);
+  RequireCurrentPublication(impl_->publication_reader_, request.expected_predecessor_publication);
+  lock.lock();
+  const auto current = impl_->ReadStateTransaction();
+  RequireAdoptionCurrentScene(current, request);
+  if (*current.active_scene_snapshot != *snapshot || !AccessStatus(current).scene_writes_open) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "logical Scene changed while staging candidate projections");
+  }
+  return health;
+}
+
+ProjectionMaintenanceInitializationStatusDTO
+CanonicalEmptySceneOwner::BeginQualifiedProductAdoption(
+    const QualifiedSceneProductAdoptionRequest &request,
+    const core::IManagerKernelApplyFencePort::HeldStatusView &held_fence) {
+  return BeginQualifiedProductAdoptionImpl(request, &held_fence, nullptr);
+}
+
+ProjectionMaintenanceInitializationStatusDTO
+CanonicalEmptySceneOwner::BeginOriginalManagerProductAdoption(
+    const QualifiedSceneProductAdoptionRequest &request,
+    const core::IManagerKernelApplyFencePort &original_parent_fence) {
+  return BeginQualifiedProductAdoptionImpl(request, nullptr, &original_parent_fence);
+}
+
+ProjectionMaintenanceInitializationStatusDTO
+CanonicalEmptySceneOwner::BeginOriginalManagerConfigurationAdoption(
+    const QualifiedSceneConfigurationAdoptionRequest &request,
+    const core::IManagerKernelApplyFencePort &original_parent_fence) {
+  return BeginQualifiedProductAdoptionImpl(request, nullptr, &original_parent_fence);
+}
+
+template <typename Request>
+ProjectionMaintenanceInitializationStatusDTO
+CanonicalEmptySceneOwner::BeginQualifiedProductAdoptionImpl(
+    const Request &request,
+    const core::IManagerKernelApplyFencePort::HeldStatusView *held_fence,
+    const core::IManagerKernelApplyFencePort *original_parent_fence) {
+  ValidateAdoptionRequest(request, impl_->fixed_query_.cell_id);
+  std::lock_guard operation_lock(impl_->maintenance_operation_mutex_);
+  RequireVerifiedAdoptionCandidate(request, impl_->retained_bundle_source_,
+                                  impl_->projection_resolver_);
+  RequireHeldAdoptionParent(request, impl_->cell_admission_, held_fence, original_parent_fence);
+  RequireCurrentPublication(impl_->publication_reader_,
+                            request.expected_predecessor_publication);
+
+  std::unique_lock lock(impl_->mutex_);
+  auto *database = impl_->database();
+  auto state = impl_->ReadStateTransaction();
+  RequireAdoptionCurrentScene(state, request);
+  const auto &owner = AdoptionOwner(request);
+  const auto find_operation = [&](const DurableState &value) {
+    return std::find_if(value.maintenance_initializations.begin(),
+                        value.maintenance_initializations.end(),
+                        [&](const auto &row) {
+                          return row.apply_id == owner.apply_id &&
+                                 row.apply_generation == owner.apply_generation;
+                        });
+  };
+  auto found = find_operation(state);
+  if (found != state.maintenance_initializations.end()) {
+    RequireAdoptionRow(*found, request);
+    if (!LiveAdoptionMatches(impl_->live_product_adoption_, request) ||
+        found != std::prev(state.maintenance_initializations.end()) ||
+        found->result_state != ProjectionMaintenanceInitializationState::kInitialized ||
+        found->publication_receipt.has_value()) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "qualified Scene adoption has no exact original live continuation");
+    }
+  } else if (impl_->live_product_adoption_.has_value() ||
+             !AccessStatus(state).scene_writes_open ||
+             state.maintenance_initializations.size() >= kMaximumMaintenanceInitializations) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption cannot enter this maintenance window");
+  }
+  const auto snapshot = *state.active_scene_snapshot;
+  const auto target = AdoptionTarget(request);
+  lock.unlock();
+  for (const auto &binding : request.native_runtime_bindings) {
+    const auto projection = ResolveRequiredProjection(
+            binding, impl_->projection_resolver_, target);
+    if (!projection.preflight_health.healthy_for_target(target)) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "qualified Scene adoption requires already healthy candidate projections");
+    }
+  }
+  // The local view caller retains its host interlock. The remote original
+  // Manager caller retains durable exclusion, not a frozen host/child view.
+  RequireHeldAdoptionParent(request, impl_->cell_admission_, held_fence, original_parent_fence);
+  RequireCurrentPublication(impl_->publication_reader_,
+                            request.expected_predecessor_publication);
+  lock.lock();
+  impl_->InvalidateSceneCommitState();
+  state = impl_->ReadStateTransaction();
+  RequireAdoptionCurrentScene(state, request);
+  if (*state.active_scene_snapshot != snapshot) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption snapshot changed before capture");
+  }
+  found = find_operation(state);
+  if (found != state.maintenance_initializations.end()) {
+    RequireAdoptionRow(*found, request);
+    return MaintenanceStatus(*found);
+  }
+  if (!AccessStatus(state).scene_writes_open) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption lost its maintenance window");
+  }
+
+  // Capture the original request before the durable boundary. Even a lost
+  // commit response cannot let an ordinary call complete this private row.
+  impl_->live_product_adoption_ = request;
+  Transaction transaction(database, "BEGIN IMMEDIATE");
+  const auto sequence = state.maintenance_initializations.size() + 1U;
+  Statement insert(
+      database,
+      "INSERT INTO logical_scene_maintenance_initialization_intents("
+      "initialization_sequence,apply_id,apply_generation,"
+      "predecessor_retained_bundle_id,predecessor_graph_revision,"
+      "predecessor_scene_id,predecessor_scene_revision_id,"
+      "predecessor_scene_content_hash,target_retained_bundle_id,"
+      "target_graph_revision,target_scene_id,target_scene_revision_id,"
+      "target_scene_content_hash,authoritative_snapshot_json,"
+      "native_binding_count,repaired_transaction_sequence) "
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+  insert.Bind(1, CheckedSafeCounter(sequence, "initialization sequence"));
+  insert.Bind(2, owner.apply_id.value());
+  insert.Bind(3, CheckedSafeCounter(owner.apply_generation.value(), "Apply generation"));
+  BindProjection(insert, 4, request.expected_active_projection_revision);
+  BindProjection(insert, 9, target);
+  insert.Bind(14, logical_scene_codec_internal::EncodeSnapshot(snapshot));
+  insert.Bind(15, static_cast<std::int64_t>(request.native_runtime_bindings.size()));
+  insert.BindNull(16);
+  if (insert.Step()) {
+    throw CanonicalEmptySceneOwnerIntegrityError("Scene adoption intent insert returned a row");
+  }
+  for (std::size_t index = 0U; index < request.native_runtime_bindings.size(); ++index) {
+    const auto &binding = request.native_runtime_bindings[index];
+    Statement row(
+        database,
+        "INSERT INTO logical_scene_maintenance_initialization_bindings("
+        "initialization_sequence,binding_ordinal,provider_binding_id,"
+        "provider_binding_revision,runtime_unit_id,runtime_epoch) VALUES(?,?,?,?,?,?)");
+    row.Bind(1, CheckedSafeCounter(sequence, "initialization sequence"));
+    row.Bind(2, static_cast<std::int64_t>(index));
+    row.Bind(3, binding.provider_binding_id.value());
+    row.Bind(4, binding.provider_binding_revision.value());
+    row.Bind(5, binding.runtime_unit_id.value());
+    row.Bind(6, binding.runtime_epoch.value());
+    if (row.Step()) {
+      throw CanonicalEmptySceneOwnerIntegrityError("Scene adoption binding insert returned a row");
+    }
+  }
+  // No Program baseline row: the exact authoritative Scene is already final.
+  InsertMaintenanceResult(database, sequence,
+                          ProjectionMaintenanceInitializationState::kInitialized,
+                          std::nullopt, false);
+  transaction.Commit();
+  const auto captured = impl_->ReadStateTransaction();
+  const auto result = MaintenanceStatus(*captured.LatestMaintenanceInitialization());
+  if (original_parent_fence != nullptr) {
+    // A lost/changed remote response after commit is uncertainty, not rollback.
+    // Keep the original continuation and durable row for observation only.
+    lock.unlock();
+    RequireHeldAdoptionParent(request, impl_->cell_admission_, nullptr, original_parent_fence);
+    RequireCurrentPublication(impl_->publication_reader_, request.expected_predecessor_publication);
+  }
+  return result;
 }
 
 ProjectionMaintenanceInitializationStatusDTO
@@ -6651,7 +7205,7 @@ CanonicalEmptySceneOwner::BeginMaintenanceInitialization(
   for (const auto &binding : initialization.bindings) {
     try {
       auto projection = ResolveRequiredProjection(
-          binding, impl_->projection_resolver_);
+          binding, impl_->projection_resolver_, initialization.target);
       if (projection.preflight_health.healthy_for_target(
               initialization.target)) {
         // A previous poll may already have installed this projection. Its
@@ -6841,7 +7395,8 @@ CanonicalEmptySceneOwner::InstallInitialScene(
   try {
     for (const auto &binding : provisional.bindings) {
       auto projection =
-          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+          ResolveRequiredProjection(
+            binding, impl_->projection_resolver_, provisional.target);
       if (!projection.preflight_health.healthy_for_target(
               provisional.target)) {
         throw CanonicalEmptySceneOwnerConflictError(
@@ -6983,10 +7538,77 @@ CanonicalEmptySceneOwner::InstallInitialScene(
 ProjectionMaintenanceInitializationStatusDTO
 CanonicalEmptySceneOwner::CompleteMaintenanceInitialization(
     const ProjectionMaintenanceCompletionDTO &completion) {
+  return CompleteMaintenanceInitializationImpl(
+      completion, static_cast<const QualifiedSceneProductAdoptionRequest *>(nullptr), nullptr, nullptr);
+}
+
+ProjectionMaintenanceInitializationStatusDTO
+CanonicalEmptySceneOwner::CompleteQualifiedProductAdoption(
+    const QualifiedSceneProductAdoptionRequest &request,
+    const ActiveBundlePublicationReceiptDTO &publication,
+    const core::IManagerKernelApplyFencePort::HeldStatusView &held_fence) {
+  ValidateAdoptionRequest(request, impl_->fixed_query_.cell_id);
+  if (publication.request.expected_previous_publication_generation !=
+      request.expected_predecessor_publication.publication_generation) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption publication changed its predecessor");
+  }
+  const auto &owner = AdoptionOwner(request);
+  return CompleteMaintenanceInitializationImpl(
+      {owner.apply_id, owner.apply_generation, AdoptionTarget(request),
+       request.expected_snapshot_identity, publication}, &request, &held_fence, nullptr);
+}
+
+ProjectionMaintenanceInitializationStatusDTO
+CanonicalEmptySceneOwner::CompleteOriginalManagerProductAdoption(
+    const QualifiedSceneProductAdoptionRequest &request,
+    const ActiveBundlePublicationReceiptDTO &publication,
+    const core::IManagerKernelApplyFencePort &original_parent_fence) {
+  ValidateAdoptionRequest(request, impl_->fixed_query_.cell_id);
+  if (publication.request.expected_previous_publication_generation !=
+      request.expected_predecessor_publication.publication_generation) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption publication changed its predecessor");
+  }
+  const auto &owner = AdoptionOwner(request);
+  return CompleteMaintenanceInitializationImpl(
+      {owner.apply_id, owner.apply_generation, AdoptionTarget(request),
+       request.expected_snapshot_identity, publication}, &request, nullptr, &original_parent_fence);
+}
+
+ProjectionMaintenanceInitializationStatusDTO
+CanonicalEmptySceneOwner::CompleteOriginalManagerConfigurationAdoption(
+    const QualifiedSceneConfigurationAdoptionRequest &request,
+    const ActiveBundlePublicationReceiptDTO &publication,
+    const core::IManagerKernelApplyFencePort &original_parent_fence) {
+  ValidateAdoptionRequest(request, impl_->fixed_query_.cell_id);
+  if (publication.request.expected_previous_publication_generation !=
+      request.expected_predecessor_publication.publication_generation) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "qualified Scene adoption publication changed its predecessor");
+  }
+  const auto &owner = AdoptionOwner(request);
+  return CompleteMaintenanceInitializationImpl(
+      {owner.apply_id, owner.apply_generation, AdoptionTarget(request),
+       request.expected_snapshot_identity, publication}, &request, nullptr, &original_parent_fence);
+}
+
+template <typename Request>
+ProjectionMaintenanceInitializationStatusDTO
+CanonicalEmptySceneOwner::CompleteMaintenanceInitializationImpl(
+    const ProjectionMaintenanceCompletionDTO &completion,
+    const Request *adoption,
+    const core::IManagerKernelApplyFencePort::HeldStatusView *held_fence,
+    const core::IManagerKernelApplyFencePort *original_parent_fence) {
   if (!completion.valid()) {
     throw std::invalid_argument("maintenance completion is invalid");
   }
   std::lock_guard operation_lock(impl_->maintenance_operation_mutex_);
+  if (adoption != nullptr) {
+    RequireVerifiedAdoptionCandidate(*adoption, impl_->retained_bundle_source_,
+                                    impl_->projection_resolver_);
+    RequireHeldAdoptionParent(*adoption, impl_->cell_admission_, held_fence, original_parent_fence);
+  }
   std::unique_lock lock(impl_->mutex_);
   impl_->InvalidateSceneCommitState();
   impl_->provider_freshness_records_.clear();
@@ -7005,12 +7627,29 @@ CanonicalEmptySceneOwner::CompleteMaintenanceInitialization(
     throw CanonicalEmptySceneOwnerConflictError(
         "maintenance completion has no exact initialized Scene operation");
   }
+  if (adoption != nullptr) {
+    RequireAdoptionRow(*found, *adoption);
+    RequireAdoptionCurrentScene(state, *adoption, found->publication_receipt.has_value());
+    if ((original_parent_fence != nullptr || !found->publication_receipt.has_value()) &&
+        !LiveAdoptionMatches(impl_->live_product_adoption_, *adoption)) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "qualified Scene adoption has no exact original live continuation");
+    }
+  } else if (impl_->live_product_adoption_.has_value() &&
+             std::visit([](const auto &request) { return AdoptionOwner(request); },
+                        *impl_->live_product_adoption_) ==
+                 core::ApplyFenceOwnerDTO{completion.apply_id, completion.apply_generation}) {
+    throw CanonicalEmptySceneOwnerConflictError(
+        "private Scene adoption requires its still-held parent completion");
+  }
   if (found->publication_receipt.has_value()) {
     if (*found->publication_receipt != completion.publication_receipt) {
       throw CanonicalEmptySceneOwnerConflictError(
           "maintenance completion replay changed the publication receipt");
     }
-    return MaintenanceStatus(*found);
+    if (adoption == nullptr) {
+      return MaintenanceStatus(*found);
+    }
   }
   if (found->result_state !=
           ProjectionMaintenanceInitializationState::kInitialized ||
@@ -7028,12 +7667,17 @@ CanonicalEmptySceneOwner::CompleteMaintenanceInitialization(
   }
   for (const auto &binding : initialization.bindings) {
     const auto projection =
-        ResolveRequiredProjection(binding, impl_->projection_resolver_);
+        ResolveRequiredProjection(
+            binding, impl_->projection_resolver_, initialization.target);
     if (!projection.preflight_health.healthy_for_target(
             initialization.target)) {
       throw CanonicalEmptySceneOwnerConflictError(
           "maintenance completion lost exact native initialization health");
     }
+  }
+  if (adoption != nullptr) {
+    RequireHeldAdoptionParent(*adoption, impl_->cell_admission_, held_fence, original_parent_fence);
+    RequireCurrentPublication(impl_->publication_reader_, completion.publication_receipt);
   }
 
   lock.lock();
@@ -7053,12 +7697,30 @@ CanonicalEmptySceneOwner::CompleteMaintenanceInitialization(
     throw CanonicalEmptySceneOwnerConflictError(
         "maintenance initialization changed before completion commit");
   }
+  if (adoption != nullptr) {
+    RequireAdoptionRow(*found, *adoption);
+    RequireAdoptionCurrentScene(state, *adoption, found->publication_receipt.has_value());
+    if (*state.active_scene_snapshot != initialization.authoritative_snapshot) {
+      throw CanonicalEmptySceneOwnerConflictError(
+          "qualified Scene adoption snapshot changed before completion");
+    }
+  }
   if (found->publication_receipt.has_value()) {
     if (*found->publication_receipt != completion.publication_receipt) {
       throw CanonicalEmptySceneOwnerConflictError(
           "maintenance completion replay changed the publication receipt");
     }
-    return MaintenanceStatus(*found);
+    const auto result = MaintenanceStatus(*found);
+    if (original_parent_fence != nullptr) {
+      lock.unlock();
+      RequireHeldAdoptionParent(*adoption, impl_->cell_admission_, nullptr, original_parent_fence);
+      RequireCurrentPublication(impl_->publication_reader_, completion.publication_receipt);
+      lock.lock();
+    }
+    if (adoption != nullptr && LiveAdoptionMatches(impl_->live_product_adoption_, *adoption)) {
+      impl_->live_product_adoption_.reset();
+    }
+    return result;
   }
   if (found->result_state !=
       ProjectionMaintenanceInitializationState::kInitialized) {
@@ -7109,7 +7771,19 @@ CanonicalEmptySceneOwner::CompleteMaintenanceInitialization(
   }
   transaction.Commit();
   const auto completed = impl_->ReadStateTransaction();
-  return MaintenanceStatus(*completed.LatestMaintenanceInitialization());
+  const auto result = MaintenanceStatus(*completed.LatestMaintenanceInitialization());
+  if (original_parent_fence != nullptr) {
+    // The completion remains durable if this observation is uncertain. The
+    // original Manager must retain its exclusions and must not infer success.
+    lock.unlock();
+    RequireHeldAdoptionParent(*adoption, impl_->cell_admission_, nullptr, original_parent_fence);
+    RequireCurrentPublication(impl_->publication_reader_, completion.publication_receipt);
+    lock.lock();
+  }
+  if (adoption != nullptr) {
+    impl_->live_product_adoption_.reset();
+  }
+  return result;
 }
 
 ProjectionAggregateHealthDTO
@@ -7150,7 +7824,8 @@ CanonicalEmptySceneOwner::ActiveProjectionHealth() const {
   for (const auto &binding : bindings) {
     try {
       auto observed =
-          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+          ResolveRequiredProjection(
+            binding, impl_->projection_resolver_, *state.active_projection);
       if (!observed.preflight_health.healthy_for_target(
               *state.active_projection)) {
         throw CanonicalEmptySceneOwnerConflictError(
@@ -7304,7 +7979,8 @@ CanonicalEmptySceneOwner::PreviewResolvedSceneCandidate(
   for (const auto &binding : required_bindings) {
     try {
       auto projection =
-          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+          ResolveRequiredProjection(
+            binding, impl_->projection_resolver_, *observed_state.active_projection);
       if (!projection.preflight_health.healthy_for_target(
               *observed_state.active_projection)) {
         return reject(
@@ -7580,7 +8256,8 @@ CanonicalEmptySceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   for (const auto &binding : required_bindings) {
     try {
       auto projection =
-          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+          ResolveRequiredProjection(
+            binding, impl_->projection_resolver_, *observed_state.active_projection);
       if (!projection.preflight_health.healthy_for_target(
               *observed_state.active_projection)) {
         return reject(core::RequestReplayStatusDTO::kAcceptedNew,
@@ -8040,7 +8717,8 @@ CanonicalEmptySceneOwner::ConfirmProviderFreshness(
   for (const auto &binding : required_bindings) {
     try {
       auto projection =
-          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+          ResolveRequiredProjection(
+            binding, impl_->projection_resolver_, active);
       if (!projection.preflight_health.healthy_for_target(active)) {
         return reject("live_scene_snapshot_unavailable",
                       "a required native scene projection is not healthy at "
@@ -8354,7 +9032,8 @@ core::Result<core::Pose3DTO> CanonicalEmptySceneOwner::GetObjectPose(
     projections.reserve(bindings.size());
     for (const auto &binding : bindings) {
       auto projection =
-          ResolveRequiredProjection(binding, impl_->projection_resolver_);
+          ResolveRequiredProjection(
+            binding, impl_->projection_resolver_, *state.active_projection);
       if (!projection.preflight_health.healthy_for_target(
               *state.active_projection)) {
         throw CanonicalEmptySceneOwnerConflictError(

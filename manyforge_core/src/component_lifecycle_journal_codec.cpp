@@ -1,8 +1,13 @@
 #include <algorithm>
+#include <bit>
+#include <charconv>
 #include <cstdint>
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/route_fence_record_codec_internal.hpp>
+#include <manyforge_core/component_lifecycle_admission.hpp>
+#include <manyforge_core/component_lifecycle_value_codec.hpp>
+#include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -17,9 +22,19 @@ namespace manyforge::core::detail {
 namespace {
 
 constexpr std::string_view kStatusMagic = "MF-CCLC-STATUS-V1";
+constexpr std::string_view kApplyStatusMagic = "MF-CCLC-APPLY-DELEGATED-STATUS-V1";
+constexpr std::string_view kApplyGenerationStatusMagic = "MF-CCLC-APPLY-DELEGATED-STATUS-V2";
+constexpr std::string_view kApplyQualifiedGenerationStatusMagic = "MF-CCLC-APPLY-DELEGATED-STATUS-V3";
+constexpr std::string_view kApplyGenerationIntentMagic = "MF-CCLC-APPLY-DELEGATED-INTENT-V1";
+constexpr std::string_view kApplyQualifiedGenerationIntentMagic = "MF-CCLC-APPLY-DELEGATED-INTENT-V2";
+constexpr std::string_view kApplyResultMagic = "MF-CCLC-APPLY-DELEGATED-RESULT-V1";
+constexpr std::string_view kSelectedStatusMagic = "MF-CCLC-SELECTED-STATUS-V1";
+constexpr std::string_view kSelectedClaimMagic = "MF-CCLC-SELECTED-BRING-UP-CLAIM-V1";
 constexpr std::string_view kProgramStatusMagic = "MF-CCLC-STATUS-V2";
 constexpr std::string_view kProgramNodeMagic = "MF-PROGRAM-NODE-ADMISSION-V1";
 constexpr std::string_view kIntentMagic = "MF-CCLC-INTENT-V1";
+constexpr std::string_view kIntentValueMagic = "MF-CCLC-INTENT-VALUE-V1";
+constexpr std::string_view kSelectedResultMagic = "MF-CCLC-SELECTED-RESULT-V1";
 constexpr std::string_view kPrimitiveIntentMagic = "MF-CCLC-PRIMITIVE-INTENT-V1";
 constexpr std::string_view kPrimitiveResultMagic = "MF-CCLC-PRIMITIVE-RESULT-V1";
 constexpr std::string_view kEffectAttemptMagic = "MF-CCLC-EFFECT-ATTEMPT-V1";
@@ -358,6 +373,34 @@ void PutIntent(Writer& writer, const ComponentLifecycleIntentDTO& value, bool in
     PutAttribution(writer, value.attribution);
   }
   writer.Counter(value.expected_admission_generation);
+}
+
+void PutApplyGenerationSelection(Writer& writer, const ApplyComponentGenerationSelectionDTO& value) {
+  writer.Optional<ComponentLifecycleGeneration>(value.predecessor_generation,
+      [&](const auto& generation) { writer.Counter(generation); });
+  writer.Counter(value.candidate_generation);
+  writer.U64(value.prior_reservation_generation);
+  if (value.owner_qualified_predecessor) {
+    writer.Counter(value.owner_qualified_predecessor->generation);
+    writer.Identity(value.owner_qualified_predecessor->snapshot_digest);
+  }
+}
+
+[[nodiscard]] ApplyComponentGenerationSelectionDTO GetApplyGenerationSelection(
+    Reader& reader, bool qualified = false) {
+  ApplyComponentGenerationSelectionDTO value{
+      reader.Optional<ComponentLifecycleGeneration>(
+          [&] { return reader.Counter<ComponentLifecycleGeneration>(); }),
+      reader.Counter<ComponentLifecycleGeneration>(), reader.U64()};
+  if (qualified) {
+    value.owner_qualified_predecessor = ApplyComponentQualifiedPredecessorDTO{
+        reader.Counter<ComponentLifecycleGeneration>(), reader.Identity<ContentDigest>()};
+  }
+  return value;
+}
+
+[[nodiscard]] bool HasQualifiedApplyPredecessor(const ComponentLifecycleIntentDTO& intent) {
+  return intent.apply_generation_selection && intent.apply_generation_selection->owner_qualified_predecessor;
 }
 
 [[nodiscard]] ComponentLifecycleIntentDTO GetIntent(Reader& reader) {
@@ -1570,8 +1613,215 @@ void PutProgramNode(Writer& writer, const ProgramNodeAdmissionEvidenceDTO& value
   return result;
 }
 
+[[nodiscard]] bool SelectedClaimIntentValid(const CellAdmissionClaimIntentDTO& intent) {
+  constexpr std::string_view prefix = "selected-lifecycle.";
+  if (!ValidateCellAdmissionClaimIntent(intent).ok() ||
+      intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
+      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
+      !intent.owner_transaction_id.starts_with(prefix) || intent.scope.resources.empty() ||
+      intent.scope.configurations.empty() || intent.program_cycle_evidence ||
+      intent.program_node_evidence || !intent.intervention_evidence ||
+      intent.intervention_evidence->parent_program_cycle_claim_generation) return false;
+  const std::string_view suffix(intent.owner_transaction_id.data() + prefix.size(),
+                                intent.owner_transaction_id.size() - prefix.size());
+  std::uint64_t generation{};
+  const auto parsed = std::from_chars(suffix.data(), suffix.data() + suffix.size(), generation);
+  return parsed.ec == std::errc{} && parsed.ptr == suffix.data() + suffix.size() &&
+         generation != 0U && suffix == std::to_string(generation);
+}
+
+void PutSelectedClaimIntent(Writer& writer, const CellAdmissionClaimIntentDTO& value) {
+  writer.EnumValue(value.claim_kind);
+  writer.EnumValue(value.owner_role);
+  writer.Identity(value.owner_epoch);
+  writer.String(value.owner_transaction_id);
+  writer.Identity(value.request_id);
+  writer.Identity(value.request_payload_digest);
+  writer.Counter(value.expected_admission_generation);
+  writer.Vector(value.scope.resources, [&](const auto& item) { writer.Identity(item); });
+  writer.Vector(value.scope.configurations, [&](const auto& item) {
+    writer.Identity(item.control_domain_id);
+    writer.Identity(item.active_configuration_id);
+    writer.Counter(item.active_configuration_generation);
+  });
+  writer.Optional<ProgramCycleAdmissionEvidenceDTO>(value.program_cycle_evidence,
+      [&](const auto& item) {
+        writer.Identity(item.draft_program_revision);
+        writer.Identity(item.applied_program_revision);
+      });
+  writer.Optional<CellAdmissionInterventionEvidenceDTO>(value.intervention_evidence,
+      [&](const auto& item) {
+        writer.EnumValue(item.offering_owner_role);
+        writer.Identity(item.offering_owner_epoch);
+        writer.String(item.offer_transaction_id);
+        writer.Identity(item.offer_digest);
+        writer.Optional<CellAdmissionClaimGeneration>(item.parent_program_cycle_claim_generation,
+            [&](const auto& generation) { writer.Counter(generation); });
+      });
+  writer.Optional<ProgramNodeAdmissionEvidenceDTO>(value.program_node_evidence,
+      [&](const auto& item) { PutProgramNode(writer, item); });
+}
+
+[[nodiscard]] CellAdmissionClaimIntentDTO GetSelectedClaimIntent(Reader& reader) {
+  return {reader.EnumValue<CellAdmissionClaimKindDTO>(),
+          reader.EnumValue<CellAdmissionOwnerRoleDTO>(),
+          reader.Identity<RequestOwnerEpoch>(), reader.String(), reader.Identity<RequestId>(),
+          reader.Identity<ContentDigest>(), reader.Counter<AdmissionGeneration>(),
+          {reader.Vector<ResourceId>([&]() { return reader.Identity<ResourceId>(); }),
+           reader.Vector<CellAdmissionConfigurationScopeDTO>([&]() {
+             return CellAdmissionConfigurationScopeDTO{reader.Identity<ControlDomainId>(),
+                 reader.Identity<ActiveControlConfigurationId>(),
+                 reader.Counter<ActiveControlConfigurationGeneration>()};
+           })},
+          reader.Optional<ProgramCycleAdmissionEvidenceDTO>([&]() {
+            return ProgramCycleAdmissionEvidenceDTO{reader.Identity<ProgramRevision>(),
+                                                    reader.Identity<ProgramRevision>()};
+          }),
+          reader.Optional<CellAdmissionInterventionEvidenceDTO>([&]() {
+            return CellAdmissionInterventionEvidenceDTO{reader.EnumValue<CellAdmissionOwnerRoleDTO>(),
+                reader.Identity<RequestOwnerEpoch>(), reader.String(), reader.Identity<ContentDigest>(),
+                reader.Optional<CellAdmissionClaimGeneration>([&]() {
+                  return reader.Counter<CellAdmissionClaimGeneration>();
+                })};
+          }),
+          reader.Optional<ProgramNodeAdmissionEvidenceDTO>([&]() { return GetProgramNode(reader); })};
+}
+
+void PutSelectedOccurrence(Writer& writer, const SelectedControllerOccurrenceDTO& value) {
+  writer.Optional<ExecutionBindingEpoch>(value.arm_binding_epoch,
+      [&](const auto& item) { writer.Counter(item); });
+  writer.Vector(value.domains, [&](const auto& item) {
+    writer.Identity(item.control_domain_id);
+    writer.U64(item.observation_generation);
+  });
+}
+
+[[nodiscard]] SelectedControllerOccurrenceDTO GetSelectedOccurrence(Reader& reader) {
+  return {reader.Optional<ExecutionBindingEpoch>([&]() {
+            return reader.Counter<ExecutionBindingEpoch>();
+          }),
+          reader.Vector<SelectedDomainOccurrenceDTO>([&]() {
+            return SelectedDomainOccurrenceDTO{reader.Identity<ControlDomainId>(), reader.U64()};
+          })};
+}
+
+void PutSelectedBringUp(Writer& writer, const SelectedComponentBringUpEvidenceDTO& value) {
+  writer.Identity(value.offer_digest);
+  writer.Identity(value.predecessor_snapshot_digest);
+  writer.String(value.incident_id);
+  writer.Identity(value.containment_stop_id);
+  writer.Counter(value.containment_stop_generation);
+  PutProjectionRevision(writer, value.candidate_projection_revision);
+  writer.Identity(value.candidate_retained_bundle_digest);
+  writer.U64(value.candidate_retained_bundle_bytes);
+  PutSelectedOccurrence(writer, value.predecessor_occurrence);
+  PutSelectedOccurrence(writer, value.successor_occurrence);
+  PutSelectedClaimIntent(writer, value.selected_claim.intent);
+  writer.Counter(value.selected_claim.claim_generation);
+  writer.Counter(value.selected_claim.acquired_admission_generation);
+  writer.I64(value.selected_claim.accepted_at_ns);
+  writer.Identity(value.accepted_fence.configuration_fence_id);
+  writer.Counter(value.accepted_fence.configuration_fence_generation);
+  PutFenceScope(writer, value.accepted_fence.captured_scope);
+  writer.I64(value.accepted_fence.accepted_at_ns);
+  writer.EnumValue(value.accepted_fence.replay_status);
+  writer.Identity(value.original_request_payload_digest);
+}
+
+[[nodiscard]] SelectedComponentBringUpEvidenceDTO GetSelectedBringUp(Reader& reader) {
+  return {reader.Identity<ContentDigest>(), reader.Identity<ContentDigest>(), reader.String(),
+          reader.Identity<StopId>(), reader.Counter<StopGeneration>(), GetProjectionRevision(reader),
+          reader.Identity<ContentDigest>(), reader.U64(), GetSelectedOccurrence(reader),
+          GetSelectedOccurrence(reader),
+          {GetSelectedClaimIntent(reader), reader.Counter<CellAdmissionClaimGeneration>(),
+           reader.Counter<AdmissionGeneration>(), reader.I64()},
+          {reader.Identity<ConfigurationFenceId>(), reader.Counter<ConfigurationFenceGeneration>(),
+           GetFenceScope(reader), reader.I64(), reader.EnumValue<RequestReplayStatusDTO>()},
+          reader.Identity<ContentDigest>()};
+}
+
+void PutApplyReference(Writer& writer, const ApplyComponentBringUpReferenceDTO& value) {
+  writer.Identity(value.owner.apply_id);
+  writer.Counter(value.owner.apply_generation);
+  writer.Identity(value.plan_digest);
+}
+
+[[nodiscard]] ApplyComponentBringUpReferenceDTO GetApplyReference(Reader& reader) {
+  return {{reader.Identity<ApplyId>(), reader.Counter<ApplyGeneration>()},
+          reader.Identity<ContentDigest>()};
+}
+
+void PutApplyAuthority(Writer& writer, const ApplyComponentBringUpAuthorityDTO& authority) {
+  PutApplyReference(writer, authority.parent);
+  // The existing concrete full-claim grammar also carries the Manager claim;
+  // no independent child claim or duplicated Manager plan is introduced.
+  PutSelectedClaimIntent(writer, authority.parent_claim.intent);
+  writer.Counter(authority.parent_claim.claim_generation);
+  writer.Counter(authority.parent_claim.acquired_admission_generation);
+  writer.I64(authority.parent_claim.accepted_at_ns);
+  const auto& query = authority.held_fence_query;
+  writer.Identity(query.owner_transaction.apply_id);
+  writer.Counter(query.owner_transaction.apply_generation);
+  writer.Identity(query.configuration_fence_id);
+  writer.Counter(query.configuration_fence_generation);
+  PutFenceScope(writer, query.expected_scope);
+  writer.Identity(query.manager_runtime_epoch);
+}
+
+[[nodiscard]] ApplyComponentBringUpAuthorityDTO GetApplyAuthority(Reader& reader) {
+  return {GetApplyReference(reader),
+          {GetSelectedClaimIntent(reader), reader.Counter<CellAdmissionClaimGeneration>(),
+           reader.Counter<AdmissionGeneration>(), reader.I64()},
+          {{reader.Identity<ApplyId>(), reader.Counter<ApplyGeneration>()},
+           reader.Identity<ConfigurationFenceId>(), reader.Counter<ConfigurationFenceGeneration>(),
+           GetFenceScope(reader), reader.Identity<RuntimeEpoch>()}};
+}
+
+void PutApplyBringUp(Writer& writer, const ApplyComponentBringUpEvidenceDTO& value) {
+  PutApplyAuthority(writer, value.parent_authority);
+  PutFenceScope(writer, value.selected_scope);
+  writer.Identity(value.original_request_payload_digest);
+  PutProjectionRevision(writer, value.candidate_projection_revision);
+  writer.Identity(value.candidate_retained_bundle_digest);
+  writer.U64(value.candidate_retained_bundle_bytes);
+  writer.Identity(value.original_execution_host.runtime_unit_id);
+  writer.Identity(value.original_execution_host.runtime_epoch);
+  writer.Optional<ApplyComponentBringUpRecoveryEvidenceDTO>(value.recovery, [&](const auto& item) {
+    writer.Identity(item.predecessor_snapshot_digest);
+    writer.String(item.incident_id);
+    writer.Identity(item.containment_stop_id);
+    writer.Counter(item.containment_stop_generation);
+  });
+  writer.Optional<SelectedControllerOccurrenceDTO>(value.predecessor_occurrence,
+      [&](const auto& item) { PutSelectedOccurrence(writer, item); });
+  writer.Optional<SelectedControllerOccurrenceDTO>(value.successor_occurrence_floor,
+      [&](const auto& item) { PutSelectedOccurrence(writer, item); });
+}
+
+[[nodiscard]] ApplyComponentBringUpEvidenceDTO GetApplyBringUp(Reader& reader) {
+  return {GetApplyAuthority(reader),
+          GetFenceScope(reader), reader.Identity<ContentDigest>(),
+          GetProjectionRevision(reader), reader.Identity<ContentDigest>(), reader.U64(),
+          {reader.Identity<RuntimeUnitId>(), reader.Identity<RuntimeEpoch>()},
+          reader.Optional<ApplyComponentBringUpRecoveryEvidenceDTO>([&]() {
+            return ApplyComponentBringUpRecoveryEvidenceDTO{reader.Identity<ContentDigest>(),
+                reader.String(), reader.Identity<StopId>(), reader.Counter<StopGeneration>()};
+          }),
+          reader.Optional<SelectedControllerOccurrenceDTO>([&]() {
+            return GetSelectedOccurrence(reader);
+          }),
+          reader.Optional<SelectedControllerOccurrenceDTO>([&]() {
+            return GetSelectedOccurrence(reader);
+          })};
+}
+
 void PutStatus(Writer& writer, const ComponentLifecycleStatusDTO& value) {
-  writer.String(value.accepted_intent.program_node_evidence ? kProgramStatusMagic : kStatusMagic);
+  writer.String(value.apply_bring_up ? (HasQualifiedApplyPredecessor(value.accepted_intent)
+                                           ? kApplyQualifiedGenerationStatusMagic
+                                           : value.accepted_intent.apply_generation_selection
+                                               ? kApplyGenerationStatusMagic : kApplyStatusMagic) :
+                value.selected_bring_up ? kSelectedStatusMagic :
+                value.accepted_intent.program_node_evidence ? kProgramStatusMagic : kStatusMagic);
   PutAccepted(writer, value.acceptance);
   PutIntent(writer, value.accepted_intent, true);
   writer.U64(value.status_sequence);
@@ -1593,11 +1843,17 @@ void PutStatus(Writer& writer, const ComponentLifecycleStatusDTO& value) {
   if (value.accepted_intent.program_node_evidence) {
     PutProgramNode(writer, *value.accepted_intent.program_node_evidence);
   }
+  if (value.selected_bring_up) PutSelectedBringUp(writer, *value.selected_bring_up);
+  if (value.apply_bring_up) PutApplyBringUp(writer, *value.apply_bring_up);
+  if (value.accepted_intent.apply_generation_selection)
+    PutApplyGenerationSelection(writer, *value.accepted_intent.apply_generation_selection);
 }
 
 [[nodiscard]] ComponentLifecycleStatusDTO GetStatus(Reader& reader) {
   const auto magic = reader.String();
-  if (magic != kStatusMagic && magic != kProgramStatusMagic) {
+  if (magic != kStatusMagic && magic != kProgramStatusMagic && magic != kSelectedStatusMagic &&
+      magic != kApplyStatusMagic && magic != kApplyGenerationStatusMagic &&
+      magic != kApplyQualifiedGenerationStatusMagic) {
     throw CodecFailure("component lifecycle journal status magic is invalid");
   }
   ComponentLifecycleStatusDTO result{
@@ -1622,6 +1878,13 @@ void PutStatus(Writer& writer, const ComponentLifecycleStatusDTO& value) {
   if (magic == kProgramStatusMagic) {
     result.accepted_intent.program_node_evidence = GetProgramNode(reader);
   }
+  if (magic == kSelectedStatusMagic) result.selected_bring_up = GetSelectedBringUp(reader);
+  if (magic == kApplyStatusMagic || magic == kApplyGenerationStatusMagic ||
+      magic == kApplyQualifiedGenerationStatusMagic)
+    result.apply_bring_up = GetApplyBringUp(reader);
+  if (magic == kApplyGenerationStatusMagic || magic == kApplyQualifiedGenerationStatusMagic)
+    result.accepted_intent.apply_generation_selection = GetApplyGenerationSelection(
+        reader, magic == kApplyQualifiedGenerationStatusMagic);
   return result;
 }
 
@@ -1661,6 +1924,40 @@ CellAdmissionConfigurationScopeDTO DecodeCCLCRouteRecoveryConfiguration(std::str
   return configuration;
 }
 
+std::string EncodeCCLCSelectedBringUpClaimIntent(const SelectedCCLCClaimIntentRecordDTO& record) {
+  if (!SelectedClaimIntentValid(record.full_claim_intent) ||
+      !IsExactLowercaseSha256Digest(record.original_request_payload_digest.value()))
+    throw CodecFailure("CCLC selected bring-up claim record is invalid");
+  Writer writer;
+  writer.String(kSelectedClaimMagic);
+  PutSelectedClaimIntent(writer, record.full_claim_intent);
+  writer.Identity(record.original_request_payload_digest);
+  return std::move(writer).Finish();
+}
+
+SelectedCCLCClaimIntentRecordDTO DecodeCCLCSelectedBringUpClaimIntent(std::string_view bytes) {
+  Reader reader(bytes);
+  if (reader.String() != kSelectedClaimMagic)
+    throw CodecFailure("CCLC selected bring-up claim magic is invalid");
+  SelectedCCLCClaimIntentRecordDTO record{GetSelectedClaimIntent(reader),
+                                        reader.Identity<ContentDigest>()};
+  reader.RequireEnd();
+  if (!SelectedClaimIntentValid(record.full_claim_intent) ||
+      !IsExactLowercaseSha256Digest(record.original_request_payload_digest.value()))
+    throw CodecFailure("CCLC selected bring-up claim record failed closed validation");
+  return record;
+}
+
+bool IsCCLCSelectedBringUpClaimIntentEncoding(std::string_view bytes) noexcept {
+  if (bytes.size() < 4U + kSelectedClaimMagic.size()) return false;
+  const auto length = static_cast<std::uint32_t>(kSelectedClaimMagic.size());
+  for (std::size_t index = 0U; index < 4U; ++index) {
+    if (static_cast<unsigned char>(bytes[index]) != ((length >> (index * 8U)) & 0xffU))
+      return false;
+  }
+  return bytes.substr(4U, kSelectedClaimMagic.size()) == kSelectedClaimMagic;
+}
+
 std::string EncodeCCLCAdmissionRejection(const ErrorDTO& error) {
   if (!CCLCLifecycleRequestResultDTO{RequestReplayStatusDTO::kAcceptedNew, std::nullopt,
                                      std::nullopt, error}
@@ -1692,6 +1989,64 @@ ProgramNodeAdmissionEvidenceDTO DecodeProgramNodeAdmissionEvidence(std::string_v
   auto evidence = GetProgramNode(reader);
   reader.RequireEnd();
   return evidence;
+}
+
+namespace {
+[[nodiscard]] bool NativeApplyComponentBringUpShapeIsValid(const NativeApplyComponentBringUpDTO& value) {
+  if (!value.parent.valid() || !IsExactLowercaseSha256Digest(value.parent.plan_digest.value()) ||
+      value.children.empty() || value.children.size() > kMaximumCCLCComponentWatermarks) return false;
+  const auto identity = [](const auto& id) {
+    return !id.empty() && id.value().size() <= kMaxLifecycleIdentityBytes;
+  };
+  for (std::size_t index = 0U; index < value.children.size(); ++index) {
+    const auto& child = value.children[index];
+    const auto& context = child.request_context;
+    if (!identity(child.component_id) || !identity(context.request_id) ||
+        !identity(context.request_owner_epoch) || context.source_label.empty() ||
+        context.source_label.size() > kMaxLifecycleRequestLabelBytes ||
+        (context.correlation_id && (context.correlation_id->empty() ||
+             context.correlation_id->size() > kMaxLifecycleRequestLabelBytes)) ||
+        !child.acceptance.locally_valid() ||
+        child.acceptance.replay_status != RequestReplayStatusDTO::kAcceptedNew ||
+        child.acceptance.request_id != context.request_id ||
+        child.acceptance.lifecycle_transaction_id.value() !=
+            "apply-lifecycle." + std::to_string(child.acceptance.lifecycle_transaction_generation.value()) ||
+        !IsExactLowercaseSha256Digest(child.original_request_payload_digest.value()) ||
+        (index && !(value.children[index - 1U].component_id < child.component_id))) return false;
+  }
+  return true;
+}
+}  // namespace
+
+std::string EncodeNativeApplyComponentBringUp(const NativeApplyComponentBringUpDTO& value) {
+  if (!NativeApplyComponentBringUpShapeIsValid(value))
+    throw CodecFailure("native Apply delegated receipts are invalid");
+  Writer writer;
+  writer.String("MF-CCLC-NATIVE-APPLY-BRING-UP-V1");
+  PutApplyReference(writer, value.parent);
+  writer.Vector(value.children, [&](const auto& child) {
+    PutPublicRequestContext(writer, child.request_context);
+    writer.Identity(child.component_id);
+    PutAccepted(writer, child.acceptance);
+    writer.Identity(child.original_request_payload_digest);
+  });
+  return std::move(writer).Finish();
+}
+
+NativeApplyComponentBringUpDTO DecodeNativeApplyComponentBringUp(std::string_view bytes) {
+  Reader reader(bytes);
+  if (reader.String() != "MF-CCLC-NATIVE-APPLY-BRING-UP-V1")
+    throw CodecFailure("native Apply delegated receipt magic is invalid");
+  NativeApplyComponentBringUpDTO value{
+      GetApplyReference(reader), reader.Vector<ApplyComponentBringUpAcceptedReceiptDTO>([&] {
+        return ApplyComponentBringUpAcceptedReceiptDTO{
+            GetPublicRequestContext(reader), reader.Identity<ControllableComponentId>(),
+            GetAccepted(reader), reader.Identity<ContentDigest>()};
+      })};
+  reader.RequireEnd();
+  if (!NativeApplyComponentBringUpShapeIsValid(value))
+    throw CodecFailure("native Apply delegated receipts failed closed validation");
+  return value;
 }
 
 std::string EncodeComponentLifecycleStatus(const ComponentLifecycleStatusDTO& status) {
@@ -1726,11 +2081,171 @@ std::string ComponentLifecycleSemanticIntentDigest(const ComponentLifecycleInten
     throw CodecFailure("component lifecycle intent is invalid at journal ingress");
   }
   Writer writer;
-  writer.String(kIntentMagic);
+  writer.String(HasQualifiedApplyPredecessor(intent) ? kApplyQualifiedGenerationIntentMagic
+      : intent.apply_generation_selection ? kApplyGenerationIntentMagic : kIntentMagic);
   PutIntent(writer, intent, false);
+  if (intent.apply_generation_selection)
+    PutApplyGenerationSelection(writer, *intent.apply_generation_selection);
   if (intent.program_node_evidence) {
     PutProgramNode(writer, *intent.program_node_evidence);
   }
+  return content_identity::sha256_digest(std::move(writer).Finish());
+}
+
+std::string SelectedComponentBringUpSemanticOfferDigest(
+    const SelectedComponentBringUpOfferDTO& offer) {
+  const auto checked_scope = SelectedComponentBringUpFenceScope(offer);
+  if (!checked_scope.ok() || !offer.lifecycle_transaction_generation.nonzero() ||
+      offer.lifecycle_transaction_id.value() !=
+          "selected-lifecycle." + std::to_string(offer.lifecycle_transaction_generation.value()) ||
+      !offer.candidate_projection_revision.valid() || !offer.fence_admission.presence_valid() ||
+      offer.fence_admission.echoed_query.affected_scope != checked_scope.value() ||
+      !IsExactLowercaseSha256Digest(offer.candidate_retained_bundle_digest.value()) ||
+      offer.candidate_retained_bundle_bytes == 0U ||
+      !IsExactLowercaseSha256Digest(offer.original_request_payload_digest.value()) ||
+      offer.incident_id.empty() ||
+      offer.incident_id.size() > kMaxComponentIncidentIdBytes ||
+      offer.containment.stop_id.empty() || !offer.containment.stop_generation.nonzero()) {
+    throw CodecFailure("selected component bring-up offer is invalid");
+  }
+  Writer writer;
+  writer.String("MF-CCLC-SELECTED-BRING-UP-OFFER-V1");
+  const auto identities = [&](const auto&... values) { (writer.Identity(values), ...); };
+  const auto optional_identity = [&](const auto& value) {
+    writer.Optional(value, [&](const auto& item) { writer.Identity(item); });
+  };
+  const auto projection = [&](const ProjectionRevisionDTO& revision) {
+    identities(revision.retained_bundle_id, revision.graph_revision,
+               revision.scene_revision.scene_id, revision.scene_revision.content_hash);
+    writer.U64(revision.scene_revision.revision_id);
+  };
+  const auto provider = [&](const RuntimeCapabilityProviderPathDTO& path) {
+    identities(path.capability_id, path.capability_definition_revision,
+               path.capability_provider_binding_id, path.capability_provider_binding_revision,
+               path.provider_instance_id, path.provider_manifest_id,
+               path.provider_manifest_revision, path.provider_runtime_unit_id,
+               path.provider_runtime_epoch);
+  };
+  PutPublicRequestContext(writer, offer.request_context);
+  identities(offer.lifecycle_transaction_id, offer.predecessor.snapshot_digest);
+  writer.Counter(offer.lifecycle_transaction_generation);
+  writer.String(offer.incident_id);
+  writer.Identity(offer.containment.stop_id);
+  writer.Counter(offer.containment.stop_generation);
+  writer.Vector(offer.containment.affected_operation_ids,
+                [&](const auto& id) { writer.Identity(id); });
+  optional_identity(offer.containment.program_run_id);
+  projection(offer.candidate_projection_revision);
+  writer.Identity(offer.candidate_retained_bundle_digest);
+  writer.U64(offer.candidate_retained_bundle_bytes);
+  // Full binding values are request identity, not a second binding authority.
+  // Their independent retained-bundle qualification and sealing remain required.
+  writer.Vector(offer.candidate_participants, [&](const RuntimeParticipantBindingDTO& binding) {
+    identities(binding.program_id, binding.program_revision, binding.program_binding_id,
+               binding.retained_bundle_id, binding.graph_revision, binding.component_role_id,
+               binding.target_role_id, binding.controllable_component_id, binding.component_type_id,
+               binding.component_type_revision, binding.command_target_id, binding.capability_id,
+               binding.capability_definition_revision);
+    writer.Optional(binding.command_schema, [&](const auto& schema) {
+      identities(schema.command_schema_id, schema.command_schema_revision);
+    });
+    writer.Vector(binding.model_bindings, [&](const auto& model) {
+      identities(model.model_role_id, model.model_instance_id, model.model_revision);
+    });
+    writer.Vector(binding.model_groups, [&](const auto& group) {
+      identities(group.model_group_role_id, group.model_instance_id);
+      writer.String(group.compiled_group_name);
+      writer.Vector(group.expanded_compiled_joint_names,
+                    [&](const auto& name) { writer.String(name); });
+    });
+    writer.Vector(binding.frame_bindings, [&](const auto& frame) {
+      identities(frame.frame_role_id, frame.model_instance_id, frame.model_revision);
+      writer.String(frame.compiled_frame_name);
+    });
+    writer.Vector(binding.resources, [&](const auto& resource) {
+      identities(resource.resource_role_id, resource.resource_id);
+      writer.Optional(resource.source_joint_name, [&](const auto& name) { writer.String(name); });
+      writer.String(resource.compiled_resource_name);
+      writer.EnumValue(resource.coordinate_kind);
+    });
+    writer.Vector(binding.collision_body_bindings, [&](const auto& body) {
+      identities(body.collision_body_role_id, body.model_instance_id, body.model_revision);
+      writer.Vector(body.compiled_collision_body_names,
+                    [&](const auto& name) { writer.String(name); });
+    });
+    writer.Optional(binding.control_path, [&](const auto& path) {
+      identities(path.control_domain_id, path.control_domain_revision, path.control_binding_id,
+                 path.control_binding_revision, path.control_interface_contract_id,
+                 path.control_interface_revision, path.controller_topology_id,
+                 path.topology_revision, path.control_route_id, path.activation_set_id,
+                 path.active_control_configuration_id);
+      writer.Counter(path.active_control_configuration_generation);
+      identities(path.provider_instance_id, path.provider_manifest_id,
+                 path.provider_manifest_revision, path.provider_runtime_unit_id,
+                 path.provider_runtime_epoch, path.state_authority_id);
+      writer.EnumValue(path.state_authority_class);
+      identities(path.stop_evidence_policy_id, path.stop_evidence_policy_revision);
+      writer.EnumValue(path.containment_granularity);
+      writer.Optional(path.runtime_scale_qualification, [&](const auto& scale) {
+        identities(scale.control_route_id, scale.scaling_domain_id, scale.command_endpoint_role_id,
+                   scale.applied_state_endpoint_role_id);
+        optional_identity(scale.coordinated_barrier_id);
+        writer.EnumValue(scale.acknowledgement_kind);
+        writer.U64(std::bit_cast<std::uint64_t>(scale.maximum_slew_per_second));
+        writer.I64(scale.freshness_budget_ns);
+      });
+    });
+    writer.Optional(binding.capability_provider_path, provider);
+    writer.Vector(binding.supporting_capability_provider_paths, provider);
+    writer.Vector(binding.runtime_unit_epochs, [&](const auto& epoch) {
+      identities(epoch.runtime_unit_id, epoch.runtime_epoch);
+    });
+    writer.Vector(binding.contact_grasp_bindings, [&](const auto& contact) {
+      identities(contact.contact_policy_id, contact.contact_policy_revision,
+                 contact.runtime_object_id);
+      writer.Vector(contact.allowed_body_bindings, [&](const auto& body) {
+        identities(body.component_role_id, body.target_role_id, body.controllable_component_id,
+                   body.command_target_id);
+        optional_identity(body.model_role_id);
+        identities(body.collision_body_role_id, body.model_instance_id, body.model_revision);
+        writer.Vector(body.collision_body_ids, [&](const auto& id) { writer.String(id); });
+      });
+      writer.U64(std::bit_cast<std::uint64_t>(contact.max_penetration_m));
+      writer.U64(std::bit_cast<std::uint64_t>(contact.terminal_window_start_fraction));
+    });
+  });
+  const auto& admission = offer.fence_admission;
+  writer.String(admission.echoed_query.manager_runtime_epoch.value());
+  const auto& scope = checked_scope.value();
+  writer.Vector(scope.controllable_component_ids, [&](const auto& id) { writer.Identity(id); });
+  writer.Vector(scope.domains, [&](const auto& domain) {
+    writer.Identity(domain.control_domain_id);
+    optional_identity(domain.predecessor_control_domain_revision);
+    optional_identity(domain.candidate_control_domain_revision);
+  });
+  writer.Vector(scope.bindings, [&](const auto& binding) {
+    writer.Identity(binding.control_binding_id);
+    optional_identity(binding.predecessor_control_binding_revision);
+    optional_identity(binding.candidate_control_binding_revision);
+  });
+  writer.Vector(scope.resources, [&](const auto& id) { writer.Identity(id); });
+  identities(admission.execution_host_epoch.runtime_unit_id,
+             admission.execution_host_epoch.runtime_epoch,
+             admission.execution_host_epoch.request_owner_epoch,
+             admission.execution_host_epoch.durable_stop_fence_ledger_digest);
+  writer.Counter(admission.execution_host_epoch.publication_generation);
+  projection(admission.active_projection_revision);
+  writer.Identity(admission.active_public_pointer_digest);
+  writer.U64(admission.operation_resource_generation);
+  writer.Counter(admission.configuration_fence_generation);
+  writer.Vector(admission.active_control_configurations, [&](const auto& configuration) {
+    identities(configuration.control_domain_id, configuration.active_control_configuration_id);
+    writer.Counter(configuration.active_control_configuration_generation);
+  });
+  writer.U64(admission.affected_queued_operation_count);
+  writer.U64(admission.affected_active_operation_count);
+  writer.Identity(admission.result_digest);
+  writer.Identity(offer.original_request_payload_digest);
   return content_identity::sha256_digest(std::move(writer).Finish());
 }
 
@@ -2025,3 +2540,187 @@ RouteConfigurationFenceReleasedDTO DecodeRouteFenceReleasedRecord(std::string_vi
 }
 
 }  // namespace manyforge::core::detail
+
+namespace manyforge::core {
+
+std::string EncodeComponentLifecycleIntent(const ComponentLifecycleIntentDTO& intent) {
+  if (!intent.locally_valid())
+    throw detail::CodecFailure("component lifecycle intent value is invalid");
+  detail::Writer writer;
+  writer.String(detail::HasQualifiedApplyPredecessor(intent) ? detail::kApplyQualifiedGenerationIntentMagic
+      : intent.apply_generation_selection ? detail::kApplyGenerationIntentMagic : detail::kIntentValueMagic);
+  detail::PutIntent(writer, intent, true);
+  writer.Optional<ProgramNodeAdmissionEvidenceDTO>(intent.program_node_evidence,
+      [&](const auto& evidence) { detail::PutProgramNode(writer, evidence); });
+  if (intent.apply_generation_selection)
+    detail::PutApplyGenerationSelection(writer, *intent.apply_generation_selection);
+  return std::move(writer).Finish();
+}
+
+ComponentLifecycleIntentDTO DecodeComponentLifecycleIntent(std::string_view bytes) {
+  detail::Reader reader(bytes);
+  const auto magic = reader.String();
+  if (magic != detail::kIntentValueMagic && magic != detail::kApplyGenerationIntentMagic &&
+      magic != detail::kApplyQualifiedGenerationIntentMagic)
+    throw detail::CodecFailure("component lifecycle intent value magic is invalid");
+  auto intent = detail::GetIntent(reader);
+  intent.program_node_evidence = reader.Optional<ProgramNodeAdmissionEvidenceDTO>(
+      [&]() { return detail::GetProgramNode(reader); });
+  if (magic == detail::kApplyGenerationIntentMagic || magic == detail::kApplyQualifiedGenerationIntentMagic)
+    intent.apply_generation_selection = detail::GetApplyGenerationSelection(
+        reader, magic == detail::kApplyQualifiedGenerationIntentMagic);
+  reader.RequireEnd();
+  if (!intent.locally_valid())
+    throw detail::CodecFailure("component lifecycle intent value failed closed validation");
+  return intent;
+}
+
+std::string EncodeSelectedComponentBringUpRequestResult(const CCLCLifecycleRequestResultDTO& result) {
+  if (!result.locally_valid() || result.incident_recovery ||
+      (result.status && !result.status->selected_bring_up))
+    throw detail::CodecFailure("selected component bring-up request result is invalid");
+  detail::Writer writer;
+  writer.String(detail::kSelectedResultMagic);
+  writer.EnumValue(result.replay_status);
+  writer.Optional<ComponentLifecycleAcceptedDTO>(result.acceptance,
+      [&](const auto& accepted) { detail::PutAccepted(writer, accepted); });
+  writer.Optional<ComponentLifecycleStatusDTO>(result.status,
+      [&](const auto& status) { detail::PutStatus(writer, status); });
+  writer.Optional<ErrorDTO>(result.rejection,
+      [&](const auto& error) { detail::PutError(writer, error); });
+  return std::move(writer).Finish();
+}
+
+CCLCLifecycleRequestResultDTO DecodeSelectedComponentBringUpRequestResult(std::string_view bytes) {
+  detail::Reader reader(bytes);
+  if (reader.String() != detail::kSelectedResultMagic)
+    throw detail::CodecFailure("selected component bring-up request result magic is invalid");
+  CCLCLifecycleRequestResultDTO result{
+      reader.EnumValue<RequestReplayStatusDTO>(),
+      reader.Optional<ComponentLifecycleAcceptedDTO>([&]() { return detail::GetAccepted(reader); }),
+      reader.Optional<ComponentLifecycleStatusDTO>([&]() { return detail::GetStatus(reader); }),
+      reader.Optional<ErrorDTO>([&]() { return detail::GetError(reader); }), std::nullopt};
+  reader.RequireEnd();
+  if (!result.locally_valid() || (result.status && !result.status->selected_bring_up))
+    throw detail::CodecFailure("selected component bring-up request result failed closed validation");
+  return result;
+}
+
+ContentDigest SelectedComponentBringUpSemanticRequestDigest(
+    const ComponentLifecycleIntentDTO& intent,
+    const ProjectionRevisionDTO& candidate_projection_revision,
+    const ContentDigest& candidate_retained_bundle_digest,
+    std::uint64_t candidate_retained_bundle_bytes,
+    const RuntimeUnitId& runtime_unit_id,
+    const RuntimeEpoch& runtime_epoch,
+    const RuntimeEpoch& manager_runtime_epoch) {
+  if (!intent.locally_valid() || intent.intent != ComponentLifecycleIntentKindDTO::kEnable ||
+      intent.program_node_evidence || !candidate_projection_revision.valid() ||
+      !IsExactLowercaseSha256Digest(candidate_retained_bundle_digest.value()) ||
+      candidate_retained_bundle_bytes == 0U || runtime_unit_id.empty() ||
+      runtime_epoch.empty() || manager_runtime_epoch.empty())
+    throw detail::CodecFailure("selected component bring-up semantic request is invalid");
+  detail::Writer writer;
+  writer.String("MF-CCLC-SELECTED-BRING-UP-REQUEST-V1");
+  detail::PutIntent(writer, intent, false);
+  detail::PutProjectionRevision(writer, candidate_projection_revision);
+  writer.Identity(candidate_retained_bundle_digest);
+  writer.U64(candidate_retained_bundle_bytes);
+  writer.Identity(runtime_unit_id);
+  writer.Identity(runtime_epoch);
+  writer.Identity(manager_runtime_epoch);
+  return ContentDigest(content_identity::sha256_digest(std::move(writer).Finish()));
+}
+
+std::string EncodeApplyDelegatedComponentLifecycleRequestResult(
+    const CCLCLifecycleRequestResultDTO& result) {
+  if (!result.locally_valid() || result.incident_recovery ||
+      (result.status && !result.status->apply_bring_up))
+    throw detail::CodecFailure("Apply delegated component lifecycle request result is invalid");
+  detail::Writer writer;
+  writer.String(detail::kApplyResultMagic);
+  writer.EnumValue(result.replay_status);
+  writer.Optional<ComponentLifecycleAcceptedDTO>(result.acceptance,
+      [&](const auto& accepted) { detail::PutAccepted(writer, accepted); });
+  writer.Optional<ComponentLifecycleStatusDTO>(result.status,
+      [&](const auto& status) { detail::PutStatus(writer, status); });
+  writer.Optional<ErrorDTO>(result.rejection,
+      [&](const auto& error) { detail::PutError(writer, error); });
+  return std::move(writer).Finish();
+}
+
+CCLCLifecycleRequestResultDTO DecodeApplyDelegatedComponentLifecycleRequestResult(
+    std::string_view bytes) {
+  detail::Reader reader(bytes);
+  if (reader.String() != detail::kApplyResultMagic)
+    throw detail::CodecFailure("Apply delegated component lifecycle request result magic is invalid");
+  CCLCLifecycleRequestResultDTO result{
+      reader.EnumValue<RequestReplayStatusDTO>(),
+      reader.Optional<ComponentLifecycleAcceptedDTO>([&]() { return detail::GetAccepted(reader); }),
+      reader.Optional<ComponentLifecycleStatusDTO>([&]() { return detail::GetStatus(reader); }),
+      reader.Optional<ErrorDTO>([&]() { return detail::GetError(reader); }), std::nullopt};
+  reader.RequireEnd();
+  if (!result.locally_valid() || (result.status && !result.status->apply_bring_up))
+    throw detail::CodecFailure("Apply delegated component lifecycle request result failed closed validation");
+  return result;
+}
+
+std::string EncodeApplyComponentBringUpAuthority(const ApplyComponentBringUpAuthorityDTO& authority) {
+  if (!authority.valid() || !ValidateCellAdmissionRecoveryReceiptQuery(
+      {authority.parent_claim.intent, authority.parent_claim, std::nullopt}).ok())
+    throw detail::CodecFailure("Apply component parent authority value is invalid");
+  detail::Writer writer;
+  writer.String("MF-CCLC-APPLY-DELEGATED-AUTHORITY-V1");
+  detail::PutApplyAuthority(writer, authority);
+  return std::move(writer).Finish();
+}
+
+ApplyComponentBringUpAuthorityDTO DecodeApplyComponentBringUpAuthority(std::string_view bytes) {
+  detail::Reader reader(bytes);
+  if (reader.String() != "MF-CCLC-APPLY-DELEGATED-AUTHORITY-V1")
+    throw detail::CodecFailure("Apply component parent authority magic is invalid");
+  auto authority = detail::GetApplyAuthority(reader);
+  reader.RequireEnd();
+  if (!authority.valid() || !ValidateCellAdmissionRecoveryReceiptQuery(
+      {authority.parent_claim.intent, authority.parent_claim, std::nullopt}).ok())
+    throw detail::CodecFailure("Apply component parent authority failed closed validation");
+  return authority;
+}
+
+ContentDigest ApplyDelegatedComponentLifecycleSemanticRequestDigest(
+    const ComponentLifecycleIntentDTO& intent,
+    const ProjectionRevisionDTO& candidate_projection_revision,
+    const ContentDigest& candidate_retained_bundle_digest,
+    std::uint64_t candidate_retained_bundle_bytes,
+    const RuntimeUnitId& runtime_unit_id,
+    const RuntimeEpoch& runtime_epoch,
+    const RuntimeEpoch& manager_runtime_epoch,
+    const ApplyComponentBringUpReferenceDTO& parent) {
+  if (!intent.locally_valid() ||
+      (intent.intent != ComponentLifecycleIntentKindDTO::kPrepare &&
+       intent.intent != ComponentLifecycleIntentKindDTO::kEnable &&
+       intent.intent != ComponentLifecycleIntentKindDTO::kDisable) ||
+      intent.program_node_evidence || !candidate_projection_revision.valid() ||
+      !IsExactLowercaseSha256Digest(candidate_retained_bundle_digest.value()) ||
+      candidate_retained_bundle_bytes == 0U || runtime_unit_id.empty() ||
+      runtime_epoch.empty() || manager_runtime_epoch.empty() || !parent.valid() ||
+      !IsExactLowercaseSha256Digest(parent.plan_digest.value()))
+    throw detail::CodecFailure("Apply delegated component lifecycle semantic request is invalid");
+  detail::Writer writer;
+  writer.String(detail::HasQualifiedApplyPredecessor(intent) ? "MF-CCLC-APPLY-DELEGATED-REQUEST-V3"
+      : intent.apply_generation_selection ? "MF-CCLC-APPLY-DELEGATED-REQUEST-V2"
+                                        : "MF-CCLC-APPLY-DELEGATED-REQUEST-V1");
+  detail::PutIntent(writer, intent, false);
+  if (intent.apply_generation_selection)
+    detail::PutApplyGenerationSelection(writer, *intent.apply_generation_selection);
+  detail::PutProjectionRevision(writer, candidate_projection_revision);
+  writer.Identity(candidate_retained_bundle_digest);
+  writer.U64(candidate_retained_bundle_bytes);
+  writer.Identity(runtime_unit_id);
+  writer.Identity(runtime_epoch);
+  writer.Identity(manager_runtime_epoch);
+  detail::PutApplyReference(writer, parent);
+  return ContentDigest(content_identity::sha256_digest(std::move(writer).Finish()));
+}
+
+}  // namespace manyforge::core

@@ -1,12 +1,17 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_component_manager/runtime_observation.hpp>
+#include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/types/active_bundle_publication.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
+#include <manyforge_core/types/lifecycle_target.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace manyforge::component_manager {
@@ -14,6 +19,37 @@ namespace manyforge::component_manager {
 enum class ManagerSelectedRuntimeCompositionPhase {
   kPrepare,
   kFinalize,
+};
+
+/// Exact outputs of the Manager-owned observer check and per-spawn epoch mint.
+/// These are private accepted operation inputs; no config bytes or new proof.
+struct ManagerIsaacPoseObserverLaunchFactsDTO final {
+  std::string retained_snapshot_path;
+  std::string source_id;
+  std::string source_epoch_base;
+
+  [[nodiscard]] bool valid() const noexcept;
+  [[nodiscard]] bool accepts_source_epoch(std::string_view epoch) const noexcept;
+  friend bool operator==(const ManagerIsaacPoseObserverLaunchFactsDTO &,
+                         const ManagerIsaacPoseObserverLaunchFactsDTO &) = default;
+};
+
+/// One closed canonical three-string value shared by accepted journal inputs
+/// and checked launch plumbing; absent optional values have no encoding here.
+[[nodiscard]] std::string EncodeManagerIsaacPoseObserverLaunchFacts(
+    const ManagerIsaacPoseObserverLaunchFactsDTO &facts);
+[[nodiscard]] ManagerIsaacPoseObserverLaunchFactsDTO
+DecodeManagerIsaacPoseObserverLaunchFacts(std::string_view bytes);
+
+/// Exact predecessor occurrence positively reaped by the Prepare producer.
+/// The enclosing request supplies the operation join; this value alone grants
+/// no process or process-group authority.
+struct ManagerIsaacPoseObserverRetirementReceiptDTO final {
+  ManagerIsaacPoseObserverLaunchFactsDTO predecessor;
+  std::int64_t leader_pid{};
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool operator==(const ManagerIsaacPoseObserverRetirementReceiptDTO &,
+                         const ManagerIsaacPoseObserverRetirementReceiptDTO &) = default;
 };
 
 /// Exact Manager-to-managed-host request to install the already selected
@@ -53,6 +89,9 @@ struct ManagerSelectedRuntimeCompositionRequestDTO final {
   /// The active product the retained controllers are currently sealed to.
   /// The host verifies its live registrations against it before re-sealing.
   manyforge::core::ProjectionRevisionDTO predecessor_projection_revision;
+  /// Persisted with the original operation and echoed exactly. Robot-only
+  /// changes retain the same snapshot/source/base, including zero membership.
+  std::optional<ManagerIsaacPoseObserverLaunchFactsDTO> isaac_pose_observer_launch_facts{};
 
   [[nodiscard]] bool valid() const noexcept;
 
@@ -104,6 +143,9 @@ struct ManagerSelectedRuntimeCompositionResultDTO final {
   /// Canonical per-component receipts, sorted by component id. Required and
   /// checked by Manager once a finalize request reports kInstalled.
   std::vector<ManagerRuntimeComponentReceiptDTO> component_receipts;
+  /// Present only on the exact Prepare ACK after positive predecessor reap.
+  /// Absence is not reap evidence; required closure belongs to the consumer.
+  std::optional<ManagerIsaacPoseObserverRetirementReceiptDTO> isaac_pose_observer_retirement_receipt{};
 
   [[nodiscard]] bool valid() const noexcept;
 
@@ -112,13 +154,221 @@ struct ManagerSelectedRuntimeCompositionResultDTO final {
              const ManagerSelectedRuntimeCompositionResultDTO &) = default;
 };
 
+/// Private selected Enable expectations. CCLC owns transaction/claim/fence
+/// identities; these references and epochs never authorize an effect.
+struct ManagerSelectedComponentBringUpRequestDTO final {
+  manyforge::core::ComponentLifecycleIntentDTO intent;
+  manyforge::core::ProjectionRevisionDTO candidate_projection_revision;
+  manyforge::core::ContentDigest candidate_retained_bundle_digest;
+  std::uint64_t candidate_retained_bundle_bytes{};
+  manyforge::core::RuntimeUnitId runtime_unit_id;
+  manyforge::core::RuntimeEpoch runtime_epoch;
+  manyforge::core::RuntimeEpoch manager_runtime_epoch;
+
+  [[nodiscard]] bool valid() const noexcept;
+
+  friend bool
+  operator==(const ManagerSelectedComponentBringUpRequestDTO &,
+             const ManagerSelectedComponentBringUpRequestDTO &) = default;
+};
+
+struct ManagerSelectedComponentBringUpReadRequestDTO final {
+  ManagerSelectedComponentBringUpRequestDTO request;
+
+  [[nodiscard]] bool valid() const noexcept;
+
+  friend bool
+  operator==(const ManagerSelectedComponentBringUpReadRequestDTO &,
+             const ManagerSelectedComponentBringUpReadRequestDTO &) = default;
+};
+
+struct ManagerSelectedComponentBringUpResultDTO final {
+  ManagerSelectedComponentBringUpRequestDTO request;
+  /// Absence is an unknown READ only. The SUBMIT caller/dispatcher must
+  /// require a present result; absence never means unsupported or accepted.
+  std::optional<manyforge::core::CCLCLifecycleRequestResultDTO> result;
+
+  [[nodiscard]] bool valid() const;
+};
+
+/// Private Prepare/Enable delegation by an existing Apply parent. These
+/// values are evidence references, not proof of a live held continuation.
+struct ManagerApplyComponentBringUpRequestDTO final {
+  manyforge::core::ComponentLifecycleIntentDTO intent;
+  manyforge::core::ProjectionRevisionDTO candidate_projection_revision;
+  manyforge::core::ContentDigest candidate_retained_bundle_digest;
+  std::uint64_t candidate_retained_bundle_bytes{};
+  manyforge::core::RuntimeUnitId runtime_unit_id;
+  manyforge::core::RuntimeEpoch runtime_epoch;
+  manyforge::core::RuntimeEpoch manager_runtime_epoch;
+  manyforge::core::ApplyComponentBringUpAuthorityDTO parent_authority;
+
+  [[nodiscard]] bool valid() const noexcept;
+
+  friend bool operator==(const ManagerApplyComponentBringUpRequestDTO &,
+                         const ManagerApplyComponentBringUpRequestDTO &) = default;
+};
+
+struct ManagerApplyComponentBringUpReadRequestDTO final {
+  ManagerApplyComponentBringUpRequestDTO request;
+  [[nodiscard]] bool valid() const noexcept;
+
+  friend bool operator==(const ManagerApplyComponentBringUpReadRequestDTO &,
+                         const ManagerApplyComponentBringUpReadRequestDTO &) = default;
+};
+
+struct ManagerApplyComponentBringUpResultDTO final {
+  ManagerApplyComponentBringUpRequestDTO request;
+  /// Absence is an unknown READ only; SUBMIT must require a present result.
+  std::optional<manyforge::core::CCLCLifecycleRequestResultDTO> result;
+  [[nodiscard]] bool valid() const;
+};
+
+/// Read-only candidate preflight. No Apply or CCLC identity is minted here.
+/// Manager binds the genuine predecessor and original process epochs; the host
+/// verifies the whole candidate and reports actual component process presence.
+struct ManagerComponentBringUpInspectionRequestDTO final {
+  manyforge::core::ProjectionRevisionDTO candidate_projection_revision;
+  manyforge::core::ContentDigest candidate_retained_bundle_digest;
+  std::uint64_t candidate_retained_bundle_bytes{};
+  manyforge::core::ProjectionRevisionDTO predecessor_projection_revision;
+  manyforge::core::ActiveBundlePublicationGeneration expected_predecessor_publication_generation;
+  manyforge::core::ContentDigest expected_predecessor_public_pointer_digest;
+  manyforge::core::RuntimeUnitId runtime_unit_id;
+  manyforge::core::RuntimeEpoch runtime_epoch;
+  manyforge::core::RuntimeEpoch manager_runtime_epoch;
+  /// Read-only facts for exactly this verified candidate component, when requested.
+  std::optional<manyforge::core::ControllableComponentId> planning_component_id{};
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool operator==(const ManagerComponentBringUpInspectionRequestDTO &,
+                         const ManagerComponentBringUpInspectionRequestDTO &) = default;
+};
+
+struct ManagerComponentProcessObservationDTO final {
+  manyforge::core::ControllableComponentId controllable_component_id;
+  ProcessPresenceState process_presence{ProcessPresenceState::kUnknown};
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool operator==(const ManagerComponentProcessObservationDTO &,
+                         const ManagerComponentProcessObservationDTO &) = default;
+};
+
+enum class ManagerCellObserverIncidentPersistenceDTO : std::uint8_t {
+  kNotApplicable = 0,
+  kPending = 1,
+  kPersisted = 2,
+  kFailed = 3,
+  kUnknown = 4,
+};
+
+/// Actual terminal wait evidence, separate from process presence and readiness.
+struct ManagerCellObserverExitDTO final {
+  std::int32_t pid{};
+  std::optional<std::uint8_t> exit_status{};
+  std::optional<std::uint8_t> signal{};
+  bool core_dumped{};
+  std::string observed_utc;
+  std::int64_t detected_at_ns{};
+
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool operator==(const ManagerCellObserverExitDTO &,
+                         const ManagerCellObserverExitDTO &) = default;
+};
+
+/// One configured observer occurrence. An incident ID remains stable even if
+/// persistence fails; only kPersisted identifies a committed durable record.
+struct ManagerCellObserverObservationDTO final {
+  manyforge::core::CellId cell_id;
+  std::string source_id;
+  std::string source_epoch_base;
+  ProcessPresenceState process_presence{ProcessPresenceState::kUnknown};
+  std::optional<ManagerCellObserverExitDTO> exit{};
+  std::optional<std::string> incident_id{};
+  ManagerCellObserverIncidentPersistenceDTO incident_persistence{
+      ManagerCellObserverIncidentPersistenceDTO::kNotApplicable};
+
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool operator==(const ManagerCellObserverObservationDTO &,
+                         const ManagerCellObserverObservationDTO &) = default;
+};
+
+/// Original owner preview and verified candidate compiler input only. This is
+/// neither installed readback nor parent/fence/acceptance authority.
+struct ManagerComponentBringUpPlanningFactsDTO final {
+  manyforge::core::ControllableComponentId component_id;
+  manyforge::core::RequestOwnerEpoch owner_epoch;
+  manyforge::core::ApplyComponentGenerationSelectionDTO generation_selection;
+  std::vector<manyforge::core::ExpectedControlDomainRevisionDTO> candidate_expected_domains;
+  /// The actual requested target and its next permitted action are distinct
+  /// from that action's postcondition and do not assert readiness.
+  manyforge::core::LifecycleTargetStateDTO requested_target;
+  manyforge::core::ComponentLifecycleIntentKindDTO next_intent;
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool operator==(const ManagerComponentBringUpPlanningFactsDTO &,
+                         const ManagerComponentBringUpPlanningFactsDTO &) = default;
+};
+
+struct ManagerComponentBringUpInspectionResultDTO final {
+  ManagerComponentBringUpInspectionRequestDTO request;
+  /// Exactly the verified candidate's configured components, sorted by ID.
+  /// Presence is observation only; it grants no lifecycle or effect permission.
+  std::vector<ManagerComponentProcessObservationDTO> configured_components;
+  std::optional<ManagerCellObserverObservationDTO> cell_observer{};
+  std::optional<ManagerComponentBringUpPlanningFactsDTO> planning_facts{};
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool operator==(const ManagerComponentBringUpInspectionResultDTO &,
+                         const ManagerComponentBringUpInspectionResultDTO &) = default;
+};
+
 class IManagerSelectedRuntimeCompositionPort {
 public:
   virtual ~IManagerSelectedRuntimeCompositionPort() = default;
 
+  [[nodiscard]] virtual manyforge::core::Result<ManagerComponentBringUpInspectionResultDTO>
+  InspectComponentBringUp(const ManagerComponentBringUpInspectionRequestDTO &) {
+    return manyforge::core::Result<ManagerComponentBringUpInspectionResultDTO>::Err(
+        {"component_bring_up_inspection_unavailable",
+         "component process inspection is not composed", {}});
+  }
+
+
   [[nodiscard]] virtual ManagerSelectedRuntimeCompositionResultDTO
   InstallOrObserve(
       const ManagerSelectedRuntimeCompositionRequestDTO &request) = 0;
+
+  [[nodiscard]] virtual manyforge::core::Result<
+      ManagerSelectedComponentBringUpResultDTO>
+  SubmitSelectedComponentBringUp(
+      const ManagerSelectedComponentBringUpRequestDTO &) {
+    return manyforge::core::Result<ManagerSelectedComponentBringUpResultDTO>::
+        Err({"selected_component_bring_up_unavailable",
+             "selected component bring-up is not composed",
+             {}});
+  }
+
+  [[nodiscard]] virtual manyforge::core::Result<
+      ManagerSelectedComponentBringUpResultDTO>
+  ReadSelectedComponentBringUp(
+      const ManagerSelectedComponentBringUpReadRequestDTO &) {
+    return manyforge::core::Result<ManagerSelectedComponentBringUpResultDTO>::
+        Err({"selected_component_bring_up_unavailable",
+             "selected component bring-up is not composed",
+             {}});
+  }
+
+  [[nodiscard]] virtual manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>
+  SubmitApplyComponentBringUp(const ManagerApplyComponentBringUpRequestDTO &) {
+    return manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>::Err(
+        {"apply_component_bring_up_unavailable",
+         "Apply component bring-up is not composed", {}});
+  }
+
+  [[nodiscard]] virtual manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>
+  ReadApplyComponentBringUp(const ManagerApplyComponentBringUpReadRequestDTO &) {
+    return manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>::Err(
+        {"apply_component_bring_up_unavailable",
+         "Apply component bring-up is not composed", {}});
+  }
+
 };
 
 } // namespace manyforge::component_manager

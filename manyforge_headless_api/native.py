@@ -265,8 +265,6 @@ class HeadlessCorePort(Protocol):
 
     def record_program_diagnostic(self, record: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def record_gripper_confirmation(self, record: Mapping[str, Any]) -> dict[str, Any]: ...
-
     def historian_health(self) -> dict[str, Any]: ...
 
     def reconcile_historian_health(
@@ -738,18 +736,6 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("record_program_diagnostic", encoded.decode("utf-8")),
             method="record_program_diagnostic",
-        )
-
-    def record_gripper_confirmation(self, record: Mapping[str, Any]) -> dict[str, Any]:
-        encoded = rfc8785.dumps(dict(record))
-        if len(encoded) > 8192:
-            raise HeadlessApiError(
-                "gripper_confirmation_trace_invalid",
-                "Gripper confirmation trace exceeds its byte bound",
-            )
-        return self._require_object(
-            self._invoke("record_gripper_confirmation", encoded.decode("utf-8")),
-            method="record_gripper_confirmation",
         )
 
     def historian_health(self) -> dict[str, Any]:

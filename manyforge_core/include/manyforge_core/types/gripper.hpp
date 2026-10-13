@@ -104,15 +104,13 @@ struct GripperCommandResultDTO {
 };
 
 enum class GraspConfirmationSourceKind {
-  kOperator,
-  kDiscreteInput,
-  kPerception,
-  kForceCurrent,
+  kDiscreteInput = 1,
+  kPerception = 2,
+  kForceCurrent = 3,
 };
 
 /// A source adapter's observation, not a Program's assertion that a command
-/// succeeded. observed_at_ns is in the receiving owner's clock domain; remote
-/// operator commands pass the common freshness gate before it is stamped.
+/// succeeded. observed_at_ns is in the receiving owner's clock domain.
 struct GripperGraspObservationDTO final {
   std::string gripper_id;
   std::uint64_t command_id{};
@@ -130,7 +128,9 @@ struct GripperGraspObservationDTO final {
 /// One bounded, immutable evidence record for the current gripper command.
 /// Its source/time are independent of commanded position and joint samples.
 struct GripperGraspEvidenceDTO final {
-  GraspConfirmationSourceKind source_kind{GraspConfirmationSourceKind::kOperator};
+  // Zero is deliberately not a source kind. Empty evidence is never a
+  // discrete-input observation; the actual source adapter supplies its kind.
+  GraspConfirmationSourceKind source_kind{};
   ControlBindingId source_id;
   ControlBindingRevision source_revision;
   RuntimeEpoch source_epoch;
@@ -142,7 +142,12 @@ struct GripperGraspEvidenceDTO final {
 
 [[nodiscard]] inline bool gripper_grasp_evidence_is_fresh(const GripperGraspEvidenceDTO& evidence,
                                                           TimePoint now_ns) noexcept {
-  return now_ns >= evidence.observation.observed_at_ns && now_ns < evidence.expires_at_ns;
+  const bool source_kind_valid =
+      evidence.source_kind == GraspConfirmationSourceKind::kDiscreteInput ||
+      evidence.source_kind == GraspConfirmationSourceKind::kPerception ||
+      evidence.source_kind == GraspConfirmationSourceKind::kForceCurrent;
+  return source_kind_valid && now_ns >= evidence.observation.observed_at_ns &&
+         now_ns < evidence.expires_at_ns;
 }
 
 /// Immutable observer snapshot published by the owning gripper adapter.

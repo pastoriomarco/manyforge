@@ -121,6 +121,30 @@ struct RetainedNativeBrandLifecyclePort::State final {
         verify_engine(std::move(verify_engine_in)),
         route_ready(std::move(route_ready_in)) {}
 
+  [[nodiscard]] core::Result<core::ComponentLifecycleStateDTO> ClassifyState() const {
+    const auto engine = verify_engine();
+    if (!engine.ok()) {
+      return core::Result<core::ComponentLifecycleStateDTO>::Err(
+          engine.error());
+    }
+    const auto route = route_ready();
+    if (!route.ok()) {
+      return core::Result<core::ComponentLifecycleStateDTO>::Err(
+          route.error());
+    }
+    // Active native readiness requires a current route. Command eligibility
+    // is the Kernel's separate fact and is not observed here.
+    if (observed_state == core::ComponentLifecycleStateDTO::kActive &&
+        !route.value()) {
+      return core::Result<core::ComponentLifecycleStateDTO>::Err(port_error(
+          "native_brand_lifecycle_route_state_changed",
+          "an Active native provider no longer has a current route",
+          "active_route_not_ready"));
+    }
+    return core::Result<core::ComponentLifecycleStateDTO>::Ok(
+        observed_state);
+  }
+
   core::ResolvedLifecycleProviderOccurrenceDTO occurrence;
   core::BrandLifecyclePlanCatalogDTO catalog;
   core::IClock *clock;
@@ -231,24 +255,9 @@ core::Result<core::BrandLifecycleObservationDTO>
 RetainedNativeBrandLifecyclePort::Observe(
     const core::BrandLifecycleObservationQueryDTO &query) {
   std::lock_guard<std::mutex> lock(state_->mutex);
-  const auto engine = state_->verify_engine();
-  if (!engine.ok()) {
-    return core::Result<core::BrandLifecycleObservationDTO>::Err(
-        engine.error());
-  }
-  const auto route = state_->route_ready();
-  if (!route.ok()) {
-    return core::Result<core::BrandLifecycleObservationDTO>::Err(
-        route.error());
-  }
-  // Active native readiness requires a current route. Command eligibility
-  // is the Kernel's separate fact and is not observed here.
-  if (state_->observed_state == core::ComponentLifecycleStateDTO::kActive &&
-      !route.value()) {
-    return core::Result<core::BrandLifecycleObservationDTO>::Err(port_error(
-        "native_brand_lifecycle_route_state_changed",
-        "an Active native provider no longer has a current route",
-        "active_route_not_ready"));
+  auto classification = state_->ClassifyState();
+  if (!classification.ok()) {
+    return core::Result<core::BrandLifecycleObservationDTO>::Err(classification.error());
   }
   const auto now = state_->clock->now();
   if (!query.locally_valid() || !exact_occurrence(state_->occurrence, query) ||
@@ -277,8 +286,32 @@ RetainedNativeBrandLifecyclePort::Observe(
        now,
        now,
        now + state_->freshness_ns,
-       state_->observed_state,
+       classification.value(),
        state_->facts});
+}
+
+core::Result<core::LifecycleDomainHealthDTO>
+RetainedNativeBrandLifecyclePort::ReadLifecycleHealth(
+    const core::ControlDomainId &domain, const core::TimePoint now_ns) const {
+  std::lock_guard lock(state_->mutex);
+  if (domain != state_->occurrence.control_domain_id || now_ns < 0) {
+    return core::Result<core::LifecycleDomainHealthDTO>::Err(port_error(
+        "native_brand_lifecycle_health_unavailable",
+        "the health read does not address this native domain or valid owner time",
+        "domain_or_clock_invalid"));
+  }
+  auto classification = state_->ClassifyState();
+  if (!classification.ok()) {
+    return core::Result<core::LifecycleDomainHealthDTO>::Err(classification.error());
+  }
+  core::LifecycleDomainHealthDTO health{classification.value(), state_->facts, std::nullopt};
+  if (!health.locally_valid()) {
+    return core::Result<core::LifecycleDomainHealthDTO>::Err(port_error(
+        "native_brand_lifecycle_health_unavailable",
+        "the retained native health facts violate the normalized contract",
+        "normalized_health_invalid"));
+  }
+  return core::Result<core::LifecycleDomainHealthDTO>::Ok(std::move(health));
 }
 
 core::BrandLifecyclePrimitiveResultDTO

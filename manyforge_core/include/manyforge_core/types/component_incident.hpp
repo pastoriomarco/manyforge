@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -26,6 +27,45 @@ inline constexpr std::size_t kMaxComponentIncidentVendorCodes = 16U;
 inline constexpr std::size_t kMaxComponentIncidentVendorCodeBytes = 64U;
 inline constexpr std::size_t kMaxComponentIncidentSummaryBytes = 1024U;
 inline constexpr std::size_t kMaxComponentIncidentTimelineEntries = 32U;
+
+/// Q96 storage target only. It grants no component lifecycle, recovery
+/// generation or Kernel containment authority. Values are the checked cell
+/// observer identities; source bytes (including NUL) are preserved.
+struct CellObserverIncidentTargetDTO final {
+  CellId cell_id;
+  std::string source_id;
+  std::string source_epoch_base;
+
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const CellObserverIncidentTargetDTO&,
+                         const CellObserverIncidentTargetDTO&) = default;
+};
+
+/// Initial observer-loss evidence in the same bounded incident table. This
+/// codec intentionally supplies no acknowledgement/closing operation.
+struct CellObserverIncidentRecordDTO final {
+  std::string incident_id;
+  CellObserverIncidentTargetDTO target;
+  std::int64_t detected_at_ns{};
+  std::string summary;
+  content_identity::CanonicalValue diagnostic_snapshot;
+
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const CellObserverIncidentRecordDTO&,
+                         const CellObserverIncidentRecordDTO&) = default;
+};
+
+/// Closed initial record, capped by kMaxComponentIncidentRecordBytes. The
+/// host owns capture of context/settings/generated maps; this ROS-free value
+/// codec preserves them and validates actual exit and bounded output shape.
+[[nodiscard]] std::string EncodeCellObserverIncidentRecord(
+    const CellObserverIncidentRecordDTO& record);
+[[nodiscard]] CellObserverIncidentRecordDTO DecodeCellObserverIncidentRecord(
+    std::string_view record_json);
+/// Existing incident_events envelope payload: byte-identical to the stored
+/// record, including event_kind under the same single 512 KiB bound.
+[[nodiscard]] std::string CellObserverIncidentEventPayload(
+    const CellObserverIncidentRecordDTO& record);
 /// Every incident time is in the CCLC owner clock domain (the one of
 /// `accepted_at_ns`): a full-width nonnegative int64 (spec 210 §1.1). JSON
 /// carries it through `content_identity::nonnegative_int64_value` (a number

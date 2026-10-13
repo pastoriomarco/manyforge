@@ -2192,3 +2192,41 @@ def test_composer_does_not_serve_removed_runtime_override_routes(headless_client
     } == {"composable_cell_runtime_unavailable"}
     assert not any("runtime-override" in path for path in served)
     assert not any("runtime-override" in item["path"] for item in requests)
+
+
+@pytest.mark.parametrize("result", [None, {"replay_status": "replayed_exact", "acceptance": None, "status": None}])
+def test_lifecycle_request_result_proxy_preserves_exact_request_without_submit(result) -> None:
+    body = {
+        "request_context": _caller(), "controllable_component_id": "component.arm",
+        "intent": "prepare", "expected_graph_revision": "graph.1",
+        "expected_component_lifecycle_generation": 4,
+        "expected_admission_generation": 7,
+        "expected_control_domains": [{
+            "control_domain_id": "domain.arm", "control_domain_revision": "domain.1",
+            "controller_topology_id": "topology.arm", "topology_revision": "topology.1",
+            "expected_active_control_configuration": {
+                "presence": "absent", "active_control_configuration_id": None,
+                "active_control_configuration_generation": None,
+            },
+            "expected_control_bindings": [{"control_binding_id": "binding.arm",
+                "control_binding_revision": "binding.1", "control_route_id": "route.1"}],
+        }],
+        "reason": "operator-confirmed Composer request", "confirmed": True,
+    }
+    calls = []
+
+    class Client:
+        def component_lifecycle_request_result(self, payload):
+            calls.append(payload)
+            return {"result": result}
+
+        def submit_component_lifecycle(self, payload):
+            raise AssertionError("request-result read must never submit")
+
+    app = FastAPI()
+    app.include_router(create_headless_router(Client(), ComposerState()))
+    with TestClient(app) as composer:
+        response = composer.post("/api/cclc/lifecycle/requests/result", json=body)
+    assert response.status_code == 200
+    assert response.json() == {"result": result}
+    assert calls == [body]

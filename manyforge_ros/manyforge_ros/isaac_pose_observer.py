@@ -286,8 +286,8 @@ def load_isaac_pose_observer_site_config(
     )
     if root["api_version"] != SITE_CONFIG_VERSION:
         raise IsaacPoseObserverConfigError("site config api_version is unsupported")
-    cell_id = _text(root["cell_id"], label="cell_id")
-    source_id = _text(root["source_id"], label="source_id")
+    cell_id = _text(root["cell_id"], label="cell_id", maximum=256)
+    source_id = _text(root["source_id"], label="source_id", maximum=256)
     poll_period = _integer(
         root["simulation_poll_period_ms"],
         label="simulation_poll_period_ms",
@@ -870,8 +870,8 @@ def _joint_binding(value: object) -> JointStateBinding | None:
         raise IsaacPoseObserverConfigError("required_joint_names must be unique")
     return JointStateBinding(
         topic=_ros_topic(record["topic"], label="joint_state topic"),
-        object_id=_text(record["object_id"], label="joint_state object_id"),
-        policy_id=_text(record["policy_id"], label="joint_state policy_id"),
+        object_id=_text(record["object_id"], label="joint_state object_id", maximum=256),
+        policy_id=_text(record["policy_id"], label="joint_state policy_id", maximum=256),
         lifetime_ns=_lifetime(record["lifetime_ns"]),
         eligible=_bool(record["eligible"], label="joint_state eligible"),
         required_joint_names=names,
@@ -916,8 +916,8 @@ def _simulation_binding(value: object) -> SimulationEntityBinding:
     return SimulationEntityBinding(
         request=request,
         frame_kind=_frame_kind(record["frame_kind"]),
-        object_id=_text(record["object_id"], label="simulation object_id"),
-        policy_id=_text(record["policy_id"], label="simulation policy_id"),
+        object_id=_text(record["object_id"], label="simulation object_id", maximum=256),
+        policy_id=_text(record["policy_id"], label="simulation policy_id", maximum=256),
         lifetime_ns=_lifetime(record["lifetime_ns"]),
         eligible=_bool(record["eligible"], label="simulation eligible"),
     )
@@ -970,8 +970,8 @@ def _detection_binding(value: object) -> Detection3dBinding:
     return Detection3dBinding(
         topic=_ros_topic(record["topic"], label="Detection3D topic"),
         frame_kind=_frame_kind(record["frame_kind"]),
-        object_id=_text(record["object_id"], label="Detection3D object_id"),
-        policy_id=_text(record["policy_id"], label="Detection3D policy_id"),
+        object_id=_text(record["object_id"], label="Detection3D object_id", maximum=256),
+        policy_id=_text(record["policy_id"], label="Detection3D policy_id", maximum=256),
         lifetime_ns=_lifetime(record["lifetime_ns"]),
         eligible=_bool(record["eligible"], label="Detection3D eligible"),
         fallback_frame_id=_optional_text(
@@ -1050,7 +1050,7 @@ def _text(value: object, *, label: str, maximum: int = _MAX_TEXT_BYTES) -> str:
         or len(value.encode("utf-8")) > maximum
     ):
         raise IsaacPoseObserverConfigError(
-            f"{label} must be bounded non-empty NFC text"
+            f"{label} must be bounded non-empty NFC text (at most {maximum} UTF-8 bytes)"
         )
     return value
 

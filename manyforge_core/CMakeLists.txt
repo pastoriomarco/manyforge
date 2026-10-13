@@ -36,6 +36,7 @@ endif()
 # Core library
 add_library(manyforge_core
   src/addressed_observed_state_publication.cpp
+  src/configured_robot_measured_state.cpp
   src/build_owned_lifecycle_plan_catalog_source.cpp
   src/component_lifecycle.cpp
   src/component_lifecycle_plan_validity.cpp
@@ -108,8 +109,6 @@ add_library(manyforge_core
   src/runtime_participant_stop_readiness.cpp
   src/runtime_participant_registry.cpp
   src/runtime_scale_governor.cpp
-  src/coordinated_motion_preparation.cpp
-  src/coordinated_execution_clock.cpp
   src/runtime_collision_query_session.cpp
   src/runtime_collision_lookahead_session.cpp
   src/scene_snapshot_lease.cpp
@@ -406,6 +405,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_addressed_observed_state_publication PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_addressed_observed_state_publication
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_configured_robot_measured_state
+    test/test_configured_robot_measured_state.cpp)
+  target_link_libraries(test_configured_robot_measured_state PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_configured_robot_measured_state
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_operation_intent

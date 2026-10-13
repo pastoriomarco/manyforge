@@ -579,8 +579,7 @@ ProductBackedRuntimeParticipantResolver::ResolveObservationTarget(
   using Target = ResolvedTargetObservation;
   try {
     if (capability_id.value() != "model.kinematics.fk" &&
-        capability_id.value() != "tool.gripper.feedback" &&
-        capability_id.value() != "tool.gripper.confirmation.operator") {
+        capability_id.value() != "tool.gripper.feedback") {
       throw std::invalid_argument("unsupported observation capability");
     }
     const bool frame_query = capability_id.value() == "model.kinematics.fk";

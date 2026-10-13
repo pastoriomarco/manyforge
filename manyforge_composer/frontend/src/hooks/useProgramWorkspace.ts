@@ -121,7 +121,7 @@ export function programWorkspaceTransitionResult(
     const applyId = response.headless?.apply_id;
     return {
       workspace: response.workspace,
-      message: `${action === 'apply' ? 'Apply' : 'Revert'} accepted (${String(applyId)}); activation progress is shown under Activity.`,
+      message: `${action === 'apply' ? 'Apply' : 'Revert'} accepted (${String(applyId)}); configuration progress is shown under Activity.`,
       transitionStatus: response.status,
       acceptedApply: acceptedApplyIdentity(applyId, response.headless?.apply_generation),
     };
@@ -138,7 +138,7 @@ export function programWorkspaceTransitionResult(
   if (action === 'load' && response.status === 'loaded') {
     return {
       workspace: response.workspace,
-      message: 'Scenario loaded; its Deployment is converged and its Program is Applied.',
+      message: 'Scenario configured; activate components separately before execution.',
       transitionStatus: response.status,
     };
   }
@@ -580,7 +580,7 @@ export function useProgramWorkspace(
         workspace: response.workspace,
         message: response.status === 'accepted'
           ? `New Scenario saved; activation accepted (${response.activation.apply_id}). No Program or motion starts automatically.`
-          : 'New Scenario saved and activated. Create a Program to enable Execute.',
+          : 'New Scenario saved and configured. Activate components separately before execution.',
         transitionStatus: response.status,
         acceptedApply: response.status === 'accepted'
           ? acceptedApplyIdentity(response.activation.apply_id, response.activation.apply_generation)
@@ -604,14 +604,14 @@ export function useProgramWorkspace(
       if (response.status === 'applied') {
         return {
           workspace: response.workspace,
-          message: 'Scenario loaded; its Deployment and Program already match the Applied configuration. No activation was needed.',
+          message: 'Scenario loaded; its Deployment and Program already match the Applied configuration. No configuration change was needed.',
           transitionStatus: 'applied',
         };
       }
       const applyId = response.activation.apply_id;
       return {
         workspace: response.workspace,
-        message: `Scenario Load accepted (${applyId}); activation progress is shown under Activity. Motion does not start automatically.`,
+        message: `Scenario Load accepted (${applyId}); configuration progress is shown under Activity. Motion does not start automatically.`,
         transitionStatus: 'accepted',
         acceptedApply: acceptedApplyIdentity(
           applyId,

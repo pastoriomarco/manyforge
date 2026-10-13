@@ -21,6 +21,8 @@
 #include "content_identity_internal.hpp"
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "manyforge_deployment/verified_retained_bundle.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -1468,6 +1470,13 @@ GraphIdentityReadyCellGraphCandidate prepare_cell_graph_identity(
           normalized.normalized_value(), normalized_configuration_budget);
       unit.configuration =
           to_json_object(normalized.normalized_value(), configuration_path);
+      if (unit.runtime_profile_id.value() ==
+          detail::kRos2ControlExecutionRuntimeProfileId) {
+        static_cast<void>(detail::require_ros2_control_execution_runtime_required_rows(
+            graph, unit));
+      }
+    } catch (const RetainedBundleError& error) {
+      fail(configuration_path, error.what());
     } catch (const ClosedSchemaError& error) {
       fail(configuration_path, error.what());
     } catch (const CanonicalValueError& error) {

@@ -9,6 +9,7 @@
 #include <manyforge_core/ports/iscene_authority.hpp>
 #include <manyforge_core/ports/iscene_candidate_preview.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
+#include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
 #include <manyforge_core/types/projection_bootstrap.hpp>
 #include <memory>
 #include <optional>
@@ -123,6 +124,16 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
   bool projection_desynchronized;
   CanonicalEmptySceneAccessStatus access;
 };
+
+/// Private Q91 continuation input, captured and sealed by the original Manager
+/// Apply plan before effects. Manager checks the complete plan and actual child
+/// proofs under its exact held-predecessor interlock before either owner call.
+/// Scene independently verifies the current Scene, candidate, bindings and
+/// still-held parent. This value and durable readback are never authority.
+using QualifiedSceneProductAdoptionRequest =
+    manyforge::core::QualifiedSceneProductAdoptionRequestDTO;
+using QualifiedSceneConfigurationAdoptionRequest =
+    manyforge::core::QualifiedSceneConfigurationAdoptionRequestDTO;
 
 /// Production owner for one exact logical-scene lineage.
 ///
@@ -255,6 +266,74 @@ public:
   ReadMaintenanceInitialization(
       const manyforge::core::ProjectionMaintenanceInitializationQueryDTO
           &query) const override;
+  /// Qualifies and durably captures the exact current logical snapshot for an
+  /// already healthy changed product. No native/world effect or Scene mutation.
+  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  BeginQualifiedProductAdoption(
+      const QualifiedSceneProductAdoptionRequest &request,
+      const manyforge::core::IManagerKernelApplyFencePort::HeldStatusView
+          &held_fence);
+  /// Completes only with the genuine current publication and still-held parent.
+  /// Exact readback uses ReadMaintenanceInitialization and never resumes work.
+  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  CompleteQualifiedProductAdoption(
+      const QualifiedSceneProductAdoptionRequest &request,
+      const manyforge::core::ActiveBundlePublicationReceiptDTO &publication,
+      const manyforge::core::IManagerKernelApplyFencePort::HeldStatusView
+          &held_fence);
+  /// Only the original captured Manager operation may call these entries while
+  /// retaining its operation lifetime, cell claim and configuration fence.
+  /// Remote reads detect uncertainty; they neither create a held view nor
+  /// freeze child status. A failed response must stop parent progression and
+  /// retain exclusions, including when this owner's commit already succeeded.
+  /// Stages candidate-only native projections from the exact preserved Scene.
+  /// This original-operation effect is consumed once by Manager. Accepted
+  /// native work is observed through the separate read entry, never retried.
+  /// No logical row/revision/publication or controller change occurs here.
+  /// Stage/READ use the original persisted Acquire attempt's held-presence
+  /// read before candidate configurations exist. Manager must already join
+  /// that attempt and its full acceptance to the original live operation.
+  [[nodiscard]] std::vector<manyforge::core::ProjectionHealthDTO>
+  StageOriginalManagerProductAdoption(
+      const QualifiedSceneProductAdoptionRequest &request,
+      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence,
+      const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt);
+  [[nodiscard]] std::vector<manyforge::core::ProjectionHealthDTO>
+  ReadOriginalManagerProductAdoptionProjectionHealth(
+      const QualifiedSceneProductAdoptionRequest &request,
+      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence,
+      const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt);
+  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  BeginOriginalManagerProductAdoption(
+      const QualifiedSceneProductAdoptionRequest &request,
+      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence);
+  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  CompleteOriginalManagerProductAdoption(
+      const QualifiedSceneProductAdoptionRequest &request,
+      const manyforge::core::ActiveBundlePublicationReceiptDTO &publication,
+      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence);
+  /// Original configuration-only Manager preservation. The producer joins the
+  /// full persisted intent/direct or authoring claim and retains its lifetime;
+  /// copied request/status values never authorize a replacement continuation.
+  [[nodiscard]] std::vector<manyforge::core::ProjectionHealthDTO>
+  StageOriginalManagerConfigurationAdoption(
+      const QualifiedSceneConfigurationAdoptionRequest &request,
+      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence,
+      const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt);
+  [[nodiscard]] std::vector<manyforge::core::ProjectionHealthDTO>
+  ReadOriginalManagerConfigurationAdoptionProjectionHealth(
+      const QualifiedSceneConfigurationAdoptionRequest &request,
+      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence,
+      const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt);
+  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  BeginOriginalManagerConfigurationAdoption(
+      const QualifiedSceneConfigurationAdoptionRequest &request,
+      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence);
+  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  CompleteOriginalManagerConfigurationAdoption(
+      const QualifiedSceneConfigurationAdoptionRequest &request,
+      const manyforge::core::ActiveBundlePublicationReceiptDTO &publication,
+      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence);
   [[nodiscard]] manyforge::core::ProjectionAggregateHealthDTO
   ActiveProjectionHealth() const override;
 
@@ -322,6 +401,27 @@ public:
   void Close();
 
 private:
+  template <typename Request>
+  [[nodiscard]] std::vector<manyforge::core::ProjectionHealthDTO>
+  OriginalManagerProductAdoptionProjectionHealthImpl(
+      const Request &request,
+      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence,
+      const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt,
+      bool stage);
+  template <typename Request>
+  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  BeginQualifiedProductAdoptionImpl(
+      const Request &request,
+      const manyforge::core::IManagerKernelApplyFencePort::HeldStatusView *held_fence,
+      const manyforge::core::IManagerKernelApplyFencePort *original_parent_fence);
+  template <typename Request>
+  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  CompleteMaintenanceInitializationImpl(
+      const manyforge::core::ProjectionMaintenanceCompletionDTO &completion,
+      const Request *adoption,
+      const manyforge::core::IManagerKernelApplyFencePort::HeldStatusView
+          *held_fence,
+      const manyforge::core::IManagerKernelApplyFencePort *original_parent_fence);
   class Impl;
   std::unique_ptr<Impl> impl_;
 };

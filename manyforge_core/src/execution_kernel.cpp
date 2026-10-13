@@ -10,7 +10,6 @@
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
-#include <manyforge_core/detail/coordinated_motion_preparation.hpp>
 #include <manyforge_core/detail/motion_resume_intent.hpp>
 #include <manyforge_core/execution_admission_support.hpp>
 #include <manyforge_core/execution_collision_support.hpp>
@@ -633,14 +632,22 @@ std::map<std::string, std::string> runtime_lookahead_authority_details(
       {"surface", "observed_runtime_lookahead"},
       {"reason_code", "runtime_collision_lookahead"},
       {"reason", result.reason},
-      {"execution_generation", std::to_string(result.execution_generation)},
-      {"runtime_bundle_epoch", std::to_string(result.runtime_bundle_epoch)},
-      {"collision_world_revision_id", std::to_string(result.collision_world_revision.revision_id)},
-      {"collision_world_content_hash", result.collision_world_revision.content_hash},
-      {"lookahead_cursor_time_ns", std::to_string(result.cursor_time_ns)},
-      {"lookahead_covered_until_time_ns", std::to_string(result.covered_until_time_ns)},
-      {"lookahead_checked_samples", std::to_string(result.checked_samples)},
-      {"lookahead_termination", runtime_collision_lookahead_termination_name(result.termination)}};
+      {"execution_generation", std::to_string(result.execution_generation)}};
+  details.insert(result.checked_input_details.begin(), result.checked_input_details.end());
+  if (result.job_context_observed) {
+    details["lookahead_requested_at_ns"] = std::to_string(result.requested_at_ns);
+    details["lookahead_cycle_deadline_ns"] = std::to_string(result.cycle_deadline_ns);
+    details["lookahead_start_jitter_ns"] = std::to_string(result.start_jitter_ns);
+    details["lookahead_cycle_duration_ns"] = std::to_string(result.cycle_duration_ns);
+    details["lookahead_cycle_deadline_exceeded"] =
+        result.cycle_deadline_exceeded ? "true" : "false";
+  }
+  if (result.selection_computed) {
+    details["lookahead_covered_until_time_ns"] = std::to_string(result.covered_until_time_ns);
+    details["lookahead_checked_samples"] = std::to_string(result.checked_samples);
+    details["lookahead_termination"] =
+        runtime_collision_lookahead_termination_name(result.termination);
+  }
   if (result.first_failing_waypoint) {
     details["collision_result_first_failure_waypoint"] =
         std::to_string(*result.first_failing_waypoint);
@@ -737,24 +744,6 @@ struct ExecutionKernel::PreparedMotionSession final {
   bool dispatch_requested{};
   bool cancel_requested{};
 };
-
-namespace {
-Result<void> apply_coordinated_candidate_timing(
-    TrajectoryDTO& trajectory, const ResolvedPreparedMotionExecutionRequestDTO& authority,
-    std::stop_token stop) {
-  if (!authority.common_timing) return Result<void>::Ok();
-  if (trajectory.runtime_scale_bounds) {
-    const auto common = authority.common_timing->arrive_and_wait(
-        authority.execution_request.binding.participant_id, *trajectory.runtime_scale_bounds, stop);
-    if (common && detail::apply_common_runtime_scaling(trajectory, *common))
-      return Result<void>::Ok();
-  }
-  authority.common_timing->cancel();
-  return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
-                                    "Common motion timing preparation failed or was cancelled",
-                                    {{"reason", "coordinated_time_law_preparation_failed"}}});
-}
-}  // namespace
 
 ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts ports,
                                  IExecutionBackend& execution_backend, IClock& clock,
@@ -1385,17 +1374,6 @@ void ExecutionKernel::request_active_validation_cancel(std::string reason) {
 }
 
 void ExecutionKernel::request_active_planning_cancel() {
-  std::shared_ptr<PreparedMotionSession> session;
-  {
-    std::lock_guard lock(prepared_motion_session_mutex_);
-    session = active_prepared_motion_session_;
-  }
-  std::shared_ptr<detail::CoordinatedMotionPreparation> common;
-  if (session) {
-    std::lock_guard lock(session->mutex);
-    common = session->authority.common_timing;
-  }
-  if (common) common->cancel();
   planner_.request_cancel();
 }
 
@@ -1798,14 +1776,17 @@ void ExecutionKernel::emit_runtime_collision_lookahead_evidence(
   }
   auto details = authority_details;
   details["stop_authority_signalled"] = result.stop_authority_signalled ? "true" : "false";
-  details["lookahead_eligible_source_waypoints"] = std::to_string(result.eligible_source_waypoints);
-  details["lookahead_sampling_reduced"] = result.sampling_reduced ? "true" : "false";
-  details["lookahead_sample_times_ns"] = std::move(sampled_times_ns);
-  details["lookahead_workers_used"] = std::to_string(result.workers_used);
-  details["lookahead_cycle_duration_ns"] = std::to_string(result.cycle_duration_ns);
-  details["lookahead_worker_active_duration_ns"] = std::to_string(result.worker_active_duration_ns);
-  details["lookahead_start_jitter_ns"] = std::to_string(result.start_jitter_ns);
-  details["lookahead_cycle_deadline_exceeded"] = result.cycle_deadline_exceeded ? "true" : "false";
+  if (result.selection_computed) {
+    details["lookahead_eligible_source_waypoints"] = std::to_string(result.eligible_source_waypoints);
+    details["lookahead_sampling_reduced"] = result.sampling_reduced ? "true" : "false";
+    details["lookahead_sample_times_ns"] = std::move(sampled_times_ns);
+  }
+  if (result.validation_completed) {
+    details["lookahead_workers_used"] = std::to_string(result.workers_used);
+  }
+  if (result.job_context_observed) {
+    details["lookahead_worker_active_duration_ns"] = std::to_string(result.worker_active_duration_ns);
+  }
   for (const auto& [key, value] : result.failure_details) {
     if (key == "collision_result_waypoint_index") {
       details["collision_result_lookahead_local_sample_index"] = value;
@@ -2369,40 +2350,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     retry_validating_snapshot.progress = 0.0;
     publish_execution_snapshot(std::move(retry_validating_snapshot));
   }
-  if (val_result.ok() && prepared_session && prepared_session->authority.common_timing) {
-    // Retain the independently validated candidate, before another
-    // participant's timing budget changes it. Cache reuse still revalidates.
-    if (!active_trajectory_from_cache || cache_revalidation_candidate)
-      store_validated_candidate(
-          request, exec_id, trajectory,
-          scene_snapshot_lease_inventory.projection_binding.projection_revision,
-          val_result.value().collision_world_revision, cache_revalidation_candidate);
-    auto timing = apply_coordinated_candidate_timing(trajectory, prepared_session->authority, st);
-    if (!timing.ok()) {
-      val_result = Result<CollisionValidationSuccess>::Err(timing.error());
-    } else {
-      // The ordinary collision-replan loop selected this candidate. Validate
-      // the actual common timing once; never reuse the earlier receipt or
-      // independently replan after the all-participant timing decision.
-      if (!planning_result || !planning_result->trajectory) {
-        prepared_session->authority.common_timing->cancel();
-        val_result = Result<CollisionValidationSuccess>::Err(
-            ErrorDTO{kErrorInternalError,
-                     "Common timing lost its planning evidence",
-                     {{"reason", "coordinated_planning_evidence_missing"}}});
-      } else {
-        planning_result->trajectory = trajectory;
-        val_result = validate_trajectory(trajectory, request, scene_snapshot_lease_inventory,
-                                         scene_snapshot_lease);
-      }
-    }
-    if (finalize_prepared_motion_cancellation_if_requested(
-            prepared_session, request, exec_id, motion_state,
-            "prepared_motion_cancelled_during_common_timing")) {
-      phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
-      return phase_result;
-    }
-  }
   if (val_result.ok()) {
     auto projection_result = build_runtime_collision_state_projection(
         trajectory, val_result.value().collision_trajectory);
@@ -2495,8 +2442,7 @@ void ExecutionKernel::store_validated_candidate(const ExecuteRequestDTO& request
                                                 const ProjectionRevisionDTO& projection_revision,
                                                 const CollisionWorldRevision& validation_revision,
                                                 bool revalidated_cache_candidate) {
-  // The exact resolved intent and validation revision remain cache authority;
-  // operation-local common timing is deliberately not retained here.
+  // The exact resolved intent and validation revision remain cache authority.
   const auto key = trajectory_cache_key(request);
   if (request.cache_mode == CacheMode::kDisable || !key.valid() ||
       !collision_world_revision_is_set(validation_revision))
@@ -2520,7 +2466,7 @@ void ExecutionKernel::store_validated_candidate(const ExecuteRequestDTO& request
 
 ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worker_dispatch_phase(
     const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
-    bool active_trajectory_from_cache, bool cache_revalidation_candidate, bool store_candidate,
+    bool active_trajectory_from_cache, bool cache_revalidation_candidate,
     const ProjectionLeaseBindingDTO& projection_binding,
     const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
     const CollisionWorldRevision& validation_world_revision,
@@ -2677,7 +2623,7 @@ ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worke
     }
   }
 
-  if (store_candidate && (!active_trajectory_from_cache || cache_revalidation_candidate))
+  if (!active_trajectory_from_cache || cache_revalidation_candidate)
     store_validated_candidate(request, exec_id, trajectory, projection_binding.projection_revision,
                               validation_world_revision, cache_revalidation_candidate);
 
@@ -3098,16 +3044,6 @@ ExecutionKernel::make_and_prepare_motion_participant(
                                                        "Execution backend rejected prepared motion",
                                                        {{"reason", "backend_prepare_rejected"}}}));
   }
-  if (authority.common_timing) {
-    auto common_clock = authority.common_timing->execution_clock();
-    if (!common_clock)
-      return reject("coordinated_execution_clock_unavailable",
-                    "Coordinated preparation was cancelled before clock binding");
-    auto bound =
-        execution_backend_.BindPreparedExecutionClock(*participant, std::move(common_clock));
-    if (!bound.ok())
-      return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(bound.error());
-  }
   return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Ok(std::move(participant));
 }
 
@@ -3137,8 +3073,6 @@ void ExecutionKernel::async_execute_worker(
         bool notify = false;
         {
           std::lock_guard lock(prepared_session->mutex);
-          if (prepared_session->authority.common_timing)
-            prepared_session->authority.common_timing->cancel();
           if (prepared_session->state == ResolvedPreparedMotionExecutionStateDTO::kPreparing ||
               prepared_session->state == ResolvedPreparedMotionExecutionStateDTO::kPrepared ||
               prepared_session->state ==
@@ -3286,8 +3220,7 @@ void ExecutionKernel::async_execute_worker(
 
     auto dispatch_phase = execute_worker_dispatch_phase(
         request, exec_id, trajectory, active_trajectory_from_cache, cache_revalidation_candidate,
-        !(prepared_session && prepared_session->authority.common_timing), projection_binding,
-        retained_scene.inventory(), validation_world_revision,
+        projection_binding, retained_scene.inventory(), validation_world_revision,
         validation_phase.scene_snapshot_lease, std::move(validation_phase.collision_trajectory),
         prepared_participant, motion_state);
     if (dispatch_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
@@ -4017,7 +3950,6 @@ Result<void> ExecutionKernel::CancelPreparedMotion(const std::uint64_t execution
     }
     session->cancel_requested = true;
     session->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
-    if (session->authority.common_timing) session->authority.common_timing->cancel();
   }
   session->changed.notify_all();
   request_active_planning_cancel();
@@ -7280,20 +7212,6 @@ Result<ResolvedRuntimeScaleStatusDTO> ExecutionKernel::runtime_scale_status(
   }
 
   auto mechanism = execution_backend_.runtime_velocity_scale_status();
-  if (mechanism.coordinated_command) {
-    const auto& shared = *mechanism.coordinated_command;
-    if (shared.operation_id != command->operation_id ||
-        shared.operation_revision < command->operation_revision ||
-        shared.generation < command->requested_runtime_scale_generation) {
-      return Result<ResolvedRuntimeScaleStatusDTO>::Err(
-          ErrorDTO{std::string(to_string(ErrorCode::kInvariantViolation)),
-                   "shared runtime-scale command does not match the active operation",
-                   {{"reason", "coordinated_runtime_scale_command_mismatch"}}});
-    }
-    command->operation_revision = shared.operation_revision;
-    command->requested_runtime_scale_generation = shared.generation;
-    command->requested_scale = mechanism.commanded_scale;
-  }
   RuntimeScaleApplicationState application_state = RuntimeScaleApplicationState::kPending;
   if (!mechanism.supported) {
     application_state = RuntimeScaleApplicationState::kRejected;

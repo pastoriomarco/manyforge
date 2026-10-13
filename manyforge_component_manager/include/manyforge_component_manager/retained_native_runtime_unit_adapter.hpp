@@ -24,6 +24,14 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+/// Exact output of the existing observer's effect-free strict config check.
+/// The caller owns its interpretation and source lifecycle; this is no
+/// readiness or observer-spawn receipt.
+struct IsaacPoseObserverCheckedConfiguration final {
+  std::filesystem::path retained_snapshot;
+  std::string metadata;
+};
+
 /// Manager-owned local adapter for the retained native execution product.
 ///
 /// The adapter resolves only the contract-fixed installed target beneath one
@@ -37,6 +45,11 @@ public:
 /// Program scene meshes. It is opened once here, kept for the adapter's
 /// lifetime, and passed to every child as an inherited directory descriptor;
 /// it is never a retained package root.
+/// `isaac_site_settings_document`, when supplied, owns the exact Manager-validated
+/// startup document. It is captured once in a private file under the Manager
+/// run root; children receive that short path and use the existing site loader.
+/// The snapshot is never overwritten or removed by the adapter, including on
+/// child retirement, and remains with the run's evidence. No payload logging.
 class RetainedNativeRuntimeUnitAdapter final
     : public IRuntimeUnitProcessPort,
       public IRuntimeUnitProgressPort,
@@ -60,7 +73,9 @@ public:
       std::filesystem::path logical_scene_database = {},
       std::filesystem::path program_cycle_journal = {},
       std::filesystem::path activation_root = {},
-      std::filesystem::path scene_asset_root = {});
+      std::filesystem::path scene_asset_root = {},
+      std::optional<std::string> isaac_site_settings_document = std::nullopt,
+      std::optional<std::filesystem::path> isaac_pose_observer_executable = std::nullopt);
   RetainedNativeRuntimeUnitAdapter(
       std::filesystem::path trusted_installed_target_root,
       std::filesystem::path trusted_package_root,
@@ -76,7 +91,9 @@ public:
       std::filesystem::path logical_scene_database = {},
       std::filesystem::path program_cycle_journal = {},
       std::filesystem::path activation_root = {},
-      std::filesystem::path scene_asset_root = {});
+      std::filesystem::path scene_asset_root = {},
+      std::optional<std::string> isaac_site_settings_document = std::nullopt,
+      std::optional<std::filesystem::path> isaac_pose_observer_executable = std::nullopt);
   ~RetainedNativeRuntimeUnitAdapter() override;
 
   RetainedNativeRuntimeUnitAdapter(const RetainedNativeRuntimeUnitAdapter &) =
@@ -87,6 +104,19 @@ public:
       delete;
   RetainedNativeRuntimeUnitAdapter &
   operator=(RetainedNativeRuntimeUnitAdapter &&) = delete;
+
+  /// Capture the supplied observer file once and execute only the configured
+  /// existing observer entrypoint with --check-config. Inherits this Manager's
+  /// container ROS overlay; no shell, host ROS, runtime child protocol or world
+  /// effects. Caller supplies the existing scene startup budget.
+  [[nodiscard]] IsaacPoseObserverCheckedConfiguration
+  CheckIsaacPoseObserverConfiguration(const std::filesystem::path &config_path,
+                                      double scene_startup_timeout_s);
+
+  /// Supply checked cell inputs before initial managed child creation. This
+  /// does not launch/restart a child; Apply facts use the accepted request.
+  void SetIsaacPoseObserverStartupLaunchFacts(
+      std::optional<ManagerIsaacPoseObserverLaunchFactsDTO> facts);
 
   [[nodiscard]] ProcessPresenceObservation
   ObserveProcess(const RuntimeUnitConvergenceQueryDTO &query) override;
@@ -146,8 +176,24 @@ public:
       std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
   ResolveProjection(const manyforge::core::ProjectionNativeRuntimeBindingDTO
                         &native_runtime_binding) const override;
+  [[nodiscard]] manyforge::core::Result<ManagerComponentBringUpInspectionResultDTO>
+  InspectComponentBringUp(const ManagerComponentBringUpInspectionRequestDTO &request) override;
   [[nodiscard]] ManagerSelectedRuntimeCompositionResultDTO InstallOrObserve(
       const ManagerSelectedRuntimeCompositionRequestDTO &request) override;
+  [[nodiscard]] manyforge::core::Result<
+      ManagerSelectedComponentBringUpResultDTO>
+  SubmitSelectedComponentBringUp(
+      const ManagerSelectedComponentBringUpRequestDTO &request) override;
+  [[nodiscard]] manyforge::core::Result<
+      ManagerSelectedComponentBringUpResultDTO>
+  ReadSelectedComponentBringUp(
+      const ManagerSelectedComponentBringUpReadRequestDTO &request) override;
+  [[nodiscard]] manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>
+  SubmitApplyComponentBringUp(
+      const ManagerApplyComponentBringUpRequestDTO &request) override;
+  [[nodiscard]] manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>
+  ReadApplyComponentBringUp(
+      const ManagerApplyComponentBringUpReadRequestDTO &request) override;
   [[nodiscard]] manyforge::core::ManagerLivenessObservationDTO
   RenewManagerLiveness(
       const ManagerLivenessTransportRequestDTO& request) override;

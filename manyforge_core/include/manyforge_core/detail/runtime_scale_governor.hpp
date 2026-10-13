@@ -6,10 +6,6 @@
 #include <optional>
 #include <span>
 
-namespace manyforge::core {
-struct TrajectoryDTO;
-}
-
 namespace manyforge::core::detail {
 
 // Subordinate numerical mechanism, not an admission/lifecycle API. The caller
@@ -36,15 +32,7 @@ struct RuntimeScalePreparation {
   RuntimeScaleBounds scale_bounds;
 };
 
-// Cold-path retiming of an unsealed candidate to a common preparation.
-// Preserves its geometric curve, Cartesian milestones and conservative Stop
-// certificate. Requires complete previously validated P/V/A knots. Failure
-// leaves the candidate unchanged; success still requires final validation and
-// sealing. Never use this to modify an already dispatched/prepared product.
-[[nodiscard]] bool apply_common_runtime_scaling(TrajectoryDTO& candidate,
-                                                const RuntimeScalePreparation& common) noexcept;
-
-// Borrowed cold-path facts for one participant. All envelopes must describe
+// Borrowed cold-path dynamics facts. All envelopes must describe
 // the same pre-dilation schedule; this numerical helper owns no barrier or
 // dispatch authority and retains none of these spans.
 struct TrajectoryDynamicsEnvelope {
@@ -55,8 +43,9 @@ struct TrajectoryDynamicsEnvelope {
   double minimum_time_multiplier{1.0};
 };
 
-// Choose one common dilation and governor budget across all participants.
-// No allocation or independent per-participant time law is introduced.
+// Choose one dilation and governor budget across the supplied dimensions.
+// Ordinary candidate preparation also uses the envelope's TCP timing floor.
+// This numerical helper owns no execution clock or participant coordination.
 [[nodiscard]] std::optional<RuntimeScalePreparation> prepare_runtime_scaling(
     std::span<const TrajectoryDynamicsEnvelope> participants, double headroom_fraction,
     RuntimeScaleBounds software_ceiling) noexcept;
@@ -112,9 +101,8 @@ class RuntimeScaleGovernor final {
   double phase_elapsed_s_{};
 };
 
-// Immutable input for evaluating one shared law at a monotonic clock instant.
-// Consumers sample copies; their different wake/tick histories cannot change
-// the anchor or each other's path clock. This grants no dispatch authority.
+// Immutable input for evaluating an execution's law at a monotonic clock instant.
+// Sampling a copy leaves its source anchor unchanged and grants no dispatch authority.
 struct RuntimeScaleTimeAnchor {
   double trajectory_time_s;
   RuntimeScaleGovernor governor;

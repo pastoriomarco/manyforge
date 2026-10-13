@@ -33,7 +33,7 @@ function controller(): DeploymentWorkspaceController {
         differsFromSaved: false,
       },
       saved: { path: '/workspace/cell-a.deployment.yaml', deploymentRevision: null },
-      managerApplied: { deploymentRevision: null, scenarioId: null },
+      managerApplied: { activationOrder: null, deploymentRevision: null, scenarioId: null },
       runAdmission: { ready: false, reason: 'not applied' },
       binding: null,
       scenarioCandidates: [],
@@ -97,7 +97,7 @@ describe('DeploymentDocumentEditor', () => {
         path: null,
         deploymentRevision: `sha256:${'1'.repeat(64)}`,
       },
-      managerApplied: {
+      managerApplied: { activationOrder: null,
         deploymentRevision: `sha256:${'2'.repeat(64)}`,
         scenarioId: 'cell-a',
       },
@@ -137,7 +137,7 @@ describe('DeploymentDocumentEditor', () => {
         deploymentRevision: `sha256:${'2'.repeat(64)}`,
         differsFromSaved: true,
       },
-      managerApplied: {
+      managerApplied: { activationOrder: null,
         deploymentRevision: `sha256:${'1'.repeat(64)}`,
         scenarioId: 'cell-a',
       },

@@ -6,6 +6,7 @@
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_scene/canonical_empty_scene_owner.hpp>
 
@@ -44,11 +45,15 @@ ToString(ManagerApplyMutationAvailability availability) noexcept;
 /// inventory (see ManagerRuntimeAccountsForCommittedApplies), so no published
 /// value ever shows a committed Apply its active publication does not hold.
 ///
+/// `active.canonical_empty` compares the verified active cell/bundle/graph
+/// exactly to the sealed construction-issued canonical-empty admission.
 /// This is a source publication, not the public headless aggregate. It does
 /// not add receiver freshness, alarm, scene, Kernel, lifecycle, or robot facts.
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 BuildManagerSourcePayload(
     const manyforge::deployment::RetainedBundle &active_bundle,
+    const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
+        &canonical_empty_admission,
     const manyforge::component_manager::ManagerActiveRuntimeConvergenceResult
         &runtime,
     const manyforge::component_manager::SqliteManagerApplyJournal
@@ -60,6 +65,8 @@ BuildManagerSourcePayload(
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 BuildManagerSourcePayload(
     const manyforge::deployment::RetainedBundle &active_bundle,
+    const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
+        &canonical_empty_admission,
     const manyforge::component_manager::ManagerActiveRuntimeConvergenceResult
         &runtime,
     const manyforge::component_manager::SqliteManagerApplyJournal

@@ -462,6 +462,17 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
     workspace.update(
         {
             "managerApplied": {
+                "activationOrder": (
+                    {
+                        "retainedBundleId": current["retained_bundle_id"],
+                        "graphRevision": current["graph_revision"],
+                        "componentIds": [
+                            row["component_id"] for row in applied_document["components"]
+                        ],
+                    }
+                    if applied_document is not None and current is not None
+                    else None
+                ),
                 "deploymentRevision": applied_revision,
                 "scenarioId": (
                     current.get("scenario_id") if current is not None else None

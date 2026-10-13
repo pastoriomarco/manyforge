@@ -6208,7 +6208,6 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
   const auto target_role = deployment::parse_strict_json_model_yaml(R"({
     "component_role":"robot",
     "required_capabilities":[
-      {"capability_id":"tool.gripper.confirmation.operator","parameters":{},"disposition":"required"},
       {"capability_id":"tool.gripper.feedback","parameters":{},"disposition":"required"}
     ],
     "required_frame_roles":["tcp"],
@@ -6302,7 +6301,7 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
   }
 
   std::vector<core::RuntimeParticipantBinding> representatives;
-  for (const auto* capability : {"tool.gripper.feedback", "tool.gripper.confirmation.operator"}) {
+  for (const auto* capability : {"tool.gripper.feedback"}) {
     const auto target = deployment::resolve_runtime_program_target(
         *selected.front(), core::TargetRoleId("first"), core::CapabilityId(capability), bundle,
         model_map);
@@ -6366,7 +6365,7 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
       std::vector<double> samples;
       for (unsigned index = 0; index < (std::string_view(profile) == "cold" ? 1U : 20U); ++index) {
         const bool alternate = std::string_view(profile) == "alternating_key";
-        const auto& representative = representatives[alternate ? index % 2 : 0];
+        const auto& representative = representatives.front();
         const auto begun = std::chrono::steady_clock::now();
         const auto result =
             query(binding_id, alternate && index % 2 ? core::TargetRoleId("second") : target_id,

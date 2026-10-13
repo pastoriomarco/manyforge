@@ -111,4 +111,51 @@ FixedCCLCPortRegistry::ResolveExactControllerLifecyclePort(
   return Result<std::shared_ptr<IControllerLifecyclePort>>::Ok(found->port);
 }
 
+Result<LifecycleDomainHealthDTO> FixedCCLCPortRegistry::ReadExactLifecycleHealth(
+    const ResolvedLifecycleProviderOccurrenceDTO& provider_occurrence,
+    std::int64_t now_ns) const {
+  if (!provider_occurrence.locally_valid()) {
+    return missing<LifecycleDomainHealthDTO>(
+        "provider_occurrence_invalid",
+        "health projection received an invalid exact provider occurrence");
+  }
+  if (now_ns < 0) {
+    return Result<LifecycleDomainHealthDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                 "health projection received an invalid receiver time",
+                 {{"reason", "receiver_time_invalid"}}});
+  }
+  const auto found = std::lower_bound(
+      brand_ports_.begin(), brand_ports_.end(), provider_occurrence,
+      [](const auto& registration, const auto& requested) {
+        return brand_key(registration.provider_occurrence) < brand_key(requested);
+      });
+  if (found == brand_ports_.end() || found->provider_occurrence != provider_occurrence) {
+    return missing<LifecycleDomainHealthDTO>(
+        "provider_occurrence_not_registered",
+        "no health projection is registered for the exact provider occurrence");
+  }
+  if (!found->health_projection) {
+    return missing<LifecycleDomainHealthDTO>(
+        "lifecycle_health_projection_missing",
+        "no pure lifecycle health projection is registered");
+  }
+  try {
+    auto projected = found->health_projection(now_ns);
+    if (!projected.ok()) return projected;
+    if (!projected.value().locally_valid()) {
+      return Result<LifecycleDomainHealthDTO>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                   "lifecycle health projection returned an invalid value",
+                   {{"reason", "lifecycle_health_projection_invalid"}}});
+    }
+    return projected;
+  } catch (...) {
+    return Result<LifecycleDomainHealthDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
+                 "lifecycle health projection is unavailable",
+                 {{"reason", "lifecycle_health_projection_exception"}}});
+  }
+}
+
 }  // namespace manyforge::core

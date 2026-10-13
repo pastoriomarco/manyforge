@@ -245,7 +245,11 @@ target_link_libraries(manyforge_scene PRIVATE
   manyforge::persistence)
 set_target_properties(manyforge_scene PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-if(BUILD_TESTING)
+# The full host graph normally embeds Scene without its tests. This opt-in
+# exposes the existing owner test to the actual managed-fence interlock there.
+option(MANYFORGE_SCENE_BUILD_TESTS_IN_CONSUMER
+  "Build existing Scene tests when embedded by the full host graph" OFF)
+if(BUILD_TESTING OR MANYFORGE_SCENE_BUILD_TESTS_IN_CONSUMER)
   enable_testing()
   find_package(GTest REQUIRED)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)

@@ -29,11 +29,30 @@ struct NativeApplyComponentFactDTO final {
   ControllableComponentId component_id;
   ComponentLifecycleStateDTO state{ComponentLifecycleStateDTO::kDeclared};
   ComponentLifecycleGeneration generation{0U};
+  friend bool operator==(const NativeApplyComponentFactDTO&, const NativeApplyComponentFactDTO&) = default;
 };
 
 struct NativeApplyRouteGenerationDTO final {
   ControlDomainId control_domain_id;
   ActiveControlConfigurationGeneration generation{0U};
+  friend bool operator==(const NativeApplyRouteGenerationDTO&, const NativeApplyRouteGenerationDTO&) = default;
+};
+
+/// Stable original delegated acceptance identity, never continuation authority.
+struct ApplyComponentBringUpAcceptedReceiptDTO final {
+  PublicRequestContextDTO request_context;
+  ControllableComponentId component_id;
+  ComponentLifecycleAcceptedDTO acceptance;
+  ContentDigest original_request_payload_digest;
+  friend bool operator==(const ApplyComponentBringUpAcceptedReceiptDTO&,
+                         const ApplyComponentBringUpAcceptedReceiptDTO&) = default;
+};
+
+struct NativeApplyComponentBringUpDTO final {
+  ApplyComponentBringUpReferenceDTO parent;
+  std::vector<ApplyComponentBringUpAcceptedReceiptDTO> children;
+  friend bool operator==(const NativeApplyComponentBringUpDTO&,
+                         const NativeApplyComponentBringUpDTO&) = default;
 };
 
 /// Parent-Apply delegation to CCLC, recorded before any route is published.
@@ -61,6 +80,7 @@ struct NativeApplyPlanRequestDTO final {
   /// only observes an externally managed controller (ROS 2 control) and the
   /// component reaches readiness later through ordinary CCLC Prepare/Enable.
   ComponentLifecycleStateDTO changed_component_state{ComponentLifecycleStateDTO::kActive};
+  std::optional<NativeApplyComponentBringUpDTO> component_bring_up{};
 };
 
 /// CCLC's recorded decision for one native Apply: which components keep an
@@ -84,7 +104,15 @@ struct NativeApplyPlanDTO final {
   std::vector<ControlDomainId> retained_domains;
   std::vector<ControllableComponentId> removed_components;
   std::vector<ControlDomainId> removed_domains;
+  std::optional<NativeApplyComponentBringUpDTO> component_bring_up{};
+  friend bool operator==(const NativeApplyPlanDTO&, const NativeApplyPlanDTO&) = default;
 };
+
+/// Observation-only classifier for the new pre-Finalize preparation plan.
+/// The owner must join the exact retained terminal and actual held parent
+/// claim. It never authorizes effects, adoption, release or command readiness.
+using NativeApplyParentPreparationFailureSource =
+    std::function<Result<bool>(const NativeApplyPlanDTO&)>;
 
 /// Private promotion of the planned facts after the matching Manager Apply
 /// has published its candidate, but before its fence is released. Accepted
@@ -94,6 +122,7 @@ struct NativeApplyFactAdoptionDTO final {
   ActiveBundlePublicationReceiptDTO publication;
   std::vector<NativeApplyComponentFactDTO> components;
   std::vector<ActiveControlConfigurationDTO> current_routes;
+  std::optional<NativeApplyComponentBringUpDTO> component_bring_up{};
 };
 
 /// Per-write informational notice; no new durable counter or incident identity.
@@ -114,7 +143,8 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
       std::filesystem::path database_path, CellId cell_id,
       std::size_t exact_result_history_capacity = kDefaultCCLCExactResultHistory,
       std::size_t terminal_result_bytes_capacity = kDefaultCCLCTerminalResultBytes,
-      std::function<void(const ComponentIncidentPruneNotice&)> on_incidents_pruned = {});
+      std::function<void(const ComponentIncidentPruneNotice&)> on_incidents_pruned = {},
+      NativeApplyParentPreparationFailureSource preparation_failure_source = {});
   ~SqliteCCLCJournal() override;
 
   SqliteCCLCJournal(const SqliteCCLCJournal&) = delete;
@@ -123,10 +153,21 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
   [[nodiscard]] Result<std::optional<NamedApplyPublicationTransactionDTO>>
   ReadUnsettledNativeApplyPlan() override;
 
+  /// Receiver startup, even when it requires an exact settled predecessor.
   [[nodiscard]] Result<CCLCJournalRecoveryDTO> BeginOwnerEpoch(
       const RequestOwnerEpoch& owner_epoch, std::int64_t started_at_ns,
       std::size_t request_membership_capacity,
       const std::optional<RequestOwnerEpoch>& quiescent_predecessor = std::nullopt) override;
+
+  [[nodiscard]] Result<CCLCJournalRecoveryDTO> BeginOwnerEpoch(
+      const RequestOwnerEpoch& owner_epoch, std::int64_t started_at_ns,
+      std::size_t request_membership_capacity,
+      const std::optional<RequestOwnerEpoch>& quiescent_predecessor,
+      CCLCOwnerEpochTransitionPurpose purpose) override;
+
+  /// Observation only: exact active owner and the existing five-table settled predicate.
+  /// The successor owner transition still performs its atomic predecessor recheck.
+  [[nodiscard]] Result<void> ReadQuiescentOwner(const RequestOwnerEpoch& expected) override;
 
   [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> InspectLifecycleRequest(
       const RequestOwnerEpoch& active_owner_epoch,
@@ -149,6 +190,40 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
       const RequestOwnerEpoch& active_owner_epoch, const ComponentLifecycleIntentDTO& intent,
       const ComponentLifecycleAcceptedDTO& candidate_acceptance,
       const ComponentLifecycleStatusDTO& candidate_initial_status) override;
+  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> AcceptOrReplayTargetLifecycle(
+      const RequestOwnerEpoch&, const ComponentLifecycleIntentDTO&,
+      const ComponentLifecycleAcceptedDTO&, const ComponentLifecycleStatusDTO&,
+      const ComponentLifecycleTargetExpectationDTO&, const CellAdmissionClaimDTO&) override;
+  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>>
+  InspectSelectedComponentBringUpRequest(const RequestOwnerEpoch&,
+                                         const ComponentLifecycleIntentDTO&,
+                                         const ContentDigest&) override;
+  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>>
+  ReadSelectedComponentBringUpRequestResult(const ComponentLifecycleIntentDTO&,
+                                            const ContentDigest&) override;
+  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> AcceptOrReplaySelectedComponentBringUp(
+      const RequestOwnerEpoch&, const ComponentLifecycleIntentDTO&,
+      const ComponentLifecycleAcceptedDTO&, const ComponentLifecycleStatusDTO&,
+      const ContentDigest&) override;
+  [[nodiscard]] Result<void> RecordSelectedCellClaimAttempt(const RequestOwnerEpoch&,
+                                                            const CellAdmissionClaimIntentDTO&,
+                                                            const ContentDigest&) override;
+  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>>
+  InspectApplyComponentBringUpRequest(const RequestOwnerEpoch&,
+      const ComponentLifecycleIntentDTO&, const ContentDigest&) override;
+  [[nodiscard]] Result<ApplyComponentGenerationSelectionDTO> ReadApplyComponentGenerationSelection(
+      const RequestOwnerEpoch&, const ControllableComponentId&,
+      const std::optional<ApplyComponentQualifiedPredecessorDTO>& = std::nullopt) override;
+  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>>
+  ReadApplyComponentBringUpRequestResult(const ComponentLifecycleIntentDTO&,
+      const ContentDigest&) override;
+  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> AcceptOrReplayApplyComponentBringUp(
+      const RequestOwnerEpoch&, const ComponentLifecycleIntentDTO&,
+      const ComponentLifecycleAcceptedDTO&, const ComponentLifecycleStatusDTO&,
+      const ContentDigest&) override;
+  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> RecordSelectedComponentBringUpRejection(
+      const RequestOwnerEpoch&, const ComponentLifecycleIntentDTO&, const ContentDigest&,
+      const ErrorDTO&, const std::optional<CellAdmissionClaimIntentDTO>&) override;
   [[nodiscard]] Result<void> RecordCellClaimAttempt(const RequestOwnerEpoch&,
                                                     const CellAdmissionClaimIntentDTO&) override;
   [[nodiscard]] Result<void> RecordCellClaimAcquired(const RequestOwnerEpoch&,
@@ -279,8 +354,20 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
       std::uint64_t recovery_generation) override;
   /// True only for a component that an unadopted native Apply plan installs,
   /// replaces or removes; a retained-unchanged component is false.
+  [[nodiscard]] Result<bool> RecordLifecycleTargetReached(
+      const ComponentLifecycleTargetExpectationDTO&, bool, std::uint64_t) override;
+  [[nodiscard]] Result<std::vector<ComponentLifecycleTargetDTO>>
+  RetireLifecycleTargetsForClose(const RequestOwnerEpoch&) override;
   [[nodiscard]] Result<bool> ComponentInUnadoptedApplyPlan(
       const ControllableComponentId& component) override;
+  /// Q96 storage-only access to this journal's one real cell observer slot.
+  /// No lifecycle owner, recovery generation, membership or containment is
+  /// acquired. Caller serializes writes of its exact current exit occurrence;
+  /// latest exact replay is idempotent, not a historical replay registry.
+  [[nodiscard]] Result<CellObserverIncidentRecordDTO> RecordCellObserverIncident(
+      const CellObserverIncidentRecordDTO& current_exit);
+  [[nodiscard]] Result<std::optional<CellObserverIncidentRecordDTO>> LoadOpenCellObserverIncident();
+
   /// Component incidents and their bounded durable history events
   /// (addendum 2, 2026-10-08); session-scoped like the targets.
   [[nodiscard]] Result<ComponentIncidentRecordDTO> OpenComponentIncident(

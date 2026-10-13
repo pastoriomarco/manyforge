@@ -5495,6 +5495,14 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   EXPECT_GT(handoff_event->sequence, 0u);
   EXPECT_LT(handoff_event->sequence, lookahead_event->sequence);
   EXPECT_EQ(handoff_event->details.at("in_collision"), "true");
+  EXPECT_EQ(handoff_event->details.at("reason"), "runtime_lookahead_collision");
+  EXPECT_EQ(handoff_event->details.at("lookahead_cursor_valid"), "true");
+  EXPECT_EQ(handoff_event->details.at("lookahead_cursor_execution_generation"), "1");
+  EXPECT_EQ(handoff_event->details.at("collision_world_revision_id"),
+            lookahead_event->details.at("collision_world_revision_id"));
+  EXPECT_EQ(handoff_event->details.at("lookahead_cycle_deadline_ns"),
+            lookahead_event->details.at("lookahead_cycle_deadline_ns"));
+  EXPECT_FALSE(handoff_event->details.contains("lookahead_sample_times_ns"));
   EXPECT_TRUE(std::none_of(captured_events.begin(), captured_events.end(), [](const auto& event) {
     return event.type == KernelEventType::kInterruptLatched;
   }));
@@ -8004,71 +8012,6 @@ TEST_F(ExecutionKernelTest, CertifiedResetHardStopsAWindingDownBackendThenComple
   EXPECT_EQ(winding.stop_attempt_count_value(), stops_before + 1);
   EXPECT_EQ(winding.retire_count.load(), retired_before + 3);
   EXPECT_EQ(ended_as(winding_kernel), "working:Idle");
-}
-
-TEST_F(ExecutionKernelTest, RuntimeScaleStatusUsesTheExactSharedCommandWithoutAnotherSetter) {
-  struct SharedExecution : MockExecution {
-    RuntimeScaleMechanismStatusDTO scale{true, true, 1.0, 1.0, 0.0, 1U, 1, std::nullopt};
-    RuntimeScaleMechanismStatusDTO runtime_velocity_scale_status() const override { return scale; }
-  } shared;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  ExecutionKernel shared_kernel{planner, context, shared, clock, scheduler, local_cache};
-  configure_authoritative_collision_validation(shared_kernel, collision_world_publisher,
-                                               collision_engine);
-  auto request = prepared_motion_request(make_test_request()).execution_request;
-  const auto& binding = request.binding;
-  request.binding.runtime_scale_qualification =
-      RuntimeScaleRouteQualificationDTO{binding.control_route_id,
-                                        ScalingDomainId("shared.scale"),
-                                        EndpointRoleId("scale-command"),
-                                        EndpointRoleId("scale-state"),
-                                        CoordinatedScalingBarrierId("shared.barrier"),
-                                        RuntimeScaleAcknowledgementKind::kAppliedState,
-                                        4.0,
-                                        100'000'000};
-  request.initial_runtime_scale =
-      ResolvedRuntimeScaleCommandDTO{binding.operation_id,
-                                     OperationRevision(1U),
-                                     binding.participant_id,
-                                     binding.controllable_component_id,
-                                     binding.command_target_id,
-                                     binding.capability_id,
-                                     binding.control_domain_id,
-                                     binding.control_domain_revision,
-                                     binding.control_binding_id,
-                                     binding.control_binding_revision,
-                                     binding.controller_goal_id,
-                                     binding.controller_goal_generation,
-                                     binding.controller_topology_id,
-                                     binding.topology_revision,
-                                     binding.control_route_id,
-                                     ScalingDomainId("shared.scale"),
-                                     CoordinatedScalingBarrierId("shared.barrier"),
-                                     binding.resources,
-                                     binding.active_control_configuration_id,
-                                     binding.active_control_configuration_generation,
-                                     RuntimeScaleGeneration(0U),
-                                     RuntimeScaleGeneration(0U),
-                                     1.0};
-  const auto admitted = prepare_and_dispatch(shared_kernel, request);
-  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
-  ASSERT_TRUE(shared_kernel.wait_for_completion(2'000'000'000));
-  shared.scale.coordinated_command = CoordinatedRuntimeScaleCommandDTO{
-      binding.operation_id, OperationRevision(1U), RuntimeScaleGeneration(1U)};
-  shared.scale.commanded_scale = 0.25;
-  auto status =
-      shared_kernel.runtime_scale_status(binding.operation_id, binding.control_binding_id);
-  ASSERT_TRUE(status.ok()) << status.error().message;
-  EXPECT_EQ(status.value().accepted_generation, RuntimeScaleGeneration(1U));
-  EXPECT_EQ(status.value().state, RuntimeScaleApplicationState::kPending);
-  shared.scale.applied_scale = 0.25;
-  status = shared_kernel.runtime_scale_status(binding.operation_id, binding.control_binding_id);
-  ASSERT_TRUE(status.ok()) << status.error().message;
-  EXPECT_EQ(status.value().state, RuntimeScaleApplicationState::kApplied);
-  shared.scale.coordinated_command->operation_id = OperationId("unrelated.operation");
-  status = shared_kernel.runtime_scale_status(binding.operation_id, binding.control_binding_id);
-  ASSERT_FALSE(status.ok());
-  EXPECT_EQ(status.error().details.at("reason"), "coordinated_runtime_scale_command_mismatch");
 }
 
 TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {

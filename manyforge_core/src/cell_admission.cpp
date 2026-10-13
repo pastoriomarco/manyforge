@@ -340,18 +340,26 @@ Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO&
          !evidence.parent_program_cycle_claim_generation || intent.scope.resources.empty())) {
       return Invalid<void>("manual_handover_evidence_invalid");
     }
-    // Replacement route recovery remains CCLC-owned. Its distinct recovery
-    // kind requires an exact owner offer; it never widens ordinary lifecycle
-    // admission or borrows an unrelated intervention owner's namespace.
-    if (intervention && intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner &&
-        (evidence.offering_owner_role != intent.owner_role ||
-         evidence.offering_owner_epoch != intent.owner_epoch ||
-         evidence.offer_transaction_id != intent.owner_transaction_id ||
-         evidence.offer_digest != intent.request_payload_digest ||
-         evidence.parent_program_cycle_claim_generation.has_value() ||
-         !intent.owner_transaction_id.starts_with("route-selection.") ||
-         !intent.scope.resources.empty() || intent.scope.configurations.size() != 1U)) {
-      return Invalid<void>("cclc_route_recovery_evidence_invalid");
+    // Both recovery offers remain private CCLC/Kernel composition. The route
+    // owner retains its observation-only, one-configuration shape; selected
+    // bring-up has the explicitly selected nonempty physical closure. Shape
+    // validation alone never authorizes either operation.
+    if (intervention && intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner) {
+      const bool exact_owner =
+          evidence.offering_owner_role == intent.owner_role &&
+          evidence.offering_owner_epoch == intent.owner_epoch &&
+          evidence.offer_transaction_id == intent.owner_transaction_id &&
+          evidence.offer_digest == intent.request_payload_digest &&
+          !evidence.parent_program_cycle_claim_generation.has_value();
+      const bool route = intent.owner_transaction_id.starts_with("route-selection.") &&
+                         intent.scope.resources.empty() && intent.scope.configurations.size() == 1U;
+      const bool selected = intent.owner_transaction_id.starts_with("selected-lifecycle.") &&
+                            !intent.scope.resources.empty() && !intent.scope.configurations.empty();
+      if (!exact_owner || (!route && !selected)) {
+        return Invalid<void>(intent.owner_transaction_id.starts_with("selected-lifecycle.")
+                                 ? "cclc_selected_recovery_evidence_invalid"
+                                 : "cclc_route_recovery_evidence_invalid");
+      }
     }
   }
   if (intent.program_node_evidence.has_value()) {

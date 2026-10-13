@@ -271,4 +271,233 @@ TEST(KernelApplyFenceRpcInternal,
 }
 
 } // namespace
+TEST(
+    KernelApplyFenceRpcInternal,
+    SelectedOwnerClaimStatusReleaseAndReconciliationHaveClosedDistinctRecords) {
+  const core::ConfigurationFenceScopeDTO scope{
+      {core::ControllableComponentId("robot.selected")},
+      {{core::ControlDomainId("domain.arm"),
+        core::ControlDomainRevision("arm.v1"),
+        core::ControlDomainRevision("arm.v1")},
+       {core::ControlDomainId("domain.gripper"),
+        core::ControlDomainRevision("gripper.v1"),
+        core::ControlDomainRevision("gripper.v1")}},
+      {{core::ControlBindingId("binding.arm"),
+        core::ControlBindingRevision("arm.v1"),
+        core::ControlBindingRevision("arm.v1")},
+       {core::ControlBindingId("binding.gripper"),
+        core::ControlBindingRevision("gripper.v1"),
+        core::ControlBindingRevision("gripper.v1")}},
+      {core::ResourceId("resource.arm"), core::ResourceId("resource.gripper")}};
+  const core::PublicRequestContextDTO request{
+      core::RequestId("selected.request"),
+      core::RequestOwnerEpoch("cclc.owner"), "selected-test", std::nullopt};
+  const core::LifecycleTransactionId transaction("selected-lifecycle.1");
+  const std::vector<core::DomainActiveControlConfigurationDTO> active{
+      {core::ControlDomainId("domain.arm"),
+       core::ActiveControlConfigurationId("active.arm"),
+       core::ActiveControlConfigurationGeneration(1U)},
+      {core::ControlDomainId("domain.gripper"),
+       core::ActiveControlConfigurationId("active.gripper"),
+       core::ActiveControlConfigurationGeneration(1U)}};
+  core::CellAdmissionScopeDTO claim_scope{scope.resources, {}};
+  for (const auto &row : active)
+    claim_scope.configurations.push_back(
+        {row.control_domain_id, row.active_control_configuration_id,
+         row.active_control_configuration_generation});
+  core::CellAdmissionClaimIntentDTO claim_intent{
+      core::CellAdmissionClaimKindDTO::kInterventionOrRecovery,
+      core::CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
+      request.request_owner_epoch,
+      transaction.value(),
+      request.request_id,
+      core::ContentDigest(std::string(kDigestOne)),
+      core::AdmissionGeneration(1U),
+      claim_scope,
+      std::nullopt,
+      core::CellAdmissionInterventionEvidenceDTO{
+          core::CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
+          request.request_owner_epoch, transaction.value(),
+          core::ContentDigest(std::string(kDigestOne)), std::nullopt}};
+  const core::RuntimeEpoch manager_epoch("manager.selected");
+  const core::ConfigurationFenceAdmissionSnapshotDTO admission{
+      {scope, manager_epoch},
+      ExecutionHostEpoch(),
+      ActiveProjection(),
+      core::ContentDigest(std::string(kDigestOne)),
+      7U,
+      core::ConfigurationFenceGeneration(7U),
+      active,
+      0U,
+      0U,
+      core::ContentDigest(std::string(kDigestTwo))};
+  const core::SelectedBringUpConfigurationFenceIntentDTO intent{
+      request,
+      transaction,
+      core::LifecycleTransactionGeneration(1U),
+      {claim_intent, core::CellAdmissionClaimGeneration(2U),
+       core::AdmissionGeneration(2U), 3},
+      admission,
+      admission.execution_host_epoch.publication_generation,
+      scope,
+      ActiveProjection()};
+  ASSERT_TRUE(intent.valid());
+  ExpectRequestRoundTripWithinPacket(intent);
+  const core::SelectedBringUpFenceAcquireAttemptQueryDTO acquire_query{
+      intent, core::ContentDigest(std::string(kDigestThree)), manager_epoch};
+  ExpectRequestRoundTripWithinPacket(acquire_query);
+  const core::ConfigurationFenceAcceptedDTO accepted{
+      core::ConfigurationFenceId("fence.selected"),
+      core::ConfigurationFenceGeneration(8U), scope, 9,
+      core::RequestReplayStatusDTO::kAcceptedNew};
+  ASSERT_TRUE(intent.matches(accepted));
+  const core::SelectedBringUpConfigurationFenceStatusQueryDTO status_query{
+      intent.owner(), accepted.configuration_fence_id,
+      accepted.configuration_fence_generation, scope, manager_epoch};
+  ExpectRequestRoundTripWithinPacket(status_query);
+  const core::SelectedBringUpConfigurationFenceReconciliationEvidenceDTO
+      evidence{admission.execution_host_epoch,
+               intent.owner(),
+               accepted.configuration_fence_id,
+               accepted.configuration_fence_generation,
+               scope,
+               7U,
+               ActiveProjection().graph_revision,
+               ActiveProjection(),
+               admission.execution_host_epoch.publication_generation,
+               admission.active_public_pointer_digest,
+               active,
+               0U,
+               0U,
+               core::ContentDigest(std::string(kDigestTwo))};
+  const core::SelectedBringUpConfigurationFenceReleaseDTO release{
+      evidence, manager_epoch};
+  ExpectRequestRoundTripWithinPacket(release);
+  ExpectRequestRoundTripWithinPacket(
+      core::SelectedBringUpFenceReleaseAttemptQueryDTO{release});
+  const core::SelectedBringUpConfigurationFenceReleasedDTO released{
+      release, admission.execution_host_epoch, 10,
+      core::RequestReplayStatusDTO::kAcceptedNew,
+      core::ContentDigest(std::string(kDigestThree))};
+  const auto decoded_released = DecodeKernelApplyFenceRpcResponse(
+      EncodeKernelApplyFenceRpcResponse(released));
+  EXPECT_EQ(std::get<core::SelectedBringUpConfigurationFenceReleasedDTO>(
+                decoded_released),
+            released);
+  const core::SelectedBringUpConfigurationFenceStatusDTO status{
+      status_query,
+      evidence,
+      core::ConfigurationFenceState::kReleased,
+      false,
+      released,
+      {},
+      core::ContentDigest(std::string(kDigestOne)),
+      std::nullopt};
+  const auto decoded_status = DecodeKernelApplyFenceRpcResponse(
+      EncodeKernelApplyFenceRpcResponse(status));
+  const auto &round_trip_status =
+      std::get<core::SelectedBringUpConfigurationFenceStatusDTO>(
+          decoded_status);
+  EXPECT_TRUE(round_trip_status.matches(status_query));
+  EXPECT_EQ(round_trip_status.reconciliation_evidence, evidence);
+  EXPECT_EQ(round_trip_status.release_receipt, released);
+  const core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO
+      acquire_result{
+          admission.execution_host_epoch,
+          acquire_query,
+          core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact,
+          accepted,
+          true,
+          {},
+          core::ContentDigest(std::string(kDigestOne)),
+          std::nullopt};
+  const auto decoded_acquire = DecodeKernelApplyFenceRpcResponse(
+      EncodeKernelApplyFenceRpcResponse(acquire_result));
+  EXPECT_TRUE(
+      std::get<core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO>(
+          decoded_acquire)
+          .matches(acquire_query));
+  const core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO
+      release_result{
+          {release},
+          core::SelectedBringUpFenceReleaseAttemptState::kReleasedExact,
+          released,
+          status,
+          std::nullopt};
+  const auto decoded_release = DecodeKernelApplyFenceRpcResponse(
+      EncodeKernelApplyFenceRpcResponse(release_result));
+  EXPECT_TRUE(
+      std::get<core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO>(
+          decoded_release)
+          .presence_valid());
+
+  auto foreign_pairing = release_result;
+  auto &foreign_status = *foreign_pairing.observed_status;
+  const core::ConfigurationFenceId foreign_fence("fence.foreign.selected");
+  foreign_status.echoed_query.configuration_fence_id = foreign_fence;
+  foreign_status.reconciliation_evidence.configuration_fence_id = foreign_fence;
+  foreign_status.release_receipt->request.reconciliation_evidence
+      .configuration_fence_id = foreign_fence;
+  ASSERT_TRUE(foreign_status.presence_valid());
+  EXPECT_FALSE(foreign_pairing.presence_valid());
+  EXPECT_THROW(EncodeKernelApplyFenceRpcResponse(foreign_pairing),
+               std::invalid_argument);
+
+  auto foreign_receipt = release_result;
+  foreign_receipt.observed_status->release_receipt->released_at_ns += 1;
+  ASSERT_TRUE(foreign_receipt.observed_status->presence_valid());
+  EXPECT_FALSE(foreign_receipt.presence_valid());
+  EXPECT_THROW(EncodeKernelApplyFenceRpcResponse(foreign_receipt),
+               std::invalid_argument);
+
+  auto foreign_epoch = release_result;
+  foreign_epoch.observed_status->echoed_query.manager_runtime_epoch =
+      core::RuntimeEpoch("manager.foreign");
+  ASSERT_TRUE(foreign_epoch.observed_status->presence_valid());
+  EXPECT_FALSE(foreign_epoch.presence_valid());
+  EXPECT_THROW(EncodeKernelApplyFenceRpcResponse(foreign_epoch),
+               std::invalid_argument);
+
+  auto held_status = status;
+  held_status.state = core::ConfigurationFenceState::kHeld;
+  held_status.admission_fenced = true;
+  held_status.release_receipt.reset();
+  const core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO held_pairing{
+      {release},
+      core::SelectedBringUpFenceReleaseAttemptState::kNotReleasedHeld,
+      std::nullopt,
+      held_status,
+      std::nullopt};
+  ASSERT_TRUE(held_pairing.presence_valid());
+  auto held_foreign_epoch = held_pairing;
+  held_foreign_epoch.observed_status->echoed_query.manager_runtime_epoch =
+      core::RuntimeEpoch("manager.foreign");
+  ASSERT_TRUE(held_foreign_epoch.observed_status->presence_valid());
+  EXPECT_FALSE(held_foreign_epoch.presence_valid());
+  EXPECT_THROW(EncodeKernelApplyFenceRpcResponse(held_foreign_epoch),
+               std::invalid_argument);
+
+  auto foreign = intent;
+  foreign.selected_claim.intent.owner_transaction_id = "route-selection.1";
+  EXPECT_FALSE(foreign.valid());
+  EXPECT_THROW(EncodeKernelApplyFenceRpcRequest(foreign),
+               std::invalid_argument);
+  auto partial = intent;
+  partial.selected_claim.intent.scope.resources.pop_back();
+  EXPECT_FALSE(partial.valid());
+  EXPECT_THROW(EncodeKernelApplyFenceRpcRequest(partial),
+               std::invalid_argument);
+  // The closed new ownership is never interpreted as Apply; its old tags stay
+  // fixed.
+  const auto encoded = EncodeKernelApplyFenceRpcRequest(intent);
+  EXPECT_EQ(static_cast<unsigned char>(encoded.at(8)), 7U);
+  const auto old_encoded =
+      EncodeKernelApplyFenceRpcRequest(MaximumIntent(scope));
+  EXPECT_EQ(static_cast<unsigned char>(old_encoded.at(8)), 2U);
+  auto malformed = encoded;
+  malformed.push_back('x');
+  EXPECT_THROW(DecodeKernelApplyFenceRpcRequest(malformed),
+               std::invalid_argument);
+}
+
 } // namespace manyforge::component_manager::detail

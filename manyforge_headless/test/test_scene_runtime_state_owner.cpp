@@ -45,6 +45,117 @@ PoseSourceObservation Observation(const std::uint64_t sequence,
 }
 
 TEST(SceneRuntimeStateOwner,
+     ConfiguredSourceLossClosesFreshnessWithoutErasingCoordinates) {
+  std::int64_t now = 10;
+  SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token"; });
+  const auto identity = RuntimeIdentity(4U);
+  owner.EstablishOpenRuntime(identity, 4U, "bootstrap");
+  owner.ConfigurePoseSourceAvailability(identity, "source-1", "base");
+  const auto observation = Observation(1U, 10, 100, "historical", "base.1");
+  static_cast<void>(owner.ObservePose(observation));
+  auto other = Observation(1U, 10, 100, "unrelated");
+  other.key.source_id = "other-source";
+  static_cast<void>(owner.ObservePose(other));
+  const auto before = owner.Snapshot();
+  now = 20;
+  owner.MarkPoseSourceUnavailable(identity, "source-1", "base");
+  const auto unavailable = owner.Snapshot();
+  ASSERT_TRUE(unavailable.configured_pose_source);
+  EXPECT_FALSE(unavailable.configured_pose_source->available);
+  ASSERT_EQ(unavailable.pose_sources.size(), 2U);
+  EXPECT_EQ(unavailable.pose_sources.front().observation, other);
+  EXPECT_TRUE(unavailable.pose_sources.front().fresh);
+  EXPECT_EQ(unavailable.pose_sources.back().observation, observation);
+  EXPECT_FALSE(unavailable.pose_sources.back().fresh);
+  EXPECT_EQ(unavailable.runtime_identity, before.runtime_identity);
+  EXPECT_EQ(unavailable.initialization_generation,
+            before.initialization_generation);
+  EXPECT_EQ(unavailable.counters.retired, before.counters.retired);
+  EXPECT_EQ(unavailable.state, SceneInitializationState::kOpen);
+  EXPECT_THROW(static_cast<void>(owner.ObservePose(observation)),
+               SceneRuntimeStateConflictError);
+  other.source_sequence = 2U;
+  EXPECT_TRUE(owner.ObservePose(other).fresh);
+  const auto encoded = SceneRuntimeStateValue(owner.Snapshot());
+  ASSERT_NE(encoded.find_object_member("configured_pose_source"), nullptr);
+  EXPECT_NE(content_identity::canonical_json(encoded).find("historical"),
+            std::string::npos);
+}
+
+TEST(SceneRuntimeStateOwner,
+     SourceLossSurvivesExactConfigureAndRobotOnlyPublication) {
+  std::int64_t now = 10;
+  SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token"; });
+  auto identity = RuntimeIdentity(4U);
+  owner.EstablishOpenRuntime(identity, 4U, "bootstrap");
+  owner.ConfigurePoseSourceAvailability(identity, "source-1", "base");
+  owner.MarkPoseSourceUnavailable(identity, "source-1", "base");
+  owner.ConfigurePoseSourceAvailability(identity, "source-1", "base");
+  EXPECT_FALSE(owner.Snapshot().configured_pose_source->available);
+  identity = RuntimeIdentity(5U);
+  ASSERT_TRUE(owner.AdoptFinalizedOpenRuntime(identity, 5U, "robot_apply"));
+  owner.ConfigurePoseSourceAvailability(identity, "source-1", "base");
+  EXPECT_FALSE(owner.Snapshot().configured_pose_source->available);
+  EXPECT_THROW(static_cast<void>(owner.ObservePose(
+                   Observation(1U, 10, 100, "old", "base.1"))),
+               SceneRuntimeStateConflictError);
+}
+
+TEST(SceneRuntimeStateOwner, ExactRetirementClearsLossBeforeCheckedSuccessor) {
+  std::int64_t now = 10;
+  SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token"; });
+  const auto identity = RuntimeIdentity(4U);
+  owner.EstablishOpenRuntime(identity, 4U, "bootstrap");
+  owner.ConfigurePoseSourceAvailability(identity, "source-1", "old-base");
+  static_cast<void>(
+      owner.ObservePose(Observation(1U, 10, 100, "old", "old-base.1")));
+  owner.MarkPoseSourceUnavailable(identity, "source-1", "old-base");
+  owner.RetirePoseSource(identity, "other-source");
+  ASSERT_TRUE(owner.Snapshot().configured_pose_source);
+  EXPECT_FALSE(owner.Snapshot().configured_pose_source->available);
+  owner.RetirePoseSource(identity, "source-1");
+  EXPECT_FALSE(owner.Snapshot().configured_pose_source);
+  EXPECT_TRUE(owner.Snapshot().pose_sources.empty());
+  owner.ConfigurePoseSourceAvailability(identity, "source-1", "new-base");
+  EXPECT_TRUE(
+      owner.ObservePose(Observation(1U, 10, 100, "new", "new-base.1")).fresh);
+}
+
+TEST(SceneRuntimeStateOwner,
+     ForeignLossAndConfigurationCannotMutateCurrentAvailability) {
+  std::int64_t now = 10;
+  SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token"; });
+  const auto identity = RuntimeIdentity(4U);
+  owner.EstablishOpenRuntime(identity, 4U, "bootstrap");
+  const std::string source("source\0id", 9U);
+  EXPECT_THROW(owner.ConfigurePoseSourceAvailability(identity, source,
+                                                     std::string(240U, 'x')),
+               SceneRuntimeStateError);
+  EXPECT_THROW(owner.ConfigurePoseSourceAvailability(
+                   identity, source, std::string("base\0id", 7U)),
+               SceneRuntimeStateError);
+  owner.ConfigurePoseSourceAvailability(identity, source, "base");
+  const auto before = content_identity::canonical_json(
+      SceneRuntimeStateValue(owner.Snapshot()));
+  EXPECT_THROW(
+      owner.MarkPoseSourceUnavailable(RuntimeIdentity(5U), source, "base"),
+      SceneRuntimeStateConflictError);
+  EXPECT_THROW(owner.MarkPoseSourceUnavailable(identity, "foreign", "base"),
+               SceneRuntimeStateConflictError);
+  EXPECT_THROW(owner.MarkPoseSourceUnavailable(identity, source, "other-base"),
+               SceneRuntimeStateConflictError);
+  EXPECT_THROW(
+      owner.ConfigurePoseSourceAvailability(identity, source, "other-base"),
+      SceneRuntimeStateConflictError);
+  EXPECT_EQ(content_identity::canonical_json(
+                SceneRuntimeStateValue(owner.Snapshot())),
+            before);
+  owner.MarkPoseSourceUnavailable(identity, source, "base");
+  EXPECT_EQ(owner.Snapshot().configured_pose_source->source_id, source);
+  EXPECT_FALSE(owner.Snapshot().configured_pose_source->available);
+}
+
+TEST(SceneRuntimeStateOwner,
      FencesResetSeedAndLatestReplayBeforeOpeningTheCandidate) {
   std::int64_t now = 10;
   std::uint64_t token_serial = 0U;
@@ -134,6 +245,79 @@ TEST(SceneRuntimeStateOwner,
   EXPECT_THROW(static_cast<void>(owner.AdoptFinalizedOpenRuntime(
                    RuntimeIdentity(8U), 8U, "concurrent_apply")),
                SceneRuntimeStateConflictError);
+}
+
+TEST(SceneRuntimeStateOwner,
+     RetiresOnlyOldSourceBeforeSameSourceReopensWithANewEpoch) {
+  std::int64_t now = 10;
+  SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token-1"; });
+  const auto identity = RuntimeIdentity(4U);
+  owner.EstablishOpenRuntime(identity, 4U, "durable_bootstrap");
+  static_cast<void>(owner.ObservePose(Observation(1U, 10, 100)));
+  auto peer = Observation(1U, 10, 100, "peer");
+  peer.key.source_id = "peer-source";
+  peer.source_epoch = "peer-epoch";
+  static_cast<void>(owner.ObservePose(peer));
+  const auto before = owner.Snapshot();
+  owner.RetirePoseSource(identity, "source-1");
+  const auto cleared = owner.Snapshot();
+  ASSERT_EQ(cleared.pose_sources.size(), 1U);
+  EXPECT_EQ(cleared.pose_sources.front().observation, peer);
+  EXPECT_EQ(cleared.runtime_identity, before.runtime_identity);
+  EXPECT_EQ(cleared.initialization_generation,
+            before.initialization_generation);
+  EXPECT_EQ(cleared.state, before.state);
+  EXPECT_EQ(cleared.updated_at_ns, before.updated_at_ns);
+  EXPECT_EQ(content_identity::canonical_json(SceneRuntimeStateValue(cleared))
+                .find("source-epoch-1"),
+            std::string::npos);
+  EXPECT_EQ(cleared.counters.retired, before.counters.retired);
+  // Erasure removes the old source's sequence/epoch ordering as well. The
+  // replacement starts from its own exact new epoch, with no old pose reused.
+  auto replacement = Observation(1U, 10, 100, "new", "new-base.1");
+  EXPECT_EQ(owner.ObservePose(replacement).disposition,
+            PoseObservationDisposition::kApplyNow);
+  const auto after = owner.Snapshot();
+  ASSERT_EQ(after.pose_sources.size(), 2U);
+  EXPECT_EQ(after.pose_sources.back().observation, replacement);
+}
+
+TEST(SceneRuntimeStateOwner,
+     SourceRetirementRefusesInvalidStaleOrReplayingStateWithoutChanges) {
+  std::int64_t now = 10;
+  SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token-1"; });
+  owner.EstablishOpenRuntime(RuntimeIdentity(4U), 4U, "durable_bootstrap");
+  static_cast<void>(owner.ObservePose(Observation(1U, 10, 100)));
+  const auto snapshot_bytes = [&] {
+    return content_identity::canonical_json(
+        SceneRuntimeStateValue(owner.Snapshot()));
+  };
+  const auto before = snapshot_bytes();
+  EXPECT_THROW(owner.RetirePoseSource(RuntimeIdentity(5U), "source-1"),
+               SceneRuntimeStateConflictError);
+  EXPECT_THROW(owner.RetirePoseSource(RuntimeIdentity(4U), ""),
+               SceneRuntimeStateError);
+  EXPECT_THROW(
+      owner.RetirePoseSource(RuntimeIdentity(4U), std::string(257U, 'x')),
+      SceneRuntimeStateError);
+  EXPECT_EQ(snapshot_bytes(), before);
+  const auto token =
+      owner.BeginInitialization(RuntimeIdentity(5U), false, "load");
+  const auto closed = snapshot_bytes();
+  EXPECT_THROW(owner.RetirePoseSource(RuntimeIdentity(5U), "source-1"),
+               SceneRuntimeStateConflictError);
+  EXPECT_EQ(snapshot_bytes(), closed);
+  static_cast<void>(owner.ObservePose(Observation(2U, 10, 100)));
+  owner.PrepareReset(token, "reset");
+  owner.MarkSeeded(token);
+  const auto batch = owner.BeginReplay(token);
+  const auto replaying = snapshot_bytes();
+  EXPECT_THROW(owner.RetirePoseSource(RuntimeIdentity(5U), "source-1"),
+               SceneRuntimeStateConflictError);
+  EXPECT_EQ(snapshot_bytes(), replaying);
+  // The refused retirement did not change the existing exact replay protocol.
+  owner.CompleteReplay(batch, batch.observations.size());
+  EXPECT_EQ(owner.Snapshot().state, SceneInitializationState::kOpen);
 }
 
 TEST(SceneRuntimeStateOwner,

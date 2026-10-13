@@ -552,6 +552,11 @@ export interface DeploymentWorkspaceResponse {
     deploymentRevision: string | null;
   };
   managerApplied: {
+    activationOrder: {
+      retainedBundleId: string;
+      graphRevision: string;
+      componentIds: string[];
+    } | null;
     deploymentRevision: string | null;
     scenarioId: string | null;
   };
@@ -1507,8 +1512,8 @@ export interface ManagerDeploymentCandidateReceipt {
   };
   expected_admission_generation: number;
   manager_owner_epoch: string;
-  /** Digest of the Manager's authoritative impact; a destructive impact is
-   * accepted only by echoing it. */
+  /** Digest of the Manager's authoritative impact; destructive changes or
+   * required component bring-up are accepted only by echoing it. */
   impact_digest: string;
   destructive_impact: boolean;
   receipt_digest: string;
@@ -1593,6 +1598,7 @@ export interface ManagerSourceMetadata {
 }
 
 export interface ManagerActiveProjection {
+  canonicalEmpty: boolean;
   cellGraph: Record<string, JsonValue>;
   graphRevision: string;
   retainedBundleId: string;

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <string>
 #include <string_view>
@@ -36,6 +37,8 @@ struct NativeProjectionPrepareResult final {
 
 struct NativeProjectionHealthQuery final {
   manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  std::optional<manyforge::core::ProjectionRevisionDTO>
+      selected_projection_revision{};
 };
 
 struct NativeProjectionTransactionRequest final {

@@ -17,7 +17,6 @@ namespace manyforge::core {
 
 namespace detail {
 struct MotionResumeIntent;
-class CoordinatedMotionPreparation;
 }
 
 /// Complete owner-issued authority for preparing one motion participant.
@@ -39,7 +38,6 @@ struct ResolvedPreparedMotionExecutionRequestDTO final {
   std::shared_ptr<const PreparedParticipantStopPlanDTO> fault_stop_plan;
   // Existing owner supplies semantic destinations only, never old dispatch authority.
   std::shared_ptr<const detail::MotionResumeIntent> continuation{};
-  std::shared_ptr<detail::CoordinatedMotionPreparation> common_timing{};
 };
 
 enum class ResolvedPreparedMotionExecutionStateDTO : std::uint8_t {

@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <limits>
+#include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/ports/ibrand_lifecycle_port.hpp>
 #include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
@@ -8,6 +11,8 @@
 #include <stop_token>
 #include <string>
 #include <type_traits>
+
+#include "../src/component_lifecycle_journal_codec_internal.hpp"
 
 namespace manyforge::core {
 namespace {
@@ -280,6 +285,115 @@ ComponentLifecycleDomainStatusDTO successful_domain_status(
           {},
           std::nullopt,
           std::nullopt};
+}
+
+ComponentLifecycleStatusDTO selected_bring_up_status() {
+  auto status = prepared_recovery_status();
+  status.acceptance.lifecycle_transaction_id = LifecycleTransactionId("selected-lifecycle.4");
+  status.accepted_intent.intent = ComponentLifecycleIntentKindDTO::kEnable;
+  status.requested_state = resolved_requested(ComponentLifecycleStateDTO::kActive);
+  status.domains.front().requested_state = status.requested_state;
+  // Prepared is an actual predecessor observation; no fabricated Faulted state.
+  status.previous_state = ComponentLifecycleStateDTO::kPrepared;
+  status.current_state = ComponentLifecycleStateDTO::kPrepared;
+  status.domains.front().previous_state = ComponentLifecycleStateDTO::kPrepared;
+  status.domains.front().current_state = ComponentLifecycleStateDTO::kPrepared;
+  const ContentDigest digest(std::string("sha256:") + std::string(64U, 'a'));
+  CellAdmissionClaimIntentDTO claim{
+      CellAdmissionClaimKindDTO::kInterventionOrRecovery,
+      CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
+      status.accepted_intent.request_context.request_owner_epoch,
+      status.acceptance.lifecycle_transaction_id.value(), status.acceptance.request_id,
+      digest, status.accepted_intent.expected_admission_generation,
+      {{ResourceId("resource-1")}, {{ControlDomainId("domain-1"),
+          ActiveControlConfigurationId("configuration-1"), ActiveControlConfigurationGeneration(7U)}}},
+      std::nullopt,
+      CellAdmissionInterventionEvidenceDTO{CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
+          status.accepted_intent.request_context.request_owner_epoch,
+          status.acceptance.lifecycle_transaction_id.value(), digest, std::nullopt},
+      std::nullopt};
+  status.selected_bring_up = SelectedComponentBringUpEvidenceDTO{
+      digest, digest, "incident-1", StopId("stop-1"), StopGeneration(9U),
+      {RetainedBundleId("candidate-bundle"), GraphRevision("candidate-graph"),
+       {SceneId(digest.value()), 1U, digest}}, digest, 1024U,
+      {ExecutionBindingEpoch(12U), {{ControlDomainId("domain-1"), 30U}}},
+      {ExecutionBindingEpoch(13U), {{ControlDomainId("domain-1"), 31U}}},
+      {claim, CellAdmissionClaimGeneration(15U), claim.expected_admission_generation, kAcceptedAtNs},
+      {ConfigurationFenceId("fence-1"), ConfigurationFenceGeneration(22U),
+       {{ControllableComponentId("component-1")},
+        {{ControlDomainId("domain-1"), ControlDomainRevision("domain-revision-1"),
+           ControlDomainRevision("domain-revision-1")}},
+        {{ControlBindingId("binding-1"), ControlBindingRevision("binding-revision-1"),
+           ControlBindingRevision("binding-revision-1")}}, {ResourceId("resource-1")}},
+       kAcceptedAtNs, RequestReplayStatusDTO::kAcceptedNew},
+      ContentDigest(std::string("sha256:") + std::string(64U, 'b'))};
+  return status;
+}
+
+ComponentLifecycleStatusDTO apply_bring_up_status(
+    ComponentLifecycleIntentKindDTO kind = ComponentLifecycleIntentKindDTO::kPrepare,
+    bool recovery = false) {
+  auto status = prepared_recovery_status();
+  status.acceptance.lifecycle_transaction_id = LifecycleTransactionId("apply-component.4");
+  status.accepted_intent.intent = kind;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kAccepted;
+  status.requested_state = resolved_requested(kind == ComponentLifecycleIntentKindDTO::kDisable
+      ? ComponentLifecycleStateDTO::kDisabled
+      : (kind == ComponentLifecycleIntentKindDTO::kPrepare
+          ? ComponentLifecycleStateDTO::kPrepared : ComponentLifecycleStateDTO::kActive));
+  status.domains.front().requested_state = status.requested_state;
+  status.domains.front().action_state = ComponentLifecycleDomainActionStateDTO::kReserved;
+  const ContentDigest digest(std::string("sha256:") + std::string(64U, 'a'));
+  const ContentDigest plan_digest(std::string("sha256:") + std::string(64U, 'c'));
+  const ConfigurationFenceScopeDTO scope{
+      {ControllableComponentId("component-1")},
+      {{ControlDomainId("domain-1"), ControlDomainRevision("domain-revision-1"),
+         ControlDomainRevision("domain-revision-1")}},
+      {{ControlBindingId("binding-1"), ControlBindingRevision("binding-revision-1"),
+         ControlBindingRevision("binding-revision-1")}}, {ResourceId("resource-1")}};
+  const ApplyFenceOwnerDTO parent_owner{ApplyId("apply-1"), ApplyGeneration(8U)};
+  const ApplyComponentBringUpReferenceDTO parent{parent_owner, plan_digest};
+  const CellAdmissionClaimIntentDTO parent_intent{
+      CellAdmissionClaimKindDTO::kManagerApply, CellAdmissionOwnerRoleDTO::kManager,
+      RequestOwnerEpoch("manager-owner"), "apply-1", RequestId("parent-request"),
+      plan_digest, AdmissionGeneration(9U), {{}, {}}, std::nullopt, std::nullopt, std::nullopt};
+  status.apply_bring_up = ApplyComponentBringUpEvidenceDTO{
+      {parent, {parent_intent, CellAdmissionClaimGeneration(17U), AdmissionGeneration(9U), kAcceptedAtNs},
+       {parent.owner, ConfigurationFenceId("parent-fence"), ConfigurationFenceGeneration(22U),
+        scope, RuntimeEpoch("manager-runtime-epoch")}},
+      scope, digest,
+      {RetainedBundleId("candidate-bundle"), GraphRevision("candidate-graph"),
+       {SceneId(digest.value()), 1U, digest}}, digest, 1024U,
+      {RuntimeUnitId("runtime-1"), RuntimeEpoch("runtime-epoch-1")},
+      std::nullopt, std::nullopt, std::nullopt};
+  auto& evidence = *status.apply_bring_up;
+  if (recovery) {
+    evidence.recovery = ApplyComponentBringUpRecoveryEvidenceDTO{
+        digest, "incident-1", StopId("stop-1"), StopGeneration(9U)};
+    evidence.predecessor_occurrence = SelectedControllerOccurrenceDTO{
+        ExecutionBindingEpoch(12U), {{ControlDomainId("domain-1"), 30U}}};
+    evidence.successor_occurrence_floor = SelectedControllerOccurrenceDTO{
+        ExecutionBindingEpoch(13U), {{ControlDomainId("domain-1"), 31U}}};
+  }
+  evidence.original_request_payload_digest = ApplyDelegatedComponentLifecycleSemanticRequestDigest(
+      status.accepted_intent, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes,
+      evidence.original_execution_host.runtime_unit_id, evidence.original_execution_host.runtime_epoch,
+      evidence.parent_authority.held_fence_query.manager_runtime_epoch, evidence.parent_authority.parent);
+  return status;
+}
+
+ComponentLifecycleStatusDTO ordinary_codec_status() {
+  const auto lifecycle_intent = intent(ComponentLifecycleIntentKindDTO::kDisable,
+                                      {expected_domain("domain-1", absent_configuration())});
+  const auto requested = resolved_requested(ComponentLifecycleStateDTO::kDisabled);
+  return {acceptance(), lifecycle_intent, 1U, lifecycle_intent.request_context.request_owner_epoch,
+          std::nullopt, std::nullopt, requested, ComponentLifecycleTransactionPhaseDTO::kAccepted,
+          {{ControlDomainId("domain-1"), lifecycle_intent.expected_control_domains.front(),
+            std::nullopt, std::nullopt, std::nullopt, std::nullopt, requested,
+            ComponentLifecycleDomainActionStateDTO::kReserved,
+            ComponentLifecycleDomainEffectDTO::kNone, {}, std::nullopt, std::nullopt}},
+          false, std::nullopt, std::nullopt, kAcceptedAtNs, kAcceptedAtNs, kTimeoutNs};
 }
 
 TEST(ComponentLifecycleStrongIds, PreserveSemanticSeparation) {
@@ -904,6 +1018,858 @@ class FakeBrandLifecyclePort final : public IBrandLifecyclePort {
   }
 };
 
+TEST(ComponentLifecycleCodec, PreservesExactOrdinaryProgramAndRouteBytes) {
+  // Frozen independently spelled V1/V2 payload fingerprints; adding selected
+  // records must not append even an absent optional tag to ordinary bytes.
+  auto ordinary = ordinary_codec_status();
+  ASSERT_TRUE(ordinary.locally_valid());
+  const auto ordinary_bytes = detail::EncodeComponentLifecycleStatus(ordinary);
+  EXPECT_EQ(ordinary_bytes.size(), 549U);
+  EXPECT_EQ(content_identity::sha256_digest(ordinary_bytes),
+            "sha256:62766c852d31bb58ae019f76ea484829d9931c4474c65a286b8adeebef4dc816");
+  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(ordinary_bytes), ordinary);
+  ordinary.accepted_intent.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("runner-epoch"), ProgramRunId("run-1"), CellAdmissionClaimGeneration(11U),
+      "node-1", "attempt-1", "cclc.lifecycle"};
+  ASSERT_TRUE(ordinary.locally_valid());
+  const auto program_bytes = detail::EncodeComponentLifecycleStatus(ordinary);
+  EXPECT_EQ(program_bytes.size(), 655U);
+  EXPECT_EQ(content_identity::sha256_digest(program_bytes),
+            "sha256:fe100787f2b80b06c190e3ad4a4e642413f138215071b087879333110a76c6c4");
+  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(program_bytes), ordinary);
+  const CellAdmissionConfigurationScopeDTO configuration{ControlDomainId("domain-1"),
+      ActiveControlConfigurationId("configuration-1"), ActiveControlConfigurationGeneration(7U)};
+  const auto route_bytes = detail::EncodeCCLCRouteRecoveryConfiguration(configuration);
+  EXPECT_EQ(route_bytes.size(), 68U);
+  EXPECT_EQ(content_identity::sha256_digest(route_bytes),
+            "sha256:3805d27b92bf168372cb1ba938b512bfe872707d67c1ad84d04ebec55b2b9245");
+  EXPECT_EQ(detail::DecodeCCLCRouteRecoveryConfiguration(route_bytes), configuration);
+}
+
+TEST(ComponentLifecycleValueCodec, PreservesIntentAttributionAndProgramEvidenceAsClosedValues) {
+  auto ordinary = intent();
+  ordinary.attribution = {RequestTransportDTO::kHttp, RequestAssuranceDTO::kExternallyAuthenticated,
+                          std::string("principal")};
+  auto bytes = EncodeComponentLifecycleIntent(ordinary);
+  EXPECT_EQ(DecodeComponentLifecycleIntent(bytes), ordinary);
+  ordinary.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("runner-epoch"), ProgramRunId("run-1"), CellAdmissionClaimGeneration(11U),
+      "node-1", "attempt-1", "cclc.lifecycle"};
+  bytes = EncodeComponentLifecycleIntent(ordinary);
+  EXPECT_EQ(DecodeComponentLifecycleIntent(bytes), ordinary);
+  EXPECT_THROW((void)DecodeComponentLifecycleIntent(bytes + "extra"), std::invalid_argument);
+  EXPECT_THROW((void)DecodeComponentLifecycleIntent(bytes.substr(0U, bytes.size() - 1U)),
+               std::invalid_argument);
+  EXPECT_THROW((void)DecodeComponentLifecycleIntent(detail::EncodeComponentLifecycleStatus(
+      ordinary_codec_status())), std::invalid_argument);
+  ordinary.intent = static_cast<ComponentLifecycleIntentKindDTO>(255U);
+  EXPECT_THROW((void)EncodeComponentLifecycleIntent(ordinary), std::invalid_argument);
+}
+
+TEST(ComponentLifecycleValueCodec, SelectedResultsKeepExactClosedAcceptanceAndNoAdmissionShapes) {
+  const auto status = selected_bring_up_status();
+  const CCLCLifecycleRequestResultDTO accepted{RequestReplayStatusDTO::kAcceptedNew,
+      status.acceptance, status, std::nullopt, std::nullopt};
+  ASSERT_TRUE(accepted.locally_valid());
+  const auto bytes = EncodeSelectedComponentBringUpRequestResult(accepted);
+  const auto decoded = DecodeSelectedComponentBringUpRequestResult(bytes);
+  EXPECT_EQ(decoded.replay_status, accepted.replay_status);
+  EXPECT_EQ(decoded.acceptance, accepted.acceptance);
+  EXPECT_EQ(decoded.status, accepted.status);
+  EXPECT_EQ(decoded.rejection, accepted.rejection);
+  EXPECT_FALSE(decoded.incident_recovery);
+  auto replay = accepted;
+  replay.replay_status = RequestReplayStatusDTO::kReplayedExact;
+  replay.acceptance->replay_status = replay.replay_status;
+  EXPECT_EQ(DecodeSelectedComponentBringUpRequestResult(
+      EncodeSelectedComponentBringUpRequestResult(replay)).acceptance, replay.acceptance);
+  const CCLCLifecycleRequestResultDTO rejected{RequestReplayStatusDTO::kAcceptedNew,
+      std::nullopt, std::nullopt,
+      ErrorDTO{"selected_refused", "effect never started", {{"effect", "not_started"}}},
+      std::nullopt};
+  ASSERT_TRUE(rejected.locally_valid());
+  EXPECT_EQ(DecodeSelectedComponentBringUpRequestResult(
+      EncodeSelectedComponentBringUpRequestResult(rejected)).rejection, rejected.rejection);
+  for (const auto replay_status : {RequestReplayStatusDTO::kRequestResultExpired,
+      RequestReplayStatusDTO::kRequestIdConflict, RequestReplayStatusDTO::kStaleRequestOwnerEpoch}) {
+    const CCLCLifecycleRequestResultDTO no_admission{replay_status, std::nullopt, std::nullopt,
+                                                   std::nullopt, std::nullopt};
+    const auto empty = DecodeSelectedComponentBringUpRequestResult(
+        EncodeSelectedComponentBringUpRequestResult(no_admission));
+    EXPECT_EQ(empty.replay_status, replay_status);
+    EXPECT_FALSE(empty.acceptance);
+    EXPECT_FALSE(empty.status);
+  }
+  const auto ordinary = ordinary_codec_status();
+  EXPECT_THROW((void)EncodeSelectedComponentBringUpRequestResult(
+      {RequestReplayStatusDTO::kAcceptedNew, ordinary.acceptance, ordinary,
+       std::nullopt, std::nullopt}), std::invalid_argument);
+  const ComponentIncidentRecoveryDTO incident_recovery{"incident-1",
+      ControllableComponentId("component-1"), LifecycleBlockingCauseClassDTO::kUnknown,
+      "operator", kAcceptedAtNs};
+  const CCLCLifecycleRequestResultDTO recovered_incident{RequestReplayStatusDTO::kAcceptedNew,
+      std::nullopt, std::nullopt, std::nullopt, incident_recovery};
+  ASSERT_TRUE(recovered_incident.locally_valid());
+  EXPECT_THROW((void)EncodeSelectedComponentBringUpRequestResult(recovered_incident),
+               std::invalid_argument);
+  EXPECT_THROW((void)DecodeSelectedComponentBringUpRequestResult(bytes + "extra"),
+               std::invalid_argument);
+  EXPECT_THROW((void)DecodeSelectedComponentBringUpRequestResult(bytes.substr(0U, bytes.size() - 1U)),
+               std::invalid_argument);
+  auto malformed = bytes;
+  malformed[4U + std::string("MF-CCLC-SELECTED-RESULT-V1").size()] = static_cast<char>(255U);
+  EXPECT_THROW((void)DecodeSelectedComponentBringUpRequestResult(malformed), std::invalid_argument);
+}
+
+TEST(ComponentLifecycleValueCodec, StableSelectedRequestDigestCoversOriginalFieldsAndOmitsAttribution) {
+  const auto status = selected_bring_up_status();
+  const auto& evidence = *status.selected_bring_up;
+  const RuntimeUnitId unit("child-unit");
+  const RuntimeEpoch runtime("child-epoch");
+  const RuntimeEpoch manager("manager-epoch");
+  const auto digest = [&](const auto& request, const auto& projection, const auto& bundle,
+                          std::uint64_t count, const auto& child, const auto& child_epoch,
+                          const auto& manager_epoch) {
+    return SelectedComponentBringUpSemanticRequestDigest(request, projection, bundle, count,
+                                                         child, child_epoch, manager_epoch);
+  };
+  const auto original = digest(status.accepted_intent, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes,
+      unit, runtime, manager);
+  EXPECT_TRUE(IsExactLowercaseSha256Digest(original.value()));
+  EXPECT_NE(original, evidence.offer_digest);
+  auto attributed = status.accepted_intent;
+  attributed.attribution = {RequestTransportDTO::kHttp, RequestAssuranceDTO::kExternallyAuthenticated,
+                            std::string("principal")};
+  EXPECT_EQ(digest(attributed, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes,
+      unit, runtime, manager), original);
+  attributed.reason = "different selected settings";
+  EXPECT_NE(digest(attributed, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes,
+      unit, runtime, manager), original);
+  auto projection = evidence.candidate_projection_revision;
+  ++projection.scene_revision.revision_id;
+  EXPECT_NE(digest(status.accepted_intent, projection, evidence.candidate_retained_bundle_digest,
+      evidence.candidate_retained_bundle_bytes, unit, runtime, manager), original);
+  EXPECT_NE(digest(status.accepted_intent, evidence.candidate_projection_revision,
+      ContentDigest(std::string("sha256:") + std::string(64U, 'c')),
+      evidence.candidate_retained_bundle_bytes, unit, runtime, manager), original);
+  EXPECT_NE(digest(status.accepted_intent, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes + 1U,
+      unit, runtime, manager), original);
+  EXPECT_NE(digest(status.accepted_intent, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes,
+      RuntimeUnitId("other-child"), runtime, manager), original);
+  EXPECT_NE(digest(status.accepted_intent, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes,
+      unit, RuntimeEpoch("replacement-child"), manager), original);
+  EXPECT_NE(digest(status.accepted_intent, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes,
+      unit, runtime, RuntimeEpoch("replacement-manager")), original);
+  EXPECT_THROW((void)digest(status.accepted_intent, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, 0U, unit, runtime, manager), std::invalid_argument);
+  EXPECT_THROW((void)digest(status.accepted_intent, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes,
+      unit, RuntimeEpoch(""), manager), std::invalid_argument);
+  auto program = status.accepted_intent;
+  program.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("runner"), ProgramRunId("run"), CellAdmissionClaimGeneration(1U),
+      "node", "attempt", "cclc.lifecycle"};
+  EXPECT_THROW((void)digest(program, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes,
+      unit, runtime, manager), std::invalid_argument);
+}
+
+TEST(SelectedBringUpCodec, RefusesMissingOrMalformedOriginalRequestDigestWithoutGuessing) {
+  const auto status = selected_bring_up_status();
+  const detail::SelectedCCLCClaimIntentRecordDTO record{
+      status.selected_bring_up->selected_claim.intent,
+      status.selected_bring_up->original_request_payload_digest};
+  const auto bytes = detail::EncodeCCLCSelectedBringUpClaimIntent(record);
+  const auto original_field_bytes = 4U + record.original_request_payload_digest.value().size();
+  EXPECT_THROW((void)detail::DecodeCCLCSelectedBringUpClaimIntent(
+      bytes.substr(0U, bytes.size() - original_field_bytes)), std::invalid_argument);
+  auto malformed = bytes;
+  malformed.back() = 'X';
+  EXPECT_THROW((void)detail::DecodeCCLCSelectedBringUpClaimIntent(malformed), std::invalid_argument);
+  const auto decoded = detail::DecodeCCLCSelectedBringUpClaimIntent(bytes);
+  EXPECT_EQ(decoded.full_claim_intent, record.full_claim_intent);
+  EXPECT_EQ(decoded.original_request_payload_digest, record.original_request_payload_digest);
+}
+
+TEST(SelectedBringUpCodec, RoundTripsFullClaimAndStatusWithoutConferringEffectAuthority) {
+  const auto status = selected_bring_up_status();
+  ASSERT_TRUE(status.locally_valid());
+  const auto& claim = status.selected_bring_up->selected_claim.intent;
+  const detail::SelectedCCLCClaimIntentRecordDTO record{
+      claim, status.selected_bring_up->original_request_payload_digest};
+  const auto claim_bytes = detail::EncodeCCLCSelectedBringUpClaimIntent(record);
+  EXPECT_TRUE(detail::IsCCLCSelectedBringUpClaimIntentEncoding(claim_bytes));
+  EXPECT_EQ(detail::DecodeCCLCSelectedBringUpClaimIntent(claim_bytes), record);
+  EXPECT_NE(record.original_request_payload_digest, claim.request_payload_digest);
+  const auto status_bytes = detail::EncodeComponentLifecycleStatus(status);
+  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(status_bytes), status);
+  EXPECT_NE(status_bytes.find("MF-CCLC-SELECTED-STATUS-V1"), std::string::npos);
+  EXPECT_THROW((void)detail::DecodeCCLCSelectedBringUpClaimIntent(claim_bytes + "extra"),
+               std::invalid_argument);
+  EXPECT_THROW((void)detail::DecodeComponentLifecycleStatus(status_bytes + "extra"),
+               std::invalid_argument);
+  EXPECT_THROW((void)detail::DecodeCCLCSelectedBringUpClaimIntent(
+      claim_bytes.substr(0U, claim_bytes.size() - 1U)), std::invalid_argument);
+  auto recovered = status;
+  recovered.status_owner_epoch = RequestOwnerEpoch("replacement-owner");
+  recovered.remaining_duration_ns = 0;
+  EXPECT_TRUE(recovered.locally_valid());  // Data validity is not redispatch permission.
+  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(detail::EncodeComponentLifecycleStatus(recovered)),
+            recovered);
+}
+
+TEST(SelectedBringUpCodec, RefusesOrdinaryRouteAndMalformedSelectedClaimShapes) {
+  const auto status = selected_bring_up_status();
+  const auto claim = status.selected_bring_up->selected_claim.intent;
+  const auto original_digest = status.selected_bring_up->original_request_payload_digest;
+  const auto route_bytes = detail::EncodeCCLCRouteRecoveryConfiguration(claim.scope.configurations[0]);
+  EXPECT_FALSE(detail::IsCCLCSelectedBringUpClaimIntentEncoding(route_bytes));
+  EXPECT_FALSE(detail::IsCCLCSelectedBringUpClaimIntentEncoding(""));
+  EXPECT_THROW((void)detail::DecodeCCLCSelectedBringUpClaimIntent(route_bytes), std::invalid_argument);
+  const auto check_invalid = [&](auto change) {
+    auto changed = claim;
+    change(changed);
+    EXPECT_THROW((void)detail::EncodeCCLCSelectedBringUpClaimIntent({changed, original_digest}),
+                 std::invalid_argument);
+  };
+  check_invalid([](auto& value) { value.owner_transaction_id = "selected-lifecycle.04";
+    value.intervention_evidence->offer_transaction_id = value.owner_transaction_id; });
+  check_invalid([](auto& value) { value.scope.resources.clear(); });
+  check_invalid([](auto& value) { value.scope.configurations.clear(); });
+  check_invalid([](auto& value) { value.request_payload_digest = ContentDigest(std::string(64U, 'b')); });
+  check_invalid([](auto& value) { value.intervention_evidence->parent_program_cycle_claim_generation =
+      CellAdmissionClaimGeneration(1U); });
+  check_invalid([](auto& value) { value.program_cycle_evidence = ProgramCycleAdmissionEvidenceDTO{
+      ProgramRevision("p"), ProgramRevision("p")}; });
+  check_invalid([](auto& value) { value.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("runner"), ProgramRunId("run"), CellAdmissionClaimGeneration(1U),
+      "node", "attempt", "cclc.lifecycle"}; });
+  EXPECT_THROW((void)detail::EncodeCCLCSelectedBringUpClaimIntent({claim, ContentDigest("invalid")}),
+               std::invalid_argument);
+  auto malformed = detail::EncodeCCLCSelectedBringUpClaimIntent({claim, original_digest});
+  const auto transaction = malformed.find("selected-lifecycle.4");
+  ASSERT_NE(transaction, std::string::npos);
+  malformed[transaction + std::string("selected-lifecycle.").size()] = '0';
+  EXPECT_THROW((void)detail::DecodeCCLCSelectedBringUpClaimIntent(malformed), std::invalid_argument);
+}
+
+TEST(SelectedBringUpStatus, RefusesBrokenClaimFenceOccurrenceAndCandidateJoins) {
+  const auto status = selected_bring_up_status();
+  ASSERT_TRUE(status.locally_valid());
+  const auto check_invalid = [&](auto change) {
+    auto changed = status;
+    change(changed);
+    EXPECT_FALSE(changed.locally_valid());
+    EXPECT_THROW((void)detail::EncodeComponentLifecycleStatus(changed), std::invalid_argument);
+  };
+  check_invalid([](auto& value) { value.accepted_intent.intent = ComponentLifecycleIntentKindDTO::kRecover; });
+  check_invalid([](auto& value) { value.selected_bring_up->offer_digest =
+      ContentDigest(std::string("sha256:") + std::string(64U, 'b')); });
+  check_invalid([](auto& value) { value.selected_bring_up->selected_claim.intent.request_id =
+      RequestId("other"); });
+  check_invalid([](auto& value) { value.selected_bring_up->selected_claim.intent.owner_epoch =
+      RequestOwnerEpoch("other"); });
+  check_invalid([](auto& value) { value.selected_bring_up->selected_claim.claim_generation =
+      CellAdmissionClaimGeneration(0U); });
+  check_invalid([](auto& value) { value.selected_bring_up->selected_claim.acquired_admission_generation =
+      AdmissionGeneration(2U); });
+  check_invalid([](auto& value) { value.selected_bring_up->accepted_fence.captured_scope.resources =
+      {ResourceId("other")}; });
+  check_invalid([](auto& value) { value.selected_bring_up->accepted_fence.captured_scope.controllable_component_ids =
+      {ControllableComponentId("other")}; });
+  check_invalid([](auto& value) { value.selected_bring_up->accepted_fence.captured_scope.domains.front().candidate_control_domain_revision =
+      ControlDomainRevision("other"); });
+  check_invalid([](auto& value) { value.selected_bring_up->accepted_fence.captured_scope.bindings.front().candidate_control_binding_revision =
+      ControlBindingRevision("other"); });
+  check_invalid([](auto& value) { ++value.selected_bring_up->successor_occurrence.domains.front().observation_generation; });
+  check_invalid([](auto& value) { value.selected_bring_up->predecessor_occurrence.domains.front().observation_generation =
+      std::numeric_limits<std::uint64_t>::max(); });
+  check_invalid([](auto& value) { value.selected_bring_up->successor_occurrence.arm_binding_epoch =
+      ExecutionBindingEpoch(12U); });
+  check_invalid([](auto& value) { value.selected_bring_up->candidate_retained_bundle_bytes = 0U; });
+  check_invalid([](auto& value) { value.selected_bring_up->candidate_retained_bundle_digest = ContentDigest("invalid"); });
+  check_invalid([](auto& value) { value.selected_bring_up->candidate_projection_revision.scene_revision.revision_id = 0U; });
+  check_invalid([](auto& value) { value.selected_bring_up->containment_stop_generation = StopGeneration(0U); });
+  check_invalid([](auto& value) { value.selected_bring_up->original_request_payload_digest = ContentDigest("invalid"); });
+}
+
+TEST(SelectedBringUpStatus, AcceptedRequiresExactPredecessorConfigurationAndObservation) {
+  auto accepted = selected_bring_up_status();
+  accepted.phase = ComponentLifecycleTransactionPhaseDTO::kAccepted;
+  ASSERT_TRUE(accepted.locally_valid());  // Same predecessor/candidate revision.
+  const auto check_invalid = [&](auto change) {
+    auto changed = accepted;
+    change(changed);
+    ASSERT_TRUE(changed.domains.front().locally_valid());
+    EXPECT_FALSE(changed.locally_valid());
+    EXPECT_THROW((void)detail::EncodeComponentLifecycleStatus(changed), std::invalid_argument);
+  };
+  check_invalid([](auto& value) {
+    value.domains.front().current_scope->active_control_configuration->active_control_configuration_id =
+        ActiveControlConfigurationId("foreign-configuration");
+  });
+  check_invalid([](auto& value) {
+    value.domains.front().current_scope->active_control_configuration->active_control_configuration_generation =
+        ActiveControlConfigurationGeneration(8U);
+  });
+  check_invalid([](auto& value) {
+    value.domains.front().current_scope->active_control_configuration.reset();
+  });
+  check_invalid([](auto& value) {
+    auto& domain = value.domains.front();
+    domain.current_scope.reset();
+    domain.resolved_provider_occurrence.reset();
+    domain.previous_state.reset();
+    domain.current_state.reset();
+  });
+  check_invalid([](auto& value) {
+    auto& domain = value.domains.front();
+    const auto changed_revision = ControlDomainRevision("candidate-revision");
+    value.accepted_intent.expected_control_domains.front().control_domain_revision = changed_revision;
+    domain.expected_domain->control_domain_revision = changed_revision;
+    value.selected_bring_up->accepted_fence.captured_scope.domains.front().candidate_control_domain_revision =
+        changed_revision;
+    domain.current_scope = current_scope(*domain.expected_domain);
+    domain.resolved_provider_occurrence = provider_occurrence(*domain.current_scope);
+  });
+
+  // A second adopted predecessor has no active configuration. Its later
+  // appearance at Accepted must fail without emptying the full selected claim.
+  const auto expected = expected_domain("domain-2", absent_configuration(), {binding("binding-2")});
+  auto scope = current_scope(expected);
+  accepted.accepted_intent.expected_control_domains.push_back(expected);
+  accepted.domains.push_back({expected.control_domain_id, expected, scope, provider_occurrence(scope),
+      ComponentLifecycleStateDTO::kPrepared, ComponentLifecycleStateDTO::kPrepared,
+      accepted.requested_state, ComponentLifecycleDomainActionStateDTO::kNotStarted,
+      ComponentLifecycleDomainEffectDTO::kNone, {}, std::nullopt, std::nullopt});
+  auto& evidence = *accepted.selected_bring_up;
+  evidence.predecessor_occurrence.domains.push_back({expected.control_domain_id, 40U});
+  evidence.successor_occurrence.domains.push_back({expected.control_domain_id, 41U});
+  evidence.accepted_fence.captured_scope.domains.push_back({expected.control_domain_id,
+      expected.control_domain_revision, expected.control_domain_revision});
+  evidence.accepted_fence.captured_scope.bindings.push_back({ControlBindingId("binding-2"),
+      ControlBindingRevision("binding-revision-1"), ControlBindingRevision("binding-revision-1")});
+  ASSERT_TRUE(accepted.locally_valid());
+  accepted.domains.back().current_scope->active_control_configuration = active_configuration(expected);
+  ASSERT_TRUE(accepted.domains.back().locally_valid());
+  EXPECT_FALSE(accepted.locally_valid());
+}
+
+TEST(SelectedBringUpStatus, AcceptedNewDomainHasNoObservationAndLaterSameRevisionProgressIsValid) {
+  auto accepted = selected_bring_up_status();
+  accepted.phase = ComponentLifecycleTransactionPhaseDTO::kAccepted;
+  const auto added = expected_domain("domain-2", absent_configuration(), {binding("binding-2")});
+  accepted.accepted_intent.expected_control_domains.push_back(added);
+  accepted.domains.push_back({added.control_domain_id, added, std::nullopt, std::nullopt,
+      std::nullopt, std::nullopt, accepted.requested_state,
+      ComponentLifecycleDomainActionStateDTO::kNotStarted, ComponentLifecycleDomainEffectDTO::kNone,
+      {}, std::nullopt, std::nullopt});
+  auto& evidence = *accepted.selected_bring_up;
+  evidence.successor_occurrence.domains.push_back({added.control_domain_id, 1U});
+  evidence.accepted_fence.captured_scope.domains.push_back({added.control_domain_id,
+      std::nullopt, added.control_domain_revision});
+  evidence.accepted_fence.captured_scope.bindings.push_back({ControlBindingId("binding-2"),
+      std::nullopt, ControlBindingRevision("binding-revision-1")});
+  ASSERT_TRUE(accepted.locally_valid());
+  accepted.domains.back().current_scope = current_scope(added);
+  accepted.domains.back().resolved_provider_occurrence =
+      provider_occurrence(*accepted.domains.back().current_scope);
+  accepted.domains.back().previous_state = ComponentLifecycleStateDTO::kPrepared;
+  accepted.domains.back().current_state = ComponentLifecycleStateDTO::kPrepared;
+  ASSERT_TRUE(accepted.domains.back().locally_valid());
+  EXPECT_FALSE(accepted.locally_valid());
+
+  // Actual successor progress can use a fresh adopted configuration with the
+  // same domain revision. The immutable selected claim keeps the predecessor.
+  accepted.phase = ComponentLifecycleTransactionPhaseDTO::kVerifying;
+  auto& current = *accepted.domains.front().current_scope->active_control_configuration;
+  current.active_control_configuration_id = ActiveControlConfigurationId("successor-configuration");
+  current.active_control_configuration_generation = ActiveControlConfigurationGeneration(8U);
+  ASSERT_TRUE(accepted.locally_valid());
+  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(detail::EncodeComponentLifecycleStatus(accepted)),
+            accepted);
+}
+
+TEST(SelectedBringUpStatus, RetainsGripperRemovalAdditionAndChangedPredecessorFacts) {
+  auto status = selected_bring_up_status();
+  auto& evidence = *status.selected_bring_up;
+  auto& fenced = evidence.accepted_fence.captured_scope;
+  // Changed candidate revision does not rewrite truthful predecessor facts.
+  status.accepted_intent.expected_control_domains.front().control_domain_revision = ControlDomainRevision("candidate-revision");
+  status.domains.front().expected_domain = status.accepted_intent.expected_control_domains.front();
+  fenced.domains.front().candidate_control_domain_revision = ControlDomainRevision("candidate-revision");
+  const auto removed = expected_domain("domain-2", present_configuration(), {binding("binding-2")});
+  const auto removed_scope = current_scope(removed, {ResourceId("resource-2")});
+  status.domains.push_back({removed.control_domain_id, std::nullopt, removed_scope,
+      provider_occurrence(removed_scope), ComponentLifecycleStateDTO::kPrepared,
+      ComponentLifecycleStateDTO::kPrepared, status.requested_state,
+      ComponentLifecycleDomainActionStateDTO::kNotStarted, ComponentLifecycleDomainEffectDTO::kKnownNoEffect,
+      {}, std::nullopt, std::nullopt});
+  evidence.predecessor_occurrence.domains.push_back({removed.control_domain_id, 40U});
+  fenced.domains.push_back({removed.control_domain_id, removed.control_domain_revision, std::nullopt});
+  fenced.bindings.push_back({ControlBindingId("binding-2"), ControlBindingRevision("binding-revision-1"), std::nullopt});
+  fenced.resources.push_back(ResourceId("resource-2"));
+  evidence.selected_claim.intent.scope.resources = fenced.resources;
+  evidence.selected_claim.intent.scope.configurations.push_back({removed.control_domain_id,
+      ActiveControlConfigurationId("configuration-1"), ActiveControlConfigurationGeneration(7U)});
+  const auto added = expected_domain("domain-3", absent_configuration(), {binding("binding-3")});
+  status.accepted_intent.expected_control_domains.push_back(added);
+  status.domains.push_back({added.control_domain_id, added, std::nullopt, std::nullopt, std::nullopt,
+      std::nullopt, status.requested_state, ComponentLifecycleDomainActionStateDTO::kNotStarted,
+      ComponentLifecycleDomainEffectDTO::kNone, {}, std::nullopt, std::nullopt});
+  evidence.successor_occurrence.domains.push_back({added.control_domain_id, 1U});
+  fenced.domains.push_back({added.control_domain_id, std::nullopt, added.control_domain_revision});
+  fenced.bindings.push_back({ControlBindingId("binding-3"), std::nullopt, ControlBindingRevision("binding-revision-1")});
+  ASSERT_TRUE(status.locally_valid());
+  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(detail::EncodeComponentLifecycleStatus(status)), status);
+  auto ordinary = status;
+  ordinary.selected_bring_up.reset();
+  EXPECT_FALSE(ordinary.locally_valid());
+  auto dropped = status;
+  dropped.selected_bring_up->accepted_fence.captured_scope.domains.erase(
+      dropped.selected_bring_up->accepted_fence.captured_scope.domains.begin() + 1);
+  EXPECT_FALSE(dropped.locally_valid());
+  dropped = status;
+  dropped.selected_bring_up->successor_occurrence.domains[1].observation_generation = 2U;
+  EXPECT_FALSE(dropped.locally_valid());
+  // After actual installation, successor scopes can replace predecessor data.
+  for (auto& domain : status.domains) {
+    if (!domain.expected_domain) continue;
+    domain.current_scope = current_scope(*domain.expected_domain);
+    domain.resolved_provider_occurrence = provider_occurrence(*domain.current_scope);
+    domain.previous_state = ComponentLifecycleStateDTO::kPrepared;
+    domain.current_state = ComponentLifecycleStateDTO::kActive;
+    domain.action_state = ComponentLifecycleDomainActionStateDTO::kSucceeded;
+    domain.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
+  }
+  status.current_state = ComponentLifecycleStateDTO::kActive;
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kSucceeded;
+  status.terminal_result = ComponentLifecycleTerminalResultDTO::kSucceeded;
+  status.remaining_duration_ns = 0;
+  EXPECT_TRUE(status.locally_valid());
+}
+
+TEST(CCLCJournalRecovery, RequiresExactSelectedClaimForObservationOnlyRecovery) {
+  const auto status = selected_bring_up_status();
+  CCLCJournalRecoveryDTO recovery{4U,
+      {{ControllableComponentId("component-1"), ComponentLifecycleGeneration(4U)}}, {status},
+      {{status.acceptance.lifecycle_transaction_id, status.acceptance.lifecycle_transaction_generation, 0U}},
+      {}, 0U, {}, {}, {}, {}, {}, {}, RequestOwnerEpoch("owner-epoch-1")};
+  EXPECT_FALSE(recovery.locally_valid());
+  const auto claim = status.selected_bring_up->selected_claim;
+  recovery.cell_claims.push_back({claim.intent, claim, std::nullopt, false, true,
+      status.selected_bring_up->original_request_payload_digest});
+  ASSERT_TRUE(recovery.locally_valid());
+  recovery.cell_claims[0].transaction_accepted = false;
+  EXPECT_FALSE(recovery.locally_valid());
+  recovery.cell_claims[0].transaction_accepted = true;
+  recovery.cell_claims[0].claim->claim_generation = CellAdmissionClaimGeneration(16U);
+  EXPECT_FALSE(recovery.locally_valid());
+  recovery.cell_claims[0].claim = claim;
+  recovery.cell_claims[0].original_request_payload_digest.reset();
+  EXPECT_FALSE(recovery.locally_valid());
+  recovery.cell_claims[0].original_request_payload_digest =
+      ContentDigest(std::string("sha256:") + std::string(64U, 'c'));
+  EXPECT_FALSE(recovery.locally_valid());
+  recovery.cell_claims[0].original_request_payload_digest =
+      status.selected_bring_up->original_request_payload_digest;
+  recovery.cell_claims.push_back(recovery.cell_claims[0]);
+  EXPECT_FALSE(recovery.locally_valid());
+}
+
+TEST(CCLCJournalRecovery, OriginalRequestDigestPresentExactlyForSelectedAttemptRows) {
+  const auto status = selected_bring_up_status();
+  const auto selected_intent = status.selected_bring_up->selected_claim.intent;
+  auto ordinary_intent = selected_intent;
+  ordinary_intent.claim_kind = CellAdmissionClaimKindDTO::kComponentLifecycle;
+  ordinary_intent.owner_transaction_id = "lifecycle.4";
+  ordinary_intent.intervention_evidence.reset();
+  ASSERT_TRUE(ValidateCellAdmissionClaimIntent(ordinary_intent).ok());
+  CCLCJournalRecoveryDTO recovery{0U, {}, {}, {}, {}, 0U, {}, {}, {}, {}, {}, {},
+                                 RequestOwnerEpoch("owner-epoch-1")};
+  recovery.cell_claims.push_back({ordinary_intent, std::nullopt, std::nullopt, false, false,
+                                 std::nullopt});
+  ASSERT_TRUE(recovery.locally_valid());
+  recovery.cell_claims.front().original_request_payload_digest =
+      status.selected_bring_up->original_request_payload_digest;
+  EXPECT_FALSE(recovery.locally_valid());
+  recovery.cell_claims.front().intent = selected_intent;
+  ASSERT_TRUE(recovery.locally_valid());  // Pre-acquisition selected attempt, no status minted.
+  recovery.cell_claims.front().original_request_payload_digest.reset();
+  EXPECT_FALSE(recovery.locally_valid());
+  recovery.cell_claims.front().original_request_payload_digest = ContentDigest("invalid");
+  EXPECT_FALSE(recovery.locally_valid());
+}
+
+TEST(ApplyDelegatedComponentLifecycleCodec, RoundTripsPrepareEnableDisableAndGenuineRecoverySeparately) {
+  for (const auto kind : {ComponentLifecycleIntentKindDTO::kPrepare, ComponentLifecycleIntentKindDTO::kEnable,
+                          ComponentLifecycleIntentKindDTO::kDisable}) {
+    for (const bool recovery : {false, true}) {
+      const auto status = apply_bring_up_status(kind, recovery);
+      ASSERT_TRUE(status.locally_valid());
+      EXPECT_FALSE(status.selected_bring_up);
+      EXPECT_EQ(status.apply_bring_up->recovery.has_value(), recovery);
+      EXPECT_EQ(status.apply_bring_up->predecessor_occurrence.has_value(), recovery);
+      const auto bytes = detail::EncodeComponentLifecycleStatus(status);
+      EXPECT_NE(bytes.find("MF-CCLC-APPLY-DELEGATED-STATUS-V1"), std::string::npos);
+      EXPECT_EQ(detail::DecodeComponentLifecycleStatus(bytes), status);
+      const CCLCLifecycleRequestResultDTO result{RequestReplayStatusDTO::kAcceptedNew,
+          status.acceptance, status, std::nullopt, std::nullopt};
+      ASSERT_TRUE(result.locally_valid());
+      const auto encoded_result = EncodeApplyDelegatedComponentLifecycleRequestResult(result);
+      const auto decoded = DecodeApplyDelegatedComponentLifecycleRequestResult(encoded_result);
+      EXPECT_EQ(decoded.acceptance, result.acceptance);
+      EXPECT_EQ(decoded.status, result.status);
+      EXPECT_THROW((void)EncodeSelectedComponentBringUpRequestResult(result), std::invalid_argument);
+      EXPECT_THROW((void)DecodeApplyDelegatedComponentLifecycleRequestResult(encoded_result + "extra"),
+                   std::invalid_argument);
+      EXPECT_THROW((void)DecodeApplyDelegatedComponentLifecycleRequestResult(
+          encoded_result.substr(0U, encoded_result.size() - 1U)), std::invalid_argument);
+      auto observed = status;
+      observed.status_owner_epoch = RequestOwnerEpoch("replacement-owner");
+      observed.remaining_duration_ns = 0;
+      ASSERT_TRUE(observed.locally_valid());
+      EXPECT_EQ(detail::DecodeComponentLifecycleStatus(detail::EncodeComponentLifecycleStatus(observed)),
+                observed);  // No live continuation or readiness is reconstructed.
+    }
+  }
+}
+
+TEST(ApplyDelegatedComponentLifecycleCodec, RejectsOtherStatusAndRetainsNoAdmissionResults) {
+  const auto selected = selected_bring_up_status();
+  const auto ordinary = ordinary_codec_status();
+  for (const auto& status : {selected, ordinary}) {
+    EXPECT_THROW((void)EncodeApplyDelegatedComponentLifecycleRequestResult(
+        {RequestReplayStatusDTO::kAcceptedNew, status.acceptance, status, std::nullopt, std::nullopt}),
+        std::invalid_argument);
+  }
+  const CCLCLifecycleRequestResultDTO rejected{RequestReplayStatusDTO::kAcceptedNew, std::nullopt,
+      std::nullopt, ErrorDTO{"refused", "not started", {{"effect", "not_started"}}}, std::nullopt};
+  EXPECT_EQ(DecodeApplyDelegatedComponentLifecycleRequestResult(
+      EncodeApplyDelegatedComponentLifecycleRequestResult(rejected)).rejection, rejected.rejection);
+  const CCLCLifecycleRequestResultDTO expired{RequestReplayStatusDTO::kRequestResultExpired,
+      std::nullopt, std::nullopt, std::nullopt, std::nullopt};
+  EXPECT_EQ(DecodeApplyDelegatedComponentLifecycleRequestResult(
+      EncodeApplyDelegatedComponentLifecycleRequestResult(expired)).replay_status, expired.replay_status);
+  const CCLCLifecycleRequestResultDTO incident{RequestReplayStatusDTO::kAcceptedNew,
+      std::nullopt, std::nullopt, std::nullopt,
+      ComponentIncidentRecoveryDTO{"incident", ControllableComponentId("component-1"),
+          LifecycleBlockingCauseClassDTO::kFault, "operator", kAcceptedAtNs}};
+  ASSERT_TRUE(incident.locally_valid());
+  EXPECT_THROW((void)EncodeApplyDelegatedComponentLifecycleRequestResult(incident), std::invalid_argument);
+  // New evidence absent: no new magic, tag, or delegated payload is appended.
+  const auto direct_bytes = detail::EncodeComponentLifecycleStatus(selected);
+  EXPECT_NE(direct_bytes.find("MF-CCLC-SELECTED-STATUS-V1"), std::string::npos);
+  EXPECT_EQ(direct_bytes.find("MF-CCLC-APPLY-DELEGATED"), std::string::npos);
+  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(direct_bytes), selected);
+}
+
+TEST(ApplyDelegatedComponentLifecycleStatus, RefusesForeignParentScopeAndOriginalIdentity) {
+  const auto status = apply_bring_up_status();
+  ASSERT_TRUE(status.locally_valid());
+  const auto invalid = [&](auto change) {
+    auto changed = status;
+    change(changed);
+    EXPECT_FALSE(changed.locally_valid());
+    const CCLCLifecycleRequestResultDTO result{RequestReplayStatusDTO::kAcceptedNew,
+        changed.acceptance, changed, std::nullopt, std::nullopt};
+    EXPECT_FALSE(result.locally_valid());
+    EXPECT_THROW((void)detail::EncodeComponentLifecycleStatus(changed), std::invalid_argument);
+    EXPECT_THROW((void)EncodeApplyDelegatedComponentLifecycleRequestResult(result), std::invalid_argument);
+  };
+  invalid([](auto& value) { value.apply_bring_up->parent_authority.parent.plan_digest =
+      ContentDigest(std::string("sha256:") + std::string(64U, 'd')); });
+  invalid([](auto& value) { value.apply_bring_up->parent_authority.parent_claim.acquired_admission_generation =
+      AdmissionGeneration(10U); });
+  invalid([](auto& value) { value.apply_bring_up->parent_authority.parent_claim.intent.claim_kind =
+      CellAdmissionClaimKindDTO::kInterventionOrRecovery; });
+  invalid([](auto& value) { value.apply_bring_up->parent_authority.held_fence_query.owner_transaction.apply_id =
+      ApplyId("foreign-parent"); });
+  invalid([](auto& value) { value.apply_bring_up->parent_authority.held_fence_query.expected_scope.resources =
+      {ResourceId("foreign-resource")}; });
+  invalid([](auto& value) { value.apply_bring_up->selected_scope.controllable_component_ids =
+      {ControllableComponentId("component-1"), ControllableComponentId("component-2")}; });
+  invalid([](auto& value) { value.apply_bring_up->selected_scope.bindings.front().predecessor_control_binding_revision =
+      ControlBindingRevision("foreign-binding-revision"); });
+  invalid([](auto& value) { value.apply_bring_up->original_request_payload_digest =
+      ContentDigest(std::string("sha256:") + std::string(64U, 'b')); });
+  invalid([](auto& value) { value.apply_bring_up->original_request_payload_digest = ContentDigest("invalid"); });
+  invalid([](auto& value) { value.apply_bring_up->candidate_retained_bundle_bytes = 0U; });
+  invalid([](auto& value) { value.apply_bring_up->original_execution_host.runtime_epoch = RuntimeEpoch("other"); });
+  invalid([](auto& value) { value.domains.front().current_scope->active_control_configuration->active_control_configuration_id =
+      ActiveControlConfigurationId("foreign-active"); });
+  invalid([](auto& value) { value.domains.front().current_scope->active_control_configuration.reset(); });
+  invalid([](auto& value) { value.selected_bring_up = selected_bring_up_status().selected_bring_up; });
+}
+
+TEST(ApplyDelegatedComponentLifecycleStatus, ValidatesRecoveryPairWithoutInventingCleanStartupFacts) {
+  auto status = apply_bring_up_status(ComponentLifecycleIntentKindDTO::kEnable, true);
+  ASSERT_TRUE(status.locally_valid());
+  auto changed = status;
+  changed.apply_bring_up->successor_occurrence_floor.reset();
+  EXPECT_FALSE(changed.locally_valid());
+  changed = status;
+  changed.apply_bring_up->predecessor_occurrence.reset();
+  EXPECT_FALSE(changed.locally_valid());
+  changed = status;
+  changed.apply_bring_up->recovery->containment_stop_generation = StopGeneration(0U);
+  EXPECT_FALSE(changed.locally_valid());
+  changed = status;
+  ++changed.apply_bring_up->successor_occurrence_floor->domains.front().observation_generation;
+  EXPECT_FALSE(changed.locally_valid());
+  changed = status;
+  changed.apply_bring_up->predecessor_occurrence->domains.front().observation_generation =
+      std::numeric_limits<std::uint64_t>::max();
+  EXPECT_FALSE(changed.locally_valid());
+  auto clean = apply_bring_up_status();
+  clean.apply_bring_up->successor_occurrence_floor = status.apply_bring_up->successor_occurrence_floor;
+  EXPECT_FALSE(clean.locally_valid());  // A floor-only startup is not an approved data shape.
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kVerifying;
+  auto& configuration = *status.domains.front().current_scope->active_control_configuration;
+  configuration.active_control_configuration_id = ActiveControlConfigurationId("actual-successor");
+  configuration.active_control_configuration_generation = ActiveControlConfigurationGeneration(8U);
+  status.domains.front().current_state = ComponentLifecycleStateDTO::kActive;
+  EXPECT_TRUE(status.locally_valid());  // Floor does not replace actual successor observations.
+}
+
+TEST(ApplyDelegatedComponentLifecycleStatus, NewAcceptedDomainHasNoInventedObservation) {
+  auto status = apply_bring_up_status(ComponentLifecycleIntentKindDTO::kEnable);
+  auto& domain = status.domains.front();
+  auto& expected = status.accepted_intent.expected_control_domains.front();
+  expected.expected_active_control_configuration = absent_configuration();
+  domain.expected_domain = expected;
+  domain.current_scope.reset();
+  domain.resolved_provider_occurrence.reset();
+  domain.previous_state.reset();
+  domain.current_state.reset();
+  status.previous_state.reset();
+  status.current_state.reset();
+  auto& evidence = *status.apply_bring_up;
+  evidence.selected_scope.domains.front().predecessor_control_domain_revision.reset();
+  evidence.selected_scope.bindings.front().predecessor_control_binding_revision.reset();
+  evidence.parent_authority.held_fence_query.expected_scope = evidence.selected_scope;
+  evidence.original_request_payload_digest = ApplyDelegatedComponentLifecycleSemanticRequestDigest(
+      status.accepted_intent, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes,
+      evidence.original_execution_host.runtime_unit_id, evidence.original_execution_host.runtime_epoch,
+      evidence.parent_authority.held_fence_query.manager_runtime_epoch, evidence.parent_authority.parent);
+  ASSERT_TRUE(status.locally_valid());
+  EXPECT_FALSE(evidence.recovery);
+  EXPECT_FALSE(evidence.predecessor_occurrence);
+  EXPECT_FALSE(evidence.successor_occurrence_floor);
+  domain.current_scope = current_scope(expected);
+  domain.resolved_provider_occurrence = provider_occurrence(*domain.current_scope);
+  domain.previous_state = ComponentLifecycleStateDTO::kDeclared;
+  domain.current_state = ComponentLifecycleStateDTO::kDeclared;
+  status.previous_state = ComponentLifecycleStateDTO::kDeclared;
+  status.current_state = ComponentLifecycleStateDTO::kDeclared;
+  ASSERT_TRUE(domain.locally_valid());
+  EXPECT_FALSE(status.locally_valid());
+  status.previous_state.reset();
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kSucceeded;
+  status.terminal_result = ComponentLifecycleTerminalResultDTO::kSucceeded;
+  status.remaining_duration_ns = 0;
+  status.current_state = ComponentLifecycleStateDTO::kActive;
+  domain.current_state = ComponentLifecycleStateDTO::kActive;
+  domain.action_state = ComponentLifecycleDomainActionStateDTO::kSucceeded;
+  domain.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
+  ASSERT_TRUE(status.locally_valid());
+  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(detail::EncodeComponentLifecycleStatus(status)), status);
+}
+
+TEST(ApplyDelegatedComponentLifecycleStatus, InitialInstalledDomainsKeepUnknownAggregateAndNoPredecessor) {
+  auto status = apply_bring_up_status();
+  auto& evidence = *status.apply_bring_up;
+  auto second_expected = expected_domain("domain-2", absent_configuration(), {binding("binding-2")});
+  status.accepted_intent.expected_control_domains.front().expected_active_control_configuration =
+      absent_configuration();
+  status.accepted_intent.expected_control_domains.push_back(second_expected);
+  auto second_domain = status.domains.front();
+  second_domain.control_domain_id = second_expected.control_domain_id;
+  status.domains.push_back(second_domain);
+  evidence.selected_scope.domains.front().predecessor_control_domain_revision.reset();
+  evidence.selected_scope.bindings.front().predecessor_control_binding_revision.reset();
+  evidence.selected_scope.domains.push_back({second_expected.control_domain_id, std::nullopt,
+                                           second_expected.control_domain_revision});
+  evidence.selected_scope.bindings.push_back({ControlBindingId("binding-2"), std::nullopt,
+                                            ControlBindingRevision("binding-revision-1")});
+  evidence.parent_authority.held_fence_query.expected_scope = evidence.selected_scope;
+  evidence.original_request_payload_digest = ApplyDelegatedComponentLifecycleSemanticRequestDigest(
+      status.accepted_intent, evidence.candidate_projection_revision,
+      evidence.candidate_retained_bundle_digest, evidence.candidate_retained_bundle_bytes,
+      evidence.original_execution_host.runtime_unit_id, evidence.original_execution_host.runtime_epoch,
+      evidence.parent_authority.held_fence_query.manager_runtime_epoch, evidence.parent_authority.parent);
+  status.previous_state.reset();
+  status.current_state.reset();
+  for (std::size_t index = 0U; index < status.domains.size(); ++index) {
+    auto& domain = status.domains[index];
+    domain.expected_domain = status.accepted_intent.expected_control_domains[index];
+    domain.current_scope.reset();
+    domain.resolved_provider_occurrence.reset();
+    domain.previous_state.reset();
+    domain.current_state.reset();
+  }
+  ASSERT_TRUE(status.locally_valid());
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kVerifying;
+  for (std::size_t index = 0U; index < status.domains.size(); ++index) {
+    auto& domain = status.domains[index];
+    domain.current_scope = current_scope(*domain.expected_domain);
+    domain.resolved_provider_occurrence = provider_occurrence(*domain.current_scope);
+    const auto observed = index == 0U ? ComponentLifecycleStateDTO::kDeclared
+                                     : ComponentLifecycleStateDTO::kPrepared;
+    domain.previous_state = observed;
+    domain.current_state = observed;
+  }
+  ASSERT_TRUE(status.locally_valid());
+  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(detail::EncodeComponentLifecycleStatus(status)), status);
+  auto fabricated = status;
+  fabricated.current_state = ComponentLifecycleStateDTO::kDeclared;
+  EXPECT_FALSE(fabricated.locally_valid());
+  fabricated = status;
+  fabricated.previous_state = ComponentLifecycleStateDTO::kDeclared;
+  EXPECT_FALSE(fabricated.locally_valid());
+  fabricated = status;
+  fabricated.apply_bring_up.reset();
+  EXPECT_FALSE(fabricated.locally_valid());
+  // A coherent aggregate is established only from the installed observations;
+  // it never supplies a predecessor for this initial transaction.
+  status.domains.front().current_state = ComponentLifecycleStateDTO::kPrepared;
+  status.current_state = ComponentLifecycleStateDTO::kPrepared;
+  ASSERT_TRUE(status.locally_valid());
+  EXPECT_FALSE(status.previous_state);
+  status.phase = ComponentLifecycleTransactionPhaseDTO::kSucceeded;
+  status.terminal_result = ComponentLifecycleTerminalResultDTO::kSucceeded;
+  status.remaining_duration_ns = 0;
+  for (auto& domain : status.domains) {
+    domain.action_state = ComponentLifecycleDomainActionStateDTO::kSucceeded;
+    domain.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
+  }
+  ASSERT_TRUE(status.locally_valid());
+  status.current_state.reset();
+  EXPECT_FALSE(status.locally_valid());
+}
+
+TEST(ApplyDelegatedComponentLifecycleStatus, ParentClosureCanContainPeersWithoutWideningChildScope) {
+  auto status = apply_bring_up_status();
+  auto& scope = status.apply_bring_up->parent_authority.held_fence_query.expected_scope;
+  scope.controllable_component_ids.push_back(ControllableComponentId("component-2"));
+  scope.domains.push_back({ControlDomainId("domain-2"), ControlDomainRevision("peer-revision"),
+                          ControlDomainRevision("peer-revision")});
+  scope.bindings.push_back({ControlBindingId("binding-2"), ControlBindingRevision("peer-binding"),
+                           ControlBindingRevision("peer-binding")});
+  scope.resources.push_back(ResourceId("resource-2"));
+  ASSERT_TRUE(status.locally_valid());
+  EXPECT_EQ(status.domains.size(), 1U);
+  EXPECT_EQ(status.apply_bring_up->selected_scope.controllable_component_ids.size(), 1U);
+  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(detail::EncodeComponentLifecycleStatus(status)), status);
+}
+
+TEST(ApplyDelegatedComponentLifecycleCodec, StableDigestSealsTypedParentAndOmitsTransportAttribution) {
+  const auto status = apply_bring_up_status();
+  const auto& evidence = *status.apply_bring_up;
+  const auto digest = [&](const auto& request, const auto& parent) {
+    return ApplyDelegatedComponentLifecycleSemanticRequestDigest(request,
+        evidence.candidate_projection_revision, evidence.candidate_retained_bundle_digest,
+        evidence.candidate_retained_bundle_bytes, evidence.original_execution_host.runtime_unit_id,
+        evidence.original_execution_host.runtime_epoch,
+        evidence.parent_authority.held_fence_query.manager_runtime_epoch, parent);
+  };
+  const auto original = digest(status.accepted_intent, evidence.parent_authority.parent);
+  EXPECT_EQ(original, evidence.original_request_payload_digest);
+  auto request = status.accepted_intent;
+  request.attribution = {RequestTransportDTO::kHttp, RequestAssuranceDTO::kExternallyAuthenticated,
+                        std::string("principal")};
+  EXPECT_EQ(digest(request, evidence.parent_authority.parent), original);
+  request.intent = ComponentLifecycleIntentKindDTO::kEnable;
+  EXPECT_NE(digest(request, evidence.parent_authority.parent), original);
+  auto parent = evidence.parent_authority.parent;
+  parent.owner.apply_id = ApplyId("other-parent");
+  EXPECT_NE(digest(status.accepted_intent, parent), original);
+  parent = evidence.parent_authority.parent;
+  parent.owner.apply_generation = ApplyGeneration(9U);
+  EXPECT_NE(digest(status.accepted_intent, parent), original);
+  parent = evidence.parent_authority.parent;
+  parent.plan_digest = ContentDigest(std::string("sha256:") + std::string(64U, 'e'));
+  EXPECT_NE(digest(status.accepted_intent, parent), original);
+  parent.plan_digest = ContentDigest("invalid");
+  EXPECT_THROW((void)digest(status.accepted_intent, parent), std::invalid_argument);
+  request.intent = ComponentLifecycleIntentKindDTO::kDisable;
+  EXPECT_NE(digest(request, evidence.parent_authority.parent), original);
+  request.intent = ComponentLifecycleIntentKindDTO::kRecover;
+  EXPECT_THROW((void)digest(request, evidence.parent_authority.parent), std::invalid_argument);
+}
+
+TEST(ApplyComponentBringUpAuthorityCodec, ReusesExactParentGrammarAndRejectsIncompleteFrames) {
+  const auto authority = apply_bring_up_status().apply_bring_up->parent_authority;
+  const auto encoded = EncodeApplyComponentBringUpAuthority(authority);
+  EXPECT_EQ(DecodeApplyComponentBringUpAuthority(encoded), authority);
+  EXPECT_THROW((void)DecodeApplyComponentBringUpAuthority(encoded + "trailing"),
+               std::invalid_argument);
+  EXPECT_THROW((void)DecodeApplyComponentBringUpAuthority(
+                   std::string_view(encoded).substr(0U, encoded.size() - 1U)),
+               std::invalid_argument);
+  auto foreign = authority;
+  foreign.parent_claim.intent.owner_transaction_id = "another-Apply";
+  EXPECT_THROW((void)EncodeApplyComponentBringUpAuthority(foreign), std::invalid_argument);
+  foreign = authority;
+  foreign.parent_claim.acquired_admission_generation = AdmissionGeneration(
+      foreign.parent_claim.acquired_admission_generation.value() + 1U);
+  EXPECT_THROW((void)EncodeApplyComponentBringUpAuthority(foreign), std::invalid_argument);
+}
+
+TEST(SelectedControllerOccurrence, AdvancesContinuingDomainsAndSeedsNewMembership) {
+  const SelectedControllerOccurrenceDTO predecessor{
+      ExecutionBindingEpoch(7U), {{ControlDomainId("arm"), 31U}, {ControlDomainId("removed"), 8U}}};
+  const auto result = ComputeSelectedControllerSuccessorOccurrence(
+      predecessor, {ControlDomainId("arm"), ControlDomainId("gripper")}, true);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().arm_binding_epoch, ExecutionBindingEpoch(8U));
+  EXPECT_EQ(result.value().domains,
+            (std::vector<SelectedDomainOccurrenceDTO>{{ControlDomainId("arm"), 32U},
+                                                       {ControlDomainId("gripper"), 1U}}));
+  EXPECT_EQ(predecessor.domains.back().control_domain_id, ControlDomainId("removed"));
+}
+
+TEST(SelectedControllerOccurrence, RefusesOverflowBeforeAnyOccurrenceCanBeInstalled) {
+  auto predecessor = SelectedControllerOccurrenceDTO{
+      ExecutionBindingEpoch(std::numeric_limits<std::uint64_t>::max()),
+      {{ControlDomainId("arm"), 4U}}};
+  EXPECT_FALSE(ComputeSelectedControllerSuccessorOccurrence(
+                   predecessor, {ControlDomainId("arm")}, true).ok());
+  predecessor.arm_binding_epoch = ExecutionBindingEpoch(7U);
+  predecessor.domains.front().observation_generation = std::numeric_limits<std::uint64_t>::max();
+  EXPECT_FALSE(ComputeSelectedControllerSuccessorOccurrence(
+                   predecessor, {ControlDomainId("arm")}, true).ok());
+  // An exhausted removed domain does not invent a successor or prevent a
+  // genuinely new domain from using its existing initial convention.
+  const auto removed = ComputeSelectedControllerSuccessorOccurrence(
+      predecessor, {ControlDomainId("gripper")}, false);
+  ASSERT_TRUE(removed.ok());
+  EXPECT_FALSE(removed.value().arm_binding_epoch);
+  EXPECT_EQ(removed.value().domains.front().observation_generation, 1U);
+}
+
+TEST(SelectedControllerOccurrence, RequiresCanonicalExactDomainMembership) {
+  const SelectedControllerOccurrenceDTO predecessor{
+      ExecutionBindingEpoch(3U), {{ControlDomainId("arm"), 0U}}};
+  EXPECT_FALSE(ComputeSelectedControllerSuccessorOccurrence(predecessor, {}, true).ok());
+  EXPECT_FALSE(ComputeSelectedControllerSuccessorOccurrence(
+                   predecessor, {ControlDomainId("gripper"), ControlDomainId("arm")}, true).ok());
+  EXPECT_FALSE(ComputeSelectedControllerSuccessorOccurrence(
+                   predecessor, {ControlDomainId("arm"), ControlDomainId("arm")}, true).ok());
+  const auto result = ComputeSelectedControllerSuccessorOccurrence(
+      predecessor, {ControlDomainId("arm")}, true);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(result.value().domains.front().observation_generation, 1U);
+}
+
 TEST(BrandLifecyclePort, PreservesExactObservationAndCancellationBoundaries) {
   FakeBrandLifecyclePort port;
   const auto observed = port.Observe(observation_query());
@@ -916,6 +1882,39 @@ TEST(BrandLifecyclePort, PreservesExactObservationAndCancellationBoundaries) {
   EXPECT_EQ(result.dispatch_state, LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
   EXPECT_EQ(result.effect, LifecyclePrimitiveEffectDTO::kNone);
   EXPECT_TRUE(result.locally_valid());
+}
+
+TEST(ComponentLifecycleHealth, ValidatesBoundedNormalizedFactsWithoutExecutionIdentity) {
+  const auto sample = observation();
+  const LifecycleDomainHealthDTO health{sample.observed_state, sample.facts, sample.diagnostic};
+  ASSERT_TRUE(health.locally_valid());
+  for (int mutation = 0; mutation < 7; ++mutation) {
+    auto invalid = health;
+    switch (mutation) {
+      case 0: invalid.observed_state = static_cast<ComponentLifecycleStateDTO>(255); break;
+      case 1: invalid.facts.push_back(invalid.facts.front()); break;
+      case 2: std::reverse(invalid.facts.begin(), invalid.facts.end()); break;
+      case 3: invalid.facts.front().value.boolean_value.reset(); break;
+      case 4: invalid.diagnostic = ErrorDTO{"", "invalid", {}}; break;
+      case 5:
+        invalid.diagnostic = ErrorDTO{"fault", std::string(kMaxLifecycleErrorMessageBytes + 1, 'x'), {}};
+        break;
+      case 6: invalid.facts.resize(kMaxLifecycleFacts + 1, health.facts.front()); break;
+    }
+    EXPECT_FALSE(invalid.locally_valid()) << mutation;
+  }
+  const auto requires_prepared = predicate(ComponentLifecycleStateDTO::kPrepared);
+  const auto before = health;
+  EXPECT_EQ(EvaluateLifecyclePredicate(requires_prepared, health),
+            EvaluateLifecyclePredicate(requires_prepared, sample));
+  EXPECT_EQ(health, before);
+  auto invalid_execution = sample;
+  invalid_execution.source_sequence = 0;
+  EXPECT_FALSE(invalid_execution.locally_valid());
+  EXPECT_EQ(EvaluateLifecyclePredicate(requires_prepared, invalid_execution),
+            LifecyclePostconditionResultDTO::kInconclusive);
+  EXPECT_EQ(EvaluateLifecyclePredicate(requires_prepared, health),
+            LifecyclePostconditionResultDTO::kSatisfied);
 }
 
 }  // namespace

@@ -10,10 +10,10 @@
 #include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
 #include <manyforge_core/kernel_cell_admission_owner.hpp>
 #include <manyforge_core/orphan_resource_reconciliation.hpp>
-#include <manyforge_core/ports/icclc_component_command_readiness_port.hpp>
 #include <manyforge_core/ports/i_manager_liveness_fail_safe_port.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
 #include <manyforge_core/ports/iaddressed_operation_owner.hpp>
+#include <manyforge_core/ports/icclc_component_command_readiness_port.hpp>
 #include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
@@ -42,6 +42,8 @@
 #include <vector>
 
 namespace manyforge::core {
+
+struct ApplyBringUpAdmissionOfferDTO;
 
 inline constexpr std::size_t kMaxI6OperationReplayEntries = 4096U;
 
@@ -423,15 +425,28 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const CellAdmissionReadinessSnapshotDTO& snapshot) override;
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent) override;
+  /// Process-local Q91 composition only. Ordinary public acquire is unchanged.
+  /// This input is insufficient without the original Manager live-plan interlock.
+  /// Incomplete composition: aggregate-deficit source attribution is not
+  /// wired; proof-unavailable refusal is not permanent Q91 policy.
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireApplyBringUpCellAdmissionClaim(
+      const CellAdmissionClaimIntentDTO& intent, const ApplyBringUpAdmissionOfferDTO& offer);
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireRouteRecoveryCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent,
       const ActiveControlConfigurationDTO& predecessor) override;
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireSelectedComponentBringUpClaim(
+      const CellAdmissionClaimIntentDTO& intent,
+      const SelectedComponentBringUpOfferDTO& offer) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseCellAdmissionClaim(
       const CellAdmissionClaimReleaseDTO& release) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
       const CellAdmissionReconcileDTO& reconcile) override;
   [[nodiscard]] Result<CellAdmissionRecoveryReceiptDTO> GetCellAdmissionRecoveryReceipt(
       const CellAdmissionRecoveryReceiptQueryDTO& query) const override;
+  /// Copy the current held ledger entry for a subsequent exact recovery query.
+  /// The observation itself grants no acquisition, effects or release.
+  [[nodiscard]] std::optional<CellAdmissionClaimDTO> ReadHeldCellAdmissionClaim(
+      CellAdmissionClaimKindDTO kind) const;
   [[nodiscard]] Result<void> ValidateProgramResetSceneAuthorization(
       const ProgramResetSceneAuthorizationDTO& authorization) const override;
   [[nodiscard]] Result<void> Publish(const ManagerLivenessObservationDTO& observation) override;
@@ -592,6 +607,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const LifecycleTransactionId& lifecycle_transaction_id,
       const ControllableComponentId& controllable_component_id);
 
+  /// Private selected-effect closure. Revalidates the full held claim and
+  /// current contained predecessor before closing only its component.
+  [[nodiscard]] Result<ComponentCommandReadinessDTO> close_component_command_eligibility(
+      const CellAdmissionClaimDTO& selected_claim, const SelectedComponentBringUpOfferDTO& offer);
+
   /// Publish one complete component result: re-seal every participant of the
   /// component at the published lifecycle generation (reusing engines, route
   /// configurations and Stop-plan bytes) and set its eligibility for all of
@@ -601,6 +621,17 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<ComponentCommandReadinessDTO> publish_component_command_readiness(
       const ComponentCommandReadinessPublicationDTO& publication,
       RuntimeParticipantAdmissionResolver participant_resolver = {});
+
+  /// False-only successor proof under the full held selected permission.
+  /// All supplied rows must already be installed and sealed; this does no
+  /// reconfiguration, resolver rebuild, or product reseal.
+  [[nodiscard]] Result<ComponentCommandReadinessDTO> publish_component_command_readiness(
+      const CellAdmissionClaimDTO& selected_claim, const SelectedComponentBringUpOfferDTO& owner_offer,
+      const ComponentLifecycleStatusDTO& selected_status,
+      const SelectedControllerOccurrenceDTO& installed_occurrence,
+      const std::vector<RuntimeParticipantExecutionRegistration>& installed_candidate_registrations,
+      const std::vector<ActiveControlConfigurationDTO>& installed_candidate_configurations,
+      bool command_eligible = false);
 
   /// Bounded readback of one component's current command eligibility.
   [[nodiscard]] Result<ComponentCommandReadinessDTO> component_command_readiness(
@@ -661,11 +692,34 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// no lifecycle projection to consult. Returns the refusal, if any.
   [[nodiscard]] std::optional<ErrorDTO> component_command_refusal_locked(
       const RuntimeParticipantExecutionRegistration& registration) const;
+  [[nodiscard]] Result<void> validate_selected_bring_up_offer_identity(
+      const CellAdmissionClaimIntentDTO& intent,
+      const SelectedComponentBringUpOfferDTO& offer) const;
+  [[nodiscard]] Result<void> validate_selected_bring_up_predecessor_locked(
+      const CellAdmissionClaimIntentDTO& intent, const SelectedComponentBringUpOfferDTO& offer);
+  [[nodiscard]] Result<void> validate_bring_up_component_closure_locked(
+      const ComponentLifecycleCurrentSnapshotDTO& predecessor,
+      const std::vector<RuntimeParticipantBindingDTO>& candidates,
+      const ConfigurationFenceAdmissionSnapshotDTO& admission);
+  [[nodiscard]] Result<void> validate_bring_up_candidate_peer_closure_locked(
+      const ControllableComponentId& component,
+      const std::vector<RuntimeParticipantBindingDTO>& candidates,
+      const ConfigurationFenceAdmissionSnapshotDTO& admission);
+  [[nodiscard]] Result<void> validate_apply_bring_up_current_locked(
+      const CellAdmissionClaimIntentDTO& intent, const ApplyBringUpAdmissionOfferDTO& offer,
+      const CellAdmissionReadinessSnapshotDTO& readiness);
+  [[nodiscard]] Result<ComponentCommandReadinessDTO> close_component_command_eligibility_locked(
+      const ControllableComponentId& controllable_component_id);
   [[nodiscard]] Result<void> require_held_lifecycle_claim_locked(
       const LifecycleTransactionId& lifecycle_transaction_id) const;
   [[nodiscard]] Result<void> require_idle_for_component_readiness_locked() const;
   [[nodiscard]] Result<void> require_component_routes_current_locked(
       const ControllableComponentId& controllable_component_id, bool command_eligible) const;
+  [[nodiscard]] Result<void> require_installed_component_routes_current_locked(
+      const ControllableComponentId& controllable_component_id) const;
+  [[nodiscard]] Result<ComponentCommandReadinessDTO> commit_component_command_readiness_locked(
+      const ControllableComponentId& component, ComponentLifecycleGeneration generation,
+      bool command_eligible);
   [[nodiscard]] std::vector<IResolvedParticipantExecutionEngine*> operation_control_engines_locked(
       const std::vector<RuntimeParticipantExecutionRegistration>& registrations) const;
   [[nodiscard]] const RuntimeParticipantExecutionRegistration* registration_for(
@@ -735,9 +789,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// reservation. A coordinated participant failure names its engine; a null
   /// engine is a whole-operation admission refusal (single or coordinated)
   /// that ends every participant InterventionRequired with `failure`.
-  [[nodiscard]] Result<void> fail_pre_dispatch(
-      const OperationId& operation_id, IResolvedParticipantExecutionEngine* failing_engine,
-      ErrorDTO failure);
+  [[nodiscard]] Result<void> fail_pre_dispatch(const OperationId& operation_id,
+                                               IResolvedParticipantExecutionEngine* failing_engine,
+                                               ErrorDTO failure);
   [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
       const OperationControlRequestDTO& request, OperationControlKind control,
       bool automatic_manual_retirement = false);
@@ -946,8 +1000,14 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::vector<AttributedContainmentStop> attributed_containment_stops_;
   /// Accepted incident containments by incident id (bounded, newest last):
   /// a repeated request for one incident returns its Stop, never a new one.
-  std::vector<std::pair<std::string, ComponentIncidentContainmentReceiptDTO>>
-      incident_containments_;
+  struct RememberedIncidentContainment final {
+    std::string incident_id;
+    ComponentIncidentContainmentReceiptDTO receipt;
+    /// Only original acceptance attributes the component. A replay whose
+    /// original bounded row was retired cannot invent that missing fact.
+    std::optional<ControllableComponentId> controllable_component_id;
+  };
+  std::vector<RememberedIncidentContainment> incident_containments_;
   bool motion_admission_closed_{};
   std::optional<RetainedOperatorAlarmAttentionDTO> operator_alarm_attention_;
 };

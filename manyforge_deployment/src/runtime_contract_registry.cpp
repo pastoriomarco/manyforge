@@ -306,8 +306,7 @@ RuntimeContractDeclarationRegistry::make_rows() {
                  declared_capabilities(
                      runtime_contract_capabilities::kExecutionServices,
                      runtime_contract_capabilities::kLogicalSceneServices,
-                     std::array<std::string_view, 2U>{"execution.runtime_scale.operation_scoped",
-                                                      "tool.gripper.confirmation.operator"})),
+                     std::array<std::string_view, 1U>{"execution.runtime_scale.operation_scoped"})),
       {role_mapping(detail::kNativeExecutionRuntimeRoleId,
                     native_execution_runtime_contract::kRuntimeRoleApiContractId,
                     "native-execution-host")},

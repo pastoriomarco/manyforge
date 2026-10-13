@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#if defined(MANYFORGE_SNAPSHOT_TEST_HAS_SQLITE_CCLC)
+#include <manyforge_core/component_lifecycle_admission.hpp>
+#include <manyforge_core/sqlite_cclc_journal.hpp>
+#endif
 #include <manyforge_deployment/component_lifecycle_current_snapshot_source.hpp>
 #include <manyforge_deployment/route_selection_current_snapshot_source.hpp>
 
@@ -314,6 +318,88 @@ TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
   EXPECT_TRUE(
       core::VerifyComponentLifecycleCurrentSnapshot(snapshot.value()).ok());
 }
+
+#if defined(MANYFORGE_SNAPSHOT_TEST_HAS_SQLITE_CCLC)
+TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
+       GenuineBootstrapSnapshotDoesNotBecomeADurableGenerationSeedForApply) {
+  ScopedTrustedRoot journal_root;
+  core::SqliteCCLCJournal journal(
+      journal_root.path() / std::string(core::kCCLCJournalFilename),
+      bundle().value().cell_graph.cell_id);
+  const auto owner = journal.BeginOwnerEpoch(
+      core::RequestOwnerEpoch("bootstrap.owner"), 1, 1024U);
+  ASSERT_TRUE(owner.ok()) << owner.error().message;
+  const auto facts = source_facts(bundle());
+  const auto receipt = publication(bundle());
+  ActivePublicationReader publication_reader(receipt);
+  CatalogSource catalogs(facts.catalog);
+  VerifiedComponentLifecycleCurrentSnapshotSource source(
+      bundle(), publication_reader, receipt, journal, catalogs, {facts.provider});
+  const auto snapshot = source.ReadCurrentComponentSnapshot(
+      facts.component->controllable_component_id);
+  ASSERT_TRUE(snapshot.ok()) << snapshot.error().message;
+  EXPECT_EQ(snapshot.value().component_lifecycle_generation,
+            core::ComponentLifecycleGeneration(1U));
+  EXPECT_EQ(snapshot.value().component_lifecycle_state,
+            core::ComponentLifecycleStateDTO::kDeclared);
+  const auto selected = journal.ReadApplyComponentGenerationSelection(
+      owner.value().request_owner_epoch, facts.component->controllable_component_id);
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+  EXPECT_FALSE(selected.value().predecessor_generation);
+  EXPECT_EQ(selected.value().candidate_generation,
+            core::ComponentLifecycleGeneration(1U));
+
+  std::vector<core::ExpectedControlDomainRevisionDTO> expected;
+  for (const auto &domain : snapshot.value().domains) {
+    ASSERT_FALSE(domain.active_control_configuration);
+    expected.push_back({domain.control_domain_id, domain.control_domain_revision,
+                        domain.controller_topology_id, domain.topology_revision,
+                        {core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
+                         std::nullopt, std::nullopt},
+                        domain.current_control_bindings});
+  }
+  core::ComponentLifecycleIntentDTO intent{
+      {core::RequestId("bootstrap.prepare"), owner.value().request_owner_epoch,
+       "test", std::nullopt},
+      facts.component->controllable_component_id,
+      core::ComponentLifecycleIntentKindDTO::kPrepare,
+      snapshot.value().active_publication_receipt.request.candidate_graph_revision,
+      snapshot.value().component_lifecycle_generation, expected, std::nullopt,
+      {core::RequestTransportDTO::kInternal, core::RequestAssuranceDTO::kUnverified,
+       std::nullopt}, core::AdmissionGeneration(1U), std::nullopt};
+  const core::ComponentLifecycleAdmissionCandidate candidate{
+      core::LifecycleTransactionId("bootstrap.lifecycle.1"),
+      core::LifecycleTransactionGeneration(1U),
+      snapshot.value().component_lifecycle_generation, 2, snapshot.value(),
+      {facts.catalog}};
+  const auto prepared = core::PrepareComponentLifecycleAdmission(intent, candidate);
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  EXPECT_EQ(prepared.value().acceptance.component_lifecycle_generation,
+            core::ComponentLifecycleGeneration(2U));
+
+  // A naked journal-absence value cannot replace the genuine snapshot.
+  intent.apply_generation_selection = selected.value();
+  EXPECT_FALSE(intent.locally_valid());
+  const auto qualified = journal.ReadApplyComponentGenerationSelection(
+      owner.value().request_owner_epoch, facts.component->controllable_component_id,
+      core::ApplyComponentQualifiedPredecessorDTO{
+          snapshot.value().component_lifecycle_generation, snapshot.value().snapshot_digest});
+  ASSERT_TRUE(qualified.ok()) << qualified.error().message;
+  EXPECT_FALSE(qualified.value().predecessor_generation);
+  EXPECT_EQ(qualified.value().candidate_generation, core::ComponentLifecycleGeneration(2U));
+  ASSERT_TRUE(qualified.value().owner_qualified_predecessor);
+  EXPECT_EQ(qualified.value().owner_qualified_predecessor->snapshot_digest,
+            snapshot.value().snapshot_digest);
+  intent.apply_generation_selection = qualified.value();
+  EXPECT_TRUE(intent.locally_valid());
+  EXPECT_FALSE(core::PrepareComponentLifecycleAdmission(intent, candidate).ok());
+  EXPECT_EQ(snapshot.value().component_lifecycle_generation,
+            core::ComponentLifecycleGeneration(1U));
+  EXPECT_EQ(journal.ReadApplyComponentGenerationSelection(
+                owner.value().request_owner_epoch,
+                facts.component->controllable_component_id).value(), selected.value());
+}
+#endif
 
 TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
        UsesOneAtomicDurableLifecycleAndActiveConfigurationReadback) {

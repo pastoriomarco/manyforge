@@ -249,6 +249,134 @@ TEST(KernelCellAdmissionOwner,
   EXPECT_TRUE(owner.AcquireCellAdmissionClaim(fresh).ok());
 }
 
+TEST(KernelCellAdmissionOwner, ApplyBringUpRequiresPositivePrivatePlanAndKeepsFaultClosed) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto owner = Owner(clock, journal, 16U, {}, [] { return true; });
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  auto intent = Intent(CellAdmissionClaimKindDTO::kManagerApply,
+                       owner.GetAuthoringAdmission().admission_generation, "apply.bring-up");
+  intent.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
+  intent.owner_transaction_id = "apply.bring-up.1";
+  EXPECT_FALSE(owner.AcquireCellAdmissionClaim(intent).ok());
+  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(intent, {}).ok());
+  const auto before = journal.sequence.load();
+  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(
+                        intent, [](const auto&, const auto&, const auto&) {
+                          return Result<void>::Err(ErrorCode::kInvalidRequest);
+                        })
+                   .ok());
+  EXPECT_EQ(journal.sequence.load(), before);
+
+  int validations = 0;
+  const CellAdmissionApplyBringUpValidator validate =
+      [&](const auto& checked, const auto& readiness, const auto& manager_epoch) {
+        ++validations;
+        EXPECT_EQ(checked, intent);
+        EXPECT_EQ(readiness, Ready());
+        EXPECT_EQ(manager_epoch, EmptyLivenessSet().manager_runtime_epoch);
+        return Result<void>::Ok();
+      };
+  const auto acquired = owner.AcquireApplyBringUpClaim(intent, validate);
+  ASSERT_TRUE(acquired.ok());
+  EXPECT_EQ(validations, 1);
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  const auto replay = owner.AcquireApplyBringUpClaim(intent, validate);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value(), acquired.value());
+  EXPECT_EQ(validations, 1);  // Replay observes the original claim, never a new effect.
+
+  auto competing = intent;
+  competing.request_id = RequestId("apply.bring-up.2");
+  competing.owner_transaction_id = "apply.bring-up.2";
+  competing.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
+  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(competing, validate).ok());
+  EXPECT_EQ(validations, 1);
+  const auto released = owner.ReleaseCellAdmissionClaim(Release(acquired.value()));
+  ASSERT_TRUE(released.ok());
+  EXPECT_FALSE(released.value().authoring_allowed);
+  competing.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
+  EXPECT_FALSE(owner.AcquireCellAdmissionClaim(competing).ok());
+}
+
+TEST(KernelCellAdmissionOwner, ApplyBringUpKeepsOtherExclusionsAndRefusesForeignClaimShape) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto owner = Owner(clock, journal);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  const CellAdmissionApplyBringUpValidator validate =
+      [](const auto&, const auto&, const auto&) { return Result<void>::Ok(); };
+  auto intent = Intent(CellAdmissionClaimKindDTO::kManagerApply,
+                       owner.GetAuthoringAdmission().admission_generation);
+  intent.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
+  auto foreign = intent;
+  foreign.claim_kind = CellAdmissionClaimKindDTO::kAuthoringMutation;
+  foreign.owner_role = CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(foreign, validate).ok());
+  auto scoped = intent;
+  scoped.scope.resources = {ResourceId("resource.1")};
+  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(scoped, validate).ok());
+  ASSERT_TRUE(owner.SetRouteRecoveryPending(true).ok());
+  intent.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
+  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(intent, validate).ok());
+  ASSERT_TRUE(owner.SetRouteRecoveryPending(false).ok());
+  intent.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
+  const auto ordinary = owner.AcquireCellAdmissionClaim(intent);
+  ASSERT_TRUE(ordinary.ok());
+  auto different = intent;
+  different.request_id = RequestId("different.apply");
+  different.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
+  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(different, validate).ok());
+}
+
+TEST(KernelCellAdmissionOwner, CleanApplyBringUpReleaseNeedsNoAdditionalReset) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto owner = Owner(clock, journal);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
+  auto intent = Intent(CellAdmissionClaimKindDTO::kManagerApply,
+                             owner.GetAuthoringAdmission().admission_generation);
+  intent.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
+  const auto acquired = owner.AcquireApplyBringUpClaim(
+      intent, [](const auto&, const auto&, const auto&) { return Result<void>::Ok(); });
+  ASSERT_TRUE(acquired.ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  const auto released = owner.ReleaseCellAdmissionClaim(Release(acquired.value()));
+  ASSERT_TRUE(released.ok());
+  EXPECT_TRUE(released.value().authoring_allowed);
+}
+
+TEST(KernelCellAdmissionOwner, ApplyBringUpCannotWaiveCurrentProgramAndOwnerDependencies) {
+  for (unsigned scenario = 0U; scenario != 7U; ++scenario) {
+    SCOPED_TRACE(scenario);
+    FixedClock clock;
+    AdmissionJournal journal;
+    auto owner = Owner(clock, journal);
+    auto readiness = Ready();
+    if (scenario == 0U) readiness.required_component_status_current = false;
+    if (scenario == 1U) readiness.deployment_status_current = false;
+    if (scenario == 2U) readiness.program_cycle_status_current = false;
+    if (scenario == 3U) readiness.unresolved_owner_count = 1U;
+    if (scenario == 4U) readiness.unsettled_effect_count = 1U;
+    if (scenario == 5U) {
+      readiness.program_cycle_status->state = ProgramCycleStateDTO::kStarting;
+      readiness.program_cycle_status->program_run_id = ProgramRunId("run.pending");
+    }
+    ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(readiness).ok());
+    auto intent = Intent(CellAdmissionClaimKindDTO::kManagerApply,
+                               owner.GetAuthoringAdmission().admission_generation);
+    intent.owner_epoch = scenario == 6U ? RequestOwnerEpoch("foreign.manager")
+                                      : EmptyLivenessSet().manager_owner_epoch;
+    unsigned validations = 0U;
+    const auto result = owner.AcquireApplyBringUpClaim(intent, [&](const auto&, const auto&, const auto&) {
+      ++validations;
+      return Result<void>::Ok();
+    });
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(validations, 0U);
+  }
+}
+
 TEST(KernelCellAdmissionOwner, RouteRecoveryBarrierSurvivesReadyUpdatesAndClaimSettlement) {
   FixedClock clock;
   AdmissionJournal journal;
@@ -1134,6 +1262,73 @@ TEST(KernelCellAdmissionOwner, CCLCRouteRecoveryRequiresExactOwnerOfferAndOneCon
     }
     EXPECT_FALSE(ValidateCellAdmissionClaimIntent(bad).ok()) << change;
   }
+}
+
+CellAdmissionClaimIntentDTO SelectedBringUpIntent(AdmissionGeneration generation) {
+  auto intent = RouteRecoveryIntent(generation);
+  intent.owner_transaction_id = "selected-lifecycle.1";
+  intent.scope.resources = {ResourceId("arm.joint"), ResourceId("gripper.position")};
+  intent.scope.configurations.push_back({ControlDomainId("gripper"), ActiveControlConfigurationId("tool.saved"),
+                                        ActiveControlConfigurationGeneration(2U)});
+  intent.intervention_evidence->offer_transaction_id = intent.owner_transaction_id;
+  return intent;
+}
+
+TEST(KernelCellAdmissionOwner, SelectedBringUpRequiresExactPrivateValidatorAndPhysicalScope) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto owner = Owner(clock, journal);
+  auto intent = SelectedBringUpIntent(owner.GetAuthoringAdmission().admission_generation);
+  ASSERT_TRUE(ValidateCellAdmissionClaimIntent(intent).ok());
+  EXPECT_FALSE(owner.AcquireSelectedBringUpClaim(intent, {}).ok());
+  EXPECT_FALSE(
+      owner
+          .AcquireRouteRecoveryClaim(
+              intent,
+              [](const auto&, const auto&) {
+                ADD_FAILURE()
+                    << "observation-only route recovery cannot validate a selected effect offer";
+                return Result<void>::Ok();
+              })
+          .ok());
+  for (int change = 0; change < 5; ++change) {
+    auto invalid = intent;
+    if (change == 0) invalid.scope.resources.clear();
+    if (change == 1) invalid.scope.configurations.clear();
+    if (change == 2) invalid.intervention_evidence->offer_digest = Digest('b');
+    if (change == 3)
+      invalid.intervention_evidence->offering_owner_epoch = RequestOwnerEpoch("foreign");
+    if (change == 4)
+      invalid.intervention_evidence->parent_program_cycle_claim_generation =
+          CellAdmissionClaimGeneration(1U);
+    EXPECT_FALSE(ValidateCellAdmissionClaimIntent(invalid).ok()) << change;
+  }
+  unsigned validated = 0;
+  const auto rejected = owner.AcquireSelectedBringUpClaim(intent, [&](const auto&, const auto&) {
+    ++validated;
+    return Result<void>::Err(ErrorDTO{"selected_not_current", "predecessor changed", {}});
+  });
+  EXPECT_FALSE(rejected.ok());
+  EXPECT_EQ(validated, 1U);
+  EXPECT_EQ(journal.sequence.load(), 0U);
+  const auto acquired =
+      owner.AcquireSelectedBringUpClaim(intent, [&](const auto& offered, const auto& parent) {
+        ++validated;
+        EXPECT_EQ(offered, intent);
+        EXPECT_FALSE(parent);
+        return Result<void>::Ok();
+      });
+  ASSERT_TRUE(acquired.ok()) << acquired.error().message;
+  EXPECT_EQ(validated, 2U);
+  EXPECT_EQ(journal.sequence.load(), 1U);
+  const auto replay = owner.AcquireSelectedBringUpClaim(intent, [&](const auto&, const auto&) {
+    ADD_FAILURE() << "exact replay must observe existing authority rather than retry an effect";
+    return Result<void>::Err(ErrorCode::kInternalError);
+  });
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value(), acquired.value());
+  EXPECT_EQ(journal.sequence.load(), 1U);
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
 }
 
 TEST(KernelCellAdmissionOwner, CCLCRouteRecoveryDoesNotGrantOrdinaryReadiness) {

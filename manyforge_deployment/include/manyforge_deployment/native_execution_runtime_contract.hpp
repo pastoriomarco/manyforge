@@ -48,7 +48,7 @@ inline constexpr std::string_view kLogicalSceneEndpointRoleId =
 inline constexpr std::string_view kImplementationId =
     "manyforge.native_execution_host";
 inline constexpr std::string_view kProcessAdapterContractId =
-    "manyforge.installed_native_target";
+    "manyforge.installed_execution_target";
 inline constexpr std::string_view kRetrievalContractId =
     "manyforge.retained_raw_artifact";
 inline constexpr std::string_view kStatusEndpointContractId =
@@ -155,8 +155,6 @@ struct Configuration final {
     std::string attach_frame;
     std::string tcp_frame;
     std::vector<std::string> auxiliary_frames;
-    // Absent unless an operator source is explicitly selected and qualified.
-    std::optional<std::int64_t> operator_confirmation_validity_ns;
 
     friend bool operator==(const GripperTargetConfiguration &,
                            const GripperTargetConfiguration &) = default;

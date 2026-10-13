@@ -284,8 +284,6 @@ public:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RecordProgramDiagnostic(manyforge::content_identity::CanonicalValue record);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
-  RecordGripperConfirmation(manyforge::content_identity::CanonicalValue record);
-  [[nodiscard]] manyforge::content_identity::CanonicalValue
   IngestOperationEvent(
       std::string source_owner_epoch, std::uint64_t source_sequence,
       std::string record_kind, std::optional<std::string> request_id,

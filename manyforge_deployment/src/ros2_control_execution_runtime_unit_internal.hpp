@@ -40,7 +40,7 @@ inline constexpr std::string_view
 inline constexpr std::string_view
     kRos2ControlExecutionRuntimeConfigurationSchemaRevision =
         "sha256:"
-        "d97e885428a83ece204fba2b318c1a048308a11a01a748849766138b9cbac5e7";
+        "c4e6e1a1418852f773520a2c3c02ffde66883e2dca3963a218bf28e2356ca16c";
 inline constexpr std::string_view kRos2ControlExecutionRuntimeRoleId =
     ros2_control_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view
@@ -89,6 +89,11 @@ void require_no_exclusive_ros_controller_topic_collision(
 
 [[nodiscard]] std::string ros2_control_execution_runtime_profile_document();
 [[nodiscard]] std::string ros2_control_execution_runtime_profile_revision();
+/// Preserve required nonempty rows for actual hosted membership at graph and
+/// retained-product qualification. Returns true for a host with no components.
+[[nodiscard]] bool require_ros2_control_execution_runtime_required_rows(
+    const core::CellGraphDTO &graph, const core::RuntimeUnitDTO &unit);
+
 [[nodiscard]] bool
 ros2_control_execution_runtime_configuration_is_qualified(
     const core::JsonObjectDTO &configuration) noexcept;

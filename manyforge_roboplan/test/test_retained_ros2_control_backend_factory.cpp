@@ -581,8 +581,10 @@ struct InitialRosInstallationFixture final {
                                {},
                                {}};
 
-  explicit InitialRosInstallationFixture(bool with_gripper = true,
-                                         bool component_local_gripper = false)
+  explicit InitialRosInstallationFixture(
+      bool with_gripper = true, bool component_local_gripper = false,
+      const std::optional<core::SelectedControllerOccurrenceDTO>
+          &successor_occurrence = std::nullopt)
       : include_gripper(with_gripper) {
     if (component_local_gripper) {
       auto value = tool.value();
@@ -636,7 +638,8 @@ struct InitialRosInstallationFixture final {
               test_participant_config());
         },
         std::move(owned_gripper), motion,
-        include_gripper ? std::optional(tool) : std::nullopt);
+        include_gripper ? std::optional(tool) : std::nullopt,
+        successor_occurrence);
     if (!bound.ok())
       throw std::logic_error("initial ROS fixture binding failed: " +
                              bound.error().message);
@@ -675,6 +678,78 @@ struct InitialRosInstallationFixture final {
         nullptr);
   }
 };
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     SelectedOccurrenceKeepsArmAndGripperGenerationsIndependent) {
+  const core::SelectedControllerOccurrenceDTO initial{
+      core::ExecutionBindingEpoch(4U),
+      {{core::ControlDomainId("domain.arm"), 7U},
+       {core::ControlDomainId("domain.gripper"), 13U}}};
+  InitialRosInstallationFixture predecessor(true, false, initial);
+  const auto predecessor_port = predecessor.handle->current_port();
+  const auto owned = predecessor.handle->ReadOwnedControllerOccurrence();
+  EXPECT_EQ(owned, initial);
+  const auto next = core::ComputeSelectedControllerSuccessorOccurrence(
+      owned,
+      {core::ControlDomainId("domain.arm"),
+       core::ControlDomainId("domain.gripper")},
+      true);
+  ASSERT_TRUE(next.ok());
+  InitialRosInstallationFixture successor(true, false, next.value());
+  EXPECT_EQ(successor.handle->current_port()->ReadReadiness().binding_epoch,
+            core::ExecutionBindingEpoch(5U));
+  EXPECT_EQ(successor.handle->ReadOwnedControllerOccurrence(), next.value());
+  for (const auto &domain : next.value().domains) {
+    const auto first = successor.handle->ReadLifecycleSnapshot(
+        domain.control_domain_id, successor.clock.now());
+    ASSERT_TRUE(first.ok());
+    EXPECT_EQ(first.value().source_generation, domain.observation_generation);
+    const auto repeated = successor.handle->ReadLifecycleSnapshot(
+        domain.control_domain_id, successor.clock.now());
+    ASSERT_TRUE(repeated.ok());
+    EXPECT_EQ(repeated.value().source_generation,
+              first.value().source_generation);
+  }
+  EXPECT_EQ(predecessor.handle->current_port(), predecessor_port);
+  EXPECT_EQ(predecessor.handle->ReadOwnedControllerOccurrence(), owned);
+  EXPECT_TRUE(predecessor.handle->OwnsBackend(
+      predecessor.backend, predecessor.motion, predecessor.tool));
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     SelectedOccurrenceUsesExactChangedGripperMembership) {
+  InitialRosInstallationFixture arm_only(false);
+  const auto added = core::ComputeSelectedControllerSuccessorOccurrence(
+      arm_only.handle->ReadOwnedControllerOccurrence(),
+      {core::ControlDomainId("domain.arm"),
+       core::ControlDomainId("domain.gripper")},
+      true);
+  ASSERT_TRUE(added.ok());
+  InitialRosInstallationFixture with_gripper(true, false, added.value());
+  EXPECT_EQ(with_gripper.handle->ReadOwnedControllerOccurrence(),
+            added.value());
+  const auto gripper = with_gripper.handle->ReadLifecycleSnapshot(
+      core::ControlDomainId("domain.gripper"), with_gripper.clock.now());
+  ASSERT_TRUE(gripper.ok());
+  EXPECT_EQ(gripper.value().source_generation, 1U);
+  const auto removed = core::ComputeSelectedControllerSuccessorOccurrence(
+      with_gripper.handle->ReadOwnedControllerOccurrence(),
+      {core::ControlDomainId("domain.arm")}, true);
+  ASSERT_TRUE(removed.ok());
+  InitialRosInstallationFixture successor(false, false, removed.value());
+  EXPECT_EQ(successor.handle->ReadOwnedControllerOccurrence(), removed.value());
+  EXPECT_FALSE(
+      successor.handle
+          ->ReadLifecycleSnapshot(core::ControlDomainId("domain.gripper"),
+                                  successor.clock.now())
+          .ok());
+  EXPECT_FALSE(successor.handle->OwnsBackend(successor.backend,
+                                             successor.motion, successor.tool));
+  EXPECT_EQ(arm_only.handle->ReadOwnedControllerOccurrence().domains.size(),
+            1U);
+  EXPECT_EQ(with_gripper.handle->ReadOwnedControllerOccurrence().domains.size(),
+            2U);
+}
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      GripperlessReceiptRequiresOnlyItsExactMotionParticipant) {
@@ -1122,6 +1197,11 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_EQ(config.observed_state_authority_profile_id,
             "manyforge.commanded_simulation");
   EXPECT_FALSE(config.isaac_guard.has_value());
+  ASSERT_TRUE(config.arm.gripper_controller.has_value());
+  EXPECT_EQ(*config.arm.gripper_controller,
+            (RetainedRos2ControlArmController{
+                "/manyforge/robot_1/controller_manager",
+                "lite_gripper_controller", "MockLite6LiteGripperSystem"}));
   ASSERT_TRUE(config.gripper.has_value());
   EXPECT_EQ(config.gripper->transport_kind, "ros_gripper_command");
   EXPECT_EQ(config.gripper->action_name,
@@ -1159,6 +1239,13 @@ TEST(RetainedRos2ControlBackendFactoryTest,
     EXPECT_EQ(config.participant.stop.hard_stop_completion_timeout_ns,
               500'000'000)
         << profile;
+    ASSERT_TRUE(config.arm.gripper_controller.has_value());
+    EXPECT_EQ(config.arm.gripper_controller->controller_manager,
+              config.arm.controller.controller_manager);
+    EXPECT_EQ(config.arm.gripper_controller->controller_name,
+              "robotiq_gripper_controller");
+    EXPECT_EQ(config.arm.gripper_controller->hardware_component_name,
+              config.arm.controller.hardware_component_name);
     ASSERT_TRUE(config.gripper.has_value());
     EXPECT_EQ(config.gripper->action_name,
               "/manyforge/robot_1/robotiq_gripper_controller/gripper_cmd");
@@ -1169,6 +1256,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
       mock_runtime_configuration("ur5_roboplan"), commanded_binding(),
       std::nullopt, kMockCancel);
   EXPECT_FALSE(ur5.gripper.has_value());
+  EXPECT_FALSE(ur5.arm.gripper_controller.has_value());
   EXPECT_EQ(ur5.arm.controller.hardware_component_name, "MockUR5System");
   EXPECT_EQ(ur5.participant.stop.hard_stop_completion_timeout_ns, 500'000'000);
 }

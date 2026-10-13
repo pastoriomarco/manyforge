@@ -5,6 +5,7 @@
 #include <manyforge_component_manager/runtime_observation.hpp>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/types/active_bundle_publication.hpp>
+#include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -111,11 +112,14 @@ int main(int argc, char **argv) {
     const auto publication_root = ParsePublicationRoot(argc, argv);
     const auto bundle =
         manyforge::headless::test::LoadAssistantAuthoringBundle();
+    const manyforge::deployment::FilesystemCanonicalEmptyRetainedBundleSource canonical_source(
+        MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+    const auto canonical_admission = canonical_source.load_verified();
     component_manager::SqliteManagerApplyJournal apply_journal(
         publication_root / "assistant-authoring-test-apply.sqlite3",
         bundle->value().cell_graph.cell_id);
     const auto payload = headless::BuildManagerSourcePayload(
-        *bundle, RuntimeSelection(*bundle), apply_journal,
+        *bundle, canonical_admission, RuntimeSelection(*bundle), apply_journal,
         headless::ManagerApplyMutationAvailability::kKernelOwnerUnavailable);
     const auto observed_at_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(

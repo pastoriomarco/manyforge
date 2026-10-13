@@ -77,8 +77,9 @@ void ValidateManagerPayload(const CanonicalValue &payload,
   Require(RequiredString(payload, "cell_id") == cell_id,
           "Manager source payload belongs to a different cell");
   const auto &active = RequiredMember(payload, "active");
-  Require(active.is_object() && active.as_object().size() == 4U,
+  Require(active.is_object() && active.as_object().size() == 5U,
           "Manager active payload is not the closed v1 shape");
+  static_cast<void>(RequiredBool(active, "canonical_empty"));
   static_cast<void>(RequiredString(active, "graph_revision"));
   static_cast<void>(RequiredString(active, "retained_bundle_id"));
   Require(RequiredMember(active, "cell_graph").is_object(),

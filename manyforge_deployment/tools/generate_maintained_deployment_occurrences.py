@@ -46,13 +46,13 @@ NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.native_execution.v1"
 )
 NATIVE_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:6b540dac39434e05a2cb5da209206e2105b824b9f56704a74f0d88f327944689"
+    "sha256:97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:d97e885428a83ece204fba2b318c1a048308a11a01a748849766138b9cbac5e7"
+    "sha256:c4e6e1a1418852f773520a2c3c02ffde66883e2dca3963a218bf28e2356ca16c"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -1582,7 +1582,7 @@ def lite6_lifecycle_identity_header(
 def controller_goal_cancel_stop_policy() -> dict[str, Any]:
     value = {
         "api_version": "manyforge.stop_evidence_policy.v2",
-        "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
+        "stop_evidence_policy_id": "manyforge.controller_goal_terminal",
         "disposition": "stoppable",
         "containment_granularity": "resource",
         "escalation_stages": [
@@ -1735,6 +1735,16 @@ def motion_controlled_stop_policy() -> dict[str, Any]:
             },
         ],
     }
+    # Preserve the qualified hard floor's scope and evidence. This prepared
+    # row realizes old-main's direct cancel when no fault profile is authored.
+    cancel_stage = copy.deepcopy(value["escalation_stages"][-1])
+    cancel_stage["stop_escalation_stage_id"] = "runtime_collision_controller_goal_cancel"
+    cancel_stage["stage_kind"] = "controlled_fallback"
+    cancel_stage["containment_command"] = {
+        "command": {"command_kind": "controller_goal_cancel"},
+    }
+    cancel_stage["evidence_requirements"][0]["evidence_item_id"] = "runtime_collision_cancel_rest"
+    value["escalation_stages"].insert(1, cancel_stage)
     return revisioned_document(
         value,
         domain="catalog-record-revision/stop_evidence_policy",

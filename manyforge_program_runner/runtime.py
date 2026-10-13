@@ -1449,14 +1449,6 @@ class ProgramRuntime:
             # Only the Kernel-selected held tasks may be retired; the owner
             # rechecks the exact capture and keeps all Program holds intact.
             "program_manual_handover": cycle.state == "running",
-            # Evidence input remains available while a Program waits for it.
-            # The native owner decides exact command/source/CAS eligibility.
-            "gripper_confirm": cycle.state
-            in {
-                "idle_after_reset",
-                "running",
-                "terminal_awaiting_reset",
-            },
             # These are coarse lifecycle prerequisites, not target permission.
             # During a Program, shared ingress requires exact native manual
             # identity/context; the Kernel retains final admission authority.

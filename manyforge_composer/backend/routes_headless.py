@@ -348,6 +348,15 @@ def create_headless_router(
     ) -> dict[str, Any]:
         return _call(lambda: client.component_lifecycle_status(transaction_id))
 
+    @router.post("/api/cclc/lifecycle/requests/result")
+    def cclc_lifecycle_request_result(
+        body: ComponentLifecycleRequest,
+    ) -> dict[str, Any]:
+        payload = body.model_dump(mode="json")
+        if payload.get("program_node_evidence") is None:
+            payload.pop("program_node_evidence", None)
+        return _call(lambda: client.component_lifecycle_request_result(payload))
+
     @router.post("/api/cclc/routes/requests")
     def cclc_route_submit(body: RouteSelectionRequest) -> dict[str, Any]:
         return _call(

@@ -40,7 +40,6 @@ struct Arguments final {
   std::filesystem::path package_root;
   std::filesystem::path metadata_path;
   bool assistant_native;
-  bool operator_confirmation;
   bool gripper_only;
 };
 
@@ -91,15 +90,13 @@ void WriteDeploymentSource(
       std::string_view(argv[4]).empty() ||
       (argc == 7 && (std::string_view(argv[5]) != "--profile" ||
                      (std::string_view(argv[6]) != "assistant-native" &&
-                      std::string_view(argv[6]) != "operator-confirmation" &&
                       std::string_view(argv[6]) != "gripper-only")))) {
     throw std::invalid_argument(
         "usage: generate_manager_apply_package --package-root <path> "
-        "--metadata <path> [--profile assistant-native|operator-confirmation|gripper-only]");
+        "--metadata <path> [--profile assistant-native|gripper-only]");
   }
   return {argv[2], argv[4],
           argc == 7 && std::string_view(argv[6]) == "assistant-native",
-          argc == 7 && std::string_view(argv[6]) == "operator-confirmation",
           argc == 7 && std::string_view(argv[6]) == "gripper-only"};
 }
 
@@ -207,7 +204,6 @@ void WriteMetadata(
 }
 
 [[nodiscard]] std::string ProgramBytes(const deployment::RetainedBundle &bundle,
-                                       const bool operator_confirmation,
                                        const bool initial_scene,
                                        const bool gripper_only) {
   const auto arm_binding =
@@ -309,19 +305,17 @@ void WriteMetadata(
             deployment::CanonicalValue(deployment::CanonicalValue::Object{})},
        })},
   });
-  if (operator_confirmation || gripper_only) {
+  if (gripper_only) {
     // One explicit qualified test source; the maintained default is unchanged.
     auto fields = root.as_object();
     for (auto &[field, value] : fields) {
       if (field == "target_roles") {
         auto targets = value.as_object();
-        if (gripper_only) {
-          targets.erase(std::remove_if(targets.begin(), targets.end(),
-                                       [](const auto &entry) {
-                                         return entry.first == "arm";
-                                       }),
-                        targets.end());
-        }
+        targets.erase(std::remove_if(targets.begin(), targets.end(),
+                                     [](const auto &entry) {
+                                       return entry.first == "arm";
+                                     }),
+                      targets.end());
         targets.emplace_back("gripper",
                              deployment::parse_strict_json_model_yaml(R"({
           "component_role":"robot",
@@ -331,28 +325,7 @@ void WriteMetadata(
           "required_collision_body_roles":["gripper_collision"], "required_model_roles":["arm_model"]
         })")
                                  .root());
-        if (operator_confirmation) {
-          auto gripper_role = targets.back().second.as_object();
-          for (auto &[name, item] : gripper_role) {
-            if (name != "required_capabilities") continue;
-            auto capabilities = item.as_array();
-            capabilities.emplace_back(deployment::parse_strict_json_model_yaml(R"({"capability_id":"tool.gripper.confirmation.operator","parameters":{},"disposition":"required"})").root());
-            capabilities.emplace_back(deployment::parse_strict_json_model_yaml(R"({"capability_id":"tool.gripper.feedback","parameters":{},"disposition":"required"})").root());
-            item = deployment::CanonicalValue(std::move(capabilities));
-          }
-          targets.back().second = deployment::CanonicalValue(std::move(gripper_role));
-        }
         value = deployment::CanonicalValue(std::move(targets));
-      } else if (field == "tree" && operator_confirmation) {
-        value = deployment::parse_strict_json_model_yaml(R"({
-          "node_id":"sequence","instance_id":"root","parameters":{},"children":[
-            {"node_id":"gripper.command_position","instance_id":"close_gripper",
-             "parameters":{"target_role":"gripper","position":{"kind":"linear_m","value_m":0.0},
-                           "command_duration_s":0.1},"children":[]},
-            {"node_id":"gripper.wait_for_status","instance_id":"confirm_grasp",
-             "parameters":{"target_role":"gripper","expected_state":"grasp_confirmed","timeout_s":10.0},
-             "children":[]}]})")
-                    .root();
       }
     }
     root = deployment::CanonicalValue(std::move(fields));
@@ -376,7 +349,6 @@ void WriteMetadata(
 [[nodiscard]] ProgramPublication PublishAssistantNativeProgram(
     const std::filesystem::path &package_root,
     const std::shared_ptr<const deployment::RetainedBundle> &bundle,
-    const bool operator_confirmation = false,
     const bool initial_scene = false,
     const bool gripper_only = false) {
   if (bundle == nullptr ||
@@ -395,8 +367,7 @@ void WriteMetadata(
     throw std::logic_error("assistant-native model map did not reopen");
   }
   const auto program = deployment::verify_program_binding_contract(
-      ProgramBytes(*bundle, operator_confirmation, initial_scene,
-                   gripper_only), *bundle);
+      ProgramBytes(*bundle, initial_scene, gripper_only), *bundle);
   deployment::FilesystemCatalogArtifactStore catalogs(package_root);
   using Value = deployment::CanonicalValue;
   Value::Array targets;
@@ -407,7 +378,7 @@ void WriteMetadata(
         {"target_role_id", Value("arm")},
     });
   }
-  if (operator_confirmation || gripper_only) {
+  if (gripper_only) {
     targets.emplace_back(Value::Object{
         {"command_target_id",
          Value(std::string(deployment::test::kLite6GripperTargetId))},
@@ -557,8 +528,7 @@ int main(int argc, char **argv) {
             : deployment::test::
                   make_lite6_native_cclc_product_retention_fixture(
                       arm_lifecycle_semantic.value().value(),
-                      gripper_lifecycle_semantic.value().value(),
-                      arguments.operator_confirmation);
+                      gripper_lifecycle_semantic.value().value());
     if (!source.native_execution_runtime_profile.has_value()) {
       throw std::logic_error(
           "Manager Apply fixture lacks its native runtime profile");
@@ -621,11 +591,10 @@ int main(int argc, char **argv) {
         deployment::detail::publish_cell_scoped_canonical_empty_admission(
             arguments.package_root, admission_filename, *predecessor);
 
-    if (arguments.assistant_native || arguments.operator_confirmation ||
-        arguments.gripper_only) {
+    if (arguments.assistant_native || arguments.gripper_only) {
       const auto program = PublishAssistantNativeProgram(
-          arguments.package_root, physical_candidate,
-          arguments.operator_confirmation, false, arguments.gripper_only);
+          arguments.package_root, physical_candidate, false,
+          arguments.gripper_only);
       WriteAssistantNativeMetadata(
           arguments.metadata_path, admission, *physical_candidate, program,
           admission_filename,
@@ -637,7 +606,7 @@ int main(int argc, char **argv) {
     }
 
     const auto program = PublishAssistantNativeProgram(
-        arguments.package_root, physical_candidate, false, true, false);
+        arguments.package_root, physical_candidate, true, false);
     WriteMetadata(arguments.metadata_path, admission, *candidate,
                   *physical_candidate, program, admission_filename);
     return 0;

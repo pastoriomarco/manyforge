@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-schema_revision: sha256:d97e885428a83ece204fba2b318c1a048308a11a01a748849766138b9cbac5e7
+schema_revision: sha256:c4e6e1a1418852f773520a2c3c02ffde66883e2dca3963a218bf28e2356ca16c
 schema_purpose: value
 root_definition_id: ros2_control_execution_runtime_configuration
 definitions:
@@ -27,7 +27,7 @@ definitions:
             kind: absent
           value_schema:
             kind: array
-            min_items: 1
+            min_items: 0
             max_items: 256
             collection:
               kind: keyed_record_set
@@ -113,7 +113,7 @@ definitions:
             kind: absent
           value_schema:
             kind: array
-            min_items: 1
+            min_items: 0
             max_items: 256
             collection:
               kind: ordered
@@ -127,7 +127,7 @@ definitions:
             kind: absent
           value_schema:
             kind: array
-            min_items: 1
+            min_items: 0
             max_items: 256
             collection:
               kind: keyed_record_set
@@ -379,18 +379,6 @@ definitions:
                         value: 0
                       - kind: maximum
                         value: 60
-                - field_id: operator_confirmation_validity_ns
-                  presence: optional
-                  default:
-                    kind: absent
-                  value_schema:
-                    kind: scalar
-                    scalar_type: integer
-                    constraints:
-                      - kind: minimum
-                        value: 1
-                      - kind: maximum
-                        value: 3600000000000
                 - field_id: touch_links
                   presence: required
                   default:

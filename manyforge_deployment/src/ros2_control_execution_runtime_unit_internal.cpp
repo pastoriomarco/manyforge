@@ -472,6 +472,32 @@ void require_no_exclusive_ros_controller_topic_collision(
   }
 }
 
+bool require_ros2_control_execution_runtime_required_rows(
+    const core::CellGraphDTO &graph, const core::RuntimeUnitDTO &unit) {
+  const bool empty_host = std::none_of(
+      graph.controllable_components.begin(), graph.controllable_components.end(),
+      [&](const auto &component) {
+        return std::find(component.runtime_unit_ids.begin(),
+                         component.runtime_unit_ids.end(), unit.runtime_unit_id) !=
+               component.runtime_unit_ids.end();
+      });
+  if (!empty_host) {
+    for (const std::string_view field : {"controller_profiles",
+                                         "initial_joint_positions_rad",
+                                         "motion_target_limits"}) {
+      const auto member = unit.configuration.find(field);
+      const auto *rows = member == unit.configuration.end()
+                             ? nullptr
+                             : std::get_if<core::JsonValueDTO::Array>(&member->second.value);
+      if (rows == nullptr || rows->empty()) {
+        fail_retained_bundle("ros2_control runtime requires nonempty " +
+                             std::string(field) + " for hosted components");
+      }
+    }
+  }
+  return empty_host;
+}
+
 bool ros2_control_execution_runtime_configuration_is_qualified(
     const core::JsonObjectDTO &configuration) noexcept {
   try {
@@ -650,6 +676,8 @@ void require_ros2_control_execution_runtime_product_matches_retained_bundle(
     fail_retained_bundle("ros2_control execution manifest differs from its "
                          "retained graph/profile");
   }
+  static_cast<void>(require_ros2_control_execution_runtime_required_rows(
+      retained_bundle.cell_graph, unit));
   const auto &group =
       require_runtime_product_group(retained_bundle, runtime_unit_id);
   const auto &product = group.products.front();
@@ -835,6 +863,61 @@ decode_fault_stop_profile(const core::JsonValueDTO &encoded) {
 
 } // namespace
 
+CanonicalValue empty_host_configuration(
+    const std::optional<std::string> &isaac_world) {
+  CanonicalValue::Object configuration{
+      {"mode", CanonicalValue("commanded_sim")},
+      {"planner_rng_seed", CanonicalValue(12345.0)},
+      {"execution_tick_hz", CanonicalValue(100.0)},
+      {"collision_monitor_period_ms", CanonicalValue(50.0)},
+      {"initial_joint_positions_rad", CanonicalValue(CanonicalValue::Array{})},
+      {"motion_target_limits", CanonicalValue(CanonicalValue::Array{})},
+      {"controller_profiles", CanonicalValue(CanonicalValue::Array{})},
+  };
+  if (isaac_world.has_value()) {
+    configuration.emplace_back("isaac_world", CanonicalValue(*isaac_world));
+  }
+  return CanonicalValue(std::move(configuration));
+}
+
+CanonicalValue empty_host_deployment(
+    const core::CellId &cell_id, const CanonicalValue &runtime_profile_reference,
+    std::string_view deployment_id, std::string_view name,
+    const std::optional<std::string> &isaac_world) {
+  using Object = CanonicalValue::Object;
+  using Array = CanonicalValue::Array;
+  const auto *profile = runtime_profile_reference.find_object_member("record_id");
+  const auto *revision = runtime_profile_reference.find_object_member("record_revision");
+  if (profile == nullptr || revision == nullptr || !profile->is_string() ||
+      profile->as_string() != kRuntimeProfileId || !revision->is_string()) {
+    throw RetainedBundleError("empty ROS Deployment requires its qualified runtime profile");
+  }
+  return CanonicalValue(Object{
+      {"api_version", CanonicalValue("manyforge.deployment.v1")},
+      {"deployment_artifact_id", CanonicalValue(std::string(deployment_id))},
+      {"deployment_revision", CanonicalValue("sha256:" + std::string(64U, '0'))},
+      {"cell_id", CanonicalValue(cell_id.value())},
+      {"name", CanonicalValue(std::string(name))},
+      {"catalogs", CanonicalValue(Object{{"records", CanonicalValue(Array{runtime_profile_reference})}})},
+      {"graph", CanonicalValue(Object{
+          {"runtime_units", CanonicalValue(Array{CanonicalValue(Object{
+              {"runtime_unit_id", CanonicalValue(std::string(kCellHostRuntimeUnitId))},
+              {"runtime_profile_id", *profile},
+              {"runtime_profile_revision", *revision},
+              {"dependency_runtime_unit_ids", CanonicalValue(Array{})},
+              {"configuration", empty_host_configuration(isaac_world)},
+          })})},
+          {"model_instances", CanonicalValue(Array{})},
+          {"controllable_components", CanonicalValue(Array{})},
+          {"control_domains", CanonicalValue(Array{})},
+          {"control_bindings", CanonicalValue(Array{})},
+          {"component_attachments", CanonicalValue(Array{})},
+      })},
+      {"desired_control_configurations", CanonicalValue(Array{})},
+      {"capability_provider_bindings", CanonicalValue(Array{})},
+  });
+}
+
 Configuration
 require_configuration(const RetainedBundle &retained_bundle,
                       const core::RuntimeUnitId &runtime_unit_id) {
@@ -915,13 +998,18 @@ require_configuration(const RetainedBundle &retained_bundle,
     return static_cast<std::uint32_t>(*number);
   };
 
+  const bool empty_host =
+      detail::require_ros2_control_execution_runtime_required_rows(
+          retained_bundle.value().cell_graph, unit);
+
   const auto *mode = std::get_if<std::string>(&require_member("mode").value);
   const auto *profiles = std::get_if<core::JsonValueDTO::Array>(
       &require_member("controller_profiles").value);
   const auto *positions = std::get_if<core::JsonValueDTO::Array>(
       &require_member("initial_joint_positions_rad").value);
   if (mode == nullptr || *mode != "commanded_sim" || profiles == nullptr ||
-      profiles->empty() || positions == nullptr || positions->empty()) {
+      positions == nullptr ||
+      (empty_host && (!profiles->empty() || !positions->empty()))) {
     throw RetainedBundleError("ros2_control runtime configuration has an "
                               "unsupported mode, profile, or initial state");
   }
@@ -998,7 +1086,8 @@ require_configuration(const RetainedBundle &retained_bundle,
             });
   const auto *motion_limits = std::get_if<core::JsonValueDTO::Array>(
       &require_member("motion_target_limits").value);
-  if (motion_limits == nullptr || motion_limits->empty()) {
+  if (motion_limits == nullptr ||
+      (empty_host && !motion_limits->empty())) {
     throw RetainedBundleError(
         "ros2_control runtime requires motion target limits");
   }

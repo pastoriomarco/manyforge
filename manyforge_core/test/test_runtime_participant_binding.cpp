@@ -1,9 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <manyforge_core/component_lifecycle_admission.hpp>
+#include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <optional>
 #include <string>
+
+#include "../src/component_lifecycle_journal_codec_internal.hpp"
 
 namespace {
 
@@ -65,6 +69,187 @@ using namespace manyforge::core;
       {},
       {RuntimeUnitEpochBindingDTO{RuntimeUnitId("runtime.native"),
                                   RuntimeEpoch("runtime-epoch.1")}}};
+}
+
+[[nodiscard]] RuntimeParticipantBindingDTO gripper_binding() {
+  auto value = valid_binding();
+  value.target_role_id = TargetRoleId("gripper");
+  value.command_target_id = CommandTargetId("gripper");
+  value.capability_id = CapabilityId("tool.gripper.command");
+  value.model_groups.clear();
+  value.resources = {{ResourceRoleId("fingers"), ResourceId("robot.gripper.logical_position"),
+                      std::nullopt, "robot.gripper.logical_position", CoordinateKind::kLinear}};
+  value.control_path->control_domain_id = ControlDomainId("domain.gripper");
+  value.control_path->control_binding_id = ControlBindingId("binding.gripper");
+  value.control_path->control_route_id = ControlRouteId("route.gripper");
+  value.control_path->active_control_configuration_id =
+      ActiveControlConfigurationId("active.gripper");
+  return value;
+}
+
+[[nodiscard]] SelectedComponentBringUpOfferDTO selected_offer(
+    std::vector<RuntimeParticipantBindingDTO> predecessor_bindings,
+    std::vector<RuntimeParticipantBindingDTO> candidates,
+    std::optional<std::string> request_reason = std::nullopt) {
+  const auto sha = [](char digit) { return "sha256:" + std::string(64U, digit); };
+  const ProjectionRevisionDTO revision{RetainedBundleId("bundle"),
+                                       GraphRevision("graph"),
+                                       {SceneId(sha('a')), 1U, ContentDigest(sha('b'))}};
+  const ActiveBundlePublicationReceiptDTO publication{
+      {BootstrapPublicationTransactionDTO{BootstrapId("boot"), BootstrapGeneration(1U)}, revision,
+       revision.retained_bundle_id, revision.graph_revision, std::nullopt,
+       ContentDigest("private")},
+      ActiveBundlePublicationGeneration(2U),
+      ContentDigest("pointer")};
+  ComponentLifecycleCurrentSnapshotDTO predecessor{ContentDigest("pending"),
+                                                   ControllableComponentId("robot.1"),
+                                                   ComponentLifecycleGeneration(3U),
+                                                   ComponentLifecycleStateDTO::kFaulted,
+                                                   publication,
+                                                   {},
+                                                   {}};
+  std::vector<DomainActiveControlConfigurationDTO> configurations;
+  for (const auto& binding : predecessor_bindings) {
+    const auto& path = *binding.control_path;
+    std::vector<ResourceId> resources;
+    for (const auto& resource : binding.resources) resources.push_back(resource.resource_id);
+    const ActiveControlConfigurationDTO active{
+        path.active_control_configuration_id,
+        path.control_domain_id,
+        path.control_domain_revision,
+        {{path.control_binding_id, path.control_binding_revision, path.control_route_id}},
+        path.activation_set_id,
+        path.controller_topology_id,
+        path.topology_revision,
+        path.provider_runtime_unit_id,
+        path.provider_runtime_epoch,
+        1U,
+        {},
+        path.active_control_configuration_generation,
+        ActiveControlConfigurationStateDTO::kReconciled};
+    predecessor.domains.push_back(
+        {path.control_domain_id,
+         path.control_domain_revision,
+         path.controller_topology_id,
+         path.topology_revision,
+         active,
+         {{path.control_binding_id, path.control_binding_revision, path.control_route_id}},
+         std::move(resources)});
+    predecessor.provider_occurrences.push_back(
+        {path.control_domain_id, path.control_domain_revision, path.provider_instance_id,
+         path.provider_manifest_id, path.provider_manifest_revision, path.provider_runtime_unit_id,
+         path.provider_runtime_epoch, ContentDigest(sha('c'))});
+    configurations.push_back({path.control_domain_id, path.active_control_configuration_id,
+                              path.active_control_configuration_generation});
+  }
+  const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(predecessor);
+  EXPECT_TRUE(digest.ok());
+  if (digest.ok()) predecessor.snapshot_digest = digest.value();
+  std::vector<ExpectedControlDomainRevisionDTO> expected_domains;
+  for (const auto& domain : predecessor.domains) {
+    const ExpectedActiveControlConfigurationDTO expected_active{
+        ExpectedActiveControlConfigurationPresenceDTO::kPresent,
+        domain.active_control_configuration->active_control_configuration_id,
+        domain.active_control_configuration->active_control_configuration_generation};
+    ExpectedControlDomainRevisionDTO expected_domain{
+        domain.control_domain_id,
+        domain.control_domain_revision,
+        domain.controller_topology_id,
+        domain.topology_revision,
+        expected_active,
+        domain.current_control_bindings};
+    expected_domains.push_back(std::move(expected_domain));
+  }
+  const ComponentLifecycleIntentDTO request{
+      {RequestId("bring-up"), RequestOwnerEpoch("cclc.owner"), "test", std::nullopt},
+      predecessor.controllable_component_id,
+      ComponentLifecycleIntentKindDTO::kEnable,
+      revision.graph_revision,
+      predecessor.component_lifecycle_generation,
+      std::move(expected_domains),
+      std::move(request_reason)};
+  const auto original_request_digest = SelectedComponentBringUpSemanticRequestDigest(
+      request, revision, ContentDigest(sha('d')), 100U, RuntimeUnitId("runtime.native"),
+      RuntimeEpoch("runtime-epoch.1"), RuntimeEpoch("manager.1"));
+  SelectedComponentBringUpOfferDTO offer{
+      {RequestId("bring-up"), RequestOwnerEpoch("cclc.owner"), "test", std::nullopt},
+      LifecycleTransactionId("selected-lifecycle.4"),
+      LifecycleTransactionGeneration(4U),
+      std::move(predecessor),
+      "incident.1",
+      {StopId("stop.1"), StopGeneration(2U), {}, std::nullopt},
+      revision,
+      ContentDigest(sha('d')),
+      100U,
+      std::move(candidates),
+      {{{}, RuntimeEpoch("manager.1")},
+       {RuntimeUnitId("runtime.native"), RuntimeEpoch("runtime-epoch.1"),
+        RequestOwnerEpoch("kernel.1"), ContentDigest(sha('e')),
+        ActiveBundlePublicationGeneration(2U)},
+       revision,
+       ContentDigest("pointer"),
+       1U,
+       ConfigurationFenceGeneration(1U),
+       std::move(configurations),
+       0U,
+       0U,
+       ContentDigest(sha('f'))},
+      original_request_digest};
+  const auto scope = SelectedComponentBringUpFenceScope(offer);
+  EXPECT_TRUE(scope.ok());
+  if (scope.ok()) offer.fence_admission.echoed_query.affected_scope = scope.value();
+  return offer;
+}
+
+TEST(SelectedBringUpScope,
+     AddedGripperHasCandidateOnlyDomainAndNoInventedPredecessorConfiguration) {
+  const auto offer = selected_offer({valid_binding()}, {valid_binding(), gripper_binding()});
+  const auto scope = SelectedComponentBringUpFenceScope(offer);
+  ASSERT_TRUE(scope.ok()) << scope.error().message;
+  ASSERT_EQ(scope.value().domains.size(), 2U);
+  EXPECT_EQ(scope.value().domains.back().control_domain_id, ControlDomainId("domain.gripper"));
+  EXPECT_FALSE(scope.value().domains.back().predecessor_control_domain_revision);
+  EXPECT_TRUE(scope.value().domains.back().candidate_control_domain_revision);
+  EXPECT_EQ(scope.value().resources.size(), 3U);
+  const auto admission = SelectedComponentBringUpAdmissionScope(offer);
+  ASSERT_TRUE(admission.ok());
+  ASSERT_EQ(admission.value().configurations.size(), 1U);
+  EXPECT_EQ(admission.value().configurations.front().control_domain_id,
+            ControlDomainId("domain.arm"));
+}
+
+TEST(SelectedBringUpScope, RemovedGripperRemainsFencedUntilItsExactPredecessorIsRetired) {
+  const auto offer = selected_offer({valid_binding(), gripper_binding()}, {valid_binding()});
+  const auto scope = SelectedComponentBringUpFenceScope(offer);
+  ASSERT_TRUE(scope.ok()) << scope.error().message;
+  ASSERT_EQ(scope.value().domains.size(), 2U);
+  EXPECT_TRUE(scope.value().domains.back().predecessor_control_domain_revision);
+  EXPECT_FALSE(scope.value().domains.back().candidate_control_domain_revision);
+  EXPECT_EQ(scope.value().resources.size(), 3U);
+  const auto admission = SelectedComponentBringUpAdmissionScope(offer);
+  ASSERT_TRUE(admission.ok());
+  EXPECT_EQ(admission.value().configurations.size(), 2U);
+}
+
+TEST(SelectedBringUpScope, RefusesForeignComponentAndConflictingCandidateRevision) {
+  auto offer = selected_offer({valid_binding()}, {valid_binding(), gripper_binding()});
+  offer.candidate_participants.back().controllable_component_id = ControllableComponentId("peer");
+  EXPECT_FALSE(SelectedComponentBringUpFenceScope(offer).ok());
+  offer.candidate_participants.back() = valid_binding();
+  offer.candidate_participants.back().control_path->control_domain_revision =
+      ControlDomainRevision("foreign-revision");
+  EXPECT_FALSE(SelectedComponentBringUpFenceScope(offer).ok());
+}
+
+TEST(SelectedBringUpScope, OriginalRequestDigestIsSealedByTheOwnerOfferProof) {
+  auto offer = selected_offer({valid_binding()}, {valid_binding()});
+  const auto changed =
+      selected_offer({valid_binding()}, {valid_binding()}, "operator changed selected settings");
+  ASSERT_NE(offer.original_request_payload_digest, changed.original_request_payload_digest);
+  const auto proof = detail::SelectedComponentBringUpSemanticOfferDigest(offer);
+  offer.original_request_payload_digest = changed.original_request_payload_digest;
+  EXPECT_EQ(offer, changed);
+  EXPECT_NE(detail::SelectedComponentBringUpSemanticOfferDigest(offer), proof);
 }
 
 TEST(RuntimeParticipantBindingTest, SealsExactControlPathRuntimeUnitEpochJoin) {

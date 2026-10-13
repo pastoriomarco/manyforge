@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
@@ -25,6 +26,11 @@ namespace manyforge::roboplan_backend {
 /// is generate_controller_robot_description().
 [[nodiscard]] IsaacControllerLane
 retained_isaac_controller_lane(std::string_view isaac_profile);
+
+/// The exact simulator topics the existing standalone scene barrier checks,
+/// from the same retained profile facts (no second profile table).
+[[nodiscard]] std::vector<std::string>
+retained_isaac_scene_required_topics(std::string_view isaac_profile);
 
 /// Expand one closed retained Isaac profile into the exact ROS execution
 /// configuration used by the installed execution host.

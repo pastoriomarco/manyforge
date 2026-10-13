@@ -13,8 +13,10 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <limits>
 #include <manyforge_component_manager/durable_store_set.hpp>
@@ -376,7 +378,8 @@ GripperOnlyManagerApplyFixtureMetadata ReadGripperOnlyManagerApplyFixtureMetadat
 
 class DaemonDirectory final {
 public:
-  DaemonDirectory() {
+  explicit DaemonDirectory(bool preserve_on_failure = false)
+      : preserve_on_failure_(preserve_on_failure) {
     auto pattern = (std::filesystem::temp_directory_path() /
                     "manyforge-headless-daemon-XXXXXX")
                        .string();
@@ -396,6 +399,13 @@ public:
   }
 
   ~DaemonDirectory() {
+    if (preserve_on_failure_ &&
+        (::testing::Test::HasFailure() || std::uncaught_exceptions() > initial_uncaught_exceptions_)) {
+      // One private tree per run. Never delete a previous failed run here.
+      std::cerr << "Manager process failure evidence retained at " << root_
+                << '\n';
+      return;
+    }
     std::error_code error;
     std::filesystem::remove_all(root_, error);
   }
@@ -452,6 +462,8 @@ public:
 private:
   std::vector<char> buffer_;
   std::filesystem::path root_;
+  bool preserve_on_failure_;
+  const int initial_uncaught_exceptions_{std::uncaught_exceptions()};
 };
 
 std::string SendCommand(const std::filesystem::path &path,
@@ -2625,6 +2637,7 @@ TEST(ManagerDaemonProcess,
     }
     return status;
   };
+  std::string preserved_scene_snapshot;
   std::string first_manager_epoch;
   std::string request;
   {
@@ -2639,8 +2652,15 @@ TEST(ManagerDaemonProcess,
     AtomicSourceSnapshotChannel scene_runtime_source(
         directory.publication_root(), "scene-runtime-source.json");
     const auto before = manager_source.Read();
+    const auto scene_before = scene_source.Read();
     const auto scene_runtime_before = scene_runtime_source.Read();
     ASSERT_TRUE(before.has_value());
+    ASSERT_TRUE(scene_before.has_value());
+    const auto *const predecessor_snapshot =
+        scene_before->payload.find_object_member("snapshot");
+    ASSERT_NE(predecessor_snapshot, nullptr);
+    ASSERT_TRUE(predecessor_snapshot->is_object());
+    preserved_scene_snapshot = content_identity::canonical_json(*predecessor_snapshot);
     ASSERT_TRUE(scene_runtime_before.has_value());
     first_manager_epoch = before->source_owner_epoch;
     EXPECT_NE(content_identity::canonical_json(before->payload)
@@ -2690,19 +2710,18 @@ TEST(ManagerDaemonProcess,
     // Apply status, the logical Scene, and the Scene-runtime identity are
     // separate owner publications. The Apply worker may publish its terminal
     // record before the Manager's bounded observation cycle has refreshed the
-    // latter two projections. Wait for that exact candidate identity instead
-    // of sampling the Scene-runtime source in the small publication window.
+    // latter two projections. Configuration-only Apply preserves the actual
+    // logical Scene; wait for the candidate runtime with that exact snapshot.
     const auto projection_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (std::chrono::steady_clock::now() < projection_deadline) {
       const auto observed_scene = scene_source.Read();
       const auto observed_scene_runtime = scene_runtime_source.Read();
       if (observed_scene.has_value() && observed_scene_runtime.has_value() &&
-          content_identity::canonical_json(observed_scene->payload)
-                  .find(fixture.physical_candidate_retained_bundle_id) !=
-              std::string::npos &&
-          content_identity::canonical_json(observed_scene->payload)
-                  .find("apply_fixture_marker") != std::string::npos &&
+          observed_scene->payload.find_object_member("snapshot") != nullptr &&
+          content_identity::canonical_json(
+              *observed_scene->payload.find_object_member("snapshot")) ==
+              preserved_scene_snapshot &&
           content_identity::canonical_json(observed_scene_runtime->payload)
                   .find(fixture.physical_candidate_retained_bundle_id) !=
               std::string::npos) {
@@ -2765,8 +2784,10 @@ TEST(ManagerDaemonProcess,
     EXPECT_NE(content_identity::canonical_json(scene_after->payload)
                   .find(fixture.physical_candidate_retained_bundle_id),
               std::string::npos);
-    EXPECT_NE(content_identity::canonical_json(scene_after->payload)
-                  .find("apply_fixture_marker"),
+    const auto *const applied_snapshot = scene_after->payload.find_object_member("snapshot");
+    ASSERT_NE(applied_snapshot, nullptr);
+    EXPECT_EQ(content_identity::canonical_json(*applied_snapshot), preserved_scene_snapshot);
+    EXPECT_EQ(content_identity::canonical_json(scene_after->payload).find("apply_fixture_marker"),
               std::string::npos);
     EXPECT_NE(content_identity::canonical_json(scene_runtime_after->payload)
                   .find(fixture.physical_candidate_retained_bundle_id),
@@ -2806,8 +2827,10 @@ TEST(ManagerDaemonProcess,
   EXPECT_NE(content_identity::canonical_json(scene_runtime_recovered->payload)
                 .find(fixture.physical_candidate_retained_bundle_id),
             std::string::npos);
-  EXPECT_NE(content_identity::canonical_json(recovered_scene->payload)
-                .find("apply_fixture_marker"),
+  const auto *const recovered_snapshot = recovered_scene->payload.find_object_member("snapshot");
+  ASSERT_NE(recovered_snapshot, nullptr);
+  EXPECT_EQ(content_identity::canonical_json(*recovered_snapshot), preserved_scene_snapshot);
+  EXPECT_EQ(content_identity::canonical_json(recovered_scene->payload).find("apply_fixture_marker"),
             std::string::npos);
   const auto recovered_execution_status = wait_execution_response();
   // Reopening the Manager may read completed Apply evidence, but it must not
@@ -3006,6 +3029,629 @@ TEST(ManagerDaemonProcess,
   EXPECT_EQ(WEXITSTATUS(stopped), 0);
 }
 #endif
+
+TEST(ManagerDaemonProcess,
+     EmptyRosApplyConfiguresInactiveMockThenExplicitActivation) {
+#if !defined(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST)
+  if (std::getenv("MANYFORGE_ROS2_CONTROL_EXECUTION_HOST") != nullptr) {
+    FAIL() << "Explicit ros-e2e lane did not register the production ROS host "
+              "fixture";
+  }
+  GTEST_SKIP() << "Requires the production ROS host and sourced ros-e2e "
+                  "container environment";
+#else
+  const auto *ros_host = std::getenv("MANYFORGE_ROS2_CONTROL_EXECUTION_HOST");
+  if (ros_host == nullptr) {
+    GTEST_SKIP() << "Requires the explicitly sourced ros-e2e lane";
+  }
+  ASSERT_TRUE(std::filesystem::equivalent(
+      ros_host, MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST));
+  using content_identity::CanonicalValue;
+  const auto read_file = [](const std::filesystem::path &path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.good()) throw std::runtime_error("Fixture input is unavailable: " + path.string());
+    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+  };
+  // The same sourced ament lookup used by ros2 launch records the selected
+  // overlay input. Refuse qualification against an older image launch file.
+  const auto *launch_evidence = std::getenv("MANYFORGE_MANAGER_ROS_LAUNCH_EVIDENCE");
+  ASSERT_NE(launch_evidence, nullptr);
+  const auto launch_input = deployment::parse_strict_json_model_yaml(read_file(launch_evidence)).root();
+  ASSERT_EQ(RequiredText(launch_input, "source_launch_file"),
+            std::filesystem::canonical(MANYFORGE_HEADLESS_TEST_ROS_LAUNCH_SOURCE).string());
+  const auto launch_hash = content_identity::sha256_digest(read_file(RequiredText(launch_input, "launch_file")));
+  EXPECT_EQ(launch_hash, RequiredText(launch_input, "launch_sha256"));
+  EXPECT_EQ(launch_hash, content_identity::sha256_digest(read_file(MANYFORGE_HEADLESS_TEST_ROS_LAUNCH_SOURCE)));
+  EXPECT_EQ(launch_hash, RequiredText(launch_input, "source_sha256"));
+  std::cerr << "actual Mock controller launch input="
+            << content_identity::canonical_json(launch_input) << '\n';
+  DaemonDirectory directory(true);
+  const auto fixture_root =
+      std::filesystem::path(MANYFORGE_HEADLESS_TEST_MANAGER_ROS_APPLY_FIXTURE);
+  std::ifstream metadata_stream(fixture_root / "metadata.json",
+                                std::ios::binary);
+  ASSERT_TRUE(metadata_stream.good());
+  const std::string metadata_bytes{
+      std::istreambuf_iterator<char>(metadata_stream),
+      std::istreambuf_iterator<char>()};
+  const auto metadata =
+      deployment::parse_strict_json_model_yaml(metadata_bytes).root();
+  ASSERT_TRUE(metadata.is_object());
+  ASSERT_EQ(metadata.as_object().size(), 9U);
+  ASSERT_EQ(content_identity::canonical_json(metadata), metadata_bytes);
+  const auto cell = RequiredText(metadata, "cell_id");
+  const auto component = RequiredText(metadata, "component_id");
+  const auto candidate_id =
+      RequiredText(metadata, "candidate_retained_bundle_id");
+  const auto predecessor_id =
+      RequiredText(metadata, "predecessor_retained_bundle_id");
+  std::filesystem::copy(fixture_root / "activation",
+                        directory.apply_package_root(),
+                        std::filesystem::copy_options::recursive);
+  // The package and daemon activation repositories are distinct capabilities.
+  // Reuse the genuine stored product exactly as the gripper-only fixture does.
+  const deployment::FilesystemPreparedActivationRepository package_activations(
+      directory.apply_package_root());
+  const auto prepared_activation = package_activations.get_verified(
+      core::ContentDigest(RequiredText(metadata, "prepared_activation_id")));
+  ASSERT_NE(prepared_activation, nullptr);
+  const deployment::FilesystemPreparedActivationRepository daemon_activations(
+      directory.activation_root());
+  ASSERT_TRUE(daemon_activations.put_if_absent(*prepared_activation));
+  // Reuse the same real installed-target loader and Program runner. ROS is an
+  // additional production executable, never a substitute native/fake package.
+  const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
+  std::filesystem::copy_file(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST,
+                             directory.installed_root() /
+                                 "manyforge_ros2_control_execution_host");
+  deployment::FilesystemVerifiedRetainedBundleSource bundles(
+      directory.apply_package_root());
+  const auto predecessor =
+      bundles.get_verified(core::RetainedBundleId(predecessor_id));
+  const auto candidate =
+      bundles.get_verified(core::RetainedBundleId(candidate_id));
+  ASSERT_NE(predecessor, nullptr);
+  ASSERT_NE(candidate, nullptr);
+  ASSERT_TRUE(predecessor->value().cell_graph.controllable_components.empty());
+  ASSERT_EQ(candidate->value().cell_graph.controllable_components.size(), 1U);
+  EXPECT_EQ(candidate->value()
+                .cell_graph.controllable_components.front()
+                .controllable_component_id.value(),
+            component);
+  for (const auto *bundle : {predecessor.get(), candidate.get()}) {
+    ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 1U);
+    EXPECT_EQ(bundle->value()
+                  .cell_graph.runtime_units.front()
+                  .runtime_profile_id.value(),
+              "manyforge.ros2_control_execution_runtime");
+  }
+  ProgramRunnerProcess program_runner(directory, cell);
+  ManagerProcess manager(directory, directory.apply_package_root().string(),
+                         RequiredText(metadata, "admission_filename"),
+                         installed_manager.string(),
+                         program_runner.socket_path().string());
+  manager.WaitReady(directory);
+  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
+                                             "manager-source.json");
+  AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
+                                           "logical-scene-source.json");
+  AtomicSourceSnapshotChannel runtime_source(directory.publication_root(),
+                                             "scene-runtime-source.json");
+  const auto before = manager_source.Read();
+  const auto scene_before = scene_source.Read();
+  const auto runtime_before = runtime_source.Read();
+  ASSERT_TRUE(before.has_value());
+  ASSERT_TRUE(scene_before.has_value());
+  ASSERT_TRUE(runtime_before.has_value());
+  EXPECT_EQ(RequiredText(RequiredMember(before->payload, "active"),
+                         "retained_bundle_id"),
+            predecessor_id);
+  const auto cclc_command = [&](const std::string &command,
+                                CanonicalValue payload) {
+    const auto bytes = SendCommand(
+        directory.execution_run_root() / "cclc-command.sock",
+        content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue("manyforge.cclc_open_request.v1")},
+            {"command", CanonicalValue(command)},
+            {"payload", std::move(payload)}})));
+    const auto response =
+        deployment::parse_strict_json_model_yaml(bytes).root();
+    if (RequiredMember(response, "ok") != CanonicalValue(true))
+      throw std::runtime_error("Actual CCLC read failed: " + bytes);
+    return RequiredMember(response, "result");
+  };
+  const auto original_owner = RequiredText(
+      cclc_command("owner_identity", CanonicalValue(CanonicalValue::Object{})),
+      "request_owner_epoch");
+  ASSERT_FALSE(original_owner.empty());
+  const auto request =
+      ApplyRequest(directory, before->source_owner_epoch,
+                   WaitForAuthoringAdmission(directory).admission_generation,
+                   RequiredText(metadata, "deployment_artifact_id"),
+                   RequiredText(metadata, "deployment_revision"),
+                   RequiredText(metadata, "predecessor_graph_revision"),
+                   predecessor_id, "empty-ros-one-mock.1", {}, false, "receipt",
+                   RequiredText(metadata, "prepared_activation_id"));
+  const auto submitted = SendCommand(directory.socket_path(), request);
+  const auto submission =
+      deployment::parse_strict_json_model_yaml(submitted).root();
+  ASSERT_EQ(RequiredMember(submission, "ok"), CanonicalValue(true))
+      << submitted;
+
+  // Reuse the existing process suite's bounded observation interval. A guard,
+  // failure or unknown outcome never qualifies as a successful first Apply.
+  const auto apply_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  std::string last;
+  bool succeeded = false;
+  while (std::chrono::steady_clock::now() < apply_deadline) {
+    const auto status = manager_source.Read();
+    if (status.has_value()) {
+      last = content_identity::canonical_json(status->payload);
+      EXPECT_TRUE(ManagerSourceHistoryIsOneGeneration(status->payload)) << last;
+      if (last.find("\"request_id\":\"empty-ros-one-mock.1\"") !=
+              std::string::npos &&
+          last.find("\"terminal_state\":\"succeeded\"") != std::string::npos) {
+        succeeded = true;
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(succeeded) << last;
+  component_manager::SqliteManagerApplyJournal journal(
+      directory.manager_root() /
+          std::string(component_manager::kManagerApplyJournalFilename),
+      core::CellId(cell));
+  const auto inventory = journal.ReadStatusInventory();
+  ASSERT_EQ(inventory.size(), 1U);
+  const auto &status = inventory.front();
+  EXPECT_FALSE(status.bring_up_plan.has_value());
+  EXPECT_TRUE(status.bring_up_child_proofs.empty());
+  ASSERT_TRUE(status.fence_released.has_value());
+  ASSERT_TRUE(status.publication_receipt.has_value());
+
+  const auto read_component = [&] {
+    return cclc_command(
+        "component_snapshot",
+        CanonicalValue(CanonicalValue::Object{
+            {"controllable_component_id", CanonicalValue(component)}}));
+  };
+  auto snapshot = read_component();
+  EXPECT_EQ(RequiredText(snapshot, "retained_bundle_id"), candidate_id);
+  EXPECT_EQ(RequiredText(snapshot, "graph_revision"),
+            candidate->value().cell_graph.graph_revision.value());
+  EXPECT_EQ(RequiredText(snapshot, "component_lifecycle_state"), "declared");
+  EXPECT_EQ(RequiredMember(snapshot, "lifecycle_target"),
+            CanonicalValue(nullptr));
+  EXPECT_EQ(RequiredText(cclc_command("owner_identity",
+                                      CanonicalValue(CanonicalValue::Object{})),
+                         "request_owner_epoch"),
+            original_owner);
+
+  const auto observe_ros = [&](const std::string &state, const std::string &label) {
+    const auto output = directory.execution_run_root() / (label + ".ros-observation.json");
+    const auto log = directory.execution_run_root() / (label + ".ros-observation.log");
+    const auto execution_root = directory.execution_run_root().string();
+    const auto helper = std::filesystem::path(MANYFORGE_HEADLESS_TEST_SOURCE_ROOT) /
+                        "manyforge_deployment/test/prepare_activation_tool.py";
+    const auto child = ::fork();
+    if (child < 0) throw std::runtime_error("ROS observation fork failed");
+    if (child == 0) {
+      const auto fd = ::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      if (fd < 0 || ::dup2(fd, STDOUT_FILENO) < 0 || ::dup2(fd, STDERR_FILENO) < 0) _exit(126);
+      ::close(fd);
+      ::execl(MANYFORGE_HEADLESS_TEST_PYTHON, MANYFORGE_HEADLESS_TEST_PYTHON,
+              helper.c_str(), "--observe-manager-ros", "--execution-root", execution_root.c_str(),
+              "--component", component.c_str(), "--state", state.c_str(), "--label", label.c_str(),
+              "--output", output.c_str(), static_cast<char *>(nullptr));
+      _exit(127);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    int result = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto waited = ::waitpid(child, &result, WNOHANG);
+      if (waited == child) {
+        if (!WIFEXITED(result) || WEXITSTATUS(result) != 0)
+          throw std::runtime_error("Actual ROS observation failed: " + read_file(log));
+        std::cerr << "actual ROS observation=" << read_file(output) << '\n';
+        return;
+      }
+      if (waited < 0 && errno != EINTR)
+        throw std::runtime_error("ROS observation wait lost child ownership: " + read_file(log));
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ::kill(child, SIGKILL);
+    while (::waitpid(child, &result, 0) < 0 && errno == EINTR) {}
+    throw std::runtime_error("Actual ROS observation timed out: " + read_file(log));
+  };
+  observe_ros("inactive", "after-apply");
+
+  // This is the installed Kernel's actual per-component command gate, not
+  // Manager convergence or process presence. Reading it never dispatches
+  // motion.
+  const auto read_command_gate = [&] {
+    const auto bytes = SendCommand(
+        directory.execution_socket_path(),
+        R"({"api_version":"manyforge.execution_command.v1","command":"targets"})");
+    const auto response =
+        deployment::parse_strict_json_model_yaml(bytes).root();
+    if (RequiredMember(response, "ok") != CanonicalValue(true))
+      throw std::runtime_error("Actual execution targets read failed: " +
+                               bytes);
+    const auto &components =
+        RequiredMember(RequiredMember(response, "targets"), "components")
+            .as_array();
+    if (components.size() != 1U ||
+        RequiredText(components.front(), "controllable_component_id") !=
+            component)
+      throw std::runtime_error("Actual execution target membership mismatch: " +
+                               bytes);
+    return RequiredMember(components.front(), "availability");
+  };
+  EXPECT_EQ(RequiredMember(read_command_gate(), "command_eligible"),
+            CanonicalValue(false));
+
+  // Produce the same intrinsic manual OperationIntent as the existing native
+  // process test. Every identity, binding, role, axis and goal comes from the
+  // installed owner's actual status; no Program-node/route authority is minted.
+  const auto submit_current_joint_hold = [&](const std::string &request_id) {
+    const auto bytes = SendCommand(directory.execution_socket_path(),
+        R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+    const auto response = deployment::parse_strict_json_model_yaml(bytes).root();
+    if (RequiredMember(response, "ok") != CanonicalValue(true))
+      throw std::runtime_error("Actual motion producer status unavailable: " + bytes);
+    const auto &actual = RequiredMember(response, "status");
+    const auto &identity = RequiredMember(actual, "identity");
+    const auto &components = RequiredMember(RequiredMember(actual, "targets"), "components").as_array();
+    if (components.size() != 1U || RequiredText(components.front(), "controllable_component_id") != component)
+      throw std::runtime_error("Actual motion producer component closure differs");
+    const auto &targets = RequiredMember(components.front(), "targets").as_array();
+    const auto target = std::find_if(targets.begin(), targets.end(), [&](const auto &row) {
+      return RequiredText(row, "presentation") == "motion";
+    });
+    if (target == targets.end()) throw std::runtime_error("Actual motion target is absent");
+    const auto &command = RequiredMember(*target, "command");
+    const auto &manual = RequiredMember(command, "manual_control");
+    const auto &observed_targets = RequiredMember(RequiredMember(actual, "control_state"), "observed_targets").as_array();
+    const auto observed_row = std::find_if(observed_targets.begin(), observed_targets.end(), [&](const auto &row) {
+      return RequiredText(row, "controllable_component_id") == component &&
+          RequiredText(row, "command_target_id") == RequiredText(*target, "command_target_id") &&
+          RequiredText(row, "operation_capability_id") == RequiredText(*target, "operation_capability_id");
+    });
+    if (observed_row == observed_targets.end()) throw std::runtime_error("Actual motion observation is absent");
+    const auto &observed = RequiredMember(*observed_row, "observed");
+    if (!observed.is_object() || RequiredMember(observed, "complete") != CanonicalValue(true) ||
+        RequiredText(observed, "source_epoch").empty() || RequiredMember(observed, "sequence").as_number() <= 0.0)
+      throw std::runtime_error("Actual motion observation is incomplete");
+    CanonicalValue::Array joint_names;
+    for (const auto &joint : RequiredMember(command, "joints").as_array())
+      joint_names.emplace_back(RequiredMember(joint, "source_joint_name"));
+    if (CanonicalValue(joint_names) != RequiredMember(observed, "source_joint_names") ||
+        joint_names.size() != RequiredMember(observed, "positions_rad").as_array().size())
+      throw std::runtime_error("Actual motion axes differ from the compiled direct target");
+    CanonicalValue payload(CanonicalValue::Object{
+        {"kind", CanonicalValue("motion")}, {"move_id", CanonicalValue(request_id + ".hold")},
+        {"base_frame_role_id", RequiredMember(command, "base_frame_role_id")},
+        {"tcp_frame_role_id", RequiredMember(command, "tcp_frame_role_id")},
+        {"tolerances", CanonicalValue(CanonicalValue::Object{
+            {"joint_position_tol_rad", CanonicalValue(0.01)}, {"translation_tol_m", CanonicalValue(0.001)},
+            {"rotation_tol_rad", CanonicalValue(0.01)}})},
+        {"speed_profile", CanonicalValue(CanonicalValue::Object{
+            {"velocity_scale", CanonicalValue(0.5)}, {"acceleration_scale", CanonicalValue(0.5)},
+            {"max_tcp_linear_speed_mps", CanonicalValue(nullptr)}})},
+        {"timeouts", CanonicalValue(CanonicalValue::Object{
+            {"planning_timeout_s", CanonicalValue(2.0)}, {"execution_timeout_s", CanonicalValue(10.0)}})},
+        {"cache_mode", CanonicalValue("default")}, {"planning_profile", CanonicalValue("first_feasible")},
+        {"target_mode", CanonicalValue("absolute")}, {"target_reference", CanonicalValue(nullptr)},
+        {"offset_reference", CanonicalValue(nullptr)},
+        {"motion", CanonicalValue(CanonicalValue::Object{
+            {"kind", CanonicalValue("joint_goal")}, {"joint_names", CanonicalValue(std::move(joint_names))},
+            {"positions_rad", RequiredMember(observed, "positions_rad")}})},
+        {"contact_policy_id", CanonicalValue(nullptr)},
+        {"per_joint_dynamics_limits", CanonicalValue(CanonicalValue::Object{})},
+        {"motion_interrupt_scopes", CanonicalValue(CanonicalValue::Array{})},
+        {"runtime_object_bindings", CanonicalValue(CanonicalValue::Array{})}});
+    CanonicalValue operation(CanonicalValue::Object{
+        {"request_context", CanonicalValue(CanonicalValue::Object{
+            {"request_id", CanonicalValue(request_id)}, {"request_owner_epoch", RequiredMember(identity, "owner_epoch")},
+            {"source_label", CanonicalValue("manager_ros_apply_fixture")}, {"correlation_id", CanonicalValue(nullptr)}})},
+        {"program_id", RequiredMember(manual, "program_id")},
+        {"program_revision", RequiredMember(manual, "program_revision")},
+        {"program_binding_id", RequiredMember(manual, "program_binding_id")},
+        {"program_run_id", RequiredMember(manual, "program_run_id")},
+        {"expected_graph_revision", RequiredMember(identity, "graph_revision")},
+        {"expected_retained_bundle_id", RequiredMember(identity, "retained_bundle_id")},
+        {"expected_scene_revision", RequiredMember(identity, "scene_revision")},
+        {"participants", CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+            {"component_role_id", RequiredMember(command, "component_role_id")},
+            {"target_role_id", RequiredMember(command, "target_role_id")},
+            {"required_capability_id", RequiredMember(*target, "operation_capability_id")},
+            {"action_span", CanonicalValue(nullptr)}, {"payload", std::move(payload)}})})},
+        {"coordination_policy", CanonicalValue("independent")}});
+    const auto submitted_motion = SendCommand(directory.execution_socket_path(),
+        content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+            {"command", CanonicalValue("submit")}, {"operation", std::move(operation)},
+            {"attribution", CanonicalValue(CanonicalValue::Object{
+                {"assurance", CanonicalValue("unverified")}, {"principal_id", CanonicalValue(nullptr)},
+                {"transport", CanonicalValue("http")}})}})));
+    return deployment::parse_strict_json_model_yaml(submitted_motion).root();
+  };
+
+  const auto explicit_lifecycle = [&](const std::string &intent) {
+    const auto current = read_component();
+    CanonicalValue::Array expected_domains;
+    for (const auto &domain : RequiredMember(current, "domains").as_array()) {
+      const auto &active =
+          RequiredMember(domain, "active_control_configuration");
+      CanonicalValue expected_active(
+          CanonicalValue::Object{{"presence", CanonicalValue("absent")}});
+      if (active.is_object()) {
+        expected_active = CanonicalValue(CanonicalValue::Object{
+            {"presence", CanonicalValue("present")},
+            {"active_control_configuration_id",
+             RequiredMember(active, "active_control_configuration_id")},
+            {"active_control_configuration_generation",
+             RequiredMember(active,
+                            "active_control_configuration_generation")}});
+      }
+      expected_domains.emplace_back(CanonicalValue::Object{
+          {"control_domain_id", RequiredMember(domain, "control_domain_id")},
+          {"control_domain_revision",
+           RequiredMember(domain, "control_domain_revision")},
+          {"controller_topology_id",
+           RequiredMember(domain, "controller_topology_id")},
+          {"topology_revision", RequiredMember(domain, "topology_revision")},
+          {"expected_active_control_configuration", std::move(expected_active)},
+          {"expected_control_bindings",
+           RequiredMember(domain, "current_control_bindings")}});
+    }
+    const auto result = cclc_command(
+        "lifecycle_submit",
+        CanonicalValue(CanonicalValue::Object{
+            {"controllable_component_id", CanonicalValue(component)},
+            {"intent", CanonicalValue(intent)},
+            {"expected_graph_revision",
+             RequiredMember(current, "graph_revision")},
+            {"expected_component_lifecycle_generation",
+             RequiredMember(current, "component_lifecycle_generation")},
+            {"expected_control_domains",
+             CanonicalValue(std::move(expected_domains))},
+            {"expected_admission_generation",
+             CanonicalValue(static_cast<double>(
+                 WaitForAuthoringAdmission(directory).admission_generation))},
+            {"request_context",
+             CanonicalValue(CanonicalValue::Object{
+                 {"request_id", CanonicalValue("empty-ros-one-mock." + intent)},
+                 {"request_owner_epoch", CanonicalValue(original_owner)},
+                 {"source_label",
+                  CanonicalValue("manager_ros_apply_fixture")}})}}));
+    const auto &acceptance = RequiredMember(result, "acceptance");
+    if (!acceptance.is_object())
+      throw std::runtime_error("Explicit lifecycle was not accepted: " +
+                               content_identity::canonical_json(result));
+    const auto transaction_id =
+        RequiredText(acceptance, "lifecycle_transaction_id");
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    CanonicalValue actual(nullptr);
+    while (std::chrono::steady_clock::now() < deadline) {
+      actual = cclc_command(
+          "lifecycle_status",
+          CanonicalValue(CanonicalValue::Object{
+              {"lifecycle_transaction_id", CanonicalValue(transaction_id)}}));
+      if (RequiredMember(actual, "terminal_result") != CanonicalValue(nullptr))
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (RequiredMember(actual, "terminal_result") !=
+        CanonicalValue("succeeded"))
+      throw std::runtime_error("Explicit lifecycle did not succeed: " +
+                               content_identity::canonical_json(actual));
+    EXPECT_EQ(RequiredText(actual, "status_owner_epoch"), original_owner);
+    EXPECT_EQ(RequiredMember(actual, "acceptance"), acceptance);
+    return actual;
+  };
+  const auto prepared = explicit_lifecycle("prepare");
+  EXPECT_EQ(RequiredText(prepared, "current_state"), "prepared");
+  // The whole authored component includes its gripper domain. An already
+  // active gripper must not be hidden by the aggregate component state.
+  const auto &prepared_domains = RequiredMember(prepared, "domains").as_array();
+  ASSERT_EQ(prepared_domains.size(),
+            candidate->value().desired_control_configurations.size());
+  for (const auto &domain : prepared_domains) {
+    ASSERT_EQ(RequiredText(domain, "current_state"), "prepared");
+    EXPECT_TRUE(
+        std::any_of(candidate->value().desired_control_configurations.begin(),
+                    candidate->value().desired_control_configurations.end(),
+                    [&](const auto &desired) {
+                      return desired.control_domain_id.value() ==
+                             RequiredText(domain, "control_domain_id");
+                    }));
+  }
+  snapshot = read_component();
+  EXPECT_EQ(RequiredText(snapshot, "component_lifecycle_state"), "prepared");
+  EXPECT_EQ(RequiredText(RequiredMember(snapshot, "lifecycle_target"),
+                         "requested_state"),
+            "prepared");
+  EXPECT_EQ(RequiredMember(read_command_gate(), "command_eligible"),
+            CanonicalValue(false));
+
+  const auto refused_motion = submit_current_joint_hold("empty-ros-one-mock.prepared-motion");
+  ASSERT_EQ(RequiredMember(refused_motion, "ok"), CanonicalValue(false))
+      << content_identity::canonical_json(refused_motion);
+  EXPECT_EQ(RequiredText(RequiredMember(RequiredMember(refused_motion, "error"), "details"), "reason"),
+            "component_command_not_eligible") << content_identity::canonical_json(refused_motion);
+
+  const auto enabled = explicit_lifecycle("enable");
+  EXPECT_EQ(RequiredText(enabled, "current_state"), "active");
+  observe_ros("active", "after-enable");
+  snapshot = read_component();
+  EXPECT_EQ(RequiredText(snapshot, "component_lifecycle_state"), "active");
+  EXPECT_EQ(RequiredText(RequiredMember(snapshot, "lifecycle_target"),
+                         "requested_state"),
+            "active");
+  const auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  CanonicalValue command_gate(nullptr);
+  do {
+    command_gate = read_command_gate();
+    if (RequiredMember(command_gate, "command_eligible") ==
+        CanonicalValue(true))
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (std::chrono::steady_clock::now() < ready_deadline);
+  EXPECT_EQ(RequiredMember(command_gate, "command_eligible"),
+            CanonicalValue(true));
+  EXPECT_EQ(RequiredText(cclc_command("owner_identity",
+                                      CanonicalValue(CanonicalValue::Object{})),
+                         "request_owner_epoch"),
+            original_owner);
+  const auto &domains = RequiredMember(snapshot, "domains").as_array();
+  ASSERT_EQ(domains.size(),
+            candidate->value().desired_control_configurations.size());
+  const auto &enabled_domains = RequiredMember(enabled, "domains").as_array();
+  ASSERT_EQ(enabled_domains.size(), domains.size());
+  for (const auto &desired :
+       candidate->value().desired_control_configurations) {
+    const auto domain =
+        std::find_if(domains.begin(), domains.end(), [&](const auto &row) {
+          return RequiredText(row, "control_domain_id") ==
+                 desired.control_domain_id.value();
+        });
+    ASSERT_NE(domain, domains.end());
+    // Lifecycle state belongs to the actual Enable transaction status;
+    // component snapshot domains contain the current route/configuration closure.
+    const auto enabled_domain = std::find_if(
+        enabled_domains.begin(), enabled_domains.end(), [&](const auto &row) {
+          return RequiredText(row, "control_domain_id") ==
+                 desired.control_domain_id.value();
+        });
+    ASSERT_NE(enabled_domain, enabled_domains.end());
+    EXPECT_EQ(RequiredText(*enabled_domain, "current_state"), "active");
+    const auto &configuration =
+        RequiredMember(*domain, "active_control_configuration");
+    ASSERT_TRUE(configuration.is_object());
+    EXPECT_EQ(RequiredText(configuration, "state"), "reconciled");
+    EXPECT_GT(
+        RequiredMember(configuration, "active_control_configuration_generation")
+            .as_number(),
+        0.0);
+    EXPECT_FALSE(RequiredText(configuration, "source_runtime_epoch").empty());
+    EXPECT_EQ(RequiredText(configuration, "control_domain_revision"),
+              desired.control_domain_revision.value());
+    EXPECT_EQ(RequiredText(configuration, "activation_set_id"),
+              desired.activation_set_id.value());
+    const auto &routes =
+        RequiredMember(configuration, "binding_routes").as_array();
+    ASSERT_EQ(routes.size(), desired.binding_routes.size());
+    for (const auto &route : desired.binding_routes) {
+      EXPECT_TRUE(
+          std::any_of(routes.begin(), routes.end(), [&](const auto &row) {
+            return RequiredText(row, "control_binding_id") ==
+                       route.control_binding_id.value() &&
+                   RequiredText(row, "control_route_id") ==
+                       route.control_route_id.value() &&
+                   RequiredText(row, "control_binding_revision") ==
+                       route.control_binding_revision.value();
+          }));
+    }
+  }
+  EXPECT_FALSE(
+      RequiredMember(snapshot, "provider_occurrences").as_array().empty());
+  // Submit, rather than preview, consumes the real current route/readiness,
+  // ordinary manual Cell claim and configured resource admission gate.
+  static_cast<void>(WaitForAuthoringAdmission(directory));
+  const auto accepted_motion = submit_current_joint_hold("empty-ros-one-mock.active-motion");
+  ASSERT_EQ(RequiredMember(accepted_motion, "ok"), CanonicalValue(true))
+      << content_identity::canonical_json(accepted_motion);
+  const auto operation_id = RequiredText(RequiredMember(accepted_motion, "accepted"), "operation_id");
+  const auto motion_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  CanonicalValue actual_motion(nullptr);
+  while (std::chrono::steady_clock::now() < motion_deadline) {
+    const auto bytes = SendCommand(directory.execution_socket_path(),
+        content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+            {"command", CanonicalValue("read")}, {"operation_id", CanonicalValue(operation_id)}})));
+    const auto actual = deployment::parse_strict_json_model_yaml(bytes).root();
+    ASSERT_EQ(RequiredMember(actual, "ok"), CanonicalValue(true)) << bytes;
+    actual_motion = RequiredMember(actual, "operation");
+    const auto state = RequiredText(actual_motion, "state");
+    if (state == "completed" || state == "failed" || state == "intervention_required" ||
+        state == "stopped" || state == "cancelled_pre_dispatch") break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(actual_motion.is_object());
+  ASSERT_EQ(RequiredText(actual_motion, "state"), "completed")
+      << content_identity::canonical_json(actual_motion);
+  const auto &motion_participants = RequiredMember(actual_motion, "participants").as_array();
+  ASSERT_EQ(motion_participants.size(), 1U);
+  const auto &motion_participant = motion_participants.front();
+  EXPECT_EQ(RequiredText(motion_participant, "controllable_component_id"), component);
+  EXPECT_EQ(RequiredText(motion_participant, "state"), "completed");
+  EXPECT_EQ(RequiredMember(motion_participant, "terminal_error"), CanonicalValue(nullptr));
+  const auto arm = std::find_if(candidate->value().cell_graph.control_bindings.begin(),
+      candidate->value().cell_graph.control_bindings.end(), [](const auto &binding) {
+        return binding.capability_id.value() == "execution.trajectory.execute";
+      });
+  ASSERT_NE(arm, candidate->value().cell_graph.control_bindings.end());
+  EXPECT_EQ(RequiredText(motion_participant, "control_binding_id"), arm->control_binding_id.value());
+  EXPECT_EQ(RequiredText(motion_participant, "control_domain_id"), arm->control_domain_id.value());
+  const auto execution = WaitForExecutionReady(directory, candidate_id);
+  EXPECT_FALSE(execution.owner_epoch.empty());
+  const auto scene_after = scene_source.Read();
+  const auto runtime_after = runtime_source.Read();
+  ASSERT_TRUE(scene_after.has_value());
+  ASSERT_TRUE(runtime_after.has_value());
+  EXPECT_NE(
+      content_identity::canonical_json(scene_after->payload).find(candidate_id),
+      std::string::npos);
+  EXPECT_NE(content_identity::canonical_json(runtime_after->payload)
+                .find(candidate_id),
+            std::string::npos);
+  EXPECT_EQ(RequiredMember(RequiredMember(scene_after->payload, "snapshot"),
+                           "objects"),
+            RequiredMember(RequiredMember(scene_before->payload, "snapshot"),
+                           "objects"));
+  EXPECT_EQ(RequiredMember(RequiredMember(scene_after->payload, "snapshot"),
+                           "carried_object_attachments"),
+            RequiredMember(RequiredMember(scene_before->payload, "snapshot"),
+                           "carried_object_attachments"));
+  EXPECT_EQ(RequiredMember(RequiredMember(scene_after->payload, "snapshot"),
+                           "revision"),
+            RequiredMember(RequiredMember(scene_before->payload, "snapshot"),
+                           "revision"));
+  EXPECT_EQ(RequiredMember(RequiredMember(scene_after->payload, "access"),
+                           "projection_leases_open"),
+            CanonicalValue(true));
+  EXPECT_EQ(RequiredText(
+                RequiredMember(RequiredMember(scene_after->payload, "access"),
+                               "active_projection"),
+                "retained_bundle_id"),
+            candidate_id);
+  static_cast<void>(explicit_lifecycle("disable"));
+  observe_ros("inactive", "after-disable");
+  EXPECT_EQ(RequiredMember(read_command_gate(), "command_eligible"), CanonicalValue(false));
+
+  // Exact config replay does not introduce activation or child work.
+  EXPECT_NE(SendCommand(directory.socket_path(), request)
+                .find("\"replay_status\":\"replayed_exact\""),
+            std::string::npos);
+  const auto replay_inventory = journal.ReadStatusInventory();
+  ASSERT_EQ(replay_inventory.size(), 1U);
+  EXPECT_FALSE(replay_inventory.front().bring_up_plan.has_value());
+  EXPECT_TRUE(replay_inventory.front().bring_up_child_proofs.empty());
+
+  // Let the actual Manager child owner settle normal runtime shutdown before
+  // the successful fixture removes the controller launch artifact directory.
+  const auto stopped = manager.Stop(SIGTERM);
+  ASSERT_TRUE(WIFEXITED(stopped));
+  EXPECT_EQ(WEXITSTATUS(stopped), 0);
+  EXPECT_FALSE(std::filesystem::exists(directory.socket_path()));
+  EXPECT_FALSE(std::filesystem::exists(directory.execution_socket_path()));
+#endif
+}
 
 } // namespace
 } // namespace manyforge::headless

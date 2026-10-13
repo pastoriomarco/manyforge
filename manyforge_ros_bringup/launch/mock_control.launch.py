@@ -2,8 +2,8 @@
 
 The deployment generator owns joint order, startup pose and controller values.
 This launch starts observation and loads the arm controller inactive; the
-existing component lifecycle owner activates it. An authored optional gripper
-controller starts active; its backend owns command admission. This launch owns
+existing component lifecycle owner activates it and the optional authored gripper
+controller. Both load inactive. This launch owns
 no motion policy.
 """
 
@@ -87,7 +87,7 @@ def launch_setup(context, *args, **kwargs):
             Node(
                 package="controller_manager",
                 executable="spawner",
-                arguments=[gripper_name, "--controller-manager", manager_path, "--param-file", str(controllers_path)],
+                arguments=[gripper_name, "--inactive", "--controller-manager", manager_path, "--param-file", str(controllers_path)],
                 output="screen",
                 ros_arguments=["--disable-external-lib-logs"],
             )

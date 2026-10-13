@@ -1040,11 +1040,11 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
-        "content_digest": "sha256:39b4dfb0332d1ce0f100057b916a0aa2825fb4c446b0b1c092bdd519e1e8cd2e",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/434fb70e6b70d8fd04bbefeb103b2832dd9b69708d621b0eff78c1db62b17120",
+        "content_digest": "sha256:4129757b590a2cfe8a848b769760498aedd4a62dfb333aee6ed4d87de8199c15",
         "record_id": "manyforge.native_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
+        "record_revision": "sha256:434fb70e6b70d8fd04bbefeb103b2832dd9b69708d621b0eff78c1db62b17120",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1058,11 +1058,11 @@
         "schema_revision": "sha256:d55eb024cdd03360b1833671b656c962b2608227a1f1b47ed67cc019b5442f13"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/stop_evidence_policy/manyforge.native_controller_goal_terminal/f105849f905caa4e8f3d6b20e6dc19fccf26629ee535be474755c0d3f7254f72",
-        "content_digest": "sha256:6182bc853e5e42a43804111a28cdc677140ea38f1805d33524593510ff3d6d9f",
-        "record_id": "manyforge.native_controller_goal_terminal",
+        "content_addressed_store_key": "catalog/maintained/stop_evidence_policy/manyforge.controller_goal_terminal/7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
+        "content_digest": "sha256:482f9c87840ab7f97034ded54ad29087f8831cf3d5565ba2112cea3d5c854581",
+        "record_id": "manyforge.controller_goal_terminal",
         "record_kind": "stop_evidence_policy",
-        "record_revision": "sha256:f105849f905caa4e8f3d6b20e6dc19fccf26629ee535be474755c0d3f7254f72",
+        "record_revision": "sha256:7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
         "schema_id": "manyforge.stop_evidence_policy.v2",
         "schema_revision": "sha256:d55eb024cdd03360b1833671b656c962b2608227a1f1b47ed67cc019b5442f13"
       }
@@ -1080,7 +1080,7 @@
     ]
   },
   "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
-  "deployment_revision": "sha256:4b1eeb82224bed15f5566011d3dc162fa03ac1250a3c04040724d4fd84a3c7f7",
+  "deployment_revision": "sha256:a8aabb67e8eb93b5a14f82719112c6d2d0c01d520e1a1154c6fc9a1d45a7dada",
   "description": "Native ManyForge pick-and-place deployment for UFACTORY Lite6 with the lite pneumatic gripper. The model bundle is self-contained; xarm_ros2 is a generation-time and real-robot runtime dependency only.",
   "desired_control_configurations": [
     {
@@ -1746,7 +1746,7 @@
         "command_target_id": "gripper",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:0e2febf309a61b40d88bf96a4283093902e18bd4af5e6a61f695b4611c3f8346",
+        "control_binding_revision": "sha256:0e951e44ee17e4a37a94208fe570a84026ea293393b6db955225847684b46f88",
         "control_domain_id": "lite6_robot.gripper.control",
         "control_interface_contract_id": "manyforge.native_gripper_position",
         "control_interface_revision": "sha256:865d6a1fa8ecd0de6bf1a7a88ea683f63120616d9355faf33535c7a55ec4b2db",
@@ -1778,8 +1778,8 @@
         ],
         "state_authority_class": "predicted",
         "state_authority_id": "lite6_robot.gripper.predicted_state",
-        "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
-        "stop_evidence_policy_revision": "sha256:f105849f905caa4e8f3d6b20e6dc19fccf26629ee535be474755c0d3f7254f72",
+        "stop_evidence_policy_id": "manyforge.controller_goal_terminal",
+        "stop_evidence_policy_revision": "sha256:7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
         "topology_revision": "sha256:1a7d97854724f63090cf8d1adb293e9633f4d7644094aae095f277a53fdfd0d0"
       },
       {
@@ -1788,7 +1788,7 @@
         "command_target_id": "gripper",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.gripper.tool-gripper-feedback",
-        "control_binding_revision": "sha256:38456ef331aa785d7dac4b6562d50a95345fc697699413377476cd72123d0144",
+        "control_binding_revision": "sha256:db3f3892c39c79f9b8b7444789fa07622102d3c14513a35aa8e804045cc49671",
         "control_domain_id": "lite6_robot.gripper.control",
         "control_interface_contract_id": "manyforge.native_gripper_position",
         "control_interface_revision": "sha256:865d6a1fa8ecd0de6bf1a7a88ea683f63120616d9355faf33535c7a55ec4b2db",
@@ -1820,8 +1820,8 @@
         ],
         "state_authority_class": "predicted",
         "state_authority_id": "lite6_robot.gripper.predicted_state",
-        "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
-        "stop_evidence_policy_revision": "sha256:f105849f905caa4e8f3d6b20e6dc19fccf26629ee535be474755c0d3f7254f72",
+        "stop_evidence_policy_id": "manyforge.controller_goal_terminal",
+        "stop_evidence_policy_revision": "sha256:7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
         "topology_revision": "sha256:1a7d97854724f63090cf8d1adb293e9633f4d7644094aae095f277a53fdfd0d0"
       }
     ],
@@ -1938,7 +1938,7 @@
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.native_execution_runtime",
-        "runtime_profile_revision": "sha256:a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
+        "runtime_profile_revision": "sha256:434fb70e6b70d8fd04bbefeb103b2832dd9b69708d621b0eff78c1db62b17120",
         "runtime_unit_id": "robot_cell.native_execution"
       }
     ]
@@ -2951,8 +2951,8 @@
           "provider_contract_role_id": "software_hard_stop"
         },
         "stop_escalation_stage_id": "software_hard",
-        "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
-        "stop_evidence_policy_revision": "sha256:f105849f905caa4e8f3d6b20e6dc19fccf26629ee535be474755c0d3f7254f72",
+        "stop_evidence_policy_id": "manyforge.controller_goal_terminal",
+        "stop_evidence_policy_revision": "sha256:7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
         "topology_revision": "sha256:1a7d97854724f63090cf8d1adb293e9633f4d7644094aae095f277a53fdfd0d0"
       },
       {
@@ -2969,8 +2969,8 @@
           "provider_contract_role_id": "software_hard_stop"
         },
         "stop_escalation_stage_id": "software_hard",
-        "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
-        "stop_evidence_policy_revision": "sha256:f105849f905caa4e8f3d6b20e6dc19fccf26629ee535be474755c0d3f7254f72",
+        "stop_evidence_policy_id": "manyforge.controller_goal_terminal",
+        "stop_evidence_policy_revision": "sha256:7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
         "topology_revision": "sha256:1a7d97854724f63090cf8d1adb293e9633f4d7644094aae095f277a53fdfd0d0"
       }
     ]

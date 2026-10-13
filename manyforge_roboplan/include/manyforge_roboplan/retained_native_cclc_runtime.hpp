@@ -2,6 +2,7 @@
 
 #include <manyforge_core/fixed_cclc_port_registry.hpp>
 #include <manyforge_deployment/cclc_runtime_composition.hpp>
+#include <manyforge_deployment/apply_component_delta.hpp>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
@@ -12,6 +13,15 @@
 #include <vector>
 
 namespace manyforge::roboplan_backend {
+
+/// A verified empty cell has no physical route publication surface. This
+/// dependency refuses every physical-domain operation and fabricates no
+/// participant or configuration readback. Recreate it with the real route
+/// owner only after the original CCLC owner and callers have fully settled.
+[[nodiscard]] core::Result<
+    std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>>
+MakeVerifiedEmptyCellRoutePublicationOwner(
+    const deployment::RetainedBundle &retained_bundle);
 
 /// Product-owned policy for the retained native CCLC join.
 struct RetainedNativeCCLCRuntimeConfig final {
@@ -28,6 +38,21 @@ struct RetainedNativeCCLCRuntimeConfig final {
     std::vector<core::KinematicResourceSourceProjectionDTO>>
 DeriveRetainedNativeStateSourceProjections(
     std::span<const core::RuntimeParticipantBinding> physical_bindings);
+
+/// Derive the same native Apply request before installation or outgoing-owner
+/// retirement. Compiled generations are planned floors; retained readbacks are
+/// exact current Kernel facts. This performs no I/O, records no plan, and proves
+/// neither actual controller survival nor installed candidate readiness.
+[[nodiscard]] core::Result<core::NativeApplyPlanRequestDTO>
+DeriveRetainedNativeApplyPlanRequest(
+    const core::NamedApplyPublicationTransactionDTO &apply,
+    const deployment::RetainedBundle &candidate,
+    const deployment::RetainedBundle *predecessor,
+    const deployment::ApplyComponentDeltaDTO &delta,
+    std::span<const core::RuntimeParticipantBinding> candidate_physical_bindings,
+    std::span<const core::RuntimeRouteConfigurationReadbackDTO> retained_route_readbacks,
+    core::ComponentLifecycleStateDTO changed_component_state =
+        core::ComponentLifecycleStateDTO::kActive);
 
 /// Parent-Apply candidate initialization delegated to CCLC. The caller must
 /// hold and verify the exact Manager fence around this call and pass the plan
@@ -81,6 +106,38 @@ CreateRetainedNativeCCLCRuntime(
         externally_managed_controller_snapshot_source = {},
     core::ICCLCComponentCommandReadinessPort *component_command_readiness_port =
         nullptr);
+
+/// Prepare a product on the existing CCLC owner using the same verified native
+/// runtime closure as CreateRetainedNativeCCLCRuntime. This neither creates nor
+/// starts a CCLC owner, installs routes, exchanges contexts, or activates a
+/// component. The publication must already be the exact current candidate.
+/// The single installed-product pin must own every borrowed candidate source,
+/// readiness port, candidate route publication owner, callback dependency and
+/// installed projection/handle set.
+/// The existing composition and its clock must outlive the prepared value.
+[[nodiscard]] core::Result<std::shared_ptr<
+    const deployment::CCLCRuntimeComposition::PreparedProductContext>>
+PrepareRetainedNativeCCLCProductContext(
+    deployment::CCLCRuntimeComposition &composition,
+    RetainedNativeCCLCRuntimeConfig config,
+    std::shared_ptr<const deployment::RetainedBundle> retained_bundle,
+    const core::IActiveBundlePublicationReader &active_publication_reader,
+    core::ActiveBundlePublicationReceiptDTO expected_active_publication,
+    const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
+    const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
+    std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
+    std::vector<core::RuntimeParticipantBinding> physical_bindings,
+    core::IClock &clock,
+    deployment::IRouteConfigurationKernelPublicationOwner
+        &kernel_publication_owner,
+    std::shared_ptr<const void> installed_product_lifetime,
+    std::function<
+        core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+            const core::ControlDomainId &)>
+        kernel_current_configuration_source = {},
+    RetainedExternallyManagedDomainSnapshotSource
+        externally_managed_controller_snapshot_source = {},
+    core::ICCLCComponentCommandReadinessPort *component_command_readiness_port = nullptr);
 
 /// Convenience overload for the production retained-native owner. Only the
 /// physical representatives are consumed; Program aliases cannot widen CCLC

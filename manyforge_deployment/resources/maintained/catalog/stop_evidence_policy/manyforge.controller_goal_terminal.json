@@ -74,6 +74,6 @@
       "stop_escalation_stage_id": "software_hard"
     }
   ],
-  "stop_evidence_policy_id": "manyforge.native_controller_goal_terminal",
-  "stop_evidence_policy_revision": "sha256:f105849f905caa4e8f3d6b20e6dc19fccf26629ee535be474755c0d3f7254f72"
+  "stop_evidence_policy_id": "manyforge.controller_goal_terminal",
+  "stop_evidence_policy_revision": "sha256:7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91"
 }

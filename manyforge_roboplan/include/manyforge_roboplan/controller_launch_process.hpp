@@ -17,6 +17,10 @@
 #include <manyforge_roboplan/controller_launch_artifacts.hpp>
 #include <manyforge_roboplan/controller_robot_description.hpp>
 
+namespace manyforge::core {
+class IScheduler;
+}
+
 namespace manyforge::roboplan_backend {
 
 /// Q78 / design §7.5 "the Manager owns the controller-manager process": the
@@ -150,6 +154,41 @@ struct ControllerLaunchExitEvidence final {
   std::optional<ControllerLaunchReadinessEvidence> readiness;
 };
 
+/// Copy of the existing occurrence cache, not proof of process aliveness.
+struct ControllerLaunchCachedFaultState final {
+  bool stopping;
+  bool unexpected_exit_observed;
+  std::optional<ControllerLaunchExitEvidence> exit_evidence;
+  std::optional<std::string> fault_reason;
+};
+
+[[nodiscard]] std::string DescribeControllerLaunchFault(
+    const ControllerLaunchExitEvidence &evidence);
+[[nodiscard]] std::optional<std::string> ProjectControllerLaunchFault(
+    const ControllerLaunchCachedFaultState &state);
+
+enum class ControllerLaunchCleanupState {
+  kNotRequested,
+  kPending,
+  kUnknown,
+  kDrained
+};
+
+/// Process-group proof from the original live host, never physical robot state.
+/// The no-live-member scan precedes release of the exact zombie leader pin.
+struct ControllerLaunchGroupDrainReceipt final {
+  int leader_pid;
+  std::string controllable_component_id;
+  std::string launch_identity;
+  std::string observed_utc;
+};
+
+struct ControllerLaunchCleanupObservation final {
+  ControllerLaunchCleanupState state{
+      ControllerLaunchCleanupState::kNotRequested};
+  std::optional<ControllerLaunchGroupDrainReceipt> receipt;
+};
+
 /// Tagged forwarding loss; bytes include tags and partial-write suffixes.
 struct ControllerLaunchForwardingCounters final {
   std::uint64_t dropped_forward_lines{0};
@@ -211,6 +250,10 @@ public:
   /// leader stays unreaped to pin its process-group identity until stop().
   [[nodiscard]] std::optional<std::string> exited();
   [[nodiscard]] std::optional<ControllerLaunchExitEvidence> exit_evidence();
+  /// Copies the cache only; never observes exit, captures readiness or cleans up.
+  [[nodiscard]] ControllerLaunchCachedFaultState ReadCachedFaultState() const;
+  /// Cached only: never waits for group cleanup, scans proc, or signals.
+  [[nodiscard]] ControllerLaunchCleanupObservation cleanup_observation();
   [[nodiscard]] ControllerLaunchOutputSnapshot output_snapshot() const;
   /// Occurrence-local scalar query; does not copy the output tail.
   [[nodiscard]] ControllerLaunchForwardingCounters output_counters() const;
@@ -238,6 +281,10 @@ private:
                           std::string context);
   void append_start_header();
   void observe_exit_locked();
+  /// Complete the one cached readiness attempt outside the evidence lock.
+  /// False also covers a concurrent capture still in progress.
+  [[nodiscard]] bool capture_exit_readiness(
+      const std::function<ControllerLaunchReadinessEvidence()> &readiness);
   void capture_exit_locked(std::optional<int> exit_status,
                            std::optional<int> signal, bool core_dumped);
   struct Output;
@@ -245,17 +292,23 @@ private:
 
   std::variant<ControllerLaunchCommand, CellLaunchCommand> command_;
   int pid_{-1};
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
+  /// Serializes the exact group retirement/reap without blocking scalar reads.
+  std::mutex retirement_mutex_;
   std::optional<std::string> exit_;
   bool stopping_{false};
+  bool unexpected_exit_observed_{false};
+  ControllerLaunchCleanupObservation cleanup_;
   bool group_owned_{true};
   std::filesystem::path upstream_log_directory_;
   std::string start_context_;
   std::string current_request_context_;
   std::optional<ControllerLaunchExitEvidence> exit_evidence_;
   std::optional<CellLaunchExitEvidence> cell_exit_evidence_;
+  bool exact_leader_reaped_{false};
   std::optional<std::string> fault_reason_;
   bool readiness_capture_started_{false};
+  bool readiness_capture_complete_{false};
   std::string last_incident_id_;
   std::string last_incident_context_;
 };
@@ -328,6 +381,12 @@ public:
                      const std::filesystem::path &artifacts_root,
                      std::string context = {});
 
+  /// Retire a real cell occurrence using this supervisor's existing grace.
+  /// True proves this host actually reaped the exact leader; a cached exit or
+  /// ECHILD never proves that receipt. No component map entry is touched.
+  [[nodiscard]] bool
+  retire_cell_process(const std::shared_ptr<CellLaunchProcess> &process);
+
   /// Discard a candidate-owned launch only when it is still the exact
   /// current process. Borrowed kKeep receipts and superseded processes are
   /// ignored. The caller keeps the retired occurrence and its dependency pins
@@ -340,6 +399,15 @@ public:
   /// until stop completes so ensure preserves predecessor-before-successor.
   [[nodiscard]] bool
   retire_exact(const std::shared_ptr<ControllerLaunchProcess> &expected);
+
+  /// Observe an unexpected component leader exit and enqueue at most once on
+  /// the existing Background lane. The host starts that lane before serving
+  /// status. The callback owns only the exact occurrence and copied grace.
+  /// Queue failure remains Unknown; this method never restarts or removes it.
+  [[nodiscard]] bool request_unexpected_exit_cleanup(
+      const std::shared_ptr<ControllerLaunchProcess> &expected,
+      core::IScheduler &scheduler, std::int64_t now_ns,
+      std::function<ControllerLaunchReadinessEvidence()> readiness = {});
 
   /// Stop every registered component. Host-owned cell processes retire through
   /// their own exact occurrence, independently of component removal.

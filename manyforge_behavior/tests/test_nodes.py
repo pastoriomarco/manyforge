@@ -20,7 +20,6 @@ from manyforge_behavior.nodes.logic import (
     CheckGripperState,
     CheckKeyBoolValue,
     CommandGripper,
-    ConfirmGripperGrasp,
     LogicNodeBindingUnavailableError,
     SetKeyBoolValue,
     WaitForKeyBool,
@@ -141,11 +140,6 @@ def test_pose_distance_math_is_finite_and_quaternion_sign_invariant() -> None:
         ),
         (
             CommandGripper,
-            LogicNodeBindingUnavailableError,
-            "logic_node_binding_unavailable",
-        ),
-        (
-            ConfirmGripperGrasp,
             LogicNodeBindingUnavailableError,
             "logic_node_binding_unavailable",
         ),

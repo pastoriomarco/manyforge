@@ -37,6 +37,9 @@ struct RetainedRos2ControlBackendConfig final {
   /// Managed first installation starts the executor only after fenced
   /// ownership.
   bool defer_ros_start{false};
+  /// Exact successor computed from the owned predecessor before retirement.
+  /// Absent on ordinary startup; never derived from caller counters here.
+  std::optional<core::SelectedControllerOccurrenceDTO> successor_occurrence;
 };
 
 /// The sole addressed arm-state authority of a controller-backed runtime:
@@ -53,7 +56,7 @@ retained_ros2_control_gripper_state_config(
     const core::RuntimeParticipantBinding &binding);
 
 /// Construct a single-use retained runtime backend factory: the shared ROS
-/// transport, the arm's JTC adapter for binding epoch 1 and the Core
+/// transport, the arm's JTC adapter for the initial binding epoch and the Core
 /// participant over it, and the gripper adapter, all owned by `runtime_handle`
 /// and joined to the retained Kernel and state publication.
 [[nodiscard]] RetainedRuntimeBackendFactory

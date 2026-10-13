@@ -4,6 +4,11 @@
 #include <string>
 #include <string_view>
 
+namespace manyforge::core {
+struct SelectedComponentBringUpOfferDTO;
+struct NativeApplyComponentBringUpDTO;
+}
+
 namespace manyforge::core::detail {
 
 inline constexpr std::size_t kMaximumComponentLifecycleJournalRecordBytes = 64U * 1024U * 1024U;
@@ -18,10 +23,29 @@ inline constexpr std::size_t kMaximumComponentLifecycleJournalRecordBytes = 64U 
 [[nodiscard]] CellAdmissionConfigurationScopeDTO DecodeCCLCRouteRecoveryConfiguration(
     std::string_view bytes);
 
+struct SelectedCCLCClaimIntentRecordDTO final {
+  CellAdmissionClaimIntentDTO full_claim_intent;
+  ContentDigest original_request_payload_digest;
+
+  friend bool operator==(const SelectedCCLCClaimIntentRecordDTO&,
+                         const SelectedCCLCClaimIntentRecordDTO&) = default;
+};
+
+/// Distinct private selected shape in the existing recovery-configuration blob.
+/// A decoded claim remains observation-only; it never authorizes redispatch.
+[[nodiscard]] std::string EncodeCCLCSelectedBringUpClaimIntent(
+    const SelectedCCLCClaimIntentRecordDTO& record);
+[[nodiscard]] SelectedCCLCClaimIntentRecordDTO DecodeCCLCSelectedBringUpClaimIntent(
+    std::string_view bytes);
+[[nodiscard]] bool IsCCLCSelectedBringUpClaimIntentEncoding(std::string_view bytes) noexcept;
+
 [[nodiscard]] std::string EncodeCCLCAdmissionRejection(const ErrorDTO& error);
 [[nodiscard]] ErrorDTO DecodeCCLCAdmissionRejection(std::string_view bytes);
 
 [[nodiscard]] std::string EncodeComponentLifecycleStatus(const ComponentLifecycleStatusDTO& status);
+
+[[nodiscard]] std::string EncodeNativeApplyComponentBringUp(const NativeApplyComponentBringUpDTO&);
+[[nodiscard]] NativeApplyComponentBringUpDTO DecodeNativeApplyComponentBringUp(std::string_view);
 
 [[nodiscard]] ComponentLifecycleStatusDTO DecodeComponentLifecycleStatus(std::string_view bytes);
 
@@ -32,6 +56,9 @@ inline constexpr std::size_t kMaximumComponentLifecycleJournalRecordBytes = 64U 
 /// the same way as ComponentLifecycleIntentDTO::replay_equal().
 [[nodiscard]] std::string ComponentLifecycleSemanticIntentDigest(
     const ComponentLifecycleIntentDTO& intent);
+/// Private selected effect request identity, using this same bounded codec.
+[[nodiscard]] std::string SelectedComponentBringUpSemanticOfferDigest(
+    const SelectedComponentBringUpOfferDTO& offer);
 
 [[nodiscard]] std::string EncodeLifecyclePrimitiveIntent(
     const BrandLifecyclePrimitiveIntentDTO& intent);

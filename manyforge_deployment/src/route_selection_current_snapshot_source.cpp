@@ -82,7 +82,13 @@ VerifiedRouteSelectionCurrentSnapshotSource::
             [](const auto &lhs, const auto &rhs) {
               return lhs.control_domain_id < rhs.control_domain_id;
             });
-  if (controller_sources_.empty() ||
+  const auto &bundle = retained_bundle_.value();
+  const auto &graph = bundle.cell_graph;
+  const bool empty_physical_graph =
+      graph.controllable_components.empty() && graph.control_domains.empty() &&
+      graph.control_bindings.empty() &&
+      bundle.desired_control_configurations.empty();
+  if ((controller_sources_.empty() && !empty_physical_graph) ||
       controller_sources_.size() > core::kMaxRouteSelectionComponents ||
       std::any_of(controller_sources_.begin(), controller_sources_.end(),
                   [](const auto &row) { return !row.locally_valid(); }) ||

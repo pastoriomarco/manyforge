@@ -29,10 +29,14 @@
 #include <iterator>
 #include <limits>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_component_manager/isaac_site_settings.hpp>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
+#include <manyforge_core/cclc_lifecycle_target_driver.hpp>
+#include <manyforge_core/component_lifecycle_admission.hpp>
+#include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/time/host_boot_identity.hpp>
 #include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
@@ -606,6 +610,7 @@ struct HostConfig final {
   std::string program_binding_id;
   std::string motion_target_role_id;
   std::string gripper_target_role_id;
+  core::NativeApplyParentPreparationFailureSource preparation_failure_source{};
 };
 
 struct ManagedRuntimeChildConfig final {
@@ -616,6 +621,10 @@ struct ManagedRuntimeChildConfig final {
   /// Approved scene-asset root for relative scene meshes; absent when the
   /// Manager has none configured (relative scene meshes then fail closed).
   std::optional<int> scene_asset_root_fd;
+  std::optional<component_manager::IsaacSiteSettings> isaac_site_settings;
+  std::optional<std::filesystem::path> isaac_pose_observer_executable;
+  std::optional<component_manager::ManagerIsaacPoseObserverLaunchFactsDTO>
+      isaac_pose_observer_launch_facts;
   std::filesystem::path package_root;
   std::filesystem::path program_artifact_root;
   std::filesystem::path manager_state_root;
@@ -633,6 +642,37 @@ struct ManagedRuntimeChildConfig final {
   std::string product_identity;
   std::string configuration_identity;
 };
+
+[[nodiscard]] component_manager::IsaacSiteSettings
+LoadManagedIsaacSiteSettings(const std::filesystem::path &path) {
+  FileDescriptor file(::open(path.c_str(),
+                             O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW));
+  if (file.get() < 0) {
+    FailErrno("open managed Isaac site snapshot " + path.string());
+  }
+  struct stat status {};
+  if (::fstat(file.get(), &status) != 0) {
+    FailErrno("inspect managed Isaac site snapshot " + path.string());
+  }
+  Require(S_ISREG(status.st_mode),
+          "managed Isaac site snapshot must be a regular file: " + path.string());
+  std::string document;
+  std::array<char, 4096U> buffer{};
+  while (true) {
+    const auto count = ::read(file.get(), buffer.data(), buffer.size());
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      FailErrno("read managed Isaac site snapshot " + path.string());
+    }
+    if (count == 0) {
+      break;
+    }
+    document.append(buffer.data(), static_cast<std::size_t>(count));
+  }
+  return component_manager::ParseIsaacSiteSettings(document);
+}
 
 [[nodiscard]] bool
 IsPortableRuntimeIdentity(const std::string_view value) noexcept {
@@ -686,6 +726,27 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       config.program_artifact_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-scene-asset-root-fd") {
       config.scene_asset_root_fd = ParseFileDescriptor(value);
+    } else if (option == "--manyforge-managed-isaac-site-settings") {
+      config.isaac_site_settings = LoadManagedIsaacSiteSettings(value);
+    } else if (option == "--manyforge-managed-isaac-pose-observer-executable") {
+      Require(!value.empty(), "managed observer executable path is empty");
+      config.isaac_pose_observer_executable = value;
+    } else if (option == "--manyforge-managed-isaac-observer-snapshot" ||
+               option == "--manyforge-managed-isaac-observer-source-id" ||
+               option == "--manyforge-managed-isaac-observer-epoch-base") {
+      if (!config.isaac_pose_observer_launch_facts)
+        config.isaac_pose_observer_launch_facts.emplace();
+      auto &facts = *config.isaac_pose_observer_launch_facts;
+      if (option == "--manyforge-managed-isaac-observer-snapshot")
+        facts.retained_snapshot_path = value;
+      else if (option == "--manyforge-managed-isaac-observer-source-id") {
+        const auto decoded = deployment::parse_strict_json_model_yaml(value).root();
+        const auto *source = std::get_if<std::string>(&decoded.storage());
+        Require(source != nullptr, "managed observer source must be a JSON string");
+        facts.source_id = *source;
+      }
+      else
+        facts.source_epoch_base = value;
     } else if (option == "--manyforge-managed-manager-state-root") {
       config.manager_state_root = value;
     } else if (option == "--manyforge-managed-manager-run-root") {
@@ -718,7 +779,7 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() >= 15U && seen.size() <= 19U &&
+  Require(seen.size() >= 15U && seen.size() <= 24U &&
               config.manager_channel_fd >= 0 &&
               config.manager_liveness_channel_fd >= 0 &&
               config.manager_liveness_channel_fd != config.manager_channel_fd &&
@@ -730,6 +791,10 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
               IsPortableRuntimeIdentity(config.runtime_unit_id) &&
               IsPortableRuntimeIdentity(config.runtime_epoch),
           "managed runtime identity is invalid");
+  Require(!config.isaac_pose_observer_launch_facts ||
+              (config.isaac_pose_observer_launch_facts->valid() &&
+               config.isaac_pose_observer_executable.has_value()),
+          "managed observer launch facts are incomplete or invalid");
   Require(!config.retained_bundle_id.empty() && !config.graph_revision.empty(),
           "managed runtime retained descriptor is invalid");
   Require(core::IsExactLowercaseSha256Digest(config.product_identity) &&
@@ -909,6 +974,9 @@ struct ManagedComponentProjectionSet final {
   std::map<core::ControllableComponentId,
            std::shared_ptr<RetainedPlannerSceneProjection>>
       by_component;
+  // Representatives do not own every provider required by the published model.
+  // Keep the complete exact selection alive through build and installation.
+  std::vector<std::shared_ptr<RetainedPlannerSceneProjection>> required_projection_pins;
 };
 
 [[nodiscard]] std::optional<ManagedComponentProjectionSet>
@@ -985,6 +1053,7 @@ SelectManagedComponentProjections(const ManagedRuntimeChildConfig &config,
     if (projection == nullptr)
       return unavailable("no active projection for " +
                          binding.provider_binding_id.value());
+    selected.required_projection_pins.push_back(projection);
     if (cell_projection == nullptr)
       cell_projection = projection;
     if (!revision_selected) {
@@ -2056,7 +2125,6 @@ enum class CommandKind {
   kIdentity,
   kTargets,
   kQueryTarget,
-  kConfirmGrasp,
   kQueryOperation,
   kControlState,
   kObservation,
@@ -2188,17 +2256,7 @@ struct TargetObservationQuery final {
   core::TargetRoleId target_role_id;
   std::optional<core::FrameRoleId> frame_role_id;
   std::optional<core::FrameRoleId> relative_to_frame_role_id;
-  bool grasp_confirmation{};
   std::optional<FrameTransformQuery> frame_transform{};
-};
-
-struct GripperConfirmationCommand final {
-  core::PublicRequestContextDTO context;
-  core::ProgramBindingId program_binding_id;
-  core::TargetRoleId target_role_id;
-  core::GripperGraspObservationDTO observation;
-  core::RequestAttributionDTO attribution;
-  core::TimePoint admission_deadline_ns;
 };
 
 struct ProgramOperationQuery final {
@@ -2213,7 +2271,6 @@ struct Command final {
 
   CommandKind kind;
   std::optional<TargetObservationQuery> target_query;
-  std::optional<GripperConfirmationCommand> confirmation;
   std::optional<ProgramOperationQuery> operation_query;
   std::optional<core::OperationIntentDTO> operation;
   std::optional<core::ProgramRunExecutionCaptureDTO> program_capture;
@@ -2362,41 +2419,6 @@ struct Command final {
     RequireExactObjectSize(root, 2U, "targets command");
     return Command{CommandKind::kTargets};
   }
-  if (command == "gripper_confirm") {
-    RequireExactObjectSize(root, 7U, "gripper confirmation command");
-    const auto &request = Member(root, "request");
-    RequireExactObjectSize(request, 8U, "gripper confirmation request");
-    Require(Text(request, "schema_version") ==
-                "manyforge.gripper_confirmation_request.v1",
-            "gripper confirmation schema is unsupported");
-    auto context = DecodeRequestContext(Member(request, "request_context"));
-    const auto origin = Text(root, "origin_epoch");
-    Require(!origin.empty() && origin.size() <= 256U,
-            "confirmation ingress origin is invalid");
-    const auto observation_id = content_identity::sha256_digest(
-        canonical_json(CanonicalValue(CanonicalValue::Array{
-            CanonicalValue(origin),
-            CanonicalValue(context.request_id.value())})));
-    Command decoded{CommandKind::kConfirmGrasp};
-    decoded.confirmation = GripperConfirmationCommand{
-        context,
-        core::ProgramBindingId(Text(request, "program_binding_id")),
-        core::TargetRoleId(Text(request, "target_role_id")),
-        core::GripperGraspObservationDTO{
-            {},
-            Counter(request, "command_id", 1U),
-            Counter(request, "generation", 1U),
-            Counter(request, "expected_status_revision", 1U),
-            observation_id,
-            Boolean(request, "confirmed"),
-            content_identity::parse_nonnegative_int64(
-                Member(root, "received_monotonic_ns")),
-            context.source_label},
-        DecodeRequestAttribution(Member(root, "attribution")),
-        content_identity::parse_nonnegative_int64(
-            Member(root, "valid_until_monotonic_ns"))};
-    return decoded;
-  }
   if (command == "query_target") {
     RequireExactObjectSize(root, 3U, "target observation command");
     const auto &query = Member(root, "query");
@@ -2416,14 +2438,12 @@ struct Command final {
           core::TargetRoleId(std::string{}),
           std::nullopt,
           std::nullopt,
-          false,
           FrameTransformQuery{DecodePose(pose), DecodeReference(source, true),
                               DecodeReference(target, true), pose, source,
                               target}};
       return decoded;
     }
-    Require(kind == "frame_pose" || kind == "gripper_status" ||
-                kind == "gripper_confirmation",
+    Require(kind == "frame_pose" || kind == "gripper_status",
             "target observation kind is unsupported");
     if (kind == "frame_pose") {
       Require(query.as_object().size() == 6U || query.as_object().size() == 7U,
@@ -2450,8 +2470,7 @@ struct Command final {
         kind == "frame_pose" && relative_frame != query.as_object().end()
             ? std::optional(
                   core::FrameRoleId(Text(query, "relative_to_frame_role_id")))
-            : std::nullopt,
-        kind == "gripper_confirmation"};
+            : std::nullopt};
     return decoded;
   }
   if (command == "query_operation") {
@@ -4833,6 +4852,39 @@ OperationStateValue(const core::OperationStateDTO &value) {
   CanonicalValue::Array participants;
   participants.reserve(value.participants.size());
   for (const auto &participant : value.participants) {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+    // Durable operation details remain authoritative. This status-observed
+    // notice is best-effort; one last key suppresses consecutive repeats only.
+    if (participant.terminal_error &&
+        participant.terminal_error->details.contains("runtime_collision_reason")) {
+      try {
+        const auto notice = content_identity::canonical_json(
+            CanonicalValue(CanonicalValue::Object{
+                {"operation_id", CanonicalValue(value.operation_id.value())},
+                {"operation_revision", CanonicalValue(static_cast<double>(
+                                           value.operation_revision.value()))},
+                {"participant_id", CanonicalValue(participant.participant_id.value())},
+                {"error", ErrorValue(*participant.terminal_error)},
+            }));
+        const auto key = content_identity::sha256_digest(notice);
+        static std::mutex notice_mutex;
+        static std::string last_notice_key;
+        std::unique_lock lock(notice_mutex, std::try_to_lock);
+        if (lock.owns_lock() && last_notice_key != key) {
+          last_notice_key = key;
+          // Keep identity and decisive cause before context: enqueue caps the line.
+          host_controller_launch_supervisor().enqueue_host_log(
+              "ERROR manyforge runtime collision: operation=" + value.operation_id.value() +
+              " revision=" + std::to_string(value.operation_revision.value()) +
+              " participant=" + participant.participant_id.value() +
+              " reason=" + participant.terminal_error->details.at("runtime_collision_reason") +
+              " context=" + notice);
+        }
+      } catch (...) {
+        // Diagnostic formatting/output never changes a status response.
+      }
+    }
+#endif
     CanonicalValue::Array resources;
     resources.reserve(participant.resources.size());
     for (const auto &resource : participant.resources) {
@@ -6443,7 +6495,6 @@ struct Composition final {
   std::optional<core::JointLimitsDTO> direct_control_joint_limits;
   CanonicalValue direct_control_motion_descriptor;
   CanonicalValue direct_control_gripper_descriptor;
-  std::optional<core::Duration> operator_confirmation_validity_ns;
   // The staged cell planning-model files of this composition's product. The
   // runtime's RoboPlan worker reloads them by path whenever it restarts, so a
   // retained runtime shares this stage with every composition that retains it
@@ -6490,6 +6541,9 @@ struct Composition final {
   std::optional<core::TargetRoleId> status_motion_target_role_id;
   std::optional<core::TargetRoleId> status_gripper_target_role_id;
   std::shared_ptr<ManagerSceneAuthorityProxy> scene_authority_proxy;
+  // Declared before dependent projection/frame owners, including participant
+  // compositions, so their destruction completes before these pins are freed.
+  std::vector<std::shared_ptr<RetainedPlannerSceneProjection>> required_projection_pins;
   std::shared_ptr<RetainedPlannerSceneProjection> planner_scene_projection;
   std::shared_ptr<RetainedSceneFrameResolver> scene_frame_resolver;
 #if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
@@ -6501,7 +6555,7 @@ struct Composition final {
       cclc_active_publication_reader;
   std::unique_ptr<deployment::FilesystemVerifiedRetainedProductArtifactSource>
       cclc_artifact_source;
-  std::unique_ptr<deployment::FilesystemVerifiedRetainedProviderManifestSource>
+  std::shared_ptr<deployment::FilesystemVerifiedRetainedProviderManifestSource>
       cclc_provider_manifest_source;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> ros2_control_runtime_handle;
@@ -6509,7 +6563,7 @@ struct Composition final {
   std::string controller_request_context;
   std::optional<ControllerLaunchSupervisor::Ensured> prepared_controller_launch;
   bool controller_launch_adopted{};
-  std::unique_ptr<RetainedRos2ControlLifecycleProduct> cclc_lifecycle_product;
+  std::shared_ptr<RetainedRos2ControlLifecycleProduct> cclc_lifecycle_product;
 #else
   std::unique_ptr<RetainedNativeLifecycleProduct> cclc_lifecycle_product;
 #endif
@@ -7023,28 +7077,13 @@ void PreemptManagedExecutionSurfacePlanning(
     ManagedExecutionSurfaceControl &control) noexcept;
 
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-[[nodiscard]] std::shared_ptr<const CanonicalValue>
-ControllerLaunchIncidentSnapshot(ControllerLaunchProcess &process,
-                                 const ControllerLaunchExitEvidence &exit,
-                                 const deployment::RetainedBundle &bundle,
-                                 const std::string &runtime_id,
-                                 const std::string &runtime_epoch) {
-  const auto optional_text = [](const std::optional<std::string> &value) {
-    return value ? CanonicalValue(*value) : CanonicalValue(nullptr);
-  };
-  const auto optional_bool = [](const std::optional<bool> value) {
-    return value ? CanonicalValue(*value) : CanonicalValue(nullptr);
-  };
-  const auto optional_number = [](const std::optional<int> value) {
-    return value ? CanonicalValue(static_cast<double>(*value))
-                 : CanonicalValue(nullptr);
-  };
+[[nodiscard]] CanonicalValue
+LaunchIncidentOutput(ControllerLaunchOutputSnapshot output) {
   const auto unsigned_value = [](const std::uint64_t value) {
     return value <= 9'007'199'254'740'991ULL
                ? CanonicalValue(static_cast<double>(value))
                : CanonicalValue(std::to_string(value));
   };
-  auto output = process.output_snapshot();
   std::uint64_t invalid_text_bytes{};
   const bool escaped_tail = !content_identity::is_utf8_nfc(output.tail);
   if (escaped_tail) {
@@ -7101,6 +7140,38 @@ ControllerLaunchIncidentSnapshot(ControllerLaunchProcess &process,
                           : static_cast<std::size_t>(std::count(
                                 output.tail.begin(), output.tail.end(), '\n')) +
                                 (output.tail.back() == '\n' ? 0U : 1U);
+  return CanonicalValue(CanonicalValue::Object{
+           {"tail", CanonicalValue(std::move(output.tail))},
+           {"line_count", CanonicalValue(static_cast<double>(line_count))},
+           {"truncated", CanonicalValue(output.truncated)},
+           {"dropped_forward_lines",
+            unsigned_value(output.dropped_forward_lines)},
+           {"dropped_forward_bytes",
+            unsigned_value(output.dropped_forward_bytes)},
+           {"invalid_text_bytes", unsigned_value(invalid_text_bytes)}});
+}
+
+[[nodiscard]] std::shared_ptr<const CanonicalValue>
+ControllerLaunchIncidentSnapshot(ControllerLaunchProcess &process,
+                                 const ControllerLaunchExitEvidence &exit,
+                                 const deployment::RetainedBundle &bundle,
+                                 const std::string &runtime_id,
+                                 const std::string &runtime_epoch) {
+  const auto optional_text = [](const std::optional<std::string> &value) {
+    return value ? CanonicalValue(*value) : CanonicalValue(nullptr);
+  };
+  const auto optional_bool = [](const std::optional<bool> value) {
+    return value ? CanonicalValue(*value) : CanonicalValue(nullptr);
+  };
+  const auto optional_number = [](const std::optional<int> value) {
+    return value ? CanonicalValue(static_cast<double>(*value))
+                 : CanonicalValue(nullptr);
+  };
+  const auto unsigned_value = [](const std::uint64_t value) {
+    return value <= 9'007'199'254'740'991ULL
+               ? CanonicalValue(static_cast<double>(value))
+               : CanonicalValue(std::to_string(value));
+  };
   const auto &command = process.command();
   CanonicalValue::Array argv;
   for (const auto &argument : command.argv)
@@ -7170,21 +7241,43 @@ ControllerLaunchIncidentSnapshot(ControllerLaunchProcess &process,
            {"robot_description_sha256",
             CanonicalValue(exit.robot_description_sha256)},
            {"controllers_sha256", CanonicalValue(exit.controllers_sha256)}})},
-      {"output",
-       CanonicalValue(CanonicalValue::Object{
-           {"tail", CanonicalValue(std::move(output.tail))},
-           {"line_count", CanonicalValue(static_cast<double>(line_count))},
-           {"truncated", CanonicalValue(output.truncated)},
-           {"dropped_forward_lines",
-            unsigned_value(output.dropped_forward_lines)},
-           {"dropped_forward_bytes",
-            unsigned_value(output.dropped_forward_bytes)},
-           {"invalid_text_bytes", unsigned_value(invalid_text_bytes)}})},
+      {"output", LaunchIncidentOutput(process.output_snapshot())},
       {"core_dump_link", CanonicalValue(nullptr)}});
   Require(core::ComponentIncidentDiagnosticSnapshotShapeIsValid(*snapshot),
           "controller launch incident snapshot exceeded its closed bound");
   return snapshot;
 }
+std::function<ControllerLaunchReadinessEvidence()>
+CachedControllerLaunchReadinessSource(
+    const std::shared_ptr<RetainedRos2ControlRuntimeHandle> &handle) {
+  return [weak = std::weak_ptr<RetainedRos2ControlRuntimeHandle>(handle)] {
+    ControllerLaunchReadinessEvidence facts;
+    const auto handle = weak.lock();
+    if (!handle)
+      return facts;
+    const auto activity = handle->arm_activity();
+    facts.controller_manager_present = activity.controller_manager_present;
+    facts.controller_observed = activity.observed;
+    if (activity.observed) {
+      facts.controller_loaded = activity.controller_loaded;
+      facts.arm_controller_active = activity.controller_active;
+      facts.hardware_ready = activity.hardware_active;
+    }
+    if (const auto port = handle->current_port()) {
+      facts.known = true;
+      const auto readiness = port->ReadReadiness();
+      facts.controller_bound = readiness.controller_bound;
+      facts.binding_epoch = readiness.binding_epoch.value();
+      const auto sample = port->ReadSample();
+      facts.joint_sample_available = sample.has_value();
+      if (sample)
+        facts.sample_age_ns = std::max<core::TimePoint>(
+            0, WallClock{}.now() - sample->local_receipt_stamp_ns);
+    }
+    return facts;
+  };
+}
+
 #endif
 
 struct RetainedNativeComponentSnapshot final {
@@ -7196,7 +7289,6 @@ struct RetainedNativeComponentSnapshot final {
   std::optional<core::JointLimitsDTO> joint_limits;
   CanonicalValue motion_descriptor;
   CanonicalValue gripper_descriptor;
-  std::optional<core::Duration> operator_confirmation_validity_ns;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> ros2_control_runtime_handle;
   std::shared_ptr<ControllerLaunchProcess> controller_process;
@@ -7253,6 +7345,12 @@ struct CompositionBuildInput final {
   // model and the candidate worker. Absent: relative scene meshes fail closed.
   std::optional<int> scene_asset_root_fd{};
   std::string controller_request_context{};
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  // Captured by the stable cell owner only after the strict observer check
+  // and cell barrier complete. Component construction performs no world work.
+  std::optional<IsaacControllerLaunchInputs> managed_isaac_launch_inputs{};
+#endif
+  std::vector<std::shared_ptr<RetainedPlannerSceneProjection>> required_projection_pins{};
 };
 
 [[nodiscard]] core::CellAdmissionSettlementValidator
@@ -7403,8 +7501,9 @@ struct NativePhysicalBindingSet final {
   std::optional<core::TargetRoleId> status_gripper_role;
 };
 
+template <typename PhysicalBindingInput>
 [[nodiscard]] NativePhysicalBindingSet ResolveNativePhysicalBindings(
-    const CompositionBuildInput &input,
+    const PhysicalBindingInput &input,
     const deployment::DirectControlProgramBindingInventory &inventory) {
   const auto select_optional_binding =
       [&](const auto &bindings, const std::string_view capability_id) {
@@ -7865,6 +7964,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
     composition->scene_frame_resolver = std::move(frame_resolver);
     composition->planner_scene_projection =
         std::move(input.planner_scene_projection);
+    composition->required_projection_pins = std::move(input.required_projection_pins);
     if (composition->planner_scene_projection != nullptr) {
       composition->scene_authority_proxy =
           std::make_shared<ManagerSceneAuthorityProxy>(
@@ -8026,8 +8126,6 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
   composition->candidate_planner_model = std::move(candidate_planner_model);
   composition->candidate_model_generation =
       std::move(candidate_model_generation);
-  composition->operator_confirmation_validity_ns =
-      predecessor->second.operator_confirmation_validity_ns;
   composition->target_resolver = std::move(target_resolver);
   composition->candidate_control_representatives =
       std::move(physical.representatives);
@@ -8065,6 +8163,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
   composition->scene_frame_resolver = std::move(frame_resolver);
   composition->planner_scene_projection =
       std::move(input.planner_scene_projection);
+  composition->required_projection_pins = std::move(input.required_projection_pins);
   composition->scene_authority_proxy =
       std::make_shared<ManagerSceneAuthorityProxy>(
           std::move(input.manager_run_root));
@@ -8306,6 +8405,7 @@ BuildStandaloneGripperProductComposition(CompositionBuildInput input) {
       std::move(resolver_factory);
   composition->planner_scene_projection =
       std::move(input.planner_scene_projection);
+  composition->required_projection_pins = std::move(input.required_projection_pins);
   composition->scene_frame_resolver = std::move(frame_resolver);
   composition->target_resolver = std::move(target_resolver);
   if (composition->planner_scene_projection != nullptr) {
@@ -8318,8 +8418,6 @@ BuildStandaloneGripperProductComposition(CompositionBuildInput input) {
     if (target.controllable_component_id ==
             gripper_value.controllable_component_id &&
         target.command_target_id == gripper_value.command_target_id) {
-      composition->operator_confirmation_validity_ns =
-          target.operator_confirmation_validity_ns;
     }
   }
   return composition;
@@ -8919,14 +9017,39 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                               ? "started"
                               : "restarted")
                 << " pid=" << ensured.process->pid() << std::endl;
+    } else if (input.managed_isaac_launch_inputs) {
+      const auto &cell_inputs = *input.managed_isaac_launch_inputs;
+      Require(cell_inputs.manager_cell_world_owned,
+              "managed Isaac component requires completed cell-world preflight");
+      Require(artifact_input.isaac_lane.has_value(),
+              "managed Isaac component has no retained controller lane");
+      const auto command = isaac_controller_launch_command(
+          written, *artifact_input.isaac_lane, cell_inputs);
+      const auto ensured = host_controller_launch_supervisor().ensure(
+          command, written.directory,
+          input.controller_request_context.empty()
+              ? "Bootstrap runtime=" +
+                    (input.runtime_unit_id ? input.runtime_unit_id->value()
+                                           : std::string("unmanaged")) +
+                    " epoch=" + input.runtime_epoch.value()
+              : input.controller_request_context);
+      prepared_launch.reset(new ControllerLaunchSupervisor::Ensured(ensured));
+      controller_process = ensured.process;
+      std::cerr << "manyforge controller launch: component="
+                << written.controllable_component_id << " decision="
+                << (ensured.decision == ControllerLaunchDecision::kKeep
+                        ? "kept"
+                        : ensured.decision == ControllerLaunchDecision::kStart
+                              ? "started"
+                              : "restarted")
+                << " pid=" << ensured.process->pid() << std::endl;
     } else {
-      // Q78 (Isaac): isaac_controller_launch_command() builds the command,
-      // but its world/scene inputs have no retained source yet; the Isaac
-      // launch stays caller-started until that source is decided.
+      // Unmanaged developer launch remains external. Managed construction
+      // receives the cell owner's qualified inputs rather than recreating
+      // its barrier/observer inside each robot launch.
       std::cerr << "manyforge controller launch: component="
                 << written.controllable_component_id
-                << " Isaac launch is not started by this host (no retained "
-                   "world/scene launch inputs)"
+                << " Isaac launch requires qualified cell-world inputs"
                 << std::endl;
     }
   }
@@ -8935,35 +9058,8 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   if (controller_process != nullptr) {
     ros2_control_runtime_handle->InstallControllerProcessFaultSource(
         ControllerLaunchSupervisor::fault_source(
-            controller_process,
-            [weak = std::weak_ptr<RetainedRos2ControlRuntimeHandle>(
-                 ros2_control_runtime_handle)] {
-              ControllerLaunchReadinessEvidence facts;
-              const auto handle = weak.lock();
-              if (!handle)
-                return facts;
-              const auto activity = handle->arm_activity();
-              facts.controller_manager_present =
-                  activity.controller_manager_present;
-              facts.controller_observed = activity.observed;
-              if (activity.observed) {
-                facts.controller_loaded = activity.controller_loaded;
-                facts.arm_controller_active = activity.controller_active;
-                facts.hardware_ready = activity.hardware_active;
-              }
-              if (const auto port = handle->current_port()) {
-                facts.known = true;
-                const auto readiness = port->ReadReadiness();
-                facts.controller_bound = readiness.controller_bound;
-                facts.binding_epoch = readiness.binding_epoch.value();
-                const auto sample = port->ReadSample();
-                facts.joint_sample_available = sample.has_value();
-                if (sample)
-                  facts.sample_age_ns = std::max<core::TimePoint>(
-                      0, WallClock{}.now() - sample->local_receipt_stamp_ns);
-              }
-              return facts;
-            }));
+            controller_process, CachedControllerLaunchReadinessSource(
+                                    ros2_control_runtime_handle)));
   }
   auto ros2_control_backend_config =
       mock_lane
@@ -9155,8 +9251,6 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       if (target.controllable_component_id ==
               gripper.value().controllable_component_id &&
           target.command_target_id == gripper.value().command_target_id) {
-        composition->operator_confirmation_validity_ns =
-            target.operator_confirmation_validity_ns;
       }
     }
   }
@@ -9173,6 +9267,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
 #endif
   composition->planner_scene_projection =
       std::move(input.planner_scene_projection);
+  composition->required_projection_pins = std::move(input.required_projection_pins);
   composition->scene_frame_resolver = std::move(direct_scene_frame_resolver);
   composition->target_resolver = std::move(target_resolver);
   if (composition->planner_scene_projection != nullptr) {
@@ -10813,11 +10908,46 @@ MakeNativeCellReadinessPort(Composition &composition) {
 }
 #endif
 
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+// Prepare the same actual product used by the installed facade. Original
+// delegated runtimes borrow its catalog/ports, so attachment must retain it.
+void EnsureInstalledRetainedRos2ControlLifecycleProduct(
+    Composition &composition, const std::filesystem::path &package_root) {
+  if (composition.cclc_lifecycle_product) {
+    Require(composition.cclc_provider_manifest_source != nullptr,
+            "installed ROS lifecycle product lost its verified provider source");
+    return;
+  }
+  Require(composition.runtime != nullptr && composition.runtime->clock != nullptr &&
+              composition.active_addressed_kernel() != nullptr,
+          "installed ROS lifecycle product requires the stable runtime and Kernel");
+  auto provider_manifest_source = std::make_unique<
+      deployment::FilesystemVerifiedRetainedProviderManifestSource>(package_root);
+  auto physical_bindings = PhysicalControlBindings(composition);
+  std::vector<std::shared_ptr<RetainedRos2ControlRuntimeHandle>> handles;
+  for (const auto &[component_id, view] : IndexNativeComponentCompositions(composition)) {
+    static_cast<void>(component_id);
+    Require(view->ros2_control_runtime_handle != nullptr,
+            "retained ROS lifecycle has no bound execution adapter");
+    handles.push_back(view->ros2_control_runtime_handle);
+  }
+  auto product = RetainedRos2ControlLifecycleProduct::Create(
+      composition.bundle, *provider_manifest_source, physical_bindings, handles,
+      *composition.runtime->clock, 1'000'000'000LL);
+  if (!product.ok())
+    Fail("native lifecycle product cannot be composed: " + product.error().message);
+  composition.cclc_provider_manifest_source = std::move(provider_manifest_source);
+  composition.cclc_lifecycle_product = std::move(product.value());
+}
+#endif
+
 void AttachRetainedNativeCCLC(Composition &composition,
                               const HostConfig &config,
                               ManagedKernelApplyFenceOwner &fence_owner,
                               const std::optional<core::ConfigurationFenceStatusQueryDTO>
-                                  &parent_apply = std::nullopt) {
+                                  &parent_apply = std::nullopt,
+                              const std::optional<core::RequestOwnerEpoch>
+                                  &quiescent_predecessor = std::nullopt) {
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   std::shared_ptr<WallClock> cell_clock;
   std::shared_ptr<SimpleScheduler> cell_scheduler;
@@ -10931,23 +11061,14 @@ void AttachRetainedNativeCCLC(Composition &composition,
   auto artifact_source = std::make_unique<
       deployment::FilesystemVerifiedRetainedProductArtifactSource>(
       config.package_root);
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  EnsureInstalledRetainedRos2ControlLifecycleProduct(composition, config.package_root);
+  auto *const lifecycle_product_view = composition.cclc_lifecycle_product.get();
+#else
   auto provider_manifest_source = std::make_unique<
       deployment::FilesystemVerifiedRetainedProviderManifestSource>(
       config.package_root);
   auto physical_bindings = PhysicalControlBindings(composition);
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-  std::vector<std::shared_ptr<RetainedRos2ControlRuntimeHandle>> handles;
-  for (const auto &[component_id, view] :
-       IndexNativeComponentCompositions(composition)) {
-    static_cast<void>(component_id);
-    Require(view->ros2_control_runtime_handle != nullptr,
-            "retained ROS lifecycle has no bound execution adapter");
-    handles.push_back(view->ros2_control_runtime_handle);
-  }
-  auto lifecycle_product = RetainedRos2ControlLifecycleProduct::Create(
-      composition.bundle, *provider_manifest_source, physical_bindings, handles,
-      *owner_clock, 1'000'000'000LL);
-#else
   core::SqliteCCLCJournal native_state_journal(
       config.execution_state_root /
           std::string(core::kCCLCJournalFilename),
@@ -11020,11 +11141,12 @@ void AttachRetainedNativeCCLC(Composition &composition,
       !parent_apply.has_value() && composition.route_recovery_pending.load(
                                       std::memory_order_acquire));
   native_state_journal.Close();
-#endif
   if (!lifecycle_product.ok()) {
     Fail("native lifecycle product cannot be composed: " +
          lifecycle_product.error().message);
   }
+  auto *const lifecycle_product_view = lifecycle_product.value().get();
+#endif
 
   deployment::CCLCRuntimeCompositionConfig cclc_config{
       config.execution_state_root,
@@ -11032,7 +11154,9 @@ void AttachRetainedNativeCCLC(Composition &composition,
       core::CellId(config.cell_id),
       {core::RequestOwnerEpoch(RandomToken("cclc-owner-")), 1024U, 2U,
        10'000'000LL, 30'000'000'000LL}};
+  cclc_config.coordinator.quiescent_predecessor = quiescent_predecessor;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  cclc_config.preparation_failure_source = config.preparation_failure_source;
   cclc_config.lifecycle_target_driver.read_output_drop_counts =
       [](const core::ControllableComponentId &component)
       -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
@@ -11055,6 +11179,34 @@ void AttachRetainedNativeCCLC(Composition &composition,
 #endif
   auto cclc = [&]() -> core::Result<
       std::unique_ptr<deployment::CCLCRuntimeComposition>> {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+    if (parent_apply || quiescent_predecessor) {
+      // A live parent installation already carries its actual routes and
+      // readiness. Reconstruct only the immutable facade dependencies; the
+      // startup recovery overload would adopt/reconcile unrelated effects.
+      auto current_configuration = [&runtime = *composition.runtime](
+          const core::ControlDomainId &domain) {
+        return runtime.ReadCurrentPublishedRouteConfiguration(domain);
+      };
+      auto created = CreateRetainedNativeCCLCRuntime(
+          RetainedNativeCCLCRuntimeConfig{std::move(cclc_config), 1'000'000'000LL},
+          composition.bundle, *active_publication_reader,
+          std::move(active_publication.value()), *artifact_source,
+          lifecycle_product_view->catalog_source(),
+          lifecycle_product_view->brand_ports(),
+          CellControlBindingRepresentatives(composition), kernel, fence_owner,
+          *composition.runtime, *owner_clock, *owner_scheduler,
+          std::move(current_configuration),
+          lifecycle_product_view->lifecycle_snapshot_source(),
+          composition.runtime.get());
+      if (!created.ok()) return created;
+      const auto started = created.value()->Start();
+      if (!started.ok())
+        return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::Err(
+            started.error());
+      return created;
+    }
+#endif
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
     const bool has_independent_gripper =
         composition.gripper_runtime != nullptr ||
@@ -11075,8 +11227,8 @@ void AttachRetainedNativeCCLC(Composition &composition,
                                           1'000'000'000LL},
           composition.bundle, *active_publication_reader,
           std::move(active_publication.value()), *artifact_source,
-          lifecycle_product.value()->catalog_source(),
-          lifecycle_product.value()->brand_ports(),
+          lifecycle_product_view->catalog_source(),
+          lifecycle_product_view->brand_ports(),
           CellControlBindingRepresentatives(composition), *composition.runtime,
           *composition.active_addressed_kernel(), fence_owner);
     }
@@ -11096,8 +11248,8 @@ void AttachRetainedNativeCCLC(Composition &composition,
                                             1'000'000'000LL},
             composition.bundle, *active_publication_reader,
             std::move(active_publication.value()), *artifact_source,
-            lifecycle_product.value()->catalog_source(),
-            lifecycle_product.value()->brand_ports(),
+            lifecycle_product_view->catalog_source(),
+            lifecycle_product_view->brand_ports(),
             CellControlBindingRepresentatives(composition),
             *composition.active_addressed_kernel(), fence_owner,
             *composition.cclc_cell_route_publication_owner,
@@ -11142,8 +11294,8 @@ void AttachRetainedNativeCCLC(Composition &composition,
                                           1'000'000'000LL},
           composition.bundle, *active_publication_reader,
           std::move(active_publication.value()), *artifact_source,
-          lifecycle_product.value()->catalog_source(),
-          lifecycle_product.value()->brand_ports(),
+          lifecycle_product_view->catalog_source(),
+          lifecycle_product_view->brand_ports(),
           CellControlBindingRepresentatives(composition),
           *composition.active_addressed_kernel(), fence_owner,
           *composition.cclc_cell_route_publication_owner, *owner_clock,
@@ -11166,13 +11318,13 @@ void AttachRetainedNativeCCLC(Composition &composition,
                                         1'000'000'000LL},
         composition.bundle, *active_publication_reader,
         std::move(active_publication.value()), *artifact_source,
-        lifecycle_product.value()->catalog_source(),
-        lifecycle_product.value()->brand_ports(),
+        lifecycle_product_view->catalog_source(),
+        lifecycle_product_view->brand_ports(),
         CellControlBindingRepresentatives(composition), *composition.runtime,
         *composition.active_addressed_kernel(), fence_owner
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
         ,
-        lifecycle_product.value()->lifecycle_snapshot_source()
+        lifecycle_product_view->lifecycle_snapshot_source()
 #endif
     );
   }();
@@ -11213,9 +11365,11 @@ void AttachRetainedNativeCCLC(Composition &composition,
   composition.cclc_active_publication_reader =
       std::move(active_publication_reader);
   composition.cclc_artifact_source = std::move(artifact_source);
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   composition.cclc_provider_manifest_source =
       std::move(provider_manifest_source);
   composition.cclc_lifecycle_product = std::move(lifecycle_product.value());
+#endif
   composition.cclc_runtime = std::move(cclc.value());
   composition.cclc_attached.store(true, std::memory_order_release);
 }
@@ -11262,6 +11416,842 @@ LoadManagedBundleAtPinnedRoot(
   }
   return std::nullopt;
 }
+
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+[[nodiscard]] core::NativeApplyParentPreparationFailureSource
+MakeNativeApplyPreparationFailureSource(
+    const ManagedRuntimeChildConfig &config,
+    core::ResourceAddressedExecutionKernel &kernel) {
+  // These roots belong to the main-scope managed child, and the stable Kernel
+  // outlives every CCLC composition. No original-live effect validator is
+  // reconstructed here: replacements may observe this immutable history.
+  return [config, &kernel](const core::NativeApplyPlanDTO &plan)
+             -> core::Result<bool> {
+    const auto candidate = LoadManagedBundleAtPinnedRoot(
+        config, plan.candidate_retained_bundle_id);
+    if (!candidate) return core::Result<bool>::Ok(false);
+    const auto manager_journal = config.manager_state_root /
+        std::string(component_manager::kManagerApplyJournalFilename);
+    const auto parent = component_manager::ReadNativeApplyParentStatusReadOnly(
+        manager_journal, core::CellId(config.cell_id), plan, *candidate->bundle);
+    if (!parent.ok()) return core::Result<bool>::Err(parent.error());
+    const auto &stored = parent.value().intent.intent;
+    // Read the existing full ledger entry rather than guessing the Q91 scope.
+    const auto claim = stored.parent_authoring_claim
+        ? stored.parent_authoring_claim
+        : kernel.ReadHeldCellAdmissionClaim(
+              core::CellAdmissionClaimKindDTO::kManagerApply);
+    if (!claim) return core::Result<bool>::Ok(false);
+    const core::CellAdmissionRecoveryReceiptQueryDTO query{
+        claim->intent, *claim, std::nullopt};
+    const auto receipt = kernel.GetCellAdmissionRecoveryReceipt(query);
+    if (!receipt.ok()) return core::Result<bool>::Err(receipt.error());
+    const auto observed =
+        component_manager::ReadNativeApplyPreparationFailureReadOnly(
+            manager_journal, core::CellId(config.cell_id), plan,
+            *candidate->bundle, *claim, query, receipt.value());
+    if (!observed.ok()) return core::Result<bool>::Err(observed.error());
+    return core::Result<bool>::Ok(observed.value().has_value());
+  };
+}
+#endif
+
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+// A borrowed compiler view, without composition/Scene/admission owners. The
+// same resolver accepts this view and the actual CompositionBuildInput.
+struct CandidatePhysicalBindingInput final {
+  const std::shared_ptr<const deployment::RetainedBundle> &bundle;
+  const deployment::VerifiedRetainedModelMap &model_map;
+  const core::RuntimeEpoch &runtime_epoch;
+  std::optional<core::ControllableComponentId> selected_component_id;
+  const deployment::ProgramBinding *status_program_binding{};
+  std::optional<core::TargetRoleId> status_motion_target_role_id{};
+  std::optional<core::TargetRoleId> status_gripper_target_role_id{};
+};
+
+struct ManagedCandidateLifecycleComponentClosure final {
+  core::ControllableComponentId component_id;
+  std::vector<core::ExpectedControlDomainRevisionDTO> candidate_expected_domains;
+  std::vector<core::ResolvedLifecycleControlDomainScopeDTO> qualified_candidate_domains;
+  std::vector<core::ResolvedLifecycleProviderOccurrenceDTO> candidate_provider_occurrences;
+  std::vector<core::BrandLifecyclePlanCatalogDTO> lifecycle_plan_catalogs;
+};
+
+struct ManagedCandidateLifecyclePlanningClosure final {
+  core::ProjectionRevisionDTO candidate_projection_revision;
+  core::ActiveBundlePublicationGeneration anticipated_publication_generation;
+  // Compiled ActiveFacts floors/paths only, never installed or ready readback.
+  std::vector<core::RuntimeParticipantBinding> compiled_physical_bindings;
+  std::vector<ManagedCandidateLifecycleComponentClosure> components;
+};
+
+// Captured only by the original synchronous fresh Acquire branch. Durable
+// plan/status reads on a replacement never reconstruct this live continuation.
+// Its facade is borrowed from the main cell lifetime, which cannot be recreated
+// until every accepted child and original managed caller has fully drained.
+struct ManagedOriginalApplyBringUpCapture final {
+  component_manager::PersistedManagerApplyBringUpPlan sealed_plan;
+  core::CellAdmissionClaimDTO parent_claim;
+  core::ActiveBundlePublicationReceiptDTO predecessor_publication;
+  core::ProjectionRevisionDTO predecessor_projection_revision;
+  ManagedBundleAtPinnedRoot predecessor;
+  ManagedBundleAtPinnedRoot candidate;
+  ManagedCandidateLifecyclePlanningClosure candidate_closure;
+  deployment::CCLCRuntimeComposition *original_facade{};
+};
+
+[[nodiscard]] core::Result<ManagedCandidateLifecyclePlanningClosure>
+BuildManagedCandidateLifecyclePlanningClosure(
+    const ManagedRuntimeChildConfig &config,
+    const ManagedBundleAtPinnedRoot &candidate,
+    const core::ProjectionRevisionDTO &revision,
+    const core::ActiveBundlePublicationGeneration anticipated_publication_generation) {
+  using Closure = ManagedCandidateLifecyclePlanningClosure;
+  try {
+    Require(candidate.bundle && deployment::verify_retained_bundle_identity(*candidate.bundle) &&
+                candidate.bundle->value().cell_graph.cell_id == core::CellId(config.cell_id) &&
+                revision.valid() && revision.retained_bundle_id == candidate.bundle->retained_bundle_id() &&
+                revision.graph_revision == candidate.bundle->value().cell_graph.graph_revision &&
+                anticipated_publication_generation.nonzero() &&
+                !config.runtime_unit_id.empty() && !config.runtime_epoch.empty(),
+            "candidate lifecycle compiler inputs do not share the pinned product");
+    const auto &bundle = *candidate.bundle;
+    const auto &graph = bundle.value().cell_graph;
+    const core::RuntimeUnitId runtime_unit_id(config.runtime_unit_id);
+    const auto runtime_configuration =
+        deployment::ros2_control_execution_runtime_contract::require_configuration(bundle, runtime_unit_id);
+    // Validate host-local ownership before the resolver's ActiveFacts uses
+    // this host epoch. A foreign retained unit must never receive it.
+    for (const auto &component : graph.controllable_components) {
+      Require(std::find(component.runtime_unit_ids.begin(), component.runtime_unit_ids.end(), runtime_unit_id) !=
+                  component.runtime_unit_ids.end() &&
+                  deployment::ros2_control_execution_runtime_contract::find_controller_profile(
+                      runtime_configuration, component.controllable_component_id) != nullptr,
+              "candidate component has no controller profile in this host runtime unit");
+    }
+    Require(std::all_of(graph.control_bindings.begin(), graph.control_bindings.end(),
+                [&](const auto &binding) { return binding.provider_runtime_unit_id == runtime_unit_id; }),
+            "candidate lifecycle provider belongs to another runtime unit");
+    Closure result{revision, anticipated_publication_generation, {}, {}};
+    if (graph.controllable_components.empty()) {
+      Require(graph.control_bindings.empty() && graph.control_domains.empty() &&
+                  bundle.value().desired_control_configurations.empty(),
+              "empty candidate has nonempty lifecycle control membership");
+      return core::Result<Closure>::Ok(std::move(result));
+    }
+    const auto &products = bundle.value().compiled_products;
+    Require(products.symbol_role_maps.size() == 1U,
+            "candidate lifecycle compiler requires the exact retained model map");
+    const deployment::FilesystemVerifiedRetainedModelMapSource map_source(candidate.package_root);
+    auto model_map = map_source.get_verified(deployment::RetainedModelMapQuery{
+        bundle.retained_bundle_id(), products.symbol_role_maps.front().product_id});
+    Require(model_map.has_value(), "candidate retained model map is absent or invalid");
+    const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(candidate.package_root);
+    const auto inventory = deployment::compile_direct_control_program_binding_inventory(
+        bundle, *model_map, catalog_store);
+    const core::RuntimeEpoch runtime_epoch(config.runtime_epoch);
+    std::map<core::ControllableComponentId, std::set<core::ControlDomainId>> component_domains;
+    for (const auto &component : graph.controllable_components) {
+      const auto [entry, inserted] = component_domains.emplace(
+          component.controllable_component_id, std::set<core::ControlDomainId>{});
+      Require(inserted, "candidate compiler has duplicate component membership");
+      CandidatePhysicalBindingInput input{candidate.bundle, *model_map, runtime_epoch,
+          entry->first, nullptr, std::nullopt, std::nullopt};
+      auto physical = ResolveNativePhysicalBindings(input, inventory);
+      result.compiled_physical_bindings.insert(result.compiled_physical_bindings.end(),
+          std::make_move_iterator(physical.representatives.begin()),
+          std::make_move_iterator(physical.representatives.end()));
+    }
+    for (const auto &binding : graph.control_bindings) {
+      const auto component = component_domains.find(binding.controllable_component_id);
+      Require(component != component_domains.end(), "candidate binding has no retained component");
+      component->second.insert(binding.control_domain_id);
+    }
+    Require(std::all_of(result.compiled_physical_bindings.begin(), result.compiled_physical_bindings.end(),
+                [](const auto &row) { return row.value().control_path.has_value(); }),
+            "candidate compiler produced an unaddressed physical binding");
+    std::sort(result.compiled_physical_bindings.begin(), result.compiled_physical_bindings.end(),
+        [](const auto &lhs, const auto &rhs) {
+          return lhs.value().control_path->control_binding_id < rhs.value().control_path->control_binding_id;
+        });
+    std::map<core::ControlBindingId, const core::RuntimeParticipantBinding *> compiled;
+    for (const auto &binding : result.compiled_physical_bindings) {
+      const auto &value = binding.value();
+      Require(value.retained_bundle_id == bundle.retained_bundle_id() &&
+                  value.graph_revision == graph.graph_revision && value.control_path &&
+                  compiled.emplace(value.control_path->control_binding_id, &binding).second,
+              "candidate compiled representatives are stale, absent or duplicated");
+    }
+    struct DomainClosure final {
+      core::ExpectedControlDomainRevisionDTO expected;
+      core::ResolvedLifecycleControlDomainScopeDTO scope;
+      core::ResolvedLifecycleProviderOccurrenceDTO provider;
+      core::BrandLifecyclePlanCatalogDTO catalog;
+    };
+    std::map<core::ControlDomainId, DomainClosure> domains;
+    std::set<core::ControlBindingId> consumed;
+    const deployment::FilesystemVerifiedRetainedProviderManifestSource manifests(candidate.package_root);
+    const deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(candidate.package_root);
+    for (const auto &desired : bundle.value().desired_control_configurations) {
+      const auto domain = std::find_if(graph.control_domains.begin(), graph.control_domains.end(),
+          [&](const auto &row) { return row.control_domain_id == desired.control_domain_id; });
+      Require(domain != graph.control_domains.end() &&
+                  domain->control_domain_revision == desired.control_domain_revision &&
+                  domain->controller_topology_id == desired.controller_topology_id &&
+                  domain->topology_revision == desired.topology_revision,
+              "candidate desired domain differs from its retained topology");
+      std::vector<core::ExpectedControlBindingRevisionDTO> bindings;
+      std::set<core::ResourceId> resources;
+      const core::RuntimeControlPathDTO *provider = nullptr;
+      for (const auto &route : desired.binding_routes) {
+        const auto representative = compiled.find(route.control_binding_id);
+        Require(representative != compiled.end() && consumed.insert(route.control_binding_id).second,
+                "candidate desired route has no unique compiled representative");
+        const auto &value = representative->second->value();
+        const auto &path = *value.control_path;
+        const auto graph_binding = std::find_if(graph.control_bindings.begin(), graph.control_bindings.end(),
+            [&](const auto &row) { return row.control_binding_id == route.control_binding_id; });
+        Require(graph_binding != graph.control_bindings.end() &&
+                    graph_binding->controllable_component_id == value.controllable_component_id &&
+                    graph_binding->control_binding_revision == route.control_binding_revision &&
+                    graph_binding->control_domain_id == desired.control_domain_id &&
+                    graph_binding->controller_topology_id == desired.controller_topology_id &&
+                    graph_binding->topology_revision == desired.topology_revision &&
+                    graph_binding->command_target_id == value.command_target_id &&
+                    graph_binding->capability_id == value.capability_id &&
+                    graph_binding->provider_instance_id == path.provider_instance_id &&
+                    graph_binding->provider_manifest_id == path.provider_manifest_id &&
+                    graph_binding->provider_manifest_revision == path.provider_manifest_revision &&
+                    graph_binding->provider_runtime_unit_id == path.provider_runtime_unit_id &&
+                    std::find(graph_binding->legal_control_route_ids.begin(),
+                              graph_binding->legal_control_route_ids.end(), route.control_route_id) !=
+                        graph_binding->legal_control_route_ids.end() &&
+                    path.control_domain_id == desired.control_domain_id &&
+                    path.control_domain_revision == desired.control_domain_revision &&
+                    path.controller_topology_id == desired.controller_topology_id &&
+                    path.topology_revision == desired.topology_revision &&
+                    path.control_binding_revision == route.control_binding_revision &&
+                    path.control_route_id == route.control_route_id &&
+                    path.provider_runtime_unit_id == runtime_unit_id &&
+                    path.provider_runtime_epoch == runtime_epoch,
+                "candidate compiled route differs from its retained binding/domain");
+        if (provider) {
+          Require(std::tie(provider->provider_instance_id, provider->provider_manifest_id,
+                           provider->provider_manifest_revision, provider->provider_runtime_unit_id,
+                           provider->provider_runtime_epoch) ==
+                      std::tie(path.provider_instance_id, path.provider_manifest_id,
+                               path.provider_manifest_revision, path.provider_runtime_unit_id,
+                               path.provider_runtime_epoch),
+                  "candidate domain spans multiple lifecycle provider occurrences");
+        } else {
+          provider = &path;
+        }
+        bindings.push_back({route.control_binding_id, route.control_binding_revision, route.control_route_id});
+      }
+      // Scope includes every domain binding/resource, including another
+      // component's share. A selected-component filter would truncate it.
+      std::size_t graph_binding_count = 0U;
+      for (const auto &binding : graph.control_bindings) {
+        if (binding.control_domain_id != desired.control_domain_id) continue;
+        ++graph_binding_count;
+        for (const auto &resource : binding.resource_bindings) resources.insert(resource.resource_id);
+      }
+      Require(provider && graph_binding_count == bindings.size() && !resources.empty(),
+              "candidate desired domain does not close all retained bindings/resources");
+      // Reuse the existing sealed product decoder; no synthetic topology or
+      // controller catalog is accepted from an inspection request.
+      static_cast<void>(deployment::load_verified_controller_lifecycle_expected_domain(
+          bundle, artifacts, desired, provider->provider_runtime_unit_id, provider->provider_runtime_epoch));
+      const auto manifest = manifests.get_verified({bundle.retained_bundle_id(),
+          provider->provider_manifest_id, provider->provider_manifest_revision});
+      Require(manifest.has_value(), "candidate retained lifecycle manifest is absent");
+      auto catalog = make_retained_ros2_control_lifecycle_catalog(manifest->value());
+      if (!catalog.ok()) return core::Result<Closure>::Err(catalog.error());
+      std::sort(bindings.begin(), bindings.end(), [](const auto &lhs, const auto &rhs) {
+        return lhs.control_binding_id < rhs.control_binding_id;
+      });
+      const core::ExpectedActiveControlConfigurationDTO absent_configuration{
+          core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt};
+      core::ExpectedControlDomainRevisionDTO expected{desired.control_domain_id,
+          desired.control_domain_revision, desired.controller_topology_id, desired.topology_revision,
+          absent_configuration, bindings};
+      core::ResolvedLifecycleControlDomainScopeDTO scope{desired.control_domain_id,
+          desired.control_domain_revision, desired.controller_topology_id, desired.topology_revision,
+          std::nullopt, std::move(bindings), std::vector<core::ResourceId>(resources.begin(), resources.end())};
+      core::ResolvedLifecycleProviderOccurrenceDTO occurrence{desired.control_domain_id,
+          desired.control_domain_revision, provider->provider_instance_id, provider->provider_manifest_id,
+          provider->provider_manifest_revision, provider->provider_runtime_unit_id,
+          provider->provider_runtime_epoch, catalog.value().catalog_digest};
+      Require(expected.locally_valid() && scope.locally_valid() && occurrence.locally_valid() &&
+                  core::ExpectedDomainMatchesResolvedScope(expected, scope),
+              "candidate lifecycle domain closure is not one valid exact value");
+      Require(domains.emplace(desired.control_domain_id, DomainClosure{
+          std::move(expected), std::move(scope), std::move(occurrence), std::move(catalog.value())}).second,
+          "candidate has duplicate desired domains");
+    }
+    Require(consumed.size() == compiled.size() && domains.size() == graph.control_domains.size(),
+            "candidate compiler has unused physical bindings or omitted domains");
+    for (const auto &[component, ids] : component_domains) {
+      Require(!ids.empty() && ids.size() <= core::kMaxLifecycleExpectedDomains,
+              "candidate component has no bounded lifecycle domain closure");
+      ManagedCandidateLifecycleComponentClosure closure{component, {}, {}, {}, {}};
+      std::size_t binding_count = 0U;
+      for (const auto &id : ids) {
+        const auto domain = domains.find(id);
+        Require(domain != domains.end(), "candidate component domain has no compiled lifecycle closure");
+        const auto count = domain->second.expected.expected_control_bindings.size();
+        Require(count <= core::kMaxLifecycleExpectedBindings - binding_count,
+                "candidate component binding closure exceeds the existing bound");
+        binding_count += count;
+        closure.candidate_expected_domains.push_back(domain->second.expected);
+        closure.qualified_candidate_domains.push_back(domain->second.scope);
+        closure.candidate_provider_occurrences.push_back(domain->second.provider);
+        closure.lifecycle_plan_catalogs.push_back(domain->second.catalog);
+      }
+      result.components.push_back(std::move(closure));
+    }
+    return core::Result<Closure>::Ok(std::move(result));
+  } catch (const std::exception &error) {
+    return core::Result<Closure>::Err({"candidate_lifecycle_planning_failed", error.what(),
+        {{"reason", "verified_candidate_closure_unavailable"}}});
+  }
+}
+
+struct ManagedInstalledLifecycleComponentClosure final {
+  std::vector<core::ResolvedLifecycleControlDomainScopeDTO> domains;
+  std::vector<core::ResolvedLifecycleProviderOccurrenceDTO> providers;
+  std::vector<core::BrandLifecyclePortRegistrationDTO> ports;
+};
+
+// Called only while the original live parent pins this installed Composition.
+// No compiled desired configuration is substituted for missing Kernel truth.
+[[nodiscard]] core::Result<ManagedInstalledLifecycleComponentClosure>
+ReadInstalledManagedCandidateLifecycleComponentClosure(
+    const Composition &composition,
+    const ManagedCandidateLifecycleComponentClosure &qualified) {
+  using Closure = ManagedInstalledLifecycleComponentClosure;
+  try {
+    Require(composition.cclc_lifecycle_product && composition.active_addressed_kernel() &&
+                IndexNativeComponentCompositions(composition).contains(qualified.component_id) &&
+                !qualified.qualified_candidate_domains.empty() &&
+                qualified.qualified_candidate_domains.size() == qualified.candidate_provider_occurrences.size() &&
+                qualified.qualified_candidate_domains.size() == qualified.lifecycle_plan_catalogs.size(),
+            "installed lifecycle component has no actual product/Kernel closure");
+    const auto physical_bindings = PhysicalControlBindings(composition);
+    const auto &product = *composition.cclc_lifecycle_product;
+    Closure result;
+    for (std::size_t index = 0U; index < qualified.qualified_candidate_domains.size(); ++index) {
+      const auto &candidate = qualified.qualified_candidate_domains[index];
+      const auto port = std::find_if(product.brand_ports().begin(), product.brand_ports().end(),
+          [&](const auto &row) { return row.provider_occurrence.control_domain_id == candidate.control_domain_id; });
+      Require(port != product.brand_ports().end() && port->port &&
+                  port->provider_occurrence == qualified.candidate_provider_occurrences[index],
+              "installed lifecycle provider differs from the qualified candidate");
+      const auto &provider = port->provider_occurrence;
+      const auto catalog = product.catalog_source().LoadExactLifecyclePlanCatalog(
+          provider.provider_manifest_id, provider.provider_manifest_revision,
+          provider.lifecycle_plan_catalog_digest);
+      Require(catalog.ok() && catalog.value() == qualified.lifecycle_plan_catalogs[index],
+              "installed lifecycle catalog differs from the qualified candidate");
+      const auto current = composition.active_addressed_kernel()->current_runtime_route_configuration(
+          candidate.control_domain_id);
+      Require(current.ok() && current.value() && current.value()->operation_admission_open,
+              "installed lifecycle domain has no current Kernel route readiness");
+      const auto &configuration = current.value()->active_configuration;
+      Require(configuration.locally_valid() &&
+                  configuration.state == core::ActiveControlConfigurationStateDTO::kReconciled &&
+                  configuration.source_runtime_unit_id == provider.provider_runtime_unit_id &&
+                  configuration.source_runtime_epoch == provider.provider_runtime_epoch &&
+                  current.value()->readiness_rows.size() == configuration.binding_routes.size(),
+              "installed lifecycle route has another provider or incomplete Stop readiness");
+      std::vector<core::ExpectedControlBindingRevisionDTO> bindings;
+      std::set<core::ResourceId> resources;
+      for (const auto &route : configuration.binding_routes) {
+        bool found = false;
+        for (const auto &physical : physical_bindings) {
+          const auto &value = physical.value();
+          if (!value.control_path || value.control_path->control_domain_id != candidate.control_domain_id ||
+              value.control_path->control_binding_id != route.control_binding_id) continue;
+          const auto &path = *value.control_path;
+          Require(value.retained_bundle_id == composition.bundle->retained_bundle_id() &&
+                      value.graph_revision == composition.bundle->value().cell_graph.graph_revision &&
+                      path.control_domain_revision == configuration.control_domain_revision &&
+                      path.controller_topology_id == configuration.controller_topology_id &&
+                      path.topology_revision == configuration.topology_revision &&
+                      path.control_binding_revision == route.control_binding_revision &&
+                      path.control_route_id == route.control_route_id &&
+                      path.activation_set_id == configuration.activation_set_id &&
+                      path.active_control_configuration_id == configuration.active_control_configuration_id &&
+                      path.active_control_configuration_generation == configuration.active_control_configuration_generation &&
+                      path.provider_instance_id == provider.provider_instance_id &&
+                      path.provider_manifest_id == provider.provider_manifest_id &&
+                      path.provider_manifest_revision == provider.provider_manifest_revision &&
+                      path.provider_runtime_unit_id == provider.provider_runtime_unit_id &&
+                      path.provider_runtime_epoch == provider.provider_runtime_epoch,
+                  "installed physical binding differs from its current Kernel route/provider");
+          found = true;
+          for (const auto &resource : value.resources) resources.insert(resource.resource_id);
+        }
+        Require(found, "installed Kernel route has no actual physical binding");
+        bindings.push_back({route.control_binding_id, route.control_binding_revision, route.control_route_id});
+      }
+      core::ResolvedLifecycleControlDomainScopeDTO actual{
+          configuration.control_domain_id, configuration.control_domain_revision,
+          configuration.controller_topology_id, configuration.topology_revision, configuration,
+          std::move(bindings), std::vector<core::ResourceId>(resources.begin(), resources.end())};
+      auto expected = candidate;
+      expected.active_control_configuration = configuration;
+      Require(actual.locally_valid() && actual == expected,
+              "installed lifecycle domain closure differs from the qualified candidate");
+      result.domains.push_back(std::move(actual));
+      result.providers.push_back(provider);
+      result.ports.push_back(*port);
+    }
+    return core::Result<Closure>::Ok(std::move(result));
+  } catch (const std::exception &error) {
+    return core::Result<Closure>::Err({"installed_lifecycle_closure_unavailable", error.what(),
+        {{"reason", "actual_installed_product_or_route_unavailable"}}});
+  }
+}
+// Assemble observation data from the actual original caller's qualified
+// values. Heldness/lifetime and effect permission are verified by the existing
+// live parent services and CCLC admission; this value creates neither.
+[[maybe_unused, nodiscard]] core::Result<core::ApplyComponentBringUpEvidenceDTO>
+BuildManagedApplyComponentBringUpEvidence(
+    const component_manager::PersistedManagerApplyBringUpPlan &sealed,
+    const component_manager::ManagerApplyBringUpChildRequestDTO &child,
+    const core::ApplyComponentBringUpAuthorityDTO &authority,
+    const core::ActiveBundlePublicationReceiptDTO &actual_predecessor_head,
+    const ManagedCandidateLifecycleComponentClosure &candidate,
+    const std::optional<core::ComponentLifecycleCurrentSnapshotDTO> &actual_predecessor,
+    const std::optional<core::ApplyComponentBringUpRecoveryEvidenceDTO> &actual_recovery,
+    const std::optional<core::SelectedControllerOccurrenceDTO> &actual_predecessor_occurrence,
+    const std::optional<core::SelectedControllerOccurrenceDTO> &actual_successor_floor,
+    bool qualified_candidate_has_arm) {
+  using Evidence = core::ApplyComponentBringUpEvidenceDTO;
+  const auto invalid = [](std::string reason) {
+    return core::Result<Evidence>::Err(core::ErrorDTO{
+        "apply_bring_up_evidence_invalid",
+        "original delegated child does not close its qualified component evidence",
+        {{"reason", std::move(reason)}}});
+  };
+  try {
+    const auto &plan = sealed.plan;
+    const core::ApplyComponentBringUpReferenceDTO parent{
+        {plan.apply_id, plan.apply_generation}, sealed.plan_digest};
+    if (!plan.valid() || !child.valid() ||
+        std::find(plan.children.begin(), plan.children.end(), child) == plan.children.end() ||
+        component_manager::ComputeManagerApplyBringUpPlanDigest(plan) != sealed.plan_digest ||
+        !authority.valid() || authority.parent != parent || !actual_predecessor_head.valid() ||
+        actual_predecessor_head.durable_public_pointer_content_digest != plan.predecessor_public_pointer_digest ||
+        actual_predecessor_head.publication_generation !=
+            plan.expected_publication.expected_previous_publication_generation ||
+        actual_predecessor_head.request.candidate_graph_revision != child.intent.expected_graph_revision ||
+        plan.expected_publication.candidate_projection_revision != child.candidate_projection_revision ||
+        authority.held_fence_query.manager_runtime_epoch != child.manager_runtime_epoch ||
+        authority.parent_claim.intent.expected_admission_generation != child.intent.expected_admission_generation ||
+        candidate.component_id != child.intent.controllable_component_id ||
+        candidate.candidate_expected_domains != child.intent.expected_control_domains ||
+        candidate.qualified_candidate_domains.size() != child.intent.expected_control_domains.size() ||
+        candidate.candidate_provider_occurrences.size() != candidate.qualified_candidate_domains.size() ||
+        candidate.lifecycle_plan_catalogs.size() != candidate.qualified_candidate_domains.size() ||
+        !child.intent.apply_generation_selection) {
+      return invalid("original_child_parent_head_or_candidate_mismatch");
+    }
+    const auto &selection = *child.intent.apply_generation_selection;
+    const auto expected_predecessor = selection.predecessor_generation
+        ? selection.predecessor_generation->value()
+        : selection.owner_qualified_predecessor ? selection.owner_qualified_predecessor->generation.value() : 0U;
+    if (!selection.locally_valid() || child.intent.expected_component_lifecycle_generation.value() != expected_predecessor ||
+        (actual_predecessor &&
+         (!selection.owner_qualified_predecessor ||
+          selection.owner_qualified_predecessor->generation != actual_predecessor->component_lifecycle_generation ||
+          selection.owner_qualified_predecessor->snapshot_digest != actual_predecessor->snapshot_digest)) ||
+        (!actual_predecessor && selection.owner_qualified_predecessor)) {
+      return invalid("original_owner_generation_selection_mismatch");
+    }
+    core::ConfigurationFenceScopeDTO selected_scope{
+        {child.intent.controllable_component_id}, {}, {}, {}};
+    std::map<core::ControlDomainId, core::ConfigurationFenceDomainScopeDTO> domains;
+    std::map<core::ControlBindingId, core::ConfigurationFenceBindingScopeDTO> bindings;
+    std::set<core::ResourceId> resources;
+    if (actual_predecessor) {
+      if (!core::VerifyComponentLifecycleCurrentSnapshot(*actual_predecessor).ok() ||
+          actual_predecessor->controllable_component_id != child.intent.controllable_component_id ||
+          actual_predecessor->active_publication_receipt != actual_predecessor_head) {
+        return invalid("actual_predecessor_snapshot_mismatch");
+      }
+      for (const auto &domain : actual_predecessor->domains) {
+        domains.emplace(domain.control_domain_id, core::ConfigurationFenceDomainScopeDTO{
+            domain.control_domain_id, domain.control_domain_revision, std::nullopt});
+        for (const auto &binding : domain.current_control_bindings) {
+          auto [entry, inserted] = bindings.emplace(binding.control_binding_id,
+              core::ConfigurationFenceBindingScopeDTO{
+                  binding.control_binding_id, binding.control_binding_revision, std::nullopt});
+          if (!inserted && entry->second.predecessor_control_binding_revision != binding.control_binding_revision)
+            return invalid("predecessor_binding_revision_conflict");
+        }
+        resources.insert(domain.current_resources.begin(), domain.current_resources.end());
+      }
+    }
+    std::vector<core::ControlDomainId> candidate_ids;
+    for (std::size_t index = 0U; index < candidate.qualified_candidate_domains.size(); ++index) {
+      const auto &domain = candidate.qualified_candidate_domains[index];
+      if (!core::ExpectedDomainMatchesResolvedScope(child.intent.expected_control_domains[index], domain))
+        return invalid("qualified_candidate_domain_mismatch");
+      candidate_ids.push_back(domain.control_domain_id);
+      auto [entry, inserted] = domains.emplace(domain.control_domain_id,
+          core::ConfigurationFenceDomainScopeDTO{
+              domain.control_domain_id, std::nullopt, domain.control_domain_revision});
+      if (!inserted) entry->second.candidate_control_domain_revision = domain.control_domain_revision;
+      // The compiler's full domain closure includes shared bindings/resources.
+      // Never reduce it to representatives whose component ID is selected.
+      for (const auto &binding : domain.current_control_bindings) {
+        auto [current, added] = bindings.emplace(binding.control_binding_id,
+            core::ConfigurationFenceBindingScopeDTO{
+                binding.control_binding_id, std::nullopt, binding.control_binding_revision});
+        if (!added) {
+          if (current->second.candidate_control_binding_revision &&
+              current->second.candidate_control_binding_revision != binding.control_binding_revision)
+            return invalid("candidate_binding_revision_conflict");
+          current->second.candidate_control_binding_revision = binding.control_binding_revision;
+        }
+      }
+      resources.insert(domain.current_resources.begin(), domain.current_resources.end());
+    }
+    for (const auto &[id, domain] : domains) { static_cast<void>(id); selected_scope.domains.push_back(domain); }
+    for (const auto &[id, binding] : bindings) { static_cast<void>(id); selected_scope.bindings.push_back(binding); }
+    selected_scope.resources.assign(resources.begin(), resources.end());
+    if (!selected_scope.valid() || actual_predecessor_occurrence.has_value() != actual_successor_floor.has_value() ||
+        (!actual_predecessor && (actual_recovery || actual_predecessor_occurrence)))
+      return invalid("selected_scope_or_occurrence_shape_mismatch");
+    if (actual_recovery &&
+        (actual_recovery->predecessor_snapshot_digest != actual_predecessor->snapshot_digest ||
+         !actual_predecessor_occurrence))
+      return invalid("actual_recovery_predecessor_mismatch");
+    const auto &parent_scope = authority.held_fence_query.expected_scope;
+    if (!std::binary_search(parent_scope.controllable_component_ids.begin(),
+            parent_scope.controllable_component_ids.end(), child.intent.controllable_component_id) ||
+        !std::includes(parent_scope.resources.begin(), parent_scope.resources.end(),
+            selected_scope.resources.begin(), selected_scope.resources.end()))
+      return invalid("selected_component_or_resources_outside_parent_scope");
+    for (const auto &domain : selected_scope.domains) {
+      const auto held = std::lower_bound(parent_scope.domains.begin(), parent_scope.domains.end(),
+          domain.control_domain_id, [](const auto &row, const auto &id) { return row.control_domain_id < id; });
+      if (held == parent_scope.domains.end() || held->control_domain_id != domain.control_domain_id ||
+          (domain.predecessor_control_domain_revision &&
+           domain.predecessor_control_domain_revision != held->predecessor_control_domain_revision) ||
+          (domain.candidate_control_domain_revision &&
+           domain.candidate_control_domain_revision != held->candidate_control_domain_revision))
+        return invalid("selected_domain_outside_parent_scope");
+    }
+    for (const auto &binding : selected_scope.bindings) {
+      const auto held = std::lower_bound(parent_scope.bindings.begin(), parent_scope.bindings.end(),
+          binding.control_binding_id, [](const auto &row, const auto &id) { return row.control_binding_id < id; });
+      if (held == parent_scope.bindings.end() || held->control_binding_id != binding.control_binding_id ||
+          (binding.predecessor_control_binding_revision &&
+           binding.predecessor_control_binding_revision != held->predecessor_control_binding_revision) ||
+          (binding.candidate_control_binding_revision &&
+           binding.candidate_control_binding_revision != held->candidate_control_binding_revision))
+        return invalid("selected_binding_outside_parent_scope");
+    }
+    if (actual_predecessor_occurrence) {
+      if (actual_predecessor_occurrence->domains.size() != actual_predecessor->domains.size())
+        return invalid("actual_predecessor_occurrence_membership_mismatch");
+      for (std::size_t index = 0U; index < actual_predecessor->domains.size(); ++index)
+        if (actual_predecessor_occurrence->domains[index].control_domain_id !=
+            actual_predecessor->domains[index].control_domain_id)
+          return invalid("actual_predecessor_occurrence_membership_mismatch");
+      const auto computed = core::ComputeSelectedControllerSuccessorOccurrence(
+          *actual_predecessor_occurrence, candidate_ids, qualified_candidate_has_arm);
+      if (!computed.ok() || computed.value() != *actual_successor_floor)
+        return invalid("actual_occurrence_floor_mismatch");
+    }
+    const auto digest = core::ApplyDelegatedComponentLifecycleSemanticRequestDigest(
+        child.intent, child.candidate_projection_revision, child.candidate_retained_bundle_digest,
+        child.candidate_retained_bundle_bytes, child.runtime_unit_id, child.runtime_epoch,
+        child.manager_runtime_epoch, parent);
+    return core::Result<Evidence>::Ok({authority, std::move(selected_scope), digest,
+        child.candidate_projection_revision, child.candidate_retained_bundle_digest,
+        child.candidate_retained_bundle_bytes, {child.runtime_unit_id, child.runtime_epoch},
+        actual_recovery, actual_predecessor_occurrence, actual_successor_floor});
+  } catch (const std::exception &error) {
+    return core::Result<Evidence>::Err(core::ErrorDTO{
+        "apply_bring_up_evidence_invalid", error.what(),
+        {{"reason", "original_qualified_evidence_unavailable"}}});
+  }
+}
+
+
+// Mechanical original-acceptance extraction only. This helper neither proves
+// the parent remains held nor grants Continue, installation, or publication.
+[[maybe_unused, nodiscard]] core::Result<core::ApplyComponentBringUpAcceptedReceiptDTO>
+MakeManagedApplyComponentBringUpAcceptedReceipt(
+    const component_manager::PersistedManagerApplyBringUpPlan &sealed,
+    const component_manager::ManagerApplyBringUpChildRequestDTO &child,
+    const core::CCLCLifecycleRequestResultDTO &result) {
+  using Receipt = core::ApplyComponentBringUpAcceptedReceiptDTO;
+  const auto invalid = [](std::string reason) {
+    return core::Result<Receipt>::Err(core::ErrorDTO{
+        "apply_bring_up_receipt_invalid",
+        "delegated acceptance differs from its original sealed child",
+        {{"reason", std::move(reason)}}});
+  };
+  try {
+    const auto &plan = sealed.plan;
+    const auto original = std::find(plan.children.begin(), plan.children.end(), child);
+    if (!plan.valid() || !child.valid() || original == plan.children.end() ||
+        component_manager::ComputeManagerApplyBringUpPlanDigest(plan) != sealed.plan_digest ||
+        !result.locally_valid() || result.incident_recovery || result.rejection ||
+        !result.acceptance || !result.status) {
+      return invalid("sealed_child_or_result_mismatch");
+    }
+    const auto &status = *result.status;
+    if (!status.apply_bring_up || status.selected_bring_up ||
+        !status.accepted_intent.replay_equal(child.intent) ||
+        status.status_owner_epoch != child.intent.request_context.request_owner_epoch ||
+        status.reconciliation_required || status.error) {
+      return invalid("original_owner_status_mismatch");
+    }
+    const auto &evidence = *status.apply_bring_up;
+    const core::ApplyComponentBringUpReferenceDTO parent{
+        {plan.apply_id, plan.apply_generation}, sealed.plan_digest};
+    const auto digest = core::ApplyDelegatedComponentLifecycleSemanticRequestDigest(
+        child.intent, child.candidate_projection_revision,
+        child.candidate_retained_bundle_digest, child.candidate_retained_bundle_bytes,
+        child.runtime_unit_id, child.runtime_epoch, child.manager_runtime_epoch, parent);
+    if (evidence.parent_authority.parent != parent ||
+        evidence.candidate_projection_revision != child.candidate_projection_revision ||
+        evidence.candidate_retained_bundle_digest != child.candidate_retained_bundle_digest ||
+        evidence.candidate_retained_bundle_bytes != child.candidate_retained_bundle_bytes ||
+        evidence.original_execution_host.runtime_unit_id != child.runtime_unit_id ||
+        evidence.original_execution_host.runtime_epoch != child.runtime_epoch ||
+        evidence.parent_authority.held_fence_query.manager_runtime_epoch != child.manager_runtime_epoch ||
+        evidence.original_request_payload_digest != digest) {
+      return invalid("original_parent_candidate_or_epoch_mismatch");
+    }
+    // Result acceptance may carry a replay disposition. The status preserves
+    // the actual durable acceptance that linked native planning joins exactly.
+    return core::Result<Receipt>::Ok({child.intent.request_context,
+        child.intent.controllable_component_id, status.acceptance, digest});
+  } catch (const std::exception &error) {
+    return core::Result<Receipt>::Err(core::ErrorDTO{
+        "apply_bring_up_receipt_invalid", error.what(),
+        {{"reason", "sealed_child_or_result_unavailable"}}});
+  }
+}
+
+
+#endif
+
+// The managed cell keeps the actual facade and its immutable construction
+// dependencies independently of its current physical Composition. Moving
+// these owners does not rotate the namespace, rebuild a registry or change
+// accepted request evidence. The pinned runtimes keep the old borrowed route
+// and observation ports alive until that facade has completely stopped.
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+// One installed product lifetime, owned by the immutable CCLC context. The
+// current/retired Composition and this pin share the same compiled ROS product.
+// Product callbacks retain actual installed runtime owners, never a mutable
+// pointer to whichever Composition later becomes current.
+struct InstalledManagedCCLCProductLifetime final {
+  std::shared_ptr<WallClock> clock;
+  std::vector<std::shared_ptr<RetainedNativeRuntime>> runtimes;
+  std::vector<std::shared_ptr<RetainedNativeGripperRuntime>> grippers;
+  std::vector<std::shared_ptr<RetainedPlannerSceneProjection>> projections;
+  std::vector<std::shared_ptr<ControllerLaunchProcess>> processes;
+  std::shared_ptr<deployment::FilesystemVerifiedRetainedProviderManifestSource>
+      provider_source;
+  std::unique_ptr<component_manager::SqliteActiveBundlePublicationStore>
+      publication_reader;
+  std::unique_ptr<deployment::FilesystemVerifiedRetainedProductArtifactSource>
+      artifacts;
+  // Destroy the borrowing compiled product before its provider source.
+  std::shared_ptr<RetainedRos2ControlLifecycleProduct> lifecycle_product;
+};
+
+struct ManagedCellCCLCLifetime final {
+  std::vector<std::shared_ptr<RetainedNativeRuntime>> runtime_pins;
+  std::shared_ptr<WallClock> clock;
+  std::shared_ptr<SimpleScheduler> scheduler;
+  std::unique_ptr<component_manager::SqliteActiveBundlePublicationStore>
+      active_publication_reader;
+  std::unique_ptr<deployment::FilesystemVerifiedRetainedProductArtifactSource>
+      artifact_source;
+  std::shared_ptr<deployment::FilesystemVerifiedRetainedProviderManifestSource>
+      provider_manifest_source;
+  std::optional<core::BuildOwnedLifecyclePlanCatalogSource> empty_catalog;
+  std::shared_ptr<RetainedRos2ControlLifecycleProduct> lifecycle_product;
+  std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>
+      route_publication_owner;
+  std::unique_ptr<RetainedNativeCellCommandReadinessPort> readiness_port;
+  // Immutable construction head. Candidate installation never retargets the
+  // original owner or retroactively changes its accepted request evidence.
+  std::optional<core::ActiveBundlePublicationReceiptDTO> publication;
+  // Original preparation for the existing installed-request reconciliation
+  // lane. The facade remains the only current-context owner.
+  std::shared_ptr<const deployment::CCLCRuntimeComposition::PreparedProductContext>
+      pending_product;
+  std::optional<component_manager::ManagerSelectedRuntimeCompositionRequestDTO>
+      pending_product_request;
+  std::optional<core::RequestOwnerEpoch> pending_product_owner;
+  // Declared last: stop/drain the real facade before any borrowed dependency.
+  std::unique_ptr<deployment::CCLCRuntimeComposition> facade;
+
+  [[nodiscard]] core::Result<std::shared_ptr<const
+      deployment::CCLCRuntimeComposition::PreparedProductContext>>
+  PrepareInstalledProduct(Composition &composition,
+                          const ManagedRuntimeChildConfig &config,
+                          const core::ActiveBundlePublicationReceiptDTO &head) {
+    Require(facade && clock && composition.runtime &&
+                composition.runtime->clock == clock && head.valid() &&
+                head.publication_generation == composition.publication_generation &&
+                head.request.candidate_retained_bundle_id ==
+                    composition.bundle->retained_bundle_id() &&
+                head.request.candidate_projection_revision == composition.projection_revision,
+            "CCLC product preparation lost its actual installed owner or publication");
+    const auto selected = LoadManagedBundleAtPinnedRoot(
+        config, composition.bundle->retained_bundle_id());
+    Require(selected && selected->bundle->canonical_bytes() ==
+                            composition.bundle->canonical_bytes(),
+            "CCLC product preparation lost the pinned candidate package");
+    EnsureInstalledRetainedRos2ControlLifecycleProduct(composition, selected->package_root);
+    auto lifetime = std::make_shared<InstalledManagedCCLCProductLifetime>();
+    lifetime->clock = clock;
+    lifetime->provider_source = composition.cclc_provider_manifest_source;
+    lifetime->lifecycle_product = composition.cclc_lifecycle_product;
+    lifetime->publication_reader = std::make_unique<
+        component_manager::SqliteActiveBundlePublicationStore>(
+        config.manager_state_root /
+            std::string(component_manager::kActiveBundlePublicationStoreFilename),
+        core::CellId(config.cell_id));
+    lifetime->artifacts = std::make_unique<
+        deployment::FilesystemVerifiedRetainedProductArtifactSource>(selected->package_root);
+    for (const auto &[id, view] : IndexNativeComponentCompositions(composition)) {
+      static_cast<void>(id);
+      Require(view && (view->runtime || view->gripper_runtime) &&
+                  (!view->runtime || view->runtime->clock == clock) &&
+                  view->controller_process && view->ros2_control_runtime_handle,
+              "CCLC installed product has an incomplete physical lifetime");
+      if (view->runtime) lifetime->runtimes.push_back(view->runtime);
+      if (view->gripper_runtime) lifetime->grippers.push_back(view->gripper_runtime);
+      lifetime->processes.push_back(view->controller_process);
+      lifetime->projections.insert(lifetime->projections.end(),
+          view->required_projection_pins.begin(), view->required_projection_pins.end());
+    }
+    Require(!lifetime->runtimes.empty() && lifetime->provider_source &&
+                lifetime->lifecycle_product,
+            "CCLC installed product has no genuine occurrence closure");
+    const auto runtime = composition.runtime;
+    deployment::CCLCRuntimeCompositionConfig context_config{
+        config.execution_state_root, config.execution_run_root,
+        core::CellId(config.cell_id),
+        {facade->coordinator().request_owner_epoch(), 1024U, 2U,
+         10'000'000LL, 30'000'000'000LL}};
+    // This reuses the existing native derivation's freshness/configuration
+    // qualification only. It never constructs or starts another owner.
+    return PrepareRetainedNativeCCLCProductContext(
+        *facade, {std::move(context_config), 1'000'000'000LL}, composition.bundle,
+        *lifetime->publication_reader, head, *lifetime->artifacts,
+        lifetime->lifecycle_product->catalog_source(),
+        lifetime->lifecycle_product->brand_ports(),
+        CellControlBindingRepresentatives(composition), *clock, *runtime, lifetime,
+        [runtime](const core::ControlDomainId &domain) {
+          return runtime->ReadCurrentPublishedRouteConfiguration(domain);
+        }, lifetime->lifecycle_product->lifecycle_snapshot_source(), runtime.get());
+  }
+
+  void TakeAttached(Composition &composition,
+                    const core::ActiveBundlePublicationReceiptDTO &head) {
+    Require(!facade && composition.cclc_runtime && composition.runtime &&
+                composition.cclc_attached.load(std::memory_order_acquire),
+            "cell CCLC transfer requires one actual attached facade");
+    Require(head.valid() &&
+                head.publication_generation == composition.publication_generation &&
+                head.request.candidate_projection_revision == composition.projection_revision &&
+                head.request.candidate_retained_bundle_id == composition.bundle->retained_bundle_id(),
+            "cell CCLC transfer differs from its immutable construction head");
+    std::vector<std::shared_ptr<RetainedNativeRuntime>> pins;
+    pins.push_back(composition.runtime);
+    for (const auto &participant : composition.participant_compositions) {
+      Require(participant && participant->runtime,
+              "cell CCLC transfer has an incomplete runtime dependency");
+      pins.push_back(participant->runtime);
+    }
+    // Copy the allocating receipt before moving any borrowed dependencies.
+    // If qualification/allocation throws, Composition still owns its facade
+    // and every source that facade borrows.
+    publication = head;
+    runtime_pins = std::move(pins);
+    clock = composition.runtime->clock;
+    scheduler = composition.runtime->scheduler;
+    active_publication_reader =
+        std::move(composition.cclc_active_publication_reader);
+    artifact_source = std::move(composition.cclc_artifact_source);
+    provider_manifest_source =
+        std::move(composition.cclc_provider_manifest_source);
+    lifecycle_product = std::move(composition.cclc_lifecycle_product);
+    route_publication_owner =
+        std::move(composition.cclc_cell_route_publication_owner);
+    readiness_port = std::move(composition.cclc_cell_command_readiness_port);
+    facade = std::move(composition.cclc_runtime);
+  }
+
+  void CreateEmpty(const ManagedRuntimeChildConfig &config,
+                   std::shared_ptr<const deployment::RetainedBundle> bundle,
+                   const core::ActiveBundlePublicationReceiptDTO &head,
+                   core::ResourceAddressedExecutionKernel &kernel,
+                   ManagedKernelApplyFenceOwner &fence_owner,
+                   std::shared_ptr<WallClock> owner_clock,
+                   std::shared_ptr<SimpleScheduler> owner_scheduler,
+                   const std::optional<core::RequestOwnerEpoch> &quiescent_predecessor = {}) {
+    Require(!facade && bundle && owner_clock && owner_scheduler,
+            "empty cell CCLC requires the original cell dependencies");
+    auto route = MakeVerifiedEmptyCellRoutePublicationOwner(*bundle);
+    Require(route.ok(), "empty cell CCLC product is not genuinely empty");
+    auto catalog = core::BuildOwnedLifecyclePlanCatalogSource::Make({});
+    Require(catalog.ok(), "empty cell lifecycle catalog cannot be constructed");
+    clock = std::move(owner_clock);
+    scheduler = std::move(owner_scheduler);
+    active_publication_reader =
+        std::make_unique<component_manager::SqliteActiveBundlePublicationStore>(
+            config.manager_state_root /
+                std::string(component_manager::kActiveBundlePublicationStoreFilename),
+            core::CellId(config.cell_id));
+    const auto integrity = active_publication_reader->VerifyIntegrity();
+    const auto current = active_publication_reader->ReadActiveBundlePublication(
+        integrity.current_generation);
+    Require(current.ok() && current.value() == head,
+            "empty cell CCLC publication changed before construction");
+    const auto selected = LoadManagedBundleAtPinnedRoot(
+        config, bundle->retained_bundle_id());
+    Require(selected && selected->bundle->canonical_bytes() == bundle->canonical_bytes(),
+            "empty cell CCLC product is not at its pinned root");
+    artifact_source = std::make_unique<
+        deployment::FilesystemVerifiedRetainedProductArtifactSource>(
+        selected->package_root);
+    empty_catalog = std::move(catalog.value());
+    route_publication_owner = std::move(route.value());
+    deployment::CCLCRuntimeCompositionConfig cclc_config{
+        config.execution_state_root, config.execution_run_root,
+        core::CellId(config.cell_id),
+        {core::RequestOwnerEpoch(RandomToken("cclc-owner-")), 1024U, 2U,
+         10'000'000LL, 30'000'000'000LL}};
+    cclc_config.coordinator.quiescent_predecessor = quiescent_predecessor;
+    cclc_config.preparation_failure_source =
+        MakeNativeApplyPreparationFailureSource(config, kernel);
+    auto created = deployment::CCLCRuntimeComposition::Create(
+        std::move(cclc_config), std::move(bundle), *active_publication_reader,
+        head, *artifact_source, *empty_catalog, {}, {}, {}, {}, {},
+        kernel, fence_owner, *route_publication_owner, *clock, *scheduler);
+    if (!created.ok()) Fail("empty cell CCLC construction failed: " + created.error().message);
+    publication = head;
+    facade = std::move(created.value());
+    const auto started = facade->Start();
+    if (!started.ok()) Fail("empty cell CCLC start failed: " + started.error().message);
+  }
+};
+#endif
 
 [[nodiscard]] std::filesystem::path ManagedProgramArtifactRoot(
     const ManagedRuntimeChildConfig &config,
@@ -11334,6 +12324,10 @@ LoadManagedBundleAtPinnedRoot(
   attachment_config.execution_run_root = config.execution_run_root;
   attachment_config.candidate_worker = config.candidate_worker;
   attachment_config.cell_id = config.cell_id;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  attachment_config.preparation_failure_source =
+      MakeNativeApplyPreparationFailureSource(config, kernel);
+#endif
   AttachRetainedNativeCCLC(composition, attachment_config, fence_owner,
                            parent_apply);
   return composition.cclc_attached.load(std::memory_order_acquire);
@@ -11434,7 +12428,7 @@ TryBuildCurrentManagedCompositionInput(
           "managed active projection has no collision model");
 
   auto planner_scene_projection = projection;
-  return CompositionBuildInput{
+  auto input = CompositionBuildInput{
       selected_package_root,
       config.execution_state_root,
       config.execution_run_root,
@@ -11482,6 +12476,8 @@ TryBuildCurrentManagedCompositionInput(
                " epoch=" + config.runtime_epoch;
       }(),
   };
+  input.required_projection_pins = std::move(component_projections->required_projection_pins);
+  return input;
 }
 
 [[nodiscard]] bool CurrentPublicationIsInstalledSuccessor(
@@ -11676,7 +12672,7 @@ struct ManagedBootstrapStopProduct final {
   Require(predecessor_generation != std::numeric_limits<std::uint64_t>::max(),
           "managed composition publication generation is exhausted");
   auto planner_scene_projection = projection;
-  return CompositionBuildInput{
+  auto input = CompositionBuildInput{
       candidate_package_root,
       config.execution_state_root,
       config.execution_run_root,
@@ -11717,6 +12713,8 @@ struct ManagedBootstrapStopProduct final {
       "Apply=" + request.apply_id.value() +
           " generation=" + std::to_string(request.apply_generation.value()),
   };
+  input.required_projection_pins = std::move(component_projections->required_projection_pins);
+  return input;
 }
 
 [[nodiscard]] bool IsExactRetainedNativeViewApply(
@@ -11740,9 +12738,17 @@ void RefreshRetainedNativePublicationView(
     const std::map<core::ControllableComponentId,
                    std::shared_ptr<RetainedPlannerSceneProjection>>
         &projections,
+    const std::vector<std::shared_ptr<RetainedPlannerSceneProjection>> &required_projection_pins,
     const core::ProjectionRevisionDTO &revision,
     const core::ActiveBundlePublicationGeneration generation,
     const std::filesystem::path &manager_run_root) {
+  // Copy before any view mutation; allocation failure retains the old owners.
+  auto replacement_pins = required_projection_pins;
+  const auto replace_pins = [&] {
+    for (auto &peer : cell.participant_compositions)
+      peer->required_projection_pins.clear();
+    cell.required_projection_pins = std::move(replacement_pins);
+  };
   std::map<core::ControllableComponentId, Composition *> components;
   components.emplace(cell.controllable_component_id, &cell);
   for (auto &peer : cell.participant_compositions) {
@@ -11763,6 +12769,7 @@ void RefreshRetainedNativePublicationView(
       composition->projection_revision = revision;
       composition->publication_generation = generation;
     }
+    replace_pins();
     return;
   }
   Require(components.size() == projections.size(),
@@ -11805,7 +12812,474 @@ void RefreshRetainedNativePublicationView(
     composition->projection_revision = revision;
     composition->publication_generation = generation;
   }
+  replace_pins();
 }
+
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+// Stable host-owned occurrences. Component Composition roots never own or
+// retire these processes. Manager has already checked the immutable observer
+// input and activates its expectation between ordinary Prepare and Finalize.
+class ManagedIsaacCellProcesses final {
+public:
+  using Facts = component_manager::ManagerIsaacPoseObserverLaunchFactsDTO;
+  explicit ManagedIsaacCellProcesses(const ManagedRuntimeChildConfig &config)
+      : config_(config) {}
+  ~ManagedIsaacCellProcesses() {
+    std::shared_ptr<CellLaunchProcess> process;
+    {
+      std::lock_guard lock(state_mutex_);
+      process = std::move(observer_);
+    }
+    if (process)
+      static_cast<void>(host_controller_launch_supervisor().retire_cell_process(process));
+  }
+
+  /// Capture the current occurrence once. Inspect grants no effect and never
+  /// regenerates detection time, settings or output when persistence retries.
+  [[nodiscard]] std::optional<component_manager::ManagerCellObserverObservationDTO>
+  observe_current(deployment::CCLCRuntimeComposition *const cclc = nullptr) {
+    std::lock_guard transition_lock(transition_mutex_);
+    std::lock_guard lock(state_mutex_);
+    if (!facts_) return std::nullopt;
+    using Presence = component_manager::ProcessPresenceState;
+    using Persistence = component_manager::ManagerCellObserverIncidentPersistenceDTO;
+    if (!observer_) {
+      return component_manager::ManagerCellObserverObservationDTO{
+          core::CellId(config_.cell_id), facts_->source_id, facts_->source_epoch_base,
+          observer_start_failure_ ? Presence::kAbsent : Presence::kUnknown};
+    }
+    const auto exit = observer_->exit_evidence();
+    if (!exit) {
+      return component_manager::ManagerCellObserverObservationDTO{
+          core::CellId(config_.cell_id), facts_->source_id, facts_->source_epoch_base,
+          Presence::kPresent};
+    }
+    if (!observer_incident_observation_) {
+      Require(exit->command.cell_id == core::CellId(config_.cell_id) &&
+                  exit->command.role == CellLaunchRole::kPoseObserver &&
+                  exit->command.observer_source_id == facts_->source_id,
+              "cell observer exit belongs to another occurrence");
+      const auto detected = WallClock{}.now();
+      const auto id = RandomToken("observer-incident-");
+      observer_incident_process_ = observer_;
+      observer_incident_observation_ =
+          component_manager::ManagerCellObserverObservationDTO{
+              core::CellId(config_.cell_id), facts_->source_id, facts_->source_epoch_base,
+              Presence::kAbsent,
+              component_manager::ManagerCellObserverExitDTO{
+                  exit->pid,
+                  exit->exit_status ? std::optional<std::uint8_t>(*exit->exit_status) : std::nullopt,
+                  exit->signal ? std::optional<std::uint8_t>(*exit->signal) : std::nullopt,
+                  exit->core_dumped, exit->observed_utc, detected},
+              std::nullopt, Persistence::kUnknown};
+      try {
+      const auto optional_number = [](const std::optional<int> value) {
+        return value ? CanonicalValue(static_cast<double>(*value)) : CanonicalValue(nullptr);
+      };
+      CanonicalValue::Array argv;
+      for (const auto &argument : exit->command.argv) argv.emplace_back(argument);
+      observer_incident_record_ = core::CellObserverIncidentRecordDTO{
+          id, {core::CellId(config_.cell_id), facts_->source_id, facts_->source_epoch_base},
+          detected, "cell pose observer exited; observation intervention required",
+          CanonicalValue(CanonicalValue::Object{
+              {"exit", CanonicalValue(CanonicalValue::Object{
+                  {"status", optional_number(exit->exit_status)},
+                  {"signal", optional_number(exit->signal)},
+                  {"core_dumped", CanonicalValue(exit->core_dumped)},
+                  {"observed_utc", CanonicalValue(exit->observed_utc)}})},
+              {"context", CanonicalValue(CanonicalValue::Object{
+                  {"cell_id", CanonicalValue(config_.cell_id)},
+                  {"source_id", CanonicalValue(facts_->source_id)},
+                  {"source_epoch_base", CanonicalValue(facts_->source_epoch_base)},
+                  {"runtime_unit_id", CanonicalValue(config_.runtime_unit_id)},
+                  {"runtime_epoch", CanonicalValue(config_.runtime_epoch)},
+                  {"pid", CanonicalValue(static_cast<double>(exit->pid))},
+                  {"launch_identity", CanonicalValue(exit->command.identity)},
+                  {"request_context", CanonicalValue(exit->request_context)}})},
+              {"settings", CanonicalValue(CanonicalValue::Object{
+                  {"argv", CanonicalValue(std::move(argv))},
+                  {"retained_snapshot_path", CanonicalValue(facts_->retained_snapshot_path)}})},
+              {"generated", CanonicalValue(CanonicalValue::Object{})},
+              {"output", LaunchIncidentOutput(observer_->output_snapshot())},
+              {"core_dump_link", CanonicalValue(nullptr)}})};
+      if (!observer_incident_record_->locally_valid()) {
+        observer_incident_observation_->incident_id = id;
+        observer_incident_observation_->incident_persistence = Persistence::kFailed;
+      }
+      } catch (const std::bad_alloc &) {
+        observer_incident_observation_->incident_persistence = Persistence::kUnknown;
+      } catch (...) {
+        // A retained real exit remains unavailable even if its payload cannot
+        // be qualified. Do not advertise an unconstructed record as pending.
+        try {
+          observer_incident_observation_->incident_id = id;
+          observer_incident_observation_->incident_persistence = Persistence::kFailed;
+        } catch (...) {
+          observer_incident_observation_->incident_id.reset();
+          observer_incident_observation_->incident_persistence = Persistence::kUnknown;
+        }
+      }
+    }
+    Require(observer_incident_process_ == observer_,
+            "pending observer incident belongs to another current occurrence");
+    if (cclc && observer_incident_record_ && observer_incident_record_->locally_valid() &&
+        !observer_incident_slot_qualified_) {
+      // The managed main channel is the sole observer writer. Lookup and
+      // capture are pinned to this exact current occurrence by the same cell
+      // transition mutex used for stop/start. An uncertain lookup is never
+      // treated as an absent slot or a newly minted durable reference.
+      try {
+        const auto open = cclc->LoadOpenCellObserverIncident();
+        if (open.ok()) {
+          if (open.value()) {
+            Require(open.value()->target.cell_id == core::CellId(config_.cell_id),
+                    "open observer incident belongs to another cell slot");
+            observer_incident_record_->incident_id = open.value()->incident_id;
+          }
+          observer_incident_observation_->incident_id = observer_incident_record_->incident_id;
+          observer_incident_observation_->incident_persistence = Persistence::kPending;
+          observer_incident_slot_qualified_ = true;
+        }
+      } catch (...) {
+        // Keep the genuine exit unavailable and retain the original canonical
+        // payload/time for another ordinary read; no false pending reference.
+        observer_incident_observation_->incident_persistence = Persistence::kUnknown;
+      }
+    }
+    return observer_incident_observation_;
+  }
+
+  // Called only by the existing serial managed status handler, outside
+  // composition/Kernel locks. Inspect itself remains entirely read-only.
+  void persist_current_exit(deployment::CCLCRuntimeComposition &cclc) {
+    static_cast<void>(observe_current(&cclc));
+    std::lock_guard transition_lock(transition_mutex_);
+    std::lock_guard lock(state_mutex_);
+    using Persistence = component_manager::ManagerCellObserverIncidentPersistenceDTO;
+    if (!observer_incident_record_ || !observer_incident_observation_ ||
+        !observer_incident_slot_qualified_ ||
+        observer_incident_observation_->incident_persistence == Persistence::kPersisted ||
+        observer_incident_observation_->incident_persistence == Persistence::kFailed)
+      return;
+    Require(observer_ && observer_incident_process_ == observer_ && facts_ &&
+                observer_incident_record_->target.cell_id == core::CellId(config_.cell_id) &&
+                observer_incident_record_->target.source_id == facts_->source_id &&
+                observer_incident_record_->target.source_epoch_base == facts_->source_epoch_base &&
+                observer_incident_observation_->incident_id == observer_incident_record_->incident_id,
+            "observer incident write lost its exact current occurrence");
+    try {
+      const auto stored = cclc.RecordCellObserverIncident(*observer_incident_record_);
+      // The first open record belongs to the cell slot; repeated exit events
+      // may have a different source/base without changing that incident ID.
+      if (stored.ok() && stored.value().incident_id == observer_incident_record_->incident_id &&
+          stored.value().target.cell_id == core::CellId(config_.cell_id)) {
+        observer_incident_observation_->incident_persistence = Persistence::kPersisted;
+      } else {
+        observer_incident_observation_->incident_persistence = Persistence::kUnknown;
+      }
+    } catch (...) {
+      observer_incident_observation_->incident_persistence = Persistence::kUnknown;
+    }
+  }
+
+  [[nodiscard]] std::optional<CellLaunchExitEvidence> observer_exit_fact() const {
+    std::shared_ptr<CellLaunchProcess> process;
+    {
+      std::lock_guard lock(state_mutex_);
+      process = observer_;
+    }
+    return process ? process->exit_evidence() : std::nullopt;
+  }
+
+  [[nodiscard]] std::optional<CellLaunchExitEvidence> retired_observer_fact() const {
+    std::shared_ptr<CellLaunchProcess> process;
+    {
+      std::lock_guard lock(state_mutex_);
+      process = retired_observer_;
+    }
+    return process ? process->exit_evidence() : std::nullopt;
+  }
+
+  [[nodiscard]] std::optional<IsaacControllerLaunchInputs>
+  prepare(const deployment::RetainedBundle &bundle,
+          const std::optional<Facts> &facts, const std::string &context,
+          const bool qualify_existing_world = false) {
+    std::lock_guard transition_lock(transition_mutex_);
+    std::optional<std::string> world;
+    std::set<std::string> topics{"/clock"};
+    for (const auto &unit : bundle.value().cell_graph.runtime_units) {
+      if (unit.runtime_unit_id.value() != config_.runtime_unit_id ||
+          unit.runtime_profile_id.value() !=
+              deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId) continue;
+      // World-free infrastructure needs no robot membership decode. The
+      // existing world-free branch below still rejects supplied observer facts.
+      if (!unit.configuration.contains("isaac_world")) continue;
+      const auto value = deployment::ros2_control_execution_runtime_contract::require_configuration(
+          bundle, unit.runtime_unit_id);
+      world = value.isaac_world;
+      for (const auto &profile : value.controller_profiles) {
+        if (!profile.isaac_profile) continue;
+        const auto required = retained_isaac_scene_required_topics(*profile.isaac_profile);
+        topics.insert(required.begin(), required.end());
+      }
+    }
+    std::optional<IsaacControllerLaunchInputs> inputs;
+    std::filesystem::path parameters;
+    std::optional<component_manager::IsaacSiteWorld> site_world;
+    double startup = 0.0;
+    double service = 0.0;
+    if (world) {
+      Require(config_.isaac_site_settings && config_.isaac_pose_observer_executable &&
+                  facts && facts->valid(),
+              "named cell world requires supplied site settings and checked observer facts");
+      const auto &site = *config_.isaac_site_settings;
+      const auto &mapping = site.ResolveWorld(*world);
+      site_world = mapping;
+      const auto *observer = site.FindPoseObserver(bundle.value().cell_graph.cell_id.value());
+      Require(observer != nullptr, "named cell world has no pose observer site mapping");
+      startup = site.scene_startup_timeout_s();
+      service = site.scene_service_timeout_s();
+      Require(std::isfinite(startup) && startup >= 0.1 && startup <= 600.0 &&
+                  std::isfinite(service) && service >= 0.1 && service <= 120.0,
+              "cell barrier timeouts violate existing barrier ranges");
+      Require(!mapping.expected_world_name.empty() && mapping.expected_world_name.size() <= 1024U,
+              "cell barrier world name violates its existing byte bound");
+      topics.insert(observer->additional_required_topics.begin(),
+                    observer->additional_required_topics.end());
+      Require(topics.size() <= 64U && std::all_of(topics.begin(), topics.end(),
+          [](const auto &topic) { return !topic.empty() && topic.front() == '/' && topic.size() <= 1024U; }),
+          "cell barrier required topics violate existing barrier limits");
+      const auto barrier = config_.isaac_pose_observer_executable->parent_path() /
+                           "isaac_scene_load_barrier";
+      Require(::access(barrier.c_str(), X_OK) == 0,
+              "installed sibling Isaac scene barrier is not executable");
+      inputs = IsaacControllerLaunchInputs{
+          mapping.world_uri, mapping.expected_world_name,
+          number_text(startup), number_text(service), config_.manager_run_root,
+          std::filesystem::path(facts->retained_snapshot_path), {}, true};
+    } else {
+      Require(!facts, "a world-free cell cannot carry observer launch facts");
+    }
+    std::optional<std::string> old_world;
+    std::optional<Facts> old_facts;
+    std::shared_ptr<CellLaunchProcess> old_observer;
+    std::optional<IsaacControllerLaunchInputs> old_inputs;
+    std::set<std::string> old_topics;
+    bool initialized = false;
+    {
+      std::lock_guard lock(state_mutex_);
+      initialized = initialized_;
+      old_world = world_;
+      old_facts = facts_;
+      old_observer = observer_;
+      old_inputs = inputs_;
+      old_topics = qualified_topics_;
+      if (initialized && old_world == world && old_facts == facts) {
+        Require(!world || old_observer || observer_start_pending_,
+                "cell pose observer is absent; explicit intervention requires a fresh occurrence");
+        Require(!old_observer || !old_observer->exit_evidence(),
+                "cell pose observer exited; explicit intervention requires a fresh occurrence");
+      }
+    }
+    const bool unchanged_observer = initialized && old_world == world && old_facts == facts;
+    if (initialized && old_facts && facts && !unchanged_observer)
+      Require(old_facts->source_epoch_base != facts->source_epoch_base,
+              "replacement cell observer requires a fresh Manager source epoch base");
+    // Cell-only observer metadata is not robot launch identity. Preserve the
+    // original robot inputs while the logical world remains unchanged (Q94).
+    if (initialized && world && old_world == world) inputs = old_inputs;
+    // The caller derives physical Add/Replace/recovery from its immutable
+    // plan. Cached topic evidence cannot certify a fresh robot occurrence.
+    const bool passive_join = initialized && world && old_world == world &&
+        (qualify_existing_world ||
+         !std::includes(old_topics.begin(), old_topics.end(), topics.begin(), topics.end()));
+    if (passive_join) {
+      parameters = barrier_parameters(*facts, *site_world, topics, startup, service, true);
+      run_barrier(parameters, *world, *facts, context, startup, service, true);
+    }
+    if (unchanged_observer) {
+      // Keep the current membership's closure, not historical topic evidence:
+      // removing then adding the last Isaac robot qualifies its topics again.
+      std::lock_guard lock(state_mutex_);
+      qualified_topics_ = world ? topics : std::set<std::string>{};
+      return old_inputs;
+    }
+    if (world && old_world != world)
+      parameters = barrier_parameters(*facts, *site_world, topics, startup, service, false);
+    // Required mappings, checked observer facts and the parameter shape above
+    // are validated before retirement. The existing barrier validates its URI.
+    // A changed source is started only by finish(), after Manager clears its
+    // old source state and activates the already-checked new expectation.
+    if (old_observer) {
+      old_observer->update_request_context(context);
+      Require(host_controller_launch_supervisor().retire_cell_process(old_observer),
+              "old cell observer exact leader reap is unknown; replacement not started");
+      std::lock_guard lock(state_mutex_);
+      retired_observer_ = old_observer;
+      observer_.reset();
+    }
+    if (world && old_world != world)
+      run_barrier(parameters, *world, *facts, context, startup, service, false);
+    {
+      std::lock_guard lock(state_mutex_);
+      initialized_ = true;
+      world_ = std::move(world);
+      facts_ = facts;
+      inputs_ = inputs;
+      observer_.reset();
+      observer_start_pending_ = facts.has_value();
+      observer_start_failure_.reset();
+      qualified_topics_ = world ? topics : std::set<std::string>{};
+    }
+    return inputs;
+  }
+
+  void finish(const std::optional<Facts> &facts, const std::string &context) {
+    std::lock_guard transition_lock(transition_mutex_);
+    std::lock_guard lock(state_mutex_);
+    Require(initialized_ && facts_ == facts,
+            "cell observer Finalize differs from prepared checked facts");
+    if (!facts_ || observer_) return;
+    Require(observer_start_pending_,
+            "cell observer start was already attempted; explicit intervention requires a fresh occurrence" +
+                (observer_start_failure_ ? ": " + *observer_start_failure_ : std::string{}));
+    const auto scalar = [](const std::string &value) {
+      return content_identity::canonical_json(CanonicalValue(value));
+    };
+    const CellLaunchCommand command{core::CellId(config_.cell_id),
+        CellLaunchRole::kPoseObserver, facts_->source_id,
+        {config_.isaac_pose_observer_executable->string(), "--ros-args",
+         "-p", "site_config_path:=" + scalar(facts_->retained_snapshot_path),
+         "-p", "manager_run_root:=" + scalar(config_.manager_run_root.string()),
+         "-p", "source_epoch_base:=" + scalar(facts_->source_epoch_base),
+         "--disable-external-lib-logs"},
+        "cell-observer:" + facts_->source_epoch_base};
+    // Consume the one authorized attempt before entering the spawner. Exact
+    // Finalize replay must observe failure, never retry an unknown spawn.
+    observer_start_pending_ = false;
+    try {
+      observer_ = host_controller_launch_supervisor().start_cell_process(
+          command, config_.execution_run_root, context);
+    } catch (const std::exception &error) {
+      observer_start_failure_ = error.what();
+      throw;
+    } catch (...) {
+      observer_start_failure_ = "unknown observer spawn failure";
+      throw;
+    }
+    // Do not wait for Open: Manager may be waiting for this host's response.
+    // Process spawn alone is not a fresh-pose or Scene-readiness receipt.
+  }
+
+private:
+  static std::string number_text(const double value) {
+    std::ostringstream out;
+    out.precision(std::numeric_limits<double>::max_digits10);
+    out << value;
+    auto text = out.str();
+    if (text.find_first_of(".eE") == std::string::npos) text += ".0";
+    return text;
+  }
+  void run_barrier(const std::filesystem::path &parameters, const std::string &world,
+                   const Facts &facts, const std::string &context,
+                   const double startup, const double service, const bool passive) const {
+    const auto barrier = config_.isaac_pose_observer_executable->parent_path() /
+                         "isaac_scene_load_barrier";
+    const CellLaunchCommand command{core::CellId(config_.cell_id),
+        CellLaunchRole::kSceneBarrier, std::nullopt,
+        {barrier.string(), "--ros-args", "--params-file", parameters.string(),
+         "--disable-external-lib-logs"},
+        std::string(passive ? "cell-passive-join:" : "cell-world:") + world + ":" +
+            facts.source_epoch_base};
+    // The normal barrier gives its stopped cleanup two separate calls using
+    // the supplied service budget after startup expires. Do not interrupt that
+    // existing cleanup with the startup-only bound used by passive joining.
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(startup + (passive ? 0.0 : 2.0 * service)));
+    const auto process = host_controller_launch_supervisor().start_cell_process(
+        command, config_.execution_run_root, context);
+    while (!process->exit_evidence() && std::chrono::steady_clock::now() < deadline &&
+           g_stop_requested == 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto exit = process->exit_evidence();
+    const bool reaped = host_controller_launch_supervisor().retire_cell_process(process);
+    Require(exit && exit->exit_status == 0 && !exit->signal && reaped,
+            "cell world barrier did not complete with actual exit zero: " +
+                (exit ? exit->description : std::string("startup budget elapsed")));
+  }
+  std::filesystem::path barrier_parameters(
+      const Facts &facts, const component_manager::IsaacSiteWorld &world,
+      const std::set<std::string> &topics, const double startup, const double service,
+      const bool passive) const {
+    const auto scalar = [](const std::string &value) {
+      return content_identity::canonical_json(CanonicalValue(value));
+    };
+    CanonicalValue::Array array;
+    for (const auto &topic : topics) array.emplace_back(topic);
+    const std::string bytes = "manyforge_isaac_scene_load_barrier:\n  ros__parameters:\n"
+        "    world_uri: " + scalar(world.world_uri) + "\n    expected_world_name: " +
+        scalar(world.expected_world_name) + "\n    passive_join: " + (passive ? "true" : "false") +
+        "\n    startup_timeout_s: " + number_text(startup) +
+        "\n    service_timeout_s: " + number_text(service) + "\n    required_topics: " +
+        content_identity::canonical_json(CanonicalValue(std::move(array))) + "\n";
+    // One bounded parameter artifact per checked-input attempt/world config;
+    // exact replay reuses these bytes. No polling writer, overwrite or cleanup.
+    const auto path = std::filesystem::path(facts.retained_snapshot_path).parent_path() /
+        (std::filesystem::path(facts.retained_snapshot_path).filename().string() +
+         ".world-" + content_identity::sha256_digest(bytes).substr(7U) + ".yaml");
+    FileDescriptor file(::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+    if (file.get() < 0 && errno == EEXIST) {
+      FileDescriptor existing(::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+      if (existing.get() < 0) FailErrno("open retained cell barrier parameters");
+      struct stat status {};
+      Require(::fstat(existing.get(), &status) == 0 && S_ISREG(status.st_mode) &&
+                  status.st_uid == ::geteuid() && (status.st_mode & 0777) == 0600 &&
+                  status.st_size >= 0 && static_cast<std::uint64_t>(status.st_size) == bytes.size(),
+              "retained cell barrier parameter file differs on exact replay");
+      std::string captured(bytes.size(), '\0');
+      std::size_t read_offset = 0U;
+      while (read_offset < captured.size()) {
+        const auto count = ::read(existing.get(), captured.data() + read_offset,
+                                  captured.size() - read_offset);
+        if (count < 0 && errno == EINTR) continue;
+        Require(count > 0, "retained cell barrier parameters are incomplete");
+        read_offset += static_cast<std::size_t>(count);
+      }
+      Require(captured == bytes, "retained cell barrier parameters differ on exact replay");
+      return path;
+    }
+    if (file.get() < 0) FailErrno("create retained cell barrier parameters");
+    std::size_t offset = 0U;
+    while (offset < bytes.size()) {
+      const auto written = ::write(file.get(), bytes.data() + offset, bytes.size() - offset);
+      if (written < 0 && errno == EINTR) continue;
+      if (written <= 0) FailErrno("write retained cell barrier parameters");
+      offset += static_cast<std::size_t>(written);
+    }
+    std::cerr << "manyforge cell barrier parameters: path=" << path
+              << " bytes=" << bytes.size() << " snapshot=" << facts.retained_snapshot_path << '\n';
+    return path;
+  }
+  const ManagedRuntimeChildConfig &config_;
+  std::mutex transition_mutex_;
+  mutable std::mutex state_mutex_;
+  bool initialized_{false};
+  std::optional<std::string> world_;
+  std::optional<Facts> facts_;
+  std::optional<IsaacControllerLaunchInputs> inputs_;
+  std::shared_ptr<CellLaunchProcess> observer_;
+  std::shared_ptr<CellLaunchProcess> retired_observer_;
+  std::shared_ptr<CellLaunchProcess> observer_incident_process_;
+  std::optional<core::CellObserverIncidentRecordDTO> observer_incident_record_;
+  std::optional<component_manager::ManagerCellObserverObservationDTO>
+      observer_incident_observation_;
+  bool observer_incident_slot_qualified_{false};
+  bool observer_start_pending_{false};
+  std::optional<std::string> observer_start_failure_;
+  std::set<std::string> qualified_topics_;
+};
+#endif
 
 [[nodiscard]] int
 RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
@@ -11816,6 +13290,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       config.product_identity + " " + config.configuration_identity;
   std::uint64_t source_report_sequence = 0U;
   ManagedKernelAdmissionGate admission_gate;
+  // Set once to the main-scope cell owner before managed requests are served.
+  // Product installations retain this Kernel; the fence callback never looks
+  // up a replaceable component composition or calls back into the fence owner.
+  core::ResourceAddressedExecutionKernel *stable_kernel_owner{};
   ManagedKernelApplyFenceOwner fence_owner(
       ManagedKernelApplyFenceOwnerConfig{
           config.execution_state_root / "kernel-apply-fence.sqlite3",
@@ -11831,6 +13309,16 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 .count();
           },
           config.program_artifact_root,
+          [&](const core::CellAdmissionRecoveryReceiptQueryDTO &query) {
+            if (stable_kernel_owner == nullptr) {
+              return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Err(
+                  {"selected_kernel_owner_unavailable", "cell Kernel is not installed", {}});
+            }
+            // The managed owner already holds the admission exclusion. This
+            // existing read takes only the claim owner's mutex, preserving
+            // fence -> admission -> claim order and the original Kernel life.
+            return stable_kernel_owner->GetCellAdmissionRecoveryReceipt(query);
+          },
       },
       admission_gate);
   const ManagedProjectionRegistryConfig projection_config{
@@ -11845,6 +13333,17 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                    std::chrono::steady_clock::now().time_since_epoch())
             .count();
       });
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  ManagedIsaacCellProcesses managed_isaac_cell(config);
+  const auto prepare_managed_cell_world = [&](const deployment::RetainedBundle &bundle,
+      const std::optional<component_manager::ManagerIsaacPoseObserverLaunchFactsDTO> &facts,
+      const std::string &context, const bool qualify_existing_world = false) {
+    return managed_isaac_cell.prepare(bundle, facts, context, qualify_existing_world);
+  };
+  const auto finish_managed_cell_observer = [&](const auto &facts, const std::string &context) {
+    managed_isaac_cell.finish(facts, context);
+  };
+#endif
   std::mutex managed_composition_mutex;
   // A failed fenced installation may already have re-rooted retained
   // participants toward the private candidate. Keep that candidate alive
@@ -11886,7 +13385,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   // Command dispatch already pins the active composition with its shared
   // lifetime lock, so this atomic selects only that same current product's
   // facts adapter; it is not a second recovery owner.
-  core::ResourceAddressedExecutionKernel *stable_kernel_owner{};
   core::SqliteOperationJournal *stable_operation_journal{};
   const auto read_current_publication = [&] {
     component_manager::SqliteActiveBundlePublicationStore publication_store(
@@ -11921,6 +13419,15 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   detached_owner_clock = std::make_shared<WallClock>();
   detached_owner_scheduler = std::make_shared<SimpleScheduler>(
       SimpleSchedulerConfig::from_environment());
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  // Keep the existing stable scheduling substrate through product exchanges.
+  // The first Background-role startup belongs to construction, never status.
+  const auto controller_cleanup_scheduler = detached_owner_scheduler;
+  const auto controller_cleanup_clock = detached_owner_clock;
+  static_cast<void>(controller_cleanup_scheduler->schedule(
+      controller_cleanup_clock->now(), [] {},
+      core::SchedulerPriority::Background));
+#endif
   core::ResourceAddressedExecutionKernelConfig bootstrap_kernel_config{
       core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
       core::CellId(config.cell_id),
@@ -11936,6 +13443,16 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       kNativeMaximumLiveStopParticipants;
   auto bootstrap_stop = LoadManagedBootstrapStopProduct(
       config, bootstrap_retained_bundle_id, bootstrap_graph_revision);
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  const auto bootstrap_cell = LoadManagedBundleAtPinnedRoot(config, bootstrap_retained_bundle_id);
+  Require(bootstrap_cell && bootstrap_cell->bundle,
+          "cell-world bootstrap has no verified retained bundle");
+  const std::string cell_bootstrap_context = "Bootstrap runtime=" + config.runtime_unit_id +
+                                           " epoch=" + config.runtime_epoch;
+  const auto bootstrap_isaac_inputs = prepare_managed_cell_world(
+      *bootstrap_cell->bundle, config.isaac_pose_observer_launch_facts, cell_bootstrap_context);
+  finish_managed_cell_observer(config.isaac_pose_observer_launch_facts, cell_bootstrap_context);
+#endif
   const bool bootstrap_requires_physical_composition =
       bootstrap_stop.requires_physical_composition;
   bootstrap_kernel_config.empty_runtime_resource_inventory =
@@ -12027,6 +13544,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
 #endif
   Require(stable_kernel_owner != nullptr && stable_operation_journal != nullptr,
           "managed native cell owner could not be created");
+
   if (bootstrap_requires_physical_composition) {
     Require(stable_kernel_owner->SetRouteRecoveryPending(true).ok(),
             "selected physical runtime could not close admission before "
@@ -12093,6 +13611,34 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   execution_composition.addressed_kernel = stable_kernel_owner;
   bool current_composition_building = false;
   bool current_predecessor_composition_pending = false;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  ManagedCellCCLCLifetime managed_cell_cclc;
+  // Main-channel ownership; child callbacks retain a copy of this immutable
+  // capture rather than reading a replaceable shared continuation variable.
+  std::shared_ptr<const ManagedOriginalApplyBringUpCapture>
+      original_apply_bring_up_capture;
+  std::optional<core::NativeApplyComponentBringUpDTO>
+      original_apply_accepted_children;
+  std::optional<core::NativeApplyPlanDTO> original_apply_native_plan;
+  if (bootstrap_cell->bundle->value().cell_graph.controllable_components.empty()) {
+    const auto bootstrap_publication = read_current_publication();
+    managed_cell_cclc.CreateEmpty(
+        config, bootstrap_cell->bundle, bootstrap_publication,
+        *stable_kernel_owner, fence_owner, detached_owner_clock,
+        detached_owner_scheduler);
+  }
+#endif
+  // The main managed channel serializes its direct reads. Recreation must
+  // separately stop all asynchronous ingress before destroying this owner.
+  const auto current_cell_cclc = [&]() -> deployment::CCLCRuntimeComposition * {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+    if (managed_cell_cclc.facade) return managed_cell_cclc.facade.get();
+#endif
+    auto *const active = active_managed_composition.get();
+    if (active && active->cclc_runtime) return active->cclc_runtime.get();
+    auto *const retired = retired_managed_composition.get();
+    return retired ? retired->cclc_runtime.get() : nullptr;
+  };
 
   ManagedExecutionSurfaceControl execution_surface_control(
       config.execution_run_root, &execution_composition,
@@ -12340,6 +13886,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       input->shared_clock = detached_owner_clock;
       input->shared_scheduler = detached_owner_scheduler;
       input->observation_wake = stable_observation_wake;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+      input->managed_isaac_launch_inputs = bootstrap_isaac_inputs;
+#endif
       current_predecessor_composition_pending = false;
       current_composition_builder_started = true;
       Require(stable_kernel_owner->SetRouteRecoveryPending(true).ok(),
@@ -12456,11 +14005,22 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 AttachCurrentPublishedCCLCIfReady(*installed, config, fence_owner);
             std::cerr << "native composition phase: control routes "
                       << (routes_attached ? "attached" : "deferred") << '\n';
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+            const auto attached_head = routes_attached
+                ? std::optional(read_current_publication()) : std::nullopt;
+#endif
             {
               std::lock_guard lock(managed_composition_mutex);
               Require(active_managed_composition.get() == installed,
                       "initial managed composition changed during CCLC "
                       "recovery");
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+              if (routes_attached) {
+                Require(!managed_cell_cclc.facade && attached_head,
+                        "initial runtime cannot construct a second cell CCLC owner");
+                managed_cell_cclc.TakeAttached(*installed, *attached_head);
+              }
+#endif
               current_composition_building = false;
             }
           } catch (...) {
@@ -12471,6 +14031,259 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         });
   };
 
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  // A copy of the fresh capture is retained in each actual accepted runtime.
+  // Every callback rereads current authority before entering the existing
+  // in-process fence pin. A stored plan cannot reconstruct this closure.
+  [[maybe_unused]] const auto make_original_apply_services =
+      [&](std::shared_ptr<const ManagedOriginalApplyBringUpCapture> captured,
+          const core::ApplyComponentBringUpAuthorityDTO &authority)
+      -> core::ComponentLifecycleCoordinatorApplyBringUpServices {
+    Require(captured && captured->original_facade && authority.valid() &&
+                authority.parent_claim == captured->parent_claim &&
+                authority.parent == core::ApplyComponentBringUpReferenceDTO{
+                    {captured->sealed_plan.plan.apply_id, captured->sealed_plan.plan.apply_generation},
+                    captured->sealed_plan.plan_digest} &&
+                managed_cell_cclc.facade.get() == captured->original_facade &&
+                managed_cell_cclc.active_publication_reader,
+            "original Apply services lack their actual fresh owner capture");
+    core::ComponentLifecycleCoordinatorApplyBringUpServices services{
+        {}, managed_cell_cclc.active_publication_reader.get(),
+        captured->sealed_plan.plan.expected_publication, captured->predecessor_publication};
+    services.with_original_live_parent =
+        [&, captured = std::move(captured), authority](
+            const core::ComponentLifecycleStatusDTO &status,
+            const std::function<core::Result<void>()> &action) -> core::Result<void> {
+      try {
+        Require(action && status.locally_valid() && status.apply_bring_up &&
+                    !status.selected_bring_up && !status.reconciliation_required &&
+                    status.apply_bring_up->parent_authority == authority &&
+                    status.status_owner_epoch == status.accepted_intent.request_context.request_owner_epoch,
+                "delegated callback lost its original child authority");
+        const auto &plan = captured->sealed_plan.plan;
+        const auto child = std::find_if(plan.children.begin(), plan.children.end(),
+            [&](const auto &row) { return row.intent == status.accepted_intent; });
+        Require(child != plan.children.end() &&
+                    child->intent.request_context.request_owner_epoch ==
+                        captured->original_facade->coordinator().request_owner_epoch() &&
+                    status.apply_bring_up->original_request_payload_digest ==
+                        core::ApplyDelegatedComponentLifecycleSemanticRequestDigest(
+                            child->intent, child->candidate_projection_revision,
+                            child->candidate_retained_bundle_digest, child->candidate_retained_bundle_bytes,
+                            child->runtime_unit_id, child->runtime_epoch, child->manager_runtime_epoch,
+                            authority.parent),
+                "delegated callback does not name its sealed original child");
+        // Journal and claim reads run before the fence/composition locks.
+        const auto parent = component_manager::ReadManagerApplyBringUpStatusReadOnly(
+            config.manager_state_root / std::string(component_manager::kManagerApplyJournalFilename),
+            core::CellId(config.cell_id), captured->parent_claim.intent);
+        Require(parent.ok() && parent.value().bring_up_plan == captured->sealed_plan &&
+                    !parent.value().terminal_outcome && parent.value().fence_acceptance &&
+                    parent.value().affected_scope &&
+                    parent.value().affected_scope->affected_scope.scope == authority.held_fence_query.expected_scope,
+                "delegated callback lost its exact current immutable parent");
+        const auto require_current_manager_and_claim = [&] {
+          Require(manager_liveness_installed.load(std::memory_order_acquire) &&
+                      manager_liveness_receiver.get(),
+                  "delegated callback has no installed Manager observation");
+          const auto manager = manager_liveness_receiver.get()->status();
+          Require(manager.state == core::ManagerLivenessStateDTO::kCurrent && !manager.command_fenced &&
+                      manager.manager_owner_epoch == captured->parent_claim.intent.owner_epoch &&
+                      manager.manager_runtime_epoch == child->manager_runtime_epoch &&
+                      manager.receiver_runtime_unit_id == child->runtime_unit_id &&
+                      manager.receiver_runtime_epoch == child->runtime_epoch,
+                  "delegated callback lost its actual current Manager/host occurrence");
+          const core::CellAdmissionRecoveryReceiptQueryDTO query{
+              captured->parent_claim.intent, captured->parent_claim, std::nullopt};
+          const auto held = stable_kernel_owner->GetCellAdmissionRecoveryReceipt(query);
+          Require(held.ok() && core::ValidateCellAdmissionRecoveryReceipt(held.value()).ok() &&
+                      core::ValidateCellAdmissionRecoveryReceiptQuery(query).ok() &&
+                      held.value().matched_claim == std::optional(captured->parent_claim) &&
+                      held.value().status == core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact,
+                  "delegated callback lost its actual full held parent claim");
+        };
+        require_current_manager_and_claim();
+        const auto head = read_current_publication();
+        core::Result<void> result = core::Result<void>::Err(
+            {"apply_bring_up_parent_not_invoked", "original parent action was not invoked", {}});
+        const auto pinned_action = [&] {
+          require_current_manager_and_claim();
+          std::lock_guard composition_lock(managed_composition_mutex);
+          Require(managed_cell_cclc.facade.get() == captured->original_facade &&
+                      managed_cell_cclc.publication == captured->predecessor_publication,
+                  "delegated callback lost its actual facade/dependency lifetime");
+          if (status.phase != core::ComponentLifecycleTransactionPhaseDTO::kAccepted) {
+            Require(active_managed_composition &&
+                        active_managed_composition->bundle->canonical_bytes() ==
+                            captured->candidate.bundle->canonical_bytes() &&
+                        active_managed_composition->projection_revision == child->candidate_projection_revision &&
+                        active_managed_composition->cclc_lifecycle_product,
+                    "delegated callback lost its actual installed candidate product");
+          }
+          // This lock pins the original product or the actual installed
+          // candidate through every synchronous Core observation/effect.
+          // No candidate view retargets the original immutable registry.
+          result = action();
+        };
+        if (head == captured->predecessor_publication) {
+          Require(!parent.value().publication_receipt,
+                  "delegated callback predecessor conflicts with parent publication");
+          fence_owner.RunWithExactHeldPredecessor(authority.held_fence_query,
+              head.publication_generation, head.durable_public_pointer_content_digest, pinned_action);
+        } else {
+          Require(parent.value().publication_receipt &&
+                      parent.value().publication_receipt->publication.publication_receipt == head &&
+                      head.request == plan.expected_publication,
+                  "delegated callback current publication is not its exact parent successor");
+          fence_owner.RunWithExactHeldSuccessor(authority.held_fence_query, head, pinned_action);
+        }
+        return result;
+      } catch (const std::exception &error) {
+        return core::Result<void>::Err({"apply_bring_up_original_parent_unavailable", error.what(), {}});
+      }
+    };
+    return services;
+  };
+
+  // Original managed-channel preparation accepts every sealed child before
+  // controller installation. The actual owner repeats W/R/S selection and
+  // admission inside its own transaction; these receipts do not permit effects.
+  [[maybe_unused]] const auto accept_original_apply_children =
+      [&](const component_manager::ManagerSelectedRuntimeCompositionRequestDTO &request)
+      -> core::NativeApplyComponentBringUpDTO {
+    std::shared_ptr<const ManagedOriginalApplyBringUpCapture> captured;
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      captured = original_apply_bring_up_capture;
+      Require(captured && captured->original_facade &&
+                  managed_cell_cclc.facade.get() == captured->original_facade &&
+                  managed_cell_cclc.publication == captured->predecessor_publication,
+              "original child acceptance lost its actual facade capture");
+    }
+    const auto &plan = captured->sealed_plan.plan;
+    const core::ApplyComponentBringUpReferenceDTO parent{
+        {plan.apply_id, plan.apply_generation}, captured->sealed_plan.plan_digest};
+    const core::ConfigurationFenceStatusQueryDTO query{
+        parent.owner, request.configuration_fence_id,
+        request.configuration_fence_generation, request.configuration_fence_scope,
+        request.manager_runtime_epoch};
+    const core::ApplyComponentBringUpAuthorityDTO authority{
+        parent, captured->parent_claim, query};
+    Require(plan.valid() && request.valid() && authority.valid() &&
+                request.phase == component_manager::ManagerSelectedRuntimeCompositionPhase::kPrepare &&
+                request.apply_id == plan.apply_id && request.apply_generation == plan.apply_generation &&
+                request.candidate_projection_revision == plan.expected_publication.candidate_projection_revision &&
+                request.retained_bundle_canonical_content_digest == plan.children.front().candidate_retained_bundle_digest &&
+                request.retained_bundle_canonical_byte_size == plan.children.front().candidate_retained_bundle_bytes &&
+                request.predecessor_projection_revision ==
+                    captured->predecessor_projection_revision &&
+                request.expected_predecessor_publication_generation ==
+                    captured->predecessor_publication.publication_generation &&
+                request.expected_predecessor_public_pointer_digest ==
+                    captured->predecessor_publication.durable_public_pointer_content_digest,
+            "original child acceptance does not match its sealed preparation");
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      if (original_apply_accepted_children) {
+        Require(original_apply_accepted_children->parent == parent &&
+                    original_apply_accepted_children->children.size() == plan.children.size(),
+                "original child receipts belong to another immutable parent");
+        return *original_apply_accepted_children;
+      }
+    }
+    // This enabled caller is the reviewed initial empty-cell path. Its actual
+    // verified predecessor inventory supplies positive absence; a failed
+    // snapshot read alone never supplies that proof.
+    Require(captured->predecessor.bundle->value().cell_graph.controllable_components.empty() &&
+                captured->predecessor.bundle->value().cell_graph.control_bindings.empty() &&
+                captured->predecessor.bundle->value().cell_graph.control_domains.empty(),
+            "initial child acceptance lacks its actual empty predecessor inventory");
+    core::NativeApplyComponentBringUpDTO accepted{parent, {}};
+    accepted.children.reserve(plan.children.size());
+    for (const auto &child : plan.children) {
+      Require(child.runtime_unit_id.value() == config.runtime_unit_id &&
+                  child.runtime_epoch.value() == config.runtime_epoch &&
+                  child.manager_runtime_epoch == request.manager_runtime_epoch &&
+                  child.intent.request_context.request_owner_epoch ==
+                      captured->original_facade->coordinator().request_owner_epoch() &&
+                  child.intent.apply_generation_selection &&
+                  !child.intent.apply_generation_selection->owner_qualified_predecessor,
+              "initial sealed child contains a foreign occurrence or predecessor");
+      const auto found = std::find_if(captured->candidate_closure.components.begin(),
+          captured->candidate_closure.components.end(), [&](const auto &row) {
+            return row.component_id == child.intent.controllable_component_id;
+          });
+      Require(found != captured->candidate_closure.components.end(),
+              "original child lacks its full qualified candidate closure");
+      const auto evidence = BuildManagedApplyComponentBringUpEvidence(
+          captured->sealed_plan, child, authority, captured->predecessor_publication,
+          *found, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false);
+      if (!evidence.ok()) Fail("original child evidence is unavailable: " + evidence.error().message);
+      auto services = make_original_apply_services(captured, authority);
+      const auto result = captured->original_facade->coordinator().AcceptApplyComponentBringUp(
+          child.intent, evidence.value(), std::nullopt, found->lifecycle_plan_catalogs,
+          found->qualified_candidate_domains, found->candidate_provider_occurrences,
+          std::move(services));
+      if (!result.ok()) Fail("original child acceptance failed: " + result.error().message);
+      const auto receipt = MakeManagedApplyComponentBringUpAcceptedReceipt(
+          captured->sealed_plan, child, result.value());
+      if (!receipt.ok()) Fail("original child acceptance receipt is invalid: " + receipt.error().message);
+      Require(result.value().status &&
+                  result.value().status->phase == core::ComponentLifecycleTransactionPhaseDTO::kAccepted &&
+                  result.value().status->status_sequence == 1U &&
+                  !result.value().status->terminal_result &&
+                  std::all_of(result.value().status->domains.begin(), result.value().status->domains.end(),
+                      [](const auto &domain) { return domain.primitive_attempts.empty(); }),
+              "original child acceptance was not inert and unstarted");
+      accepted.children.push_back(receipt.value());
+    }
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      Require(original_apply_bring_up_capture == captured &&
+                  managed_cell_cclc.facade.get() == captured->original_facade,
+              "original child owner changed before receipt retention");
+      original_apply_accepted_children = accepted;
+    }
+    return accepted;
+  };
+#endif
+
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  // Read actual owner-issued lifecycle facts outside composition/Kernel locks.
+  // The serial managed caller borrows the stable facade; product exchange must
+  // exclude these reads through its accounted current-context pin.
+  const auto require_inactive_changed_components =
+      [&](const deployment::ApplyComponentDeltaDTO &delta,
+          const core::ActiveBundlePublicationReceiptDTO &predecessor) {
+    Require(delta.valid() && predecessor.valid(),
+            "configuration Apply has invalid delta/predecessor evidence");
+    deployment::CCLCRuntimeComposition *facade = nullptr;
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      facade = current_cell_cclc();
+      Require(facade != nullptr && !current_composition_building &&
+                  !managed_composition_building,
+              "configuration Apply has no stable current component owner");
+    }
+    for (const auto &change : delta.components) {
+      if (change.disposition != deployment::ApplyComponentDisposition::kReplace &&
+          change.disposition != deployment::ApplyComponentDisposition::kRemove)
+        continue;
+      const auto fact = facade->ReadCurrentComponentSnapshot(change.controllable_component_id);
+      Require(fact.ok() && fact.value().locally_valid() &&
+                  fact.value().controllable_component_id == change.controllable_component_id &&
+                  fact.value().active_publication_receipt == predecessor,
+              "configuration Apply cannot read the exact current component " +
+                  change.controllable_component_id.value());
+      Require(fact.value().component_lifecycle_state != core::ComponentLifecycleStateDTO::kActive,
+              "configuration Apply cannot replace or remove Active component " +
+                  change.controllable_component_id.value() + "; deactivate it first");
+    }
+    Require(read_current_publication() == predecessor,
+            "configuration Apply predecessor changed during component inspection");
+  };
+#endif
+
   const auto install_or_observe_composition =
       [&](const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
               &request)
@@ -12479,6 +14292,84 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 request.runtime_unit_id.value() == config.runtime_unit_id &&
                 request.runtime_epoch.value() == config.runtime_epoch,
             "runtime-composition request names another managed child");
+    bool original_configuration_finalize = false;
+    // This classifies the exact stored configuration operation's Scene target;
+    // effect authority still comes from the existing held-fence checks below.
+    // Keep the missing linked child acceptance/install continuation fail-closed.
+    // Its existing ordinary native planner is not a substitute generation or
+    // effect owner. This guard is removed only with that complete caller join.
+    auto configuration_parent_claim = stable_addressed_kernel()->ReadHeldCellAdmissionClaim(
+        core::CellAdmissionClaimKindDTO::kManagerApply);
+    if (!configuration_parent_claim) {
+      configuration_parent_claim = stable_addressed_kernel()->ReadHeldCellAdmissionClaim(
+          core::CellAdmissionClaimKindDTO::kAuthoringMutation);
+    }
+    if (configuration_parent_claim &&
+        (configuration_parent_claim->intent.claim_kind == core::CellAdmissionClaimKindDTO::kAuthoringMutation ||
+         configuration_parent_claim->intent.owner_transaction_id == request.apply_id.value())) {
+      const auto parent = component_manager::ReadManagerApplyConfigurationStatusReadOnly(
+          config.manager_state_root / std::string(component_manager::kManagerApplyJournalFilename),
+          core::CellId(config.cell_id), {request.apply_id, request.apply_generation},
+          *configuration_parent_claim);
+      if (!parent.ok()) {
+        std::string detail = "runtime composition cannot verify its original Manager parent";
+        if (const auto found = parent.error().details.find("reason"); found != parent.error().details.end())
+          detail += "; reason=" + found->second;
+        if (const auto found = parent.error().details.find("integrity_detail"); found != parent.error().details.end())
+          detail += "; integrity_detail=" + found->second;
+        Require(false, std::move(detail));
+      }
+      Require(!parent.value().bring_up_plan,
+              "linked runtime preparation requires its original accepted child continuation");
+      if (request.phase == component_manager::ManagerSelectedRuntimeCompositionPhase::kFinalize &&
+          request.candidate_projection_revision.scene_revision ==
+              request.predecessor_projection_revision.scene_revision) {
+        const auto &stored = parent.value();
+        const auto &intent = stored.intent.intent;
+        Require(stored.fence_attempt && stored.fence_acceptance &&
+                    stored.runtime_convergence_intent && stored.latest_runtime_staged_ready &&
+                    intent.apply_id == request.apply_id && intent.apply_generation == request.apply_generation &&
+                    intent.expected_active_projection_revision == request.predecessor_projection_revision &&
+                    intent.candidate_retained_bundle_id == request.candidate_projection_revision.retained_bundle_id &&
+                    intent.candidate_graph_revision == request.candidate_projection_revision.graph_revision &&
+                    stored.fence_attempt->fence_intent.owner_request_context == intent.request_context &&
+                    stored.fence_attempt->fence_intent.owner_transaction ==
+                        core::ApplyFenceOwnerDTO{request.apply_id, request.apply_generation} &&
+                    stored.fence_acceptance->fence_attempt_digest == stored.fence_attempt->fence_attempt_digest &&
+                    stored.fence_acceptance->accepted_fence.matches(stored.fence_attempt->fence_intent) &&
+                    stored.fence_acceptance->accepted_fence.configuration_fence_id == request.configuration_fence_id &&
+                    stored.fence_acceptance->accepted_fence.configuration_fence_generation == request.configuration_fence_generation &&
+                    stored.fence_acceptance->accepted_fence.captured_scope == request.configuration_fence_scope &&
+                    stored.runtime_convergence_intent->runtime_convergence_intent.predecessor_publication_generation ==
+                        request.expected_predecessor_publication_generation &&
+                    stored.runtime_convergence_intent->runtime_convergence_intent.predecessor_public_pointer_digest ==
+                        request.expected_predecessor_public_pointer_digest &&
+                    std::any_of(stored.latest_runtime_staged_ready->staged_ready.runtime_units.begin(),
+                                stored.latest_runtime_staged_ready->staged_ready.runtime_units.end(),
+                                [&](const auto &unit) {
+                                  return unit.valid() && unit.runtime_unit_id == request.runtime_unit_id &&
+                                      unit.runtime_epoch == request.runtime_epoch;
+                                }),
+                "preserved configuration finalization differs from its exact stored parent/fence/host");
+        original_configuration_finalize = true;
+      }
+    }
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+    if (request.phase == component_manager::ManagerSelectedRuntimeCompositionPhase::kPrepare &&
+        !preparing_composition_request && !installed_under_fence_composition_request &&
+        (!installed_composition_request ||
+         installed_composition_request->apply_id != request.apply_id ||
+         installed_composition_request->apply_generation != request.apply_generation)) {
+      const auto predecessor = read_current_publication();
+      // A published successor is existing observation/replay, not first
+      // preparation. Its original predecessor may no longer be current.
+      if (predecessor.publication_generation == request.expected_predecessor_publication_generation &&
+          predecessor.durable_public_pointer_content_digest == request.expected_predecessor_public_pointer_digest &&
+          core::SameActiveDeployment(predecessor.request.candidate_projection_revision,
+                                     request.predecessor_projection_revision))
+        require_inactive_changed_components(request.component_delta, predecessor);
+    }
+#endif
     if (selected_composition_failure != nullptr) {
       std::rethrow_exception(selected_composition_failure);
     }
@@ -12547,6 +14438,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         }
       }
       if (prepared_request.has_value()) {
+        Require(!original_configuration_finalize ||
+                    request.authoritative_scene_snapshot_digest ==
+                        prepared_request->authoritative_scene_snapshot_digest,
+                "preserved configuration finalization changed its prepared Scene snapshot");
         auto expected = request;
         expected.phase = component_manager::
             ManagerSelectedRuntimeCompositionPhase::kPrepare;
@@ -12554,14 +14449,96 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             prepared_request->candidate_projection_revision;
         expected.authoritative_scene_snapshot_digest =
             prepared_request->authoritative_scene_snapshot_digest;
-        Require(expected == *prepared_request &&
+        bool original_linked_finalize = false;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+        {
+          std::lock_guard lock(managed_composition_mutex);
+          if (original_apply_bring_up_capture &&
+              original_apply_bring_up_capture->sealed_plan.plan.apply_id == request.apply_id &&
+              original_apply_bring_up_capture->sealed_plan.plan.apply_generation == request.apply_generation) {
+            Require(original_apply_native_plan && original_apply_accepted_children &&
+                        original_apply_native_plan->component_bring_up == original_apply_accepted_children &&
+                        original_apply_native_plan->apply ==
+                            core::NamedApplyPublicationTransactionDTO{request.apply_id, request.apply_generation} &&
+                        original_apply_native_plan->candidate_retained_bundle_id ==
+                            request.candidate_projection_revision.retained_bundle_id &&
+                        original_apply_native_plan->candidate_graph_revision ==
+                            request.candidate_projection_revision.graph_revision &&
+                        managed_cell_cclc.facade.get() ==
+                            original_apply_bring_up_capture->original_facade,
+                    "original finalization lost its accepted child plan or owner");
+            original_linked_finalize = true;
+          }
+        }
+#endif
+        const bool exact_prepared_apply = expected == *prepared_request &&
                     request.candidate_projection_revision.scene_revision.scene_id ==
                         prepared_request->candidate_projection_revision
                             .scene_revision.scene_id &&
-                    request.candidate_projection_revision.scene_revision.revision_id >
-                        prepared_request->candidate_projection_revision
-                            .scene_revision.revision_id,
-                "final runtime composition differs from its exact prepared Apply");
+                    ((original_linked_finalize || original_configuration_finalize)
+                         ? request.candidate_projection_revision.scene_revision ==
+                               prepared_request->candidate_projection_revision.scene_revision
+                         : request.candidate_projection_revision.scene_revision.revision_id >
+                               prepared_request->candidate_projection_revision.scene_revision.revision_id);
+        if (!exact_prepared_apply) {
+          // Bounded field names diagnose refusal without disclosing payloads or
+          // changing the exact prepared-request or Scene proof predicates.
+          std::string mismatches;
+          const auto compare = [&](std::string_view field, const auto &actual,
+                                   const auto &prepared) {
+            if (actual != prepared) {
+              if (!mismatches.empty()) mismatches += ",";
+              mismatches += field;
+            }
+          };
+          compare("authoritative_scene_snapshot_digest", expected.authoritative_scene_snapshot_digest,
+                  prepared_request->authoritative_scene_snapshot_digest);
+          compare("apply_id", expected.apply_id,
+                  prepared_request->apply_id);
+          compare("apply_generation", expected.apply_generation,
+                  prepared_request->apply_generation);
+          compare("candidate_projection_revision", expected.candidate_projection_revision,
+                  prepared_request->candidate_projection_revision);
+          compare("expected_predecessor_publication_generation", expected.expected_predecessor_publication_generation,
+                  prepared_request->expected_predecessor_publication_generation);
+          compare("expected_predecessor_public_pointer_digest", expected.expected_predecessor_public_pointer_digest,
+                  prepared_request->expected_predecessor_public_pointer_digest);
+          compare("retained_bundle_canonical_content_digest", expected.retained_bundle_canonical_content_digest,
+                  prepared_request->retained_bundle_canonical_content_digest);
+          compare("retained_bundle_canonical_byte_size", expected.retained_bundle_canonical_byte_size,
+                  prepared_request->retained_bundle_canonical_byte_size);
+          compare("runtime_unit_id", expected.runtime_unit_id,
+                  prepared_request->runtime_unit_id);
+          compare("runtime_epoch", expected.runtime_epoch,
+                  prepared_request->runtime_epoch);
+          compare("manager_runtime_epoch", expected.manager_runtime_epoch,
+                  prepared_request->manager_runtime_epoch);
+          compare("configuration_fence_id", expected.configuration_fence_id,
+                  prepared_request->configuration_fence_id);
+          compare("configuration_fence_generation", expected.configuration_fence_generation,
+                  prepared_request->configuration_fence_generation);
+          compare("configuration_fence_scope", expected.configuration_fence_scope,
+                  prepared_request->configuration_fence_scope);
+          compare("phase", expected.phase,
+                  prepared_request->phase);
+          compare("component_delta", expected.component_delta,
+                  prepared_request->component_delta);
+          compare("predecessor_projection_revision", expected.predecessor_projection_revision,
+                  prepared_request->predecessor_projection_revision);
+          compare("isaac_pose_observer_launch_facts", expected.isaac_pose_observer_launch_facts,
+                  prepared_request->isaac_pose_observer_launch_facts);
+          Require(false,
+                  "final runtime composition differs from its exact prepared Apply; "
+                  "normalized_mismatching_fields=[" + mismatches + "]" +
+                      "; original_configuration_finalize=" +
+                      (original_configuration_finalize ? "true" : "false") +
+                      "; actual_scene_revision=" +
+                      std::to_string(request.candidate_projection_revision
+                                         .scene_revision.revision_id) +
+                      "; prepared_scene_revision=" +
+                      std::to_string(prepared_request->candidate_projection_revision
+                                         .scene_revision.revision_id));
+        }
         require_installed_candidate_configuration();
         const auto selected_bundle =
             LoadExactManagedCandidateBundle(config, request);
@@ -12602,6 +14579,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                         "native composition changed before final Scene");
                 RefreshRetainedNativePublicationView(
                     *current, final_projections->by_component,
+                    final_projections->required_projection_pins,
                     request.candidate_projection_revision,
                     current->publication_generation,
                     config.manager_run_root);
@@ -12712,8 +14690,96 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     if (published_installed_composition != nullptr) {
       bool attached = false;
       try {
-        attached = AttachCurrentPublishedCCLCIfReady(
-            *published_installed_composition, config, fence_owner, fence_query);
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+        if (original_configuration_finalize) {
+          const auto head = read_current_publication();
+          auto *const facade = managed_cell_cclc.facade.get();
+          const auto *const original_apply = std::get_if<
+              core::NamedApplyPublicationTransactionDTO>(&head.request.transaction_ref);
+          Require(facade && managed_cell_cclc.publication &&
+                      head.valid() && original_apply &&
+                      *original_apply == core::NamedApplyPublicationTransactionDTO{
+                          request.apply_id, request.apply_generation},
+                  "configuration handover lost its actual CCLC owner or successor");
+          fence_owner.RunWithExactHeldSuccessor(fence_query, head, [&] {
+            if (managed_cell_cclc.publication == head) {
+              attached = true;
+              return;
+            }
+            Require(installed_composition_request == request &&
+                        managed_cell_cclc.publication->publication_generation ==
+                        request.expected_predecessor_publication_generation &&
+                        managed_cell_cclc.publication->durable_public_pointer_content_digest ==
+                            request.expected_predecessor_public_pointer_digest,
+                    "configuration handover changed its original product predecessor");
+            if (!managed_cell_cclc.pending_product) {
+              // Storage writes finish their operation pins before exchange.
+              // Plan/adoption authority remains the original host fence above.
+              const auto plan = facade->LoadNativeApplyPlan(
+                  {request.apply_id, request.apply_generation});
+              Require(plan.ok() && plan.value() && !plan.value()->component_bring_up,
+                      "configuration handover has no exact ordinary native plan");
+              const auto adopted = facade->AdoptNativeApplyFacts(ReadNativeApplyFacts(
+                  *published_installed_composition, head, *plan.value()));
+              if (!adopted.ok())
+                Fail("configuration handover could not adopt current facts: " +
+                     adopted.error().message);
+              const auto prepared = managed_cell_cclc.PrepareInstalledProduct(
+                  *published_installed_composition, config, head);
+              if (!prepared.ok())
+                Fail("configuration handover could not prepare its actual product: " +
+                     prepared.error().message);
+              // Stage all allocating metadata before installing the one
+              // prepared value; a failed capture retains the original context.
+              auto exact_request = request;
+              auto owner = facade->coordinator().request_owner_epoch();
+              managed_cell_cclc.pending_product_request = std::move(exact_request);
+              managed_cell_cclc.pending_product_owner = std::move(owner);
+              managed_cell_cclc.pending_product = prepared.value();
+            }
+            Require(managed_cell_cclc.pending_product_request == request &&
+                        managed_cell_cclc.pending_product_owner &&
+                        facade == managed_cell_cclc.facade.get(),
+                    "configuration handover lost its original prepared identity");
+            // Copy the allocating successor receipt before the context swap.
+            auto successor = head;
+            const auto exchanged = facade->TryExchangeProductContext(
+                *managed_cell_cclc.pending_product,
+                *managed_cell_cclc.pending_product_owner,
+                *managed_cell_cclc.publication);
+            if (!exchanged.ok())
+              Fail("configuration product exchange could not be qualified: " +
+                   exchanged.error().message);
+            attached = exchanged.value().phase ==
+                core::ComponentLifecycleProductExchangePhase::kCompleted;
+            if (attached) {
+              Require(exchanged.value().current_publication == head &&
+                          exchanged.value().owner_epoch ==
+                              *managed_cell_cclc.pending_product_owner,
+                      "completed configuration product exchange changed identity");
+              // NativeAdopt verified the complete installed route inventory;
+              // completed exchange now selects that exact product. Clear only
+              // this attachment gate, retaining the Manager claim/fence and
+              // every independent Stop/fault/admission exclusion.
+              Require(published_installed_composition->active_addressed_kernel()
+                          ->SetRouteRecoveryPending(false).ok(),
+                      "completed configuration exchange could not clear route recovery");
+              published_installed_composition->route_recovery_pending.store(
+                  false, std::memory_order_release);
+              managed_cell_cclc.publication = std::move(successor);
+              published_installed_composition->cclc_attached.store(
+                  true, std::memory_order_release);
+              managed_cell_cclc.pending_product.reset();
+              managed_cell_cclc.pending_product_request.reset();
+              managed_cell_cclc.pending_product_owner.reset();
+            }
+          });
+        } else
+#endif
+        {
+          attached = AttachCurrentPublishedCCLCIfReady(
+              *published_installed_composition, config, fence_owner, fence_query);
+        }
         std::lock_guard lock(managed_composition_mutex);
         Require(active_managed_composition.get() ==
                     published_installed_composition,
@@ -12737,6 +14803,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       } catch (...) {
         std::lock_guard lock(managed_composition_mutex);
         current_composition_building = false;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+        if (original_configuration_finalize)
+          selected_composition_failure = std::current_exception();
+#endif
         throw;
       }
       return {
@@ -12785,12 +14855,43 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               plan_request.changed_component_state =
                   core::ComponentLifecycleStateDTO::kDeclared;
 #endif
-              core::SqliteCCLCJournal plan_journal(
-                  config.execution_state_root /
-                      std::string(core::kCCLCJournalFilename),
-                  core::CellId(config.cell_id));
-              const auto plan = plan_journal.PlanNativeApply(plan_request);
-              plan_journal.Close();
+              const auto plan = [&]() -> core::Result<core::NativeApplyPlanDTO> {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+                {
+                  std::lock_guard lock(managed_composition_mutex);
+                  if (original_apply_bring_up_capture &&
+                      original_apply_bring_up_capture->sealed_plan.plan.apply_id == request.apply_id &&
+                      original_apply_bring_up_capture->sealed_plan.plan.apply_generation == request.apply_generation) {
+                    Require(original_apply_native_plan && original_apply_accepted_children &&
+                                original_apply_native_plan->component_bring_up == original_apply_accepted_children &&
+                                original_apply_native_plan->apply == plan_request.apply &&
+                                original_apply_native_plan->candidate_retained_bundle_id ==
+                                    plan_request.candidate_retained_bundle_id &&
+                                original_apply_native_plan->candidate_graph_revision == plan_request.candidate_graph_revision &&
+                                managed_cell_cclc.facade.get() ==
+                                    original_apply_bring_up_capture->original_facade,
+                            "original finalization lost its pre-effect accepted plan");
+                    // Holding children have already advanced their genuine facts.
+                    // The original pre-effect plan remains the recorded decision;
+                    // finalization must not allocate again or reclassify them as Declared.
+                    return core::Result<core::NativeApplyPlanDTO>::Ok(*original_apply_native_plan);
+                  }
+                }
+#endif
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+                Require(managed_cell_cclc.facade != nullptr,
+                        "configuration Apply lost the existing CCLC journal owner");
+                return managed_cell_cclc.facade->PlanNativeApply(plan_request);
+#else
+                core::SqliteCCLCJournal plan_journal(
+                    config.execution_state_root /
+                        std::string(core::kCCLCJournalFilename),
+                    core::CellId(config.cell_id));
+                const auto recorded = plan_journal.PlanNativeApply(plan_request);
+                plan_journal.Close();
+                return recorded;
+#endif
+              }();
               if (!plan.ok()) {
                 Fail("native CCLC could not record the Apply plan: " +
                      plan.error().message);
@@ -12914,8 +15015,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                         .compiled_products.planning_collision_model,
                     owner->direct_control_joint_limits,
                     owner->direct_control_motion_descriptor,
-                    owner->direct_control_gripper_descriptor,
-                    owner->operator_confirmation_validity_ns
+                    owner->direct_control_gripper_descriptor
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
                     ,
                     owner->ros2_control_runtime_handle,
@@ -12962,7 +15062,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       }
 #endif
       managed_composition_builder = std::jthread(
-          [&, request, shared_clock = std::move(shared_clock),
+          [&, request, fence_query, shared_clock = std::move(shared_clock),
            shared_scheduler = std::move(shared_scheduler),
            retained_snapshots = std::move(retained_snapshots)]() mutable {
             try {
@@ -12974,6 +15074,110 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     std::move(retained_snapshots);
                 input->observation_wake = stable_observation_wake;
               }
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+              // The outgoing lifecycle reader must see the exact Replace /
+              // Remove decision before ensure() retires its controller.
+              // These are planned floors, never installed readiness proof.
+              std::vector<core::RuntimeParticipantBinding> planned_bindings;
+              if (input.has_value()) {
+                const deployment::FilesystemVerifiedCatalogArtifactSource
+                    catalogs(input->package_root);
+                const auto inventory =
+                    deployment::compile_direct_control_program_binding_inventory(
+                        *input->bundle, input->model_map, catalogs);
+                for (const auto &component :
+                     input->bundle->value().cell_graph.controllable_components) {
+                  auto selected = *input;
+                  selected.selected_component_id =
+                      component.controllable_component_id;
+                  auto physical =
+                      ResolveNativePhysicalBindings(selected, inventory);
+                  planned_bindings.insert(
+                      planned_bindings.end(),
+                      std::make_move_iterator(physical.representatives.begin()),
+                      std::make_move_iterator(physical.representatives.end()));
+                }
+              }
+              const auto planned_candidate = LoadExactManagedCandidateBundle(
+                  config, request);
+              const auto planned_predecessor = LoadManagedBundleAtPinnedRoot(
+                  config,
+                  request.predecessor_projection_revision.retained_bundle_id);
+              Require(planned_candidate.has_value() &&
+                          planned_predecessor.has_value(),
+                      "managed Apply planning lost its verified products");
+              std::optional<core::NativeApplyComponentBringUpDTO> linked_children;
+              {
+                std::lock_guard lock(managed_composition_mutex);
+                if (original_apply_bring_up_capture &&
+                    original_apply_bring_up_capture->sealed_plan.plan.apply_id == request.apply_id &&
+                    original_apply_bring_up_capture->sealed_plan.plan.apply_generation == request.apply_generation)
+                  linked_children = core::NativeApplyComponentBringUpDTO{
+                      {{request.apply_id, request.apply_generation},
+                       original_apply_bring_up_capture->sealed_plan.plan_digest}, {}};
+              }
+              if (linked_children)
+                linked_children = accept_original_apply_children(request);
+              fence_owner.RunWithExactHeldPredecessor(
+                  fence_query,
+                  request.expected_predecessor_publication_generation,
+                  request.expected_predecessor_public_pointer_digest, [&] {
+                    std::lock_guard lock(managed_composition_mutex);
+                    Require(preparing_composition_request == request,
+                            "managed Apply planning lost its original request");
+                    VerifyRetainedNativePredecessors(
+                        active_managed_composition.get(), request);
+                    std::vector<core::RuntimeRouteConfigurationReadbackDTO>
+                        retained_routes;
+                    for (const auto &desired : planned_candidate->bundle
+                                                   ->value()
+                                                   .desired_control_configurations) {
+                      const bool retained = std::any_of(
+                          request.component_delta.components.begin(),
+                          request.component_delta.components.end(),
+                          [&](const auto &component) {
+                            return component.disposition ==
+                                       deployment::ApplyComponentDisposition::kRetain &&
+                                   std::binary_search(
+                                       component.candidate_domains.begin(),
+                                       component.candidate_domains.end(),
+                                       desired.control_domain_id);
+                          });
+                      if (!retained)
+                        continue;
+                      const auto route = stable_addressed_kernel()
+                                             ->current_runtime_route_configuration(
+                                                 desired.control_domain_id);
+                      Require(route.ok() && route.value().has_value(),
+                              "managed Apply retained route is unavailable before preparation");
+                      retained_routes.push_back(*route.value());
+                    }
+                    auto derived = DeriveRetainedNativeApplyPlanRequest(
+                        {request.apply_id, request.apply_generation},
+                        *planned_candidate->bundle,
+                        planned_predecessor->bundle.get(),
+                        request.component_delta, planned_bindings,
+                        retained_routes,
+                        core::ComponentLifecycleStateDTO::kDeclared);
+                    if (!derived.ok())
+                      Fail("managed Apply plan derivation failed: " +
+                           derived.error().message);
+                    if (linked_children)
+                      derived.value().component_bring_up = *linked_children;
+                    Require(managed_cell_cclc.facade != nullptr,
+                            "managed Apply planning lost the existing CCLC journal owner");
+                    const auto recorded =
+                        managed_cell_cclc.facade->PlanNativeApply(derived.value());
+                    if (!recorded.ok())
+                      Fail("managed CCLC could not record Apply before preparation: " +
+                           recorded.error().message);
+                    if (linked_children) {
+                      Require(recorded.value().component_bring_up == linked_children,
+                              "managed Apply plan differs from its actual accepted child receipts");
+                      original_apply_native_plan = recorded.value();
+                    }
+                  });
+#endif
               const bool retain_view =
                   input.has_value() &&
                   IsExactRetainedNativeViewApply(request);
@@ -13055,6 +15259,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             RefreshRetainedNativePublicationView(
                 candidate,
                 retained_view_input->component_planner_scene_projections,
+                retained_view_input->required_projection_pins,
                 request.candidate_projection_revision, generation,
                 config.manager_run_root);
             candidate.bundle = std::move(retained_view_input->bundle);
@@ -13314,6 +15519,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   include_projection(*component);
                 RefreshRetainedNativePublicationView(
                     *prepared, selected_projections,
+                    prepared->required_projection_pins,
                     request.candidate_projection_revision,
                     prepared->publication_generation,
                     config.manager_run_root);
@@ -13486,6 +15692,27 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               Require(view->ros2_control_runtime_handle != nullptr,
                       "installed ROS component has no bound runtime handle");
               view->ros2_control_runtime_handle->StartBackend();
+            }
+            if (original_apply_native_plan &&
+                original_apply_native_plan->apply ==
+                    core::NamedApplyPublicationTransactionDTO{request.apply_id, request.apply_generation}) {
+              Require(original_apply_native_plan->component_bring_up &&
+                          original_apply_native_plan->component_bring_up == original_apply_accepted_children &&
+                          original_apply_native_plan->candidate_retained_bundle_id ==
+                              candidate.bundle->retained_bundle_id(),
+                      "installed original Apply lost its accepted native plan");
+              const auto package = LoadExactManagedCandidateBundle(config, request);
+              Require(package && package->bundle->canonical_bytes() == candidate.bundle->canonical_bytes(),
+                      "installed original Apply lost its exact product artifacts");
+              EnsureInstalledRetainedRos2ControlLifecycleProduct(candidate, package->package_root);
+              const deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(package->package_root);
+              const auto representatives = CellControlBindingRepresentatives(candidate);
+              const auto routes = InitializeRetainedNativeCandidateControlRoutes(
+                  *candidate.bundle, *candidate.active_addressed_kernel(), *candidate.runtime,
+                  *candidate.runtime, candidate.publication_generation, *original_apply_native_plan,
+                  artifacts, representatives, config.execution_run_root, request.configuration_fence_id);
+              if (!routes.ok())
+                Fail("installed original Apply routes are unavailable: " + routes.error().message);
             }
 #endif
             InstallDirectSceneFrameResolver(projections, candidate);
@@ -13929,6 +16156,53 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
     if (request == "status") {
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+      struct InstalledControllerOccurrence final {
+        std::shared_ptr<ControllerLaunchProcess> process;
+        std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle;
+      };
+      std::vector<InstalledControllerOccurrence> controller_occurrences;
+      {
+        std::lock_guard lock(managed_composition_mutex);
+        // Every installed occurrence, including inactive/no-target components.
+        // A changing composition does not erase the predecessor's actual owner.
+        if (active_managed_composition) {
+          const auto retain = [&](const Composition &component) {
+            if (component.controller_process)
+              controller_occurrences.push_back(
+                  {component.controller_process,
+                   component.ros2_control_runtime_handle});
+          };
+          retain(*active_managed_composition);
+          for (const auto &peer :
+               active_managed_composition->participant_compositions)
+            retain(*peer);
+        }
+      }
+      // Only cached installed-handle readiness, waitid(WNOHANG), a short
+      // evidence lock and an already-started lane enqueue run here. Group
+      // waits/scan/reap execute off this 750ms RPC lane.
+      for (const auto &occurrence : controller_occurrences)
+        static_cast<void>(
+            host_controller_launch_supervisor().request_unexpected_exit_cleanup(
+                occurrence.process, *controller_cleanup_scheduler,
+                controller_cleanup_clock->now(),
+                CachedControllerLaunchReadinessSource(occurrence.handle)));
+      deployment::CCLCRuntimeComposition *observer_journal_owner = nullptr;
+      {
+        std::lock_guard lock(managed_composition_mutex);
+        if (!current_composition_building && !managed_composition_building &&
+            !preparing_composition_request &&
+            !installed_under_fence_composition_request)
+          observer_journal_owner = current_cell_cclc();
+      }
+      if (observer_journal_owner) {
+        try {
+          managed_isaac_cell.persist_current_exit(*observer_journal_owner);
+        } catch (...) {
+          // Persistence never suppresses the genuine exit or ordinary host
+          // status. The read-only observation still reports uncertainty.
+        }
+      }
       // The ordinary Manager progress poll also correlates the already minted
       // CCLC incident with its existing process evidence. No new polling owner.
       try {
@@ -13946,7 +16220,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         {
           std::lock_guard lock(managed_composition_mutex);
           auto *cell = active_managed_composition.get();
-          if (cell && cell->cclc_runtime) {
+          auto *const cclc = current_cell_cclc();
+          if (cell && cclc) {
             const auto snapshot = [&](Composition &component) {
               if (!component.controller_process ||
                   (component.ros2_control_runtime_handle &&
@@ -13954,7 +16229,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                        ->HasControllerProcessIncidentDiagnostic()))
                 return;
               const auto view =
-                  cell->cclc_runtime->lifecycle_target_driver().ReadTargetView(
+                  cclc->lifecycle_target_driver().ReadTargetView(
                       component.controllable_component_id);
               if (!view.ok() || !view.value().progress ||
                   !view.value().progress->incident)
@@ -14055,9 +16330,382 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                                  "dispatched",
                                  {}}};
       try {
-        response = install_or_observe_composition(
-            component_manager::detail::
-                DecodeSelectedRuntimeCompositionRpcRequest(request));
+        const auto decoded = component_manager::detail::
+            DecodeSelectedRuntimeCompositionRpcRequestVariant(request);
+        response = std::visit(
+            [&](const auto &value)
+                -> component_manager::detail::SelectedRuntimeCompositionRpcResponse {
+              using T = std::decay_t<decltype(value)>;
+              if constexpr (std::is_same_v<
+                                T, component_manager::ManagerSelectedRuntimeCompositionRequestDTO>) {
+                return install_or_observe_composition(value);
+              } else if constexpr (std::is_same_v<
+                                       T, component_manager::ManagerComponentBringUpInspectionRequestDTO>) {
+                Require(value.valid() && value.runtime_unit_id.value() == config.runtime_unit_id &&
+                            value.runtime_epoch.value() == config.runtime_epoch,
+                        "component inspection names another host occurrence");
+                Require(manager_liveness_installed.load(std::memory_order_acquire),
+                        "component inspection has no current Manager observation");
+                const auto manager = manager_liveness_receiver.get()->status();
+                Require(manager.state == core::ManagerLivenessStateDTO::kCurrent &&
+                            !manager.command_fenced &&
+                            manager.manager_runtime_epoch == value.manager_runtime_epoch &&
+                            manager.receiver_runtime_unit_id == value.runtime_unit_id &&
+                            manager.receiver_runtime_epoch == value.runtime_epoch,
+                        "component inspection names an unavailable Manager occurrence");
+                const auto require_predecessor = [&](const auto &publication) {
+                  Require(publication.publication_generation == value.expected_predecessor_publication_generation &&
+                              publication.durable_public_pointer_content_digest == value.expected_predecessor_public_pointer_digest &&
+                              publication.request.candidate_projection_revision == value.predecessor_projection_revision,
+                          "component inspection predecessor publication changed");
+                };
+                const auto predecessor = read_current_publication();
+                require_predecessor(predecessor);
+                const auto selected = LoadManagedBundleAtPinnedRoot(
+                    config, value.candidate_projection_revision.retained_bundle_id);
+                Require(selected && selected->bundle &&
+                            selected->bundle->value().cell_graph.cell_id == core::CellId(config.cell_id) &&
+                            selected->bundle->value().cell_graph.graph_revision == value.candidate_projection_revision.graph_revision &&
+                            selected->bundle->canonical_bytes().size() == value.candidate_retained_bundle_bytes &&
+                            core::ContentDigest(content_identity::sha256_digest(selected->bundle->canonical_bytes())) == value.candidate_retained_bundle_digest,
+                        "component inspection candidate is not the exact verified bundle");
+                const auto predecessor_bundle = LoadManagedBundleAtPinnedRoot(
+                    config, value.predecessor_projection_revision.retained_bundle_id);
+                Require(predecessor_bundle && predecessor_bundle->bundle,
+                        "component inspection predecessor bundle is unavailable");
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+                std::optional<ManagedCandidateLifecyclePlanningClosure> candidate_planning;
+                if (value.planning_component_id) {
+                  Require(value.expected_predecessor_publication_generation.value() !=
+                              std::numeric_limits<std::uint64_t>::max(),
+                          "component planning publication generation is exhausted");
+                  auto compiled = BuildManagedCandidateLifecyclePlanningClosure(
+                      config, *selected, value.candidate_projection_revision,
+                      core::ActiveBundlePublicationGeneration(
+                          value.expected_predecessor_publication_generation.value() + 1U));
+                  if (!compiled.ok())
+                    return component_manager::detail::SelectedRuntimeCompositionRpcFailure{compiled.error()};
+                  candidate_planning = std::move(compiled.value());
+                }
+                deployment::CCLCRuntimeComposition *planning_owner = nullptr;
+                deployment::CCLCRuntimeComposition *observer_read_owner = nullptr;
+                bool planning_predecessor_present = false;
+#endif
+                component_manager::ManagerComponentBringUpInspectionResultDTO result{value, {}};
+                {
+                  // Borrow the existing owners only for synchronous process reads.
+                  // No construction, dispatch, shutdown, or epoch mintage occurs.
+                  std::lock_guard composition_lock(managed_composition_mutex);
+                  std::shared_lock execution_lock(execution_composition.mutex);
+                  const bool changing = current_composition_building || managed_composition_building ||
+                      preparing_composition_request || installed_under_fence_composition_request ||
+                      prepared_managed_composition || prepared_retained_view ||
+                      prepared_managed_composition_is_empty ||
+                      selected_composition_failure != nullptr || managed_composition_failure != nullptr;
+                  // Changing component owners are unknown. The independent cell
+                  // observer can still report its actual exit while Apply holds
+                  // the composition fence; unknown rows authorize no bring-up.
+                  if (!changing && active_managed_composition)
+                    Require(active_managed_composition->projection_revision == value.predecessor_projection_revision &&
+                                active_managed_composition->publication_generation == value.expected_predecessor_publication_generation,
+                            "component inspection owner belongs to another publication");
+                  // A populated published predecessor with no installed owners
+                  // is unknown, not proof that its processes are absent.
+                  const auto installed = active_managed_composition
+                      ? IndexNativeComponentCompositions(*active_managed_composition)
+                      : std::map<core::ControllableComponentId, const Composition *>{};
+                  std::set<core::ControllableComponentId> predecessor_components;
+                  for (const auto &row : predecessor_bundle->bundle->value().cell_graph.controllable_components)
+                    predecessor_components.insert(row.controllable_component_id);
+                  for (const auto &row : selected->bundle->value().cell_graph.controllable_components) {
+                    Require(std::find(row.runtime_unit_ids.begin(), row.runtime_unit_ids.end(), value.runtime_unit_id) != row.runtime_unit_ids.end(),
+                            "component inspection candidate names another runtime unit");
+                    auto presence = component_manager::ProcessPresenceState::kUnknown;
+                    const auto current = installed.find(row.controllable_component_id);
+                    if (changing) {
+                      // No installed-component presence inference is valid here.
+                    } else if (current == installed.end()) {
+                      if (!predecessor_components.contains(row.controllable_component_id))
+                        presence = component_manager::ProcessPresenceState::kAbsent;
+                    } else {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+                      if (current->second->controller_process) {
+                        Require(current->second->controller_process->command().controllable_component_id == row.controllable_component_id.value(),
+                                "component process observation has foreign attribution");
+                        presence = current->second->controller_process->exited()
+                            ? component_manager::ProcessPresenceState::kAbsent
+                            : component_manager::ProcessPresenceState::kPresent;
+                      }
+#endif
+                    }
+                    result.configured_components.push_back({row.controllable_component_id, presence});
+                  }
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+                  // The initial builder can transfer ownership concurrently.
+                  // Read the pointer under its publication mutex; an established
+                  // cell facade is stable through later composition changes.
+                  if (managed_cell_cclc.facade)
+                    observer_read_owner = managed_cell_cclc.facade.get();
+                  else if (!changing)
+                    observer_read_owner = current_cell_cclc();
+                  if (value.planning_component_id) {
+                    Require(!changing && managed_cell_cclc.facade &&
+                                managed_cell_cclc.publication == predecessor,
+                            "component planning has no stable original cell owner");
+                    planning_owner = managed_cell_cclc.facade.get();
+                    planning_predecessor_present =
+                        predecessor_components.contains(*value.planning_component_id);
+                    if (!planning_predecessor_present) {
+                      const auto row = std::find_if(result.configured_components.begin(),
+                          result.configured_components.end(), [&](const auto &component) {
+                            return component.controllable_component_id == *value.planning_component_id;
+                          });
+                      Require(!installed.contains(*value.planning_component_id) &&
+                                  row != result.configured_components.end() &&
+                                  row->process_presence == component_manager::ProcessPresenceState::kAbsent,
+                              "initial component planning lacks positive predecessor inventory absence");
+                    }
+                  }
+#endif
+                }
+                std::sort(result.configured_components.begin(), result.configured_components.end(),
+                          [](const auto &lhs, const auto &rhs) {
+                            return lhs.controllable_component_id < rhs.controllable_component_id;
+                          });
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+                if (planning_owner) {
+                  // Journal/catalog reads never run under composition or Kernel
+                  // locks. The serial managed caller pins this actual facade;
+                  // recreation must first exclude and drain all such callers.
+                  const auto component = *value.planning_component_id;
+                  const auto owner_epoch = planning_owner->coordinator().request_owner_epoch();
+                  const auto generation = planning_owner->ReadApplyComponentGenerationSelection(component);
+                  if (!generation.ok())
+                    return component_manager::detail::SelectedRuntimeCompositionRpcFailure{generation.error()};
+                  std::optional<core::ComponentLifecycleCurrentSnapshotDTO> snapshot;
+                  if (planning_predecessor_present) {
+                    const auto current = planning_owner->ReadCurrentComponentSnapshot(component);
+                    if (!current.ok())
+                      return component_manager::detail::SelectedRuntimeCompositionRpcFailure{current.error()};
+                    Require(generation.value().owner_qualified_predecessor &&
+                                generation.value().owner_qualified_predecessor->generation ==
+                                    current.value().component_lifecycle_generation &&
+                                generation.value().owner_qualified_predecessor->snapshot_digest ==
+                                    current.value().snapshot_digest &&
+                                current.value().active_publication_receipt == predecessor,
+                            "component planning snapshot differs from the owner-selected predecessor");
+                    snapshot = current.value();
+                  } else {
+                    Require(!generation.value().owner_qualified_predecessor,
+                            "initial component planning contains a foreign predecessor snapshot");
+                  }
+                  const auto target_view = planning_owner->lifecycle_target_driver().ReadTargetView(component);
+                  if (!target_view.ok())
+                    return component_manager::detail::SelectedRuntimeCompositionRpcFailure{target_view.error()};
+                  // This is the same absent-target startup choice used by
+                  // native adoption. It is not an achieved lifecycle state.
+                  const auto target = target_view.value().target
+                      ? target_view.value().target->requested_state
+                      : core::LifecycleTargetStateDTO::kActive;
+                  const auto next = snapshot
+                      ? core::NextLifecycleIntentTowardTarget(snapshot->component_lifecycle_state, target)
+                      : std::optional<core::ComponentLifecycleIntentKindDTO>{
+                            target == core::LifecycleTargetStateDTO::kDisabled
+                                ? core::ComponentLifecycleIntentKindDTO::kDisable
+                                : core::ComponentLifecycleIntentKindDTO::kPrepare};
+                  Require(next && *next != core::ComponentLifecycleIntentKindDTO::kRecover,
+                          "component planning has no approved next Apply bring-up action");
+                  const auto closure = std::find_if(candidate_planning->components.begin(),
+                      candidate_planning->components.end(), [&](const auto &row) {
+                        return row.component_id == component;
+                      });
+                  Require(closure != candidate_planning->components.end(),
+                          "component planning lacks its complete verified candidate closure");
+                  const auto generation_after = planning_owner->ReadApplyComponentGenerationSelection(component);
+                  const auto target_after = planning_owner->lifecycle_target_driver().ReadTargetView(component);
+                  Require(generation_after.ok() && generation_after.value() == generation.value() &&
+                              target_after.ok() && target_after.value().target == target_view.value().target &&
+                              planning_owner->coordinator().request_owner_epoch() == owner_epoch,
+                          "component planning owner facts changed during observation");
+                  {
+                    std::lock_guard composition_lock(managed_composition_mutex);
+                    Require(managed_cell_cclc.facade.get() == planning_owner &&
+                                managed_cell_cclc.publication == predecessor &&
+                                !current_composition_building && !managed_composition_building &&
+                                !preparing_composition_request && !installed_under_fence_composition_request,
+                            "component planning original owner changed during observation");
+                  }
+                  result.planning_facts = component_manager::ManagerComponentBringUpPlanningFactsDTO{
+                      component, owner_epoch, generation.value(), closure->candidate_expected_domains,
+                      target, *next};
+                }
+                result.cell_observer = managed_isaac_cell.observe_current(observer_read_owner);
+#endif
+                require_predecessor(read_current_publication());
+                const auto after = manager_liveness_receiver.get()->status();
+                Require(after.state == core::ManagerLivenessStateDTO::kCurrent && !after.command_fenced &&
+                            after.manager_runtime_epoch == value.manager_runtime_epoch &&
+                            after.receiver_runtime_epoch == value.runtime_epoch && result.valid(),
+                        "component process inspection lost its current occurrence");
+                return result;
+              } else {
+                constexpr bool read_only =
+                    std::is_same_v<T, component_manager::ManagerSelectedComponentBringUpReadRequestDTO> ||
+                    std::is_same_v<T, component_manager::ManagerApplyComponentBringUpReadRequestDTO>;
+                const auto &original = [&]() -> const auto & {
+                  if constexpr (read_only) return value.request;
+                  else return value;
+                }();
+                using Request = std::decay_t<decltype(original)>;
+                constexpr bool delegated = std::is_same_v<
+                    Request, component_manager::ManagerApplyComponentBringUpRequestDTO>;
+                using Response = std::conditional_t<
+                    delegated, component_manager::ManagerApplyComponentBringUpResultDTO,
+                    component_manager::ManagerSelectedComponentBringUpResultDTO>;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+                if constexpr (delegated && !read_only) {
+                  const auto digest = core::ApplyDelegatedComponentLifecycleSemanticRequestDigest(
+                      original.intent, original.candidate_projection_revision,
+                      original.candidate_retained_bundle_digest, original.candidate_retained_bundle_bytes,
+                      original.runtime_unit_id, original.runtime_epoch, original.manager_runtime_epoch,
+                      original.parent_authority.parent);
+                  deployment::CCLCRuntimeComposition *result_owner{};
+                  std::shared_ptr<const ManagedOriginalApplyBringUpCapture> captured;
+                  {
+                    std::lock_guard lock(managed_composition_mutex);
+                    result_owner = current_cell_cclc();
+                    captured = original_apply_bring_up_capture;
+                  }
+                  Require(result_owner, "original delegated result journal is unavailable");
+                  // The serial main channel pins this facade for the read. A
+                  // retained result is classified before any current capture
+                  // authorization, including after owner recreation or restart.
+                  const auto retained = result_owner->coordinator().ReadApplyComponentBringUpRequestResult(
+                      original.intent, digest);
+                  if (!retained.ok())
+                    return component_manager::detail::SelectedRuntimeCompositionRpcFailure{retained.error()};
+                  if (!retained.value())
+                    return component_manager::detail::SelectedRuntimeCompositionRpcFailure{
+                        core::ErrorDTO{"component_bring_up_live_authority_unavailable",
+                                       "new bring-up requires the original accepted continuation", {}}};
+                  Require(retained.value()->status.has_value(),
+                          "delegated continuation has no actual retained child status");
+                  const bool same_original_parent = captured &&
+                      captured->sealed_plan.plan.apply_id == original.parent_authority.parent.owner.apply_id &&
+                      captured->sealed_plan.plan.apply_generation == original.parent_authority.parent.owner.apply_generation &&
+                      captured->sealed_plan.plan_digest == original.parent_authority.parent.plan_digest;
+                  if (retained.value()->status->phase != core::ComponentLifecycleTransactionPhaseDTO::kAccepted ||
+                      !same_original_parent) {
+                    Response result{original, retained.value()};
+                    Require(result.valid(), "delegated retained result differs from its request");
+                    return result;
+                  }
+                  {
+                    std::lock_guard lock(managed_composition_mutex);
+                    Require(original_apply_bring_up_capture == captured &&
+                                captured->original_facade && result_owner == captured->original_facade &&
+                                managed_cell_cclc.facade.get() == captured->original_facade &&
+                                original_apply_accepted_children && original_apply_native_plan &&
+                                original_apply_native_plan->component_bring_up == original_apply_accepted_children,
+                            "new delegated continuation lacks its actual original accepted runtime");
+                  }
+                  const auto &plan = captured->sealed_plan.plan;
+                  const auto child = std::find_if(plan.children.begin(), plan.children.end(),
+                      [&](const auto &row) { return row.intent == original.intent; });
+                  Require(child != plan.children.end(),
+                          "delegated continuation is not a sealed original child");
+                  const component_manager::ManagerApplyComponentBringUpRequestDTO expected{
+                      child->intent, child->candidate_projection_revision,
+                      child->candidate_retained_bundle_digest, child->candidate_retained_bundle_bytes,
+                      child->runtime_unit_id, child->runtime_epoch, child->manager_runtime_epoch,
+                      original.parent_authority};
+                  Require(expected == original && original.parent_authority.parent_claim == captured->parent_claim &&
+                              original.parent_authority.parent == core::ApplyComponentBringUpReferenceDTO{
+                                  {plan.apply_id, plan.apply_generation}, captured->sealed_plan.plan_digest},
+                          "delegated continuation differs from its full original request");
+                  auto &coordinator = captured->original_facade->coordinator();
+                  const auto qualified = std::find_if(captured->candidate_closure.components.begin(),
+                      captured->candidate_closure.components.end(), [&](const auto &row) {
+                        return row.component_id == original.intent.controllable_component_id;
+                      });
+                  Require(qualified != captured->candidate_closure.components.end(),
+                          "delegated continuation lost its qualified candidate closure");
+                  std::optional<ManagedInstalledLifecycleComponentClosure> installed;
+                  core::ICCLCComponentCommandReadinessPort *readiness{};
+                  const auto &query = original.parent_authority.held_fence_query;
+                  fence_owner.RunWithExactHeldPredecessor(query,
+                      captured->predecessor_publication.publication_generation,
+                      captured->predecessor_publication.durable_public_pointer_content_digest, [&] {
+                    std::lock_guard lock(managed_composition_mutex);
+                    Require(managed_cell_cclc.facade.get() == captured->original_facade &&
+                                !current_composition_building && !managed_composition_building &&
+                                active_managed_composition && active_managed_composition->runtime &&
+                                active_managed_composition->bundle->canonical_bytes() ==
+                                    captured->candidate.bundle->canonical_bytes() &&
+                                active_managed_composition->projection_revision == original.candidate_projection_revision &&
+                                installed_under_fence_composition_request &&
+                                installed_under_fence_composition_request->phase ==
+                                    component_manager::ManagerSelectedRuntimeCompositionPhase::kPrepare &&
+                                installed_under_fence_composition_request->apply_id == plan.apply_id &&
+                                installed_under_fence_composition_request->apply_generation == plan.apply_generation,
+                            "delegated continuation lacks its exact completed installation");
+                    const auto actual = ReadInstalledManagedCandidateLifecycleComponentClosure(
+                        *active_managed_composition, *qualified);
+                    if (!actual.ok()) Fail("delegated installed closure is unavailable: " + actual.error().message);
+                    installed = actual.value();
+                    readiness = active_managed_composition->runtime.get();
+                  });
+                  Require(installed && readiness,
+                          "delegated continuation did not retain its actual installed ports");
+                  const auto continued = coordinator.ContinueApplyComponentBringUp(original.intent, digest,
+                      installed->domains, installed->providers, installed->ports, {}, readiness);
+                  if (!continued.ok())
+                    return component_manager::detail::SelectedRuntimeCompositionRpcFailure{continued.error()};
+                  Response result{original, continued.value()};
+                  Require(result.valid(), "delegated continuation result differs from its request");
+                  return result;
+                }
+#endif
+                // Original membership is consulted before current occurrence
+                // authorization. Replayed evidence never enters an effect path.
+                std::lock_guard lock(managed_composition_mutex);
+                auto *const cclc = current_cell_cclc();
+                Require(cclc != nullptr,
+                        "original component result journal is unavailable");
+                auto &coordinator = cclc->coordinator();
+                const auto retained = [&] {
+                  if constexpr (delegated) {
+                    const auto digest = core::ApplyDelegatedComponentLifecycleSemanticRequestDigest(
+                        original.intent, original.candidate_projection_revision,
+                        original.candidate_retained_bundle_digest,
+                        original.candidate_retained_bundle_bytes,
+                        original.runtime_unit_id, original.runtime_epoch,
+                        original.manager_runtime_epoch, original.parent_authority.parent);
+                    return coordinator.ReadApplyComponentBringUpRequestResult(original.intent, digest);
+                  } else {
+                    const auto digest = core::SelectedComponentBringUpSemanticRequestDigest(
+                        original.intent, original.candidate_projection_revision,
+                        original.candidate_retained_bundle_digest,
+                        original.candidate_retained_bundle_bytes,
+                        original.runtime_unit_id, original.runtime_epoch,
+                        original.manager_runtime_epoch);
+                    return coordinator.ReadSelectedComponentBringUpRequestResult(original.intent, digest);
+                  }
+                }();
+                if (!retained.ok())
+                  return component_manager::detail::SelectedRuntimeCompositionRpcFailure{
+                      retained.error()};
+                if constexpr (!read_only) {
+                  if (!retained.value())
+                    return component_manager::detail::SelectedRuntimeCompositionRpcFailure{
+                        core::ErrorDTO{"component_bring_up_live_authority_unavailable",
+                                       "new bring-up requires the original live qualified continuation", {}}};
+                }
+                Response result{original, retained.value()};
+                Require(result.valid(), "retained component result does not match its original request");
+                return result;
+              }
+            }, decoded);
       } catch (const std::exception &error) {
         std::cerr << "native selected composition failed: " << error.what() << '\n';
         response =
@@ -14088,6 +16736,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         const auto decoded =
             component_manager::detail::DecodeKernelApplyFenceRpcRequest(
                 request);
+        const auto selected_result = [](const auto &result)
+            -> component_manager::detail::KernelApplyFenceRpcResponse {
+          if (!result.ok()) {
+            return component_manager::detail::KernelApplyFenceRpcFailure{
+                result.error()};
+          }
+          return result.value();
+        };
         response = std::visit(
             [&](const auto &value)
                 -> component_manager::detail::KernelApplyFenceRpcResponse {
@@ -14107,6 +16763,34 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               } else if constexpr (
                   std::is_same_v<T, core::ConfigurationFenceStatusQueryDTO>) {
                 return fence_owner.QueryStatus(value);
+              } else if constexpr (
+                  std::is_same_v<
+                      T, core::SelectedBringUpConfigurationFenceIntentDTO>) {
+                return selected_result(
+                    fence_owner.AcquireSelectedBringUpFence(value));
+              } else if constexpr (
+                  std::is_same_v<
+                      T, core::SelectedBringUpFenceAcquireAttemptQueryDTO>) {
+                return selected_result(
+                    fence_owner.ReconcileSelectedBringUpFenceAcquireAttempt(
+                        value));
+              } else if constexpr (
+                  std::is_same_v<
+                      T,
+                      core::SelectedBringUpConfigurationFenceStatusQueryDTO>) {
+                return selected_result(
+                    fence_owner.ObserveSelectedBringUpFenceStatus(value));
+              } else if constexpr (
+                  std::is_same_v<
+                      T, core::SelectedBringUpConfigurationFenceReleaseDTO>) {
+                return selected_result(
+                    fence_owner.ReleaseSelectedBringUpFence(value));
+              } else if constexpr (
+                  std::is_same_v<
+                      T, core::SelectedBringUpFenceReleaseAttemptQueryDTO>) {
+                return selected_result(
+                    fence_owner.ReconcileSelectedBringUpFenceReleaseAttempt(
+                        value));
               } else {
                 return fence_owner.Release(value);
               }
@@ -14147,8 +16831,180 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           std::lock_guard lock(managed_composition_mutex);
           owner = stable_addressed_kernel();
           Require(owner != nullptr, "stable Kernel is not installed");
-          response = component_manager::detail::DispatchKernelCellAdmissionRpc(
-              *owner, decoded);
+        }
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+        const auto *const acquire_intent =
+            std::get_if<core::CellAdmissionClaimIntentDTO>(&decoded.request);
+        if (decoded.command == "cell_admission_acquire" && acquire_intent &&
+            acquire_intent->claim_kind == core::CellAdmissionClaimKindDTO::kManagerApply) {
+          // Classify ordinary versus linked only from a successful complete
+          // owner snapshot. Read errors never select ordinary permission.
+          const auto read = component_manager::ReadManagerApplyBringUpStatusReadOnly(
+              config.manager_state_root / std::string(component_manager::kManagerApplyJournalFilename),
+              core::CellId(config.cell_id), *acquire_intent);
+          if (!read.ok()) {
+            response = read.error();
+          } else if (!read.value().bring_up_plan) {
+            const auto existing_claim = owner->ReadHeldCellAdmissionClaim(
+                core::CellAdmissionClaimKindDTO::kManagerApply);
+            // Exact retained acquisition is observation even after publication
+            // or during uncertainty. Classify it before any fresh-product read.
+            if (!existing_claim || existing_claim->intent != *acquire_intent) {
+              const auto &parent = read.value();
+              const auto predecessor = read_current_publication();
+              const auto previous = LoadManagedBundleAtPinnedRoot(config,
+                  parent.intent.intent.expected_active_projection_revision.retained_bundle_id);
+              const auto candidate = LoadManagedBundleAtPinnedRoot(config,
+                  parent.intent.intent.candidate_retained_bundle_id);
+              Require(previous && previous->bundle && candidate && candidate->bundle &&
+                          core::SameActiveDeployment(predecessor.request.candidate_projection_revision,
+                              parent.intent.intent.expected_active_projection_revision),
+                      "configuration Apply lacks its exact current/candidate products");
+              require_inactive_changed_components(
+                  deployment::derive_apply_component_delta(*previous->bundle, *candidate->bundle),
+                  predecessor);
+            }
+            std::lock_guard lock(managed_composition_mutex);
+            response = component_manager::detail::DispatchKernelCellAdmissionRpc(*owner, decoded);
+          } else {
+            const auto &parent = read.value();
+            const auto &sealed = *parent.bring_up_plan;
+            const auto &plan = sealed.plan;
+            const auto predecessor = read_current_publication();
+            Require(manager_liveness_installed.load(std::memory_order_acquire),
+                    "Apply bring-up acquire has no current Manager observation");
+            const auto manager = manager_liveness_receiver.get()->status();
+            Require(
+                        manager.state == core::ManagerLivenessStateDTO::kCurrent && !manager.command_fenced &&
+                        manager.manager_owner_epoch == acquire_intent->owner_epoch &&
+                        manager.receiver_runtime_unit_id == core::RuntimeUnitId(config.runtime_unit_id) &&
+                        manager.receiver_runtime_epoch == core::RuntimeEpoch(config.runtime_epoch) &&
+                        !parent.terminal_outcome && !parent.fence_attempt && !parent.fence_acceptance &&
+                        !parent.private_materialization && !parent.publication_receipt &&
+                        predecessor.request.candidate_projection_revision.retained_bundle_id ==
+                            parent.intent.intent.expected_active_projection_revision.retained_bundle_id &&
+                        predecessor.request.candidate_projection_revision.graph_revision ==
+                            parent.intent.intent.expected_active_projection_revision.graph_revision &&
+                        predecessor.request.candidate_projection_revision.scene_revision.scene_id ==
+                            parent.intent.intent.expected_active_projection_revision.scene_revision.scene_id &&
+                        predecessor.durable_public_pointer_content_digest == plan.predecessor_public_pointer_digest &&
+                        predecessor.publication_generation == plan.expected_publication.expected_previous_publication_generation,
+                    "Apply bring-up acquire lost its fresh original owner or predecessor");
+            const auto candidate = LoadManagedBundleAtPinnedRoot(config, parent.intent.intent.candidate_retained_bundle_id);
+            const auto previous = LoadManagedBundleAtPinnedRoot(config,
+                parent.intent.intent.expected_active_projection_revision.retained_bundle_id);
+            Require(candidate && candidate->bundle && previous && previous->bundle && !plan.children.empty(),
+                    "Apply bring-up acquire has no exact verified products");
+            std::vector<core::ControllableComponentId> candidate_components;
+            for (const auto &component : candidate->bundle->value().cell_graph.controllable_components)
+              candidate_components.push_back(component.controllable_component_id);
+            std::sort(candidate_components.begin(), candidate_components.end());
+            Require(candidate_components == plan.configured_components,
+                    "Apply bring-up acquire configured membership changed");
+            const auto &first = plan.children.front();
+            Require(predecessor.publication_generation.value() != std::numeric_limits<std::uint64_t>::max(),
+                    "Apply bring-up publication generation is exhausted");
+            const auto compiled = BuildManagedCandidateLifecyclePlanningClosure(config, *candidate,
+                first.candidate_projection_revision,
+                core::ActiveBundlePublicationGeneration(predecessor.publication_generation.value() + 1U));
+            if (!compiled.ok()) Fail(compiled.error().message);
+            deployment::CCLCRuntimeComposition *facade = nullptr;
+            std::set<core::ControllableComponentId> installed_components;
+            {
+              std::lock_guard composition_lock(managed_composition_mutex);
+              Require(!current_composition_building && !managed_composition_building &&
+                          !preparing_composition_request && !installed_under_fence_composition_request &&
+                          managed_cell_cclc.facade && managed_cell_cclc.publication == predecessor,
+                      "Apply bring-up acquire has no pinned original cell facade");
+              facade = managed_cell_cclc.facade.get();
+              Require(facade->coordinator().accepting_new_requests() &&
+                          !facade->coordinator().admission_fault_closed(),
+                      "Apply bring-up acquire original cell owner is closed");
+              if (active_managed_composition)
+                for (const auto &[id, view] : IndexNativeComponentCompositions(*active_managed_composition)) {
+                  static_cast<void>(view);
+                  installed_components.insert(id);
+                }
+            }
+            core::ConfigurationFenceScopeDTO scope;
+            std::map<core::ControlDomainId, core::ConfigurationFenceDomainScopeDTO> domains;
+            std::map<core::ControlBindingId, core::ConfigurationFenceBindingScopeDTO> bindings;
+            std::set<core::ResourceId> resources;
+            std::vector<core::ApplyBringUpAdmissionComponentDTO> needed;
+            for (const auto &child : plan.children) {
+              const auto component = child.intent.controllable_component_id;
+              const auto closure = std::find_if(compiled.value().components.begin(), compiled.value().components.end(),
+                  [&](const auto &row) { return row.component_id == component; });
+              const auto selection = facade->ReadApplyComponentGenerationSelection(component);
+              Require(child.valid() && child.runtime_unit_id == manager.receiver_runtime_unit_id &&
+                          child.runtime_epoch == manager.receiver_runtime_epoch && child.manager_runtime_epoch == manager.manager_runtime_epoch &&
+                          child.intent.request_context.request_owner_epoch == facade->coordinator().request_owner_epoch() &&
+                          child.candidate_projection_revision == first.candidate_projection_revision &&
+                          child.candidate_projection_revision.retained_bundle_id == candidate->bundle->retained_bundle_id() &&
+                          child.candidate_retained_bundle_bytes == candidate->bundle->canonical_bytes().size() &&
+                          child.candidate_retained_bundle_digest == core::ContentDigest(content_identity::sha256_digest(candidate->bundle->canonical_bytes())) &&
+                          closure != compiled.value().components.end() && child.intent.expected_control_domains == closure->candidate_expected_domains &&
+                          selection.ok() && child.intent.apply_generation_selection == std::optional(selection.value()),
+                      "Apply bring-up acquire changed its sealed owner selection or candidate closure");
+              // Positive inventory absence, not a failed snapshot read, proves
+              // this initial path. Retained/recovery offers need their genuine
+              // containment join; they are never recast as initial here.
+              Require(!installed_components.contains(component) &&
+                          std::none_of(previous->bundle->value().cell_graph.controllable_components.begin(),
+                              previous->bundle->value().cell_graph.controllable_components.end(),
+                              [&](const auto &row) { return row.controllable_component_id == component; }) &&
+                          !selection.value().owner_qualified_predecessor,
+                      "Apply bring-up initial offer has a retained predecessor");
+              core::ApplyBringUpAdmissionComponentDTO row{component,
+                  core::ApplyBringUpAdmissionComponentKindDTO::kInitial, std::nullopt, {}, std::nullopt};
+              scope.controllable_component_ids.push_back(component);
+              for (const auto &binding : compiled.value().compiled_physical_bindings) {
+                const auto &value = binding.value();
+                if (value.controllable_component_id != component) continue;
+                row.candidate_participants.push_back(value);
+                const auto &path = *value.control_path;
+                domains.emplace(path.control_domain_id, core::ConfigurationFenceDomainScopeDTO{
+                    path.control_domain_id, std::nullopt, path.control_domain_revision});
+                bindings.emplace(path.control_binding_id, core::ConfigurationFenceBindingScopeDTO{
+                    path.control_binding_id, std::nullopt, path.control_binding_revision});
+                for (const auto &resource : value.resources) resources.insert(resource.resource_id);
+              }
+              Require(!row.candidate_participants.empty(), "Apply bring-up initial physical closure is absent");
+              needed.push_back(std::move(row));
+            }
+            for (const auto &[id, row] : domains) { static_cast<void>(id); scope.domains.push_back(row); }
+            for (const auto &[id, row] : bindings) { static_cast<void>(id); scope.bindings.push_back(row); }
+            scope.resources.assign(resources.begin(), resources.end());
+            const auto admission = fence_owner.ObserveAdmission({scope, manager.manager_runtime_epoch});
+            Require(admission.matches({scope, manager.manager_runtime_epoch}) &&
+                        admission.active_projection_revision == predecessor.request.candidate_projection_revision &&
+                        admission.active_public_pointer_digest == predecessor.durable_public_pointer_content_digest &&
+                        read_current_publication() == predecessor && manager_liveness_receiver.get()->status().manager_owner_epoch == manager.manager_owner_epoch,
+                    "Apply bring-up acquire current observation changed");
+            const core::ApplyBringUpAdmissionOfferDTO offer{{{plan.apply_id, plan.apply_generation}, sealed.plan_digest},
+                admission, plan.configured_components, std::move(needed)};
+            const auto acquired = owner->AcquireApplyBringUpCellAdmissionClaim(*acquire_intent, offer);
+            if (acquired.ok()) {
+              Require(acquired.value().intent == *acquire_intent,
+                      "Apply bring-up acquired claim differs from its original request");
+              // Copy only actual original-owner facts after successful fresh
+              // acquisition. Allocation uncertainty retains the durable claim;
+              // it does not create a replacement/replay effect capability.
+              original_apply_bring_up_capture =
+                  std::make_shared<const ManagedOriginalApplyBringUpCapture>(
+                      ManagedOriginalApplyBringUpCapture{
+                          sealed, acquired.value(), predecessor,
+                          parent.intent.intent.expected_active_projection_revision, *previous,
+                          *candidate, compiled.value(), facade});
+            }
+            response = acquired.ok() ? component_manager::detail::KernelCellAdmissionRpcResponse(acquired.value())
+                                     : component_manager::detail::KernelCellAdmissionRpcResponse(acquired.error());
+          }
+        } else
+#endif
+        {
+          std::lock_guard lock(managed_composition_mutex);
+          response = component_manager::detail::DispatchKernelCellAdmissionRpc(*owner, decoded);
         }
       } catch (const std::exception &error) {
         response =
@@ -14879,9 +17735,7 @@ private:
       return FrameTransformResponse(query, composition);
     const bool frame_query = query.frame_role_id.has_value();
     const auto capability_id = core::CapabilityId(
-        frame_query                ? "model.kinematics.fk"
-        : query.grasp_confirmation ? "tool.gripper.confirmation.operator"
-                                   : "tool.gripper.feedback");
+        frame_query ? "model.kinematics.fk" : "tool.gripper.feedback");
     std::map<std::string, std::string> failures;
     const auto owner =
         ResolveObservationOwner(query.program_binding_id, query.target_role_id,
@@ -14896,78 +17750,6 @@ private:
     const auto &binding = observed_binding.value();
     const auto &resolved = owner->resolved;
     const auto &target = resolved.target.target_role();
-    if (query.grasp_confirmation) {
-      if (!selected.operator_confirmation_validity_ns)
-        return ErrorResponse(
-            "grasp_confirmation_unavailable",
-            "target has no explicit operator confirmation policy");
-      const auto current = ReadCurrentGripperStatus(
-          selected, resolved.observation_binding);
-      if (!current.ok())
-        return ErrorResponse(current.error().code, current.error().message);
-      const auto &status = current.value();
-      if (status.command_id == 0U || status.revision == 0U)
-        return ErrorResponse("gripper_command_unavailable",
-                             "confirmation requires a current gripper command");
-      const auto &source = *resolved.observation_binding.value().control_path;
-      const bool fresh =
-          status.grasp_evidence &&
-          core::gripper_grasp_evidence_is_fresh(*status.grasp_evidence,
-                                                selected.cell_runtime != nullptr
-                                                    ? selected.cell_runtime->clock()->now()
-                                                    : selected.runtime->clock->now());
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("query_target")},
-          {"ok", CanonicalValue(true)},
-          {"target_observation",
-           CanonicalValue(CanonicalValue::Object{
-               {"schema_version",
-                CanonicalValue("manyforge.target_observation.v1")},
-               {"kind", CanonicalValue("gripper_confirmation")},
-               {"owner_epoch", CanonicalValue(owner_epoch_.value())},
-               {"program_binding_id",
-                CanonicalValue(query.program_binding_id.value())},
-               {"target_role_id", CanonicalValue(query.target_role_id.value())},
-               {"source_epoch",
-                CanonicalValue(source.provider_runtime_epoch.value())},
-               {"source_sequence",
-                CanonicalValue(static_cast<double>(status.revision))},
-               {"value",
-                CanonicalValue(CanonicalValue::Object{
-                    {"state", CanonicalValue(core::gripper_command_state_name(
-                                  status.state))},
-                    {"command_id",
-                     CanonicalValue(static_cast<double>(status.command_id))},
-                    {"generation",
-                     CanonicalValue(static_cast<double>(status.generation))},
-                    {"revision",
-                     CanonicalValue(static_cast<double>(status.revision))},
-                    {"source_id",
-                     CanonicalValue(source.control_binding_id.value())},
-                    {"source_revision",
-                     CanonicalValue(source.control_binding_revision.value())},
-                    {"source_epoch",
-                     CanonicalValue(source.provider_runtime_epoch.value())},
-                    {"active_control_configuration_id",
-                     CanonicalValue(
-                         source.active_control_configuration_id.value())},
-                    {"active_control_configuration_generation",
-                     CanonicalValue(static_cast<double>(
-                         source.active_control_configuration_generation
-                             .value()))},
-                    {"grasp_confirmed",
-                     fresh ? CanonicalValue(
-                                 status.grasp_evidence->observation.confirmed)
-                           : CanonicalValue(nullptr)},
-                    {"evidence",
-                     status.grasp_evidence
-                         ? GraspEvidenceValue(*status.grasp_evidence)
-                         : CanonicalValue(nullptr)},
-                })},
-           })},
-      });
-    }
     const auto observed = channel->current_state(
         selected.cell_runtime != nullptr ? selected.cell_runtime->clock()->now()
                                          : selected.runtime->clock->now());
@@ -15130,74 +17912,6 @@ private:
         {"command", CanonicalValue("query_target")},
         {"ok", CanonicalValue(true)},
         {"target_observation", CanonicalValue(std::move(result))},
-    });
-  }
-
-  [[nodiscard]] static CanonicalValue
-  GraspEvidenceValue(const core::GripperGraspEvidenceDTO &evidence) {
-    const auto &accepted = evidence.observation;
-    return CanonicalValue(CanonicalValue::Object{
-        {"source_kind", CanonicalValue("operator")},
-        {"source_id", CanonicalValue(evidence.source_id.value())},
-        {"source_revision", CanonicalValue(evidence.source_revision.value())},
-        {"source_epoch", CanonicalValue(evidence.source_epoch.value())},
-        {"observation_id", CanonicalValue(accepted.observation_id)},
-        {"attribution", CanonicalValue(accepted.attribution)},
-        {"command_id",
-         CanonicalValue(static_cast<double>(accepted.command_id))},
-        {"generation",
-         CanonicalValue(static_cast<double>(accepted.generation))},
-        {"confirmed", CanonicalValue(accepted.confirmed)},
-        {"observed_at_ns",
-         content_identity::nonnegative_int64_value(accepted.observed_at_ns)},
-        {"expires_at_ns",
-         content_identity::nonnegative_int64_value(evidence.expires_at_ns)},
-    });
-  }
-
-  [[nodiscard]] CanonicalValue
-  ConfirmGraspResponse(const GripperConfirmationCommand &command,
-                       Composition &composition) const {
-    if (command.context.request_owner_epoch != owner_epoch_)
-      return ErrorResponse("stale_request_owner_epoch",
-                           "confirmation names a replaced native owner");
-    const auto owner = ResolveObservationOwner(
-        command.program_binding_id, command.target_role_id,
-        core::CapabilityId("tool.gripper.confirmation.operator"), false,
-        composition);
-    if (!owner.has_value())
-      return ErrorResponse("grasp_confirmation_unavailable",
-                           "target has no unique qualified gripper owner");
-    auto &selected = *owner->composition;
-    if (!selected.operator_confirmation_validity_ns || !owner->channel)
-      return ErrorResponse(
-          "grasp_confirmation_unavailable",
-          "target has no explicitly configured operator source");
-    const auto &physical = owner->physical;
-    const auto &source = owner->resolved;
-    auto observation = command.observation;
-    observation.gripper_id = physical.value().command_target_id.value();
-    const auto recorded = selected.runtime != nullptr
-                              ? selected.runtime->RecordGraspObservation(
-                                    source.observation_binding, observation,
-                                    *selected.operator_confirmation_validity_ns,
-                                    command.admission_deadline_ns)
-                              : selected.gripper_runtime->backend()
-                                    ->record_grasp_observation(
-                                        source.observation_binding, observation,
-                                        *selected.operator_confirmation_validity_ns,
-                                        command.admission_deadline_ns);
-    if (!recorded.ok())
-      return ErrorResponse(recorded.error().code, recorded.error().message);
-    return CanonicalValue(CanonicalValue::Object{
-        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-        {"command", CanonicalValue("gripper_confirm")},
-        {"ok", CanonicalValue(true)},
-        {"owner_epoch", CanonicalValue(owner_epoch_.value())},
-        {"program_binding_id",
-         CanonicalValue(command.program_binding_id.value())},
-        {"target_role_id", CanonicalValue(command.target_role_id.value())},
-        {"confirmation", GraspEvidenceValue(recorded.value())},
     });
   }
 
@@ -16665,9 +19379,6 @@ private:
           {"ok", CanonicalValue(false)},
       });
     }
-    if (command.kind == CommandKind::kConfirmGrasp) {
-      return ConfirmGraspResponse(*command.confirmation, composition);
-    }
     if (command.kind == CommandKind::kPreviewCapabilityCommand) {
       auto preview =
           composition.active_addressed_kernel()
@@ -17112,7 +19823,6 @@ private:
       case CommandKind::kIdentity:
       case CommandKind::kTargets:
       case CommandKind::kQueryTarget:
-      case CommandKind::kConfirmGrasp:
       case CommandKind::kQueryOperation:
       case CommandKind::kControlState:
       case CommandKind::kObservation:

@@ -185,7 +185,8 @@ public:
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
                                           NativeProjectionHealthQuery>) {
-            return ProjectionHealth(value.native_runtime_binding);
+            return ProjectionHealth(value.native_runtime_binding,
+                                    value.selected_projection_revision);
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
                                           NativeProjectionTransactionRequest>) {
@@ -424,7 +425,6 @@ public:
     // every ProjectionHealth read happens after that lock is released. A
     // provider whose worker is constructing a candidate therefore cannot hold
     // up this readiness hint, nor any other provider's assessment.
-    const auto registered = Registered();
     bool found = false;
     for (const auto &provider : bundle.value().capability_provider_bindings) {
       if (!core::RequiresNativeSceneProjection(
@@ -452,24 +452,21 @@ public:
       const ManagedProjectionKey key{
           provider.capability_provider_binding_id,
           provider.capability_provider_binding_revision};
-      if (WorkPending(key)) {
-        ReportProjectionReadiness("waiting for " + key.first.value());
-        return false;
-      }
-      const auto entry = std::find_if(
-          registered.begin(), registered.end(), [&](const auto &candidate) {
-            return candidate.first == key;
-          });
-      if (entry == registered.end() || entry->second.projection == nullptr) {
-        ReportProjectionReadiness("missing " + key.first.value());
-        return false;
-      }
       const core::ProjectionNativeRuntimeBindingDTO binding{
           provider.capability_provider_binding_id,
           provider.capability_provider_binding_revision,
           core::RuntimeUnitId(config_.runtime_unit_id),
           core::RuntimeEpoch(config_.runtime_epoch)};
-      const auto health = entry->second.projection->ProjectionHealth();
+      const auto projection = FindRevision(binding, expected);
+      if (projection == nullptr) {
+        ReportProjectionReadiness("missing " + key.first.value());
+        return false;
+      }
+      if (WorkPendingFor(key, projection)) {
+        ReportProjectionReadiness("waiting for " + key.first.value());
+        return false;
+      }
+      const auto health = projection->ProjectionHealth();
       if (health.native_runtime_binding != binding ||
           !health.healthy_for_target(expected)) {
         ReportProjectionReadiness("not healthy " + key.first.value());
@@ -535,18 +532,17 @@ public:
             provider.capability_provider_binding_revision};
         Require(required_keys.insert(key).second,
                 "active native projection binding is repeated");
-        const auto found = projections_.find(key);
-        Require(found != projections_.end() &&
-                    found->second.projection != nullptr,
-                "active frame-resolver set lacks a required projection");
-        Require(!WorkPendingLocked(key),
-                "active frame-resolver set names progressing projection work");
         const core::ProjectionNativeRuntimeBindingDTO expected_binding{
             provider.capability_provider_binding_id,
             provider.capability_provider_binding_revision,
             core::RuntimeUnitId(config_.runtime_unit_id),
             core::RuntimeEpoch(config_.runtime_epoch)};
-        required.emplace_back(expected_binding, found->second.projection);
+        const auto projection = FindRevisionLocked(expected_binding, expected);
+        Require(projection != nullptr,
+                "active frame-resolver set lacks a required projection");
+        Require(!WorkPendingForLocked(key, projection),
+                "active frame-resolver set names progressing projection work");
+        required.emplace_back(expected_binding, projection);
       }
     }
     Require(!required.empty(),
@@ -861,10 +857,21 @@ private:
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection> FindRevision(
       const core::ProjectionNativeRuntimeBindingDTO &binding,
       const core::ProjectionRevisionDTO &revision) const {
-    for (const auto &entry : OwnedProjections(binding)) {
-      if (entry.identity.retained_bundle_id == revision.retained_bundle_id &&
-          entry.identity.graph_revision == revision.graph_revision) {
-        return entry.projection;
+    RequireLocalBinding(binding);
+    std::lock_guard lock(mutex_);
+    return FindRevisionLocked(binding, revision);
+  }
+
+  [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection>
+  FindRevisionLocked(const core::ProjectionNativeRuntimeBindingDTO &binding,
+                     const core::ProjectionRevisionDTO &revision) const {
+    for (const auto *slots : {&projections_, &retired_projections_}) {
+      const auto found = slots->find(Key(binding));
+      if (found != slots->end() && found->second.binding == binding &&
+          found->second.identity.retained_bundle_id ==
+              revision.retained_bundle_id &&
+          found->second.identity.graph_revision == revision.graph_revision) {
+        return found->second.projection;
       }
     }
     return nullptr;
@@ -1241,7 +1248,9 @@ private:
     return accepted;
   }
 
-  /// Observes current projection health.
+  /// Observes current health when no selector is supplied, or the exact
+  /// retained model when selected. A missing selected model never falls back
+  /// to the current binding slot.
   ///
   /// While a job runs, the answer is the predecessor health captured at
   /// acceptance plus the truthful statement that the job is unsettled; the
@@ -1249,8 +1258,11 @@ private:
   /// terminal result reported an uncertain effect keeps reporting that result
   /// instead of reverting to the predecessor row after one read.
   [[nodiscard]] core::ProjectionHealthDTO ProjectionHealth(
-      const core::ProjectionNativeRuntimeBindingDTO &binding) {
-    auto projection = Find(binding);
+      const core::ProjectionNativeRuntimeBindingDTO &binding,
+      const std::optional<core::ProjectionRevisionDTO> &selected_revision) {
+    auto projection = selected_revision.has_value()
+                          ? RevisionHandle(binding, *selected_revision)
+                          : Find(binding);
     const auto key = Key(binding);
     std::optional<core::ProjectionHealthDTO> captured;
     std::optional<core::ProjectionHealthDTO> terminal;

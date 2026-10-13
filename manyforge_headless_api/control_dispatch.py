@@ -23,7 +23,6 @@ from .control_protocol import (
 from .models import (
     CycleRecoveryActionRequest,
     FullStopIntentRequest,
-    GripperConfirmationRequest,
     ManualResultStageRequest,
     OperationControlRequest,
     OperationIntentRequest,
@@ -54,7 +53,6 @@ _NATIVE_EXECUTION_COMMANDS = frozenset(
         "cell_full_stop",
         "stop_recovery",
         "runtime_scale",
-        "gripper_confirm",
     }
 )
 _EXPECTED_EXECUTION_OWNER_FIELD = "expected_execution_owner_epoch"
@@ -446,21 +444,6 @@ class HeadlessExecutionControlDispatch:
                 model = ManualResultStageRequest.model_validate({**payload, **context})
                 result = self._service.program_runtime_control_action(
                     model.program_run_id, "manual-result", model
-                )
-            elif kind == "gripper_confirm":
-                if stamp.valid_until_monotonic_ns is None:
-                    raise HeadlessApiError(
-                        "control_freshness_invalid",
-                        "confirmation requires verified ordinary ingress",
-                    )
-                result = self._service.execution_confirm_grasp(
-                    GripperConfirmationRequest.model_validate(
-                        {**payload, "request_context": context}
-                    ),
-                    attribution,
-                    origin_epoch=origin_epoch,
-                    received_monotonic_ns=stamp.received_monotonic_ns,
-                    valid_until_monotonic_ns=stamp.valid_until_monotonic_ns,
                 )
             elif kind == "operation_start":
                 result = self._service.execution_submit(

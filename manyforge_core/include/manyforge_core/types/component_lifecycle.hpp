@@ -2,7 +2,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/ports/iexecution_port.hpp>
+#include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/active_bundle_publication.hpp>
 #include <manyforge_core/types/active_control_configuration.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
@@ -224,6 +227,30 @@ struct ExpectedControlDomainRevisionDTO final {
                          const ExpectedControlDomainRevisionDTO&) = default;
 };
 
+/// Actual predecessor qualified by the original CCLC owner from a verified
+/// snapshot. It does not create or replace a durable journal watermark.
+struct ApplyComponentQualifiedPredecessorDTO final {
+  ComponentLifecycleGeneration generation;
+  ContentDigest snapshot_digest;
+
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const ApplyComponentQualifiedPredecessorDTO&,
+                         const ApplyComponentQualifiedPredecessorDTO&) = default;
+};
+
+/// Owner-read Q97 generation prediction. This value grants no authority;
+/// delegated acceptance rechecks every field against the durable journal.
+struct ApplyComponentGenerationSelectionDTO final {
+  std::optional<ComponentLifecycleGeneration> predecessor_generation;
+  ComponentLifecycleGeneration candidate_generation;
+  std::uint64_t prior_reservation_generation{};
+  std::optional<ApplyComponentQualifiedPredecessorDTO> owner_qualified_predecessor{};
+
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const ApplyComponentGenerationSelectionDTO&,
+                         const ApplyComponentGenerationSelectionDTO&) = default;
+};
+
 struct ComponentLifecycleIntentDTO final {
   PublicRequestContextDTO request_context;
   ControllableComponentId controllable_component_id;
@@ -235,6 +262,7 @@ struct ComponentLifecycleIntentDTO final {
   RequestAttributionDTO attribution{};
   AdmissionGeneration expected_admission_generation{1U};
   std::optional<ProgramNodeAdmissionEvidenceDTO> program_node_evidence{};
+  std::optional<ApplyComponentGenerationSelectionDTO> apply_generation_selection{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   [[nodiscard]] bool replay_equal(const ComponentLifecycleIntentDTO& other) const noexcept;
@@ -278,6 +306,26 @@ struct LifecycleFactDTO final {
   friend bool operator==(const LifecycleFactDTO&, const LifecycleFactDTO&) = default;
 };
 
+/// Pure projection of one exact provider's existing normalized health facts.
+/// This value grants no admission and carries no execution transaction,
+/// synthetic observation generation, source timestamp, or mutable state owner.
+struct LifecycleDomainHealthDTO final {
+  ComponentLifecycleStateDTO observed_state;
+  std::vector<LifecycleFactDTO> facts;
+  std::optional<ErrorDTO> diagnostic;
+
+  [[nodiscard]] bool locally_valid() const noexcept;
+
+  friend bool operator==(const LifecycleDomainHealthDTO&,
+                         const LifecycleDomainHealthDTO&) = default;
+};
+
+/// Product-owned projection over the same maintained source as lifecycle
+/// observation. Implementations must not advance observation/bookkeeping,
+/// acquire authority, perform lifecycle effects, or manufacture a sample.
+using LifecycleDomainHealthProjection =
+    std::function<Result<LifecycleDomainHealthDTO>(std::int64_t now_ns)>;
+
 struct LifecycleFactPredicateDTO final {
   LifecycleFactId lifecycle_fact_id;
   LifecycleFactValueDTO expected_value;
@@ -305,6 +353,10 @@ struct BrandLifecycleObservationDTO;
 [[nodiscard]] LifecyclePostconditionResultDTO EvaluateLifecyclePredicate(
     const LifecyclePredicateDTO& predicate,
     const BrandLifecycleObservationDTO& observation) noexcept;
+
+[[nodiscard]] LifecyclePostconditionResultDTO EvaluateLifecyclePredicate(
+    const LifecyclePredicateDTO& predicate,
+    const LifecycleDomainHealthDTO& health) noexcept;
 
 struct LifecyclePrimitiveTransitionDTO final {
   LifecyclePrimitiveId lifecycle_primitive_id;
@@ -502,6 +554,31 @@ struct ComponentLifecycleCurrentSnapshotDTO final {
                          const ComponentLifecycleCurrentSnapshotDTO&) = default;
 };
 
+/// Owner-local controller occurrence transferred only by selected bring-up.
+/// CCLC's component watermark is deliberately not mirrored here. Zero is a
+/// real domain floor before its first observation, not a ready observation.
+struct SelectedDomainOccurrenceDTO final {
+  ControlDomainId control_domain_id;
+  std::uint64_t observation_generation{};
+  friend bool operator==(const SelectedDomainOccurrenceDTO&,
+                         const SelectedDomainOccurrenceDTO&) = default;
+};
+
+struct SelectedControllerOccurrenceDTO final {
+  std::optional<ExecutionBindingEpoch> arm_binding_epoch;
+  std::vector<SelectedDomainOccurrenceDTO> domains;
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const SelectedControllerOccurrenceDTO&,
+                         const SelectedControllerOccurrenceDTO&) = default;
+};
+
+/// Pure successor construction from the exact owned predecessor, before any
+/// retirement. Continuing domains advance; new domains use first generation
+/// one; removed domains are absent. It grants no effect or publication right.
+[[nodiscard]] Result<SelectedControllerOccurrenceDTO> ComputeSelectedControllerSuccessorOccurrence(
+    const SelectedControllerOccurrenceDTO& predecessor,
+    const std::vector<ControlDomainId>& candidate_domains, bool candidate_has_arm);
+
 inline constexpr std::string_view kComponentLifecycleCurrentSnapshotIdentityDomain =
     "component-lifecycle-current-snapshot";
 inline constexpr std::string_view kComponentLifecycleCurrentSnapshotApiVersion =
@@ -538,6 +615,59 @@ struct ComponentLifecycleDomainStatusDTO final {
                          const ComponentLifecycleDomainStatusDTO&) = default;
 };
 
+/// Durable selected bring-up evidence is observation/reconciliation data.
+/// Shape validation never grants qualification, dispatch, or replay authority.
+struct SelectedComponentBringUpEvidenceDTO final {
+  ContentDigest offer_digest;
+  ContentDigest predecessor_snapshot_digest;
+  std::string incident_id;
+  StopId containment_stop_id;
+  StopGeneration containment_stop_generation;
+  ProjectionRevisionDTO candidate_projection_revision;
+  ContentDigest candidate_retained_bundle_digest;
+  std::uint64_t candidate_retained_bundle_bytes;  // Byte count, never bundle payload.
+  SelectedControllerOccurrenceDTO predecessor_occurrence;
+  SelectedControllerOccurrenceDTO successor_occurrence;
+  CellAdmissionClaimDTO selected_claim;
+  ConfigurationFenceAcceptedDTO accepted_fence;
+  ContentDigest original_request_payload_digest;
+
+  friend bool operator==(const SelectedComponentBringUpEvidenceDTO&,
+                         const SelectedComponentBringUpEvidenceDTO&) = default;
+};
+
+/// Real contained predecessor facts, absent for ordinary initial activation.
+struct ApplyComponentBringUpRecoveryEvidenceDTO final {
+  ContentDigest predecessor_snapshot_digest;
+  std::string incident_id;
+  StopId containment_stop_id;
+  StopGeneration containment_stop_generation;
+
+  friend bool operator==(const ApplyComponentBringUpRecoveryEvidenceDTO&,
+                         const ApplyComponentBringUpRecoveryEvidenceDTO&) = default;
+};
+
+/// Observation of one Q91 component operation under the existing Apply
+/// parent's exclusion. It is not an independent child Kernel claim. The
+/// full Manager plan stays in Manager; the original request identity is sealed
+/// separately. Restoring this value never recreates a continuation.
+struct ApplyComponentBringUpEvidenceDTO final {
+  ApplyComponentBringUpAuthorityDTO parent_authority;
+  ConfigurationFenceScopeDTO selected_scope;
+  ContentDigest original_request_payload_digest;
+  ProjectionRevisionDTO candidate_projection_revision;
+  ContentDigest candidate_retained_bundle_digest;
+  std::uint64_t candidate_retained_bundle_bytes{};
+  RuntimeUnitEpochBindingDTO original_execution_host;
+  std::optional<ApplyComponentBringUpRecoveryEvidenceDTO> recovery;
+  std::optional<SelectedControllerOccurrenceDTO> predecessor_occurrence;
+  /// Transfer lower bound, not a device observation or proof of readiness.
+  std::optional<SelectedControllerOccurrenceDTO> successor_occurrence_floor;
+
+  friend bool operator==(const ApplyComponentBringUpEvidenceDTO&,
+                         const ApplyComponentBringUpEvidenceDTO&) = default;
+};
+
 struct ComponentLifecycleStatusDTO final {
   ComponentLifecycleAcceptedDTO acceptance;
   ComponentLifecycleIntentDTO accepted_intent;
@@ -554,6 +684,8 @@ struct ComponentLifecycleStatusDTO final {
   std::int64_t accepted_at_ns;
   std::int64_t latest_updated_at_ns;
   std::int64_t remaining_duration_ns;
+  std::optional<SelectedComponentBringUpEvidenceDTO> selected_bring_up{};
+  std::optional<ApplyComponentBringUpEvidenceDTO> apply_bring_up{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 

@@ -104,6 +104,23 @@ class ICCLCLifecycleTargetStore {
       const ControllableComponentId& component, bool reached,
       std::uint64_t recovery_generation) = 0;
 
+  /// Same write, fenced by BOTH actual target and recovery generation. An old
+  /// reached marker may never mark an absent target or a successor.
+  [[nodiscard]] virtual Result<bool> RecordLifecycleTargetReached(
+      const ComponentLifecycleTargetExpectationDTO&, bool, std::uint64_t) {
+    return Result<bool>::Err({"component_lifecycle_target_fence_unavailable",
+                             "target-fenced reached writes are not composed", {}});
+  }
+
+  /// Storage-only retirement for the actual confirmed Close owner. Preserves
+  /// causes/recovery/history; returned rows are the exact ordered prior targets.
+  [[nodiscard]] virtual Result<std::vector<ComponentLifecycleTargetDTO>>
+  RetireLifecycleTargetsForClose(const RequestOwnerEpoch&) {
+    return Result<std::vector<ComponentLifecycleTargetDTO>>::Err(
+        {"component_lifecycle_target_retirement_unavailable",
+         "Close target retirement is not composed", {}});
+  }
+
   /// True while a recorded, not yet adopted Apply plan replaces (changes) or
   /// removes the component: only that component's loss is then explained by
   /// the Apply. A component the plan retains unchanged is false: its provider

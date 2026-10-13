@@ -11,6 +11,10 @@
 
 namespace manyforge::headless {
 
+/// Exact existing provider origin shared by projection and freshness admission.
+[[nodiscard]] std::string
+SceneRuntimePoseProviderSourceEpoch(const PoseSourceObservation &observation);
+
 enum class SceneRuntimePoseApplicationStatus {
   kNotRequested,
   kDeferredBeforePlanning,

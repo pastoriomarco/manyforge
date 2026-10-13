@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-10-08 14:53:41 UTC
+  Last regenerated: 2026-10-12 18:10:17 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -1937,7 +1937,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               "program_runtime_blackboard_write",
               "program_manual_result_stage",
               "program_manual_handover",
-              "gripper_confirm",
               "operation_start",
               "operation_stop",
               "operation_reset",
@@ -5787,18 +5786,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "minLength": 1,
             "title": "Requestownerepoch",
             "type": "string"
-          },
-          "timing": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Timing"
           }
         },
         "required": [
@@ -5811,8 +5798,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedWorkspaceRevision",
           "controllable_component_id",
           "command_target_id",
-          "profile",
-          "timing"
+          "profile"
         ],
         "title": "UpdateControlledStopRequest",
         "type": "object"

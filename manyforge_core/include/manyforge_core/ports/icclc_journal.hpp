@@ -9,6 +9,7 @@
 #include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/lifecycle_target.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <vector>
@@ -19,6 +20,13 @@ inline constexpr std::size_t kMaximumCCLCRequestMembership = 4096U;
 inline constexpr std::size_t kMaximumCCLCActiveTransactions = 64U;
 inline constexpr std::size_t kMaximumCCLCComponentWatermarks = 64U;
 inline constexpr std::size_t kMaximumCCLCActiveConfigurationWatermarks = 64U;
+
+/// Trusted caller distinction: receiver startup retires Active intent, while
+/// an exact settled capacity checkpoint preserves the same live product.
+enum class CCLCOwnerEpochTransitionPurpose {
+  kRestart,
+  kLiveCapacityCheckpoint,
+};
 
 /// Highest durably minted lifecycle generation for one component.
 struct ComponentLifecycleGenerationWatermarkDTO final {
@@ -173,6 +181,7 @@ struct CCLCJournalRecoveryDTO final {
     std::optional<CellAdmissionClaimReleaseDTO> release_intent;
     bool release_receipt_recorded{};
     bool transaction_accepted{};
+    std::optional<ContentDigest> original_request_payload_digest{};
   };
   std::vector<CellClaimRecovery> cell_claims;
   /// Journal-minted namespace; the caller's startup-unique seed is not the
@@ -239,12 +248,37 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
   /// work. The supplied seed is not a caller-selected namespace. New admission
   /// remains closed until CCLC has reconciled those transactions and the exact
   /// Kernel owner mapping. Live callers must establish quiescence first.
-  /// A live checkpoint supplies the exact predecessor: the journal then
-  /// rejects atomically if any transaction, claim or effect is unresolved.
+  /// This compatibility entry denotes startup, including when it requires
+  /// an exact settled predecessor. The explicit live-checkpoint overload
+  /// also rejects atomically if any transaction, claim or effect is unresolved.
   [[nodiscard]] virtual Result<CCLCJournalRecoveryDTO> BeginOwnerEpoch(
       const RequestOwnerEpoch& unique_seed, std::int64_t started_at_ns,
       std::size_t request_membership_capacity,
       const std::optional<RequestOwnerEpoch>& quiescent_predecessor = std::nullopt) = 0;
+
+  /// Explicit purpose for the existing live capacity checkpoint only. Startup
+  /// keeps the four-argument call even when it requires a settled predecessor.
+  /// The fallback preserves existing fake journal implementations.
+  [[nodiscard]] virtual Result<CCLCJournalRecoveryDTO> BeginOwnerEpoch(
+      const RequestOwnerEpoch& unique_seed, std::int64_t started_at_ns,
+      std::size_t request_membership_capacity,
+      const std::optional<RequestOwnerEpoch>& quiescent_predecessor,
+      CCLCOwnerEpochTransitionPurpose purpose) {
+    if (purpose != CCLCOwnerEpochTransitionPurpose::kRestart &&
+        purpose != CCLCOwnerEpochTransitionPurpose::kLiveCapacityCheckpoint) {
+      return Result<CCLCJournalRecoveryDTO>::Err(
+          {"component_lifecycle_journal_owner_epoch_invalid", "owner transition purpose is invalid", {}});
+    }
+    return BeginOwnerEpoch(unique_seed, started_at_ns, request_membership_capacity,
+                           quiescent_predecessor);
+  }
+
+  /// Observation only: exact active owner and the journal's settled predicate.
+  /// Absence of this storage capability must refuse context exchange.
+  [[nodiscard]] virtual Result<void> ReadQuiescentOwner(const RequestOwnerEpoch&) {
+    return Result<void>::Err(
+        {"component_lifecycle_quiescence_unavailable", "journal quiescence observation is not composed", {}});
+  }
 
   /// Classifies only the owner-wide request membership/replay promise. A
   /// null optional is a previously unseen request in the current owner epoch.
@@ -280,6 +314,90 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
       const RequestOwnerEpoch& active_owner_epoch, const ComponentLifecycleIntentDTO& intent,
       const ComponentLifecycleAcceptedDTO& candidate_acceptance,
       const ComponentLifecycleStatusDTO& candidate_initial_status) = 0;
+
+  /// Private follower entry. Replay precedes the actual target-generation CAS.
+  /// A fresh refusal consumes only its original no-admission membership and
+  /// exact acquired-claim no-effect release intent, never a lifecycle generation.
+  [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO> AcceptOrReplayTargetLifecycle(
+      const RequestOwnerEpoch&, const ComponentLifecycleIntentDTO&,
+      const ComponentLifecycleAcceptedDTO&, const ComponentLifecycleStatusDTO&,
+      const ComponentLifecycleTargetExpectationDTO&, const CellAdmissionClaimDTO&) {
+    return Result<CCLCLifecycleRequestResultDTO>::Err(
+        {"component_lifecycle_target_acceptance_unavailable",
+         "target-fenced lifecycle acceptance is not composed", {}});
+  }
+
+  /// Private selected-effect ledger entries use the stable original caller
+  /// digest, independently of the owner offer proof. Readback never dispatches.
+  [[nodiscard]] virtual Result<std::optional<CCLCLifecycleRequestResultDTO>>
+  InspectSelectedComponentBringUpRequest(const RequestOwnerEpoch&,
+                                         const ComponentLifecycleIntentDTO&, const ContentDigest&) {
+    return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
+        {"selected_bring_up_journal_unavailable", "selected bring-up ledger is not composed", {}});
+  }
+  [[nodiscard]] virtual Result<std::optional<CCLCLifecycleRequestResultDTO>>
+  ReadSelectedComponentBringUpRequestResult(const ComponentLifecycleIntentDTO&,
+                                            const ContentDigest&) {
+    return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
+        {"selected_bring_up_journal_unavailable",
+         "selected bring-up result lookup is not composed",
+         {}});
+  }
+  [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO>
+  AcceptOrReplaySelectedComponentBringUp(const RequestOwnerEpoch&,
+                                         const ComponentLifecycleIntentDTO&,
+                                         const ComponentLifecycleAcceptedDTO&,
+                                         const ComponentLifecycleStatusDTO&, const ContentDigest&) {
+    return Result<CCLCLifecycleRequestResultDTO>::Err(
+        {"selected_bring_up_journal_unavailable", "selected bring-up ledger is not composed", {}});
+  }
+
+  /// Q91 private delegated component ledger. The original live CCLC owner
+  /// must prove the full held parent Apply authority before calling acceptance;
+  /// persisted evidence is observation-only and never grants that authority.
+  /// The parent's claim stays in its existing Manager journal, not this
+  /// component's independent claim table.
+  [[nodiscard]] virtual Result<ApplyComponentGenerationSelectionDTO>
+  ReadApplyComponentGenerationSelection(const RequestOwnerEpoch&, const ControllableComponentId&,
+      const std::optional<ApplyComponentQualifiedPredecessorDTO>& = std::nullopt) {
+    return Result<ApplyComponentGenerationSelectionDTO>::Err(
+        {"apply_bring_up_journal_unavailable", "delegated generation lookup is not composed", {}});
+  }
+  [[nodiscard]] virtual Result<std::optional<CCLCLifecycleRequestResultDTO>>
+  InspectApplyComponentBringUpRequest(const RequestOwnerEpoch&,
+      const ComponentLifecycleIntentDTO&, const ContentDigest&) {
+    return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
+        {"apply_bring_up_journal_unavailable", "delegated Apply ledger is not composed", {}});
+  }
+  [[nodiscard]] virtual Result<std::optional<CCLCLifecycleRequestResultDTO>>
+  ReadApplyComponentBringUpRequestResult(const ComponentLifecycleIntentDTO&, const ContentDigest&) {
+    return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
+        {"apply_bring_up_journal_unavailable", "delegated Apply lookup is not composed", {}});
+  }
+  [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO>
+  AcceptOrReplayApplyComponentBringUp(const RequestOwnerEpoch&,
+      const ComponentLifecycleIntentDTO&, const ComponentLifecycleAcceptedDTO&,
+      const ComponentLifecycleStatusDTO&, const ContentDigest&) {
+    return Result<CCLCLifecycleRequestResultDTO>::Err(
+        {"apply_bring_up_journal_unavailable", "delegated Apply ledger is not composed", {}});
+  }
+
+  [[nodiscard]] virtual Result<void> RecordSelectedCellClaimAttempt(
+      const RequestOwnerEpoch&, const CellAdmissionClaimIntentDTO&, const ContentDigest&) {
+    return Result<void>::Err({"selected_bring_up_journal_unavailable",
+                              "selected claim persistence is not composed",
+                              {}});
+  }
+  [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO>
+  RecordSelectedComponentBringUpRejection(const RequestOwnerEpoch&,
+                                          const ComponentLifecycleIntentDTO&, const ContentDigest&,
+                                          const ErrorDTO&,
+                                          const std::optional<CellAdmissionClaimIntentDTO>&) {
+    return Result<CCLCLifecycleRequestResultDTO>::Err(
+        {"selected_bring_up_journal_unavailable",
+         "selected rejection persistence is not composed",
+         {}});
+  }
 
   [[nodiscard]] virtual Result<void> RecordCellClaimAttempt(
       const RequestOwnerEpoch& active_owner_epoch, const CellAdmissionClaimIntentDTO& intent) {

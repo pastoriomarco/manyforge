@@ -96,5 +96,69 @@ TEST(FixedCCLCPortRegistry, RejectsNullDuplicateAndMalformedRows) {
   EXPECT_THROW((FixedCCLCPortRegistry({}, {{malformed, controller}})), std::invalid_argument);
 }
 
+TEST(FixedCCLCPortRegistry, HealthUsesAllExactKeyFieldsAndNoObservationFallback) {
+  int calls = 0;
+  std::int64_t received_time = -1;
+  const auto key = BrandKey();
+  const LifecycleDomainHealthDTO health{ComponentLifecycleStateDTO::kDeclared,
+      {{LifecycleFactId("custom.mode"),
+        {LifecycleFactValueKindDTO::kToken, std::nullopt, std::nullopt, "manual"}}}, std::nullopt};
+  FixedCCLCPortRegistry registry({{key, std::make_shared<BrandPort>(),
+      [&](std::int64_t now) {
+        ++calls;
+        received_time = now;
+        return Result<LifecycleDomainHealthDTO>::Ok(health);
+      }}}, {});
+  for (int mutation = 0; mutation < 8; ++mutation) {
+    auto foreign = key;
+    switch (mutation) {
+      case 0: foreign.control_domain_id = ControlDomainId("foreign"); break;
+      case 1: foreign.control_domain_revision = ControlDomainRevision(Sha('8')); break;
+      case 2: foreign.provider_instance_id = ProviderInstanceId("foreign"); break;
+      case 3: foreign.provider_manifest_id = ProviderManifestId("foreign"); break;
+      case 4: foreign.provider_manifest_revision = ProviderManifestRevision(Sha('8')); break;
+      case 5: foreign.provider_runtime_unit_id = RuntimeUnitId("foreign"); break;
+      case 6: foreign.provider_runtime_epoch = RuntimeEpoch("foreign"); break;
+      case 7: foreign.lifecycle_plan_catalog_digest = ContentDigest(Sha('8')); break;
+    }
+    EXPECT_FALSE(registry.ReadExactLifecycleHealth(foreign, 42).ok()) << mutation;
+  }
+  EXPECT_FALSE(registry.ReadExactLifecycleHealth(key, -1).ok());
+  EXPECT_EQ(calls, 0);
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    const auto read = registry.ReadExactLifecycleHealth(key, 42);
+    ASSERT_TRUE(read.ok());
+    EXPECT_EQ(read.value(), health);
+  }
+  EXPECT_EQ(calls, 2);
+  EXPECT_EQ(received_time, 42);
+  FixedCCLCPortRegistry missing({{key, std::make_shared<BrandPort>()}}, {});
+  const auto absent = missing.ReadExactLifecycleHealth(key, 42);
+  ASSERT_FALSE(absent.ok());
+  EXPECT_EQ(absent.error().details.at("reason"), "lifecycle_health_projection_missing");
+}
+
+TEST(FixedCCLCPortRegistry, HealthPreservesSourceRefusalAndRejectsInvalidOrThrowingProjection) {
+  const auto key = BrandKey();
+  const ErrorDTO original{"source_unavailable", "original bounded source refusal",
+                          {{"reason", "source_missing"}}};
+  FixedCCLCPortRegistry refused({{key, std::make_shared<BrandPort>(),
+      [&](std::int64_t) { return Result<LifecycleDomainHealthDTO>::Err(original); }}}, {});
+  const auto read = refused.ReadExactLifecycleHealth(key, 0);
+  ASSERT_FALSE(read.ok());
+  EXPECT_EQ(read.error(), original);
+  FixedCCLCPortRegistry invalid({{key, std::make_shared<BrandPort>(),
+      [](std::int64_t) { return Result<LifecycleDomainHealthDTO>::Ok(
+          {static_cast<ComponentLifecycleStateDTO>(255), {}, std::nullopt}); }}}, {});
+  const auto bad = invalid.ReadExactLifecycleHealth(key, 0);
+  ASSERT_FALSE(bad.ok());
+  EXPECT_EQ(bad.error().details.at("reason"), "lifecycle_health_projection_invalid");
+  FixedCCLCPortRegistry throwing({{key, std::make_shared<BrandPort>(),
+      [](std::int64_t) -> Result<LifecycleDomainHealthDTO> { throw std::runtime_error("source"); }}}, {});
+  const auto unavailable = throwing.ReadExactLifecycleHealth(key, 0);
+  ASSERT_FALSE(unavailable.ok());
+  EXPECT_EQ(unavailable.error().details.at("reason"), "lifecycle_health_projection_exception");
+}
+
 }  // namespace
 }  // namespace manyforge::core

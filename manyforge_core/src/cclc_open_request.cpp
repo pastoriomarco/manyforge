@@ -1004,9 +1004,13 @@ ComponentLifecycleCoordinatorOpenRequestPort::ComponentLifecycleCoordinatorOpenR
     const ICCLCRouteSelectionTemplateSource& route_template_source,
     CCLCLifecycleTargetDriver* target_driver) noexcept
     : coordinator_(coordinator),
-      current_component_source_(current_component_source),
-      route_template_source_(route_template_source),
+      current_component_source_(&current_component_source),
+      route_template_source_(&route_template_source),
       target_driver_(target_driver) {}
+
+ComponentLifecycleCoordinatorOpenRequestPort::ComponentLifecycleCoordinatorOpenRequestPort(
+    ComponentLifecycleCoordinator& coordinator, CCLCLifecycleTargetDriver* target_driver) noexcept
+    : coordinator_(coordinator), target_driver_(target_driver) {}
 
 Result<ComponentLifecycleTargetViewDTO>
 ComponentLifecycleCoordinatorOpenRequestPort::ReadLifecycleTargetView(
@@ -1039,7 +1043,13 @@ Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinatorOpenRequestPo
   // request (and a Recover without an open incident) is admitted unchanged.
   if (target_driver_ != nullptr) {
     auto recovered = target_driver_->RecoverIncident(intent);
-    if (!recovered.ok()) return Result<CCLCLifecycleRequestResultDTO>::Err(recovered.error());
+    if (!recovered.ok()) {
+      // During exchange, exact Recover replay remains a journal observation;
+      // a genuinely new Recover is refused before its mutation or admission.
+      if (recovered.error().code == "cclc_product_exchange_pending")
+        return coordinator_.SubmitLifecycle(intent);
+      return Result<CCLCLifecycleRequestResultDTO>::Err(recovered.error());
+    }
     if (recovered.value()) {
       return Result<CCLCLifecycleRequestResultDTO>::Ok(std::move(*recovered.value()));
     }
@@ -1077,13 +1087,25 @@ ComponentLifecycleCoordinatorOpenRequestPort::LoadLifecycleStatus(
 Result<ComponentLifecycleCurrentSnapshotDTO>
 ComponentLifecycleCoordinatorOpenRequestPort::ReadCurrentComponent(
     const ControllableComponentId& component_id) const {
-  return current_component_source_.ReadCurrentComponentSnapshot(component_id);
+  if (current_component_source_)
+    return current_component_source_->ReadCurrentComponentSnapshot(component_id);
+  auto pin = coordinator_.AcquireProductPin();
+  if (!pin.ok()) return Result<ComponentLifecycleCurrentSnapshotDTO>::Err(pin.error());
+  return pin.value().context().current_snapshot_source.ReadCurrentComponentSnapshot(component_id);
 }
 
 Result<CCLCRouteSelectionTemplateSetDTO>
 ComponentLifecycleCoordinatorOpenRequestPort::ReadRouteSelectionTemplates(
     const ControllableComponentId& component_id) const {
-  return route_template_source_.ReadCurrentRouteSelectionTemplates(component_id);
+  if (route_template_source_)
+    return route_template_source_->ReadCurrentRouteSelectionTemplates(component_id);
+  auto pin = coordinator_.AcquireProductPin();
+  if (!pin.ok()) return Result<CCLCRouteSelectionTemplateSetDTO>::Err(pin.error());
+  const auto* source = pin.value().context().route_template_source;
+  if (source == nullptr)
+    return Result<CCLCRouteSelectionTemplateSetDTO>::Err(
+        {"cclc_route_templates_unavailable", "route templates are not composed", {}});
+  return source->ReadCurrentRouteSelectionTemplates(component_id);
 }
 
 Result<CCLCRouteSelectionRequestResultDTO>

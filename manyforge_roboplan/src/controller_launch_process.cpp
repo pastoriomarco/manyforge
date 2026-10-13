@@ -1,5 +1,7 @@
 #include <manyforge_roboplan/controller_launch_process.hpp>
 
+#include <manyforge_core/time/ischeduler.hpp>
+
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -820,6 +822,8 @@ void ControllerLaunchProcess::observe_exit_locked() {
                 std::to_string(status.si_status);
       }
     }
+    if (!stopping_)
+      unexpected_exit_observed_ = true;
     capture_exit_locked(
         status.si_code == CLD_EXITED ? std::optional<int>(status.si_status)
                                      : std::nullopt,
@@ -830,6 +834,8 @@ void ControllerLaunchProcess::observe_exit_locked() {
     // Another owner has reaped the leader. Its PID/group can be reused, so
     // there is no longer an identity proof for group signalling.
     group_owned_ = false;
+    if (!stopping_)
+      unexpected_exit_observed_ = true;
     if (!exit_.has_value()) {
       exit_ = subject + " process is no longer a child of this host";
     }
@@ -925,43 +931,84 @@ std::optional<std::string> ControllerLaunchProcess::exited() {
   return exit_;
 }
 
+ControllerLaunchCleanupObservation
+ControllerLaunchProcess::cleanup_observation() {
+  std::lock_guard lock(mutex_);
+  return cleanup_;
+}
+
 void ControllerLaunchProcess::stop(const std::chrono::milliseconds grace) noexcept {
+  // Scalar observation never takes this lock. All official reapers/signallers
+  // of this occurrence do, keeping its WNOWAIT identity until the last scan.
+  std::lock_guard retirement_lock(retirement_mutex_);
   std::string context;
   std::string incident_id;
   bool owned = false;
   {
     std::lock_guard lock(mutex_);
+    observe_exit_locked();
     owned = group_owned_;
-    const auto contain = [&] {
-      stopping_ = true;
-      if (!group_owned_)
-        return;
-      observe_exit_locked();
-      if (!group_owned_)
-        return;
-      // Keep the leader unreaped until every signal has been sent. In
-      // particular, an unexpectedly exited wrapper may have left CM/RSP
-      // children behind.
+    stopping_ = true;
+    if (owned) {
       static_cast<void>(::kill(-pid_, SIGINT));
-      const auto deadline = std::chrono::steady_clock::now() + grace;
-      while (true) {
+      context = current_request_context_;
+      incident_id = last_incident_id_;
+    }
+  }
+  bool scanned_drained = false;
+  const auto no_live_members = [&] {
+    try {
+      return !group_has_running_members(pid_);
+    } catch (...) {
+      return false; // Allocation/read errors never establish absence.
+    }
+  };
+  if (owned) {
+    const auto deadline = std::chrono::steady_clock::now() + grace;
+    while (true) {
+      bool exited = false;
+      {
+        std::lock_guard lock(mutex_);
         observe_exit_locked();
         if (!group_owned_)
-          return;
-        if (exit_.has_value() && !group_has_running_members(pid_))
           break;
-        if (std::chrono::steady_clock::now() >= deadline)
-          break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        exited = exit_.has_value();
       }
-      // The zombie leader still pins this group. Escalate before the final
-      // reap, then release ownership so a stale receipt/destructor can never
-      // signal it.
-      static_cast<void>(::kill(-pid_, SIGKILL));
+      if (exited && no_live_members()) {
+        scanned_drained = true;
+        break;
+      }
+      if (std::chrono::steady_clock::now() >= deadline)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    bool can_reap = false;
+    {
+      std::lock_guard lock(mutex_);
+      observe_exit_locked();
+      can_reap = group_owned_;
+      if (can_reap)
+        static_cast<void>(::kill(-pid_, SIGKILL));
+    }
+    // No second grace: a complete read immediately after escalation may prove
+    // drain; otherwise Unknown. The same leader is still owned/unreaped here.
+    if (can_reap && !scanned_drained)
+      scanned_drained = no_live_members();
+    while (can_reap) {
       int status = 0;
-      while (true) {
-        const auto result = ::waitpid(pid_, &status, 0);
+      int result = 0;
+      int wait_error = 0;
+      {
+        std::lock_guard lock(mutex_);
+        observe_exit_locked();
+        if (!group_owned_)
+          break;
+        // WNOHANG keeps scalar evidence/status responsive while an actual
+        // child takes time to become waitable after SIGKILL. No new deadline.
+        result = ::waitpid(pid_, &status, WNOHANG);
+        wait_error = errno;
         if (result == pid_) {
+          exact_leader_reaped_ = true;
           if (!exit_.has_value())
             exit_ = describe_status(status,
                 std::holds_alternative<CellLaunchCommand>(command_));
@@ -972,24 +1019,38 @@ void ControllerLaunchProcess::stop(const std::chrono::milliseconds grace) noexce
                                   : std::nullopt,
               WIFSIGNALED(status) && WCOREDUMP(status));
           group_owned_ = false;
-          return;
-        }
-        if (result < 0 && errno != EINTR) {
-          if (!exit_.has_value()) {
+        } else if (result < 0 && wait_error != EINTR) {
+          if (!exit_.has_value())
             exit_ = std::holds_alternative<CellLaunchCommand>(command_)
                         ? "cell launch process is no longer a child of this host"
                         : "controller launch process is no longer a child of this host";
-          }
           group_owned_ = false;
           capture_exit_locked(std::nullopt, std::nullopt, false);
-          return;
         }
       }
-    };
-    contain();
-    if (owned) {
-      context = current_request_context_;
-      incident_id = last_incident_id_;
+      if (result == pid_ || (result < 0 && wait_error != EINTR))
+        break;
+      if (result == 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+  {
+    std::lock_guard lock(mutex_);
+    if (cleanup_.state != ControllerLaunchCleanupState::kDrained) {
+      cleanup_.state = ControllerLaunchCleanupState::kUnknown;
+      if (scanned_drained && exact_leader_reaped_) {
+        if (const auto *component =
+                std::get_if<ControllerLaunchCommand>(&command_)) {
+          try {
+            cleanup_.receipt = ControllerLaunchGroupDrainReceipt{
+                pid_, component->controllable_component_id, component->identity,
+                observed_utc_now()};
+            cleanup_.state = ControllerLaunchCleanupState::kDrained;
+          } catch (...) {
+            // Missing receipt stays Unknown, independently of exit evidence.
+          }
+        }
+      }
     }
   }
   if (owned) {
@@ -1457,65 +1518,142 @@ ControllerLaunchSupervisor::observe(const std::string &controllable_component_id
                                      !current->exited().has_value()};
 }
 
+bool ControllerLaunchProcess::capture_exit_readiness(
+    const std::function<ControllerLaunchReadinessEvidence()> &readiness) {
+  {
+    std::lock_guard lock(mutex_);
+    observe_exit_locked();
+    if (!exit_evidence_)
+      return false;
+    if (readiness_capture_complete_)
+      return true;
+    if (readiness_capture_started_)
+      return false;
+    readiness_capture_started_ = true;
+  }
+  // This is the existing cached handle callback, never a synchronous ROS query.
+  // A concurrent status tick must not queue effects until this attempt
+  // finishes.
+  std::optional<ControllerLaunchReadinessEvidence> captured;
+  try {
+    if (readiness) {
+      captured = readiness();
+      if (captured->captured_utc.empty())
+        captured->captured_utc = observed_utc_now();
+    }
+  } catch (...) {
+    // Unknown readiness preserves the original primary fault.
+  }
+  std::lock_guard lock(mutex_);
+  exit_evidence_->readiness = std::move(captured);
+  readiness_capture_complete_ = true;
+  return true;
+}
+
+ControllerLaunchCachedFaultState
+ControllerLaunchProcess::ReadCachedFaultState() const {
+  std::lock_guard lock(mutex_);
+  return {stopping_, unexpected_exit_observed_, exit_evidence_, fault_reason_};
+}
+
+std::string DescribeControllerLaunchFault(
+    const ControllerLaunchExitEvidence &evidence) {
+  std::string reason =
+      "controller_launch_exited: " + evidence.description +
+      " component=" + log_field(evidence.controllable_component_id) +
+      " pid=" + std::to_string(evidence.pid) +
+      " observed_utc=" + evidence.observed_utc +
+      " core_dumped=" + (evidence.core_dumped ? "true" : "false") +
+      " robot_description_sha256=" +
+      log_field(evidence.robot_description_sha256) +
+      " controllers_sha256=" + log_field(evidence.controllers_sha256) +
+      " upstream_log_directory=" +
+      log_field(evidence.upstream_log_directory.string());
+  reason +=
+      " context=" + bounded_text(log_field(evidence.request_context), 300U);
+  reason = bounded_text(std::move(reason), 1024U);
+  return reason;
+}
+
+std::optional<std::string> ProjectControllerLaunchFault(
+    const ControllerLaunchCachedFaultState &state) {
+  if (state.stopping && !state.unexpected_exit_observed)
+    return std::nullopt;
+  if (state.fault_reason)
+    return state.fault_reason;
+  if (!state.exit_evidence)
+    return std::nullopt;
+  return DescribeControllerLaunchFault(*state.exit_evidence);
+}
+
 std::function<std::optional<std::string>()>
 ControllerLaunchSupervisor::fault_source(
     std::shared_ptr<ControllerLaunchProcess> process,
     std::function<ControllerLaunchReadinessEvidence()> readiness) {
-  if (process == nullptr) fail("fault source has no process");
+  if (process == nullptr)
+    fail("fault source has no process");
   return [process = std::move(process),
           readiness = std::move(readiness)]() -> std::optional<std::string> {
     const auto evidence = process->exit_evidence();
-    bool capture_readiness = false;
     {
       std::lock_guard lock(process->mutex_);
       // A stop this host ordered (restart or teardown) is not a failure.
-      if (process->stopping_)
+      if (process->stopping_ && !process->unexpected_exit_observed_)
         return std::nullopt;
       if (process->fault_reason_.has_value())
         return process->fault_reason_;
-      if (evidence.has_value() && !process->readiness_capture_started_) {
-        process->readiness_capture_started_ = true;
-        capture_readiness = true;
-      }
     }
     if (!evidence.has_value())
       return std::nullopt;
-    // The host callback only reads cached controller/readiness facts.
-    // It must run outside the process mutex (no synchronous CM query).
-    if (capture_readiness && readiness) {
-      std::optional<ControllerLaunchReadinessEvidence> captured;
-      try {
-        captured = readiness();
-        if (captured->captured_utc.empty())
-          captured->captured_utc = observed_utc_now();
-      } catch (...) {
-        // Optional observation loss cannot replace or delay the primary fault.
-      }
-      std::lock_guard lock(process->mutex_);
-      process->exit_evidence_->readiness = std::move(captured);
-    }
-    std::string reason =
-        "controller_launch_exited: " + evidence->description +
-        " component=" + log_field(evidence->controllable_component_id) +
-        " pid=" + std::to_string(evidence->pid) +
-        " observed_utc=" + evidence->observed_utc +
-        " core_dumped=" + (evidence->core_dumped ? "true" : "false") +
-        " robot_description_sha256=" +
-        log_field(evidence->robot_description_sha256) +
-        " controllers_sha256=" + log_field(evidence->controllers_sha256) +
-        " upstream_log_directory=" +
-        log_field(evidence->upstream_log_directory.string());
-    reason +=
-        " context=" + bounded_text(log_field(evidence->request_context), 300U);
-    reason = bounded_text(std::move(reason), 1024U);
+    static_cast<void>(process->capture_exit_readiness(readiness));
+    auto reason = DescribeControllerLaunchFault(*evidence);
     std::lock_guard lock(process->mutex_);
-    if (process->stopping_)
+    if (process->stopping_ && !process->unexpected_exit_observed_)
       return std::nullopt;
     if (!process->fault_reason_.has_value()) {
       process->fault_reason_ = std::move(reason);
     }
     return process->fault_reason_;
   };
+}
+
+bool ControllerLaunchSupervisor::request_unexpected_exit_cleanup(
+    const std::shared_ptr<ControllerLaunchProcess> &expected,
+    core::IScheduler &scheduler, const std::int64_t now_ns,
+    std::function<ControllerLaunchReadinessEvidence()> readiness) {
+  if (!expected || now_ns < 0)
+    return false;
+  if (!expected->capture_exit_readiness(readiness))
+    return false;
+  {
+    std::lock_guard lock(expected->mutex_);
+    expected->observe_exit_locked();
+    if (!expected->unexpected_exit_observed_ ||
+        expected->cleanup_.state != ControllerLaunchCleanupState::kNotRequested)
+      return false;
+    expected->cleanup_.state = ControllerLaunchCleanupState::kPending;
+  }
+  try {
+    // A due callback may start before schedule returns. The consumed state and
+    // owning occurrence are published first; no supervisor/host is captured.
+    static_cast<void>(scheduler.schedule(
+        now_ns, [expected, grace = stop_grace_] { expected->stop(grace); },
+        core::SchedulerPriority::Background));
+    return true;
+  } catch (...) {
+    std::lock_guard lock(expected->mutex_);
+    if (expected->cleanup_.state == ControllerLaunchCleanupState::kPending)
+      expected->cleanup_.state = ControllerLaunchCleanupState::kUnknown;
+    return false;
+  }
+}
+
+bool ControllerLaunchSupervisor::retire_cell_process(
+    const std::shared_ptr<CellLaunchProcess> &process) {
+  if (!process) return false;
+  process->occurrence_->stop(stop_grace_);
+  std::lock_guard lock(process->occurrence_->mutex_);
+  return process->occurrence_->exact_leader_reaped_;
 }
 
 ControllerLaunchSupervisor &host_controller_launch_supervisor() {

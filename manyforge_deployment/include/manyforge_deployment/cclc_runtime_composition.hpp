@@ -47,9 +47,37 @@ struct CCLCRuntimeCompositionConfig final {
   // Optional informational logging only; invoked after journal commit/unlock.
   std::function<void(const core::ComponentIncidentPruneNotice &)>
       on_incidents_pruned{};
+  /// Read-only exact early-preparation terminal classification; no authority.
+  core::NativeApplyParentPreparationFailureSource preparation_failure_source{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   [[nodiscard]] bool trusted_roots_valid() const noexcept;
+};
+
+/// Complete product inputs for preparation on an already existing cell owner.
+/// The single strong lifetime pin encloses every borrowed product dependency,
+/// including artifacts/catalog/readiness and the full installed projection set.
+/// Missing live occurrences are truthful inputs, not absent configured members.
+struct CCLCProductContextInputs final {
+  std::shared_ptr<const RetainedBundle> retained_bundle;
+  const core::IActiveBundlePublicationReader &active_publication_reader;
+  core::ActiveBundlePublicationReceiptDTO expected_publication;
+  const IVerifiedRetainedProductArtifactSource &artifact_source;
+  const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source;
+  std::vector<core::ResolvedLifecycleProviderOccurrenceDTO>
+      lifecycle_provider_occurrences;
+  std::vector<ControllerLifecycleSourceOccurrenceDTO> controller_sources;
+  std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports;
+  std::vector<core::ControllerLifecyclePortRegistrationDTO> controller_ports;
+  std::vector<core::KinematicResourceSourceProjectionDTO> source_projections;
+  std::function<
+      core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+          const core::ControlDomainId &)>
+      current_configuration_source;
+  core::ICCLCComponentCommandReadinessPort *readiness_port;
+  IRouteConfigurationKernelPublicationOwner &kernel_publication_owner;
+  std::shared_ptr<const void> installed_product_lifetime;
+  std::shared_ptr<const core::ConfiguredRobotMeasuredStateInventory> measured_state_inventory{};
 };
 
 /// Complete L0.4 production lifetime join for one exact retained bundle.
@@ -62,7 +90,51 @@ struct CCLCRuntimeCompositionConfig final {
 /// this object. Destruction stops/drains the coordinator before releasing any
 /// owned dependency.
 class CCLCRuntimeComposition final {
+  class ProductContext;
+
 public:
+  /// Origin-bound, immutable preparation; only this facade can construct it.
+  /// It conveys lifetime and exact identity, never activation/release
+  /// authority.
+  class PreparedProductContext final {
+  public:
+    PreparedProductContext(const PreparedProductContext &) = delete;
+    PreparedProductContext &operator=(const PreparedProductContext &) = delete;
+
+  private:
+    friend class CCLCRuntimeComposition;
+    PreparedProductContext(
+        const CCLCRuntimeComposition *origin, core::RequestOwnerEpoch owner,
+        std::shared_ptr<const core::ComponentLifecycleProductContext> previous,
+        std::shared_ptr<const ProductContext> product)
+        : origin_(origin), owner_(std::move(owner)),
+          previous_(std::move(previous)), product_(std::move(product)) {}
+    const CCLCRuntimeComposition *const origin_;
+    const core::RequestOwnerEpoch owner_;
+    const std::shared_ptr<const core::ComponentLifecycleProductContext>
+        previous_;
+    const std::shared_ptr<const ProductContext> product_;
+  };
+
+  /// Existing actual-journal operations. Writes hold one product operation
+  /// pin through commit; the original host still proves parent/fence/installed
+  /// facts. The read remains available during pending product exchange.
+  [[nodiscard]] core::Result<core::NativeApplyPlanDTO>
+  PlanNativeApply(const core::NativeApplyPlanRequestDTO &request);
+  [[nodiscard]] core::Result<std::optional<core::NativeApplyPlanDTO>>
+  LoadNativeApplyPlan(const core::NamedApplyPublicationTransactionDTO &apply);
+  [[nodiscard]] core::Result<void>
+  AdoptNativeApplyFacts(const core::NativeApplyFactAdoptionDTO &adoption);
+
+  /// Preparation never constructs a journal, owner or transport.
+  /// The origin owner must outlive the prepared value and all its use.
+  [[nodiscard]] core::Result<std::shared_ptr<const PreparedProductContext>>
+  PrepareProductContext(CCLCProductContextInputs inputs);
+  [[nodiscard]] core::Result<core::ComponentLifecycleProductExchangeObservation>
+  TryExchangeProductContext(
+      const PreparedProductContext &prepared,
+      const core::RequestOwnerEpoch &expected_owner,
+      const core::ActiveBundlePublicationReceiptDTO &expected_previous);
   [[nodiscard]] static core::Result<std::unique_ptr<CCLCRuntimeComposition>>
   Create(CCLCRuntimeCompositionConfig config,
          std::shared_ptr<const RetainedBundle> retained_bundle,
@@ -94,6 +166,29 @@ public:
   /// requests or resuming journaled effects. Call only with startup authority;
   /// a failed Start is terminal for this composition and requires destruction.
   [[nodiscard]] core::Result<void> Start();
+
+  /// Join the follower and request servers while retaining the owner and dependencies.
+  /// Call outside their threads; the host must separately drain managed callers and work.
+  void StopRequestFollowingAndTransports() noexcept;
+
+  /// Store checked observer exit evidence through this facade's existing journal.
+  /// This grants no component lifecycle or containment authority.
+  [[nodiscard]] core::Result<core::CellObserverIncidentRecordDTO>
+  RecordCellObserverIncident(const core::CellObserverIncidentRecordDTO &record);
+
+  /// Observe the first open record in the existing single cell observer slot.
+  [[nodiscard]] core::Result<std::optional<core::CellObserverIncidentRecordDTO>>
+  LoadOpenCellObserverIncident();
+
+  /// Observe this genuine owner's Q97 component generation selection. The
+  /// journal verifies its current owner and later acceptance repeats the CAS.
+  [[nodiscard]] core::Result<core::ApplyComponentGenerationSelectionDTO>
+  ReadApplyComponentGenerationSelection(
+      const core::ControllableComponentId &component);
+
+  /// Observe the existing journal's exact settled owner; grants no handoff authority.
+  [[nodiscard]] core::Result<void>
+  ReadQuiescentOwner(const core::RequestOwnerEpoch &expected);
 
   ~CCLCRuntimeComposition();
 
@@ -141,14 +236,17 @@ private:
       core::ICCLCComponentCommandReadinessPort *component_command_readiness_port);
 
   CCLCRuntimeCompositionConfig config_;
-  std::shared_ptr<const RetainedBundle> retained_bundle_;
   core::SqliteCCLCJournal journal_;
   core::CCLCDomainReservationTable domain_reservations_;
-  core::FixedCCLCPortRegistry port_registry_;
-  core::FilesystemResolvedStopBasePlanRepository plan_repository_;
-  VerifiedComponentLifecycleCurrentSnapshotSource lifecycle_snapshot_source_;
-  VerifiedRouteSelectionCurrentSnapshotSource route_snapshot_source_;
-  VerifiedRouteConfigurationPublicationPort route_publication_port_;
+  std::unique_ptr<core::FilesystemResolvedStopBasePlanRepository>
+      plan_repository_;
+  // Stable cell-wide construction ports; product-specific referents belong
+  // to the one immutable context and its owning installed-product pin.
+  core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port_;
+  core::IClock &clock_;
+  // Constructor-only root. After coordinator aliasing ownership is installed,
+  // this is reset; the coordinator has the sole current-context slot.
+  std::shared_ptr<const ProductContext> initial_product_context_;
   core::ComponentLifecycleCoordinator coordinator_;
   core::CoordinatorLifecycleTargetDriverPorts target_driver_ports_;
   // Declared after the coordinator: destroyed (stopped) before it.

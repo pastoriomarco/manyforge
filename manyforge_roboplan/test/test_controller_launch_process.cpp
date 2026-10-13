@@ -1,4 +1,6 @@
+#include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_roboplan/controller_launch_process.hpp>
+#include <manyforge_roboplan/native_runtime_support.hpp>
 
 #include <gtest/gtest.h>
 
@@ -408,7 +410,7 @@ private:
 // can reap the probe and assert actual termination even under container PID 1.
 class GroupChild final {
 public:
-  explicit GroupChild(const int group_id) {
+  explicit GroupChild(const int group_id, const bool ignore_interrupt = true) {
     int ready[2];
     if (::pipe(ready) != 0)
       throw std::runtime_error("cannot create group child pipe");
@@ -416,7 +418,7 @@ public:
     if (pid_ == 0) {
       ::close(ready[0]);
       const char joined = ::setpgid(0, group_id) == 0 ? '1' : '0';
-      ::signal(SIGINT, SIG_IGN);
+      ::signal(SIGINT, ignore_interrupt ? SIG_IGN : SIG_DFL);
       ::signal(SIGTERM, SIG_IGN);
       const auto ignored = ::write(ready[1], &joined, 1U);
       static_cast<void>(ignored);
@@ -446,13 +448,14 @@ public:
     }
   }
   [[nodiscard]] bool running() const { return ::kill(pid_, 0) == 0; }
-  [[nodiscard]] bool reap_killed() {
+  [[nodiscard]] bool reap_killed() { return reap_signal(SIGKILL); }
+  [[nodiscard]] bool reap_signal(const int expected_signal) {
     int status = 0;
     for (int attempt = 0; attempt < 200; ++attempt) {
       const auto result = ::waitpid(pid_, &status, WNOHANG);
       if (result == pid_) {
         reaped_ = true;
-        return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+        return WIFSIGNALED(status) && WTERMSIG(status) == expected_signal;
       }
       if (result < 0)
         return false;
@@ -1480,6 +1483,72 @@ TEST(ControllerLaunchSupervisor,
   return false;
 }
 
+TEST(ControllerLaunchSupervisor, PureFaultProjectionDoesNotObserveOrCacheExit) {
+  FakeLaunch fake;
+  ::setenv("FAKE_LAUNCH_EXIT", "7", 1);
+  ControllerLaunchSupervisor supervisor(100ms);
+  const auto started = supervisor.ensure(
+      mock_controller_launch_command(mock_artifacts(fake.root())),
+      fake.root() / "pure-fault-artifacts", "apply_id=pure.fault");
+  ASSERT_TRUE(wait_for_unreaped_exit(started.process->pid()));
+  const auto &process = *started.process;
+  // The process has exited, but only the existing producer may observe it.
+  for (int read = 0; read < 3; ++read) {
+    const auto cache = process.ReadCachedFaultState();
+    EXPECT_FALSE(cache.exit_evidence);
+    EXPECT_FALSE(cache.fault_reason);
+    EXPECT_FALSE(cache.unexpected_exit_observed);
+    EXPECT_FALSE(ProjectControllerLaunchFault(cache));
+  }
+  const auto evidence = started.process->exit_evidence();
+  ASSERT_TRUE(evidence);
+  const auto before = process.ReadCachedFaultState();
+  ASSERT_TRUE(before.exit_evidence);
+  EXPECT_FALSE(before.exit_evidence->readiness);
+  EXPECT_FALSE(before.fault_reason);
+  const auto expected = DescribeControllerLaunchFault(*evidence);
+  for (int read = 0; read < 3; ++read) {
+    const auto cache = process.ReadCachedFaultState();
+    EXPECT_EQ(ProjectControllerLaunchFault(cache), expected);
+    EXPECT_FALSE(cache.fault_reason);
+    ASSERT_TRUE(cache.exit_evidence);
+    EXPECT_FALSE(cache.exit_evidence->readiness);
+    EXPECT_EQ(cache.exit_evidence->observed_utc, evidence->observed_utc);
+    EXPECT_EQ(cache.exit_evidence->pid, evidence->pid);
+    EXPECT_EQ(cache.stopping, before.stopping);
+    EXPECT_EQ(cache.unexpected_exit_observed, before.unexpected_exit_observed);
+  }
+  EXPECT_EQ(started.process->cleanup_observation().state,
+            ControllerLaunchCleanupState::kNotRequested);
+  int captures = 0;
+  const auto lifecycle = ControllerLaunchSupervisor::fault_source(
+      started.process, [&] {
+        ++captures;
+        return ControllerLaunchReadinessEvidence{};
+      });
+  EXPECT_EQ(lifecycle(), expected);
+  EXPECT_EQ(captures, 1);
+  const auto committed = process.ReadCachedFaultState();
+  EXPECT_EQ(committed.fault_reason, expected);
+  ASSERT_TRUE(committed.exit_evidence);
+  EXPECT_TRUE(committed.exit_evidence->readiness);
+  EXPECT_EQ(ProjectControllerLaunchFault(committed), lifecycle());
+  EXPECT_EQ(captures, 1);
+}
+
+TEST(ControllerLaunchFaultProjection, RetainsControlledStopSuppression) {
+  ControllerLaunchExitEvidence evidence;
+  evidence.description = "status 7";
+  evidence.controllable_component_id = "component.1";
+  ControllerLaunchCachedFaultState cache{true, false, evidence, "retained fault"};
+  EXPECT_FALSE(ProjectControllerLaunchFault(cache));
+  cache.unexpected_exit_observed = true;
+  EXPECT_EQ(ProjectControllerLaunchFault(cache), "retained fault");
+  cache.fault_reason.reset();
+  EXPECT_EQ(ProjectControllerLaunchFault(cache), DescribeControllerLaunchFault(evidence));
+  EXPECT_FALSE(cache.fault_reason);
+}
+
 TEST(ControllerLaunchSupervisor,
      ReplacementStopDoesNotBlockCountersAndConcurrentEnsureKeepsOneSuccessor) {
   FakeLaunch fake;
@@ -1510,13 +1579,19 @@ TEST(ControllerLaunchSupervisor,
       std::launch::async, [&] { return supervisor.observe("ui6i_lite6"); });
   EXPECT_EQ(first.wait_for(10ms), std::future_status::timeout);
   EXPECT_EQ(second.wait_for(10ms), std::future_status::timeout);
-  EXPECT_EQ(observation.wait_for(10ms), std::future_status::timeout);
+  // Scalar observation remains responsive while the owned group blocks stop.
+  const auto observation_ready = observation.wait_for(200ms);
   auto counters = std::async(std::launch::async, [&] {
     return supervisor.component_output_counters("ui6i_lite6");
   });
   const auto ready = counters.wait_for(200ms);
   // Always release the owned blocker before waiting on test futures.
   blocker.reset();
+  EXPECT_EQ(observation_ready, std::future_status::ready);
+  const auto observed = observation.get();
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->identity, original.process->command().identity);
+  EXPECT_FALSE(observed->running);
   EXPECT_EQ(ready, std::future_status::ready);
   EXPECT_TRUE(counters.get().has_value());
   const auto installed = first.get();
@@ -1526,7 +1601,6 @@ TEST(ControllerLaunchSupervisor,
                concurrent.decision == ControllerLaunchDecision::kKeep) ||
               (concurrent.decision == ControllerLaunchDecision::kRestart &&
                installed.decision == ControllerLaunchDecision::kKeep));
-  static_cast<void>(observation.get());
   EXPECT_FALSE(alive(original.process->pid()));
   EXPECT_TRUE(alive(installed.process->pid()));
   EXPECT_TRUE(alive(peer.process->pid()));
@@ -1938,7 +2012,8 @@ TEST(CellLaunchProcess, CellObserverSurvivesComponentRemovalAndFreshAddition) {
       fake.root() / "next_component");
   ASSERT_TRUE(fake.wait_for(fake.out(next.process->pid(), ".args")));
   observer->update_request_context("Apply parent=next_request");
-  observer->stop(0ms);
+  EXPECT_TRUE(supervisor.retire_cell_process(observer));
+  EXPECT_TRUE(supervisor.retire_cell_process(observer)); // Exact positive receipt replays.
   EXPECT_FALSE(alive(observer->pid()));
   EXPECT_TRUE(alive(next.process->pid()));
   EXPECT_TRUE(supervisor.observe("ui6i_lite6")->running);
@@ -1946,6 +2021,27 @@ TEST(CellLaunchProcess, CellObserverSurvivesComponentRemovalAndFreshAddition) {
   ASSERT_TRUE(evidence.has_value());
   EXPECT_EQ(evidence->request_context, "Apply parent=next_request");
   EXPECT_EQ(evidence->command.observer_source_id, "configured_pose_source");
+}
+
+TEST(CellLaunchProcess, CachedExitNeverClaimsAnExternallyReapedLeader) {
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(100ms);
+  const auto process = supervisor.start_cell_process(
+      cell_command(CellLaunchRole::kPoseObserver), fake.root() / "observer");
+  ASSERT_TRUE(fake.wait_for(fake.out(process->pid(), ".args")));
+  ASSERT_EQ(::kill(process->pid(), SIGKILL), 0);
+  std::optional<CellLaunchExitEvidence> evidence;
+  for (int attempt = 0; attempt < 200 && !evidence; ++attempt) {
+    evidence = process->exit_evidence();
+    if (!evidence) std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(evidence.has_value());
+  ASSERT_EQ(evidence->signal, SIGKILL);
+  ASSERT_EQ(::waitpid(process->pid(), nullptr, 0), process->pid());
+  EXPECT_FALSE(supervisor.retire_cell_process(process));
+  EXPECT_FALSE(supervisor.retire_cell_process(process));
+  // Keep the real earlier diagnostic, but never promote it to a reap receipt.
+  EXPECT_EQ(process->exit_evidence()->observed_utc, evidence->observed_utc);
 }
 
 TEST(CellLaunchProcess, InvalidTypedInputsAndLogRootRefuseBeforeSpawn) {
@@ -2013,3 +2109,247 @@ TEST(CellLaunchProcess, ZombieLeaderPinsGroupUntilExactCellStop) {
 }
 
 } // namespace
+
+TEST(ControllerLaunchSupervisor,
+     UnexpectedExitQueuesOnceAndPreservesCrashWithExactDrainReceipt) {
+  FakeLaunch fake;
+  manyforge::core::ManualScheduler scheduler;
+  ControllerLaunchSupervisor supervisor(2s);
+  const auto command =
+      mock_controller_launch_command(mock_artifacts(fake.root()));
+  const auto crashed =
+      supervisor.ensure(command, fake.root() / "crashed.artifacts");
+  const auto peer =
+      supervisor.ensure(mock_controller_launch_command(
+                            mock_artifacts(fake.root(), "sha256:peer", "peer")),
+                        fake.root() / "peer.artifacts");
+  ASSERT_TRUE(fake.wait_for(fake.out(crashed.process->pid(), ".args")));
+  GroupChild child(crashed.process->pid(), false);
+  int readiness_reads = 0;
+  const auto installed_readiness = [&] {
+    ++readiness_reads;
+    EXPECT_TRUE(child.running());
+    EXPECT_EQ(
+        scheduler.pending_count(manyforge::core::SchedulerPriority::Background),
+        0U);
+    ControllerLaunchReadinessEvidence readiness;
+    readiness.known = true;
+    return readiness;
+  };
+  const auto fault = ControllerLaunchSupervisor::fault_source(
+      crashed.process, installed_readiness);
+  int candidate_readiness_reads = 0;
+  {
+    const auto candidate =
+        supervisor.ensure(command, fake.root() / "candidate.artifacts");
+    ASSERT_EQ(candidate.decision, ControllerLaunchDecision::kKeep);
+    ASSERT_EQ(candidate.process, crashed.process);
+    const auto candidate_readiness =
+        std::make_shared<ControllerLaunchReadinessEvidence>();
+    static_cast<void>(ControllerLaunchSupervisor::fault_source(
+        candidate.process,
+        [weak = std::weak_ptr<ControllerLaunchReadinessEvidence>(
+             candidate_readiness),
+         &candidate_readiness_reads] {
+          ++candidate_readiness_reads;
+          const auto value = weak.lock();
+          return value ? *value : ControllerLaunchReadinessEvidence{};
+        }));
+    EXPECT_FALSE(supervisor.discard_candidate(candidate));
+  }
+  ASSERT_EQ(::kill(crashed.process->pid(), SIGKILL), 0);
+  for (int attempt = 0; attempt < 200 && !crashed.process->exited(); ++attempt)
+    std::this_thread::sleep_for(10ms);
+  ASSERT_TRUE(crashed.process->exited());
+  const auto first_exit = crashed.process->exit_evidence();
+  ASSERT_TRUE(first_exit);
+  EXPECT_TRUE(supervisor.request_unexpected_exit_cleanup(
+      crashed.process, scheduler, 0, installed_readiness));
+  EXPECT_EQ(readiness_reads, 1);
+  EXPECT_EQ(candidate_readiness_reads, 0);
+  ASSERT_TRUE(crashed.process->exit_evidence()->readiness);
+  EXPECT_EQ(crashed.process->exit_evidence()->readiness->known, true);
+  const auto first_fault = fault();
+  ASSERT_TRUE(first_fault);
+  for (int tick = 0; tick < 20; ++tick)
+    EXPECT_FALSE(supervisor.request_unexpected_exit_cleanup(crashed.process,
+                                                            scheduler, 0));
+  EXPECT_EQ(
+      scheduler.pending_count(manyforge::core::SchedulerPriority::Background),
+      1U);
+  EXPECT_EQ(crashed.process->cleanup_observation().state,
+            ControllerLaunchCleanupState::kPending);
+  scheduler.advance_to(0, manyforge::core::SchedulerPriority::Background);
+  const auto cleaned = crashed.process->cleanup_observation();
+  ASSERT_EQ(cleaned.state, ControllerLaunchCleanupState::kDrained);
+  ASSERT_TRUE(cleaned.receipt);
+  EXPECT_EQ(cleaned.receipt->leader_pid, crashed.process->pid());
+  EXPECT_EQ(cleaned.receipt->controllable_component_id,
+            command.controllable_component_id);
+  EXPECT_EQ(cleaned.receipt->launch_identity, command.identity);
+  EXPECT_FALSE(cleaned.receipt->observed_utc.empty());
+  EXPECT_TRUE(child.reap_signal(SIGINT));
+  EXPECT_TRUE(alive(peer.process->pid()));
+  EXPECT_EQ(fault(), first_fault);
+  EXPECT_EQ(crashed.process->exit_evidence()->observed_utc,
+            first_exit->observed_utc);
+  EXPECT_EQ(crashed.process->exit_evidence()->signal,
+            std::optional<int>(SIGKILL));
+  EXPECT_FALSE(supervisor.request_unexpected_exit_cleanup(crashed.process,
+                                                          scheduler, 0));
+  const auto successor =
+      supervisor.ensure(command, fake.root() / "successor.artifacts");
+  EXPECT_NE(successor.process, crashed.process);
+  EXPECT_EQ(successor.process->cleanup_observation().state,
+            ControllerLaunchCleanupState::kNotRequested);
+  EXPECT_FALSE(successor.process->cleanup_observation().receipt);
+  EXPECT_TRUE(alive(successor.process->pid()));
+}
+
+TEST(ControllerLaunchSupervisor,
+     BackgroundCleanupKeepsStatusResponsiveThroughoutTenSecondGrace) {
+  FakeLaunch fake;
+  SimpleScheduler scheduler;
+  WallClock clock;
+  const auto warm = std::make_shared<std::promise<void>>();
+  auto warmed = warm->get_future();
+  static_cast<void>(scheduler.schedule(
+      clock.now(), [warm] { warm->set_value(); },
+      manyforge::core::SchedulerPriority::Background));
+  ASSERT_EQ(warmed.wait_for(2s), std::future_status::ready);
+  ControllerLaunchSupervisor supervisor(10s);
+  const auto crashed = supervisor.ensure(
+      mock_controller_launch_command(mock_artifacts(fake.root())),
+      fake.root() / "crashed.artifacts");
+  ASSERT_TRUE(fake.wait_for(fake.out(crashed.process->pid(), ".args")));
+  GroupChild child(crashed.process->pid());
+  ASSERT_EQ(::kill(crashed.process->pid(), SIGKILL), 0);
+  for (int attempt = 0; attempt < 200 && !crashed.process->exited(); ++attempt)
+    std::this_thread::sleep_for(10ms);
+  ASSERT_TRUE(crashed.process->exited());
+  const auto fault = ControllerLaunchSupervisor::fault_source(crashed.process);
+  const auto first_fault = fault();
+  ASSERT_TRUE(first_fault);
+  ASSERT_TRUE(supervisor.request_unexpected_exit_cleanup(
+      crashed.process, scheduler, clock.now()));
+  const auto finished = std::make_shared<std::promise<void>>();
+  auto completed = finished->get_future();
+  static_cast<void>(scheduler.schedule(
+      clock.now(), [finished] { finished->set_value(); },
+      manyforge::core::SchedulerPriority::Background));
+  ASSERT_EQ(completed.wait_for(100ms), std::future_status::timeout);
+  EXPECT_TRUE(child.running());
+  const auto before = std::chrono::steady_clock::now();
+  for (int tick = 0; tick < 100; ++tick) {
+    const auto status = supervisor.observe(
+        crashed.process->command().controllable_component_id);
+    ASSERT_TRUE(status);
+    EXPECT_FALSE(status->running);
+    EXPECT_TRUE(crashed.process->exit_evidence());
+    EXPECT_EQ(crashed.process->cleanup_observation().state,
+              ControllerLaunchCleanupState::kPending);
+    EXPECT_EQ(fault(), first_fault);
+    EXPECT_FALSE(supervisor.request_unexpected_exit_cleanup(
+        crashed.process, scheduler, clock.now()));
+  }
+  EXPECT_LT(std::chrono::steady_clock::now() - before, 750ms);
+  ASSERT_EQ(completed.wait_for(12s), std::future_status::ready);
+  EXPECT_TRUE(child.reap_killed());
+  const auto outcome = crashed.process->cleanup_observation();
+  EXPECT_TRUE(outcome.state == ControllerLaunchCleanupState::kDrained ||
+              outcome.state == ControllerLaunchCleanupState::kUnknown);
+  EXPECT_EQ(outcome.receipt.has_value(),
+            outcome.state == ControllerLaunchCleanupState::kDrained);
+  EXPECT_EQ(fault(), first_fault);
+}
+
+TEST(ControllerLaunchSupervisor,
+     QueuedCleanupDiscardLeavesNormalShutdownAndEvidenceIntact) {
+  FakeLaunch fake;
+  std::shared_ptr<ControllerLaunchProcess> process;
+  std::optional<ControllerLaunchExitEvidence> first_exit;
+  {
+    ControllerLaunchSupervisor supervisor(2s);
+    auto scheduler = std::make_unique<manyforge::core::ManualScheduler>();
+    const auto started = supervisor.ensure(
+        mock_controller_launch_command(mock_artifacts(fake.root())),
+        fake.root() / "launch.artifacts");
+    process = started.process;
+    ASSERT_TRUE(fake.wait_for(fake.out(process->pid(), ".args")));
+    ASSERT_EQ(::kill(process->pid(), SIGKILL), 0);
+    for (int attempt = 0; attempt < 200 && !process->exited(); ++attempt)
+      std::this_thread::sleep_for(10ms);
+    first_exit = process->exit_evidence();
+    ASSERT_TRUE(first_exit);
+    ASSERT_TRUE(
+        supervisor.request_unexpected_exit_cleanup(process, *scheduler, 0));
+    EXPECT_EQ(scheduler->pending_count(
+                  manyforge::core::SchedulerPriority::Background),
+              1U);
+    scheduler.reset(); // Like scheduler shutdown discarding an unstarted task.
+    EXPECT_EQ(process->cleanup_observation().state,
+              ControllerLaunchCleanupState::kPending);
+  } // Normal supervisor teardown still retires and reaps the pinned occurrence.
+  EXPECT_NE(process->cleanup_observation().state,
+            ControllerLaunchCleanupState::kPending);
+  EXPECT_EQ(process->exit_evidence()->observed_utc, first_exit->observed_utc);
+  EXPECT_EQ(process->exit_evidence()->signal, std::optional<int>(SIGKILL));
+  EXPECT_TRUE(ControllerLaunchSupervisor::fault_source(process)());
+}
+
+TEST(ControllerLaunchSupervisor,
+     ExternallyReapedUnexpectedLeaderCannotProduceDrainReceipt) {
+  FakeLaunch fake;
+  manyforge::core::ManualScheduler scheduler;
+  ControllerLaunchSupervisor supervisor(100ms);
+  const auto started = supervisor.ensure(
+      mock_controller_launch_command(mock_artifacts(fake.root())),
+      fake.root() / "launch.artifacts");
+  ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
+  GroupChild child(started.process->pid());
+  ASSERT_EQ(::kill(started.process->pid(), SIGKILL), 0);
+  ASSERT_EQ(::waitpid(started.process->pid(), nullptr, 0),
+            started.process->pid());
+  EXPECT_TRUE(supervisor.request_unexpected_exit_cleanup(started.process,
+                                                         scheduler, 0));
+  scheduler.advance_to(0, manyforge::core::SchedulerPriority::Background);
+  EXPECT_EQ(started.process->cleanup_observation().state,
+            ControllerLaunchCleanupState::kUnknown);
+  EXPECT_FALSE(started.process->cleanup_observation().receipt);
+  EXPECT_TRUE(child.running());
+  EXPECT_TRUE(ControllerLaunchSupervisor::fault_source(started.process)());
+}
+
+TEST(ControllerLaunchSupervisor,
+     CleanupSchedulingFailureIsUnknownAndNeverAutomaticallyRetried) {
+  class RejectingScheduler final : public manyforge::core::IScheduler {
+  public:
+    manyforge::core::ScheduleHandle
+    schedule(manyforge::core::TimePoint, std::function<void()>,
+             manyforge::core::SchedulerPriority) override {
+      ++attempts;
+      throw std::runtime_error("test-only scheduler queue unavailable");
+    }
+    void cancel(manyforge::core::ScheduleHandle) override {}
+    int attempts{0};
+  } scheduler;
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(100ms);
+  const auto started = supervisor.ensure(
+      mock_controller_launch_command(mock_artifacts(fake.root())),
+      fake.root() / "launch.artifacts");
+  ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
+  ASSERT_EQ(::kill(started.process->pid(), SIGKILL), 0);
+  for (int attempt = 0; attempt < 200 && !started.process->exited(); ++attempt)
+    std::this_thread::sleep_for(10ms);
+  ASSERT_TRUE(started.process->exited());
+  EXPECT_FALSE(supervisor.request_unexpected_exit_cleanup(started.process,
+                                                          scheduler, 0));
+  EXPECT_EQ(started.process->cleanup_observation().state,
+            ControllerLaunchCleanupState::kUnknown);
+  EXPECT_FALSE(started.process->cleanup_observation().receipt);
+  EXPECT_FALSE(supervisor.request_unexpected_exit_cleanup(started.process,
+                                                          scheduler, 0));
+  EXPECT_EQ(scheduler.attempts, 1);
+  EXPECT_TRUE(ControllerLaunchSupervisor::fault_source(started.process)());
+}

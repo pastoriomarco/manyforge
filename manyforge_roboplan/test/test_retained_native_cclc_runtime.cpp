@@ -5,6 +5,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iterator>
+#include <limits>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_core/build_owned_lifecycle_plan_catalog_source.hpp>
@@ -16,6 +17,7 @@
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/retained_native_cclc_runtime.hpp>
@@ -50,7 +52,10 @@ TEST(RetainedNativeCCLCRuntime, NativeAdapterOwnsProviderReadinessButNeverComman
   using Intent = core::ComponentLifecycleIntentKindDTO;
   const core::ProviderManifestId manifest_id("manyforge.provider.native_control");
   const core::ProviderManifestRevision manifest_revision(Sha('1'));
-  const core::LifecyclePredicateDTO active{{State::kActive}, {}};
+  const core::LifecyclePredicateDTO active{
+      {State::kActive},
+      {{core::LifecycleFactId("native.test.ready"),
+        {core::LifecycleFactValueKindDTO::kBoolean, true, std::nullopt, std::nullopt}}}};
   const core::LifecyclePredicateDTO prepared{{State::kPrepared}, {}};
   const core::LifecyclePredicateDTO disabled{{State::kDisabled}, {}};
   const auto catalog = core::MakeBrandLifecyclePlanCatalog(
@@ -71,9 +76,14 @@ TEST(RetainedNativeCCLCRuntime, NativeAdapterOwnsProviderReadinessButNeverComman
   clock.set(100);
   // Route readiness is observed only; the adapter has no command-gate seam.
   bool route_open = true;
+  bool engine_available = true;
   const auto port = RetainedNativeBrandLifecyclePort::Create(
       occurrence, catalog.value(), clock, 1000,
-      [] { return core::Result<void>::Ok(); },
+      [&] {
+        return engine_available ? core::Result<void>::Ok()
+                                : core::Result<void>::Err(
+                                      {"native_engine_unavailable", "test source missing", {}});
+      },
       [&] { return core::Result<bool>::Ok(route_open); }, State::kActive);
   ASSERT_TRUE(port.ok()) << port.error().message;
   const core::BrandLifecycleObservationQueryDTO query{
@@ -94,9 +104,38 @@ TEST(RetainedNativeCCLCRuntime, NativeAdapterOwnsProviderReadinessButNeverComman
     return port.value()->Dispatch(request, std::stop_token{});
   };
 
+  for (int read = 0; read < 3; ++read) {
+    const auto health = port.value()->ReadLifecycleHealth(occurrence.control_domain_id, clock.now());
+    ASSERT_TRUE(health.ok()) << health.error().message;
+    EXPECT_EQ(health.value().observed_state, State::kActive);
+    ASSERT_EQ(health.value().facts.size(), 1U);
+    EXPECT_EQ(health.value().facts.front().lifecycle_fact_id,
+              core::LifecycleFactId("native.test.ready"));
+    EXPECT_EQ(health.value().facts.front().value.boolean_value, true);
+  }
+  EXPECT_FALSE(port.value()->ReadLifecycleHealth(core::ControlDomainId("foreign.domain"),
+                                                clock.now()).ok());
+  EXPECT_FALSE(port.value()->ReadLifecycleHealth(occurrence.control_domain_id, -1).ok());
   const auto first = port.value()->Observe(query);
   ASSERT_TRUE(first.ok()) << first.error().message;
   EXPECT_EQ(first.value().observed_state, State::kActive);
+  EXPECT_EQ(first.value().source_sequence, 1U);
+  const auto pure = port.value()->ReadLifecycleHealth(occurrence.control_domain_id, clock.now());
+  ASSERT_TRUE(pure.ok());
+  EXPECT_EQ(pure.value().observed_state, first.value().observed_state);
+  EXPECT_EQ(pure.value().facts, first.value().facts);
+  const auto after_reads = port.value()->Observe(query);
+  ASSERT_TRUE(after_reads.ok());
+  EXPECT_EQ(after_reads.value().source_sequence, first.value().source_sequence + 1U);
+  EXPECT_EQ(after_reads.value().observation_generation, first.value().observation_generation);
+
+  engine_available = false;
+  const auto missing_engine = port.value()->ReadLifecycleHealth(occurrence.control_domain_id,
+                                                               clock.now());
+  ASSERT_FALSE(missing_engine.ok());
+  EXPECT_EQ(missing_engine.error().code, "native_engine_unavailable");
+  EXPECT_FALSE(port.value()->Observe(query).ok());
+  engine_available = true;
   const auto stale = dispatch("native.control.disable", 2U);
   EXPECT_EQ(stale.dispatch_state, core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
 
@@ -142,6 +181,9 @@ TEST(RetainedNativeCCLCRuntime, NativeAdapterOwnsProviderReadinessButNeverComman
   // An Active provider without a current route is not an observation.
   route_open = false;
   EXPECT_FALSE(port.value()->Observe(query).ok());
+  const auto no_route = port.value()->ReadLifecycleHealth(occurrence.control_domain_id, clock.now());
+  ASSERT_FALSE(no_route.ok());
+  EXPECT_EQ(no_route.error().code, "native_brand_lifecycle_route_state_changed");
 
   const auto strict_restart = RetainedNativeBrandLifecyclePort::Create(
       occurrence, catalog.value(), clock, 1000,
@@ -246,14 +288,16 @@ struct RuntimeContext final {
 };
 
 [[nodiscard]] RuntimeContext
-make_runtime_context(const deployment::RetainedBundle &bundle) {
+make_runtime_context(
+    const deployment::RetainedBundle &bundle,
+    const core::CapabilityId &capability =
+        core::CapabilityId("execution.trajectory.execute")) {
   const auto &graph = bundle.value().cell_graph;
-  const core::CapabilityId trajectory_execute_capability_id(
-      "execution.trajectory.execute");
+  const bool motion = capability == core::CapabilityId("execution.trajectory.execute");
   const auto &binding = require_one(
-      graph.control_bindings, trajectory_execute_capability_id,
+      graph.control_bindings, capability,
       [](const auto &value) { return value.capability_id; },
-      "trajectory control binding");
+      "selected control binding");
   const auto &component = require_one(
       graph.controllable_components, binding.controllable_component_id,
       [](const auto &value) { return value.controllable_component_id; },
@@ -290,7 +334,8 @@ make_runtime_context(const deployment::RetainedBundle &bundle) {
     const auto &resource = binding.resource_bindings[index];
     const auto symbol = "joint_" + std::to_string(index + 1U);
     resources.push_back({resource.resource_role_id, resource.resource_id,
-                         symbol, symbol, core::CoordinateKind::kAngular});
+                         symbol, symbol, motion ? core::CoordinateKind::kAngular
+                                               : core::CoordinateKind::kLinear});
   }
   std::sort(resources.begin(), resources.end(),
             [](const auto &lhs, const auto &rhs) {
@@ -318,47 +363,51 @@ make_runtime_context(const deployment::RetainedBundle &bundle) {
   const core::RuntimeEpoch runtime_epoch(
       "epoch." + binding.provider_runtime_unit_id.value());
   const core::RuntimeEpoch provider_epoch("provider.epoch.native-cclc.1");
-  const core::CapabilityId joint_planning_capability_id(
-      "planning.motion.joint_goal");
-  const auto &planner = require_one(
-      bundle.value().capability_provider_bindings, joint_planning_capability_id,
-      [](const auto &value) { return value.capability_id; },
-      "joint planner provider");
-  std::set<core::RuntimeUnitId> planner_runtime_units;
-  for (const auto &endpoint : planner.endpoint_bindings) {
-    if (endpoint.source_kind !=
-        core::CapabilityEndpointSourceKind::kRuntimeUnit) {
-      continue;
-    }
-    const auto *runtime_unit =
-        std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
-    if (runtime_unit == nullptr) {
-      throw std::runtime_error("planner runtime endpoint is malformed");
-    }
-    planner_runtime_units.insert(*runtime_unit);
-  }
-  if (planner_runtime_units.size() != 1U) {
-    throw std::runtime_error("planner has no sole runtime unit");
-  }
-  const core::RuntimeCapabilityProviderPathDTO planner_path{
-      planner.capability_id,
-      planner.capability_definition_revision,
-      planner.capability_provider_binding_id,
-      planner.capability_provider_binding_revision,
-      planner.provider_instance_id,
-      planner.provider_manifest_id,
-      planner.provider_manifest_revision,
-      *planner_runtime_units.begin(),
-      core::RuntimeEpoch("provider.epoch.native-planner.1")};
   std::vector<core::RuntimeUnitEpochBindingDTO> runtime_unit_epochs{
       {binding.provider_runtime_unit_id, runtime_epoch}};
-  if (*planner_runtime_units.begin() != binding.provider_runtime_unit_id) {
-    runtime_unit_epochs.push_back(
-        {*planner_runtime_units.begin(), runtime_epoch});
-    std::sort(runtime_unit_epochs.begin(), runtime_unit_epochs.end(),
-              [](const auto &lhs, const auto &rhs) {
-                return lhs.runtime_unit_id < rhs.runtime_unit_id;
-              });
+  std::vector<core::RuntimeCapabilityProviderPathDTO> planner_paths;
+  if (motion) {
+    const core::CapabilityId joint_planning_capability_id(
+        "planning.motion.joint_goal");
+    const auto &planner = require_one(
+        bundle.value().capability_provider_bindings, joint_planning_capability_id,
+        [](const auto &value) { return value.capability_id; },
+        "joint planner provider");
+    std::set<core::RuntimeUnitId> planner_runtime_units;
+    for (const auto &endpoint : planner.endpoint_bindings) {
+      if (endpoint.source_kind !=
+          core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+        continue;
+      }
+      const auto *runtime_unit =
+          std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+      if (runtime_unit == nullptr) {
+        throw std::runtime_error("planner runtime endpoint is malformed");
+      }
+      planner_runtime_units.insert(*runtime_unit);
+    }
+    if (planner_runtime_units.size() != 1U) {
+      throw std::runtime_error("planner has no sole runtime unit");
+    }
+    const core::RuntimeCapabilityProviderPathDTO planner_path{
+        planner.capability_id,
+        planner.capability_definition_revision,
+        planner.capability_provider_binding_id,
+        planner.capability_provider_binding_revision,
+        planner.provider_instance_id,
+        planner.provider_manifest_id,
+        planner.provider_manifest_revision,
+        *planner_runtime_units.begin(),
+        core::RuntimeEpoch("provider.epoch.native-planner.1")};
+    planner_paths.push_back(planner_path);
+    if (*planner_runtime_units.begin() != binding.provider_runtime_unit_id) {
+      runtime_unit_epochs.push_back(
+          {*planner_runtime_units.begin(), runtime_epoch});
+      std::sort(runtime_unit_epochs.begin(), runtime_unit_epochs.end(),
+                [](const auto &lhs, const auto &rhs) {
+                  return lhs.runtime_unit_id < rhs.runtime_unit_id;
+                });
+    }
   }
   core::RuntimeParticipantBindingDTO candidate{
       core::ProgramId("native.cclc.readiness.program"),
@@ -405,7 +454,7 @@ make_runtime_context(const deployment::RetainedBundle &bundle) {
           binding.containment_granularity,
           std::nullopt},
       std::nullopt,
-      {planner_path},
+      std::move(planner_paths),
       std::move(runtime_unit_epochs),
       {}};
   auto sealed = core::verify_runtime_participant_binding(std::move(candidate));
@@ -418,6 +467,197 @@ make_runtime_context(const deployment::RetainedBundle &bundle) {
           &binding,
           &desired,
           provider_epoch};
+}
+
+[[nodiscard]] core::RuntimeRouteConfigurationReadbackDTO
+make_retained_plan_readback(const RuntimeContext &runtime) {
+  const auto &desired = *runtime.desired;
+  const auto &path = *runtime.binding.value().control_path;
+  core::ActiveControlConfigurationDTO active{
+      core::ActiveControlConfigurationId("existing.retained.route"),
+      desired.control_domain_id, desired.control_domain_revision, {},
+      desired.activation_set_id, desired.controller_topology_id,
+      desired.topology_revision, path.provider_runtime_unit_id,
+      path.provider_runtime_epoch, 9U, {},
+      core::ActiveControlConfigurationGeneration(17U),
+      core::ActiveControlConfigurationStateDTO::kReconciled};
+  for (const auto &route : desired.binding_routes)
+    active.binding_routes.push_back({route.control_binding_id,
+                                    route.control_binding_revision,
+                                    route.control_route_id});
+  return {std::move(active), {}, true};
+}
+
+TEST(RetainedNativeCCLCRuntime,
+     VerifiedEmptyCellRoutePortRefusesAnActualPhysicalConfiguration) {
+  const deployment::FilesystemCanonicalEmptyRetainedBundleSource empty_source(
+      std::filesystem::path(MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE_ROOT));
+  const auto empty = empty_source.load_verified();
+  auto port = MakeVerifiedEmptyCellRoutePublicationOwner(empty.retained_bundle());
+  ASSERT_TRUE(port.ok()) << port.error().message;
+
+  const auto populated = load_fixture_bundle(MANYFORGE_CCLC_READINESS_FIXTURE_ROOT);
+  const auto runtime = make_runtime_context(*populated);
+  const auto physical = make_retained_plan_readback(runtime).active_configuration;
+  const auto read = port.value()->ReadCurrentPhysicalParticipants(physical);
+  ASSERT_FALSE(read.ok());
+  EXPECT_EQ(read.error().code, "empty_cell_physical_route_unavailable");
+  EXPECT_EQ(read.error().details.at("effect"), "not_started");
+  const auto publish = port.value()->PublishAndReadBackRouteConfiguration(physical, {});
+  ASSERT_FALSE(publish.ok());
+  EXPECT_EQ(publish.error().code, "empty_cell_physical_route_unavailable");
+  EXPECT_FALSE(MakeVerifiedEmptyCellRoutePublicationOwner(*populated).ok());
+}
+
+TEST(RetainedNativeApplyPlanning, RetainedRouteIsExactCurrentFactBeforeAnyEffects) {
+  const auto bundle = load_fixture_bundle(MANYFORGE_CCLC_READINESS_FIXTURE_ROOT);
+  const auto runtime = make_runtime_context(*bundle);
+  const auto delta = deployment::derive_apply_component_delta(*bundle, *bundle);
+  const std::vector<core::RuntimeParticipantBinding> bindings{runtime.binding};
+  const std::vector<core::RuntimeRouteConfigurationReadbackDTO> current{
+      make_retained_plan_readback(runtime)};
+  const core::NamedApplyPublicationTransactionDTO apply{
+      core::ApplyId("pre-effect.retained"), core::ApplyGeneration(3U)};
+  const auto result = DeriveRetainedNativeApplyPlanRequest(
+      apply, *bundle, bundle.get(), delta, bindings, current);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().apply, apply);
+  EXPECT_EQ(result.value().candidate_retained_bundle_id, bundle->retained_bundle_id());
+  EXPECT_EQ(result.value().candidate_graph_revision, bundle->value().cell_graph.graph_revision);
+  EXPECT_EQ(result.value().components,
+            std::vector<core::ControllableComponentId>{runtime.component->controllable_component_id});
+  EXPECT_EQ(result.value().retained_components, result.value().components);
+  EXPECT_TRUE(result.value().removed_components.empty());
+  EXPECT_TRUE(result.value().removed_domains.empty());
+  ASSERT_EQ(result.value().compiled_routes.size(), 1U);
+  EXPECT_EQ(result.value().compiled_routes.front().control_domain_id, runtime.domain->control_domain_id);
+  EXPECT_EQ(result.value().compiled_routes.front().generation,
+            runtime.binding.value().control_path->active_control_configuration_generation);
+  EXPECT_EQ(result.value().retained_routes,
+            std::vector<core::ActiveControlConfigurationDTO>{current.front().active_configuration});
+  EXPECT_NE(result.value().retained_routes.front().active_control_configuration_generation,
+            result.value().compiled_routes.front().generation);
+  EXPECT_EQ(result.value().changed_component_state, core::ComponentLifecycleStateDTO::kActive);
+  // The helper has no Kernel, journal, controller, readiness or install port.
+  EXPECT_EQ(bindings.front().value(), runtime.binding.value());
+  EXPECT_EQ(current.front(), make_retained_plan_readback(runtime));
+}
+
+TEST(RetainedNativeApplyPlanning, InitialAdditionContainsOnlyPlannedCandidateValues) {
+  const auto bundle = load_fixture_bundle(MANYFORGE_CCLC_READINESS_FIXTURE_ROOT);
+  const auto runtime = make_runtime_context(*bundle);
+  auto delta = deployment::derive_apply_component_delta(*bundle, *bundle);
+  for (auto &row : delta.components) {
+    row.disposition = deployment::ApplyComponentDisposition::kAdd;
+    row.predecessor_runtime_identity.reset();
+    row.predecessor_domains.clear();
+  }
+  ASSERT_TRUE(delta.valid());
+  const std::vector<core::RuntimeParticipantBinding> bindings{runtime.binding};
+  const auto result = DeriveRetainedNativeApplyPlanRequest(
+      {core::ApplyId("pre-effect.add"), core::ApplyGeneration(4U)},
+      *bundle, nullptr, delta, bindings, {}, core::ComponentLifecycleStateDTO::kDeclared);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().components,
+            std::vector<core::ControllableComponentId>{runtime.component->controllable_component_id});
+  EXPECT_TRUE(result.value().retained_components.empty());
+  EXPECT_TRUE(result.value().retained_routes.empty());
+  EXPECT_TRUE(result.value().removed_components.empty());
+  EXPECT_TRUE(result.value().removed_domains.empty());
+  ASSERT_EQ(result.value().compiled_routes.size(), 1U);
+  EXPECT_EQ(result.value().compiled_routes.front().generation,
+            runtime.binding.value().control_path->active_control_configuration_generation);
+  EXPECT_EQ(result.value().changed_component_state, core::ComponentLifecycleStateDTO::kDeclared);
+}
+
+TEST(RetainedNativeApplyPlanning, ReplaceMembershipPrecedesOutgoingAvailabilityLoss) {
+  const auto predecessor = load_fixture_bundle(MANYFORGE_I6_NATIVE_FIXTURE_ROOT);
+  const auto candidate = load_fixture_bundle(MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT);
+  ASSERT_EQ(predecessor->value().cell_graph.cell_id, candidate->value().cell_graph.cell_id);
+  ASSERT_TRUE(deployment::verify_retained_bundle_identity(*predecessor));
+  ASSERT_TRUE(deployment::verify_retained_bundle_identity(*candidate));
+  const auto arm = make_runtime_context(*candidate);
+  const auto gripper = make_runtime_context(*candidate, core::CapabilityId("tool.gripper.command"));
+  const auto delta = deployment::derive_apply_component_delta(*predecessor, *candidate);
+  std::vector<core::ControllableComponentId> replaced;
+  for (const auto &row : delta.components) {
+    ASSERT_NE(row.disposition, deployment::ApplyComponentDisposition::kRemove);
+    if (row.disposition == deployment::ApplyComponentDisposition::kReplace)
+      replaced.push_back(row.controllable_component_id);
+  }
+  ASSERT_EQ(replaced, std::vector<core::ControllableComponentId>{arm.component->controllable_component_id});
+  const std::vector<core::RuntimeParticipantBinding> bindings{arm.binding, gripper.binding};
+  const auto result = DeriveRetainedNativeApplyPlanRequest(
+      {core::ApplyId("pre-effect.replace"), core::ApplyGeneration(5U)},
+      *candidate, predecessor.get(), delta, bindings, {},
+      core::ComponentLifecycleStateDTO::kDeclared);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().components, replaced);
+  EXPECT_TRUE(result.value().removed_components.empty());
+  EXPECT_TRUE(result.value().removed_domains.empty());
+  EXPECT_TRUE(result.value().retained_components.empty());
+  EXPECT_TRUE(result.value().retained_routes.empty());
+  ASSERT_EQ(result.value().compiled_routes.size(), 2U);
+  for (const auto &route : result.value().compiled_routes) {
+    const auto physical = std::find_if(bindings.begin(), bindings.end(), [&](const auto &binding) {
+      return binding.value().control_path->control_domain_id == route.control_domain_id;
+    });
+    ASSERT_NE(physical, bindings.end());
+    EXPECT_EQ(route.generation, physical->value().control_path->active_control_configuration_generation);
+  }
+  EXPECT_EQ(result.value().candidate_retained_bundle_id, candidate->retained_bundle_id());
+  EXPECT_EQ(result.value().changed_component_state, core::ComponentLifecycleStateDTO::kDeclared);
+  // No installed composition or retiring controller is needed to make this
+  // exact replacement membership visible. This pair has no removal coverage.
+}
+
+TEST(RetainedNativeApplyPlanning, ForeignCandidateDomainGenerationAndReadbackJoinsRefuse) {
+  const auto bundle = load_fixture_bundle(MANYFORGE_CCLC_READINESS_FIXTURE_ROOT);
+  const auto runtime = make_runtime_context(*bundle);
+  const auto delta = deployment::derive_apply_component_delta(*bundle, *bundle);
+  const core::NamedApplyPublicationTransactionDTO apply{
+      core::ApplyId("pre-effect.foreign"), core::ApplyGeneration(6U)};
+  const std::vector<core::RuntimeParticipantBinding> bindings{runtime.binding};
+  const std::vector<core::RuntimeRouteConfigurationReadbackDTO> current{
+      make_retained_plan_readback(runtime)};
+  const auto reject_binding = [&](const auto &mutate) {
+    auto value = runtime.binding.value();
+    mutate(value);
+    auto verified = core::verify_runtime_participant_binding(std::move(value));
+    ASSERT_TRUE(verified.ok()) << verified.error().message;
+    const std::vector<core::RuntimeParticipantBinding> foreign{std::move(verified.value())};
+    EXPECT_FALSE(DeriveRetainedNativeApplyPlanRequest(apply, *bundle, bundle.get(),
+                                                     delta, foreign, current).ok());
+  };
+  reject_binding([](auto &value) { value.retained_bundle_id = core::RetainedBundleId(Sha('1')); });
+  reject_binding([](auto &value) { value.graph_revision = core::GraphRevision(Sha('2')); });
+  reject_binding([](auto &value) { value.control_path->control_domain_revision = core::ControlDomainRevision(Sha('3')); });
+  reject_binding([](auto &value) {
+    value.control_path->active_control_configuration_generation =
+        core::ActiveControlConfigurationGeneration(std::numeric_limits<std::uint64_t>::max());
+  });
+  EXPECT_FALSE(DeriveRetainedNativeApplyPlanRequest(apply, *bundle, bundle.get(),
+                                                   delta, {}, current).ok());
+  auto duplicate = bindings;
+  duplicate.push_back(runtime.binding);
+  EXPECT_FALSE(DeriveRetainedNativeApplyPlanRequest(apply, *bundle, bundle.get(),
+                                                   delta, duplicate, current).ok());
+  const auto reject_current = [&](const auto &mutate) {
+    auto foreign = current;
+    mutate(foreign.front());
+    EXPECT_FALSE(DeriveRetainedNativeApplyPlanRequest(apply, *bundle, bundle.get(),
+                                                     delta, bindings, foreign).ok());
+  };
+  reject_current([](auto &value) { value.operation_admission_open = false; });
+  reject_current([](auto &value) { value.active_configuration.control_domain_id = core::ControlDomainId("foreign-domain"); });
+  reject_current([](auto &value) { value.active_configuration.binding_routes.front().control_route_id = core::ControlRouteId("foreign-route"); });
+  reject_current([](auto &value) { value.active_configuration.active_control_configuration_generation = core::ActiveControlConfigurationGeneration(0U); });
+  auto foreign_delta = delta;
+  foreign_delta.shared_scene_projection_changed = !foreign_delta.shared_scene_projection_changed;
+  EXPECT_FALSE(DeriveRetainedNativeApplyPlanRequest(apply, *bundle, bundle.get(),
+                                                   foreign_delta, bindings, current).ok());
+  EXPECT_FALSE(DeriveRetainedNativeApplyPlanRequest(apply, *bundle, bundle.get(),
+      delta, bindings, current, core::ComponentLifecycleStateDTO::kDisabled).ok());
 }
 
 [[nodiscard]] core::BrandLifecyclePlanCatalogDTO

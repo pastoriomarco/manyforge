@@ -220,35 +220,6 @@ def gen_headless_rest_api() -> str:
         "one exact installed NodeEnvironment and requires ordinary Program/Binding "
         "validation before any subsequent execution.\n\n"
     )
-    from manyforge_headless_api.models import GripperConfirmationRequest
-
-    body.extend(
-        [
-            "## Explicit operator gripper confirmation\n\n",
-            "Submit `gripper_confirm` once through `/api/control/commands` or the "
-            "same control WebSocket. Read a current `/api/control/state` freshness "
-            "context and the native execution owner epoch first. The payload uses "
-            "the DTO below plus `expected_execution_owner_epoch`. The transport "
-            "retains `request_context.request_id` but replaces its owner/source "
-            "attribution from the admitted envelope. No caller timestamp, validity "
-            "duration, sensor source or automatic retry is accepted.\n\n",
-            "This requires an explicitly qualified retained "
-            "`tool.gripper.confirmation.operator` binding and configured validity; "
-            "maintained defaults do not enable it. It records an attributed "
-            "operator statement for one completed command, not sensor proof or "
-            "attachment permission. Query `gripper_confirmation` at the existing "
-            "target-observation endpoint; expired evidence is trace only. Program "
-            "`gripper.wait_for_status` consumes the same current evidence.\n\n",
-            "The result carries native confirmation evidence and `history_recorded`. "
-            "That flag means both bounded History submissions were queued, not "
-            "synchronous disk durability. A History failure cannot change native "
-            "acceptance; a lost reply remains unconfirmed and must not be resent "
-            "as a new physical action.\n\n",
-            "```json\n",
-            json.dumps(GripperConfirmationRequest.model_json_schema(), indent=2, sort_keys=True),
-            "\n```\n\n",
-        ]
-    )
     _append_openapi_routes(body, spec)
     return "".join(body)
 

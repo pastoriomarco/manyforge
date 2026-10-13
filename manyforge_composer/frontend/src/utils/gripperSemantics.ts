@@ -15,7 +15,6 @@ const TOKEN_LABELS: Record<string, string> = {
   request_ack_then_dwell: 'Request ack then dwell',
   open_loop_immediate: 'Open-loop immediate',
   none_open_loop: 'None, open loop',
-  operator_confirm: 'Operator confirm',
   discrete_signal: 'Discrete signal',
   perception: 'Perception',
   force_or_current: 'Force/current',

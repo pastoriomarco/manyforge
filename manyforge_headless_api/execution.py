@@ -21,9 +21,6 @@ from .models import (
     MAX_IDENTITY_BYTES,
     FullStopIntentRequest,
     GripperFeedbackObservation,
-    GripperConfirmationRequest,
-    GripperGraspEvidenceObservation,
-    GripperConfirmationStatusObservation,
     OperationControlRequest,
     OperationRecoveryActionRequest,
     OperationIntentRequest,
@@ -181,16 +178,6 @@ CAPABILITY_COMMAND_PREVIEW_RECEIPT_KEYS = frozenset(
 
 
 class ExecutionPort(Protocol):
-    def confirm_grasp(
-        self,
-        request: GripperConfirmationRequest,
-        *,
-        trusted_principal_id: str | None,
-        origin_epoch: str,
-        received_monotonic_ns: int,
-        valid_until_monotonic_ns: int,
-    ) -> dict[str, Any]: ...
-
     def diagnostics(self) -> dict[str, Any]: ...
 
     def identity(self) -> dict[str, Any]: ...
@@ -961,82 +948,6 @@ class ExecutionCommandClient:
             )
         return response
 
-    def confirm_grasp(
-        self,
-        request: GripperConfirmationRequest,
-        *,
-        trusted_principal_id: str | None,
-        origin_epoch: str,
-        received_monotonic_ns: int,
-        valid_until_monotonic_ns: int,
-    ) -> dict[str, Any]:
-        response = self.require_success(
-            self._exchange(
-                {
-                    "api_version": EXECUTION_COMMAND_VERSION,
-                    "command": "gripper_confirm",
-                    "request": request.model_dump(mode="json"),
-                    "attribution": self._request_attribution(trusted_principal_id),
-                    "origin_epoch": origin_epoch,
-                    "received_monotonic_ns": nonnegative_int64_value(
-                        received_monotonic_ns
-                    ),
-                    "valid_until_monotonic_ns": nonnegative_int64_value(
-                        valid_until_monotonic_ns
-                    ),
-                }
-            )
-        )
-        confirmation = response.get("confirmation")
-        try:
-            evidence = GripperGraspEvidenceObservation.model_validate(confirmation)
-        except ValueError as error:
-            raise HeadlessApiError(
-                "grasp_confirmation_response_invalid",
-                "native confirmation omitted exact qualified-source evidence",
-            ) from error
-        observation_id = (
-            "sha256:"
-            + hashlib.sha256(
-                rfc8785.dumps(
-                    [
-                        origin_epoch,
-                        request.request_context.request_id,
-                    ]
-                )
-            ).hexdigest()
-        )
-        if (
-            set(response)
-            != {
-                "api_version",
-                "command",
-                "ok",
-                "confirmation",
-                "owner_epoch",
-                "program_binding_id",
-                "target_role_id",
-            }
-            or response.get("api_version") != EXECUTION_RESPONSE_VERSION
-            or response.get("command") != "gripper_confirm"
-            or response.get("owner_epoch")
-            != request.request_context.request_owner_epoch
-            or response.get("program_binding_id") != request.program_binding_id
-            or response.get("target_role_id") != request.target_role_id
-            or not isinstance(confirmation, dict)
-            or evidence.observation_id != observation_id
-            or evidence.attribution != request.request_context.source_label
-            or evidence.observed_at_ns > received_monotonic_ns
-            or confirmation.get("command_id") != request.command_id
-            or confirmation.get("generation") != request.generation
-            or confirmation.get("confirmed") is not request.confirmed
-        ):
-            raise HeadlessApiError(
-                "grasp_confirmation_response_invalid",
-                "native confirmation did not identify the requested observation",
-            )
-        return response
-
     def query_target(self, request: TargetObservationQuery) -> dict[str, Any]:
         response = self.require_success(
             self._exchange(
@@ -1088,25 +999,6 @@ class ExecutionCommandClient:
                     raise ValueError(
                         "native frame orientation is not a unit quaternion"
                     )
-            elif request.kind == "gripper_confirmation":
-                status = GripperConfirmationStatusObservation.model_validate(
-                    observation["value"]
-                )
-                if (
-                    observation["source_epoch"] != status.source_epoch
-                    or observation["source_sequence"] != status.revision
-                ):
-                    raise ValueError("confirmation read changed its source revision")
-                if status.grasp_confirmed is not None:
-                    evidence = status.evidence
-                    # This private owner and Headless share the host monotonic
-                    # clock. A delayed sample is not current grasp evidence.
-                    if not (
-                        evidence.observed_at_ns
-                        <= time.monotonic_ns()
-                        < evidence.expires_at_ns
-                    ):
-                        raise ValueError("confirmation expired before receipt")
             else:
                 GripperFeedbackObservation.model_validate(observation["value"])
         except ValueError as error:

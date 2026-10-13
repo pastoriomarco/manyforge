@@ -7,6 +7,7 @@ import argparse
 import base64
 import copy
 import json
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -43,6 +44,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--runtime-identity", action="store_true")
     parser.add_argument("--no-program", action="store_true")
     parser.add_argument("--ros2-control", action="store_true")
+    parser.add_argument("--manager-ros-apply-fixture-root", type=Path)
     return parser.parse_args()
 
 
@@ -1075,8 +1077,8 @@ def _check_ros_preparation(
                                            label="shared-world test URDF")
         assert b'<link name="world"' in urdf
     _run(args, repeated_world_request, root / "ros-repeated-shared-world")
-    # The cell-wide cadence agreement is unchanged: a mismatched cadence is
-    # still refused.
+    # Components sharing the one ROS execution host must agree on its
+    # execution_tick_hz; this checks host cadence, not linked activation.
     mismatched = copy.deepcopy(two_profiles)
     for component in mismatched["deployment_draft"]["components"]:
         if component["component_id"] == "isaac_lite6_robot":
@@ -1096,10 +1098,208 @@ def _check_ros_preparation(
              expect_error="must be one ROS name token")
 
 
+def _write_manager_ros_apply_fixture(
+    args: argparse.Namespace, request: dict[str, object]
+) -> None:
+    """Materialize the existing one-Mock Scenario through the production tool."""
+    components = request["deployment"]["components"]
+    if len(components) != 1:
+        raise AssertionError("Manager ROS fixture requires exactly one component")
+    configuration = components[0]["configuration"]
+    if (
+        configuration["runtime_kind"] != "ros2_control"
+        or "mock_profile" not in configuration["runtime_configuration"]
+        or request["deployment"].get("isaac_world") is not None
+    ):
+        raise AssertionError("Manager ROS fixture must use Mock ROS without a world")
+    # This is the real runtime cell requested by the test, not a retained ID,
+    # catalog seal, generation, owner epoch, or readiness observation.
+    request["runtime_cell_id"] = "manager_ros_apply_fixture"
+    root = args.manager_ros_apply_fixture_root.resolve()
+    root.parent.mkdir(parents=True, exist_ok=True)
+    prepared = _run(args, request, root, publish_canonical_empty=True, reuse_root=True)
+    bundle = prepared["activation_payload"]["retained_bundle"]
+    graph = bundle["cell_graph"]
+    units = graph["runtime_units"]
+    if len(units) != 1 or units[0]["runtime_profile_id"] != (
+        "manyforge.ros2_control_execution_runtime"
+    ):
+        raise AssertionError("Manager fixture did not compile the real ROS runtime")
+    admission_filename = f"canonical-empty-admission.{graph['cell_id']}.json"
+    admission = json.loads((root / "activation" / admission_filename).read_bytes())
+    empty = json.loads((root / "activation" / "retained-bundles" / "sha256" /
+        f"{admission['retained_bundle_id'].removeprefix('sha256:')}.json").read_bytes())
+    if empty["cell_graph"]["controllable_components"] or (
+        empty["cell_graph"]["runtime_units"][0]["runtime_profile_id"] !=
+        "manyforge.ros2_control_execution_runtime"
+    ):
+        raise AssertionError("Manager fixture predecessor must be genuinely empty ROS")
+    metadata = {
+        "admission_filename": admission_filename,
+        "candidate_retained_bundle_id": bundle["retained_bundle_id"],
+        "cell_id": graph["cell_id"],
+        "component_id": components[0]["component_id"],
+        "deployment_artifact_id": bundle["deployment_artifact_id"],
+        "deployment_revision": bundle["deployment_revision"],
+        "prepared_activation_id": prepared["prepared_activation_id"],
+        "predecessor_graph_revision": empty["cell_graph"]["graph_revision"],
+        "predecessor_retained_bundle_id": admission["retained_bundle_id"],
+    }
+    (root / "metadata.json").write_bytes(canonical_json_bytes(metadata))
+
+
+
+def _observe_manager_ros() -> int:
+    """Read actual CM/JSB facts for the existing Manager process fixture."""
+    import math
+    import socket
+    import time
+    import yaml
+    import rclpy
+    from controller_manager_msgs.srv import ListControllers
+    from sensor_msgs.msg import JointState
+    from rclpy.qos import qos_profile_sensor_data
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--execution-root", required=True, type=Path)
+    parser.add_argument("--component", required=True)
+    parser.add_argument("--state", choices=("inactive", "active"), required=True)
+    parser.add_argument("--label", required=True)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args(sys.argv[2:])
+    records = [json.loads(p.read_bytes()) for p in
+               (args.execution_root / "controller-launch-artifacts").rglob("controller_launch_artifacts.json")]
+    records = [row for row in records if row["controllable_component_id"] == args.component]
+    if len(records) != 1 or records[0]["lane"] != "mock":
+        raise AssertionError("Expected exactly one actual Mock launch artifact")
+    artifact = records[0]
+    launch = dict(value.split(":=", 1) for value in artifact["launch_arguments"])
+    namespace = launch["runtime_namespace"].rstrip("/")
+    arm, gripper = launch["arm_controller_name"], launch["gripper_controller_name"]
+    yaml_bytes = Path(artifact["controllers_file"]).read_bytes()
+    if raw_sha256_digest(yaml_bytes) != artifact["controllers_sha256"]:
+        raise AssertionError("Actual controllers YAML does not match its writing receipt")
+    configuration = yaml.safe_load(yaml_bytes)
+    joint = configuration[f"/**/{gripper}"]["ros__parameters"]["joint"]
+
+    def command(payload: dict[str, object], *, allow_refusal: bool = False) -> dict[str, object]:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+            connection.settimeout(5.0)
+            connection.connect(str(args.execution_root / "execution-command.sock"))
+            connection.sendall(canonical_json_bytes(payload))
+            data, _, flags, _ = connection.recvmsg(8 * 1024 * 1024)
+            if not data or flags & socket.MSG_TRUNC:
+                raise AssertionError("Execution response exceeds fixture bound or is empty")
+        response = json.loads(data)
+        if not allow_refusal and not response["ok"]:
+            raise AssertionError(response)
+        return response
+
+    # This is the actual installed compiled target, including model source name.
+    status = command({"api_version": "manyforge.execution_command.v1", "command": "targets"})
+    components = [row for row in status["targets"]["components"]
+                  if row["controllable_component_id"] == args.component]
+    if len(components) != 1:
+        raise AssertionError("Installed target component differs from launch artifact")
+    targets = [row for row in components[0]["targets"] if row["presentation"] == "gripper"]
+    if len(targets) != 1:
+        raise AssertionError("Expected one actual installed model-backed gripper target")
+    target, direct = targets[0], targets[0]["command"]
+    if direct["resource"]["source_kind"] != "model_role" or direct["resource"]["source_coordinate_name"] != joint:
+        raise AssertionError("Generated gripper joint differs from actual retained model binding")
+
+    rclpy.init()
+    node = rclpy.create_node("manyforge_manager_fixture_observation")
+    deadline = time.monotonic() + 8.0
+    sample = None
+    topic = None
+    subscription = None
+    rows = None
+    try:
+        client = node.create_client(ListControllers, namespace + "/" + launch["controller_manager_name"] + "/list_controllers")
+        while time.monotonic() < deadline:
+            if not client.wait_for_service(timeout_sec=min(0.1, max(0.0, deadline - time.monotonic()))):
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+            future = client.call_async(ListControllers.Request())
+            rclpy.spin_until_future_complete(node, future, timeout_sec=max(0.0, deadline - time.monotonic()))
+            if not future.done() or future.result() is None:
+                break
+            rows = {row.name: {"state": row.state, "type": row.type} for row in future.result().controller}
+            broadcasters = [name for name, row in rows.items() if row["type"] == "joint_state_broadcaster/JointStateBroadcaster" and row["state"] == "active"]
+            if rows.get(arm, {}).get("state") != args.state or rows.get(gripper, {}).get("state") != args.state or len(broadcasters) != 1:
+                rclpy.spin_once(node, timeout_sec=0.05)
+                # spin_once may return immediately; failed observations need a real pause.
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+            if subscription is None:
+                topics = [name for name, types in node.get_topic_names_and_types()
+                          if "sensor_msgs/msg/JointState" in types and any(
+                              info.node_name == broadcasters[0] and info.node_namespace.rstrip("/") == namespace
+                              for info in node.get_publishers_info_by_topic(name))]
+                if len(topics) != 1:
+                    rclpy.spin_once(node, timeout_sec=0.05)
+                    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                    continue
+                topic = topics[0]
+                started_ns = node.get_clock().now().nanoseconds
+
+                def receive(message: JointState) -> None:
+                    nonlocal sample
+                    stamp_ns = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+                    now_ns = node.get_clock().now().nanoseconds
+                    if message.name.count(joint) == 1:
+                        index = message.name.index(joint)
+                        if index < len(message.position) and math.isfinite(message.position[index]) and started_ns <= stamp_ns <= now_ns and now_ns - stamp_ns <= 1_000_000_000:
+                            sample = {"joint": joint, "position": message.position[index], "stamp_ns": stamp_ns, "received_ns": now_ns}
+                subscription = node.create_subscription(JointState, topic, receive, qos_profile_sensor_data)
+            rclpy.spin_once(node, timeout_sec=0.05)
+            if sample is not None and node.get_clock().now().nanoseconds - sample["stamp_ns"] <= 1_000_000_000:
+                break
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        if rows is None or rows.get(arm, {}).get("state") != args.state or rows.get(gripper, {}).get("state") != args.state or len(broadcasters) != 1 or sample is None or not 0 <= node.get_clock().now().nanoseconds - sample["stamp_ns"] <= 1_000_000_000:
+            raise AssertionError({"expected_state": args.state, "controllers": rows, "topic": topic, "fresh_gripper_sample": sample})
+        evidence = {"label": args.label, "controller_manager": namespace + "/" + launch["controller_manager_name"],
+                    "arm_controller": arm, "gripper_controller": gripper, "controllers": rows,
+                    "joint_state_topic": topic, "fresh_gripper_sample": {**sample, "stamp_ns": str(sample["stamp_ns"]), "received_ns": str(sample["received_ns"])},
+                    "controllers_sha256": artifact["controllers_sha256"]}
+        if args.state == "inactive":
+            # Same production intrinsic manual producer as test_native_execution_path.
+            identity, manual = status["identity"], direct["manual_control"]
+            kind = direct["resource"]["coordinate_kind"]
+            position = {"kind": kind, "value_rad" if kind == "angular_rad" else "value_m": sample["position"]}
+            operation = {"request_context": {"request_id": "empty-ros-one-mock." + args.label + ".gripper", "request_owner_epoch": identity["owner_epoch"], "source_label": "manager_ros_apply_fixture", "correlation_id": None},
+                         **{key: manual[key] for key in ("program_id", "program_revision", "program_binding_id", "program_run_id")},
+                         "expected_graph_revision": identity["graph_revision"], "expected_retained_bundle_id": identity["retained_bundle_id"], "expected_scene_revision": identity["scene_revision"],
+                         "participants": [{"component_role_id": direct["component_role_id"], "target_role_id": direct["target_role_id"], "required_capability_id": target["operation_capability_id"], "action_span": None,
+                                           "payload": {"kind": "capability_command", "command_schema_id": direct["command_schema_id"], "command_schema_revision": direct["command_schema_revision"],
+                                                       "command_value": {"kind": "gripper_position", "position": position, "max_effort": None}, "completion_timeout_s": 2.0,
+                                                       "caller_options": [{"option_id": "command_duration_s", "value_s": 0.5}]}}], "coordination_policy": "independent"}
+            envelope = {"api_version": "manyforge.execution_command.v1", "command": "submit", "operation": operation,
+                        "attribution": {"assurance": "unverified", "principal_id": None, "transport": "http"}}
+            refusal = command(envelope, allow_refusal=True)
+            # Existing Kernel checks route publication/readback before component eligibility.
+            # Declared/no-W and Disabled must refuse through one of those actual gates.
+            closed_admission_reasons = {"runtime_route_publication_required", "runtime_route_configuration_not_ready", "component_command_not_eligible"}
+            if refusal["ok"] or refusal["error"]["details"].get("reason") not in closed_admission_reasons:
+                raise AssertionError(refusal)
+            evidence["gripper_submit_refusal"] = refusal
+        args.output.write_bytes(canonical_json_bytes(evidence))
+        print(json.dumps(evidence, sort_keys=True))
+        return 0
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--observe-manager-ros":
+        return _observe_manager_ros()
     args = _arguments()
     workspace = args.workspace.resolve()
     scenario_path, document, request = _scenario_request(workspace, args.scenario)
+    if args.manager_ros_apply_fixture_root is not None:
+        _write_manager_ros_apply_fixture(args, request)
+        return 0
     with tempfile.TemporaryDirectory(prefix="manyforge-prepare-test-") as raw:
         temporary = Path(raw)
         if args.ros2_control:

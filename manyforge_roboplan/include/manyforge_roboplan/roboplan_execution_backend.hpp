@@ -76,9 +76,6 @@ public:
   core::PrepareParticipantResultDTO
   Prepare(const core::PreparedOperationParticipantDTO &participant,
           std::uint64_t execution_id) override;
-  core::Result<void> BindPreparedExecutionClock(
-      const core::PreparedOperationParticipantDTO &participant,
-      std::shared_ptr<core::detail::CoordinatedExecutionClock> clock) override;
   core::Result<void>
   RetirePreparedExecution(std::uint64_t execution_id) override;
   core::ExecutionHandle
@@ -208,13 +205,7 @@ private:
                               SceneUpdateMode mode = SceneUpdateMode::kBlocking,
                               std::int64_t source_timestamp_ns = 0);
   void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory,
-                        std::uint64_t execution_generation,
-                        std::shared_ptr<core::detail::CoordinatedExecutionClock> common_clock,
-                        core::OperationParticipantId participant_id);
-  core::ExecutionHandle execute_with_clock(
-      const core::TrajectoryDTO &trajectory,
-      std::shared_ptr<core::detail::CoordinatedExecutionClock> common_clock,
-      core::OperationParticipantId participant_id);
+                        std::uint64_t execution_generation);
   void request_execution_worker_stop() noexcept;
   bool issue_software_hard_stop(
       std::optional<std::uint64_t> expected_execution = std::nullopt) noexcept;
@@ -236,7 +227,7 @@ private:
   void request_active_controlled_stop();
   void observe_stop_qualification(detail::NativeStopQualificationEvent event,
                                   std::string_view detail = {});
-  std::optional<std::int64_t> begin_controlled_stop_runtime_scale_freeze();
+  void begin_controlled_stop_runtime_scale_freeze();
   bool end_controlled_stop_runtime_scale_freeze();
   void record_scene_projection_success(std::int64_t source_timestamp_ns);
   void record_scene_projection_miss();
@@ -275,7 +266,6 @@ private:
 
   mutable std::mutex execution_mutex_;
   mutable std::mutex state_mutex_;
-  std::condition_variable_any stop_snapshot_cv_;
   // On-demand observations of the native scaler itself, independent of the
   // motion stream (which has no ticks while idle).
   mutable std::uint64_t runtime_scale_observation_sequence_{};
@@ -296,9 +286,6 @@ private:
   // pairs with memory_order_acquire on the worker's per-tick read.
   std::atomic<double> runtime_velocity_scale_{1.0};
   mutable std::mutex runtime_velocity_scale_mutex_;
-  // Guarded by runtime_velocity_scale_mutex_, not prepared membership.
-  std::shared_ptr<core::detail::CoordinatedExecutionClock>
-      active_execution_clock_;
   int controlled_stop_runtime_scale_freeze_depth_ = 0;
   std::optional<double> deferred_runtime_velocity_scale_;
   std::atomic<std::uint64_t> scene_projection_misses_total_{0};
@@ -350,7 +337,6 @@ private:
   mutable std::mutex prepared_execution_mutex_;
   core::PreparedExecutionMembership prepared_membership_;
   std::optional<PreparedGoalRecord> prepared_goal_;
-  std::shared_ptr<core::detail::CoordinatedExecutionClock> prepared_execution_clock_;
   std::jthread terminal_scene_projection_retry_thread_;
 
   friend class detail::NativeStopQualificationAccess;

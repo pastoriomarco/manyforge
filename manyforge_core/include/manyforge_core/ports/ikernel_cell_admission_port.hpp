@@ -8,6 +8,7 @@
 namespace manyforge::core {
 
 struct ActiveControlConfigurationDTO;
+struct SelectedComponentBringUpOfferDTO;
 
 class IKernelCellAdmissionPort {
  public:
@@ -16,13 +17,11 @@ class IKernelCellAdmissionPort {
   [[nodiscard]] virtual AuthoringAdmissionDTO GetAuthoringAdmission() const = 0;
   [[nodiscard]] virtual Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
       const CellAdmissionReadinessSnapshotDTO& snapshot) = 0;
-  [[nodiscard]] virtual Result<void> Publish(
-      const ManagerLivenessObservationDTO& observation) {
+  [[nodiscard]] virtual Result<void> Publish(const ManagerLivenessObservationDTO& observation) {
     static_cast<void>(observation);
-    return Result<void>::Err(
-        ErrorDTO{"cell_admission_liveness_publication_unsupported",
-                 "Kernel cell-admission liveness publication is unsupported",
-                 {}});
+    return Result<void>::Err(ErrorDTO{"cell_admission_liveness_publication_unsupported",
+                                      "Kernel cell-admission liveness publication is unsupported",
+                                      {}});
   }
   /// Headless Alarm Lifecycle Owner publication of its generation-fenced
   /// motion-attention projection. Only the Kernel evaluates it at admission.
@@ -58,19 +57,26 @@ class IKernelCellAdmissionPort {
                  "Kernel route recovery admission is unavailable",
                  {{"reason", "route_recovery_admission_unsupported"}}});
   }
+  /// Private effectful selected-component admission. Ordinary wire acquisition
+  /// never exposes this entry or treats an observation-only route as a permit.
+  [[nodiscard]] virtual Result<CellAdmissionClaimDTO> AcquireSelectedComponentBringUpClaim(
+      const CellAdmissionClaimIntentDTO&, const SelectedComponentBringUpOfferDTO&) {
+    return Result<CellAdmissionClaimDTO>::Err(
+        ErrorDTO{"invalid_request",
+                 "Kernel selected bring-up admission is unavailable",
+                 {{"reason", "selected_bring_up_admission_unsupported"}}});
+  }
   [[nodiscard]] virtual Result<AuthoringAdmissionDTO> ReleaseCellAdmissionClaim(
       const CellAdmissionClaimReleaseDTO& release) = 0;
   [[nodiscard]] virtual Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
       const CellAdmissionReconcileDTO& reconcile) = 0;
-  [[nodiscard]] virtual Result<CellAdmissionRecoveryReceiptDTO>
-  GetCellAdmissionRecoveryReceipt(
+  [[nodiscard]] virtual Result<CellAdmissionRecoveryReceiptDTO> GetCellAdmissionRecoveryReceipt(
       const CellAdmissionRecoveryReceiptQueryDTO& query) const = 0;
   [[nodiscard]] virtual Result<void> ValidateProgramResetSceneAuthorization(
       const ProgramResetSceneAuthorizationDTO& authorization) const {
     static_cast<void>(authorization);
     return Result<void>::Err(
-        ErrorDTO{"authoring_not_ready",
-                 "Program Reset scene authorization is unsupported", {}});
+        ErrorDTO{"authoring_not_ready", "Program Reset scene authorization is unsupported", {}});
   }
 };
 

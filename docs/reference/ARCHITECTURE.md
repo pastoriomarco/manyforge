@@ -495,13 +495,6 @@ freshness checks run on every read. Changing the composition discards the slot;
 concurrent queries pin their own selected value. This avoids repeatedly
 re-verifying unchanged product bytes without adding an observation owner.
 
-Operator grasp confirmation is an explicit, optional qualified source, not
-sensor proof or a consequence of successful gripper motion. The native command
-owner retains its current-command evidence and expiry. Program waits consume
-that evidence with bounded ordinary reads; History records attribution for
-traceability but never grants current grasp or attachment authority. The
-generated [Headless contract](HEADLESS_REST_API.md) defines the public command.
-
 Assistant-provider selection is a separate axis and never changes an execution
 lane's command or state authority:
 

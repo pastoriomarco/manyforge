@@ -231,7 +231,7 @@ function deploymentWorkspace(environment: Environment): DeploymentWorkspaceRespo
       differsFromSaved: environment.deploymentContent !== APPLIED_DEPLOYMENT,
     },
     saved: { path: '/cell/cell.deployment.yaml', deploymentRevision: APPLIED_DEPLOYMENT },
-    managerApplied: { deploymentRevision: APPLIED_DEPLOYMENT, scenarioId: 'cell' },
+    managerApplied: { activationOrder: null, deploymentRevision: APPLIED_DEPLOYMENT, scenarioId: 'cell' },
     runAdmission: { ready: environment.deploymentContent === APPLIED_DEPLOYMENT, reason: null },
     binding: null,
     scenarioCandidates: [],

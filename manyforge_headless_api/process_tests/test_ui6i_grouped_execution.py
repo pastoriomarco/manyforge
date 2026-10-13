@@ -85,20 +85,127 @@ def _dual_robot_stack() -> Iterator[ProcessStack]:
                 stack.close()
 
 
-def _wait_components_reached_requested_target(
-    stack: ProcessStack, timeout_seconds: float = 60.0
-) -> None:
-    """Wait until every deployed component reached its requested lifecycle target.
-
-    Apply success records the requested target; CCLC reports the achieved
-    state separately (ADR-0026), and motion stays closed until it is reached.
-    """
+def _applied_activation_order(stack: ProcessStack) -> list[str]:
+    """Use the captured applied Deployment order, never the mutable Draft."""
     with (
         HeadlessHttpClient(stack.composer_url, timeout_seconds=10.0) as composer,
         HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
     ):
-        document = composer.request("GET", "/api/deployment/workspace")["draft"]["document"]
-        component_ids = sorted(row["component_id"] for row in document["components"])
+        selected = composer.request("GET", "/api/deployment/workspace")["managerApplied"]
+        order = selected["activationOrder"]
+        assert order is not None, selected
+        applied = headless.program_applied_status()
+        assert selected["scenarioId"] == applied["scenario_id"], (selected, applied)
+        assert selected["deploymentRevision"] == applied["deployment_revision"], (selected, applied)
+        assert order["retainedBundleId"] == applied["retained_bundle_id"], (order, applied)
+        assert order["graphRevision"] == applied["graph_revision"], (order, applied)
+        component_ids = order["componentIds"]
+        assert isinstance(component_ids, list) and component_ids, order
+        assert len(component_ids) == len(set(component_ids)), order
+        for component_id in component_ids:
+            current = headless.cclc_component(component_id)
+            assert current["retained_bundle_id"] == order["retainedBundleId"], current
+            assert current["graph_revision"] == order["graphRevision"], current
+        return component_ids
+
+
+def _component_lifecycle(
+    stack: ProcessStack, component_id: str, intent: str, owner_epoch: str
+) -> dict[str, Any]:
+    """Submit one ordinary confirmed command with actual current CAS facts."""
+    achieved = {"prepare": "prepared", "enable": "active", "disable": "disabled"}[intent]
+    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+        assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
+        current = headless.cclc_component(component_id)
+        expected_domains = []
+        for domain in current["domains"]:
+            active = domain["active_control_configuration"]
+            expected_active = {"presence": "absent"} if active is None else {
+                "presence": "present",
+                "active_control_configuration_id": active["active_control_configuration_id"],
+                "active_control_configuration_generation": active["active_control_configuration_generation"],
+            }
+            expected_domains.append({
+                **{key: domain[key] for key in (
+                    "control_domain_id", "control_domain_revision",
+                    "controller_topology_id", "topology_revision",
+                )},
+                "expected_active_control_configuration": expected_active,
+                "expected_control_bindings": domain["current_control_bindings"],
+            })
+        admission = stack.wait_authoring_admission(expected_allowed=True)
+        request = {
+            "request_context": {
+                "request_id": f"ui6i.{component_id}.{intent}.{uuid.uuid4().hex}",
+                "request_owner_epoch": owner_epoch,
+                "source_label": "ui6i_process_fixture",
+            },
+            "controllable_component_id": component_id,
+            "intent": intent,
+            "expected_graph_revision": current["graph_revision"],
+            "expected_component_lifecycle_generation": current["component_lifecycle_generation"],
+            "expected_control_domains": expected_domains,
+            "expected_admission_generation": admission["admission_generation"],
+            "confirmed": True,
+        }
+        # A refusal or unknown response stops the sequence. Never repeat effects.
+        submitted = headless.submit_component_lifecycle(request)
+        acceptance = submitted["acceptance"]
+        assert acceptance is not None, submitted
+        deadline = time.monotonic() + 20.0
+        while True:
+            status = headless.component_lifecycle_status(acceptance["lifecycle_transaction_id"])["status"]
+            assert status is not None, acceptance
+            assert status["status_owner_epoch"] == owner_epoch, status
+            assert status["acceptance"] == acceptance, status
+            if status["terminal_result"] is not None:
+                assert status["terminal_result"] == "succeeded", status
+                break
+            assert time.monotonic() < deadline, status
+            time.sleep(0.01)
+        assert status["current_state"] == achieved, status
+        assert {row["control_domain_id"] for row in status["domains"]} == {
+            row["control_domain_id"] for row in expected_domains
+        }, status
+        assert len(status["domains"]) == len(expected_domains), status
+        assert all(row["current_state"] == achieved for row in status["domains"]), status
+        installed = headless.cclc_component(component_id)
+        assert installed["component_lifecycle_state"] == achieved, installed
+        assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
+        return status
+
+
+def _activate_loaded_components(stack: ProcessStack) -> list[str]:
+    component_ids = _applied_activation_order(stack)
+    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+        owner_epoch = headless.cclc_owner_identity()["request_owner_epoch"]
+        for component_id in component_ids:
+            before = headless.cclc_component(component_id)
+            state = before["component_lifecycle_state"]
+            if state == "active":
+                continue  # Unchanged Active owners never cycle on config-only Apply.
+            assert state in {"declared", "disabled", "prepared"}, before
+            if state != "prepared":
+                _component_lifecycle(stack, component_id, "prepare", owner_epoch)
+            _component_lifecycle(stack, component_id, "enable", owner_epoch)
+        assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
+    assert _applied_activation_order(stack) == component_ids
+    return component_ids
+
+
+def _disable_for_reload(stack: ProcessStack, component_id: str) -> None:
+    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+        current = headless.cclc_component(component_id)
+        assert current["component_lifecycle_state"] == "active", current
+        owner_epoch = headless.cclc_owner_identity()["request_owner_epoch"]
+    _component_lifecycle(stack, component_id, "disable", owner_epoch)
+
+
+def _wait_components_reached_requested_target(
+    stack: ProcessStack, component_ids: list[str], timeout_seconds: float = 60.0
+) -> None:
+    """Observe achieved targets after explicit ordinary component activation."""
+    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
         deadline = time.monotonic() + timeout_seconds
         while True:
             states: dict[str, Any] = {}
@@ -134,6 +241,7 @@ def _load_scenario(
     scenario_path: Path | None = None,
     executable: bool = True,
     on_apply_succeeded: Callable[[], None] | None = None,
+    on_configuration_applied: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], str]:
     # Each deliberate Load is a new Manager request, even when it loads the
     # same Scenario again. Retries within this one Load keep their own distinct
@@ -238,13 +346,16 @@ def _load_scenario(
                     )
                     if on_apply_succeeded is not None:
                         on_apply_succeeded()
+                    if on_configuration_applied is not None:
+                        on_configuration_applied(status)
                     break
                 if time.monotonic() >= deadline:
                     raise AssertionError(
                         f"Scenario activation did not settle: {status!r}"
                     )
                 time.sleep(0.02)
-        _wait_components_reached_requested_target(stack)
+        component_ids = _activate_loaded_components(stack)
+        _wait_components_reached_requested_target(stack, component_ids)
         stack.wait_authoring_admission(expected_allowed=True)
         deployment = composer.request("GET", "/api/deployment/workspace")
         assert deployment["draft"]["document"]["deployment_artifact_id"] == (
@@ -304,7 +415,7 @@ def _save_and_reopen_current_scenario(
                             "revision"
                         ],
                         "path": str(target),
-                        "scenarioId": f"{scenario_id}_saved",
+                        "scenarioId": scenario_id,
                         "name": "UI6-I grouped Scenario copy",
                         "description": "Native Save/Load qualification copy",
                         "confirmOverwrite": False,
@@ -324,8 +435,8 @@ def _save_and_reopen_current_scenario(
         # status until it is loaded and qualified again.
         assert saved["last_known_status"] == "unknown"
         assert saved["path"] == str(target.resolve())
-        # Save only persists authored content. Load below deliberately activates
-        # the saved copy and may publish a new activation of the same runtime.
+        # Save only persists content. Reload configures the same logical Scenario;
+        # unchanged Active owners must remain untouched.
         assert composer.manager_status()["status"]["active"] == manager_before
         index = composer.request(
             "GET",
@@ -386,7 +497,7 @@ def _save_and_reopen_current_scenario(
                         "reopened Scenario Apply did not settle: " f"{status!r}"
                     )
                 time.sleep(0.02)
-        _wait_components_reached_requested_target(stack)
+        _wait_components_reached_requested_target(stack, _applied_activation_order(stack))
         stack.wait_authoring_admission(expected_allowed=True)
         manager_after = composer.manager_status()["status"]["active"]
         for key in ("retained_bundle_id", "graph_revision", "cell_graph"):
@@ -401,7 +512,7 @@ def _save_and_reopen_current_scenario(
             ):
                 assert after[key] == before[key], (component_id, key, before, after)
         applied = composer.program_applied()
-        assert applied["scenario_id"] == f"{scenario_id}_saved"
+        assert applied["scenario_id"] == scenario_id
         for key in ("program_revision", "program_binding_id"):
             assert applied[key] == applied_before[key]
         return applied
@@ -643,15 +754,15 @@ def _reset_cycle(client: HeadlessHttpClient, program_run_id: str) -> None:
 
 def test_repeated_project_activation_replaces_one_coherent_publication() -> None:
     with _dual_robot_stack() as stack:
+        paths = _write_mixed_variants(stack, ("isolation",))
         observed: list[tuple[str, str, str]] = []
-        for scenario_id in (
-            GROUPED_SCENARIO,
-            ISOLATION_SCENARIO,
-            GROUPED_SCENARIO,
-            ISOLATION_SCENARIO,
-        ):
-            applied, _source_document_digest = _load_scenario(stack, scenario_id)
-            assert applied["scenario_id"] == scenario_id
+        # Alternate Program contents within one logical Scenario. A different
+        # Scenario requires Close, which is a separate qualification path.
+        for scenario_path in (None, paths["isolation"], None, paths["isolation"]):
+            applied, _source_document_digest = _load_scenario(
+                stack, GROUPED_SCENARIO, scenario_path=scenario_path
+            )
+            assert applied["scenario_id"] == GROUPED_SCENARIO
             assert applied["deployment_artifact_id"] == "ur5e_lite6_wall"
             assert applied["program_binding_id"]
             observed.append(
@@ -704,7 +815,15 @@ def _write_mixed_variants(
     paths: dict[str, Path] = {}
     for kind in kinds:
         candidate = deepcopy(document)
-        candidate["scenario_id"] = f"mixed_{kind}"
+        source_project = source
+        if kind == "isolation":
+            source_project = examples / f"{ISOLATION_SCENARIO}.scenario"
+            candidate, _ = load_scenario_artifact(
+                str(source_project), allowed_roots=[str(examples)]
+            )
+        # These variants qualify retention during a same-Scenario reload.
+        # Their distinct paths/digests remain real independent source facts.
+        candidate["scenario_id"] = GROUPED_SCENARIO
         candidate["name"] = f"Mixed Apply {kind}"
         components = candidate["deployment_draft"]["components"]
         if kind in ("single", "solo", "solo_cartesian"):
@@ -770,7 +889,7 @@ def _write_mixed_variants(
             ur5e = next(row for row in components if row["component_id"] == "ur5e_robot")
             # Change only B's controller input; A must survive unchanged.
             ur5e["configuration"]["runtime_configuration"]["initial_joint_positions_rad"][0] = 0.1
-        else:
+        elif kind != "isolation":
             assert kind == "single", kind
         target = variants / f"mixed_{kind}.scenario"
         candidate = build_scenario_document(
@@ -786,7 +905,7 @@ def _write_mixed_variants(
         save_scenario_artifact(
             candidate, str(target),
             allowed_roots=[str(examples), str(stack.root)],
-            overwrite=False, source_project_path=str(source),
+            overwrite=False, source_project_path=str(source_project),
         )
         paths[kind] = target
     return paths
@@ -802,8 +921,9 @@ def test_retained_robot_plans_after_apply_retires_its_first_composition() -> Non
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             survivor = headless.cclc_component("lite6_robot")
         paths = _write_mixed_variants(stack, ("replace",))
+        _disable_for_reload(stack, "ur5e_robot")
         applied, source_document_digest = _load_scenario(
-            stack, "mixed_replace", scenario_path=paths["replace"]
+            stack, GROUPED_SCENARIO, scenario_path=paths["replace"]
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             retained = headless.cclc_component("lite6_robot")
@@ -847,8 +967,9 @@ def test_retained_robot_plans_in_the_candidate_cell_planning_model() -> None:
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             survivors = {robot: headless.cclc_component(robot) for robot in robots}
         paths = _write_mixed_variants(stack, ("move",))
+        _disable_for_reload(stack, "ur5e_robot")
         applied, source_document_digest = _load_scenario(
-            stack, "mixed_move", scenario_path=paths["move"]
+            stack, GROUPED_SCENARIO, scenario_path=paths["move"]
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             for robot in robots:
@@ -948,8 +1069,9 @@ def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             survivor = headless.cclc_component("lite6_robot")
         paths = _write_mixed_variants(stack, ("solo", "solo_cartesian"))
+        _disable_for_reload(stack, "ur5e_robot")
         applied, source_document_digest = _load_scenario(
-            stack, "mixed_solo", scenario_path=paths["solo"]
+            stack, GROUPED_SCENARIO, scenario_path=paths["solo"]
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             retained = headless.cclc_component("lite6_robot")
@@ -996,7 +1118,7 @@ def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
         # A Program-only Apply after the peer removal must preserve the same
         # physical owner and use that owner's commanded frame/path publication.
         cartesian, digest = _load_scenario(
-            stack, "mixed_solo_cartesian", scenario_path=paths["solo_cartesian"]
+            stack, GROUPED_SCENARIO, scenario_path=paths["solo_cartesian"]
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             assert headless.cclc_component("lite6_robot")["provider_occurrences"] == survivor["provider_occurrences"]
@@ -1185,9 +1307,14 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
                         if reader.done():
                             reader.result()
                         raise AssertionError("concurrent publication reader did not start")
-                    for kind in ("single", "restore", "replace", "restore"):
+                    for index, kind in enumerate(("single", "restore", "replace", "restore")):
+                        # Disable only the peer about to change or be removed.
+                        # The first restore adds an absent peer; the last
+                        # restore replaces the preceding changed peer.
+                        if kind != "restore" or index == 3:
+                            _disable_for_reload(stack, "ur5e_robot")
                         _load_scenario(
-                            stack, GROUPED_SCENARIO if kind == "restore" else f"mixed_{kind}",
+                            stack, GROUPED_SCENARIO,
                             scenario_path=None if kind == "restore" else paths[kind],
                             executable=kind != "single",
                         )
@@ -1396,3 +1523,238 @@ def test_separate_group_stop_does_not_stop_the_other_robot() -> None:
             terminal = _wait_run_state(client, program_run_id, {"succeeded"})
             assert terminal["state"] == "succeeded"
             _reset_cycle(client, program_run_id)
+
+
+
+def _assert_stored_authoring_apply_without_linked_children(
+    stack: ProcessStack, status: dict[str, Any]
+) -> None:
+    """Observe the owned journal; this read never acquires or constructs authority."""
+    from contextlib import closing
+    import sqlite3
+
+    assert status["state"] == "succeeded", status
+    revision = status["candidate_projection_revision"]
+    journal = stack.manager_root / "manager-apply-journal.sqlite3"
+    assert journal.is_file(), journal
+    with closing(sqlite3.connect(journal.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+        connection.execute("BEGIN")
+        assert connection.execute(
+            "SELECT schema_id,schema_version,cell_id FROM apply_journal_metadata WHERE singleton=1"
+        ).fetchone() == (
+            "manyforge.internal.component-manager.apply-journal.h1a.v17", 17, stack.cell_id
+        )
+        key = (status["apply_id"], status["apply_generation"])
+        rows = connection.execute(
+            "SELECT request_id,request_owner_epoch,candidate_retained_bundle_id,candidate_graph_revision,"
+            "parent_authoring_claim,expected_admission_generation FROM manager_apply_intents "
+            "WHERE apply_id=? AND apply_generation=?", key,
+        ).fetchall()
+        assert len(rows) == 1, (key, rows)
+        request_id, owner_epoch, bundle, graph, parent, direct_generation = rows[0]
+        assert (request_id, owner_epoch) == (status["request_id"], status["request_owner_epoch"])
+        assert (bundle, graph) == (revision["retained_bundle_id"], revision["graph_revision"])
+        assert isinstance(parent, bytes) and parent, rows
+        assert direct_generation is None, rows
+        for table in ("manager_apply_bring_up_plans", "manager_apply_bring_up_child_proofs"):
+            assert connection.execute(
+                f"SELECT count(*) FROM {table} WHERE apply_id=? AND apply_generation=?", key
+            ).fetchone() == (0,), (key, table)
+
+
+def _observe_authoring_mock_controllers(
+    stack: ProcessStack, component_id: str, state: str, label: str
+) -> dict[str, Any]:
+    """Reuse the strict process fixture's actual CM/JSB/model/command observer."""
+    import subprocess
+
+    helper = Path(__file__).resolve().parents[2] / "manyforge_deployment/test/prepare_activation_tool.py"
+    assert helper.is_file(), helper
+    output = stack.root / f"{label}.{component_id}.ros-observation.json"
+    log_path = stack.root / f"{label}.{component_id}.ros-observation.log"
+    with log_path.open("wb") as log:
+        result = subprocess.run(
+            [sys.executable, str(helper), "--observe-manager-ros",
+             "--execution-root", str(stack.execution_run_root),
+             "--component", component_id, "--state", state,
+             "--label", f"{label}.{component_id}", "--output", str(output)],
+            stdout=log, stderr=subprocess.STDOUT, timeout=15.0, check=False,
+        )
+    assert result.returncode == 0, log_path.read_text(encoding="utf-8", errors="replace")
+    evidence = json.loads(output.read_text(encoding="utf-8"))
+    assert evidence["controllers"][evidence["arm_controller"]]["state"] == state, evidence
+    assert evidence["controllers"][evidence["gripper_controller"]]["state"] == state, evidence
+    if state == "inactive":
+        assert evidence["gripper_submit_refusal"]["ok"] is False, evidence
+    return evidence
+
+
+def _commit_authoring_scene_object(
+    stack: ProcessStack, operation: dict[str, Any], label: str
+) -> dict[str, Any]:
+    with HeadlessHttpClient(stack.base_url, timeout_seconds=20.0) as headless:
+        scene = headless.scene()["logical_scene"]
+        request = {
+            "request_context": {
+                "request_id": f"ui6i.authoring-scene.{label}.{uuid.uuid4().hex}",
+                "request_owner_epoch": scene["source_owner_epoch"],
+                "source_label": "ui6i_authoring_apply_fixture",
+                "correlation_id": None,
+            },
+            "expected_projection_revision": scene["payload"]["access"]["active_projection"],
+            "operation": operation,
+        }
+        if operation["kind"] == "add_object":
+            request["expected_admission_generation"] = stack.wait_authoring_admission(
+                expected_allowed=True
+            )["admission_generation"]
+        else:
+            assert operation["kind"] == "attach_carried_object", operation
+            # Runtime Attach uses the actual owner/projection CAS, without authoring authorization.
+        committed = headless.commit_scene_transaction(request)
+        assert committed["ok"] is True, committed
+        deadline = time.monotonic() + 20.0
+        while True:
+            snapshot = headless.scene()["logical_scene"]["payload"]["snapshot"]
+            if snapshot["revision"] == committed["committed_projection_revision"]["scene_revision"]:
+                return snapshot
+            assert time.monotonic() < deadline, (committed, snapshot)
+            time.sleep(0.01)
+
+
+def _strict_authoring_mock_apply(stack: ProcessStack, *, single: bool) -> None:
+    component_ids = ["lite6_robot"] if single else ["lite6_robot", "ur5e_robot"]
+    scenario_path = _write_mixed_variants(stack, ("solo",))["solo"] if single else None
+    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+        initial_scene = headless.scene()["logical_scene"]["payload"]["snapshot"]
+
+    def configured_inactive(status: dict[str, Any], *, initial: bool, preserved: dict[str, Any]) -> None:
+        _assert_stored_authoring_apply_without_linked_children(stack, status)
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            snapshots = [headless.cclc_component(component) for component in component_ids]
+            for current in snapshots:
+                assert current["component_lifecycle_state"] == ("declared" if initial else "disabled"), current
+                if initial:
+                    assert current["lifecycle_target"] is None, current
+                    revision = status["candidate_projection_revision"]
+                    assert (current["retained_bundle_id"], current["graph_revision"]) == (
+                        revision["retained_bundle_id"], revision["graph_revision"]
+                    ), current
+                    for domain in current["domains"]:
+                        active = domain["active_control_configuration"]
+                        # Reconciled configuration currency does not enable the component.
+                        assert active is not None and set(active) == {
+                            "activation_set_id", "active_control_configuration_generation",
+                            "active_control_configuration_id", "binding_routes", "control_domain_id",
+                            "control_domain_revision", "controller_topology_id", "source_runtime_epoch",
+                            "source_runtime_unit_id", "source_sequence", "state", "topology_revision",
+                        }, active
+                        assert active["state"] == "reconciled", active
+                        assert active["active_control_configuration_generation"] > 0, active
+                        assert active["activation_set_id"] and active["active_control_configuration_id"] and active["source_runtime_epoch"] and active["source_runtime_unit_id"], active
+                        assert active["source_sequence"] >= 0, active
+                        assert all(active[key] == domain[key] for key in (
+                            "control_domain_id", "control_domain_revision", "controller_topology_id", "topology_revision"
+                        )), domain
+                        assert active["binding_routes"] and active["binding_routes"] == domain["current_control_bindings"], domain
+                        assert all(set(route) == {"control_binding_id", "control_binding_revision", "control_route_id"}
+                                   and all(route.values()) for route in active["binding_routes"]), active
+                else:
+                    assert current["lifecycle_target"]["requested_state"] == "disabled", current
+            if initial:
+                from contextlib import closing
+                import sqlite3
+
+                # Observe this fresh stack's actual plan/adoption, without decoding or using it as authority.
+                journal = stack.execution_state_root / "cclc-journal.sqlite3"
+                assert journal.is_file(), journal
+                with closing(sqlite3.connect(journal.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+                    connection.execute("BEGIN")
+                    revision = status["candidate_projection_revision"]
+                    key = (status["apply_id"], status["apply_generation"])
+                    assert connection.execute(
+                        "SELECT apply_id,apply_generation,candidate_bundle_id,candidate_graph_revision,component_bring_up "
+                        "FROM cclc_native_apply_plans WHERE singleton=1"
+                    ).fetchall() == [(*key, revision["retained_bundle_id"], revision["graph_revision"], None)]
+                    routes = {domain["control_domain_id"]:
+                              domain["active_control_configuration"]["active_control_configuration_generation"]
+                              for current in snapshots for domain in current["domains"]}
+                    assert len(routes) == sum(len(current["domains"]) for current in snapshots), snapshots
+                    assert dict(connection.execute(
+                        "SELECT control_domain_id,active_control_configuration_generation FROM cclc_native_apply_plan_routes"
+                    )) == routes
+                    assert sorted(connection.execute(
+                        "SELECT control_domain_id,active_control_configuration_generation,"
+                        "origin_route_selection_transaction_id,origin_route_selection_transaction_generation "
+                        "FROM control_domain_active_configurations"
+                    )) == sorted((domain, generation, None, None) for domain, generation in routes.items())
+                    assert connection.execute(
+                        "SELECT publication_generation,public_pointer_digest,candidate_bundle_id,candidate_graph_revision "
+                        "FROM cclc_native_apply_adoptions WHERE apply_id=? AND apply_generation=?", key
+                    ).fetchall() == [(snapshots[0]["publication_generation"], snapshots[0]["active_public_pointer_digest"],
+                                      revision["retained_bundle_id"], revision["graph_revision"])]
+                    for table in ("lifecycle_transactions", "route_selection_transactions"):
+                        assert connection.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,), table
+            targets = headless.execution_targets()["targets"]["components"]
+            assert {row["controllable_component_id"] for row in targets} == set(component_ids), targets
+            assert len(targets) == len(component_ids), targets
+            assert all(row["availability"]["command_eligible"] is False for row in targets), targets
+        for component in component_ids:
+            _observe_authoring_mock_controllers(stack, component, "inactive", "first-load" if initial else "preserved-reload")
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            assert headless.scene()["logical_scene"]["payload"]["snapshot"] == preserved
+
+    _load_scenario(
+        stack, GROUPED_SCENARIO, scenario_path=scenario_path,
+        on_configuration_applied=lambda status: configured_inactive(status, initial=True, preserved=initial_scene),
+    )
+    for component in component_ids:
+        _observe_authoring_mock_controllers(stack, component, "active", "first-activate")
+    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+        (component,) = [row for row in headless.execution_targets()["targets"]["components"]
+                        if row["controllable_component_id"] == "lite6_robot"]
+        (motion,) = [row for row in component["targets"] if row["presentation"] == "motion"]
+
+    for resource in ("authoring_world_marker", "authoring_carried_marker"):
+        _commit_authoring_scene_object(stack, {
+            "kind": "add_object", "scene_resource_id": resource,
+            "shape": {"type": "box", "box_dimensions_m": {"x_m": 0.02, "y_m": 0.02, "z_m": 0.02}},
+            "pose": {"position_m": {"x_m": 3.0 if resource == "authoring_world_marker" else 3.2,
+                                    "y_m": 0.0, "z_m": 0.0},
+                     "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
+            "frame_ref": {"kind": "cell_frame", "cell_id": stack.cell_id},
+        }, resource)
+    preserved = _commit_authoring_scene_object(stack, {
+        "kind": "attach_carried_object", "carried_object_attachment_id": "authoring_marker_attachment",
+        "scene_resource_id": "authoring_carried_marker", "controllable_component_id": "lite6_robot",
+        "command_target_id": motion["command_target_id"],
+        "frame_role_id": motion["command"]["base_frame_role_id"],
+        # Both real Scenario inputs have no structural component attachments;
+        # the installed arm's base path crosses none. No touch exemptions.
+        "touch_body_roles": [], "expected_component_attachment_revisions": [],
+    }, "attach")
+    assert {row["scene_resource_id"] for row in preserved["objects"]} == {
+        "authoring_world_marker", "authoring_carried_marker"
+    }, preserved
+    assert len(preserved["carried_object_attachments"]) == 1, preserved
+    assert preserved["carried_object_attachments"][0]["scene_resource_id"] == "authoring_carried_marker", preserved
+    for component in component_ids:
+        _disable_for_reload(stack, component)
+    _load_scenario(
+        stack, GROUPED_SCENARIO, scenario_path=scenario_path,
+        on_configuration_applied=lambda status: configured_inactive(status, initial=False, preserved=preserved),
+    )
+    for component in component_ids:
+        _observe_authoring_mock_controllers(stack, component, "active", "reload-activate")
+    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+        assert headless.scene()["logical_scene"]["payload"]["snapshot"] == preserved
+
+
+def test_authoring_single_mock_apply_preserves_scene_and_stays_inactive_until_activate() -> None:
+    with _dual_robot_stack() as stack:
+        _strict_authoring_mock_apply(stack, single=True)
+
+
+def test_authoring_two_mock_apply_preserves_scene_and_stays_inactive_until_activate() -> None:
+    with _dual_robot_stack() as stack:
+        _strict_authoring_mock_apply(stack, single=False)

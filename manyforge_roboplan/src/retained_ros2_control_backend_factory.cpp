@@ -242,7 +242,8 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
                   make_sample_period_waiter(clock, state_rate_hz),
                   state_authority, std::move(participant_config));
             },
-            std::move(gripper), motion_binding, gripper_binding);
+            std::move(gripper), motion_binding, gripper_binding,
+            selected.successor_occurrence);
         if (!bound.ok()) {
           throw std::invalid_argument(bound.error().message);
         }

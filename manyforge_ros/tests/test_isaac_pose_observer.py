@@ -559,3 +559,31 @@ def test_dispatcher_rejects_unconfigured_keys_without_growing_a_queue() -> None:
             observer_bindings=(),
             source_epoch_factory=lambda: "source.epoch.1",
         )
+
+
+@pytest.mark.parametrize("location", ["cell_id", "source_id", "object_id", "policy_id"])
+def test_open_identities_use_the_existing_256_byte_utf8_budget(
+    tmp_path: Path, location: str,
+) -> None:
+    path = tmp_path / "site.json"
+    value = _config_value()
+    target = value if location in {"cell_id", "source_id"} else value["joint_state"]
+    # NFC multibyte text: 128 characters are exactly the existing 256-byte cap.
+    target[location] = "é" * 128
+    _write_config(path, value)
+    load_isaac_pose_observer_site_config(path)
+    target[location] += "a"
+    _write_config(path, value)
+    with pytest.raises(IsaacPoseObserverConfigError, match="bounded non-empty NFC text"):
+        load_isaac_pose_observer_site_config(path)
+
+
+def test_q94_identity_budget_does_not_narrow_unrelated_authored_text(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "site.json"
+    value = _config_value()
+    value["joint_state"]["required_joint_names"] = ["joint_" + "a" * 300]
+    _write_config(path, value)
+    config = load_isaac_pose_observer_site_config(path)
+    assert config.joint_state.required_joint_names == ("joint_" + "a" * 300,)

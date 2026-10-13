@@ -255,6 +255,14 @@ retained_isaac_controller_lane(const std::string_view isaac_profile) {
                           profile.initial_joint_positions_rad.end())};
 }
 
+std::vector<std::string>
+retained_isaac_scene_required_topics(const std::string_view isaac_profile) {
+  const auto &profile = profile_facts(isaac_profile);
+  return {"/clock", std::string(kArmJointCommandsTopic),
+          std::string(kIsaacJointStatesTopic),
+          std::string(profile.gripper_command_topic)};
+}
+
 RetainedRos2ControlBackendConfig
 make_retained_isaac_ros2_control_backend_config(
     const deployment::ros2_control_execution_runtime_contract::Configuration
@@ -464,6 +472,10 @@ make_retained_mock_ros2_control_backend_config(
     gripper_config.transport_kind = "ros_gripper_command";
     gripper_config.action_name = scoped_name(
         runtime_namespace, *profile.gripper_controller_name + "/gripper_cmd");
+    config.arm.gripper_controller = RetainedRos2ControlArmController{
+        config.arm.controller.controller_manager,
+        *profile.gripper_controller_name,
+        std::string(profile.hardware_component_name)};
     gripper_config.command_joint_names = {
         *gripper.value().resources.front().source_joint_name};
     gripper_config.state_joint_name =

@@ -29,3 +29,19 @@ add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_roboplan" robopl
 set_target_properties(manyforge_ros2_control_execution_host manyforge_native_execution_host
   manyforge_roboplan_candidate_worker
   PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+# The existing Headless process fixture resolves this test host beside the
+# native host and candidate worker. It exists only in BUILD_TESTING graphs.
+if(TARGET manyforge_native_execution_host_pick_place_planning_fixture)
+  set_target_properties(manyforge_native_execution_host_pick_place_planning_fixture
+    PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
+
+# Report-only ROS hot-path measurement, invoked explicitly after cutover.
+# EXCLUDE_FROM_ALL keeps measurement out of ordinary builds and tests.
+add_executable(perf_ros2_control_hot_paths EXCLUDE_FROM_ALL
+  "${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_ros2_control_execution/test/perf/perf_ros2_control_hot_paths.cpp")
+target_compile_features(perf_ros2_control_hot_paths PRIVATE cxx_std_20)
+target_include_directories(perf_ros2_control_hot_paths PRIVATE
+  "${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_roboplan/test")
+target_link_libraries(perf_ros2_control_hot_paths PRIVATE
+  manyforge_roboplan_ros2_control_runtime manyforge_roboplan_native_runtime_support)

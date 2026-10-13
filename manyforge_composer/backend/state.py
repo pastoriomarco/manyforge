@@ -1390,8 +1390,8 @@ class ComposerState:
                     "expected_admission_generation"
                 ],
                 "candidate_receipt": receipt,
-                # Only a confirmed destructive impact is accepted; the
-                # Manager revalidates it and refuses a stale acceptance.
+                # Destructive configuration impact requires the same
+                # exact confirmation; Manager revalidates its accepted digest.
                 "accepted_impact_digest": (
                     receipt.get("impact_digest")
                     if destructive_impact

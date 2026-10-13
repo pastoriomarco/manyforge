@@ -120,6 +120,11 @@ public:
   [[nodiscard]] core::Result<core::BrandLifecycleObservationDTO>
   Observe(const core::BrandLifecycleObservationQueryDTO &query) override;
 
+  /// Reads the existing transport cache and classifies a copy of vendor history.
+  [[nodiscard]] core::Result<core::LifecycleDomainHealthDTO>
+  ReadLifecycleHealth(const core::ControlDomainId &domain,
+                      core::TimePoint now_ns) const;
+
   [[nodiscard]] core::BrandLifecyclePrimitiveResultDTO
   Dispatch(const core::BrandLifecyclePrimitiveIntentDTO &intent,
            std::stop_token cancellation) override;
@@ -129,11 +134,6 @@ private:
       const core::BrandLifecycleObservationQueryDTO &query) const noexcept;
   [[nodiscard]] bool matches_occurrence(
       const core::BrandLifecyclePrimitiveIntentDTO &intent) const noexcept;
-  // Classifies one fresh vendor report's mode/state against the last
-  // explained pair and this port's own in-flight or just-completed primitive.
-  void track_vendor_control(const XArmObservedState &observed,
-                            std::int64_t now_ns);
-
   /// One vendor mode/state pair; -1 is unknown.
   struct VendorControlPair final {
     int mode = -1;
@@ -149,30 +149,45 @@ private:
     std::optional<std::int64_t> completed_at_ns;
   };
 
+  struct VendorTrackingState final {
+    // Semantic generation and owner publication sequence are independently
+    // nondecreasing within the fenced transport occurrence. Repeated samples
+    // and heartbeat publications with unchanged semantic generation are valid.
+    std::uint64_t last_observation_generation_ = 0U;
+    std::uint64_t last_owner_publication_sequence_ = 0U;
+    core::LifecycleBlockingCauseClassDTO last_intervention_cause_{
+        core::LifecycleBlockingCauseClassDTO::kNone};
+    // Unrequested mode/state change detection (guarded by cause_mutex_).
+    std::optional<VendorControlPair> explained_pair_;
+    std::optional<VendorControlPair> last_reported_pair_;
+    std::optional<OwnPrimitiveExpectation> own_expectation_;
+    bool external_control_detected_ = false;
+    // Vendor error code of the latest fresh report; -1 when unknown.
+    int last_reported_error_code_ = -1;
+  };
+
+  struct ClassifiedHealth final {
+    core::LifecycleDomainHealthDTO health;
+    VendorTrackingState tracking;
+  };
+
+  static void TrackVendorControl(const XArmObservedState &observed,
+                                 std::int64_t now_ns,
+                                 VendorTrackingState &tracking);
+  [[nodiscard]] static core::Result<ClassifiedHealth> ComputeHealth(
+      const XArmObservedState &observed, std::int64_t now_ns,
+      const VendorTrackingState &tracking,
+      core::LifecycleDomainHealthDTO health);
+  [[nodiscard]] core::Result<XArmObservedState>
+  ReadCachedObservation(std::int64_t now_ns) const;
+
   Lite6BrandLifecyclePortConfig config_;
   core::IClock &clock_;
   std::unique_ptr<ILite6BrandLifecycleTransport> transport_;
-  // Serialize the bounded cache read with its classification. Dispatch never
-  // takes this mutex, so observation capture cannot wait for a command effect
-  // or prevent a Stop-direction primitive from reaching the transport.
-  std::mutex observation_mutex_;
-  // Last intervention-requiring cause established from a vendor report. A
-  // connected observation without a report cannot clear it.
-  std::mutex cause_mutex_;
-  // Semantic generation and owner publication sequence are independently
-  // nondecreasing within the fenced transport occurrence. Repeated samples
-  // and heartbeat publications with unchanged semantic generation are valid.
-  std::uint64_t last_observation_generation_ = 0U;
-  std::uint64_t last_owner_publication_sequence_ = 0U;
-  core::LifecycleBlockingCauseClassDTO last_intervention_cause_{
-      core::LifecycleBlockingCauseClassDTO::kNone};
-  // Unrequested mode/state change detection (guarded by cause_mutex_).
-  std::optional<VendorControlPair> explained_pair_;
-  std::optional<VendorControlPair> last_reported_pair_;
-  std::optional<OwnPrimitiveExpectation> own_expectation_;
-  bool external_control_detected_ = false;
-  // Vendor error code of the latest fresh report; -1 when unknown.
-  int last_reported_error_code_ = -1;
+  // Serializes cache capture with classification; Dispatch never takes it.
+  mutable std::mutex observation_mutex_;
+  mutable std::mutex cause_mutex_;
+  VendorTrackingState tracking_;
 };
 
 } // namespace manyforge::xarm_control

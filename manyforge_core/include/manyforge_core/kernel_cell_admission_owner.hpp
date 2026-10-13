@@ -15,6 +15,9 @@ namespace manyforge::core {
 
 using CellAdmissionInterventionValidator = std::function<Result<void>(
     const CellAdmissionClaimIntentDTO&, const std::optional<CellAdmissionClaimDTO>&)>;
+using CellAdmissionApplyBringUpValidator = std::function<Result<void>(
+    const CellAdmissionClaimIntentDTO&, const CellAdmissionReadinessSnapshotDTO&,
+    const RuntimeEpoch&)>;
 using CellAdmissionProgramNodeValidator =
     std::function<Result<void>(const ProgramNodeAdmissionEvidenceDTO&)>;
 using CellAdmissionSettlementValidator =
@@ -63,6 +66,16 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireRouteRecoveryClaim(
       const CellAdmissionClaimIntentDTO& intent,
       const CellAdmissionInterventionValidator& validate_offer);
+  /// Private selected-component effect permission; the exact Kernel validator
+  /// is mandatory. This shares the ledger/replay owner, not route authority.
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireSelectedBringUpClaim(
+      const CellAdmissionClaimIntentDTO& intent,
+      const CellAdmissionInterventionValidator& validate_offer);
+  /// Private Q91 parent acquisition. The composing Kernel must positively
+  /// validate its exact captured plan; ordinary Manager Apply is unchanged.
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireApplyBringUpClaim(
+      const CellAdmissionClaimIntentDTO& intent,
+      const CellAdmissionApplyBringUpValidator& validate_plan);
   /// Read the same readiness/claim preconditions used by manual acquisition.
   /// This reserves nothing; the composing Kernel still checks the target hold.
   [[nodiscard]] Result<void> CheckManualCellAdmissionReadiness(
@@ -100,7 +113,8 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
  private:
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireClaim(
       const CellAdmissionClaimIntentDTO& intent,
-      const CellAdmissionInterventionValidator& validate_offer);
+      const CellAdmissionInterventionValidator& validate_offer,
+      bool selected_apply_bring_up = false);
   struct Entry final {
     CellAdmissionClaimDTO claim;
     std::optional<CellAdmissionClaimReleaseDTO> release;

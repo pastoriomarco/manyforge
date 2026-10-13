@@ -509,8 +509,6 @@ run_headless_python_tests() {
         MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$build/canonical-empty-test-package" \
         MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT="$build/assistant-native-test-fixture/retained-package" \
         MANYFORGE_ASSISTANT_NATIVE_METADATA="$build/assistant-native-test-fixture/metadata.json" \
-        MANYFORGE_GRIPPER_CONFIRMATION_FIXTURE="$build/gripper-confirmation-test-fixture/retained-package" \
-        MANYFORGE_GRIPPER_CONFIRMATION_METADATA="$build/gripper-confirmation-test-fixture/metadata.json" \
         MANYFORGE_MANAGER_APPLY_PACKAGE_ROOT="$build/manager-apply-test-fixture/retained-package" \
         MANYFORGE_MANAGER_APPLY_METADATA="$build/manager-apply-test-fixture/metadata.json" \
         MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/ui6i-dual-scenario-fixture/retained-package" \
@@ -853,9 +851,30 @@ run_ros_e2e_tests() {
          # shellcheck disable=SC1090
          source "$overlay"
          set -u
+         # Resolve using the actual sourced ament environment inherited by
+         # Manager/host/ros2 launch; keep exact input path/hash in this run.
+         python3 - "$WORKSPACE" "$evidence/controller-launch-input.json" <<'PY_LAUNCH' || exit 1
+import hashlib
+import json
+import sys
+from pathlib import Path
+from ament_index_python.packages import get_package_share_directory
+share = Path(get_package_share_directory("manyforge_ros_bringup"))
+launch = share / "launch" / "mock_control.launch.py"
+source = Path(sys.argv[1]) / "manyforge_ros_bringup" / "launch" / "mock_control.launch.py"
+digest = lambda path: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+record = {"package_share_directory": str(share), "launch_file": str(launch),
+          "resolved_launch_file": str(launch.resolve(strict=True)), "launch_sha256": digest(launch),
+          "source_launch_file": str(source.resolve(strict=True)), "source_sha256": digest(source)}
+Path(sys.argv[2]).write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+print(json.dumps(record, sort_keys=True))
+if record["launch_sha256"] != record["source_sha256"]:
+    raise SystemExit("Actual sourced Mock launch differs from the current qualified source")
+PY_LAUNCH
+         export MANYFORGE_MANAGER_ROS_LAUNCH_EVIDENCE="$evidence/controller-launch-input.json"
          setup_pythonpath
          export PYTHONPATH="$headless:$PYTHONPATH"
-         MANYFORGE_MANAGER_DAEMON="$headless/manyforge_manager_daemon" \
+         export MANYFORGE_MANAGER_DAEMON="$headless/manyforge_manager_daemon" \
          MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$headless/canonical-empty-test-package" \
          MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/ui6i-dual-scenario-fixture/retained-package" \
          MANYFORGE_ACTIVATION_PREPARER="$BUILD_DIR/deployment/manyforge_prepare_activation" \
@@ -863,8 +882,21 @@ run_ros_e2e_tests() {
          MANYFORGE_NATIVE_EXECUTION_HOST="$ros_build/manyforge_native_execution_host" \
          MANYFORGE_ROBOPLAN_CANDIDATE_WORKER="$ros_build/manyforge_roboplan_candidate_worker" \
          MANYFORGE_ROS2_CONTROL_EXECUTION_HOST="$ros_build/manyforge_ros2_control_execution_host" \
-         MANYFORGE_PROCESS_TEST_EVIDENCE_ROOT="$evidence" \
+         MANYFORGE_PROCESS_TEST_EVIDENCE_ROOT="$evidence"
+         local manager_apply_status=0
+         ctest --test-dir "$headless" --output-on-failure --no-tests=error \
+             --timeout "$CTEST_TEST_TIMEOUT_S" \
+             -R '^ManagerDaemonProcess\.EmptyRosApplyConfiguresInactiveMockThenExplicitActivation$' \
+             > "$evidence/empty-ros-apply-ctest.log" 2>&1 || manager_apply_status=$?
+         cat "$evidence/empty-ros-apply-ctest.log"
+         printf '%s\n' "$manager_apply_status" > "$evidence/empty-ros-apply-ctest.status"
          pytest "${UI6I_ROS_PROCESS_TESTS[@]}" -p no:cacheprovider -v ); then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+    if [[ -f "$evidence/empty-ros-apply-ctest.status" ]] &&
+       [[ "$(< "$evidence/empty-ros-apply-ctest.status")" == "0" ]]; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))

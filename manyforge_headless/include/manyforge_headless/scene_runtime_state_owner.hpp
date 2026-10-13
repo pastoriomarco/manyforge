@@ -128,6 +128,15 @@ struct SceneInitializationCounters final {
   std::uint64_t stale_completion_rejected{};
 };
 
+/// One Manager-configured cell source; loss does not discard historical poses.
+struct ConfiguredPoseSourceAvailability final {
+  std::string source_id;
+  std::string source_epoch_base;
+  bool available{true};
+  friend bool operator==(const ConfiguredPoseSourceAvailability &,
+                         const ConfiguredPoseSourceAvailability &) = default;
+};
+
 struct SceneRuntimeStateSnapshot final {
   std::uint64_t initialization_generation{};
   std::optional<std::string> initialization_token;
@@ -141,6 +150,7 @@ struct SceneRuntimeStateSnapshot final {
   std::optional<std::uint64_t> active_replay_id;
   SceneInitializationCounters counters;
   std::vector<PoseSourceLifetimeSnapshot> pose_sources;
+  std::optional<ConfiguredPoseSourceAvailability> configured_pose_source{};
 };
 
 struct SceneReplayBatch final {
@@ -179,6 +189,21 @@ public:
   AdoptFinalizedOpenRuntime(SceneRuntimeIdentity identity,
                             std::uint64_t initialization_generation,
                             std::string reason);
+
+  /// Internal Manager transition after exact observer retirement, before any
+  /// replacement Open. Clears only that source's retained poses in the exact
+  /// already-open runtime; never resets Scene or an initialization/replay.
+  void RetirePoseSource(const SceneRuntimeIdentity &expected_runtime_identity,
+                        std::string_view source_id);
+
+  /// Pins the current checked source. Exact re-publication never clears loss.
+  void ConfigurePoseSourceAvailability(
+      const SceneRuntimeIdentity &expected_runtime_identity,
+      std::string source_id, std::string source_epoch_base);
+  /// Exact current-source loss closes freshness independently of incident IO.
+  void MarkPoseSourceUnavailable(
+      const SceneRuntimeIdentity &expected_runtime_identity,
+      std::string_view source_id, std::string_view source_epoch_base);
 
   [[nodiscard]] std::string BeginInitialization(SceneRuntimeIdentity candidate,
                                                 bool deferred,
@@ -224,6 +249,7 @@ private:
   std::optional<std::string> active_replay_digest_;
   SceneInitializationCounters counters_;
   std::map<PoseObservationKey, PoseRecord> pose_records_;
+  std::optional<ConfiguredPoseSourceAvailability> configured_pose_source_;
 };
 
 [[nodiscard]] manyforge::content_identity::CanonicalValue

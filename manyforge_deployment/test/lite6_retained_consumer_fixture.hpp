@@ -123,13 +123,13 @@ materialize_lite6_native_arm_only_cclc_product_retained_consumer_fixture(
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_lite6_native_cclc_product_retained_consumer_fixture(
     const std::filesystem::path& package_root, std::string_view arm_lifecycle_semantic_digest,
-    std::string_view gripper_lifecycle_semantic_digest, bool operator_confirmation = false,
+    std::string_view gripper_lifecycle_semantic_digest, bool gripper_feedback = false,
     std::optional<double> initial_joint1_position_rad = std::nullopt) {
   return materialize_lite6_retained_consumer_fixture_from(
       package_root,
       make_lite6_native_cclc_product_retention_fixture(
           arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest,
-          operator_confirmation, initial_joint1_position_rad));
+          gripper_feedback, initial_joint1_position_rad));
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture

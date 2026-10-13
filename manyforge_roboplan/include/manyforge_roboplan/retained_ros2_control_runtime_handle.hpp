@@ -9,7 +9,9 @@
 #include <string>
 #include <vector>
 
+#include <manyforge_core/configured_robot_measured_state.hpp>
 #include <manyforge_core/execution_port_participant.hpp>
+#include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
@@ -92,6 +94,9 @@ struct RetainedRos2ControlArmTransport final {
   /// The participant binding's compiled joint names, index-aligned with
   /// `adapter.lane_facts.joint_names` (same coordinate order).
   std::vector<std::string> compiled_joint_names;
+  /// An explicitly configured gripper controller in this same controller
+  /// manager/hardware. Absent for non-CM transports; never derived from an URL.
+  std::optional<RetainedRos2ControlArmController> gripper_controller{};
 };
 
 /// Retained ROS resource lifetime of one runtime composition: the shared
@@ -129,16 +134,26 @@ public:
   RetainedRos2ControlRuntimeHandle &
   operator=(const RetainedRos2ControlRuntimeHandle &) = delete;
 
-  /// Binds once: constructs the epoch-1 adapter, the participant over it and
+  /// Binds once: constructs the initial adapter, the participant over it and
   /// takes the gripper adapter. Fails closed (everything shut down) on any
-  /// mismatch.
+  /// mismatch. Selected bring-up consumes the exact owner-computed successor;
+  /// absent seed preserves epoch 1 and the ordinary first observation.
   [[nodiscard]] core::Result<void> Bind(
       std::unique_ptr<ros2_control_execution::Ros2TransportResources> resources,
       core::IClock &clock, RetainedRos2ControlArmTransport arm,
       const ParticipantFactory &make_participant,
-      std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend> gripper,
+      std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend>
+          gripper,
       const core::RuntimeParticipantBinding &motion_binding,
-      const std::optional<core::RuntimeParticipantBinding> &gripper_binding);
+      const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
+      const std::optional<core::SelectedControllerOccurrenceDTO>
+          &successor_occurrence = std::nullopt);
+
+  /// Exact owned arm epoch and canonical domain observation floors, including
+  /// zero before an ordinary first observation. Unbound handles have no
+  /// domains.
+  [[nodiscard]] core::SelectedControllerOccurrenceDTO
+  ReadOwnedControllerOccurrence() const;
 
   [[nodiscard]] std::shared_ptr<core::ExecutionPortParticipant>
   participant() const;
@@ -152,6 +167,18 @@ public:
 
   /// The shared transport node (CCLC switch client, guard binding).
   [[nodiscard]] rclcpp::Node::SharedPtr node() const;
+
+  /// Unwired measured-source construction on the already bound node/executor.
+  /// The explicit topic carries JointState; descriptors explicitly map
+  /// their source_joint_names to addressed coordinates, index for index.
+  /// Receipt uses the same owner clock supplied to Bind.
+  /// Reconfiguration starts empty and retires old writes; owning readers keep
+  /// their previous publication storage and last sample. No lifecycle effects.
+  [[nodiscard]] core::Result<
+      std::vector<std::shared_ptr<const core::IObservedStateProvider>>>
+  ConfigureMeasuredStateSources(
+      std::vector<core::MeasuredStateSourceDescriptor> descriptors,
+      std::string joint_state_topic, core::IClock &receiver_clock);
 
   /// Installs the lane guard's hooks; only before `StartBackend`.
   void InstallGuardHooks(RetainedRos2ControlArmGuardHooks hooks);
@@ -207,8 +234,8 @@ public:
   /// Nonwaiting, one-shot transport start after the host retains fenced
   /// ownership: completes the gripper's ROS configuration, creates the
   /// controller-manager activity subscription, switch client and controller
-  /// statistics monitor (Q54), then starts the executor. A partial-start exception is retained; observing it never
-  /// retries startup.
+  /// statistics monitor (Q54), then starts the executor. A partial-start
+  /// exception is retained; observing it never retries startup.
   void StartBackend();
 
   /// CCLC Prepare primitive: no controller-manager effect; the loaded
@@ -264,16 +291,24 @@ public:
 
 private:
   struct ArmState;
+  struct MeasuredStateChannels;
   class ArmPort;
 
-  void ObserveActivity(RetainedRos2ControlArmActivity activity);
+  void ObserveActivity(
+      RetainedRos2ControlArmActivity activity,
+      std::optional<RetainedRos2ControlArmActivity> gripper_activity = {});
+  [[nodiscard]] RetainedRos2ControlSwitchResult PrepareGripperController();
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  SwitchGripperController(bool activate, std::stop_token cancellation);
   void PublishReadinessLocked();
   [[nodiscard]] core::Result<void> RotateEpochLocked();
   [[nodiscard]] RetainedRos2ControlSwitchResult
-  SendSwitch(bool activate, std::stop_token cancellation);
+  SendSwitch(bool activate, std::stop_token cancellation,
+             std::optional<std::string> selected_controller = {});
 
   struct DomainGenerationState final {
     std::uint64_t publication_generation{};
+    bool first_observation_pending{true};
     std::string source_signature;
     core::LifecycleBlockingCauseClassDTO last_intervention_cause{
         core::LifecycleBlockingCauseClassDTO::kNone};
@@ -285,6 +320,7 @@ private:
   std::mutex switch_mutex_;
   std::unique_ptr<ros2_control_execution::Ros2TransportResources> resources_;
   core::IClock *clock_{};
+  std::shared_ptr<MeasuredStateChannels> measured_state_channels_;
   std::optional<RetainedRos2ControlArmTransport> arm_transport_;
   std::shared_ptr<ArmState> arm_;
   std::shared_ptr<core::ExecutionPortParticipant> participant_;
@@ -305,6 +341,9 @@ private:
   std::optional<core::ControlDomainId> motion_domain_id_;
   std::optional<core::ControlDomainId> gripper_domain_id_;
   std::optional<std::string> gripper_id_;
+  RetainedRos2ControlArmActivity gripper_activity_{};
+  core::ComponentLifecycleStateDTO gripper_requested_{
+      core::ComponentLifecycleStateDTO::kDeclared};
   std::map<core::ControlDomainId, DomainGenerationState> domain_generations_;
 };
 

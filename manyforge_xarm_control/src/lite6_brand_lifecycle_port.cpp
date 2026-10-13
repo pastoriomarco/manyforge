@@ -210,7 +210,7 @@ constexpr int kCollisionErrorCode = 31;
 // A positive controller error code is classified by its documented meaning;
 // every other positive code is `fault`. The protective stop has no documented
 // code and is never inferred: anything not established from the report is
-// `unknown`. An unrequested mode/state change (see `track_vendor_control`) is
+// `unknown`. An unrequested mode/state change (see `TrackVendorControl`) is
 // `external_control`.
 [[nodiscard]] core::LifecycleBlockingCauseClassDTO
 vendor_cause(const XArmObservedState &observed,
@@ -579,78 +579,67 @@ bool Lite6BrandLifecyclePort::matches_occurrence(
 // non-stop primitive, which it does only after the operator's acknowledgement;
 // that dispatch re-baselines from the latest fresh report. Detection of real
 // Studio jogs and of these vendor sequences is verified on hardware in R7.
-void Lite6BrandLifecyclePort::track_vendor_control(
-    const XArmObservedState &observed, const std::int64_t now_ns) {
+void Lite6BrandLifecyclePort::TrackVendorControl(
+    const XArmObservedState &observed, const std::int64_t now_ns,
+    VendorTrackingState &tracking) {
   if (report_unavailable(observed)) {
     return;
   }
-  last_reported_error_code_ = observed.error_code;
+  tracking.last_reported_error_code_ = observed.error_code;
   if (observed.mode < 0 || observed.state < 0) {
     return;
   }
   const VendorControlPair reported{observed.mode, observed.state};
-  last_reported_pair_ = reported;
-  if (own_expectation_.has_value()) {
-    if (own_expectation_->completed_at_ns.has_value() &&
-        now_ns - *own_expectation_->completed_at_ns > kOwnPrimitiveSettleNs) {
-      own_expectation_.reset();
-    } else if (own_expectation_->base.mode < 0 ||
-               own_expectation_->base.state < 0) {
-      own_expectation_->base = explained_pair_.value_or(reported);
+  tracking.last_reported_pair_ = reported;
+  if (tracking.own_expectation_.has_value()) {
+    if (tracking.own_expectation_->completed_at_ns.has_value() &&
+        now_ns - *tracking.own_expectation_->completed_at_ns > kOwnPrimitiveSettleNs) {
+      tracking.own_expectation_.reset();
+    } else if (tracking.own_expectation_->base.mode < 0 ||
+               tracking.own_expectation_->base.state < 0) {
+      tracking.own_expectation_->base = tracking.explained_pair_.value_or(reported);
     }
   }
   // A vendor error explains the pair it reports; its code classifies it.
   if (observed.error_code != 0 || !is_false(observed.fault_present) ||
       !is_false(observed.recovery_required)) {
-    explained_pair_ = reported;
+    tracking.explained_pair_ = reported;
     return;
   }
   // ManyForge only ever selects position or joint-servo mode.
   if (reported.mode != kPositionMode && reported.mode != kJointServoMode) {
-    external_control_detected_ = true;
+    tracking.external_control_detected_ = true;
     return;
   }
-  if (!explained_pair_.has_value()) {
-    explained_pair_ = reported;
+  if (!tracking.explained_pair_.has_value()) {
+    tracking.explained_pair_ = reported;
     return;
   }
-  if (!equivalent_pair(explained_pair_->mode, explained_pair_->state,
+  if (!equivalent_pair(tracking.explained_pair_->mode, tracking.explained_pair_->state,
                        reported.mode, reported.state)) {
-    if (!own_expectation_.has_value() ||
-        !own_effect_explains(own_expectation_->command,
-                             own_expectation_->base.mode,
-                             own_expectation_->base.state, reported.mode,
+    if (!tracking.own_expectation_.has_value() ||
+        !own_effect_explains(tracking.own_expectation_->command,
+                             tracking.own_expectation_->base.mode,
+                             tracking.own_expectation_->base.state, reported.mode,
                              reported.state)) {
       // The explained pair stays frozen at the last explained status.
-      external_control_detected_ = true;
+      tracking.external_control_detected_ = true;
       return;
     }
-    explained_pair_ = reported;
+    tracking.explained_pair_ = reported;
   }
-  if (own_expectation_.has_value() &&
-      own_expectation_->completed_at_ns.has_value() &&
-      own_effect_completed(own_expectation_->command, reported.mode,
+  if (tracking.own_expectation_.has_value() &&
+      tracking.own_expectation_->completed_at_ns.has_value() &&
+      own_effect_completed(tracking.own_expectation_->command, reported.mode,
                            reported.state)) {
-    own_expectation_.reset();
+    tracking.own_expectation_.reset();
   }
 }
 
-core::Result<BrandLifecycleObservationDTO> Lite6BrandLifecyclePort::Observe(
-    const core::BrandLifecycleObservationQueryDTO &query) {
-  if (!query.locally_valid() || !matches_occurrence(query)) {
-    return core::Result<BrandLifecycleObservationDTO>::Err(error(
-        "xarm_lifecycle_observation_identity_mismatch",
-        "the observation query does not address this Lite6 provider occurrence",
-        "provider_occurrence_mismatch"));
-  }
-
-  // Concurrent target polls and coordinator reads must sample and classify in
-  // the same order. Rejecting their harmless reordering would report provider
-  // loss to CCLC. This lock covers only a bounded cached read, never execute.
-  std::lock_guard observation_lock(observation_mutex_);
-  const auto now_ns = clock_.now();
+core::Result<XArmObservedState> Lite6BrandLifecyclePort::ReadCachedObservation(
+    const std::int64_t now_ns) const {
   if (now_ns < 0) {
-    return core::Result<BrandLifecycleObservationDTO>::Err(
+    return core::Result<XArmObservedState>::Err(
         error("xarm_lifecycle_observation_clock_invalid",
               "the lifecycle observation clock returned a negative time",
               "negative_owner_clock"));
@@ -659,11 +648,11 @@ core::Result<BrandLifecycleObservationDTO> Lite6BrandLifecyclePort::Observe(
   try {
     observed = transport_->observe(now_ns);
   } catch (const std::exception &exception) {
-    return core::Result<BrandLifecycleObservationDTO>::Err(error(
+    return core::Result<XArmObservedState>::Err(error(
         "xarm_lifecycle_observation_unavailable",
         "the restricted xArm observation boundary failed", exception.what()));
   } catch (...) {
-    return core::Result<BrandLifecycleObservationDTO>::Err(
+    return core::Result<XArmObservedState>::Err(
         error("xarm_lifecycle_observation_unavailable",
               "the restricted xArm observation boundary failed",
               "unknown_transport_exception"));
@@ -683,13 +672,119 @@ core::Result<BrandLifecycleObservationDTO> Lite6BrandLifecyclePort::Observe(
       observed.fresh_until_ns <= now_ns ||
       observed.transport_owner_received_timestamp_ns >=
           observed.fresh_until_ns) {
-    return core::Result<BrandLifecycleObservationDTO>::Err(error(
+    return core::Result<XArmObservedState>::Err(error(
         "xarm_lifecycle_observation_unavailable",
         "the restricted xArm observation is stale, invalid, or cross-epoch",
         observed.transport_owner_progress_reason.empty()
             ? "observation_invariant_failed"
             : observed.transport_owner_progress_reason));
   }
+
+  return core::Result<XArmObservedState>::Ok(std::move(observed));
+}
+
+core::Result<Lite6BrandLifecyclePort::ClassifiedHealth>
+Lite6BrandLifecyclePort::ComputeHealth(
+    const XArmObservedState &observed, const std::int64_t now_ns,
+    const VendorTrackingState &previous_tracking,
+    core::LifecycleDomainHealthDTO health) {
+  if (!health.locally_valid()) {
+    return core::Result<ClassifiedHealth>::Err(
+        error("xarm_lifecycle_observation_invalid",
+              "the normalized Lite6 observation violates the Core contract",
+              "normalized_observation_invalid"));
+  }
+  auto tracking = previous_tracking;
+  if (observed.generation < tracking.last_observation_generation_ ||
+      observed.transport_owner_progress_sequence <
+          tracking.last_owner_publication_sequence_) {
+    return core::Result<ClassifiedHealth>::Err(error(
+        "xarm_lifecycle_observation_unavailable",
+        "the restricted xArm observation regressed within its owner epoch",
+        observed.generation < tracking.last_observation_generation_
+            ? "observation_generation_regressed"
+            : "owner_publication_sequence_regressed"));
+  }
+
+  // A connected observation without a vendor report is an availability loss
+  // only while no intervention-requiring cause was previously reported; any
+  // classification from a report replaces the retained cause.
+  auto cause = core::LifecycleBlockingCauseClassDTO::kUnknown;
+  TrackVendorControl(observed, now_ns, tracking);
+  cause = vendor_cause(observed, tracking.external_control_detected_);
+  if (cause == core::LifecycleBlockingCauseClassDTO::kAvailability) {
+    if (tracking.last_intervention_cause_ !=
+        core::LifecycleBlockingCauseClassDTO::kNone) {
+      cause = tracking.last_intervention_cause_;
+    }
+  } else {
+    tracking.last_intervention_cause_ =
+        core::lifecycle_cause_requires_intervention(cause)
+            ? cause
+            : core::LifecycleBlockingCauseClassDTO::kNone;
+  }
+
+  // The DTO is validated before history changes. Only its canonical cause
+  // token depends on ordered classification; the remaining facts stay intact.
+  for (auto &fact : health.facts) {
+    if (fact.lifecycle_fact_id.value() == core::kLifecycleBlockingCauseFactId) {
+      fact.value = token_value(std::string(core::to_string(cause)));
+      break;
+    }
+  }
+  tracking.last_observation_generation_ = observed.generation;
+  tracking.last_owner_publication_sequence_ = observed.transport_owner_progress_sequence;
+  return core::Result<ClassifiedHealth>::Ok(
+      {std::move(health), std::move(tracking)});
+}
+
+core::Result<core::LifecycleDomainHealthDTO>
+Lite6BrandLifecyclePort::ReadLifecycleHealth(
+    const core::ControlDomainId &domain, const core::TimePoint now_ns) const {
+  if (domain != config_.control_domain_id) {
+    return core::Result<core::LifecycleDomainHealthDTO>::Err(error(
+        "xarm_lifecycle_health_unavailable",
+        "the health read does not address this Lite6 domain",
+        "provider_occurrence_mismatch"));
+  }
+  std::lock_guard observation_lock(observation_mutex_);
+  const auto observed = ReadCachedObservation(now_ns);
+  if (!observed.ok()) {
+    return core::Result<core::LifecycleDomainHealthDTO>::Err(observed.error());
+  }
+  std::lock_guard cause_lock(cause_mutex_);
+  auto classified = ComputeHealth(
+      observed.value(), now_ns, tracking_,
+      {observed_state(observed.value()),
+       normalized_facts(observed.value(),
+                        core::LifecycleBlockingCauseClassDTO::kUnknown),
+       std::nullopt});
+  if (!classified.ok()) {
+    return core::Result<core::LifecycleDomainHealthDTO>::Err(classified.error());
+  }
+  return core::Result<core::LifecycleDomainHealthDTO>::Ok(
+      std::move(classified.value().health));
+}
+
+core::Result<BrandLifecycleObservationDTO> Lite6BrandLifecyclePort::Observe(
+    const core::BrandLifecycleObservationQueryDTO &query) {
+  if (!query.locally_valid() || !matches_occurrence(query)) {
+    return core::Result<BrandLifecycleObservationDTO>::Err(error(
+        "xarm_lifecycle_observation_identity_mismatch",
+        "the observation query does not address this Lite6 provider occurrence",
+        "provider_occurrence_mismatch"));
+  }
+
+  // Concurrent target polls and coordinator reads must sample and classify in
+  // the same order. Rejecting their harmless reordering would report provider
+  // loss to CCLC. This lock covers only a bounded cached read, never execute.
+  std::lock_guard observation_lock(observation_mutex_);
+  const auto now_ns = clock_.now();
+  const auto captured = ReadCachedObservation(now_ns);
+  if (!captured.ok()) {
+    return core::Result<BrandLifecycleObservationDTO>::Err(captured.error());
+  }
+  const auto &observed = captured.value();
 
   BrandLifecycleObservationDTO result{
       query.lifecycle_transaction_id,
@@ -720,45 +815,15 @@ core::Result<BrandLifecycleObservationDTO> Lite6BrandLifecyclePort::Observe(
   // Reject a genuine source regression before changing vendor history.
   // The observation lock prevents concurrent callers from causing one here.
   std::lock_guard lock(cause_mutex_);
-  if (observed.generation < last_observation_generation_ ||
-      observed.transport_owner_progress_sequence <
-          last_owner_publication_sequence_) {
-    return core::Result<BrandLifecycleObservationDTO>::Err(error(
-        "xarm_lifecycle_observation_unavailable",
-        "the restricted xArm observation regressed within its owner epoch",
-        observed.generation < last_observation_generation_
-            ? "observation_generation_regressed"
-            : "owner_publication_sequence_regressed"));
+  auto classified = ComputeHealth(
+      observed, now_ns, tracking_,
+      {result.observed_state, std::move(result.facts), std::nullopt});
+  if (!classified.ok()) {
+    return core::Result<BrandLifecycleObservationDTO>::Err(classified.error());
   }
-
-  // A connected observation without a vendor report is an availability loss
-  // only while no intervention-requiring cause was previously reported; any
-  // classification from a report replaces the retained cause.
-  auto cause = core::LifecycleBlockingCauseClassDTO::kUnknown;
-  track_vendor_control(observed, now_ns);
-  cause = vendor_cause(observed, external_control_detected_);
-  if (cause == core::LifecycleBlockingCauseClassDTO::kAvailability) {
-    if (last_intervention_cause_ !=
-        core::LifecycleBlockingCauseClassDTO::kNone) {
-      cause = last_intervention_cause_;
-    }
-  } else {
-    last_intervention_cause_ =
-        core::lifecycle_cause_requires_intervention(cause)
-            ? cause
-            : core::LifecycleBlockingCauseClassDTO::kNone;
-  }
-
-  // The DTO is validated before history changes. Only its canonical cause
-  // token depends on ordered classification; the remaining facts stay intact.
-  for (auto &fact : result.facts) {
-    if (fact.lifecycle_fact_id.value() == core::kLifecycleBlockingCauseFactId) {
-      fact.value = token_value(std::string(core::to_string(cause)));
-      break;
-    }
-  }
-  last_observation_generation_ = observed.generation;
-  last_owner_publication_sequence_ = observed.transport_owner_progress_sequence;
+  result.observed_state = classified.value().health.observed_state;
+  result.facts = std::move(classified.value().health.facts);
+  tracking_ = std::move(classified.value().tracking);
   return core::Result<BrandLifecycleObservationDTO>::Ok(std::move(result));
 }
 
@@ -783,31 +848,31 @@ BrandLifecyclePrimitiveResultDTO Lite6BrandLifecyclePort::Dispatch(
     // Servo faults C10-C17 need a power cycle; a clearing command must not
     // precede it (R7 verification list).
     if (*command == XArmLifecycleCommand::kClearError &&
-        power_cycle_error(last_reported_error_code_)) {
+        power_cycle_error(tracking_.last_reported_error_code_)) {
       return not_dispatched(intent, "xarm_lifecycle_primitive_not_permitted",
                             "power_cycle_required");
     }
     // CCLC dispatches a non-stop primitive only after the operator
     // acknowledged an intervention; recovery starts from the fresh report.
-    if (!stop_direction(*command) && external_control_detected_) {
-      external_control_detected_ = false;
-      explained_pair_ = last_reported_pair_;
+    if (!stop_direction(*command) && tracking_.external_control_detected_) {
+      tracking_.external_control_detected_ = false;
+      tracking_.explained_pair_ = tracking_.last_reported_pair_;
     }
-    own_expectation_ = OwnPrimitiveExpectation{
-        *command, last_reported_pair_.value_or(VendorControlPair{}),
+    tracking_.own_expectation_ = OwnPrimitiveExpectation{
+        *command, tracking_.last_reported_pair_.value_or(VendorControlPair{}),
         std::nullopt};
   }
   const auto settle_own_expectation = [&](const bool effect_possible) {
     std::lock_guard lock(cause_mutex_);
-    if (!own_expectation_.has_value() ||
-        own_expectation_->command != *command ||
-        own_expectation_->completed_at_ns.has_value()) {
+    if (!tracking_.own_expectation_.has_value() ||
+        tracking_.own_expectation_->command != *command ||
+        tracking_.own_expectation_->completed_at_ns.has_value()) {
       return;
     }
     if (effect_possible) {
-      own_expectation_->completed_at_ns = clock_.now();
+      tracking_.own_expectation_->completed_at_ns = clock_.now();
     } else {
-      own_expectation_.reset();
+      tracking_.own_expectation_.reset();
     }
   };
 

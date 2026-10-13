@@ -73,6 +73,7 @@ function ComponentLifecycleSummary({ snapshot }: { snapshot: CCLCComponentSnapsh
 }
 
 type PendingConfirmation =
+  | { kind: 'activation'; sequence: boolean; label: string; detail: string }
   | { kind: 'lifecycle'; intent: CCLCLifecycleIntent; label: string; detail: string }
   | { kind: 'route'; template: CCLCRouteTemplate; label: string; detail: string };
 
@@ -116,7 +117,10 @@ export function CCLCPanelView({
     const current = confirmation;
     setConfirmation(null);
     if (current === null) return;
-    if (current.kind === 'lifecycle') await submitLifecycle(current.intent);
+    if (current.kind === 'activation') {
+      if (current.sequence) await controller.activateSequence();
+      else await controller.activate();
+    } else if (current.kind === 'lifecycle') await submitLifecycle(current.intent);
     else await submitRoute(current.template);
   };
 
@@ -204,6 +208,30 @@ export function CCLCPanelView({
           );
         })}
       </div>
+
+      <div className="button-row" aria-label="Explicit activation">
+        <button type="button" disabled={!enabled || !mutationAvailable || busy || snapshot === null || controller.pendingActivationRequest !== null}
+          onClick={() => setConfirmation({ kind: 'activation', sequence: false,
+            label: 'Activate component?', detail: 'Prepare if required, then Enable this component to Active.' })}>
+          Activate
+        </button>
+        <button type="button" disabled={!enabled || !mutationAvailable || busy || componentIds.length === 0 || controller.pendingActivationRequest !== null}
+          onClick={() => setConfirmation({ kind: 'activation', sequence: true,
+            label: 'Activate sequence?', detail: 'Activate in the applied Deployment list order. Stop at the first failure or unknown outcome.' })}>
+          Activate sequence
+        </button>
+        {busy && controller.activationProgress !== null && (
+          <button type="button" onClick={controller.cancelActivation}>Cancel remaining activation</button>
+        )}
+      </div>
+      {controller.activationProgress !== null && <p role="status">{controller.activationProgress}</p>}
+      {controller.pendingActivationRequest !== null && (
+        <div role="status">
+          Activation outcome unknown for {controller.pendingActivationRequest.controllable_component_id}
+          {' · request '}{controller.pendingActivationRequest.request_context.request_id}
+          <button type="button" disabled={busy} onClick={() => void reconcileTransaction()}>Reconcile</button>
+        </div>
+      )}
 
       <div className="cclc-routes">
         <h3>Control routes</h3>

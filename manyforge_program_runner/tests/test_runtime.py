@@ -3449,7 +3449,6 @@ def test_runtime_controls_are_state_conditioned_and_restore_current_projection(
     commands = {
         row["command_kind"]: row for row in runtime.cycle_status()["allowed_commands"]
     }
-    assert commands["gripper_confirm"]["allowed"] is True
     # Native target/context checks, not this coarse cycle projection, decide
     # whether held-cycle manual motion can be admitted.
     assert commands["operation_start"]["allowed"] is True

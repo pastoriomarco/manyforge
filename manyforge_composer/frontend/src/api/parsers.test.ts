@@ -349,7 +349,7 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
       differsFromSaved: false,
     },
     saved: { path: '/workspace/deployment.fixture.json', deploymentRevision: digestA },
-    managerApplied: { deploymentRevision: digestA, scenarioId: 'fixture' },
+    managerApplied: { activationOrder: null, deploymentRevision: digestA, scenarioId: 'fixture' },
     runAdmission: { ready: true, reason: null },
     binding: programBindingFixture('fixture-program', digestB, digestA),
     scenarioCandidates: [{
@@ -1576,6 +1576,17 @@ describe('Applied Program status parser', () => {
 });
 
 describe('Deployment workspace parser', () => {
+  it('requires the nullable applied order and preserves authored order', () => {
+    const fixture = deploymentWorkspaceFixture();
+    const applied = fixture.managerApplied as Record<string, unknown>;
+    applied.activationOrder = { retainedBundleId: 'bundle.current', graphRevision: `sha256:${'a'.repeat(64)}`, componentIds: ['z', 'a'] };
+    expect(parseDeploymentWorkspaceResponse(fixture).managerApplied.activationOrder?.componentIds).toEqual(['z', 'a']);
+    (applied.activationOrder as Record<string, unknown>).componentIds = ['z', 'z'];
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow('unique ordered components');
+    delete applied.activationOrder;
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow();
+  });
+
   it('binds a candidate receipt to one prepared activation identity', () => {
     const digestA = `sha256:${'a'.repeat(64)}`;
     const digestB = `sha256:${'b'.repeat(64)}`;
@@ -1815,7 +1826,7 @@ describe('Deployment workspace parser', () => {
       graphRevision: null,
     });
     fixture.saved = { path: null, deploymentRevision: null };
-    fixture.managerApplied = { deploymentRevision: null, scenarioId: null };
+    fixture.managerApplied = { activationOrder: null, deploymentRevision: null, scenarioId: null };
     fixture.runAdmission = {
       ready: false, reason: 'Deployment Draft differs from Manager Applied',
     };
@@ -2650,7 +2661,7 @@ describe('headless projection parsers', () => {
       source,
       status: {
         api_version: 'manyforge.manager_source.v1',
-        active: {
+        active: { canonical_empty: false,
           cell_graph: { cell_id: 'cell-a', components: [] },
           graph_revision: 'graph.1',
           retained_bundle_id: 'bundle.1',

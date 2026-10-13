@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <map>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,29 @@
 
 namespace manyforge::roboplan_backend {
 namespace {
+
+class EmptyCellRoutePublicationOwner final
+    : public deployment::IRouteConfigurationKernelPublicationOwner {
+public:
+  [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
+  ReadCurrentPhysicalParticipants(
+      const core::ActiveControlConfigurationDTO &) const override {
+    return core::Result<std::vector<core::RuntimeParticipantBinding>>::Err(
+        {"empty_cell_physical_route_unavailable",
+         "the verified empty cell has no physical control domain",
+         {{"effect", "not_started"}}});
+  }
+
+  [[nodiscard]] core::Result<core::RuntimeRouteConfigurationReadbackDTO>
+  PublishAndReadBackRouteConfiguration(
+      const core::ActiveControlConfigurationDTO &,
+      std::vector<deployment::VerifiedRouteReadinessParticipant>) override {
+    return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+        {"empty_cell_physical_route_unavailable",
+         "the verified empty cell has no physical control domain",
+         {{"effect", "not_started"}}});
+  }
+};
 
 template <typename Value>
 [[nodiscard]] core::Result<Value> reject(std::string reason,
@@ -167,7 +191,8 @@ adopt_durable_route_configurations(
     core::SqliteCCLCJournal journal(
         config.state_root / std::string(core::kCCLCJournalFilename),
         config.cell_id, config.exact_result_history_capacity,
-        config.terminal_result_bytes_capacity);
+        config.terminal_result_bytes_capacity, config.on_incidents_pruned,
+        config.preparation_failure_source);
     const auto facts = journal.LoadCurrentSnapshotFacts(
         std::vector<core::ControllableComponentId>(component_ids.begin(),
                                                    component_ids.end()),
@@ -774,6 +799,25 @@ struct DerivedRuntimeClosure final {
 
 } // namespace
 
+core::Result<
+    std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>>
+MakeVerifiedEmptyCellRoutePublicationOwner(
+    const deployment::RetainedBundle &retained_bundle) {
+  const auto &graph = retained_bundle.value().cell_graph;
+  if (!deployment::verify_retained_bundle_identity(retained_bundle) ||
+      !graph.controllable_components.empty() ||
+      !graph.control_domains.empty() || !graph.control_bindings.empty() ||
+      !retained_bundle.value().desired_control_configurations.empty()) {
+    return reject<
+        std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>>(
+        "empty_cell_route_product_invalid",
+        "empty-cell route dependency requires a verified empty physical graph");
+  }
+  return core::Result<
+      std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>>::Ok(
+      std::make_unique<EmptyCellRoutePublicationOwner>());
+}
+
 core::Result<std::vector<core::KinematicResourceSourceProjectionDTO>>
 DeriveRetainedNativeStateSourceProjections(
     const std::span<const core::RuntimeParticipantBinding> physical_bindings) {
@@ -841,6 +885,148 @@ DeriveRetainedNativeStateSourceProjections(
   return core::Result<
       std::vector<core::KinematicResourceSourceProjectionDTO>>::Ok(
       std::move(result));
+}
+
+core::Result<core::NativeApplyPlanRequestDTO>
+DeriveRetainedNativeApplyPlanRequest(
+    const core::NamedApplyPublicationTransactionDTO &apply,
+    const deployment::RetainedBundle &candidate,
+    const deployment::RetainedBundle *predecessor,
+    const deployment::ApplyComponentDeltaDTO &delta,
+    const std::span<const core::RuntimeParticipantBinding> candidate_physical_bindings,
+    const std::span<const core::RuntimeRouteConfigurationReadbackDTO> retained_route_readbacks,
+    const core::ComponentLifecycleStateDTO changed_component_state) {
+  using Plan = core::NativeApplyPlanRequestDTO;
+  try {
+    if (!apply.valid() || !deployment::verify_retained_bundle_identity(candidate) ||
+        !delta.valid() ||
+        (changed_component_state != core::ComponentLifecycleStateDTO::kActive &&
+         changed_component_state != core::ComponentLifecycleStateDTO::kDeclared) ||
+        candidate_physical_bindings.size() > core::kMaxRouteReadinessPublicationRows) {
+      return reject<Plan>("native_apply_plan_input_invalid",
+                          "native Apply planning requires exact retained inputs");
+    }
+    const auto &graph = candidate.value().cell_graph;
+    if (graph.controllable_components.size() > core::kMaximumCCLCComponentWatermarks ||
+        candidate.value().desired_control_configurations.size() >
+            core::kMaximumCCLCActiveConfigurationWatermarks) {
+      return reject<Plan>("native_apply_plan_input_invalid",
+                          "native Apply scope exceeds the existing CCLC plan limits");
+    }
+    if (predecessor != nullptr &&
+        (!deployment::verify_retained_bundle_identity(*predecessor) ||
+         predecessor->value().cell_graph.cell_id != graph.cell_id ||
+         deployment::derive_apply_component_delta(*predecessor, candidate) != delta)) {
+      return reject<Plan>("native_apply_plan_delta_mismatch",
+                          "native Apply delta differs from the verified bundles");
+    }
+    Plan plan{apply, candidate.retained_bundle_id(), graph.graph_revision,
+              {}, {}, {}, {}, {}, {}, changed_component_state};
+    std::map<core::ControllableComponentId, std::vector<core::ControlDomainId>> candidate_domains;
+    for (const auto &component : graph.controllable_components) {
+      plan.components.push_back(component.controllable_component_id);
+      candidate_domains.emplace(component.controllable_component_id,
+                                 std::vector<core::ControlDomainId>{});
+    }
+    std::sort(plan.components.begin(), plan.components.end());
+    for (const auto &binding : graph.control_bindings)
+      candidate_domains.at(binding.controllable_component_id).push_back(binding.control_domain_id);
+    for (auto &[_, domains] : candidate_domains) {
+      std::sort(domains.begin(), domains.end());
+      domains.erase(std::unique(domains.begin(), domains.end()), domains.end());
+    }
+    std::size_t candidate_rows = 0U;
+    for (const auto &row : delta.components) {
+      const auto domains = candidate_domains.find(row.controllable_component_id);
+      const auto identity = deployment::derive_component_runtime_identity(
+          candidate, row.controllable_component_id);
+      if (identity != row.candidate_runtime_identity ||
+          (domains == candidate_domains.end()
+               ? !row.candidate_domains.empty()
+               : domains->second != row.candidate_domains) ||
+          (predecessor == nullptr && row.disposition != deployment::ApplyComponentDisposition::kAdd)) {
+        return reject<Plan>("native_apply_plan_component_mismatch",
+                            "native Apply component membership differs from the retained candidate");
+      }
+      if (identity) ++candidate_rows;
+      if (row.disposition == deployment::ApplyComponentDisposition::kRetain)
+        plan.retained_components.push_back(row.controllable_component_id);
+      else if (row.disposition == deployment::ApplyComponentDisposition::kRemove)
+        plan.removed_components.push_back(row.controllable_component_id);
+    }
+    if (candidate_rows != plan.components.size())
+      return reject<Plan>("native_apply_plan_component_mismatch",
+                          "native Apply delta does not cover every candidate component");
+
+    std::map<core::ControlBindingId, const core::RuntimeParticipantBinding *> physical_by_binding;
+    for (const auto &physical : candidate_physical_bindings) {
+      const auto &value = physical.value();
+      if (value.retained_bundle_id != candidate.retained_bundle_id() ||
+          value.graph_revision != graph.graph_revision || !value.control_path ||
+          !physical_by_binding.emplace(value.control_path->control_binding_id, &physical).second)
+        return reject<Plan>("native_apply_plan_binding_mismatch",
+                            "native Apply physical bindings are stale, duplicated or unaddressed");
+    }
+    std::set<core::ControlBindingId> consumed;
+    std::set<core::ControlDomainId> retained_domains;
+    for (const auto &desired : candidate.value().desired_control_configurations) {
+      std::optional<core::ActiveControlConfigurationGeneration> floor;
+      for (const auto &route : desired.binding_routes) {
+        const auto *binding = unique_by(graph.control_bindings, route.control_binding_id,
+            [](const auto &row) { return row.control_binding_id; });
+        const auto physical = physical_by_binding.find(route.control_binding_id);
+        if (binding == nullptr || physical == physical_by_binding.end() ||
+            binding->control_binding_revision != route.control_binding_revision ||
+            binding->control_domain_id != desired.control_domain_id ||
+            !exact_graph_binding(physical->second->value(), *binding, desired, route) ||
+            !consumed.insert(route.control_binding_id).second)
+          return reject<Plan>("native_apply_plan_binding_mismatch",
+                              "native Apply desired route has no exact compiled representative");
+        const auto generation = physical->second->value().control_path->active_control_configuration_generation;
+        if (!generation.nonzero() ||
+            generation.value() > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+            (floor && *floor != generation))
+          return reject<Plan>("native_apply_plan_generation_mismatch",
+                              "native Apply domain has conflicting compiled generation floors");
+        floor = generation;
+        if (std::binary_search(plan.retained_components.begin(), plan.retained_components.end(),
+                               binding->controllable_component_id))
+          retained_domains.insert(desired.control_domain_id);
+      }
+      if (!floor)
+        return reject<Plan>("native_apply_plan_binding_mismatch",
+                            "native Apply desired domain has no compiled representative");
+      plan.compiled_routes.push_back({desired.control_domain_id, *floor});
+      if (!retained_domains.contains(desired.control_domain_id)) continue;
+      const auto *readback = unique_by(retained_route_readbacks, desired.control_domain_id,
+          [](const auto &row) { return row.active_configuration.control_domain_id; });
+      if (readback == nullptr || !readback->operation_admission_open ||
+          !readback->active_configuration.locally_valid() ||
+          readback->active_configuration.state != core::ActiveControlConfigurationStateDTO::kReconciled ||
+          !active_configuration_matches_desired(readback->active_configuration, desired))
+        return reject<Plan>("native_apply_plan_retained_route_mismatch",
+                            "native Apply retained domain has no exact current open Kernel route");
+      plan.retained_routes.push_back(readback->active_configuration);
+    }
+    if (consumed.size() != physical_by_binding.size() ||
+        retained_route_readbacks.size() != retained_domains.size())
+      return reject<Plan>("native_apply_plan_route_coverage_mismatch",
+                          "native Apply bindings or retained readbacks widen the planned domains");
+    if (predecessor != nullptr) {
+      for (const auto &desired : predecessor->value().desired_control_configurations)
+        if (std::none_of(candidate.value().desired_control_configurations.begin(),
+                         candidate.value().desired_control_configurations.end(),
+                         [&](const auto &row) { return row.control_domain_id == desired.control_domain_id; }))
+          plan.removed_domains.push_back(desired.control_domain_id);
+    }
+    if (plan.removed_components.size() > core::kMaximumCCLCComponentWatermarks ||
+        plan.removed_domains.size() > core::kMaximumCCLCActiveConfigurationWatermarks)
+      return reject<Plan>("native_apply_plan_input_invalid",
+                          "native Apply removals exceed the existing CCLC plan limits");
+    return core::Result<Plan>::Ok(std::move(plan));
+  } catch (const std::exception &error) {
+    return reject<Plan>("native_apply_plan_derivation_failed", error.what());
+  }
 }
 
 bool RetainedNativeCCLCRuntimeConfig::locally_valid() const noexcept {
@@ -1126,6 +1312,56 @@ CreateRetainedNativeCCLCRuntime(
       std::move(kernel_current_configuration_source),
       component_command_readiness_port);
   return composition;
+}
+
+core::Result<std::shared_ptr<
+    const deployment::CCLCRuntimeComposition::PreparedProductContext>>
+PrepareRetainedNativeCCLCProductContext(
+    deployment::CCLCRuntimeComposition &composition,
+    RetainedNativeCCLCRuntimeConfig config,
+    std::shared_ptr<const deployment::RetainedBundle> retained_bundle,
+    const core::IActiveBundlePublicationReader &active_publication_reader,
+    core::ActiveBundlePublicationReceiptDTO expected_active_publication,
+    const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
+    const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
+    std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
+    std::vector<core::RuntimeParticipantBinding> physical_bindings,
+    core::IClock &clock,
+    deployment::IRouteConfigurationKernelPublicationOwner
+        &kernel_publication_owner,
+    std::shared_ptr<const void> installed_product_lifetime,
+    std::function<
+        core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+            const core::ControlDomainId &)>
+        kernel_current_configuration_source,
+    RetainedExternallyManagedDomainSnapshotSource
+        externally_managed_controller_snapshot_source,
+    core::ICCLCComponentCommandReadinessPort *component_command_readiness_port) {
+  using PreparedContext =
+      deployment::CCLCRuntimeComposition::PreparedProductContext;
+  if (retained_bundle == nullptr) {
+    return reject<std::shared_ptr<const PreparedContext>>(
+        "native_cclc_retained_bundle_missing",
+        "native CCLC composition has no retained bundle");
+  }
+  auto closure = derive_runtime_closure(
+      config, *retained_bundle, artifact_source, lifecycle_catalog_source,
+      std::move(brand_ports), physical_bindings, clock,
+      externally_managed_controller_snapshot_source);
+  if (!closure.ok()) {
+    return core::Result<std::shared_ptr<const PreparedContext>>::Err(
+        closure.error());
+  }
+  auto &value = closure.value();
+  return composition.PrepareProductContext({
+      std::move(retained_bundle), active_publication_reader,
+      std::move(expected_active_publication), artifact_source,
+      lifecycle_catalog_source, std::move(value.lifecycle_provider_occurrences),
+      std::move(value.controller_sources), std::move(value.brand_ports),
+      std::move(value.controller_ports), std::move(value.source_projections),
+      std::move(kernel_current_configuration_source),
+      component_command_readiness_port, kernel_publication_owner,
+      std::move(installed_product_lifetime)});
 }
 
 core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>

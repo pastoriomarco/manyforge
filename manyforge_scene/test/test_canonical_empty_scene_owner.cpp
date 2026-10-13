@@ -11,6 +11,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <initializer_list>
 #include <manyforge_core/logical_scene_identity.hpp>
@@ -34,6 +35,12 @@
 #include "manyforge_scene/logical_scene_value_codec.hpp"
 #include "manyforge_scene/scene_transaction_codec.hpp"
 #include "sqlite_scene_lifecycle_internal.hpp"
+
+#ifdef MANYFORGE_SCENE_TEST_MANAGED_INTERLOCK
+#include "managed_kernel_apply_fence_owner.hpp"
+#include <manyforge_component_manager/active_bundle_publication_store.hpp>
+#include <manyforge_component_manager/durable_store_set.hpp>
+#endif
 
 namespace manyforge::scene {
 namespace {
@@ -146,6 +153,11 @@ public:
   enum class LostReply { kNone, kAcquire, kRelease };
   void LoseNextReply(LostReply reply) { lost_reply_ = reply; }
   void RejectNextClaim(ErrorDTO error) { next_rejection_ = std::move(error); }
+
+  void RefuseApplyClaimLookupAfter(std::size_t successful_reads) {
+    std::lock_guard lock(mutex_);
+    remaining_apply_claim_reads_ = successful_reads;
+  }
 
   void RejectProgramResetSceneAuthorization(bool reject) {
     std::lock_guard lock(mutex_);
@@ -290,6 +302,14 @@ public:
   GetCellAdmissionRecoveryReceipt(
       const core::CellAdmissionRecoveryReceiptQueryDTO &query) const override {
     std::lock_guard lock(mutex_);
+    if (query.intent.claim_kind == core::CellAdmissionClaimKindDTO::kManagerApply &&
+        remaining_apply_claim_reads_.has_value()) {
+      if (*remaining_apply_claim_reads_ == 0U) {
+        return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Err(
+            {"kernel_owner_unavailable", "test Apply claim lookup unavailable", {}});
+      }
+      --*remaining_apply_claim_reads_;
+    }
     core::CellAdmissionRecoveryReceiptDTO receipt{
         core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown,
         RequestOwnerEpoch("kernel-owner.scene-test"),
@@ -355,6 +375,7 @@ private:
   bool reject_program_reset_scene_authorization_{};
   LostReply lost_reply_{LostReply::kNone};
   std::optional<ErrorDTO> next_rejection_;
+  mutable std::optional<std::size_t> remaining_apply_claim_reads_;
 };
 
 class ControlledPublicationReader final
@@ -2343,6 +2364,32 @@ public:
         std::move(effective));
   }
 
+  void ObserveRevisionQueries() {
+    observe_revision_queries_ = true;
+    last_health_revision_.reset();
+  }
+
+  [[nodiscard]] const std::optional<ProjectionRevisionDTO> &last_health_revision() const {
+    return last_health_revision_;
+  }
+
+  core::ProjectionHealthDTO ProjectionHealthForRevision(
+      const ProjectionRevisionDTO &revision) const override {
+    // This fake has one exact model. Like native RevisionHandle, selecting its
+    // retained product returns actual health, including a healthy predecessor
+    // Scene revision during an ordinary in-place maintenance successor.
+    if (!revision.valid() ||
+        (health_.active_projection_revision.has_value() &&
+         (health_.active_projection_revision->retained_bundle_id != revision.retained_bundle_id ||
+          health_.active_projection_revision->graph_revision != revision.graph_revision))) {
+      throw std::invalid_argument("test health revision names an absent retained model");
+    }
+    if (observe_revision_queries_) {
+      last_health_revision_ = revision;
+    }
+    return health_;
+  }
+
   core::ProjectionHealthDTO ProjectionHealth() const override {
     return health_;
   }
@@ -2459,7 +2506,48 @@ private:
   mutable std::size_t frame_resolution_calls_{};
   mutable std::size_t policy_projection_calls_{};
   std::set<core::ProjectionLeaseId> retained_leases_;
+  bool observe_revision_queries_{false};
+  mutable std::optional<ProjectionRevisionDTO> last_health_revision_;
 };
+
+TEST(CanonicalEmptySceneOwner, DefaultProjectionHealthSelectorRefusesConflictingTruth) {
+  FakePlannerSceneProjection projection("default-health-selector");
+  const ProjectionRevisionDTO selected{
+      core::RetainedBundleId(Digest('b').value()), GraphRevision(Digest('c').value()),
+      core::SceneRevision{core::SceneId(Digest('d').value()), 1U, Digest('a')}};
+  const auto default_health = [&](const ProjectionRevisionDTO &revision) {
+    return projection.core::IPlannerSceneProjection::ProjectionHealthForRevision(revision);
+  };
+  ASSERT_TRUE(selected.valid());
+  const auto pending = projection.ProjectionHealth();
+  const auto observed_pending = default_health(selected);
+  EXPECT_EQ(observed_pending.state, pending.state);
+  EXPECT_EQ(observed_pending.active_projection_revision, pending.active_projection_revision);
+  EXPECT_EQ(observed_pending.source_sequence, pending.source_sequence);
+  auto invalid = selected;
+  invalid.retained_bundle_id = core::RetainedBundleId("");
+  EXPECT_THROW(default_health(invalid), std::invalid_argument);
+  projection.Reset(selected, FakePlannerSceneProjection::Mode::kCommit);
+  const auto exact = projection.ProjectionHealth();
+  const auto observed_exact = default_health(selected);
+  EXPECT_EQ(observed_exact.native_runtime_binding, exact.native_runtime_binding);
+  EXPECT_EQ(observed_exact.source_sequence, exact.source_sequence);
+  EXPECT_EQ(observed_exact.state, exact.state);
+  EXPECT_EQ(observed_exact.active_projection_revision, exact.active_projection_revision);
+  EXPECT_EQ(observed_exact.native_projection_generation, exact.native_projection_generation);
+  EXPECT_EQ(observed_exact.projection_content_digest, exact.projection_content_digest);
+  EXPECT_EQ(observed_exact.error, exact.error);
+  auto foreign = selected;
+  foreign.retained_bundle_id = core::RetainedBundleId(Digest('e').value());
+  EXPECT_THROW(default_health(foreign), std::invalid_argument);
+  auto other_scene = selected;
+  ++other_scene.scene_revision.revision_id;
+  EXPECT_THROW(default_health(other_scene), std::invalid_argument);
+  EXPECT_EQ(projection.ProjectionHealth().active_projection_revision, exact.active_projection_revision);
+  EXPECT_EQ(projection.ProjectionHealth().source_sequence, exact.source_sequence);
+  EXPECT_EQ(projection.rebuild_calls(), 0U);
+  EXPECT_EQ(projection.calls(), 0U);
+}
 
 /// Deliberately return a distinct forwarding client from the resolver so the
 /// owner exercises only the transport-neutral port, never a participant
@@ -2496,6 +2584,11 @@ public:
 
   void ReleaseProjection(const core::ProjectionLeaseId &lease_id) override {
     projection_.ReleaseProjection(lease_id);
+  }
+
+  core::ProjectionHealthDTO ProjectionHealthForRevision(
+      const ProjectionRevisionDTO &revision) const override {
+    return projection_.ProjectionHealthForRevision(revision);
   }
 
   core::ProjectionHealthDTO ProjectionHealth() const override {
@@ -2708,6 +2801,1460 @@ void ResetProjections(
               core::ProjectionMaintenanceInitializationState::kCompleted,
           "native candidate did not complete");
   return completed.target_projection_revision;
+}
+
+class TestAdoptionFence final : public core::IManagerKernelApplyFencePort {
+public:
+  void Configure(const core::ConfigurationFenceStatusQueryDTO &query,
+                 const ActiveBundlePublicationReceiptDTO &predecessor) {
+    const auto &projection = predecessor.request.candidate_projection_revision;
+    status_ = core::ConfigurationFenceStatusDTO{
+        query,
+        {{core::RuntimeUnitId("execution-host"), core::RuntimeEpoch("host.1"),
+          RequestOwnerEpoch("kernel.1"), Digest('4'), predecessor.publication_generation},
+         query.owner_transaction, query.configuration_fence_id,
+         query.configuration_fence_generation, query.expected_scope, 1U,
+         projection.graph_revision, projection, predecessor.publication_generation,
+         predecessor.durable_public_pointer_content_digest, {}, 0U, 0U, Digest('5')},
+        core::ConfigurationFenceState::kHeld, true, std::nullopt, "", Digest('6'), std::nullopt};
+    Require(status_->matches(query), "test adoption fence must be well formed");
+    Require(query.configuration_fence_generation.value() > 0U,
+            "test adoption fence must have an actual accepted generation");
+    original_attempt_ = core::ApplyFenceAcquireAttemptQueryDTO{
+        {{core::RequestId("parent-fence-request"), RequestOwnerEpoch("manager.1"),
+          "original-Manager-test", std::nullopt},
+         query.owner_transaction, query.expected_scope,
+         core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+         predecessor.request.candidate_retained_bundle_id,
+         predecessor.request.candidate_graph_revision, 0U,
+         core::ConfigurationFenceGeneration(query.configuration_fence_generation.value() - 1U),
+         {}, "preserve the actual Scene"}, Digest('7'), query.manager_runtime_epoch};
+    presence_ = core::ApplyFenceAcquireAttemptReconcileResultDTO{
+        status_->reconciliation_evidence.execution_host_epoch, *original_attempt_,
+        core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact,
+        core::ConfigurationFenceAcceptedDTO{query.configuration_fence_id,
+            query.configuration_fence_generation, query.expected_scope, 0,
+            core::RequestReplayStatusDTO::kAcceptedNew},
+        true, {}, Digest('8'), std::nullopt};
+    Require(presence_->matches(*original_attempt_), "test held presence must name its configured owner");
+  }
+
+  void WithView(const std::function<void(const HeldStatusView &)> &callback) const {
+    Require(status_.has_value(), "test adoption fence has not been configured");
+    WithHeldStatusView(*status_, callback);
+  }
+
+  void AllowOriginalManagerQueries() { original_manager_queries_ = true; }
+  [[nodiscard]] const core::ApplyFenceAcquireAttemptQueryDTO &OriginalAttemptQuery() const {
+    Require(original_attempt_.has_value(), "test original attempt is unavailable");
+    return *original_attempt_;
+  }
+  [[nodiscard]] const core::ApplyFenceAcquireAttemptReconcileResultDTO &Presence() const {
+    Require(presence_.has_value(), "test held presence is unavailable");
+    return *presence_;
+  }
+  void SetPresence(core::ApplyFenceAcquireAttemptReconcileResultDTO presence) {
+    presence_ = std::move(presence);
+  }
+  void RefuseFullStatusQueries() { full_status_queries_allowed_ = false; }
+
+  void RefuseRemoteQueryAfter(std::size_t successful_queries) {
+    remaining_remote_queries_ = successful_queries;
+  }
+
+  core::ConfigurationFenceStatusDTO QueryStatus(
+      const core::ConfigurationFenceStatusQueryDTO &) const override {
+    Require(full_status_queries_allowed_, "full status requires installed candidate configurations");
+    RequireOriginalRead();
+    return *status_;
+  }
+
+  core::ConfigurationFenceAdmissionSnapshotDTO ObserveAdmission(
+      const core::ConfigurationFenceAdmissionQueryDTO &) const override {
+    throw std::logic_error("Scene adoption must not observe/acquire a new fence");
+  }
+  core::ConfigurationFenceAcceptedDTO Acquire(
+      const core::ApplyConfigurationFenceIntentDTO &) override {
+    throw std::logic_error("Scene adoption must not acquire a fence");
+  }
+  core::ApplyFenceAcquireAttemptReconcileResultDTO ReconcileAcquireAttempt(
+      const core::ApplyFenceAcquireAttemptQueryDTO &) const override {
+    RequireOriginalRead();
+    return *presence_;
+  }
+  core::ApplyFenceReconcileResultDTO Rehydrate(
+      const core::ApplyFenceRehydrateDTO &) override {
+    throw std::logic_error("Scene adoption must not rehydrate a fence");
+  }
+  core::ConfigurationFenceReleasedDTO Release(
+      const core::ConfigurationFenceReleaseDTO &) override {
+    throw std::logic_error("Scene adoption must not release a fence");
+  }
+
+private:
+  void RequireOriginalRead() const {
+    if (!original_manager_queries_) {
+      throw std::logic_error("local Scene adoption must use the pinned view");
+    }
+    Require(status_.has_value() && presence_.has_value(), "test adoption fence has not been configured");
+    if (remaining_remote_queries_.has_value()) {
+      if (*remaining_remote_queries_ == 0U) {
+        throw std::runtime_error("original Manager fence response unavailable");
+      }
+      --*remaining_remote_queries_;
+    }
+  }
+  std::optional<core::ConfigurationFenceStatusDTO> status_;
+  std::optional<core::ApplyFenceAcquireAttemptQueryDTO> original_attempt_;
+  std::optional<core::ApplyFenceAcquireAttemptReconcileResultDTO> presence_;
+  bool full_status_queries_allowed_{true};
+  bool original_manager_queries_{false};
+  mutable std::optional<std::size_t> remaining_remote_queries_;
+};
+
+deployment::CanonicalEmptyRetainedBundleAdmission PrepareAdoptionAdmission(
+    const std::filesystem::path &package_root) {
+  CopyCanonicalEmptyPackage(package_root);
+  return LoadAdmission(package_root);
+}
+
+deployment::test::DurableLite6RetainedConsumerFixture AdoptionProduct(
+    const std::filesystem::path &package_root, const CellId &cell_id,
+    const char lifecycle_digest_digit) {
+  return deployment::test::materialize_lite6_retained_consumer_fixture_from(
+      package_root, deployment::test::make_lite6_controllable_retention_fixture(
+                        false, false, 1U, false, true, cell_id.value(),
+                        false, true, "resource", true, Digest(lifecycle_digest_digit).value()));
+}
+
+struct SceneProductAdoptionFixture final {
+  TemporaryDirectory directory{"scene-product-adoption"};
+  std::filesystem::path package_root{directory.path() / "packages"};
+  std::filesystem::path database_path{directory.path() / "logical-scene.sqlite3"};
+  deployment::CanonicalEmptyRetainedBundleAdmission admission{PrepareAdoptionAdmission(package_root)};
+  deployment::test::DurableLite6RetainedConsumerFixture predecessor{
+      AdoptionProduct(package_root, admission.cell_id(), '1')};
+  deployment::test::DurableLite6RetainedConsumerFixture candidate{
+      AdoptionProduct(package_root, admission.cell_id(), '2')};
+  std::vector<ProjectionNativeRuntimeBindingDTO> predecessor_bindings{
+      NativeRuntimeBindings(predecessor.bundle->value(), "predecessor")};
+  std::vector<ProjectionNativeRuntimeBindingDTO> candidate_bindings{
+      NativeRuntimeBindings(candidate.bundle->value(), "candidate")};
+  OwnedFakePlannerSceneProjections predecessor_projections{MakeFakeProjections(predecessor_bindings)};
+  OwnedFakePlannerSceneProjections candidate_projections{MakeFakeProjections(candidate_bindings)};
+  FakePlannerSceneProjectionResolver resolver{ProjectionClients(predecessor_projections)};
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source{package_root};
+  TestCellAdmissionPort cell_admission;
+  TestAdoptionFence fence;
+  std::unique_ptr<CanonicalEmptySceneOwner> owner{
+      std::make_unique<CanonicalEmptySceneOwner>(database_path, admission, publication_reader,
+                                                bundle_source, resolver, cell_admission)};
+
+  bool original_manager_authority{false};
+
+  explicit SceneProductAdoptionFixture(bool original_manager = false)
+      : original_manager_authority(original_manager) {
+    if (original_manager_authority) {
+      fence.AllowOriginalManagerQueries();
+    }
+    const auto current = FinalizeNativeCandidate(
+        *owner, publication_reader, admission, *predecessor.bundle, predecessor_bindings);
+    ResetProjections(predecessor_projections, current, FakePlannerSceneProjection::Mode::kCommit);
+    Require(predecessor.bundle->value().retained_bundle_id != candidate.bundle->value().retained_bundle_id,
+            "adoption fixture must change the sealed product");
+  }
+
+  QualifiedSceneProductAdoptionRequest CaptureRequest() {
+    const core::ApplyFenceOwnerDTO parent{ApplyId("apply-private-adoption"), ApplyGeneration(1U)};
+    const auto claim = cell_admission.AcquireCellAdmissionClaim(
+        {core::CellAdmissionClaimKindDTO::kManagerApply, core::CellAdmissionOwnerRoleDTO::kManager,
+         RequestOwnerEpoch("manager.1"), parent.apply_id.value(), core::RequestId("parent-request"),
+         Digest('3'), core::AdmissionGeneration(1U), {}, std::nullopt, std::nullopt});
+    Require(claim.ok(), "test Apply parent must be acquired");
+    const auto published = publication_reader.ReadActiveBundlePublication(ActiveBundlePublicationGeneration(2U));
+    Require(published.ok(), "test predecessor publication must be current");
+    const core::ConfigurationFenceStatusQueryDTO query{
+        parent, core::ConfigurationFenceId("apply-fence"), core::ConfigurationFenceGeneration(1U),
+        {}, core::RuntimeEpoch("manager-runtime.1")};
+    fence.Configure(query, published.value());
+    const auto snapshot = owner->LogicalSnapshot();
+    return {{{parent, Digest('3')}, claim.value(), query}, published.value(),
+            owner->CurrentProjectionRevision(), snapshot->identity(), candidate.bundle->value(), candidate_bindings};
+  }
+
+  QualifiedSceneConfigurationAdoptionRequest CaptureConfigurationRequest(
+      bool authoring = false, bool same_product = false) {
+    const core::ApplyFenceOwnerDTO manager{ApplyId("apply-configuration"), ApplyGeneration(1U)};
+    // Configuration intent digest supplied by this fixture's Manager producer;
+    // no lifecycle plan or child authority is constructed.
+    const auto manager_intent_digest = Digest('b');
+    core::CellAdmissionClaimIntentDTO claim_intent{
+        core::CellAdmissionClaimKindDTO::kManagerApply, core::CellAdmissionOwnerRoleDTO::kManager,
+        RequestOwnerEpoch("manager.1"), manager.apply_id.value(), core::RequestId("configuration-request"),
+        manager_intent_digest, core::AdmissionGeneration(1U), {}, std::nullopt, std::nullopt};
+    if (authoring) {
+      claim_intent.claim_kind = core::CellAdmissionClaimKindDTO::kAuthoringMutation;
+      claim_intent.owner_role = core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+      claim_intent.owner_epoch = RequestOwnerEpoch("composer.1");
+      claim_intent.owner_transaction_id = "composer-configuration";
+      claim_intent.request_id = core::RequestId("composer-request");
+      claim_intent.request_payload_digest = Digest('c');
+    }
+    Require(core::ValidateCellAdmissionClaimIntent(claim_intent).ok(), "test configuration claim must be genuine");
+    const auto claim = cell_admission.AcquireCellAdmissionClaim(claim_intent);
+    Require(claim.ok(), "test configuration claim must actually be held");
+    const auto published = publication_reader.ReadActiveBundlePublication(ActiveBundlePublicationGeneration(2U));
+    Require(published.ok(), "test configuration predecessor must actually be current");
+    const core::ConfigurationFenceStatusQueryDTO query{
+        manager, core::ConfigurationFenceId("configuration-fence"), core::ConfigurationFenceGeneration(1U),
+        {}, core::RuntimeEpoch("manager-runtime.1")};
+    fence.Configure(query, published.value());
+    return {{manager, manager_intent_digest, claim.value(), query}, published.value(),
+            owner->CurrentProjectionRevision(), owner->LogicalSnapshot()->identity(),
+            same_product ? predecessor.bundle->value() : candidate.bundle->value(),
+            same_product ? predecessor_bindings : candidate_bindings};
+  }
+
+  ActiveBundlePublicationReceiptDTO Publication(
+      const QualifiedSceneConfigurationAdoptionRequest &request) const {
+    const auto &manager = request.authority.owner;
+    const ProjectionRevisionDTO target{request.candidate_retained_bundle.retained_bundle_id,
+        request.candidate_retained_bundle.cell_graph.graph_revision, request.expected_snapshot_identity.revision};
+    return {{NamedApplyPublicationTransactionDTO{manager.apply_id, manager.apply_generation},
+             target, target.retained_bundle_id, target.graph_revision,
+             request.expected_predecessor_publication.publication_generation, Digest('7')},
+            ActiveBundlePublicationGeneration(3U), Digest('8')};
+  }
+
+  void PrepareCandidateClients() {
+    auto clients = ProjectionClients(predecessor_projections);
+    const auto candidates = ProjectionClients(candidate_projections);
+    clients.insert(clients.end(), candidates.begin(), candidates.end());
+    resolver.ReplaceWith(std::move(clients));
+  }
+
+  void QualifyCandidate(const QualifiedSceneProductAdoptionRequest &request) {
+    const ProjectionRevisionDTO target{request.candidate_retained_bundle.retained_bundle_id,
+                                       request.candidate_retained_bundle.cell_graph.graph_revision,
+                                       request.expected_snapshot_identity.revision};
+    ResetProjections(candidate_projections, target, FakePlannerSceneProjection::Mode::kCommit);
+    // Changed predecessor engines may retire; adoption must not query them.
+    resolver.ReplaceWith(ProjectionClients(candidate_projections));
+  }
+
+  ActiveBundlePublicationReceiptDTO Publication(
+      const QualifiedSceneProductAdoptionRequest &request) const {
+    const auto &parent = request.parent_authority.parent.owner;
+    const ProjectionRevisionDTO target{request.candidate_retained_bundle.retained_bundle_id,
+                                       request.candidate_retained_bundle.cell_graph.graph_revision,
+                                       request.expected_snapshot_identity.revision};
+    return {{NamedApplyPublicationTransactionDTO{parent.apply_id, parent.apply_generation},
+             target, target.retained_bundle_id, target.graph_revision,
+             request.expected_predecessor_publication.publication_generation, Digest('7')},
+            ActiveBundlePublicationGeneration(3U), Digest('8')};
+  }
+
+  core::ProjectionMaintenanceInitializationStatusDTO Begin(
+      const QualifiedSceneProductAdoptionRequest &request) {
+    if (original_manager_authority) {
+      return owner->BeginOriginalManagerProductAdoption(request, fence);
+    }
+    std::optional<core::ProjectionMaintenanceInitializationStatusDTO> result;
+    fence.WithView([&](const core::IManagerKernelApplyFencePort::HeldStatusView &view) {
+      result = owner->BeginQualifiedProductAdoption(request, view);
+    });
+    Require(result.has_value(), "test adoption callback did not run");
+    return *result;
+  }
+
+  core::ProjectionMaintenanceInitializationStatusDTO Complete(
+      const QualifiedSceneProductAdoptionRequest &request,
+      const ActiveBundlePublicationReceiptDTO &publication) {
+    if (original_manager_authority) {
+      return owner->CompleteOriginalManagerProductAdoption(request, publication, fence);
+    }
+    std::optional<core::ProjectionMaintenanceInitializationStatusDTO> result;
+    fence.WithView([&](const core::IManagerKernelApplyFencePort::HeldStatusView &view) {
+      result = owner->CompleteQualifiedProductAdoption(request, publication, view);
+    });
+    Require(result.has_value(), "test adoption callback did not run");
+    return *result;
+  }
+
+  void ExpectNoCandidateEffects(std::size_t expected_rebuilds = 0U,
+                                bool same_product = false) const {
+    const auto &projections = same_product ? predecessor_projections : candidate_projections;
+    for (const auto &projection : projections) {
+      EXPECT_EQ(projection->calls(), 0U);
+      EXPECT_EQ(projection->rebuild_calls(), expected_rebuilds);
+      EXPECT_EQ(projection->retained_lease_count(), 0U);
+      EXPECT_EQ(projection->policy_projection_calls(), 0U);
+    }
+  }
+};
+
+#ifdef MANYFORGE_SCENE_TEST_MANAGED_INTERLOCK
+TEST(CanonicalEmptySceneOwner, ActualManagedFenceIssuesBorrowedAdoptionViewWithoutRecursiveQuery) {
+  namespace manager = manyforge::component_manager;
+  using manyforge::roboplan_backend::ManagedKernelAdmissionGate;
+  using manyforge::roboplan_backend::ManagedKernelApplyFenceOwner;
+  using manyforge::roboplan_backend::ManagedKernelApplyFenceOwnerConfig;
+  SceneProductAdoptionFixture fixture;
+  auto request = fixture.CaptureRequest();
+  const auto state_root = fixture.directory.path() / "manager";
+  std::filesystem::create_directories(state_root);
+  manager::SqliteActiveBundlePublicationStore store(
+      state_root / std::string(manager::kActiveBundlePublicationStoreFilename), fixture.admission.cell_id());
+  auto bootstrap_projection = request.expected_active_projection_revision;
+  bootstrap_projection.retained_bundle_id = fixture.admission.retained_bundle_id();
+  bootstrap_projection.graph_revision = fixture.admission.graph_revision();
+  const auto bootstrap = store.PublishActiveBundle(
+      {BootstrapPublicationTransactionDTO{BootstrapId("interlock-bootstrap"), BootstrapGeneration(1U)},
+       bootstrap_projection, bootstrap_projection.retained_bundle_id, bootstrap_projection.graph_revision,
+       std::nullopt, Digest('a')});
+  ASSERT_TRUE(bootstrap.valid());
+  const auto predecessor = store.PublishActiveBundle(request.expected_predecessor_publication.request);
+  ASSERT_TRUE(predecessor.valid());
+  store.Close();
+  request.expected_predecessor_publication = predecessor;
+  fixture.publication_reader.SetCurrent(predecessor);
+  ManagedKernelAdmissionGate gate;
+  const core::ResourceId new_resource("adoption.new-resource");
+  auto table = std::make_shared<core::ResourceSlotTable>(
+      std::vector<core::ResourceId>{new_resource}, std::vector<core::DomainActiveControlConfigurationDTO>{},
+      gate.shared_admission_mutex());
+  gate.BindResourceTable(table);
+  const ManagedKernelApplyFenceOwnerConfig config{
+      state_root / "kernel-fence.sqlite", state_root, fixture.package_root, fixture.admission.cell_id(),
+      core::RuntimeUnitId("execution-host"), core::RuntimeEpoch("host.1"), RequestOwnerEpoch("kernel.1"),
+      [] { return std::int64_t{1000}; }};
+  ManagedKernelApplyFenceOwner fence(config, gate);
+  const auto &parent = request.parent_authority.parent.owner;
+  auto scope = request.parent_authority.held_fence_query.expected_scope;
+  const core::ControlDomainId new_domain("adoption.new-domain");
+  scope.controllable_component_ids.push_back(
+      request.candidate_retained_bundle.cell_graph.controllable_components.front().controllable_component_id);
+  scope.domains.push_back({new_domain, std::nullopt,
+                           core::ControlDomainRevision("adoption.new-domain.revision")});
+  scope.bindings.push_back({core::ControlBindingId("adoption.new-binding"), std::nullopt,
+                            core::ControlBindingRevision("adoption.new-binding.revision")});
+  scope.resources.push_back(new_resource);
+  ASSERT_TRUE(scope.valid());
+  const auto manager_epoch = request.parent_authority.held_fence_query.manager_runtime_epoch;
+  const auto admission = fence.ObserveAdmission({scope, manager_epoch});
+  const core::ApplyConfigurationFenceIntentDTO intent{
+      {core::RequestId("interlock-fence"), RequestOwnerEpoch("manager.1"), "interlock-test", std::nullopt},
+      parent, scope, core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+      predecessor.request.candidate_retained_bundle_id, predecessor.request.candidate_graph_revision,
+      admission.operation_resource_generation, admission.configuration_fence_generation,
+      admission.active_control_configurations, "preserve logical Scene under original Apply"};
+  const auto accepted = fence.Acquire(intent);
+  ASSERT_TRUE(accepted.matches(intent));
+  request.parent_authority.held_fence_query =
+      {parent, accepted.configuration_fence_id, accepted.configuration_fence_generation, scope, manager_epoch};
+  fixture.QualifyCandidate(request);
+  unsigned entries = 0U;
+  const auto begin = [&] {
+    fence.RunWithExactHeldPredecessorReadback(
+        request.parent_authority.held_fence_query, predecessor.publication_generation,
+        predecessor.durable_public_pointer_content_digest,
+        [&](const core::IManagerKernelApplyFencePort::HeldStatusView &view) {
+          ++entries;
+          EXPECT_TRUE(fixture.owner->BeginQualifiedProductAdoption(request, view).ready_for_publication());
+        });
+  };
+  // No successor configuration exists before installation. A predecessor-side
+  // readback must refuse honestly without entering the effect callback.
+  EXPECT_THROW(begin(), std::runtime_error);
+  EXPECT_EQ(entries, 0U);
+  const core::DomainActiveControlConfigurationDTO installed_configuration{
+      new_domain, core::ActiveControlConfigurationId("adoption.installed-config"),
+      core::ActiveControlConfigurationGeneration(1U)};
+  const auto installed = table->reconfigure_runtime_inventory(
+      {new_resource}, {installed_configuration}, {installed_configuration});
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+  // This enters the real nonrecursive fence-owner mutex, then the real Scene
+  // owner. The CTest bound catches the previous QueryStatus self-deadlock.
+  EXPECT_NO_THROW(begin());
+  EXPECT_EQ(entries, 1U);
+  fixture.ExpectNoCandidateEffects();
+  fixture.cell_admission.RefuseApplyClaimLookupAfter(0U);
+  EXPECT_THROW(begin(), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_EQ(entries, 2U);
+  fixture.cell_admission.RefuseApplyClaimLookupAfter(2U);
+  manager::SqliteActiveBundlePublicationStore publication_store(
+      state_root / std::string(manager::kActiveBundlePublicationStoreFilename), fixture.admission.cell_id());
+  const auto successor = publication_store.PublishActiveBundle(fixture.Publication(request).request);
+  publication_store.Close();
+  fixture.publication_reader.SetCurrent(successor);
+  unsigned completions = 0U;
+  EXPECT_NO_THROW(fence.RunWithExactHeldSuccessorReadback(
+      request.parent_authority.held_fence_query, successor,
+      [&](const core::IManagerKernelApplyFencePort::HeldStatusView &view) {
+        ++completions;
+        EXPECT_EQ(fixture.owner->CompleteQualifiedProductAdoption(request, successor, view).state,
+                  core::ProjectionMaintenanceInitializationState::kCompleted);
+      }));
+  EXPECT_EQ(completions, 1U);
+  fixture.ExpectNoCandidateEffects();
+  gate.ReleaseFence(accepted.configuration_fence_id, scope);
+  EXPECT_THROW(fence.RunWithExactHeldSuccessorReadback(
+      request.parent_authority.held_fence_query, successor,
+      [&](const auto &) { ++completions; }), std::runtime_error);
+  EXPECT_EQ(completions, 1U);
+  EXPECT_EQ(entries, 2U);
+}
+#endif
+
+void VerifyProductAdoptionPreservesObjectsAttachmentsAndLogicalIdentity(
+    bool original_manager, bool stage_candidate = false) {
+  SceneProductAdoptionFixture fixture(original_manager);
+  auto active = fixture.owner->CurrentProjectionRevision();
+  const auto added = fixture.owner->Commit(AddBoxRequest(active, fixture.admission.cell_id(), "adoption-add"));
+  ASSERT_TRUE(added.success);
+  ASSERT_TRUE(added.committed_projection_revision.has_value());
+  active = *added.committed_projection_revision;
+  const core::ComponentAttachmentRevision structural_revision("component-attachment-revision-1");
+  for (auto &projection : fixture.predecessor_projections) {
+    projection->SetFrameResolution(core::Pose3DTO{}, {structural_revision});
+    projection->SetResolvedFrameRoleOverride(core::FrameRoleId("asset_tool_frame"));
+  }
+  core::SceneTransactionRequestDTO attach{
+      SceneRequestContext("adoption-attach", active), {}, active,
+      core::AttachCarriedObjectRequestDTO{
+          core::CarriedObjectAttachmentId("attachment.1"), core::SceneResourceId("scene-box"),
+          core::ControllableComponentId("component.1"), core::CommandTargetId("arm"),
+          core::FrameRoleId("tool_frame"), {core::CollisionBodyRoleId("finger")}, {structural_revision}},
+      std::nullopt};
+  attach.expected_admission_generation = core::AdmissionGeneration(1U);
+  attach.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("runner.2"), core::ProgramRunId("program.2"), core::CellAdmissionClaimGeneration(9U),
+      "attach", "attach:attempt.1", "scene.carried_attachment"};
+  const auto attached = fixture.owner->Commit(attach);
+  ASSERT_TRUE(attached.success) << (attached.error.has_value() ? attached.error->message : "missing error");
+  ASSERT_TRUE(attached.committed_projection_revision.has_value());
+  active = *attached.committed_projection_revision;
+  const auto snapshot = fixture.owner->LogicalSnapshot();
+  ASSERT_EQ(snapshot->objects.size(), 1U);
+  ASSERT_EQ(snapshot->carried_object_attachments.size(), 1U);
+  const auto snapshot_bytes = EncodeLogicalSceneSnapshot(*snapshot);
+  const auto owner_epoch = fixture.owner->CurrentRequestOwnerEpoch();
+  const auto integrity_before = fixture.owner->VerifyIntegrity();
+  const auto request = fixture.CaptureRequest();
+  if (stage_candidate) {
+    for (auto &projection : fixture.predecessor_projections) {
+      projection->ObserveRevisionQueries();
+    }
+    for (auto &projection : fixture.candidate_projections) {
+      projection->ObserveRevisionQueries();
+    }
+    fixture.PrepareCandidateClients();
+    ASSERT_GE(request.native_runtime_bindings.size(), 2U);
+    const auto staged = fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, fixture.fence.OriginalAttemptQuery());
+    ASSERT_EQ(staged.size(), request.native_runtime_bindings.size());
+    const ProjectionRevisionDTO target{
+        request.candidate_retained_bundle.retained_bundle_id,
+        request.candidate_retained_bundle.cell_graph.graph_revision, snapshot->revision};
+    for (std::size_t index = 0U; index < staged.size(); ++index) {
+      EXPECT_EQ(staged[index].native_runtime_binding, request.native_runtime_bindings[index]);
+      EXPECT_TRUE(staged[index].healthy_for_target(target));
+      EXPECT_EQ(fixture.candidate_projections[index]->last_health_revision(), std::optional{target});
+      const auto &rebuilds = fixture.candidate_projections[index]->rebuild_requests();
+      ASSERT_EQ(rebuilds.size(), 1U);
+      EXPECT_EQ(EncodeLogicalSceneSnapshot(*rebuilds.front().logical_scene), snapshot_bytes);
+      EXPECT_FALSE(rebuilds.front().maintenance_successor.has_value());
+      EXPECT_FALSE(rebuilds.front().maintenance_predecessor.has_value());
+    }
+    EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+        {request.parent_authority.parent.owner.apply_id,
+         request.parent_authority.parent.owner.apply_generation}).has_value());
+    EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), active);
+    EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot_bytes);
+    const auto public_health = fixture.owner->ActiveProjectionHealth();
+    ASSERT_EQ(public_health.native_projection_health.size(), fixture.predecessor_bindings.size());
+    EXPECT_TRUE(public_health.healthy_for_target(active));
+    for (const auto &projection : fixture.predecessor_projections) {
+      EXPECT_EQ(projection->last_health_revision(), std::optional{active});
+    }
+    for (const auto &row : public_health.native_projection_health) {
+      EXPECT_TRUE(row.healthy_for_target(active));
+      EXPECT_TRUE(std::find(request.native_runtime_bindings.begin(),
+                            request.native_runtime_bindings.end(), row.native_runtime_binding) ==
+                  request.native_runtime_bindings.end());
+    }
+    // Even a locally valid private-candidate preview cannot select staged
+    // projections through the ordinary current Scene API.
+    auto private_preview_request = attach;
+    private_preview_request.expected_projection_revision = target;
+    private_preview_request.request_context.request_id = core::RequestId("private-candidate-preview");
+    private_preview_request.request_context.request_owner_epoch = owner_epoch;
+    const core::SceneFrameResolutionReceiptDTO candidate_frame{
+        core::ResolvedComponentModelFrameDTO{
+            core::ControllableComponentId("component.1"), core::ModelInstanceId("model.1"),
+            core::FrameRoleId("asset_tool_frame"), "compiled_asset_tool_frame",
+            core::ModelRevision("model-revision-1")},
+        core::Pose3DTO{}, {structural_revision},
+        core::ProjectionLeaseBindingDTO{target, core::ProjectionLeaseId("private-preview-frame")},
+        Digest('8'), Digest('9')};
+    ASSERT_TRUE(candidate_frame.valid());
+    const auto preview = fixture.owner->PreviewResolvedSceneCandidate(
+        {private_preview_request, candidate_frame});
+    ASSERT_FALSE(preview.ok());
+    EXPECT_EQ(preview.error().code, "stale_revision");
+    EXPECT_EQ(preview.error().details.at("reason"), "scene_candidate_projection_stale");
+    const auto head = fixture.publication_reader.ReadActiveBundlePublication(
+        request.expected_predecessor_publication.publication_generation);
+    ASSERT_TRUE(head.ok());
+    EXPECT_EQ(head.value(), request.expected_predecessor_publication);
+    const auto observed = fixture.owner->ReadOriginalManagerProductAdoptionProjectionHealth(request, fixture.fence, fixture.fence.OriginalAttemptQuery());
+    ASSERT_EQ(observed.size(), staged.size());
+    for (const auto &row : observed) {
+      EXPECT_TRUE(row.healthy_for_target(target));
+    }
+  } else {
+    fixture.QualifyCandidate(request);
+  }
+  const auto ready = fixture.Begin(request);
+  ASSERT_TRUE(ready.ready_for_publication());
+  EXPECT_EQ(ready.target_projection_revision.scene_revision, snapshot->revision);
+  EXPECT_EQ(ready.authoritative_snapshot_identity, snapshot->identity());
+  EXPECT_FALSE(fixture.owner->ReadAccessStatus().scene_writes_open);
+  const auto during = fixture.owner->ReadActiveSnapshot();
+  ASSERT_TRUE(during.has_value());
+  EXPECT_EQ(EncodeLogicalSceneSnapshot(*during->shared()), snapshot_bytes);
+  EXPECT_EQ(fixture.Begin(request), ready);
+  fixture.ExpectNoCandidateEffects(stage_candidate ? 1U : 0U);
+  const auto publication = fixture.Publication(request);
+  fixture.publication_reader.SetCurrent(publication);
+  const auto completed = fixture.Complete(request, publication);
+  EXPECT_EQ(completed.state, core::ProjectionMaintenanceInitializationState::kCompleted);
+  EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), ready.target_projection_revision);
+  if (stage_candidate) {
+    EXPECT_TRUE(fixture.owner->ActiveProjectionHealth().healthy_for_target(ready.target_projection_revision));
+    for (const auto &projection : fixture.candidate_projections) {
+      EXPECT_EQ(projection->last_health_revision(), std::optional{ready.target_projection_revision});
+    }
+  }
+  EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot_bytes);
+  EXPECT_EQ(fixture.owner->CurrentRequestOwnerEpoch(), owner_epoch);
+  const auto integrity_after = fixture.owner->VerifyIntegrity();
+  EXPECT_EQ(integrity_after.transaction_intent_count, integrity_before.transaction_intent_count);
+  EXPECT_EQ(integrity_after.owner_event_count, integrity_before.owner_event_count);
+  EXPECT_EQ(integrity_after.projection_result_count, integrity_before.projection_result_count);
+  fixture.ExpectNoCandidateEffects(stage_candidate ? 1U : 0U);
+  // Ordinary completed replay remains evidence-only, including same-Scene rows.
+  EXPECT_EQ(fixture.owner->CompleteMaintenanceInitialization(
+                {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation,
+                 ready.target_projection_revision, ready.authoritative_snapshot_identity, publication}), completed);
+  fixture.owner.reset();
+  fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(
+      fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
+      fixture.resolver, fixture.cell_admission);
+  EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot_bytes);
+  EXPECT_EQ(fixture.owner->CurrentRequestOwnerEpoch(), owner_epoch);
+  EXPECT_EQ(fixture.owner->ReadMaintenanceInitialization(
+                {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}),
+            std::optional{completed});
+}
+
+TEST(CanonicalEmptySceneOwner,
+     QualifiedProductAdoptionPreservesObjectsAttachmentsAndLogicalIdentity) {
+  VerifyProductAdoptionPreservesObjectsAttachmentsAndLogicalIdentity(false);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     OriginalManagerProductAdoptionPreservesObjectsAttachmentsAndLogicalIdentity) {
+  VerifyProductAdoptionPreservesObjectsAttachmentsAndLogicalIdentity(true);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     QualifiedProductAdoptionRefusesStaleInputsAndUnheldAuthorityBeforeCapture) {
+  SceneProductAdoptionFixture fixture;
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  auto altered = request;
+  altered.parent_authority.parent_claim.claim_generation = core::CellAdmissionClaimGeneration(99U);
+  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  altered = request;
+  altered.parent_authority.held_fence_query.configuration_fence_id = core::ConfigurationFenceId("other-fence");
+  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  altered = request;
+  altered.expected_predecessor_publication.durable_public_pointer_content_digest = Digest('a');
+  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  altered = request;
+  ++altered.expected_snapshot_identity.revision.revision_id;
+  altered.expected_active_projection_revision.scene_revision = altered.expected_snapshot_identity.revision;
+  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  altered = request;
+  altered.candidate_retained_bundle.cell_graph.graph_revision = core::GraphRevision("forged-graph");
+  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  fixture.cell_admission.ProveHeldClaimHadNoEffect();
+  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+      {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}).has_value());
+  EXPECT_TRUE(fixture.owner->ReadAccessStatus().scene_writes_open);
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     QualifiedProductAdoptionRequiresExactCompleteAlreadyHealthyBindings) {
+  SceneProductAdoptionFixture fixture;
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  auto altered = request;
+  altered.native_runtime_bindings.pop_back();
+  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  ASSERT_GE(request.native_runtime_bindings.size(), 2U);
+  altered = request;
+  altered.native_runtime_bindings.back() = altered.native_runtime_bindings.front();
+  altered.native_runtime_bindings.back().runtime_epoch = core::RuntimeEpoch("zz-duplicate-epoch");
+  std::sort(altered.native_runtime_bindings.begin(), altered.native_runtime_bindings.end(), core::CanonicalProjectionNativeBindingLess);
+  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  fixture.candidate_projections.front()->Reset(request.expected_active_projection_revision, FakePlannerSceneProjection::Mode::kCommit);
+  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+      {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}).has_value());
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     QualifiedProductAdoptionRechecksHeldClaimAfterCandidateHealth) {
+  SceneProductAdoptionFixture fixture;
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  fixture.cell_admission.RefuseApplyClaimLookupAfter(1U);
+  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+      {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}).has_value());
+  EXPECT_TRUE(fixture.owner->ReadAccessStatus().scene_writes_open);
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     PendingPrivateAdoptionCannotCompleteThroughOrdinaryPortOrChangedRequest) {
+  SceneProductAdoptionFixture fixture;
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  const auto ready = fixture.Begin(request);
+  const auto publication = fixture.Publication(request);
+  fixture.publication_reader.SetCurrent(publication);
+  const core::ProjectionMaintenanceCompletionDTO ordinary{
+      request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation,
+      ready.target_projection_revision, ready.authoritative_snapshot_identity, publication};
+  EXPECT_THROW(fixture.owner->CompleteMaintenanceInitialization(ordinary), CanonicalEmptySceneOwnerConflictError);
+  auto changed = request;
+  changed.expected_predecessor_publication.durable_public_pointer_content_digest = Digest('b');
+  fixture.publication_reader.SetCurrent(changed.expected_predecessor_publication);
+  EXPECT_THROW(fixture.Begin(changed), CanonicalEmptySceneOwnerConflictError);
+  fixture.publication_reader.SetCurrent(publication);
+  EXPECT_THROW(fixture.Complete(changed, publication), CanonicalEmptySceneOwnerConflictError);
+  fixture.cell_admission.RefuseApplyClaimLookupAfter(0U);
+  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_EQ(fixture.owner->ReadMaintenanceInitialization(
+                {ordinary.apply_id, ordinary.apply_generation}), std::optional{ready});
+  EXPECT_FALSE(fixture.owner->ReadAccessStatus().scene_writes_open);
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     QualifiedProductAdoptionCompletionRechecksPublicationHealthAndClaim) {
+  SceneProductAdoptionFixture fixture;
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  const auto ready = fixture.Begin(request);
+  const auto publication = fixture.Publication(request);
+  // A supplied receipt is not evidence that publication actually happened.
+  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  fixture.publication_reader.SetCurrent(publication);
+  fixture.candidate_projections.front()->Reset(request.expected_active_projection_revision, FakePlannerSceneProjection::Mode::kCommit);
+  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  fixture.QualifyCandidate(request);
+  fixture.cell_admission.RefuseApplyClaimLookupAfter(1U);
+  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_EQ(fixture.owner->ReadMaintenanceInitialization(
+                {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}),
+            std::optional{ready});
+  EXPECT_FALSE(fixture.owner->ReadAccessStatus().scene_writes_open);
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     ReopenedPrivateAdoptionRemainsInterruptedAndCannotResumeThroughReadback) {
+  SceneProductAdoptionFixture fixture;
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  const auto ready = fixture.Begin(request);
+  fixture.owner.reset();
+  fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(
+      fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
+      fixture.resolver, fixture.cell_admission);
+  const auto status = fixture.owner->ReadMaintenanceInitialization(
+      {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation});
+  ASSERT_TRUE(status.has_value());
+  EXPECT_EQ(status->state, core::ProjectionMaintenanceInitializationState::kInterrupted);
+  EXPECT_TRUE(status->effects_unknown);
+  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  const auto publication = fixture.Publication(request);
+  fixture.publication_reader.SetCurrent(publication);
+  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.owner->CompleteMaintenanceInitialization(
+                   {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation,
+                    ready.target_projection_revision, ready.authoritative_snapshot_identity, publication}),
+               CanonicalEmptySceneOwnerConflictError);
+  EXPECT_FALSE(fixture.owner->ReadAccessStatus().scene_writes_open);
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     MissingClaimDependencyCannotAdmitQualifiedProductAdoption) {
+  SceneProductAdoptionFixture fixture;
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  fixture.owner.reset();
+  fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(
+      fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
+      fixture.resolver);
+  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+      {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}).has_value());
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     ConfigurationAdoptionPreservesPopulatedSceneWithDirectOrStoredAuthoringClaim) {
+  for (const bool same_product : {false, true}) {
+    SCOPED_TRACE(same_product);
+  for (const bool authoring : {false, true}) {
+    SCOPED_TRACE(authoring);
+    SceneProductAdoptionFixture fixture(true);
+  auto active = fixture.owner->CurrentProjectionRevision();
+  const auto added = fixture.owner->Commit(AddBoxRequest(active, fixture.admission.cell_id(), "adoption-add"));
+  ASSERT_TRUE(added.success);
+  ASSERT_TRUE(added.committed_projection_revision.has_value());
+  active = *added.committed_projection_revision;
+  const core::ComponentAttachmentRevision structural_revision("component-attachment-revision-1");
+  for (auto &projection : fixture.predecessor_projections) {
+    projection->SetFrameResolution(core::Pose3DTO{}, {structural_revision});
+    projection->SetResolvedFrameRoleOverride(core::FrameRoleId("asset_tool_frame"));
+  }
+  core::SceneTransactionRequestDTO attach{
+      SceneRequestContext("adoption-attach", active), {}, active,
+      core::AttachCarriedObjectRequestDTO{
+          core::CarriedObjectAttachmentId("attachment.1"), core::SceneResourceId("scene-box"),
+          core::ControllableComponentId("component.1"), core::CommandTargetId("arm"),
+          core::FrameRoleId("tool_frame"), {core::CollisionBodyRoleId("finger")}, {structural_revision}},
+      std::nullopt};
+  attach.expected_admission_generation = core::AdmissionGeneration(1U);
+  attach.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("runner.2"), core::ProgramRunId("program.2"), core::CellAdmissionClaimGeneration(9U),
+      "attach", "attach:attempt.1", "scene.carried_attachment"};
+  const auto attached = fixture.owner->Commit(attach);
+  ASSERT_TRUE(attached.success) << (attached.error.has_value() ? attached.error->message : "missing error");
+  ASSERT_TRUE(attached.committed_projection_revision.has_value());
+  active = *attached.committed_projection_revision;
+  const auto snapshot = fixture.owner->LogicalSnapshot();
+  ASSERT_EQ(snapshot->objects.size(), 1U);
+  ASSERT_EQ(snapshot->carried_object_attachments.size(), 1U);
+  const auto snapshot_bytes = EncodeLogicalSceneSnapshot(*snapshot);
+  const auto owner_epoch = fixture.owner->CurrentRequestOwnerEpoch();
+    const auto request = fixture.CaptureConfigurationRequest(authoring, same_product);
+    ASSERT_EQ(request.authority.held_cell_claim.intent.claim_kind,
+              authoring ? core::CellAdmissionClaimKindDTO::kAuthoringMutation
+                        : core::CellAdmissionClaimKindDTO::kManagerApply);
+    if (authoring) {
+      EXPECT_NE(request.authority.held_cell_claim.intent.request_payload_digest,
+                request.authority.persisted_manager_intent_digest);
+    } else {
+      EXPECT_EQ(request.authority.held_cell_claim.intent.request_payload_digest,
+                request.authority.persisted_manager_intent_digest);
+    }
+    if (same_product) {
+      EXPECT_EQ(request.candidate_retained_bundle.retained_bundle_id,
+                fixture.predecessor.bundle->value().retained_bundle_id);
+      EXPECT_EQ(request.candidate_retained_bundle.cell_graph.graph_revision,
+                fixture.predecessor.bundle->value().cell_graph.graph_revision);
+      EXPECT_EQ(request.native_runtime_bindings, fixture.predecessor_bindings);
+    } else {
+      fixture.PrepareCandidateClients();
+    }
+    const auto &projections = same_product ? fixture.predecessor_projections : fixture.candidate_projections;
+    std::vector<std::size_t> calls_before;
+    std::vector<std::size_t> rebuilds_before;
+    std::vector<std::size_t> policy_calls_before;
+    for (const auto &projection : projections) {
+      calls_before.push_back(projection->calls());
+      rebuilds_before.push_back(projection->rebuild_calls());
+      policy_calls_before.push_back(projection->policy_projection_calls());
+    }
+    const auto &attempt = fixture.fence.OriginalAttemptQuery();
+    const auto staged = fixture.owner->StageOriginalManagerConfigurationAdoption(request, fixture.fence, attempt);
+    const auto observed = fixture.owner->ReadOriginalManagerConfigurationAdoptionProjectionHealth(
+        request, fixture.fence, attempt);
+    ASSERT_FALSE(staged.empty());
+    ASSERT_EQ(staged.size(), request.native_runtime_bindings.size());
+    ASSERT_EQ(observed.size(), staged.size());
+    const ProjectionRevisionDTO target{request.candidate_retained_bundle.retained_bundle_id,
+        request.candidate_retained_bundle.cell_graph.graph_revision, request.expected_snapshot_identity.revision};
+    for (const auto &row : staged) {
+      EXPECT_TRUE(row.healthy_for_target(target));
+    }
+    for (const auto &row : observed) {
+      EXPECT_TRUE(row.healthy_for_target(target));
+    }
+    EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot_bytes);
+    EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), active);
+    EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+        {request.authority.owner.apply_id, request.authority.owner.apply_generation}));
+    const auto ready = fixture.owner->BeginOriginalManagerConfigurationAdoption(request, fixture.fence);
+    ASSERT_TRUE(ready.ready_for_publication());
+    if (same_product) {
+      EXPECT_EQ(ready.target_projection_revision, request.expected_active_projection_revision);
+    }
+    EXPECT_EQ(ready.authoritative_snapshot_identity, snapshot->identity());
+    const auto captured = fixture.owner->ReadActiveSnapshot();
+    ASSERT_TRUE(captured.has_value());
+    EXPECT_EQ(EncodeLogicalSceneSnapshot(*captured->shared()), snapshot_bytes);
+    const auto publication = fixture.Publication(request);
+    ASSERT_TRUE(publication.request.expected_previous_publication_generation.has_value());
+    EXPECT_EQ(*publication.request.expected_previous_publication_generation, ActiveBundlePublicationGeneration(2U));
+    EXPECT_EQ(publication.publication_generation, ActiveBundlePublicationGeneration(3U));
+    fixture.publication_reader.SetCurrent(publication);
+    const auto completed = fixture.owner->CompleteOriginalManagerConfigurationAdoption(request, publication, fixture.fence);
+    EXPECT_EQ(completed.state, core::ProjectionMaintenanceInitializationState::kCompleted);
+    EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot_bytes);
+    EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), ready.target_projection_revision);
+    EXPECT_EQ(fixture.owner->CurrentRequestOwnerEpoch(), owner_epoch);
+    for (std::size_t index = 0U; index < projections.size(); ++index) {
+      EXPECT_EQ(projections[index]->calls(), calls_before[index]);
+      EXPECT_EQ(projections[index]->rebuild_calls(), rebuilds_before[index] + (same_product ? 0U : 1U));
+      EXPECT_EQ(projections[index]->policy_projection_calls(), policy_calls_before[index]);
+      EXPECT_EQ(projections[index]->retained_lease_count(), 0U);
+    }
+    if (same_product) {
+      fixture.ExpectNoCandidateEffects();  // The unrelated changed-product clients were never selected.
+    } else {
+      fixture.ExpectNoCandidateEffects(1U);
+    }
+    const auto held = fixture.cell_admission.GetCellAdmissionRecoveryReceipt(
+        {request.authority.held_cell_claim.intent, request.authority.held_cell_claim, std::nullopt});
+    ASSERT_TRUE(held.ok());
+    EXPECT_EQ(held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+  }
+  }
+}
+
+TEST(CanonicalEmptySceneOwner, ConfigurationAdoptionRefusesForeignClaimIntentFenceAndScene) {
+  for (const bool same_product : {false, true}) {
+    SCOPED_TRACE(same_product);
+  for (unsigned scenario = 0U; scenario < 9U; ++scenario) {
+    SCOPED_TRACE(scenario);
+    SceneProductAdoptionFixture fixture(true);
+    auto request = fixture.CaptureConfigurationRequest(false, same_product);
+    if (!same_product) {
+      fixture.PrepareCandidateClients();
+    }
+    const auto bytes = EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot());
+    switch (scenario) {
+    case 0U: request.authority.persisted_manager_intent_digest = Digest('a'); break;
+    case 1U: request.authority.held_cell_claim.intent.owner_transaction_id = "foreign-manager"; break;
+    case 2U: request.authority.held_cell_claim.claim_generation = core::CellAdmissionClaimGeneration(99U); break;
+    case 3U: request.authority.held_fence_query.configuration_fence_id = core::ConfigurationFenceId("foreign-fence"); break;
+    case 4U: request.expected_predecessor_publication.durable_public_pointer_content_digest = Digest('a'); break;
+    case 5U:
+      ++request.expected_snapshot_identity.revision.revision_id;
+      request.expected_active_projection_revision.scene_revision = request.expected_snapshot_identity.revision;
+      break;
+    case 6U: fixture.cell_admission.ProveHeldClaimHadNoEffect(); break;
+    case 7U: request.candidate_retained_bundle.cell_graph.graph_revision = GraphRevision("foreign-candidate"); break;
+    case 8U: request.native_runtime_bindings.pop_back(); break;
+    }
+    const auto stage = [&] {
+      return fixture.owner->StageOriginalManagerConfigurationAdoption(
+          request, fixture.fence, fixture.fence.OriginalAttemptQuery());
+    };
+    const auto begin = [&] { return fixture.owner->BeginOriginalManagerConfigurationAdoption(request, fixture.fence); };
+    if (scenario < 2U) {
+      EXPECT_THROW(stage(), std::invalid_argument);
+      EXPECT_THROW(begin(), std::invalid_argument);
+    } else {
+      EXPECT_THROW(stage(), CanonicalEmptySceneOwnerConflictError);
+      EXPECT_THROW(begin(), CanonicalEmptySceneOwnerConflictError);
+    }
+    fixture.ExpectNoCandidateEffects(0U, same_product);
+    EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), bytes);
+    EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+        {request.authority.owner.apply_id, request.authority.owner.apply_generation}));
+  }
+  }
+}
+
+TEST(CanonicalEmptySceneOwner, ConfigurationAdoptionUncertaintyRetainsTruthAndRestartCannotContinue) {
+  for (const bool same_product : {false, true}) {
+    SCOPED_TRACE(same_product);
+  for (const bool completion_uncertainty : {false, true}) {
+    SCOPED_TRACE(completion_uncertainty);
+    SceneProductAdoptionFixture fixture(true);
+    const auto request = fixture.CaptureConfigurationRequest(true, same_product);
+    if (!same_product) {
+      fixture.PrepareCandidateClients();
+    }
+    const auto &attempt = fixture.fence.OriginalAttemptQuery();
+    ASSERT_FALSE(fixture.owner->StageOriginalManagerConfigurationAdoption(request, fixture.fence, attempt).empty());
+    const auto publication = fixture.Publication(request);
+    if (completion_uncertainty) {
+      ASSERT_TRUE(fixture.owner->BeginOriginalManagerConfigurationAdoption(request, fixture.fence).ready_for_publication());
+      fixture.publication_reader.SetCurrent(publication);
+      fixture.fence.RefuseRemoteQueryAfter(2U);
+      EXPECT_THROW(fixture.owner->CompleteOriginalManagerConfigurationAdoption(request, publication, fixture.fence), std::runtime_error);
+    } else {
+      fixture.fence.RefuseRemoteQueryAfter(2U);
+      EXPECT_THROW(fixture.owner->BeginOriginalManagerConfigurationAdoption(request, fixture.fence), std::runtime_error);
+    }
+    const core::ProjectionMaintenanceInitializationQueryDTO query{
+        request.authority.owner.apply_id, request.authority.owner.apply_generation};
+    const auto actual = fixture.owner->ReadMaintenanceInitialization(query);
+    ASSERT_TRUE(actual.has_value());
+    EXPECT_EQ(actual->state, completion_uncertainty ? core::ProjectionMaintenanceInitializationState::kCompleted
+                                                  : core::ProjectionMaintenanceInitializationState::kInitialized);
+    fixture.fence.RefuseRemoteQueryAfter(100U);
+    fixture.owner.reset();
+    fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(fixture.database_path, fixture.admission,
+        fixture.publication_reader, fixture.bundle_source, fixture.resolver, fixture.cell_admission);
+    const auto recovered = fixture.owner->ReadMaintenanceInitialization(query);
+    ASSERT_TRUE(recovered.has_value());
+    if (completion_uncertainty) {
+      EXPECT_EQ(recovered, actual);
+    } else {
+      EXPECT_EQ(recovered->state, core::ProjectionMaintenanceInitializationState::kInterrupted);
+      EXPECT_TRUE(recovered->effects_unknown);
+    }
+    EXPECT_THROW(fixture.owner->CompleteOriginalManagerConfigurationAdoption(request, publication, fixture.fence),
+                 CanonicalEmptySceneOwnerConflictError);
+    fixture.ExpectNoCandidateEffects(same_product ? 0U : 1U, same_product);
+  }
+  }
+}
+
+
+TEST(CanonicalEmptySceneOwner, EqualConfigurationAdoptionRequiresExactCurrentProjectionHealth) {
+  SceneProductAdoptionFixture fixture(true);
+  const auto request = fixture.CaptureConfigurationRequest(false, true);
+  const auto bytes = EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot());
+  ASSERT_FALSE(fixture.owner->StageOriginalManagerConfigurationAdoption(
+      request, fixture.fence, fixture.fence.OriginalAttemptQuery()).empty());
+  for (const auto &projection : fixture.predecessor_projections) {
+    EXPECT_EQ(projection->rebuild_calls(), 0U);
+  }
+  auto stale = request.expected_active_projection_revision;
+  ++stale.scene_revision.revision_id;
+  fixture.predecessor_projections.front()->Reset(stale, FakePlannerSceneProjection::Mode::kCommit);
+  std::vector<std::size_t> rebuilds_before;
+  for (const auto &projection : fixture.predecessor_projections) {
+    rebuilds_before.push_back(projection->rebuild_calls());
+  }
+  EXPECT_THROW(fixture.owner->BeginOriginalManagerConfigurationAdoption(request, fixture.fence),
+               CanonicalEmptySceneOwnerConflictError);
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+      {request.authority.owner.apply_id, request.authority.owner.apply_generation}));
+  const auto stored = fixture.owner->ReadActiveSnapshot();
+  ASSERT_TRUE(stored.has_value());
+  EXPECT_EQ(EncodeLogicalSceneSnapshot(*stored->shared()), bytes);
+  for (std::size_t index = 0U; index < fixture.predecessor_projections.size(); ++index) {
+    EXPECT_EQ(fixture.predecessor_projections[index]->rebuild_calls(), rebuilds_before[index]);
+    EXPECT_EQ(fixture.predecessor_projections[index]->calls(), 0U);
+    EXPECT_EQ(fixture.predecessor_projections[index]->retained_lease_count(), 0U);
+  }
+  fixture.ExpectNoCandidateEffects();
+  const auto held = fixture.cell_admission.GetCellAdmissionRecoveryReceipt(
+      {request.authority.held_cell_claim.intent, request.authority.held_cell_claim, std::nullopt});
+  ASSERT_TRUE(held.ok());
+  EXPECT_EQ(held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+}
+
+TEST(CanonicalEmptySceneOwner, LegacyQualifiedProductAdoptionStillRefusesAnEqualProjection) {
+  for (const bool original_manager : {false, true}) {
+    SCOPED_TRACE(original_manager);
+    SceneProductAdoptionFixture fixture(original_manager);
+    auto request = fixture.CaptureRequest();
+    request.candidate_retained_bundle = fixture.predecessor.bundle->value();
+    request.native_runtime_bindings = fixture.predecessor_bindings;
+    const auto bytes = EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot());
+    bool refused = false;
+    try {
+      fixture.Begin(request);
+    } catch (const std::invalid_argument &error) {
+      refused = true;
+      EXPECT_EQ(std::string(error.what()),
+                "qualified Scene product adoption is invalid: legacy_projection_unchanged");
+    }
+    EXPECT_TRUE(refused);
+    EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), bytes);
+    fixture.ExpectNoCandidateEffects(0U, true);
+    fixture.ExpectNoCandidateEffects();
+    EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+        {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}));
+  }
+}
+
+TEST(CanonicalEmptySceneOwner,
+     OriginalManagerStagingUsesHeldPresenceBeforeInstalledConfigurationStatus) {
+  SceneProductAdoptionFixture fixture(true);
+  const auto request = fixture.CaptureRequest();
+  const auto snapshot = EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot());
+  fixture.PrepareCandidateClients();
+  fixture.fence.RefuseFullStatusQueries();
+  const auto &attempt = fixture.fence.OriginalAttemptQuery();
+  ASSERT_TRUE(fixture.fence.Presence().matches(attempt));
+  ASSERT_NE(attempt.persisted_intent.owner_request_context.request_id,
+            request.parent_authority.parent_claim.intent.request_id);
+  const auto staged = fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, attempt);
+  const auto observed = fixture.owner->ReadOriginalManagerProductAdoptionProjectionHealth(
+      request, fixture.fence, attempt);
+  const ProjectionRevisionDTO target{request.candidate_retained_bundle.retained_bundle_id,
+      request.candidate_retained_bundle.cell_graph.graph_revision,
+      request.expected_snapshot_identity.revision};
+  ASSERT_EQ(staged.size(), request.native_runtime_bindings.size());
+  ASSERT_EQ(observed.size(), staged.size());
+  for (const auto &row : observed) {
+    EXPECT_TRUE(row.healthy_for_target(target));
+  }
+  fixture.ExpectNoCandidateEffects(1U);
+  EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot);
+  EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), request.expected_active_projection_revision);
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+      {request.parent_authority.parent.owner.apply_id,
+       request.parent_authority.parent.owner.apply_generation}).has_value());
+  // Begin still requires its full installed status; held presence cannot replace it.
+  EXPECT_THROW(fixture.Begin(request), std::runtime_error);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     OriginalManagerStagingRefusesForeignMissingReleasedAndStaleHeldPresence) {
+  for (unsigned scenario = 0U; scenario < 10U; ++scenario) {
+    SCOPED_TRACE(scenario);
+    SceneProductAdoptionFixture fixture(true);
+    auto request = fixture.CaptureRequest();
+    const auto snapshot = EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot());
+    fixture.PrepareCandidateClients();
+    auto attempt = fixture.fence.OriginalAttemptQuery();
+    auto presence = fixture.fence.Presence();
+    switch (scenario) {
+    case 0U:
+      attempt.persisted_attempt_digest = Digest('a');
+      break;
+    case 1U:
+      attempt.persisted_intent.reason = "foreign complete intent";
+      break;
+    case 2U:
+      attempt.persisted_intent.owner_transaction.apply_id = ApplyId("foreign-parent");
+      break;
+    case 3U:
+      attempt.manager_runtime_epoch = core::RuntimeEpoch("foreign-manager");
+      break;
+    case 4U:
+      presence.admission_fenced = false;
+      break;
+    case 5U:
+      presence.state = core::ApplyFenceAcquireAttemptReconcileState::kNotSeen;
+      presence.accepted_fence.reset();
+      presence.admission_fenced = false;
+      break;
+    case 6U:
+      // The actual owner reports a released request as conflicting, never held.
+      presence.state = core::ApplyFenceAcquireAttemptReconcileState::kConflicting;
+      presence.accepted_fence.reset();
+      presence.required_compensation_or_operator_direction = "released fence remains excluded";
+      presence.error = ErrorDTO{"configuration_fence_request_conflict", "request is already released", {}};
+      break;
+    case 7U:
+      presence.execution_host_epoch.publication_generation = ActiveBundlePublicationGeneration(99U);
+      break;
+    case 8U:
+      presence.accepted_fence->configuration_fence_id = core::ConfigurationFenceId("foreign-fence");
+      break;
+    case 9U:
+      request.expected_predecessor_publication.durable_public_pointer_content_digest = Digest('a');
+      break;
+    }
+    fixture.fence.SetPresence(presence);
+    EXPECT_THROW(fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, attempt),
+                 CanonicalEmptySceneOwnerConflictError);
+    EXPECT_THROW(fixture.owner->ReadOriginalManagerProductAdoptionProjectionHealth(request, fixture.fence, attempt),
+                 CanonicalEmptySceneOwnerConflictError);
+    fixture.ExpectNoCandidateEffects();
+    EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot);
+    EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+        {request.parent_authority.parent.owner.apply_id,
+         request.parent_authority.parent.owner.apply_generation}).has_value());
+  }
+}
+
+TEST(CanonicalEmptySceneOwner,
+     OriginalManagerStagingPreservesPopulatedSceneAndKeepsPublicProjectionOnPredecessor) {
+  VerifyProductAdoptionPreservesObjectsAttachmentsAndLogicalIdentity(true, true);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     OriginalManagerStagingPartialFailureKeepsOldSceneAndProjectionTruth) {
+  SceneProductAdoptionFixture fixture(true);
+  const auto request = fixture.CaptureRequest();
+  const auto snapshot = EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot());
+  const auto old_revision = fixture.owner->CurrentProjectionRevision();
+  const auto integrity = fixture.owner->VerifyIntegrity();
+  for (auto &projection : fixture.predecessor_projections) {
+    projection->ObserveRevisionQueries();
+  }
+  for (auto &projection : fixture.candidate_projections) {
+    projection->ObserveRevisionQueries();
+  }
+  fixture.PrepareCandidateClients();
+  ASSERT_GE(fixture.candidate_projections.size(), 2U);
+  fixture.candidate_projections.back()->RejectNextRebuildWithoutEffect();
+  EXPECT_THROW(fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, fixture.fence.OriginalAttemptQuery()),
+               CanonicalEmptySceneOwnerConflictError);
+  // A prior binding really committed; no cleanup/rollback/retry is fabricated.
+  const ProjectionRevisionDTO target{
+      request.candidate_retained_bundle.retained_bundle_id,
+      request.candidate_retained_bundle.cell_graph.graph_revision,
+      request.expected_snapshot_identity.revision};
+  EXPECT_TRUE(fixture.candidate_projections.front()->ProjectionHealth().healthy_for_target(target));
+  EXPECT_FALSE(fixture.candidate_projections.back()->ProjectionHealth().healthy_for_target(target));
+  for (const auto &projection : fixture.candidate_projections) {
+    EXPECT_EQ(projection->rebuild_calls(), 1U);
+    EXPECT_EQ(projection->calls(), 0U);
+  }
+  EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), old_revision);
+  EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot);
+  const auto public_health = fixture.owner->ActiveProjectionHealth();
+  EXPECT_TRUE(public_health.healthy_for_target(old_revision));
+  for (const auto &projection : fixture.predecessor_projections) {
+    EXPECT_EQ(projection->last_health_revision(), std::optional{old_revision});
+  }
+  for (const auto &projection : fixture.candidate_projections) {
+    EXPECT_EQ(projection->last_health_revision(), std::optional{target});
+  }
+  for (const auto &row : public_health.native_projection_health) {
+    EXPECT_TRUE(row.healthy_for_target(old_revision));
+  }
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+      {request.parent_authority.parent.owner.apply_id,
+       request.parent_authority.parent.owner.apply_generation}).has_value());
+  const auto after = fixture.owner->VerifyIntegrity();
+  EXPECT_EQ(after.transaction_intent_count, integrity.transaction_intent_count);
+  EXPECT_EQ(after.owner_event_count, integrity.owner_event_count);
+  EXPECT_EQ(after.projection_result_count, integrity.projection_result_count);
+  const auto held = fixture.cell_admission.GetCellAdmissionRecoveryReceipt(
+      {request.parent_authority.parent_claim.intent, request.parent_authority.parent_claim, std::nullopt});
+  ASSERT_TRUE(held.ok());
+  EXPECT_EQ(held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     OriginalManagerStagingObservesAcceptedWorkWithoutRepeatingSceneEffects) {
+  SceneProductAdoptionFixture fixture(true);
+  const auto request = fixture.CaptureRequest();
+  for (auto &projection : fixture.predecessor_projections) {
+    projection->ObserveRevisionQueries();
+  }
+  for (auto &projection : fixture.candidate_projections) {
+    projection->ObserveRevisionQueries();
+  }
+  fixture.PrepareCandidateClients();
+  fixture.candidate_projections.front()->AcceptNextRebuildAs(request.native_runtime_bindings.front());
+  const auto staged = fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, fixture.fence.OriginalAttemptQuery());
+  ASSERT_EQ(staged.size(), request.native_runtime_bindings.size());
+  EXPECT_EQ(staged.front().state, core::ProjectionHealthState::kRebuilding);
+  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  const auto pending = fixture.owner->ReadOriginalManagerProductAdoptionProjectionHealth(request, fixture.fence, fixture.fence.OriginalAttemptQuery());
+  ASSERT_EQ(pending.size(), staged.size());
+  const ProjectionRevisionDTO target{
+      request.candidate_retained_bundle.retained_bundle_id,
+      request.candidate_retained_bundle.cell_graph.graph_revision,
+      request.expected_snapshot_identity.revision};
+  EXPECT_FALSE(pending.front().healthy_for_target(target));
+  for (const auto &projection : fixture.candidate_projections) {
+    EXPECT_EQ(projection->last_health_revision(), std::optional{target});
+  }
+  const auto active = fixture.owner->CurrentProjectionRevision();
+  EXPECT_TRUE(fixture.owner->ActiveProjectionHealth().healthy_for_target(active));
+  for (const auto &projection : fixture.predecessor_projections) {
+    EXPECT_EQ(projection->last_health_revision(), std::optional{active});
+  }
+  for (const auto &projection : fixture.candidate_projections) {
+    EXPECT_EQ(projection->rebuild_calls(), 1U);
+  }
+  // Complete the fake native producer's captured job, without calling Stage.
+  const auto job = fixture.candidate_projections.front()->rebuild_requests().front();
+  const auto completed = fixture.candidate_projections.front()->RebuildProjection(job);
+  ASSERT_EQ(completed.result, core::ProjectionCommitResultStateDTO::kCommitted);
+  const auto observed = fixture.owner->ReadOriginalManagerProductAdoptionProjectionHealth(request, fixture.fence, fixture.fence.OriginalAttemptQuery());
+  ASSERT_EQ(observed.size(), staged.size());
+  for (const auto &row : observed) {
+    EXPECT_TRUE(row.healthy_for_target(job.target_projection_revision));
+  }
+  EXPECT_EQ(fixture.candidate_projections.front()->rebuild_calls(), 2U);
+  const auto ready = fixture.Begin(request);
+  EXPECT_TRUE(ready.ready_for_publication());
+  EXPECT_EQ(fixture.candidate_projections.front()->rebuild_calls(), 2U);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     OriginalManagerStagingRefusesForeignProofBeforeNativeEffectsAndPreservesLostResponseTruth) {
+  SceneProductAdoptionFixture fixture(true);
+  const auto request = fixture.CaptureRequest();
+  fixture.PrepareCandidateClients();
+  auto foreign = request;
+  foreign.parent_authority.held_fence_query.manager_runtime_epoch = core::RuntimeEpoch("foreign-manager");
+  EXPECT_THROW(fixture.owner->StageOriginalManagerProductAdoption(foreign, fixture.fence, fixture.fence.OriginalAttemptQuery()),
+               CanonicalEmptySceneOwnerConflictError);
+  fixture.ExpectNoCandidateEffects();
+  fixture.fence.RefuseRemoteQueryAfter(1U);
+  EXPECT_THROW(fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, fixture.fence.OriginalAttemptQuery()), std::runtime_error);
+  for (const auto &projection : fixture.candidate_projections) {
+    EXPECT_EQ(projection->rebuild_calls(), 1U);
+  }
+  EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), request.expected_active_projection_revision);
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+      {request.parent_authority.parent.owner.apply_id,
+       request.parent_authority.parent.owner.apply_generation}).has_value());
+  const auto held = fixture.cell_admission.GetCellAdmissionRecoveryReceipt(
+      {request.parent_authority.parent_claim.intent, request.parent_authority.parent_claim, std::nullopt});
+  ASSERT_TRUE(held.ok());
+  EXPECT_EQ(held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     OriginalManagerProductAdoptionRefusesForeignIdentityHeadSnapshotAndHealth) {
+  SceneProductAdoptionFixture fixture(true);
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  auto foreign = request;
+  foreign.parent_authority.parent_claim.claim_generation = core::CellAdmissionClaimGeneration(99U);
+  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  foreign = request;
+  foreign.parent_authority.parent.owner.apply_id = ApplyId("foreign-parent");
+  foreign.parent_authority.parent_claim.intent.owner_transaction_id = "foreign-parent";
+  foreign.parent_authority.held_fence_query.owner_transaction = foreign.parent_authority.parent.owner;
+  ASSERT_TRUE(foreign.parent_authority.valid());
+  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  foreign = request;
+  foreign.parent_authority.held_fence_query.manager_runtime_epoch = core::RuntimeEpoch("foreign-manager");
+  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  foreign = request;
+  foreign.expected_predecessor_publication.durable_public_pointer_content_digest = Digest('9');
+  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  foreign = request;
+  ++foreign.expected_snapshot_identity.revision.revision_id;
+  foreign.expected_active_projection_revision.scene_revision = foreign.expected_snapshot_identity.revision;
+  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  foreign = request;
+  foreign.native_runtime_bindings.pop_back();
+  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  fixture.candidate_projections.front()->Reset(
+      request.expected_active_projection_revision, FakePlannerSceneProjection::Mode::kCommit);
+  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+      {request.parent_authority.parent.owner.apply_id,
+       request.parent_authority.parent.owner.apply_generation}).has_value());
+  EXPECT_TRUE(fixture.owner->ReadAccessStatus().scene_writes_open);
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     OriginalManagerUnavailableResponseBeforeCaptureRecordsNothing) {
+  SceneProductAdoptionFixture fixture(true);
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  fixture.fence.RefuseRemoteQueryAfter(1U);
+  EXPECT_THROW(fixture.Begin(request), std::runtime_error);
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
+      {request.parent_authority.parent.owner.apply_id,
+       request.parent_authority.parent.owner.apply_generation}).has_value());
+  EXPECT_TRUE(fixture.owner->ReadAccessStatus().scene_writes_open);
+  const auto held = fixture.cell_admission.GetCellAdmissionRecoveryReceipt(
+      {request.parent_authority.parent_claim.intent, request.parent_authority.parent_claim, std::nullopt});
+  ASSERT_TRUE(held.ok());
+  EXPECT_EQ(held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     OriginalManagerLostCaptureResponsePreservesTruthAndRestartCannotResume) {
+  SceneProductAdoptionFixture fixture(true);
+  const auto snapshot = EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot());
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  fixture.fence.RefuseRemoteQueryAfter(2U);
+  EXPECT_THROW(fixture.Begin(request), std::runtime_error);
+  const auto query = core::ProjectionMaintenanceInitializationQueryDTO{
+      request.parent_authority.parent.owner.apply_id,
+      request.parent_authority.parent.owner.apply_generation};
+  const auto captured = fixture.owner->ReadMaintenanceInitialization(query);
+  ASSERT_TRUE(captured.has_value());
+  EXPECT_EQ(captured->state, core::ProjectionMaintenanceInitializationState::kInitialized);
+  EXPECT_FALSE(fixture.owner->ReadAccessStatus().scene_writes_open);
+  const auto captured_snapshot = fixture.owner->ReadActiveSnapshot();
+  ASSERT_TRUE(captured_snapshot.has_value());
+  EXPECT_EQ(EncodeLogicalSceneSnapshot(*captured_snapshot->shared()), snapshot);
+  const auto held = fixture.cell_admission.GetCellAdmissionRecoveryReceipt(
+      {request.parent_authority.parent_claim.intent, request.parent_authority.parent_claim, std::nullopt});
+  ASSERT_TRUE(held.ok());
+  EXPECT_EQ(held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+  fixture.owner.reset();
+  fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(
+      fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
+      fixture.resolver, fixture.cell_admission);
+  fixture.fence.RefuseRemoteQueryAfter(100U);
+  const auto interrupted = fixture.owner->ReadMaintenanceInitialization(query);
+  ASSERT_TRUE(interrupted.has_value());
+  EXPECT_EQ(interrupted->state, core::ProjectionMaintenanceInitializationState::kInterrupted);
+  EXPECT_TRUE(interrupted->effects_unknown);
+  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  const auto publication = fixture.Publication(request);
+  fixture.publication_reader.SetCurrent(publication);
+  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  const auto reopened_snapshot = fixture.owner->ReadActiveSnapshot();
+  ASSERT_TRUE(reopened_snapshot.has_value());
+  EXPECT_EQ(EncodeLogicalSceneSnapshot(*reopened_snapshot->shared()), snapshot);
+  EXPECT_FALSE(fixture.owner->ReadAccessStatus().scene_writes_open);
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     OriginalManagerLostCompletionResponseKeepsDurableCompletionAndParentHeld) {
+  SceneProductAdoptionFixture fixture(true);
+  const auto snapshot = EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot());
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  const auto ready = fixture.Begin(request);
+  const auto publication = fixture.Publication(request);
+  fixture.publication_reader.SetCurrent(publication);
+  fixture.fence.RefuseRemoteQueryAfter(2U);
+  EXPECT_THROW(fixture.Complete(request, publication), std::runtime_error);
+  const auto query = core::ProjectionMaintenanceInitializationQueryDTO{
+      request.parent_authority.parent.owner.apply_id,
+      request.parent_authority.parent.owner.apply_generation};
+  const auto completed = fixture.owner->ReadMaintenanceInitialization(query);
+  ASSERT_TRUE(completed.has_value());
+  EXPECT_EQ(completed->state, core::ProjectionMaintenanceInitializationState::kCompleted);
+  EXPECT_EQ(completed->target_projection_revision, ready.target_projection_revision);
+  EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot);
+  const auto held = fixture.cell_admission.GetCellAdmissionRecoveryReceipt(
+      {request.parent_authority.parent_claim.intent, request.parent_authority.parent_claim, std::nullopt});
+  ASSERT_TRUE(held.ok());
+  EXPECT_EQ(held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+  fixture.owner.reset();
+  fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(
+      fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
+      fixture.resolver, fixture.cell_admission);
+  fixture.fence.RefuseRemoteQueryAfter(100U);
+  EXPECT_EQ(fixture.owner->ReadMaintenanceInitialization(query), completed);
+  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     LegacySameSceneMaintenanceCompletionAndReplayRemainOrdinary) {
+  SceneProductAdoptionFixture fixture;
+  auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  const auto snapshot = fixture.owner->LogicalSnapshot();
+  const auto quote = [](const std::string &value) {
+    char *encoded = sqlite3_mprintf("%Q", value.c_str());
+    if (encoded == nullptr) {
+      throw std::bad_alloc();
+    }
+    std::string result(encoded);
+    sqlite3_free(encoded);
+    return result;
+  };
+  const auto columns = [&](const ProjectionRevisionDTO &projection) {
+    return quote(projection.retained_bundle_id.value()) + "," + quote(projection.graph_revision.value()) + "," +
+           quote(projection.scene_revision.scene_id.value()) + "," + std::to_string(projection.scene_revision.revision_id) + "," +
+           quote(projection.scene_revision.content_hash.value());
+  };
+  const ProjectionRevisionDTO target{request.candidate_retained_bundle.retained_bundle_id,
+                                     request.candidate_retained_bundle.cell_graph.graph_revision, snapshot->revision};
+  // The original v8 producer (ce29a2fd/a68a2189) stored unchanged Scene
+  // revisions and no Program baseline row. Populate that actual row shape
+  // after owner startup; an unfinished row reopened at startup is interrupted.
+  std::string sql =
+      "BEGIN IMMEDIATE; INSERT INTO logical_scene_maintenance_initialization_intents("
+      "initialization_sequence,apply_id,apply_generation,predecessor_retained_bundle_id,predecessor_graph_revision,"
+      "predecessor_scene_id,predecessor_scene_revision_id,predecessor_scene_content_hash,target_retained_bundle_id,"
+      "target_graph_revision,target_scene_id,target_scene_revision_id,target_scene_content_hash,authoritative_snapshot_json,"
+      "native_binding_count,repaired_transaction_sequence) VALUES(2,'legacy-maintenance',1," +
+      columns(request.expected_active_projection_revision) + "," + columns(target) + "," +
+      quote(EncodeLogicalSceneSnapshot(*snapshot)) + "," + std::to_string(request.native_runtime_bindings.size()) + ",NULL);";
+  for (std::size_t index = 0U; index < request.native_runtime_bindings.size(); ++index) {
+    const auto &binding = request.native_runtime_bindings[index];
+    sql += "INSERT INTO logical_scene_maintenance_initialization_bindings("
+           "initialization_sequence,binding_ordinal,provider_binding_id,provider_binding_revision,runtime_unit_id,runtime_epoch) "
+           "VALUES(2," + std::to_string(index) + "," + quote(binding.provider_binding_id.value()) + "," +
+           quote(binding.provider_binding_revision.value()) + "," + quote(binding.runtime_unit_id.value()) + "," +
+           quote(binding.runtime_epoch.value()) + ");";
+  }
+  sql += "INSERT INTO logical_scene_maintenance_initialization_results("
+         "initialization_sequence,state,first_error_code,first_error_message,effects_unknown) "
+         "VALUES(2,'initialized',NULL,NULL,0); COMMIT;";
+  ExecuteSql(fixture.database_path, sql);
+  request.parent_authority.parent.owner.apply_id = ApplyId("legacy-maintenance");
+  const auto publication = fixture.Publication(request);
+  fixture.publication_reader.SetCurrent(publication);
+  const core::ProjectionMaintenanceCompletionDTO completion{
+      ApplyId("legacy-maintenance"), ApplyGeneration(1U), target, snapshot->identity(), publication};
+  const auto completed = fixture.owner->CompleteMaintenanceInitialization(completion);
+  EXPECT_EQ(completed.state, core::ProjectionMaintenanceInitializationState::kCompleted);
+  EXPECT_EQ(fixture.owner->CompleteMaintenanceInitialization(completion), completed);
+  EXPECT_EQ(*fixture.owner->LogicalSnapshot(), *snapshot);
+  fixture.ExpectNoCandidateEffects();
+}
+
+TEST(CanonicalEmptySceneOwner,
+     QualifiedProductAdoptionCannotRepairAnUncertainSceneTransaction) {
+  SceneProductAdoptionFixture fixture;
+  const auto active = fixture.owner->CurrentProjectionRevision();
+  fixture.predecessor_projections.front()->SetMode(FakePlannerSceneProjection::Mode::kUncertain);
+  const auto failed = fixture.owner->Commit(AddBoxRequest(active, fixture.admission.cell_id(), "adoption-uncertain"));
+  ASSERT_FALSE(failed.success);
+  const auto integrity_before = fixture.owner->VerifyIntegrity();
+  ASSERT_TRUE(integrity_before.projection_desynchronized);
+  // Capture only real pre-effect values; public projection-lease access is
+  // correctly closed by the failed transaction and cannot be used as truth.
+  // A Kernel reset settlement does not repair the Scene owner's uncertainty.
+  const auto claims = fixture.cell_admission.Claims();
+  ASSERT_FALSE(claims.empty());
+  const auto &held = claims.back();
+  ASSERT_TRUE(fixture.cell_admission.ReleaseCellAdmissionClaim(
+      {held.intent.owner_role, held.intent.owner_epoch, held.intent.owner_transaction_id,
+       held.intent.request_id, held.intent.request_payload_digest, held.acquired_admission_generation,
+       held.claim_generation, {core::CellAdmissionSettlementKindDTO::kExplicitReset, Digest('e')}}).ok());
+  const core::ApplyFenceOwnerDTO parent{ApplyId("apply-private-adoption"), ApplyGeneration(1U)};
+  const auto claim = fixture.cell_admission.AcquireCellAdmissionClaim(
+      {core::CellAdmissionClaimKindDTO::kManagerApply, core::CellAdmissionOwnerRoleDTO::kManager,
+       RequestOwnerEpoch("manager.1"), parent.apply_id.value(), core::RequestId("parent-request"),
+       Digest('3'), core::AdmissionGeneration(1U), {}, std::nullopt, std::nullopt});
+  ASSERT_TRUE(claim.ok());
+  const auto published = fixture.publication_reader.ReadActiveBundlePublication(ActiveBundlePublicationGeneration(2U));
+  ASSERT_TRUE(published.ok());
+  const core::ConfigurationFenceStatusQueryDTO query{
+      parent, core::ConfigurationFenceId("apply-fence"), core::ConfigurationFenceGeneration(1U),
+      {}, core::RuntimeEpoch("manager-runtime.1")};
+  fixture.fence.Configure(query, published.value());
+  const auto snapshot = fixture.owner->ReadActiveSnapshot();
+  ASSERT_TRUE(snapshot.has_value());
+  const QualifiedSceneProductAdoptionRequest request{
+      {{parent, Digest('3')}, claim.value(), query}, published.value(), active,
+      snapshot->shared()->identity(), fixture.candidate.bundle->value(), fixture.candidate_bindings};
+  fixture.QualifyCandidate(request);
+  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  const auto integrity_after = fixture.owner->VerifyIntegrity();
+  EXPECT_TRUE(integrity_after.projection_desynchronized);
+  EXPECT_EQ(integrity_after.transaction_intent_count, integrity_before.transaction_intent_count);
+  EXPECT_EQ(integrity_after.owner_event_count, integrity_before.owner_event_count);
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization({parent.apply_id, parent.apply_generation}).has_value());
+  fixture.ExpectNoCandidateEffects();
 }
 
 TEST(CanonicalEmptySceneOwner,

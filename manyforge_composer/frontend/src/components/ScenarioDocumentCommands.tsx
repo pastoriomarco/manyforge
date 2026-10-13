@@ -454,7 +454,7 @@ export function ScenarioDocumentCommands({
                     confirmDiscard: true,
                   }));
                 }}>
-                {deploymentChoice === 'keep_applied' ? 'Create and activate' : 'Create and unload components'}
+                {deploymentChoice === 'keep_applied' ? 'Create and configure' : 'Create and unload components'}
               </button>
             </div>
           </div>

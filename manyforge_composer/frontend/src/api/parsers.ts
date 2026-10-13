@@ -1688,10 +1688,11 @@ function parseManagerActiveProjection(
   const record = objectAt(value, path);
   exactKeysAt(
     record,
-    ['cell_graph', 'graph_revision', 'publication', 'retained_bundle_id'],
+    ['canonical_empty', 'cell_graph', 'graph_revision', 'publication', 'retained_bundle_id'],
     path,
   );
   return {
+    canonicalEmpty: booleanAt(record.canonical_empty, path + '.canonical_empty'),
     cellGraph: jsonRecordAt(record.cell_graph, path + '.cell_graph'),
     graphRevision: stringAt(record.graph_revision, path + '.graph_revision'),
     retainedBundleId: stringAt(
@@ -3484,7 +3485,7 @@ export function parseDeploymentWorkspaceResponse(
     return fail(`${path}.saved`, 'one complete Saved identity');
   }
   const managerRecord = objectAt(record.managerApplied, `${path}.managerApplied`);
-  exactKeysAt(managerRecord, ['deploymentRevision', 'scenarioId'], `${path}.managerApplied`);
+  exactKeysAt(managerRecord, ['activationOrder', 'deploymentRevision', 'scenarioId'], `${path}.managerApplied`);
   const managerRevision = managerRecord.deploymentRevision === null
     ? null
     : digestAt(managerRecord.deploymentRevision, `${path}.managerApplied.deploymentRevision`);
@@ -3494,6 +3495,22 @@ export function parseDeploymentWorkspaceResponse(
   );
   if ((managerRevision === null) !== (managerScenarioId === null)) {
     return fail(`${path}.managerApplied`, 'one complete Manager Applied identity');
+  }
+  let activationOrder: DeploymentWorkspaceResponse['managerApplied']['activationOrder'] = null;
+  if (managerRecord.activationOrder !== null) {
+    const orderPath = `${path}.managerApplied.activationOrder`;
+    const order = objectAt(managerRecord.activationOrder, orderPath);
+    exactKeysAt(order, ['retainedBundleId', 'graphRevision', 'componentIds'], orderPath);
+    const componentIds = boundedArrayAt(order.componentIds, `${orderPath}.componentIds`, 4096)
+      .map((id, index) => nonEmptyStringAt(id, `${orderPath}.componentIds[${index}]`));
+    if (new Set(componentIds).size !== componentIds.length || managerScenarioId === null) {
+      return fail(orderPath, 'unique ordered components bound to Manager Applied');
+    }
+    activationOrder = {
+      retainedBundleId: nonEmptyStringAt(order.retainedBundleId, `${orderPath}.retainedBundleId`),
+      graphRevision: digestAt(order.graphRevision, `${orderPath}.graphRevision`),
+      componentIds,
+    };
   }
   const admissionRecord = objectAt(record.runAdmission, `${path}.runAdmission`);
   exactKeysAt(admissionRecord, ['ready', 'reason'], `${path}.runAdmission`);
@@ -3631,6 +3648,7 @@ export function parseDeploymentWorkspaceResponse(
     },
     saved: { path: savedPath, deploymentRevision: savedRevision },
     managerApplied: {
+      activationOrder,
       deploymentRevision: managerRevision,
       scenarioId: managerScenarioId,
     },

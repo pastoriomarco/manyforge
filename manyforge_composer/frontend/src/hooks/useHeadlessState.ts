@@ -219,7 +219,6 @@ export type ExecutionControlCommandKind =
   | 'program_runtime_blackboard_write'
   | 'program_manual_result_stage'
   | 'program_manual_handover'
-  | 'gripper_confirm'
   | 'operation_start'
   | 'operation_stop'
   | 'operation_reset'

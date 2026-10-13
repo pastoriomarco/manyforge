@@ -2,7 +2,6 @@
 #include <cmath>
 #include <limits>
 #include <manyforge_core/detail/runtime_scale_governor.hpp>
-#include <manyforge_core/types/trajectory_dto.hpp>
 #include <stdexcept>
 
 namespace manyforge::core::detail {
@@ -21,64 +20,6 @@ bool positive(double value) noexcept {
   return std::isfinite(value) && value > 0.0;
 }
 }  // namespace
-
-bool apply_common_runtime_scaling(TrajectoryDTO& candidate,
-                                  const RuntimeScalePreparation& common) noexcept {
-  if (!candidate.runtime_scale_bounds || candidate.waypoints.empty()) return false;
-  auto& bounds = *candidate.runtime_scale_bounds;
-  if (!bounds.nominal_time_multiplier || !positive(*bounds.nominal_time_multiplier) ||
-      *bounds.nominal_time_multiplier < 1.0 || !positive(common.trajectory_time_multiplier) ||
-      common.trajectory_time_multiplier < *bounds.nominal_time_multiplier ||
-      !positive(bounds.max_rate_per_s) || !positive(bounds.max_rate_change_per_s2) ||
-      !positive(bounds.max_stop_path_rate) || bounds.max_stop_path_rate < 1.0 ||
-      !positive(common.scale_bounds.max_rate_per_s) ||
-      !positive(common.scale_bounds.max_rate_change_per_s2) ||
-      common.scale_bounds.max_rate_per_s > bounds.max_rate_per_s ||
-      common.scale_bounds.max_rate_change_per_s2 > bounds.max_rate_change_per_s2)
-    return false;
-  const double factor = common.trajectory_time_multiplier / *bounds.nominal_time_multiplier;
-  if (!positive(factor) || factor < 1.0) return false;
-  // Check representability before touching any field. Two linear passes avoid
-  // both a second trajectory allocation and partial mutation on failure.
-  const auto representable = [](double before, double after) {
-    return std::isfinite(before) && std::isfinite(after) && (before == 0.0 || after != 0.0);
-  };
-  const auto width = candidate.joint_names.size();
-  if (width == 0U || candidate.waypoints.front().time_from_start_s != 0.0) return false;
-  double previous = -1.0;
-  for (const auto& point : candidate.waypoints) {
-    const double time = point.time_from_start_s * factor;
-    if (!representable(point.time_from_start_s, time) || time <= previous ||
-        point.positions_rad.size() != width || point.velocities_rad_s.size() != width ||
-        point.accelerations_rad_s2.size() != width)
-      return false;
-    previous = time;
-    for (std::size_t i = 0; i < width; ++i)
-      if (!std::isfinite(point.positions_rad[i]) ||
-          !representable(point.velocities_rad_s[i], point.velocities_rad_s[i] / factor) ||
-          !representable(point.accelerations_rad_s2[i],
-                         point.accelerations_rad_s2[i] / factor / factor))
-        return false;
-  }
-  for (const auto* endpoint : {&candidate.waypoints.front(), &candidate.waypoints.back()})
-    for (std::size_t i = 0; i < width; ++i)
-      if (endpoint->velocities_rad_s[i] != 0.0 || endpoint->accelerations_rad_s2[i] != 0.0)
-        return false;
-  for (double time : candidate.cartesian_waypoint_times_s)
-    if (!representable(time, time * factor)) return false;
-
-  for (auto& point : candidate.waypoints) {
-    point.time_from_start_s *= factor;
-    for (double& velocity : point.velocities_rad_s) velocity /= factor;
-    for (double& acceleration : point.accelerations_rad_s2)
-      acceleration = acceleration / factor / factor;
-  }
-  for (double& time : candidate.cartesian_waypoint_times_s) time *= factor;
-  bounds.nominal_time_multiplier = common.trajectory_time_multiplier;
-  bounds.max_rate_per_s = common.scale_bounds.max_rate_per_s;
-  bounds.max_rate_change_per_s2 = common.scale_bounds.max_rate_change_per_s2;
-  return true;
-}
 
 std::optional<RuntimeScalePreparation> prepare_runtime_scaling(
     std::span<const TrajectoryDerivativeBounds> derivatives,

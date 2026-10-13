@@ -15,9 +15,6 @@
 #include <utility>
 
 namespace manyforge::core {
-namespace detail {
-class CoordinatedExecutionClock;
-}
 
 /// A critical internal fault of a dispatched execution (item 17; Q52: a
 /// controller cycle later than the lane margin). A backend reports it by
@@ -58,15 +55,6 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   /// only; preparation never sends a transport command.
   virtual PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant,
                                               std::uint64_t execution_id) = 0;
-
-  /// Side-effect-free binding for an exact prepared coordinated product.
-  /// Unsupported adapters reject before dispatch; independent motion does not
-  /// call this method. This clock cannot replace sealed dispatch authority.
-  virtual Result<void> BindPreparedExecutionClock(
-      const PreparedOperationParticipantDTO&,
-      std::shared_ptr<detail::CoordinatedExecutionClock>) {
-    return Result<void>::Err(ErrorCode::kUnsupportedCapability);
-  }
 
   /// Owner-authorized retirement after worker, dispatch, Stop and recovery
   /// quiescence. Never stops motion or resets observed state. Old requests must

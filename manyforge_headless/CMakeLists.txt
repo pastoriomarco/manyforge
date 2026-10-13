@@ -308,9 +308,10 @@ if(BUILD_TESTING)
     DEPENDS "${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_MARKER}")
 
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
-  set(
+  get_filename_component(
     MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT
-    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper"
+    REALPATH)
   set(
     MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT
     "${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural")
@@ -601,31 +602,6 @@ if(BUILD_TESTING)
     add_custom_target(manyforge_headless_test_gripper_only_package
       DEPENDS "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}")
 
-    set(MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT
-      "${CMAKE_CURRENT_BINARY_DIR}/gripper-confirmation-test-fixture")
-    add_custom_command(
-      OUTPUT "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}/metadata.json"
-      COMMAND "${CMAKE_COMMAND}" -E remove_directory
-        "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}"
-      COMMAND "${CMAKE_COMMAND}" -E make_directory
-        "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}"
-      COMMAND "$<TARGET_FILE:manyforge_generate_headless_manager_apply_test_package>"
-        --package-root
-        "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}/retained-package"
-        --metadata
-        "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}/metadata.json"
-        --profile operator-confirmation
-      DEPENDS
-        manyforge_generate_headless_manager_apply_test_package
-        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
-        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}"
-        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
-        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
-        ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
-      VERBATIM)
-    add_custom_target(manyforge_headless_test_gripper_confirmation_package
-      DEPENDS "${MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT}/metadata.json")
-
     # O1.4g uses a compatible pick/place host to materialize a second package.
     # Its semantic component declaration is admitted independently from the
     # primary host; no executable-proof bundle is involved.
@@ -666,14 +642,17 @@ if(BUILD_TESTING)
   add_executable(manyforge_publish_headless_assistant_test_source
     test/publish_assistant_authoring_source.cpp)
   add_dependencies(manyforge_publish_headless_assistant_test_source
-    manyforge_headless_test_assistant_package)
+    manyforge_headless_test_assistant_package
+    manyforge_headless_test_canonical_empty_package)
   target_compile_definitions(
     manyforge_publish_headless_assistant_test_source PRIVATE
     MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE="${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}"
-    MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}")
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}"
+    MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
   target_link_libraries(
     manyforge_publish_headless_assistant_test_source PRIVATE
-    manyforge_headless_owner_publication)
+    manyforge_headless_owner_publication
+    manyforge::deployment_admission)
 
   add_executable(test_headless_api_core test/test_headless_api_core.cpp)
   add_dependencies(test_headless_api_core
@@ -698,9 +677,12 @@ if(BUILD_TESTING)
 
   add_executable(test_owner_publication test/test_owner_publication.cpp)
   add_dependencies(test_owner_publication
-    manyforge_headless_test_canonical_empty_package)
+    manyforge_headless_test_canonical_empty_package
+    manyforge_headless_test_assistant_package)
   target_compile_definitions(test_owner_publication PRIVATE
-    MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
+    MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE="${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}"
+    MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}")
   target_link_libraries(test_owner_publication PRIVATE
     manyforge_headless_owner_publication
     manyforge::deployment_admission
@@ -767,8 +749,7 @@ if(BUILD_TESTING)
     add_dependencies(test_manager_daemon_process
       manyforge_headless_test_manager_apply_package
       manyforge_headless_test_assistant_native_package
-      manyforge_headless_test_gripper_only_package
-      manyforge_headless_test_gripper_confirmation_package)
+      manyforge_headless_test_gripper_only_package)
     target_compile_definitions(test_manager_daemon_process PRIVATE
       MANYFORGE_HEADLESS_TEST_PYTHON="${Python3_EXECUTABLE}"
       MANYFORGE_HEADLESS_TEST_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
@@ -784,6 +765,48 @@ if(BUILD_TESTING)
       MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER="${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}")
     add_dependencies(test_manager_daemon_process
       manyforge_headless_test_manager_apply_replacement_package)
+  endif()
+  # Test registration only: the existing ros-e2e lane supplies the native
+  # host from the same build directory as this production ROS host.
+  if(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
+    get_filename_component(_manager_ros_host_directory
+      "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}" DIRECTORY)
+    set(_manager_ros_host
+      "${_manager_ros_host_directory}/manyforge_ros2_control_execution_host")
+    if(EXISTS "${_manager_ros_host}")
+      file(REAL_PATH "${_manager_ros_host}" _manager_ros_host)
+      set(_manager_ros_fixture "${CMAKE_CURRENT_BINARY_DIR}/manager-ros-apply-fixture")
+      file(GLOB_RECURSE _manager_ros_fixture_models CONFIGURE_DEPENDS
+        LIST_DIRECTORIES false
+        "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper/*")
+      add_custom_command(
+        OUTPUT "${_manager_ros_fixture}/metadata.json"
+        COMMAND "${CMAKE_COMMAND}" -E env
+          "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/..:${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior"
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/test/prepare_activation_tool.py"
+          --tool "$<TARGET_FILE:manyforge_prepare_activation>"
+          --workspace "${CMAKE_CURRENT_SOURCE_DIR}/.."
+          --scenario examples/lite6_pick_and_place.scenario
+          --manager-ros-apply-fixture-root "${_manager_ros_fixture}"
+        DEPENDS manyforge_prepare_activation
+          "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/test/prepare_activation_tool.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/scenario.yaml"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/deployment.yaml"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/program.yaml"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/assignment.yaml"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_lite_gripper_pick_and_place.program.yaml"
+          ${_manager_ros_fixture_models}
+        VERBATIM)
+      add_custom_target(manyforge_headless_test_manager_ros_apply_fixture
+        DEPENDS "${_manager_ros_fixture}/metadata.json")
+      add_dependencies(test_manager_daemon_process
+        manyforge_headless_test_manager_ros_apply_fixture)
+      target_compile_definitions(test_manager_daemon_process PRIVATE
+        MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="${_manager_ros_host}"
+        MANYFORGE_HEADLESS_TEST_MANAGER_ROS_APPLY_FIXTURE="${_manager_ros_fixture}"
+        MANYFORGE_HEADLESS_TEST_ROS_LAUNCH_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_ros_bringup/launch/mock_control.launch.py")
+    endif()
   endif()
   target_link_libraries(test_manager_daemon_process PRIVATE
     manyforge_headless_owner_publication

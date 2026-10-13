@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_core/types/lifecycle_cause.hpp>
@@ -96,6 +97,24 @@ enum class LifecycleProgressPhaseDTO : std::uint8_t {
   }
   return std::nullopt;
 }
+
+/// Owner-private actual target read. It is neither caller attribution nor a
+/// public request/wire field; fresh follower acceptance and reached writes
+/// compare it to the same durable target row inside their transaction.
+struct ComponentLifecycleTargetExpectationDTO final {
+  ControllableComponentId controllable_component_id;
+  std::uint64_t target_generation{};
+
+  [[nodiscard]] bool locally_valid() const noexcept {
+    return !controllable_component_id.empty() &&
+           controllable_component_id.value().size() <= kMaxLifecycleIdentityBytes &&
+           target_generation != 0U &&
+           target_generation <= static_cast<std::uint64_t>(
+               std::numeric_limits<std::int64_t>::max());
+  }
+  friend bool operator==(const ComponentLifecycleTargetExpectationDTO&,
+                         const ComponentLifecycleTargetExpectationDTO&) = default;
+};
 
 /// Durable session-scoped requested target. `target_generation` increases
 /// monotonically per component for the session, including across removal.

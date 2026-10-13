@@ -154,9 +154,5 @@ class CommandGripper(_UnavailableLogicNode):
     pass
 
 
-class ConfirmGripperGrasp(_UnavailableLogicNode):
-    pass
-
-
 class WaitForGripperState(_UnavailableLogicNode):
     pass

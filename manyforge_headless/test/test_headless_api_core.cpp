@@ -209,6 +209,9 @@ HeadlessApiCoreClocks Clocks() {
 }
 
 CanonicalValue ManagerPayloadFor(const deployment::RetainedBundle &bundle) {
+  const deployment::FilesystemCanonicalEmptyRetainedBundleSource source(
+      MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+  const auto admission = source.load_verified();
   const auto *cell_graph =
       bundle.normalized_root().find_object_member("cell_graph");
   if (cell_graph == nullptr || !cell_graph->is_object()) {
@@ -217,6 +220,9 @@ CanonicalValue ManagerPayloadFor(const deployment::RetainedBundle &bundle) {
   return CanonicalValue(CanonicalValue::Object{
       {"active",
        CanonicalValue(CanonicalValue::Object{
+           {"canonical_empty", CanonicalValue(
+                bundle.retained_bundle_id() == admission.retained_bundle_id() &&
+                bundle.value().cell_graph.graph_revision == admission.graph_revision())},
            {"cell_graph", *cell_graph},
            {"graph_revision",
             CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
@@ -2109,65 +2115,6 @@ TEST(HeadlessApiCore, ViewerClientIncidentsAreErrorsWithTheirClosedKinds) {
     EXPECT_EQ(Text(event, "event_type"), "client_incident_activated");
     EXPECT_EQ(Text(event, "severity"), "ERROR");
     EXPECT_EQ(Text(Member(event, "payload"), "original_severity"), "ERROR");
-  }
-}
-
-TEST(HeadlessApiCore,
-     GripperConfirmationTraceIsBoundedAttributedAndNeverLiveProof) {
-  TemporaryDirectory directory;
-  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
-  CanonicalValue record(CanonicalValue::Object{
-      {"schema_version",
-       CanonicalValue("manyforge.gripper_confirmation_trace.v1")},
-      {"origin_epoch", CanonicalValue("control.session.1")},
-      {"request_id", CanonicalValue("press.1")},
-      {"source_label", CanonicalValue("station.operator")},
-      {"native_owner_epoch", CanonicalValue("native.1")},
-      {"program_binding_id", CanonicalValue(Digest('2'))},
-      {"target_role_id", CanonicalValue("gripper")},
-      {"command_id", CanonicalValue(7.0)},
-      {"generation", CanonicalValue(2.0)},
-      {"expected_status_revision", CanonicalValue(9.0)},
-      {"confirmed", CanonicalValue(true)},
-      {"phase", CanonicalValue("attempted")},
-      {"details", CanonicalValue(CanonicalValue::Object{
-                      {"assurance", CanonicalValue("unverified")},
-                      {"principal_id", CanonicalValue(nullptr)},
-                  })},
-  });
-  const auto result = core.RecordGripperConfirmation(record);
-  EXPECT_TRUE(std::get<bool>(Member(result, "recorded").storage()));
-  HistorianQuery query;
-  query.components.insert("manyforge.gripper");
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
-  CanonicalValue page;
-  do {
-    page = core.HistoryPage(query);
-    if (Array(page, "events").size() == 1U)
-      break;
-    std::this_thread::yield();
-  } while (std::chrono::steady_clock::now() < deadline);
-  ASSERT_EQ(Array(page, "events").size(), 1U);
-  const auto &event = Member(Array(page, "events").front(), "event");
-  EXPECT_EQ(Text(event, "event_type"), "gripper_confirmation_attempted");
-  const auto &payload = Member(event, "payload");
-  EXPECT_EQ(Text(payload, "origin_epoch"), "control.session.1");
-  EXPECT_EQ(Text(payload, "clock_owner"), "headless:api.epoch.1");
-  EXPECT_EQ(Text(payload, "evidence_kind"), "operator_attestation_trace");
-  EXPECT_EQ(payload.find_object_member("evidence"), nullptr);
-  for (const auto &[field, invalid] : CanonicalValue::Object{
-           {"phase", CanonicalValue("sensor_proof")},
-           {"command_id", CanonicalValue(0.0)},
-           {"details", CanonicalValue(std::string(9000, 'x'))},
-           {"confirmed", CanonicalValue(1.0)},
-       }) {
-    auto changed = record.as_object();
-    for (auto &[key, value] : changed)
-      if (key == field)
-        value = invalid;
-    EXPECT_THROW(static_cast<void>(
-                     core.RecordGripperConfirmation(CanonicalValue(changed))),
-                 OperatorAlarmError);
   }
 }
 

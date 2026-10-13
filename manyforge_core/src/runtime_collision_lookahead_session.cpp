@@ -761,6 +761,7 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
 
 RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const Job& job) {
   RuntimeCollisionLookaheadResult result;
+  result.job_context_observed = true;
   result.execution_id = job.arm.execution_id;
   result.execution_generation = job.arm.execution_generation;
   result.arm_generation = job.arm.arm_generation;
@@ -779,7 +780,12 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     output.cycle_duration_ns = std::max<std::int64_t>(0, clock_->now() - job.requested_at_ns);
     return output;
   };
-  const auto deadline_exceeded = [&]() { return clock_->now() >= absolute_deadline_ns; };
+  const auto deadline_exceeded = [&]() {
+    const auto checked_at_ns = clock_->now();
+    result.checked_input_details["lookahead_deadline_checked_at_ns"] =
+        std::to_string(checked_at_ns);
+    return checked_at_ns >= absolute_deadline_ns;
+  };
 
   if (deadline_exceeded()) {
     result.reason = "runtime_lookahead_deadline_exceeded";
@@ -787,11 +793,21 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   }
 
   const auto& cursor = job.cursor;
+  result.checked_input_details["lookahead_cursor_valid"] = cursor.valid ? "true" : "false";
+  result.checked_input_details["lookahead_cursor_execution_generation"] =
+      std::to_string(cursor.execution_generation);
+  result.checked_input_details["lookahead_cursor_time_ns"] =
+      std::to_string(cursor.trajectory_time_ns);
   if (!cursor.valid || cursor.execution_generation != job.arm.execution_generation) {
     result.reason = !cursor.valid ? "progress_cursor_invalid" : "progress_generation_mismatch";
     return finish(std::move(result));
   }
   const auto now_ns = clock_->now();
+  result.checked_input_details["lookahead_cursor_freshness_checked_at_ns"] = std::to_string(now_ns);
+  result.checked_input_details["lookahead_cursor_received_timestamp_ns"] =
+      std::to_string(cursor.received_timestamp_ns);
+  result.checked_input_details["lookahead_cursor_freshness_budget_ns"] =
+      std::to_string(cursor.freshness_budget_ns);
   if (cursor.freshness_budget_ns > 0 &&
       (cursor.received_timestamp_ns < 0 || cursor.received_timestamp_ns > now_ns ||
        now_ns - cursor.received_timestamp_ns > cursor.freshness_budget_ns)) {
@@ -800,12 +816,46 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   }
   result.cursor_time_ns = cursor.trajectory_time_ns;
 
+  result.checked_input_details["lookahead_bundle_present"] = job.bundle ? "true" : "false";
+  if (job.bundle) {
+    result.checked_input_details["runtime_bundle_epoch"] = std::to_string(job.bundle->epoch);
+    result.checked_input_details["lookahead_world_present"] = job.bundle->world ? "true" : "false";
+    result.checked_input_details["lookahead_policy_present"] = job.bundle->policy ? "true" : "false";
+    result.checked_input_details["lookahead_policy_index_present"] =
+        job.bundle->policy_index ? "true" : "false";
+    result.checked_input_details["lookahead_lookup_order_valid"] =
+        job.bundle->lookup_order_valid ? "true" : "false";
+    if (job.bundle->world) {
+      result.checked_input_details["collision_world_revision_id"] =
+          std::to_string(job.bundle->world->revision.revision_id);
+      result.checked_input_details["collision_world_content_hash"] =
+          job.bundle->world->revision.content_hash;
+    }
+  }
   if (!job.bundle || !job.bundle->world || !job.bundle->policy || !job.bundle->policy_index ||
       !job.bundle->lookup_order_valid) {
     result.reason = "runtime_lookahead_bundle_invalid";
     return finish(std::move(result));
   }
   if (job.arm.admission_projection_revision.has_value()) {
+    const auto record_projection = [&](const std::string& prefix,
+                                       const std::optional<ProjectionRevisionDTO>& revision) {
+      result.checked_input_details[prefix + "present"] = revision ? "true" : "false";
+      if (!revision) {
+        return;
+      }
+      result.checked_input_details[prefix + "retained_bundle_id"] =
+          revision->retained_bundle_id.value();
+      result.checked_input_details[prefix + "graph_revision"] = revision->graph_revision.value();
+      result.checked_input_details[prefix + "scene_id"] = revision->scene_revision.scene_id.value();
+      result.checked_input_details[prefix + "scene_revision_id"] =
+          std::to_string(revision->scene_revision.revision_id);
+      result.checked_input_details[prefix + "scene_content_hash"] =
+          revision->scene_revision.content_hash.value();
+    };
+    record_projection("lookahead_admission_projection_", job.arm.admission_projection_revision);
+    record_projection("lookahead_latest_projection_", job.arm.latest_projection_revision);
+    record_projection("lookahead_observed_projection_", job.bundle->projection_revision);
     if (!job.bundle->projection_revision.has_value() ||
         !job.arm.latest_projection_revision.has_value() ||
         !projection_is_same_or_forward_in_lineage(*job.bundle->projection_revision,
@@ -818,6 +868,14 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   }
   const auto policy_bundle =
       job.contact_state.binding_owner ? job.contact_state.binding_owner : job.bundle;
+  result.checked_input_details["lookahead_policy_binding_present"] =
+      policy_bundle ? "true" : "false";
+  if (policy_bundle) {
+    result.checked_input_details["lookahead_bound_policy_present"] =
+        policy_bundle->policy ? "true" : "false";
+    result.checked_input_details["lookahead_bound_policy_index_present"] =
+        policy_bundle->policy_index ? "true" : "false";
+  }
   if (!policy_bundle || !policy_bundle->policy || !policy_bundle->policy_index) {
     result.reason = "runtime_lookahead_policy_binding_unavailable";
     return finish(std::move(result));
@@ -841,11 +899,15 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     }
     indexed_arm_generation_ = job.arm.arm_generation;
   }
+  result.checked_input_details["lookahead_selection_horizon_ns"] = std::to_string(config_.horizon_ns);
+  result.checked_input_details["lookahead_selection_max_samples"] = std::to_string(config_.max_samples);
   select_runtime_collision_lookahead_samples_from_index(
       *job.arm.trajectory, waypoint_times_scratch_, cursor.trajectory_time_ns, config_.horizon_ns,
       config_.max_samples, selection_scratch_, required_times_scratch_, target_times_scratch_,
       sample_scratch_);
   auto& selection = selection_scratch_;
+  result.selection_computed =
+      selection.termination != RuntimeCollisionLookaheadTermination::kInvalidInput;
   result.termination = selection.termination;
   result.covered_until_time_ns = selection.covered_until_time_ns;
   result.checked_samples = selection.trajectory.waypoints.size();
@@ -924,6 +986,7 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   auto decision = pool_.validate_trajectory(job.bundle->world, engines_, selection.trajectory,
                                             job.cancel, std::move(pass), absolute_deadline_ns);
   const auto telemetry = pool_.last_telemetry();
+  result.validation_completed = true;
   result.workers_used = telemetry.workers_actually_used;
   result.first_failing_waypoint = decision.decision.first_failing_waypoint;
   result.first_failing_time_ns = decision.decision.first_failing_time_ns;

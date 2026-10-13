@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "activation_deployment_compiler_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "retained_bundle_internal.hpp"
 #include "retention_store_fixtures.hpp"
@@ -264,6 +265,87 @@ TEST(ApplyComponentDelta,
     EXPECT_NE(reason.find(FirstArm().value()), std::string::npos);
     EXPECT_NE(reason.find(SecondArm().value()), std::string::npos);
     EXPECT_NE(reason.find("/isaac_joint_commands"), std::string::npos);
+  }
+}
+
+TEST(ApplyComponentDelta, EmptyRosHostAcceptsWorldAndNoWorldWithoutFakeComponents) {
+  for (const std::string_view world : {"", "lite6_grf_ros2"}) {
+    const auto catalog = test::lite6_controllable_fixture_detail::qualify_control_catalog(
+        false, true, false, "resource", false, {}, true);
+    const auto &profile = *catalog.ros2_control_execution_runtime_profile;
+    detail::ActivationDeploymentIntent intent{};
+    intent.deployment_artifact_id = "empty_ros_compiler_regression";
+    intent.name = "Empty ROS compiler regression";
+    intent.isaac_world = world.empty() ? std::nullopt
+                                     : std::optional<std::string>(world);
+    intent.attachments = CanonicalValue(CanonicalValue::Array{});
+    intent.policies = CanonicalValue(CanonicalValue::Object{});
+    const auto authored = detail::compile_activation_deployment(
+        intent, core::CellId(std::string(kFixtureCellId)), {}, {},
+        {profile.reference()}, {profile});
+    const auto *authored_graph = authored.find_object_member("graph");
+    ASSERT_NE(authored_graph, nullptr);
+    const auto *units = authored_graph->find_object_member("runtime_units");
+    ASSERT_NE(units, nullptr);
+    ASSERT_EQ(units->as_array().size(), 1U);
+    const auto &host = units->as_array().front();
+    EXPECT_EQ(host.find_object_member("runtime_profile_id")->as_string(),
+              ros2_control_execution_runtime_contract::kRuntimeProfileId);
+    EXPECT_EQ(canonical_json(*host.find_object_member("configuration")),
+              canonical_json(
+                  ros2_control_execution_runtime_contract::empty_host_configuration(
+                      intent.isaac_world)));
+    const auto fixture = test::make_lite6_controllable_retention_fixture(
+        false, false, 0U, false, true, kFixtureCellId, false, false, "resource",
+        false, {}, {}, true, false, false, std::nullopt, false,
+        test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", world);
+    ASSERT_TRUE(fixture.structural_preparations().empty());
+    ASSERT_TRUE(fixture.qualified.compiler_ir().applicability().composition()
+                    .model_assets().empty());
+    const auto bundle = Materialize(fixture);
+    const auto &graph = bundle->value().cell_graph;
+    ASSERT_EQ(graph.runtime_units.size(), 1U);
+    EXPECT_TRUE(graph.controllable_components.empty());
+    EXPECT_TRUE(graph.model_instances.empty());
+    EXPECT_TRUE(graph.control_domains.empty());
+    EXPECT_TRUE(graph.control_bindings.empty());
+    const auto configuration =
+        ros2_control_execution_runtime_contract::require_configuration(
+            *bundle, graph.runtime_units.front().runtime_unit_id);
+    EXPECT_TRUE(configuration.controller_profiles.empty());
+    EXPECT_TRUE(configuration.initial_joint_positions_rad.empty());
+    EXPECT_TRUE(configuration.motion_target_limits.empty());
+    EXPECT_EQ(configuration.planner_rng_seed, 12345U);
+    EXPECT_EQ(configuration.execution_tick_hz, 100U);
+    EXPECT_EQ(configuration.collision_monitor_period_ms, 50.0);
+    EXPECT_EQ(configuration.isaac_world,
+              world.empty() ? std::nullopt : std::optional<std::string>(world));
+  }
+}
+
+TEST(ApplyComponentDelta, NonemptyRosHostStillRefusesEmptyRequiredRows) {
+  const auto valid_fixture = test::make_lite6_controllable_retention_fixture(
+      false, false, 1U, false, true, kFixtureCellId, false, false, "resource",
+      false, {}, {}, true);
+  const auto valid_bundle = Materialize(valid_fixture);
+  const auto &graph = valid_bundle->value().cell_graph;
+  for (const std::string_view field : {"controller_profiles",
+                                       "initial_joint_positions_rad",
+                                       "motion_target_limits"}) {
+    SCOPED_TRACE(field);
+    EXPECT_THROW(
+        static_cast<void>(test::make_lite6_controllable_retention_fixture(
+            false, false, 1U, false, true, kFixtureCellId, false, false, "resource",
+            false, {}, {}, true, false, false, std::nullopt, false,
+            test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", "lite6_grf_ros2",
+            true, field)),
+        CellGraphCodecError);
+    auto unit = graph.runtime_units.front();
+    unit.configuration.at(std::string(field)).value = core::JsonValueDTO::Array{};
+    EXPECT_THROW(
+        static_cast<void>(detail::require_ros2_control_execution_runtime_required_rows(
+            graph, unit)),
+        RetainedBundleError);
   }
 }
 

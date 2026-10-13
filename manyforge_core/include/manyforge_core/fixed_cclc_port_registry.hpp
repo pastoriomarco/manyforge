@@ -10,6 +10,7 @@ namespace manyforge::core {
 struct BrandLifecyclePortRegistrationDTO final {
   ResolvedLifecycleProviderOccurrenceDTO provider_occurrence;
   std::shared_ptr<IBrandLifecyclePort> port;
+  LifecycleDomainHealthProjection health_projection{};
 };
 
 struct ControllerLifecyclePortRegistrationDTO final {
@@ -30,6 +31,10 @@ class FixedCCLCPortRegistry final : public ICCLCBrandLifecyclePortResolver,
 
   [[nodiscard]] Result<std::shared_ptr<IBrandLifecyclePort>> ResolveExactLifecyclePort(
       const ResolvedLifecycleProviderOccurrenceDTO& provider_occurrence) const override;
+
+  [[nodiscard]] Result<LifecycleDomainHealthDTO> ReadExactLifecycleHealth(
+      const ResolvedLifecycleProviderOccurrenceDTO& provider_occurrence,
+      std::int64_t now_ns) const override;
 
   [[nodiscard]] Result<std::shared_ptr<IControllerLifecyclePort>>
   ResolveExactControllerLifecyclePort(

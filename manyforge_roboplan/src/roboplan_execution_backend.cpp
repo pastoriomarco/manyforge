@@ -10,7 +10,6 @@
 #include <manyforge_core/prepared_planning_codec.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_roboplan/roboplan_execution_backend.hpp>
-#include <manyforge_core/detail/coordinated_execution_clock.hpp>
 #include <map>
 #include <numeric>
 #include <stdexcept>
@@ -659,34 +658,10 @@ core::PrepareParticipantResultDTO RoboPlanExecutionBackend::Prepare(
   if (!result.ok()) {
     throw std::invalid_argument(result.error().message);
   }
-  const bool same_preparation = prepared_membership_.matches(participant);
   if (const auto invalid =
           prepared_membership_.prepare(execution_id, participant))
     return reject(std::string(*invalid));
-  if (!same_preparation)
-    prepared_execution_clock_.reset();
   return std::move(result.value());
-}
-
-core::Result<void> RoboPlanExecutionBackend::BindPreparedExecutionClock(
-    const core::PreparedOperationParticipantDTO &participant,
-    std::shared_ptr<core::detail::CoordinatedExecutionClock> clock) {
-  std::lock_guard lock(prepared_execution_mutex_);
-  const auto *motion =
-      std::get_if<core::PreparedMotionExecutionDTO>(&participant.payload);
-  if (!clock || !prepared_membership_.matches(participant) || !motion ||
-      !motion->trajectory.runtime_scale_bounds ||
-      !clock->accepts(
-          participant.participant_id,
-          {motion->trajectory.runtime_scale_bounds->max_rate_per_s,
-           motion->trajectory.runtime_scale_bounds->max_rate_change_per_s2})) {
-    return core::Result<void>::Err(core::ErrorDTO{
-        core::kErrorExecutionRejected,
-        "Prepared coordinated clock does not match the participant",
-        {{"reason", "prepared_execution_clock_mismatch"}}});
-  }
-  prepared_execution_clock_ = std::move(clock);
-  return core::Result<void>::Ok();
 }
 
 core::Result<void> RoboPlanExecutionBackend::RetirePreparedExecution(
@@ -709,7 +684,6 @@ core::Result<void> RoboPlanExecutionBackend::RetirePreparedExecution(
   }
   if (active == execution_id) {
     prepared_goal_.reset();
-    prepared_execution_clock_.reset();
   }
   return core::Result<void>::Ok();
 }
@@ -777,8 +751,7 @@ core::ExecutionHandle RoboPlanExecutionBackend::dispatch_prepared(
   const auto &trajectory =
       std::get<core::PreparedMotionExecutionDTO>(participant.payload)
           .trajectory;
-  auto handle = execute_with_clock(trajectory, prepared_execution_clock_,
-                                   participant.participant_id);
+  auto handle = execute_trajectory(trajectory);
   handle.controller_goal_id = controller_goal_id;
   handle.controller_goal_generation = controller_goal_generation;
   handle.prepared_contract_digest = participant.prepared_contract_digest;
@@ -878,8 +851,6 @@ std::int64_t RoboPlanExecutionBackend::publish_snapshot(
                state != core::ExecutionState::kStopping) {
       state_.active_runtime_scale_rate_per_s = 0.0;
     }
-    if (controlled_stop_activity_count_.load(std::memory_order_acquire) != 0U)
-      stop_snapshot_cv_.notify_all();
   }
   const bool at_rest_state =
       state == core::ExecutionState::kIdle ||
@@ -1161,9 +1132,7 @@ void RoboPlanExecutionBackend::
 
 void RoboPlanExecutionBackend::execution_worker(
     std::stop_token st, core::TrajectoryDTO trajectory,
-    std::uint64_t execution_generation,
-    std::shared_ptr<core::detail::CoordinatedExecutionClock> common_clock,
-    core::OperationParticipantId participant_id) {
+    std::uint64_t execution_generation) {
   const double total_duration_s =
       trajectory.waypoints.empty()
           ? 0.0
@@ -1210,32 +1179,6 @@ void RoboPlanExecutionBackend::execution_worker(
   observe_stop_qualification(
       detail::NativeStopQualificationEvent::kExecutionLoopArmed);
 
-  if (common_clock) {
-    const auto origin = common_clock->start_and_wait(participant_id, clock_,
-                                                     applied_runtime_scale, st);
-    if (!origin && !st.stop_requested()) {
-      const bool stopped_before_start = common_clock->stop_prevented_start();
-      publish_snapshot(
-          stopped_before_start ? core::ExecutionState::kStopped
-                               : core::ExecutionState::kFailed,
-          0.0, latest_positions,
-          stopped_before_start
-              ? std::nullopt
-              : std::optional<core::ErrorDTO>{core::ErrorDTO{
-                    core::kErrorExecutionRejected,
-                    "Coordinated start was cancelled or inconsistent",
-                    {{"reason", "coordinated_execution_start_failed"}}}});
-      (void)execution_progress_publication_->invalidate_generation(
-          execution_generation);
-      publish_execution_inactive();
-      return;
-    }
-    if (origin) {
-      last_tick_ns = origin->timestamp_ns;
-      governor = origin->governor;
-    }
-  }
-
   while (true) {
     if (st.stop_requested()) {
       observe_stop_qualification(detail::NativeStopQualificationEvent::
@@ -1265,10 +1208,8 @@ void RoboPlanExecutionBackend::execution_worker(
     }
     // Integrate the already-applied law, then accept the newest target for
     // future time. A wake must not retroactively change the preceding interval.
-    const auto advanced =
-        common_clock ? common_clock->sample_now()
-                     : core::detail::sample_runtime_scale_time(
-                           {trajectory_time_s, governor, last_tick_ns}, now_ns);
+    const auto advanced = core::detail::sample_runtime_scale_time(
+        {trajectory_time_s, governor, last_tick_ns}, now_ns);
     if (!advanced) {
       publish_snapshot(
           core::ExecutionState::kFailed, get_execution_snapshot().progress,
@@ -1281,8 +1222,6 @@ void RoboPlanExecutionBackend::execution_worker(
     now_ns = advanced->timestamp_ns;
     last_tick_ns = now_ns;
     governor = advanced->governor;
-    if (common_clock)
-      available_target_scale = governor.target_scale();
     applied_runtime_scale = governor.scale();
     trajectory_time_s = std::min(total_duration_s, advanced->trajectory_time_s);
     (void)execution_progress_publication_->publish(
@@ -1357,12 +1296,9 @@ void RoboPlanExecutionBackend::execution_worker(
     std::unique_lock<std::mutex> lock(execution_mutex_);
     execution_cv_.wait_for(
         lock, std::chrono::nanoseconds(config_.execution_tick_period_ns),
-        [this, &st, coordinated = static_cast<bool>(common_clock),
-         target_scale = governor.target_scale()]() {
+        [this, &st, target_scale = governor.target_scale()]() {
           if (st.stop_requested())
             return true;
-          if (coordinated)
-            return false;
           std::lock_guard scale_lock(runtime_velocity_scale_mutex_);
           return controlled_stop_runtime_scale_freeze_depth_ == 0 &&
                  runtime_velocity_scale_.load(std::memory_order_acquire) !=
@@ -1426,20 +1362,6 @@ void RoboPlanExecutionBackend::publish_execution_inactive() noexcept {
 
 core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
     const core::TrajectoryDTO &trajectory) {
-  return execute_with_clock(trajectory, {}, core::OperationParticipantId(""));
-}
-
-core::ExecutionHandle RoboPlanExecutionBackend::execute_with_clock(
-    const core::TrajectoryDTO &trajectory,
-    std::shared_ptr<core::detail::CoordinatedExecutionClock> common_clock,
-    core::OperationParticipantId participant_id) {
-  struct PendingStartGuard {
-    std::shared_ptr<core::detail::CoordinatedExecutionClock> clock;
-    ~PendingStartGuard() {
-      if (clock)
-        clock->cancel_pending_start();
-    }
-  } pending_start{common_clock};
   if (!trajectory.runtime_scale_bounds ||
       !core::EncodePreparedTrajectory(trajectory).ok()) {
     core::ExecutionSnapshot rejected;
@@ -1497,7 +1419,6 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_with_clock(
     std::scoped_lock lock(runtime_velocity_scale_mutex_, state_mutex_);
     state_.active_trajectory =
         std::make_shared<const core::TrajectoryDTO>(trajectory);
-    active_execution_clock_ = common_clock;
     state_.active_trajectory_generation = execution_generation;
     state_.original_path_cursor_valid = true;
     state_.active_trajectory_time_s = 0.0;
@@ -1525,15 +1446,12 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_with_clock(
     state_.running.store(true, std::memory_order_release);
     state_.natural_completion_stop_requested.store(false,
                                                    std::memory_order_release);
-    worker_thread_ = std::jthread(
-        [this, trajectory_copy = core::TrajectoryDTO(trajectory),
-         execution_generation, common_clock = std::move(common_clock),
-         participant_id =
-             std::move(participant_id)](std::stop_token st) mutable {
-          execution_worker(st, std::move(trajectory_copy), execution_generation,
-                           std::move(common_clock), std::move(participant_id));
+    worker_thread_ =
+        std::jthread([this, trajectory_copy = core::TrajectoryDTO(trajectory),
+                      execution_generation](std::stop_token st) mutable {
+          execution_worker(st, std::move(trajectory_copy),
+                           execution_generation);
         });
-    pending_start.clock.reset();
   }
 
   return core::ExecutionHandle{
@@ -2363,7 +2281,7 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
     std::stop_token stop_token, std::uint64_t hard_stop_request_generation,
     std::chrono::steady_clock::time_point command_deadline) {
   controlled_stop_activity_count_.fetch_add(1U, std::memory_order_acq_rel);
-  const auto shared_law_origin = begin_controlled_stop_runtime_scale_freeze();
+  begin_controlled_stop_runtime_scale_freeze();
   const auto runtime_scale_freeze_scope =
       std::shared_ptr<void>(nullptr, [this](void *) {
         end_controlled_stop_runtime_scale_freeze();
@@ -2379,16 +2297,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
   // silently producing a hold for a path-preserving request.
   core::ControlledStopResultDTO result;
   result.executed_stop_mode = profile.stop_mode;
-  const auto shared_command_budget_exceeded = [&] {
-    result.accepted = false;
-    result.backend_stop_confirmed = false;
-    result.error = core::ErrorDTO{
-        core::kErrorMotionInterruptBackendStopFailed,
-        "Coordinated Stop exhausted its remaining command budget",
-        {{"reason", "coordinated_stop_command_budget_exceeded"},
-         {"recommended_disposition", "hard_stop"}}};
-    return result;
-  };
   const auto controlled_stop_requested = [&]() {
     return stop_token.stop_requested() ||
            hard_stop_request_generation_.load(std::memory_order_acquire) !=
@@ -2551,32 +2459,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
     return cancelled_result("controlled_stop_entry");
   }
 
-  if (shared_law_origin) {
-    // Retargeting is frozen. A strictly later worker sample therefore belongs
-    // to that final law, even if retarget and an older sample had equal clock
-    // timestamps. Do not synthesize a measured pose or retain target history.
-    std::unique_lock lock(state_mutex_);
-    const bool ready =
-        stop_snapshot_cv_.wait_until(lock, stop_token, command_deadline, [&] {
-          return controlled_stop_requested() ||
-                 state_.snapshot.state != core::ExecutionState::kExecuting ||
-                 state_.snapshot.timestamp_ns > *shared_law_origin;
-        });
-    if (controlled_stop_requested())
-      return cancelled_result("coordinated_stop_snapshot_wait");
-    if (!ready) {
-      result.accepted = false;
-      result.backend_stop_confirmed = false;
-      result.error = core::ErrorDTO{
-          core::kErrorMotionInterruptBackendStopFailed,
-          "Coordinated Stop did not receive a matching worker sample within "
-          "its command budget",
-          {{"reason", "coordinated_stop_snapshot_budget_exceeded"},
-           {"recommended_disposition", "hard_stop"}}};
-      return result;
-    }
-  }
-
   if (profile.stop_mode == core::MotionInterruptStopMode::kSoftOnPath) {
     std::shared_ptr<const core::TrajectoryDTO> active_trajectory;
     core::ExecutionSnapshot active_snapshot;
@@ -2708,9 +2590,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
     if (controlled_stop_requested()) {
       return cancelled_result("soft_on_path_before_dispatch");
     }
-    if (shared_law_origin &&
-        std::chrono::steady_clock::now() >= command_deadline)
-      return shared_command_budget_exceeded();
     observe_stop_qualification(
         detail::NativeStopQualificationEvent::kPhysicalDispatch,
         "soft_on_path");
@@ -2965,8 +2844,6 @@ RoboPlanExecutionBackend::execute_controlled_stop_impl(
   // on the native command stream. This mirrors the ros2_control lane: the
   // controlled stop itself is a replacement trajectory, not cancel-first hold
   // behavior.
-  if (shared_law_origin && std::chrono::steady_clock::now() >= command_deadline)
-    return shared_command_budget_exceeded();
   observe_stop_qualification(
       detail::NativeStopQualificationEvent::kPhysicalDispatch,
       "spring_back_hold");
@@ -3146,7 +3023,6 @@ core::ResetResultDTO RoboPlanExecutionBackend::reset() {
   {
     std::scoped_lock lock(runtime_velocity_scale_mutex_, state_mutex_);
     state_.active_trajectory.reset();
-    active_execution_clock_.reset();
     state_.active_trajectory_generation = 0U;
     state_.original_path_cursor_valid = false;
     state_.active_trajectory_time_s = 0.0;
@@ -3240,14 +3116,7 @@ core::RuntimeScaleMechanismStatusDTO
 RoboPlanExecutionBackend::runtime_velocity_scale_status() const {
   std::scoped_lock lock(runtime_velocity_scale_mutex_, state_mutex_);
   const bool active = state_.running.load(std::memory_order_acquire);
-  auto target = runtime_velocity_scale_.load(std::memory_order_acquire);
-  std::optional<core::CoordinatedRuntimeScaleCommandDTO> coordinated_command;
-  if (active && active_execution_clock_) {
-    if (const auto shared = active_execution_clock_->target()) {
-      target = shared->scale;
-      coordinated_command = shared->command;
-    }
-  }
+  const auto target = runtime_velocity_scale_.load(std::memory_order_acquire);
   // This is a real, synchronous observation of an in-process mechanism, not
   // a renewed timestamp on cached physical feedback. Do not couple its
   // freshness to motion frames or produce idle motion frames to keep it live.
@@ -3273,19 +3142,12 @@ RoboPlanExecutionBackend::runtime_velocity_scale_status() const {
       state_.active_trajectory_time_s,
       ++runtime_scale_observation_sequence_,
       clock_.now(),
-      std::nullopt,
-      std::move(coordinated_command)};
+      std::nullopt};
 }
 
-std::optional<std::int64_t>
-RoboPlanExecutionBackend::begin_controlled_stop_runtime_scale_freeze() {
+void RoboPlanExecutionBackend::begin_controlled_stop_runtime_scale_freeze() {
   std::lock_guard<std::mutex> lock(runtime_velocity_scale_mutex_);
   ++controlled_stop_runtime_scale_freeze_depth_;
-  // No prepared-membership or nominal adapter lock on this boundary. Workers
-  // release the clock lock before taking the scale lock for publication.
-  if (active_execution_clock_)
-    return active_execution_clock_->freeze_retargeting();
-  return std::nullopt;
 }
 
 bool RoboPlanExecutionBackend::end_controlled_stop_runtime_scale_freeze() {

@@ -298,8 +298,8 @@ export interface CCLCAdmission {
   /**
    * Present only when CCLC answered the operator's `recover` of an open
    * incident authorization-only: the incident is closed without a lifecycle
-   * transaction (`transactionId` and `status` are null) and the requested
-   * target is followed again once ordinary admission is open.
+   * transaction (`transactionId` and `status` are null) and keeps the retained evidence. Component activation is a separate
+   * explicit operator action.
    */
   incidentRecovery: CCLCIncidentRecovery | null;
 }

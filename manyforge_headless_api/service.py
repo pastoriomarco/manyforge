@@ -48,7 +48,6 @@ from .models import (
     ManualResultStageRequest,
     RuntimeBlackboardWriteRequest,
     FullStopIntentRequest,
-    GripperConfirmationRequest,
     OperationControlRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
@@ -511,87 +510,6 @@ class HeadlessService:
             request, trusted_principal_id=attribution.principal_id
         )
 
-    def execution_confirm_grasp(
-        self,
-        request: GripperConfirmationRequest,
-        attribution: TrustedAttribution,
-        *,
-        origin_epoch: str,
-        received_monotonic_ns: int,
-        valid_until_monotonic_ns: int,
-    ) -> dict[str, Any]:
-        record = {
-            "schema_version": "manyforge.gripper_confirmation_trace.v1",
-            "origin_epoch": origin_epoch,
-            "request_id": request.request_context.request_id,
-            "source_label": request.request_context.source_label,
-            "native_owner_epoch": request.request_context.request_owner_epoch,
-            **request.model_dump(
-                include={
-                    "program_binding_id",
-                    "target_role_id",
-                    "command_id",
-                    "generation",
-                    "expected_status_revision",
-                    "confirmed",
-                }
-            ),
-        }
-        trusted = {
-            "principal_id": attribution.principal_id,
-            "assurance": attribution.assurance,
-        }
-
-        def trace(phase, details):
-            # History is evidence, never command admission. Native queue loss
-            # raises historian health; a broken recorder also stays visible
-            # without changing or concealing the native owner's result.
-            try:
-                recorded = (
-                    self.core.record_gripper_confirmation(
-                        {**record, "phase": phase, "details": details}
-                    ).get("recorded")
-                    is True
-                )
-            except Exception:
-                recorded = False
-            if not recorded:
-                try:
-                    logging.getLogger(__name__).warning(
-                        "gripper_confirmation_trace_unavailable phase=%s request_id=%r",
-                        phase,
-                        record["request_id"],
-                    )
-                except Exception:
-                    pass  # A broken fallback sink is not command admission either.
-            return recorded
-
-        attempted_recorded = trace("attempted", trusted)
-        try:
-            result = self._execution().confirm_grasp(
-                request,
-                trusted_principal_id=attribution.principal_id,
-                origin_epoch=origin_epoch,
-                received_monotonic_ns=received_monotonic_ns,
-                valid_until_monotonic_ns=valid_until_monotonic_ns,
-            )
-        except Exception as error:
-            # Failure at this boundary may be a lost reply. Do not infer
-            # rejection, retry the command, or reconstruct live proof here.
-            trace(
-                "unconfirmed",
-                {
-                    **trusted,
-                    "reason_code": getattr(
-                        error, "code", "confirmation_delivery_failed"
-                    ),
-                    "message": str(error)[:512],
-                },
-            )
-            raise
-        recorded = trace("accepted", {**trusted, "evidence": result["confirmation"]})
-        return {**result, "history_recorded": attempted_recorded and recorded}
-
     def execution_preview_motion(
         self,
         request: OperationIntentRequest,
@@ -843,6 +761,14 @@ class HeadlessService:
             raise HeadlessApiError(
                 "manager_source_invalid",
                 "Manager source payload version is unsupported",
+            )
+        active = payload.get("active")
+        if not isinstance(active, dict) or not isinstance(
+            active.get("canonical_empty"), bool
+        ):
+            raise HeadlessApiError(
+                "manager_source_invalid",
+                "Manager source active.canonical_empty must be a boolean",
             )
         return {
             "schema_version": "manyforge.manager_status_projection.v1",

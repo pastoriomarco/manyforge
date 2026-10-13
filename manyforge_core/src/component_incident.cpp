@@ -90,10 +90,10 @@ using content_identity::CanonicalValue;
 [[nodiscard]] CanonicalValue TimelineEntry(const std::int64_t at_ns,
                                            const LifecycleBlockingCauseClassDTO cause,
                                            const std::vector<std::string>& vendor_codes) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"at_ns", NonNegative(at_ns)},
-      {"cause_class", CanonicalValue(std::string(to_string(cause)))},
-      {"vendor_codes", Strings(vendor_codes)}});
+  return CanonicalValue(
+      CanonicalValue::Object{{"at_ns", NonNegative(at_ns)},
+                             {"cause_class", CanonicalValue(std::string(to_string(cause)))},
+                             {"vendor_codes", Strings(vendor_codes)}});
 }
 
 /// `record_json` with the named members replaced (or added).
@@ -110,6 +110,64 @@ using content_identity::CanonicalValue;
   }
   for (auto& replaced : replacements) fields.push_back(std::move(replaced));
   return content_identity::canonical_json(CanonicalValue(std::move(fields)));
+}
+
+/// Shared Q86 exit/output contract; observer and component captures use the
+/// same actual wait evidence and encoded-tail limits.
+[[nodiscard]] bool IncidentExitAndOutputShapeIsValid(const CanonicalValue& exit,
+                                                     const CanonicalValue& output) {
+  const auto exact = [](const CanonicalValue& value, std::initializer_list<std::string_view> keys) {
+    return value.is_object() && value.as_object().size() == keys.size() &&
+           std::all_of(keys.begin(), keys.end(),
+                       [&](auto key) { return value.find_object_member(key); });
+  };
+  const auto text = [](const CanonicalValue& value, std::size_t limit, bool nullable = true) {
+    return (nullable && value.is_null()) ||
+           (value.is_string() && value.as_string().size() <= limit);
+  };
+  const auto owner_unsigned = [](const CanonicalValue& value, bool nullable = true) {
+    if (value.is_null()) return nullable;
+    if (value.is_number())
+      return value.as_number() >= 0.0 && value.as_number() <= 9007199254740991.0 &&
+             std::floor(value.as_number()) == value.as_number();
+    if (!value.is_string() || value.as_string().empty() ||
+        (value.as_string().size() > 1U && value.as_string().front() == '0'))
+      return false;
+    std::uint64_t parsed{};
+    const auto& token = value.as_string();
+    const auto [last, error] = std::from_chars(token.data(), token.data() + token.size(), parsed);
+    return error == std::errc{} && last == token.data() + token.size();
+  };
+  if (!exact(exit, {"status", "signal", "core_dumped", "observed_utc"})) return false;
+  for (auto key : {"status", "signal"}) {
+    const auto& value = *exit.find_object_member(key);
+    if (!value.is_null() &&
+        (!value.is_number() || value.as_number() < 0.0 || value.as_number() > 255.0 ||
+         std::floor(value.as_number()) != value.as_number()))
+      return false;
+  }
+  if (!exit.find_object_member("core_dumped")->is_bool() ||
+      !text(*exit.find_object_member("observed_utc"), 128U, false))
+    return false;
+  if (!exact(output, {"tail", "line_count", "truncated", "dropped_forward_lines",
+                      "dropped_forward_bytes", "invalid_text_bytes"}))
+    return false;
+  const auto& tail = *output.find_object_member("tail");
+  const auto& lines = *output.find_object_member("line_count");
+  if (!tail.is_string() || content_identity::canonical_json(tail).size() > 128U * 1024U ||
+      !lines.is_number() || lines.as_number() < 0.0 || lines.as_number() > 2000.0 ||
+      std::floor(lines.as_number()) != lines.as_number() ||
+      !output.find_object_member("truncated")->is_bool())
+    return false;
+  const auto& bytes = tail.as_string();
+  const auto count = bytes.empty()
+                         ? 0U
+                         : static_cast<std::size_t>(std::count(bytes.begin(), bytes.end(), '\n')) +
+                               (bytes.back() == '\n' ? 0U : 1U);
+  if (lines.as_number() != static_cast<double>(count)) return false;
+  for (auto key : {"dropped_forward_lines", "dropped_forward_bytes", "invalid_text_bytes"})
+    if (!owner_unsigned(*output.find_object_member(key), false)) return false;
+  return true;
 }
 
 }  // namespace
@@ -131,6 +189,112 @@ bool ComponentLifecycleIncidentDTO::locally_valid() const noexcept {
           containment.has_value()) &&
          acknowledged == acknowledged_at_ns.has_value() &&
          (!acknowledged_at_ns || *acknowledged_at_ns >= 0);
+}
+
+bool CellObserverIncidentTargetDTO::locally_valid() const noexcept {
+  // Same Q94 checked identity budgets as the launch-facts value. Do not
+  // normalize or reject an accepted source NUL; the canonical codec escapes it.
+  constexpr std::string_view suffix = ".9007199254740991";
+  return !cell_id.empty() && cell_id.value().size() <= 256U && !source_id.empty() &&
+         source_id.size() <= 256U && !source_epoch_base.empty() &&
+         source_epoch_base.size() <= 256U - suffix.size() &&
+         source_epoch_base.find('\0') == std::string::npos;
+}
+
+bool CellObserverIncidentRecordDTO::locally_valid() const noexcept {
+  try {
+    if (incident_id.empty() || incident_id.size() > kMaxComponentIncidentIdBytes ||
+        !target.locally_valid() || detected_at_ns < 0 || summary.empty() ||
+        summary.size() > kMaxComponentIncidentSummaryBytes || !diagnostic_snapshot.is_object() ||
+        diagnostic_snapshot.as_object().size() != 6U)
+      return false;
+    for (const auto key : {"exit", "context", "settings", "generated", "output", "core_dump_link"})
+      if (!diagnostic_snapshot.find_object_member(key)) return false;
+    const auto& exit = *diagnostic_snapshot.find_object_member("exit");
+    const auto& output = *diagnostic_snapshot.find_object_member("output");
+    if (!IncidentExitAndOutputShapeIsValid(exit, output) ||
+        exit.find_object_member("status")->is_null() ==
+            exit.find_object_member("signal")->is_null())
+      return false;
+    for (const auto key : {"context", "settings", "generated"})
+      if (!diagnostic_snapshot.find_object_member(key)->is_object()) return false;
+    const auto& context = *diagnostic_snapshot.find_object_member("context");
+    for (const auto& [key, expected] :
+         {std::pair<std::string_view, std::string_view>{"cell_id", target.cell_id.value()},
+          {"source_id", target.source_id},
+          {"source_epoch_base", target.source_epoch_base}}) {
+      const auto* value = context.find_object_member(key);
+      if (!value || !value->is_string() || value->as_string() != expected) return false;
+    }
+    const auto& core = *diagnostic_snapshot.find_object_member("core_dump_link");
+    return core.is_null() || (core.is_string() && core.as_string().size() <= 1024U);
+  } catch (...) {
+    return false;
+  }
+}
+
+std::string EncodeCellObserverIncidentRecord(const CellObserverIncidentRecordDTO& record) {
+  if (!record.locally_valid())
+    throw std::invalid_argument("cell observer incident record is invalid");
+  const auto bytes = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"incident_id", CanonicalValue(record.incident_id)},
+      {"event_kind", CanonicalValue(kComponentIncidentEventKind.data())},
+      {"target_kind", CanonicalValue("cell_observer")},
+      {"target", CanonicalValue(CanonicalValue::Object{
+                     {"cell_id", CanonicalValue(record.target.cell_id.value())},
+                     {"source_id", CanonicalValue(record.target.source_id)},
+                     {"source_epoch_base", CanonicalValue(record.target.source_epoch_base)}})},
+      {"cause_class", CanonicalValue("provider_lost")},
+      {"detected_at_ns", NonNegative(record.detected_at_ns)},
+      {"summary", CanonicalValue(record.summary)},
+      {"acknowledgement", CanonicalValue(nullptr)},
+      {"diagnostic_snapshot", record.diagnostic_snapshot}}));
+  if (bytes.size() > kMaxComponentIncidentRecordBytes)
+    throw std::invalid_argument("cell observer incident record exceeds the shared byte bound");
+  return bytes;
+}
+
+CellObserverIncidentRecordDTO DecodeCellObserverIncidentRecord(const std::string_view bytes) {
+  if (bytes.empty() || bytes.size() > kMaxComponentIncidentRecordBytes)
+    throw std::invalid_argument("cell observer incident record exceeds the shared byte bound");
+  auto limits = content_identity::CanonicalJsonParseLimits{};
+  limits.maximum_bytes = kMaxComponentIncidentRecordBytes;
+  const auto root = content_identity::parse_canonical_json(bytes, limits);
+  const auto exact = [](const CanonicalValue& value, std::initializer_list<std::string_view> keys) {
+    return value.is_object() && value.as_object().size() == keys.size() &&
+           std::all_of(keys.begin(), keys.end(),
+                       [&](auto key) { return value.find_object_member(key) != nullptr; });
+  };
+  if (!exact(root, {"incident_id", "event_kind", "target_kind", "target", "cause_class",
+                    "detected_at_ns", "summary", "acknowledgement", "diagnostic_snapshot"}))
+    throw std::invalid_argument("cell observer incident record fields differ");
+  const auto text = [](const CanonicalValue& value, const std::string_view key) -> std::string {
+    const auto* member = value.find_object_member(key);
+    if (!member || !member->is_string())
+      throw std::invalid_argument("cell observer incident text field is invalid");
+    return member->as_string();
+  };
+  const auto& target = *root.find_object_member("target");
+  if (text(root, "event_kind") != kComponentIncidentEventKind ||
+      text(root, "target_kind") != "cell_observer" ||
+      text(root, "cause_class") != "provider_lost" ||
+      !root.find_object_member("acknowledgement")->is_null() ||
+      !exact(target, {"cell_id", "source_id", "source_epoch_base"}))
+    throw std::invalid_argument("cell observer incident target or initial state is invalid");
+  CellObserverIncidentRecordDTO result{
+      text(root, "incident_id"),
+      {CellId(text(target, "cell_id")), text(target, "source_id"),
+       text(target, "source_epoch_base")},
+      content_identity::parse_nonnegative_int64(*root.find_object_member("detected_at_ns")),
+      text(root, "summary"),
+      *root.find_object_member("diagnostic_snapshot")};
+  if (!result.locally_valid())
+    throw std::invalid_argument("cell observer incident record values are invalid");
+  return result;
+}
+
+std::string CellObserverIncidentEventPayload(const CellObserverIncidentRecordDTO& record) {
+  return EncodeCellObserverIncidentRecord(record);
 }
 
 std::vector<LifecycleIncidentRecoveryPolicyDTO> DefaultLifecycleIncidentRecoveryPolicy() {
@@ -229,8 +393,8 @@ std::string ComponentIncidentEventPayload(const ComponentLifecycleIncidentDTO& i
       {"acknowledged_at_ns", acknowledged && incident.acknowledged_at_ns
                                  ? NonNegative(*incident.acknowledged_at_ns)
                                  : CanonicalValue(nullptr)},
-      {"acknowledged_by", acknowledged ? OptionalText(incident.acknowledged_by)
-                                       : CanonicalValue(nullptr)},
+      {"acknowledged_by",
+       acknowledged ? OptionalText(incident.acknowledged_by) : CanonicalValue(nullptr)},
       {"acknowledgement_request_id",
        acknowledged && incident.acknowledgement_request_id
            ? CanonicalValue(incident.acknowledgement_request_id->value())
@@ -278,17 +442,16 @@ std::string ComponentIncidentRecordWithContainment(
     for (const auto& operation : receipt->affected_operation_ids) {
       operations.emplace_back(operation.value());
     }
-    stop = CanonicalValue(CanonicalValue::Object{
-        {"stop_generation", Unsigned(receipt->stop_generation.value())},
-        {"stop_id", CanonicalValue(receipt->stop_id.value())}});
+    stop = CanonicalValue(
+        CanonicalValue::Object{{"stop_generation", Unsigned(receipt->stop_generation.value())},
+                               {"stop_id", CanonicalValue(receipt->stop_id.value())}});
     if (receipt->program_run_id) program_run = CanonicalValue(receipt->program_run_id->value());
   }
-  return Patched(record_json,
-                 {{"active_operation_ids", CanonicalValue(std::move(operations))},
-                  {"containment_error", OptionalText(error)},
-                  {"containment_state", CanonicalValue(std::string(to_string(state)))},
-                  {"program_run_id", std::move(program_run)},
-                  {"stop", std::move(stop)}});
+  return Patched(record_json, {{"active_operation_ids", CanonicalValue(std::move(operations))},
+                               {"containment_error", OptionalText(error)},
+                               {"containment_state", CanonicalValue(std::string(to_string(state)))},
+                               {"program_run_id", std::move(program_run)},
+                               {"stop", std::move(stop)}});
 }
 
 std::string ComponentIncidentRecordWithChange(const std::string_view record_json,
@@ -369,17 +532,8 @@ bool ComponentIncidentDiagnosticSnapshotShapeIsValid(const CanonicalValue& snaps
     if (!exact(snapshot, {"exit", "context", "readiness", "settings", "generated", "output",
                           "core_dump_link"}))
       return false;
-    const auto& exit = *snapshot.find_object_member("exit");
-    if (!exact(exit, {"status", "signal", "core_dumped", "observed_utc"})) return false;
-    for (auto key : {"status", "signal"}) {
-      const auto& value = *exit.find_object_member(key);
-      if (!value.is_null() &&
-          (!value.is_number() || value.as_number() < 0.0 || value.as_number() > 255.0 ||
-           std::floor(value.as_number()) != value.as_number()))
-        return false;
-    }
-    if (!exit.find_object_member("core_dumped")->is_bool() ||
-        !text(*exit.find_object_member("observed_utc"), 128U, false))
+    if (!IncidentExitAndOutputShapeIsValid(*snapshot.find_object_member("exit"),
+                                           *snapshot.find_object_member("output")))
       return false;
     const auto& context = *snapshot.find_object_member("context");
     if (!exact(context, {"component_id", "request_context", "runtime_unit_id", "runtime_epoch",
@@ -426,25 +580,6 @@ bool ComponentIncidentDiagnosticSnapshotShapeIsValid(const CanonicalValue& snaps
       for (const char digit : value.as_string().substr(7U))
         if (!((digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'))) return false;
     }
-    const auto& output = *snapshot.find_object_member("output");
-    if (!exact(output, {"tail", "line_count", "truncated", "dropped_forward_lines",
-                        "dropped_forward_bytes", "invalid_text_bytes"}))
-      return false;
-    const auto& tail = *output.find_object_member("tail");
-    const auto& lines = *output.find_object_member("line_count");
-    if (!tail.is_string() || content_identity::canonical_json(tail).size() > 128U * 1024U ||
-        !lines.is_number() || lines.as_number() < 0.0 || lines.as_number() > 2000.0 ||
-        std::floor(lines.as_number()) != lines.as_number() ||
-        !output.find_object_member("truncated")->is_bool())
-      return false;
-    const auto& bytes = tail.as_string();
-    const auto count =
-        bytes.empty() ? 0U
-                      : static_cast<std::size_t>(std::count(bytes.begin(), bytes.end(), '\n')) +
-                            (bytes.back() == '\n' ? 0U : 1U);
-    if (lines.as_number() != static_cast<double>(count)) return false;
-    for (auto key : {"dropped_forward_lines", "dropped_forward_bytes", "invalid_text_bytes"})
-      if (!owner_unsigned(*output.find_object_member(key), false)) return false;
     return text(*snapshot.find_object_member("core_dump_link"), 1024U);
   } catch (...) {
     return false;

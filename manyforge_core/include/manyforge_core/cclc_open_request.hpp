@@ -3,6 +3,7 @@
 #include <manyforge_core/cclc_lifecycle_target_driver.hpp>
 #include <manyforge_core/component_lifecycle_coordinator.hpp>
 #include <manyforge_core/ports/icclc_current_component_snapshot_source.hpp>
+#include <manyforge_core/ports/icclc_route_selection_template_source.hpp>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -13,42 +14,6 @@ inline constexpr std::string_view kCCLCOpenRequestApiVersion = "manyforge.cclc_o
 inline constexpr std::string_view kCCLCOpenResponseApiVersion = "manyforge.cclc_open_response.v1";
 inline constexpr std::size_t kMaximumCCLCOpenRequestBytes = 4U * 1024U * 1024U;
 inline constexpr std::size_t kMaximumCCLCOpenResponseBytes = 8U * 1024U * 1024U;
-
-/// One fresh, complete-domain route request template reconstructed only from
-/// the selected retained bundle and current CCLC facts. A caller adds its own
-/// request context; it must not edit or merge any field in this value.
-struct CCLCRouteSelectionTemplateDTO final {
-  DesiredControlConfigurationDTO desired_configuration;
-  ExpectedActiveControlConfigurationDTO expected_active_control_configuration;
-  std::vector<RouteSelectionComponentExpectationDTO> component_expectations;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const CCLCRouteSelectionTemplateDTO&,
-                         const CCLCRouteSelectionTemplateDTO&) = default;
-};
-
-/// Retained/current route templates relevant to one exact component. Empty is
-/// a truthful statement that the component has no retained selectable route.
-struct CCLCRouteSelectionTemplateSetDTO final {
-  ControllableComponentId controllable_component_id;
-  RetainedBundleId retained_bundle_id;
-  GraphRevision graph_revision;
-  std::vector<CCLCRouteSelectionTemplateDTO> templates;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const CCLCRouteSelectionTemplateSetDTO&,
-                         const CCLCRouteSelectionTemplateSetDTO&) = default;
-};
-
-class ICCLCRouteSelectionTemplateSource {
- public:
-  virtual ~ICCLCRouteSelectionTemplateSource() = default;
-
-  [[nodiscard]] virtual Result<CCLCRouteSelectionTemplateSetDTO> ReadCurrentRouteSelectionTemplates(
-      const ControllableComponentId& component_id) const = 0;
-};
 
 /// Narrow caller-neutral semantic surface shared by HTTP, ROS, CLI, Behavior,
 /// and other open clients. Implementations own no policy or runtime truth;
@@ -103,6 +68,11 @@ class ComponentLifecycleCoordinatorOpenRequestPort final : public ICCLCOpenReque
       const ICCLCCurrentComponentSnapshotSource& current_component_source,
       const ICCLCRouteSelectionTemplateSource& route_template_source,
       CCLCLifecycleTargetDriver* target_driver = nullptr) noexcept;
+  /// Current composed product; each product read uses one owner pin. Journal,
+  /// progress and retained request reads stay independent of pending exchange.
+  explicit ComponentLifecycleCoordinatorOpenRequestPort(
+      ComponentLifecycleCoordinator& coordinator,
+      CCLCLifecycleTargetDriver* target_driver = nullptr) noexcept;
 
   [[nodiscard]] RequestOwnerEpoch ReadRequestOwnerEpoch() const override;
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
@@ -128,8 +98,8 @@ class ComponentLifecycleCoordinatorOpenRequestPort final : public ICCLCOpenReque
 
  private:
   ComponentLifecycleCoordinator& coordinator_;
-  const ICCLCCurrentComponentSnapshotSource& current_component_source_;
-  const ICCLCRouteSelectionTemplateSource& route_template_source_;
+  const ICCLCCurrentComponentSnapshotSource* current_component_source_{};
+  const ICCLCRouteSelectionTemplateSource* route_template_source_{};
   CCLCLifecycleTargetDriver* target_driver_;
 };
 

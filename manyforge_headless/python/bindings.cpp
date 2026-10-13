@@ -489,17 +489,6 @@ public:
     });
   }
 
-  std::string RecordGripperConfirmation(const std::string& record_json) {
-    py::gil_scoped_release release;
-    return Invoke([this, &record_json]() {
-      if (record_json.size() > 8192U)
-        throw OperatorAlarmError("gripper_confirmation_trace_invalid",
-                                 "Gripper confirmation trace exceeds its byte bound");
-      auto record = deployment::parse_strict_json_model_yaml(record_json).root();
-      return core_->RecordGripperConfirmation(std::move(record));
-    });
-  }
-
   std::string RecordProgramDiagnostic(const std::string& record_json) {
     py::gil_scoped_release release;
     return Invoke([this, &record_json]() {
@@ -1158,9 +1147,6 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("historian_health", &HeadlessApiBridge::HistorianHealth)
       .def("record_program_diagnostic",
            &HeadlessApiBridge::RecordProgramDiagnostic, py::arg("record_json"))
-      .def("record_gripper_confirmation",
-           &HeadlessApiBridge::RecordGripperConfirmation,
-           py::arg("record_json"))
       .def("commit_program_model_attempt",
            &HeadlessApiBridge::CommitProgramModelAttempt,
            py::arg("record_json"))

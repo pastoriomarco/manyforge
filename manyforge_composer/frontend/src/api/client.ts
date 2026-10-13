@@ -659,6 +659,30 @@ export const api = {
       signal,
       { method: 'POST', body: JSON.stringify(request) },
     ),
+    lifecycleRequestResult: (
+      request: CCLCLifecycleRequestBody,
+      signal?: AbortSignal,
+    ): Promise<CCLCAdmission | null> => requestJson(
+      '/api/cclc/lifecycle/requests/result',
+      (value) => {
+        const envelope = parseObjectResponse(value);
+        if (Object.keys(envelope).length !== 1 || !Object.hasOwn(envelope, 'result')) {
+          throw new Error('lifecycle request result must contain only result');
+        }
+        if (envelope.result === null) return null;
+        const result = parseCCLCAdmission(envelope.result, 'lifecycle');
+        if (result.requestId !== null && result.requestId !== request.request_context.request_id) {
+          throw new Error('lifecycle request result does not match its request');
+        }
+        if (result.incidentRecovery !== null
+          && result.incidentRecovery.componentId !== request.controllable_component_id) {
+          throw new Error('incident recovery does not match its request');
+        }
+        return result;
+      },
+      signal,
+      { method: 'POST', body: JSON.stringify(request) },
+    ),
     lifecycleStatus: (
       transactionId: string,
       signal?: AbortSignal,

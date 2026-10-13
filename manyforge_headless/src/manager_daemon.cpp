@@ -7,6 +7,7 @@
 
 #include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
+#include <manyforge_component_manager/isaac_site_settings.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
 #include <manyforge_component_manager/manager_liveness_transport.hpp>
 #include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
@@ -406,8 +407,37 @@ struct DaemonConfig final {
   /// Optional approved root for relative Program scene meshes. The native
   /// runtime adapter opens it once; empty means relative meshes fail closed.
   std::filesystem::path scene_asset_root;
+  std::optional<std::filesystem::path> isaac_site_settings_path;
+  std::optional<std::filesystem::path> isaac_pose_observer_executable;
   std::chrono::milliseconds reconciliation_period{500};
 };
+
+struct LoadedIsaacSiteSettings final {
+  std::string document;
+  component_manager::IsaacSiteSettings value;
+};
+
+[[nodiscard]] std::optional<LoadedIsaacSiteSettings>
+LoadIsaacSiteSettings(const std::optional<std::filesystem::path> &path) {
+  if (!path.has_value()) return std::nullopt;
+  FileDescriptor file(::open(path->c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+  if (file.get() < 0) FailErrno("open Isaac site settings " + path->string());
+  struct stat status {};
+  if (::fstat(file.get(), &status) != 0)
+    FailErrno("inspect Isaac site settings " + path->string());
+  Require(S_ISREG(status.st_mode), "Isaac site settings must be a regular file: " + path->string());
+  std::string document;
+  std::array<char, 4096U> buffer{};
+  while (true) {
+    const auto count = ::read(file.get(), buffer.data(), buffer.size());
+    if (count < 0 && errno == EINTR) continue;
+    if (count < 0) FailErrno("read Isaac site settings " + path->string());
+    if (count == 0) break;
+    document.append(buffer.data(), static_cast<std::size_t>(count));
+  }
+  auto value = component_manager::ParseIsaacSiteSettings(document);
+  return LoadedIsaacSiteSettings{std::move(document), std::move(value)};
+}
 
 enum class CommandKind {
   kDeploymentCandidatePreview,
@@ -1594,6 +1624,51 @@ SceneRuntimeOwnerReadResponse(const std::string_view cell_id,
   });
 }
 
+struct ManagedIsaacPoseObserverExpectation final {
+  component_manager::ManagerIsaacPoseObserverLaunchFactsDTO launch_facts;
+  std::vector<PoseObserverBinding> bindings;
+  bool available{true};
+  bool inspection_current{false};
+  // Only the current configured bindings, updated after actual pose commits.
+  std::map<PoseObservationKey, core::SceneObjectProviderEvidenceDTO>
+      provider_origins{};
+  std::optional<component_manager::ManagerCellObserverObservationDTO>
+      observation{};
+};
+
+[[nodiscard]] ManagedIsaacPoseObserverExpectation
+DecodeCheckedIsaacPoseObserverConfiguration(
+    const component_manager::IsaacPoseObserverCheckedConfiguration &checked,
+    const core::CellId &cell_id, const SceneRuntimeIdentity &runtime_identity,
+    std::string source_epoch_base) {
+  const auto root = deployment::parse_strict_json_model_yaml(checked.metadata).root();
+  RequireExactObjectSize(root, 3U, "checked observer metadata");
+  Require(RequiredString(root, "cell_id") == cell_id.value(),
+          "checked observer cell differs from the verified deployment");
+  ManagedIsaacPoseObserverExpectation result{
+      {checked.retained_snapshot.string(), RequiredString(root, "source_id"),
+       std::move(source_epoch_base)},
+      RequiredPoseObserverBindings(RequiredMember(root, "bindings"))};
+  Require(result.launch_facts.valid(), "checked observer launch facts are invalid");
+  // Exercise the unchanged Open grammar and total packet cap with the widest
+  // existing generation encodings. This is only a local grammar probe; the
+  // actual runtime identity remains the already-qualified startup input.
+  auto maximum_identity = runtime_identity;
+  maximum_identity.deployment_generation = 9007199254740991ULL;
+  maximum_identity.program_generation = 9007199254740991ULL;
+  maximum_identity.runtime_generation = 9007199254740991ULL;
+  const CanonicalValue open(CanonicalValue::Object{
+      {"api_version", CanonicalValue(std::string(kManagerCommandApiVersion))},
+      {"command", CanonicalValue("scene_runtime_observer_open")},
+      {"expected_runtime_identity", SceneRuntimeIdentityResponseValue(maximum_identity)},
+      {"source_id", CanonicalValue(result.launch_facts.source_id)},
+      {"source_epoch", CanonicalValue(result.launch_facts.source_epoch_base +
+                                      ".9007199254740991")},
+      {"bindings", RequiredMember(root, "bindings")}});
+  static_cast<void>(DecodeCommand(content_identity::canonical_json(open)));
+  return result;
+}
+
 CanonicalValue SceneRuntimeObserverOpenResponse(
     const std::string_view cell_id, const SceneRuntimeIdentity &identity,
     const std::string_view source_id, const std::string_view source_epoch,
@@ -2565,10 +2640,95 @@ private:
   AdmissionCloser admission_closer_;
 };
 
+// Only the daemon's named coordinator owns this adapter. Its Q101 entries
+// are called inside the original captured named operation; a replacement
+// coordinator has no such capture and can only read retained Scene evidence.
+// The actual remote port supplies checked owner readback, never HeldStatusView.
+class OriginalManagerSceneMaintenanceAdapter final
+    : public core::IManagerSceneProjectionMaintenancePort {
+public:
+  OriginalManagerSceneMaintenanceAdapter(
+      scene::CanonicalEmptySceneOwner &owner,
+      const core::IManagerKernelApplyFencePort &original_parent_fence)
+      : owner_(owner), original_parent_fence_(original_parent_fence) {}
+
+  core::ProjectionRevisionDTO CurrentProjectionRevision() const override {
+    return owner_.CurrentProjectionRevision();
+  }
+  core::ProjectionMaintenanceInitializationStatusDTO
+  BeginMaintenanceInitialization(
+      const core::ProjectionMaintenanceInitializationRequestDTO &request) override {
+    return owner_.BeginMaintenanceInitialization(request);
+  }
+  core::ProjectionMaintenanceInitializationStatusDTO InstallInitialScene(
+      const core::ProjectionMaintenanceInitializationRequestDTO &request) override {
+    return owner_.InstallInitialScene(request);
+  }
+  core::ProjectionMaintenanceInitializationStatusDTO
+  CompleteMaintenanceInitialization(
+      const core::ProjectionMaintenanceCompletionDTO &completion) override {
+    return owner_.CompleteMaintenanceInitialization(completion);
+  }
+  std::optional<core::ProjectionMaintenanceInitializationStatusDTO>
+  ReadMaintenanceInitialization(
+      const core::ProjectionMaintenanceInitializationQueryDTO &query) const override {
+    return owner_.ReadMaintenanceInitialization(query);
+  }
+  std::vector<core::ProjectionHealthDTO> StageOriginalManagerProductAdoption(
+      const core::QualifiedSceneProductAdoptionRequestDTO &request,
+      const core::ApplyFenceAcquireAttemptQueryDTO &attempt_query) override {
+    return owner_.StageOriginalManagerProductAdoption(request, original_parent_fence_, attempt_query);
+  }
+  std::vector<core::ProjectionHealthDTO> ReadOriginalManagerProductAdoptionProjectionHealth(
+      const core::QualifiedSceneProductAdoptionRequestDTO &request,
+      const core::ApplyFenceAcquireAttemptQueryDTO &attempt_query) override {
+    return owner_.ReadOriginalManagerProductAdoptionProjectionHealth(request, original_parent_fence_, attempt_query);
+  }
+  core::ProjectionMaintenanceInitializationStatusDTO
+  BeginOriginalManagerProductAdoption(
+      const core::QualifiedSceneProductAdoptionRequestDTO &request) override {
+    return owner_.BeginOriginalManagerProductAdoption(request, original_parent_fence_);
+  }
+  core::ProjectionMaintenanceInitializationStatusDTO
+  CompleteOriginalManagerProductAdoption(
+      const core::QualifiedSceneProductAdoptionRequestDTO &request,
+      const core::ActiveBundlePublicationReceiptDTO &publication) override {
+    return owner_.CompleteOriginalManagerProductAdoption(
+        request, publication, original_parent_fence_);
+  }
+  std::vector<core::ProjectionHealthDTO> StageOriginalManagerConfigurationAdoption(
+      const core::QualifiedSceneConfigurationAdoptionRequestDTO &request,
+      const core::ApplyFenceAcquireAttemptQueryDTO &attempt) override {
+    return owner_.StageOriginalManagerConfigurationAdoption(request, original_parent_fence_, attempt);
+  }
+  std::vector<core::ProjectionHealthDTO> ReadOriginalManagerConfigurationAdoptionProjectionHealth(
+      const core::QualifiedSceneConfigurationAdoptionRequestDTO &request,
+      const core::ApplyFenceAcquireAttemptQueryDTO &attempt) override {
+    return owner_.ReadOriginalManagerConfigurationAdoptionProjectionHealth(request, original_parent_fence_, attempt);
+  }
+  core::ProjectionMaintenanceInitializationStatusDTO BeginOriginalManagerConfigurationAdoption(
+      const core::QualifiedSceneConfigurationAdoptionRequestDTO &request) override {
+    return owner_.BeginOriginalManagerConfigurationAdoption(request, original_parent_fence_);
+  }
+  core::ProjectionMaintenanceInitializationStatusDTO CompleteOriginalManagerConfigurationAdoption(
+      const core::QualifiedSceneConfigurationAdoptionRequestDTO &request,
+      const core::ActiveBundlePublicationReceiptDTO &publication) override {
+    return owner_.CompleteOriginalManagerConfigurationAdoption(request, publication, original_parent_fence_);
+  }
+  core::ProjectionAggregateHealthDTO ActiveProjectionHealth() const override {
+    return owner_.ActiveProjectionHealth();
+  }
+
+private:
+  scene::CanonicalEmptySceneOwner &owner_;
+  const core::IManagerKernelApplyFencePort &original_parent_fence_;
+};
+
 class ManagerDaemon final {
 public:
   explicit ManagerDaemon(DaemonConfig config)
       : config_(ValidateConfig(std::move(config))),
+        isaac_site_settings_(LoadIsaacSiteSettings(config_.isaac_site_settings_path)),
         started_at_(std::chrono::steady_clock::now()),
         package_generation_(config_.install_root,
                             deployment::runtime_contract_declaration_registry()
@@ -2595,12 +2755,17 @@ public:
                     deployment::ros2_control_execution_runtime_contract::
                         kLaunchEnvironmentContract)},
             config_.logical_scene_database, config_.program_cycle_journal,
-            config_.activation_root, config_.scene_asset_root),
+            config_.activation_root, config_.scene_asset_root,
+            isaac_site_settings_.has_value()
+                ? std::optional<std::string>(isaac_site_settings_->document)
+                : std::nullopt,
+            config_.isaac_pose_observer_executable),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
                      stores_.active_bundle_publication_store(),
                      verified_package_, native_runtime_adapter_,
                      native_runtime_adapter_),
+        original_manager_scene_maintenance_(scene_owner_, native_runtime_adapter_),
         scene_runtime_pose_projector_(scene_owner_, admission_.cell_id()),
         plan_source_(stores_.active_bundle_publication_store(),
                      stores_.apply_journal(),
@@ -2627,7 +2792,7 @@ public:
         named_apply_(
             stores_.apply_journal(), plan_source_, verified_package_,
             verified_package_, stores_.active_bundle_publication_store(),
-            scene_owner_, &scene_owner_, native_runtime_adapter_,
+            original_manager_scene_maintenance_, &scene_owner_, native_runtime_adapter_,
             native_runtime_adapter_, native_runtime_adapter_,
             runtime_adapter_router_, runtime_adapter_router_,
             planned_maintenance_,
@@ -2961,7 +3126,525 @@ private:
   /// dependency order.
   PublicationGenerations InitializeRuntimeAndPublish() {
     RequireCurrentPackageGeneration();
+    const auto plan = plan_source_.ReadCurrentPlan();
+    const auto bundle = verified_package_.get_verified(
+        plan.active_publication.request.candidate_retained_bundle_id);
+    Require(bundle != nullptr, "initial observer preflight has no verified active bundle");
+    const auto generation = plan.active_publication.publication_generation.value();
+    const SceneRuntimeIdentity identity{
+        bundle->retained_bundle_id().value(),
+        bundle->value().cell_graph.graph_revision.value(), generation, 0U, generation};
+    auto expectation = CheckConfiguredIsaacPoseObserver(*bundle, identity);
+    native_runtime_adapter_.SetIsaacPoseObserverStartupLaunchFacts(
+        expectation ? std::optional(expectation->launch_facts) : std::nullopt);
+    {
+      std::lock_guard lock(manager_source_mutex_);
+      managed_pose_observer_expectation_ = std::move(expectation);
+    }
     return PublishActiveRuntime(active_runtime_.Initialize());
+  }
+
+  [[nodiscard]] std::optional<ManagedIsaacPoseObserverExpectation>
+  CheckConfiguredIsaacPoseObserver(const deployment::RetainedBundle &bundle,
+                                  const SceneRuntimeIdentity &identity) {
+    for (const auto &unit : bundle.value().cell_graph.runtime_units) {
+      if (unit.runtime_profile_id.value() !=
+          deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId)
+        continue;
+      // Canonical-empty ROS retains infrastructure configuration, including
+      // future robot rows. No named world means no observer preflight; actual
+      // robot construction still uses the strict populated configuration read.
+      if (!unit.configuration.contains("isaac_world")) continue;
+      const auto configuration =
+          deployment::ros2_control_execution_runtime_contract::require_configuration(
+              bundle, unit.runtime_unit_id);
+      if (!configuration.isaac_world) continue;
+      Require(isaac_site_settings_.has_value(),
+              "named Isaac world requires --isaac-site-settings");
+      static_cast<void>(isaac_site_settings_->value.ResolveWorld(*configuration.isaac_world));
+      const auto *observer = isaac_site_settings_->value.FindPoseObserver(
+          bundle.value().cell_graph.cell_id.value());
+      Require(observer != nullptr,
+              "named Isaac world has no supplied cell pose observer mapping");
+      const auto checked = native_runtime_adapter_.CheckIsaacPoseObserverConfiguration(
+          observer->site_config, isaac_site_settings_->value.scene_startup_timeout_s());
+      return DecodeCheckedIsaacPoseObserverConfiguration(
+          checked, bundle.value().cell_graph.cell_id, identity,
+          RandomToken("isaac-source-"));
+    }
+    return std::nullopt;
+  }
+
+  [[nodiscard]] std::optional<ManagedIsaacPoseObserverExpectation>
+  CaptureOriginalApplyPoseObserver(
+      const deployment::RetainedBundle &predecessor,
+      const deployment::RetainedBundle &candidate) {
+    const auto world = [](const deployment::RetainedBundle &bundle) {
+      for (const auto &unit : bundle.value().cell_graph.runtime_units) {
+        if (unit.runtime_profile_id.value() ==
+            deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId) {
+          if (!unit.configuration.contains("isaac_world"))
+            return std::optional<std::string>{};
+          return deployment::ros2_control_execution_runtime_contract::
+              require_configuration(bundle, unit.runtime_unit_id).isaac_world;
+        }
+      }
+      return std::optional<std::string>{};
+    };
+    const auto candidate_world = world(candidate);
+    if (candidate_world == world(predecessor)) {
+      if (!candidate_world)
+        return std::nullopt;
+      // Robot-only Apply retains the original immutable observer input and
+      // Manager base, including when the last robot is removed. Availability
+      // is observation, never permission to restart the observer here.
+      std::lock_guard lock(manager_source_mutex_);
+      Require(managed_pose_observer_expectation_.has_value(),
+              "unchanged Isaac world has no retained checked observer input");
+      return managed_pose_observer_expectation_;
+    }
+    if (!candidate_world)
+      return std::nullopt;
+    const auto current = scene_runtime_owner_.Snapshot();
+    Require(current.runtime_identity.has_value(),
+            "Apply observer preflight has no current Scene runtime identity");
+    auto grammar_identity = *current.runtime_identity;
+    grammar_identity.retained_bundle_id = candidate.retained_bundle_id().value();
+    grammar_identity.graph_revision =
+        candidate.value().cell_graph.graph_revision.value();
+    // This identity is only the existing Open grammar/cap probe. No successor
+    // runtime generation or source expectation is published before Prepare.
+    return CheckConfiguredIsaacPoseObserver(candidate, grammar_identity);
+  }
+
+  // Only the first managed observer for this live Manager. A predecessor
+  // observer requires the separately qualified retirement transition; this
+  // initial continuation grants no replacement or process authority.
+  void ActivateInitialApplyPoseObserver(
+      ManagedIsaacPoseObserverExpectation checked,
+      const SceneRuntimeIdentity &expected_runtime,
+      const component_manager::ManagerApplyIntentDTO &intent,
+      const deployment::RetainedBundle &candidate,
+      const component_manager::ManagerSelectedRuntimeCompositionResultDTO
+          &prepared) {
+    Require(
+        intent.valid() && prepared.valid() &&
+            prepared.request.phase ==
+                component_manager::ManagerSelectedRuntimeCompositionPhase::
+                    kPrepare &&
+            prepared.state ==
+                component_manager::ManagerSelectedRuntimeCompositionState::
+                    kInstalled &&
+            !prepared.isaac_pose_observer_retirement_receipt &&
+            prepared.request.apply_id == intent.apply_id &&
+            prepared.request.apply_generation == intent.apply_generation &&
+            prepared.request.manager_runtime_epoch == manager_runtime_epoch_ &&
+            intent.cell_id == admission_.cell_id() &&
+            candidate.value().cell_graph.cell_id == intent.cell_id &&
+            candidate.retained_bundle_id() ==
+                intent.candidate_retained_bundle_id &&
+            candidate.value().cell_graph.graph_revision ==
+                intent.candidate_graph_revision &&
+            prepared.request.candidate_projection_revision.retained_bundle_id ==
+                intent.candidate_retained_bundle_id &&
+            prepared.request.candidate_projection_revision.graph_revision ==
+                intent.candidate_graph_revision &&
+            expected_runtime.retained_bundle_id ==
+                intent.expected_active_projection_revision.retained_bundle_id
+                    .value() &&
+            expected_runtime.graph_revision ==
+                intent.expected_active_projection_revision.graph_revision
+                    .value() &&
+            intent.isaac_pose_observer_launch_facts ==
+                std::optional(checked.launch_facts) &&
+            prepared.request.isaac_pose_observer_launch_facts ==
+                intent.isaac_pose_observer_launch_facts,
+        "initial observer activation lacks its exact original Prepare "
+        "acknowledgement");
+    std::lock_guard lock(manager_source_mutex_);
+    Require(!managed_pose_observer_expectation_ &&
+                scene_runtime_owner_.Snapshot().runtime_identity ==
+                    std::optional(expected_runtime),
+            "initial observer activation predecessor changed before Prepare "
+            "acknowledgement");
+    // Configure the existing source freshness latch before Finalize can spawn.
+    // Publication adopts the successor identity; observer Open then returns
+    // through the ordinary listener. Never wait for it in this callback.
+    scene_runtime_owner_.ConfigurePoseSourceAvailability(
+        expected_runtime, checked.launch_facts.source_id,
+        checked.launch_facts.source_epoch_base);
+    managed_pose_observer_expectation_ = std::move(checked);
+  }
+
+  // Caller holds manager_source_mutex_; no transport or process IO here.
+  [[nodiscard]] bool ManagedPoseObserverCommandMatchesLocked(
+      const ManagerCommand &command, const bool opening) const {
+    if (!managed_pose_observer_expectation_ ||
+        *command.pose_source_id != managed_pose_observer_expectation_->launch_facts.source_id)
+      return true;  // Existing unmanaged source acceptance is unchanged.
+    const auto &expected = *managed_pose_observer_expectation_;
+    return expected.available &&
+           expected.launch_facts.accepts_source_epoch(
+               *command.pose_source_epoch) &&
+           (!opening || expected.bindings == command.pose_observer_bindings);
+  }
+
+  // An owned replay copy may outlive a transport call. Never write its result
+  // back to a session retired or replaced by the Apply progression lane.
+  [[nodiscard]] bool PoseReplayIsCurrentLocked(
+      const PoseObservationReplay &record) const {
+    const auto runtime = scene_runtime_owner_.Snapshot();
+    if (!runtime.runtime_identity ||
+        *runtime.runtime_identity != record.runtime_identity)
+      return false;
+    const auto &observation = record.observation;
+    if (managed_pose_observer_expectation_ &&
+        managed_pose_observer_expectation_->launch_facts.source_id ==
+            observation.key.source_id &&
+        (!managed_pose_observer_expectation_->available ||
+         !managed_pose_observer_expectation_->launch_facts.accepts_source_epoch(
+             observation.source_epoch)))
+      return false;
+    const auto session = pose_observer_sessions_.find(observation.key.source_id);
+    const auto replay = pose_observation_replays_.find(observation.key);
+    return session != pose_observer_sessions_.end() &&
+           session->second.runtime_identity == record.runtime_identity &&
+           session->second.source_epoch == observation.source_epoch &&
+           session->second.source_epoch_order == observation.source_epoch_order &&
+           replay != pose_observation_replays_.end() &&
+           replay->second.runtime_identity == record.runtime_identity &&
+           replay->second.observation == observation;
+  }
+
+  // Ordinary Inspect is observation-only. The original checked identity is
+  // retained independently of producer sessions and incident persistence.
+  bool ReconcileManagedPoseObserver(
+      const component_manager::ManagerActiveRuntimeConvergenceResult &runtime,
+      const deployment::RetainedBundle &bundle) {
+    std::optional<ManagedIsaacPoseObserverExpectation> expected;
+    {
+      std::lock_guard lock(manager_source_mutex_);
+      if (managed_pose_observer_expectation_)
+        managed_pose_observer_expectation_->inspection_current = false;
+      expected = managed_pose_observer_expectation_;
+    }
+    if (!expected)
+      return true;
+    const auto owner = scene_runtime_owner_.Snapshot();
+    if (!owner.runtime_identity ||
+        owner.state != SceneInitializationState::kOpen)
+      return false;
+    const auto &identity = *owner.runtime_identity;
+    {
+      std::lock_guard lock(manager_source_mutex_);
+      if (!managed_pose_observer_expectation_ ||
+          managed_pose_observer_expectation_->launch_facts !=
+              expected->launch_facts ||
+          scene_runtime_owner_.Snapshot().runtime_identity !=
+              owner.runtime_identity)
+        return false;
+      scene_runtime_owner_.ConfigurePoseSourceAvailability(
+          identity, expected->launch_facts.source_id,
+          expected->launch_facts.source_epoch_base);
+    }
+    const auto &publication = runtime.plan.active_publication;
+    if (bundle.retained_bundle_id() !=
+            publication.request.candidate_retained_bundle_id ||
+        bundle.value().cell_graph.graph_revision.value() !=
+            identity.graph_revision ||
+        bundle.retained_bundle_id().value() != identity.retained_bundle_id)
+      return false;
+    for (const auto &unit : bundle.value().cell_graph.runtime_units) {
+      if (unit.runtime_profile_id.value() !=
+          deployment::ros2_control_execution_runtime_contract::
+              kRuntimeProfileId)
+        continue;
+      const auto *host =
+          runtime.observations.observation(unit.runtime_unit_id.value());
+      if (!host ||
+          host->process_presence() !=
+              component_manager::ProcessPresenceState::kPresent ||
+          host->runtime_epoch().empty())
+        return false;
+      const component_manager::ManagerComponentBringUpInspectionRequestDTO
+          request{publication.request.candidate_projection_revision,
+                  core::ContentDigest(content_identity::sha256_digest(
+                      bundle.canonical_bytes())),
+                  bundle.canonical_bytes().size(),
+                  publication.request.candidate_projection_revision,
+                  publication.publication_generation,
+                  publication.durable_public_pointer_content_digest,
+                  unit.runtime_unit_id,
+                  core::RuntimeEpoch(host->runtime_epoch()),
+                  manager_runtime_epoch_};
+      const auto inspected =
+          native_runtime_adapter_.InspectComponentBringUp(request);
+      if (!inspected.ok() || !inspected.value().valid() ||
+          inspected.value().request != request ||
+          !inspected.value().cell_observer)
+        return false;
+      const auto &observed = *inspected.value().cell_observer;
+      if (observed.cell_id != admission_.cell_id() ||
+          observed.source_id != expected->launch_facts.source_id ||
+          observed.source_epoch_base !=
+              expected->launch_facts.source_epoch_base)
+        return false;
+      // Recheck after RPC; no source lock spans child IO.
+      std::lock_guard lock(manager_source_mutex_);
+      if (!managed_pose_observer_expectation_ ||
+          managed_pose_observer_expectation_->launch_facts !=
+              expected->launch_facts ||
+          scene_runtime_owner_.Snapshot().runtime_identity !=
+              owner.runtime_identity)
+        return false;
+      auto &current = *managed_pose_observer_expectation_;
+      current.inspection_current = true;
+      if (observed.exit) {
+        // Close freshness first, even for pending/failed/unknown durable
+        // writes.
+        scene_runtime_owner_.MarkPoseSourceUnavailable(
+            identity, observed.source_id, observed.source_epoch_base);
+        current.available = false;
+      }
+      if (!current.observation || !current.observation->exit || observed.exit)
+        current.observation = observed;
+      return current.available &&
+             observed.process_presence ==
+                 component_manager::ProcessPresenceState::kPresent;
+    }
+    return false;
+  }
+
+  void
+  RetainManagedPoseProviderOrigin(const PoseSourceObservation &observation) {
+    const auto object = scene_owner_.GetObjectState(
+        core::SceneResourceId(observation.key.object_id));
+    if (!object.provider_evidence || object.attached ||
+        object.provider_evidence->provider_source_epoch !=
+            SceneRuntimePoseProviderSourceEpoch(observation) ||
+        object.provider_evidence->provider_source_sequence !=
+            observation.source_sequence)
+      return;
+    std::lock_guard lock(manager_source_mutex_);
+    if (!managed_pose_observer_expectation_)
+      return;
+    auto &expected = *managed_pose_observer_expectation_;
+    const PoseObserverBinding binding{observation.key.object_id,
+                                      observation.key.policy_id,
+                                      observation.eligible};
+    if (expected.launch_facts.source_id == observation.key.source_id &&
+        expected.launch_facts.accepts_source_epoch(observation.source_epoch) &&
+        std::find(expected.bindings.begin(), expected.bindings.end(),
+                  binding) != expected.bindings.end()) {
+      expected.provider_origins.insert_or_assign(observation.key,
+                                                 *object.provider_evidence);
+    }
+  }
+
+  struct OriginalConfiguredBringUpInput final {
+    component_manager::ManagerComponentBringUpInspectionRequestDTO request;
+    std::vector<core::ControllableComponentId> needed_components;
+    std::vector<component_manager::ManagerComponentProcessObservationDTO> configured_components;
+  };
+
+  CanonicalValue WithConfiguredBringUpImpact(
+      CanonicalValue impact, const deployment::RetainedBundle &candidate,
+      const component_manager::ManagerActiveRuntimePlanDTO &active,
+      std::vector<OriginalConfiguredBringUpInput> *original_inputs = nullptr) {
+    const auto &graph = candidate.value().cell_graph;
+    const bool ros_host = std::any_of(graph.runtime_units.begin(), graph.runtime_units.end(),
+        [](const auto &unit) {
+          return unit.runtime_profile_id.value() == deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId;
+        });
+    if (!ros_host) return impact;
+    std::optional<component_manager::ManagerActiveRuntimeConvergenceResult> runtime;
+    {
+      std::lock_guard source_lock(manager_source_mutex_);
+      runtime = last_runtime_;
+    }
+    Require(runtime && runtime->plan.active_publication == active.active_publication,
+            "component bring-up preflight has no exact current runtime observation");
+    const auto current_scene = scene_owner_.CurrentProjectionRevision();
+    Require(current_scene.retained_bundle_id == active.active_publication.request.candidate_retained_bundle_id &&
+                current_scene.graph_revision == active.active_publication.request.candidate_graph_revision,
+            "component bring-up preflight Scene belongs to another current product");
+    const core::ProjectionRevisionDTO candidate_projection{
+        candidate.retained_bundle_id(), graph.graph_revision, current_scene.scene_revision};
+    std::set<core::ControllableComponentId> observed_components;
+    std::set<core::ControllableComponentId> needed_components;
+    CanonicalValue::Array observations;
+    for (const auto &unit : graph.runtime_units) {
+      if (unit.runtime_profile_id.value() != deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId)
+        continue;
+      const auto *owner = runtime->observations.observation(unit.runtime_unit_id.value());
+      Require(owner && owner->process_presence() == component_manager::ProcessPresenceState::kPresent &&
+                  !owner->runtime_epoch().empty(),
+              "component bring-up preflight requires its actual shared host process");
+      const component_manager::ManagerComponentBringUpInspectionRequestDTO request{
+          candidate_projection,
+          core::ContentDigest(content_identity::sha256_digest(candidate.canonical_bytes())),
+          candidate.canonical_bytes().size(), active.active_publication.request.candidate_projection_revision,
+          active.active_publication.publication_generation,
+          active.active_publication.durable_public_pointer_content_digest,
+          unit.runtime_unit_id, core::RuntimeEpoch(owner->runtime_epoch()), manager_runtime_epoch_};
+      const auto inspected = native_runtime_adapter_.InspectComponentBringUp(request);
+      if (!inspected.ok())
+        throw std::runtime_error("component bring-up preflight [" + inspected.error().code + "]: " + inspected.error().message);
+      Require(inspected.value().valid() && inspected.value().request == request,
+              "component bring-up preflight returned a foreign request");
+      OriginalConfiguredBringUpInput original{
+          request, {}, inspected.value().configured_components};
+      std::set<core::ControllableComponentId> expected;
+      for (const auto &component : graph.controllable_components)
+        if (std::find(component.runtime_unit_ids.begin(), component.runtime_unit_ids.end(), unit.runtime_unit_id) != component.runtime_unit_ids.end())
+          expected.insert(component.controllable_component_id);
+      CanonicalValue::Array rows;
+      for (const auto &component : inspected.value().configured_components) {
+        Require(expected.erase(component.controllable_component_id) == 1U &&
+                    observed_components.insert(component.controllable_component_id).second,
+                "component bring-up preflight membership differs from the verified candidate");
+        Require(component.process_presence != component_manager::ProcessPresenceState::kUnknown,
+                "component bring-up preflight cannot classify an unknown process owner");
+        const bool needed = component.process_presence == component_manager::ProcessPresenceState::kAbsent;
+        if (needed) {
+          needed_components.insert(component.controllable_component_id);
+          original.needed_components.push_back(component.controllable_component_id);
+        }
+        rows.emplace_back(CanonicalValue::Object{
+            {"controllable_component_id", CanonicalValue(component.controllable_component_id.value())},
+            {"process_presence", CanonicalValue(needed ? "absent" : "present")}});
+      }
+      Require(expected.empty(), "component bring-up preflight omitted configured candidate components");
+      if (original_inputs && !original.needed_components.empty())
+        original_inputs->push_back(std::move(original));
+      observations.emplace_back(CanonicalValue::Object{
+          {"runtime_unit_id", CanonicalValue(unit.runtime_unit_id.value())},
+          {"runtime_epoch", CanonicalValue(owner->runtime_epoch())},
+          {"manager_runtime_epoch", CanonicalValue(manager_runtime_epoch_.value())},
+          {"components", CanonicalValue(std::move(rows))}});
+    }
+    Require(observed_components.size() == graph.controllable_components.size(),
+            "component bring-up preflight has no complete actual process inventory");
+    Require(plan_source_.ReadCurrentPlan().active_publication == active.active_publication &&
+                scene_owner_.CurrentProjectionRevision() == current_scene,
+            "component bring-up preflight current publication or Scene changed");
+    CanonicalValue::Array needed;
+    for (const auto &component : needed_components) needed.emplace_back(component.value());
+    auto object = std::get<CanonicalValue::Object>(impact.storage());
+    object.emplace_back("bring_up_components", CanonicalValue(std::move(needed)));
+    object.emplace_back("bring_up_required", CanonicalValue(!needed_components.empty()));
+    object.emplace_back("bring_up_process_observations", CanonicalValue(std::move(observations)));
+    return CanonicalValue(std::move(object));
+  }
+
+  component_manager::ManagerApplyBringUpPlanDTO BuildOriginalBringUpPlan(
+      const std::vector<OriginalConfiguredBringUpInput> &inputs,
+      const component_manager::ManagerApplyIntentDTO &intent,
+      const deployment::RetainedBundle &predecessor,
+      const deployment::RetainedBundle &candidate,
+      const component_manager::ManagerActiveRuntimePlanDTO &active,
+      const core::RequestAttributionDTO &attribution) {
+    const auto &head = active.active_publication;
+    const auto &graph = candidate.value().cell_graph;
+    Require(!inputs.empty() &&
+                intent.expected_admission_generation.has_value() &&
+                !intent.parent_authoring_claim &&
+                predecessor.retained_bundle_id() ==
+                    head.request.candidate_retained_bundle_id &&
+                intent.expected_active_projection_revision.retained_bundle_id ==
+                    head.request.candidate_retained_bundle_id &&
+                intent.expected_active_projection_revision.graph_revision ==
+                    head.request.candidate_graph_revision &&
+                plan_source_.ReadCurrentPlan().active_publication == head,
+            "original bring-up plan lost its exact predecessor publication");
+    const core::ProjectionRevisionDTO target{
+        candidate.retained_bundle_id(), graph.graph_revision,
+        intent.expected_active_projection_revision.scene_revision};
+    const core::ContentDigest digest(
+        content_identity::sha256_digest(candidate.canonical_bytes()));
+    std::vector<component_manager::ManagerApplyBringUpChildRequestDTO> children;
+    for (const auto &input : inputs) {
+      Require(input.request.candidate_projection_revision == target &&
+                  input.request.candidate_retained_bundle_digest == digest &&
+                  input.request.candidate_retained_bundle_bytes ==
+                      candidate.canonical_bytes().size() &&
+                  input.request.predecessor_projection_revision ==
+                      head.request.candidate_projection_revision &&
+                  input.request.expected_predecessor_publication_generation ==
+                      head.publication_generation &&
+                  input.request.expected_predecessor_public_pointer_digest ==
+                      head.durable_public_pointer_content_digest,
+              "original bring-up input differs from captured Apply products");
+      for (const auto &component_id : input.needed_components) {
+        auto request = input.request;
+        request.planning_component_id = component_id;
+        const auto inspected =
+            native_runtime_adapter_.InspectComponentBringUp(request);
+        if (!inspected.ok())
+          throw std::runtime_error("original component planning [" +
+                                   inspected.error().code + "]: " +
+                                   inspected.error().message);
+        Require(inspected.value().valid() &&
+                    inspected.value().request == request &&
+                    inspected.value().configured_components == input.configured_components &&
+                    inspected.value().planning_facts &&
+                    inspected.value().planning_facts->component_id == component_id,
+                "original component planning returned foreign owner facts");
+        const auto &facts = *inspected.value().planning_facts;
+        const auto row = std::find_if(
+            inspected.value().configured_components.begin(),
+            inspected.value().configured_components.end(), [&](const auto &value) {
+              return value.controllable_component_id == component_id;
+            });
+        Require(row != inspected.value().configured_components.end() &&
+                    row->process_presence ==
+                        component_manager::ProcessPresenceState::kAbsent,
+                "acknowledged component bring-up inventory changed");
+        const auto &selection = facts.generation_selection;
+        const auto expected_generation = selection.predecessor_generation
+            ? *selection.predecessor_generation
+            : selection.owner_qualified_predecessor
+                  ? selection.owner_qualified_predecessor->generation
+                  : core::ComponentLifecycleGeneration(0U);
+        core::ComponentLifecycleIntentDTO child_intent{
+            {core::RequestId(RandomToken("apply-child.")), facts.owner_epoch,
+             intent.request_context.source_label,
+             intent.request_context.correlation_id},
+            component_id, facts.next_intent,
+            intent.expected_active_projection_revision.graph_revision,
+            expected_generation, facts.candidate_expected_domains, std::nullopt,
+            attribution, *intent.expected_admission_generation, std::nullopt,
+            selection};
+        children.push_back({std::move(child_intent), target, digest,
+                            candidate.canonical_bytes().size(), request.runtime_unit_id,
+                            request.runtime_epoch, request.manager_runtime_epoch});
+      }
+    }
+    std::sort(children.begin(), children.end(), [](const auto &left, const auto &right) {
+      return left.intent.controllable_component_id <
+             right.intent.controllable_component_id;
+    });
+    const component_manager::ManagerApplyPrivateMaterializationDTO materialization{
+        target.scene_revision.content_hash, intent.apply_id, intent.apply_generation,
+        target, digest, candidate.canonical_bytes().size()};
+    const core::ActiveBundlePublicationRequestDTO publication{
+        core::NamedApplyPublicationTransactionDTO{intent.apply_id, intent.apply_generation},
+        target, target.retained_bundle_id, target.graph_revision,
+        head.publication_generation,
+        component_manager::ComputeManagerApplyPrivateMaterializationDigest(materialization)};
+    component_manager::ManagerApplyBringUpPlanDTO plan{
+        intent.apply_id, intent.apply_generation,
+        component_manager::ComputeManagerApplyIntentDigest(intent), {},
+        std::move(children), publication, head.durable_public_pointer_content_digest};
+    for (const auto &component : graph.controllable_components)
+      plan.configured_components.push_back(component.controllable_component_id);
+    std::sort(plan.configured_components.begin(), plan.configured_components.end());
+    Require(plan.valid() &&
+                plan_source_.ReadCurrentPlan().active_publication == head &&
+                scene_owner_.CurrentProjectionRevision() ==
+                    intent.expected_active_projection_revision,
+            "original bring-up plan lost its exact current owner inputs");
+    return plan;
   }
 
   PublicationGenerations PublishActiveRuntime(
@@ -3026,19 +3709,23 @@ private:
         0U,
         publication_generation,
     };
-    if (scene_runtime_owner_.Snapshot().initialization_generation == 0U) {
-      scene_runtime_owner_.EstablishOpenRuntime(
-          desired_scene_runtime, publication_generation,
-          "durable_finalized_active_projection");
-    } else {
-      const auto changed = scene_runtime_owner_.AdoptFinalizedOpenRuntime(
-          desired_scene_runtime, publication_generation,
-          "durable_finalized_active_projection");
-      if (changed) {
-        pose_observer_sessions_.clear();
-        pose_observation_replays_.clear();
+    {
+      std::lock_guard source_lock(manager_source_mutex_);
+      if (scene_runtime_owner_.Snapshot().initialization_generation == 0U) {
+        scene_runtime_owner_.EstablishOpenRuntime(
+            desired_scene_runtime, publication_generation,
+            "durable_finalized_active_projection");
+      } else {
+        const auto changed = scene_runtime_owner_.AdoptFinalizedOpenRuntime(
+            desired_scene_runtime, publication_generation,
+            "durable_finalized_active_projection");
+        if (changed) {
+          pose_observer_sessions_.clear();
+          pose_observation_replays_.clear();
+        }
       }
     }
+    ReconcileManagedPoseObserver(runtime, *active_bundle);
     const auto manager = [&] {
       // One lock spans the journal read, the build and the write, so every
       // Manager source value pairs one active publication with the Apply
@@ -3048,7 +3735,7 @@ private:
           "component_manager", manager_owner_id_, manager_owner_epoch_,
           observed_at,
           BuildManagerSourcePayload(
-              *active_bundle, runtime, stores_.apply_journal(),
+              *active_bundle, admission_, runtime, stores_.apply_journal(),
               stores_.apply_journal().ReadStatusInventory(),
               kernel_apply_available
                   ? ManagerApplyMutationAvailability::kAvailable
@@ -3692,12 +4379,71 @@ private:
   }
 
   std::uint64_t PublishSceneRuntime(const std::int64_t observed_at) {
+    auto payload = BuildSceneRuntimeSourcePayload(
+        admission_.cell_id().value(), scene_runtime_owner_.Snapshot());
+    {
+      std::lock_guard lock(manager_source_mutex_);
+      if (managed_pose_observer_expectation_) {
+        const auto &expected = *managed_pose_observer_expectation_;
+        const auto &observation = expected.observation;
+        const bool present =
+            expected.inspection_current && observation &&
+            observation->process_presence ==
+                component_manager::ProcessPresenceState::kPresent;
+        const auto availability = !expected.available ? "unavailable"
+                                  : present           ? "available"
+                                  : !observation      ? "pending"
+                                                      : "unknown";
+        CanonicalValue exit(nullptr);
+        if (observation && observation->exit) {
+          const auto &fact = *observation->exit;
+          exit = CanonicalValue(CanonicalValue::Object{
+              {"pid", CanonicalValue(static_cast<double>(fact.pid))},
+              {"exit_status",
+               fact.exit_status
+                   ? CanonicalValue(static_cast<double>(*fact.exit_status))
+                   : CanonicalValue(nullptr)},
+              {"signal", fact.signal
+                             ? CanonicalValue(static_cast<double>(*fact.signal))
+                             : CanonicalValue(nullptr)},
+              {"core_dumped", CanonicalValue(fact.core_dumped)},
+              {"observed_utc", CanonicalValue(fact.observed_utc)},
+              {"detected_at_ns", content_identity::nonnegative_int64_value(
+                                     fact.detected_at_ns)}});
+        }
+        auto object = std::get<CanonicalValue::Object>(payload.storage());
+        object.emplace_back(
+            "cell_observer",
+            CanonicalValue(CanonicalValue::Object{
+                {"cell_id", CanonicalValue(admission_.cell_id().value())},
+                {"source_id", CanonicalValue(expected.launch_facts.source_id)},
+                {"source_epoch_base",
+                 CanonicalValue(expected.launch_facts.source_epoch_base)},
+                {"availability", CanonicalValue(availability)},
+                {"observation_current",
+                 CanonicalValue(expected.inspection_current)},
+                {"process_presence",
+                 observation
+                     ? CanonicalValue(std::string(component_manager::ToString(
+                           observation->process_presence)))
+                     : CanonicalValue("unknown")},
+                {"exit", std::move(exit)},
+                {"incident_id", observation && observation->incident_id
+                                    ? CanonicalValue(*observation->incident_id)
+                                    : CanonicalValue(nullptr)},
+                {"incident_persistence",
+                 CanonicalValue(static_cast<double>(
+                     observation
+                         ? observation->incident_persistence
+                         : component_manager::
+                               ManagerCellObserverIncidentPersistenceDTO::
+                                   kUnknown))}}));
+        payload = CanonicalValue(std::move(object));
+      }
+    }
     return scene_runtime_channel_
-        .Publish(
-            "scene_runtime", scene_runtime_owner_id_,
-            scene_runtime_owner_epoch_, observed_at,
-            BuildSceneRuntimeSourcePayload(admission_.cell_id().value(),
-                                           scene_runtime_owner_.Snapshot()))
+        .Publish("scene_runtime", scene_runtime_owner_id_,
+                 scene_runtime_owner_epoch_, observed_at, std::move(payload))
         .source_generation;
   }
 
@@ -3723,7 +4469,7 @@ private:
               "component_manager", manager_owner_id_, manager_owner_epoch_,
               observed_at,
               BuildManagerSourcePayload(
-                  *last_active_bundle_, *last_runtime_,
+                  *last_active_bundle_, admission_, *last_runtime_,
                   stores_.apply_journal(), apply_inventory,
                   kernel_apply_available_
                       ? ManagerApplyMutationAvailability::kAvailable
@@ -3750,6 +4496,37 @@ private:
       // readiness closed and leave ordinary active reconciliation alone.
       if (HasIncompleteApply()) {
         TrySubmitFailClosedReadiness();
+        std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>
+            runtime;
+        std::shared_ptr<const deployment::RetainedBundle> bundle;
+        {
+          std::lock_guard source_lock(manager_source_mutex_);
+          if (managed_pose_observer_expectation_) {
+            managed_pose_observer_expectation_->inspection_current = false;
+            runtime = last_runtime_;
+            bundle = last_active_bundle_;
+          }
+        }
+        // Read only the independent cell occurrence while component Apply
+        // remains excluded. Inspect never spans the Manager source lock and
+        // cannot converge or restart a process. Its exact identity checks
+        // leave a changed publication unknown while preserving known loss.
+        if (runtime && bundle) {
+          try {
+            static_cast<void>(ReconcileManagedPoseObserver(*runtime, *bundle));
+          } catch (...) {
+            // Publish current observation uncertainty through the existing
+            // Scene path before the ordinary fail-closed handler reports it.
+            try {
+              static_cast<void>(
+                  PublishSceneRuntime(static_cast<std::int64_t>(ElapsedNs())));
+            } catch (...) {
+              // Preserve the first inspection failure if publication also
+              // fails; the ordinary handler keeps readiness closed.
+            }
+            throw;
+          }
+        }
         TryPublishApplyTransition();
         RequestApplyProgress();
         return;
@@ -3890,7 +4667,7 @@ private:
           "component_manager", manager_owner_id_, manager_owner_epoch_,
           static_cast<std::int64_t>(ElapsedNs()),
           BuildManagerSourcePayload(
-              *last_active_bundle_, *last_runtime_, stores_.apply_journal(),
+              *last_active_bundle_, admission_, *last_runtime_, stores_.apply_journal(),
               apply_inventory,
               ManagerApplyMutationAvailability::kFullStackRestartRequired)));
     } catch (const std::exception &publication_error) {
@@ -3980,7 +4757,7 @@ private:
       return core::Result<BeforePlanningLatchResult>::Err(core::ErrorDTO{
           std::move(code), std::move(message), std::move(details)});
     };
-    const auto owner = scene_runtime_owner_.Snapshot();
+    auto owner = scene_runtime_owner_.Snapshot();
     if (owner.state != SceneInitializationState::kOpen ||
         !owner.runtime_identity.has_value() ||
         *owner.runtime_identity != runtime_identity) {
@@ -4017,18 +4794,144 @@ private:
           "scene-runtime identity has no exact verified active bundle");
     }
 
+    std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>
+        runtime;
+    std::optional<ManagedIsaacPoseObserverExpectation> expected;
+    {
+      std::lock_guard lock(manager_source_mutex_);
+      runtime = last_runtime_;
+      expected = managed_pose_observer_expectation_;
+    }
+    bool observed_available = true;
+    if (expected) {
+      observed_available =
+          runtime && ReconcileManagedPoseObserver(*runtime, *bundle);
+      owner = scene_runtime_owner_.Snapshot();
+      {
+        std::lock_guard lock(manager_source_mutex_);
+        expected = managed_pose_observer_expectation_;
+      }
+      if (!owner.runtime_identity ||
+          *owner.runtime_identity != runtime_identity)
+        return failure("scene_runtime_identity_changed",
+                       "runtime changed during observer inspection");
+    }
+    std::map<std::string, PoseObserverSession> sessions;
+    std::map<PoseObservationKey, PoseObservationReplay> replays;
+    bool requires_managed_source = false;
+    {
+      std::lock_guard lock(manager_source_mutex_);
+      sessions = pose_observer_sessions_;
+      replays = pose_observation_replays_;
+    }
+    if (expected) {
+      for (const auto &binding : expected->bindings) {
+        if (!binding.eligible)
+          continue;
+        core::SceneObjectStateDTO object{
+            core::SceneResourceId(binding.object_id), false, false,
+            std::nullopt, std::nullopt};
+        try {
+          object = scene_owner_.GetObjectState(
+              core::SceneResourceId(binding.object_id));
+        } catch (const std::exception &error) {
+          return failure("scene_runtime_pose_scene_unavailable", error.what());
+        }
+        if (!object.exists || object.attached)
+          continue;
+        const PoseObservationKey key{expected->launch_facts.source_id,
+                                     binding.object_id, binding.policy_id};
+        bool depends_on_source = binding.policy_id == "before_planning";
+        if (binding.policy_id == "continuous_unattached" &&
+            object.provider_evidence) {
+          const auto origin = expected->provider_origins.find(key);
+          depends_on_source =
+              origin != expected->provider_origins.end() &&
+              object.provider_evidence->provider_instance_id ==
+                  origin->second.provider_instance_id &&
+              object.provider_evidence->provider_manifest_id ==
+                  origin->second.provider_manifest_id &&
+              object.provider_evidence->provider_manifest_revision ==
+                  origin->second.provider_manifest_revision &&
+              object.provider_evidence->provider_source_epoch ==
+                  origin->second.provider_source_epoch;
+        }
+        if (!depends_on_source)
+          continue;
+        requires_managed_source = true;
+        if (!expected->available || !observed_available)
+          return failure(
+              "scene_runtime_pose_source_unavailable",
+              "configured observer cannot provide fresh planning evidence",
+              {{"source_id", key.source_id}, {"object_id", key.object_id}});
+        const auto session = sessions.find(key.source_id);
+        if (session == sessions.end() ||
+            session->second.runtime_identity != runtime_identity ||
+            !expected->launch_facts.accepts_source_epoch(
+                session->second.source_epoch))
+          return failure(
+              "scene_runtime_pose_observation_missing",
+              "required configured binding has no current observer session",
+              {{"source_id", key.source_id}, {"object_id", key.object_id}});
+        const auto observation =
+            std::find_if(owner.pose_sources.begin(), owner.pose_sources.end(),
+                         [&](const PoseSourceLifetimeSnapshot &pose) {
+                           return pose.observation.key == key;
+                         });
+        if (observation == owner.pose_sources.end() || !observation->fresh ||
+            observation->buffered || !observation->observation.eligible ||
+            observation->observation.quality != PoseSourceQuality::kGood ||
+            observation->observation.source_epoch !=
+                session->second.source_epoch ||
+            observation->observation.source_epoch_order !=
+                session->second.source_epoch_order)
+          return failure(
+              "scene_runtime_pose_observation_stale",
+              "source-dependent planning requires a fresh current-runtime "
+              "observation",
+              {{"source_id", key.source_id}, {"object_id", key.object_id}});
+        if (binding.policy_id == "continuous_unattached") {
+          const auto replay = replays.find(key);
+          if (replay == replays.end() ||
+              replay->second.runtime_identity != runtime_identity ||
+              replay->second.observation != observation->observation ||
+              !replay->second.application ||
+              (replay->second.application->status !=
+                   SceneRuntimePoseApplicationStatus::kCommitted &&
+               replay->second.application->status !=
+                   SceneRuntimePoseApplicationStatus::kAlreadyApplied &&
+               replay->second.application->status !=
+                   SceneRuntimePoseApplicationStatus::kFreshnessConfirmed) ||
+              !object.provider_evidence ||
+              object.provider_evidence->provider_source_sequence !=
+                  observation->observation.source_sequence)
+            return failure(
+                "scene_runtime_pose_observation_unretained",
+                "continuous planning evidence has no successful exact pose "
+                "application",
+                {{"source_id", key.source_id}, {"object_id", key.object_id}});
+        }
+      }
+    }
+
     struct LatchCandidate final {
       PoseObservationReplay *replay{};
       PoseSourceObservation observation;
     };
     std::vector<LatchCandidate> candidates;
-    for (const auto &[source_id, session] : pose_observer_sessions_) {
+    for (const auto &[source_id, session] : sessions) {
       if (session.runtime_identity != runtime_identity) {
         continue;
       }
       for (const auto &binding : session.bindings) {
         if (!binding.eligible || binding.policy_id != "before_planning") {
           continue;
+        }
+        if (expected && source_id == expected->launch_facts.source_id) {
+          const auto object = scene_owner_.GetObjectState(
+              core::SceneResourceId(binding.object_id));
+          if (object.attached)
+            continue;
         }
         const PoseObservationKey key{source_id, binding.object_id,
                                      binding.policy_id};
@@ -4055,8 +4958,8 @@ private:
               "before-planning pose source has no fresh eligible observation",
               {{"object_id", binding.object_id}, {"source_id", source_id}});
         }
-        const auto replay = pose_observation_replays_.find(key);
-        if (replay == pose_observation_replays_.end() ||
+        const auto replay = replays.find(key);
+        if (replay == replays.end() ||
             replay->second.runtime_identity != runtime_identity ||
             replay->second.observation != observed->observation) {
           return failure(
@@ -4079,11 +4982,20 @@ private:
       const auto generation =
           PublishSceneRuntime(static_cast<std::int64_t>(ElapsedNs()));
       result.scene_runtime_source_generation = generation;
+      std::lock_guard lock(manager_source_mutex_);
       for (auto *const record : applied_records) {
         record->publication_generation = generation;
+        if (PoseReplayIsCurrentLocked(*record))
+          pose_observation_replays_.at(record->observation.key) = *record;
       }
     };
     for (auto &candidate : candidates) {
+      {
+        std::lock_guard lock(manager_source_mutex_);
+        if (!PoseReplayIsCurrentLocked(*candidate.replay))
+          return failure("scene_runtime_observer_session_stale",
+                         "observer session changed before pose latching");
+      }
       // The retained application lets an already confirmed exact
       // observation be reported again without a second confirmation.
       auto application = scene_runtime_pose_projector_.Apply(
@@ -4125,7 +5037,19 @@ private:
             "scene_runtime_pose_latch_result_invalid",
             "before-planning pose projector returned a non-latched status");
       }
-      candidate.replay->application = application.value();
+      {
+        std::lock_guard lock(manager_source_mutex_);
+        if (!PoseReplayIsCurrentLocked(*candidate.replay))
+          return failure("scene_runtime_observer_session_stale",
+                         "observer session changed during pose latching");
+        candidate.replay->application = application.value();
+        candidate.replay->publication_generation.reset();
+        pose_observation_replays_.at(candidate.observation.key) =
+            *candidate.replay;
+      }
+      if (application.value().status !=
+          SceneRuntimePoseApplicationStatus::kSkippedAttached)
+        RetainManagedPoseProviderOrigin(candidate.observation);
       candidate.replay->publication_generation.reset();
       applied_records.push_back(candidate.replay);
       ++result.latched_observation_count;
@@ -4137,6 +5061,23 @@ private:
       return failure(
           "scene_runtime_pose_projection_changed",
           "logical-scene projection changed while pose latching completed");
+    }
+    {
+      std::lock_guard lock(manager_source_mutex_);
+      const auto current = scene_runtime_owner_.Snapshot();
+      const auto facts = [](const auto &value) {
+        return value
+            ? std::optional<component_manager::ManagerIsaacPoseObserverLaunchFactsDTO>(
+                  value->launch_facts)
+            : std::nullopt;
+      };
+      if (!current.runtime_identity ||
+          *current.runtime_identity != runtime_identity ||
+          (requires_managed_source &&
+           (facts(expected) != facts(managed_pose_observer_expectation_) ||
+            !managed_pose_observer_expectation_->available)))
+        return failure("scene_runtime_observer_session_stale",
+                       "runtime or managed source changed during pose latching");
     }
     return core::Result<BeforePlanningLatchResult>::Ok(std::move(result));
   }
@@ -4381,6 +5322,9 @@ private:
                     "equal to its summary"));
             return false;
           }
+          std::optional<ManagedIsaacPoseObserverExpectation>
+              original_checked_observer;
+          std::optional<SceneRuntimeIdentity> original_initial_observer_runtime;
           if (!existing.has_value()) {
             if (std::find(deployment_candidate_receipts_.begin(),
                           deployment_candidate_receipts_.end(),
@@ -4430,7 +5374,7 @@ private:
                                              host_continuity.error()));
               return false;
             }
-            const auto impact = DeploymentApplyImpact(
+            auto impact = DeploymentApplyImpact(
                 *current_bundle, *candidate_bundle, config_.activation_root,
                 candidate_receipt.prepared_activation_id);
             if (DeploymentApplyImpactDigest(impact) !=
@@ -4447,33 +5391,64 @@ private:
               TrySendResponse(
                   client.get(),
                   ApplyErrorResponse(command, "confirmation_required",
-                                     "Deployment Apply removes or replaces "
-                                     "components or leaves the Program "
-                                     "non-executable; accept its exact "
-                                     "impact digest"));
+                                     "Deployment Apply impact requires acknowledgment "
+                                     "of its exact preview digest"));
               return false;
+            }
+            original_checked_observer = CaptureOriginalApplyPoseObserver(
+                *current_bundle, *candidate_bundle);
+            if (original_checked_observer) {
+              std::lock_guard source_lock(manager_source_mutex_);
+              if (!managed_pose_observer_expectation_) {
+                original_initial_observer_runtime =
+                    scene_runtime_owner_.Snapshot().runtime_identity;
+                Require(original_initial_observer_runtime.has_value(),
+                        "initial Apply observer has no current Scene runtime");
+              }
             }
           }
           const auto candidate_retained_bundle_id =
               existing.has_value()
                   ? existing->intent.candidate_retained_bundle_id
                   : candidate_receipt.candidate_retained_bundle_id;
-          const auto result = named_apply_.AcceptOrReplay({
-              core::PublicRequestContextDTO{
-                  core::RequestId(*command.request_id),
-                  core::RequestOwnerEpoch(*command.request_owner_epoch),
-                  *command.source_label,
-                  command.correlation_id,
+          // Q106: configuration Apply never creates/advances lifecycle children.
+          // The old producer remains unwired until the post-M deletion inventory.
+          component_manager::ManagerNamedApplyCoordinator::
+              OriginalPrepareAcknowledgement original_prepare_acknowledgement;
+          if (!existing && original_initial_observer_runtime) {
+            original_prepare_acknowledgement =
+                [this, checked = *original_checked_observer,
+                 expected_runtime = *original_initial_observer_runtime](
+                    const auto &intent, const auto &candidate,
+                    const auto &prepared) {
+                  ActivateInitialApplyPoseObserver(checked, expected_runtime,
+                                                   intent, candidate, prepared);
+                };
+          }
+          const auto result = named_apply_.AcceptOrReplay(
+              {
+                  core::PublicRequestContextDTO{
+                      core::RequestId(*command.request_id),
+                      core::RequestOwnerEpoch(*command.request_owner_epoch),
+                      *command.source_label,
+                      command.correlation_id,
+                  },
+                  *command.deployment_artifact_id,
+                  *command.deployment_revision,
+                  *command.expected_current_retained_bundle_id,
+                  *command.expected_current_graph_revision,
+                  candidate_retained_bundle_id,
+                  *command.prepared_activation,
+                  command.expected_admission_generation,
+                  command.parent_authoring_claim,
+                  existing.has_value()
+                      ? existing->intent.isaac_pose_observer_launch_facts
+                  : original_checked_observer
+                      ? std::optional(original_checked_observer->launch_facts)
+                      : std::nullopt,
               },
-              *command.deployment_artifact_id,
-              *command.deployment_revision,
-              *command.expected_current_retained_bundle_id,
-              *command.expected_current_graph_revision,
-              candidate_retained_bundle_id,
-              *command.prepared_activation,
-              command.expected_admission_generation,
-              command.parent_authoring_claim,
-          });
+              {},
+              std::move(original_prepare_acknowledgement));
           TrySendResponse(client.get(), ApplyResponse(command, result));
           if (result.state ==
               component_manager::ManagerNamedApplyResultState::kPending) {
@@ -4635,10 +5610,12 @@ private:
                     command.pose_source_epoch.has_value() &&
                     !command.pose_observer_bindings.empty(),
                 "decoded scene-runtime observer open lacks identity");
+        std::unique_lock source_lock(manager_source_mutex_);
         const auto snapshot = scene_runtime_owner_.Snapshot();
         if (!snapshot.runtime_identity.has_value() ||
             *snapshot.runtime_identity !=
                 *command.expected_scene_runtime_identity) {
+          source_lock.unlock();
           TrySendResponse(
               client.get(),
               ErrorResponse(
@@ -4646,9 +5623,17 @@ private:
                   "scene-runtime observer targets an inactive runtime"));
           return false;
         }
+        if (!ManagedPoseObserverCommandMatchesLocked(command, true)) {
+          source_lock.unlock();
+          TrySendResponse(client.get(),
+              ErrorResponse("scene_runtime_observer_session_stale",
+                            "managed observer Open differs from its checked source, bindings or current base"));
+          return false;
+        }
         auto found = pose_observer_sessions_.find(*command.pose_source_id);
         if (found == pose_observer_sessions_.end() &&
             pose_observer_sessions_.size() >= kMaximumPoseObserverSessions) {
+          source_lock.unlock();
           TrySendResponse(
               client.get(),
               ErrorResponse("scene_runtime_observer_capacity_exhausted",
@@ -4660,6 +5645,7 @@ private:
           if (found->second.runtime_identity == *snapshot.runtime_identity &&
               found->second.source_epoch == *command.pose_source_epoch) {
             if (found->second.bindings != command.pose_observer_bindings) {
+              source_lock.unlock();
               TrySendResponse(
                   client.get(),
                   ErrorResponse(
@@ -4671,6 +5657,7 @@ private:
             source_epoch_order = found->second.source_epoch_order;
           } else {
             if (found->second.source_epoch_order >= 9007199254740991ULL) {
+              source_lock.unlock();
               TrySendResponse(
                   client.get(),
                   ErrorResponse("scene_runtime_observer_epoch_exhausted",
@@ -4696,6 +5683,7 @@ private:
                   return other.eligible && other.object_id == binding.object_id;
                 });
             if (conflict != other_session.bindings.end()) {
+              source_lock.unlock();
               TrySendResponse(
                   client.get(),
                   ErrorResponse(
@@ -4711,6 +5699,7 @@ private:
             PoseObserverSession{*snapshot.runtime_identity,
                                 *command.pose_source_epoch, source_epoch_order,
                                 command.pose_observer_bindings});
+        source_lock.unlock();
         TrySendResponse(client.get(),
                         SceneRuntimeObserverOpenResponse(
                             admission_.cell_id().value(),
@@ -4731,10 +5720,12 @@ private:
                     command.pose_eligible.has_value() &&
                     command.pose_payload.has_value(),
                 "decoded scene-runtime observation is incomplete");
+        std::unique_lock source_lock(manager_source_mutex_);
         const auto snapshot = scene_runtime_owner_.Snapshot();
         if (!snapshot.runtime_identity.has_value() ||
             *snapshot.runtime_identity !=
                 *command.expected_scene_runtime_identity) {
+          source_lock.unlock();
           TrySendResponse(
               client.get(),
               ErrorResponse(
@@ -4742,11 +5733,19 @@ private:
                   "pose observation targets an inactive scene runtime"));
           return false;
         }
+        if (!ManagedPoseObserverCommandMatchesLocked(command, false)) {
+          source_lock.unlock();
+          TrySendResponse(client.get(),
+              ErrorResponse("scene_runtime_observer_session_stale",
+                            "managed observation names an obsolete source epoch base"));
+          return false;
+        }
         const auto session =
             pose_observer_sessions_.find(*command.pose_source_id);
         if (session == pose_observer_sessions_.end() ||
             session->second.runtime_identity != *snapshot.runtime_identity ||
             session->second.source_epoch != *command.pose_source_epoch) {
+          source_lock.unlock();
           TrySendResponse(client.get(),
                           ErrorResponse("scene_runtime_observer_session_stale",
                                         "pose observation does not match the "
@@ -4763,6 +5762,7 @@ private:
             (*command.pose_eligible && !declared->eligible) ||
             (*command.pose_eligible &&
              *command.pose_quality != PoseSourceQuality::kGood)) {
+          source_lock.unlock();
           TrySendResponse(
               client.get(),
               ErrorResponse(
@@ -4774,7 +5774,7 @@ private:
                                                  *command.pose_object_id,
                                                  *command.pose_policy_id};
         auto replay = pose_observation_replays_.find(observation_key);
-        PoseObservationReplay *record = nullptr;
+        std::optional<PoseObservationReplay> retained;
         if (replay != pose_observation_replays_.end() &&
             replay->second.observation.source_epoch_order ==
                 session->second.source_epoch_order &&
@@ -4790,6 +5790,7 @@ private:
               exact_record.observation.eligible == *command.pose_eligible &&
               exact_record.observation.payload == *command.pose_payload;
           if (!exact) {
+            source_lock.unlock();
             TrySendResponse(
                 client.get(),
                 ErrorResponse("scene_runtime_observation_request_conflict",
@@ -4797,23 +5798,12 @@ private:
                               "changed intent"));
             return false;
           }
-          record = &replay->second;
-          if (record->application.has_value()) {
-            if (!record->publication_generation.has_value()) {
-              record->publication_generation =
-                  PublishSceneRuntime(static_cast<std::int64_t>(ElapsedNs()));
-            }
-            TrySendResponse(client.get(),
-                            SceneRuntimeObserveResponse(
-                                record->observation, record->acceptance,
-                                *record->application,
-                                *record->publication_generation));
-            return false;
-          }
+          retained = replay->second;
         } else {
           const auto observed_at = HostMonotonicNs();
           if (observed_at < 0 || *command.pose_lifetime_ns > static_cast<std::uint64_t>(
                   std::numeric_limits<std::int64_t>::max() - observed_at)) {
+            source_lock.unlock();
             TrySendResponse(
                 client.get(),
                 ErrorResponse(
@@ -4839,38 +5829,80 @@ private:
                                     *command.pose_lifetime_ns, observation,
                                     acceptance, std::nullopt, std::nullopt});
           static_cast<void>(inserted);
-          record = &stored->second;
+          retained = stored->second;
         }
-        Require(record != nullptr,
+        Require(retained.has_value(),
                 "pose observation replay record was not retained");
-        const auto application = ResolvePoseApplication(
-            record->runtime_identity, record->observation, record->acceptance);
-        if (!application.ok()) {
-          if (!record->publication_generation.has_value()) {
-            record->publication_generation =
-                PublishSceneRuntime(static_cast<std::int64_t>(ElapsedNs()));
+        source_lock.unlock();
+        auto &record = *retained;
+        const bool applied_now = !record.application;
+        if (!record.application) {
+          const auto application = ResolvePoseApplication(
+              record.runtime_identity, record.observation, record.acceptance);
+          if (application.ok())
+            record.application = application.value();
+          {
+            std::lock_guard lock(manager_source_mutex_);
+            if (PoseReplayIsCurrentLocked(record)) {
+              pose_observation_replays_.at(record.observation.key) = record;
+            }
           }
+          if (!application.ok()) {
+            if (!record.publication_generation)
+              record.publication_generation = PublishSceneRuntime(
+                  static_cast<std::int64_t>(ElapsedNs()));
+            {
+              std::lock_guard lock(manager_source_mutex_);
+              if (PoseReplayIsCurrentLocked(record))
+                pose_observation_replays_.at(record.observation.key) = record;
+            }
+            TrySendResponse(client.get(),
+                            ErrorResponse(application.error().code,
+                                          application.error().message));
+            return false;
+          }
+        }
+        bool current = false;
+        {
+          std::lock_guard lock(manager_source_mutex_);
+          current = PoseReplayIsCurrentLocked(record);
+        }
+        if (!current) {
           TrySendResponse(client.get(),
-                          ErrorResponse(application.error().code,
-                                        application.error().message));
+                          ErrorResponse("scene_runtime_observer_session_stale",
+                                        "observer session changed during pose application"));
           return false;
         }
-        record->application = application.value();
-        // Only a committed transaction changes the logical scene; a
-        // freshness confirmation republishes the runtime source alone.
-        if (record->application->status ==
-            SceneRuntimePoseApplicationStatus::kCommitted) {
+        if (applied_now && (record.application->status ==
+                SceneRuntimePoseApplicationStatus::kCommitted ||
+            record.application->status ==
+                SceneRuntimePoseApplicationStatus::kAlreadyApplied ||
+            record.application->status ==
+                SceneRuntimePoseApplicationStatus::kFreshnessConfirmed))
+          RetainManagedPoseProviderOrigin(record.observation);
+        if (applied_now && record.application->status ==
+            SceneRuntimePoseApplicationStatus::kCommitted)
           TryPublishLogicalScene();
-        }
-        if (!record->publication_generation.has_value()) {
-          record->publication_generation =
+        if (!record.publication_generation)
+          record.publication_generation =
               PublishSceneRuntime(static_cast<std::int64_t>(ElapsedNs()));
+        {
+          std::lock_guard lock(manager_source_mutex_);
+          current = PoseReplayIsCurrentLocked(record);
+          if (current)
+            pose_observation_replays_.at(record.observation.key) = record;
+        }
+        if (!current) {
+          TrySendResponse(client.get(),
+                          ErrorResponse("scene_runtime_observer_session_stale",
+                                        "observer session changed during pose publication"));
+          return false;
         }
         TrySendResponse(
             client.get(),
-            SceneRuntimeObserveResponse(record->observation, record->acceptance,
-                                        *record->application,
-                                        *record->publication_generation));
+            SceneRuntimeObserveResponse(record.observation, record.acceptance,
+                                        *record.application,
+                                        *record.publication_generation));
         return false;
       }
       case CommandKind::kSceneRuntimeLatchBeforePlanning: {
@@ -4945,6 +5977,8 @@ private:
   }
 
   DaemonConfig config_;
+  // Own the startup value and exact document before constructing child adapters.
+  std::optional<LoadedIsaacSiteSettings> isaac_site_settings_;
   std::chrono::steady_clock::time_point started_at_;
   ManagerPackageGeneration package_generation_;
   DaemonLock daemon_lock_;
@@ -4953,6 +5987,7 @@ private:
   component_manager::RetainedNativeRuntimeUnitAdapter native_runtime_adapter_;
   component_manager::ExternallyProvisionedManagerStores stores_;
   manyforge::scene::CanonicalEmptySceneOwner scene_owner_;
+  OriginalManagerSceneMaintenanceAdapter original_manager_scene_maintenance_;
   SceneRuntimePoseProjector scene_runtime_pose_projector_;
   component_manager::DurableManagerActiveRuntimePlanSource plan_source_;
   component_manager::RetainedPosixRuntimeUnitAdapter reference_runtime_adapter_;
@@ -4961,8 +5996,8 @@ private:
   DaemonPlannedMaintenanceGate planned_maintenance_gate_;
   component_manager::ManagerPlannedMaintenanceCoordinator
       planned_maintenance_;
-  // Guards the three members below (written by the command strand, read by
-  // the Apply progression lane) and spans every Manager source build+write.
+  // Guards retained runtime/source facts and observer session/replay maps
+  // shared with the Apply progression lane. Never spans child transport IO.
   std::mutex manager_source_mutex_;
   bool kernel_apply_available_{};
   std::atomic<bool> scene_admission_reconciled_{false};
@@ -4971,6 +6006,9 @@ private:
   std::shared_ptr<const deployment::RetainedBundle> last_active_bundle_;
   core::RuntimeEpoch manager_runtime_epoch_;
   component_manager::ManagerNamedApplyCoordinator named_apply_;
+  // Guarded by manager_source_mutex_. Publication/session adoption does not
+  // retire the cell observer or erase its checked per-spawn expectation.
+  std::optional<ManagedIsaacPoseObserverExpectation> managed_pose_observer_expectation_;
   SceneRuntimeStateOwner scene_runtime_owner_;
   AtomicSourceSnapshotChannel manager_channel_;
   AtomicSourceSnapshotChannel scene_channel_;
@@ -5037,6 +6075,8 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   bool program_runner_liveness = false;
   bool period = false;
   bool scene_asset = false;
+  bool isaac_site_settings = false;
+  bool isaac_pose_observer_executable = false;
   for (int index = 1; index < argc; index += 2) {
     Require(index + 1 < argc, "every option requires one value");
     const std::string_view option(argv[index]);
@@ -5078,6 +6118,14 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     } else if (option == "--scene-asset-root" && !scene_asset) {
       config.scene_asset_root = value;
       scene_asset = true;
+    } else if (option == "--isaac-site-settings" && !isaac_site_settings) {
+      Require(!value.empty(), "--isaac-site-settings requires one explicit path");
+      config.isaac_site_settings_path = value;
+      isaac_site_settings = true;
+    } else if (option == "--isaac-pose-observer-executable" && !isaac_pose_observer_executable) {
+      Require(!value.empty(), "--isaac-pose-observer-executable requires the installed executable path");
+      config.isaac_pose_observer_executable = value;
+      isaac_pose_observer_executable = true;
     } else if (option == "--reconciliation-period-ms" && !period) {
       config.reconciliation_period =
           std::chrono::milliseconds(ParsePeriod(value));

@@ -685,7 +685,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   ExecuteWorkerDispatchPhaseResult execute_worker_dispatch_phase(
       const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
-      bool active_trajectory_from_cache, bool cache_revalidation_candidate, bool store_candidate,
+      bool active_trajectory_from_cache, bool cache_revalidation_candidate,
       const ProjectionLeaseBindingDTO& projection_binding,
       const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
       const CollisionWorldRevision& validation_world_revision,

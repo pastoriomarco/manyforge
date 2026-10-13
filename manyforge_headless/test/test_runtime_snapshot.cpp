@@ -55,6 +55,7 @@ CanonicalValue ManagerPayload(const std::string &cell_id,
   return CanonicalValue(CanonicalValue::Object{
       {"active",
        CanonicalValue(CanonicalValue::Object{
+           {"canonical_empty", CanonicalValue(false)},
            {"cell_graph",
             CanonicalValue(CanonicalValue::Object{
                 {"api_version", CanonicalValue("manyforge.cell_graph.v1")},
@@ -387,6 +388,69 @@ TEST(RuntimeSnapshotAggregator, RejectsInvalidConfigurationAndForeignSources) {
   EXPECT_NE(content_identity::canonical_json(snapshot.root)
                 .find("manager_source_identity_mismatch"),
             std::string::npos);
+}
+
+TEST(RuntimeSnapshotAggregator, PreservesRequiredCanonicalEmptyOwnerBoolean) {
+  for (const bool canonical_empty : {false, true}) {
+    TemporaryDirectory directory;
+    auto payload = ManagerPayload("cell-a", "graph-1");
+    auto members = payload.as_object();
+    for (auto &[name, value] : members) {
+      if (name != "active") continue;
+      auto active = value.as_object();
+      for (auto &[key, field] : active) {
+        if (key == "canonical_empty") field = CanonicalValue(canonical_empty);
+      }
+      value = CanonicalValue(std::move(active));
+    }
+    AtomicSourceSnapshotChannel manager(directory.path(), "manager-source.json");
+    static_cast<void>(manager.Publish("component_manager", "component-manager.cell-a",
+                                     "manager-epoch", 10, CanonicalValue(std::move(members))));
+    const auto observed = manager.ReadObserved();
+    ASSERT_TRUE(observed.has_value());
+    RuntimeSnapshotAggregator aggregator(directory.path(), "cell-a", "api.cell-a", "epoch",
+                                         {100, 100, 100},
+                                         [&] { return observed->file_modified_at_unix_ns; },
+                                         [] { return 1; });
+    const auto snapshot = aggregator.Evaluate();
+    const auto &section = Section(snapshot, "manager");
+    ASSERT_TRUE(RequiredBool(section, "available"));
+    const auto &active = RequiredMember(RequiredMember(section, "payload"), "active");
+    EXPECT_EQ(RequiredBool(active, "canonical_empty"), canonical_empty);
+  }
+}
+
+TEST(RuntimeSnapshotAggregator, RejectsMissingNonBooleanAndUnknownCanonicalEmptyShape) {
+  for (const int invalid_shape : {0, 1, 2}) {
+    TemporaryDirectory directory;
+    auto members = ManagerPayload("cell-a", "graph-1").as_object();
+    for (auto &[name, value] : members) {
+      if (name != "active") continue;
+      CanonicalValue::Object active;
+      for (const auto &[key, field] : value.as_object()) {
+        if (key == "canonical_empty" && invalid_shape == 0) continue;
+        active.emplace_back(key, key == "canonical_empty" && invalid_shape == 1
+                                     ? CanonicalValue("true") : field);
+      }
+      if (invalid_shape == 2) active.emplace_back("unknown", CanonicalValue(false));
+      value = CanonicalValue(std::move(active));
+    }
+    AtomicSourceSnapshotChannel manager(directory.path(), "manager-source.json");
+    static_cast<void>(manager.Publish("component_manager", "component-manager.cell-a",
+                                     "manager-epoch", 10, CanonicalValue(std::move(members))));
+    const auto observed = manager.ReadObserved();
+    ASSERT_TRUE(observed.has_value());
+    RuntimeSnapshotAggregator aggregator(directory.path(), "cell-a", "api.cell-a", "epoch",
+                                         {100, 100, 100},
+                                         [&] { return observed->file_modified_at_unix_ns; },
+                                         [] { return 1; });
+    const auto snapshot = aggregator.Evaluate();
+    const auto &section = Section(snapshot, "manager");
+    EXPECT_FALSE(RequiredBool(section, "available"));
+    EXPECT_NE(content_identity::canonical_json(section).find("manager_source_invalid"),
+              std::string::npos);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(RequiredMember(section, "payload").storage()));
+  }
 }
 
 } // namespace

@@ -6,6 +6,7 @@
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/gripper_participant_engine.hpp>
+#include <manyforge_core/component_lifecycle_admission.hpp>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/retained_native_cell_runtime.hpp>
@@ -2051,7 +2052,7 @@ core::Result<void> reseal_retained_native_runtime_for_apply(
   }
 
   // Every reader and writer of a participant's routes (GripperSourceIsCurrent,
-  // RecordGraspObservation, ReadGripperStatus, route publication) serializes
+  // ReadGripperStatus, route publication) serializes
   // on its cell root's mutex, so the re-seal must hold that same mutex: a peer
   // participant's own mutex would leave those readers running against the
   // bindings and registrations replaced below.
@@ -2703,9 +2704,7 @@ RetainedNativeRuntime::ReadCurrentPublishedRouteConfiguration(
 bool RetainedNativeRuntime::GripperSourceIsCurrent(
     const core::RuntimeParticipantBinding &source) const {
   if (!gripper || !source.value().control_path.has_value() ||
-      (source.value().capability_id.value() !=
-           "tool.gripper.confirmation.operator" &&
-       source.value().capability_id.value() != "tool.gripper.feedback"))
+      source.value().capability_id.value() != "tool.gripper.feedback")
     return false;
   const auto &path = *source.value().control_path;
   const auto current =
@@ -2737,28 +2736,6 @@ bool RetainedNativeRuntime::GripperSourceIsCurrent(
                    }))
     return false;
   return true;
-}
-
-core::Result<core::GripperGraspEvidenceDTO>
-RetainedNativeRuntime::RecordGraspObservation(
-    const core::RuntimeParticipantBinding &source,
-    const core::GripperGraspObservationDTO &observation,
-    const core::Duration freshness_budget_ns,
-    const core::TimePoint admission_deadline_ns) {
-  auto *const cell_root = cell_runtime_root != nullptr ? cell_runtime_root : this;
-  std::lock_guard lock(cell_root->route_publication_mutex_);
-  if (!GripperSourceIsCurrent(source) ||
-      source.value().capability_id.value() !=
-          "tool.gripper.confirmation.operator")
-    return core::Result<core::GripperGraspEvidenceDTO>::Err(core::ErrorDTO{
-        "grasp_confirmation_source_stale",
-        "Confirmation source has no exact current native realization",
-        {}});
-  // An unknown route can be published without rebinding the backend. Keep
-  // this final check and write within the same existing publication lock;
-  // never install evidence and subsequently call that a no-effect rejection.
-  return gripper->record_grasp_observation(
-      source, observation, freshness_budget_ns, admission_deadline_ns);
 }
 
 core::Result<core::GripperCommandStatusDTO>
@@ -3287,6 +3264,24 @@ RetainedNativeRuntime::CloseComponentCommandEligibility(
 }
 
 core::Result<core::ComponentCommandReadinessDTO>
+RetainedNativeRuntime::CloseComponentCommandEligibility(
+    const core::CellAdmissionClaimDTO &selected_claim,
+    const core::SelectedComponentBringUpOfferDTO &offer) {
+  auto *const cell_root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  auto *const kernel = cell_root->addressed_kernel != nullptr
+                           ? cell_root->addressed_kernel.get()
+                           : cell_root->cell_addressed_kernel;
+  if (kernel == nullptr) {
+    return route_publication_error<core::ComponentCommandReadinessDTO>(
+        "component_readiness_kernel_missing",
+        "selected component readiness has no stable addressed Kernel owner",
+        core::ErrorCode::kMissingReference);
+  }
+  return kernel->close_component_command_eligibility(selected_claim, offer);
+}
+
+core::Result<core::ComponentCommandReadinessDTO>
 RetainedNativeRuntime::ReadComponentCommandReadiness(
     const core::ControllableComponentId &controllable_component_id) const {
   const auto *const cell_root =
@@ -3415,6 +3410,79 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
     return route_publication_error<core::ComponentCommandReadinessDTO>(
         "component_readiness_native_composition_failed", exception.what());
   }
+}
+
+core::Result<core::ComponentCommandReadinessDTO>
+RetainedNativeRuntime::PublishComponentCommandReadiness(
+    const core::CellAdmissionClaimDTO &claim,
+    const core::SelectedComponentBringUpOfferDTO &offer,
+    const core::ComponentLifecycleStatusDTO &status,
+    const core::SelectedControllerOccurrenceDTO &occurrence,
+    const std::vector<core::RuntimeParticipantExecutionRegistration> &installed,
+    const std::vector<core::ActiveControlConfigurationDTO> &configurations,
+    bool command_eligible) {
+  auto *const root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(root->route_publication_mutex_);
+  auto *const kernel = root->addressed_kernel ? root->addressed_kernel.get()
+                                            : root->cell_addressed_kernel;
+  if (kernel == nullptr) {
+    return route_publication_error<core::ComponentCommandReadinessDTO>(
+        "component_readiness_kernel_missing",
+        "selected successor readiness has no stable addressed Kernel owner",
+        core::ErrorCode::kMissingReference);
+  }
+  const auto &component = offer.predecessor.controllable_component_id;
+  const auto exact = [](const auto &left, const auto &right) {
+    return left.binding.value() == right.binding.value() &&
+           left.stop_readiness.has_value() == right.stop_readiness.has_value() &&
+           (!left.stop_readiness || left.stop_readiness->value() == right.stop_readiness->value()) &&
+           same_registration_after_product_reseal(left, right);
+  };
+  const auto actual_count = std::count_if(root->participant_registrations.begin(),
+      root->participant_registrations.end(), [&](const auto &row) {
+        return row.binding.value().controllable_component_id == component;
+      });
+  if (static_cast<std::size_t>(actual_count) != installed.size() ||
+      std::any_of(installed.begin(), installed.end(), [&](const auto &row) {
+        return row.binding.value().controllable_component_id != component ||
+               std::none_of(root->participant_registrations.begin(),
+                   root->participant_registrations.end(),
+                   [&](const auto &current) { return exact(current, row); });
+      })) {
+    return route_publication_error<core::ComponentCommandReadinessDTO>(
+        "selected_successor_runtime_inventory_changed",
+        "selected successor differs from the actual installed cell cache");
+  }
+  // Read only the existing component caches under the same publication pin.
+  // No cache reseal, resolver replacement or participant installation occurs.
+  bool cache_exact = true;
+  for_each_cell_runtime(*root, [&](RetainedNativeRuntime &runtime) {
+    for (const auto &row : runtime.participant_registrations) {
+      if (row.binding.value().controllable_component_id == component &&
+          std::none_of(installed.begin(), installed.end(),
+                       [&](const auto &current) { return exact(current, row); })) {
+        cache_exact = false;
+      }
+    }
+  });
+  if (!cache_exact) {
+    return route_publication_error<core::ComponentCommandReadinessDTO>(
+        "selected_successor_runtime_inventory_changed",
+        "selected successor component caches are not the installed occurrence");
+  }
+  auto published = kernel->publish_component_command_readiness(
+      claim, offer, status, occurrence, installed, configurations, command_eligible);
+  if (!published.ok()) return published;
+  auto readback = kernel->component_command_readiness(component);
+  if (!readback.ok() || readback.value() != published.value() ||
+      readback.value().command_eligible ||
+      readback.value().component_lifecycle_generation != status.acceptance.component_lifecycle_generation) {
+    return route_publication_error<core::ComponentCommandReadinessDTO>(
+        "component_readiness_readback_mismatch",
+        "selected successor Kernel readiness is not the exact closed accepted generation",
+        core::ErrorCode::kInvariantViolation);
+  }
+  return readback;
 }
 
 namespace {

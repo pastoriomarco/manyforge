@@ -2485,3 +2485,104 @@ def test_retry_is_refused_with_unapplied_draft_and_reset_is_not(route: str) -> N
     applied["program_revision"] = _DIGEST
     assert recover("retry_motion_from_current_state").status_code == 200
     assert submitted == ["reset_cycle", "retry_motion_from_current_state"]
+
+
+
+def _configuration_preparation(tmp_path: Path):
+    digest = "sha256:" + "a" * 64
+    current = {"retained_bundle_id": "bundle.current", "graph_revision": "graph.current"}
+    prepared_activation = {
+        "schema_version": "manyforge.prepared_activation_input.v5",
+        "prepared_activation_id": digest, "scenario_id": "cell",
+        "source_document_digest": digest, "captured_input_digest": digest,
+        "deployment_artifact_id": "deployment.fixture", "deployment_revision": digest,
+        "retained_bundle_id": "bundle.next", "graph_revision": "graph.next",
+        "program_id": None, "program_revision": None,
+        "program_outcome": {"kind": "no_program"},
+        "node_environment_digest": digest, "assistant_mode": "forbidden",
+    }
+    preview = {
+        "api_version": "manyforge.manager_command_response.v1", "ok": True,
+        "converged": False,
+        "diff": {kind: {"added": [], "changed": [], "removed": []} for kind in (
+            "component_attachments", "controllable_components", "control_bindings",
+            "control_domains", "model_instances", "runtime_units",
+        )},
+        "candidate_receipt": {
+            "schema_version": "manyforge.manager_deployment_candidate_receipt.v2",
+            "deployment_artifact_id": "deployment.fixture", "deployment_revision": digest,
+            "prepared_activation_id": digest,
+            "candidate_retained_bundle_id": "bundle.next", "candidate_graph_revision": "graph.next",
+            "expected_current": current, "expected_admission_generation": 1,
+            "manager_owner_epoch": "manager.epoch.1", "impact_digest": digest,
+            "destructive_impact": False, "receipt_digest": digest,
+        },
+        "impact": {
+            "attachment_changed_components": [], "component_delta_digest": digest,
+            "components": [
+                {"controllable_component_id": "arm.1", "disposition": "retain", "replacement_reasons": []},
+                {"controllable_component_id": "arm.2", "disposition": "retain", "replacement_reasons": []},
+            ],
+            "destructive": False, "detached_components": [], "shared_scene_projection_changed": False,
+            "program": {"executable": False, "non_executable": None, "program_id": None, "program_revision": None},
+
+        },
+    }
+
+    class Headless:
+        def prepare_activation(self, _request):
+            return {"prepared_activation": deepcopy(prepared_activation)}
+
+        def manager_status(self):
+            return {
+                "source": {"available": True, "freshness": "fresh", "known_gaps": [],
+                           "source_owner_epoch": "manager.epoch.1"},
+                "status": {"manager_ready": True, "active": dict(current)},
+            }
+
+        def manager_deployment_candidate_preview(self, _request):
+            return deepcopy(preview)
+
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state.headless_client = Headless()  # type: ignore[assignment]
+    intent = {
+        "scenario_id": "cell", "source_document_digest": digest, "captured_input_digest": digest,
+        "deployment": {}, "model_source_closure": {}, "program": None, "program_role_assignment": {},
+        "expected_manager_current": current, "expected_admission_generation": 1,
+        "manager_request_id": "request", "correlation_id": "correlation",
+        "confirmation_token": None, "draft_id": "draft", "draft_revision": 1,
+    }
+    return state, intent, preview
+
+
+@pytest.mark.parametrize("destructive", [False, True])
+def test_configuration_confirmation_never_authorizes_bring_up(tmp_path: Path, destructive: bool) -> None:
+    state, intent, preview = _configuration_preparation(tmp_path)
+    preview["impact"]["destructive"] = destructive
+    preview["candidate_receipt"]["destructive_impact"] = destructive
+    prepared = state._prepare_authored_deployment_candidate(intent, None, apply=True)
+    assert prepared["confirmation_required"] is destructive
+    if destructive:
+        intent["confirmation_token"] = prepared["confirmation_token"]
+        prepared = state._prepare_authored_deployment_candidate(intent, None, apply=True)
+    assert prepared["manager_apply"] is not None
+    assert prepared["manager_apply"]["accepted_impact_digest"] == (
+        preview["candidate_receipt"]["impact_digest"] if destructive else None
+    )
+
+
+def test_activation_order_comes_from_exact_applied_capture_not_draft(monkeypatch: pytest.MonkeyPatch) -> None:
+    from manyforge_composer.backend.routes_deployment_draft import _workspace
+    state = ComposerState()
+    state.headless_client = object()  # type: ignore[assignment]
+    publication = {"scenario_id": "cell", "deployment_revision": _DIGEST,
+                   "retained_bundle_id": "bundle", "graph_revision": _DIGEST}
+    monkeypatch.setattr(state, "published_scenario", lambda: {"ready": True, "published_scenario": publication})
+    def captured(current):
+        assert current == publication
+        return {"components": [{"component_id": "z"}, {"component_id": "a"}]}
+    monkeypatch.setattr(state, "applied_deployment_for_publication", captured)
+    assert _workspace(state)["managerApplied"]["activationOrder"] == {
+        "retainedBundleId": "bundle", "graphRevision": _DIGEST, "componentIds": ["z", "a"]}
+    monkeypatch.setattr(state, "applied_deployment_for_publication", lambda _current: None)
+    assert _workspace(state)["managerApplied"]["activationOrder"] is None

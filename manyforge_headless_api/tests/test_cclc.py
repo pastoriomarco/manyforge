@@ -883,6 +883,59 @@ def test_client_reads_ordered_incident_events(tmp_path: Path) -> None:
         CCLCOpenRequestClient(tmp_path).incident_events(0, 65)
 
 
+def test_client_preserves_cell_observer_incident_and_bounded_tail(tmp_path: Path) -> None:
+    event = _incident_event(3)
+    event["incident_id"] = "observer." + "a" * 64
+    event["payload"] = {
+        "event_kind": "component_incident",
+        "incident_id": event["incident_id"],
+        "target_kind": "cell_observer",
+        "target": {
+            "cell_id": "robot_cell",
+            "source_id": "observer\x00source",
+            "source_epoch_base": "manager-observer",
+        },
+        "cause_class": "provider_lost",
+        "detected_at_ns": "9223372036854775807",
+        "summary": "observer exited with signal 11",
+        "acknowledgement": None,
+        "diagnostic_snapshot": {
+            "exit": {
+                "status": None,
+                "signal": 11,
+                "core_dumped": False,
+                "observed_utc": "2026-10-12T14:00:00Z",
+            },
+            "context": {
+                "cell_id": "robot_cell",
+                "source_id": "observer\x00source",
+                "source_epoch_base": "manager-observer",
+                "pid": 1234,
+            },
+            "settings": {"retained_snapshot_path": "/run/observer-input.json"},
+            "generated": {},
+            "output": {
+                "tail": "x" * (128 * 1024 - 2),
+                "line_count": 1,
+                "truncated": True,
+                "dropped_forward_lines": 0,
+                "dropped_forward_bytes": 0,
+                "invalid_text_bytes": 0,
+            },
+            "core_dump_link": None,
+        },
+    }
+    page = {"events": [event], "through_sequence": 3}
+    result = _through_client(
+        tmp_path,
+        "incident_events",
+        page,
+        lambda client: client.incident_events(2, 64),
+    )
+    assert result == page
+    assert "controllable_component_id" not in result["events"][0]["payload"]
+
+
 @pytest.mark.parametrize(
     "page",
     [

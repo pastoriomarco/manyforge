@@ -41,7 +41,6 @@ constexpr std::string_view kZeroDigest =
 enum class FixtureKind {
   kApplication,
   kCCLCProduct,
-  kCCLCOperatorConfirmation,
   kCCLCReadiness,
   kProjectionSuccessor,
   // A native cell whose one unit hosts only the gripper (no motion owner).
@@ -59,7 +58,7 @@ struct GeneratorArguments final {
         "usage: generate_lite6_native_execution_fixture "
         "--output-root PATH "
         "[--fixture-kind "
-        "cclc-product|cclc-operator-confirmation|cclc-readiness|"
+        "cclc-product|cclc-readiness|"
         "projection-successor|gripper-only]");
   }
 
@@ -92,8 +91,6 @@ struct GeneratorArguments final {
   if (fixture_kind.has_value()) {
     if (fixture_kind->string() == "cclc-product") {
       selected_kind = FixtureKind::kCCLCProduct;
-    } else if (fixture_kind->string() == "cclc-operator-confirmation") {
-      selected_kind = FixtureKind::kCCLCOperatorConfirmation;
     } else if (fixture_kind->string() == "cclc-readiness") {
       selected_kind = FixtureKind::kCCLCReadiness;
     } else if (fixture_kind->string() == "projection-successor") {
@@ -131,8 +128,7 @@ void write_exact_file(const std::filesystem::path &path,
 
 [[nodiscard]] CanonicalValue make_program_root(const deployment::RetainedBundle& bundle,
                                                const bool include_arm,
-                                               const bool include_gripper,
-                                               const bool operator_confirmation) {
+                                               const bool include_gripper) {
   CanonicalValue::Object target_roles;
   if (include_arm) target_roles.emplace_back(
       "arm",
@@ -170,13 +166,6 @@ void write_exact_file(const std::filesystem::path &path,
         {"parameters", CanonicalValue(CanonicalValue::Object{})},
         {"disposition", CanonicalValue("required")},
     })};
-    if (operator_confirmation) {
-      gripper_capabilities.emplace_back(CanonicalValue::Object{
-          {"capability_id", CanonicalValue("tool.gripper.confirmation.operator")},
-          {"parameters", CanonicalValue(CanonicalValue::Object{})},
-          {"disposition", CanonicalValue("required")},
-      });
-    }
     target_roles.emplace_back(
         "gripper",
         CanonicalValue(CanonicalValue::Object{
@@ -232,10 +221,8 @@ void write_exact_file(const std::filesystem::path &path,
 
 [[nodiscard]] std::string make_program_bytes(const deployment::RetainedBundle& bundle,
                                              const bool include_arm,
-                                             const bool include_gripper,
-                                             const bool operator_confirmation) {
-  CanonicalValue root =
-      make_program_root(bundle, include_arm, include_gripper, operator_confirmation);
+                                             const bool include_gripper) {
+  CanonicalValue root = make_program_root(bundle, include_arm, include_gripper);
   const std::string revision = deployment::detail::compute_content_identity(
       root, deployment::detail::ContentIdentitySpec{
                 .identity_domain = "program-revision",
@@ -322,8 +309,7 @@ int main(int argc, char **argv) {
                   anchor("lite6_gripper_provider"));
         }
         return deployment::test::materialize_lite6_native_cclc_product_retained_consumer_fixture(
-            package_root, anchor("lite6_arm_provider"), anchor("lite6_gripper_provider"),
-            arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation,
+            package_root, anchor("lite6_arm_provider"), anchor("lite6_gripper_provider"), false,
             // Runtime configuration changes the exact graph/model-map binding
             // without changing component types, providers or host infrastructure.
             arguments.fixture_kind == FixtureKind::kProjectionSuccessor
@@ -363,9 +349,8 @@ int main(int argc, char **argv) {
     const bool include_gripper =
         arguments.fixture_kind != FixtureKind::kCCLCReadiness;
     const bool include_arm = !gripper_only;
-    const std::string program_bytes = make_program_bytes(
-        bundle, include_arm, include_gripper,
-        arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation);
+    const std::string program_bytes =
+        make_program_bytes(bundle, include_arm, include_gripper);
     const auto program =
         deployment::verify_program_binding_contract(program_bytes, bundle);
     deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
@@ -433,7 +418,6 @@ int main(int argc, char **argv) {
         {"api_version", CanonicalValue("manyforge.i6.native-execution-fixture.v1")},
         {"cclc_product",
          CanonicalValue(arguments.fixture_kind == FixtureKind::kCCLCProduct ||
-                        arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation ||
                         arguments.fixture_kind == FixtureKind::kProjectionSuccessor ||
                         gripper_only)},
         {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},

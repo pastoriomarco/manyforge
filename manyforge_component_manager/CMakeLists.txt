@@ -238,6 +238,7 @@ target_link_libraries(manyforge_component_manager PRIVATE
   manyforge::deployment_admission
   manyforge::persistence
   manyforge::scene_value_codec
+  manyforge_core
 )
 target_link_libraries(manyforge_component_manager PUBLIC
   manyforge::deployment_verification_core)
@@ -459,9 +460,34 @@ if(BUILD_TESTING)
     manyforge_component_manager
     manyforge::deployment
     manyforge_deployment_canonical_package_generator
+    manyforge::scene
     GTest::gtest_main)
+  # The real failure/restart test owns the concrete journals. Standalone
+  # Manager embeds pure Core; composed graphs can reuse its existing adapters.
+  foreach(_manager_test_journal IN ITEMS sqlite_operation_journal sqlite_cclc_journal)
+    if(TARGET manyforge_core_${_manager_test_journal})
+      target_link_libraries(test_manager_runtime_convergence_coordinator PRIVATE
+        manyforge_core_${_manager_test_journal})
+    else()
+      target_sources(test_manager_runtime_convergence_coordinator PRIVATE
+        "${MANYFORGE_CORE_INCLUDE_DIR}/../src/${_manager_test_journal}.cpp")
+    endif()
+  endforeach()
+  target_link_libraries(test_manager_runtime_convergence_coordinator PRIVATE
+    SQLite::SQLite3)
   gtest_discover_tests(test_manager_runtime_convergence_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+  # The read-only native-plan join uses the same sealed products as the
+  # existing named coordinator tests, with no additional fixture generator.
+  target_compile_definitions(test_manager_apply_journal PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_MANAGER_LITE6_FIXTURE}"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_MANAGER_LITE6_SOURCE}")
+  target_include_directories(test_manager_apply_journal PRIVATE
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
+  target_link_libraries(test_manager_apply_journal PRIVATE
+    manyforge_deployment_canonical_package_generator)
+
 
   add_executable(test_selected_runtime_composition_rpc_internal
     test/test_selected_runtime_composition_rpc_internal.cpp)

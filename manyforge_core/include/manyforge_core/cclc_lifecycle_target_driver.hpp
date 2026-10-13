@@ -24,6 +24,15 @@
 
 namespace manyforge::core {
 
+/// Pure next intent toward the target from the achieved CCLC state, or
+/// nullopt when satisfied. Active also satisfies a Prepared target.
+[[nodiscard]] std::optional<ComponentLifecycleIntentKindDTO> NextLifecycleIntentTowardTarget(
+    ComponentLifecycleStateDTO achieved, LifecycleTargetStateDTO target);
+
+/// The intent a target names before any achieved state is known.
+[[nodiscard]] ComponentLifecycleIntentKindDTO NominalLifecycleIntentForTarget(
+    LifecycleTargetStateDTO target);
+
 struct CCLCLifecycleTargetDriverConfig final {
   bool enabled{true};
   /// Low-rate fallback re-evaluation when no event arrives.
@@ -65,6 +74,15 @@ class ICCLCLifecycleTargetDriverPorts {
  public:
   virtual ~ICCLCLifecycleTargetDriverPorts() = default;
 
+  /// One complete follower pass on one version. Fixed ports keep their exact
+  /// existing dependency set; the composed owner overrides this with one
+  /// accounted context pin and a scoped bound adapter supplied to the pass.
+  [[nodiscard]] virtual Result<void> WithPinnedProduct(
+      const std::function<void(ICCLCLifecycleTargetDriverPorts&)>& pass) {
+    pass(*this);
+    return Result<void>::Ok();
+  }
+
   [[nodiscard]] virtual Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
       const ControllableComponentId& component) = 0;
   [[nodiscard]] virtual Result<BrandLifecyclePlanCatalogDTO> LoadLifecyclePlanCatalog(
@@ -80,8 +98,28 @@ class ICCLCLifecycleTargetDriverPorts {
   /// The component's latest lifecycle transaction is not yet terminal.
   [[nodiscard]] virtual bool ComponentLifecycleSettling(
       const ControllableComponentId& component) = 0;
+  /// Retirement bookkeeping only: actual owner claims/work/callbacks and
+  /// this component's accepted work have settled. Missing proof is unknown.
+  [[nodiscard]] virtual bool RetiredTargetWorkSettled(const ControllableComponentId&) {
+    return false;
+  }
   [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) = 0;
+  /// Follower-only acceptance fences the actual target from its facts read.
+  [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO> SubmitTargetLifecycle(
+      const ComponentLifecycleIntentDTO&, const ComponentLifecycleTargetExpectationDTO&) {
+    return Result<CCLCLifecycleRequestResultDTO>::Err(
+        {"lifecycle_target_submission_unavailable", "target-fenced submission is unavailable", {}});
+  }
+  /// Exact original request observation; never admission or effect replay.
+  [[nodiscard]] virtual Result<std::optional<CCLCLifecycleRequestResultDTO>> ReadLifecycleRequestResult(
+      const ComponentLifecycleIntentDTO&) {
+    return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
+        {"lifecycle_request_observation_unavailable", "request observation is unavailable", {}});
+  }
+  /// Only a pinned immutable product identity proves membership absence.
+  [[nodiscard]] virtual std::optional<bool> ConfiguredComponentMembership(
+      const ControllableComponentId&) const { return std::nullopt; }
   [[nodiscard]] virtual Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(
       const LifecycleTransactionId& lifecycle_transaction_id) = 0;
   /// System-attributed cell containment for one incident through the
@@ -102,6 +140,17 @@ class CoordinatorLifecycleTargetDriverPorts final : public ICCLCLifecycleTargetD
       std::function<Result<std::vector<ControllableComponentId>>()> unsettled_components =
           {}) noexcept;
 
+  /// Composed current-context ports. One whole-pass pin supplies the verified
+  /// sources and is reused by admission; the fixed-reference overload remains.
+  CoordinatorLifecycleTargetDriverPorts(
+      ComponentLifecycleCoordinator& coordinator,
+      IKernelCellAdmissionPort& kernel_cell_admission_port,
+      std::function<Result<std::vector<ControllableComponentId>>()> unsettled_components =
+          {}) noexcept;
+
+  [[nodiscard]] Result<void> WithPinnedProduct(
+      const std::function<void(ICCLCLifecycleTargetDriverPorts&)>& pass) override;
+
   [[nodiscard]] Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
       const ControllableComponentId& component) override;
   [[nodiscard]] Result<BrandLifecyclePlanCatalogDTO> LoadLifecyclePlanCatalog(
@@ -113,8 +162,16 @@ class CoordinatorLifecycleTargetDriverPorts final : public ICCLCLifecycleTargetD
   [[nodiscard]] RequestOwnerEpoch ReadRequestOwnerEpoch() override;
   [[nodiscard]] bool AcceptingLifecycleRequests() override;
   [[nodiscard]] bool ComponentLifecycleSettling(const ControllableComponentId& component) override;
+  [[nodiscard]] bool RetiredTargetWorkSettled(const ControllableComponentId& component) override;
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) override;
+  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitTargetLifecycle(
+      const ComponentLifecycleIntentDTO& intent,
+      const ComponentLifecycleTargetExpectationDTO& expected_target) override;
+  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> ReadLifecycleRequestResult(
+      const ComponentLifecycleIntentDTO& intent) override;
+  [[nodiscard]] std::optional<bool> ConfiguredComponentMembership(
+      const ControllableComponentId& component) const override;
   [[nodiscard]] Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(
       const LifecycleTransactionId& lifecycle_transaction_id) override;
   [[nodiscard]] Result<ComponentIncidentContainmentReceiptDTO> RequestIncidentContainment(
@@ -122,9 +179,10 @@ class CoordinatorLifecycleTargetDriverPorts final : public ICCLCLifecycleTargetD
 
  private:
   ComponentLifecycleCoordinator& coordinator_;
-  const ICCLCCurrentComponentSnapshotSource& snapshot_source_;
-  const ICCLCLifecyclePlanCatalogSource& catalog_source_;
-  const ICCLCBrandLifecyclePortResolver& port_resolver_;
+  const ICCLCCurrentComponentSnapshotSource* snapshot_source_{};
+  const ICCLCLifecyclePlanCatalogSource* catalog_source_{};
+  const ICCLCBrandLifecyclePortResolver* port_resolver_{};
+  const ComponentLifecycleProductPin* product_pin_{};
   IKernelCellAdmissionPort& kernel_cell_admission_port_;
   std::function<Result<std::vector<ControllableComponentId>>()> unsettled_components_;
 };
@@ -229,7 +287,7 @@ class CCLCLifecycleTargetDriver final {
   struct InFlight final {
     LifecycleTransactionId lifecycle_transaction_id;
     ComponentLifecycleIntentKindDTO intent;
-    std::uint64_t target_generation{};
+    ComponentLifecycleTargetExpectationDTO expected_target;
   };
   /// Inputs a known failure or rejection was based on. The same step is not
   /// tried again until one of them changes (or the target does).
@@ -260,9 +318,10 @@ class CCLCLifecycleTargetDriver final {
     /// Known terminal failures of the current step.
     std::uint32_t failures{};
     std::optional<InFlight> in_flight;
-    /// Exact intent whose submission outcome is unknown; re-sent unchanged
-    /// (exact replay) before any other request for this component.
+    /// Exact unknown request plus its original target fence. Retired requests
+    /// are observed only; current requests retain ordinary exact replay.
     std::optional<ComponentLifecycleIntentDTO> pending_intent;
+    std::optional<ComponentLifecycleTargetExpectationDTO> pending_target;
     AttemptBasis attempt_basis;
     std::optional<AttemptBasis> failed_basis;
     std::optional<std::string> failure_reason;
@@ -288,6 +347,9 @@ class CCLCLifecycleTargetDriver final {
     /// failed: the recovery generation it was reached under. Until it is
     /// durable the component is classified as reached (fail closed).
     std::optional<std::uint64_t> unrecorded_reached;
+    /// Positive target-fence refusal of the original marker; owner-local
+    /// presentation only, retained until the other obligations settle.
+    bool retired_reached_observation{};
   };
   /// The Kernel's answer to one incident's containment request.
   struct ContainmentOutcome final {
@@ -305,15 +367,22 @@ class CCLCLifecycleTargetDriver final {
     kAny,
   };
 
-  /// One component's pass. False when its target was cancelled since the
-  /// target list was read (it is no longer followed).
-  bool EvaluateComponent(const ComponentLifecycleTargetDTO& listed, ComponentState& state,
+  void RunOncePinned(ICCLCLifecycleTargetDriverPorts& ports);
+
+  /// Follows original work/evidence before replacing or dropping its target.
+  bool EvaluateComponent(ICCLCLifecycleTargetDriverPorts& ports,
+                         const ControllableComponentId& component, ComponentState& state,
                          std::int64_t now_ns);
   /// Follows a pending or open request. True when this pass must stop.
-  bool FollowInFlight(const ComponentLifecycleTargetDTO& target, ComponentState& state,
+  bool FollowInFlight(ICCLCLifecycleTargetDriverPorts& ports,
+                      const std::optional<ComponentLifecycleTargetDTO>& target, ComponentState& state,
                       std::int64_t now_ns);
-  void SubmitIntent(ComponentState& state, const ComponentLifecycleIntentDTO& intent,
-                    std::int64_t now_ns);
+  void SubmitIntent(ICCLCLifecycleTargetDriverPorts& ports, ComponentState& state,
+                    const ComponentLifecycleIntentDTO& intent,
+                    const ComponentLifecycleTargetExpectationDTO& expected_target, std::int64_t now_ns);
+  void ConsumeSubmissionResult(ComponentState& state, const ComponentLifecycleIntentDTO& intent,
+                    const ComponentLifecycleTargetExpectationDTO& expected_target,
+                    const CCLCLifecycleRequestResultDTO& result, std::int64_t now_ns);
   void Publish(ComponentState& state, LifecycleProgressPhaseDTO phase,
                std::optional<ComponentLifecycleIntentKindDTO> next_intent,
                LifecycleBlockingCauseClassDTO cause, std::optional<std::string> reason,
@@ -321,33 +390,34 @@ class CCLCLifecycleTargetDriver final {
   /// Opens, extends or follows the component's incident from this pass's
   /// observations. True when this pass published progress and must stop: an
   /// incident is open or detected, or a replaced component's loss is waiting.
-  bool EvaluateIncident(const ComponentLifecycleTargetDTO& target, ComponentState& state,
-                        const ComponentLifecycleCurrentSnapshotDTO& current,
-                        const std::vector<DomainCondition>& conditions,
-                        std::optional<ComponentIncidentRecordDTO> open,
-                        IncidentDetection detection,
-                        std::optional<ComponentLifecycleIntentKindDTO> next_intent,
-                        std::int64_t now_ns,
-                        LifecycleBlockingCauseClassDTO unexplained =
-                            LifecycleBlockingCauseClassDTO::kNone);
+  bool EvaluateIncident(
+      ICCLCLifecycleTargetDriverPorts& ports, const ComponentLifecycleTargetDTO& target,
+      ComponentState& state, const ComponentLifecycleCurrentSnapshotDTO& current,
+      const std::vector<DomainCondition>& conditions,
+      std::optional<ComponentIncidentRecordDTO> open, IncidentDetection detection,
+      std::optional<ComponentLifecycleIntentKindDTO> next_intent, std::int64_t now_ns,
+      LifecycleBlockingCauseClassDTO unexplained = LifecycleBlockingCauseClassDTO::kNone);
   /// Requests containment of `state.unrecorded_incident` (once) and records
   /// it; a failed record keeps it for the next pass.
-  void ContainAndRecordIncident(ComponentState& state, std::int64_t now_ns);
+  void ContainAndRecordIncident(ICCLCLifecycleTargetDriverPorts& ports, ComponentState& state,
+                                std::int64_t now_ns);
   void PublishIncident(ComponentState& state, const ComponentLifecycleIncidentDTO& incident,
                        std::int64_t now_ns,
                        const std::optional<ErrorDTO>& diagnostic = std::nullopt,
                        bool diagnostic_loaded = true) const;
   /// The Kernel's containment of one incident, requested at most once per
   /// incident by this driver; a later call returns the remembered outcome.
-  const ContainmentOutcome& Contain(const ComponentLifecycleIncidentDTO& incident);
+  const ContainmentOutcome& Contain(ICCLCLifecycleTargetDriverPorts& ports,
+                                    const ComponentLifecycleIncidentDTO& incident);
   /// Writes the containment outcome into a still-pending incident record.
-  void RecordContainment(const ComponentIncidentRecordDTO& record, std::int64_t now_ns);
+  void RecordContainment(ICCLCLifecycleTargetDriverPorts& ports,
+                         const ComponentIncidentRecordDTO& record, std::int64_t now_ns);
   /// The current unadopted Apply replaces or removes the component, so it is
   /// starting over. An unreadable fact explains nothing.
   [[nodiscard]] bool ApplyReplacesComponent(const ControllableComponentId& component);
   [[nodiscard]] std::vector<DomainCondition> ObserveAllDomains(
-      const ComponentLifecycleTargetDTO& target, ComponentState& state,
-      const ComponentLifecycleCurrentSnapshotDTO& current,
+      ICCLCLifecycleTargetDriverPorts& ports, const ComponentLifecycleTargetDTO& target,
+      ComponentState& state, const ComponentLifecycleCurrentSnapshotDTO& current,
       const std::map<ControlDomainId, LifecycleBlockingCauseClassDTO>& retained,
       bool record_causes);
   [[nodiscard]] Result<bool> WriteInterventionCause(const ControllableComponentId& component,
@@ -362,7 +432,7 @@ class CCLCLifecycleTargetDriver final {
   /// Recover to `retained` for this pass.
   void RetryUnrecordedCauses(ComponentState& state, const ControllableComponentId& component,
                              std::map<ControlDomainId, LifecycleBlockingCauseClassDTO>& retained);
-  [[nodiscard]] Result<bool> WriteReached(const ControllableComponentId& component,
+  [[nodiscard]] Result<bool> WriteReached(const ComponentLifecycleTargetExpectationDTO& expected_target,
                                           std::uint64_t recovery_generation);
   void ScheduleFallback(std::int64_t delay_ns);
   void WorkerLoop();

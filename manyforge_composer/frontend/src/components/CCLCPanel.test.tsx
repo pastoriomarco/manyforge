@@ -29,6 +29,7 @@ function controller(): CCLCController {
     },
     transaction: null,
     pendingTransaction: null,
+    pendingActivationRequest: null,
     busy: false,
     readUnavailableReason: null,
     error: null,
@@ -36,12 +37,35 @@ function controller(): CCLCController {
     refresh: vi.fn(),
     reconcileTransaction: vi.fn(),
     dismissError: vi.fn(),
+    activate: vi.fn(async () => {}),
+    activateSequence: vi.fn(async () => {}),
+    cancelActivation: vi.fn(),
+    activationProgress: null,
     submitLifecycle: vi.fn(),
     submitRoute: vi.fn(),
   };
 }
 
 describe('CCLC presentation', () => {
+  it('retains the exact unknown activation request address for read-only reconciliation', () => {
+    const unknown = controller();
+    unknown.pendingActivationRequest = {
+      request_context: { request_id: 'sent.request.7', request_owner_epoch: 'owner.1',
+        source_label: 'manyforge_composer', correlation_id: null },
+      controllable_component_id: 'component.other', intent: 'prepare',
+      expected_graph_revision: 'graph.1', expected_component_lifecycle_generation: 4,
+      expected_admission_generation: 7, expected_control_domains: [], confirmed: true,
+      reason: 'operator-confirmed Composer request',
+    };
+    const html = renderToStaticMarkup(createElement(CCLCPanelView, {
+      enabled: true, mutationAvailable: true, mutationUnavailableReason: null,
+      controller: unknown,
+    }));
+    expect(html).toContain('Activation outcome unknown for component.other');
+    expect(html).toContain('sent.request.7');
+    expect(html).toContain('Reconcile');
+    expect(html).toMatch(/disabled=""[^>]*>Activate<\/button>/);
+  });
   it('shows owner facts while every mutation requires confirmation', () => {
     const html = renderToStaticMarkup(createElement(CCLCPanelView, {
       enabled: true,

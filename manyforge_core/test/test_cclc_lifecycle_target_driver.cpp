@@ -142,6 +142,26 @@ class FakeStore final : public ICCLCLifecycleTargetStore {
     if (reached) found->second.recovered_cause.reset();
     return Result<bool>::Ok(true);
   }
+  Result<bool> RecordLifecycleTargetReached(const ComponentLifecycleTargetExpectationDTO& expected,
+                                            bool reached, std::uint64_t generation) override {
+    BeforeWrite();
+    const auto found = targets.find(expected.controllable_component_id);
+    if (!expected.locally_valid() || found == targets.end() ||
+        found->second.target_generation != expected.target_generation) {
+      auto error = StaleFacts();
+      error.details["reason"] = "target_retired_or_superseded";
+      return Result<bool>::Err(std::move(error));
+    }
+    if (Generation(expected.controllable_component_id) != generation) {
+      return Result<bool>::Err(StaleFacts());
+    }
+    if (fail_record_reached) return Result<bool>::Err(Unavailable());
+    if (found->second.reached == reached) return Result<bool>::Ok(false);
+    ++writes;
+    found->second.reached = reached;
+    if (reached) found->second.recovered_cause.reset();
+    return Result<bool>::Ok(true);
+  }
   ComponentIncidentRecordDTO* Open(const ControllableComponentId& component) {
     for (auto& [id, row] : incidents) {
       if (row.incident.controllable_component_id == component && !row.incident.acknowledged) {
@@ -423,6 +443,10 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
   RequestOwnerEpoch ReadRequestOwnerEpoch() override { return RequestOwnerEpoch("cclc.owner.1"); }
   bool AcceptingLifecycleRequests() override { return accepting; }
   bool ComponentLifecycleSettling(const ControllableComponentId&) override { return settling; }
+  bool RetiredTargetWorkSettled(const ControllableComponentId&) override {
+    ++retired_settlement_reads;
+    return !settling && owner_settled;
+  }
 
   Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) override {
@@ -449,8 +473,44 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
     accepted.insert_or_assign(id, std::pair(intent.request_context.request_id, intent));
     statuses.insert_or_assign(id, Status(intent, id, ComponentLifecycleTransactionPhaseDTO::kExecuting,
                           std::nullopt, false));
+    if (lose_accepted_reply) {
+      lose_accepted_reply = false;
+      return Result<CCLCLifecycleRequestResultDTO>::Err(
+          {"cclc_open_request_failure", "accepted reply lost", {}});
+    }
     return Result<CCLCLifecycleRequestResultDTO>::Ok(
         {RequestReplayStatusDTO::kAcceptedNew, Accepted(intent, id), std::nullopt});
+  }
+
+  Result<CCLCLifecycleRequestResultDTO> SubmitTargetLifecycle(
+      const ComponentLifecycleIntentDTO& intent,
+      const ComponentLifecycleTargetExpectationDTO& expected) override {
+    submitted_targets.push_back(expected);
+    if (on_target_submit) on_target_submit();
+    if (target_is_current && !target_is_current(expected)) {
+      return Result<CCLCLifecycleRequestResultDTO>::Ok(
+          {RequestReplayStatusDTO::kAcceptedNew, std::nullopt, std::nullopt,
+           ErrorDTO{"lifecycle_target_stale", "target retired before admission", {}}});
+    }
+    return SubmitLifecycle(intent);
+  }
+  Result<std::optional<CCLCLifecycleRequestResultDTO>> ReadLifecycleRequestResult(
+      const ComponentLifecycleIntentDTO& intent) override {
+    observed_requests.push_back(intent);
+    using Value = std::optional<CCLCLifecycleRequestResultDTO>;
+    if (fail_request_read) return Result<Value>::Err({"request_read_failed", "unavailable", {}});
+    if (request_read_override) return Result<Value>::Ok(request_read_override);
+    for (const auto& [id, transaction] : accepted) {
+      if (transaction.first == intent.request_context.request_id && transaction.second == intent) {
+        return Result<Value>::Ok(CCLCLifecycleRequestResultDTO{
+            RequestReplayStatusDTO::kReplayedExact, Accepted(intent, id), std::nullopt});
+      }
+    }
+    return Result<Value>::Ok(std::nullopt);
+  }
+  std::optional<bool> ConfiguredComponentMembership(const ControllableComponentId&) const override {
+    if (throw_membership_read) throw std::runtime_error("membership read failed");
+    return configured_membership;
   }
 
   Result<ComponentIncidentContainmentReceiptDTO> RequestIncidentContainment(
@@ -514,6 +574,8 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
   bool authoring_allowed{true};
   bool accepting{true};
   bool settling{};
+  bool owner_settled{true};
+  unsigned retired_settlement_reads{};
   std::uint64_t admission_generation{3U};
   SubmitMode submit_mode{SubmitMode::kAccept};
   std::vector<LifecycleFactDTO> vendor_facts;
@@ -521,6 +583,15 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
   std::vector<ComponentIncidentContainmentIntentDTO> containments;
 
   std::vector<ComponentLifecycleIntentDTO> submitted;
+  std::vector<ComponentLifecycleTargetExpectationDTO> submitted_targets;
+  std::vector<ComponentLifecycleIntentDTO> observed_requests;
+  std::optional<CCLCLifecycleRequestResultDTO> request_read_override;
+  bool fail_request_read{};
+  bool lose_accepted_reply{};
+  std::optional<bool> configured_membership;
+  bool throw_membership_read{};
+  std::function<void()> on_target_submit;
+  std::function<bool(const ComponentLifecycleTargetExpectationDTO&)> target_is_current;
   std::map<LifecycleTransactionId, std::pair<RequestId, ComponentLifecycleIntentDTO>> accepted;
   std::map<LifecycleTransactionId, ComponentLifecycleStatusDTO> statuses;
   int observations{};
@@ -575,7 +646,13 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
 
 class LifecycleTargetDriverTest : public ::testing::Test {
  protected:
-  LifecycleTargetDriverTest() : ports_(clock_) { clock_.set(100 * kSecond); }
+  LifecycleTargetDriverTest() : ports_(clock_) {
+    clock_.set(100 * kSecond);
+    ports_.target_is_current = [&](const ComponentLifecycleTargetExpectationDTO& expected) {
+      const auto found = store_.targets.find(expected.controllable_component_id);
+      return found != store_.targets.end() && found->second.target_generation == expected.target_generation;
+    };
+  }
 
   CCLCLifecycleTargetDriver& Driver() {
     if (!driver_) {
@@ -846,31 +923,167 @@ TEST_F(LifecycleTargetDriverTest, OperatorDisableCancelsProgressionAndIsNeverReE
   EXPECT_EQ(store_.targets.at(kComponent).requested_state, LifecycleTargetStateDTO::kDisabled);
 }
 
-TEST_F(LifecycleTargetDriverTest, SupersedingTargetCancelsWaitingAndRemovalStopsFollowing) {
+TEST_F(LifecycleTargetDriverTest, SupersedingTargetObservesOriginalUnknownRequestBeforeFollowingSuccessor) {
   Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
   ports_.BecomeReady();
   ports_.submit_mode = SubmitMode::kError;
-  Driver().RunOnce();  // unknown submission pending for g1
+  Driver().RunOnce();
   ASSERT_EQ(ports_.submitted.size(), 1U);
-
-  // A superseding Apply replaces the target: the g1 request is not re-sent.
-  ports_.submit_mode = SubmitMode::kAccept;
+  const auto original = ports_.submitted.front();
   Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.submit_mode = SubmitMode::kAccept;
+  Driver().RunOnce();
+  EXPECT_EQ(ports_.submitted.size(), 1U);
+  ASSERT_EQ(ports_.observed_requests.size(), 1U);
+  EXPECT_EQ(ports_.observed_requests.back(), original);
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kOutcomeUncertain);
+
+  // Only exact readback proves this original request was rejected. A claim
+  // still settling keeps the successor closed despite the retained rejection.
+  ports_.request_read_override = CCLCLifecycleRequestResultDTO{
+      RequestReplayStatusDTO::kReplayedExact, std::nullopt, std::nullopt,
+      ErrorDTO{"lifecycle_target_stale", "original target retired", {}}};
+  ports_.settling = true;
+  Driver().RunOnce();
+  EXPECT_EQ(ports_.submitted.size(), 1U);
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kOutcomeUncertain);
+  ports_.settling = false;
   Driver().RunOnce();
   ASSERT_EQ(ports_.submitted.size(), 2U);
   EXPECT_EQ(ports_.submitted.back().request_context.request_id.value(),
             "manyforge_lifecycle_target.component.arm.g2.s0.prepare.a1");
+}
 
-  // Removal cancels the target: no progress, no further requests.
-  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
-                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+TEST_F(LifecycleTargetDriverTest, RemovedTargetKeepsAcceptedWorkUntilExactStatusAndOwnerSettle) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.BecomeReady();
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 1U);
+  const auto observations = ports_.observations;
   store_.targets.clear();
   Driver().RunOnce();
-  const auto view = Driver().ReadTargetView(kComponent);
-  ASSERT_TRUE(view.ok());
-  EXPECT_FALSE(view.value().target.has_value());
-  EXPECT_FALSE(view.value().progress.has_value());
-  EXPECT_EQ(ports_.submitted.size(), 2U);
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kTransitionInProgress);
+  EXPECT_FALSE(Driver().ReadTargetView(kComponent).value().target);
+  EXPECT_EQ(ports_.observations, observations);
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  ports_.settling = true;
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kOutcomeUncertain);
+  ports_.settling = false;
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kCancelled);
+  EXPECT_EQ(Progress().blocking_reason, "target_retired:original_work_settled");
+  EXPECT_EQ(ports_.submitted.size(), 1U);
+  EXPECT_EQ(ports_.observations, observations);
+}
+
+TEST_F(LifecycleTargetDriverTest, RetirementBetweenFactsAndAcceptanceUsesActualTargetExpectation) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.BecomeReady();
+  ports_.on_target_submit = [&] { store_.targets.clear(); };
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted_targets.size(), 1U);
+  EXPECT_EQ(ports_.submitted_targets.front(), (ComponentLifecycleTargetExpectationDTO{kComponent, 1U}));
+  EXPECT_TRUE(ports_.accepted.empty());
+  EXPECT_TRUE(ports_.submitted.empty());
+  Driver().RunOnce();
+  EXPECT_FALSE(Driver().ReadTargetView(kComponent).value().target);
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kCancelled);
+  EXPECT_EQ(ports_.submitted_targets.size(), 1U);
+}
+
+TEST_F(LifecycleTargetDriverTest, RetiredUnknownRequestsAreReadOnlyOnMissingErrorAndExpiredResults) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.BecomeReady();
+  ports_.submit_mode = SubmitMode::kError;
+  Driver().RunOnce();
+  const auto original = ports_.submitted.front();
+  store_.targets.clear();
+  for (unsigned mode = 0U; mode < 3U; ++mode) {
+    ports_.fail_request_read = mode == 1U;
+    if (mode == 2U) {
+      ports_.request_read_override = CCLCLifecycleRequestResultDTO{
+          RequestReplayStatusDTO::kRequestResultExpired, std::nullopt, std::nullopt};
+    }
+    Driver().RunOnce();
+    EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kOutcomeUncertain);
+    EXPECT_FALSE(Driver().ReadTargetView(kComponent).value().target);
+    EXPECT_EQ(ports_.submitted.size(), 1U);
+    EXPECT_EQ(ports_.observed_requests.back(), original);
+  }
+}
+
+TEST_F(LifecycleTargetDriverTest, RetiredLostAcceptanceReplyReadsOriginalTransactionWithoutResubmission) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.BecomeReady();
+  ports_.lose_accepted_reply = true;
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.accepted.size(), 1U);
+  const auto original = ports_.submitted.front();
+  store_.targets.clear();
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kTransitionInProgress);
+  ASSERT_EQ(ports_.observed_requests.size(), 1U);
+  EXPECT_EQ(ports_.observed_requests.back(), original);
+  EXPECT_EQ(ports_.submitted.size(), 1U);
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  ports_.owner_settled = false;
+  ports_.configured_membership = false;
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kOutcomeUncertain);
+  EXPECT_TRUE(Driver().ReadTargetView(kComponent).value().progress);
+  ports_.owner_settled = true;
+  ports_.configured_membership.reset();
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kCancelled);
+  EXPECT_EQ(ports_.submitted.size(), 1U);
+}
+
+TEST_F(LifecycleTargetDriverTest, MissingRetirementOwnerProofCannotResetASuccessor) {
+  EXPECT_FALSE(ports_.ICCLCLifecycleTargetDriverPorts::RetiredTargetWorkSettled(kComponent));
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  Driver().RunOnce();
+  Target(LifecycleTargetStateDTO::kPrepared, LifecycleTargetOriginDTO::kOperator);
+  ports_.BecomeReady();
+  ports_.owner_settled = false;
+  Driver().RunOnce();
+  EXPECT_TRUE(ports_.submitted.empty());
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kOutcomeUncertain);
+  ASSERT_GT(ports_.retired_settlement_reads, 0U);
+  ports_.owner_settled = true;
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted_targets.size(), 1U);
+  EXPECT_EQ(ports_.submitted_targets.back().target_generation, 2U);
+}
+
+TEST_F(LifecycleTargetDriverTest, CurrentTargetPursuitDoesNotRequireRetiredOwnerProof) {
+  Target(LifecycleTargetStateDTO::kPrepared, LifecycleTargetOriginDTO::kOperator);
+  ports_.BecomeReady();
+  ports_.owner_settled = false;
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 1U);
+  EXPECT_EQ(ports_.retired_settlement_reads, 0U);
+}
+
+TEST_F(LifecycleTargetDriverTest, FinishedAbsentStateEvictsOnlyOnVerifiedPinnedMembershipExclusion) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  Driver().RunOnce();
+  store_.targets.clear();
+  for (const auto membership : {std::optional<bool>{}, std::optional<bool>{true}}) {
+    ports_.configured_membership = membership;
+    Driver().RunOnce();
+    EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kCancelled);
+  }
+  ports_.throw_membership_read = true;
+  EXPECT_NO_THROW(Driver().RunOnce());
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kCancelled);
+  ports_.throw_membership_read = false;
+  ports_.configured_membership = false;
+  Driver().RunOnce();
+  EXPECT_FALSE(Driver().ReadTargetView(kComponent).value().progress);
+  EXPECT_TRUE(ports_.submitted.empty());
 }
 
 TEST_F(LifecycleTargetDriverTest, InterventionCauseIsRetainedUntilTheOperatorsRecover) {
@@ -1985,6 +2198,116 @@ TEST_F(LifecycleIncidentTest, UnrecordedReachedMarkerIsRetriedAndClassifiedAsRea
   EXPECT_TRUE(store_.targets.at(kComponent).reached);
   EXPECT_TRUE(Progress().incident.has_value());
   EXPECT_EQ(ports_.containments.size(), 1U);
+  EXPECT_TRUE(ports_.submitted.empty());
+}
+
+TEST_F(LifecycleIncidentTest, RetiredUnrecordedCauseAndIncidentRemainVisibleWithoutATarget) {
+  ReachTarget();
+  ports_.cause = LifecycleBlockingCauseClassDTO::kProtectiveStop;
+  store_.fail_record_cause = true;
+  store_.fail_open_incident = true;
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.containments.size(), 1U);
+  const auto observations = ports_.observations;
+  store_.targets.clear();
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().blocking_cause_class, LifecycleBlockingCauseClassDTO::kProtectiveStop);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  EXPECT_EQ(ports_.observations, observations);
+  store_.fail_record_cause = false;
+  store_.fail_open_incident = false;
+  Driver().RunOnce();
+  const auto view = Driver().ReadTargetView(kComponent);
+  ASSERT_TRUE(view.ok());
+  EXPECT_FALSE(view.value().target);
+  ASSERT_TRUE(view.value().progress);
+  ASSERT_TRUE(view.value().progress->incident);
+  EXPECT_EQ(view.value().progress->incident->cause_class, LifecycleBlockingCauseClassDTO::kProtectiveStop);
+  EXPECT_EQ(store_.causes.size(), 1U);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  EXPECT_TRUE(ports_.submitted.empty());
+  driver_.reset();
+  const auto replacement = Driver().ReadTargetView(kComponent);
+  ASSERT_TRUE(replacement.ok());
+  EXPECT_FALSE(replacement.value().target);
+  ASSERT_TRUE(replacement.value().progress);
+  EXPECT_EQ(replacement.value().progress->incident, view.value().progress->incident);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+}
+
+TEST_F(LifecycleIncidentTest, RetiredReachedObservationCannotMarkASuccessorAndKeepsExactReason) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.achieved = ComponentLifecycleStateDTO::kActive;
+  ports_.BecomeReady();
+  store_.fail_record_reached = true;
+  Driver().RunOnce();
+  EXPECT_FALSE(store_.targets.at(kComponent).reached);
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kOperator);
+  ports_.settling = true;
+  store_.fail_record_reached = false;
+  Driver().RunOnce();
+  EXPECT_FALSE(store_.targets.at(kComponent).reached);
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kOutcomeUncertain);
+  store_.targets.clear();
+  ports_.settling = false;
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kCancelled);
+  EXPECT_EQ(Progress().blocking_reason,
+            "target_retired:retired_target_reached_observation_not_applied");
+  EXPECT_FALSE(Driver().ReadTargetView(kComponent).value().target);
+  EXPECT_TRUE(ports_.submitted.empty());
+}
+
+TEST_F(LifecycleIncidentTest, AtomicReachedRefusalIdentifiesRetirementAfterFactsRead) {
+  for (const bool retry_marker : {false, true}) {
+    SCOPED_TRACE(retry_marker);
+    driver_.reset();
+    store_.targets.clear();
+    Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+    ports_.achieved = ComponentLifecycleStateDTO::kActive;
+    ports_.BecomeReady();
+    if (retry_marker) {
+      store_.fail_record_reached = true;
+      Driver().RunOnce();
+      store_.fail_record_reached = false;
+    }
+    const auto original_generation = store_.targets.at(kComponent).target_generation;
+    store_.before_write = [&] {
+      Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kOperator);
+    };
+    ports_.owner_settled = false;
+    Driver().RunOnce();
+    EXPECT_EQ(store_.targets.at(kComponent).target_generation, original_generation + 1U);
+    EXPECT_FALSE(store_.targets.at(kComponent).reached);
+    EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kOutcomeUncertain);
+    EXPECT_EQ(Progress().blocking_reason,
+              "target_retired:retired_target_reached_observation_not_applied");
+    store_.targets.clear();
+    Driver().RunOnce();
+    EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kOutcomeUncertain);
+    ports_.owner_settled = true;
+    Driver().RunOnce();
+    EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kCancelled);
+    EXPECT_EQ(Progress().blocking_reason,
+              "target_retired:retired_target_reached_observation_not_applied");
+    EXPECT_TRUE(ports_.submitted.empty());
+  }
+}
+
+TEST_F(LifecycleIncidentTest, RecoveryOnlyReachedRefusalDoesNotRetireCurrentTarget) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.achieved = ComponentLifecycleStateDTO::kActive;
+  ports_.BecomeReady();
+  const auto original_generation = store_.targets.at(kComponent).target_generation;
+  store_.before_write = [&] { store_.OrdinaryRecover(kComponent); };
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_EQ(store_.targets.at(kComponent).target_generation, original_generation);
+  EXPECT_FALSE(store_.targets.at(kComponent).reached);
+  Driver().RunOnce();
+  EXPECT_TRUE(store_.targets.at(kComponent).reached);
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_EQ(ports_.retired_settlement_reads, 0U);
   EXPECT_TRUE(ports_.submitted.empty());
 }
 

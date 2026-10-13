@@ -26,7 +26,6 @@ from manyforge_behavior.failure_details import (
     bounded_failure_details,
     exception_failure_details,
 )
-from manyforge_behavior.json_scalars import nonnegative_int64
 from manyforge_behavior.kernel_client import (
     ActionSpan,
     ExecutionState,
@@ -3259,30 +3258,17 @@ class _NativeTargetQueryPort:
             raise ProductionPortError("target query node is unsupported")
         context = self._owner._context(identity.program_run_id)
         frame_query = node_id == "model.get_frame_pose"
-        confirmation = inputs.parameters.get("expected_state") == "grasp_confirmed"
         target = self._owner._target(
             context,
             _text(inputs.parameters.get("target_role"), field="target_role"),
-            (
-                "model.kinematics.fk"
-                if frame_query
-                else (
-                    "tool.gripper.confirmation.operator"
-                    if confirmation
-                    else "tool.gripper.feedback"
-                )
-            ),
+            "model.kinematics.fk" if frame_query else "tool.gripper.feedback",
         )
         query = {
             "schema_version": "manyforge.target_observation_query.v1",
             "owner_epoch": context.request_owner_epoch,
             "program_binding_id": context.capture.program_binding_id,
             "target_role_id": target.target_role_id,
-            "kind": (
-                "frame_pose"
-                if frame_query
-                else ("gripper_confirmation" if confirmation else "gripper_status")
-            ),
+            "kind": "frame_pose" if frame_query else "gripper_status",
         }
         if frame_query:
             query["frame_role_id"] = _text(inputs.parameters.get("frame_role"), field="frame_role")
@@ -3326,48 +3312,15 @@ class _NativeTargetQueryPort:
             )
         )
         metadata["command_state"] = value["state"]
-        if expected_state == "grasp_confirmed":
-            confirmed = value.get("grasp_confirmed")
-            if confirmed is None:
-                return OwnerInvocationResult(
-                    False,
-                    metadata=metadata,
-                    reason_code="gripper_status_not_matched",
-                    message="Waiting for current qualified operator confirmation.",
-                )
-            evidence = _mapping(value.get("evidence"), field="grasp evidence")
-            # Headless and Runner share the qualified host monotonic clock.
-            # Recheck at consumption: the HTTP read may outlive this proof
-            # even while the node's longer wait deadline is still valid.
-            if not (
-                nonnegative_int64(evidence.get("observed_at_ns"))
-                <= time.monotonic_ns()
-                < nonnegative_int64(evidence.get("expires_at_ns"))
-            ):
-                return OwnerInvocationResult(
-                    False,
-                    metadata=metadata,
-                    reason_code="grasp_confirmation_not_current",
-                    message="Grasp evidence is not current at consumption.",
-                )
-            if confirmed is False:
-                return OwnerInvocationResult(
-                    False,
-                    metadata=metadata,
-                    reason_code="grasp_not_confirmed",
-                    message="The qualified source explicitly did not confirm the grasp.",
-                )
-            matched = confirmed is True
-        else:
-            expected_native = {
-                "idle": "idle",
-                "moving": "executing",
-                "reached": "completed",
-                "failed": "failed",
-            }
-            if expected_state not in expected_native:
-                raise ProductionPortError("gripper expected state is unsupported")
-            matched = value.get("state") == expected_native[expected_state]
+        expected_native = {
+            "idle": "idle",
+            "moving": "executing",
+            "reached": "completed",
+            "failed": "failed",
+        }
+        if expected_state not in expected_native:
+            raise ProductionPortError("gripper expected state is unsupported")
+        matched = value.get("state") == expected_native[expected_state]
         return OwnerInvocationResult(
             matched,
             metadata=metadata,

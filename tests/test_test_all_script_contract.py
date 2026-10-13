@@ -98,14 +98,6 @@ def test_reduced_aggregate_has_an_explicit_retained_selector() -> None:
     assert "run_composer_frontend_build" in retained_body
     assert "run_composer_frontend_tests" in retained_body
     assert "manyforge_headless_api/process_tests/" in source
-    assert (
-        'MANYFORGE_GRIPPER_CONFIRMATION_FIXTURE="$build/gripper-confirmation-test-fixture/retained-package"'
-        in source
-    )
-    assert (
-        'MANYFORGE_GRIPPER_CONFIRMATION_METADATA="$build/gripper-confirmation-test-fixture/metadata.json"'
-        in source
-    )
     assert "manyforge_program_runner/tests/" in source
     assert "-p no:cacheprovider" in source
     assert "tests/test_public_contract_entrypoint_reconciliation.py" in source

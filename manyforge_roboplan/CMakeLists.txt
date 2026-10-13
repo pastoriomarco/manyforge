@@ -723,6 +723,7 @@ if(BUILD_TESTING)
       MANYFORGE_TEST_REPOSITORY_ROOT="${_MANYFORGE_REPOSITORY_SOURCE_ROOT}")
     target_link_libraries(test_controller_launch_process PRIVATE
       manyforge_roboplan_controller_launch_process
+      manyforge_roboplan_native_runtime_support
       manyforge_core manyforge::content_identity GTest::gtest_main)
 
     add_executable(test_cell_admission_command_codec
@@ -876,12 +877,20 @@ if(BUILD_TESTING)
     target_link_libraries(test_retained_native_controller_lifecycle_port PRIVATE
       manyforge_roboplan_native_runtime_support GTest::gtest_main)
 
+    # Exercise the existing Deployment facade test in this consumer graph too;
+    # dependency packages deliberately have BUILD_TESTING disabled here.
     add_executable(test_retained_native_cclc_runtime
-      test/test_retained_native_cclc_runtime.cpp)
+      test/test_retained_native_cclc_runtime.cpp
+      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test/test_cclc_runtime_composition.cpp")
+    target_include_directories(test_retained_native_cclc_runtime PRIVATE
+      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test"
+      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src")
     target_link_libraries(test_retained_native_cclc_runtime PRIVATE
       manyforge_roboplan_native_cclc_runtime
       manyforge_component_manager
       manyforge_deployment
+      manyforge::deployment_admission
+      manyforge_deployment_canonical_package_generator
       GTest::gtest_main)
 
     add_executable(test_native_stop_qualification_seams
@@ -898,6 +907,7 @@ if(BUILD_TESTING)
     target_include_directories(test_managed_kernel_admission_gate PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_managed_kernel_admission_gate PRIVATE
+      SQLite::SQLite3
       manyforge_roboplan_managed_kernel_apply_fence
       manyforge::core_sqlite_operation_journal
       manyforge_component_manager
@@ -1277,8 +1287,14 @@ if(BUILD_TESTING)
     add_custom_target(generate_lite6_native_cclc_readiness_fixture ALL
       DEPENDS "${_MANYFORGE_CCLC_READINESS_FIXTURE_MANIFEST}")
     add_dependencies(test_retained_native_cclc_runtime
-      generate_lite6_native_cclc_readiness_fixture)
+      generate_canonical_empty_product_package
+      generate_lite6_native_cclc_readiness_fixture
+      generate_lite6_native_execution_fixture)
     target_compile_definitions(test_retained_native_cclc_runtime PRIVATE
+      MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE_ROOT="${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE}"
+      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}"
+      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}"
+      MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
       MANYFORGE_CCLC_READINESS_FIXTURE_ROOT="${_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT}")
 
     # Same provider/controller catalog and host infrastructure as the ordinary
@@ -1304,6 +1320,10 @@ if(BUILD_TESTING)
       VERBATIM)
     add_custom_target(generate_lite6_native_projection_successor_fixture ALL
       DEPENDS "${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_MANIFEST}")
+    add_dependencies(test_retained_native_cclc_runtime
+      generate_lite6_native_projection_successor_fixture)
+    target_compile_definitions(test_retained_native_cclc_runtime PRIVATE
+      MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT="${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT}")
 
     add_executable(test_retained_product_consumer
       src/product_backed_runtime_participant_resolver.cpp
@@ -1353,6 +1373,7 @@ if(BUILD_TESTING)
       generate_lite6_native_gripper_only_fixture
       manyforge_native_execution_host
       manyforge_native_execution_host_projection_fixture
+      manyforge_native_execution_host_pick_place_planning_fixture
       manyforge_roboplan_candidate_worker)
     target_compile_definitions(
       test_retained_native_runtime_unit_adapter PRIVATE
@@ -1495,6 +1516,17 @@ if(BUILD_TESTING)
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    # The existing Scene target can exercise its private adoption through the
+    # actual managed owner when this complete host graph is configured.
+    if(TARGET test_canonical_empty_scene_owner)
+      target_link_libraries(test_canonical_empty_scene_owner PRIVATE
+        manyforge_roboplan_managed_kernel_apply_fence
+        manyforge_component_manager)
+      target_include_directories(test_canonical_empty_scene_owner PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+      target_compile_definitions(test_canonical_empty_scene_owner PRIVATE
+        MANYFORGE_SCENE_TEST_MANAGED_INTERLOCK=1)
+    endif()
     gtest_discover_tests(test_process_contained_candidate_client
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"

@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -16,6 +17,8 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <iostream>
+#include <map>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
@@ -37,6 +40,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -44,6 +48,9 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "../../manyforge_component_manager/src/native_projection_rpc_internal.hpp"
+#include "../../manyforge_component_manager/src/selected_runtime_composition_rpc_internal.hpp"
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -2440,6 +2447,25 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_TRUE(BootstrapNativeProjectionSet(
       fixture, adapter, bootstrap, initial_scene, projection));
 
+  const auto published_health =
+      projection.ProjectionHealthForRevision(initial_revision);
+  ASSERT_TRUE(published_health.healthy_for_target(initial_revision));
+  EXPECT_THROW(static_cast<void>(projection.ProjectionHealthForRevision(
+                   core::ProjectionRevisionDTO{})),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  auto missing_revision = initial_revision;
+  missing_revision.retained_bundle_id =
+      core::RetainedBundleId("unprepared-bundle");
+  try {
+    static_cast<void>(projection.ProjectionHealthForRevision(missing_revision));
+    ADD_FAILURE() << "missing selected model fell back to current";
+  } catch (
+      const component_manager::RetainedNativeRuntimeUnitAdapterError &error) {
+    EXPECT_NE(std::string(error.what()).find("unprepared retained model"),
+              std::string::npos)
+        << error.what();
+  }
+
   const core::ProjectionLeaseId old_lease("native-adapter.predecessor-lease");
   const auto retained =
       projection.RetainProjectionBinding(initial_revision, old_lease);
@@ -2483,6 +2509,19 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       successor.bundle->retained_bundle_id(),
       successor.bundle->value().cell_graph.graph_revision,
       initial_scene.shared()->revision};
+  const auto prepared_published_health =
+      projection.ProjectionHealthForRevision(initial_revision);
+  EXPECT_TRUE(prepared_published_health.healthy_for_target(initial_revision));
+  EXPECT_EQ(prepared_published_health.native_projection_generation,
+            published_health.native_projection_generation);
+  const auto prepared_candidate_health =
+      projection.ProjectionHealthForRevision(candidate_revision);
+  EXPECT_EQ(prepared_candidate_health.native_runtime_binding, binding);
+  EXPECT_EQ(prepared_candidate_health.state,
+            core::ProjectionHealthState::kUninitialized);
+  EXPECT_FALSE(
+      prepared_candidate_health.healthy_for_target(candidate_revision));
+
   const core::NativeProjectionRebuildDTO rebuild{
       binding, candidate_revision,
       successor.bundle->value().compiled_products.planning_collision_model,
@@ -2499,6 +2538,17 @@ TEST(RetainedNativeRuntimeUnitAdapter,
     std::this_thread::yield();
   }
   ASSERT_TRUE(std::filesystem::exists(entered));
+  const auto pending_published_health =
+      projection.ProjectionHealthForRevision(initial_revision);
+  EXPECT_TRUE(pending_published_health.healthy_for_target(initial_revision));
+  EXPECT_EQ(pending_published_health.native_projection_generation,
+            published_health.native_projection_generation);
+  const auto pending_candidate_health =
+      projection.ProjectionHealthForRevision(candidate_revision);
+  EXPECT_EQ(pending_candidate_health.native_runtime_binding, binding);
+  EXPECT_EQ(pending_candidate_health.state,
+            core::ProjectionHealthState::kRebuilding);
+  EXPECT_FALSE(pending_candidate_health.healthy_for_target(candidate_revision));
 
   // Exact preparation replay must not conflict with its own progressing
   // rebuild, while a different model remains refused.
@@ -2514,7 +2564,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
     ADD_FAILURE() << "conflicting projection preparation was admitted";
   } catch (const component_manager::RetainedNativeRuntimeUnitAdapterError &error) {
     EXPECT_NE(std::string(error.what()).find(
-                  "conflicts with progressing projection work"),
+                  "predecessor is still retained"),
               std::string::npos)
         << error.what();
   }
@@ -2529,6 +2579,21 @@ TEST(RetainedNativeRuntimeUnitAdapter,
     health = projection.ProjectionHealth();
   }
   ASSERT_TRUE(health.healthy_for_target(candidate_revision));
+  EXPECT_TRUE(projection.ProjectionHealthForRevision(initial_revision)
+                  .healthy_for_target(initial_revision));
+  const auto selected_candidate_health =
+      projection.ProjectionHealthForRevision(candidate_revision);
+  EXPECT_TRUE(selected_candidate_health.healthy_for_target(candidate_revision));
+  EXPECT_EQ(selected_candidate_health.native_runtime_binding, binding);
+  EXPECT_EQ(selected_candidate_health.native_projection_generation,
+            health.native_projection_generation);
+  // Same model, different Scene revision: ordinary maintenance must receive
+  // the truthful existing row, never a fabricated target revision.
+  auto future_scene_revision = candidate_revision;
+  ++future_scene_revision.scene_revision.revision_id;
+  EXPECT_EQ(projection.ProjectionHealthForRevision(future_scene_revision)
+                .active_projection_revision,
+            std::optional<core::ProjectionRevisionDTO>(candidate_revision));
   const auto old_frame = projection.ResolveSceneFrame(frame_query);
   ASSERT_TRUE(old_frame.ok()) << old_frame.error().message;
   EXPECT_EQ(old_frame.value().projection_binding, retained.value());
@@ -2585,6 +2650,151 @@ TEST(RetainedNativeRuntimeUnitAdapter,
             component_manager::ProcessPresenceState::kAbsent);
 }
 
+TEST(RetainedNativeRuntimeUnitAdapter,
+     FailedSameBindingCandidateHealthNeverReplacesPublishedModel) {
+  ScopedTemporaryRoot merged;
+  const auto fixture_root = merged.path() / "fixture";
+  std::filesystem::copy(MANYFORGE_I6_NATIVE_FIXTURE_ROOT, fixture_root,
+                        std::filesystem::copy_options::recursive);
+  NativeFixture successor(MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT);
+  std::filesystem::copy(successor.root / "retained-package",
+                        fixture_root / "retained-package",
+                        std::filesystem::copy_options::recursive |
+                            std::filesystem::copy_options::skip_existing);
+  NativeFixture fixture(fixture_root);
+  const auto publication = PublishActiveFixture(fixture);
+  ScopedTemporaryRoot projection_control;
+  auto adapter =
+      MakeAdapter(fixture, MANYFORGE_NATIVE_PROJECTION_TEST_TARGET_ROOT);
+  ProjectionConstructionHold projection_hold(projection_control.path(),
+                                             "rebuild");
+  ASSERT_TRUE(projection_hold.Configure());
+  ASSERT_TRUE(projection_hold.Release());
+  // Reuse the existing construction-failure boundary, present only in this
+  // fixture host. Restore the parent test environment on every exit.
+  struct RestoreFailureSelection final {
+    std::optional<std::string> previous;
+    ~RestoreFailureSelection() {
+      if (previous.has_value()) {
+        static_cast<void>(::setenv("MANYFORGE_NATIVE_PROJECTION_TEST_FAIL",
+                                   previous->c_str(), 1));
+      } else {
+        static_cast<void>(::unsetenv("MANYFORGE_NATIVE_PROJECTION_TEST_FAIL"));
+      }
+    }
+  };
+  const char *const previous_failure =
+      std::getenv("MANYFORGE_NATIVE_PROJECTION_TEST_FAIL");
+  const RestoreFailureSelection restore_failure{
+      previous_failure != nullptr ? std::optional<std::string>(previous_failure)
+                                  : std::nullopt};
+  ASSERT_EQ(::setenv("MANYFORGE_NATIVE_PROJECTION_TEST_FAIL", "rebuild", 1), 0);
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  const auto binding = NativeProjectionBinding(fixture, epoch);
+  ASSERT_EQ(binding, NativeProjectionBinding(successor, epoch));
+  const auto resolved = adapter.ResolveProjection(binding);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  auto &projection = *resolved.value();
+  const auto initial_scene =
+      MakeEmptyScene(fixture.bundle->value().cell_graph.cell_id, 1U);
+  const auto initial_revision =
+      publication.request.candidate_projection_revision;
+  const core::NativeProjectionBootstrapStatusQueryDTO bootstrap{
+      core::BootstrapId("failed-stage-bootstrap"),
+      core::BootstrapGeneration(1U), binding, initial_revision};
+  ASSERT_TRUE(BootstrapNativeProjectionSet(fixture, adapter, bootstrap,
+                                           initial_scene, projection));
+  const auto published_health =
+      projection.ProjectionHealthForRevision(initial_revision);
+  ASSERT_TRUE(published_health.healthy_for_target(initial_revision));
+  const core::ProjectionLeaseId old_lease("failed-stage.published-lease");
+  const auto old_retained =
+      projection.RetainProjectionBinding(initial_revision, old_lease);
+  ASSERT_TRUE(old_retained.ok()) << old_retained.error().message;
+
+  const auto prepared = adapter.EnsureRunning(*successor.query);
+  ASSERT_EQ(prepared.state(),
+            component_manager::ProcessPresenceState::kPresent);
+  ASSERT_EQ(prepared.process_incarnation(), started.process_incarnation());
+  // The candidate uses the genuine predecessor Scene unchanged. Failure is
+  // at the actual Rebuild worker boundary, before candidate readiness; the
+  // parent Manager exclusions remain a separate Scene/host qualification.
+  const core::ProjectionRevisionDTO candidate_revision{
+      successor.bundle->retained_bundle_id(),
+      successor.bundle->value().cell_graph.graph_revision,
+      initial_scene.shared()->revision};
+  const core::NativeProjectionRebuildDTO rebuild{
+      binding, candidate_revision,
+      successor.bundle->value().compiled_products.planning_collision_model,
+      initial_scene.shared()};
+  ASSERT_TRUE(rebuild.valid());
+  const auto accepted = projection.RebuildProjection(rebuild);
+  ASSERT_TRUE(accepted.presence_valid());
+  ASSERT_EQ(accepted.result, core::ProjectionCommitResultStateDTO::kAccepted);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  auto failed_health =
+      projection.ProjectionHealthForRevision(candidate_revision);
+  while (failed_health.state != core::ProjectionHealthState::kUnavailable &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    failed_health = projection.ProjectionHealthForRevision(candidate_revision);
+  }
+  ASSERT_EQ(failed_health.state, core::ProjectionHealthState::kUnavailable);
+  EXPECT_EQ(failed_health.native_runtime_binding, binding);
+  ASSERT_TRUE(failed_health.error.has_value());
+  EXPECT_EQ(failed_health.error->details.at("reason"),
+            "native_projection_rebuild_worker_failed");
+  EXPECT_NE(failed_health.error->message.find(
+                "injected native projection construction failure"),
+            std::string::npos);
+  EXPECT_FALSE(failed_health.active_projection_revision.has_value());
+  EXPECT_FALSE(failed_health.healthy_for_target(candidate_revision));
+  EXPECT_TRUE(projection.ProjectionHealthForRevision(initial_revision)
+                  .healthy_for_target(initial_revision));
+  EXPECT_EQ(projection.ProjectionHealthForRevision(initial_revision)
+                .native_projection_generation,
+            published_health.native_projection_generation);
+  const auto retained_replay =
+      projection.RetainProjectionBinding(initial_revision, old_lease);
+  ASSERT_TRUE(retained_replay.ok()) << retained_replay.error().message;
+  EXPECT_EQ(retained_replay.value(), old_retained.value());
+  const auto failed_replay = projection.RebuildProjection(rebuild);
+  EXPECT_EQ(failed_replay.result,
+            core::ProjectionCommitResultStateDTO::kFailedProjectionUncertain);
+  EXPECT_EQ(failed_replay.resulting_health.state,
+            core::ProjectionHealthState::kUnavailable);
+  const auto candidate_retained = projection.RetainProjectionBinding(
+      candidate_revision, core::ProjectionLeaseId("failed-stage.candidate"));
+  EXPECT_FALSE(candidate_retained.ok());
+  try {
+    static_cast<void>(adapter.EnsureRunning(*fixture.query));
+    ADD_FAILURE()
+        << "failed staged slot silently replaced the retained predecessor";
+  } catch (
+      const component_manager::RetainedNativeRuntimeUnitAdapterError &error) {
+    EXPECT_NE(std::string(error.what()).find("predecessor is still retained"),
+              std::string::npos)
+        << error.what();
+  }
+  EXPECT_EQ(adapter.ObserveProcess(*successor.query).process_incarnation(),
+            started.process_incarnation());
+  EXPECT_EQ(projection.ProjectionHealthForRevision(candidate_revision).state,
+            core::ProjectionHealthState::kUnavailable);
+  const auto trace = ReadFile(projection_control.path() / "trace.log");
+  const auto execution =
+      "execute rebuild " + binding.provider_binding_id.value() + "\n";
+  const auto first_execution = trace.find(execution);
+  ASSERT_NE(first_execution, std::string::npos);
+  EXPECT_EQ(trace.find(execution, first_execution + execution.size()),
+            std::string::npos)
+      << "exact failed replay repeated construction";
+  projection.ReleaseProjection(old_lease);
+  EXPECT_EQ(adapter.EnsureStopped(*successor.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
 TEST(RetainedNativeRuntimeUnitAdapter,
      TimedOutExchangeForgetsItsReapedChildSoConvergenceRelaunches) {
   NativeFixture fixture;
@@ -2834,5 +3044,787 @@ TEST(RuntimeUnitAdapterRouter,
   EXPECT_EQ(reference.calls, 0U);
 }
 
+[[nodiscard]] component_manager::ManagerSelectedComponentBringUpRequestDTO
+SelectedAdapterRequest(const NativeFixture &fixture,
+                       const core::RuntimeEpoch &epoch,
+                       const std::string &fixture_response) {
+  const core::ExpectedActiveControlConfigurationDTO absent_configuration{
+      core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
+      std::nullopt, std::nullopt};
+  const core::ExpectedControlDomainRevisionDTO domain{
+      core::ControlDomainId("selected.domain"),
+      core::ControlDomainRevision("domain.1"),
+      core::ControllerTopologyId("topology.1"),
+      core::TopologyRevision("topology.1"),
+      absent_configuration,
+      {{core::ControlBindingId("binding.1"),
+        core::ControlBindingRevision("binding.1"),
+        core::ControlRouteId("route.1")}}};
+  return {{{core::RequestId("selected.request"),
+            core::RequestOwnerEpoch("original.cclc.1"), "adapter-test",
+            std::nullopt},
+           core::ControllableComponentId("selected.component"),
+           core::ComponentLifecycleIntentKindDTO::kEnable,
+           fixture.query->candidate_graph_revision,
+           core::ComponentLifecycleGeneration(1U),
+           {domain},
+           fixture_response,
+           {}},
+          {fixture.bundle->retained_bundle_id(),
+           fixture.query->candidate_graph_revision,
+           {core::SceneId(std::string(kIntentDigest)), 1U,
+            core::ContentDigest(std::string(kIntentDigest))}},
+          core::ContentDigest(std::string(kIntentDigest)),
+          1024U,
+          fixture.query->plan.runtime_unit_id,
+          epoch,
+          core::RuntimeEpoch("original.manager.1")};
+}
+
+// This is only a packet peer: production admission/codec values are reused,
+// but no planner, CCLC, robot, engine or effect owner is implemented here.
+int RunSelectedAdapterPacketChild(const int argc, char **argv) {
+  namespace rpc = component_manager::detail;
+  std::map<std::string, std::string> arguments;
+  for (int index = 1; index + 1 < argc; index += 2) {
+    if (!arguments.emplace(argv[index], argv[index + 1]).second)
+      throw std::invalid_argument("duplicate managed packet fixture argument");
+  }
+  const auto channel =
+      std::stoi(arguments.at("--manyforge-managed-runtime-channel-fd"));
+  const auto package_fd =
+      std::stoi(arguments.at("--manyforge-managed-package-root-fd"));
+  const auto package_root =
+      std::filesystem::path("/proc/self/fd") / std::to_string(package_fd);
+  deployment::FilesystemVerifiedRetainedBundleSource bundles(package_root);
+  deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(
+      package_root);
+  const auto bundle = bundles.get_verified(core::RetainedBundleId(
+      arguments.at("--manyforge-managed-retained-bundle-id")));
+  if (!bundle)
+    throw std::runtime_error("managed packet fixture bundle missing");
+  const auto admission =
+      component_manager::VerifyNativeExecutionRuntimeUnitForHost(
+          *bundle, core::RuntimeUnitId(arguments.at("--runtime-unit-id")),
+          artifacts, contract::kOperatingSystem,
+          contract::kLaunchEnvironmentContract);
+  if (!admission)
+    throw std::runtime_error("managed packet fixture admission missing");
+  const core::RuntimeEpoch epoch(arguments.at("--runtime-epoch"));
+  const auto run_root = std::filesystem::path(
+      arguments.at("--manyforge-managed-execution-run-root"));
+  if (arguments.contains("--manyforge-managed-isaac-site-settings")) {
+    std::ofstream captured(run_root / "site.arguments", std::ios::binary);
+    for (int index = 1; index < argc; ++index) {
+      captured << argv[index];
+      captured.put('\0');
+    }
+    if (!captured) throw std::runtime_error("site argv fixture capture failed");
+  }
+  std::uint64_t sequence = 0U;
+  for (;;) {
+    std::string packet(rpc::kMaximumSelectedRuntimeCompositionRpcPacketBytes,
+                       '\0');
+    const auto count = ::recv(channel, packet.data(), packet.size(), MSG_TRUNC);
+    if (count <= 0)
+      return 0;
+    if (static_cast<std::size_t>(count) > packet.size())
+      throw std::runtime_error("managed packet fixture input oversized");
+    packet.resize(static_cast<std::size_t>(count));
+    if (packet == "shutdown")
+      return 0;
+    std::string response;
+    if (packet == "hello") {
+      response = admission->expected_ready_packet(epoch);
+    } else if (packet == "status") {
+      response = admission->expected_status_packet(epoch, ++sequence);
+    } else if (!rpc::IsSelectedRuntimeCompositionRpcPacket(packet)) {
+      const auto request = rpc::DecodeNativeProjectionRpcRequest(packet);
+      const auto *prepare =
+          std::get_if<rpc::NativeProjectionPrepareRequest>(&request);
+      if (!prepare)
+        throw std::invalid_argument(
+            "managed packet fixture only acknowledges Prepare");
+      response = rpc::EncodeNativeProjectionRpcResponse(
+          rpc::NativeProjectionPrepareResult{*prepare});
+    } else {
+      const auto request =
+          rpc::DecodeSelectedRuntimeCompositionRpcRequestVariant(packet);
+      if (const auto *inspection = std::get_if<
+              component_manager::ManagerComponentBringUpInspectionRequestDTO>(&request)) {
+        auto echo = *inspection;
+        if (echo.manager_runtime_epoch.value() == "inspection.delay")
+          std::this_thread::sleep_for(std::chrono::milliseconds(11000));
+        if (echo.manager_runtime_epoch.value() == "inspection.foreign")
+          echo.manager_runtime_epoch = core::RuntimeEpoch("inspection.foreign-response");
+        if (echo.manager_runtime_epoch.value() == "inspection.failure")
+          response = rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+              rpc::SelectedRuntimeCompositionRpcFailure{{"inspection_unavailable", "fixture observation unavailable", {}}});
+        else
+          response = rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+              component_manager::ManagerComponentBringUpInspectionResultDTO{
+                  echo, {{core::ControllableComponentId("component.absent"), component_manager::ProcessPresenceState::kAbsent},
+                         {core::ControllableComponentId("component.present"), component_manager::ProcessPresenceState::kPresent},
+                         {core::ControllableComponentId("component.unknown"), component_manager::ProcessPresenceState::kUnknown}}});
+        if (::send(channel, response.data(), response.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(response.size()))
+          throw std::runtime_error("inspection packet response was not atomic");
+        continue;
+      }
+      const auto *apply_submit = std::get_if<
+          component_manager::ManagerApplyComponentBringUpRequestDTO>(&request);
+      const auto *apply_read = std::get_if<
+          component_manager::ManagerApplyComponentBringUpReadRequestDTO>(&request);
+      if (apply_submit || apply_read) {
+        std::ofstream observed(run_root / "selected-test-last-request.bin", std::ios::binary);
+        observed.write(packet.data(), static_cast<std::streamsize>(packet.size()));
+        observed.close();
+        if (!observed) throw std::runtime_error("delegated packet observation failed");
+        auto echo = apply_submit ? *apply_submit : apply_read->request;
+        const auto marker = echo.intent.reason.value_or("");
+        if (marker == "close") return 0;
+        if (marker == "rpc-failure") {
+          response = rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+              rpc::SelectedRuntimeCompositionRpcFailure{{"packet_peer_failure", "response unavailable", {}}});
+        } else {
+          if (marker == "foreign-parent-receipt")
+            echo.parent_authority.parent_claim.claim_generation = core::CellAdmissionClaimGeneration(999U);
+          if (marker == "foreign-attribution")
+            echo.intent.attribution = {core::RequestTransportDTO::kHttp,
+                core::RequestAssuranceDTO::kExternallyAuthenticated, std::string("foreign.principal")};
+          std::optional<core::CCLCLifecycleRequestResultDTO> result;
+          if (marker != "unknown")
+            result = core::CCLCLifecycleRequestResultDTO{
+                core::RequestReplayStatusDTO::kRequestIdConflict, std::nullopt, std::nullopt};
+          response = rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+              component_manager::ManagerApplyComponentBringUpResultDTO{echo, result});
+        }
+        if (::send(channel, response.data(), response.size(), MSG_NOSIGNAL) !=
+            static_cast<ssize_t>(response.size()))
+          throw std::runtime_error("delegated packet response was not atomic");
+        continue;
+      }
+      const auto *submit = std::get_if<
+          component_manager::ManagerSelectedComponentBringUpRequestDTO>(
+          &request);
+      const auto *read = std::get_if<
+          component_manager::ManagerSelectedComponentBringUpReadRequestDTO>(
+          &request);
+      if (!submit && !read)
+        throw std::invalid_argument(
+            "managed packet fixture expected selected request");
+      std::ofstream observed(run_root / "selected-test-last-request.bin",
+                             std::ios::binary);
+      observed.write(packet.data(),
+                     static_cast<std::streamsize>(packet.size()));
+      observed.close();
+      if (!observed)
+        throw std::runtime_error("managed packet fixture observation failed");
+      auto echo = submit ? *submit : read->request;
+      const auto marker = echo.intent.reason.value_or("");
+      if (marker == "close")
+        return 0; // Sent request, lost response: outcome unknown.
+      if (marker == "rpc-failure") {
+        response = rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+            rpc::SelectedRuntimeCompositionRpcFailure{
+                {"packet_peer_failure",
+                 "response unavailable",
+                 {{"reason", "fixture"}}}});
+      } else if (marker == "malformed") {
+        response = "malformed selected response";
+      } else if (marker == "wrong-kind") {
+        const component_manager::ManagerSelectedRuntimeCompositionRequestDTO
+            ordinary{core::ContentDigest(std::string(kIntentDigest)),
+                     core::ApplyId("fixture.apply"),
+                     core::ApplyGeneration(1U),
+                     echo.candidate_projection_revision,
+                     core::ActiveBundlePublicationGeneration(1U),
+                     core::ContentDigest(std::string(kIntentDigest)),
+                     echo.candidate_retained_bundle_digest,
+                     echo.candidate_retained_bundle_bytes,
+                     echo.runtime_unit_id,
+                     echo.runtime_epoch,
+                     echo.manager_runtime_epoch,
+                     core::ConfigurationFenceId("fixture.fence"),
+                     core::ConfigurationFenceGeneration(1U),
+                     {},
+                     component_manager::ManagerSelectedRuntimeCompositionPhase::
+                         kPrepare,
+                     {},
+                     echo.candidate_projection_revision};
+        response = rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+            component_manager::ManagerSelectedRuntimeCompositionResultDTO{
+                ordinary,
+                component_manager::ManagerSelectedRuntimeCompositionState::
+                    kPreparing,
+                {}});
+      } else {
+        if (marker == "foreign-unit")
+          echo.runtime_unit_id = core::RuntimeUnitId("foreign.unit");
+        if (marker == "foreign-host")
+          echo.runtime_epoch = core::RuntimeEpoch("foreign.host");
+        if (marker == "foreign-manager")
+          echo.manager_runtime_epoch = core::RuntimeEpoch("foreign.manager");
+        if (marker == "foreign-intent")
+          echo.intent.request_context.request_id =
+              core::RequestId("foreign.request");
+        if (marker == "foreign-attribution")
+          echo.intent.attribution = {
+              core::RequestTransportDTO::kHttp,
+              core::RequestAssuranceDTO::kExternallyAuthenticated,
+              std::string("foreign.principal")};
+        if (marker == "foreign-candidate")
+          ++echo.candidate_retained_bundle_bytes;
+        std::optional<core::CCLCLifecycleRequestResultDTO> result;
+        if (marker != "unknown") {
+          result = core::CCLCLifecycleRequestResultDTO{
+              core::RequestReplayStatusDTO::kRequestIdConflict, std::nullopt,
+              std::nullopt};
+          if (marker == "rejection") {
+            result = core::CCLCLifecycleRequestResultDTO{
+                core::RequestReplayStatusDTO::kReplayedExact, std::nullopt,
+                std::nullopt,
+                core::ErrorDTO{"selected_refused",
+                               "no admission",
+                               {{"effect", "not_started"}}}};
+          }
+        }
+        response = rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+            component_manager::ManagerSelectedComponentBringUpResultDTO{
+                echo, result});
+      }
+    }
+    if (::send(channel, response.data(), response.size(), MSG_NOSIGNAL) !=
+        static_cast<ssize_t>(response.size()))
+      throw std::runtime_error(
+          "managed packet fixture response not sent atomically");
+  }
+}
+
+[[nodiscard]] std::filesystem::path
+InstallSelectedPacketTestTargets(const std::filesystem::path &root) {
+  return InstallNativeTestTargets(
+      "/proc/self/exe",
+      std::filesystem::path(MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT) /
+          std::string(contract::kCandidateWorkerInstalledTargetId),
+      root);
+}
+
+[[nodiscard]] component_manager::detail::SelectedRuntimeCompositionRpcRequest
+ReadObservedSelectedRequest(const NativeFixture &fixture) {
+  return component_manager::detail::
+      DecodeSelectedRuntimeCompositionRpcRequestVariant(
+          ReadFile(fixture.execution_run_root.path() /
+                   "selected-test-last-request.bin"));
+}
+
+[[nodiscard]] component_manager::ManagerApplyComponentBringUpRequestDTO
+ApplyAdapterRequest(const NativeFixture &fixture, const core::RuntimeEpoch &epoch,
+                    const std::string &marker) {
+  auto common = SelectedAdapterRequest(fixture, epoch, marker);
+  const core::ApplyFenceOwnerDTO owner{core::ApplyId("parent.apply"), core::ApplyGeneration(8U)};
+  const core::ApplyComponentBringUpReferenceDTO parent{
+      owner, core::ContentDigest(std::string(kIntentDigest))};
+  const core::CellAdmissionClaimIntentDTO claim{
+      core::CellAdmissionClaimKindDTO::kManagerApply, core::CellAdmissionOwnerRoleDTO::kManager,
+      core::RequestOwnerEpoch("parent.manager"), owner.apply_id.value(), core::RequestId("parent.request"),
+      parent.plan_digest, core::AdmissionGeneration(9U), {}, std::nullopt, std::nullopt, std::nullopt};
+  const core::ConfigurationFenceScopeDTO scope{};
+  return {common.intent, common.candidate_projection_revision,
+          common.candidate_retained_bundle_digest, common.candidate_retained_bundle_bytes,
+          common.runtime_unit_id, common.runtime_epoch, common.manager_runtime_epoch,
+          {parent, {claim, core::CellAdmissionClaimGeneration(17U), core::AdmissionGeneration(9U), 1000},
+           {owner, core::ConfigurationFenceId("parent.fence"), core::ConfigurationFenceGeneration(22U),
+            scope, common.manager_runtime_epoch}}};
+}
+
+component_manager::ManagerComponentBringUpInspectionRequestDTO InspectionAdapterRequest(
+    const NativeFixture &fixture, const core::RuntimeEpoch &epoch,
+    const std::string &manager_epoch) {
+  const auto selected = SelectedAdapterRequest(fixture, epoch, "");
+  return {selected.candidate_projection_revision, selected.candidate_retained_bundle_digest,
+          selected.candidate_retained_bundle_bytes, selected.candidate_projection_revision,
+          core::ActiveBundlePublicationGeneration(1U), core::ContentDigest(std::string(kIntentDigest)),
+          selected.runtime_unit_id, epoch, core::RuntimeEpoch(manager_epoch)};
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter, ComponentInspectionPreservesExactOccurrenceAndUnavailableFacts) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  const auto request = InspectionAdapterRequest(fixture, epoch, "inspection.current");
+  const auto inspected = adapter.InspectComponentBringUp(request);
+  ASSERT_TRUE(inspected.ok());
+  EXPECT_EQ(inspected.value().request, request);
+  ASSERT_EQ(inspected.value().configured_components.size(), 3U);
+  EXPECT_EQ(inspected.value().configured_components[0].process_presence, component_manager::ProcessPresenceState::kAbsent);
+  EXPECT_EQ(inspected.value().configured_components[1].process_presence, component_manager::ProcessPresenceState::kPresent);
+  EXPECT_EQ(inspected.value().configured_components[2].process_presence, component_manager::ProcessPresenceState::kUnknown);
+  const auto refused = adapter.InspectComponentBringUp(InspectionAdapterRequest(fixture, epoch, "inspection.failure"));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "inspection_unavailable");
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(), epoch.value());
+  EXPECT_TRUE(adapter.ObserveProgress(*fixture.query, epoch).has_value());
+  EXPECT_THROW((void)adapter.InspectComponentBringUp(InspectionAdapterRequest(fixture, epoch, "inspection.foreign")),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(), component_manager::ProcessPresenceState::kPresent);
+  // A consumed foreign echo cannot restore correlation, or permit an effect.
+  EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch));
+  EXPECT_FALSE(adapter.SubmitApplyComponentBringUp(ApplyAdapterRequest(fixture, epoch, "present")).ok());
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(), component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter, ComponentInspectionTimeoutKeepsHostAndSettlesOnlyExactLateReply) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  const auto timed_out = adapter.InspectComponentBringUp(InspectionAdapterRequest(fixture, epoch, "inspection.delay"));
+  ASSERT_FALSE(timed_out.ok());
+  EXPECT_EQ(timed_out.error().code, "component_bring_up_inspection_timed_out");
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(), component_manager::ProcessPresenceState::kPresent);
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(), epoch.value());
+  EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch));
+  EXPECT_FALSE(adapter.SubmitApplyComponentBringUp(ApplyAdapterRequest(fixture, epoch, "present")).ok());
+  const auto blocked = adapter.InspectComponentBringUp(InspectionAdapterRequest(fixture, epoch, "inspection.current"));
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().code, "component_bring_up_inspection_pending");
+  bool settled = false;
+  for (int attempt = 0; attempt < 200 && !settled; ++attempt) {
+    settled = adapter.ObserveProgress(*fixture.query, epoch).has_value();
+    if (!settled) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(settled);
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(), epoch.value());
+  EXPECT_TRUE(adapter.InspectComponentBringUp(InspectionAdapterRequest(fixture, epoch, "inspection.current")).ok());
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter, ApplyDelegationPreservesOriginalRequestOnReplacementChild) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto first = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(first.state(), component_manager::ProcessPresenceState::kPresent);
+  const auto original = ApplyAdapterRequest(fixture, core::RuntimeEpoch(first.process_incarnation()), "present");
+  ASSERT_TRUE(original.valid());
+  ASSERT_TRUE(adapter.SubmitApplyComponentBringUp(original).ok());
+  ASSERT_EQ(adapter.EnsureStopped(*fixture.query).state(), component_manager::ProcessPresenceState::kAbsent);
+  const auto replacement = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(replacement.state(), component_manager::ProcessPresenceState::kPresent);
+  ASSERT_NE(replacement.process_incarnation(), first.process_incarnation());
+  for (const bool read : {false, true}) {
+    const auto result = read ? adapter.ReadApplyComponentBringUp({original})
+                             : adapter.SubmitApplyComponentBringUp(original);
+    ASSERT_TRUE(result.ok());
+    EXPECT_EQ(result.value().request, original);
+    ASSERT_TRUE(result.value().result.has_value());
+    const auto received = ReadObservedSelectedRequest(fixture);
+    if (read)
+      EXPECT_EQ(std::get<component_manager::ManagerApplyComponentBringUpReadRequestDTO>(received).request, original);
+    else
+      EXPECT_EQ(std::get<component_manager::ManagerApplyComponentBringUpRequestDTO>(received), original);
+  }
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter, ApplyDelegationRequiresExactEchoAndPresentSubmit) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  const auto unknown = ApplyAdapterRequest(fixture, epoch, "unknown");
+  const auto read = adapter.ReadApplyComponentBringUp({unknown});
+  ASSERT_TRUE(read.ok());
+  EXPECT_FALSE(read.value().result);
+  EXPECT_THROW((void)adapter.SubmitApplyComponentBringUp(unknown),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  for (const auto &marker : {"foreign-parent-receipt", "foreign-attribution"}) {
+    const auto request = ApplyAdapterRequest(fixture, epoch, marker);
+    ASSERT_TRUE(request.valid());
+    EXPECT_THROW((void)adapter.SubmitApplyComponentBringUp(request),
+                 component_manager::RetainedNativeRuntimeUnitAdapterError);
+    EXPECT_THROW((void)adapter.ReadApplyComponentBringUp({request}),
+                 component_manager::RetainedNativeRuntimeUnitAdapterError);
+  }
+  const auto failed = adapter.SubmitApplyComponentBringUp(ApplyAdapterRequest(fixture, epoch, "rpc-failure"));
+  ASSERT_FALSE(failed.ok());
+  EXPECT_EQ(failed.error().code, "packet_peer_failure");
+  EXPECT_FALSE(failed.error().details.contains("effect"));
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     SelectedPacketRoundTripsSubmitReadAndUnknownWithoutEffects) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  const auto request = SelectedAdapterRequest(fixture, epoch, "present");
+  ASSERT_TRUE(request.valid());
+  const auto submit = adapter.SubmitSelectedComponentBringUp(request);
+  ASSERT_TRUE(submit.ok());
+  EXPECT_EQ(submit.value().request, request);
+  ASSERT_TRUE(submit.value().result.has_value());
+  EXPECT_EQ(submit.value().result->replay_status,
+            core::RequestReplayStatusDTO::kRequestIdConflict);
+  EXPECT_EQ(
+      std::get<component_manager::ManagerSelectedComponentBringUpRequestDTO>(
+          ReadObservedSelectedRequest(fixture)),
+      request);
+  const auto read = adapter.ReadSelectedComponentBringUp({request});
+  ASSERT_TRUE(read.ok());
+  EXPECT_EQ(read.value().request, request);
+  ASSERT_TRUE(read.value().result.has_value());
+  EXPECT_EQ(
+      std::get<
+          component_manager::ManagerSelectedComponentBringUpReadRequestDTO>(
+          ReadObservedSelectedRequest(fixture))
+          .request,
+      request);
+  const auto unknown_request =
+      SelectedAdapterRequest(fixture, epoch, "unknown");
+  const auto unknown = adapter.ReadSelectedComponentBringUp({unknown_request});
+  ASSERT_TRUE(unknown.ok());
+  EXPECT_EQ(unknown.value().request, unknown_request);
+  EXPECT_FALSE(unknown.value().result.has_value());
+  EXPECT_THROW((void)adapter.SubmitSelectedComponentBringUp(unknown_request),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  const auto rejection_request =
+      SelectedAdapterRequest(fixture, epoch, "rejection");
+  const auto rejected =
+      adapter.SubmitSelectedComponentBringUp(rejection_request);
+  ASSERT_TRUE(rejected.ok());
+  ASSERT_TRUE(rejected.value().result->rejection.has_value());
+  EXPECT_EQ(rejected.value().result->rejection->details.at("effect"),
+            "not_started");
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     SelectedObservationPreservesOriginalEpochsAcrossChildReplacement) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto first = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(first.state(), component_manager::ProcessPresenceState::kPresent);
+  const auto original = SelectedAdapterRequest(
+      fixture, core::RuntimeEpoch(first.process_incarnation()), "present");
+  ASSERT_TRUE(adapter.SubmitSelectedComponentBringUp(original).ok());
+  ASSERT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+  const auto second = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(second.state(), component_manager::ProcessPresenceState::kPresent);
+  ASSERT_NE(second.process_incarnation(), first.process_incarnation());
+  for (const bool read_only : {false, true}) {
+    const auto result = read_only
+                            ? adapter.ReadSelectedComponentBringUp({original})
+                            : adapter.SubmitSelectedComponentBringUp(original);
+    ASSERT_TRUE(result.ok());
+    EXPECT_EQ(result.value().request, original);
+    const auto received = ReadObservedSelectedRequest(fixture);
+    if (read_only)
+      EXPECT_EQ(
+          std::get<
+              component_manager::ManagerSelectedComponentBringUpReadRequestDTO>(
+              received)
+              .request,
+          original);
+    else
+      EXPECT_EQ(
+          std::get<
+              component_manager::ManagerSelectedComponentBringUpRequestDTO>(
+              received),
+          original);
+  }
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     SelectedExchangeRefusesForeignFullEchoAndWrongResultKind) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  for (const auto marker :
+       {"foreign-unit", "foreign-host", "foreign-manager", "foreign-intent",
+        "foreign-attribution", "foreign-candidate", "wrong-kind"}) {
+    SCOPED_TRACE(marker);
+    const auto request = SelectedAdapterRequest(fixture, epoch, marker);
+    EXPECT_THROW((void)adapter.SubmitSelectedComponentBringUp(request),
+                 component_manager::RetainedNativeRuntimeUnitAdapterError);
+    EXPECT_THROW((void)adapter.ReadSelectedComponentBringUp({request}),
+                 component_manager::RetainedNativeRuntimeUnitAdapterError);
+  }
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     SelectedRpcFailureMalformedAndLostReplyAreNotNoAdmissionResults) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  const auto failed = adapter.SubmitSelectedComponentBringUp(
+      SelectedAdapterRequest(fixture, epoch, "rpc-failure"));
+  ASSERT_FALSE(failed.ok());
+  EXPECT_EQ(failed.error().code, "packet_peer_failure");
+  EXPECT_FALSE(failed.error().details.contains("effect"));
+  const auto read_failed = adapter.ReadSelectedComponentBringUp(
+      {SelectedAdapterRequest(fixture, epoch, "rpc-failure")});
+  ASSERT_FALSE(read_failed.ok());
+  EXPECT_FALSE(read_failed.error().details.contains("effect"));
+  EXPECT_THROW((void)adapter.SubmitSelectedComponentBringUp(
+                   SelectedAdapterRequest(fixture, epoch, "malformed")),
+               std::invalid_argument);
+  const auto lost = SelectedAdapterRequest(fixture, epoch, "close");
+  EXPECT_THROW((void)adapter.SubmitSelectedComponentBringUp(lost),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  EXPECT_EQ(
+      std::get<component_manager::ManagerSelectedComponentBringUpRequestDTO>(
+          ReadObservedSelectedRequest(fixture)),
+      lost);
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     SelectedInvalidAndAbsentChildRequestsNeverStartAChild) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  auto request = SelectedAdapterRequest(
+      fixture, core::RuntimeEpoch("original.host"), "present");
+  EXPECT_FALSE(adapter.SubmitSelectedComponentBringUp(request).ok());
+  EXPECT_FALSE(adapter.ReadSelectedComponentBringUp({request}).ok());
+  request.candidate_retained_bundle_bytes = 0;
+  EXPECT_THROW((void)adapter.SubmitSelectedComponentBringUp(request),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  EXPECT_THROW((void)adapter.ReadSelectedComponentBringUp({request}),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+  EXPECT_FALSE(std::filesystem::exists(fixture.execution_run_root.path() /
+                                       "selected-test-last-request.bin"));
+}
+
 } // namespace
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     SiteDocumentIsCapturedAndRetainedWithOnlyItsPathInExecArguments) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  const auto executable = InstallSelectedPacketTestTargets(targets.path());
+  const auto arguments_path = fixture.execution_run_root.path() / "site.arguments";
+  std::string document =
+      "schema: manyforge.isaac_site.v1\n"
+      "scene_startup_timeout_s: 60\nscene_service_timeout_s: 60\n"
+      "worlds: {}\npose_observers_by_cell: {}\n"
+      "# shell-looking text stays data: ; $(not_a_command) 'quoted'\n";
+  // Accepted site documents can exceed Linux's single exec argument limit.
+  document.append(256U * 1024U, ' ');
+  const auto expected_document = document;
+  std::filesystem::path snapshot_path;
+  {
+    auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
+        targets.path(), fixture.root / "retained-package",
+        fixture.manager_state_root.path(), fixture.manager_run_root.path(),
+        fixture.execution_state_root.path(), fixture.execution_run_root.path(),
+        fixture.bundle_source, fixture.artifact_source,
+        std::string(contract::kOperatingSystem),
+        std::string(contract::kLaunchEnvironmentContract), {}, {}, {}, {}, document, executable);
+    const component_manager::ManagerIsaacPoseObserverLaunchFactsDTO observer_facts{
+        (fixture.manager_run_root.path() / "original-observer.json").string(),
+        std::string("configured\0source", 17U), "manager-spawn-1"};
+    adapter.SetIsaacPoseObserverStartupLaunchFacts(observer_facts);
+    document.assign("changed caller storage");
+    const auto started = adapter.EnsureRunning(*fixture.query);
+    ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+    for (int attempt = 0; attempt < 200 &&
+         !std::filesystem::exists(arguments_path); ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(std::filesystem::exists(arguments_path));
+    EXPECT_THROW(adapter.SetIsaacPoseObserverStartupLaunchFacts(std::nullopt),
+                 component_manager::RetainedNativeRuntimeUnitAdapterError);
+    std::istringstream captured(ReadFile(arguments_path));
+    std::vector<std::string> arguments;
+    for (std::string argument; std::getline(captured, argument, '\0');)
+      arguments.push_back(std::move(argument));
+    const auto expect_argument = [&](const std::string_view name,
+                                     const std::string &expected) {
+      const auto found = std::find(arguments.begin(), arguments.end(), name);
+      ASSERT_NE(found, arguments.end());
+      ASSERT_NE(std::next(found), arguments.end());
+      EXPECT_EQ(*std::next(found), expected);
+    };
+    expect_argument("--manyforge-managed-isaac-observer-snapshot",
+                    observer_facts.retained_snapshot_path);
+    expect_argument("--manyforge-managed-isaac-observer-source-id",
+                    manyforge::content_identity::canonical_json(
+                        CanonicalValue(observer_facts.source_id)));
+    expect_argument("--manyforge-managed-isaac-observer-epoch-base",
+                    observer_facts.source_epoch_base);
+    const auto option = std::find(arguments.begin(), arguments.end(),
+                                 "--manyforge-managed-isaac-site-settings");
+    ASSERT_NE(option, arguments.end());
+    ASSERT_NE(std::next(option), arguments.end());
+    snapshot_path = *std::next(option);
+    EXPECT_EQ(snapshot_path.parent_path(), fixture.manager_run_root.path());
+    EXPECT_NE(*std::next(option), expected_document);
+    EXPECT_EQ(ReadFile(snapshot_path), expected_document);
+    struct stat snapshot_status {};
+    ASSERT_EQ(::lstat(snapshot_path.c_str(), &snapshot_status), 0);
+    EXPECT_TRUE(S_ISREG(snapshot_status.st_mode));
+    EXPECT_EQ(snapshot_status.st_mode & 0777, 0600);
+    EXPECT_EQ(std::count(arguments.begin(), arguments.end(),
+                         "--manyforge-managed-isaac-site-settings"), 1);
+    EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+              component_manager::ProcessPresenceState::kAbsent);
+    EXPECT_EQ(ReadFile(snapshot_path), expected_document);
+  }
+  // Adapter destruction and child retirement keep the original run evidence.
+  EXPECT_EQ(ReadFile(snapshot_path), expected_document);
+}
+
+
+TEST(RetainedNativeRuntimeUnitAdapter, ObserverCheckCapturesLosslessOutputAndKeepsSnapshot) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  const auto executable = InstallSelectedPacketTestTargets(targets.path());
+  auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
+      targets.path(), fixture.root / "retained-package",
+      fixture.manager_state_root.path(), fixture.manager_run_root.path(),
+      fixture.execution_state_root.path(), fixture.execution_run_root.path(),
+      fixture.bundle_source, fixture.artifact_source,
+      std::string(contract::kOperatingSystem),
+      std::string(contract::kLaunchEnvironmentContract), {}, {}, {}, {}, std::nullopt,
+      executable);
+  const auto source = fixture.manager_run_root.path() / "observer-check.input";
+  std::string expected = "{\"cell_id\":\"cell\",\"source_id\":\"source\",\"bindings\":[]}\n";
+  expected.append(256U * 1024U, ' ');
+  const std::string document("fixture-expanded");
+  { std::ofstream input(source, std::ios::binary); input << document; }
+  const auto checked = adapter.CheckIsaacPoseObserverConfiguration(source, 5.0);
+  EXPECT_EQ(checked.metadata, expected);
+  EXPECT_EQ(ReadFile(checked.retained_snapshot), document);
+  EXPECT_EQ(checked.retained_snapshot.parent_path(), fixture.manager_run_root.path());
+  { std::ofstream input(source, std::ios::binary); input << "changed external input"; }
+  EXPECT_EQ(ReadFile(checked.retained_snapshot), document);
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(), component_manager::ProcessPresenceState::kAbsent);
+  struct stat status {};
+  ASSERT_EQ(::lstat(checked.retained_snapshot.c_str(), &status), 0);
+  EXPECT_EQ(status.st_mode & 0777, 0600);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter, ObserverCheckRefusalTimeoutAndOutputOverflowStayUnavailable) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  const auto executable = InstallSelectedPacketTestTargets(targets.path());
+  auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
+      targets.path(), fixture.root / "retained-package",
+      fixture.manager_state_root.path(), fixture.manager_run_root.path(),
+      fixture.execution_state_root.path(), fixture.execution_run_root.path(),
+      fixture.bundle_source, fixture.artifact_source,
+      std::string(contract::kOperatingSystem),
+      std::string(contract::kLaunchEnvironmentContract), {}, {}, {}, {}, std::nullopt,
+      executable);
+  const auto source = fixture.manager_run_root.path() / "observer-check.input";
+  for (const auto &input : {std::string("fixture-refuse"), std::string("fixture-wait"),
+                            std::string("fixture-overflow")}) {
+    { std::ofstream file(source, std::ios::binary); file << input; }
+    EXPECT_THROW((void)adapter.CheckIsaacPoseObserverConfiguration(
+                     source, input == "fixture-wait" ? 0.05 : 5.0),
+                 component_manager::RetainedNativeRuntimeUnitAdapterError);
+    EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(), component_manager::ProcessPresenceState::kAbsent);
+  }
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter, ObserverCheckPreservesStrictSourceFileQualification) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  const auto executable = InstallSelectedPacketTestTargets(targets.path());
+  auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
+      targets.path(), fixture.root / "retained-package",
+      fixture.manager_state_root.path(), fixture.manager_run_root.path(),
+      fixture.execution_state_root.path(), fixture.execution_run_root.path(),
+      fixture.bundle_source, fixture.artifact_source,
+      std::string(contract::kOperatingSystem),
+      std::string(contract::kLaunchEnvironmentContract), {}, {}, {}, {}, std::nullopt,
+      executable);
+  const auto source = fixture.manager_run_root.path() / "observer-source.input";
+  const auto alias = fixture.manager_run_root.path() / "observer-source.alias";
+  { std::ofstream input(source, std::ios::binary); input << "fixture-expanded"; }
+  std::filesystem::create_symlink(source, alias);
+  EXPECT_THROW((void)adapter.CheckIsaacPoseObserverConfiguration(alias, 5.0),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  { std::ofstream input(source, std::ios::binary); }
+  EXPECT_THROW((void)adapter.CheckIsaacPoseObserverConfiguration(source, 5.0),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  { std::ofstream input(source, std::ios::binary); input << std::string(256U * 1024U + 1U, 'x'); }
+  EXPECT_THROW((void)adapter.CheckIsaacPoseObserverConfiguration(source, 5.0),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(), component_manager::ProcessPresenceState::kAbsent);
+}
+
 } // namespace manyforge::roboplan_backend
+
+int main(int argc, char **argv) {
+  if (argc == 3 && std::string_view(argv[1]) == "--check-config") {
+    std::ifstream input(argv[2], std::ios::binary);
+    if (!input) return 78;
+    const std::string document{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    if (document == "fixture-refuse") return 78;
+    if (document == "fixture-wait") {
+      std::this_thread::sleep_for(std::chrono::seconds(2));
+      return 0;
+    }
+    if (document == "fixture-expanded") {
+      std::cout << "{\"cell_id\":\"cell\",\"source_id\":\"source\",\"bindings\":[]}\n"
+                << std::string(256U * 1024U, ' ') << std::flush;
+      return std::cout ? 0 : 78;
+    }
+    if (document == "fixture-overflow") {
+      std::cout << std::string(2U * 1024U * 1024U + 1U, ' ') << std::flush;
+      return std::cout ? 0 : 78;
+    }
+    std::cout << document << std::flush;
+    return std::cout ? 0 : 78;
+  }
+  for (int index = 1; index < argc; ++index) {
+    if (std::string_view(argv[index]) ==
+        "--manyforge-managed-runtime-channel-fd") {
+      try {
+        return manyforge::roboplan_backend::RunSelectedAdapterPacketChild(argc,
+                                                                          argv);
+      } catch (const std::exception &error) {
+        std::cerr << "selected adapter packet fixture: " << error.what()
+                  << '\n';
+        return 2;
+      }
+    }
+  }
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

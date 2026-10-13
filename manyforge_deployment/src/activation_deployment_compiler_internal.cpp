@@ -532,7 +532,7 @@ struct ComponentProjection final {
     const auto &stop = catalog.require(
         core::CatalogRecordKind::kStopEvidencePolicy,
         target == "arm" ? "manyforge.arm_motion_controlled_stop"
-                        : "manyforge.native_controller_goal_terminal");
+                        : "manyforge.controller_goal_terminal");
     const std::string provider_id = ros2_control
                                         ? "manyforge.provider.ros2_control"
                                         : "manyforge.provider.native_control";
@@ -721,8 +721,9 @@ CanonicalValue compile_activation_deployment(
   }
   CatalogSelection catalog(catalog_records);
   const bool ros2_control =
-      !component_profiles.empty() && component_profiles.front().runtime_kind ==
+      component_profiles.empty() || component_profiles.front().runtime_kind ==
                                          ActivationRuntimeKind::kRos2Control;
+  // Q89: empty membership keeps the same ROS cell host and optional world.
   // Q68: a ROS composition admits any number of robots and components, each
   // of which must select a ROS controller profile from the catalog. Mixing
   // with native components stays refused until the native executor goes.
@@ -780,8 +781,9 @@ CanonicalValue compile_activation_deployment(
     if (!object(intent.policies, "policies").empty() || intent.assistant_profile_id.has_value()) {
       fail("empty Deployment has no component policies or assistant profile");
     }
-    auto authored = native_execution_runtime_contract::empty_host_deployment(
-        runtime_cell_id, catalog_value(runtime_ref), intent.deployment_artifact_id, intent.name).as_object();
+    auto authored = ros2_control_execution_runtime_contract::empty_host_deployment(
+        runtime_cell_id, catalog_value(runtime_ref), intent.deployment_artifact_id,
+        intent.name, intent.isaac_world).as_object();
     authored.emplace_back("compatibility", CanonicalValue(Object{
         {"lane", CanonicalValue("manyforge-only")},
         {"provides", CanonicalValue(Array{})},

@@ -2,6 +2,7 @@
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/component_lifecycle_plan_evaluator.hpp>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace manyforge::core {
@@ -11,6 +12,45 @@ template <typename T>
 [[nodiscard]] Result<T> reject(std::string code, std::string message, std::string reason) {
   return Result<T>::Err(
       ErrorDTO{std::move(code), std::move(message), {{"reason", std::move(reason)}}});
+}
+
+// DX496: diagnostics come only from the same validated observation on failure.
+// They never participate in eligibility or source/generation comparisons.
+template <typename Health>
+[[nodiscard]] const char* observed_boolean_fact(const Health& observation,
+                                                std::string_view id) noexcept {
+  const auto found = std::find_if(
+      observation.facts.begin(), observation.facts.end(),
+      [id](const LifecycleFactDTO& fact) { return fact.lifecycle_fact_id.value() == id; });
+  if (found == observation.facts.end()) {
+    return "missing";
+  }
+  switch (found->value.kind) {
+    case LifecycleFactValueKindDTO::kUnknown:
+      return "unknown";
+    case LifecycleFactValueKindDTO::kBoolean:
+      return *found->value.boolean_value ? "true" : "false";
+    case LifecycleFactValueKindDTO::kInteger:
+    case LifecycleFactValueKindDTO::kToken:
+      return "nonboolean";
+  }
+  return "nonboolean";
+}
+
+template <typename Health>
+[[nodiscard]] Result<LifecycleDomainPlanDecision> reject_evaluation(
+    std::string code, std::string message, std::string reason,
+    const Health& observation) {
+  return Result<LifecycleDomainPlanDecision>::Err(ErrorDTO{
+      std::move(code),
+      std::move(message),
+      {{"reason", std::move(reason)},
+       {"observed_state", std::string(to_string(observation.observed_state))},
+       {"observed_controller_loaded",
+        observed_boolean_fact(observation, "external.controller_loaded")},
+       {"observed_fault_present", observed_boolean_fact(observation, "external.fault_present")},
+       {"observed_transport_ready",
+        observed_boolean_fact(observation, "external.transport_ready")}}});
 }
 
 [[nodiscard]] bool occurrence_matches_observation(
@@ -40,6 +80,60 @@ template <typename T>
     return nullptr;
   }
   return &*match;
+}
+
+template <typename Health>
+[[nodiscard]] Result<LifecycleDomainPlanDecision> evaluate_normalized_plan(
+    ComponentLifecycleIntentKindDTO intent, ComponentLifecycleStateDTO requested_state,
+    const BrandLifecyclePlanCatalogDTO& catalog, const Health& fresh_observation) {
+  const auto* selected_plan = find_plan(catalog, intent, requested_state);
+  if (selected_plan == nullptr) {
+    return reject_evaluation("component_lifecycle_intent_unsupported",
+                             "the accepted provider catalog has no requested lifecycle plan",
+                             "selected_plan_missing", fresh_observation);
+  }
+
+  const auto requested =
+      EvaluateLifecyclePredicate(selected_plan->requested_postcondition, fresh_observation);
+  if (requested == LifecyclePostconditionResultDTO::kSatisfied) {
+    return Result<LifecycleDomainPlanDecision>::Ok(
+        {LifecycleDomainPlanDecisionKind::kAlreadySatisfied, *selected_plan, std::nullopt});
+  }
+  if (requested == LifecyclePostconditionResultDTO::kInconclusive) {
+    return reject_evaluation("component_lifecycle_postcondition_inconclusive",
+                             "the requested lifecycle postcondition is inconclusive",
+                             "requested_postcondition_inconclusive", fresh_observation);
+  }
+
+  const LifecyclePrimitiveTransitionDTO* selected_transition = nullptr;
+  bool any_inconclusive = false;
+  for (const auto& transition : selected_plan->transitions) {
+    const auto eligibility =
+        EvaluateLifecyclePredicate(transition.eligibility_predicate, fresh_observation);
+    if (eligibility == LifecyclePostconditionResultDTO::kSatisfied) {
+      if (selected_transition != nullptr) {
+        return reject_evaluation("component_lifecycle_transition_ambiguous",
+                                 "several lifecycle primitives are eligible for one observation",
+                                 "several_transitions_satisfied", fresh_observation);
+      }
+      selected_transition = &transition;
+    } else if (eligibility == LifecyclePostconditionResultDTO::kInconclusive) {
+      any_inconclusive = true;
+    }
+  }
+  if (any_inconclusive) {
+    return reject_evaluation(
+        "component_lifecycle_transition_inconclusive",
+        "every non-selected lifecycle transition must be conclusively ineligible",
+        "transition_eligibility_inconclusive", fresh_observation);
+  }
+  if (selected_transition == nullptr) {
+    return reject_evaluation("component_lifecycle_transition_missing",
+                             "no lifecycle primitive is eligible for the fresh observation",
+                             "no_transition_satisfied", fresh_observation);
+  }
+  return Result<LifecycleDomainPlanDecision>::Ok(
+      {LifecycleDomainPlanDecisionKind::kDispatchPrimitive, *selected_plan, *selected_transition});
 }
 
 }  // namespace
@@ -139,56 +233,25 @@ Result<LifecycleDomainPlanDecision> EvaluateLifecycleDomainPlan(
         "the plan catalog and observation are not one exact provider contract",
         "catalog_or_observation_invalid");
   }
-  const auto* selected_plan = find_plan(catalog, intent, requested_state);
-  if (selected_plan == nullptr) {
-    return reject<LifecycleDomainPlanDecision>(
-        "component_lifecycle_intent_unsupported",
-        "the accepted provider catalog has no requested lifecycle plan", "selected_plan_missing");
-  }
+  return evaluate_normalized_plan(intent, requested_state, catalog, fresh_observation);
+}
 
-  const auto requested =
-      EvaluateLifecyclePredicate(selected_plan->requested_postcondition, fresh_observation);
-  if (requested == LifecyclePostconditionResultDTO::kSatisfied) {
-    return Result<LifecycleDomainPlanDecision>::Ok(
-        {LifecycleDomainPlanDecisionKind::kAlreadySatisfied, *selected_plan, std::nullopt});
-  }
-  if (requested == LifecyclePostconditionResultDTO::kInconclusive) {
+Result<LifecycleDomainPlanDecision> EvaluateLifecycleDomainPlan(
+    ComponentLifecycleIntentKindDTO intent, ComponentLifecycleStateDTO requested_state,
+    const BrandLifecyclePlanCatalogDTO& catalog,
+    const ResolvedLifecycleProviderOccurrenceDTO& provider_occurrence,
+    const LifecycleDomainHealthDTO& health) {
+  if (!VerifyBrandLifecyclePlanCatalog(catalog).ok() ||
+      !provider_occurrence.locally_valid() || !health.locally_valid() ||
+      catalog.provider_manifest_id != provider_occurrence.provider_manifest_id ||
+      catalog.provider_manifest_revision != provider_occurrence.provider_manifest_revision ||
+      catalog.catalog_digest != provider_occurrence.lifecycle_plan_catalog_digest) {
     return reject<LifecycleDomainPlanDecision>(
-        "component_lifecycle_postcondition_inconclusive",
-        "the requested lifecycle postcondition is inconclusive",
-        "requested_postcondition_inconclusive");
+        "component_lifecycle_plan_evaluation_invalid",
+        "the plan catalog, occurrence and health are not one exact provider contract",
+        "catalog_occurrence_or_health_invalid");
   }
-
-  const LifecyclePrimitiveTransitionDTO* selected_transition = nullptr;
-  bool any_inconclusive = false;
-  for (const auto& transition : selected_plan->transitions) {
-    const auto eligibility =
-        EvaluateLifecyclePredicate(transition.eligibility_predicate, fresh_observation);
-    if (eligibility == LifecyclePostconditionResultDTO::kSatisfied) {
-      if (selected_transition != nullptr) {
-        return reject<LifecycleDomainPlanDecision>(
-            "component_lifecycle_transition_ambiguous",
-            "several lifecycle primitives are eligible for one observation",
-            "several_transitions_satisfied");
-      }
-      selected_transition = &transition;
-    } else if (eligibility == LifecyclePostconditionResultDTO::kInconclusive) {
-      any_inconclusive = true;
-    }
-  }
-  if (any_inconclusive) {
-    return reject<LifecycleDomainPlanDecision>(
-        "component_lifecycle_transition_inconclusive",
-        "every non-selected lifecycle transition must be conclusively ineligible",
-        "transition_eligibility_inconclusive");
-  }
-  if (selected_transition == nullptr) {
-    return reject<LifecycleDomainPlanDecision>(
-        "component_lifecycle_transition_missing",
-        "no lifecycle primitive is eligible for the fresh observation", "no_transition_satisfied");
-  }
-  return Result<LifecycleDomainPlanDecision>::Ok(
-      {LifecycleDomainPlanDecisionKind::kDispatchPrimitive, *selected_plan, *selected_transition});
+  return evaluate_normalized_plan(intent, requested_state, catalog, health);
 }
 
 }  // namespace manyforge::core

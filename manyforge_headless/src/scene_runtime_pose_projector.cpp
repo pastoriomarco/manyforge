@@ -205,8 +205,7 @@ CanonicalValue Unsigned(const std::uint64_t value,
 
 CanonicalValue Integer(const std::int64_t value, const std::string_view label) {
   if (value < 0) {
-    throw std::invalid_argument(std::string(label) +
-                                " must be nonnegative");
+    throw std::invalid_argument(std::string(label) + " must be nonnegative");
   }
   return content_identity::nonnegative_int64_value(value);
 }
@@ -227,16 +226,6 @@ ProjectionRevisionValue(const core::ProjectionRevisionDTO &revision) {
             CanonicalValue(revision.scene_revision.scene_id.value())},
        })},
   });
-}
-
-std::string ProviderSourceEpoch(const PoseSourceObservation &observation) {
-  return content_identity::sha256_digest(
-      content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-          {"api_version",
-           CanonicalValue(std::string(kPoseApplicationRequestApiVersion))},
-          {"source_epoch", CanonicalValue(observation.source_epoch)},
-          {"source_id", CanonicalValue(observation.key.source_id)},
-      })));
 }
 
 std::string SceneRequestId(const core::ProjectionRevisionDTO &projection,
@@ -276,6 +265,17 @@ bool SameProviderOrigin(const core::SceneObjectProviderEvidenceDTO &left,
 }
 
 } // namespace
+
+std::string
+SceneRuntimePoseProviderSourceEpoch(const PoseSourceObservation &observation) {
+  return content_identity::sha256_digest(
+      content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+          {"api_version",
+           CanonicalValue(std::string(kPoseApplicationRequestApiVersion))},
+          {"source_epoch", CanonicalValue(observation.source_epoch)},
+          {"source_id", CanonicalValue(observation.key.source_id)},
+      })));
+}
 
 std::string_view
 ToString(const SceneRuntimePoseApplicationStatus status) noexcept {
@@ -378,10 +378,14 @@ SceneRuntimePoseProjector::Apply(
   const auto freshness_budget =
       observation.expires_at_ns - observation.observed_at_ns;
   core::SceneObjectProviderEvidenceDTO evidence{
-      provider->provider_instance_id,       provider->provider_manifest_id,
-      provider->provider_manifest_revision, ProviderSourceEpoch(observation),
-      observation.source_sequence,          observation.observed_at_ns,
-      decoded.source_timestamp_ns,          freshness_budget,
+      provider->provider_instance_id,
+      provider->provider_manifest_id,
+      provider->provider_manifest_revision,
+      SceneRuntimePoseProviderSourceEpoch(observation),
+      observation.source_sequence,
+      observation.observed_at_ns,
+      decoded.source_timestamp_ns,
+      freshness_budget,
   };
   if (!evidence.valid()) {
     return core::Result<SceneRuntimePoseApplicationResult>::Err(

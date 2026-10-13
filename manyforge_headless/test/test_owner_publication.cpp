@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "manyforge_headless/owner_publication.hpp"
+#include "assistant_authoring_fixture.hpp"
 
 namespace manyforge::headless {
 namespace {
@@ -306,18 +307,86 @@ TEST(ManagerSourcePublication,
       directory.path() / "apply.sqlite3", admission.cell_id());
 
   const auto payload = BuildManagerSourcePayload(
-      admission.retained_bundle(), Runtime(admission), journal,
+      admission.retained_bundle(), admission, Runtime(admission), journal,
       ManagerApplyMutationAvailability::kKernelOwnerUnavailable);
   const auto bytes = content_identity::canonical_json(payload);
   EXPECT_NE(bytes.find("\"api_version\":\"manyforge.manager_source.v1\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"cell_graph\":"), std::string::npos);
+  const auto *const active = payload.find_object_member("active");
+  ASSERT_NE(active, nullptr);
+  const auto *const canonical_empty = active->find_object_member("canonical_empty");
+  ASSERT_NE(canonical_empty, nullptr);
+  ASSERT_TRUE(canonical_empty->is_bool());
+  EXPECT_TRUE(canonical_empty->as_bool());
   EXPECT_NE(bytes.find("\"manager_ready\":true"), std::string::npos);
   EXPECT_NE(bytes.find("\"mutation_available\":false"), std::string::npos);
   EXPECT_NE(
       bytes.find("\"unavailable_reason_code\":\"kernel_owner_unavailable\""),
       std::string::npos);
   EXPECT_NE(bytes.find("\"records\":[]"), std::string::npos);
+}
+
+TEST(ManagerSourcePublication, NamedClosePublicationIsCanonicalEmptyByAdmissionIdentity) {
+  const auto admission = LoadAdmission();
+  TemporaryDirectory directory;
+  component_manager::SqliteManagerApplyJournal journal(
+      directory.path() / "apply.sqlite3", admission.cell_id());
+  auto runtime = Runtime(admission);
+  runtime.plan.active_publication.request.transaction_ref =
+      core::NamedApplyPublicationTransactionDTO{core::ApplyId("apply.close"), core::ApplyGeneration(1U)};
+  runtime.plan.active_publication.request.expected_previous_publication_generation =
+      core::ActiveBundlePublicationGeneration(1U);
+  runtime.plan.active_publication.publication_generation = core::ActiveBundlePublicationGeneration(2U);
+  runtime.plan.runtime_convergence_intent_digest = core::ContentDigest(std::string(kDigestOne));
+  ASSERT_TRUE(runtime.plan.valid());
+  const auto payload = BuildManagerSourcePayload(admission.retained_bundle(), admission,
+      runtime, journal, ManagerApplyMutationAvailability::kAvailable);
+  const auto *const active = payload.find_object_member("active");
+  ASSERT_NE(active, nullptr);
+  const auto *const canonical_empty = active->find_object_member("canonical_empty");
+  ASSERT_NE(canonical_empty, nullptr);
+  ASSERT_TRUE(canonical_empty->is_bool());
+  EXPECT_TRUE(canonical_empty->as_bool());
+  EXPECT_NE(content_identity::canonical_json(*active).find("\"apply_id\":\"apply.close\""), std::string::npos);
+}
+
+TEST(ManagerSourcePublication, VerifiedNonemptyProductIsNotCanonicalEmpty) {
+  const auto admission = LoadAdmission();
+  const auto bundle = test::LoadAssistantAuthoringBundle();
+  ASSERT_NE(bundle, nullptr);
+  ASSERT_TRUE(deployment::verify_retained_bundle_identity(*bundle));
+  ASSERT_NE(bundle->retained_bundle_id(), admission.retained_bundle_id());
+  const auto *const graph = bundle->normalized_root().find_object_member("cell_graph");
+  ASSERT_NE(graph, nullptr);
+  // The existing independently verified assistant fixture actually contains
+  // configured components; the production predicate does not count them.
+  const auto *const components = graph->find_object_member("controllable_components");
+  ASSERT_NE(components, nullptr);
+  ASSERT_TRUE(components->is_array());
+  ASSERT_FALSE(components->as_array().empty());
+  TemporaryDirectory directory;
+  component_manager::SqliteManagerApplyJournal journal(
+      directory.path() / "apply.sqlite3", bundle->value().cell_graph.cell_id);
+  auto runtime = Runtime(admission);
+  const core::ProjectionRevisionDTO projection{
+      bundle->retained_bundle_id(), bundle->value().cell_graph.graph_revision, SceneRevision()};
+  runtime.plan.active_publication.request.candidate_projection_revision = projection;
+  runtime.plan.active_publication.request.candidate_retained_bundle_id = projection.retained_bundle_id;
+  runtime.plan.active_publication.request.candidate_graph_revision = projection.graph_revision;
+  runtime.plan.active_publication.request.transaction_ref =
+      core::NamedApplyPublicationTransactionDTO{core::ApplyId("apply.nonempty"), core::ApplyGeneration(1U)};
+  runtime.plan.active_publication.request.expected_previous_publication_generation =
+      core::ActiveBundlePublicationGeneration(1U);
+  runtime.plan.active_publication.publication_generation = core::ActiveBundlePublicationGeneration(2U);
+  runtime.plan.runtime_convergence_intent_digest = core::ContentDigest(std::string(kDigestOne));
+  ASSERT_TRUE(runtime.plan.valid());
+  const auto payload = BuildManagerSourcePayload(*bundle, admission, runtime, journal,
+      ManagerApplyMutationAvailability::kAvailable);
+  const auto *const canonical_empty = payload.find_object_member("active")->find_object_member("canonical_empty");
+  ASSERT_NE(canonical_empty, nullptr);
+  ASSERT_TRUE(canonical_empty->is_bool());
+  EXPECT_FALSE(canonical_empty->as_bool());
 }
 
 TEST(ManagerSourcePublication,
@@ -339,7 +408,7 @@ TEST(ManagerSourcePublication,
       }));
 
   const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(
-      admission.retained_bundle(), Runtime(admission), journal,
+      admission.retained_bundle(), admission, Runtime(admission), journal,
       ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
   EXPECT_NE(bytes.find("\"apply_id\":\"apply-1\""), std::string::npos);
   EXPECT_NE(bytes.find("\"phase\":\"scope_persisted\""), std::string::npos);
@@ -382,7 +451,7 @@ TEST(ManagerSourcePublication,
       };
   EXPECT_FALSE(ManagerRuntimeAccountsForCommittedApplies(runtime, inventory));
   EXPECT_THROW(static_cast<void>(BuildManagerSourcePayload(
-                   admission.retained_bundle(), runtime, journal, inventory,
+                   admission.retained_bundle(), admission, runtime, journal, inventory,
                    ManagerApplyMutationAvailability::kAvailable)),
                std::invalid_argument);
 
@@ -408,7 +477,7 @@ TEST(ManagerSourcePublication,
       directory.path() / "apply.sqlite3", admission.cell_id());
 
   const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(
-      admission.retained_bundle(), Runtime(admission), journal,
+      admission.retained_bundle(), admission, Runtime(admission), journal,
       ManagerApplyMutationAvailability::kFullStackRestartRequired));
   EXPECT_NE(bytes.find("\"manager_ready\":false"), std::string::npos);
   EXPECT_NE(bytes.find("\"converged\":false"), std::string::npos);
@@ -425,7 +494,7 @@ TEST(ManagerSourcePublication, ProjectsSelectedAndObservedOfferDigests) {
       directory.path() / "apply.sqlite3", admission.cell_id());
 
   const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(
-      admission.retained_bundle(),
+      admission.retained_bundle(), admission,
       RuntimeWithRow(admission, ObservationWithDigest(),
                      component_manager::ManagerActiveRuntimeConvergenceState::
                          kConverged),
@@ -446,7 +515,7 @@ TEST(ManagerSourcePublication, HostNoticeCountsPreserveFullWidthAndReadiness) {
   const auto publish = [&](const std::optional<std::uint64_t> lines,
                            const std::optional<std::uint64_t> bytes) {
     return content_identity::canonical_json(BuildManagerSourcePayload(
-        admission.retained_bundle(),
+        admission.retained_bundle(), admission,
         RuntimeWithRow(admission, ObservationWithDigest(lines, bytes),
                        component_manager::ManagerActiveRuntimeConvergenceState::
                            kConverged),
@@ -480,7 +549,7 @@ TEST(ManagerSourcePublication, ProjectsMissingObservedOfferDigestAsNull) {
       directory.path() / "apply.sqlite3", admission.cell_id());
 
   const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(
-      admission.retained_bundle(),
+      admission.retained_bundle(), admission,
       RuntimeWithRow(admission, ObservationWithoutDigest(),
                      component_manager::ManagerActiveRuntimeConvergenceState::
                          kPending),

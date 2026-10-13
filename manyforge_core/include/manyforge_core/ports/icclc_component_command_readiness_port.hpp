@@ -1,12 +1,16 @@
 #pragma once
 
+#include <cstdint>
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/strong_id.hpp>
-#include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace manyforge::core {
+
+struct SelectedComponentBringUpOfferDTO;
+struct RuntimeParticipantExecutionRegistration;
 
 /// Kernel projection of one component's command eligibility.
 ///
@@ -80,9 +84,31 @@ class ICCLCComponentCommandReadinessPort {
       const LifecycleTransactionId& lifecycle_transaction_id,
       const ControllableComponentId& controllable_component_id) = 0;
 
+  /// Private selected bring-up authority; ordinary transactions retain their
+  /// existing overload. No transport exposes this effect permission.
+  [[nodiscard]] virtual Result<ComponentCommandReadinessDTO> CloseComponentCommandEligibility(
+      const CellAdmissionClaimDTO&, const SelectedComponentBringUpOfferDTO&) {
+    return Result<ComponentCommandReadinessDTO>::Err(
+        ErrorDTO{"invalid_request",
+                 "selected component readiness closure is unavailable",
+                 {{"reason", "selected_bring_up_readiness_unsupported"}}});
+  }
+
   /// Publish one complete component result and return the Kernel readback.
   [[nodiscard]] virtual Result<ComponentCommandReadinessDTO> PublishComponentCommandReadiness(
       const ComponentCommandReadinessPublicationDTO& publication) = 0;
+
+  /// Original live selected owner only: publish already-installed successor
+  /// facts without opening commands, resealing products, or installing engines.
+  [[nodiscard]] virtual Result<ComponentCommandReadinessDTO> PublishComponentCommandReadiness(
+      const CellAdmissionClaimDTO&, const SelectedComponentBringUpOfferDTO&,
+      const ComponentLifecycleStatusDTO&, const SelectedControllerOccurrenceDTO&,
+      const std::vector<RuntimeParticipantExecutionRegistration>&,
+      const std::vector<ActiveControlConfigurationDTO>&, bool = false) {
+    return Result<ComponentCommandReadinessDTO>::Err(
+        ErrorDTO{"invalid_request", "selected successor readiness publication is unavailable",
+                 {{"reason", "selected_successor_readiness_unsupported"}}});
+  }
 
   /// Bounded Kernel readback, used to verify containment without authority.
   [[nodiscard]] virtual Result<ComponentCommandReadinessDTO> ReadComponentCommandReadiness(

@@ -540,6 +540,106 @@ cause_class(const core::BrandLifecycleObservationDTO &observation) {
   return *fact->value.token_value;
 }
 
+TEST(Lite6BrandLifecyclePort, PureHealthMatchesObserveWithoutCommittingVendorHistory) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  fake->observation = disabled_observation();
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+  const auto domain = port_config().control_domain_id;
+  const auto baseline = fake->observation;
+  // A projected newer source must not advance either observation watermark.
+  fake->observation.generation += 2U;
+  fake->observation.transport_owner_progress_sequence += 2U;
+  for (int read = 0; read < 3; ++read) {
+    const auto health = port.ReadLifecycleHealth(domain, clock.now());
+    ASSERT_TRUE(health.ok()) << health.error().message;
+    EXPECT_EQ(health.value().observed_state, core::ComponentLifecycleStateDTO::kDisabled);
+  }
+  fake->observation = baseline;
+  const auto observed = port.Observe(observation_query());
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  const auto health = port.ReadLifecycleHealth(domain, clock.now());
+  ASSERT_TRUE(health.ok());
+  EXPECT_EQ(health.value().observed_state, observed.value().observed_state);
+  EXPECT_EQ(health.value().facts, observed.value().facts);
+
+  // Prospective external-control classification never commits its sticky cause.
+  fake->observation.mode = 0;
+  fake->observation.state = 5;
+  ++fake->observation.generation;
+  for (int read = 0; read < 3; ++read) {
+    const auto external = port.ReadLifecycleHealth(domain, clock.now());
+    ASSERT_TRUE(external.ok());
+    const auto fact = std::find_if(external.value().facts.begin(), external.value().facts.end(),
+                                 [](const auto &candidate) {
+      return candidate.lifecycle_fact_id.value() == core::kLifecycleBlockingCauseFactId;
+    });
+    ASSERT_NE(fact, external.value().facts.end());
+    EXPECT_EQ(fact->value.token_value, "external_control");
+  }
+  fake->observation = baseline;
+  const auto unchanged = port.Observe(observation_query());
+  ASSERT_TRUE(unchanged.ok()) << unchanged.error().message;
+  EXPECT_EQ(cause_class(unchanged.value()), "none");
+  EXPECT_EQ(unchanged.value().observation_generation, observed.value().observation_generation);
+  EXPECT_EQ(unchanged.value().source_sequence, observed.value().source_sequence);
+
+  // Projecting a vendor fault does not commit cause or power-cycle history.
+  fake->observation.error_code = 10;
+  fake->observation.fault_present = FactState::kTrue;
+  fake->observation.recovery_required = FactState::kTrue;
+  ++fake->observation.generation;
+  const auto fault = port.ReadLifecycleHealth(domain, clock.now());
+  ASSERT_TRUE(fault.ok());
+  fake->observation = baseline;
+  const auto before_dispatch = port.Observe(observation_query());
+  ASSERT_TRUE(before_dispatch.ok());
+  EXPECT_EQ(cause_class(before_dispatch.value()), "none");
+  const auto cleared = port.Dispatch(primitive_intent(std::string(kXArmClearErrorPrimitiveId)),
+                                     std::stop_token{});
+  EXPECT_EQ(cleared.dispatch_state, core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown);
+  ASSERT_EQ(fake->commands.size(), 1U);
+}
+
+TEST(Lite6BrandLifecyclePort, PureHealthPreservesRetainedCauseAndRejectsForeignSource) {
+  core::FakeClock clock;
+  clock.set(10'000);
+  auto transport = std::make_unique<FakeSupervisedSession>();
+  auto *fake = transport.get();
+  fake->observation = disabled_observation();
+  fake->observation.error_code = 22;
+  fake->observation.fault_present = FactState::kTrue;
+  fake->observation.recovery_required = FactState::kTrue;
+  Lite6BrandLifecyclePort port(port_config(), clock, std::move(transport));
+  ASSERT_TRUE(port.Observe(observation_query()).ok());
+  const auto domain = port_config().control_domain_id;
+  fake->observation = disabled_observation();
+  fake->observation.blocking_reason_codes = {"xarm_report_unavailable"};
+  fake->observation.motion_enabled = FactState::kUnknown;
+  fake->observation.fault_present = FactState::kUnknown;
+  fake->observation.recovery_required = FactState::kUnknown;
+  fake->observation.vendor_control_ready = FactState::kUnknown;
+  const auto health = port.ReadLifecycleHealth(domain, clock.now());
+  ASSERT_TRUE(health.ok());
+  const auto observed = port.Observe(observation_query());
+  ASSERT_TRUE(observed.ok());
+  EXPECT_EQ(health.value().observed_state, observed.value().observed_state);
+  EXPECT_EQ(health.value().facts, observed.value().facts);
+  EXPECT_EQ(cause_class(observed.value()), "fault");
+  const auto calls = fake->observe_calls;
+  EXPECT_FALSE(port.ReadLifecycleHealth(core::ControlDomainId("foreign.domain"), clock.now()).ok());
+  EXPECT_EQ(fake->observe_calls, calls);
+  fake->observation.transport_owner_component_epoch = "foreign.owner";
+  EXPECT_FALSE(port.ReadLifecycleHealth(domain, clock.now()).ok());
+  fake->observation.transport_owner_component_epoch = port_config().transport_owner_component_epoch;
+  fake->observation.transport_owner_progress_healthy = false;
+  EXPECT_FALSE(port.ReadLifecycleHealth(domain, clock.now()).ok());
+  EXPECT_FALSE(port.ReadLifecycleHealth(domain, -1).ok());
+  EXPECT_TRUE(fake->commands.empty());
+}
+
 TEST(Lite6BrandLifecyclePort, FaultCauseClassPrecedesDisabledAndIsSticky) {
   core::FakeClock clock;
   clock.set(10'000);

@@ -819,18 +819,7 @@ decode_execution_gripper_target_configurations(
     const auto component_id = string_member("controllable_component_id");
     const auto target_id = string_member("command_target_id");
     const auto actuation_kind = string_member("actuation_kind");
-    std::optional<std::int64_t> confirmation_validity_ns;
-    const auto confirmation = object->find("operator_confirmation_validity_ns");
-    if (confirmation != object->end()) {
-      const auto* value = std::get_if<double>(&confirmation->second.value);
-      if (value == nullptr || !std::isfinite(*value) || std::trunc(*value) != *value ||
-          *value < 1.0 || *value > 3'600'000'000'000.0) {
-        throw RetainedBundleError(
-            std::string(label) + " has invalid "
-            "operator confirmation validity");
-      }
-      confirmation_validity_ns = static_cast<std::int64_t>(*value);
-    } else if (object->size() != 12U) {
+    if (object->size() != 12U) {
       throw RetainedBundleError(
           std::string(label) + " has an unknown gripper target field");
     }
@@ -846,7 +835,7 @@ decode_execution_gripper_target_configurations(
         string_member("description"), actuation_kind, string_member("open_state_ref"),
         string_member("closed_state_ref"), *duration_s, string_array_member("touch_links", true),
         string_member("mount_frame"), string_member("attach_frame"), string_member("tcp_frame"),
-        string_array_member("auxiliary_frames", false), confirmation_validity_ns});
+        string_array_member("auxiliary_frames", false)});
   }
   std::sort(result.begin(),
             result.end(),

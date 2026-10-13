@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 2.4.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:5431cf57379b786ab05dccf2252ffa27cd6441ce32edbe76a7eef0f5ea995529
+catalog_digest: sha256:30003afcdf6cb6de7bc84272e0ae717d9d972539bb4ae115a8515e9c97d0e010
 schema_types:
   coordinate_position:
     type: object
@@ -2475,7 +2475,6 @@ entries:
       - idle
       - moving
       - reached
-      - grasp_confirmed
       - failed
   required_capabilities:
   - capability_id: tool.gripper.feedback
@@ -2502,12 +2501,6 @@ entries:
     when:
       parameter: expected_state
       equals: failed
-  - capability_id: tool.gripper.confirmation.operator
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: expected_state
-      equals: grasp_confirmed
   execution:
     blocking: false
     cancellable: false
@@ -2526,8 +2519,7 @@ entries:
   description: 'Wait for the captured gripper command and source, with a bounded timeout
     counted in Program time, which stands still while the Program is halted. By default
     (timeout_while_held: pause) time the node itself is held by an operator Stop does
-    not count toward the timeout; with timeout_while_held: count it does. Grasp confirmation
-    is an explicit operator statement, never inferred from movement.'
+    not count toward the timeout; with timeout_while_held: count it does.'
   stability: stable
   tags:
   - gripper
@@ -2552,7 +2544,6 @@ entries:
       - idle
       - moving
       - reached
-      - grasp_confirmed
       - failed
   - id: timeout_s
     required: true
@@ -2594,12 +2585,6 @@ entries:
     when:
       parameter: expected_state
       equals: failed
-  - capability_id: tool.gripper.confirmation.operator
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: expected_state
-      equals: grasp_confirmed
   execution:
     blocking: true
     cancellable: true

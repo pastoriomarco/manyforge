@@ -51,8 +51,7 @@ void ValidateSafeInteger(const std::uint64_t value,
 
 void ValidateSafeInteger(const std::int64_t value,
                          const std::string_view label) {
-  Require(value >= 0,
-          std::string(label) + " must be a nonnegative int64");
+  Require(value >= 0, std::string(label) + " must be a nonnegative int64");
 }
 
 void ValidateIdentity(const SceneRuntimeIdentity &identity) {
@@ -372,6 +371,82 @@ bool SceneRuntimeStateOwner::AdoptFinalizedOpenRuntime(
   return true;
 }
 
+void SceneRuntimeStateOwner::RetirePoseSource(
+    const SceneRuntimeIdentity &expected_runtime_identity,
+    const std::string_view source_id) {
+  ValidateIdentity(expected_runtime_identity);
+  ValidateText(std::string(source_id), "pose source_id",
+               kMaximumIdentifierBytes);
+  std::lock_guard lock(mutex_);
+  if (state_ != SceneInitializationState::kOpen ||
+      initialization_token_.has_value() || !runtime_identity_.has_value() ||
+      *runtime_identity_ != expected_runtime_identity ||
+      active_replay_id_.has_value() || active_replay_digest_.has_value()) {
+    throw SceneRuntimeStateConflictError(
+        "scene runtime state owner: pose source retirement requires the exact "
+        "already-open runtime without initialization or active replay");
+  }
+  std::erase_if(pose_records_, [&](const auto &entry) {
+    return entry.first.source_id == source_id;
+  });
+  if (configured_pose_source_ &&
+      configured_pose_source_->source_id == source_id)
+    configured_pose_source_.reset();
+}
+
+void SceneRuntimeStateOwner::ConfigurePoseSourceAvailability(
+    const SceneRuntimeIdentity &expected_runtime_identity,
+    std::string source_id, std::string source_epoch_base) {
+  ValidateIdentity(expected_runtime_identity);
+  ValidateText(source_id, "pose source_id", kMaximumIdentifierBytes);
+  constexpr std::string_view suffix = ".9007199254740991";
+  ValidateText(source_epoch_base, "pose source_epoch_base",
+               kMaximumIdentifierBytes - suffix.size());
+  Require(source_epoch_base.find('\0') == std::string::npos,
+          "pose source_epoch_base contains NUL");
+  const auto now = Now();
+  std::lock_guard lock(mutex_);
+  if (!runtime_identity_ || *runtime_identity_ != expected_runtime_identity ||
+      state_ != SceneInitializationState::kOpen) {
+    throw SceneRuntimeStateConflictError(
+        "scene runtime state owner: configured pose source requires current "
+        "open runtime");
+  }
+  if (configured_pose_source_) {
+    if (configured_pose_source_->source_id != source_id ||
+        configured_pose_source_->source_epoch_base != source_epoch_base) {
+      throw SceneRuntimeStateConflictError(
+          "scene runtime state owner: configured pose source transition is not "
+          "admitted");
+    }
+    return; // Publication/session loss must never reopen an exited occurrence.
+  }
+  configured_pose_source_ = ConfiguredPoseSourceAvailability{
+      std::move(source_id), std::move(source_epoch_base), true};
+  updated_at_ns_ = now;
+}
+
+void SceneRuntimeStateOwner::MarkPoseSourceUnavailable(
+    const SceneRuntimeIdentity &expected_runtime_identity,
+    const std::string_view source_id,
+    const std::string_view source_epoch_base) {
+  ValidateIdentity(expected_runtime_identity);
+  const auto now = Now();
+  std::lock_guard lock(mutex_);
+  if (!runtime_identity_ || *runtime_identity_ != expected_runtime_identity ||
+      !configured_pose_source_ ||
+      configured_pose_source_->source_id != source_id ||
+      configured_pose_source_->source_epoch_base != source_epoch_base) {
+    throw SceneRuntimeStateConflictError(
+        "scene runtime state owner: loss does not name current configured pose "
+        "source");
+  }
+  if (configured_pose_source_->available) {
+    configured_pose_source_->available = false;
+    updated_at_ns_ = now;
+  }
+}
+
 std::string SceneRuntimeStateOwner::BeginInitialization(
     SceneRuntimeIdentity candidate, const bool deferred, std::string reason) {
   ValidateIdentity(candidate);
@@ -614,6 +689,11 @@ SceneRuntimeStateOwner::ObservePose(PoseSourceObservation observation) {
   const auto observation_key = observation.key;
   const auto now = Now();
   std::lock_guard lock(mutex_);
+  if (configured_pose_source_ && !configured_pose_source_->available &&
+      configured_pose_source_->source_id == observation.key.source_id) {
+    throw SceneRuntimeStateConflictError(
+        "scene runtime state owner: configured pose source is unavailable");
+  }
   auto found = pose_records_.find(observation_key);
   if (found != pose_records_.end()) {
     const auto &current = found->second.observation;
@@ -682,7 +762,10 @@ SceneRuntimeStateSnapshot SceneRuntimeStateOwner::Snapshot() const {
     pose_sources.push_back(PoseSourceLifetimeSnapshot{
         record.observation,
         record.observation.quality == PoseSourceQuality::kGood &&
-            record.observation.expires_at_ns >= now,
+            record.observation.expires_at_ns >= now &&
+            (!configured_pose_source_ || configured_pose_source_->available ||
+             configured_pose_source_->source_id !=
+                 record.observation.key.source_id),
         record.buffered,
     });
   }
@@ -699,6 +782,7 @@ SceneRuntimeStateSnapshot SceneRuntimeStateOwner::Snapshot() const {
       active_replay_id_,
       counters_,
       std::move(pose_sources),
+      configured_pose_source_,
   };
 }
 
@@ -722,7 +806,7 @@ SceneRuntimeStateValue(const SceneRuntimeStateSnapshot &snapshot) {
   const auto identity = snapshot.runtime_identity.has_value()
                             ? RuntimeIdentityValue(*snapshot.runtime_identity)
                             : CanonicalValue(nullptr);
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object result{
       {"active_replay_id",
        OptionalNumber(snapshot.active_replay_id, "active_replay_id")},
       {"api_version",
@@ -739,7 +823,17 @@ SceneRuntimeStateValue(const SceneRuntimeStateSnapshot &snapshot) {
       {"started_at_ns", Number(snapshot.started_at_ns, "started_at_ns")},
       {"state", CanonicalValue(std::string(ToString(snapshot.state)))},
       {"updated_at_ns", Number(snapshot.updated_at_ns, "updated_at_ns")},
-  });
+  };
+  if (snapshot.configured_pose_source) {
+    const auto &source = *snapshot.configured_pose_source;
+    result.emplace_back(
+        "configured_pose_source",
+        CanonicalValue(CanonicalValue::Object{
+            {"source_id", CanonicalValue(source.source_id)},
+            {"source_epoch_base", CanonicalValue(source.source_epoch_base)},
+            {"freshness_open", CanonicalValue(source.available)}}));
+  }
+  return CanonicalValue(std::move(result));
 }
 
 } // namespace manyforge::headless

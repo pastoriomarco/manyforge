@@ -48,10 +48,6 @@ public:
   command_gripper(const core::GripperCommandRequestDTO &request) override;
   core::GripperCommandStatusDTO
   get_gripper_status(const std::string &gripper_id) const override;
-  core::Result<core::GripperGraspEvidenceDTO> record_grasp_observation(
-      const core::RuntimeParticipantBinding& source,
-      const core::GripperGraspObservationDTO& observation, core::Duration freshness_budget_ns,
-      core::TimePoint admission_deadline_ns) override;
   void invalidate_grasp_evidence() noexcept override;
   core::GripperCommandResultDTO mark_gripper_grasp_lost(
       const std::string &gripper_id, std::uint64_t expected_command_id,

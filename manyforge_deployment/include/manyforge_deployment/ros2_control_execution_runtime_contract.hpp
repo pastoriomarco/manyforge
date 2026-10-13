@@ -37,7 +37,7 @@ inline constexpr std::string_view kLogicalSceneEndpointRoleId =
 inline constexpr std::string_view kImplementationId =
     "manyforge.ros2_control_execution_host";
 inline constexpr std::string_view kProcessAdapterContractId =
-    "manyforge.installed_native_target";
+    "manyforge.installed_execution_target";
 inline constexpr std::string_view kRetrievalContractId =
     "manyforge.retained_raw_artifact";
 inline constexpr std::string_view kStatusEndpointContractId =
@@ -127,6 +127,16 @@ struct Configuration final {
   friend bool operator==(const Configuration &,
                          const Configuration &) = default;
 };
+
+/// Q89: the same ROS cell host with no hosted components. Values retain the
+/// established empty-host planner seed and cadence; no component is fabricated.
+[[nodiscard]] CanonicalValue empty_host_configuration(
+    const std::optional<std::string> &isaac_world = std::nullopt);
+
+[[nodiscard]] CanonicalValue empty_host_deployment(
+    const core::CellId &cell_id, const CanonicalValue &runtime_profile_reference,
+    std::string_view deployment_id, std::string_view name,
+    const std::optional<std::string> &isaac_world = std::nullopt);
 
 [[nodiscard]] Configuration
 require_configuration(const RetainedBundle &retained_bundle,

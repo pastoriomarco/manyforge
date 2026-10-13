@@ -75,10 +75,10 @@ value_schemas:
     relative_path: value/manyforge.value_schema.runtime.empty.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.native_execution.v1
-    schema_revision: sha256:6b540dac39434e05a2cb5da209206e2105b824b9f56704a74f0d88f327944689
+    schema_revision: sha256:97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48
     relative_path: value/manyforge.value_schema.runtime.native_execution.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-    schema_revision: sha256:d97e885428a83ece204fba2b318c1a048308a11a01a748849766138b9cbac5e7
+    schema_revision: sha256:c4e6e1a1418852f773520a2c3c02ffde66883e2dca3963a218bf28e2356ca16c
     relative_path: value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml
     qualification: qualified

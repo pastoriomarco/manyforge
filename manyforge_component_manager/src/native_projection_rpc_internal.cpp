@@ -151,6 +151,8 @@ public:
     return result;
   }
 
+  [[nodiscard]] bool HasRemaining() const { return offset_ != bytes_.size(); }
+
   void Finish() const {
     if (offset_ != bytes_.size()) {
       Fail("packet has trailing fields");
@@ -1205,6 +1207,16 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
           }
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kHealth));
           WriteBinding(writer, value.native_runtime_binding);
+          // Absence retains the original tag-2 body byte for byte. An explicit
+          // zero marker is not an alternative encoding of absence.
+          if (value.selected_projection_revision.has_value()) {
+            if (!value.selected_projection_revision->valid()) {
+              Fail("cannot encode invalid projection health selector");
+            }
+            writer.Byte(1U);
+            WriteProjectionRevision(writer,
+                                    *value.selected_projection_revision);
+          }
         } else if constexpr (std::is_same_v<
                                  T, NativeProjectionTransactionRequest>) {
           if (!value.valid()) {
@@ -1282,8 +1294,16 @@ DecodeNativeProjectionRpcRequest(const std::string_view bytes) {
     switch (static_cast<RequestKind>(reader.Byte())) {
     case RequestKind::kPrepare:
       return ReadPrepare(reader);
-    case RequestKind::kHealth:
-      return NativeProjectionHealthQuery{ReadBinding(reader)};
+    case RequestKind::kHealth: {
+      NativeProjectionHealthQuery query{ReadBinding(reader)};
+      if (reader.HasRemaining()) {
+        if (reader.Byte() != 1U) {
+          Fail("projection health selector marker is noncanonical");
+        }
+        query.selected_projection_revision = ReadProjectionRevision(reader);
+      }
+      return query;
+    }
     case RequestKind::kTransaction:
       return NativeProjectionTransactionRequest{
           ReadBinding(reader), scene::DecodeSceneTransaction(reader.String())};

@@ -536,7 +536,6 @@ std::int64_t RetentionPartition(const HistorianEvent &event) {
   const auto severity = HistorianConditionSeverity(event);
   return severity == "ERROR" || severity == "CRITICAL" ||
          event.event_type.find("stop") != std::string::npos ||
-         event.event_type.starts_with("gripper_confirmation_") ||
          event.event_type.find("acknowledged") != std::string::npos;
 }
 

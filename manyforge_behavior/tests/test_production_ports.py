@@ -691,10 +691,6 @@ def _context() -> ProgramRunPortContext:
                             "capability_id": "tool.gripper.feedback",
                             "command_schema": None,
                         },
-                        {
-                            "capability_id": "tool.gripper.confirmation.operator",
-                            "command_schema": None,
-                        },
                     ],
                 },
             ],
@@ -798,7 +794,6 @@ def test_deferred_execution_policy_is_rejected_before_binding_effects() -> None:
         ("gripper.check_status", "failed", "failed", True),
         ("gripper.check_status", "idle", "idle", True),
         ("gripper.check_status", "reached", "executing", False),
-        ("gripper.check_status", "grasp_confirmed", "completed", False),
     ],
 )
 def test_native_queries_use_one_captured_read_without_effects(
@@ -869,65 +864,9 @@ def test_native_queries_use_one_captured_read_without_effects(
             "position_m": [0.1, 0.2, 0.3],
             "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
         }
-    if expected_state == "grasp_confirmed":
-        assert result.reason_code == "gripper_status_not_matched"
     assert transport.identity_reads == 1  # bind only, not a second read per query
     assert transport.submissions == []
     assert transport.controls == []
-
-
-@pytest.mark.parametrize("node_id", ["gripper.check_status", "gripper.wait_for_status"])
-@pytest.mark.parametrize("arrival_ns", [99, 100, 101])
-def test_grasp_consumption_does_not_extend_proof_by_http_or_wait_timeout(
-    node_id, arrival_ns, monkeypatch
-):
-    clock = [10]
-    monkeypatch.setattr("manyforge_behavior.production_ports.time.monotonic_ns", lambda: clock[0])
-
-    class QueryTransport(_Transport):
-        def query_target(self, query):
-            # The native sample was valid at 10 ns; transport can consume the
-            # remaining validity without consuming the wait's 10-second budget.
-            clock[0] = arrival_ns
-            return {
-                "ok": True,
-                "target_observation": {
-                    **query,
-                    "schema_version": "manyforge.target_observation.v1",
-                    "source_epoch": "source.1",
-                    "source_sequence": 7,
-                    "value": {
-                        "state": "completed",
-                        "grasp_confirmed": True,
-                        "command_id": 1,
-                        "generation": 2,
-                        "source_id": "binding.gripper",
-                        "source_revision": _DIGEST_A,
-                        "source_epoch": "provider.1",
-                        "active_control_configuration_id": "route.1",
-                        "active_control_configuration_generation": 3,
-                        "evidence": {"observed_at_ns": "10", "expires_at_ns": "100"},
-                    },
-                },
-            }
-
-    transport = QueryTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_context())
-    result = port.queries.invoke(
-        node_id,
-        _identity("query"),
-        OwnerNodeInputs(
-            parameters={
-                "target_role": "gripper",
-                "expected_state": "grasp_confirmed",
-                "timeout_s": 10.0,
-            }
-        ),
-    )
-    assert result.succeeded is (arrival_ns < 100)
-    assert result.reason_code == (None if arrival_ns < 100 else "grasp_confirmation_not_current")
-    assert transport.submissions == []
 
 
 def test_relative_pose_submission_uses_capture_and_preserves_portable_roles() -> None:

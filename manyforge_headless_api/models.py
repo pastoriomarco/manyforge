@@ -165,7 +165,7 @@ class TargetObservationQuery(StrictRequest):
     owner_epoch: str
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     target_role_id: str | None = None
-    kind: Literal["frame_pose", "gripper_status", "gripper_confirmation", "frame_transform"]
+    kind: Literal["frame_pose", "gripper_status", "frame_transform"]
     frame_role_id: str | None = None
     relative_to_frame_role_id: str | None = None
     pose: Pose3Request | None = None
@@ -263,58 +263,6 @@ class CallerAttributionRequest(StrictRequest):
             label="correlation_id",
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
-
-
-class GripperConfirmationRequest(StrictRequest):
-    """Operator input, never a caller-selected source policy or timestamp."""
-
-    schema_version: Literal["manyforge.gripper_confirmation_request.v1"]
-    program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    target_role_id: str
-    command_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    expected_status_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    confirmed: bool
-    request_context: CallerAttributionRequest
-
-    @field_validator("target_role_id")
-    @classmethod
-    def bounded_target(cls, value: str) -> str:
-        return _bounded_nfc(value, label="target_role_id", maximum_bytes=256)
-
-
-class GripperGraspEvidenceObservation(StrictRequest):
-    """Qualified-source observation, not an inferred grasp or control grant."""
-
-    source_kind: Literal["operator"]
-    source_id: str
-    source_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    source_epoch: str
-    observation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    attribution: str
-    command_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    confirmed: bool
-    observed_at_ns: int
-    expires_at_ns: int
-
-    @field_validator("source_id", "source_epoch", "attribution")
-    @classmethod
-    def bounded_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(value, label=info.field_name, maximum_bytes=256)
-
-    @field_validator("observed_at_ns", "expires_at_ns", mode="before")
-    @classmethod
-    def exact_timestamp(cls, value):
-        from manyforge_behavior.json_scalars import nonnegative_int64
-
-        return nonnegative_int64(value)
-
-    @model_validator(mode="after")
-    def positive_validity(self) -> "GripperGraspEvidenceObservation":
-        if not 0 < self.expires_at_ns - self.observed_at_ns <= 3_600_000_000_000:
-            raise ValueError("confirmation must have an explicit bounded validity")
-        return self
 
 
 class ExecutionControlAttributionRequest(CallerAttributionRequest):
@@ -2167,35 +2115,6 @@ class GripperCommandObservation(StrictRequest):
 class GripperFeedbackObservation(GripperCommandObservation):
     observed_position: CoordinatePositionRequest
     grasp_confirmed: bool | None
-
-
-class GripperConfirmationStatusObservation(GripperCommandObservation):
-    command_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    grasp_confirmed: bool | None
-    evidence: GripperGraspEvidenceObservation | None
-
-    @model_validator(mode="after")
-    def coherent_evidence(self) -> "GripperConfirmationStatusObservation":
-        if self.evidence is None:
-            if self.grasp_confirmed is not None:
-                raise ValueError("grasp confirmation requires evidence")
-            return self
-        if (
-            self.evidence.command_id != self.command_id
-            or self.evidence.generation != self.generation
-            or self.evidence.source_id != self.source_id
-            or self.evidence.source_revision != self.source_revision
-            or self.evidence.source_epoch != self.source_epoch
-            or self.state != "completed"
-            or (
-                self.grasp_confirmed is not None
-                and self.grasp_confirmed is not self.evidence.confirmed
-            )
-        ):
-            raise ValueError("grasp evidence crosses its current command or source")
-        return self
 
 
 class AngularEffortRequest(StrictRequest):

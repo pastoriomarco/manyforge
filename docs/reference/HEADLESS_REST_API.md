@@ -3,119 +3,13 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-10-08 14:53:38 UTC
+  Last regenerated: 2026-10-12 18:10:14 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
 # Headless Runtime REST API
 
 This is the independent headless projection over Manager, logical-scene, scene-runtime, Alarm Lifecycle, Historian, and the selected addressed execution owner and independent Program runner. Reads return owner-issued facts. Alarm acknowledgement, Manager and Program Apply, execution submission, no-motion preview, Program Run, explicit Program Stop, and confirmed CCLC lifecycle/route requests are attributed intents. Generic `/api/control/state` and `/api/control/commands` provide the freshness-aware REST form of the same transport-neutral control ingress used by `/ws/control`; no command is automatically replayed. The API never owns or reduces execution, Program-run, lifecycle, or controller-route state. Preview cannot dispatch, and approval uses the ordinary operation endpoint. An unconfigured or lost Program runner makes Program-owned routes unavailable and is never interpreted as idle; independently owned native operation and Stop routes remain available when their owner is configured. No condition mutation endpoint exists. `/api/health` reports only `headless_projection_ready`; robot readiness has no H0 owner and is explicitly unavailable. The alarm page defaults to 32 records and is bounded at 128, history defaults to and is bounded at 32 records, ordinary request bodies are bounded at 1 MiB, Program Apply at 17 MiB, model-attempt audit at 256 KiB, native/HTTP responses at 64 MiB, and private Program-runner responses at 32 MiB. Program diagnostic captures are separately limited to 64 KiB and asynchronously written by the existing Historian. Their producer-clock values, omissions and delivery losses are available through History/debug export and recorder health, not the high-rate control/viewer stream. Skill expansion is effect-free, selects one exact installed NodeEnvironment and requires ordinary Program/Binding validation before any subsequent execution.
-
-## Explicit operator gripper confirmation
-
-Submit `gripper_confirm` once through `/api/control/commands` or the same control WebSocket. Read a current `/api/control/state` freshness context and the native execution owner epoch first. The payload uses the DTO below plus `expected_execution_owner_epoch`. The transport retains `request_context.request_id` but replaces its owner/source attribution from the admitted envelope. No caller timestamp, validity duration, sensor source or automatic retry is accepted.
-
-This requires an explicitly qualified retained `tool.gripper.confirmation.operator` binding and configured validity; maintained defaults do not enable it. It records an attributed operator statement for one completed command, not sensor proof or attachment permission. Query `gripper_confirmation` at the existing target-observation endpoint; expired evidence is trace only. Program `gripper.wait_for_status` consumes the same current evidence.
-
-The result carries native confirmation evidence and `history_recorded`. That flag means both bounded History submissions were queued, not synchronous disk durability. A History failure cannot change native acceptance; a lost reply remains unconfirmed and must not be resent as a new physical action.
-
-```json
-{
-  "$defs": {
-    "CallerAttributionRequest": {
-      "additionalProperties": false,
-      "properties": {
-        "correlation_id": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Correlation Id"
-        },
-        "request_id": {
-          "title": "Request Id",
-          "type": "string"
-        },
-        "request_owner_epoch": {
-          "title": "Request Owner Epoch",
-          "type": "string"
-        },
-        "source_label": {
-          "title": "Source Label",
-          "type": "string"
-        }
-      },
-      "required": [
-        "request_id",
-        "request_owner_epoch",
-        "source_label"
-      ],
-      "title": "CallerAttributionRequest",
-      "type": "object"
-    }
-  },
-  "additionalProperties": false,
-  "description": "Operator input, never a caller-selected source policy or timestamp.",
-  "properties": {
-    "command_id": {
-      "maximum": 9007199254740991,
-      "minimum": 1,
-      "title": "Command Id",
-      "type": "integer"
-    },
-    "confirmed": {
-      "title": "Confirmed",
-      "type": "boolean"
-    },
-    "expected_status_revision": {
-      "maximum": 9007199254740991,
-      "minimum": 1,
-      "title": "Expected Status Revision",
-      "type": "integer"
-    },
-    "generation": {
-      "maximum": 9007199254740991,
-      "minimum": 1,
-      "title": "Generation",
-      "type": "integer"
-    },
-    "program_binding_id": {
-      "pattern": "^sha256:[0-9a-f]{64}$",
-      "title": "Program Binding Id",
-      "type": "string"
-    },
-    "request_context": {
-      "$ref": "#/$defs/CallerAttributionRequest"
-    },
-    "schema_version": {
-      "const": "manyforge.gripper_confirmation_request.v1",
-      "title": "Schema Version",
-      "type": "string"
-    },
-    "target_role_id": {
-      "title": "Target Role Id",
-      "type": "string"
-    }
-  },
-  "required": [
-    "schema_version",
-    "program_binding_id",
-    "target_role_id",
-    "command_id",
-    "generation",
-    "expected_status_revision",
-    "confirmed",
-    "request_context"
-  ],
-  "title": "GripperConfirmationRequest",
-  "type": "object"
-}
-```
 
 The live schema is available at `/openapi.json` and `/docs` while the API process is running.
 

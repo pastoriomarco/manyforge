@@ -457,6 +457,7 @@ def _manager_payload() -> dict[str, Any]:
     return {
         "api_version": "manyforge.manager_source.v1",
         "active": {
+            "canonical_empty": False,
             "cell_graph": {"cell_id": "cell-a", "components": []},
             "graph_revision": "graph.1",
             "retained_bundle_id": "bundle.1",
@@ -2026,6 +2027,37 @@ def test_node_environment_rejects_a_stale_runner_applied_identity() -> None:
         service.node_environment()
 
     assert stale.value.code == "program_node_availability_stale"
+
+
+@pytest.mark.parametrize("canonical_empty", [False, True])
+def test_manager_status_preserves_owner_canonical_empty(
+    canonical_empty: bool,
+) -> None:
+    core = FakeCore()
+    core.manager_payload["active"]["canonical_empty"] = canonical_empty
+    status = _service(core, FakeManager()).manager_status()
+    assert status["status"] == core.manager_payload
+    assert status["status"]["active"]["canonical_empty"] is canonical_empty
+    assert status["source"]["source_generation"] == 2
+
+
+def test_manager_status_rejects_missing_canonical_empty() -> None:
+    core = FakeCore()
+    del core.manager_payload["active"]["canonical_empty"]
+    with pytest.raises(HeadlessApiError) as error:
+        _service(core, FakeManager()).manager_status()
+    assert error.value.code == "manager_source_invalid"
+
+
+@pytest.mark.parametrize("canonical_empty", [None, 0, 1, "true", [], {}])
+def test_manager_status_rejects_nonboolean_canonical_empty(
+    canonical_empty: object,
+) -> None:
+    core = FakeCore()
+    core.manager_payload["active"]["canonical_empty"] = canonical_empty
+    with pytest.raises(HeadlessApiError) as error:
+        _service(core, FakeManager()).manager_status()
+    assert error.value.code == "manager_source_invalid"
 
 
 def test_manager_status_and_diff_preserve_offer_digest_fields() -> None:

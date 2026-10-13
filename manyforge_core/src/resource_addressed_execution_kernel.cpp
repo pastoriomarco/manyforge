@@ -8,8 +8,6 @@
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
-#include <manyforge_core/detail/coordinated_execution_clock.hpp>
-#include <manyforge_core/detail/coordinated_motion_preparation.hpp>
 #include <manyforge_core/detail/motion_resume_intent.hpp>
 #include <manyforge_core/execution_recovery_support.hpp>
 #include <manyforge_core/execution_stop_support.hpp>
@@ -20,6 +18,9 @@
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
 #include <manyforge_core/stop_terminal_reducer.hpp>
+#include <manyforge_core/component_lifecycle_admission.hpp>
+
+#include "component_lifecycle_journal_codec_internal.hpp"
 #include <manyforge_core/types/capability_definition.hpp>
 #include <numeric>
 #include <set>
@@ -1026,6 +1027,16 @@ struct StopStaticFacts final {
   return Result<GripperCommandRequestDTO>::Ok(std::move(request));
 }
 
+[[nodiscard]] std::size_t controller_goal_cancel_stage_index(
+    const PreparedParticipantStopPlanDTO& plan) {
+  const auto found =
+      std::find_if(plan.stage_commands.begin(), plan.stage_commands.end(), [](const auto& command) {
+        return command.resolved_stage.containment_command.command_kind ==
+               StopContainmentCommandKind::kControllerGoalCancel;
+      });
+  return static_cast<std::size_t>(std::distance(plan.stage_commands.begin(), found));
+}
+
 [[nodiscard]] Result<std::optional<PreparedParticipantStopPlanDTO>> make_runtime_fault_stop_plan(
     const RuntimeParticipantStopReadiness& readiness,
     const std::optional<MotionInterruptStopProfileDTO>& profile,
@@ -1576,7 +1587,6 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   // Run/Resume and motion-producing recovery; they never gate a manual
   // operation, whether or not a manual cell-admission claim still names it.
   bool manual{};
-  std::shared_ptr<detail::CoordinatedMotionPreparation> common_timing{};
   mutable std::vector<KernelRecoveryAssessmentDTO> recovery_assessment_inputs{};
   mutable std::uint64_t recovery_assessment_revision{};
 
@@ -3669,6 +3679,432 @@ ResourceAddressedExecutionKernel::AcquireRouteRecoveryCellAdmissionClaim(
       });
 }
 
+Result<void> ResourceAddressedExecutionKernel::validate_selected_bring_up_offer_identity(
+    const CellAdmissionClaimIntentDTO& intent,
+    const SelectedComponentBringUpOfferDTO& offer) const {
+  const auto scope = SelectedComponentBringUpAdmissionScope(offer);
+  const auto fence_scope = SelectedComponentBringUpFenceScope(offer);
+  if (!scope.ok()) return Result<void>::Err(scope.error());
+  if (!fence_scope.ok()) return Result<void>::Err(fence_scope.error());
+  try {
+    if (intent.owner_transaction_id != offer.lifecycle_transaction_id.value() ||
+        intent.request_id != offer.request_context.request_id ||
+        intent.owner_epoch != offer.request_context.request_owner_epoch ||
+        intent.scope != scope.value() ||
+        intent.request_payload_digest !=
+            ContentDigest(detail::SelectedComponentBringUpSemanticOfferDigest(offer)) ||
+        offer.fence_admission.echoed_query.affected_scope != fence_scope.value() ||
+        offer.fence_admission.active_projection_revision !=
+            offer.predecessor.active_publication_receipt.request.candidate_projection_revision ||
+        offer.fence_admission.execution_host_epoch.publication_generation !=
+            offer.predecessor.active_publication_receipt.publication_generation ||
+        offer.fence_admission.active_public_pointer_digest !=
+            offer.predecessor.active_publication_receipt.durable_public_pointer_content_digest ||
+        offer.fence_admission.affected_active_operation_count != 0U ||
+        offer.fence_admission.affected_queued_operation_count != 0U) {
+      return reject<void>("selected bring-up offer identity is not exact",
+                          "selected_bring_up_offer_invalid", ErrorCode::kInvalidRequest);
+    }
+  } catch (const std::exception&) {
+    return reject<void>("selected bring-up offer cannot be encoded",
+                        "selected_bring_up_offer_invalid", ErrorCode::kInvalidRequest);
+  }
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceAddressedExecutionKernel::validate_selected_bring_up_predecessor_locked(
+    const CellAdmissionClaimIntentDTO& intent, const SelectedComponentBringUpOfferDTO& offer) {
+  if (auto valid = validate_selected_bring_up_offer_identity(intent, offer); !valid.ok())
+    return valid;
+  std::lock_guard state_lock(state_mutex_);
+  const auto& component = offer.predecessor.controllable_component_id;
+  const auto readiness = component_command_readiness_.find(component);
+  const auto containment =
+      std::find_if(incident_containments_.begin(), incident_containments_.end(),
+                   [&](const auto& row) { return row.incident_id == offer.incident_id; });
+  if (parent_program_cycle_claim(intent) || !is_active_stop_fault_latch(active_stop_fault_latch_) ||
+      !motion_admission_closed_ || readiness == component_command_readiness_.end() ||
+      readiness->second.component_lifecycle_generation !=
+          offer.predecessor.component_lifecycle_generation ||
+      containment == incident_containments_.end() || containment->receipt != offer.containment ||
+      containment->controllable_component_id != component ||
+      offer.fence_admission.execution_host_epoch.request_owner_epoch !=
+          config_.request_owner_epoch) {
+    return reject<void>("selected bring-up has no exact contained failed predecessor",
+                        "selected_bring_up_predecessor_not_current");
+  }
+  const auto terminal = std::find_if(
+      stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
+        return record->status.accepted.stop_id == offer.containment.stop_id &&
+               record->status.accepted.stop_generation == offer.containment.stop_generation;
+      });
+  if (terminal == stop_terminal_history_.end() || !(*terminal)->status.unsettled.empty() ||
+      std::any_of(stop_transactions_.begin(), stop_transactions_.end(),
+                  [](const auto& stop) { return stop->active && !stop->terminal; }) ||
+      pending_program_run_admission_ || !active_operations_.empty() ||
+      operation_control_reconfiguration_busy_locked() || motion_admission_unreconciled_ ||
+      manager_liveness_motion_inhibited_) {
+    return reject<void>("selected bring-up requires settled resident containment and work",
+                        "selected_bring_up_effects_not_settled");
+  }
+  const auto slots = resource_slots_->snapshot();
+  if (std::any_of(slots.begin(), slots.end(), [](const auto& slot) {
+        return slot.state != ResourceSlotState::kFree || slot.owner.has_value();
+      })) {
+    return reject<void>("selected bring-up has reserved or unknown physical effects",
+                        "selected_bring_up_resources_not_settled");
+  }
+  return validate_bring_up_component_closure_locked(
+      offer.predecessor, offer.candidate_participants, offer.fence_admission);
+}
+
+Result<void> ResourceAddressedExecutionKernel::validate_bring_up_component_closure_locked(
+    const ComponentLifecycleCurrentSnapshotDTO& predecessor,
+    const std::vector<RuntimeParticipantBindingDTO>& candidates,
+    const ConfigurationFenceAdmissionSnapshotDTO& admission) {
+  const auto& component = predecessor.controllable_component_id;
+  std::vector<ResourceId> current_resources;
+  std::set<ControlBindingId> current_bindings;
+  for (const auto& registration : registrations_) {
+    const auto& binding = registration.binding.value();
+    if (binding.controllable_component_id != component || !binding.control_path) continue;
+    const auto domain = std::find_if(
+        predecessor.domains.begin(), predecessor.domains.end(), [&](const auto& row) {
+          return row.control_domain_id == binding.control_path->control_domain_id;
+        });
+    if (domain == predecessor.domains.end()) {
+      return reject<void>("selected bring-up omits an owned predecessor domain",
+                          "selected_bring_up_registration_not_current");
+    }
+  }
+  for (std::size_t index = 0; index < predecessor.domains.size(); ++index) {
+    const auto& domain = predecessor.domains[index];
+    const auto& provider = predecessor.provider_occurrences[index];
+    const auto adopted = runtime_route_configuration_readbacks_.find(domain.control_domain_id);
+    if (!domain.active_control_configuration ||
+        adopted == runtime_route_configuration_readbacks_.end() ||
+        adopted->second.active_configuration != *domain.active_control_configuration) {
+      return reject<void>("selected bring-up predecessor configuration is not adopted",
+                          "selected_bring_up_configuration_not_current");
+    }
+    for (const auto& registration : registrations_) {
+      const auto& binding = registration.binding.value();
+      if (binding.controllable_component_id != component || !binding.control_path ||
+          binding.control_path->control_domain_id != domain.control_domain_id)
+        continue;
+      const auto& path = *binding.control_path;
+      const auto control_binding =
+          std::find_if(domain.current_control_bindings.begin(),
+                       domain.current_control_bindings.end(), [&](const auto& row) {
+                         return row.control_binding_id == path.control_binding_id &&
+                                row.control_binding_revision == path.control_binding_revision &&
+                                row.control_route_id == path.control_route_id;
+                       });
+      if (binding.retained_bundle_id !=
+              admission.active_projection_revision.retained_bundle_id ||
+          binding.graph_revision !=
+              admission.active_projection_revision.graph_revision ||
+          path.control_domain_revision != domain.control_domain_revision ||
+          path.controller_topology_id != domain.controller_topology_id ||
+          path.topology_revision != domain.topology_revision ||
+          control_binding == domain.current_control_bindings.end() ||
+          path.provider_instance_id != provider.provider_instance_id ||
+          path.provider_manifest_id != provider.provider_manifest_id ||
+          path.provider_manifest_revision != provider.provider_manifest_revision ||
+          path.provider_runtime_unit_id != provider.provider_runtime_unit_id ||
+          path.provider_runtime_epoch != provider.provider_runtime_epoch ||
+          path.provider_runtime_unit_id !=
+              admission.execution_host_epoch.runtime_unit_id ||
+          path.provider_runtime_epoch != admission.execution_host_epoch.runtime_epoch) {
+        return reject<void>("selected bring-up predecessor registration is not exact",
+                            "selected_bring_up_registration_not_current");
+      }
+      current_bindings.insert(path.control_binding_id);
+      for (const auto& resource : binding.resources)
+        current_resources.push_back(resource.resource_id);
+    }
+    for (const auto& binding : domain.current_control_bindings) {
+      if (!current_bindings.contains(binding.control_binding_id)) {
+        return reject<void>("selected bring-up predecessor participant is missing",
+                            "selected_bring_up_registration_not_current");
+      }
+    }
+  }
+  std::sort(current_resources.begin(), current_resources.end());
+  current_resources.erase(std::unique(current_resources.begin(), current_resources.end()),
+                          current_resources.end());
+  std::vector<ResourceId> expected_resources;
+  for (const auto& domain : predecessor.domains)
+    expected_resources.insert(expected_resources.end(), domain.current_resources.begin(),
+                              domain.current_resources.end());
+  std::sort(expected_resources.begin(), expected_resources.end());
+  expected_resources.erase(std::unique(expected_resources.begin(), expected_resources.end()),
+                           expected_resources.end());
+  if (current_resources != expected_resources) {
+    return reject<void>("selected bring-up predecessor physical closure changed",
+                        "selected_bring_up_resources_not_current");
+  }
+  return validate_bring_up_candidate_peer_closure_locked(component, candidates, admission);
+}
+
+Result<void> ResourceAddressedExecutionKernel::validate_bring_up_candidate_peer_closure_locked(
+    const ControllableComponentId& component,
+    const std::vector<RuntimeParticipantBindingDTO>& candidates,
+    const ConfigurationFenceAdmissionSnapshotDTO& admission) {
+  for (const auto& candidate : candidates) {
+    const auto& path = *candidate.control_path;
+    if (path.provider_runtime_unit_id !=
+            admission.execution_host_epoch.runtime_unit_id ||
+        path.provider_runtime_epoch != admission.execution_host_epoch.runtime_epoch) {
+      return reject<void>("selected bring-up cannot change the shared host epoch",
+                          "selected_bring_up_host_epoch_changed");
+    }
+    for (const auto& registration : registrations_) {
+      const auto& other = registration.binding.value();
+      if (other.controllable_component_id == component) continue;
+      if (other.control_path &&
+          (other.control_path->control_domain_id == path.control_domain_id ||
+           other.control_path->control_binding_id == path.control_binding_id)) {
+        return reject<void>("selected bring-up crosses a healthy peer domain or binding",
+                            "selected_bring_up_nonselected_scope_changed");
+      }
+      for (const auto& resource : candidate.resources) {
+        if (std::any_of(other.resources.begin(), other.resources.end(),
+                        [&](const auto& row) { return row.resource_id == resource.resource_id; })) {
+          return reject<void>("selected bring-up crosses a healthy peer resource",
+                              "selected_bring_up_nonselected_scope_changed");
+        }
+      }
+    }
+  }
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceAddressedExecutionKernel::validate_apply_bring_up_current_locked(
+    const CellAdmissionClaimIntentDTO& intent, const ApplyBringUpAdmissionOfferDTO& offer,
+    const CellAdmissionReadinessSnapshotDTO& readiness) {
+  // The aggregate producer currently erases which components contributed a
+  // deficit. Do not subtract the offered subset or treat count equality as
+  // exact attribution. This slice stays explicitly incomplete until that
+  // source-qualified join is composed by the existing owners.
+  if (readiness.blocking_fault_count != 0U || !readiness.deployment_converged ||
+      readiness.required_component_total !=
+          readiness.required_component_current_compatible_ready_converged) {
+    return reject<void>("selected readiness deficits have no exact source-qualified attribution",
+                        "apply_bring_up_readiness_attribution_unavailable");
+  }
+  if (!offer.parent.valid() || !offer.admission.presence_valid() ||
+      intent.owner_transaction_id != offer.parent.owner.apply_id.value() ||
+      intent.request_payload_digest != offer.parent.plan_digest ||
+      offer.admission.execution_host_epoch.request_owner_epoch != config_.request_owner_epoch ||
+      offer.admission.affected_active_operation_count != 0U ||
+      offer.admission.affected_queued_operation_count != 0U ||
+      offer.configured_components.empty() || offer.needed_components.empty() ||
+      std::any_of(offer.configured_components.begin(), offer.configured_components.end(),
+                  [](const auto& component) { return component.empty(); }) ||
+      offer.configured_components.size() > kMaximumCellAdmissionScopeEntries ||
+      offer.needed_components.size() > offer.configured_components.size() ||
+      !std::is_sorted(offer.configured_components.begin(), offer.configured_components.end()) ||
+      std::adjacent_find(offer.configured_components.begin(), offer.configured_components.end()) !=
+          offer.configured_components.end()) {
+    return reject<void>("Apply bring-up parent/current input is not exact",
+                        "apply_bring_up_offer_invalid", ErrorCode::kInvalidRequest);
+  }
+  std::lock_guard state_lock(state_mutex_);
+  if (pending_program_run_admission_ || !active_operations_.empty() ||
+      operation_control_reconfiguration_busy_locked() || motion_admission_unreconciled_ ||
+      manager_liveness_motion_inhibited_ ||
+      std::any_of(stop_transactions_.begin(), stop_transactions_.end(),
+                  [](const auto& stop) { return stop->active && !stop->terminal; })) {
+    return reject<void>("Apply bring-up requires settled physical and Program work",
+                        "apply_bring_up_effects_not_settled");
+  }
+  const auto slots = resource_slots_->snapshot();
+  if (std::any_of(slots.begin(), slots.end(), [](const auto& slot) {
+        return slot.state != ResourceSlotState::kFree || slot.owner.has_value();
+      })) {
+    return reject<void>("Apply bring-up has reserved or unknown physical effects",
+                        "apply_bring_up_resources_not_settled");
+  }
+  ConfigurationFenceScopeDTO closure;
+  std::map<ControlDomainId, ConfigurationFenceDomainScopeDTO> domains;
+  std::map<ControlBindingId, ConfigurationFenceBindingScopeDTO> bindings;
+  std::set<ResourceId> resources;
+  std::map<ResourceId, ControllableComponentId> candidate_resource_owners;
+  bool exact_latch = false;
+  std::set<std::string> incidents;
+  for (const auto& row : offer.needed_components) {
+    const auto& component = row.controllable_component_id;
+    if (component.empty() ||
+        (!closure.controllable_component_ids.empty() &&
+         !(closure.controllable_component_ids.back() < component)) ||
+        !std::binary_search(offer.configured_components.begin(),
+                            offer.configured_components.end(), component)) {
+      return reject<void>("Apply bring-up needed set is not canonical/configured",
+                          "apply_bring_up_offer_invalid", ErrorCode::kInvalidRequest);
+    }
+    closure.controllable_component_ids.push_back(component);
+    if (row.candidate_participants.empty() ||
+        row.candidate_participants.size() > kMaximumCellAdmissionScopeEntries) {
+      return reject<void>("Apply bring-up candidate closure is absent or exceeds its bound",
+                          "apply_bring_up_candidate_invalid", ErrorCode::kInvalidRequest);
+    }
+    for (const auto& candidate : row.candidate_participants) {
+      const auto verified = verify_runtime_participant_binding(candidate);
+      if (!verified.ok() || candidate.controllable_component_id != component ||
+          !candidate.control_path) {
+        return reject<void>("Apply bring-up candidate binding is not qualified",
+                            "apply_bring_up_candidate_invalid", ErrorCode::kInvalidRequest);
+      }
+      // Preserve derive_stop_static_facts' existing physical attribution:
+      // same-component aliases are valid; another component cannot own it.
+      for (const auto& resource : candidate.resources) {
+        const auto [owner, inserted] = candidate_resource_owners.emplace(resource.resource_id, component);
+        if (!inserted && owner->second != component) {
+          return reject<void>("candidate Stop resource belongs to multiple components",
+                              "apply_bring_up_candidate_resource_owner_conflict");
+        }
+      }
+    }
+    if (row.kind == ApplyBringUpAdmissionComponentKindDTO::kInitial) {
+      // Manager's original live caller proves the never-brought-up owner
+      // classification. Kernel independently proves actual absent installation
+      // and healthy ordinary prerequisites; absence alone is not authority.
+      if (row.predecessor || row.recovery || is_active_stop_fault_latch(active_stop_fault_latch_) ||
+          motion_admission_closed_ || component_command_readiness_.contains(component) ||
+          std::any_of(registrations_.begin(), registrations_.end(), [&](const auto& current) {
+            return current.binding.value().controllable_component_id == component;
+          }) || std::any_of(incident_containments_.begin(), incident_containments_.end(),
+                           [&](const auto& current) {
+            return current.controllable_component_id == component;
+          })) {
+        return reject<void>("initial bring-up has an installed or faulted predecessor",
+                            "apply_bring_up_initial_not_current");
+      }
+      if (auto current = validate_bring_up_candidate_peer_closure_locked(
+              component, row.candidate_participants, offer.admission); !current.ok()) return current;
+    } else {
+      if (row.kind != ApplyBringUpAdmissionComponentKindDTO::kContainedRecovery ||
+          !row.predecessor || !row.recovery || row.candidate_participants.empty() ||
+          row.candidate_participants.size() > kMaximumCellAdmissionScopeEntries ||
+          row.predecessor->controllable_component_id != component ||
+          !VerifyComponentLifecycleCurrentSnapshot(*row.predecessor).ok() ||
+          !incidents.insert(row.recovery->incident_id).second) {
+        return reject<void>("Apply bring-up recovery row is incomplete",
+                            "apply_bring_up_offer_invalid", ErrorCode::kInvalidRequest);
+      }
+      const auto& predecessor = *row.predecessor;
+      const auto& containment = row.recovery->containment;
+      const auto ready = component_command_readiness_.find(component);
+      const auto incident = std::find_if(incident_containments_.begin(), incident_containments_.end(),
+          [&](const auto& current) { return current.incident_id == row.recovery->incident_id; });
+      const auto terminal = std::find_if(stop_terminal_history_.begin(), stop_terminal_history_.end(),
+          [&](const auto& current) {
+            return current->status.accepted.stop_id == containment.stop_id &&
+                   current->status.accepted.stop_generation == containment.stop_generation;
+          });
+      if (!is_active_stop_fault_latch(active_stop_fault_latch_) || !motion_admission_closed_ ||
+          ready == component_command_readiness_.end() ||
+          ready->second.component_lifecycle_generation != predecessor.component_lifecycle_generation ||
+          incident == incident_containments_.end() || incident->controllable_component_id != component ||
+          incident->receipt != containment || terminal == stop_terminal_history_.end() ||
+          !(*terminal)->status.unsettled.empty() ||
+          predecessor.active_publication_receipt.publication_generation !=
+              offer.admission.execution_host_epoch.publication_generation ||
+          predecessor.active_publication_receipt.request.candidate_projection_revision !=
+              offer.admission.active_projection_revision ||
+          predecessor.active_publication_receipt.durable_public_pointer_content_digest !=
+              offer.admission.active_public_pointer_digest) {
+        return reject<void>("Apply bring-up has no exact settled contained predecessor",
+                            "apply_bring_up_predecessor_not_current");
+      }
+      if (active_stop_fault_latch_->stop_id == containment.stop_id &&
+          active_stop_fault_latch_->stop_generation == containment.stop_generation) {
+        exact_latch = std::any_of(attributed_containment_stops_.begin(),
+            attributed_containment_stops_.end(), [&](const auto& current) {
+              return current.stop_id == containment.stop_id &&
+                     current.stop_generation == containment.stop_generation &&
+                     current.origin == StopFaultLatchOriginDTO::kComponentIncident;
+            });
+      }
+      if (auto current = validate_bring_up_component_closure_locked(
+              predecessor, row.candidate_participants, offer.admission); !current.ok()) return current;
+      for (const auto& domain : predecessor.domains) {
+        auto& entry = domains.try_emplace(
+            domain.control_domain_id,
+            ConfigurationFenceDomainScopeDTO{domain.control_domain_id, {}, {}}).first->second;
+        entry.control_domain_id = domain.control_domain_id;
+        entry.predecessor_control_domain_revision = domain.control_domain_revision;
+        for (const auto& binding : domain.current_control_bindings) {
+          auto& current = bindings.try_emplace(
+              binding.control_binding_id,
+              ConfigurationFenceBindingScopeDTO{binding.control_binding_id, {}, {}}).first->second;
+          current.control_binding_id = binding.control_binding_id;
+          current.predecessor_control_binding_revision = binding.control_binding_revision;
+        }
+        resources.insert(domain.current_resources.begin(), domain.current_resources.end());
+      }
+    }
+    for (const auto& candidate : row.candidate_participants) {
+      const auto& path = *candidate.control_path;
+      auto& domain = domains.try_emplace(
+          path.control_domain_id,
+          ConfigurationFenceDomainScopeDTO{path.control_domain_id, {}, {}}).first->second;
+      domain.control_domain_id = path.control_domain_id;
+      if (domain.candidate_control_domain_revision &&
+          domain.candidate_control_domain_revision != path.control_domain_revision) {
+        return reject<void>("candidate domain closure conflicts", "apply_bring_up_candidate_invalid");
+      }
+      domain.candidate_control_domain_revision = path.control_domain_revision;
+      auto& binding = bindings.try_emplace(
+          path.control_binding_id,
+          ConfigurationFenceBindingScopeDTO{path.control_binding_id, {}, {}}).first->second;
+      binding.control_binding_id = path.control_binding_id;
+      if (binding.candidate_control_binding_revision &&
+          binding.candidate_control_binding_revision != path.control_binding_revision) {
+        return reject<void>("candidate binding closure conflicts", "apply_bring_up_candidate_invalid");
+      }
+      binding.candidate_control_binding_revision = path.control_binding_revision;
+      for (const auto& resource : candidate.resources) resources.insert(resource.resource_id);
+    }
+  }
+  for (const auto& [id, domain] : domains) { static_cast<void>(id); closure.domains.push_back(domain); }
+  for (const auto& [id, binding] : bindings) { static_cast<void>(id); closure.bindings.push_back(binding); }
+  closure.resources.assign(resources.begin(), resources.end());
+  if ((is_active_stop_fault_latch(active_stop_fault_latch_) && !exact_latch) ||
+      closure != offer.admission.echoed_query.affected_scope) {
+    return reject<void>("Apply bring-up crosses its exact contained selected scope",
+                        "apply_bring_up_scope_not_exact");
+  }
+  return Result<void>::Ok();
+}
+
+Result<CellAdmissionClaimDTO>
+ResourceAddressedExecutionKernel::AcquireApplyBringUpCellAdmissionClaim(
+    const CellAdmissionClaimIntentDTO& intent, const ApplyBringUpAdmissionOfferDTO& offer) {
+  std::lock_guard submit_lock(submission_mutex_);
+  std::lock_guard admission_lock(*admission_mutex_);
+  return cell_admission_owner_->AcquireApplyBringUpClaim(
+      intent, [&](const auto& current, const auto& readiness, const auto& actual_manager_epoch) {
+        if (offer.admission.echoed_query.manager_runtime_epoch != actual_manager_epoch) {
+          return reject<void>("Apply bring-up Manager epoch is not current",
+                              "apply_bring_up_manager_epoch_not_current");
+        }
+        return validate_apply_bring_up_current_locked(current, offer, readiness);
+      });
+}
+
+Result<CellAdmissionClaimDTO>
+ResourceAddressedExecutionKernel::AcquireSelectedComponentBringUpClaim(
+    const CellAdmissionClaimIntentDTO& intent, const SelectedComponentBringUpOfferDTO& offer) {
+  if (auto valid = validate_selected_bring_up_offer_identity(intent, offer); !valid.ok())
+    return Result<CellAdmissionClaimDTO>::Err(valid.error());
+  std::lock_guard submit_lock(submission_mutex_);
+  std::lock_guard admission_lock(*admission_mutex_);
+  return cell_admission_owner_->AcquireSelectedBringUpClaim(intent, [&](const auto&, const auto&) {
+    return validate_selected_bring_up_predecessor_locked(intent, offer);
+  });
+}
 Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReleaseCellAdmissionClaim(
     const CellAdmissionClaimReleaseDTO& release) {
   std::lock_guard admission_lock(*admission_mutex_);
@@ -3915,6 +4351,12 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_manual_operation_admiss
   return Result<void>::Ok();
 }
 
+std::optional<CellAdmissionClaimDTO>
+ResourceAddressedExecutionKernel::ReadHeldCellAdmissionClaim(
+    const CellAdmissionClaimKindDTO kind) const {
+  return cell_admission_owner_->held_claim(kind);
+}
+
 Result<CellAdmissionRecoveryReceiptDTO>
 ResourceAddressedExecutionKernel::GetCellAdmissionRecoveryReceipt(
     const CellAdmissionRecoveryReceiptQueryDTO& query) const {
@@ -4144,9 +4586,9 @@ ResourceAddressedExecutionKernel::RequestComponentIncidentContainment(
     std::lock_guard state_lock(state_mutex_);
     // Closed before any Stop I/O, exactly like the liveness fail-safe.
     motion_admission_closed_ = true;
-    for (const auto& [incident_id, receipt] : incident_containments_) {
-      if (incident_id == intent.incident_id) {
-        return Result<ComponentIncidentContainmentReceiptDTO>::Ok(receipt);
+    for (const auto& remembered : incident_containments_) {
+      if (remembered.incident_id == intent.incident_id) {
+        return Result<ComponentIncidentContainmentReceiptDTO>::Ok(remembered.receipt);
       }
     }
     expected_stop_generation = cell_stop_generation_;
@@ -4189,7 +4631,11 @@ ResourceAddressedExecutionKernel::RequestComponentIncidentContainment(
     if (incident_containments_.size() >= kMaximumRememberedIncidentContainments) {
       incident_containments_.erase(incident_containments_.begin());
     }
-    incident_containments_.emplace_back(intent.incident_id, receipt);
+    incident_containments_.push_back(
+        {intent.incident_id, receipt,
+         stopped.value().replay_status == RequestReplayStatusDTO::kAcceptedNew
+             ? std::optional(intent.controllable_component_id)
+             : std::nullopt});
   }
   return Result<ComponentIncidentContainmentReceiptDTO>::Ok(std::move(receipt));
 }
@@ -5074,6 +5520,11 @@ Result<void> ResourceAddressedExecutionKernel::require_component_routes_current_
   if (!command_eligible) {
     return Result<void>::Ok();
   }
+  return require_installed_component_routes_current_locked(controllable_component_id);
+}
+
+Result<void> ResourceAddressedExecutionKernel::require_installed_component_routes_current_locked(
+    const ControllableComponentId& controllable_component_id) const {
   bool any_domain = false;
   for (const auto& registration : registrations_) {
     const auto& binding = registration.binding.value();
@@ -5123,6 +5574,12 @@ ResourceAddressedExecutionKernel::close_component_command_eligibility(
     return Result<ComponentCommandReadinessDTO>::Err(held.error());
   }
   std::lock_guard state_lock(state_mutex_);
+  return close_component_command_eligibility_locked(controllable_component_id);
+}
+
+Result<ComponentCommandReadinessDTO>
+ResourceAddressedExecutionKernel::close_component_command_eligibility_locked(
+    const ControllableComponentId& controllable_component_id) {
   try {
     auto [entry, inserted] = component_command_readiness_.try_emplace(
         controllable_component_id,
@@ -5131,12 +5588,31 @@ ResourceAddressedExecutionKernel::close_component_command_eligibility(
     entry->second.command_eligible = false;
     return Result<ComponentCommandReadinessDTO>::Ok(entry->second);
   } catch (...) {
-    return reject<ComponentCommandReadinessDTO>(
-        "component readiness closure could not be recorded",
-        "component_readiness_capacity_unavailable", ErrorCode::kInternalError);
+    return reject<ComponentCommandReadinessDTO>("component readiness closure could not be recorded",
+                                                "component_readiness_capacity_unavailable",
+                                                ErrorCode::kInternalError);
   }
 }
 
+Result<ComponentCommandReadinessDTO>
+ResourceAddressedExecutionKernel::close_component_command_eligibility(
+    const CellAdmissionClaimDTO& selected_claim, const SelectedComponentBringUpOfferDTO& offer) {
+  std::lock_guard submit_lock(submission_mutex_);
+  std::lock_guard admission_lock(*admission_mutex_);
+  const auto held =
+      cell_admission_owner_->held_claim(CellAdmissionClaimKindDTO::kInterventionOrRecovery);
+  if (!held || *held != selected_claim) {
+    return reject<ComponentCommandReadinessDTO>(
+        "selected component readiness requires its exact full held claim",
+        "component_readiness_claim_not_held");
+  }
+  if (auto valid = validate_selected_bring_up_predecessor_locked(selected_claim.intent, offer);
+      !valid.ok()) {
+    return Result<ComponentCommandReadinessDTO>::Err(valid.error());
+  }
+  std::lock_guard state_lock(state_mutex_);
+  return close_component_command_eligibility_locked(offer.predecessor.controllable_component_id);
+}
 Result<ComponentCommandReadinessDTO>
 ResourceAddressedExecutionKernel::publish_component_command_readiness(
     const ComponentCommandReadinessPublicationDTO& publication,
@@ -5268,6 +5744,14 @@ ResourceAddressedExecutionKernel::publish_component_command_readiness(
   if (auto idle = require_idle_for_component_readiness_locked(); !idle.ok()) {
     return Result<ComponentCommandReadinessDTO>::Err(idle.error());
   }
+  return commit_component_command_readiness_locked(
+      component, publication.component_lifecycle_generation, publication.command_eligible);
+}
+
+Result<ComponentCommandReadinessDTO>
+ResourceAddressedExecutionKernel::commit_component_command_readiness_locked(
+    const ControllableComponentId& component, ComponentLifecycleGeneration generation,
+    bool command_eligible) {
   std::set<ControlDomainId> component_domains;
   for (const auto& registration : registrations_) {
     const auto& binding = registration.binding.value();
@@ -5276,15 +5760,14 @@ ResourceAddressedExecutionKernel::publish_component_command_readiness(
     }
     if (registration.stop_readiness.has_value() &&
         registration.stop_readiness->value().component_lifecycle_generation !=
-            publication.component_lifecycle_generation) {
+            generation) {
       return reject<ComponentCommandReadinessDTO>(
           "component participants changed during readiness publication",
           "component_readiness_generation_raced", ErrorCode::kInvariantViolation);
     }
     component_domains.insert(binding.control_path->control_domain_id);
   }
-  if (auto routes = require_component_routes_current_locked(component,
-                                                            publication.command_eligible);
+  if (auto routes = require_component_routes_current_locked(component, command_eligible);
       !routes.ok()) {
     return Result<ComponentCommandReadinessDTO>::Err(routes.error());
   }
@@ -5311,9 +5794,174 @@ ResourceAddressedExecutionKernel::publish_component_command_readiness(
     runtime_route_configuration_readbacks_.at(domain).readiness_rows = std::move(rows);
   }
   auto& entry = component_command_readiness_.at(component);
-  entry.component_lifecycle_generation = publication.component_lifecycle_generation;
-  entry.command_eligible = publication.command_eligible;
+  entry.component_lifecycle_generation = generation;
+  entry.command_eligible = command_eligible;
   return Result<ComponentCommandReadinessDTO>::Ok(entry);
+}
+
+Result<ComponentCommandReadinessDTO>
+ResourceAddressedExecutionKernel::publish_component_command_readiness(
+    const CellAdmissionClaimDTO& selected_claim, const SelectedComponentBringUpOfferDTO& offer,
+    const ComponentLifecycleStatusDTO& status,
+    const SelectedControllerOccurrenceDTO& installed_occurrence,
+    const std::vector<RuntimeParticipantExecutionRegistration>& installed,
+    const std::vector<ActiveControlConfigurationDTO>& configurations, bool command_eligible) {
+  if (command_eligible || !status.locally_valid() || !status.selected_bring_up ||
+      status.apply_bring_up || !installed_occurrence.locally_valid() || installed.empty() ||
+      status.phase == ComponentLifecycleTransactionPhaseDTO::kAccepted ||
+      status.status_owner_epoch != selected_claim.intent.owner_epoch) {
+    return reject<ComponentCommandReadinessDTO>(
+        "selected successor publication requires original live false-only holding facts",
+        "selected_successor_publication_invalid", ErrorCode::kInvalidRequest);
+  }
+  std::lock_guard submit_lock(submission_mutex_);
+  std::lock_guard admission_lock(*admission_mutex_);
+  const auto held = cell_admission_owner_->held_claim(CellAdmissionClaimKindDTO::kInterventionOrRecovery);
+  if (!held || *held != selected_claim) {
+    return reject<ComponentCommandReadinessDTO>("selected successor claim is not exactly held",
+                                                "component_readiness_claim_not_held");
+  }
+  if (auto valid = validate_selected_bring_up_offer_identity(selected_claim.intent, offer);
+      !valid.ok()) return Result<ComponentCommandReadinessDTO>::Err(valid.error());
+  const auto& evidence = *status.selected_bring_up;
+  const auto& component = offer.predecessor.controllable_component_id;
+  const auto scope = SelectedComponentBringUpFenceScope(offer);
+  if (!scope.ok()) return Result<ComponentCommandReadinessDTO>::Err(scope.error());
+  if (evidence.selected_claim != selected_claim ||
+      evidence.offer_digest != selected_claim.intent.request_payload_digest ||
+      evidence.original_request_payload_digest != offer.original_request_payload_digest ||
+      evidence.predecessor_snapshot_digest != offer.predecessor.snapshot_digest ||
+      evidence.incident_id != offer.incident_id ||
+      evidence.containment_stop_id != offer.containment.stop_id ||
+      evidence.containment_stop_generation != offer.containment.stop_generation ||
+      evidence.candidate_projection_revision != offer.candidate_projection_revision ||
+      evidence.candidate_retained_bundle_digest != offer.candidate_retained_bundle_digest ||
+      evidence.candidate_retained_bundle_bytes != offer.candidate_retained_bundle_bytes ||
+      status.acceptance.lifecycle_transaction_id != offer.lifecycle_transaction_id ||
+      status.acceptance.lifecycle_transaction_generation != offer.lifecycle_transaction_generation ||
+      status.accepted_intent.request_context != offer.request_context ||
+      status.accepted_intent.controllable_component_id != component ||
+      status.accepted_intent.expected_component_lifecycle_generation !=
+          offer.predecessor.component_lifecycle_generation ||
+      evidence.accepted_fence.captured_scope != scope.value() ||
+      config_.operation_admission_gate == nullptr ||
+      !config_.operation_admission_gate->exact_fence_is_held(
+          evidence.accepted_fence.configuration_fence_id, scope.value())) {
+    return reject<ComponentCommandReadinessDTO>("selected successor proof/held fence is not exact",
+                                                "selected_successor_authority_not_exact");
+  }
+  std::lock_guard state_lock(state_mutex_);
+  const auto containment = std::find_if(incident_containments_.begin(), incident_containments_.end(),
+      [&](const auto& row) { return row.incident_id == offer.incident_id; });
+  const auto terminal = std::find_if(stop_terminal_history_.begin(), stop_terminal_history_.end(),
+      [&](const auto& row) {
+        return row->status.accepted.stop_id == offer.containment.stop_id &&
+               row->status.accepted.stop_generation == offer.containment.stop_generation;
+      });
+  if (!is_active_stop_fault_latch(active_stop_fault_latch_) || !motion_admission_closed_ ||
+      containment == incident_containments_.end() ||
+      containment->controllable_component_id != component || containment->receipt != offer.containment ||
+      terminal == stop_terminal_history_.end() || !(*terminal)->status.unsettled.empty() ||
+      pending_program_run_admission_ ||
+      std::any_of(stop_transactions_.begin(), stop_transactions_.end(),
+                  [](const auto& stop) { return stop->active && !stop->terminal; }) ||
+      motion_admission_unreconciled_ || manager_liveness_motion_inhibited_) {
+    return reject<ComponentCommandReadinessDTO>("selected successor containment is not settled/current",
+                                                "selected_bring_up_effects_not_settled");
+  }
+  if (auto idle = require_idle_for_component_readiness_locked(); !idle.ok())
+    return Result<ComponentCommandReadinessDTO>::Err(idle.error());
+  if (auto peers = validate_bring_up_candidate_peer_closure_locked(
+          component, offer.candidate_participants, offer.fence_admission); !peers.ok())
+    return Result<ComponentCommandReadinessDTO>::Err(peers.error());
+  const auto readiness = component_command_readiness_.find(component);
+  const auto generation = status.acceptance.component_lifecycle_generation;
+  if (readiness == component_command_readiness_.end() || readiness->second.command_eligible ||
+      (readiness->second.component_lifecycle_generation != offer.predecessor.component_lifecycle_generation &&
+       readiness->second.component_lifecycle_generation != generation)) {
+    return reject<ComponentCommandReadinessDTO>("selected successor requires the already closed component",
+                                                "selected_successor_generation_not_current");
+  }
+  std::vector<ControlDomainId> domains;
+  bool has_arm = false;
+  std::size_t current_count = 0U;
+  for (const auto& current : registrations_) {
+    if (current.binding.value().controllable_component_id != component) continue;
+    ++current_count;
+    if (std::none_of(installed.begin(), installed.end(), [&](const auto& row) {
+          return registration_truth_equal(row, current);
+        })) {
+      return reject<ComponentCommandReadinessDTO>("selected successor inventory changed",
+                                                  "selected_successor_registration_not_current");
+    }
+  }
+  if (current_count != installed.size() || installed.size() != offer.candidate_participants.size()) {
+    return reject<ComponentCommandReadinessDTO>("selected successor inventory is incomplete",
+                                                "selected_successor_registration_not_current");
+  }
+  for (const auto& row : installed) {
+    const auto& binding = row.binding.value();
+    if (binding.controllable_component_id != component || !binding.control_path ||
+        !row.stop_readiness || row.stop_readiness->value().component_lifecycle_generation != generation ||
+        row.engine == nullptr || row.stop_execution_port == nullptr ||
+        std::count(offer.candidate_participants.begin(), offer.candidate_participants.end(), binding) != 1 ||
+        std::count_if(installed.begin(), installed.end(), [&](const auto& other) {
+          return other.binding.value() == binding;
+        }) != 1) {
+      return reject<ComponentCommandReadinessDTO>("selected successor is not the sealed installed candidate",
+                                                  "selected_successor_registration_not_current");
+    }
+    domains.push_back(binding.control_path->control_domain_id);
+    has_arm = has_arm || row.prepared_motion_engine != nullptr;
+  }
+  std::sort(domains.begin(), domains.end());
+  domains.erase(std::unique(domains.begin(), domains.end()), domains.end());
+  const auto successor = ComputeSelectedControllerSuccessorOccurrence(
+      evidence.predecessor_occurrence, domains, has_arm);
+  if (!successor.ok()) return Result<ComponentCommandReadinessDTO>::Err(successor.error());
+  if (successor.value() != evidence.successor_occurrence ||
+      installed_occurrence.arm_binding_epoch != successor.value().arm_binding_epoch ||
+      installed_occurrence.domains.size() != domains.size() || configurations.size() != domains.size()) {
+    return reject<ComponentCommandReadinessDTO>("selected successor occurrence is not the owner-issued successor",
+                                                "selected_successor_occurrence_not_current");
+  }
+  for (std::size_t i = 0U; i < domains.size(); ++i) {
+    const auto& observed = installed_occurrence.domains[i];
+    const auto domain = std::find_if(status.domains.begin(), status.domains.end(),
+        [&](const auto& row) { return row.control_domain_id == domains[i]; });
+    const auto route = runtime_route_configuration_readbacks_.find(domains[i]);
+    if (observed.control_domain_id != domains[i] || observed.observation_generation == 0U ||
+        observed.observation_generation < successor.value().domains[i].observation_generation ||
+        configurations[i].control_domain_id != domains[i] ||
+        route == runtime_route_configuration_readbacks_.end() ||
+        route->second.active_configuration != configurations[i] ||
+        domain == status.domains.end() || !domain->current_scope ||
+        domain->current_scope->active_control_configuration != configurations[i] ||
+        domain->current_state != ComponentLifecycleStateDTO::kActive ||
+        !domain->reconciliation_evidence ||
+        domain->reconciliation_evidence->observation_generation != observed.observation_generation ||
+        domain->reconciliation_evidence->observed_state != ComponentLifecycleStateDTO::kActive ||
+        domain->reconciliation_evidence->postcondition_result != LifecyclePostconditionResultDTO::kSatisfied) {
+      return reject<ComponentCommandReadinessDTO>("selected successor lacks exact current holding observations",
+                                                  "selected_successor_holding_not_current");
+    }
+    for (const auto& row : installed) {
+      const auto& path = *row.binding.value().control_path;
+      if (path.control_domain_id != domains[i]) continue;
+      const auto& observation = *domain->reconciliation_evidence;
+      if (observation.provider_instance_id != path.provider_instance_id ||
+          observation.provider_manifest_id != path.provider_manifest_id ||
+          observation.provider_manifest_revision != path.provider_manifest_revision ||
+          observation.provider_runtime_unit_id != path.provider_runtime_unit_id ||
+          observation.provider_runtime_epoch != path.provider_runtime_epoch) {
+        return reject<ComponentCommandReadinessDTO>("selected successor observation belongs to another occurrence",
+                                                    "selected_successor_holding_not_current");
+      }
+    }
+  }
+  if (auto routes = require_installed_component_routes_current_locked(component); !routes.ok())
+    return Result<ComponentCommandReadinessDTO>::Err(routes.error());
+  return commit_component_command_readiness_locked(component, generation, false);
 }
 
 Result<ComponentCommandReadinessDTO> ResourceAddressedExecutionKernel::component_command_readiness(
@@ -6326,32 +6974,13 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
   } else if (group && active.size() == 1U &&
              active.front()->intent.coordination_policy ==
                  OperationCoordinationPolicy::kCoordinatedAll) {
-    const auto* coordinated = active.front();
-    const auto shared =
-        coordinated->common_timing ? coordinated->common_timing->execution_clock() : nullptr;
-    const auto now = clock_.now();
-    const auto expected_state = coordinated->state.state;
-    bool ready =
-        expected_state == OperationStateKind::kExecuting &&
-        shared && shared->sample_now() && coordinated->runtime_scale_status &&
-        coordinated->runtime_scale_status->participants.size() == coordinated->participants.size();
-    for (std::size_t index = 0; ready && index < coordinated->participants.size(); ++index) {
-      const auto& row = coordinated->runtime_scale_status->participants[index];
-      const auto freshness = coordinated->participants[index]
-                                 .binding.value()
-                                 .control_path->runtime_scale_qualification->freshness_budget_ns;
-      ready = coordinated->state.participants[index].state == expected_state && row.supported &&
-              !row.error && row.acknowledgement_sequence != 0U &&
-              row.acknowledgement_timestamp_ns >= 0 && row.acknowledgement_timestamp_ns <= now &&
-              now - row.acknowledgement_timestamp_ns <= freshness;
-    }
-    if (!ready) {
-      status.frozen = true;
-      status.reason =
-          error(std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                "synchronized velocity requires every participant ready on the shared clock",
-                "coordinated_runtime_scale_not_ready");
-    }
+    // Shared-start execution is removed (Q8a): a synchronized motion never
+    // has a shared clock, so its group velocity stays frozen.
+    status.frozen = true;
+    status.reason =
+        error(std::string(to_string(ErrorCode::kInvalidStateTransition)),
+              "synchronized velocity requires every participant ready on the shared clock",
+              "coordinated_runtime_scale_not_ready");
   } else if (group && std::any_of(active.begin(), active.end(), [](const auto* operation) {
                return operation->state.state != OperationStateKind::kPlanning &&
                       operation->state.state != OperationStateKind::kValidating &&
@@ -6791,6 +7420,14 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       resolved.value().retained_default_stop_limits);
   if (!ordinary_stop_plan.ok()) {
     return Result<OperationAcceptedDTO>::Err(ordinary_stop_plan.error());
+  }
+  if (payload_kind == OperationParticipantPayloadKind::kMotion &&
+      !resolved.value().default_fault_stop_profile.has_value() &&
+      controller_goal_cancel_stage_index(ordinary_stop_plan.value()) ==
+          ordinary_stop_plan.value().stage_commands.size()) {
+    return reject<OperationAcceptedDTO>(
+        "motion without a fault Stop profile requires a qualified controller-goal cancel",
+        "runtime_collision_cancel_unqualified", ErrorCode::kUnsupportedCapability);
   }
   auto fault_stop_plan = make_runtime_fault_stop_plan(
       *resolved.value().stop_readiness,
@@ -7531,6 +8168,28 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                           std::move(retained_stop_plan), std::move(retained_fault_stop_plan)});
   }
 
+  // Synchronized multi-motion execution is withdrawn (Q8a). Keep the
+  // existing resolved route/readiness/model checks, then refuse centrally
+  // before admission; participant adapters cannot turn it into independent motion.
+  if (std::count_if(admissions.begin(), admissions.end(), [](const auto& admission) {
+        return admission.motion_request.has_value();
+      }) > 1) {
+    return reject<OperationAcceptedDTO>("coordinated multi-motion execution is not supported",
+                                        "coordinated_multi_motion_unsupported",
+                                        ErrorCode::kUnsupportedCapability);
+  }
+
+  if (std::any_of(admissions.begin(), admissions.end(), [](const auto& admission) {
+        return admission.motion_request.has_value() &&
+               !admission.registration.default_fault_stop_profile.has_value() &&
+               controller_goal_cancel_stage_index(*admission.stop_plan) ==
+                   admission.stop_plan->stage_commands.size();
+      })) {
+    return reject<OperationAcceptedDTO>(
+        "motion without a fault Stop profile requires a qualified controller-goal cancel",
+        "runtime_collision_cancel_unqualified", ErrorCode::kUnsupportedCapability);
+  }
+
   std::sort(reservation_rows.begin(), reservation_rows.end(),
             [](const auto& left, const auto& right) {
               return std::tie(left.owner.operation_id, left.owner.participant_id) <
@@ -7556,7 +8215,6 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
   std::map<OperationId, std::unique_ptr<ActiveOperation>>::node_type prepared_operation;
   ReplayEntry prepared_replay{intent, accepted};
   std::vector<OperationId> protected_operation_ids;
-  std::shared_ptr<detail::CoordinatedMotionPreparation> common_timing;
   try {
     std::optional<RuntimeScaleStatusDTO> initial_runtime_scale_status;
     const bool all_scalable =
@@ -7580,13 +8238,6 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
             admission.registration.binding.value().control_path->provider_runtime_epoch));
       operation_state.runtime_scale_generation = RuntimeScaleGeneration(0U);
     }
-    std::vector<OperationParticipantId> motion_participants;
-    for (const auto& admission : admissions)
-      if (admission.motion_request)
-        motion_participants.push_back(admission.motion_request->binding.participant_id);
-    if (motion_participants.size() > 1U)
-      common_timing =
-          std::make_shared<detail::CoordinatedMotionPreparation>(std::move(motion_participants));
     std::map<OperationId, std::unique_ptr<ActiveOperation>> staging;
     staging.emplace(operation_id, std::make_unique<ActiveOperation>(ActiveOperation{
                                       intent, accepted, std::move(active_participants),
@@ -7594,7 +8245,6 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                                       false, std::move(initial_runtime_scale_status)}));
     stamp_operation_capture_locked(*staging.at(operation_id), operation_state);
     staging.at(operation_id)->state = operation_state;
-    staging.at(operation_id)->common_timing = common_timing;
     prepared_operation = staging.extract(operation_id);
   } catch (...) {
     return reject<OperationAcceptedDTO>(
@@ -7798,7 +8448,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                 *admission.registration.deployment_maximum_tcp_linear_speed_mps,
                 admission.registration.retained_default_stop_limits,
                 admission.registration.stop_node_category, admission.stop_plan,
-                admission.fault_stop_plan, std::move(continuation), common_timing});
+                admission.fault_stop_plan, std::move(continuation)});
       }
       return admission.registration.prepared_motion_engine->PrepareCapabilityCommand(
           ResolvedPreparedCapabilityCommandExecutionRequestDTO{
@@ -11144,9 +11794,12 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
           if (!participant_selected(operation_id, participant.slot_owner.participant_id)) {
             continue;
           }
-          const auto& selected_stop_plan = runtime_collision_containment
-                                               ? participant.fault_stop_plan
-                                               : participant.ordinary_stop_plan;
+          const auto& selected_stop_plan =
+              runtime_collision_containment &&
+                      participant.payload_kind == OperationParticipantPayloadKind::kMotion &&
+                      participant.fault_stop_plan != nullptr
+                  ? participant.fault_stop_plan
+                  : participant.ordinary_stop_plan;
           if (selected_stop_plan == nullptr) {
             return reject<StopAcceptedDTO>("resolved Stop participant has no prepared plan",
                                            "stop_participant_plan_missing",
@@ -12505,9 +13158,13 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                     participant_state.participant_id)) {
               continue;
             }
-            const auto& selected_active_stop_plan = runtime_collision_containment
-                                                        ? active_participant.fault_stop_plan
-                                                        : active_participant.ordinary_stop_plan;
+            const auto& selected_active_stop_plan =
+                runtime_collision_containment &&
+                        active_participant.payload_kind ==
+                            OperationParticipantPayloadKind::kMotion &&
+                        active_participant.fault_stop_plan != nullptr
+                    ? active_participant.fault_stop_plan
+                    : active_participant.ordinary_stop_plan;
             if (selected_active_stop_plan == nullptr ||
                 active_participant.slot_owner.participant_id != participant_state.participant_id) {
               motion_admission_closed_ = true;
@@ -12553,6 +13210,13 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                      std::nullopt,
                                      std::nullopt};
             work.retained_results.reserve(kMaxStopEscalationStages * 2U);
+            if (runtime_collision_containment &&
+                active_participant.payload_kind == OperationParticipantPayloadKind::kMotion &&
+                active_participant.fault_stop_plan == nullptr) {
+              // Admission required this exact prepared cancel row. The selected
+              // ordinary plan stays a dispatched-goal member; no profile is invented.
+              work.current_stage_index = controller_goal_cancel_stage_index(work.plan);
+            }
             work.lane_hard_stop_requested =
                 !work.plan.stage_commands.empty() &&
                 (internal_stop == InternalStopKind::kZeroSpeedHold ||
@@ -13493,26 +14157,6 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
     ResolvedRuntimeScaleCommandDTO command;
   };
   std::vector<ScaleEffectTarget> effect_targets;
-  std::shared_ptr<detail::CoordinatedExecutionClock> common_clock;
-  const auto shared_participants_ready = [&](const ActiveOperation& operation) {
-    const auto now = clock_.now();
-    const auto& rows = operation.runtime_scale_status->participants;
-    const auto expected_state = operation.state.state;
-    if (expected_state != OperationStateKind::kExecuting) return false;
-    if (rows.size() != operation.participants.size()) return false;
-    for (std::size_t index = 0; index < rows.size(); ++index) {
-      const auto& row = rows[index];
-      const auto freshness = operation.participants[index]
-                                 .binding.value()
-                                 .control_path->runtime_scale_qualification->freshness_budget_ns;
-      if (operation.state.participants[index].state != expected_state || !row.supported ||
-          row.error || row.acknowledgement_sequence == 0U || row.acknowledgement_timestamp_ns < 0 ||
-          row.acknowledgement_timestamp_ns > now ||
-          now - row.acknowledgement_timestamp_ns > freshness)
-        return false;
-    }
-    return true;
-  };
   RuntimeScaleAcceptedDTO accepted{request.request_context.request_id,
                                    RequestReplayStatusDTO::kAcceptedNew,
                                    request.operation_id,
@@ -13579,15 +14223,12 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
       return reject<RuntimeScaleAcceptedDTO>("runtime scale expected operation revision is stale",
                                              "operation_revision_stale");
     }
-    if (active_operation->participants.size() != 1U) {
-      if (active_operation->common_timing)
-        common_clock = active_operation->common_timing->execution_clock();
-      if (!common_clock || !common_clock->sample_now() ||
-          active_operation->state.state != OperationStateKind::kExecuting)
-        return reject<RuntimeScaleAcceptedDTO>(
-            "coordinated runtime scaling requires a released shared execution clock",
-            "coordinated_runtime_scale_not_qualified", ErrorCode::kUnsupportedCapability);
-    }
+    // Shared-start execution is removed (Q8a): no coordinated operation has a
+    // shared execution clock, so its runtime scaling stays refused.
+    if (active_operation->participants.size() != 1U)
+      return reject<RuntimeScaleAcceptedDTO>(
+          "coordinated runtime scaling requires a released shared execution clock",
+          "coordinated_runtime_scale_not_qualified", ErrorCode::kUnsupportedCapability);
     if (!active_operation->runtime_scale_status.has_value() ||
         std::any_of(active_operation->participants.begin(), active_operation->participants.end(),
                     [](const auto& participant) {
@@ -13599,9 +14240,6 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
           "the exact operation binding has no qualified runtime scaling",
           "runtime_scale_unsupported", ErrorCode::kUnsupportedCapability);
     }
-    if (common_clock && !shared_participants_ready(*active_operation))
-      return reject<RuntimeScaleAcceptedDTO>("a coordinated participant is not ready for scaling",
-                                             "coordinated_runtime_scale_not_ready");
     if (active_operation->pending_control.has_value() ||
         active_operation->runtime_scale_effect_in_flight ||
         active_operation->recovery_effect_in_flight) {
@@ -13673,35 +14311,8 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
         active_operation->state.operation_revision != prior_state.operation_revision ||
         active_operation->state.active_stop_id != prior_state.active_stop_id)
       return Result<RuntimeScaleAcceptedDTO>::Ok(accepted);
-    const bool shared_ready = !common_clock || shared_participants_ready(*active_operation);
     active_operation->state = std::move(accepted_state);
     active_operation->runtime_scale_status = std::move(accepted_status);
-    if (common_clock && active_operation->state.state == OperationStateKind::kExecuting) {
-      // One immutable-law publication, not a loop over effectful participant
-      // setters. Stop can freeze this occurrence; it is never reopened here.
-      if (!shared_ready ||
-          !common_clock->retarget(
-              request.scale,
-              CoordinatedRuntimeScaleCommandDTO{
-                  request.operation_id, request.expected_operation_revision, next_generation})) {
-        auto failed = *active_operation->runtime_scale_status;
-        failed.state = RuntimeScaleApplicationState::kFailed;
-        for (auto& participant : failed.participants) {
-          participant.state = RuntimeScaleApplicationState::kFailed;
-          participant.error =
-              error(std::string(to_string(ErrorCode::kExecutionRejected)),
-                    shared_ready ? "shared runtime-scale law rejected the accepted target"
-                                 : "shared scaling evidence changed or expired before publication",
-                    shared_ready ? "coordinated_runtime_scale_effect_rejected"
-                                 : "coordinated_runtime_scale_not_ready");
-        }
-        (void)retain_runtime_scale_observation_locked(
-            state_lock, *active_operation, std::move(failed), "runtime_scale_effect_rejected");
-      }
-      // Existing participant observation supplies applied evidence; publication
-      // of a common target alone must never claim that either robot applied it.
-      return Result<RuntimeScaleAcceptedDTO>::Ok(std::move(accepted));
-    }
     effect_targets.reserve(active_operation->participants.size());
     for (std::size_t index = 0U; index < active_operation->participants.size(); ++index) {
       const auto& current_participant = active_operation->participants[index];
@@ -13734,7 +14345,6 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
                                          current_generation,
                                          next_generation,
                                          request.scale}});
-      if (!common_clock) break;
     }
     active_operation->runtime_scale_effect_in_flight = true;
   }
@@ -15598,34 +16208,6 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
     return reject<void>("prepared execution observation has an invalid state shape",
                         "prepared_motion_observation_invalid", ErrorCode::kInvariantViolation);
   }
-  const auto* prepared_motion =
-      std::get_if<PreparedMotionExecutionDTO>(&snapshot.value().participant->payload);
-  bool common_time_law_missing = false;
-  if (prepared_motion && prepared_motion->trajectory.runtime_scale_bounds) {
-    std::lock_guard state_lock(state_mutex_);
-    const auto* operation = find_active_operation_locked(operation_id);
-    const bool common_time_law_required =
-        operation != nullptr &&
-        operation->intent.coordination_policy == OperationCoordinationPolicy::kCoordinatedAll &&
-        std::count_if(operation->participants.begin(), operation->participants.end(),
-                      [](const auto& row) {
-                        return row.payload_kind == OperationParticipantPayloadKind::kMotion;
-                      }) > 1;
-    if (common_time_law_required) {
-      const auto& bounds = *prepared_motion->trajectory.runtime_scale_bounds;
-      common_time_law_missing =
-          !operation->common_timing || !operation->common_timing->accepts_prepared(
-                                           snapshot.value().participant->participant_id, bounds);
-    }
-  }
-  if (common_time_law_missing) {
-    release_claim();
-    return fail_pre_dispatch(
-        operation_id, target->engine,
-        error(std::string(to_string(ErrorCode::kUnsupportedCapability)),
-              "Coordinated trajectories require a qualified common time-law preparation",
-              "coordinated_time_law_preparation_not_qualified"));
-  }
   const auto verified = VerifyPreparedOperationParticipant(
       *snapshot.value().participant, target->binding, target->readiness,
       target->retained_default_stop_limits, target->stop_node_category);
@@ -16631,6 +17213,9 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
       auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
       if (operation != nullptr && participant != nullptr && !terminal(operation->state.state)) {
         auto collision_details = event.details;
+        if (const auto reason = collision_details.find("reason"); reason != collision_details.end()) {
+          collision_details["runtime_collision_reason"] = reason->second;
+        }
         collision_details["reason"] = "runtime_collision_fault";
         ErrorDTO collision_error{std::string(to_string(ErrorCode::kExecutionAborted)),
                                  "Runtime collision containment stopped the operation",

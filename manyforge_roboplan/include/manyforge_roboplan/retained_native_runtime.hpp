@@ -475,6 +475,11 @@ struct RetainedNativeRuntime final
       const core::LifecycleTransactionId &lifecycle_transaction_id,
       const core::ControllableComponentId &controllable_component_id) override;
 
+  [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
+  CloseComponentCommandEligibility(
+      const core::CellAdmissionClaimDTO &selected_claim,
+      const core::SelectedComponentBringUpOfferDTO &offer) override;
+
   /// Publish one complete component result for the whole cell: re-seal the
   /// component's participants in every robot runtime at the published
   /// generation (same engines, routes and Stop plans), rebuild the Kernel
@@ -482,6 +487,16 @@ struct RetainedNativeRuntime final
   [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
   PublishComponentCommandReadiness(
       const core::ComponentCommandReadinessPublicationDTO &publication) override;
+
+  [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
+  PublishComponentCommandReadiness(
+      const core::CellAdmissionClaimDTO &selected_claim,
+      const core::SelectedComponentBringUpOfferDTO &owner_offer,
+      const core::ComponentLifecycleStatusDTO &selected_status,
+      const core::SelectedControllerOccurrenceDTO &installed_occurrence,
+      const std::vector<core::RuntimeParticipantExecutionRegistration> &installed_candidate_registrations,
+      const std::vector<core::ActiveControlConfigurationDTO> &installed_candidate_configurations,
+      bool command_eligible = false) override;
 
   [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
   ReadComponentCommandReadiness(
@@ -503,15 +518,6 @@ struct RetainedNativeRuntime final
   [[nodiscard]] core::Result<std::optional<core::ActiveControlConfigurationDTO>>
   ReadCurrentPublishedRouteConfiguration(
       const core::ControlDomainId &control_domain_id) const;
-
-  /// Final source check and evidence write share route-publication ordering.
-  /// The host supplies the verified confirmation representative and its
-  /// explicit policy; this is not an unqualified public mutation endpoint.
-  [[nodiscard]] core::Result<core::GripperGraspEvidenceDTO>
-  RecordGraspObservation(const core::RuntimeParticipantBinding &source,
-                         const core::GripperGraspObservationDTO &observation,
-                         core::Duration freshness_budget_ns,
-                         core::TimePoint admission_deadline_ns);
 
   [[nodiscard]] core::Result<core::GripperCommandStatusDTO>
   ReadGripperStatus(const core::RuntimeParticipantBinding &source) const;

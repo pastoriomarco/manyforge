@@ -796,16 +796,21 @@ bool ManagerRuntimeAccountsForCommittedApplies(
 
 CanonicalValue BuildManagerSourcePayload(
     const manyforge::deployment::RetainedBundle &active_bundle,
+    const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
+        &canonical_empty_admission,
     const component_manager::ManagerActiveRuntimeConvergenceResult &runtime,
     const component_manager::SqliteManagerApplyJournal &apply_journal,
     const ManagerApplyMutationAvailability apply_availability) {
-  return BuildManagerSourcePayload(active_bundle, runtime, apply_journal,
+  return BuildManagerSourcePayload(active_bundle, canonical_empty_admission,
+                                   runtime, apply_journal,
                                    apply_journal.ReadStatusInventory(),
                                    apply_availability);
 }
 
 CanonicalValue BuildManagerSourcePayload(
     const manyforge::deployment::RetainedBundle &active_bundle,
+    const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
+        &canonical_empty_admission,
     const component_manager::ManagerActiveRuntimeConvergenceResult &runtime,
     const component_manager::SqliteManagerApplyJournal &apply_journal,
     const std::vector<component_manager::PersistedManagerApplyStatus>
@@ -824,6 +829,15 @@ CanonicalValue BuildManagerSourcePayload(
           "active runtime plan does not select the supplied retained bundle");
   Require(apply_journal.cell_id() == active_bundle.value().cell_graph.cell_id,
           "Apply journal belongs to a different cell");
+  // The verified active bundle and publication are already joined above.
+  // Identity, not transaction kind or component inventory, proves empty.
+  const bool canonical_empty =
+      active_bundle.value().cell_graph.cell_id ==
+          canonical_empty_admission.cell_id() &&
+      active_bundle.retained_bundle_id() ==
+          canonical_empty_admission.retained_bundle_id() &&
+      active_bundle.value().cell_graph.graph_revision ==
+          canonical_empty_admission.graph_revision();
   const auto *graph =
       active_bundle.normalized_root().find_object_member("cell_graph");
   Require(graph != nullptr && graph->is_object(),
@@ -874,6 +888,7 @@ CanonicalValue BuildManagerSourcePayload(
   return CanonicalValue(CanonicalValue::Object{
       {"active",
        CanonicalValue(CanonicalValue::Object{
+           {"canonical_empty", CanonicalValue(canonical_empty)},
            {"cell_graph", *graph},
            {"graph_revision",
             CanonicalValue(active_revision.graph_revision.value())},

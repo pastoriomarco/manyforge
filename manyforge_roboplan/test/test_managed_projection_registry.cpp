@@ -355,6 +355,86 @@ FreshnessRequest(const std::string &provider = "arm-a") {
   return {Binding(provider), FreshnessConfirmation()};
 }
 
+TEST(NativeProjectionRpcCodec, HealthSelectorPreservesLegacyAndHasOneEncoding) {
+  namespace detail = component_manager::detail;
+  // Frozen original MFNPRPC4/tag-2 request, independent of codec writers.
+  static constexpr char legacy_bytes[] = "MFNPRPC4\x02"
+                                         "\x00\x00\x00\x05"
+                                         "arm-a"
+                                         "\x00\x00\x00\x0e"
+                                         "arm-a-revision"
+                                         "\x00\x00\x00\x0b"
+                                         "native-unit"
+                                         "\x00\x00\x00\x07"
+                                         "epoch-1";
+  const std::string legacy(legacy_bytes, sizeof(legacy_bytes) - 1U);
+  const detail::NativeProjectionHealthQuery ordinary{Binding("arm-a")};
+  EXPECT_EQ(detail::EncodeNativeProjectionRpcRequest(ordinary), legacy);
+  const auto ordinary_decoded =
+      detail::DecodeNativeProjectionRpcRequest(legacy);
+  const auto &plain =
+      std::get<detail::NativeProjectionHealthQuery>(ordinary_decoded);
+  EXPECT_EQ(plain.native_runtime_binding, ordinary.native_runtime_binding);
+  EXPECT_FALSE(plain.selected_projection_revision.has_value());
+
+  static constexpr char selector_bytes[] =
+      "\x01"
+      "\x00\x00\x00\x08"
+      "bundle-1"
+      "\x00\x00\x00\x07"
+      "graph-1"
+      "\x00\x00\x00\x47"
+      "sha256:"
+      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      "\x00\x00\x00\x00\x00\x00\x00\x03"
+      "\x00\x00\x00\x47"
+      "sha256:"
+      "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+  const auto selected_revision =
+      FreshnessConfirmation().expected_projection_revision;
+  const detail::NativeProjectionHealthQuery selected{Binding("arm-a"),
+                                                     selected_revision};
+  const std::string canonical =
+      legacy + std::string(selector_bytes, sizeof(selector_bytes) - 1U);
+  EXPECT_EQ(detail::EncodeNativeProjectionRpcRequest(selected), canonical);
+  const auto decoded = detail::DecodeNativeProjectionRpcRequest(canonical);
+  const auto &typed = std::get<detail::NativeProjectionHealthQuery>(decoded);
+  EXPECT_EQ(typed.native_runtime_binding, selected.native_runtime_binding);
+  EXPECT_EQ(typed.selected_projection_revision,
+            selected.selected_projection_revision);
+
+  for (const char marker : {'\x00', '\x02', '\xff'}) {
+    EXPECT_THROW(static_cast<void>(detail::DecodeNativeProjectionRpcRequest(
+                     legacy + std::string(1U, marker))),
+                 std::invalid_argument);
+  }
+  EXPECT_THROW(static_cast<void>(detail::DecodeNativeProjectionRpcRequest(
+                   legacy + std::string(1U, '\x01'))),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(detail::DecodeNativeProjectionRpcRequest(
+                   canonical.substr(0U, canonical.size() - 1U))),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(detail::DecodeNativeProjectionRpcRequest(
+                   canonical + std::string(1U, '\x00'))),
+               std::invalid_argument);
+  // Present selector with an empty retained-bundle identity is not absence.
+  const std::string invalid_empty_bundle =
+      legacy + std::string("\x01\x00\x00\x00\x00", 5U) +
+      std::string(selector_bytes + 13U, sizeof(selector_bytes) - 1U - 13U);
+  EXPECT_THROW(static_cast<void>(detail::DecodeNativeProjectionRpcRequest(
+                   invalid_empty_bundle)),
+               std::invalid_argument);
+  auto invalid = selected;
+  invalid.selected_projection_revision->graph_revision =
+      core::GraphRevision("");
+  EXPECT_THROW(
+      static_cast<void>(detail::EncodeNativeProjectionRpcRequest(invalid)),
+      std::invalid_argument);
+  EXPECT_THROW(
+      static_cast<void>(detail::DecodeNativeProjectionRpcResponse(canonical)),
+      std::invalid_argument);
+}
+
 TEST(NativeProjectionRpcCodec, ProviderFreshnessRequestRoundTripsExactly) {
   const auto request = FreshnessRequest();
   ASSERT_TRUE(request.valid());

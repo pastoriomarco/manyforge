@@ -642,15 +642,48 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireRouteRecoveryClai
     const CellAdmissionClaimIntentDTO& intent,
     const CellAdmissionInterventionValidator& validate_offer) {
   if (intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
-      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner || !validate_offer) {
+      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
+      !intent.owner_transaction_id.starts_with("route-selection.") ||
+      !intent.scope.resources.empty() || intent.scope.configurations.size() != 1U ||
+      !validate_offer) {
     return Reject<CellAdmissionClaimDTO>("invalid_request", "route_recovery_validator_required");
   }
   return AcquireClaim(intent, validate_offer);
 }
 
-Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
+Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireSelectedBringUpClaim(
     const CellAdmissionClaimIntentDTO& intent,
     const CellAdmissionInterventionValidator& validate_offer) {
+  if (intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
+      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
+      !intent.owner_transaction_id.starts_with("selected-lifecycle.") || !validate_offer) {
+    return Reject<CellAdmissionClaimDTO>("invalid_request", "selected_bring_up_validator_required");
+  }
+  return AcquireClaim(intent, validate_offer);
+}
+
+Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireApplyBringUpClaim(
+    const CellAdmissionClaimIntentDTO& intent,
+    const CellAdmissionApplyBringUpValidator& validate_plan) {
+  if (intent.claim_kind != CellAdmissionClaimKindDTO::kManagerApply ||
+      intent.owner_role != CellAdmissionOwnerRoleDTO::kManager ||
+      !intent.scope.resources.empty() || !intent.scope.configurations.empty() ||
+      intent.program_cycle_evidence || intent.intervention_evidence || intent.program_node_evidence ||
+      !validate_plan) {
+    return Reject<CellAdmissionClaimDTO>("invalid_request", "apply_bring_up_validator_required");
+  }
+  return AcquireClaim(intent, [&](const auto& checked, const auto&) {
+    // AcquireClaim invokes this synchronously under this owner's mutex. The
+    // composing Kernel joins permitted selected deficits to these actual
+    // published counts, rather than trusting caller-supplied readiness flags.
+    return validate_plan(checked, readiness_, manager_liveness_required_set_->manager_runtime_epoch);
+  }, true);
+}
+
+Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
+    const CellAdmissionClaimIntentDTO& intent,
+    const CellAdmissionInterventionValidator& validate_offer,
+    const bool selected_apply_bring_up) {
   std::lock_guard transition_lock(liveness_transition_mutex_);
   auto valid = ValidateCellAdmissionClaimIntent(intent);
   if (!valid.ok()) {
@@ -687,9 +720,11 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
   if (!intent.program_node_evidence && intent.expected_admission_generation != generation_) {
     return Reject<CellAdmissionClaimDTO>("stale_generation", "expected_generation_stale");
   }
-  // Exact replay above remains observable during a fault. Only the private
-  // replacement-route offer may acquire new authority while it is latched.
+  // Exact replay above remains observable during a fault. The private Q91
+  // parent alternative still requires its positive plan validation below;
+  // ordinary Manager Apply receives no fault exception.
   if ((published_stop_fault_active_ || (stop_fault_active_ && stop_fault_active_())) &&
+      !selected_apply_bring_up &&
       !(intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery &&
         intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner)) {
     return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
@@ -786,6 +821,28 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     if (!admitted.ok()) return Result<CellAdmissionClaimDTO>::Err(admitted.error());
     if (intent.expected_admission_generation != generation_) {
       return Reject<CellAdmissionClaimDTO>("stale_generation", "expected_generation_stale");
+    }
+  } else if (selected_apply_bring_up) {
+    if (held_claim_count_ != 0U || !validate_offer) {
+      return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
+                                                      "apply_bring_up_claim_conflict");
+    }
+    if (!manager_liveness_required_set_.has_value() ||
+        intent.owner_epoch != manager_liveness_required_set_->manager_owner_epoch ||
+        manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size() ||
+        !readiness_.required_component_status_current || !readiness_.deployment_status_current ||
+        !readiness_.program_cycle_status_current || !readiness_.program_cycle_status ||
+        readiness_.program_cycle_status->state != ProgramCycleStateDTO::kIdleAfterReset ||
+        readiness_.unresolved_owner_count != 0U || readiness_.unsettled_effect_count != 0U) {
+      return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
+                                                      "apply_bring_up_dependencies_not_current");
+    }
+    // Validate while the existing owner serializes acquisition. This callback
+    // is supplied only by the composing Kernel, never by a public request or
+    // restored status, and creates no second pending-plan registry.
+    const auto validated = validate_offer(intent, std::nullopt);
+    if (!validated.ok()) {
+      return Result<CellAdmissionClaimDTO>::Err(validated.error());
     }
   } else if (intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
              (intent.claim_kind == CellAdmissionClaimKindDTO::kManualOperation &&

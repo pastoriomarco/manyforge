@@ -24,7 +24,7 @@ function deployment(draftRevision: string, applied: string, differsFromSaved = f
   return {
     draft: { document: {}, deploymentRevision: draftRevision, differsFromSaved },
     saved: { path: 'cell/deployment.yaml', deploymentRevision: 'x' },
-    managerApplied: { deploymentRevision: applied, scenarioId: 'cell' },
+    managerApplied: { activationOrder: null, deploymentRevision: applied, scenarioId: 'cell' },
     // The backend compares the documents; revisions may be absent.
     runAdmission: { ready: draftRevision === applied, reason: null },
   } as unknown as DeploymentWorkspaceResponse;

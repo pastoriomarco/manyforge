@@ -80,12 +80,26 @@ class ManagerSelectedBundleTransitionCoordinator final {
                     const manyforge::deployment::RetainedBundle &predecessor,
                     const manyforge::deployment::RetainedBundle &candidate);
 
+   /// Publish the verified configuration; the original Manager's qualified
+   /// Scene entry owns completion. This never calls ordinary Scene Complete.
+   [[nodiscard]] ManagerSelectedBundleTransitionResult
+   PublishOriginalConfiguration(const manyforge::core::ApplyId &apply_id,
+                    manyforge::core::ApplyGeneration apply_generation,
+                    const manyforge::deployment::RetainedBundle &predecessor,
+                    const manyforge::deployment::RetainedBundle &candidate);
+
    ManagerSelectedBundleTransitionCoordinator(
        const ManagerSelectedBundleTransitionCoordinator &) = delete;
    ManagerSelectedBundleTransitionCoordinator &
    operator=(const ManagerSelectedBundleTransitionCoordinator &) = delete;
 
  private:
+  [[nodiscard]] ManagerSelectedBundleTransitionResult Advance(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation,
+      const manyforge::deployment::RetainedBundle &predecessor,
+      const manyforge::deployment::RetainedBundle &candidate,
+      bool complete_scene);
   SqliteManagerApplyJournal& apply_journal_;
   manyforge::core::IActiveBundlePublicationStore& publication_store_;
   manyforge::core::IManagerSceneProjectionMaintenancePort& scene_owner_;

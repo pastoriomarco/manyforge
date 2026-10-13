@@ -41,4 +41,13 @@ struct LifecycleRecoverSelectionInput final {
     const BrandLifecyclePlanCatalogDTO& catalog,
     const BrandLifecycleObservationDTO& fresh_observation);
 
+/// Evaluate the same plan/predicates over a pure exact-occurrence health
+/// projection. This does not construct or validate an execution observation
+/// and cannot grant admission or dispatch a primitive.
+[[nodiscard]] Result<LifecycleDomainPlanDecision> EvaluateLifecycleDomainPlan(
+    ComponentLifecycleIntentKindDTO intent, ComponentLifecycleStateDTO requested_state,
+    const BrandLifecyclePlanCatalogDTO& catalog,
+    const ResolvedLifecycleProviderOccurrenceDTO& provider_occurrence,
+    const LifecycleDomainHealthDTO& health);
+
 }  // namespace manyforge::core

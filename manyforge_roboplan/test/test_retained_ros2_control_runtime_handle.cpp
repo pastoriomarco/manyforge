@@ -20,6 +20,8 @@
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <manyforge_roboplan/retained_ros2_control_statistics_monitor.hpp>
 
+#include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <limits>
 #include <map>
@@ -27,6 +29,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
@@ -111,11 +114,17 @@ public:
 /// One handle over the fake controller manager and trajectory controller.
 struct ArmWorld final {
   explicit ArmWorld(const std::string &action_controller = "arm_controller",
-                    core::RuntimeParticipantBinding initial_binding = ArmBinding())
-      : binding(std::move(initial_binding)),
+                    const std::optional<core::SelectedControllerOccurrenceDTO>
+                        &successor_occurrence = std::nullopt,
+                    std::size_t *participant_constructions = nullptr,
+                    core::RuntimeParticipantBinding initial_binding = ArmBinding(),
+                    core::IClock *receiver_clock = nullptr)
+      : clock(receiver_clock ? *receiver_clock : wall_clock),
+        binding(std::move(initial_binding)),
         prefix("/manyforge_handle_test_" + fake::unique_suffix()),
         jtc(prefix + "/arm_controller", {"source_joint_1"}),
-        manager(prefix + "/controller_manager", "arm_controller", "TestSystem", &jtc) {
+        manager(prefix + "/controller_manager", "arm_controller", "TestSystem",
+                &jtc) {
     RetainedRos2ControlArmTransport arm;
     arm.adapter.action_name = prefix + "/" + action_controller +
                               "/follow_joint_trajectory";
@@ -133,7 +142,10 @@ struct ArmWorld final {
             "manyforge_handle_test_" + fake::unique_suffix(), "/", 3U,
             std::make_shared<NullSink>(), "arm", clock),
         clock, std::move(arm),
-        [this](std::shared_ptr<core::IExecutionPort> port) {
+        [this, participant_constructions](
+            std::shared_ptr<core::IExecutionPort> port) {
+          if (participant_constructions)
+            ++*participant_constructions;
           core::ExecutionPortParticipantConfig config;
           config.stop.trip_authority = core::StateAuthorityClass::kCommanded;
           config.stop.stop_traj_delta_s = 0.1;
@@ -150,7 +162,7 @@ struct ArmWorld final {
                   &publication, [] { return core::Result<void>::Ok(); }},
               std::move(config));
         },
-        nullptr, binding, std::nullopt);
+        nullptr, binding, std::nullopt, successor_occurrence);
     if (!bound.ok()) throw std::logic_error(bound.error().message);
   }
 
@@ -182,7 +194,8 @@ struct ArmWorld final {
     return fake::WaitUntil([&] { return Snapshot().component_state == state; });
   }
 
-  WallClock clock;
+  WallClock wall_clock;
+  core::IClock &clock;
   SimpleScheduler scheduler;
   core::RuntimeParticipantBinding binding;
   core::ObservedRobotStatePublication publication{
@@ -199,6 +212,471 @@ struct ArmWorld final {
 
 using State = core::ComponentLifecycleStateDTO;
 using Outcome = RetainedRos2ControlSwitchOutcome;
+
+// This peer publishes the same CM activity and strict switch service as the
+// existing arm fixture, with a separately configured gripper controller.
+class GripperControllerManager final : public fake::PeerNode {
+public:
+  using Switch = controller_manager_msgs::srv::SwitchController;
+  using Gripper = control_msgs::action::GripperCommand;
+  explicit GripperControllerManager(const std::string &prefix,
+                                    fake::FakeJtc &jtc, bool expose_action)
+      : PeerNode("manyforge_gripper_cm"), jtc_(jtc) {
+    activity_ =
+        node()
+            ->create_publisher<
+                controller_manager_msgs::msg::ControllerManagerActivity>(
+                prefix + "/controller_manager/activity",
+                rclcpp::QoS(1).reliable().transient_local());
+    switch_ = node()->create_service<Switch>(
+        prefix + "/controller_manager/switch_controller",
+        [this](const std::shared_ptr<Switch::Request> request,
+               std::shared_ptr<Switch::Response> response) {
+          std::lock_guard lock(mutex_);
+          requests_.push_back(*request);
+          const auto &names = request->activate_controllers.empty()
+                                  ? request->deactivate_controllers
+                                  : request->activate_controllers;
+          if (refuse_ || request->strictness != Switch::Request::STRICT ||
+              names.size() != 1U ||
+              (names.front() != "arm_controller" &&
+               names.front() != "gripper_controller")) {
+            response->ok = false;
+            return;
+          }
+          const bool active = !request->activate_controllers.empty();
+          if (names.front() == "arm_controller") {
+            arm_active_ = active;
+            jtc_.SetActive(active);
+          } else {
+            gripper_active_ = active;
+          }
+          PublishLocked();
+          response->ok = true;
+        });
+    // Deliberately reachable even when CM reports the controller inactive:
+    // action discovery must not become physical lifecycle authority.
+    if (expose_action) {
+      action_ = rclcpp_action::create_server<Gripper>(
+          node(), prefix + "/gripper_controller/gripper_cmd",
+          [](const rclcpp_action::GoalUUID &,
+             std::shared_ptr<const Gripper::Goal>) {
+            return rclcpp_action::GoalResponse::REJECT;
+          },
+          [](const std::shared_ptr<rclcpp_action::ServerGoalHandle<Gripper>>) {
+            return rclcpp_action::CancelResponse::ACCEPT;
+          },
+          [](const std::shared_ptr<rclcpp_action::ServerGoalHandle<Gripper>>) {
+          });
+    }
+    Start();
+    std::lock_guard lock(mutex_);
+    PublishLocked();
+  }
+  ~GripperControllerManager() override { Stop(); }
+  void SetGripper(bool loaded, bool active) {
+    std::lock_guard lock(mutex_);
+    gripper_loaded_ = loaded;
+    gripper_active_ = active;
+    PublishLocked();
+  }
+  void Refuse(bool value) {
+    std::lock_guard lock(mutex_);
+    refuse_ = value;
+  }
+  std::vector<Switch::Request> Requests() const {
+    std::lock_guard lock(mutex_);
+    return requests_;
+  }
+
+private:
+  void PublishLocked() {
+    controller_manager_msgs::msg::ControllerManagerActivity message;
+    message.header.stamp = node()->now();
+    const auto row = [](const std::string &name, bool active) {
+      controller_manager_msgs::msg::NamedLifecycleState result;
+      result.name = name;
+      result.state.id =
+          active ? lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE
+                 : lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
+      return result;
+    };
+    message.controllers.push_back(row("arm_controller", arm_active_));
+    if (gripper_loaded_)
+      message.controllers.push_back(row("gripper_controller", gripper_active_));
+    message.hardware_components.push_back(row("TestSystem", true));
+    activity_->publish(message);
+  }
+  fake::FakeJtc &jtc_;
+  mutable std::mutex mutex_;
+  bool arm_active_{false}, gripper_active_{false}, gripper_loaded_{true},
+      refuse_{false};
+  std::vector<Switch::Request> requests_;
+  rclcpp::Publisher<controller_manager_msgs::msg::ControllerManagerActivity>::
+      SharedPtr activity_;
+  rclcpp::Service<Switch>::SharedPtr switch_;
+  rclcpp_action::Server<Gripper>::SharedPtr action_;
+};
+
+core::RuntimeParticipantBinding GripperBinding() {
+  auto value = ArmBinding().value();
+  value.target_role_id = core::TargetRoleId("gripper");
+  value.command_target_id = core::CommandTargetId("gripper.target");
+  value.capability_id = core::CapabilityId("tool.gripper.command");
+  value.model_groups = {{core::ModelGroupRoleId("gripper_group"),
+                         core::ModelInstanceId("robot.model"),
+                         "gripper",
+                         {"gripper_joint"}}};
+  value.resources = {
+      {core::ResourceRoleId("fingers"), core::ResourceId("robot.gripper.1"),
+       "source_gripper_joint", "gripper_joint", core::CoordinateKind::kLinear}};
+  value.control_path->control_domain_id =
+      core::ControlDomainId("domain.gripper");
+  value.control_path->control_binding_id =
+      core::ControlBindingId("binding.gripper");
+  value.control_path->control_interface_contract_id =
+      core::ControlInterfaceContractId("interface.gripper");
+  auto sealed = core::verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok())
+    throw std::logic_error(sealed.error().message);
+  return std::move(sealed.value());
+}
+
+struct GripperWorld final {
+  explicit GripperWorld(bool expose_action = true)
+      : prefix("/manyforge_gripper_handle_test_" + fake::unique_suffix()),
+        jtc(prefix + "/arm_controller", {"source_joint_1"}),
+        manager(prefix, jtc, expose_action) {
+    auto sink = std::make_shared<NullSink>();
+    auto resources =
+        std::make_unique<ros2_control_execution::Ros2TransportResources>(
+            "manyforge_gripper_handle_" + fake::unique_suffix(), "/", 3U, sink,
+            "arm", clock);
+    auto gripper =
+        std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
+            *resources, sink, clock, scheduler, true);
+    ros2_control_execution::Ros2GripperActionConfig config;
+    config.action_name = prefix + "/gripper_controller/gripper_cmd";
+    config.group_id = "gripper";
+    config.joint_name = "gripper_joint";
+    gripper->configure_gripper_action("gripper.target", config);
+    RetainedRos2ControlArmTransport arm;
+    arm.adapter.action_name =
+        prefix + "/arm_controller/follow_joint_trajectory";
+    arm.adapter.state_topic = prefix + "/arm_controller/controller_state";
+    arm.adapter.scale_topic = prefix + "/arm_controller/speed_scaling_input";
+    arm.adapter.lane_facts.joint_names = {"source_joint_1"};
+    arm.adapter.lane_facts.supports_scale = true;
+    arm.adapter.lane_facts.state_rate_hz = 100.0;
+    arm.adapter.lane_facts.feedback_rate_hz = 100.0;
+    arm.adapter.lane_facts.controller_update_rate_hz = 100.0;
+    arm.compiled_joint_names = {"joint_1"};
+    arm.controller = {prefix + "/controller_manager", "arm_controller",
+                      "TestSystem"};
+    arm.gripper_controller = RetainedRos2ControlArmController{
+        prefix + "/controller_manager", "gripper_controller", "TestSystem"};
+    const auto bound = handle->Bind(
+        std::move(resources), clock, std::move(arm),
+        [this](std::shared_ptr<core::IExecutionPort> port) {
+          core::ExecutionPortParticipantConfig config;
+          config.stop.trip_authority = core::StateAuthorityClass::kCommanded;
+          config.stop.stop_traj_delta_s = 0.1;
+          config.stop.sample_period_s = 0.01;
+          config.stop.replacement_start_allowance_s = 0.02;
+          config.stop.hard_stop_completion_timeout_ns = 1'000'000'000;
+          config.late_cycle_margin_s = 0.5;
+          return std::make_shared<core::ExecutionPortParticipant>(
+              motion, std::move(port), clock, scheduler,
+              [](core::TimePoint, const std::stop_token &) {
+                std::this_thread::sleep_for(1ms);
+              },
+              core::ExecutionPortParticipantStateAuthority{
+                  &publication, [] { return core::Result<void>::Ok(); }},
+              std::move(config));
+        },
+        std::move(gripper), motion, tool);
+    if (!bound.ok())
+      throw std::logic_error(bound.error().message);
+  }
+  RetainedExternallyManagedDomainSnapshot
+  Snapshot(const char *domain = "domain.gripper") {
+    auto value = handle->ReadLifecycleSnapshot(core::ControlDomainId(domain),
+                                               clock.now());
+    if (!value.ok())
+      throw std::logic_error(value.error().message);
+    return value.value();
+  }
+  bool WaitForState(core::ComponentLifecycleStateDTO state,
+                    const char *domain = "domain.gripper") {
+    return fake::WaitUntil(
+        [&] { return Snapshot(domain).component_state == state; });
+  }
+  RetainedExternallyManagedPrimitiveOutcome
+  Dispatch(const char *primitive, const char *domain = "domain.gripper") {
+    return handle->lifecycle_primitive_dispatcher()(
+        core::ControlDomainId(domain),
+        core::LifecyclePrimitiveId(std::string("ros2_control.controller.") +
+                                   primitive),
+        {});
+  }
+  WallClock clock;
+  SimpleScheduler scheduler;
+  core::RuntimeParticipantBinding motion{ArmBinding()}, tool{GripperBinding()};
+  core::ObservedRobotStatePublication publication{
+      {"joint_1"},
+      {core::ObservedRobotStateSourceConfig{
+          core::ObservedRobotStateSourceKind::kCommandedState,
+          "commanded_state",
+          core::ObservedRobotStateAuthorityProfile::kCommandedSimulation, 0}}};
+  std::string prefix;
+  fake::FakeJtc jtc;
+  GripperControllerManager manager;
+  std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle =
+      std::make_shared<RetainedRos2ControlRuntimeHandle>();
+};
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     ConfiguredGripperUsesRealInactiveControllerAndExactSwitches) {
+  GripperWorld world;
+  world.handle->StartBackend();
+  ASSERT_TRUE(world.WaitForState(State::kDeclared));
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    return world.handle->gripper_transport_readiness_snapshot()->ready;
+  }));
+  EXPECT_EQ(world.Snapshot().component_state, State::kDeclared);
+  EXPECT_EQ(ArmWorld::Fact(world.Snapshot(),
+                           "external.controller_configuration_ready"),
+            false);
+  EXPECT_TRUE(world.manager.Requests().empty());
+  ASSERT_TRUE(world.Dispatch("prepare", "domain.arm").known ==
+              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.Dispatch("prepare").known ==
+              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kPrepared));
+  EXPECT_TRUE(world.manager.Requests().empty());
+  ASSERT_TRUE(world.Dispatch("activate", "domain.arm").known ==
+              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.Dispatch("activate").known ==
+              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kActive, "domain.arm"));
+  ASSERT_TRUE(world.WaitForState(State::kActive));
+  ASSERT_TRUE(world.Dispatch("deactivate").known ==
+              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.Dispatch("deactivate", "domain.arm").known ==
+              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kDisabled));
+  ASSERT_TRUE(world.WaitForState(State::kDisabled, "domain.arm"));
+  EXPECT_TRUE(world.handle->gripper_transport_readiness_snapshot()->ready);
+  EXPECT_FALSE(world.Snapshot().exact_controller_configuration_active);
+  const auto requests = world.manager.Requests();
+  ASSERT_EQ(requests.size(), 4U);
+  EXPECT_EQ(requests[0].activate_controllers,
+            std::vector<std::string>{"arm_controller"});
+  EXPECT_EQ(requests[1].activate_controllers,
+            std::vector<std::string>{"gripper_controller"});
+  EXPECT_EQ(requests[2].deactivate_controllers,
+            std::vector<std::string>{"gripper_controller"});
+  EXPECT_EQ(requests[3].deactivate_controllers,
+            std::vector<std::string>{"arm_controller"});
+  for (const auto &request : requests) {
+    EXPECT_EQ(request.strictness,
+              GripperControllerManager::Switch::Request::STRICT);
+    EXPECT_FALSE(request.activate_asap);
+  }
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     InactiveGripperPreparesWithoutActionServerButEnableNeedsTransport) {
+  GripperWorld world(false);
+  world.handle->StartBackend();
+  ASSERT_TRUE(world.WaitForState(State::kDeclared));
+  EXPECT_FALSE(world.handle->gripper_transport_readiness_snapshot()->ready);
+  const auto prepared = world.Dispatch("prepare");
+  ASSERT_EQ(prepared.known, core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kPrepared));
+  EXPECT_EQ(ArmWorld::Fact(world.Snapshot(), "external.controller_loaded"),
+            true);
+  EXPECT_EQ(ArmWorld::Fact(world.Snapshot(), "external.transport_ready"), true);
+  EXPECT_TRUE(world.manager.Requests().empty());
+  ASSERT_EQ(world.Dispatch("activate").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kDegraded));
+  EXPECT_FALSE(world.Snapshot().exact_controller_configuration_active);
+  EXPECT_EQ(ArmWorld::Cause(world.Snapshot()), "availability");
+  const auto requests = world.manager.Requests();
+  ASSERT_EQ(requests.size(), 1U);
+  EXPECT_EQ(requests.front().activate_controllers,
+            std::vector<std::string>{"gripper_controller"});
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     GripperMissingOrExternallyActiveCannotPrepare) {
+  GripperWorld world;
+  world.manager.SetGripper(false, false);
+  world.handle->StartBackend();
+  ASSERT_TRUE(world.WaitForState(State::kDegraded));
+  EXPECT_FALSE(world.Dispatch("prepare").known ==
+               core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  EXPECT_TRUE(world.manager.Requests().empty());
+  world.manager.SetGripper(true, true);
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    return ArmWorld::Fact(world.Snapshot(), "external.controller_loaded") ==
+           true;
+  }));
+  EXPECT_EQ(world.Snapshot().component_state, State::kDegraded);
+  EXPECT_FALSE(world.Dispatch("prepare").known ==
+               core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  EXPECT_TRUE(world.manager.Requests().empty());
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     RefusedGripperSwitchCannotReportActive) {
+  GripperWorld world;
+  world.handle->StartBackend();
+  ASSERT_TRUE(world.WaitForState(State::kDeclared));
+  ASSERT_TRUE(world.Dispatch("prepare").known ==
+              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  world.manager.Refuse(true);
+  const auto refused = world.Dispatch("activate");
+  EXPECT_EQ(refused.dispatch,
+            core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown);
+  EXPECT_EQ(refused.known, core::LifecyclePrimitiveKnownResultDTO::kFailed);
+  EXPECT_EQ(refused.effect, core::LifecyclePrimitiveEffectDTO::kPossible);
+  EXPECT_EQ(world.Snapshot().component_state, State::kPrepared);
+  EXPECT_FALSE(world.Snapshot().exact_controller_configuration_active);
+  const auto foreign = world.Dispatch("activate", "domain.foreign");
+  EXPECT_EQ(foreign.dispatch,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  ASSERT_EQ(world.manager.Requests().size(), 1U);
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     SuccessorConsumesOwnedEpochAndFirstGenerationWithoutChangingSurvivors) {
+  ArmWorld predecessor;
+  ArmWorld survivor;
+  const auto old_port = predecessor.handle->current_port();
+  const auto survivor_port = survivor.handle->current_port();
+  const auto untouched = survivor.handle->ReadOwnedControllerOccurrence();
+  auto owned = predecessor.handle->ReadOwnedControllerOccurrence();
+  ASSERT_TRUE(owned.locally_valid());
+  ASSERT_EQ(owned.domains.size(), 1U);
+  EXPECT_EQ(owned.domains.front().observation_generation, 0U);
+  EXPECT_EQ(predecessor.Snapshot().source_generation, 1U);
+  owned = predecessor.handle->ReadOwnedControllerOccurrence();
+  const auto next = core::ComputeSelectedControllerSuccessorOccurrence(
+      owned, {core::ControlDomainId("domain.arm")}, true);
+  ASSERT_TRUE(next.ok());
+  ArmWorld successor("arm_controller", next.value());
+  EXPECT_EQ(successor.handle->ReadOwnedControllerOccurrence(), next.value());
+  EXPECT_EQ(successor.handle->current_port()->ReadReadiness().binding_epoch,
+            core::ExecutionBindingEpoch(2U));
+  const auto first = successor.Snapshot();
+  EXPECT_EQ(first.source_generation, 2U);
+  EXPECT_EQ(successor.Snapshot().source_generation, first.source_generation);
+  EXPECT_FALSE(successor.handle->arm_activity().observed);
+  EXPECT_FALSE(
+      successor.handle->current_port()->ReadReadiness().controller_bound);
+  EXPECT_NE(successor.handle->current_port(), old_port);
+  EXPECT_EQ(predecessor.handle->current_port(), old_port);
+  EXPECT_TRUE(predecessor.handle->OwnsBinding(predecessor.binding));
+  EXPECT_EQ(predecessor.handle->ReadOwnedControllerOccurrence(), owned);
+  EXPECT_EQ(survivor.handle->current_port(), survivor_port);
+  EXPECT_EQ(survivor.handle->ReadOwnedControllerOccurrence(), untouched);
+  EXPECT_EQ(predecessor.manager.switch_requests(), 0U);
+  EXPECT_EQ(successor.manager.switch_requests(), 0U);
+  EXPECT_EQ(survivor.manager.switch_requests(), 0U);
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     InvalidSuccessorRefusesBeforeConstructingTheParticipant) {
+  const core::SelectedControllerOccurrenceDTO valid{
+      core::ExecutionBindingEpoch(2U),
+      {{core::ControlDomainId("domain.arm"), 2U}}};
+  auto missing_arm = valid;
+  missing_arm.arm_binding_epoch.reset();
+  auto zero_generation = valid;
+  zero_generation.domains.front().observation_generation = 0U;
+  auto foreign_domain = valid;
+  foreign_domain.domains.front().control_domain_id =
+      core::ControlDomainId("foreign.arm");
+  auto duplicate_domain = valid;
+  duplicate_domain.domains.push_back(duplicate_domain.domains.front());
+  for (const auto &seed :
+       {missing_arm, zero_generation, foreign_domain, duplicate_domain}) {
+    std::size_t constructed = 0U;
+    EXPECT_THROW(ArmWorld("arm_controller", seed, &constructed),
+                 std::logic_error);
+    EXPECT_EQ(constructed, 0U);
+  }
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     MaximumOwnedFloorsRefuseSuccessorAndNeverWrapObservation) {
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  ArmWorld predecessor("arm_controller",
+                       core::SelectedControllerOccurrenceDTO{
+                           core::ExecutionBindingEpoch(maximum),
+                           {{core::ControlDomainId("domain.arm"), maximum}}});
+  bool failed = false;
+  predecessor.handle->InstallControllerProcessFaultSource([&] {
+    return failed ? std::optional<std::string>("exact launch exited")
+                  : std::nullopt;
+  });
+  const auto owned = predecessor.handle->ReadOwnedControllerOccurrence();
+  const auto port = predecessor.handle->current_port();
+  EXPECT_FALSE(core::ComputeSelectedControllerSuccessorOccurrence(
+                   owned, {core::ControlDomainId("domain.arm")}, true)
+                   .ok());
+  EXPECT_EQ(predecessor.Snapshot().source_generation, maximum);
+  failed = true;
+  const auto changed = predecessor.handle->ReadLifecycleSnapshot(
+      core::ControlDomainId("domain.arm"), predecessor.clock.now());
+  ASSERT_FALSE(changed.ok());
+  EXPECT_EQ(changed.error().details.at("reason"),
+            "ros2_control_lifecycle_generation_exhausted");
+  EXPECT_EQ(predecessor.handle->ReadOwnedControllerOccurrence(), owned);
+  EXPECT_EQ(predecessor.handle->current_port(), port);
+  EXPECT_EQ(predecessor.manager.switch_requests(), 0U);
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     MaximumSeedRefusesReactivationBeforeRetiringTheAdapter) {
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  const auto successor = core::ComputeSelectedControllerSuccessorOccurrence(
+      {core::ExecutionBindingEpoch(maximum - 1U),
+       {{core::ControlDomainId("domain.arm"), 0U}}},
+      {core::ControlDomainId("domain.arm")}, true);
+  ASSERT_TRUE(successor.ok());
+  ArmWorld world("arm_controller", successor.value());
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    const auto activity = world.handle->arm_activity();
+    return activity.observed && activity.controller_loaded &&
+           activity.hardware_active;
+  }));
+  ASSERT_EQ(world.handle->PrepareArmController().outcome, Outcome::kSucceeded);
+  ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
+            Outcome::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kActive));
+  ASSERT_EQ(world.handle->DeactivateArmController({}).outcome,
+            Outcome::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kDisabled));
+  const auto port = world.handle->current_port();
+  const auto readiness = port->ReadReadiness();
+  ASSERT_TRUE(readiness.hardware_active);
+  EXPECT_EQ(readiness.binding_epoch, core::ExecutionBindingEpoch(maximum));
+  const auto owned = world.handle->ReadOwnedControllerOccurrence();
+  const auto switches = world.manager.switch_requests();
+  const auto refused = world.handle->ActivateArmController({});
+  EXPECT_EQ(refused.outcome, Outcome::kNotSent);
+  ASSERT_TRUE(refused.error.has_value());
+  EXPECT_EQ(refused.error->details.at("reason"),
+            "ros2_control_binding_epoch_exhausted");
+  EXPECT_EQ(world.handle->current_port(), port);
+  EXPECT_EQ(port->ReadReadiness(), readiness);
+  EXPECT_EQ(world.handle->ReadOwnedControllerOccurrence(), owned);
+  EXPECT_EQ(world.manager.switch_requests(), switches);
+}
 
 TEST(RetainedRos2ControlRuntimeHandleTest,
      ActivePostconditionWaitsForItsOwnActionClientDiscovery) {
@@ -336,7 +814,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   peer_value.control_path->state_authority_id = core::StateAuthorityId("state.peer");
   auto peer_binding = core::verify_runtime_participant_binding(peer_value);
   ASSERT_TRUE(peer_binding.ok());
-  auto peer = std::make_unique<ArmWorld>("arm_controller", peer_binding.value());
+  auto peer = std::make_unique<ArmWorld>("arm_controller", std::nullopt, nullptr, peer_binding.value());
   const auto port = survivor.handle->current_port();
   const auto participant = survivor.handle->participant();
   const auto readiness = port->ReadReadiness();
@@ -345,7 +823,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   // must not rewrite the survivor's component/provider epoch or live port.
   auto retired_peer = std::move(peer);
   const auto replaced_peer_port = retired_peer->handle->current_port();
-  peer = std::make_unique<ArmWorld>("arm_controller", peer_binding.value());
+  peer = std::make_unique<ArmWorld>("arm_controller", std::nullopt, nullptr, peer_binding.value());
   EXPECT_NE(peer->handle->current_port(), replaced_peer_port);
   EXPECT_NE(peer->handle, retired_peer->handle);
   auto candidate_value = survivor.binding.value();
@@ -373,7 +851,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   // Remove/Add the peer again. The real candidate route generation is
   // retained, while the survivor still names its original occurrence.
   peer.reset();
-  peer = std::make_unique<ArmWorld>("arm_controller", peer_binding.value());
+  peer = std::make_unique<ArmWorld>("arm_controller", std::nullopt, nullptr, peer_binding.value());
   const auto replaced_binding = candidate.value();
   candidate_value.retained_bundle_id = core::RetainedBundleId("add.bundle");
   candidate_value.graph_revision = core::GraphRevision("add.graph");
@@ -427,6 +905,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   EXPECT_TRUE(survivor.handle->OwnsBinding(survivor.binding));
   EXPECT_EQ(survivor.handle->current_port(), port);
 }
+
 
 TEST(RetainedRos2ControlRuntimeHandleTest,
      CclcPrimitivesSwitchTheInactiveLoadedControllerAndReportItsLifecycle) {
@@ -549,7 +1028,8 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   ASSERT_TRUE(world.WaitForState(State::kActive));
   {
     std::lock_guard lock(mutex);
-    exit_reason = "controller_launch_exited: controller launch was terminated by signal 9";
+    exit_reason = "controller_launch_exited: controller launch was terminated "
+                  "by signal 9";
   }
   auto snapshot = world.Snapshot();
   EXPECT_EQ(snapshot.component_state, State::kFaulted);
@@ -747,7 +1227,8 @@ TEST(RetainedRos2ControlRuntimeHandleTest, LaneGuardHooksGateActivationMotionAnd
   ASSERT_TRUE(world.WaitForState(State::kPrepared));
 }
 
-// --- Isaac guard binding ------------------------------------------------------
+// --- Isaac guard binding
+// ------------------------------------------------------
 
 /// Scripted arm facts and a record of the binding's effects, in order.
 class FakeArmHost final : public IRetainedIsaacArmHost {
@@ -1032,10 +1513,11 @@ TEST(RetainedIsaacArmGuardBindingTest, TripReportsTheFaultThenSwitchesOffAndWait
   ASSERT_TRUE(fake::WaitUntil([&] { return world.Admitted(); }));
 }
 
-// --- Q54: controller statistics monitor (observed statistics only) -------------
+// --- Q54: controller statistics monitor (observed statistics only)
+// -------------
 
-[[nodiscard]] pal_statistics_msgs::msg::Statistics Statistics(
-    const std::vector<std::pair<std::string, double>> &values) {
+[[nodiscard]] pal_statistics_msgs::msg::Statistics
+Statistics(const std::vector<std::pair<std::string, double>> &values) {
   pal_statistics_msgs::msg::Statistics message;
   for (const auto &[name, value] : values) {
     pal_statistics_msgs::msg::Statistic statistic;
@@ -1130,6 +1612,287 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   EXPECT_FALSE(timing.period_min_s.has_value());
   EXPECT_FALSE(timing.period_max_s.has_value());
   EXPECT_FALSE(timing.period_stddev_s.has_value());
+}
+
+// Explicit test-owner measured identities and physical-name mapping. These do
+// not derive measured authority from the arm's commanded execution binding.
+[[nodiscard]] core::MeasuredStateSourceDescriptor MeasuredSourceDescriptor() {
+  core::ObservedStateQueryContextDTO query{
+      core::ControllableComponentId("robot_1"), core::CommandTargetId("arm.target"),
+      core::CapabilityId("state.observed.current"), core::ControlDomainId("domain.arm"),
+      core::ControlDomainRevision("domain-revision"), core::ControlBindingId("measured.binding"),
+      core::ControlBindingRevision("measured-binding-revision"),
+      core::ControllerTopologyId("topology.ros2_control"), core::TopologyRevision("topology-revision"),
+      core::ControlRouteId("route.measured"), {core::ResourceId("robot.joint.1")}, {"joint_1"},
+      {core::CoordinateKind::kAngular}, core::ControlInterfaceContractId("interface.measured"),
+      core::ControlInterfaceRevision("interface-revision"),
+      core::ActiveControlConfigurationId("active.ros2_control"),
+      core::ActiveControlConfigurationGeneration(1U), core::ProviderInstanceId("measured.provider"),
+      core::ProviderManifestId("measured.manifest"), core::ProviderManifestRevision("manifest-revision"),
+      core::RuntimeEpoch("measured-epoch.1"), core::StateAuthorityId("state.measured"),
+      core::StateAuthorityClass::kMeasured, 100};
+  return {{query, {{core::ObservedRobotStateSourceKind::kJointState, "actual-joint-state",
+                    core::ObservedRobotStateAuthorityProfile::kMeasured, 100, "state.measured"}},
+           7U, 8U}, {"source_joint_1"}};
+}
+
+TEST(RetainedRos2ControlRuntimeHandle, InactiveJointStateSamplesAreMeasuredAndReadsNeverRefresh) {
+  core::FakeClock clock;
+  clock.set(1000);
+  ArmWorld world("arm_controller", std::nullopt, nullptr, ArmBinding(), &clock);
+  const auto descriptor = MeasuredSourceDescriptor();
+  const auto &query = descriptor.publication.query_context;
+  const auto configured = world.handle->ConfigureMeasuredStateSources(
+      {descriptor}, world.prefix + "/joint_states", clock);
+  ASSERT_TRUE(configured.ok()) << configured.error().message;
+  ASSERT_EQ(configured.value().size(), 1U);
+  const auto reader = configured.value().front();
+  EXPECT_FALSE(reader->current_state(query, 1000).ok());
+  auto publisher = world.handle->node()->create_publisher<sensor_msgs::msg::JointState>(
+      world.prefix + "/joint_states", rclcpp::QoS(1));
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil([&] { return publisher->get_subscription_count() == 1U; }));
+  sensor_msgs::msg::JointState message;
+  message.header.stamp.sec = 2;
+  message.header.stamp.nanosec = 3;
+  message.name = {"irrelevant_source", "source_joint_1"};
+  message.position = {99.0, 0.25};
+  message.velocity = {99.0, 0.5};
+  publisher->publish(message);
+  ASSERT_TRUE(fake::WaitUntil([&] { return reader->current_state(query, 1000).ok(); }));
+  const auto sampled = reader->current_state(query, 1000);
+  ASSERT_TRUE(sampled.ok());
+  EXPECT_EQ(sampled.value().joint_names, query.joint_names);
+  EXPECT_EQ(sampled.value().resources, query.resources);
+  EXPECT_DOUBLE_EQ(std::get<core::AngularPositionDTO>(sampled.value().positions[0]).value_rad, 0.25);
+  ASSERT_TRUE(sampled.value().velocities.has_value());
+  EXPECT_DOUBLE_EQ(std::get<core::AngularVelocityDTO>((*sampled.value().velocities)[0]).value_rad_s, 0.5);
+  EXPECT_EQ(sampled.value().source_kind, core::ObservedStateSourceKind::kJointState);
+  EXPECT_EQ(sampled.value().state_authority_class, core::StateAuthorityClass::kMeasured);
+  EXPECT_EQ(sampled.value().source_timestamp_ns, 2'000'000'003);
+  EXPECT_EQ(sampled.value().received_timestamp_ns, 1000);
+  clock.set(9'000'000);
+  EXPECT_EQ(reader->current_state(query, 1050).value(), sampled.value());
+  EXPECT_TRUE(reader->current_state(query, 1100).ok());
+  EXPECT_FALSE(reader->current_state(query, 1101).ok());
+  EXPECT_FALSE(reader->current_state(query, 1102).ok());
+  EXPECT_EQ(world.manager.switch_requests(), 0U);
+  EXPECT_FALSE(world.handle->arm_activity().controller_active);
+  // A real new malformed sample invalidates completeness instead of leaving
+  // the earlier complete sample as the apparent current measurement.
+  clock.set(9'000'100);
+  message.name = {"source_joint_1", "source_joint_1"};
+  message.position = {0.1, 0.2};
+  publisher->publish(message);
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    const auto envelope = reader->publication(query.control_binding_id, query.control_binding_revision);
+    return envelope.ok() && envelope.value().publication_sequence > sampled.value().sequence &&
+           !envelope.value().snapshot.complete && envelope.value().received_timestamp_ns == 9'000'100;
+  }));
+  EXPECT_FALSE(reader->current_state(query, 9'000'100).ok());
+  message.name = {"source_joint_1"};
+  message.position = {0.75};
+  message.velocity.clear();
+  publisher->publish(message);
+  ASSERT_TRUE(fake::WaitUntil([&] { return reader->current_state(query, 9'000'100).ok(); }));
+  EXPECT_FALSE(reader->current_state(query, 9'000'100).value().velocities.has_value());
+}
+
+TEST(RetainedRos2ControlRuntimeHandle, MeasuredReplacementStartsEmptyAndOwningRetiredReadersStayPinned) {
+  core::FakeClock clock;
+  clock.set(1000);
+  ArmWorld world("arm_controller", std::nullopt, nullptr, ArmBinding(), &clock);
+  const auto original = MeasuredSourceDescriptor();
+  auto configured = world.handle->ConfigureMeasuredStateSources(
+      {original}, world.prefix + "/joint_states", clock);
+  ASSERT_TRUE(configured.ok());
+  const auto old_reader = configured.value().front();
+  auto publisher = world.handle->node()->create_publisher<sensor_msgs::msg::JointState>(
+      world.prefix + "/joint_states", rclcpp::QoS(1));
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil([&] { return publisher->get_subscription_count() == 1U; }));
+  sensor_msgs::msg::JointState message;
+  message.name = {"source_joint_1"};
+  message.position = {0.25};
+  publisher->publish(message);
+  const auto &old_query = original.publication.query_context;
+  ASSERT_TRUE(fake::WaitUntil([&] { return old_reader->current_state(old_query, 1000).ok(); }));
+  const auto old_snapshot = old_reader->current_state(old_query, 1000).value();
+  auto successor = original;
+  successor.publication.query_context.runtime_epoch = core::RuntimeEpoch("measured-epoch.2");
+  successor.publication.query_context.active_control_configuration_generation =
+      core::ActiveControlConfigurationGeneration(2U);
+  auto replacement = world.handle->ConfigureMeasuredStateSources(
+      {successor}, world.prefix + "/joint_states", clock);
+  ASSERT_TRUE(replacement.ok());
+  const auto new_reader = replacement.value().front();
+  const auto &new_query = successor.publication.query_context;
+  EXPECT_FALSE(new_reader->current_state(new_query, 1000).ok());
+  EXPECT_FALSE(new_reader->current_state(old_query, 1000).ok());
+  ASSERT_TRUE(fake::WaitUntil([&] { return publisher->get_subscription_count() == 1U; }));
+  clock.set(1050);
+  message.position = {0.75};
+  // Publish while polling actual receipt; discovery count alone can describe
+  // the just-retired subscriber until DDS notices the replacement endpoint.
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    publisher->publish(message);
+    return new_reader->current_state(new_query, 1050).ok();
+  }));
+  EXPECT_DOUBLE_EQ(std::get<core::AngularPositionDTO>(
+      new_reader->current_state(new_query, 1050).value().positions[0]).value_rad, 0.75);
+  EXPECT_EQ(old_reader->current_state(old_query, 1050).value(), old_snapshot);
+  EXPECT_FALSE(old_reader->current_state(new_query, 1050).ok());
+  auto cleared = world.handle->ConfigureMeasuredStateSources({}, world.prefix + "/joint_states", clock);
+  ASSERT_TRUE(cleared.ok());
+  EXPECT_TRUE(cleared.value().empty());
+  ASSERT_TRUE(fake::WaitUntil([&] { return publisher->get_subscription_count() == 0U; }));
+  publisher.reset();
+  world.handle.reset();
+  EXPECT_EQ(old_reader->current_state(old_query, 1050).value(), old_snapshot);
+  EXPECT_TRUE(new_reader->current_state(new_query, 1050).ok());
+  EXPECT_FALSE(old_reader->current_state(old_query, 1101).ok());
+  EXPECT_EQ(world.manager.switch_requests(), 0U);
+}
+
+// The inactive JTC fixture sends no controller samples. After its initial
+// activity is drained, the next owner-clock read comes from the actual measured
+// subscription receipt. Hold that boundary to exercise concurrent last-owner
+// release without relying on a timing window or adding a product test hook.
+class BlockingMeasuredReceiptClock final : public core::IClock {
+public:
+  ~BlockingMeasuredReceiptClock() override { Release(); }
+
+  core::TimePoint now() const override {
+    std::unique_lock lock(mutex_);
+    ++reads_;
+    if (armed_) {
+      entered_ = true;
+      cv_.notify_all();
+      cv_.wait(lock, [&] { return released_; });
+    }
+    return 1000;
+  }
+  void Arm() {
+    std::lock_guard lock(mutex_);
+    armed_ = true;
+  }
+  [[nodiscard]] bool Entered() const {
+    std::lock_guard lock(mutex_);
+    return entered_;
+  }
+  void Release() {
+    std::lock_guard lock(mutex_);
+    armed_ = false;
+    released_ = true;
+    cv_.notify_all();
+  }
+  [[nodiscard]] std::size_t Reads() const {
+    std::lock_guard lock(mutex_);
+    return reads_;
+  }
+private:
+  mutable std::mutex mutex_;
+  mutable std::condition_variable cv_;
+  bool armed_{false};
+  mutable bool entered_{false};
+  bool released_{false};
+  mutable std::size_t reads_{};
+};
+
+TEST(RetainedRos2ControlRuntimeHandle, MeasuredReceiptDoesNotOwnHandleAndTeardownDrainsBeforeClockRelease) {
+  BlockingMeasuredReceiptClock clock;
+  ArmWorld world("arm_controller", std::nullopt, nullptr, ArmBinding(), &clock);
+  const auto descriptor = MeasuredSourceDescriptor();
+  const auto &query = descriptor.publication.query_context;
+  const auto configured = world.handle->ConfigureMeasuredStateSources(
+      {descriptor}, world.prefix + "/joint_states", clock);
+  ASSERT_TRUE(configured.ok());
+  const auto reader = configured.value().front();
+  auto publisher = world.handle->node()->create_publisher<sensor_msgs::msg::JointState>(
+      world.prefix + "/joint_states", rclcpp::QoS(1));
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    return publisher->get_subscription_count() == 1U && world.handle->arm_activity().observed;
+  }));
+  EXPECT_FALSE(world.handle->arm_activity().controller_active);
+  EXPECT_EQ(world.manager.switch_requests(), 0U);
+  const std::weak_ptr<RetainedRos2ControlRuntimeHandle> weak_owner = world.handle;
+  clock.Arm();
+  sensor_msgs::msg::JointState message;
+  message.name = {"source_joint_1"};
+  message.position = {0.375};
+  publisher->publish(message);
+  const bool receipt_entered = fake::WaitUntil([&] { return clock.Entered(); });
+  if (!receipt_entered) clock.Release();
+  ASSERT_TRUE(receipt_entered);
+  std::atomic<bool> destroyed{false};
+  std::jthread destroyer([retained = std::move(world.handle), &destroyed]() mutable {
+    retained.reset();
+    destroyed.store(true, std::memory_order_release);
+  });
+  const bool no_callback_owner = fake::WaitUntil([&] { return weak_owner.expired(); });
+  // If the regression recurs, rescue the old implementation's last callback
+  // owner before unblocking it. The assertion reports the ownership error
+  // without deliberately causing executor self-join during the test cleanup.
+  auto rescue = no_callback_owner ? std::shared_ptr<RetainedRos2ControlRuntimeHandle>{}
+                                 : weak_owner.lock();
+  EXPECT_TRUE(no_callback_owner);
+  EXPECT_FALSE(destroyed.load(std::memory_order_acquire));
+  clock.Release();
+  destroyer.join();
+  if (rescue) {
+    // In the prior implementation join only drained the external reset, not
+    // the callback's strong owner. Keep the rescue until that owner positively
+    // releases; the inactive fixture has no other continuing handle owners.
+    EXPECT_TRUE(fake::WaitUntil([&] { return rescue.use_count() == 1; }));
+    // Even after a failed bounded assertion, never unwind borrowed fixture
+    // lifetimes while the callback still owns the handle. Actual completion
+    // remains required; the existing CTest timeout bounds a stuck callback.
+    while (rescue.use_count() != 1) std::this_thread::yield();
+  }
+  rescue.reset();
+  EXPECT_TRUE(destroyed.load(std::memory_order_acquire));
+  EXPECT_TRUE(weak_owner.expired());
+  const auto frozen = reader->current_state(query, 1000);
+  ASSERT_TRUE(frozen.ok());
+  EXPECT_DOUBLE_EQ(std::get<core::AngularPositionDTO>(frozen.value().positions[0]).value_rad, 0.375);
+  EXPECT_EQ(frozen.value().received_timestamp_ns, 1000);
+  const auto clock_reads = clock.Reads();
+  EXPECT_EQ(reader->current_state(query, 1050).value(), frozen.value());
+  EXPECT_FALSE(reader->current_state(query, 1101).ok());
+  EXPECT_TRUE(reader->publication(query.control_binding_id, query.control_binding_revision).ok());
+  EXPECT_EQ(clock.Reads(), clock_reads);
+  EXPECT_EQ(world.manager.switch_requests(), 0U);
+}
+
+TEST(RetainedRos2ControlRuntimeHandle, InvalidMeasuredReconfigurationDoesNotReplaceExistingSource) {
+  core::FakeClock clock;
+  clock.set(1000);
+  ArmWorld world("arm_controller", std::nullopt, nullptr, ArmBinding(), &clock);
+  const auto descriptor = MeasuredSourceDescriptor();
+  const auto configured = world.handle->ConfigureMeasuredStateSources(
+      {descriptor}, world.prefix + "/joint_states", clock);
+  ASSERT_TRUE(configured.ok());
+  auto publisher = world.handle->node()->create_publisher<sensor_msgs::msg::JointState>(
+      world.prefix + "/joint_states", rclcpp::QoS(1));
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil([&] { return publisher->get_subscription_count() == 1U; }));
+  core::FakeClock foreign_clock;
+  EXPECT_FALSE(world.handle->ConfigureMeasuredStateSources({descriptor}, world.prefix + "/joint_states",
+                                                          foreign_clock).ok());
+  auto invalid = descriptor;
+  invalid.source_joint_names.clear();
+  EXPECT_FALSE(world.handle->ConfigureMeasuredStateSources({invalid}, world.prefix + "/joint_states", clock).ok());
+  EXPECT_FALSE(world.handle->ConfigureMeasuredStateSources({descriptor}, "", clock).ok());
+  EXPECT_FALSE(world.handle->ConfigureMeasuredStateSources({descriptor}, "relative", clock).ok());
+  EXPECT_FALSE(world.handle->ConfigureMeasuredStateSources({descriptor}, world.prefix + "/bad topic", clock).ok());
+  sensor_msgs::msg::JointState message;
+  message.name = {"source_joint_1"};
+  message.position = {0.5};
+  publisher->publish(message);
+  const auto &query = descriptor.publication.query_context;
+  ASSERT_TRUE(fake::WaitUntil([&] { return configured.value().front()->current_state(query, 1000).ok(); }));
+  EXPECT_EQ(world.manager.switch_requests(), 0U);
 }
 
 } // namespace

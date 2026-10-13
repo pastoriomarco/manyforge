@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -22,6 +23,20 @@ constexpr std::uint8_t kRequestTag = 1U;
 constexpr std::uint8_t kPreparingTag = 2U;
 constexpr std::uint8_t kInstalledTag = 3U;
 constexpr std::uint8_t kFailureTag = 4U;
+constexpr std::uint8_t kSelectedSubmitTag = 5U;
+constexpr std::uint8_t kSelectedReadTag = 6U;
+constexpr std::uint8_t kSelectedResultTag = 7U;
+constexpr std::uint8_t kApplySubmitTag = 8U;
+constexpr std::uint8_t kApplyReadTag = 9U;
+constexpr std::uint8_t kApplyResultTag = 10U;
+constexpr std::uint8_t kInspectionRequestTag = 11U;
+constexpr std::uint8_t kInspectionResultTag = 12U;
+constexpr std::uint8_t kInspectionPlanningTail = 2U;
+constexpr std::string_view kInspectionPlanningRequestMagic = "MFNSRC4-INSPECT-PLANNING-REQUEST-V1";
+constexpr std::string_view kInspectionPlanningResultMagic = "MFNSRC4-INSPECT-PLANNING-RESULT-V2";
+
+constexpr std::uint8_t kObserverRetirementTail = 3U;
+constexpr std::string_view kObserverRetirementMagic = "MFNSRC4-OBSERVER-RETIREMENT-V1";
 
 [[noreturn]] void Fail(const std::string &detail) {
   throw std::invalid_argument("selected-runtime composition RPC codec: " +
@@ -128,6 +143,13 @@ public:
     std::string result(bytes_.substr(offset_, size));
     offset_ += size;
     return result;
+  }
+
+  [[nodiscard]] bool AtEnd() const noexcept { return offset_ == bytes_.size(); }
+
+  [[nodiscard]] std::uint8_t Peek() const {
+    Require(1U);
+    return static_cast<std::uint8_t>(bytes_[offset_]);
   }
 
   void Finish() const {
@@ -295,6 +317,21 @@ void WriteRequest(Writer &writer,
   WriteProjectionRevision(writer, request.predecessor_projection_revision);
 }
 
+// Optional facts extend only the whole ordinary packet tail. With no facts,
+// the request/result retain their exact existing MFNSRC4 bytes.
+void WriteObserverLaunchFacts(Writer &writer,
+    const std::optional<ManagerIsaacPoseObserverLaunchFactsDTO> &facts) {
+  if (facts) writer.String(EncodeManagerIsaacPoseObserverLaunchFacts(*facts));
+}
+
+[[nodiscard]] std::optional<ManagerIsaacPoseObserverLaunchFactsDTO>
+ReadObserverLaunchFacts(Reader &reader, const bool allow_retirement_tail = false) {
+  // A bounded string length starts with zero; the closed result marker cannot
+  // be confused with the existing canonical launch-facts string.
+  if (reader.AtEnd() || (allow_retirement_tail && reader.Peek() == kObserverRetirementTail)) return std::nullopt;
+  return DecodeManagerIsaacPoseObserverLaunchFacts(reader.String());
+}
+
 [[nodiscard]] ManagerSelectedRuntimeCompositionRequestDTO
 ReadRequest(Reader &reader) {
   return {
@@ -316,6 +353,284 @@ ReadRequest(Reader &reader) {
       manyforge::deployment::DecodeApplyComponentDelta(reader.String()),
       ReadProjectionRevision(reader),
   };
+}
+
+template <typename Request>
+void WriteSelectedRequest(Writer &writer, const Request &request) {
+  writer.String(core::EncodeComponentLifecycleIntent(request.intent));
+  WriteProjectionRevision(writer, request.candidate_projection_revision);
+  WriteStrong(writer, request.candidate_retained_bundle_digest);
+  writer.U64(request.candidate_retained_bundle_bytes);
+  WriteStrong(writer, request.runtime_unit_id);
+  WriteStrong(writer, request.runtime_epoch);
+  WriteStrong(writer, request.manager_runtime_epoch);
+}
+
+[[nodiscard]] ManagerSelectedComponentBringUpRequestDTO
+ReadSelectedRequest(Reader &reader) {
+  return {core::DecodeComponentLifecycleIntent(reader.String()),
+          ReadProjectionRevision(reader),
+          ReadStrong<core::ContentDigest>(reader),
+          reader.U64(),
+          ReadStrong<core::RuntimeUnitId>(reader),
+          ReadStrong<core::RuntimeEpoch>(reader),
+          ReadStrong<core::RuntimeEpoch>(reader)};
+}
+
+void WriteApplyRequest(Writer &writer,
+                       const ManagerApplyComponentBringUpRequestDTO &request) {
+  WriteSelectedRequest(writer, request);
+  writer.String(core::EncodeApplyComponentBringUpAuthority(request.parent_authority));
+}
+
+[[nodiscard]] ManagerApplyComponentBringUpRequestDTO ReadApplyRequest(Reader &reader) {
+  auto common = ReadSelectedRequest(reader);
+  return {std::move(common.intent), std::move(common.candidate_projection_revision),
+          std::move(common.candidate_retained_bundle_digest), common.candidate_retained_bundle_bytes,
+          std::move(common.runtime_unit_id), std::move(common.runtime_epoch),
+          std::move(common.manager_runtime_epoch),
+          core::DecodeApplyComponentBringUpAuthority(reader.String())};
+}
+
+void WriteInspectionRequest(
+    Writer &writer,
+    const ManagerComponentBringUpInspectionRequestDTO &request) {
+  WriteProjectionRevision(writer, request.candidate_projection_revision);
+  WriteStrong(writer, request.candidate_retained_bundle_digest);
+  writer.U64(request.candidate_retained_bundle_bytes);
+  WriteProjectionRevision(writer, request.predecessor_projection_revision);
+  WriteGeneration(writer, request.expected_predecessor_publication_generation);
+  WriteStrong(writer, request.expected_predecessor_public_pointer_digest);
+  WriteStrong(writer, request.runtime_unit_id);
+  WriteStrong(writer, request.runtime_epoch);
+  WriteStrong(writer, request.manager_runtime_epoch);
+}
+
+[[nodiscard]] ManagerComponentBringUpInspectionRequestDTO
+ReadInspectionRequest(Reader &reader) {
+  return {ReadProjectionRevision(reader),
+          ReadStrong<core::ContentDigest>(reader),
+          reader.U64(),
+          ReadProjectionRevision(reader),
+          ReadGeneration<core::ActiveBundlePublicationGeneration>(reader),
+          ReadStrong<core::ContentDigest>(reader),
+          ReadStrong<core::RuntimeUnitId>(reader),
+          ReadStrong<core::RuntimeEpoch>(reader),
+          ReadStrong<core::RuntimeEpoch>(reader)};
+}
+
+void WriteObserverRetirementTail(Writer &writer,
+    const std::optional<ManagerIsaacPoseObserverRetirementReceiptDTO> &receipt) {
+  if (!receipt) return;
+  writer.Byte(kObserverRetirementTail);
+  writer.String(kObserverRetirementMagic);
+  writer.String(EncodeManagerIsaacPoseObserverLaunchFacts(receipt->predecessor));
+  writer.U64(static_cast<std::uint64_t>(receipt->leader_pid));
+}
+
+[[nodiscard]] std::optional<ManagerIsaacPoseObserverRetirementReceiptDTO>
+ReadObserverRetirementTail(Reader &reader) {
+  if (reader.AtEnd()) return std::nullopt;
+  if (reader.Byte() != kObserverRetirementTail || reader.String() != kObserverRetirementMagic)
+    Fail("observer retirement extension is not a closed supported result value");
+  auto predecessor = DecodeManagerIsaacPoseObserverLaunchFacts(reader.String());
+  const auto pid = reader.U64();
+  if (pid > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+    Fail("observer retirement PID exceeds its signed value domain");
+  ManagerIsaacPoseObserverRetirementReceiptDTO receipt{std::move(predecessor), static_cast<std::int64_t>(pid)};
+  if (!receipt.valid()) Fail("observer retirement receipt is invalid");
+  return receipt;
+}
+
+void WriteInspectionPlanningRequestTail(Writer &writer,
+    const ManagerComponentBringUpInspectionRequestDTO &request) {
+  if (!request.planning_component_id) return;
+  writer.Byte(kInspectionPlanningTail);
+  writer.String(kInspectionPlanningRequestMagic);
+  WriteStrong(writer, *request.planning_component_id);
+}
+
+void ReadInspectionPlanningRequestTail(Reader &reader,
+    ManagerComponentBringUpInspectionRequestDTO &request) {
+  if (reader.AtEnd()) return;
+  if (reader.Byte() != kInspectionPlanningTail || reader.String() != kInspectionPlanningRequestMagic)
+    Fail("component planning request extension is not a closed supported value");
+  request.planning_component_id = ReadStrong<core::ControllableComponentId>(reader);
+}
+
+void WritePlanningDomain(Writer &writer, const core::ExpectedControlDomainRevisionDTO &domain) {
+  WriteStrong(writer, domain.control_domain_id);
+  WriteStrong(writer, domain.control_domain_revision);
+  WriteStrong(writer, domain.controller_topology_id);
+  WriteStrong(writer, domain.topology_revision);
+  const auto &configuration = domain.expected_active_control_configuration;
+  writer.Byte(static_cast<std::uint8_t>(configuration.presence));
+  WriteOptionalStrong(writer, configuration.active_control_configuration_id);
+  writer.Boolean(configuration.active_control_configuration_generation.has_value());
+  if (configuration.active_control_configuration_generation)
+    WriteGeneration(writer, *configuration.active_control_configuration_generation);
+  WriteVector(writer, domain.expected_control_bindings, [](Writer &output, const auto &binding) {
+    WriteStrong(output, binding.control_binding_id);
+    WriteStrong(output, binding.control_binding_revision);
+    WriteStrong(output, binding.control_route_id);
+  });
+}
+
+[[nodiscard]] core::ExpectedControlDomainRevisionDTO ReadPlanningDomain(Reader &reader) {
+  auto domain = ReadStrong<core::ControlDomainId>(reader);
+  auto revision = ReadStrong<core::ControlDomainRevision>(reader);
+  auto topology = ReadStrong<core::ControllerTopologyId>(reader);
+  auto topology_revision = ReadStrong<core::TopologyRevision>(reader);
+  const auto presence = reader.Byte();
+  if (presence > static_cast<std::uint8_t>(core::ExpectedActiveControlConfigurationPresenceDTO::kPresent))
+    Fail("component planning active-configuration presence is unknown");
+  auto configuration_id = ReadOptionalStrong<core::ActiveControlConfigurationId>(reader);
+  std::optional<core::ActiveControlConfigurationGeneration> configuration_generation;
+  if (reader.Boolean()) configuration_generation = ReadGeneration<core::ActiveControlConfigurationGeneration>(reader);
+  const core::ExpectedActiveControlConfigurationDTO configuration{
+      static_cast<core::ExpectedActiveControlConfigurationPresenceDTO>(presence),
+      std::move(configuration_id), configuration_generation};
+  auto bindings = ReadVector<core::ExpectedControlBindingRevisionDTO>(reader, [](Reader &input) {
+    return core::ExpectedControlBindingRevisionDTO{ReadStrong<core::ControlBindingId>(input),
+        ReadStrong<core::ControlBindingRevision>(input), ReadStrong<core::ControlRouteId>(input)};
+  });
+  return {std::move(domain), std::move(revision), std::move(topology), std::move(topology_revision),
+          configuration, std::move(bindings)};
+}
+
+void WriteInspectionPlanningResultTail(Writer &writer,
+    const ManagerComponentBringUpInspectionResultDTO &result) {
+  if (!result.planning_facts) return;
+  writer.Byte(kInspectionPlanningTail);
+  writer.String(kInspectionPlanningResultMagic);
+  WriteStrong(writer, *result.request.planning_component_id);
+  const auto &facts = *result.planning_facts;
+  WriteStrong(writer, facts.component_id);
+  WriteStrong(writer, facts.owner_epoch);
+  const auto &selection = facts.generation_selection;
+  writer.Boolean(selection.predecessor_generation.has_value());
+  if (selection.predecessor_generation) WriteGeneration(writer, *selection.predecessor_generation);
+  WriteGeneration(writer, selection.candidate_generation);
+  writer.U64(selection.prior_reservation_generation);
+  writer.Boolean(selection.owner_qualified_predecessor.has_value());
+  if (selection.owner_qualified_predecessor) {
+    WriteGeneration(writer, selection.owner_qualified_predecessor->generation);
+    WriteStrong(writer, selection.owner_qualified_predecessor->snapshot_digest);
+  }
+  WriteVector(writer, facts.candidate_expected_domains, WritePlanningDomain);
+  writer.Byte(static_cast<std::uint8_t>(facts.requested_target));
+  writer.Byte(static_cast<std::uint8_t>(facts.next_intent));
+}
+
+void ReadInspectionPlanningResultTail(Reader &reader,
+    ManagerComponentBringUpInspectionResultDTO &result) {
+  if (reader.AtEnd()) return;
+  if (reader.Byte() != kInspectionPlanningTail || reader.String() != kInspectionPlanningResultMagic)
+    Fail("component planning result extension is not a closed supported value");
+  result.request.planning_component_id = ReadStrong<core::ControllableComponentId>(reader);
+  auto component = ReadStrong<core::ControllableComponentId>(reader);
+  auto owner = ReadStrong<core::RequestOwnerEpoch>(reader);
+  std::optional<core::ComponentLifecycleGeneration> watermark;
+  if (reader.Boolean()) watermark = ReadGeneration<core::ComponentLifecycleGeneration>(reader);
+  core::ApplyComponentGenerationSelectionDTO selection{
+      watermark, ReadGeneration<core::ComponentLifecycleGeneration>(reader), reader.U64()};
+  if (reader.Boolean()) {
+    selection.owner_qualified_predecessor = core::ApplyComponentQualifiedPredecessorDTO{
+        ReadGeneration<core::ComponentLifecycleGeneration>(reader), ReadStrong<core::ContentDigest>(reader)};
+  }
+  result.planning_facts = ManagerComponentBringUpPlanningFactsDTO{std::move(component), std::move(owner),
+      std::move(selection), ReadVector<core::ExpectedControlDomainRevisionDTO>(reader, ReadPlanningDomain),
+      static_cast<core::LifecycleTargetStateDTO>(reader.Byte()),
+      static_cast<core::ComponentLifecycleIntentKindDTO>(reader.Byte())};
+}
+
+void WriteProcessObservations(
+    Writer &writer,
+    const std::vector<ManagerComponentProcessObservationDTO> &observations) {
+  WriteVector(writer, observations, [](Writer &output, const auto &row) {
+    WriteStrong(output, row.controllable_component_id);
+    output.Byte(static_cast<std::uint8_t>(row.process_presence));
+  });
+}
+
+[[nodiscard]] std::vector<ManagerComponentProcessObservationDTO>
+ReadProcessObservations(Reader &reader) {
+  return ReadVector<ManagerComponentProcessObservationDTO>(
+      reader, [](Reader &input) {
+        auto component_id = ReadStrong<core::ControllableComponentId>(input);
+        const auto presence = input.Byte();
+        if (presence >
+            static_cast<std::uint8_t>(ProcessPresenceState::kPresent)) {
+          Fail("component process presence is unknown");
+        }
+        return ManagerComponentProcessObservationDTO{
+            std::move(component_id),
+            static_cast<ProcessPresenceState>(presence)};
+      });
+}
+
+void WriteCellObserverTail(Writer &writer,
+                          const ManagerCellObserverObservationDTO &observer) {
+  // Absence has no byte representation. The optional extension is one closed
+  // whole-packet tail, bounded by the existing Writer packet limit.
+  writer.Boolean(true);
+  WriteStrong(writer, observer.cell_id);
+  writer.String(observer.source_id);
+  writer.String(observer.source_epoch_base);
+  writer.Byte(static_cast<std::uint8_t>(observer.process_presence));
+  writer.Boolean(observer.exit.has_value());
+  if (observer.exit) {
+    const auto &exit = *observer.exit;
+    writer.U32(static_cast<std::uint32_t>(exit.pid));
+    writer.Boolean(exit.exit_status.has_value());
+    if (exit.exit_status) writer.Byte(*exit.exit_status);
+    writer.Boolean(exit.signal.has_value());
+    if (exit.signal) writer.Byte(*exit.signal);
+    writer.Boolean(exit.core_dumped);
+    writer.String(exit.observed_utc);
+    writer.U64(static_cast<std::uint64_t>(exit.detected_at_ns));
+  }
+  writer.Boolean(observer.incident_id.has_value());
+  if (observer.incident_id) writer.String(*observer.incident_id);
+  writer.Byte(static_cast<std::uint8_t>(observer.incident_persistence));
+}
+
+[[nodiscard]] std::optional<ManagerCellObserverObservationDTO>
+ReadCellObserverTail(Reader &reader) {
+  if (reader.AtEnd() || reader.Peek() == kInspectionPlanningTail) return std::nullopt;
+  if (!reader.Boolean()) Fail("observer extension must be present or omitted");
+  ManagerCellObserverObservationDTO observer{
+      ReadStrong<core::CellId>(reader), reader.String(), reader.String()};
+  const auto presence = reader.Byte();
+  if (presence > static_cast<std::uint8_t>(ProcessPresenceState::kPresent))
+    Fail("observer process presence is unknown");
+  observer.process_presence = static_cast<ProcessPresenceState>(presence);
+  if (reader.Boolean()) {
+    ManagerCellObserverExitDTO exit;
+    const auto pid = reader.U32();
+    if (pid > static_cast<std::uint32_t>(
+                  std::numeric_limits<std::int32_t>::max()))
+      Fail("observer PID exceeds its signed domain");
+    exit.pid = static_cast<std::int32_t>(pid);
+    if (reader.Boolean()) exit.exit_status = reader.Byte();
+    if (reader.Boolean()) exit.signal = reader.Byte();
+    exit.core_dumped = reader.Boolean();
+    exit.observed_utc = reader.String();
+    const auto detected_at_ns = reader.U64();
+    if (detected_at_ns > static_cast<std::uint64_t>(
+                             std::numeric_limits<std::int64_t>::max()))
+      Fail("observer detection time exceeds its nonnegative signed domain");
+    exit.detected_at_ns = static_cast<std::int64_t>(detected_at_ns);
+    observer.exit = std::move(exit);
+  }
+  if (reader.Boolean()) observer.incident_id = reader.String();
+  const auto persistence = reader.Byte();
+  if (persistence > static_cast<std::uint8_t>(
+                        ManagerCellObserverIncidentPersistenceDTO::kUnknown))
+    Fail("observer incident persistence is unknown");
+  observer.incident_persistence =
+      static_cast<ManagerCellObserverIncidentPersistenceDTO>(persistence);
+  return observer;
 }
 
 void WriteReceipts(Writer &writer,
@@ -416,6 +731,7 @@ std::string EncodeSelectedRuntimeCompositionRpcRequest(
   }
   Writer writer(kRequestTag);
   WriteRequest(writer, request);
+  WriteObserverLaunchFacts(writer, request.isaac_pose_observer_launch_facts);
   return std::move(writer).Finish();
 }
 
@@ -426,8 +742,89 @@ DecodeSelectedRuntimeCompositionRpcRequest(const std::string_view bytes) {
     Fail("packet is not a request");
   }
   auto request = ReadRequest(reader);
+  request.isaac_pose_observer_launch_facts = ReadObserverLaunchFacts(reader);
   reader.Finish();
   if (!request.valid()) {
+    Fail("decoded request is invalid");
+  }
+  return request;
+}
+
+std::string EncodeSelectedRuntimeCompositionRpcRequest(
+    const ManagerSelectedComponentBringUpRequestDTO &request) {
+  if (!request.valid())
+    Fail("cannot encode an invalid selected submit");
+  Writer writer(kSelectedSubmitTag);
+  WriteSelectedRequest(writer, request);
+  return std::move(writer).Finish();
+}
+
+std::string EncodeSelectedRuntimeCompositionRpcRequest(
+    const ManagerSelectedComponentBringUpReadRequestDTO &request) {
+  if (!request.valid())
+    Fail("cannot encode an invalid selected read");
+  Writer writer(kSelectedReadTag);
+  WriteSelectedRequest(writer, request.request);
+  return std::move(writer).Finish();
+}
+
+std::string EncodeSelectedRuntimeCompositionRpcRequest(
+    const ManagerApplyComponentBringUpRequestDTO &request) {
+  if (!request.valid()) Fail("cannot encode an invalid Apply submit");
+  Writer writer(kApplySubmitTag);
+  WriteApplyRequest(writer, request);
+  return std::move(writer).Finish();
+}
+
+std::string EncodeSelectedRuntimeCompositionRpcRequest(
+    const ManagerApplyComponentBringUpReadRequestDTO &request) {
+  if (!request.valid()) Fail("cannot encode an invalid Apply read");
+  Writer writer(kApplyReadTag);
+  WriteApplyRequest(writer, request.request);
+  return std::move(writer).Finish();
+}
+
+std::string EncodeSelectedRuntimeCompositionRpcRequest(
+    const ManagerComponentBringUpInspectionRequestDTO &request) {
+  if (!request.valid()) {
+    Fail("cannot encode an invalid component inspection request");
+  }
+  Writer writer(kInspectionRequestTag);
+  WriteInspectionRequest(writer, request);
+  WriteInspectionPlanningRequestTail(writer, request);
+  return std::move(writer).Finish();
+}
+
+SelectedRuntimeCompositionRpcRequest
+DecodeSelectedRuntimeCompositionRpcRequestVariant(
+    const std::string_view bytes) {
+  Reader reader(bytes);
+  const auto tag = reader.Byte();
+  SelectedRuntimeCompositionRpcRequest request =
+      [&]() -> SelectedRuntimeCompositionRpcRequest {
+    if (tag == kRequestTag) {
+      auto ordinary = ReadRequest(reader);
+      ordinary.isaac_pose_observer_launch_facts = ReadObserverLaunchFacts(reader);
+      return ordinary;
+    }
+    if (tag == kSelectedSubmitTag)
+      return ReadSelectedRequest(reader);
+    if (tag == kSelectedReadTag) {
+      return ManagerSelectedComponentBringUpReadRequestDTO{
+          ReadSelectedRequest(reader)};
+    }
+    if (tag == kApplySubmitTag) return ReadApplyRequest(reader);
+    if (tag == kApplyReadTag)
+      return ManagerApplyComponentBringUpReadRequestDTO{ReadApplyRequest(reader)};
+    if (tag == kInspectionRequestTag) {
+      auto inspection = ReadInspectionRequest(reader);
+      ReadInspectionPlanningRequestTail(reader, inspection);
+      return inspection;
+    }
+    Fail("packet is not a request");
+  }();
+  reader.Finish();
+  if (!std::visit([](const auto &value) { return value.valid(); }, request)) {
     Fail("decoded request is invalid");
   }
   return request;
@@ -449,6 +846,43 @@ std::string EncodeSelectedRuntimeCompositionRpcResponse(
                   : kInstalledTag);
           WriteRequest(writer, value.request);
           WriteReceipts(writer, value.component_receipts);
+          WriteObserverLaunchFacts(writer, value.request.isaac_pose_observer_launch_facts);
+          WriteObserverRetirementTail(writer, value.isaac_pose_observer_retirement_receipt);
+          return std::move(writer).Finish();
+        } else if constexpr (std::is_same_v<
+                                 Value,
+                                 ManagerSelectedComponentBringUpResultDTO>) {
+          if (!value.valid())
+            Fail("cannot encode an invalid selected result");
+          Writer writer(kSelectedResultTag);
+          WriteSelectedRequest(writer, value.request);
+          writer.Boolean(value.result.has_value());
+          if (value.result.has_value()) {
+            writer.String(core::EncodeSelectedComponentBringUpRequestResult(
+                *value.result));
+          }
+          return std::move(writer).Finish();
+        } else if constexpr (std::is_same_v<Value, ManagerApplyComponentBringUpResultDTO>) {
+          if (!value.valid()) Fail("cannot encode an invalid Apply result");
+          Writer writer(kApplyResultTag);
+          WriteApplyRequest(writer, value.request);
+          writer.Boolean(value.result.has_value());
+          if (value.result.has_value()) {
+            writer.String(core::EncodeApplyDelegatedComponentLifecycleRequestResult(*value.result));
+          }
+          return std::move(writer).Finish();
+        } else if constexpr (std::is_same_v<
+                                 Value,
+                                 ManagerComponentBringUpInspectionResultDTO>) {
+          if (!value.valid()) {
+            Fail("cannot encode an invalid component inspection result");
+          }
+          Writer writer(kInspectionResultTag);
+          WriteInspectionRequest(writer, value.request);
+          WriteProcessObservations(writer, value.configured_components);
+          if (value.cell_observer)
+            WriteCellObserverTail(writer, *value.cell_observer);
+          WriteInspectionPlanningResultTail(writer, value);
           return std::move(writer).Finish();
         } else {
           Writer writer(kFailureTag);
@@ -468,17 +902,50 @@ DecodeSelectedRuntimeCompositionRpcResponse(const std::string_view bytes) {
     reader.Finish();
     return SelectedRuntimeCompositionRpcFailure{std::move(error)};
   }
+  if (tag == kSelectedResultTag) {
+    ManagerSelectedComponentBringUpResultDTO result{ReadSelectedRequest(reader),
+                                                    std::nullopt};
+    if (reader.Boolean()) {
+      result.result =
+          core::DecodeSelectedComponentBringUpRequestResult(reader.String());
+    }
+    reader.Finish();
+    if (!result.valid())
+      Fail("decoded selected result is invalid");
+    return result;
+  }
+  if (tag == kApplyResultTag) {
+    ManagerApplyComponentBringUpResultDTO result{ReadApplyRequest(reader), std::nullopt};
+    if (reader.Boolean())
+      result.result = core::DecodeApplyDelegatedComponentLifecycleRequestResult(reader.String());
+    reader.Finish();
+    if (!result.valid()) Fail("decoded Apply result is invalid");
+    return result;
+  }
+  if (tag == kInspectionResultTag) {
+    auto request = ReadInspectionRequest(reader);
+    auto observations = ReadProcessObservations(reader);
+    ManagerComponentBringUpInspectionResultDTO result{
+        std::move(request), std::move(observations), ReadCellObserverTail(reader)};
+    ReadInspectionPlanningResultTail(reader, result);
+    reader.Finish();
+    if (!result.valid()) {
+      Fail("decoded component inspection result is invalid");
+    }
+    return result;
+  }
   if (tag != kPreparingTag && tag != kInstalledTag) {
     Fail("packet is not a response");
   }
   auto request = ReadRequest(reader);
   auto receipts = ReadReceipts(reader);
+  request.isaac_pose_observer_launch_facts = ReadObserverLaunchFacts(reader, true);
   ManagerSelectedRuntimeCompositionResultDTO result{
       std::move(request),
       tag == kPreparingTag
           ? ManagerSelectedRuntimeCompositionState::kPreparing
           : ManagerSelectedRuntimeCompositionState::kInstalled,
-      std::move(receipts)};
+      std::move(receipts), ReadObserverRetirementTail(reader)};
   reader.Finish();
   if (!result.valid()) {
     Fail("decoded result is invalid");

@@ -31,6 +31,11 @@ public:
   [[nodiscard]] core::Result<core::BrandLifecycleObservationDTO>
   Observe(const core::BrandLifecycleObservationQueryDTO &query) override;
 
+  /// Same native classification as Observe, without advancing its bookkeeping.
+  [[nodiscard]] core::Result<core::LifecycleDomainHealthDTO>
+  ReadLifecycleHealth(const core::ControlDomainId &domain,
+                      core::TimePoint now_ns) const;
+
   [[nodiscard]] core::BrandLifecyclePrimitiveResultDTO
   Dispatch(const core::BrandLifecyclePrimitiveIntentDTO &intent,
            std::stop_token cancellation) override;

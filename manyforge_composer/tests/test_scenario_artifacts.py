@@ -649,7 +649,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
     admission = _PassThroughAdmission()
     state.authoring_admission = admission  # type: ignore[assignment]
     state.headless_client = type(
-        "ManagerStub", (), {"manager_status": lambda _self: {}}
+        "ManagerStub", (), {"manager_status": lambda _self: {"status": {"active": {"canonical_empty": True}}}}
     )()  # type: ignore[assignment]
     client = _scenario_client(state)
 
@@ -784,7 +784,7 @@ def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
     state = ComposerState(allowed_fs_roots=[str(tmp_path)])
     admission = _PassThroughAdmission()
     state.authoring_admission = admission  # type: ignore[assignment]
-    state.headless_client = type("Manager", (), {"manager_status": lambda _self: {}})()  # type: ignore[assignment]
+    state.headless_client = type("Manager", (), {"manager_status": lambda _self: {"status": {"active": {"canonical_empty": True}}}})()  # type: ignore[assignment]
     monkeypatch.setattr(state, "_manager_current", lambda _status: ("bundle", "graph", "epoch"))
     monkeypatch.setattr(routes_scenario_documents, "program_workspace",
                         lambda _state: {"authoringWorkspace": {"workspaceEpoch": "test"}})
@@ -1822,3 +1822,34 @@ def test_scenario_member_save_reports_the_effect_it_recorded(
         assert current["program"]["saved"]["matchesDraft"] is False
     else:
         assert current["deployment"]["differsFromSaved"] is True
+
+
+@pytest.mark.parametrize("canonical_empty", [None, "true", False, True])
+def test_load_identity_uses_owner_canonical_empty_proof(monkeypatch: pytest.MonkeyPatch, canonical_empty) -> None:
+    state = ComposerState()
+    status = {"status": {"active": {"canonical_empty": canonical_empty}}}
+    monkeypatch.setattr(state, "_manager_current", lambda actual: (
+        "bundle", "graph", "owner") if actual is status else None)
+    monkeypatch.setattr(state, "published_scenario", lambda: {
+        "published_scenario": {"scenario_id": "old-cell"}})
+    monkeypatch.setattr(state, "_manager_published_matches_scenario", lambda actual, _publication: actual is status)
+    if canonical_empty is True:
+        routes_scenario_documents._require_scenario_load_identity(state, "new-cell", status)
+    else:
+        with pytest.raises(ScenarioArtifactError) as error:
+            routes_scenario_documents._require_scenario_load_identity(state, "new-cell", status)
+        assert error.value.code == ("scenario_close_required" if canonical_empty is False
+                                    else "scenario_load_current_configuration_unavailable")
+
+
+def test_same_scenario_reload_requires_exact_current_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = ComposerState()
+    status = {"status": {"active": {"canonical_empty": False}}}
+    monkeypatch.setattr(state, "_manager_current", lambda _status: ("bundle", "graph", "owner"))
+    monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": {"scenario_id": "cell"}})
+    monkeypatch.setattr(state, "_manager_published_matches_scenario", lambda _status, _publication: True)
+    routes_scenario_documents._require_scenario_load_identity(state, "cell", status)
+    monkeypatch.setattr(state, "_manager_published_matches_scenario", lambda _status, _publication: False)
+    with pytest.raises(ScenarioArtifactError) as error:
+        routes_scenario_documents._require_scenario_load_identity(state, "cell", status)
+    assert error.value.code == "scenario_load_current_configuration_unavailable"

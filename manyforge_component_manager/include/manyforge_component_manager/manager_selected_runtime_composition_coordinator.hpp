@@ -45,10 +45,35 @@ public:
                    manyforge::core::ApplyGeneration apply_generation,
                    const manyforge::deployment::RetainedBundle &candidate);
 
+  /// Original configuration-only preparation after qualified private Stage.
+  /// Its actual captured snapshot/claim replaces ordinary Scene initialization,
+  /// without fabricating a linked plan or logical Scene status.
+  [[nodiscard]] ManagerSelectedRuntimeCompositionCoordinatorResult
+  PrepareOriginalConfiguration(
+      const manyforge::core::QualifiedSceneConfigurationAdoptionRequestDTO &original,
+      const manyforge::deployment::RetainedBundle &candidate);
+
+  /// Original process input only. The named coordinator positively verifies
+  /// its captured claim before calling; retained plans alone never delegate.
+  /// This preparation does not initialize or materialize logical Scene.
+  [[nodiscard]] ManagerSelectedRuntimeCompositionCoordinatorResult
+  PrepareOriginalApplyComponentBringUp(
+      const PersistedManagerApplyBringUpPlan &original_plan,
+      const manyforge::core::LogicalSceneSnapshotIdentityDTO &captured_predecessor_snapshot,
+      const manyforge::core::CellAdmissionClaimDTO &original_parent_claim,
+      const manyforge::deployment::RetainedBundle &candidate);
+
   [[nodiscard]] ManagerSelectedRuntimeCompositionCoordinatorResult
   InstallOrRecover(const manyforge::core::ApplyId &apply_id,
                    manyforge::core::ApplyGeneration apply_generation,
                    const manyforge::deployment::RetainedBundle &candidate);
+
+  /// Existing typed transport only. These calls grant no continuation from
+  /// retained data; the named coordinator must retain its original capture.
+  [[nodiscard]] manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>
+  SubmitApplyComponentBringUp(const ManagerApplyComponentBringUpRequestDTO &request);
+  [[nodiscard]] manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>
+  ReadApplyComponentBringUp(const ManagerApplyComponentBringUpReadRequestDTO &request);
 
 private:
   [[nodiscard]] ManagerSelectedRuntimeCompositionCoordinatorResult

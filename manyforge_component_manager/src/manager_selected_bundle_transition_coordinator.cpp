@@ -93,6 +93,22 @@ ManagerSelectedBundleTransitionCoordinator::AdvanceOrRecover(
     const core::ApplyGeneration apply_generation,
     const deployment::RetainedBundle &predecessor,
     const deployment::RetainedBundle &candidate) {
+  return Advance(apply_id, apply_generation, predecessor, candidate, true);
+}
+
+ManagerSelectedBundleTransitionResult
+ManagerSelectedBundleTransitionCoordinator::PublishOriginalConfiguration(
+    const core::ApplyId &apply_id, const core::ApplyGeneration apply_generation,
+    const deployment::RetainedBundle &predecessor,
+    const deployment::RetainedBundle &candidate) {
+  return Advance(apply_id, apply_generation, predecessor, candidate, false);
+}
+
+ManagerSelectedBundleTransitionResult
+ManagerSelectedBundleTransitionCoordinator::Advance(
+    const core::ApplyId &apply_id, const core::ApplyGeneration apply_generation,
+    const deployment::RetainedBundle &predecessor,
+    const deployment::RetainedBundle &candidate, const bool complete_scene) {
   std::lock_guard lock(operation_mutex_);
   const auto apply = apply_journal_.ReadIntent(apply_id, apply_generation);
   const auto ready =
@@ -264,7 +280,7 @@ ManagerSelectedBundleTransitionCoordinator::AdvanceOrRecover(
     return {materialization, durable_publication, true,
             ManagerSelectedBundleTransitionPath::kRecoveredCompletedOwnerStatus};
   }
-  if (durable_publication.inserted) {
+  if (durable_publication.inserted || !complete_scene) {
     return {materialization, durable_publication, false, path};
   }
 

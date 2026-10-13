@@ -50,6 +50,10 @@ struct ManagerNamedApplyRequestDTO final {
       expected_admission_generation;
   std::optional<manyforge::core::CellAdmissionClaimDTO>
       parent_authoring_claim;
+  /// Manager-checked startup input captured before acceptance. Exact replay
+  /// retains the stored snapshot and base rather than recapturing either.
+  std::optional<ManagerIsaacPoseObserverLaunchFactsDTO>
+      isaac_pose_observer_launch_facts{};
 
   [[nodiscard]] bool valid() const noexcept;
 
@@ -90,6 +94,22 @@ public:
   using InitialSceneSource = std::function<std::vector<manyforge::core::AddObjectRequestDTO>(
       const ManagerApplyPreparedActivationDTO &,
       const manyforge::deployment::RetainedBundle &)>;
+  /// Supplied only by the trusted, fresh named-Apply call after exact preview
+  /// acknowledgment and current configured-process inspection. It derives
+  /// immutable input from this owner's captured verified products; it neither
+  /// acquires authority nor effects a component. Replay/restart never invokes it.
+  using OriginalBringUpPlanSource = std::function<ManagerApplyBringUpPlanDTO(
+      const ManagerApplyIntentDTO &,
+      const manyforge::deployment::RetainedBundle &,
+      const manyforge::deployment::RetainedBundle &,
+      const ManagerActiveRuntimePlanDTO &)>;
+  /// Fresh caller continuation after the exact host Prepare acknowledgement.
+  /// It runs before Scene installation/Finalize, without waiting for observer
+  /// Open. Retained or recovered acceptance cannot reconstruct this callback.
+  using OriginalPrepareAcknowledgement = std::function<void(
+      const ManagerApplyIntentDTO &,
+      const manyforge::deployment::RetainedBundle &,
+      const ManagerSelectedRuntimeCompositionResultDTO &)>;
   using ApplyIdFactory = std::function<manyforge::core::ApplyId()>;
   using ApplyProgressObserver =
       std::function<void(const ManagerApplyIntentDTO &)>;
@@ -123,13 +143,18 @@ public:
   /// Validate and durably accept one exact request without advancing any
   /// runtime effect. Exact replay returns terminal evidence when it already
   /// exists; otherwise the sole progression owner resumes it through
-  /// RecoverIncompleteApply().
+  /// RecoverIncompleteApply(). Only the original process capture can progress
+  /// a linked bring-up parent; persisted facts alone remain observations.
   [[nodiscard]] ManagerNamedApplyResult
-  AcceptOrReplay(const ManagerNamedApplyRequestDTO &request);
+  AcceptOrReplay(const ManagerNamedApplyRequestDTO &request,
+                 OriginalBringUpPlanSource original_bring_up_plan_source = {},
+                 OriginalPrepareAcknowledgement original_prepare_acknowledgement = {});
 
   /// Resume the sole nonterminal Apply, if any. More than one nonterminal
   /// transaction is an integrity failure because this coordinator owns one
-  /// serialized progression lane.
+  /// serialized progression lane. A linked parent progresses only with this
+  /// process's captured original claim and inputs. Recovery never reconstructs
+  /// live delegation from retained observations.
   [[nodiscard]] std::optional<ManagerNamedApplyResult> RecoverIncompleteApply();
 
   ManagerNamedApplyCoordinator(const ManagerNamedApplyCoordinator &) = delete;
@@ -143,10 +168,46 @@ private:
     std::shared_ptr<const manyforge::deployment::RetainedBundle> predecessor;
     std::shared_ptr<const manyforge::deployment::RetainedBundle> candidate;
     std::vector<manyforge::core::AddObjectRequestDTO> initial_scene;
+    std::optional<PersistedManagerApplyBringUpPlan> bring_up_plan{};
+    OriginalPrepareAcknowledgement original_prepare_acknowledgement{};
+    bool prepare_acknowledgement_consumed{};
+    std::optional<manyforge::core::CellAdmissionClaimDTO> original_parent_claim{};
+    std::vector<manyforge::core::ControllableComponentId> submitted_children{};
+    bool original_preparation_completed{};
+    std::optional<manyforge::core::ActiveBundlePublicationReceiptDTO> original_predecessor_publication{};
+    std::optional<manyforge::core::QualifiedSceneProductAdoptionRequestDTO> original_scene_adoption{};
+    std::optional<manyforge::core::QualifiedSceneConfigurationAdoptionRequestDTO> original_configuration_adoption{};
+    bool original_scene_stage_consumed{};
+    bool original_scene_stage_completed{};
+    bool original_scene_begin_consumed{};
+    bool original_scene_complete_consumed{};
+    std::optional<manyforge::core::ProjectionMaintenanceInitializationStatusDTO> original_scene_completed{};
   };
 
   [[nodiscard]] ManagerNamedApplyResult
   Continue(const ManagerApplyIntentDTO &intent, bool request_replayed);
+  [[nodiscard]] std::optional<ManagerNamedApplyResult>
+  ObserveBringUpParent(const ManagerApplyIntentDTO &intent,
+                       bool request_replayed) const;
+  [[nodiscard]] manyforge::core::QualifiedSceneProductAdoptionRequestDTO
+  CaptureOriginalSceneAdoption(
+      const ManagerApplyIntentDTO &intent,
+      const std::optional<manyforge::core::ApplyFenceAcquireAttemptQueryDTO> &staging_attempt = std::nullopt);
+  [[nodiscard]] manyforge::core::ApplyFenceAcquireAttemptQueryDTO
+  CaptureOriginalSceneStagingAttempt(const ManagerApplyIntentDTO &intent);
+  [[nodiscard]] bool HasOriginalBringUpCapture(const ManagerApplyIntentDTO &intent) const;
+  [[nodiscard]] bool AdvanceOriginalBringUpChildren(const ManagerApplyIntentDTO &intent,
+                                                   bool after_publication);
+  [[nodiscard]] ManagerNamedApplyResult FinishOriginalBringUpPublication(
+      const PersistedManagerApplyIntent &intent, bool request_replayed);
+  [[nodiscard]] bool HasOriginalConfigurationCapture(const ManagerApplyIntentDTO &intent) const;
+  [[nodiscard]] manyforge::core::QualifiedSceneConfigurationAdoptionRequestDTO
+  CaptureOriginalConfigurationAdoption(const ManagerApplyIntentDTO &intent,
+      const std::optional<manyforge::core::ApplyFenceAcquireAttemptQueryDTO> &staging_attempt = std::nullopt);
+  [[nodiscard]] ManagerNamedApplyResult ContinueOriginalConfiguration(
+      const PersistedManagerApplyIntent &intent, bool request_replayed);
+  [[nodiscard]] ManagerNamedApplyResult FinishOriginalConfigurationPublication(
+      const PersistedManagerApplyIntent &intent, bool request_replayed);
   [[nodiscard]] manyforge::core::ApplyId MintApplyId();
 
   SqliteManagerApplyJournal &apply_journal_;
@@ -155,6 +216,9 @@ private:
       &retained_bundle_source_;
   const manyforge::deployment::IVerifiedRetainedProductArtifactSource
       &artifact_source_;
+  // Borrow the existing constructor-supplied publication store as a reader.
+  // Its lifetime already covers this coordinator and the nested consumers.
+  const manyforge::core::IActiveBundlePublicationReader &publication_reader_;
   manyforge::core::IManagerSceneProjectionMaintenancePort &scene_owner_;
   manyforge::core::IManagerKernelApplyFencePort &kernel_fence_;
   manyforge::core::IKernelCellAdmissionPort &cell_admission_;

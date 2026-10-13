@@ -120,7 +120,7 @@ def test_explicit_prefix_only_changes_mock_rsp_frames(tmp_path, prefix):
     "gripper_name",
     ["lite_gripper_controller", "robotiq_gripper_controller", "authored_tool_controller"],
 )
-def test_optional_authored_gripper_starts_active_on_the_same_manager(tmp_path, gripper_name):
+def test_optional_authored_gripper_starts_inactive_on_the_same_manager(tmp_path, gripper_name):
     nodes = _module().launch_setup(_context(tmp_path, gripper_name=gripper_name))
     assert len(nodes) == 5
     assert nodes[3]._Node__arguments == [
@@ -129,7 +129,7 @@ def test_optional_authored_gripper_starts_active_on_the_same_manager(tmp_path, g
     ]
     assert nodes[4]._Node__node_executable == "spawner"
     assert nodes[4]._Node__arguments == [
-        gripper_name, "--controller-manager", "/fixture/arm/control",
+        gripper_name, "--inactive", "--controller-manager", "/fixture/arm/control",
         "--param-file", str(tmp_path / "controllers.yaml"),
     ]
     # Generated description/controllers remain the only joint/seed source.

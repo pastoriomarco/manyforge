@@ -110,6 +110,13 @@ struct RuntimeCollisionLookaheadResult {
   std::optional<std::int64_t> first_failing_waypoint;
   std::optional<std::int64_t> first_failing_time_ns;
   std::optional<CollisionPairId> first_failing_pair;
+  /// Presence describes work actually performed, never validity/authority.
+  bool job_context_observed = false;
+  bool selection_computed = false;
+  bool validation_completed = false;
+  /// Fixed-key input diagnostics populated only at the check that reads them.
+  /// Separate from potentially large engine evidence at the Stop handoff.
+  std::map<std::string, std::string> checked_input_details;
   /// Bounded diagnostics from the first failing collision-engine record.
   /// Populated only for a collision or inconclusive result, off the immediate
   /// runtime-monitor path.
