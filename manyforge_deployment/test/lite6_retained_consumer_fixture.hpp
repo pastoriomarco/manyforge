@@ -55,7 +55,7 @@ materialize_lite6_retained_consumer_fixture_from(const std::filesystem::path& pa
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_lite6_retained_consumer_fixture(const std::filesystem::path& package_root) {
   return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_controllable_retention_fixture());
+      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture());
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
@@ -121,6 +121,27 @@ materialize_lite6_native_arm_only_cclc_product_retained_consumer_fixture(
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_ros2_control_arm_only_cclc_product_retained_consumer_fixture(
+    const std::filesystem::path& package_root,
+    std::string_view lifecycle_semantic_digest) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_ros2_control_arm_only_cclc_product_retention_fixture(
+                        lifecycle_semantic_digest));
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_ros2_control_cclc_product_retained_consumer_fixture(
+    const std::filesystem::path& package_root,
+    std::string_view lifecycle_semantic_digest,
+    bool gripper_feedback = false,
+    std::optional<double> initial_joint1_position_rad = std::nullopt) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_ros2_control_cclc_product_retention_fixture(
+                        lifecycle_semantic_digest, gripper_feedback,
+                        initial_joint1_position_rad));
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_lite6_native_cclc_product_retained_consumer_fixture(
     const std::filesystem::path& package_root, std::string_view arm_lifecycle_semantic_digest,
     std::string_view gripper_lifecycle_semantic_digest, bool gripper_feedback = false,
@@ -139,6 +160,41 @@ materialize_lite6_native_gripper_only_cclc_product_retained_consumer_fixture(
   return materialize_lite6_retained_consumer_fixture_from(
       package_root, make_lite6_native_gripper_only_cclc_product_retention_fixture(
                         arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest));
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_ros2_control_retained_consumer_fixture(
+    const std::filesystem::path& package_root) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture());
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
+    const std::filesystem::path& package_root) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture({}, 1U, true));
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(
+    const std::filesystem::path& package_root) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture({}, 1U, true, true));
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
+    const std::filesystem::path& package_root, std::string_view cell_id) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture(cell_id, 1U, false, false));
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
+    const std::filesystem::path& package_root, std::string_view cell_id) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture(cell_id, 2U, false, false));
 }
 
 }  // namespace manyforge::deployment::test

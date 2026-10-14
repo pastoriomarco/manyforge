@@ -78,4 +78,11 @@ generate_native_empty_package(const std::filesystem::path &output_root,
                               const core::CellId &cell_id,
                               std::string_view runtime_profile_bytes);
 
+/// The same workbench infrastructure producer for the qualified empty ROS host.
+/// It owns no controller, model, Program or authored world.
+[[nodiscard]] CanonicalEmptyRetainedBundleAdmission
+generate_ros_empty_package(const std::filesystem::path &output_root,
+                          const core::CellId &cell_id,
+                          std::string_view runtime_profile_bytes);
+
 } // namespace manyforge::deployment::detail

@@ -1,3 +1,5 @@
+#include <manyforge_deployment/execution_runtime_contract.hpp>
+#include <manyforge_roboplan/execution_runtime_qualification.hpp>
 #include "retained_native_runtime_internal.hpp"
 #include <algorithm>
 #include <cmath>
@@ -181,23 +183,6 @@ inline constexpr std::string_view kNoActiveGoalEvidenceDomain =
     "native-no-active-goal-evidence-digest";
 inline constexpr std::string_view kNoActiveGoalEvidenceApiVersion =
     "manyforge.native-no-active-goal-evidence.v1";
-
-[[nodiscard]] RetainedObservedStateChannelConfig
-native_state_config(const core::RuntimeParticipantBinding &binding) {
-  const auto &value = binding.value();
-  if (!value.control_path.has_value() ||
-      value.control_path->state_authority_class !=
-          core::StateAuthorityClass::kPredicted) {
-    throw std::invalid_argument(
-        "native simulated runtime requires a predicted state authority");
-  }
-  return RetainedObservedStateChannelConfig{
-      core::ObservedStateSourceKind::kPredictedState,
-      "roboplan_native/" + value.controllable_component_id.value() + "/" +
-          value.command_target_id.value() + "/" +
-          value.control_path->control_binding_revision.value(),
-      0, 1U};
-}
 
 void require_planner_binding(
     const core::RuntimeParticipantBinding &runtime,
@@ -1095,11 +1080,13 @@ namespace detail {
 
 RetainedObservedStateChannelConfig select_retained_state_channel_config(
     std::optional<RetainedObservedStateChannelConfig> selected,
-    const core::RuntimeParticipantBinding &binding) {
+    const core::RuntimeParticipantBinding &) {
   if (selected.has_value()) {
     return std::move(*selected);
   }
-  return native_state_config(binding);
+  throw std::invalid_argument(
+      "retained runtime execution adapter set is incomplete or owns a "
+      "second state authority");
 }
 
 } // namespace detail
@@ -1252,8 +1239,7 @@ create_retained_native_runtime_participants(
             core::RuntimeScaleAcknowledgementKind::kAppliedState ||
         runtime_scale.coordinated_barrier_id.has_value() ||
         runtime_scale.maximum_slew_per_second !=
-            RoboPlanExecutionBackend::
-                qualified_runtime_scale_slew_per_second()) {
+            qualified_runtime_scale_slew_per_second()) {
       throw std::invalid_argument("native motion runtime-scale qualification "
                                   "differs from the selected mechanism");
     }
@@ -1353,7 +1339,7 @@ create_retained_native_runtime_participants(
         motion_value.command_target_id.value());
     if (!limits.ok())
       throw std::invalid_argument(limits.error().message);
-    auto profile = deployment::native_execution_runtime_contract::
+    auto profile = deployment::execution_runtime_contract::
         resolve_ordinary_motion_jerk_policy(
             *input.ordinary_motion_jerk,
             runtime->motion_binding.value().resources, limits.value());
@@ -1427,33 +1413,6 @@ create_retained_native_runtime_participants(
     runtime->gripper_stop_execution_port = selected.gripper_stop_execution_port;
     runtime->rebind_motion_route = std::move(selected.rebind_motion_route);
     runtime->rebind_gripper_route = std::move(selected.rebind_gripper_route);
-  } else {
-    auto native_execution = std::make_shared<RoboPlanExecutionBackend>(
-        runtime->motion_binding, runtime->motion_state_channel, *runtime->clock,
-        *runtime->scheduler, std::move(config.execution));
-    runtime->execution = native_execution;
-    runtime->rebind_motion_route =
-        [native_execution](
-            core::RuntimeParticipantBinding binding,
-            std::vector<core::RuntimeParticipantBinding> program_aliases) {
-          return native_execution->RebindRoute(std::move(binding),
-                                               std::move(program_aliases));
-        };
-    if (runtime->gripper_binding.has_value()) {
-      auto native_gripper = std::make_shared<RetainedGripperCommandBackend>(
-          *runtime->gripper_binding, runtime->gripper_state_channel,
-          runtime->gripper_position_limits, *runtime->clock,
-          *runtime->scheduler, config.gripper_update_period_ns);
-      runtime->gripper = native_gripper;
-      runtime->gripper_stop_execution_port = native_gripper.get();
-      runtime->rebind_gripper_route =
-          [native_gripper](
-              core::RuntimeParticipantBinding binding,
-              std::shared_ptr<IRetainedObservedStateChannel> state_channel) {
-            return native_gripper->RebindRoute(std::move(binding),
-                                               std::move(state_channel));
-          };
-    }
   }
   if (!runtime->execution || !runtime->rebind_motion_route ||
       runtime->execution->observed_robot_state_publication() !=

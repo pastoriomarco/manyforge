@@ -421,7 +421,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<std::unique_ptr<ICellCloseAdmissionLease>>
   AcquireCellCloseAdmissionLease() override;
   [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
-  [[nodiscard]] bool has_external_route_recovery_claims() const;
   [[nodiscard]] Result<void> SetRouteRecoveryPending(bool pending);
   [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
       const CellAdmissionReadinessSnapshotDTO& snapshot) override;

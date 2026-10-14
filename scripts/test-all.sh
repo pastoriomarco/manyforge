@@ -193,7 +193,7 @@ build_manyforge_component_manager() {
 
 build_manyforge_headless() {
     local build="$1"
-    local native_execution_host="$2"
+    local ros_execution_host="$2"
     local pybind11_cmake_dir
     pybind11_cmake_dir="$(
         python3 -c 'import pybind11; print(pybind11.get_cmake_dir())'
@@ -204,7 +204,7 @@ build_manyforge_headless() {
         -DBUILD_TESTING=ON \
         -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
         -Dpybind11_DIR="$pybind11_cmake_dir" \
-        -DMANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="$native_execution_host" \
+        -DMANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="$ros_execution_host" \
         -DMANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
 }
@@ -318,6 +318,7 @@ configure_roboplan_build() {
         return
     fi
 
+    source_ros_integration_environment
     local pinocchio_cmake_dir
     pinocchio_cmake_dir="$(
         python3 - <<'PY'
@@ -362,6 +363,7 @@ PY
         BOOST_LIBRARYDIR="${boost_root:+${boost_root}/lib}" \
         cmake "$WORKSPACE/manyforge_roboplan" -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=ON \
+        -DMANYFORGE_BUILD_ROS2_CONTROL_RUNTIME=ON \
         -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S"; then
         echo -e "${RED}  FAIL: RoboPlan producer configure failed${NC}"
         return 1
@@ -374,25 +376,36 @@ build_headless_roboplan_producer_closure() {
     if [[ "$ROBOPLAN_HEADLESS_PRODUCER_BUILD" == "$build" ]]; then
         return
     fi
-    if ! configure_roboplan_build; then
+    if ! MANYFORGE_ROS2_CONTROL_BUILD_TESTING=ON \
+        MANYFORGE_ROS2_CONTROL_BUILD_ROOT="$BUILD_DIR/isaac" \
+        MANYFORGE_ROBOPLAN_BUILD_DIR="$build" \
+        CMAKE_GENERATOR="$BUILD_GENERATOR" \
+        MANYFORGE_ROS2_CONTROL_BUILD_KEEP_GOING=ON \
+        CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_PARALLEL_LEVEL" \
+        bash "$WORKSPACE/scripts/ros/build-ros2-control-runtime.sh" \
+            --target manyforge_ros2_control_execution_host \
+            --target manyforge_ros2_control_execution_host_pick_place_planning_fixture \
+            --target manyforge_ros2_control_execution_host_admission_fixture \
+            --target manyforge_ros2_control_execution_host_projection_fixture \
+            --target manyforge_roboplan_candidate_worker \
+            --topic-install "$ROS_INTEGRATION_TOPIC_INSTALL" \
+            --data-overlay "$ROS_INTEGRATION_DATA_OVERLAY"; then
+        echo -e "${RED}  FAIL: ROS producer closure build failed${NC}"
         return 1
     fi
-    local producer_targets=(
-        manyforge_native_execution_host
-        manyforge_native_execution_host_pick_place_planning_fixture
-        manyforge_roboplan_candidate_worker
-    )
-    set_build_keep_going_args "$build" || return 1
-    if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" \
-        --target "${producer_targets[@]}" -- "${BUILD_KEEP_GOING_ARGS[@]}"; then
-        echo -e "${RED}  FAIL: RoboPlan producer closure build failed${NC}"
-        return 1
-    fi
+    ROBOPLAN_CONFIGURED_BUILD="$build"
+    source_ros_integration_environment
+    set +u
+    # shellcheck disable=SC1090
+    source "$BUILD_DIR/isaac/ros-overlay/install/setup.bash"
+    set -u
 
     local producer_input
     for producer_input in \
-        "$build/manyforge_native_execution_host" \
-        "$build/manyforge_native_execution_host_pick_place_planning_fixture" \
+        "$build/manyforge_ros2_control_execution_host" \
+        "$build/manyforge_ros2_control_execution_host_pick_place_planning_fixture" \
+        "$build/manyforge_ros2_control_execution_host_admission_fixture" \
+        "$build/ros_projection_host_fixture/manyforge_ros2_control_execution_host" \
         "$build/manyforge_roboplan_candidate_worker"; do
         if [[ ! -f "$producer_input" ]]; then
             echo -e "${RED}  FAIL: RoboPlan producer closure did not create ${producer_input}${NC}"
@@ -402,7 +415,7 @@ build_headless_roboplan_producer_closure() {
     ROBOPLAN_HEADLESS_PRODUCER_BUILD="$build"
 }
 
-require_headless_native_packages() {
+require_headless_runtime_packages() {
     local build="$1"
     local package_metadata
     for package_metadata in \
@@ -410,7 +423,7 @@ require_headless_native_packages() {
         "$build/manager-apply-o1-4g-replacement-fixture/metadata.json" \
         "$build/assistant-native-test-fixture/metadata.json"; do
         if [[ ! -f "$package_metadata" ]]; then
-            echo -e "${RED}  FAIL: Headless native package was not generated: ${package_metadata}${NC}"
+            echo -e "${RED}  FAIL: Headless runtime package was not generated: ${package_metadata}${NC}"
             return 1
         fi
     done
@@ -464,16 +477,16 @@ run_roboplan_tests() {
 run_headless_cpp_tests() {
     section "C++ I5/H0 headless owner tests"
     local build="$BUILD_DIR/headless"
-    local native_execution_host="$BUILD_DIR/roboplan/manyforge_native_execution_host"
+    local ros_execution_host="$BUILD_DIR/roboplan/manyforge_ros2_control_execution_host"
     build_headless_roboplan_producer_closure
-    build_manyforge_headless "$build" "$native_execution_host"
+    build_manyforge_headless "$build" "$ros_execution_host"
     cd "$build"
     if ! require_ctest_tests "manyforge_headless" \
         "ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop" \
         "ManagerDaemonProcess.NamedApplyUsesTheRealManagedFenceAndSurvivesReplacement" \
         "ManagerDaemonProcess.PhysicalCompositionStaysClosedAfterUnexpectedChildLossAndManagerReplacement"; then
         FAIL=$((FAIL + 1))
-    elif ! require_headless_native_packages "$build"; then
+    elif ! require_headless_runtime_packages "$build"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
@@ -514,7 +527,7 @@ run_headless_python_tests() {
         MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/ui6i-dual-scenario-fixture/retained-package" \
         MANYFORGE_ACTIVATION_PREPARER="$BUILD_DIR/deployment/manyforge_prepare_activation" \
         MANYFORGE_EXAMPLE_SCENARIO_ROOT="$WORKSPACE/examples" \
-        MANYFORGE_NATIVE_EXECUTION_HOST="$BUILD_DIR/roboplan/manyforge_native_execution_host" \
+        MANYFORGE_ROS2_CONTROL_EXECUTION_HOST="$BUILD_DIR/roboplan/manyforge_ros2_control_execution_host" \
         MANYFORGE_ROBOPLAN_CANDIDATE_WORKER="$BUILD_DIR/roboplan/manyforge_roboplan_candidate_worker" \
         pytest \
             manyforge_headless_api/tests/ \
@@ -802,19 +815,17 @@ run_ros_e2e_tests() {
     local overlay="$build_root/ros-overlay/install/setup.bash"
     local headless="$BUILD_DIR/headless"
     local helper_status=0
-    # One ROS-enabled graph supplies the ROS host and, like the workbench's
-    # ROS mode, the native host and planner worker installed beside it. The
-    # Headless build that supplies Manager requires the test-only planning
-    # fixture host beside its configured native host, hence BUILD_TESTING=ON;
-    # only the named targets are built.
+    # One ROS graph supplies Manager's host, planner worker and the real ROS
+    # fixture hosts. Only the named targets are built.
     MANYFORGE_ROS2_CONTROL_BUILD_TESTING=ON \
     MANYFORGE_ROS2_CONTROL_BUILD_ROOT="$build_root" \
     CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_PARALLEL_LEVEL" \
         bash "$WORKSPACE/scripts/ros/build-ros2-control-runtime.sh" \
             --target manyforge_ros2_control_execution_host \
             --target manyforge_roboplan_candidate_worker \
-            --target manyforge_native_execution_host \
-            --target manyforge_native_execution_host_pick_place_planning_fixture \
+            --target manyforge_ros2_control_execution_host_pick_place_planning_fixture \
+            --target manyforge_ros2_control_execution_host_admission_fixture \
+            --target manyforge_ros2_control_execution_host_projection_fixture \
             --topic-install "$ROS_INTEGRATION_TOPIC_INSTALL" \
             --data-overlay "$ROS_INTEGRATION_DATA_OVERLAY" || helper_status=$?
     if (( helper_status != 0 )); then
@@ -829,7 +840,7 @@ run_ros_e2e_tests() {
     if ! cmake -S "$WORKSPACE/manyforge_headless" -B "$headless" -G "$BUILD_GENERATOR" \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
             -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON -Dpybind11_DIR="$pybind11_cmake_dir" \
-            -DMANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="$ros_build/manyforge_native_execution_host" \
+            -DMANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="$ros_build/manyforge_ros2_control_execution_host" \
             -DMANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" \
         || ! cmake --build "$headless" --parallel "$BUILD_PARALLEL_LEVEL"; then
         echo -e "${RED}  FAIL: Headless build failed${NC}"
@@ -879,7 +890,6 @@ PY_LAUNCH
          MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/ui6i-dual-scenario-fixture/retained-package" \
          MANYFORGE_ACTIVATION_PREPARER="$BUILD_DIR/deployment/manyforge_prepare_activation" \
          MANYFORGE_EXAMPLE_SCENARIO_ROOT="$WORKSPACE/examples" \
-         MANYFORGE_NATIVE_EXECUTION_HOST="$ros_build/manyforge_native_execution_host" \
          MANYFORGE_ROBOPLAN_CANDIDATE_WORKER="$ros_build/manyforge_roboplan_candidate_worker" \
          MANYFORGE_ROS2_CONTROL_EXECUTION_HOST="$ros_build/manyforge_ros2_control_execution_host" \
          MANYFORGE_PROCESS_TEST_EVIDENCE_ROOT="$evidence"

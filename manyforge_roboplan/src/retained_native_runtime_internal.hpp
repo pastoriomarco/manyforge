@@ -7,8 +7,7 @@
 
 namespace manyforge::roboplan_backend::detail {
 
-/// Select the product-owned state channel configuration without evaluating
-/// the native predicted-state fallback unless no product selection exists.
+/// Select the product-owned state channel configuration.
 [[nodiscard]] RetainedObservedStateChannelConfig
 select_retained_state_channel_config(
     std::optional<RetainedObservedStateChannelConfig> selected,

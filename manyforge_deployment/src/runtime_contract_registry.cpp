@@ -263,8 +263,6 @@ std::vector<RuntimeContractDeclaration>
 RuntimeContractDeclarationRegistry::make_rows() {
   const std::string reference_product_revision =
       detail::reference_runtime_product_contract_revision().value();
-  const std::string native_product_revision =
-      detail::native_execution_runtime_product_contract_revision().value();
   const std::string ros_product_revision =
       detail::ros2_control_execution_runtime_product_contract_revision().value();
   std::vector<RuntimeContractDeclaration> rows;
@@ -289,36 +287,6 @@ RuntimeContractDeclarationRegistry::make_rows() {
       {endpoint_mapping(detail::kReferenceRuntimeStatusEndpointRoleId,
                         detail::kReferenceRuntimeStatusApiContractId,
                         "reference-runtime")}));
-  rows.push_back(RuntimeContractDeclaration(
-      core::RuntimeProfileId(std::string(detail::kNativeExecutionRuntimeProfileId)),
-      core::RuntimeProfileRevision(detail::native_execution_runtime_profile_revision()),
-      core::ProductContractId(std::string(detail::kNativeExecutionRuntimeProductContractId)),
-      core::ProductContractRevision(native_product_revision),
-      make_offer(detail::kNativeExecutionRuntimeImplementationId,
-                 {core::ApiContractId(
-                      std::string(native_execution_runtime_contract::kRuntimeRoleApiContractId)),
-                  core::ApiContractId(
-                      std::string(native_execution_runtime_contract::kStatusEndpointApiContractId)),
-                  core::ApiContractId(std::string(
-                      native_execution_runtime_contract::kProjectionEndpointApiContractId)),
-                  core::ApiContractId(std::string(
-                      native_execution_runtime_contract::kLogicalSceneEndpointApiContractId))},
-                 declared_capabilities(
-                     runtime_contract_capabilities::kExecutionServices,
-                     runtime_contract_capabilities::kLogicalSceneServices,
-                     std::array<std::string_view, 1U>{"execution.runtime_scale.operation_scoped"})),
-      {role_mapping(detail::kNativeExecutionRuntimeRoleId,
-                    native_execution_runtime_contract::kRuntimeRoleApiContractId,
-                    "native-execution-host")},
-      {endpoint_mapping(detail::kNativeExecutionRuntimeStatusEndpointRoleId,
-                        native_execution_runtime_contract::kStatusEndpointApiContractId,
-                        "native-execution-host"),
-       endpoint_mapping(detail::kNativeExecutionRuntimeProjectionEndpointRoleId,
-                        native_execution_runtime_contract::kProjectionEndpointApiContractId,
-                        "native-execution-host"),
-       endpoint_mapping(detail::kNativeExecutionRuntimeLogicalSceneEndpointRoleId,
-                        native_execution_runtime_contract::kLogicalSceneEndpointApiContractId,
-                        "native-execution-host")}));
   rows.push_back(RuntimeContractDeclaration(
       core::RuntimeProfileId(
           std::string(detail::kRos2ControlExecutionRuntimeProfileId)),

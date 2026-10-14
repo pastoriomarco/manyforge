@@ -1,4 +1,5 @@
 #include "manyforge_component_manager/native_execution_runtime_unit_admission.hpp"
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 
 #include <algorithm>
 #include <limits>
@@ -116,19 +117,6 @@ struct RuntimeContractFacts final {
 
 [[nodiscard]] RuntimeContractFacts
 RequireRuntimeContract(const std::string_view product_contract_id) {
-  if (product_contract_id == native_contract::kProductContractId) {
-    return {native_contract::kProductContractId,
-            native_contract::kImplementationId,
-            native_contract::implementation_revision(),
-            native_contract::kInstalledTargetId,
-            native_contract::kCandidateWorkerInstalledTargetId,
-            native_contract::kRuntimeRoleId,
-            native_contract::kStatusEndpointRoleId,
-            native_contract::kStatusEndpointContractId,
-            native_contract::kProcessAdapterContractId,
-            native_contract::kRetrievalContractId,
-            OfferDigestForFamily(native_contract::kImplementationId)};
-  }
   if (product_contract_id == ros2_control_contract::kProductContractId) {
     return {ros2_control_contract::kProductContractId,
             ros2_control_contract::kImplementationId,

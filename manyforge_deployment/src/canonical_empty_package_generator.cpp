@@ -415,10 +415,16 @@ generate_canonical_empty_package(const std::filesystem::path &output_root) {
   }
 }
 
-CanonicalEmptyRetainedBundleAdmission generate_native_empty_package(
+namespace {
+
+CanonicalEmptyRetainedBundleAdmission generate_execution_empty_package_impl(
     const std::filesystem::path &output_root, const core::CellId &cell_id,
-    std::string_view runtime_profile_bytes) {
+    std::string_view runtime_profile_bytes, bool ros2_control) {
   using Object = CanonicalValue::Object;
+  const std::string_view lane = ros2_control ? "ROS" : "native";
+  const auto profile_id = ros2_control
+      ? ros2_control_execution_runtime_contract::kRuntimeProfileId
+      : native_execution_runtime_contract::kRuntimeProfileId;
   // Validate before creating any artifact repositories or admission locator.
   const auto &cell_text = cell_id.value();
   if (cell_text.empty() || cell_text.size() > 128U ||
@@ -427,7 +433,7 @@ CanonicalEmptyRetainedBundleAdmission generate_native_empty_package(
         return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
                c == '_' || c == '-' || c == '.';
       })) {
-    fail("native bootstrap cell_id must be a bounded portable identifier");
+    fail(std::string(lane) + " bootstrap cell_id must be a bounded portable identifier");
   }
   const auto root = normalize_canonical_empty_package_root(output_root);
   const auto parsed = parse_strict_json_model_yaml(runtime_profile_bytes);
@@ -436,7 +442,7 @@ CanonicalEmptyRetainedBundleAdmission generate_native_empty_package(
   const auto *schema = build_qualified_closed_schema_registry()
                            .find_catalog_schema_family(kind);
   if (schema == nullptr || schema->compiled_schema() == nullptr) {
-    fail("native bootstrap runtime profile schema is unavailable");
+    fail(std::string(lane) + " bootstrap runtime profile schema is unavailable");
   }
   const std::string digest = sha256_digest(runtime_profile_bytes);
   const core::RuntimeProfileCatalogRecordRefDTO reference{
@@ -445,13 +451,15 @@ CanonicalEmptyRetainedBundleAdmission generate_native_empty_package(
       core::SchemaId("manyforge.runtime_profile.v1"),
       schema->compiled_schema()->schema_revision(),
       core::ContentDigest(digest),
-      core::ContentAddressedStoreKey("catalog/native-bootstrap/" + digest.substr(7U)),
+      core::ContentAddressedStoreKey(
+          std::string(ros2_control ? "catalog/ros-bootstrap/"
+                                  : "catalog/native-bootstrap/") + digest.substr(7U)),
   };
   const auto profile = resolve_and_qualify_runtime_profile(
       reference, reference.content_addressed_store_key, runtime_profile_bytes);
-  if (profile.value().runtime_profile_id.value() !=
-      native_execution_runtime_contract::kRuntimeProfileId) {
-    fail("native bootstrap requires the native execution profile");
+  if (profile.value().runtime_profile_id.value() != profile_id) {
+    fail(std::string(lane) + " bootstrap requires the " +
+         (ros2_control ? "ROS" : "native") + " execution profile");
   }
   const std::vector<QualifiedRuntimeProfile> profiles{profile};
   const CanonicalValue catalog_reference(Object{
@@ -465,11 +473,15 @@ CanonicalEmptyRetainedBundleAdmission generate_native_empty_package(
   });
   // These are workbench infrastructure settings, not controller defaults.
   // An incompatible infrastructure change remains a pre-effect Apply refusal.
+  const auto authored_deployment = ros2_control
+      ? ros2_control_execution_runtime_contract::empty_host_deployment(
+            cell_id, catalog_reference, "ros_workbench_bootstrap",
+            "ROS workbench infrastructure")
+      : native_execution_runtime_contract::empty_host_deployment(
+            cell_id, catalog_reference, "native_workbench_bootstrap",
+            "Native workbench infrastructure");
   const auto deployment = compute_deployment_artifact_revision(
-      parse_strict_json_model_yaml(canonical_json(
-          native_execution_runtime_contract::empty_host_deployment(
-              cell_id, catalog_reference, "native_workbench_bootstrap",
-              "Native workbench infrastructure"))), profiles);
+      parse_strict_json_model_yaml(canonical_json(authored_deployment)), profiles);
   const auto qualified = compile_fixed_deployment(deployment, profiles);
   FilesystemBuildManifestRepository manifests(root);
   FilesystemRawArtifactStore artifacts(root);
@@ -494,11 +506,34 @@ CanonicalEmptyRetainedBundleAdmission generate_native_empty_package(
   } source(reference, runtime_profile_bytes);
   const auto bundle = RetainedBundleMaterializer::materialize_store_and_reload_production(
       qualified, manifests, source, {}, catalogs, artifacts, bundles);
-  if (bundle == nullptr) fail("native bootstrap retained product is unavailable");
-  static_cast<void>(native_execution_runtime_contract::require_configuration(
-      *bundle, bundle->value().cell_graph.runtime_units.front().runtime_unit_id));
+  if (bundle == nullptr) fail(std::string(lane) + " bootstrap retained product is unavailable");
+  const auto &runtime_id =
+      bundle->value().cell_graph.runtime_units.front().runtime_unit_id;
+  if (ros2_control) {
+    static_cast<void>(ros2_control_execution_runtime_contract::require_configuration(
+        *bundle, runtime_id));
+  } else {
+    static_cast<void>(native_execution_runtime_contract::require_configuration(
+        *bundle, runtime_id));
+  }
   return publish_cell_scoped_canonical_empty_admission(
       root, cell_scoped_canonical_empty_admission_filename(cell_id), *bundle);
+}
+
+} // namespace
+
+CanonicalEmptyRetainedBundleAdmission generate_native_empty_package(
+    const std::filesystem::path &output_root, const core::CellId &cell_id,
+    std::string_view runtime_profile_bytes) {
+  return generate_execution_empty_package_impl(output_root, cell_id,
+                                               runtime_profile_bytes, false);
+}
+
+CanonicalEmptyRetainedBundleAdmission generate_ros_empty_package(
+    const std::filesystem::path &output_root, const core::CellId &cell_id,
+    std::string_view runtime_profile_bytes) {
+  return generate_execution_empty_package_impl(output_root, cell_id,
+                                               runtime_profile_bytes, true);
 }
 
 } // namespace manyforge::deployment::detail

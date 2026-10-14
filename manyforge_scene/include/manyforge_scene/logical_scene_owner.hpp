@@ -45,39 +45,39 @@ inline constexpr std::size_t kMaximumLogicalSceneTransactions = 256U;
 inline constexpr std::size_t kMaximumLogicalSceneTransactionBytes =
     128U * 1024U;
 
-class CanonicalEmptySceneOwnerError : public std::runtime_error {
+class LogicalSceneOwnerError : public std::runtime_error {
 public:
   using std::runtime_error::runtime_error;
 };
 
-class CanonicalEmptySceneOwnerConflictError final
-    : public CanonicalEmptySceneOwnerError {
+class LogicalSceneOwnerConflictError final
+    : public LogicalSceneOwnerError {
 public:
-  using CanonicalEmptySceneOwnerError::CanonicalEmptySceneOwnerError;
+  using LogicalSceneOwnerError::LogicalSceneOwnerError;
 };
 
-class CanonicalEmptySceneOwnerIntegrityError final
-    : public CanonicalEmptySceneOwnerError {
+class LogicalSceneOwnerIntegrityError final
+    : public LogicalSceneOwnerError {
 public:
-  using CanonicalEmptySceneOwnerError::CanonicalEmptySceneOwnerError;
+  using LogicalSceneOwnerError::LogicalSceneOwnerError;
 };
 
-class CanonicalEmptySceneOwnerLimitError final
-    : public CanonicalEmptySceneOwnerError {
+class LogicalSceneOwnerLimitError final
+    : public LogicalSceneOwnerError {
 public:
-  using CanonicalEmptySceneOwnerError::CanonicalEmptySceneOwnerError;
+  using LogicalSceneOwnerError::LogicalSceneOwnerError;
 };
 
-class CanonicalEmptySceneOwnerBusyError final
-    : public CanonicalEmptySceneOwnerError {
+class LogicalSceneOwnerBusyError final
+    : public LogicalSceneOwnerError {
 public:
-  using CanonicalEmptySceneOwnerError::CanonicalEmptySceneOwnerError;
+  using LogicalSceneOwnerError::LogicalSceneOwnerError;
 };
 
-class CanonicalEmptySceneOwnerClosedError final
-    : public CanonicalEmptySceneOwnerError {
+class LogicalSceneOwnerClosedError final
+    : public LogicalSceneOwnerError {
 public:
-  using CanonicalEmptySceneOwnerError::CanonicalEmptySceneOwnerError;
+  using LogicalSceneOwnerError::LogicalSceneOwnerError;
 };
 
 enum class CanonicalEmptySceneBootstrapPhase {
@@ -167,32 +167,32 @@ using QualifiedSceneConfigurationAdoptionRequest =
 /// removed predecessor/candidate Stage/Activate/Finalize protocol. This owner
 /// implements no compatibility wrapper, robot command, authorization layer,
 /// or legacy SceneAuthority fallback.
-class CanonicalEmptySceneOwner final
+class LogicalSceneOwner final
     : public manyforge::core::IManagerSceneProjectionBootstrapPort,
       public manyforge::core::IManagerSceneProjectionMaintenancePort,
       public manyforge::core::ISceneAuthority,
       public manyforge::core::ISceneCandidatePreview {
 public:
-  CanonicalEmptySceneOwner(
+  LogicalSceneOwner(
       std::filesystem::path database_path,
       const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
           &admission,
       const manyforge::core::IActiveBundlePublicationReader
           &publication_reader);
-  CanonicalEmptySceneOwner(
+  LogicalSceneOwner(
       std::filesystem::path database_path,
       const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
           &admission,
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
       manyforge::core::IKernelCellAdmissionPort &cell_admission);
-  CanonicalEmptySceneOwner(
+  LogicalSceneOwner(
       std::filesystem::path database_path,
       const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
           &admission,
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
       const manyforge::deployment::IVerifiedRetainedBundleSource
           &retained_bundle_source);
-  CanonicalEmptySceneOwner(
+  LogicalSceneOwner(
       std::filesystem::path database_path,
       const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
           &admission,
@@ -201,7 +201,7 @@ public:
           &retained_bundle_source,
       const manyforge::core::IPlannerSceneProjectionResolver
           &projection_resolver);
-  CanonicalEmptySceneOwner(
+  LogicalSceneOwner(
       std::filesystem::path database_path,
       const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
           &admission,
@@ -211,13 +211,13 @@ public:
       const manyforge::core::IPlannerSceneProjectionResolver
           &projection_resolver,
       manyforge::core::IKernelCellAdmissionPort &cell_admission);
-  ~CanonicalEmptySceneOwner() override;
+  ~LogicalSceneOwner() override;
 
-  CanonicalEmptySceneOwner(CanonicalEmptySceneOwner &&) noexcept;
-  CanonicalEmptySceneOwner &operator=(CanonicalEmptySceneOwner &&) noexcept;
-  CanonicalEmptySceneOwner(const CanonicalEmptySceneOwner &) = delete;
-  CanonicalEmptySceneOwner &
-  operator=(const CanonicalEmptySceneOwner &) = delete;
+  LogicalSceneOwner(LogicalSceneOwner &&) noexcept;
+  LogicalSceneOwner &operator=(LogicalSceneOwner &&) noexcept;
+  LogicalSceneOwner(const LogicalSceneOwner &) = delete;
+  LogicalSceneOwner &
+  operator=(const LogicalSceneOwner &) = delete;
 
   [[nodiscard]] const std::filesystem::path &database_path() const noexcept;
   [[nodiscard]] const manyforge::core::ProjectionBootstrapPrerequisiteQueryDTO &

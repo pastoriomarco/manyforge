@@ -228,7 +228,12 @@ set_target_properties(manyforge_scene_value_codec PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
 add_library(manyforge_scene
-  src/canonical_empty_scene_owner.cpp
+  src/logical_scene_owner.cpp
+  src/logical_scene_owner_store.cpp
+  src/logical_scene_owner_transactions.cpp
+  src/logical_scene_owner_adoption.cpp
+  src/logical_scene_owner_claims.cpp
+  src/logical_scene_owner_health.cpp
   src/sqlite_scene_lifecycle_internal.cpp)
 add_library(manyforge::scene ALIAS manyforge_scene)
 target_include_directories(manyforge_scene PUBLIC
@@ -342,6 +347,7 @@ if(BUILD_TESTING OR MANYFORGE_SCENE_BUILD_TESTS_IN_CONSUMER)
     "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
   target_link_libraries(test_canonical_empty_scene_owner PRIVATE
     manyforge_scene
+    manyforge::scene_value_codec
     manyforge_deployment
     manyforge::deployment_admission
     SQLite::SQLite3

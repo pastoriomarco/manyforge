@@ -283,6 +283,18 @@ hardening done before the first tag was granted.
 
 ### Removed
 
+- **Native simulator execution core (major change).** Commit `1c5b9e39` is the
+  last commit that contains the native in-process (RoboPlan) execution
+  simulator and its native host lane. From the next commit on, every lane —
+  offline mock, Isaac Sim and real robots — executes through ROS 2
+  (`ros2_control` with the stock JointTrajectoryController; mock hardware for
+  the offline lane), as decided for the R4 shared-execution design. The
+  transition began earlier (custom controller plugin, in-loop motion step and
+  Isaac command gate already removed); this step deletes the simulator
+  backend, its lifecycle ports, the native host executables and their
+  native-only tests and configuration records. Lane-neutral components that
+  only carry "native" in their name (for example the cell runtime owner) and
+  every wire/durable identifier are kept.
 - **Legacy Viser/HMI stack**: `manyforge_hmi/`, `ViserPanel`, the `viser`
   dependency, launcher/compose wiring, and the HMI test lane are deleted; the
   native Composer viewer owns the operator and assistant-visible render

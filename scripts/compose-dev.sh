@@ -13,7 +13,7 @@ runtime_root=${MANYFORGE_DEV_RUNTIME_STATE_ROOT:-"$cache_base/runtime/$container
 retention_helper="$repo_root/scripts/lib/export_retention.py"
 project=
 bootstrap_project=
-ros2_control=false
+ros2_control=true
 started_container=false
 operator_instance=${MANYFORGE_DEV_LAUNCH_INSTANCE_ID:-}
 operator_digest=${MANYFORGE_DEV_LAUNCH_INPUT_DIGEST:-}
@@ -108,7 +108,7 @@ cleanup_failed_start() {
 trap cleanup_failed_start EXIT
 
 usage() {
-  echo "Usage: $0 start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] [--ros2-control] | status | stop [--keep-evidence]" >&2
+  echo "Usage: $0 start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | status | stop [--keep-evidence]" >&2
 }
 
 stop_with_evidence() {
@@ -290,10 +290,6 @@ case "$command" in
           project=$2
           shift 2
           ;;
-        --ros2-control)
-          ros2_control=true
-          shift
-          ;;
         --bootstrap-project)
           [[ $# -ge 2 ]] || { usage; exit 64; }
           bootstrap_project=$2
@@ -303,11 +299,7 @@ case "$command" in
       esac
     done
     if [[ -n "$bootstrap_project" && ( "$ros2_control" != true || -n "$project" ) ]]; then
-      echo "--bootstrap-project requires --ros2-control and excludes --project." >&2
-      exit 64
-    fi
-    if [[ "$operator_mode" != true && "$ros2_control" == true && -z "$project" && -z "$bootstrap_project" ]]; then
-      echo "--ros2-control requires --bootstrap-project or --project selecting the intended first Scenario." >&2
+      echo "--bootstrap-project requires ROS control and excludes --project." >&2
       exit 64
     fi
     if docker inspect "$container_ref" >/dev/null 2>&1; then
@@ -316,7 +308,7 @@ case "$command" in
         existing_ros=$(docker inspect -f '{{index .Config.Labels "manyforge.dev.ros2-control"}}' "$container_ref")
         if [[ "$existing_ros" == true && "$ros2_control" != true ]] ||
             [[ "$existing_ros" != true && "$ros2_control" == true ]]; then
-          echo "A workbench with different runtime capabilities is already running; stop it before changing --ros2-control." >&2
+          echo "A workbench with different runtime capabilities is already running; stop it before starting this ROS workbench." >&2
           exit 69
         fi
         if [[ -n "$bootstrap_project" ]]; then
@@ -415,7 +407,6 @@ case "$command" in
     ros_environment=()
     ros_identity=()
     if [[ "$ros2_control" == true ]]; then
-      serve_args+=(--ros2-control)
       # The full ROS image has its own development UID. Keep all bind-mounted
       # writes with the launching user's ownership, including npm/ROS caches.
       mkdir -p "$cache_root/home"

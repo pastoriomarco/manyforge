@@ -1,4 +1,5 @@
 #include "manyforge_deployment/verified_retained_bundle.hpp"
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -2817,7 +2818,7 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
           : detail::reference_runtime_retrieval_contract_revision(),
       (native_execution || ros2_control_execution)
           ? std::optional<core::ManagerLivenessPolicyDTO>(
-                native_execution_runtime_contract::manager_liveness_policy())
+                execution_runtime_contract::manager_liveness_policy())
           : std::nullopt);
 }
 

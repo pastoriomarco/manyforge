@@ -176,9 +176,7 @@ target_link_libraries(manyforge_roboplan_native_state_projection PUBLIC
 
 add_library(manyforge_roboplan_native_runtime_support
   src/native_runtime_support.cpp
-  src/retained_externally_managed_lifecycle_ports.cpp
-  src/retained_native_controller_lifecycle_port.cpp
-  src/retained_native_brand_lifecycle_port.cpp)
+  src/retained_externally_managed_lifecycle_ports.cpp)
 target_include_directories(manyforge_roboplan_native_runtime_support PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -262,18 +260,7 @@ target_link_libraries(manyforge_roboplan_controller_launch_process
   PUBLIC manyforge_roboplan_controller_launch_artifacts
   PRIVATE Threads::Threads)
 
-add_library(manyforge_roboplan_native_lifecycle_product
-  src/retained_native_lifecycle_product.cpp)
-target_include_directories(manyforge_roboplan_native_lifecycle_product PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
-target_link_libraries(manyforge_roboplan_native_lifecycle_product PUBLIC
-  manyforge_roboplan_native_runtime_support
-  manyforge_lite6_product
-  manyforge_deployment)
-
 add_library(manyforge_roboplan_native_gripper
-  src/retained_gripper_command_backend.cpp
   src/retained_native_gripper_runtime.cpp
   src/retained_native_gripper_route_publication_owner.cpp)
 target_include_directories(manyforge_roboplan_native_gripper PUBLIC
@@ -299,14 +286,6 @@ target_link_libraries(
   pinocchio::pinocchio
   roboplan::roboplan)
 
-add_library(manyforge_roboplan_native_execution
-  src/roboplan_execution_backend.cpp)
-target_include_directories(manyforge_roboplan_native_execution PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
-target_link_libraries(manyforge_roboplan_native_execution PUBLIC
-  manyforge_roboplan_native_state_projection
-  manyforge_roboplan_native_runtime_support)
 
 # The safety/fidelity algorithms were retained and qualified before the native
 # owner returned. I6 promotes the same implementations into the production
@@ -362,7 +341,6 @@ target_include_directories(manyforge_roboplan_native_runtime PUBLIC
 target_compile_definitions(manyforge_roboplan_native_runtime PRIVATE
   COAL_DISABLE_HPP_FCL_WARNINGS)
 target_link_libraries(manyforge_roboplan_native_runtime PUBLIC
-  manyforge_roboplan_native_execution
   manyforge_roboplan_native_focused_adapters
   manyforge_roboplan_native_gripper
   manyforge_roboplan_planner_backend
@@ -422,7 +400,6 @@ target_include_directories(manyforge_roboplan_native_cclc_runtime PUBLIC
 target_link_libraries(manyforge_roboplan_native_cclc_runtime PUBLIC
   manyforge_roboplan_native_runtime
   manyforge_roboplan_native_runtime_support
-  manyforge_roboplan_native_lifecycle_product
   manyforge::deployment_cclc_runtime_composition)
 
 add_library(manyforge_roboplan_worker_protocol STATIC
@@ -488,46 +465,19 @@ target_link_libraries(manyforge_roboplan_cell_admission_command_codec
   PUBLIC manyforge_component_manager manyforge::content_identity
   PRIVATE SQLite::SQLite3)
 
-# Selected composition root for the first complete addressed native path.
-# Its same-user Unix socket is a bounded private transport consumed by the
-# headless API; it is not a second public execution contract.
-add_executable(manyforge_native_execution_host
-  src/product_backed_runtime_participant_resolver.cpp
-  src/managed_projection_registry.cpp
-  src/native_execution_host_main.cpp)
-target_include_directories(manyforge_native_execution_host PRIVATE
-  "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
-target_compile_definitions(manyforge_native_execution_host PRIVATE
-  COAL_DISABLE_HPP_FCL_WARNINGS)
-target_link_libraries(manyforge_native_execution_host PRIVATE
-  manyforge_roboplan_managed_kernel_apply_fence
-  manyforge_roboplan_cell_admission_command_codec
-  manyforge_roboplan_native_cclc_runtime
-  manyforge_roboplan_native_runtime
-  manyforge_roboplan_process_candidate_client
-  manyforge_roboplan_retained_consumer
-  manyforge_roboplan_scene_factory
-  manyforge_component_manager
-  manyforge::content_identity
-  manyforge::scene
-  manyforge::scene_value_codec
-  manyforge_deployment
-  manyforge::persistence
-  SQLite::SQLite3
-  Threads::Threads)
-install(TARGETS
-  manyforge_native_execution_host
-  manyforge_roboplan_candidate_worker
-  RUNTIME DESTINATION bin)
+install(TARGETS manyforge_roboplan_candidate_worker RUNTIME DESTINATION bin)
 
 if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
-  # I9 keeps the native and ros2_control implementations as separate runtime
-  # products.  They share the retained host protocol and CCLC composition but
-  # never select an execution backend through an in-process runtime switch.
   add_executable(manyforge_ros2_control_execution_host
     src/product_backed_runtime_participant_resolver.cpp
     src/managed_projection_registry.cpp
-  src/native_execution_host_main.cpp)
+  src/execution_host_posix.cpp
+  src/execution_host_commands.cpp
+  src/execution_host_responses.cpp
+  src/execution_host_scene_bridge.cpp
+  src/execution_host_surface.cpp
+  src/ros_managed_runtime_host.cpp
+  src/ros_execution_host_main.cpp)
   target_include_directories(manyforge_ros2_control_execution_host PRIVATE
     "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
   target_compile_definitions(manyforge_ros2_control_execution_host PRIVATE
@@ -552,12 +502,10 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
   install(TARGETS manyforge_ros2_control_execution_host
     RUNTIME DESTINATION bin)
   message(STATUS
-    "manyforge_roboplan retained runtime: native execution remains available "
-    "and the I9 ros2_control adapter is a separate installed runtime product")
+    "manyforge_roboplan retained runtime: ros2_control execution is selected")
 else()
   message(STATUS
-    "manyforge_roboplan retained runtime: native execution is built; the I9 "
-    "ros2_control adapter seam is not selected in this build")
+    "manyforge_roboplan retained runtime: no execution host is selected in this build")
 endif()
 
 # Tests
@@ -568,32 +516,40 @@ if(BUILD_TESTING)
     include(GoogleTest)
     find_package(roboplan_example_models REQUIRED)
 
-    # Test-only variant of the exact native transport host. It joins the real
+    if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
+    # Test-only variant of the exact ROS transport host. It joins the real
     # addressed C++ pick/place planning owner to deterministic subordinate
     # ports so the Python/headless/Behavior/Composer process path can be
     # qualified without introducing a second production scene or runtime
     # owner. The installed host above never compiles this fixture.
-    add_executable(manyforge_native_execution_host_pick_place_planning_fixture
+    add_executable(manyforge_ros2_control_execution_host_pick_place_planning_fixture
       src/product_backed_runtime_participant_resolver.cpp
       src/managed_projection_registry.cpp
-      src/native_execution_host_main.cpp
+      src/execution_host_posix.cpp
+      src/execution_host_commands.cpp
+      src/execution_host_responses.cpp
+      src/execution_host_scene_bridge.cpp
+      src/execution_host_surface.cpp
+      src/ros_managed_runtime_host.cpp
+      src/ros_execution_host_main.cpp
       test/focused_pick_place_planning_fixture.cpp)
     target_include_directories(
-      manyforge_native_execution_host_pick_place_planning_fixture PRIVATE
+      manyforge_ros2_control_execution_host_pick_place_planning_fixture PRIVATE
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src"
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include"
       "${CMAKE_CURRENT_SOURCE_DIR}/test")
     target_compile_definitions(
-      manyforge_native_execution_host_pick_place_planning_fixture PRIVATE
+      manyforge_ros2_control_execution_host_pick_place_planning_fixture PRIVATE
       COAL_DISABLE_HPP_FCL_WARNINGS
       MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE=1
+      MANYFORGE_ROS2_CONTROL_EXECUTION_HOST=1
       MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE=1)
     target_link_libraries(
-      manyforge_native_execution_host_pick_place_planning_fixture PRIVATE
+      manyforge_ros2_control_execution_host_pick_place_planning_fixture PRIVATE
       manyforge_roboplan_managed_kernel_apply_fence
       manyforge_roboplan_cell_admission_command_codec
       manyforge_roboplan_native_cclc_runtime
-      manyforge_roboplan_native_runtime
+      manyforge_roboplan_ros2_control_runtime
       manyforge_roboplan_process_candidate_client
       manyforge_roboplan_retained_consumer
       manyforge_roboplan_scene_factory
@@ -609,23 +565,30 @@ if(BUILD_TESTING)
     # Compile-time-only standalone admission fixture. The installed native
     # host remains fail-closed without Manager liveness; this target supplies
     # deterministic Idle facts solely to exercise real CCLC claim mechanics.
-    add_executable(manyforge_native_execution_host_admission_fixture
+    add_executable(manyforge_ros2_control_execution_host_admission_fixture
       src/product_backed_runtime_participant_resolver.cpp
       src/managed_projection_registry.cpp
-  src/native_execution_host_main.cpp)
+  src/execution_host_posix.cpp
+  src/execution_host_commands.cpp
+  src/execution_host_responses.cpp
+  src/execution_host_scene_bridge.cpp
+  src/execution_host_surface.cpp
+  src/ros_managed_runtime_host.cpp
+  src/ros_execution_host_main.cpp)
     target_include_directories(
-      manyforge_native_execution_host_admission_fixture PRIVATE
+      manyforge_ros2_control_execution_host_admission_fixture PRIVATE
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
     target_compile_definitions(
-      manyforge_native_execution_host_admission_fixture PRIVATE
+      manyforge_ros2_control_execution_host_admission_fixture PRIVATE
       COAL_DISABLE_HPP_FCL_WARNINGS
-      MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE=1)
+      MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE=1
+      MANYFORGE_ROS2_CONTROL_EXECUTION_HOST=1)
     target_link_libraries(
-      manyforge_native_execution_host_admission_fixture PRIVATE
+      manyforge_ros2_control_execution_host_admission_fixture PRIVATE
       manyforge_roboplan_managed_kernel_apply_fence
       manyforge_roboplan_cell_admission_command_codec
       manyforge_roboplan_native_cclc_runtime
-      manyforge_roboplan_native_runtime
+      manyforge_roboplan_ros2_control_runtime
       manyforge_roboplan_process_candidate_client
       manyforge_roboplan_retained_consumer
       manyforge_roboplan_scene_factory
@@ -644,29 +607,36 @@ if(BUILD_TESTING)
     # installed host or the ordinary collision-projection library. Its product
     # output name lives in a dedicated directory consumed only by the focused
     # native adapter cases that request injection.
-    add_executable(manyforge_native_execution_host_projection_fixture
+    add_executable(manyforge_ros2_control_execution_host_projection_fixture
       src/product_backed_runtime_participant_resolver.cpp
       src/managed_projection_registry.cpp
-      src/native_execution_host_main.cpp
+      src/execution_host_posix.cpp
+      src/execution_host_commands.cpp
+      src/execution_host_responses.cpp
+      src/execution_host_scene_bridge.cpp
+      src/execution_host_surface.cpp
+      src/ros_managed_runtime_host.cpp
+      src/ros_execution_host_main.cpp
       src/retained_planner_scene_projection.cpp)
     set_target_properties(
-      manyforge_native_execution_host_projection_fixture PROPERTIES
-      OUTPUT_NAME manyforge_native_execution_host
+      manyforge_ros2_control_execution_host_projection_fixture PROPERTIES
+      OUTPUT_NAME manyforge_ros2_control_execution_host
       RUNTIME_OUTPUT_DIRECTORY
-        "${CMAKE_CURRENT_BINARY_DIR}/native_projection_host_fixture")
+        "${CMAKE_CURRENT_BINARY_DIR}/ros_projection_host_fixture")
     target_include_directories(
-      manyforge_native_execution_host_projection_fixture PRIVATE
+      manyforge_ros2_control_execution_host_projection_fixture PRIVATE
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
     target_compile_definitions(
-      manyforge_native_execution_host_projection_fixture PRIVATE
+      manyforge_ros2_control_execution_host_projection_fixture PRIVATE
       COAL_DISABLE_HPP_FCL_WARNINGS
-      MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY=1)
+      MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY=1
+      MANYFORGE_ROS2_CONTROL_EXECUTION_HOST=1)
     target_link_libraries(
-      manyforge_native_execution_host_projection_fixture PRIVATE
+      manyforge_ros2_control_execution_host_projection_fixture PRIVATE
       manyforge_roboplan_managed_kernel_apply_fence
       manyforge_roboplan_cell_admission_command_codec
       manyforge_roboplan_native_cclc_runtime
-      manyforge_roboplan_native_runtime
+      manyforge_roboplan_ros2_control_runtime
       manyforge_roboplan_process_candidate_client
       manyforge_roboplan_retained_consumer
       manyforge_roboplan_scene_factory
@@ -678,14 +648,16 @@ if(BUILD_TESTING)
       manyforge::persistence
       SQLite::SQLite3
       Threads::Threads)
-    add_dependencies(manyforge_native_execution_host_projection_fixture
+    add_dependencies(manyforge_ros2_control_execution_host_projection_fixture
       manyforge_roboplan_candidate_worker)
     add_custom_command(
-      TARGET manyforge_native_execution_host_projection_fixture POST_BUILD
+      TARGET manyforge_ros2_control_execution_host_projection_fixture POST_BUILD
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "$<TARGET_FILE:manyforge_roboplan_candidate_worker>"
-        "$<TARGET_FILE_DIR:manyforge_native_execution_host_projection_fixture>/$<TARGET_FILE_NAME:manyforge_roboplan_candidate_worker>"
+        "$<TARGET_FILE_DIR:manyforge_ros2_control_execution_host_projection_fixture>/$<TARGET_FILE_NAME:manyforge_roboplan_candidate_worker>"
       VERBATIM)
+
+    endif() # ROS execution host fixture variants
 
     if(NOT TARGET manyforge_collision)
       message(FATAL_ERROR
@@ -816,7 +788,6 @@ if(BUILD_TESTING)
     add_executable(test_retained_native_backends
       test/test_retained_native_backends.cpp)
     target_link_libraries(test_retained_native_backends PRIVATE
-      manyforge_roboplan_native_execution
       manyforge_roboplan_native_gripper
       manyforge_roboplan_native_runtime
       GTest::gtest_main)
@@ -836,7 +807,8 @@ if(BUILD_TESTING)
       # Isaac guard binding against in-process ROS stand-ins.
       add_executable(test_retained_ros2_control_runtime_handle
         test/test_retained_ros2_control_runtime_handle.cpp
-        test/test_retained_ros2_control_lifecycle_product.cpp)
+        test/test_retained_ros2_control_lifecycle_product.cpp
+        test/test_retained_native_lifecycle_product.cpp)
       target_include_directories(test_retained_ros2_control_runtime_handle PRIVATE
         "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test"
         "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src")
@@ -886,7 +858,6 @@ if(BUILD_TESTING)
     # dependency packages deliberately have BUILD_TESTING disabled here.
     add_executable(test_retained_native_cclc_runtime
       test/test_retained_native_cclc_runtime.cpp
-      test/test_retained_native_lifecycle_product.cpp
       test/test_retained_measured_robot_geometry.cpp
       "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test/test_cclc_runtime_composition.cpp")
     target_include_directories(test_retained_native_cclc_runtime PRIVATE
@@ -904,9 +875,11 @@ if(BUILD_TESTING)
       test/test_native_stop_qualification_seams.cpp)
     target_include_directories(test_native_stop_qualification_seams PRIVATE
       "${CMAKE_CURRENT_SOURCE_DIR}/src"
-      "${CMAKE_CURRENT_SOURCE_DIR}/test")
+      "${CMAKE_CURRENT_SOURCE_DIR}/test"
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include")
     target_link_libraries(test_native_stop_qualification_seams PRIVATE
-      manyforge_roboplan_native_execution
+      manyforge_core
+      manyforge_roboplan_native_state_projection
       GTest::gtest_main)
 
     add_executable(test_managed_kernel_admission_gate
@@ -1114,6 +1087,27 @@ if(BUILD_TESTING)
       _MANYFORGE_ROBOPLAN_UR5E_FIXTURE_ROOT
       _MANYFORGE_ROBOPLAN_UR5E_RESOURCE_INPUTS)
 
+    # Dedicated genuine UR5 arm-only model for generic absence/protocol coverage.
+    set(_MANYFORGE_UR5_ARM_ONLY_SOURCE_ROOT
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/resources/maintained/model_sources/ur5_roboplan")
+    set(_MANYFORGE_UR5_ARM_ONLY_RESOURCE_ROOT
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/.docker/roboplan/roboplan_example_models/models/ur_robot_model")
+    if(NOT EXISTS "${_MANYFORGE_UR5_ARM_ONLY_RESOURCE_ROOT}/meshes/visual/base.dae")
+      find_package(roboplan_example_models CONFIG REQUIRED)
+      get_filename_component(_MANYFORGE_UR5_ARM_ONLY_RESOURCE_ROOT
+        "${roboplan_example_models_DIR}/../../../share/roboplan_example_models/models/ur_robot_model"
+        REALPATH)
+    endif()
+    _manyforge_prepare_roboplan_model_fixture(
+      "${_MANYFORGE_UR5_ARM_ONLY_SOURCE_ROOT}"
+      "${_MANYFORGE_UR5_ARM_ONLY_RESOURCE_ROOT}"
+      ur5_roboplan ur5_gripper.structural.urdf ur5_gripper.structural.srdf
+      "package://roboplan_example_models/models/ur_robot_model/"
+      _MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT
+      _MANYFORGE_UR5_ARM_ONLY_RESOURCE_INPUTS)
+    set(_MANYFORGE_UR5_ARM_ONLY_CATALOG_PATH
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/resources/maintained/model_assets/ur5_roboplan.model_asset.json")
+
     # Deployment owns this deterministic test-only generator. It publishes
     # exact retained bytes and compiler maps, without importing any RoboPlan,
     # collision-engine, Composer, or Pinocchio consumer API.
@@ -1169,6 +1163,10 @@ if(BUILD_TESTING)
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test/generate_lite6_native_execution_fixture.cpp")
     target_compile_definitions(
       generate_lite6_native_execution_fixture_tool PRIVATE
+      MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT}"
+      MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_UR5_ARM_ONLY_SOURCE_ROOT}"
+      MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_RESOURCE_ROOT="${_MANYFORGE_UR5_ARM_ONLY_RESOURCE_ROOT}"
+      MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_CATALOG_PATH="${_MANYFORGE_UR5_ARM_ONLY_CATALOG_PATH}"
       MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}"
       MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}")
     target_include_directories(
@@ -1198,6 +1196,7 @@ if(BUILD_TESTING)
         "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
         --output-root
         "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+        --fixture-kind application-ros
       DEPENDS
         generate_lite6_native_execution_fixture_tool
         "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
@@ -1211,6 +1210,7 @@ if(BUILD_TESTING)
     target_compile_definitions(test_managed_kernel_admission_gate PRIVATE
       MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}")
 
+    if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     # L0.7 production-process fixture with complete arm+gripper lifecycle
     # catalogs, runnable Program products, and two-domain route configuration.
     set(_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT
@@ -1228,10 +1228,10 @@ if(BUILD_TESTING)
       COMMAND
         "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
         --output-root "${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
-        --fixture-kind cclc-product
+        --fixture-kind cclc-product-ros
       DEPENDS
         generate_lite6_native_execution_fixture_tool
-        manyforge_native_execution_host
+        manyforge_ros2_control_execution_host
         "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
         "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.srdf"
         ${_MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS}
@@ -1239,32 +1239,12 @@ if(BUILD_TESTING)
     add_custom_target(generate_lite6_native_cclc_product_fixture ALL
       DEPENDS "${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_MANIFEST}")
 
-    # Managed component with a gripper command and no motion/planner binding.
+    endif()
+
+    # Gripper-only source and assertions remain NOT_RUN until A1's independent
+    # cell owner can qualify the existing supported topology.
     set(_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT
       "${CMAKE_CURRENT_BINARY_DIR}/lite6_native_gripper_only_fixture")
-    set(_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST
-      "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}/manifest.json")
-    add_custom_command(
-      OUTPUT "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST}"
-      COMMAND
-        "${CMAKE_COMMAND}" -E rm -rf
-        "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
-      COMMAND
-        "${CMAKE_COMMAND}" -E make_directory
-        "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
-      COMMAND
-        "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
-        --output-root "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
-        --fixture-kind gripper-only
-      DEPENDS
-        generate_lite6_native_execution_fixture_tool
-        manyforge_native_execution_host
-        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
-        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.srdf"
-        ${_MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS}
-      VERBATIM)
-    add_custom_target(generate_lite6_native_gripper_only_fixture ALL
-      DEPENDS "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST}")
 
     # Focused single-domain fixture for the CCLC repository-readiness test.
     # It exercises the ordinary retained product path without pulling the
@@ -1284,9 +1264,10 @@ if(BUILD_TESTING)
       COMMAND
         "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
         --output-root "${_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT}"
-        --fixture-kind cclc-readiness
+        --fixture-kind cclc-readiness-ros
       DEPENDS
         generate_lite6_native_execution_fixture_tool
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/retained_ros2_control_lifecycle_plans_internal.hpp"
         "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
         "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.srdf"
         ${_MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS}
@@ -1309,6 +1290,27 @@ if(BUILD_TESTING)
         MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}")
     endif()
 
+    set(_MANYFORGE_UR5_ARM_ONLY_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/ur5_arm_only_ros_fixture")
+    add_custom_command(
+      OUTPUT "${_MANYFORGE_UR5_ARM_ONLY_FIXTURE_ROOT}/manifest.json"
+      COMMAND "${CMAKE_COMMAND}" -E rm -rf "${_MANYFORGE_UR5_ARM_ONLY_FIXTURE_ROOT}"
+      COMMAND "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
+        --output-root "${_MANYFORGE_UR5_ARM_ONLY_FIXTURE_ROOT}"
+        --fixture-kind ur5-arm-only-ros
+      DEPENDS
+        generate_lite6_native_execution_fixture_tool
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test/ur5_arm_only_retention_fixture.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/retained_ros2_control_lifecycle_plans_internal.hpp"
+        "${_MANYFORGE_UR5_ARM_ONLY_CATALOG_PATH}"
+        "${_MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT}/model.urdf"
+        "${_MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT}/model.srdf"
+        "${_MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
+        ${_MANYFORGE_UR5_ARM_ONLY_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(generate_ur5_arm_only_ros_fixture
+      DEPENDS "${_MANYFORGE_UR5_ARM_ONLY_FIXTURE_ROOT}/manifest.json")
+
     # Same provider/controller catalog and host infrastructure as the ordinary
     # fixture, with a new graph/bundle for projection candidate staging.
     set(_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT
@@ -1323,7 +1325,7 @@ if(BUILD_TESTING)
         "${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT}"
       COMMAND "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
         --output-root "${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT}"
-        --fixture-kind projection-successor
+        --fixture-kind projection-successor-ros
       DEPENDS
         generate_lite6_native_execution_fixture_tool
         "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
@@ -1377,26 +1379,35 @@ if(BUILD_TESTING)
       roboplan::roboplan
       GTest::gtest_main)
 
+    if(TARGET manyforge_roboplan_ros2_control_runtime)
+      target_link_libraries(test_retained_product_consumer PRIVATE
+        manyforge_roboplan_ros2_control_runtime)
+      target_compile_definitions(test_retained_product_consumer PRIVATE
+        MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY=1)
+    endif()
+
+    if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     add_executable(test_retained_native_runtime_unit_adapter
       test/test_retained_native_runtime_unit_adapter.cpp)
     add_dependencies(test_retained_native_runtime_unit_adapter
+      generate_ur5_arm_only_ros_fixture
       generate_lite6_native_execution_fixture
       generate_lite6_native_cclc_readiness_fixture
       generate_lite6_native_projection_successor_fixture
-      generate_lite6_native_gripper_only_fixture
-      manyforge_native_execution_host
-      manyforge_native_execution_host_projection_fixture
-      manyforge_native_execution_host_pick_place_planning_fixture
+      manyforge_ros2_control_execution_host
+      manyforge_ros2_control_execution_host_projection_fixture
+      manyforge_ros2_control_execution_host_pick_place_planning_fixture
       manyforge_roboplan_candidate_worker)
     target_compile_definitions(
       test_retained_native_runtime_unit_adapter PRIVATE
+      MANYFORGE_UR5_ARM_ONLY_FIXTURE_ROOT="${_MANYFORGE_UR5_ARM_ONLY_FIXTURE_ROOT}"
       MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
       MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
       MANYFORGE_CCLC_READINESS_FIXTURE_ROOT="${_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT}"
       MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT="${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT}"
-      MANYFORGE_NATIVE_PICK_PLACE_PLANNING_TARGET="$<TARGET_FILE:manyforge_native_execution_host_pick_place_planning_fixture>"
-      MANYFORGE_NATIVE_PROJECTION_TEST_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_native_execution_host_projection_fixture>"
-      MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_native_execution_host>")
+      MANYFORGE_NATIVE_PICK_PLACE_PLANNING_TARGET="$<TARGET_FILE:manyforge_ros2_control_execution_host_pick_place_planning_fixture>"
+      MANYFORGE_NATIVE_PROJECTION_TEST_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_ros2_control_execution_host_projection_fixture>"
+      MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_ros2_control_execution_host>")
     target_link_libraries(test_retained_native_runtime_unit_adapter PRIVATE
       manyforge_component_manager
       manyforge_deployment_verification_core
@@ -1407,6 +1418,8 @@ if(BUILD_TESTING)
       manyforge::scene_value_codec
       manyforge_roboplan_native_runtime
       GTest::gtest_main)
+
+    endif()
 
     # Pinocchio/coal/roboplan .so files live in cmeel.prefix/lib.
     # Discover the active Python site-packages roots rather than hardcoding a
@@ -1473,10 +1486,12 @@ if(BUILD_TESTING)
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    if(TARGET test_retained_native_runtime_unit_adapter)
     gtest_discover_tests(test_retained_native_runtime_unit_adapter
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    endif()
     gtest_discover_tests(test_roboplan_scene_generation
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
@@ -1576,6 +1591,7 @@ if(BUILD_TESTING)
         ENVIRONMENT
           "PYTHONOPTIMIZE=1;PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     add_test(
       NAME native_addressed_execution_process
       COMMAND
@@ -1585,11 +1601,13 @@ if(BUILD_TESTING)
       native_addressed_execution_process
       PROPERTIES
         ENVIRONMENT
-          "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host_admission_fixture>;MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host>;MANYFORGE_NATIVE_PICK_PLACE_PLANNING_FIXTURE_HOST=$<TARGET_FILE:manyforge_native_execution_host_pick_place_planning_fixture>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_ROBOPLAN_FAKE_WORKER=$<TARGET_FILE:fake_process_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT};MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT=${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+          "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_ros2_control_execution_host_admission_fixture>;MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST=$<TARGET_FILE:manyforge_ros2_control_execution_host>;MANYFORGE_NATIVE_PICK_PLACE_PLANNING_FIXTURE_HOST=$<TARGET_FILE:manyforge_ros2_control_execution_host_pick_place_planning_fixture>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_ROBOPLAN_FAKE_WORKER=$<TARGET_FILE:fake_process_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT};MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT=${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
         # This process test intentionally executes many sequential, model-
         # limited trajectories. Keep its harness deadline independent from
         # the much shorter per-operation execution deadlines it verifies.
         TIMEOUT 180)
+
+    endif() # actual ROS process fixture targets
 
   endif()
 endif()

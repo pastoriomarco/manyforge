@@ -9,7 +9,7 @@
 #include <manyforge_core/runtime_participant_stop_readiness.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
-#include <manyforge_roboplan/retained_gripper_command_backend.hpp>
+#include <manyforge_roboplan/retained_gripper_position_limits.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <memory>
 #include <mutex>
@@ -49,35 +49,6 @@ struct RetainedNativeGripperRuntimeInput final {
 class RetainedNativeGripperRuntime final {
  public:
   explicit RetainedNativeGripperRuntime(RetainedNativeGripperRuntimeInput input);
-
-  /// Construct the native gripper-only runtime product. This creates the
-  /// existing gripper command backend and binds route re-verification to that
-  /// backend's exact RebindRoute operation; it creates no motion backend or
-  /// planner. The owner retains the clock and scheduler used by the backend.
-  [[nodiscard]] static std::unique_ptr<RetainedNativeGripperRuntime> CreateNative(
-      core::RuntimeParticipantBinding binding,
-      std::shared_ptr<IRetainedObservedStateChannel> state_channel,
-      std::shared_ptr<core::IClock> clock, std::shared_ptr<core::IScheduler> scheduler,
-      std::optional<RetainedGripperPositionLimits> position_limits,
-      std::optional<core::RuntimeParticipantStopReadiness> stop_readiness,
-      bool intrinsic_direct_control = false, core::Duration update_period_ns = 10'000'000);
-
-  /// Build and retain the exact observed-state channel together with the
-  /// standalone gripper backend. Model-backed bindings require their verified
-  /// projector and seed from its exact current projection; component-local
-  /// bindings start unavailable and require an owner-issued state sample.
-  [[nodiscard]] static std::unique_ptr<RetainedNativeGripperRuntime>
-  CreateNativeWithOwnedStateChannel(
-      core::RuntimeParticipantBinding binding,
-      std::shared_ptr<RetainedKinematicStateProjector> state_projector,
-      RetainedObservedStateChannelConfig state_channel_config,
-      std::shared_ptr<core::IClock> clock,
-      std::shared_ptr<core::IScheduler> scheduler,
-      std::shared_ptr<RetainedObservationWake> observation_wake,
-      std::optional<RetainedGripperPositionLimits> position_limits,
-      std::optional<core::RuntimeParticipantStopReadiness> stop_readiness,
-      bool intrinsic_direct_control = false,
-      core::Duration update_period_ns = 10'000'000);
 
   RetainedNativeGripperRuntime(const RetainedNativeGripperRuntime&) = delete;
   RetainedNativeGripperRuntime& operator=(const RetainedNativeGripperRuntime&) = delete;

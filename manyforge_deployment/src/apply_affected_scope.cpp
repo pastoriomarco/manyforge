@@ -1,4 +1,5 @@
 #include "manyforge_deployment/apply_affected_scope.hpp"
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 
 #include "apply_affected_scope_internal.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
@@ -128,10 +129,10 @@ void MarkComponent(const core::CellGraphDTO &graph,
 
 using NativeComponentConfigurations =
     std::map<core::ControllableComponentId,
-             native_execution_runtime_contract::Configuration>;
+             execution_runtime_contract::Configuration>;
 
 struct NativeHostConfigurations final {
-  native_execution_runtime_contract::Configuration shared;
+  execution_runtime_contract::Configuration shared;
   NativeComponentConfigurations components;
 };
 

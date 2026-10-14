@@ -602,5 +602,147 @@ TEST(OwnerSettlementReaders,
                    terminal.path(), {claim}, current, reconcile)
                    .ok());
 }
+
+TEST(OwnerSettlementReaders,
+     NoSceneOwnerReconciliationRequiresExactEmbeddedClaimAndRun) {
+  const auto claim_json = ClaimJson("program_cycle", "program_runner",
+                                    "runner.1", "cycle.1", "start.1");
+  const auto foreign_claim = ClaimJson("program_cycle", "program_runner",
+                                       "runner.1", "cycle.1", "foreign.start");
+  const auto claim = DecodeCellAdmissionClaim(claim_json);
+  const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> current{
+      {core::CellAdmissionOwnerRoleDTO::kProgramRunner,
+       core::RequestOwnerEpoch("runner.1")}};
+  const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> requested{
+      {core::CellAdmissionOwnerRoleDTO::kProgramRunner,
+       core::RequestOwnerEpoch("runner.2")}};
+  const auto evidence =
+      core::CellAdmissionOwnerEpochReconciliationEvidenceDigest(
+          core::CellAdmissionOwnerRoleDTO::kProgramRunner,
+          core::RequestOwnerEpoch("runner.2"));
+  ASSERT_TRUE(evidence.ok());
+  const core::CellAdmissionReconcileDTO reconcile{
+      core::RequestOwnerEpoch("kernel.1"),
+      {claim},
+      requested,
+      evidence.value()};
+  for (const auto *kind : {"proven_no_effect", "terminal_effects_settled"}) {
+    for (const auto *variant : {"exact", "foreign_claim", "foreign_run",
+                                "malformed_scene", "foreign_terminal"}) {
+      SCOPED_TRACE(kind);
+      SCOPED_TRACE(variant);
+      const std::string which(variant);
+      const std::string state(kind);
+      if (which == "foreign_terminal" && state == "proven_no_effect")
+        continue;
+      const auto settlement =
+          "{\"claim\":" +
+          (which == "foreign_claim" ? foreign_claim : claim_json) +
+          ",\"kind\":\"" + state + "\",\"prepared_scene\":" +
+          (which == "malformed_scene" ? "{\"unexpected\":true}" : "{}") +
+          ",\"program_run_id\":\"" +
+          (which == "foreign_run" ? "foreign.cycle" : "cycle.1") +
+          "\",\"schema_version\":\"manyforge.program_cycle_start_settlement."
+          "v1\"" +
+          (state == "terminal_effects_settled"
+               ? ",\"terminal_run\":{\"capture\":{\"program_run_id\":\"" +
+                     std::string(which == "foreign_terminal" ? "foreign.cycle"
+                                                             : "cycle.1") +
+                     "\"},\"state\":\"stopped\"}"
+               : "") +
+          "}";
+      // Recompute the genuine reference: every negative targets its embedded
+      // identity/scene grammar, rather than failing on a stale outer digest.
+      const auto reference = content_identity::sha256_digest(settlement);
+      TemporaryDatabase fixture;
+      fixture.Exec(
+          "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
+          "schema_version INTEGER); INSERT INTO program_cycle_metadata "
+          "VALUES(1,7);"
+          "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
+          "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
+          "release_intent_json TEXT,terminal_reference TEXT,"
+          "start_settlement_json TEXT,reconciliation_required INTEGER,"
+          "acquisition_pending_json TEXT,reconciliation_evidence_digest TEXT);"
+          "INSERT INTO program_cycle VALUES(1,'terminal_awaiting_reset',"
+          "'runner.1','cycle.1','" +
+          claim_json + "',NULL,'" + reference + "','" + settlement +
+          "',1,NULL,'" + evidence.value().value() + "')");
+      const auto validation = ValidateProgramRunnerOwnerReconciliationReadOnly(
+          fixture.path(), {claim}, current, reconcile);
+      const bool accepted = which == "exact";
+      ASSERT_EQ(validation.ok(), accepted);
+      if (accepted) {
+        ASSERT_EQ(validation.value().settlements.size(), 1U);
+        EXPECT_EQ(validation.value().settlements.front(),
+                  (core::CellAdmissionReconcileSettlementDTO{
+                      claim, core::CellAdmissionOwnerRoleDTO::kProgramRunner,
+                      core::RequestOwnerEpoch("runner.2"),
+                      core::CellAdmissionSettlementKindDTO::kReconciled,
+                      evidence.value()}));
+      }
+    }
+  }
+}
+
+TEST(OwnerSettlementReaders,
+     NoSceneTerminalEffectsResetRequiresExactClaimRunAndTerminal) {
+  const auto claim_json = ClaimJson("program_cycle", "program_runner",
+                                    "runner.1", "cycle.1", "start.1");
+  const auto foreign_claim = ClaimJson("program_cycle", "program_runner",
+                                       "runner.1", "cycle.1", "foreign.start");
+  const auto claim = DecodeCellAdmissionClaim(claim_json);
+  for (const auto *variant : {"stopped", "succeeded", "failed", "running",
+                              "foreign_claim", "foreign_run", "foreign_capture",
+                              "missing_capture", "malformed_scene"}) {
+    SCOPED_TRACE(variant);
+    const std::string which(variant);
+    const auto terminal =
+        which == "missing_capture"
+            ? "{\"state\":\"stopped\"}"
+            : "{\"capture\":{\"program_run_id\":\"" +
+                  std::string(which == "foreign_capture" ? "foreign.cycle"
+                                                         : "cycle.1") +
+                  "\"},\"state\":\"" +
+                  (which == "succeeded" || which == "failed" ||
+                           which == "running"
+                       ? which
+                       : "stopped") +
+                  "\"}";
+    const auto settlement =
+        "{\"claim\":" +
+        (which == "foreign_claim" ? foreign_claim : claim_json) +
+        ",\"kind\":\"terminal_effects_settled\",\"prepared_scene\":" +
+        (which == "malformed_scene" ? "{\"unexpected\":true}" : "{}") +
+        ",\"program_run_id\":\"" +
+        (which == "foreign_run" ? "foreign.cycle" : "cycle.1") +
+        "\",\"schema_version\":\"manyforge.program_cycle_start_settlement.v1\","
+        "\"terminal_run\":" +
+        terminal + "}";
+    const auto reference = content_identity::sha256_digest(settlement);
+    const auto release_json =
+        ReleaseJson("program_runner", "runner.1", "cycle.1", "start.1",
+                    "explicit_reset", reference);
+    const auto release = DecodeCellAdmissionClaimRelease(release_json);
+    TemporaryDatabase fixture;
+    fixture.Exec(
+        "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
+        "schema_version INTEGER); INSERT INTO program_cycle_metadata "
+        "VALUES(1,7);"
+        "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
+        "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
+        "terminal_reference TEXT,start_settlement_json TEXT,"
+        "release_intent_json TEXT,reconciliation_required INTEGER,"
+        "acquisition_pending_json TEXT,reset_phase TEXT);"
+        "INSERT INTO program_cycle "
+        "VALUES(1,'resetting','runner.1','cycle.1','" +
+        claim_json + "','" + reference + "','" + settlement + "','" +
+        release_json + "',0,NULL,'releasing')");
+    EXPECT_EQ(
+        ValidateProgramCycleSettlementReadOnly(fixture.path(), claim, release)
+            .ok(),
+        which == "stopped" || which == "succeeded" || which == "failed");
+  }
+}
 } // namespace
 } // namespace manyforge::roboplan_backend::detail

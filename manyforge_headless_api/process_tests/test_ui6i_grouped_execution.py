@@ -350,6 +350,168 @@ def _wait_components_reached_requested_target(
             time.sleep(0.1)
 
 
+def observe_applied_activation_projection(
+    headless: HeadlessHttpClient,
+    composer: HeadlessHttpClient,
+    status: dict[str, Any],
+    scenario_id: str,
+    *,
+    predecessor: dict[str, Any] | None = None,
+    timeout_seconds: float = 30.0,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    on_observation: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Read the accepted Apply's exact projection before any activation effect."""
+    assert status["state"] == "succeeded" and status["ok"] is True, status
+    expected = status["candidate_projection_revision"]
+    owner = status["request_owner_epoch"]
+    apply_identity = (status["apply_id"], status["apply_generation"])
+    deployment_revision = status["prepared_activation"]["deployment_revision"]
+    program_binding_id = status["prepared_activation"]["program_binding_id"]
+    prior_publication, prior_selected, prior_program = None, None, None
+    if predecessor is not None:
+        prior_source = predecessor["source"]
+        assert prior_source["source_owner_epoch"] == owner, predecessor
+        assert (prior_source["available"] is True and prior_source["freshness"] == "fresh"
+                and prior_source["known_gaps"] == []), predecessor
+        prior_publication = predecessor["publication"]
+        prior_selected = predecessor["managerApplied"]
+        prior_program = predecessor["applied_status"]
+        prior_order = prior_selected["activationOrder"]
+        assert prior_publication is not None, predecessor
+        assert prior_publication.get("transaction", {}).get("kind") in {"bootstrap", "named_apply"}, predecessor
+        if prior_publication is not None and prior_publication["transaction"]["kind"] == "named_apply":
+            prior_apply = predecessor["apply_status"]
+            transaction = prior_publication["transaction"]
+            assert (prior_apply["apply_id"], prior_apply["apply_generation"]) == (
+                transaction["apply_id"], transaction["apply_generation"]
+            ), predecessor
+            # This immutable prior request may belong to a previous Manager
+            # epoch; the publication transaction carries no owner epoch.
+            assert prior_apply["state"] == "succeeded" and prior_apply["ok"] is True, predecessor
+            assert prior_apply["candidate_projection_revision"] == prior_publication["projection_revision"], predecessor
+            assert prior_program is not None, predecessor
+            for field in ("deployment_artifact_id", "deployment_revision", "program_binding_id"):
+                assert prior_apply["prepared_activation"][field] == prior_program[field], predecessor
+        prior_is_sealed = (prior_program is not None
+                           and prior_program["origin"]["kind"] == "sealed_canonical_empty")
+        if prior_is_sealed:
+            assert prior_publication is not None, predecessor
+            assert prior_publication["transaction"]["kind"] == "named_apply", predecessor
+            assert prior_selected == {"scenarioId": None, "deploymentRevision": None,
+                                      "activationOrder": None}, predecessor
+            assert prior_program["executable"] is False, predecessor
+            assert all(prior_program[field] is None for field in (
+                "program", "program_id", "program_revision", "program_binding_id", "non_executable"
+            )), predecessor
+            for field in ("deployment_artifact_id", "deployment_revision",
+                          "retained_bundle_id", "graph_revision"):
+                assert prior_program["origin"][field] == prior_program[field], predecessor
+            prior_revision = prior_publication["projection_revision"]
+            assert prior_program["retained_bundle_id"] == prior_revision["retained_bundle_id"], predecessor
+            assert prior_program["graph_revision"] == prior_revision["graph_revision"], predecessor
+        elif prior_publication is not None and prior_publication["transaction"]["kind"] == "named_apply":
+            assert prior_order is not None and prior_program is not None, predecessor
+            prior_revision = prior_publication["projection_revision"]
+            assert prior_order["retainedBundleId"] == prior_revision["retained_bundle_id"], predecessor
+            assert prior_order["graphRevision"] == prior_revision["graph_revision"], predecessor
+        else:
+            assert prior_program is None, predecessor
+            assert prior_selected == {"scenarioId": None, "deploymentRevision": None,
+                                      "activationOrder": None}, predecessor
+        if prior_program is not None and not prior_is_sealed:
+            assert prior_program["origin"]["kind"] == "scenario", predecessor
+            assert prior_selected["scenarioId"] == prior_program["origin"]["scenario_id"], predecessor
+            assert prior_selected["deploymentRevision"] == prior_program["deployment_revision"], predecessor
+            assert prior_order["retainedBundleId"] == prior_program["retained_bundle_id"], predecessor
+            assert prior_order["graphRevision"] == prior_program["graph_revision"], predecessor
+    deadline = monotonic() + timeout_seconds
+    while True:
+        current = headless.manager_apply_status(*apply_identity)
+        assert (current["apply_id"], current["apply_generation"]) == apply_identity, current
+        assert current["state"] == "succeeded" and current["ok"] is True, current
+        assert current["candidate_projection_revision"] == expected, current
+        assert current["request_owner_epoch"] == owner, current
+        assert current["prepared_activation"] == status["prepared_activation"], current
+        manager = headless.manager_status()
+        source, payload = manager["source"], manager["status"]
+        assert source.get("source_owner_epoch") == owner, source
+        publication = payload["active"].get("publication")
+        publication_is_prior = publication is not None and publication == prior_publication
+        if publication is not None and not publication_is_prior:
+            assert publication.get("transaction", {}).get("kind") == "named_apply", publication
+            transaction = publication["transaction"]
+            assert (transaction["apply_id"], transaction["apply_generation"]) == apply_identity, publication
+            assert publication["projection_revision"] == expected, publication
+        selected = composer.request("GET", "/api/deployment/workspace")["managerApplied"]
+        order = selected["activationOrder"]
+        selection_is_candidate = (
+            order is not None and selected["scenarioId"] == scenario_id
+            and selected["deploymentRevision"] == deployment_revision
+            and order["retainedBundleId"] == expected["retained_bundle_id"]
+            and order["graphRevision"] == expected["graph_revision"]
+        )
+        selection_is_prior = (predecessor is not None and selected == prior_selected
+                              and not selection_is_candidate)
+        if order is None and not selection_is_prior:
+            absent = selected == {"scenarioId": None, "deploymentRevision": None,
+                                  "activationOrder": None}
+            assert absent or (selected["scenarioId"] == scenario_id
+                              and selected["deploymentRevision"] == deployment_revision), selected
+        if order is not None and not selection_is_prior:
+            assert selected["scenarioId"] == scenario_id, selected
+            assert selected["deploymentRevision"] == deployment_revision, selected
+            assert order["retainedBundleId"] == expected["retained_bundle_id"], order
+            assert order["graphRevision"] == expected["graph_revision"], order
+        applied, applied_error = None, None
+        try:
+            applied = headless.program_applied_status()
+        except HeadlessClientError as error:
+            if error.code not in {"program_applied_selection_not_active", "program_applied_selection_not_found"}:
+                raise
+            applied_error = {"code": error.code, "response": error.response}
+        program_is_candidate = (
+            applied is not None and applied["origin"]["kind"] == "scenario"
+            and applied["origin"]["scenario_id"] == scenario_id
+            and applied["deployment_revision"] == deployment_revision
+            and applied["retained_bundle_id"] == expected["retained_bundle_id"]
+            and applied["graph_revision"] == expected["graph_revision"]
+            and applied["program_binding_id"] == program_binding_id
+        )
+        program_is_prior = (applied is not None and applied == prior_program
+                            and not program_is_candidate)
+        if applied is not None and not program_is_prior:
+            assert applied["origin"]["kind"] == "scenario", applied
+            assert applied["origin"]["scenario_id"] == scenario_id, applied
+            assert applied["deployment_revision"] == deployment_revision, applied
+            assert applied["retained_bundle_id"] == expected["retained_bundle_id"], applied
+            assert applied["graph_revision"] == expected["graph_revision"], applied
+            assert applied["program_binding_id"] == program_binding_id, applied
+        observation = {
+            "apply_id": apply_identity[0], "apply_generation": apply_identity[1],
+            "candidate": expected, "manager_source": source,
+            "manager_ready": payload.get("manager_ready"),
+            "runtime_converged": payload.get("runtime", {}).get("converged"),
+            "active_publication": publication, "managerApplied": selected,
+            "applied_status": applied, "applied_error": applied_error,
+        }
+        if on_observation is not None:
+            on_observation(observation)
+        if (order is not None and applied is not None and publication is not None
+                and not selection_is_prior and not program_is_prior and not publication_is_prior):
+            transaction = publication["transaction"]
+            assert transaction["kind"] == "named_apply", publication
+            assert (transaction["apply_id"], transaction["apply_generation"]) == apply_identity, publication
+            assert publication["projection_revision"] == expected, publication
+            if (source["available"] is True and source["freshness"] == "fresh"
+                    and source["known_gaps"] == [] and payload["manager_ready"] is True
+                    and payload["runtime"]["converged"] is True):
+                return observation
+        assert monotonic() < deadline, f"Applied activation projection did not settle: {observation!r}"
+        sleep(0.02)
+
+
 def _load_scenario(
     stack: ProcessStack,
     scenario_id: str,
@@ -377,6 +539,29 @@ def _load_scenario(
         for attempt in range(8):
             snapshot = _matching_composer_snapshot(snapshots, draft)
             deployment = composer.request("GET", "/api/deployment/workspace")
+            with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as previous:
+                previous_manager = previous.manager_status()
+                previous_publication = previous_manager["status"]["active"].get("publication")
+                previous_apply = None
+                if (previous_publication is not None
+                        and previous_publication["transaction"]["kind"] == "named_apply"):
+                    transaction = previous_publication["transaction"]
+                    previous_apply = previous.manager_apply_status(
+                        transaction["apply_id"], transaction["apply_generation"]
+                    )
+                try:
+                    previous_program = previous.program_applied_status()
+                except HeadlessClientError as error:
+                    if error.code not in {"program_applied_selection_not_active", "program_applied_selection_not_found"}:
+                        raise
+                    previous_program = None
+            predecessor = deepcopy({
+                "source": previous_manager["source"],
+                "publication": previous_publication,
+                "apply_status": previous_apply,
+                "managerApplied": deployment["managerApplied"],
+                "applied_status": previous_program,
+            })
             try:
                 loaded = composer.request(
                     "POST",
@@ -459,6 +644,13 @@ def _load_scenario(
                 if status["state"] != "pending":
                     assert status["state"] == "succeeded", (
                         f"{scenario_id}: terminal Apply status {status!r}"
+                    )
+                    assert (status["apply_id"], status["apply_generation"]) == (
+                        activation["apply_id"], activation["apply_generation"]
+                    ), status
+                    observe_applied_activation_projection(
+                        headless, composer, status, scenario_id, predecessor=predecessor,
+                        timeout_seconds=max(0.0, deadline - time.monotonic()),
                     )
                     if on_apply_succeeded is not None:
                         on_apply_succeeded()

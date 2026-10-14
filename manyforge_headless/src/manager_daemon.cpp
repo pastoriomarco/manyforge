@@ -1,4 +1,5 @@
 #include "manyforge_headless/cell_admission_readiness_reducer.hpp"
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 #include "manyforge_headless/manager_package_generation.hpp"
 #include "manyforge_headless/owner_publication.hpp"
 #include "manyforge_headless/scene_runtime_pose_projector.hpp"
@@ -28,7 +29,7 @@
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
-#include <manyforge_scene/canonical_empty_scene_owner.hpp>
+#include <manyforge_scene/logical_scene_owner.hpp>
 #include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <manyforge_scene/scene_transaction_codec.hpp>
 
@@ -2733,7 +2734,7 @@ private:
   std::size_t native_execution_hosts = 0U;
   for (const auto &row : runtime.plan.runtime_units) {
     if (row.process_adapter_contract_id ==
-        deployment::native_execution_runtime_contract::
+        deployment::execution_runtime_contract::
             kProcessAdapterContractId) {
       ++native_execution_hosts;
     }
@@ -2775,7 +2776,7 @@ class OriginalManagerSceneMaintenanceAdapter final
     : public core::IManagerSceneProjectionMaintenancePort {
 public:
   OriginalManagerSceneMaintenanceAdapter(
-      scene::CanonicalEmptySceneOwner &owner,
+      scene::LogicalSceneOwner &owner,
       const core::IManagerKernelApplyFencePort &original_parent_fence)
       : owner_(owner), original_parent_fence_(original_parent_fence) {}
 
@@ -2847,7 +2848,7 @@ public:
   }
 
 private:
-  scene::CanonicalEmptySceneOwner &owner_;
+  scene::LogicalSceneOwner &owner_;
   const core::IManagerKernelApplyFencePort &original_parent_fence_;
 };
 
@@ -2904,7 +2905,7 @@ public:
             {{std::string(
                   component_manager::kRetainedPosixProcessAdapterContractId),
               &reference_runtime_adapter_, &reference_runtime_adapter_},
-             {std::string(deployment::native_execution_runtime_contract::
+             {std::string(deployment::execution_runtime_contract::
                               kProcessAdapterContractId),
               &native_runtime_adapter_, &native_runtime_adapter_}}),
         active_runtime_(
@@ -4138,10 +4139,10 @@ private:
     // package lookup shares its lock with cold verification during Apply and
     // must never run on the heartbeat lane.
     const auto &retained_policy = deployment::
-        native_execution_runtime_contract::manager_liveness_policy();
+        execution_runtime_contract::manager_liveness_policy();
     for (const auto &row : snapshot.runtime.plan.runtime_units) {
       if (row.process_adapter_contract_id !=
-          deployment::native_execution_runtime_contract::
+          deployment::execution_runtime_contract::
               kProcessAdapterContractId)
         continue;
       const auto product = verified_package_.runtime_unit_product(
@@ -4271,7 +4272,7 @@ private:
       manager_liveness_retry_gate_.RecordAttemptFailure(
           native_batch, ElapsedNs(),
           static_cast<std::uint64_t>(
-              deployment::native_execution_runtime_contract::
+              deployment::execution_runtime_contract::
                   manager_liveness_policy()
                       .expiry_timeout_ns));
     };
@@ -4282,10 +4283,10 @@ private:
       std::vector<core::RequiredManagerLivenessReceiverDTO> native_receivers;
       native_receivers.reserve(runtime.plan.runtime_units.size());
       const auto &retained_policy = deployment::
-          native_execution_runtime_contract::manager_liveness_policy();
+          execution_runtime_contract::manager_liveness_policy();
       for (const auto &row : runtime.plan.runtime_units) {
         if (row.process_adapter_contract_id !=
-            deployment::native_execution_runtime_contract::
+            deployment::execution_runtime_contract::
                 kProcessAdapterContractId) {
           continue;
         }
@@ -4603,7 +4604,7 @@ private:
 
   void RunNativeManagerLivenessLane() noexcept {
     const auto heartbeat_period = std::chrono::nanoseconds(
-        deployment::native_execution_runtime_contract::manager_liveness_policy()
+        deployment::execution_runtime_contract::manager_liveness_policy()
             .heartbeat_period_ns);
     std::unique_lock lock(manager_liveness_lane_mutex_);
     while (!manager_liveness_lane_stop_) {
@@ -6336,7 +6337,7 @@ private:
   ManagerVerifiedPackageView verified_package_;
   component_manager::RetainedNativeRuntimeUnitAdapter native_runtime_adapter_;
   component_manager::ExternallyProvisionedManagerStores stores_;
-  manyforge::scene::CanonicalEmptySceneOwner scene_owner_;
+  manyforge::scene::LogicalSceneOwner scene_owner_;
   OriginalManagerSceneMaintenanceAdapter original_manager_scene_maintenance_;
   SceneRuntimePoseProjector scene_runtime_pose_projector_;
   component_manager::DurableManagerActiveRuntimePlanSource plan_source_;

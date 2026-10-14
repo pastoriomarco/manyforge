@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -64,6 +65,13 @@ def test_repository_bootstrap_uses_the_exact_source_owned_generator(
     generator.write_text("generator", encoding="utf-8")
     generator.chmod(0o755)
     bootstrap = tmp_path / "bootstrap"
+    workspace = tmp_path / "workspace"
+    runtime = "ros2_control"
+    profile_relative = Path("manyforge_deployment/resources/maintained/catalog/"
+                            f"runtime_profile/manyforge.{runtime}_execution_runtime.json")
+    profile = workspace / profile_relative
+    profile.parent.mkdir(parents=True)
+    profile.write_bytes((REPOSITORY_ROOT / profile_relative).read_bytes())
     observed: list[tuple[str, ...]] = []
 
     def run(command: tuple[str, ...], **_kwargs: Any) -> None:
@@ -73,21 +81,30 @@ def test_repository_bootstrap_uses_the_exact_source_owned_generator(
         (selected_root / "canonical-empty-admission.c1_build_authority_cell.json").write_text("{}")
 
     monkeypatch.setattr(dev_workbench, "CANONICAL_EMPTY_GENERATOR", generator)
-    monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
+    monkeypatch.setattr(dev_workbench, "WORKSPACE", workspace)
     monkeypatch.setattr(dev_workbench, "BOOTSTRAP_ROOT", bootstrap)
     monkeypatch.setattr(dev_workbench, "_run", run)
 
-    root = dev_workbench._ensure_repository_bootstrap_package()
+    def ensure() -> Path:
+        return dev_workbench._ensure_repository_bootstrap_package()
+
+    root = ensure()
     assert root.parent == bootstrap
+    digest = hashlib.sha256(f"{runtime}-workbench:c1_build_authority_cell\0".encode())
+    digest.update(generator.read_bytes() + b"\0" + profile.read_bytes() + b"\0")
+    assert root.name == digest.hexdigest()
     assert observed == [
         (str(generator), "--output-root", str(root),
-         "--cell-id", "c1_build_authority_cell", "--native-runtime-profile",
-         str(dev_workbench.WORKSPACE / "manyforge_deployment/resources/maintained/catalog/"
-             "runtime_profile/manyforge.native_execution_runtime.json")),
+         "--cell-id", "c1_build_authority_cell",
+         "--ros-runtime-profile",
+         str(profile)),
     ]
-    assert dev_workbench._ensure_repository_bootstrap_package() == root
+    assert ensure() == root
+    profile.write_bytes(profile.read_bytes() + b"\n")
+    profile_root = ensure()
+    assert profile_root != root
     generator.write_text("updated generator", encoding="utf-8")
-    assert dev_workbench._ensure_repository_bootstrap_package() != root
+    assert ensure() != profile_root
     assert (root / "canonical-empty-admission.c1_build_authority_cell.json").exists()
 
 
@@ -251,45 +268,6 @@ def test_backend_build_uses_current_source_and_only_production_targets(
     assert observed[1][observed[1].index("--parallel") + 1] == "3"
 
 
-def test_native_build_uses_current_source_and_only_runtime_targets(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
-    build = tmp_path / "roboplan"
-    native_host = build / "manyforge_native_execution_host"
-    candidate_worker = build / "manyforge_roboplan_candidate_worker"
-    observed: list[tuple[str, ...]] = []
-
-    def run(command: tuple[str, ...], **_kwargs: Any) -> None:
-        observed.append(command)
-        if command[0] == "cmake" and command[1] == "--build":
-            build.mkdir(parents=True, exist_ok=True)
-            for path in (native_host, candidate_worker):
-                path.write_bytes(b"current-native")
-                path.chmod(0o755)
-
-    monkeypatch.setattr(dev_workbench, "ROBOPLAN_BUILD", build)
-    monkeypatch.setattr(dev_workbench, "NATIVE_EXECUTION_HOST", native_host)
-    monkeypatch.setattr(dev_workbench, "NATIVE_CANDIDATE_WORKER", candidate_worker)
-    monkeypatch.setattr(dev_workbench, "_run", run)
-    monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "3")
-
-    assert dev_workbench._ensure_current_native_backend() == (
-        native_host,
-        candidate_worker,
-    )
-
-    assert len(observed) == 2
-    assert "-DBUILD_TESTING=OFF" in observed[0]
-    assert observed[1][-5:] == (
-        "manyforge_native_execution_host",
-        "manyforge_roboplan_candidate_worker",
-        "--",
-        "-k",
-        "0",
-    )
-    assert observed[1][observed[1].index("--parallel") + 1] == "3"
-
-
 def test_startup_requires_the_existing_manager_baseline_to_be_fully_converged() -> None:
     status = {
         "source": {
@@ -380,13 +358,14 @@ def test_workbench_parser_allows_empty_or_project_startup() -> None:
 
     assert empty.project is None
     assert selected.project == "examples/lite6_pick_and_place.scenario"
-    assert empty.ros2_control is False
-    assert dev_workbench._parser().parse_args(["serve", "--ros2-control"]).ros2_control
+    assert not hasattr(empty, "ros2_control")
+    with pytest.raises(SystemExit):
+        dev_workbench._parser().parse_args(["serve", "--ros2-control"])
 
 
 def test_ros_bootstrap_selection_leaves_the_composer_startup_empty() -> None:
     selected = dev_workbench._parser().parse_args([
-        "serve", "--ros2-control", "--bootstrap-project", "examples/first.scenario",
+        "serve", "--bootstrap-project", "examples/first.scenario",
     ])
     assert selected.project is None
     assert selected.bootstrap_project == "examples/first.scenario"
@@ -402,9 +381,120 @@ def test_ros_bootstrap_selection_leaves_the_composer_startup_empty() -> None:
     assert "--startup-scenario-document" not in workbench._composer_command("http://headless")
 
 
+def test_no_project_ros_start_selects_repository_empty_with_original_identity(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MANYFORGE_STATE_DIR", str(tmp_path / "installation-state"))
+    monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
+    monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(dev_workbench, "BOOTSTRAP_ROOT", tmp_path / "bootstrap")
+    sources = {}
+    for name in ("manyforge_manager_daemon", "manyforge_roboplan_candidate_worker",
+                 "manyforge_ros2_control_execution_host", "generator", "preparer", "extension"):
+        source = tmp_path / name
+        source.write_bytes(name.encode())
+        source.chmod(0o755)
+        sources[name] = source
+    monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", sources["manyforge_manager_daemon"])
+    monkeypatch.setattr(dev_workbench, "CANONICAL_EMPTY_GENERATOR", sources["generator"])
+    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", lambda: sources["extension"])
+    monkeypatch.setattr(dev_workbench, "_ensure_current_ros_backend", lambda: (
+        sources["manyforge_roboplan_candidate_worker"], sources["manyforge_ros2_control_execution_host"]))
+    monkeypatch.setattr(dev_workbench, "_ensure_activation_preparer", lambda: sources["preparer"])
+    monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies", lambda: None)
+    monkeypatch.setattr(dev_workbench, "_port_available", lambda _port: True)
+    monkeypatch.setattr(dev_workbench, "_capture_ros_bootstrap_project",
+                        lambda *_a, **_k: pytest.fail("no-project startup has no Scenario to capture"))
+    monkeypatch.setattr(dev_workbench, "_ensure_ros_bootstrap_package",
+                        lambda *_a, **_k: pytest.fail("no-project startup uses the empty generator"))
+    generator_commands = []
+
+    def generate(command: tuple[str, ...]) -> None:
+        generator_commands.append(command)
+        (Path(command[2]) / dev_workbench.BOOTSTRAP_ADMISSION).write_text("{}")
+
+    monkeypatch.setattr(dev_workbench, "_run", generate)
+    workbench = dev_workbench.Workbench(
+        project_path=None,
+        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+    )
+    commands = {}
+
+    class PreparedStartup(Exception):
+        pass
+
+    def spawn(name: str, command: tuple[str, ...]) -> None:
+        commands[name] = command
+        if name == "Manager":
+            raise PreparedStartup
+
+    monkeypatch.setattr(workbench, "_spawn", spawn)
+    monkeypatch.setattr(workbench, "_wait_until", lambda *_a, **_k: None)
+    with pytest.raises(PreparedStartup):
+        workbench.start()
+
+    assert len(generator_commands) == 1
+    generated = generator_commands[0]
+    assert generated[3:] == (
+        "--cell-id", "c1_build_authority_cell", "--ros-runtime-profile",
+        str(REPOSITORY_ROOT / "manyforge_deployment/resources/maintained/catalog/"
+            "runtime_profile/manyforge.ros2_control_execution_runtime.json"),
+    )
+    for name in ("Headless API", "Manager"):
+        command = commands[name]
+        assert command[command.index("--install-root") + 1] == generated[2]
+        assert command[command.index("--canonical-empty-admission-filename") + 1] == (
+            "canonical-empty-admission.c1_build_authority_cell.json")
+    for name in ("Program runner", "Headless API"):
+        command = commands[name]
+        assert command[command.index("--cell-id") + 1] == "c1_build_authority_cell"
+    installed = tmp_path / "state/installed-targets"
+    assert {path.name for path in installed.iterdir()} == {
+        "manyforge_manager_daemon", "manyforge_roboplan_candidate_worker",
+        "manyforge_ros2_control_execution_host",
+    }
+    assert workbench.project_path is None and workbench.scenario_id is None
+    assert "--startup-scenario-document" not in workbench._composer_command("http://headless")
+    assert workbench.processes == []  # Every service spawn is mocked.
+
+
+def test_process_stack_stages_only_selected_host_without_starting_services(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    from manyforge_headless_api.process_tests.test_process_stack import ProcessStack
+
+    host = "manyforge_ros2_control_execution_host"
+    selected_environment = "MANYFORGE_ROS2_CONTROL_EXECUTION_HOST"
+    monkeypatch.delenv("MANYFORGE_NATIVE_EXECUTION_HOST", raising=False)
+    monkeypatch.delenv("MANYFORGE_ROS2_CONTROL_EXECUTION_HOST", raising=False)
+    sources = {}
+    for name in ("manyforge_manager_daemon", "manyforge_roboplan_candidate_worker", host):
+        source = tmp_path / name
+        source.write_bytes(name.encode())
+        source.chmod(0o755)
+        sources[name] = source
+    monkeypatch.setenv(selected_environment, str(sources[host]))
+    monkeypatch.setenv("MANYFORGE_ROBOPLAN_CANDIDATE_WORKER",
+                       str(sources["manyforge_roboplan_candidate_worker"]))
+    package_root = tmp_path / "package"
+    package_root.mkdir()
+    admission = "canonical-empty-admission.selected_cell.json"
+    (package_root / admission).write_text("{}")
+    stack = SimpleNamespace(root=tmp_path, package_root=package_root,
+                            manager_executable=sources["manyforge_manager_daemon"])
+    ProcessStack.prepare_native_package(stack, admission, ros2_control=True)
+    installed = tmp_path / "installed-targets"
+    assert {path.name for path in installed.iterdir()} == set(sources)
+    for name, source in sources.items():
+        assert (installed / name).read_bytes() == source.read_bytes()
+        assert os.access(installed / name, os.X_OK)
+    assert stack.manager_executable == installed / "manyforge_manager_daemon"
+    assert stack.manager_package_root == package_root
+    assert stack.manager_admission_filename == admission
+
+
 @pytest.mark.parametrize("project,bootstrap,ros,error", [
-    (None, None, True, "requires --bootstrap-project or --project"),
-    (None, "first", False, "requires --ros2-control"),
+    (None, "first", False, "requires ROS control"),
     ("first", "second", True, "excludes --project"),
     ("non_ros_fixture", None, True, "only ros2_control execution components"),
 ])
@@ -509,33 +599,27 @@ def test_ros_source_change_during_frontend_preparation_never_starts_runtime(
     assert workbench.processes == []
 
 
-@pytest.mark.parametrize("ros2_control", [False, True])
 def test_runtime_capability_selection_keeps_one_build_closure(
-    monkeypatch: Any, tmp_path: Path, ros2_control: bool
+    monkeypatch: Any, tmp_path: Path
 ) -> None:
-    native = (tmp_path / "native", tmp_path / "worker")
-    ros = (*native, tmp_path / "ros")
+    ros = (tmp_path / "worker", tmp_path / "ros")
     calls: list[str] = []
-    monkeypatch.setattr(
-        dev_workbench, "_ensure_current_native_backend",
-        lambda: calls.append("native") or native,
-    )
     monkeypatch.setattr(
         dev_workbench, "_ensure_current_ros_backend",
         lambda: calls.append("ros") or ros,
     )
     workbench = dev_workbench.Workbench(
         project_path=None, headless_port=1, runner_port=2,
-        composer_port=3, frontend_port=4, ros2_control=ros2_control,
+        composer_port=3, frontend_port=4,
     )
 
-    assert workbench._runtime_targets() == (ros if ros2_control else native)
-    assert calls == (["ros"] if ros2_control else ["native"])
+    assert workbench.ros2_control is True
+    assert workbench._runtime_targets() == ros
+    assert calls == ["ros"]
     monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
     assert workbench._simulation_control_arguments() == (
         ("--simulation-control-config", str(REPOSITORY_ROOT /
          "manyforge_ros_bringup/config/isaac_program_simulation_site.json"))
-        if ros2_control else ()
     )
 
 
@@ -561,10 +645,7 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
         assert env["CMAKE_BUILD_PARALLEL_LEVEL"] == "2"
         assert env["CMAKE_GENERATOR"] == "Ninja"
         ros_build.mkdir(parents=True, exist_ok=True)
-        targets = (
-            ("manyforge_ros2_control_execution_host", "manyforge_roboplan_candidate_worker")
-            if len(commands) == 1 else ("manyforge_native_execution_host",)
-        )
+        targets = ("manyforge_ros2_control_execution_host", "manyforge_roboplan_candidate_worker")
         for name in targets:
             source = ros_build / name
             source.write_bytes(name.encode())
@@ -582,13 +663,9 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
     monkeypatch.setattr(dev_workbench, "_run", build)
     monkeypatch.setattr(dev_workbench.subprocess, "run", source_overlay)
     targets = dev_workbench._ensure_current_ros_backend()
-    assert commands[0] == (str(REPOSITORY_ROOT / "scripts/ros/build-ros2-control-runtime.sh"),)
-    assert commands[1] == (
-        "cmake", "--build", str(ros_build), "--parallel", "2", "--target",
-        "manyforge_native_execution_host", "--", "-k", "0",
-    )
+    assert commands == [(str(REPOSITORY_ROOT / "scripts/ros/build-ros2-control-runtime.sh"),)]
     assert [target.name for target in targets] == [
-        "manyforge_native_execution_host", "manyforge_roboplan_candidate_worker",
+        "manyforge_roboplan_candidate_worker",
         "manyforge_ros2_control_execution_host",
     ]
     installed = tmp_path / "installed-targets"
@@ -597,6 +674,7 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
     for target in targets:
         assert (installed / target.name).read_bytes() == target.name.encode()
         assert os.access(installed / target.name, os.X_OK)
+    assert not (installed / "manyforge_native_execution_host").exists()
     assert parent_environment["AMENT_PREFIX_PATH"] == "/current/overlay"
     assert parent_environment["ROS_STATIC_PEERS"] == "orin;laptop"
 

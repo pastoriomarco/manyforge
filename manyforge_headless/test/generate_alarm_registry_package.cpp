@@ -51,10 +51,10 @@ int main(int argc, char **argv) {
           "the canonical-empty configuration belongs to another cell");
     }
     const auto single = manyforge::deployment::test::
-        materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+        materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
             arguments.package_root, arguments.cell_id);
     const auto dual = manyforge::deployment::test::
-        materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+        materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
             arguments.package_root, arguments.cell_id);
     std::ofstream stream(arguments.bundle_ids_output,
                          std::ios::binary | std::ios::trunc);

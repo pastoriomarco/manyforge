@@ -1,4 +1,6 @@
 #include "native_execution_runtime_unit_internal.hpp"
+#include <manyforge_deployment/execution_runtime_contract.hpp>
+#include "execution_runtime_contract_identity_internal.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -164,15 +166,7 @@ canonical_to_json_value(const CanonicalValue &value) {
   }
 }
 
-[[nodiscard]] std::string contract_revision(std::string_view domain,
-                                            std::string_view description) {
-  std::string preimage("manyforge.native-execution-runtime-contract.v1");
-  preimage.push_back('\0');
-  preimage.append(domain);
-  preimage.push_back('\0');
-  preimage.append(description);
-  return sha256_digest(preimage);
-}
+using execution_runtime_contract_identity::contract_revision;
 
 } // namespace
 
@@ -467,22 +461,7 @@ bool native_execution_runtime_configuration_is_qualified(
 }
 
 const core::ManagerLivenessPolicyDTO& manager_liveness_policy_value() {
-  static const core::ManagerLivenessPolicyDTO policy{
-      core::RuntimePolicyId(std::string(
-          native_execution_runtime_contract::kManagerLivenessPolicyId)),
-      core::RuntimePolicyRevision(contract_revision(
-          "manager-liveness-policy",
-          "retained-native-v1;heartbeat-period-ns=250000000;"
-          "expiry-timeout-ns=1000000000;"
-          "local-safe=manyforge.native_execution.manager_loss_safe")),
-      250'000'000,
-      1'000'000'000,
-      core::ProductContractId(std::string(
-          native_execution_runtime_contract::kManagerLivenessLocalSafeContractId)),
-      core::ProductContractRevision(contract_revision(
-          "manager-loss-local-safe",
-          "native-kernel-direct-fail-safe;full-stop;loss-inhibit-v1"))};
-  return policy;
+  return execution_runtime_contract::manager_liveness_policy();
 }
 
 std::string native_execution_runtime_implementation_revision() {
@@ -692,11 +671,11 @@ void require_native_execution_runtime_product_matches_retained_bundle(
   }
 }
 
-std::vector<native_execution_runtime_contract::Configuration::MotionTargetLimit>
+std::vector<execution_runtime_contract::Configuration::MotionTargetLimit>
 decode_execution_motion_target_limits(
     const core::JsonValueDTO::Array &motion_target_limits,
     const bool include_ordinary_jerk) {
-  using native_execution_runtime_contract::Configuration;
+  using execution_runtime_contract::Configuration;
   std::vector<Configuration::MotionTargetLimit> result;
   result.reserve(motion_target_limits.size());
   for (const auto &entry : motion_target_limits) {
@@ -732,7 +711,7 @@ decode_execution_motion_target_limits(
             ? detail::decode_ordinary_motion_jerk_settings(
                   std::get<core::JsonObjectDTO>(
                       object->at("ordinary_motion_jerk").value))
-            : native_execution_runtime_contract::OrdinaryMotionJerkSettings{}});
+            : execution_runtime_contract::OrdinaryMotionJerkSettings{}});
   }
   std::sort(result.begin(), result.end(),
             [](const auto &left, const auto &right) {
@@ -755,11 +734,11 @@ decode_execution_motion_target_limits(
 }
 
 std::vector<
-    native_execution_runtime_contract::Configuration::GripperTargetConfiguration>
+    execution_runtime_contract::Configuration::GripperTargetConfiguration>
 decode_execution_gripper_target_configurations(
     const core::JsonValueDTO::Array &gripper_target_configurations,
     const std::string_view label) {
-  using native_execution_runtime_contract::Configuration;
+  using execution_runtime_contract::Configuration;
   std::vector<Configuration::GripperTargetConfiguration> result;
   result.reserve(
       gripper_target_configurations.size());
@@ -859,11 +838,11 @@ decode_execution_gripper_target_configurations(
   return result;
 }
 
-native_execution_runtime_contract::Configuration
+execution_runtime_contract::Configuration
 decode_native_execution_runtime_configuration(
     const core::JsonObjectDTO &configuration, const core::CellGraphDTO &graph,
     const core::RuntimeUnitId &runtime_unit_id) {
-  using native_execution_runtime_contract::Configuration;
+  using execution_runtime_contract::Configuration;
   const auto require_member =
       [&](const std::string_view name) -> const core::JsonValueDTO & {
     const auto found = configuration.find(name);
@@ -1156,10 +1135,6 @@ require_configuration(const RetainedBundle &retained_bundle,
 
 std::string implementation_revision() {
   return detail::native_execution_runtime_implementation_revision();
-}
-
-const core::ManagerLivenessPolicyDTO& manager_liveness_policy() {
-  return detail::manager_liveness_policy_value();
 }
 
 } // namespace manyforge::deployment::native_execution_runtime_contract

@@ -34,7 +34,6 @@
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
 #include <manyforge_roboplan/retained_collision_world_projector.hpp>
-#include <manyforge_roboplan/retained_gripper_command_backend.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_kinematic_state_projector.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
@@ -59,6 +58,12 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_roboplan/retained_ros2_control_backend_factory.hpp>
+#include "../src/retained_ros2_control_lifecycle_plans_internal.hpp"
+#endif
 
 #include "content_identity_internal.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
@@ -1544,7 +1549,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
 
   const auto materialized = deployment::test::
-      materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
+      materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
           package_root);
   ASSERT_NE(materialized.bundle, nullptr);
   ASSERT_EQ(
@@ -1870,7 +1875,7 @@ TEST(RetainedProductRoboPlanConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(empty_ambient_root));
 
   const auto materialized =
-      deployment::test::materialize_lite6_retained_consumer_fixture(
+      deployment::test::materialize_lite6_ros2_control_retained_consumer_fixture(
           package_root);
   ASSERT_NE(materialized.bundle, nullptr);
   ASSERT_EQ(materialized.bundle->value().provenance.generator_records.size(),
@@ -2104,7 +2109,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(empty_ambient_root));
 
   const auto materialized = deployment::test::
-      materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
+      materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
           package_root);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
@@ -2268,7 +2273,7 @@ TEST(
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
 
   const auto materialized = deployment::test::
-      materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
+      materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(
           package_root);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
@@ -2316,10 +2321,10 @@ TEST(
       "scene-frame-direct-owner-epoch");
   const auto arm_binding = make_fixture_runtime_participant(
       *materialized.bundle, model_map, component_id, arm_target_id,
-      core::StateAuthorityClass::kPredicted, std::nullopt, local_runtime_epoch);
+      std::nullopt, std::nullopt, local_runtime_epoch);
   const auto gripper_binding = make_fixture_runtime_participant(
       *materialized.bundle, model_map, component_id, gripper_target_id,
-      core::StateAuthorityClass::kPredicted, std::nullopt, local_runtime_epoch);
+      std::nullopt, std::nullopt, local_runtime_epoch);
 
   auto stage =
       RetainedPlanningModelStage::create_verified(retained, staging_parent);
@@ -2337,12 +2342,12 @@ TEST(
   auto arm_channel = std::make_shared<RetainedObservedStateChannel>(
       arm_binding, state_projector,
       RetainedObservedStateChannelConfig{
-          core::ObservedStateSourceKind::kPredictedState,
+          core::ObservedStateSourceKind::kCommandedState,
           "test/direct-owner/arm", 0, 1U});
   auto gripper_channel = std::make_shared<RetainedObservedStateChannel>(
       gripper_binding, state_projector,
       RetainedObservedStateChannelConfig{
-          core::ObservedStateSourceKind::kPredictedState,
+          core::ObservedStateSourceKind::kCommandedState,
           "test/direct-owner/gripper", 0, 1U});
   ASSERT_TRUE(arm_channel->initialize_from_projection(10).applied());
   ASSERT_TRUE(gripper_channel->initialize_from_projection(10).applied());
@@ -2365,10 +2370,8 @@ TEST(
   const std::shared_ptr<const core::IObservedStateProvider> gripper_provider(
       gripper_channel, gripper_channel->addressed_publication());
   const std::vector<RetainedSceneFrameStateSourceInput> provided_state_sources{
-      {arm_channel->query_context(),
-       core::ObservedStateSourceKind::kPredictedState, arm_provider},
-      {gripper_channel->query_context(),
-       core::ObservedStateSourceKind::kPredictedState, gripper_provider}};
+      {arm_channel->query_context(), arm_channel->source_kind(), arm_provider},
+      {gripper_channel->query_context(), gripper_channel->source_kind(), gripper_provider}};
   auto resolver = RetainedSceneFrameResolver::create_verified(
       collision_model, *materialized.bundle, model_map, retained,
       local_runtime_unit_id, local_runtime_epoch, provided_state_sources);
@@ -2644,7 +2647,7 @@ TEST(RetainedProductCrossConsumer,
 
   constexpr std::string_view cell_id = "i6_cell_frame_resolver_cell";
   const auto materialized = deployment::test::
-      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+      materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, cell_id);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &bundle = *materialized.bundle;
@@ -2671,7 +2674,8 @@ TEST(RetainedProductCrossConsumer,
       bundle, model_map, root_component_id, arm_target_id, std::nullopt,
       std::nullopt, root_epoch);
   const auto peer_binding = make_fixture_runtime_participant(
-      bundle, model_map, peer_component_id, arm_target_id);
+      bundle, model_map, peer_component_id, arm_target_id, std::nullopt,
+      std::nullopt, root_epoch);
 
   const auto &root_component = require_fixture_one(
       bundle.value().cell_graph.controllable_components,
@@ -2719,7 +2723,7 @@ TEST(RetainedProductCrossConsumer,
     return std::make_shared<RetainedObservedStateChannel>(
         binding, projector,
         RetainedObservedStateChannelConfig{
-            core::ObservedStateSourceKind::kPredictedState,
+            core::ObservedStateSourceKind::kCommandedState,
             "test/cell-frame/" + std::string(channel_name), 0, 1U});
   };
   auto root_channel = make_arm_channel(root_binding, "root-arm");
@@ -2737,8 +2741,7 @@ TEST(RetainedProductCrossConsumer,
       root_target->model_groups.front().compiled_group_name);
   const auto source_for = [](const auto &channel) {
     return RetainedSceneFrameStateSourceInput{
-        channel->query_context(),
-        core::ObservedStateSourceKind::kPredictedState,
+        channel->query_context(), channel->source_kind(),
         std::shared_ptr<const core::IObservedStateProvider>(
             channel, channel->addressed_publication())};
   };
@@ -2795,7 +2798,7 @@ TEST(RetainedProductCrossConsumer,
 
   constexpr std::string_view cell_id = "i6_peer_reference_cell";
   const auto materialized = deployment::test::
-      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+      materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, cell_id);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &bundle = *materialized.bundle;
@@ -2822,7 +2825,8 @@ TEST(RetainedProductCrossConsumer,
       bundle, model_map, root_component_id, arm_target_id, std::nullopt,
       std::nullopt, root_epoch);
   const auto peer_binding = make_fixture_runtime_participant(
-      bundle, model_map, peer_component_id, arm_target_id);
+      bundle, model_map, peer_component_id, arm_target_id, std::nullopt,
+      std::nullopt, root_epoch);
   const auto &root_component = require_fixture_one(
       bundle.value().cell_graph.controllable_components,
       [&](const auto &candidate) {
@@ -2865,7 +2869,7 @@ TEST(RetainedProductCrossConsumer,
   auto root_channel = std::make_shared<RetainedObservedStateChannel>(
       root_binding, projector,
       RetainedObservedStateChannelConfig{
-          core::ObservedStateSourceKind::kPredictedState,
+          core::ObservedStateSourceKind::kCommandedState,
           "test/peer-reference/root-arm", 0, 1U});
   // The peer source is owned by its own projector with a positive freshness
   // budget so admission-time staleness of the other robot is observable.
@@ -2882,7 +2886,7 @@ TEST(RetainedProductCrossConsumer,
   auto peer_channel = std::make_shared<RetainedObservedStateChannel>(
       peer_binding, peer_projector,
       RetainedObservedStateChannelConfig{
-          core::ObservedStateSourceKind::kPredictedState,
+          core::ObservedStateSourceKind::kCommandedState,
           "test/peer-reference/peer-arm", kPeerFreshnessBudgetNs, 1U});
   ASSERT_TRUE(root_channel->initialize_from_projection(10).applied());
   ASSERT_TRUE(peer_channel->initialize_from_projection(10).applied());
@@ -2897,8 +2901,7 @@ TEST(RetainedProductCrossConsumer,
       root_target->model_groups.front().compiled_group_name);
   const auto source_for = [](const auto &channel) {
     return RetainedSceneFrameStateSourceInput{
-        channel->query_context(),
-        core::ObservedStateSourceKind::kPredictedState,
+        channel->query_context(), channel->source_kind(),
         std::shared_ptr<const core::IObservedStateProvider>(
             channel, channel->addressed_publication())};
   };
@@ -3445,8 +3448,7 @@ TEST(RetainedProductCrossConsumer,
       root_epoch,
       {source_for(root_channel),
        RetainedSceneFrameStateSourceInput{
-           peer_context, core::ObservedStateSourceKind::kPredictedState,
-           scripted}});
+           peer_context, peer_channel->source_kind(), scripted}});
   const auto coherent = scripted_resolver->ResolveFrameTransform(
       RetainedSceneFrameTransformQuery{probe, carried, peer_tcp,
                                        projection_binding},
@@ -3518,14 +3520,14 @@ TEST(RetainedProductCrossConsumer,
 }
 
 TEST(RetainedProductCrossConsumer,
-     ProductSelectedStateConfigDoesNotEvaluateNativePredictedFallback) {
+     ProductSelectedStateConfigRequiresExplicitSelection) {
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
       temporary.path() / "retained-package";
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
 
   const auto materialized = deployment::test::
-      materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
+      materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(
           package_root);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
@@ -3545,9 +3547,6 @@ TEST(RetainedProductCrossConsumer,
   const auto commanded_binding = make_fixture_runtime_participant(
       *materialized.bundle, model_map, component_id, target_id,
       core::StateAuthorityClass::kCommanded, std::nullopt, runtime_epoch);
-  const auto predicted_binding = make_fixture_runtime_participant(
-      *materialized.bundle, model_map, component_id, target_id,
-      core::StateAuthorityClass::kPredicted, std::nullopt, runtime_epoch);
 
   const RetainedObservedStateChannelConfig selected{
       core::ObservedStateSourceKind::kCommandedState,
@@ -3563,11 +3562,6 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_THROW(static_cast<void>(detail::select_retained_state_channel_config(
                    std::nullopt, commanded_binding)),
                std::invalid_argument);
-  const auto native_default = detail::select_retained_state_channel_config(
-      std::nullopt, predicted_binding);
-  EXPECT_EQ(native_default.source_kind,
-            core::ObservedStateSourceKind::kPredictedState);
-  EXPECT_EQ(native_default.authority_generation, 1U);
 }
 
 enum class Lite6AggregateCheck {
@@ -3576,6 +3570,10 @@ enum class Lite6AggregateCheck {
   kRefreshCellModel,
   kDeploymentFaultStopProfile,
   kExecutionPortParticipant,
+  kMissingSelectedBackend,
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+  kRosOrdinaryJerkRejection,
+#endif
   kSameRoutePredecessorQualification,
   kMeasuredPublication, kMeasuredOptionalDomainRace, kMeasuredNullOptionalDomainRace
 };
@@ -3590,7 +3588,166 @@ void check_refreshed_cell_model(
     const core::RuntimeParticipantBinding &gripper_binding,
     const std::string &tcp_frame);
 
-void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
+// The selected Core constructor cases never submit a gripper command.
+// The second participant supplies only the required owned interfaces;
+// unexpected command/Stop execution fails the fixture instead of simulating law.
+class UnusedSelectedGripperBackend final
+    : public core::IGripperCommandBackend,
+      public core::IControlDomainExecutionPort {
+public:
+  UnusedSelectedGripperBackend(core::RuntimeParticipantBinding binding,
+      std::shared_ptr<IRetainedObservedStateChannel> channel)
+      : binding_(std::move(binding)), channel_(std::move(channel)) {}
+
+  core::Result<void> RebindRoute(core::RuntimeParticipantBinding binding,
+      std::shared_ptr<IRetainedObservedStateChannel> channel) {
+    if (!channel || binding.value().controllable_component_id !=
+                        binding_.value().controllable_component_id ||
+        binding.value().command_target_id != binding_.value().command_target_id)
+      return core::Result<void>::Err({"test_gripper_route_invalid", "selected gripper owner differs", {}});
+    binding_ = std::move(binding);
+    channel_ = std::move(channel);
+    return core::Result<void>::Ok();
+  }
+
+  core::GripperCommandResultDTO command_gripper(
+      const core::GripperCommandRequestDTO &) override {
+    throw std::logic_error("selected-owner fixture does not execute gripper commands");
+  }
+  core::GripperCommandStatusDTO get_gripper_status(
+      const std::string &gripper_id) const override {
+    if (gripper_id != binding_.value().command_target_id.value() || !channel_)
+      throw std::logic_error("selected-owner fixture has no matching gripper state owner");
+    const auto context = channel_->query_context();
+    const auto expected = core::make_observed_state_query_context(
+        binding_, context.freshness_budget_ns);
+    if (!expected.ok() || context != expected.value() ||
+        context.resources.size() != 1U ||
+        context.coordinate_kinds.front() != core::CoordinateKind::kLinear)
+      throw std::logic_error("selected-owner fixture gripper channel differs from its binding");
+
+    // This fixture has accepted no command: Idle and command counters zero
+    // describe its own history, independently of route readiness or presence.
+    core::GripperCommandStatusDTO status;
+    status.state = core::GripperCommandState::kIdle;
+    status.gripper_id = gripper_id;
+    const auto state = channel_->current_controlled_state();
+    if (!state.ok()) {
+      status.error = state.error();
+      return status;
+    }
+    if (state.value().controllable_component_id != context.controllable_component_id ||
+        state.value().command_target_id != context.command_target_id ||
+        state.value().control_binding_id != context.control_binding_id ||
+        state.value().control_binding_revision != context.control_binding_revision ||
+        state.value().active_control_configuration_id != context.active_control_configuration_id ||
+        state.value().active_control_configuration_generation !=
+            context.active_control_configuration_generation ||
+        state.value().resources != context.resources ||
+        state.value().joint_names != context.joint_names ||
+        state.value().positions.size() != 1U ||
+        !std::holds_alternative<core::LinearPositionDTO>(state.value().positions.front()))
+      throw std::logic_error("selected-owner fixture gripper positions differ from its channel");
+    const auto position = std::get<core::LinearPositionDTO>(
+        state.value().positions.front()).value_m;
+    status.current_position = position;
+    status.commanded_position = position;
+    status.observed_position = position;
+    return status;
+  }
+  core::GripperCommandResultDTO mark_gripper_grasp_lost(
+      const std::string &, std::uint64_t, std::uint64_t,
+      const std::string &, const std::string &, const std::string &) override {
+    throw std::logic_error("selected-owner fixture does not mutate grasp evidence");
+  }
+  void invalidate_gripper_commands(core::GripperInvalidationReason) noexcept override {}
+  void authorize_gripper_commands() noexcept override {}
+  core::ParticipantStopStageResultDTO TranslateStopStage(
+      const core::ResolvedParticipantStopStageDTO &,
+      const core::RemainingStopBudgetDTO &, std::stop_token) override {
+    throw std::logic_error("selected-owner fixture does not execute gripper Stop");
+  }
+private:
+  core::RuntimeParticipantBinding binding_;
+  std::shared_ptr<IRetainedObservedStateChannel> channel_;
+};
+
+// Focused Core seam: the selected product supplies bindings and state, while
+// FakeExecutionPort exposes ownership/rebind behavior without simulator law.
+[[nodiscard]] RetainedRuntimeBackendFactory selected_core_test_backend_factory(
+    core::ExecutionPortParticipant *&port_participant,
+    bool require_gripper = false) {
+  return [&port_participant, require_gripper](
+            const core::RuntimeParticipantBinding &motion,
+            const std::optional<core::RuntimeParticipantBinding> &gripper,
+            const std::shared_ptr<RetainedObservedStateChannel> &motion_channel,
+            const std::shared_ptr<RetainedObservedStateChannel> &gripper_channel,
+            core::IClock &clock, core::IScheduler &scheduler) {
+          auto port = std::make_shared<core::testing::FakeExecutionPort>();
+          core::ExecutionLaneFactsDTO facts;
+          for (const auto &resource : motion.value().resources)
+            facts.joint_names.push_back(resource.compiled_resource_name);
+          facts.supports_scale = true;
+          facts.state_rate_hz = 100.0;
+          facts.controller_update_rate_hz = 150.0;
+          port->SetLaneFacts(facts);
+          core::ExecutionPortParticipantConfig config;
+          config.stop.trip_authority = motion.value().control_path->state_authority_class;
+          config.stop.stop_traj_delta_s = 0.05;
+          config.stop.sample_period_s = 0.01;
+          config.stop.replacement_start_allowance_s = 0.02;
+          config.stop.hard_stop_completion_timeout_ns = 500'000'000;
+          config.late_cycle_margin_s = 0.015;
+          auto participant = std::make_shared<core::ExecutionPortParticipant>(
+              motion, port, clock, scheduler,
+              [](core::TimePoint, const std::stop_token &) {},
+              core::ExecutionPortParticipantStateAuthority{
+                  &motion_channel->publication().numeric_publication(),
+                  [] { return core::Result<void>::Ok(); }},
+              std::move(config));
+          port_participant = participant.get();
+          if (require_gripper) {
+            EXPECT_TRUE(gripper.has_value());
+            EXPECT_NE(gripper_channel, nullptr);
+          }
+          auto gripper_backend = gripper.has_value()
+              ? std::make_shared<UnusedSelectedGripperBackend>(*gripper, gripper_channel)
+              : nullptr;
+          RetainedRuntimeBackendSet selected;
+          selected.execution = participant;
+          selected.gripper = gripper_backend;
+          selected.gripper_stop_execution_port = gripper_backend.get();
+          selected.rebind_motion_route =
+              [participant](
+                  core::RuntimeParticipantBinding binding,
+                  std::vector<core::RuntimeParticipantBinding> aliases) {
+                return participant->RebindRoute(std::move(binding), std::move(aliases));
+              };
+          if (gripper_backend) {
+            selected.rebind_gripper_route =
+                [gripper_backend](core::RuntimeParticipantBinding binding,
+                    std::shared_ptr<IRetainedObservedStateChannel> channel) {
+                  return gripper_backend->RebindRoute(std::move(binding), std::move(channel));
+                };
+          }
+          return selected;
+        };
+}
+
+[[nodiscard]] RetainedObservedStateChannelConfig selected_core_test_state_config(
+    const core::RuntimeParticipantBinding &binding) {
+  return {binding.value().control_path->state_authority_class == core::StateAuthorityClass::kPredicted
+              ? core::ObservedStateSourceKind::kPredictedState
+              : core::ObservedStateSourceKind::kCommandedState,
+          "test/selected-core-state", 0, 1U};
+}
+
+void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+  const bool ros_jerk_rejection = check == Lite6AggregateCheck::kRosOrdinaryJerkRejection;
+#else
+  const bool ros_jerk_rejection = false;
+#endif
   const bool reseal_capability_inventory =
       check == Lite6AggregateCheck::kResealInventory;
   ScopedTemporaryRoot temporary;
@@ -3604,9 +3761,22 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
   ASSERT_TRUE(std::filesystem::create_directory(empty_ambient_root));
 
-  const auto materialized = deployment::test::
-      materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
-          package_root);
+  const auto materialized = [&]() {
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+    if (ros_jerk_rejection) {
+      const auto plans = detail::ros2_control_lifecycle_plans_internal::
+          retained_ros2_control_lifecycle_plans();
+      const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+          core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
+      if (!semantic.ok()) throw std::logic_error(semantic.error().message);
+      return deployment::test::
+          materialize_lite6_ros2_control_cclc_product_retained_consumer_fixture(
+              package_root, semantic.value().value());
+    }
+#endif
+    return deployment::test::
+        materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(package_root);
+  }();
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
   ASSERT_EQ(products.symbol_role_maps.size(), 1U);
@@ -3629,16 +3799,17 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
   ASSERT_EQ(graph.runtime_units.size(), 1U);
   const core::RuntimeEpoch local_runtime_epoch(
       "epoch." + graph.runtime_units.front().runtime_unit_id.value());
+  const auto state_authority = core::StateAuthorityClass::kCommanded;
   const auto arm_binding = make_fixture_runtime_participant(
       *materialized.bundle, model_map, component_id, arm_target_id,
-      core::StateAuthorityClass::kPredicted, std::nullopt, local_runtime_epoch);
+      state_authority, std::nullopt, local_runtime_epoch);
   const core::ProgramCommandSchemaRefDTO command_schema{
       core::CommandSchemaId(std::string(core::kGripperPositionCommandSchemaId)),
       core::CommandSchemaRevision(
           std::string(core::kGripperPositionCommandSchemaRevision))};
   const auto gripper_binding = make_fixture_runtime_participant(
       *materialized.bundle, model_map, component_id, gripper_target_id,
-      core::StateAuthorityClass::kPredicted, command_schema,
+      state_authority, command_schema,
       local_runtime_epoch);
 
   auto stage =
@@ -3710,7 +3881,6 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
       1024U,
       core::CacheConfig{},
       core::ExecutionKernelConfig{},
-      RoboPlanExecutionBackendConfig{},
       SimpleSchedulerConfig{},
       10'000'000,
       {0.0, 0.0, 1.57, 0.0, 0.0, 0.0},
@@ -3755,16 +3925,65 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
       {},
       {}};
   runtime_input.deployment_maximum_tcp_linear_speed_mps = 0.15;
-  core::OrdinaryMotionJerkPolicy jerk_profile{true, false, {}};
-  for (const auto &resource : arm_binding.value().resources)
-    jerk_profile.limits.emplace(*resource.source_joint_name,
-                                core::AngularJerkDTO{50.0});
-  runtime_input.ordinary_motion_jerk =
-      deployment::native_execution_runtime_contract::OrdinaryMotionJerkSettings{
-          true, 1.0, {}};
-  for (const auto &[joint, limit] : jerk_profile.limits)
-    runtime_input.ordinary_motion_jerk->joint_limits.push_back(
-        {joint, std::get<core::AngularJerkDTO>(limit).value_rad_s3, {}});
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+  if (ros_jerk_rejection) {
+    core::OrdinaryMotionJerkPolicy jerk_profile{true, false, {}};
+    for (const auto &resource : arm_binding.value().resources)
+      jerk_profile.limits.emplace(*resource.source_joint_name,
+                                  core::AngularJerkDTO{50.0});
+    runtime_input.ordinary_motion_jerk =
+        deployment::native_execution_runtime_contract::OrdinaryMotionJerkSettings{
+            true, 1.0, {}};
+    for (const auto &[joint, limit] : jerk_profile.limits)
+      runtime_input.ordinary_motion_jerk->joint_limits.push_back(
+          {joint, std::get<core::AngularJerkDTO>(limit).value_rad_s3, {}});
+    EXPECT_EQ(graph.runtime_units.front().runtime_profile_id.value(),
+              "manyforge.ros2_control_execution_runtime");
+    ASSERT_TRUE(arm_binding.value().control_path.has_value());
+    EXPECT_EQ(arm_binding.value().control_path->state_authority_class,
+              core::StateAuthorityClass::kCommanded);
+    ASSERT_TRUE(runtime_input.ordinary_motion_jerk.has_value());
+    EXPECT_TRUE(runtime_input.ordinary_motion_jerk->enabled);
+
+    RetainedRos2ControlBackendConfig ros_config;
+    ros_config.node_name = "manyforge_jerk_rejection_fixture";
+    ros_config.node_namespace = "/manyforge/" + component_id.value();
+    ros_config.executor_thread_count = 1U;
+    ros_config.participant.stop.trip_authority =
+        arm_binding.value().control_path->state_authority_class;
+    ros_config.observed_state_authority_profile_id = "manyforge.commanded_simulation";
+    ros_config.defer_ros_start = true;
+    for (const auto& resource : arm_binding.value().resources) {
+      ASSERT_TRUE(resource.source_joint_name.has_value());
+      ros_config.arm.adapter.lane_facts.joint_names.push_back(*resource.source_joint_name);
+    }
+    runtime_input.motion_state_channel_config = retained_ros2_control_motion_state_config(ros_config);
+    runtime_input.gripper_state_channel_config =
+        retained_ros2_control_gripper_state_config(gripper_binding);
+    auto ros_factory = make_retained_ros2_control_backend_factory(std::move(ros_config));
+    ASSERT_TRUE(static_cast<bool>(ros_factory));
+    unsigned factory_calls = 0U;
+    runtime_input.backend_factory =
+        [real_factory = std::move(ros_factory), &factory_calls](
+            const core::RuntimeParticipantBinding& motion,
+            const std::optional<core::RuntimeParticipantBinding>& gripper,
+            const std::shared_ptr<RetainedObservedStateChannel>& motion_channel,
+            const std::shared_ptr<RetainedObservedStateChannel>& gripper_channel,
+            core::IClock& clock, core::IScheduler& scheduler) {
+          ++factory_calls;
+          return real_factory(motion, gripper, motion_channel, gripper_channel, clock, scheduler);
+        };
+    try {
+      static_cast<void>(create_retained_native_runtime(
+          std::move(runtime_input), std::move(runtime_config)));
+      ADD_FAILURE() << "selected ROS ordinary jerk must refuse before backend construction";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_STREQ(error.what(), "ordinary jerk profile requires the native execution backend");
+    }
+    EXPECT_EQ(factory_calls, 0U);
+    return;
+  }
+#endif
   if (reseal_capability_inventory) {
     // This synthetic DTO fixture adds a real control-facing feedback capability
     // to the same controller. It tests owner classification, not graph/compiler
@@ -3803,68 +4022,23 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
     runtime_input.fault_stop_profile_from_deployment = true;
     runtime_input.deployment_fault_stop_profile = authored_fault;
   }
-  // The Core robot participant over an execution port enters through the
-  // existing retained backend seam; the gripper keeps its own backend.
-  // Owned by the runtime (it also owns the clock and scheduler it uses).
+  // All constructor cases select the existing Core execution-port seam.
   core::ExecutionPortParticipant *port_participant = nullptr;
-  if (check == Lite6AggregateCheck::kExecutionPortParticipant) {
-    runtime_input.ordinary_motion_jerk.reset();
-    runtime_input.backend_factory =
-        [&port_participant, &scene](
-            const core::RuntimeParticipantBinding &motion,
-            const std::optional<core::RuntimeParticipantBinding> &gripper,
-            const std::shared_ptr<RetainedObservedStateChannel> &motion_channel,
-            const std::shared_ptr<RetainedObservedStateChannel> &gripper_channel,
-            core::IClock &clock, core::IScheduler &scheduler) {
-          auto port = std::make_shared<core::testing::FakeExecutionPort>();
-          core::ExecutionLaneFactsDTO facts;
-          for (const auto &resource : motion.value().resources)
-            facts.joint_names.push_back(resource.compiled_resource_name);
-          facts.supports_scale = true;
-          facts.state_rate_hz = 100.0;
-          facts.controller_update_rate_hz = 150.0;
-          port->SetLaneFacts(facts);
-          core::ExecutionPortParticipantConfig config;
-          config.stop.trip_authority = core::StateAuthorityClass::kCommanded;
-          config.stop.stop_traj_delta_s = 0.05;
-          config.stop.sample_period_s = 0.01;
-          config.stop.replacement_start_allowance_s = 0.02;
-          config.stop.hard_stop_completion_timeout_ns = 500'000'000;
-          config.late_cycle_margin_s = 0.015;
-          auto participant = std::make_shared<core::ExecutionPortParticipant>(
-              motion, port, clock, scheduler,
-              [](core::TimePoint, const std::stop_token &) {},
-              core::ExecutionPortParticipantStateAuthority{
-                  &motion_channel->publication().numeric_publication(),
-                  [] { return core::Result<void>::Ok(); }},
-              std::move(config));
-          port_participant = participant.get();
-          const auto &finger = gripper->value().resources.front();
-          const auto joint = scene->getJointInfo(finger.compiled_resource_name);
-          auto gripper_backend = std::make_shared<RetainedGripperCommandBackend>(
-              *gripper, gripper_channel,
-              RetainedGripperPositionLimits{finger.coordinate_kind,
-                                            joint->limits.min_position[0],
-                                            joint->limits.max_position[0]},
-              clock, scheduler);
-          RetainedRuntimeBackendSet selected;
-          selected.execution = participant;
-          selected.gripper = gripper_backend;
-          selected.gripper_stop_execution_port = gripper_backend.get();
-          selected.rebind_motion_route =
-              [participant](
-                  core::RuntimeParticipantBinding binding,
-                  std::vector<core::RuntimeParticipantBinding> aliases) {
-                return participant->RebindRoute(std::move(binding), std::move(aliases));
-              };
-          selected.rebind_gripper_route =
-              [gripper_backend](core::RuntimeParticipantBinding binding,
-                                std::shared_ptr<IRetainedObservedStateChannel> channel) {
-                return gripper_backend->RebindRoute(std::move(binding), std::move(channel));
-              };
-          return selected;
-        };
+  runtime_input.motion_state_channel_config = selected_core_test_state_config(arm_binding);
+  runtime_input.gripper_state_channel_config = selected_core_test_state_config(gripper_binding);
+  if (check == Lite6AggregateCheck::kMissingSelectedBackend) {
+    try {
+      static_cast<void>(create_retained_native_runtime(
+          std::move(runtime_input), std::move(runtime_config)));
+      ADD_FAILURE() << "retained runtime requires an explicit selected execution backend";
+    } catch (const std::invalid_argument &error) {
+      EXPECT_STREQ(error.what(),
+                   "retained runtime execution adapter set is incomplete or owns a second state authority");
+    }
+    EXPECT_EQ(port_participant, nullptr);
+    return;
   }
+  runtime_input.backend_factory = selected_core_test_backend_factory(port_participant, true);
   unsigned rebinds = 0, enabled = 0, retired = 0, reentrant_reads = 0;
   auto runtime = create_retained_native_runtime(std::move(runtime_input),
                                                 std::move(runtime_config));
@@ -3893,7 +4067,7 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
   if (check == Lite6AggregateCheck::kMeasuredPublication ||
       check == Lite6AggregateCheck::kMeasuredOptionalDomainRace ||
       check == Lite6AggregateCheck::kMeasuredNullOptionalDomainRace) {
-    // Use the already verified retained fixture and real backends/Kernel.
+    // Use the verified ROS product and actual Kernel with the focused Core port.
     // Stop readiness is produced by the existing sealed repository boundary.
     deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(package_root);
     core::FilesystemResolvedStopBasePlanRepository plans(temporary.path());
@@ -4224,11 +4398,6 @@ void check_predicted_lite6_aggregate(const Lite6AggregateCheck check) {
       motion_registration->deployment_maximum_tcp_linear_speed_mps.has_value());
   EXPECT_DOUBLE_EQ(
       *motion_registration->deployment_maximum_tcp_linear_speed_mps, 0.15);
-  ASSERT_TRUE(
-      motion_registration->participant_policy->value().ordinary_motion_jerk);
-  EXPECT_EQ(
-      *motion_registration->participant_policy->value().ordinary_motion_jerk,
-      jerk_profile);
   ASSERT_NE(runtime->motion_state_channel, nullptr);
   ASSERT_NE(runtime->gripper_state_channel, nullptr);
   const auto initial_motion_state =
@@ -4649,44 +4818,56 @@ void check_refreshed_cell_model(
 }
 
 TEST(RetainedProductCrossConsumer,
-     PredictedLite6AggregateComposesButUnqualifiedParticipantsStayClosed) {
-  check_predicted_lite6_aggregate(Lite6AggregateCheck::kCompose);
+     SelectedCoreLite6AggregateComposesButUnqualifiedParticipantsStayClosed) {
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kCompose);
+}
+
+TEST(RetainedProductCrossConsumer,
+     MissingSelectedBackendRefusesInsteadOfConstructingASimulator) {
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMissingSelectedBackend);
 }
 
 TEST(RetainedProductCrossConsumer,
      SameRoutePredecessorAdoptionPreservesExactScaleQualificationWithoutOpeningReadiness) {
-  check_predicted_lite6_aggregate(Lite6AggregateCheck::kSameRoutePredecessorQualification);
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kSameRoutePredecessorQualification);
 }
 
 TEST(RetainedNativeMeasuredRoutePublication, ExactStagePrecedesRebindAndRealThenNullCommitPreserveKernelPublication) {
-  check_predicted_lite6_aggregate(Lite6AggregateCheck::kMeasuredPublication);
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMeasuredPublication);
 }
 TEST(RetainedNativeMeasuredRoutePublication, RealStageRefusesOptionalDomainAppearanceBeforePhysicalEffects) {
-  check_predicted_lite6_aggregate(Lite6AggregateCheck::kMeasuredOptionalDomainRace);
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMeasuredOptionalDomainRace);
 }
 TEST(RetainedNativeMeasuredRoutePublication, NullStageRefusesOptionalDomainAppearanceBeforePhysicalEffects) {
-  check_predicted_lite6_aggregate(Lite6AggregateCheck::kMeasuredNullOptionalDomainRace);
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMeasuredNullOptionalDomainRace);
 }
 
 TEST(RetainedProductCrossConsumer,
      RetainedControllerRefreshesEveryModelConsumerWithTheCellModel) {
-  check_predicted_lite6_aggregate(Lite6AggregateCheck::kRefreshCellModel);
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kRefreshCellModel);
 }
 
 TEST(RetainedProductCrossConsumer,
      SameControllerCapabilityInventoryResealPreservesOwnersAndRejectsChangedRegistration) {
-  check_predicted_lite6_aggregate(Lite6AggregateCheck::kResealInventory);
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kResealInventory);
 }
 
 TEST(RetainedProductCrossConsumer,
      ExecutionPortParticipantRegistersThroughTheRetainedBackendSeam) {
-  check_predicted_lite6_aggregate(
+  check_selected_core_lite6_aggregate(
       Lite6AggregateCheck::kExecutionPortParticipant);
 }
 
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+TEST(RetainedProductCrossConsumer,
+     SelectedRosOrdinaryJerkRefusesBeforeBackendFactoryConstruction) {
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kRosOrdinaryJerkRejection);
+}
+#endif
+
 TEST(RetainedProductCrossConsumer,
      DeploymentAuthoredFaultStopProfileIsTheMotionFaultProfile) {
-  check_predicted_lite6_aggregate(
+  check_selected_core_lite6_aggregate(
       Lite6AggregateCheck::kDeploymentFaultStopProfile);
 }
 
@@ -4705,10 +4886,20 @@ TEST(RetainedProductCrossConsumer,
 
   constexpr std::string_view cell_id = "i6_joined_teardown_cell";
   const auto materialized = deployment::test::
-      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+      materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, cell_id);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &bundle = *materialized.bundle;
+  const auto &graph = bundle.value().cell_graph;
+  ASSERT_EQ(graph.runtime_units.size(), 1U);
+  ASSERT_EQ(graph.controllable_components.size(), 2U);
+  const auto &shared_runtime_unit_id = graph.runtime_units.front().runtime_unit_id;
+  for (const auto &component : graph.controllable_components) {
+    ASSERT_EQ(component.runtime_unit_ids.size(), 1U);
+    EXPECT_EQ(component.runtime_unit_ids.front(), shared_runtime_unit_id);
+  }
+  // Q68: both selected ROS components belong to this exact shared host.
+  // Cross-unit isolation remains NOT_RUN/R7 after native simulator retirement.
   const auto &products = bundle.value().compiled_products;
   ASSERT_EQ(products.symbol_role_maps.size(), 1U);
   const auto retained = load_lite6_planning_model(
@@ -4746,10 +4937,8 @@ TEST(RetainedProductCrossConsumer,
         *program_binding);
     ASSERT_TRUE(physical.value().control_path.has_value());
     EXPECT_TRUE(component_ids.insert(component_id).second);
-    EXPECT_TRUE(runtime_unit_ids
-                    .insert(physical.value()
-                                .control_path->provider_runtime_unit_id)
-                    .second);
+    runtime_unit_ids.insert(
+        physical.value().control_path->provider_runtime_unit_id);
     for (const auto &resource : physical.value().resources) {
       ++physical_resource_count;
       EXPECT_TRUE(physical_resources.insert(resource.resource_id).second)
@@ -4758,7 +4947,8 @@ TEST(RetainedProductCrossConsumer,
     physical_bindings.push_back(std::move(physical));
   }
   ASSERT_EQ(component_ids.size(), 2U);
-  ASSERT_EQ(runtime_unit_ids.size(), 2U);
+  ASSERT_EQ(runtime_unit_ids.size(), 1U);
+  EXPECT_EQ(*runtime_unit_ids.begin(), shared_runtime_unit_id);
   ASSERT_EQ(physical_resources.size(), physical_resource_count);
 
   auto model_stage =
@@ -4840,7 +5030,6 @@ TEST(RetainedProductCrossConsumer,
         1024U,
         core::CacheConfig{},
         core::ExecutionKernelConfig{},
-        RoboPlanExecutionBackendConfig{},
         SimpleSchedulerConfig{},
         10'000'000,
         std::vector<double>(physical.value().resources.size(), 0.0),
@@ -4889,9 +5078,9 @@ TEST(RetainedProductCrossConsumer,
         {},
         {}};
     runtime_input.deployment_maximum_tcp_linear_speed_mps = 0.15;
-    runtime_input.ordinary_motion_jerk =
-        deployment::native_execution_runtime_contract::OrdinaryMotionJerkSettings{
-            false, 1.0, {}};
+    core::ExecutionPortParticipant *selected_participant = nullptr;
+    runtime_input.motion_state_channel_config = selected_core_test_state_config(physical);
+    runtime_input.backend_factory = selected_core_test_backend_factory(selected_participant);
 
     std::shared_ptr<RetainedNativeRuntime> runtime;
     if (runtimes.empty()) {
@@ -5241,7 +5430,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(empty_ambient_root));
 
   const auto materialized = deployment::test::
-      materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
+      materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
           package_root);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
@@ -5866,7 +6055,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
 
   const auto materialized = deployment::test::
-      materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
+      materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
           package_root);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
@@ -6404,8 +6593,8 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
   const auto package_root = temporary.path() / "retained-package";
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
   const auto materialized =
-      deployment::test::materialize_lite6_native_cclc_product_retained_consumer_fixture(
-          package_root, kZeroDigest, kZeroDigest, true);
+      deployment::test::materialize_lite6_ros2_control_cclc_product_retained_consumer_fixture(
+          package_root, kZeroDigest, true);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto& bundle = *materialized.bundle;
   const auto model_map = load_lite6_model_map(
@@ -6677,10 +6866,20 @@ TEST(RetainedProductCrossConsumer,
 
   constexpr std::string_view cell_id = "i6_two_lite6_program_binding_cell";
   const auto materialized = deployment::test::
-      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+      materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, cell_id);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &bundle = *materialized.bundle;
+  const auto &graph = bundle.value().cell_graph;
+  ASSERT_EQ(graph.runtime_units.size(), 1U);
+  ASSERT_EQ(graph.controllable_components.size(), 2U);
+  const auto &shared_runtime_unit_id = graph.runtime_units.front().runtime_unit_id;
+  for (const auto &component : graph.controllable_components) {
+    ASSERT_EQ(component.runtime_unit_ids.size(), 1U);
+    EXPECT_EQ(component.runtime_unit_ids.front(), shared_runtime_unit_id);
+  }
+  // Q68: both selected ROS components belong to this exact shared host.
+  // Cross-unit isolation remains NOT_RUN/R7 after native simulator retirement.
   ASSERT_EQ(bundle.value().compiled_products.symbol_role_maps.size(), 1U);
   const auto model_map = load_lite6_model_map(
       package_root,
@@ -6725,9 +6924,7 @@ TEST(RetainedProductCrossConsumer,
                     .insert(value.model_bindings.front().model_instance_id)
                     .second);
     ASSERT_EQ(value.runtime_unit_epochs.size(), 1U);
-    EXPECT_TRUE(runtime_unit_ids
-                    .insert(value.runtime_unit_epochs.front().runtime_unit_id)
-                    .second);
+    runtime_unit_ids.insert(value.runtime_unit_epochs.front().runtime_unit_id);
     std::vector<std::string> source_joint_order;
     source_joint_order.reserve(value.resources.size());
     for (const auto &resource : value.resources) {
@@ -6743,7 +6940,8 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(program_binding_ids.size(), 2U);
   EXPECT_EQ(component_ids.size(), 2U);
   EXPECT_EQ(model_instance_ids.size(), 2U);
-  EXPECT_EQ(runtime_unit_ids.size(), 2U);
+  ASSERT_EQ(runtime_unit_ids.size(), 1U);
+  EXPECT_EQ(*runtime_unit_ids.begin(), shared_runtime_unit_id);
   EXPECT_EQ(all_resources.size(), 12U);
   EXPECT_EQ(all_compiled_resources.size(), 12U);
   ASSERT_EQ(source_joint_orders.size(), 2U);
@@ -6897,10 +7095,10 @@ TEST(
 
   constexpr std::string_view cell_id = "i6_projection_transition_cell";
   const auto predecessor = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, cell_id);
   const auto candidate = deployment::test::
-      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+      materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, cell_id);
   ASSERT_NE(predecessor.bundle, nullptr);
   ASSERT_NE(candidate.bundle, nullptr);
@@ -7042,7 +7240,7 @@ struct ProviderFreshnessFixture final {
     std::filesystem::create_directory(package_root);
     std::filesystem::create_directory(staging_parent);
     bundle = deployment::test::
-                 materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
+                 materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
                      package_root)
                      .bundle;
     if (bundle == nullptr) {

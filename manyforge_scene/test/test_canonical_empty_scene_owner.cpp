@@ -31,7 +31,7 @@
 
 #include "lite6_retained_consumer_fixture.hpp"
 #include "logical_scene_codec_internal.hpp"
-#include "manyforge_scene/canonical_empty_scene_owner.hpp"
+#include "manyforge_scene/logical_scene_owner.hpp"
 #include "manyforge_scene/logical_scene_value_codec.hpp"
 #include "manyforge_scene/scene_transaction_codec.hpp"
 #include "sqlite_scene_lifecycle_internal.hpp"
@@ -82,11 +82,11 @@ constexpr std::string_view kExpectedEmptySceneContentHash =
 constexpr std::int64_t kSustainedNoOpCommitP95BudgetNs = 50'000'000;
 
 static_assert(
-    !std::is_constructible_v<CanonicalEmptySceneOwner, std::filesystem::path,
+    !std::is_constructible_v<LogicalSceneOwner, std::filesystem::path,
                              ProjectionBootstrapPrerequisiteQueryDTO,
                              const IActiveBundlePublicationReader &>);
 static_assert(std::is_constructible_v<
-              CanonicalEmptySceneOwner, std::filesystem::path,
+              LogicalSceneOwner, std::filesystem::path,
               const deployment::CanonicalEmptyRetainedBundleAdmission &,
               const IActiveBundlePublicationReader &>);
 
@@ -635,7 +635,7 @@ void Require(const bool condition, const std::string_view message) {
 }
 
 ProjectionBootstrapAcceptedDTO FinalizeCanonicalBootstrap(
-    CanonicalEmptySceneOwner &owner,
+    LogicalSceneOwner &owner,
     ControlledPublicationReader &publication_reader,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission) {
   const auto accepted = owner.BeginProjectionBootstrap(Intent(admission));
@@ -682,7 +682,7 @@ TEST(CanonicalEmptySceneOwner, SealedAdmissionMintsGoldenAndHoldsGatesClosed) {
   TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader);
 
   EXPECT_EQ(owner.fixed_query().cell_id, admission.cell_id());
@@ -733,14 +733,14 @@ TEST(CanonicalEmptySceneOwner,
   TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader);
 
   auto cross_spliced = Intent(admission);
   cross_spliced.canonical_empty_retained_bundle.deployment_artifact_id =
       core::DeploymentArtifactId("forged-deployment");
   EXPECT_THROW(owner.BeginProjectionBootstrap(cross_spliced),
-               CanonicalEmptySceneOwnerConflictError);
+               LogicalSceneOwnerConflictError);
   EXPECT_EQ(owner.VerifyIntegrity().acceptance_row_count, 0);
 
   const auto accepted = owner.BeginProjectionBootstrap(Intent(admission));
@@ -750,7 +750,7 @@ TEST(CanonicalEmptySceneOwner,
             accepted.initialized_logical_scene.shared()->revision);
   EXPECT_THROW(
       owner.BeginProjectionBootstrap(Intent(admission, "bootstrap-beta")),
-      CanonicalEmptySceneOwnerConflictError);
+      LogicalSceneOwnerConflictError);
   EXPECT_EQ(owner.VerifyIntegrity().acceptance_row_count, 1);
 }
 
@@ -761,7 +761,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   ProjectionRevisionDTO target = [&] {
-    CanonicalEmptySceneOwner owner(database_path, admission,
+    LogicalSceneOwner owner(database_path, admission,
                                    publication_reader);
     const auto accepted = owner.BeginProjectionBootstrap(Intent(admission));
     ExpectExactCanonicalEmptySnapshot(accepted, admission);
@@ -769,7 +769,7 @@ TEST(CanonicalEmptySceneOwner,
     return accepted.canonical_empty_target;
   }();
 
-  CanonicalEmptySceneOwner reopened(database_path, admission,
+  LogicalSceneOwner reopened(database_path, admission,
                                     publication_reader);
   const auto status =
       reopened.ProjectionBootstrapStatus(ProjectionBootstrapStatusQueryDTO{
@@ -795,7 +795,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   ProjectionBootstrapAcceptedDTO accepted = [&] {
-    CanonicalEmptySceneOwner owner(database_path, admission,
+    LogicalSceneOwner owner(database_path, admission,
                                    publication_reader);
     auto value = owner.BeginProjectionBootstrap(Intent(admission));
     const auto rebuilt =
@@ -814,7 +814,7 @@ TEST(CanonicalEmptySceneOwner,
     return value;
   }();
 
-  CanonicalEmptySceneOwner reopened(database_path, admission,
+  LogicalSceneOwner reopened(database_path, admission,
                                     publication_reader);
   const auto status = reopened.ProjectionBootstrapStatus(
       {accepted.bootstrap_id, accepted.bootstrap_generation});
@@ -835,7 +835,7 @@ TEST(CanonicalEmptySceneOwner, NonzeroNativeBootstrapIsExplicitlyUnavailable) {
   TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader);
   auto intent = Intent(admission);
   intent.native_runtime_bindings.push_back(ProjectionNativeRuntimeBindingDTO{
@@ -845,7 +845,7 @@ TEST(CanonicalEmptySceneOwner, NonzeroNativeBootstrapIsExplicitlyUnavailable) {
       core::RuntimeEpoch("epoch"),
   });
   EXPECT_THROW(owner.BeginProjectionBootstrap(intent),
-               CanonicalEmptySceneOwnerConflictError);
+               LogicalSceneOwnerConflictError);
   EXPECT_EQ(owner.VerifyIntegrity().acceptance_row_count, 0);
 }
 
@@ -856,7 +856,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   ActiveBundlePublicationReceiptDTO exact_receipt = [&] {
-    CanonicalEmptySceneOwner owner(database_path, admission,
+    LogicalSceneOwner owner(database_path, admission,
                                    publication_reader);
     const auto accepted = owner.BeginProjectionBootstrap(Intent(admission));
     static_cast<void>(
@@ -913,7 +913,7 @@ TEST(CanonicalEmptySceneOwner,
 
   publication_reader.Clear();
   const auto calls_before_reopen = publication_reader.calls();
-  CanonicalEmptySceneOwner reopened(database_path, admission,
+  LogicalSceneOwner reopened(database_path, admission,
                                     publication_reader);
   const auto status = reopened.ProjectionBootstrapStatus(
       {BootstrapId("bootstrap-alpha"), BootstrapGeneration(1U)});
@@ -942,7 +942,7 @@ TEST(CanonicalEmptySceneOwner,
   TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader);
   const auto accepted = owner.BeginProjectionBootstrap(Intent(admission));
   static_cast<void>(owner.RebuildProjectionBootstrap(RebuildRequest(accepted)));
@@ -1009,7 +1009,7 @@ TEST(CanonicalEmptySceneOwner, ConcurrentFirstOpenConvergesOneExactEmptyStore) {
       openings.push_back(std::async(std::launch::async, [&, index, start] {
         start.get();
         open_together.arrive_and_wait();
-        CanonicalEmptySceneOwner owner(database, admission, publication_reader);
+        LogicalSceneOwner owner(database, admission, publication_reader);
         const auto report = owner.VerifyIntegrity();
         if (index % 2U == 0U) {
           owner.Close();
@@ -1043,7 +1043,7 @@ TEST(CanonicalEmptySceneOwner, ConcurrentFirstOpenConvergesOneExactEmptyStore) {
     }
   }
   ExpectNoSqliteSidecars(database);
-  CanonicalEmptySceneOwner reopened(database, admission, publication_reader);
+  LogicalSceneOwner reopened(database, admission, publication_reader);
   EXPECT_EQ(reopened.VerifyIntegrity().acceptance_row_count, 0);
 }
 
@@ -1051,12 +1051,12 @@ TEST(CanonicalEmptySceneOwner, ConcurrentExactBeginCommitsOneAcceptance) {
   TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  CanonicalEmptySceneOwner first(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner first(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader);
-  CanonicalEmptySceneOwner second(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner second(directory.path() / "logical-scene.sqlite3",
                                   admission, publication_reader);
   std::barrier start(3);
-  const auto call = [&](CanonicalEmptySceneOwner &owner) {
+  const auto call = [&](LogicalSceneOwner &owner) {
     start.arrive_and_wait();
     return owner.BeginProjectionBootstrap(Intent(admission))
         .canonical_empty_target;
@@ -1073,19 +1073,19 @@ TEST(CanonicalEmptySceneOwner, ConcurrentConflictingBeginHasOneWinner) {
   TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  CanonicalEmptySceneOwner first(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner first(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader);
-  CanonicalEmptySceneOwner second(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner second(directory.path() / "logical-scene.sqlite3",
                                   admission, publication_reader);
   std::barrier start(3);
-  const auto call = [&admission, &start](CanonicalEmptySceneOwner &owner,
+  const auto call = [&admission, &start](LogicalSceneOwner &owner,
                                          std::string bootstrap_id) {
     start.arrive_and_wait();
     try {
       static_cast<void>(owner.BeginProjectionBootstrap(
           Intent(admission, std::move(bootstrap_id))));
       return true;
-    } catch (const CanonicalEmptySceneOwnerConflictError &) {
+    } catch (const LogicalSceneOwnerConflictError &) {
       return false;
     }
   };
@@ -1107,7 +1107,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   {
-    CanonicalEmptySceneOwner owner(database_path, admission,
+    LogicalSceneOwner owner(database_path, admission,
                                    publication_reader);
     static_cast<void>(owner.BeginProjectionBootstrap(Intent(admission)));
     owner.Close();
@@ -1124,8 +1124,8 @@ TEST(CanonicalEmptySceneOwner,
       "SELECT RAISE(ABORT, 'canonical_empty_scene_acceptance is immutable');"
       "END;");
   EXPECT_THROW(
-      CanonicalEmptySceneOwner(database_path, admission, publication_reader),
-      CanonicalEmptySceneOwnerIntegrityError);
+      LogicalSceneOwner(database_path, admission, publication_reader),
+      LogicalSceneOwnerIntegrityError);
 }
 
 TEST(CanonicalEmptySceneOwner, StartupRejectsTheProvisionalV3PayloadContract) {
@@ -1134,14 +1134,14 @@ TEST(CanonicalEmptySceneOwner, StartupRejectsTheProvisionalV3PayloadContract) {
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   {
-    CanonicalEmptySceneOwner owner(database_path, admission,
+    LogicalSceneOwner owner(database_path, admission,
                                    publication_reader);
     owner.Close();
   }
   ExecuteSql(database_path, "PRAGMA user_version = 3;");
   EXPECT_THROW(
-      CanonicalEmptySceneOwner(database_path, admission, publication_reader),
-      CanonicalEmptySceneOwnerIntegrityError);
+      LogicalSceneOwner(database_path, admission, publication_reader),
+      LogicalSceneOwnerIntegrityError);
 }
 
 TEST(CanonicalEmptySceneOwner, StartupRejectsOversizedDatabaseImage) {
@@ -1150,7 +1150,7 @@ TEST(CanonicalEmptySceneOwner, StartupRejectsOversizedDatabaseImage) {
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   {
-    CanonicalEmptySceneOwner owner(database_path, admission,
+    LogicalSceneOwner owner(database_path, admission,
                                    publication_reader);
     owner.Close();
   }
@@ -1159,8 +1159,8 @@ TEST(CanonicalEmptySceneOwner, StartupRejectsOversizedDatabaseImage) {
       static_cast<std::uintmax_t>(kMaximumSceneStoreDatabasePageImageBytes) +
           1U);
   EXPECT_THROW(
-      CanonicalEmptySceneOwner(database_path, admission, publication_reader),
-      CanonicalEmptySceneOwnerError);
+      LogicalSceneOwner(database_path, admission, publication_reader),
+      LogicalSceneOwnerError);
 }
 
 TEST(CanonicalEmptySceneOwner, StartupRejectsOversizedWalResidue) {
@@ -1170,7 +1170,7 @@ TEST(CanonicalEmptySceneOwner, StartupRejectsOversizedWalResidue) {
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   {
-    CanonicalEmptySceneOwner owner(database_path, admission,
+    LogicalSceneOwner owner(database_path, admission,
                                    publication_reader);
     owner.Close();
   }
@@ -1181,8 +1181,8 @@ TEST(CanonicalEmptySceneOwner, StartupRejectsOversizedWalResidue) {
   std::filesystem::resize_file(
       wal_path, static_cast<std::uintmax_t>(kMaximumSceneStoreWalBytes) + 1U);
   EXPECT_THROW(
-      CanonicalEmptySceneOwner(database_path, admission, publication_reader),
-      CanonicalEmptySceneOwnerError);
+      LogicalSceneOwner(database_path, admission, publication_reader),
+      LogicalSceneOwnerError);
 }
 
 TEST(CanonicalEmptySceneOwner, RestartsExactEmptyInitializationResidue) {
@@ -1199,7 +1199,7 @@ TEST(CanonicalEmptySceneOwner, RestartsExactEmptyInitializationResidue) {
 
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  CanonicalEmptySceneOwner owner(database_path, admission, publication_reader);
+  LogicalSceneOwner owner(database_path, admission, publication_reader);
   const auto inventory = owner.VerifyIntegrity();
   EXPECT_EQ(inventory.acceptance_row_count, 0);
   EXPECT_EQ(inventory.rebuild_row_count, 0);
@@ -1214,7 +1214,7 @@ TEST(CanonicalEmptySceneOwner, RejectsOverBoundBootstrapIdentifier) {
   TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader);
   EXPECT_THROW(
       owner.BeginProjectionBootstrap(Intent(
@@ -1356,7 +1356,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, cell_admission);
   const auto active =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission)
@@ -1394,7 +1394,7 @@ TEST(CanonicalEmptySceneOwner,
   auto conflicting = request;
   conflicting.program_node_evidence->node_attempt_id = "add:attempt.2";
   EXPECT_THROW(owner.ReadCommitResult(conflicting),
-               CanonicalEmptySceneOwnerConflictError);
+               LogicalSceneOwnerConflictError);
   auto missing = request;
   missing.request_context.request_id = core::RequestId("scene-program-missing");
   EXPECT_FALSE(owner.ReadCommitResult(missing).has_value());
@@ -1408,7 +1408,7 @@ TEST(CanonicalEmptySceneOwner,
     const auto admission = LoadAdmission();
     ControlledPublicationReader publication_reader;
     TestCellAdmissionPort cell_admission;
-    CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+    LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                    admission, publication_reader,
                                    cell_admission);
     const auto active =
@@ -1451,7 +1451,7 @@ TEST(CanonicalEmptySceneOwner,
   TestCellAdmissionPort cell_admission;
   const auto path = directory.path() / "logical-scene.sqlite3";
   {
-    CanonicalEmptySceneOwner owner(path, admission, publication_reader,
+    LogicalSceneOwner owner(path, admission, publication_reader,
                                    cell_admission);
     const auto active =
         FinalizeCanonicalBootstrap(owner, publication_reader, admission)
@@ -1480,7 +1480,7 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_EQ(owner.VerifyIntegrity().request_outcome_count, 0);
     EXPECT_TRUE(cell_admission.Claims().empty());
   }
-  CanonicalEmptySceneOwner reopened(path, admission, publication_reader,
+  LogicalSceneOwner reopened(path, admission, publication_reader,
                                     cell_admission);
   EXPECT_TRUE(reopened.ReconcileAuthoredSceneAdmissionClaims().ok());
   EXPECT_TRUE(reopened.GetSceneObjects().empty());
@@ -1492,7 +1492,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, cell_admission);
   const auto active =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission)
@@ -1583,7 +1583,7 @@ TEST(CanonicalEmptySceneOwner, UpsertCreatesReplacesAndRecognizesAnExactNoOp) {
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, cell_admission);
   auto active = FinalizeCanonicalBootstrap(owner, publication_reader, admission)
                     .canonical_empty_target;
@@ -1671,7 +1671,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader,
                                  cell_admission);
   const auto active =
@@ -1711,7 +1711,7 @@ TEST(CanonicalEmptySceneOwner,
   ProjectionRevisionDTO committed_projection;
   std::optional<core::SceneTransactionRequestDTO> request;
   {
-    CanonicalEmptySceneOwner owner(database_path, admission,
+    LogicalSceneOwner owner(database_path, admission,
                                    publication_reader, cell_admission);
     const auto accepted =
         FinalizeCanonicalBootstrap(owner, publication_reader, admission);
@@ -1780,7 +1780,7 @@ TEST(CanonicalEmptySceneOwner,
     owner.Close();
   }
 
-  CanonicalEmptySceneOwner reopened(database_path, admission,
+  LogicalSceneOwner reopened(database_path, admission,
                                     publication_reader);
   EXPECT_EQ(reopened.CurrentProjectionRevision(), committed_projection);
   const auto snapshot = reopened.LogicalSnapshot();
@@ -1800,12 +1800,12 @@ TEST(CanonicalEmptySceneOwner,
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner first(database_path, admission, publication_reader,
+  LogicalSceneOwner first(database_path, admission, publication_reader,
                                  cell_admission);
   const auto initial =
       FinalizeCanonicalBootstrap(first, publication_reader, admission)
           .canonical_empty_target;
-  CanonicalEmptySceneOwner second(database_path, admission,
+  LogicalSceneOwner second(database_path, admission,
                                   publication_reader, cell_admission);
 
   // Warm both process-local views before either connection advances the scene.
@@ -1854,7 +1854,7 @@ TEST(CanonicalEmptySceneOwner,
   TestCellAdmissionPort cell_admission;
   ProjectionRevisionDTO projection;
   {
-    CanonicalEmptySceneOwner owner(database_path, admission,
+    LogicalSceneOwner owner(database_path, admission,
                                    publication_reader, cell_admission);
     projection =
         FinalizeCanonicalBootstrap(owner, publication_reader, admission)
@@ -1956,7 +1956,7 @@ TEST(CanonicalEmptySceneOwner,
     owner.Close();
   }
 
-  CanonicalEmptySceneOwner reopened(database_path, admission,
+  LogicalSceneOwner reopened(database_path, admission,
                                     publication_reader);
   EXPECT_EQ(reopened.CurrentProjectionRevision(), projection);
   const auto restored = reopened.LogicalSnapshot();
@@ -1974,7 +1974,7 @@ TEST(CanonicalEmptySceneOwner, CommitsTheClosedPortableCollisionShapeSet) {
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
@@ -2760,7 +2760,7 @@ void ResetProjections(
 }
 
 [[nodiscard]] ProjectionRevisionDTO FinalizeNativeCandidate(
-    CanonicalEmptySceneOwner &owner,
+    LogicalSceneOwner &owner,
     ControlledPublicationReader &publication_reader,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const deployment::RetainedBundle &candidate,
@@ -2947,8 +2947,8 @@ struct SceneProductAdoptionFixture final {
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source{package_root};
   TestCellAdmissionPort cell_admission;
   TestAdoptionFence fence;
-  std::unique_ptr<CanonicalEmptySceneOwner> owner{
-      std::make_unique<CanonicalEmptySceneOwner>(database_path, admission, publication_reader,
+  std::unique_ptr<LogicalSceneOwner> owner{
+      std::make_unique<LogicalSceneOwner>(database_path, admission, publication_reader,
                                                 bundle_source, resolver, cell_admission)};
 
   bool original_manager_authority{false};
@@ -3180,7 +3180,7 @@ TEST(CanonicalEmptySceneOwner, ActualManagedFenceIssuesBorrowedAdoptionViewWitho
   EXPECT_EQ(entries, 1U);
   fixture.ExpectNoCandidateEffects();
   fixture.cell_admission.RefuseApplyClaimLookupAfter(0U);
-  EXPECT_THROW(begin(), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(begin(), LogicalSceneOwnerConflictError);
   EXPECT_EQ(entries, 2U);
   fixture.cell_admission.RefuseApplyClaimLookupAfter(2U);
   manager::SqliteActiveBundlePublicationStore publication_store(
@@ -3348,7 +3348,7 @@ void VerifyProductAdoptionPreservesObjectsAttachmentsAndLogicalIdentity(
                 {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation,
                  ready.target_projection_revision, ready.authoritative_snapshot_identity, publication}), completed);
   fixture.owner.reset();
-  fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(
+  fixture.owner = std::make_unique<LogicalSceneOwner>(
       fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
       fixture.resolver, fixture.cell_admission);
   EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot_bytes);
@@ -3368,6 +3368,46 @@ TEST(CanonicalEmptySceneOwner,
   VerifyProductAdoptionPreservesObjectsAttachmentsAndLogicalIdentity(true);
 }
 
+// Holds the store's write lock from a second connection until destroyed.
+class HeldSqliteWriteLock final {
+public:
+  explicit HeldSqliteWriteLock(const std::filesystem::path &database_path) {
+    if (sqlite3_open_v2(database_path.c_str(), &database_, SQLITE_OPEN_READWRITE,
+                        nullptr) != SQLITE_OK ||
+        sqlite3_exec(database_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+      sqlite3_close(database_);
+      throw std::runtime_error("cannot hold the test database write lock");
+    }
+  }
+  HeldSqliteWriteLock(const HeldSqliteWriteLock &) = delete;
+  HeldSqliteWriteLock &operator=(const HeldSqliteWriteLock &) = delete;
+  ~HeldSqliteWriteLock() {
+    sqlite3_exec(database_, "ROLLBACK", nullptr, nullptr, nullptr);
+    sqlite3_close(database_);
+  }
+
+private:
+  sqlite3 *database_ = nullptr;
+};
+
+TEST(CanonicalEmptySceneOwner,
+     QualifiedProductAdoptionCanRetryAfterAFailureBeforeItsIntentCommits) {
+  SceneProductAdoptionFixture fixture;
+  const auto request = fixture.CaptureRequest();
+  fixture.QualifyCandidate(request);
+  const core::ProjectionMaintenanceInitializationQueryDTO query{
+      request.parent_authority.parent.owner.apply_id,
+      request.parent_authority.parent.owner.apply_generation};
+  {
+    // The intent transaction cannot begin, so nothing durable is written.
+    const HeldSqliteWriteLock held(fixture.database_path);
+    EXPECT_ANY_THROW(fixture.Begin(request));
+  }
+  EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(query).has_value());
+  EXPECT_TRUE(fixture.Begin(request).ready_for_publication());
+  EXPECT_TRUE(fixture.owner->ReadMaintenanceInitialization(query).has_value());
+}
+
 TEST(CanonicalEmptySceneOwner,
      QualifiedProductAdoptionRefusesStaleInputsAndUnheldAuthorityBeforeCapture) {
   SceneProductAdoptionFixture fixture;
@@ -3375,22 +3415,22 @@ TEST(CanonicalEmptySceneOwner,
   fixture.QualifyCandidate(request);
   auto altered = request;
   altered.parent_authority.parent_claim.claim_generation = core::CellAdmissionClaimGeneration(99U);
-  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(altered), LogicalSceneOwnerConflictError);
   altered = request;
   altered.parent_authority.held_fence_query.configuration_fence_id = core::ConfigurationFenceId("other-fence");
-  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(altered), LogicalSceneOwnerConflictError);
   altered = request;
   altered.expected_predecessor_publication.durable_public_pointer_content_digest = Digest('a');
-  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(altered), LogicalSceneOwnerConflictError);
   altered = request;
   ++altered.expected_snapshot_identity.revision.revision_id;
   altered.expected_active_projection_revision.scene_revision = altered.expected_snapshot_identity.revision;
-  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(altered), LogicalSceneOwnerConflictError);
   altered = request;
   altered.candidate_retained_bundle.cell_graph.graph_revision = core::GraphRevision("forged-graph");
-  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(altered), LogicalSceneOwnerConflictError);
   fixture.cell_admission.ProveHeldClaimHadNoEffect();
-  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
   EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
       {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}).has_value());
   EXPECT_TRUE(fixture.owner->ReadAccessStatus().scene_writes_open);
@@ -3404,15 +3444,15 @@ TEST(CanonicalEmptySceneOwner,
   fixture.QualifyCandidate(request);
   auto altered = request;
   altered.native_runtime_bindings.pop_back();
-  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(altered), LogicalSceneOwnerConflictError);
   ASSERT_GE(request.native_runtime_bindings.size(), 2U);
   altered = request;
   altered.native_runtime_bindings.back() = altered.native_runtime_bindings.front();
   altered.native_runtime_bindings.back().runtime_epoch = core::RuntimeEpoch("zz-duplicate-epoch");
   std::sort(altered.native_runtime_bindings.begin(), altered.native_runtime_bindings.end(), core::CanonicalProjectionNativeBindingLess);
-  EXPECT_THROW(fixture.Begin(altered), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(altered), LogicalSceneOwnerConflictError);
   fixture.candidate_projections.front()->Reset(request.expected_active_projection_revision, FakePlannerSceneProjection::Mode::kCommit);
-  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
   EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
       {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}).has_value());
   fixture.ExpectNoCandidateEffects();
@@ -3424,7 +3464,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto request = fixture.CaptureRequest();
   fixture.QualifyCandidate(request);
   fixture.cell_admission.RefuseApplyClaimLookupAfter(1U);
-  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
   EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
       {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}).has_value());
   EXPECT_TRUE(fixture.owner->ReadAccessStatus().scene_writes_open);
@@ -3442,15 +3482,15 @@ TEST(CanonicalEmptySceneOwner,
   const core::ProjectionMaintenanceCompletionDTO ordinary{
       request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation,
       ready.target_projection_revision, ready.authoritative_snapshot_identity, publication};
-  EXPECT_THROW(fixture.owner->CompleteMaintenanceInitialization(ordinary), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.owner->CompleteMaintenanceInitialization(ordinary), LogicalSceneOwnerConflictError);
   auto changed = request;
   changed.expected_predecessor_publication.durable_public_pointer_content_digest = Digest('b');
   fixture.publication_reader.SetCurrent(changed.expected_predecessor_publication);
-  EXPECT_THROW(fixture.Begin(changed), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(changed), LogicalSceneOwnerConflictError);
   fixture.publication_reader.SetCurrent(publication);
-  EXPECT_THROW(fixture.Complete(changed, publication), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Complete(changed, publication), LogicalSceneOwnerConflictError);
   fixture.cell_admission.RefuseApplyClaimLookupAfter(0U);
-  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Complete(request, publication), LogicalSceneOwnerConflictError);
   EXPECT_EQ(fixture.owner->ReadMaintenanceInitialization(
                 {ordinary.apply_id, ordinary.apply_generation}), std::optional{ready});
   EXPECT_FALSE(fixture.owner->ReadAccessStatus().scene_writes_open);
@@ -3465,13 +3505,13 @@ TEST(CanonicalEmptySceneOwner,
   const auto ready = fixture.Begin(request);
   const auto publication = fixture.Publication(request);
   // A supplied receipt is not evidence that publication actually happened.
-  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Complete(request, publication), LogicalSceneOwnerConflictError);
   fixture.publication_reader.SetCurrent(publication);
   fixture.candidate_projections.front()->Reset(request.expected_active_projection_revision, FakePlannerSceneProjection::Mode::kCommit);
-  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Complete(request, publication), LogicalSceneOwnerConflictError);
   fixture.QualifyCandidate(request);
   fixture.cell_admission.RefuseApplyClaimLookupAfter(1U);
-  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Complete(request, publication), LogicalSceneOwnerConflictError);
   EXPECT_EQ(fixture.owner->ReadMaintenanceInitialization(
                 {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}),
             std::optional{ready});
@@ -3486,7 +3526,7 @@ TEST(CanonicalEmptySceneOwner,
   fixture.QualifyCandidate(request);
   const auto ready = fixture.Begin(request);
   fixture.owner.reset();
-  fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(
+  fixture.owner = std::make_unique<LogicalSceneOwner>(
       fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
       fixture.resolver, fixture.cell_admission);
   const auto status = fixture.owner->ReadMaintenanceInitialization(
@@ -3494,14 +3534,14 @@ TEST(CanonicalEmptySceneOwner,
   ASSERT_TRUE(status.has_value());
   EXPECT_EQ(status->state, core::ProjectionMaintenanceInitializationState::kInterrupted);
   EXPECT_TRUE(status->effects_unknown);
-  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
   const auto publication = fixture.Publication(request);
   fixture.publication_reader.SetCurrent(publication);
-  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Complete(request, publication), LogicalSceneOwnerConflictError);
   EXPECT_THROW(fixture.owner->CompleteMaintenanceInitialization(
                    {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation,
                     ready.target_projection_revision, ready.authoritative_snapshot_identity, publication}),
-               CanonicalEmptySceneOwnerConflictError);
+               LogicalSceneOwnerConflictError);
   EXPECT_FALSE(fixture.owner->ReadAccessStatus().scene_writes_open);
   fixture.ExpectNoCandidateEffects();
 }
@@ -3512,10 +3552,10 @@ TEST(CanonicalEmptySceneOwner,
   const auto request = fixture.CaptureRequest();
   fixture.QualifyCandidate(request);
   fixture.owner.reset();
-  fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(
+  fixture.owner = std::make_unique<LogicalSceneOwner>(
       fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
       fixture.resolver);
-  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
   EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
       {request.parent_authority.parent.owner.apply_id, request.parent_authority.parent.owner.apply_generation}).has_value());
   fixture.ExpectNoCandidateEffects();
@@ -3678,8 +3718,8 @@ TEST(CanonicalEmptySceneOwner, ConfigurationAdoptionRefusesForeignClaimIntentFen
       EXPECT_THROW(stage(), std::invalid_argument);
       EXPECT_THROW(begin(), std::invalid_argument);
     } else {
-      EXPECT_THROW(stage(), CanonicalEmptySceneOwnerConflictError);
-      EXPECT_THROW(begin(), CanonicalEmptySceneOwnerConflictError);
+      EXPECT_THROW(stage(), LogicalSceneOwnerConflictError);
+      EXPECT_THROW(begin(), LogicalSceneOwnerConflictError);
     }
     fixture.ExpectNoCandidateEffects(0U, same_product);
     EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), bytes);
@@ -3719,7 +3759,7 @@ TEST(CanonicalEmptySceneOwner, ConfigurationAdoptionUncertaintyRetainsTruthAndRe
                                                   : core::ProjectionMaintenanceInitializationState::kInitialized);
     fixture.fence.RefuseRemoteQueryAfter(100U);
     fixture.owner.reset();
-    fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(fixture.database_path, fixture.admission,
+    fixture.owner = std::make_unique<LogicalSceneOwner>(fixture.database_path, fixture.admission,
         fixture.publication_reader, fixture.bundle_source, fixture.resolver, fixture.cell_admission);
     const auto recovered = fixture.owner->ReadMaintenanceInitialization(query);
     ASSERT_TRUE(recovered.has_value());
@@ -3730,7 +3770,7 @@ TEST(CanonicalEmptySceneOwner, ConfigurationAdoptionUncertaintyRetainsTruthAndRe
       EXPECT_TRUE(recovered->effects_unknown);
     }
     EXPECT_THROW(fixture.owner->CompleteOriginalManagerConfigurationAdoption(request, publication, fixture.fence),
-                 CanonicalEmptySceneOwnerConflictError);
+                 LogicalSceneOwnerConflictError);
     fixture.ExpectNoCandidateEffects(same_product ? 0U : 1U, same_product);
   }
   }
@@ -3754,7 +3794,7 @@ TEST(CanonicalEmptySceneOwner, EqualConfigurationAdoptionRequiresExactCurrentPro
     rebuilds_before.push_back(projection->rebuild_calls());
   }
   EXPECT_THROW(fixture.owner->BeginOriginalManagerConfigurationAdoption(request, fixture.fence),
-               CanonicalEmptySceneOwnerConflictError);
+               LogicalSceneOwnerConflictError);
   EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
       {request.authority.owner.apply_id, request.authority.owner.apply_generation}));
   const auto stored = fixture.owner->ReadActiveSnapshot();
@@ -3879,9 +3919,9 @@ TEST(CanonicalEmptySceneOwner,
     }
     fixture.fence.SetPresence(presence);
     EXPECT_THROW(fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, attempt),
-                 CanonicalEmptySceneOwnerConflictError);
+                 LogicalSceneOwnerConflictError);
     EXPECT_THROW(fixture.owner->ReadOriginalManagerProductAdoptionProjectionHealth(request, fixture.fence, attempt),
-                 CanonicalEmptySceneOwnerConflictError);
+                 LogicalSceneOwnerConflictError);
     fixture.ExpectNoCandidateEffects();
     EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot);
     EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
@@ -3912,7 +3952,7 @@ TEST(CanonicalEmptySceneOwner,
   ASSERT_GE(fixture.candidate_projections.size(), 2U);
   fixture.candidate_projections.back()->RejectNextRebuildWithoutEffect();
   EXPECT_THROW(fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, fixture.fence.OriginalAttemptQuery()),
-               CanonicalEmptySceneOwnerConflictError);
+               LogicalSceneOwnerConflictError);
   // A prior binding really committed; no cleanup/rollback/retry is fabricated.
   const ProjectionRevisionDTO target{
       request.candidate_retained_bundle.retained_bundle_id,
@@ -3965,7 +4005,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto staged = fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, fixture.fence.OriginalAttemptQuery());
   ASSERT_EQ(staged.size(), request.native_runtime_bindings.size());
   EXPECT_EQ(staged.front().state, core::ProjectionHealthState::kRebuilding);
-  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
   const auto pending = fixture.owner->ReadOriginalManagerProductAdoptionProjectionHealth(request, fixture.fence, fixture.fence.OriginalAttemptQuery());
   ASSERT_EQ(pending.size(), staged.size());
   const ProjectionRevisionDTO target{
@@ -4007,7 +4047,7 @@ TEST(CanonicalEmptySceneOwner,
   auto foreign = request;
   foreign.parent_authority.held_fence_query.manager_runtime_epoch = core::RuntimeEpoch("foreign-manager");
   EXPECT_THROW(fixture.owner->StageOriginalManagerProductAdoption(foreign, fixture.fence, fixture.fence.OriginalAttemptQuery()),
-               CanonicalEmptySceneOwnerConflictError);
+               LogicalSceneOwnerConflictError);
   fixture.ExpectNoCandidateEffects();
   fixture.fence.RefuseRemoteQueryAfter(1U);
   EXPECT_THROW(fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, fixture.fence.OriginalAttemptQuery()), std::runtime_error);
@@ -4031,29 +4071,29 @@ TEST(CanonicalEmptySceneOwner,
   fixture.QualifyCandidate(request);
   auto foreign = request;
   foreign.parent_authority.parent_claim.claim_generation = core::CellAdmissionClaimGeneration(99U);
-  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(foreign), LogicalSceneOwnerConflictError);
   foreign = request;
   foreign.parent_authority.parent.owner.apply_id = ApplyId("foreign-parent");
   foreign.parent_authority.parent_claim.intent.owner_transaction_id = "foreign-parent";
   foreign.parent_authority.held_fence_query.owner_transaction = foreign.parent_authority.parent.owner;
   ASSERT_TRUE(foreign.parent_authority.valid());
-  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(foreign), LogicalSceneOwnerConflictError);
   foreign = request;
   foreign.parent_authority.held_fence_query.manager_runtime_epoch = core::RuntimeEpoch("foreign-manager");
-  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(foreign), LogicalSceneOwnerConflictError);
   foreign = request;
   foreign.expected_predecessor_publication.durable_public_pointer_content_digest = Digest('9');
-  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(foreign), LogicalSceneOwnerConflictError);
   foreign = request;
   ++foreign.expected_snapshot_identity.revision.revision_id;
   foreign.expected_active_projection_revision.scene_revision = foreign.expected_snapshot_identity.revision;
-  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(foreign), LogicalSceneOwnerConflictError);
   foreign = request;
   foreign.native_runtime_bindings.pop_back();
-  EXPECT_THROW(fixture.Begin(foreign), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(foreign), LogicalSceneOwnerConflictError);
   fixture.candidate_projections.front()->Reset(
       request.expected_active_projection_revision, FakePlannerSceneProjection::Mode::kCommit);
-  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
   EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
       {request.parent_authority.parent.owner.apply_id,
        request.parent_authority.parent.owner.apply_generation}).has_value());
@@ -4102,7 +4142,7 @@ TEST(CanonicalEmptySceneOwner,
   ASSERT_TRUE(held.ok());
   EXPECT_EQ(held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
   fixture.owner.reset();
-  fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(
+  fixture.owner = std::make_unique<LogicalSceneOwner>(
       fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
       fixture.resolver, fixture.cell_admission);
   fixture.fence.RefuseRemoteQueryAfter(100U);
@@ -4110,10 +4150,10 @@ TEST(CanonicalEmptySceneOwner,
   ASSERT_TRUE(interrupted.has_value());
   EXPECT_EQ(interrupted->state, core::ProjectionMaintenanceInitializationState::kInterrupted);
   EXPECT_TRUE(interrupted->effects_unknown);
-  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
   const auto publication = fixture.Publication(request);
   fixture.publication_reader.SetCurrent(publication);
-  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Complete(request, publication), LogicalSceneOwnerConflictError);
   const auto reopened_snapshot = fixture.owner->ReadActiveSnapshot();
   ASSERT_TRUE(reopened_snapshot.has_value());
   EXPECT_EQ(EncodeLogicalSceneSnapshot(*reopened_snapshot->shared()), snapshot);
@@ -4145,12 +4185,12 @@ TEST(CanonicalEmptySceneOwner,
   ASSERT_TRUE(held.ok());
   EXPECT_EQ(held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
   fixture.owner.reset();
-  fixture.owner = std::make_unique<CanonicalEmptySceneOwner>(
+  fixture.owner = std::make_unique<LogicalSceneOwner>(
       fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
       fixture.resolver, fixture.cell_admission);
   fixture.fence.RefuseRemoteQueryAfter(100U);
   EXPECT_EQ(fixture.owner->ReadMaintenanceInitialization(query), completed);
-  EXPECT_THROW(fixture.Complete(request, publication), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Complete(request, publication), LogicalSceneOwnerConflictError);
   fixture.ExpectNoCandidateEffects();
 }
 
@@ -4248,7 +4288,7 @@ TEST(CanonicalEmptySceneOwner,
       {{parent, Digest('3')}, claim.value(), query}, published.value(), active,
       snapshot->shared()->identity(), fixture.candidate.bundle->value(), fixture.candidate_bindings};
   fixture.QualifyCandidate(request);
-  EXPECT_THROW(fixture.Begin(request), CanonicalEmptySceneOwnerConflictError);
+  EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
   const auto integrity_after = fixture.owner->VerifyIntegrity();
   EXPECT_TRUE(integrity_after.projection_desynchronized);
   EXPECT_EQ(integrity_after.transaction_intent_count, integrity_before.transaction_intent_count);
@@ -4273,7 +4313,7 @@ TEST(CanonicalEmptySceneOwner,
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
                                  resolver, cell_admission);
   const auto accepted =
@@ -4448,7 +4488,7 @@ TEST(CanonicalEmptySceneOwner,
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
                                  resolver, cell_admission);
   const auto accepted =
@@ -4504,7 +4544,7 @@ TEST(CanonicalEmptySceneOwner,
   std::optional<core::ProjectionMaintenanceInitializationRequestDTO> request;
   std::size_t rebuild_calls = 0U;
   {
-    CanonicalEmptySceneOwner owner(database_path, admission,
+    LogicalSceneOwner owner(database_path, admission,
                                    publication_reader, bundle_source, resolver,
                                    cell_admission);
     const auto accepted =
@@ -4529,7 +4569,7 @@ TEST(CanonicalEmptySceneOwner,
     owner.Close();
   }
 
-  CanonicalEmptySceneOwner reopened(database_path, admission,
+  LogicalSceneOwner reopened(database_path, admission,
                                     publication_reader, bundle_source, resolver,
                                     cell_admission);
   const auto interrupted = reopened.ReadMaintenanceInitialization(
@@ -4563,7 +4603,7 @@ TEST(CanonicalEmptySceneOwner,
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       package_root);
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
                                  resolver, cell_admission);
   const auto accepted =
@@ -4610,7 +4650,7 @@ TEST(CanonicalEmptySceneOwner,
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
                                  resolver, cell_admission);
   const auto predecessor = FinalizeNativeCandidate(
@@ -4655,7 +4695,7 @@ TEST(CanonicalEmptySceneOwner,
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       package_root);
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
                                  resolver, cell_admission);
   const auto accepted =
@@ -4711,7 +4751,7 @@ TEST(CanonicalEmptySceneOwner,
   std::optional<core::ProjectionMaintenanceInitializationRequestDTO>
       interrupted_request;
   {
-    CanonicalEmptySceneOwner owner(database_path, admission,
+    LogicalSceneOwner owner(database_path, admission,
                                    publication_reader, bundle_source, resolver,
                                    cell_admission);
     const auto accepted =
@@ -4729,7 +4769,7 @@ TEST(CanonicalEmptySceneOwner,
     rebuild_calls.push_back(projection->rebuild_calls());
   }
 
-  CanonicalEmptySceneOwner reopened(database_path, admission,
+  LogicalSceneOwner reopened(database_path, admission,
                                     publication_reader, bundle_source, resolver,
                                     cell_admission);
   const auto interrupted = reopened.ReadMaintenanceInitialization(
@@ -4787,7 +4827,7 @@ TEST(CanonicalEmptySceneOwner,
   auto &projection = *projections.front();
   FakePlannerSceneProjectionResolver projection_resolver(projection_clients);
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
                                  projection_resolver, cell_admission);
   auto active = FinalizeNativeCandidate(
@@ -5125,7 +5165,7 @@ TEST(CanonicalEmptySceneOwner,
   FakePlannerSceneProjectionResolver projection_resolver(
       ProjectionClients(projections));
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
                                  projection_resolver, cell_admission);
   const auto active = FinalizeNativeCandidate(
@@ -5169,7 +5209,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
@@ -5363,7 +5403,7 @@ TEST(CanonicalEmptySceneOwner, LongServiceProviderEvidenceSurvivesRealJournalRes
       "provider-epoch", 1U, years31 + 1, years31 - 1, 5000,
   };
   {
-    CanonicalEmptySceneOwner owner(database, admission, publication_reader, cell_admission);
+    LogicalSceneOwner owner(database, admission, publication_reader, cell_admission);
     const auto bootstrap = FinalizeCanonicalBootstrap(owner, publication_reader, admission);
     const auto added = owner.Commit(AddBoxRequest(bootstrap.canonical_empty_target, admission.cell_id()));
     ASSERT_TRUE(added.success);
@@ -5380,7 +5420,7 @@ TEST(CanonicalEmptySceneOwner, LongServiceProviderEvidenceSurvivesRealJournalRes
     EXPECT_EQ(owner.GetObjectState(core::SceneResourceId("scene-box")).provider_evidence, evidence);
     EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 2);
   }
-  CanonicalEmptySceneOwner replacement(database, admission, publication_reader, cell_admission);
+  LogicalSceneOwner replacement(database, admission, publication_reader, cell_admission);
   EXPECT_EQ(replacement.GetObjectState(core::SceneResourceId("scene-box")).provider_evidence, evidence);
   EXPECT_EQ(replacement.VerifyIntegrity().transaction_intent_count, 2);
 }
@@ -5412,7 +5452,7 @@ TEST(CanonicalEmptySceneOwner,
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
     TestCellAdmissionPort cell_admission;
-    CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+    LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                    admission, publication_reader, bundle_source,
                                    projection_resolver, cell_admission);
     const auto active = FinalizeNativeCandidate(
@@ -5445,7 +5485,7 @@ TEST(CanonicalEmptySceneOwner,
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
     TestCellAdmissionPort cell_admission;
-    CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+    LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                    admission, publication_reader, bundle_source,
                                    projection_resolver, cell_admission);
     const auto active = FinalizeNativeCandidate(
@@ -5477,7 +5517,7 @@ TEST(CanonicalEmptySceneOwner,
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
     TestCellAdmissionPort cell_admission;
-    CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+    LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                    admission, publication_reader, bundle_source,
                                    projection_resolver, cell_admission);
     const auto active = FinalizeNativeCandidate(
@@ -5495,7 +5535,7 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
     EXPECT_TRUE(owner.VerifyIntegrity().projection_desynchronized);
     EXPECT_THROW(owner.LogicalSnapshot(),
-                 CanonicalEmptySceneOwnerConflictError);
+                 LogicalSceneOwnerConflictError);
   }
 
   {
@@ -5505,7 +5545,7 @@ TEST(CanonicalEmptySceneOwner,
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
     TestCellAdmissionPort cell_admission;
-    CanonicalEmptySceneOwner owner(
+    LogicalSceneOwner owner(
         directory.path() / "logical-scene.sqlite3", admission,
         publication_reader, bundle_source, projection_resolver,
         cell_admission);
@@ -5537,7 +5577,7 @@ TEST(CanonicalEmptySceneOwner,
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
     TestCellAdmissionPort cell_admission;
-    CanonicalEmptySceneOwner owner(
+    LogicalSceneOwner owner(
         directory.path() / "logical-scene.sqlite3", admission,
         publication_reader, bundle_source, projection_resolver,
         cell_admission);
@@ -5602,7 +5642,7 @@ TEST(CanonicalEmptySceneOwner,
     std::optional<core::SceneTransactionRequestDTO> request;
     ProjectionRevisionDTO committed_projection;
     {
-      CanonicalEmptySceneOwner owner(database_path, admission,
+      LogicalSceneOwner owner(database_path, admission,
                                      publication_reader, cell_admission);
       const auto accepted =
           FinalizeCanonicalBootstrap(owner, publication_reader, admission);
@@ -5624,7 +5664,7 @@ TEST(CanonicalEmptySceneOwner,
                "WHERE singleton = 1) != 1 BEGIN SELECT RAISE(ABORT, "
                "'logical_scene_request_outcomes is immutable'); END;");
 
-    CanonicalEmptySceneOwner recovered(database_path, admission,
+    LogicalSceneOwner recovered(database_path, admission,
                                        publication_reader);
     EXPECT_EQ(recovered.CurrentProjectionRevision(), committed_projection);
     ASSERT_TRUE(request.has_value());
@@ -5654,7 +5694,7 @@ TEST(CanonicalEmptySceneOwner,
         ProjectionClients(projections));
     TestCellAdmissionPort cell_admission;
     {
-      CanonicalEmptySceneOwner owner(database_path, native_admission,
+      LogicalSceneOwner owner(database_path, native_admission,
                                      publication_reader, bundle_source,
                                      projection_resolver, cell_admission);
       const auto active = FinalizeNativeCandidate(
@@ -5686,7 +5726,7 @@ TEST(CanonicalEmptySceneOwner,
                "WHERE singleton = 1) != 1 BEGIN SELECT RAISE(ABORT, "
                "'logical_scene_projection_results is immutable'); END;");
 
-    CanonicalEmptySceneOwner recovered(database_path, native_admission,
+    LogicalSceneOwner recovered(database_path, native_admission,
                                        publication_reader, bundle_source,
                                        projection_resolver);
     const auto integrity = recovered.VerifyIntegrity();
@@ -5697,7 +5737,7 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_EQ(integrity.projection_result_count, 0);
     EXPECT_FALSE(recovered.ReadAccessStatus().scene_writes_open);
     EXPECT_THROW(recovered.LogicalSnapshot(),
-                 CanonicalEmptySceneOwnerConflictError);
+                 LogicalSceneOwnerConflictError);
   }
 }
 
@@ -5744,7 +5784,7 @@ public:
                      FakePlannerSceneProjection::Mode::kCommit);
   }
 
-  [[nodiscard]] CanonicalEmptySceneOwner &owner() noexcept { return owner_; }
+  [[nodiscard]] LogicalSceneOwner &owner() noexcept { return owner_; }
   [[nodiscard]] OwnedFakePlannerSceneProjections &projections() noexcept {
     return projections_;
   }
@@ -5816,7 +5856,7 @@ private:
   ControlledPublicationReader publication_reader_;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
   TestCellAdmissionPort cell_admission_;
-  CanonicalEmptySceneOwner owner_;
+  LogicalSceneOwner owner_;
   core::Pose3DTO pose_{};
   core::SceneObjectProviderEvidenceDTO committed_evidence_{
       core::ProviderInstanceId("provider-instance"),

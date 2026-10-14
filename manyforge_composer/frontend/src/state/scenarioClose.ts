@@ -1,6 +1,6 @@
 import { api } from '../api/client';
 import { awaitActivationCompletion, browserRequestIdentity, cclcRequestOwnerEpoch, lifecycleRequestFromSnapshot, requestContext } from '../hooks/useCCLC';
-import type { ManagerActiveProjection } from '../types/api';
+import type { JsonValue, ManagerActiveProjection } from '../types/api';
 import type { ManagerApplyIdentity } from './managerApply';
 
 interface CloseInputs {
@@ -12,6 +12,40 @@ interface CloseInputs {
   progress: (message: string) => void;
 }
 const identity = () => browserRequestIdentity('composer-close');
+
+const object = (value: JsonValue | undefined): value is Record<string, JsonValue> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+const positiveGeneration = (value: JsonValue | undefined): boolean =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+const nonemptyString = (value: JsonValue | undefined): boolean =>
+  typeof value === 'string' && value.length > 0;
+
+function validPublication(active: ManagerActiveProjection): boolean {
+  const publication = active.publication;
+  const revision = publication.projection_revision;
+  const transaction = publication.transaction;
+  if (!positiveGeneration(publication.publication_generation)
+    || !nonemptyString(publication.durable_public_pointer_content_digest)
+    || !object(revision) || revision.retained_bundle_id !== active.retainedBundleId
+    || revision.graph_revision !== active.graphRevision || !object(revision.scene_revision)
+    || !nonemptyString(revision.scene_revision.scene_id)
+    || !positiveGeneration(revision.scene_revision.revision_id)
+    || !nonemptyString(revision.scene_revision.content_hash) || !object(transaction)) return false;
+  return transaction.kind === 'named_apply'
+    ? nonemptyString(transaction.apply_id) && positiveGeneration(transaction.apply_generation)
+    : transaction.kind === 'bootstrap'
+      && nonemptyString(transaction.bootstrap_id) && positiveGeneration(transaction.bootstrap_generation);
+}
+
+function sameJson(left: JsonValue, right: JsonValue): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) && Array.isArray(right))
+    return left.length === right.length && left.every((value, index) => sameJson(value, right[index]));
+  if (!object(left) || !object(right)) return false;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length
+    && keys.every((key) => Object.hasOwn(right, key) && sameJson(left[key], right[key]));
+}
 
 /** GUI composition only. Every effect uses the existing owner command and refusal. */
 export async function closeScenario({ expected, signal, admissionGeneration,
@@ -111,12 +145,33 @@ export async function closeScenario({ expected, signal, admissionGeneration,
     status = await api.manager.applyStatus(apply.applyId, apply.applyGeneration, signal);
   }
   if (status.state !== 'succeeded') throw new Error(status.failure?.message ?? 'Empty Apply failed or is unknown; the Scenario was not replaced.');
-  const final = await api.manager.status(signal);
-  if (!final.source.available || final.source.freshness !== 'fresh' || !final.status.active.canonicalEmpty
-    || final.status.active.retainedBundleId !== prepared.retained_bundle_id
-    || final.status.active.graphRevision !== prepared.graph_revision) {
-    throw new Error('Empty Apply completed, but its current publication cannot be verified.');
+  for (;;) {
+    signal.throwIfAborted();
+    const final = await api.manager.status(signal);
+    const active = final.status.active;
+    if (!final.source.available || final.source.freshness !== 'fresh'
+      || current.source.sourceOwnerEpoch !== selection.request_owner_epoch
+      || final.source.sourceOwnerEpoch !== current.source.sourceOwnerEpoch
+      || !current.source.sourceOwnerId
+      || final.source.sourceOwnerId !== current.source.sourceOwnerId
+      || !validPublication(active)) {
+      throw new Error('Empty Apply completed, but its current publication cannot be verified.');
+    }
+    const transaction = active.publication.transaction;
+    if (active.canonicalEmpty && active.retainedBundleId === prepared.retained_bundle_id
+      && active.graphRevision === prepared.graph_revision && object(transaction)
+      && transaction.kind === 'named_apply' && transaction.apply_id === apply.applyId
+      && transaction.apply_generation === apply.applyGeneration) {
+      progress('Scenario closed.');
+      return active;
+    }
+    const predecessor = current.status.active;
+    if (!validPublication(predecessor) || active.canonicalEmpty !== predecessor.canonicalEmpty
+      || active.retainedBundleId !== predecessor.retainedBundleId
+      || active.graphRevision !== predecessor.graphRevision
+      || !sameJson(active.publication, predecessor.publication)) {
+      throw new Error('Empty Apply completed, but its current publication cannot be verified.');
+    }
+    await waitForObservation();
   }
-  progress('Scenario closed.');
-  return final.status.active;
 }

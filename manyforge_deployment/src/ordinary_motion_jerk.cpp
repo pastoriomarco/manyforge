@@ -1,4 +1,5 @@
 #include "native_execution_runtime_unit_internal.hpp"
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -9,7 +10,7 @@
 
 namespace manyforge::deployment {
 namespace {
-namespace native = native_execution_runtime_contract;
+namespace native = execution_runtime_contract;
 
 const core::JsonValueDTO &member(const core::JsonObjectDTO &object,
                                  std::string_view key) {

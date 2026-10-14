@@ -101,7 +101,7 @@ ProgramBytes(const deployment::RetainedBundle &bundle,
                      deployment::CanonicalValue(
                          deployment::CanonicalValue::Object{
                              {"capability_id", deployment::CanonicalValue(
-                                                   "state.observed.current")},
+                                                   "execution.trajectory.execute")},
                              {"disposition",
                               deployment::CanonicalValue("required")},
                              {"parameters",
@@ -207,7 +207,7 @@ int main(int argc, char **argv) {
     const auto arguments = ParseArguments(argc, argv);
     std::filesystem::create_directories(arguments.package_root);
     auto source = manyforge::deployment::test::
-        make_lite6_composer_assistant_retention_fixture();
+        make_lite6_ros2_control_composer_assistant_retention_fixture();
     WriteDeploymentSource(arguments.package_root,
                           source.qualified.deployment());
     const auto fixture = manyforge::deployment::test::

@@ -3501,6 +3501,176 @@ TEST(SqliteCCLCJournal, AnUnsettledPlanBlocksFreshWorkAndItsReservationsAreNever
                    .ok());
 }
 
+TEST(SqliteCCLCJournal, RecordedEmptyNativeApplyAdoptsOnSameOwnerAndPreservesRemovalWatermarks) {
+  ScopedTemporaryDirectory temporary;
+  RequestOwnerEpoch owner("owner.empty-apply");
+  const ControllableComponentId component("component.1");
+  const auto route = ActiveConfiguration(ExpectedDomain());
+  auto empty_request = NativeApplyPlanRequestWithDelta(
+      "apply.empty", "bundle.empty", {}, {}, {}, {component}, {}, {route.control_domain_id});
+  empty_request.changed_component_state = ComponentLifecycleStateDTO::kDeclared;
+  const auto empty_publication = NativeApplyPublication("apply.empty", 1U, "bundle.empty", 3U);
+  ComponentLifecycleGeneration predecessor_generation(0U);
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, kDefaultCCLCExactResultHistory).ok());
+    auto present_request = NativeApplyPlanRequest("apply.present", 1U, "bundle.present", route);
+    present_request.changed_component_state = ComponentLifecycleStateDTO::kDeclared;
+    const auto present = journal.PlanNativeApply(present_request);
+    ASSERT_TRUE(present.ok()) << present.error().message;
+    ASSERT_EQ(present.value().components.size(), 1U);
+    predecessor_generation = present.value().components.front().generation;
+    ASSERT_TRUE(journal.AdoptNativeApplyFacts({
+        NativeApplyPublication("apply.present", 1U, "bundle.present", 2U),
+        present.value().components, {route}}).ok());
+    ASSERT_TRUE(journal.SetLifecycleTarget(component, LifecycleTargetStateDTO::kPrepared,
+                                           LifecycleTargetOriginDTO::kOperator).ok());
+    const auto planned = journal.PlanNativeApply(empty_request);
+    ASSERT_TRUE(planned.ok()) << planned.error().message;
+    EXPECT_TRUE(planned.value().components.empty());
+    EXPECT_TRUE(planned.value().routes.empty());
+    EXPECT_FALSE(planned.value().component_bring_up);
+    EXPECT_EQ(planned.value().removed_components, std::vector<ControllableComponentId>{component});
+    EXPECT_EQ(planned.value().removed_domains, std::vector<ControlDomainId>{route.control_domain_id});
+    const auto recorded = journal.LoadNativeApplyPlan(empty_request.apply);
+    ASSERT_TRUE(recorded.ok() && recorded.value());
+    EXPECT_EQ(*recorded.value(), planned.value());
+    EXPECT_EQ(journal.ReadUnsettledNativeApplyPlan().value(), empty_request.apply);
+    // Planning alone cannot turn a missing physical product into empty facts.
+    EXPECT_EQ(journal.LoadCurrentComponentLifecycleFact(component).value().current_state,
+              ComponentLifecycleStateDTO::kDeclared);
+    EXPECT_EQ(journal.LoadCurrentActiveControlConfiguration(route.control_domain_id).value(), route);
+    EXPECT_FALSE(journal.HasNativeApplyFacts(empty_publication).value());
+    ASSERT_TRUE(journal.AdoptNativeApplyFacts({empty_publication, {}, {}}).ok());
+    ASSERT_TRUE(journal.HasNativeApplyFacts(empty_publication).value());
+    EXPECT_FALSE(journal.ReadUnsettledNativeApplyPlan().value());
+    const auto removed = journal.LoadCurrentComponentLifecycleFact(component);
+    ASSERT_TRUE(removed.ok());
+    EXPECT_FALSE(removed.value().current_state);
+    EXPECT_EQ(removed.value().durable_generation, predecessor_generation);
+    EXPECT_FALSE(journal.LoadCurrentActiveControlConfiguration(route.control_domain_id).value());
+    EXPECT_FALSE(journal.LoadLifecycleTarget(component).value());
+    EXPECT_TRUE(journal.LoadLifecycleTargets().value().empty());
+    ASSERT_TRUE(journal.ReadQuiescentOwner(owner).ok());
+    EXPECT_FALSE(journal.ReadQuiescentOwner(RequestOwnerEpoch("owner.foreign")).ok());
+    ASSERT_TRUE(journal.AdoptNativeApplyFacts({empty_publication, {}, {}}).ok());
+    EXPECT_EQ(journal.LoadNativeApplyPlan(empty_request.apply).value(), recorded.value());
+    EXPECT_EQ(journal.LoadCurrentComponentLifecycleFact(component).value().durable_generation,
+              predecessor_generation);
+  }
+  SqliteCCLCJournal reopened(JournalPath(temporary), CellId("cell.1"));
+  ASSERT_TRUE(reopened.ReadQuiescentOwner(owner).ok());
+  ASSERT_TRUE(reopened.HasNativeApplyFacts(empty_publication).value());
+  const auto recorded = reopened.LoadNativeApplyPlan(empty_request.apply);
+  ASSERT_TRUE(recorded.ok() && recorded.value());
+  EXPECT_TRUE(recorded.value()->components.empty());
+  EXPECT_TRUE(recorded.value()->routes.empty());
+  EXPECT_FALSE(recorded.value()->component_bring_up);
+  EXPECT_FALSE(reopened.LoadCurrentComponentLifecycleFact(component).value().current_state);
+  EXPECT_FALSE(reopened.LoadCurrentActiveControlConfiguration(route.control_domain_id).value());
+  const auto selection = reopened.ReadApplyComponentGenerationSelection(owner, component);
+  ASSERT_TRUE(selection.ok());
+  EXPECT_EQ(selection.value().predecessor_generation, predecessor_generation);
+  EXPECT_EQ(selection.value().candidate_generation.value(), predecessor_generation.value() + 1U);
+  auto readd = NativeApplyPlanRequest("apply.readd", 1U, "bundle.present", route);
+  readd.changed_component_state = ComponentLifecycleStateDTO::kDeclared;
+  const auto readded = reopened.PlanNativeApply(readd);
+  ASSERT_TRUE(readded.ok()) << readded.error().message;
+  ASSERT_EQ(readded.value().components.size(), 1U);
+  ASSERT_EQ(readded.value().routes.size(), 1U);
+  EXPECT_EQ(readded.value().components.front().generation, selection.value().candidate_generation);
+  EXPECT_EQ(readded.value().routes.front().generation.value(),
+            route.active_control_configuration_generation.value() + 1U);
+}
+
+TEST(SqliteCCLCJournal, EmptyNativeApplyFactsRequireTheActualMatchingRecordedEmptyPlan) {
+  for (const std::string_view kind : {"missing", "foreign_apply", "foreign_generation",
+                                      "foreign_bundle", "foreign_graph", "nonempty_plan"}) {
+    SCOPED_TRACE(kind);
+    ScopedTemporaryDirectory temporary;
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    RequestOwnerEpoch owner("owner.empty-apply");
+    ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, kDefaultCCLCExactResultHistory).ok());
+    auto request = NativeApplyPlanRequestWithDelta(
+        "apply.empty", "bundle.empty", {}, {}, {}, {}, {}, {});
+    request.changed_component_state = ComponentLifecycleStateDTO::kDeclared;
+    if (kind == "nonempty_plan") {
+      request = NativeApplyPlanRequest("apply.empty", 1U, "bundle.empty", ActiveConfiguration(ExpectedDomain()));
+      request.changed_component_state = ComponentLifecycleStateDTO::kDeclared;
+    }
+    if (kind != "missing") {
+      ASSERT_TRUE(journal.PlanNativeApply(request).ok());
+    }
+    const auto before = journal.LoadNativeApplyPlan(request.apply);
+    ASSERT_TRUE(before.ok());
+    auto publication = NativeApplyPublication("apply.empty", 1U, "bundle.empty", 2U);
+    auto& transaction = std::get<NamedApplyPublicationTransactionDTO>(publication.request.transaction_ref);
+    if (kind == "foreign_apply") transaction.apply_id = ApplyId("apply.foreign");
+    if (kind == "foreign_generation") transaction.apply_generation = ApplyGeneration(2U);
+    if (kind == "foreign_bundle") {
+      publication.request.candidate_retained_bundle_id = RetainedBundleId("bundle.foreign");
+      publication.request.candidate_projection_revision.retained_bundle_id = RetainedBundleId("bundle.foreign");
+    }
+    if (kind == "foreign_graph") {
+      publication.request.candidate_graph_revision = GraphRevision("graph.foreign");
+      publication.request.candidate_projection_revision.graph_revision = GraphRevision("graph.foreign");
+    }
+    ASSERT_TRUE(publication.valid());
+    const auto rejected = journal.AdoptNativeApplyFacts({publication, {}, {}});
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.error().code, "component_lifecycle_native_apply_unplanned");
+    EXPECT_EQ(journal.LoadNativeApplyPlan(request.apply).value(), before.value());
+    EXPECT_FALSE(journal.HasNativeApplyFacts(publication).value());
+    EXPECT_FALSE(journal.LoadCurrentComponentLifecycleFact(ControllableComponentId("component.1"))
+                     .value().current_state);
+    EXPECT_FALSE(journal.LoadCurrentActiveControlConfiguration(ControlDomainId("domain.1")).value());
+    ASSERT_TRUE(journal.ReadQuiescentOwner(owner).ok());
+    if (kind == "missing") {
+      EXPECT_FALSE(journal.ReadUnsettledNativeApplyPlan().value());
+    } else {
+      EXPECT_EQ(journal.ReadUnsettledNativeApplyPlan().value(), request.apply);
+    }
+  }
+}
+
+TEST(SqliteCCLCJournal, EmptyNativeApplyReplayRefusesForeignHeadAndUnexpectedFacts) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+  RequestOwnerEpoch owner("owner.empty-apply");
+  ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, kDefaultCCLCExactResultHistory).ok());
+  auto request = NativeApplyPlanRequestWithDelta(
+      "apply.empty", "bundle.empty", {}, {}, {}, {}, {}, {});
+  request.changed_component_state = ComponentLifecycleStateDTO::kDeclared;
+  const auto plan = journal.PlanNativeApply(request);
+  ASSERT_TRUE(plan.ok());
+  ASSERT_TRUE(plan.value().components.empty() && plan.value().routes.empty());
+  const auto publication = NativeApplyPublication("apply.empty", 1U, "bundle.empty", 2U);
+  ASSERT_TRUE(journal.AdoptNativeApplyFacts({publication, {}, {}}).ok());
+  for (const std::string_view kind : {"generation", "pointer_digest", "components", "routes"}) {
+    SCOPED_TRACE(kind);
+    NativeApplyFactAdoptionDTO foreign{publication, {}, {}};
+    if (kind == "generation") foreign.publication.publication_generation = ActiveBundlePublicationGeneration(3U);
+    if (kind == "pointer_digest") foreign.publication.durable_public_pointer_content_digest = ContentDigest(Sha('e'));
+    if (kind == "components") {
+      foreign.components.push_back({ControllableComponentId("component.1"),
+          ComponentLifecycleStateDTO::kDeclared, ComponentLifecycleGeneration(1U)});
+    }
+    if (kind == "routes") foreign.current_routes.push_back(ActiveConfiguration(ExpectedDomain()));
+    ASSERT_TRUE(foreign.publication.valid());
+    const auto rejected = journal.AdoptNativeApplyFacts(foreign);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.error().code, "component_lifecycle_native_apply_conflict");
+    EXPECT_EQ(journal.LoadNativeApplyPlan(request.apply).value(), plan.value());
+    EXPECT_TRUE(journal.HasNativeApplyFacts(publication).value());
+    EXPECT_FALSE(journal.ReadUnsettledNativeApplyPlan().value());
+    EXPECT_FALSE(journal.LoadCurrentComponentLifecycleFact(ControllableComponentId("component.1"))
+                     .value().current_state);
+    EXPECT_FALSE(journal.LoadCurrentActiveControlConfiguration(ControlDomainId("domain.1")).value());
+    EXPECT_TRUE(journal.LoadLifecycleTargets().value().empty());
+    ASSERT_TRUE(journal.ReadQuiescentOwner(owner).ok());
+  }
+}
+
 TEST(SqliteCCLCJournal, NativeApplyFactsRequireARecordedPlanAndExactReplay) {
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
@@ -5486,6 +5656,213 @@ TEST(SqliteCCLCJournal, PruneNoticeFailureCannotUndoCommittedPruningOrNewInciden
   EXPECT_EQ(RawScalar(JournalPath(temporary),
                       "SELECT count(*) FROM cclc_component_incidents WHERE acknowledged=0"),
             2);
+}
+
+namespace {
+[[nodiscard]] std::shared_ptr<const content_identity::CanonicalValue>
+IdentityAloneExceedsDiagnosticBudget() {
+  using content_identity::CanonicalValue;
+  auto snapshot = *TestLaunchDiagnosticSnapshot();
+  snapshot = WithObserverMember(snapshot, "context", WithObserverMember(
+      *snapshot.find_object_member("context"), "launch_identity",
+      CanonicalValue(std::string(kMaximumCellAdmissionPrivateBinaryBytes, '\x01'))));
+  auto settings = snapshot.find_object_member("settings")->as_object();
+  for (auto& [key, value] : settings)
+    if (key != "argv") value = CanonicalValue(nullptr);
+  snapshot = WithObserverMember(snapshot, "settings", CanonicalValue(std::move(settings)));
+  return std::make_shared<const CanonicalValue>(std::move(snapshot));
+}
+}  // namespace
+
+TEST(SqliteCCLCJournal, ImpossibleIdentityCaptureRecordsNamedAbsentSnapshotAndPreservesFirstError) {
+  const auto snapshot = IdentityAloneExceedsDiagnosticBudget();
+  ASSERT_TRUE(ComponentIncidentDiagnosticSnapshotShapeIsValid(*snapshot));
+  ASSERT_GT(content_identity::canonical_json(*snapshot).size(), kMaxComponentIncidentRecordBytes);
+  for (const bool short_first : {false, true}) {
+    SCOPED_TRACE(short_first);
+    ScopedTemporaryDirectory temporary;
+    const ControllableComponentId component("ur5e_robot");
+    const auto initial = TestIncident("incident.ur5e", component,
+                                      LifecycleBlockingCauseClassDTO::kFault, 100);
+    const ErrorDTO first{"controller_launch_exited", "original signal=11", {{"original", "fact"}}};
+    const ErrorDTO incoming{"controller_launch_exited", "incoming signal=11", {{"incoming", "fact"}}};
+    {
+      SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+      ASSERT_TRUE(journal.OpenComponentIncident(initial, 0U).ok());
+      const auto contained = ComponentIncidentRecordWithContainment(
+          initial.record_json, ComponentIncidentContainmentStateDTO::kFailed, std::nullopt,
+          std::string("fixture containment unavailable"));
+      ASSERT_TRUE(journal.RecordComponentIncidentContainment(
+          "incident.ur5e", ComponentIncidentContainmentStateDTO::kFailed, contained, 110).value());
+      if (short_first) {
+        ASSERT_TRUE(journal.AppendComponentIncidentDiagnostic("incident.ur5e", 115, first).value());
+      }
+      const auto appended = journal.AppendComponentIncidentDiagnostic(
+          "incident.ur5e", 120, incoming, snapshot);
+      ASSERT_TRUE(appended.ok()) << appended.error().message;
+      ASSERT_TRUE(appended.value());
+      const auto current = journal.LoadOpenComponentIncident(component).value();
+      ASSERT_TRUE(current && current->diagnostic);
+      const auto& original_error = short_first ? first : incoming;
+      EXPECT_EQ(current->diagnostic->code, original_error.code);
+      EXPECT_EQ(current->diagnostic->message, original_error.message);
+      for (const auto& [key, value] : original_error.details)
+        EXPECT_EQ(current->diagnostic->details.at(key), value);
+      EXPECT_EQ(current->diagnostic->details.at("snapshot_omitted_fields"), "diagnostic_too_large");
+      EXPECT_FALSE(current->diagnostic_snapshot);
+      const auto events = journal.LoadComponentIncidentEvents(0U, 16U).value();
+      std::shared_ptr<const content_identity::CanonicalValue> event_snapshot;
+      EXPECT_EQ(ComponentIncidentDiagnosticFromRecord(events.back().payload_json, &event_snapshot),
+                current->diagnostic);
+      EXPECT_FALSE(event_snapshot);
+      EXPECT_FALSE(journal.AppendComponentIncidentDiagnostic(
+          "incident.ur5e", 130, incoming, snapshot).value());
+      EXPECT_EQ(journal.LoadComponentIncidentEvents(0U, 16U).value(), events);
+      EXPECT_EQ(snapshot->find_object_member("context")->find_object_member("launch_identity")->as_string(),
+                std::string(kMaximumCellAdmissionPrivateBinaryBytes, '\x01'));
+    }
+    SqliteCCLCJournal reopened(JournalPath(temporary), CellId("cell.1"));
+    const auto retained = reopened.LoadOpenComponentIncident(component).value();
+    ASSERT_TRUE(retained && retained->diagnostic);
+    EXPECT_EQ(retained->diagnostic->message, (short_first ? first : incoming).message);
+    EXPECT_EQ(retained->diagnostic->details.at("snapshot_omitted_fields"), "diagnostic_too_large");
+    EXPECT_FALSE(retained->diagnostic_snapshot);
+  }
+}
+
+TEST(SqliteCCLCJournal, ImpossibleIdentityCaptureReusesEighthMetadataSlot) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+  const ControllableComponentId component("ur5e_robot");
+  const auto initial = TestIncident("incident.ur5e", component,
+                                    LifecycleBlockingCauseClassDTO::kFault, 100);
+  ASSERT_TRUE(journal.OpenComponentIncident(initial, 0U).ok());
+  const auto contained = ComponentIncidentRecordWithContainment(
+      initial.record_json, ComponentIncidentContainmentStateDTO::kFailed, std::nullopt,
+      std::string("fixture containment unavailable"));
+  ASSERT_TRUE(journal.RecordComponentIncidentContainment(
+      "incident.ur5e", ComponentIncidentContainmentStateDTO::kFailed, contained, 110).value());
+  ErrorDTO first{"controller_launch_exited", "original signal=11", {{"snapshot_omitted_fields", ""}}};
+  for (std::size_t i = 1; i < kMaxLifecycleErrorDetails; ++i)
+    first.details.emplace("original." + std::to_string(i), "fact");
+  ASSERT_EQ(first.details.size(), kMaxLifecycleErrorDetails);
+  ASSERT_TRUE(journal.AppendComponentIncidentDiagnostic("incident.ur5e", 115, first).value());
+  const auto appended = journal.AppendComponentIncidentDiagnostic("incident.ur5e", 120,
+      ErrorDTO{"controller_launch_exited", "replacement signal", {}}, IdentityAloneExceedsDiagnosticBudget());
+  ASSERT_TRUE(appended.ok()) << appended.error().message;
+  ASSERT_TRUE(appended.value());
+  const auto current = journal.LoadOpenComponentIncident(component).value();
+  ASSERT_TRUE(current && current->diagnostic);
+  EXPECT_EQ(current->diagnostic->code, first.code);
+  EXPECT_EQ(current->diagnostic->message, first.message);
+  EXPECT_EQ(current->diagnostic->details.size(), kMaxLifecycleErrorDetails);
+  for (const auto& [key, value] : first.details)
+    if (key != "snapshot_omitted_fields") {
+      EXPECT_EQ(current->diagnostic->details.at(key), value);
+    }
+  EXPECT_EQ(current->diagnostic->details.at("snapshot_omitted_fields"), "diagnostic_too_large");
+  EXPECT_FALSE(current->diagnostic_snapshot);
+}
+
+TEST(SqliteCCLCJournal, ImpossibleIdentityCaptureDoesNotInventOverflowMetadataCapacity) {
+  for (const bool full_metadata : {false, true}) {
+    SCOPED_TRACE(full_metadata);
+    ScopedTemporaryDirectory temporary;
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    const ControllableComponentId component("ur5e_robot");
+    const auto initial = TestIncident("incident.ur5e", component,
+                                      LifecycleBlockingCauseClassDTO::kFault, 100);
+    ASSERT_TRUE(journal.OpenComponentIncident(initial, 0U).ok());
+    const auto contained = ComponentIncidentRecordWithContainment(
+        initial.record_json, ComponentIncidentContainmentStateDTO::kFailed, std::nullopt,
+        std::string("fixture containment unavailable"));
+    ASSERT_TRUE(journal.RecordComponentIncidentContainment(
+        "incident.ur5e", ComponentIncidentContainmentStateDTO::kFailed, contained, 110).value());
+    ErrorDTO incoming{"controller_launch_exited", "original signal=11", {}};
+    if (full_metadata)
+      incoming.details.emplace("snapshot_omitted_fields", std::string(kMaxLifecycleErrorDetailValueBytes, 'x'));
+    for (std::size_t i = incoming.details.size(); i < kMaxLifecycleErrorDetails; ++i)
+      incoming.details.emplace("original." + std::to_string(i), "fact");
+    ASSERT_TRUE(ComponentIncidentDiagnosticIsValid(incoming));
+    if (!full_metadata) {
+      ASSERT_TRUE(journal.AppendComponentIncidentDiagnostic("incident.ur5e", 115, incoming).value());
+    }
+    const auto before = journal.LoadOpenComponentIncident(component).value();
+    const auto events = journal.LoadComponentIncidentEvents(0U, 16U).value();
+    const auto appended = journal.AppendComponentIncidentDiagnostic(
+        "incident.ur5e", 120, incoming, IdentityAloneExceedsDiagnosticBudget());
+    ASSERT_FALSE(appended.ok());
+    EXPECT_EQ(appended.error().code, "component_lifecycle_incident_invalid");
+    EXPECT_NE(appended.error().message.find("diagnostic_too_large"), std::string::npos);
+    EXPECT_EQ(journal.LoadOpenComponentIncident(component).value()->record_json, before->record_json);
+    EXPECT_EQ(journal.LoadComponentIncidentEvents(0U, 16U).value(), events);
+  }
+}
+
+TEST(SqliteCCLCJournal, Real257ByteObserverIncidentIdentitySurvivesReadbackAndReopen) {
+  ASSERT_EQ(kUr5eLaunchIdentity257.size(), 257U);
+  ScopedTemporaryDirectory temporary;
+  auto incident = ObserverLossRecord();
+  const auto context = WithObserverMember(
+      *incident.diagnostic_snapshot.find_object_member("context"), "launch_identity",
+      content_identity::CanonicalValue(kUr5eLaunchIdentity257));
+  incident.diagnostic_snapshot = WithObserverMember(incident.diagnostic_snapshot, "context", context);
+  ASSERT_TRUE(incident.locally_valid());
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), incident.target.cell_id);
+    ASSERT_TRUE(journal.RecordCellObserverIncident(incident).ok());
+    EXPECT_EQ(journal.LoadOpenCellObserverIncident().value(), incident);
+  }
+  SqliteCCLCJournal reopened(JournalPath(temporary), incident.target.cell_id);
+  const auto retained = reopened.LoadOpenCellObserverIncident().value();
+  ASSERT_TRUE(retained);
+  EXPECT_EQ(retained->diagnostic_snapshot.find_object_member("context")
+                ->find_object_member("launch_identity")->as_string(), kUr5eLaunchIdentity257);
+}
+
+TEST(SqliteCCLCJournal, CeilingIdentityKeepsLatestMarkedTailWithinExistingJournalBudget) {
+  ScopedTemporaryDirectory temporary;
+  const ControllableComponentId component("ur5e_robot");
+  const auto initial = TestIncident("incident.ur5e", component,
+                                    LifecycleBlockingCauseClassDTO::kFault, 100);
+  const std::string identity(kMaximumCellAdmissionPrivateBinaryBytes, 'i');
+  const std::string tail = std::string(128U * 1024U - 128U, 't') + "latest crash line\n";
+  auto snapshot = *TestLaunchDiagnosticSnapshot();
+  snapshot = WithObserverMember(snapshot, "context", WithObserverMember(
+      *snapshot.find_object_member("context"), "launch_identity", content_identity::CanonicalValue(identity)));
+  auto output = WithObserverMember(*snapshot.find_object_member("output"), "tail",
+                                  content_identity::CanonicalValue(tail));
+  output = WithObserverMember(output, "truncated", content_identity::CanonicalValue(false));
+  snapshot = WithObserverMember(snapshot, "output", output);
+  ASSERT_TRUE(ComponentIncidentDiagnosticSnapshotShapeIsValid(snapshot));
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    ASSERT_TRUE(journal.OpenComponentIncident(initial, 0U).ok());
+    const auto contained = ComponentIncidentRecordWithContainment(
+        initial.record_json, ComponentIncidentContainmentStateDTO::kFailed, std::nullopt,
+        std::string("fixture containment unavailable"));
+    ASSERT_TRUE(journal.RecordComponentIncidentContainment(
+        "incident.ur5e", ComponentIncidentContainmentStateDTO::kFailed, contained, 110).value());
+    ASSERT_TRUE(journal.AppendComponentIncidentDiagnostic("incident.ur5e", 120,
+        ErrorDTO{"controller_launch_exited", "signal=11", {}},
+        std::make_shared<const content_identity::CanonicalValue>(snapshot)).value());
+    const auto current = journal.LoadOpenComponentIncident(component).value();
+    ASSERT_TRUE(current && current->diagnostic_snapshot);
+    EXPECT_LE(current->record_json.size(), kMaxComponentIncidentRecordBytes);
+    const auto& captured = *current->diagnostic_snapshot;
+    EXPECT_EQ(captured.find_object_member("context")->find_object_member("launch_identity")->as_string(), identity);
+    const auto& captured_output = *captured.find_object_member("output");
+    EXPECT_TRUE(captured_output.find_object_member("truncated")->as_bool());
+    const auto& retained_tail = captured_output.find_object_member("tail")->as_string();
+    EXPECT_TRUE(retained_tail.starts_with("[truncated]"));
+    EXPECT_TRUE(retained_tail.ends_with("latest crash line\n"));
+    EXPECT_LT(retained_tail.size(), tail.size());
+  }
+  SqliteCCLCJournal reopened(JournalPath(temporary), CellId("cell.1"));
+  const auto retained = reopened.LoadOpenComponentIncident(component).value();
+  ASSERT_TRUE(retained && retained->diagnostic_snapshot);
+  EXPECT_EQ(retained->diagnostic_snapshot->find_object_member("context")
+                ->find_object_member("launch_identity")->as_string(), identity);
 }
 
 TEST(SqliteCCLCJournal, Real257ByteLaunchIdentitySurvivesIncidentReadbackAndReopen) {

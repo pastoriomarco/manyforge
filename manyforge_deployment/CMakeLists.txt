@@ -666,6 +666,7 @@ add_library(manyforge_deployment_verification_core
   src/deployment_catalog_codec.cpp
   src/model_asset_codec.cpp
   src/model_source.cpp
+  src/execution_runtime_contract.cpp
   src/native_execution_runtime_unit_internal.cpp
   src/native_component_configuration.cpp
   src/ordinary_motion_jerk.cpp
@@ -2019,6 +2020,7 @@ if(BUILD_TESTING)
       "-DMANYFORGE_GENERATOR=$<TARGET_FILE:manyforge_generate_canonical_empty_package>"
       "-DMANYFORGE_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/canonical_empty_cli_package"
       "-DMANYFORGE_NATIVE_PROFILE=${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/catalog/runtime_profile/manyforge.native_execution_runtime.json"
+      "-DMANYFORGE_ROS_PROFILE=${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/catalog/runtime_profile/manyforge.ros2_control_execution_runtime.json"
       -P
       "${CMAKE_CURRENT_SOURCE_DIR}/test/canonical_empty_generator_cli.cmake")
 

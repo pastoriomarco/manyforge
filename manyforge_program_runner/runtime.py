@@ -2309,13 +2309,22 @@ class ProgramRuntime:
                 )
             admission = admission_client.get()
             generation = self._admission_generation(admission)
-            if (
-                admission.get("authoring_allowed") is not True
-                or generation != request.expected_admission_generation
-            ):
+            admission_details = {
+                "admission_generation": generation,
+                "authoring_allowed": admission.get("authoring_allowed"),
+                "expected_admission_generation": request.expected_admission_generation,
+            }
+            if admission.get("authoring_allowed") is not True:
+                raise ProgramRunnerError(
+                    "authoring_not_ready",
+                    "authoring admission is not ready for scene preparation",
+                    details=admission_details,
+                )
+            if generation != request.expected_admission_generation:
                 raise ProgramRunnerError(
                     "stale_generation",
                     "authoring admission changed before scene preparation",
+                    details=admission_details,
                 )
             context_id = (
                 "program-scene."
@@ -3102,6 +3111,33 @@ class ProgramRuntime:
                 self._starting_kernel_owner_epoch = None
             if acquired_for_request:
                 failed_cycle = journal.read()
+                if (
+                    outcome.code == "program_run_admission_failed"
+                    and failed_cycle.state == "terminal_awaiting_reset"
+                    and failed_cycle.owner_epoch == self.owner_epoch
+                    and failed_cycle.cycle_generation == cycle.cycle_generation
+                    and failed_cycle.program_run_id == program_run_id
+                    and failed_cycle.claim == claim
+                    and failed_cycle.current_command_kind == "program_stop"
+                    and failed_cycle.failure is None
+                    and self._cycle_terminal_evidence_is_exact(journal, failed_cycle)
+                ):
+                    terminal = journal.read_run_snapshot(program_run_id)
+                    if terminal is not None and terminal.get("state") == "failed":
+                        # The host's authenticated terminal is the outcome;
+                        # the lost Running CAS is not its failure cause.
+                        code = terminal.get("reason_code")
+                        message = terminal.get("message")
+                        native_details = terminal.get("details")
+                        outcome = ProgramRunnerError(
+                            code if isinstance(code, str) and code else "program_run_host_failed",
+                            message if isinstance(message, str) and message else "Program host reported a failed terminal",
+                            details={
+                                **(dict(native_details) if isinstance(native_details, Mapping) else {}),
+                                "host_state": "failed",
+                                "host_run_revision": terminal.get("run_revision"),
+                            },
+                        )
                 details = {
                     **outcome.details,
                     "cause_code": outcome.code,

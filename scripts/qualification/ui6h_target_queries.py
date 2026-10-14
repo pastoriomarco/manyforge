@@ -1,12 +1,9 @@
-"""Qualify target queries and optional control Programs against native owners.
+"""Historical UI6-H target-query qualification, with ROS product inputs.
 
-Run only in the pinned image, with an already checked maintained package and
-current native/Headless builds. Uses the maintained workbench's real startup
-and shutdown, but a private package, private state and container-local ports.
-The default Program is read-only; --controls adds simulated native motion,
-a Program-owned runtime scale and two short manual gripper moves before the
-Program.
-No fixture substitutes for an owner response.
+NOT_RUN: the old Scenario/package handoff and private Workbench authoring
+hooks still need N4 migration. Enabled ordinary jerk is unavailable on ROS;
+its shared cold-law assertions remain at their owning Core/Deployment seams.
+These source joins do not qualify the old live workflow.
 """
 
 from __future__ import annotations
@@ -1325,14 +1322,8 @@ def main() -> None:
     workbench.STATE_ROOT = state / "owners"
     workbench.PACKAGE_ROOT = package
     workbench.HEADLESS_BUILD = args.build_root / "headless"
-    workbench.ROBOPLAN_BUILD = args.build_root / "roboplan"
+    workbench.BUILD_ROOT = args.build_root
     workbench.MANAGER_BINARY = workbench.HEADLESS_BUILD / "manyforge_manager_daemon"
-    workbench.NATIVE_EXECUTION_HOST = (
-        workbench.ROBOPLAN_BUILD / "manyforge_native_execution_host"
-    )
-    workbench.NATIVE_CANDIDATE_WORKER = (
-        workbench.ROBOPLAN_BUILD / "manyforge_roboplan_candidate_worker"
-    )
     # These only locate already qualified build/package inputs. Normal owner
     # construction, exact tuple checks, lifecycle convergence and teardown run.
     workbench._import_package = lambda: None

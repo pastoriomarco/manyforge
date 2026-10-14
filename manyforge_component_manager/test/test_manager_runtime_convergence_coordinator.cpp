@@ -17,7 +17,7 @@
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <memory>
 #include <set>
-#include <manyforge_scene/canonical_empty_scene_owner.hpp>
+#include <manyforge_scene/logical_scene_owner.hpp>
 #include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
@@ -667,15 +667,16 @@ public:
   [[nodiscard]] ConfigurationFenceAdmissionSnapshotDTO ObserveAdmission(
       const ConfigurationFenceAdmissionQueryDTO &query) const override {
     ++observe_admission_calls;
+    auto epoch = original_execution_host.value_or(ExecutionHostEpochDTO{
+        RuntimeUnitId("runtime.kernel"),
+        RuntimeEpoch("kernel-runtime-aggregate-1"),
+        RequestOwnerEpoch("kernel-owner-aggregate-1"),
+        ContentDigest(std::string(kDigestOne)),
+        predecessor_.publication_generation});
+    epoch.publication_generation = predecessor_.publication_generation;
     return {
         query,
-        ExecutionHostEpochDTO{
-            RuntimeUnitId("runtime.kernel"),
-            RuntimeEpoch("kernel-runtime-aggregate-1"),
-            RequestOwnerEpoch("kernel-owner-aggregate-1"),
-            ContentDigest(std::string(kDigestOne)),
-            predecessor_.publication_generation,
-        },
+        std::move(epoch),
         predecessor_.request.candidate_projection_revision,
         predecessor_.durable_public_pointer_content_digest,
         0U,
@@ -970,6 +971,17 @@ private:
 class ScriptedRuntimeCompositionPort final
     : public IManagerSelectedRuntimeCompositionPort {
 public:
+  [[nodiscard]] Result<ManagerComponentProcessInventoryResultDTO>
+  InspectInstalledComponentProcesses(
+      const ManagerComponentProcessInventoryRequestDTO &request) override {
+    if (installed_processes) return installed_processes(request);
+    return IManagerSelectedRuntimeCompositionPort::
+        InspectInstalledComponentProcesses(request);
+  }
+
+  std::function<Result<ManagerComponentProcessInventoryResultDTO>(
+      const ManagerComponentProcessInventoryRequestDTO &)> installed_processes;
+
   [[nodiscard]] ManagerSelectedRuntimeCompositionResultDTO InstallOrObserve(
       const ManagerSelectedRuntimeCompositionRequestDTO &request) override {
     ++calls;
@@ -2415,7 +2427,7 @@ std::vector<ProjectionNativeRuntimeBindingDTO> AdoptionBindings(
 
 class OriginalSceneAdapter final : public IManagerSceneProjectionMaintenancePort {
 public:
-  OriginalSceneAdapter(scene::CanonicalEmptySceneOwner &owner, AggregateFencePort &fence)
+  OriginalSceneAdapter(scene::LogicalSceneOwner &owner, AggregateFencePort &fence)
       : owner_(owner), fence_(fence) {}
   ProjectionRevisionDTO CurrentProjectionRevision() const override { return owner_.CurrentProjectionRevision(); }
   ProjectionAggregateHealthDTO ActiveProjectionHealth() const override { return owner_.ActiveProjectionHealth(); }
@@ -2504,12 +2516,12 @@ public:
   std::function<void(QualifiedSceneProductAdoptionRequestDTO &)> alter_begin;
   std::function<void()> after_begin, after_complete;
 private:
-  scene::CanonicalEmptySceneOwner &owner_;
+  scene::LogicalSceneOwner &owner_;
   AggregateFencePort &fence_;
 };
 
 ActiveBundlePublicationReceiptDTO EstablishActualScenePredecessor(
-    scene::CanonicalEmptySceneOwner &owner, ScriptedPublicationStore &publication,
+    scene::LogicalSceneOwner &owner, ScriptedPublicationStore &publication,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const deployment::RetainedBundle &predecessor,
     const std::vector<ProjectionNativeRuntimeBindingDTO> &bindings) {
@@ -2569,7 +2581,7 @@ struct RuntimeConfigurationSceneFixture final {
   RuntimePackage empty;
   deployment::CanonicalEmptyRetainedBundleAdmission admission;
   AdoptionProjectionResolver resolver;
-  scene::CanonicalEmptySceneOwner owner;
+  scene::LogicalSceneOwner owner;
   ActiveBundlePublicationReceiptDTO predecessor;
   std::string snapshot_bytes;
 };
@@ -2618,6 +2630,38 @@ TEST(ManagerNamedApplyCoordinator,
       ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
   kernel_fence.allow_prepublication_status = true;
   ScriptedRuntimeCompositionPort runtime_composition;
+  ASSERT_TRUE(deployment::verify_retained_bundle_identity(*actual_scene.empty.bundle));
+  const auto &installed_graph = actual_scene.empty.bundle->value().cell_graph;
+  ASSERT_TRUE(installed_graph.controllable_components.empty());
+  ASSERT_TRUE(installed_graph.control_domains.empty());
+  ASSERT_TRUE(installed_graph.control_bindings.empty());
+  // This fresh scripted owner has launched no component processes. Its exact
+  // verified predecessor and host/Manager epochs qualify that known inventory;
+  // an uncomposed inspection on any other fixture still refuses.
+  const ManagerComponentProcessInventoryRequestDTO installed_scope{
+      predecessor.request.candidate_projection_revision,
+      predecessor.publication_generation,
+      predecessor.durable_public_pointer_content_digest,
+      kernel_fence.original_execution_host->runtime_unit_id,
+      kernel_fence.original_execution_host->runtime_epoch,
+      RuntimeEpoch("manager-runtime.aggregate.1")};
+  ASSERT_TRUE(installed_scope.valid());
+  ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
+            actual_scene.empty.bundle->retained_bundle_id());
+  ASSERT_EQ(installed_scope.predecessor_projection_revision.graph_revision,
+            installed_graph.graph_revision);
+  const std::vector<ManagerComponentProcessOccurrenceDTO> installed_processes{};
+  runtime_composition.installed_processes =
+      [installed_scope, installed_processes](
+          const ManagerComponentProcessInventoryRequestDTO &request) {
+        if (!request.valid() || request != installed_scope) {
+          return Result<ManagerComponentProcessInventoryResultDTO>::Err(
+              {"fixture_installed_inventory_foreign",
+               "installed process inspection does not name the fixture owner", {}});
+        }
+        return Result<ManagerComponentProcessInventoryResultDTO>::Ok(
+            {request, installed_processes, std::nullopt});
+      };
   ManagerActiveRuntimeCoordinator active_runtime(
       active_plan_source, runtime_ports, runtime_ports, [] { return 1'000U; });
   AlwaysIdleMaintenanceGate maintenance_gate;
@@ -2837,6 +2881,38 @@ TEST(ManagerNamedApplyCoordinator,
         predecessor.publication_generation};
     kernel_fence.allow_prepublication_status = true;
     ScriptedRuntimeCompositionPort runtime_composition;
+    ASSERT_TRUE(deployment::verify_retained_bundle_identity(*actual_scene.empty.bundle));
+    const auto &installed_graph = actual_scene.empty.bundle->value().cell_graph;
+    ASSERT_TRUE(installed_graph.controllable_components.empty());
+    ASSERT_TRUE(installed_graph.control_domains.empty());
+    ASSERT_TRUE(installed_graph.control_bindings.empty());
+    // This fresh scripted owner has launched no component processes. Its exact
+    // verified predecessor and host/Manager epochs qualify that known inventory;
+    // an uncomposed inspection on any other fixture still refuses.
+    const ManagerComponentProcessInventoryRequestDTO installed_scope{
+        predecessor.request.candidate_projection_revision,
+        predecessor.publication_generation,
+        predecessor.durable_public_pointer_content_digest,
+        kernel_fence.original_execution_host->runtime_unit_id,
+        kernel_fence.original_execution_host->runtime_epoch,
+        RuntimeEpoch("manager-runtime.failed-composition.1")};
+    ASSERT_TRUE(installed_scope.valid());
+    ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
+              actual_scene.empty.bundle->retained_bundle_id());
+    ASSERT_EQ(installed_scope.predecessor_projection_revision.graph_revision,
+              installed_graph.graph_revision);
+    const std::vector<ManagerComponentProcessOccurrenceDTO> installed_processes{};
+    runtime_composition.installed_processes =
+        [installed_scope, installed_processes](
+            const ManagerComponentProcessInventoryRequestDTO &request) {
+          if (!request.valid() || request != installed_scope) {
+            return Result<ManagerComponentProcessInventoryResultDTO>::Err(
+                {"fixture_installed_inventory_foreign",
+                 "installed process inspection does not name the fixture owner", {}});
+          }
+          return Result<ManagerComponentProcessInventoryResultDTO>::Ok(
+              {request, installed_processes, std::nullopt});
+        };
     runtime_composition.fail_on_call = failing_call == 3 ? 0 : failing_call;
     const auto original_admission = cell_admission.GetAuthoringAdmission();
     ASSERT_TRUE(original_admission.authoring_allowed);
@@ -3102,6 +3178,38 @@ TEST(ManagerNamedApplyCoordinator,
       ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
   kernel_fence.allow_prepublication_status = true;
   ScriptedRuntimeCompositionPort runtime_composition;
+  ASSERT_TRUE(deployment::verify_retained_bundle_identity(*actual_scene.empty.bundle));
+  const auto &installed_graph = actual_scene.empty.bundle->value().cell_graph;
+  ASSERT_TRUE(installed_graph.controllable_components.empty());
+  ASSERT_TRUE(installed_graph.control_domains.empty());
+  ASSERT_TRUE(installed_graph.control_bindings.empty());
+  // This fresh scripted owner has launched no component processes. Its exact
+  // verified predecessor and host/Manager epochs qualify that known inventory;
+  // an uncomposed inspection on any other fixture still refuses.
+  const ManagerComponentProcessInventoryRequestDTO installed_scope{
+      predecessor.request.candidate_projection_revision,
+      predecessor.publication_generation,
+      predecessor.durable_public_pointer_content_digest,
+      kernel_fence.original_execution_host->runtime_unit_id,
+      kernel_fence.original_execution_host->runtime_epoch,
+      RuntimeEpoch("manager-runtime.receipts.1")};
+  ASSERT_TRUE(installed_scope.valid());
+  ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
+            actual_scene.empty.bundle->retained_bundle_id());
+  ASSERT_EQ(installed_scope.predecessor_projection_revision.graph_revision,
+            installed_graph.graph_revision);
+  const std::vector<ManagerComponentProcessOccurrenceDTO> installed_processes{};
+  runtime_composition.installed_processes =
+      [installed_scope, installed_processes](
+          const ManagerComponentProcessInventoryRequestDTO &request) {
+        if (!request.valid() || request != installed_scope) {
+          return Result<ManagerComponentProcessInventoryResultDTO>::Err(
+              {"fixture_installed_inventory_foreign",
+               "installed process inspection does not name the fixture owner", {}});
+        }
+        return Result<ManagerComponentProcessInventoryResultDTO>::Ok(
+            {request, installed_processes, std::nullopt});
+      };
   runtime_composition.omit_receipts = true;
   ManagerActiveRuntimeCoordinator active_runtime(
       active_plan_source, runtime_ports, runtime_ports, [] { return 1'000U; });
@@ -3445,7 +3553,7 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_EQ(old_bindings.empty(), initial);
     for (const auto &binding : old_bindings) resolver.clients.push_back(std::make_shared<AdoptionProjection>(binding));
     const auto scene_path = state_root.path() / "actual-logical-scene.sqlite3";
-    scene::CanonicalEmptySceneOwner actual_scene(scene_path, admission, publication_store,
+    scene::LogicalSceneOwner actual_scene(scene_path, admission, publication_store,
         *package.bundle_source, resolver, cell_admission);
     const auto predecessor = EstablishActualScenePredecessor(
         actual_scene, publication_store, admission, *previous.bundle, old_bindings);
@@ -3927,7 +4035,7 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_EQ(kernel_fence.release_calls, releases);
     EXPECT_EQ(publication_store.publish_calls, publishes);
     EXPECT_EQ(authored_scene_reads, 0);
-    scene::CanonicalEmptySceneOwner reopened_scene(scene_path, admission, publication_store,
+    scene::LogicalSceneOwner reopened_scene(scene_path, admission, publication_store,
         *package.bundle_source, resolver, cell_admission);
     const auto reopened_snapshot = reopened_scene.ReadActiveSnapshot();
     ASSERT_TRUE(reopened_snapshot);
@@ -3962,7 +4070,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response) {
     ASSERT_FALSE(old_bindings.empty());
     for (const auto &binding : old_bindings) resolver.clients.push_back(std::make_shared<AdoptionProjection>(binding));
     const auto scene_path = state_root.path() / "actual-logical-scene.sqlite3";
-    scene::CanonicalEmptySceneOwner actual_scene(scene_path, admission, publication_store,
+    scene::LogicalSceneOwner actual_scene(scene_path, admission, publication_store,
         *package.bundle_source, resolver, cell_admission);
     const auto predecessor = EstablishActualScenePredecessor(
         actual_scene, publication_store, admission, *previous.bundle, old_bindings);
@@ -4007,6 +4115,50 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response) {
         RuntimeEpoch("process-epoch-1"), RequestOwnerEpoch("original-host-owner"),
         ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
     kernel_fence.allow_prepublication_status = true;
+    ASSERT_TRUE(deployment::verify_retained_bundle_identity(*previous.bundle));
+    const auto &installed_graph = previous.bundle->value().cell_graph;
+    ASSERT_EQ(installed_graph.controllable_components.size(), 1U);
+    ASSERT_FALSE(installed_graph.control_bindings.empty());
+    const auto component = installed_graph.controllable_components.front().controllable_component_id;
+    ASSERT_EQ(installed_graph.control_bindings.front().controllable_component_id, component);
+    ASSERT_EQ(installed_graph.control_bindings.front().provider_runtime_unit_id,
+              kernel_fence.original_execution_host->runtime_unit_id);
+    const auto installed_identity =
+        deployment::derive_component_runtime_identity(*previous.bundle, component);
+    ASSERT_TRUE(installed_identity.has_value());
+    const ManagerComponentProcessInventoryRequestDTO installed_scope{
+        predecessor.request.candidate_projection_revision,
+        predecessor.publication_generation,
+        predecessor.durable_public_pointer_content_digest,
+        kernel_fence.original_execution_host->runtime_unit_id,
+        kernel_fence.original_execution_host->runtime_epoch,
+        RuntimeEpoch("manager-runtime.original")};
+    ASSERT_TRUE(installed_scope.valid());
+    ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
+              previous.bundle->retained_bundle_id());
+    ASSERT_EQ(installed_scope.predecessor_projection_revision.graph_revision,
+              installed_graph.graph_revision);
+    // Initial observations in this controlled fake owner, not POSIX evidence:
+    // the original host and this component occurrence are already present.
+    // Their installed identity comes from the previous sealed product.
+    runtime_ports.ReplaceProcess("process-epoch-1");
+    const std::vector<ManagerComponentProcessOccurrenceDTO> installed_processes{
+        {component, "fixture-original-configuration-component", 42,
+         ProcessPresenceState::kPresent, core::ControllerLaunchCleanupState::kNotRequested,
+         std::nullopt, installed_identity}};
+    ASSERT_TRUE((ManagerComponentProcessInventoryResultDTO{
+        installed_scope, installed_processes, std::nullopt}).valid());
+    runtime_composition.installed_processes =
+        [installed_scope, installed_processes](
+            const ManagerComponentProcessInventoryRequestDTO &request) {
+          if (!request.valid() || request != installed_scope) {
+            return Result<ManagerComponentProcessInventoryResultDTO>::Err(
+                {"fixture_installed_inventory_foreign",
+                 "installed process inspection does not name the fixture owner", {}});
+          }
+          return Result<ManagerComponentProcessInventoryResultDTO>::Ok(
+              {request, installed_processes, std::nullopt});
+        };
     for (const auto &desired : previous.bundle->value().desired_control_configurations) {
       kernel_fence.predecessor_configurations.push_back({
           desired.control_domain_id,
@@ -4088,6 +4240,11 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response) {
     EXPECT_FALSE(journal.ReadBringUpPlan(accepted.apply_id, accepted.apply_generation));
     const auto first = coordinator.RecoverIncompleteApply();
     ASSERT_TRUE(first);
+    const auto failure_detail = first->terminal_outcome && first->terminal_outcome->failure
+        ? first->terminal_outcome->failure->failure_code + ": " +
+              first->terminal_outcome->failure->failure_message
+        : std::string("no terminal failure");
+    SCOPED_TRACE(failure_detail);
     EXPECT_EQ(scene_owner.stage_calls, 1);
     EXPECT_EQ(scene_owner.stage_read_calls, 0);
     EXPECT_EQ(runtime_composition.calls, 0);

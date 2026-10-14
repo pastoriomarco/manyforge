@@ -21,6 +21,14 @@ def _copy_retention_helper(launcher: Path) -> None:
     target.write_text((REPOSITORY_ROOT / "scripts/lib/export_retention.py").read_text())
 
 
+def _copy_writable_launcher(tmp_path: Path) -> Path:
+    launcher = tmp_path / "workspace/scripts" / LAUNCHER.name
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(LAUNCHER.read_text(encoding="utf-8"), encoding="utf-8")
+    _copy_retention_helper(launcher)
+    return launcher
+
+
 def _fake_docker_environment(tmp_path: Path, **settings: str) -> dict[str, str]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -312,10 +320,12 @@ def test_plain_stop_reports_failed_stop_without_deleting(tmp_path: Path) -> None
     assert "Failed to stop" in completed.stderr
 
 
-@pytest.mark.parametrize("ros2_control", [False, True])
+@pytest.mark.parametrize("explicit_ros_flag", [False, True])
+@pytest.mark.parametrize("selection", [[], ["--bootstrap-project", "examples/first.scenario"],
+                                       ["--project", "examples/authored.scenario"]])
 @pytest.mark.parametrize("container_name", ["manyforge-development-workbench", "isolated-workbench"])
-def test_start_preserves_explicit_ros_topology_only_when_requested(
-    tmp_path: Path, ros2_control: bool, container_name: str
+def test_start_preserves_ros_topology_by_default_and_refuses_removed_flag(
+    tmp_path: Path, explicit_ros_flag: bool, selection: list[str], container_name: str
 ) -> None:
     environment = _fake_docker_environment(tmp_path)
     workspace = tmp_path / "workspace"
@@ -354,13 +364,16 @@ esac
         MANYFORGE_DEV_IMAGE="current-ros-image",
         MANYFORGE_DEV_CONTAINER_NAME=container_name,
     )
-    arguments = ["start", *([
-        "--ros2-control", "--bootstrap-project", "examples/first.scenario",
-    ] if ros2_control else [])]
+    arguments = ["start", *(["--ros2-control"] if explicit_ros_flag else []), *selection]
     completed = subprocess.run(
         ["/bin/bash", str(launcher), *arguments], cwd=workspace,
         env=environment, capture_output=True, text=True, check=False,
     )
+    if explicit_ros_flag:
+        assert completed.returncode == 64
+        assert "Usage:" in completed.stderr
+        assert not Path(environment["FAKE_DOCKER_CALLS"]).exists()
+        return
     assert completed.returncode == 0, completed.stderr
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
     command = next(call for call in calls if call.startswith("run "))
@@ -370,38 +383,33 @@ esac
     assert f"-v {runtime_root}:/tmp/manyforge-state" in command
     assert runtime_root.is_dir()
     assert "--network host" in command
-    assert f"--label manyforge.dev.ros2-control={str(ros2_control).lower()}" in command
+    assert "--label manyforge.dev.ros2-control=true" in command
     assert command.endswith(
         "sha256:test python3 scripts/dev-workbench.py serve" +
-        (" --ros2-control --bootstrap-project examples/first.scenario" if ros2_control else "")
+        (" " + " ".join(selection) if selection else "")
     )
     for name in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "ROS_STATIC_PEERS"):
-        assert (f"--env {name}" in command) is ros2_control
-    if ros2_control:
-        assert f"--user {os.getuid()}:{os.getgid()}" in command
-        assert "--env HOME=/runner/home" in command
-        assert "--env MANYFORGE_BUILD_DIR=/runner/build" in command
-        cache_root = tmp_path / "cache/images/test"
-        for directory in ("home", "build", "node_modules"):
-            assert (cache_root / directory).is_dir()
-            assert (cache_root / directory).stat().st_uid == os.getuid()
-    else:
-        assert "--user " not in command
-        assert "--env HOME=" not in command
-        assert "--env MANYFORGE_BUILD_DIR=" not in command
-        assert not (tmp_path / "cache/images/test/home").exists()
+        assert f"--env {name}" in command
+    assert f"--user {os.getuid()}:{os.getgid()}" in command
+    assert "--env HOME=/runner/home" in command
+    assert "--env MANYFORGE_BUILD_DIR=/runner/build" in command
+    cache_root = tmp_path / "cache/images/test"
+    for directory in ("home", "build", "node_modules"):
+        assert (cache_root / directory).is_dir()
+        assert (cache_root / directory).stat().st_uid == os.getuid()
     assert "launch-isaac" not in command
     assert "ROS_STATIC_PEERS=orin;laptop" not in command
 
 
 @pytest.mark.parametrize("same_root", [False, True])
 def test_start_refuses_shared_live_state_but_allows_another_root(tmp_path: Path, same_root: bool) -> None:
+    launcher = LAUNCHER if same_root else _copy_writable_launcher(tmp_path)
     state_root = tmp_path / "owned-state"
     environment = _fake_docker_environment(tmp_path,
-        MANYFORGE_DEV_IMAGE="sha256:test", FAKE_CONTAINER_PRESENT="false",
+        FAKE_WORKSPACE=str(launcher.parents[1]), MANYFORGE_DEV_IMAGE="sha256:test", FAKE_CONTAINER_PRESENT="false",
         MANYFORGE_DEV_RUNTIME_STATE_ROOT=str(state_root),
         FAKE_BOUND_STATE_ROOT=str(state_root if same_root else tmp_path / "another-state"))
-    completed = subprocess.run(["bash", str(LAUNCHER), "start"], cwd=REPOSITORY_ROOT,
+    completed = subprocess.run(["bash", str(launcher), "start"], cwd=REPOSITORY_ROOT,
         env=environment, capture_output=True, text=True, check=False)
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
     if same_root:
@@ -445,7 +453,7 @@ def test_ros_start_refuses_an_existing_native_workbench(tmp_path: Path) -> None:
     environment = _fake_docker_environment(tmp_path, FAKE_ROS_LABEL="false")
 
     completed = subprocess.run(
-        ["/bin/bash", str(LAUNCHER), "start", "--ros2-control",
+        ["/bin/bash", str(LAUNCHER), "start",
          "--bootstrap-project", "examples/first.scenario"],
         cwd=REPOSITORY_ROOT, env=environment, capture_output=True, text=True,
         check=False,
@@ -457,9 +465,7 @@ def test_ros_start_refuses_an_existing_native_workbench(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("arguments,error", [
-    (["--ros2-control"], "requires --bootstrap-project or --project"),
-    (["--bootstrap-project", "first"], "requires --ros2-control"),
-    (["--ros2-control", "--bootstrap-project", "first", "--project", "second"],
+    (["--bootstrap-project", "first", "--project", "second"],
      "excludes --project"),
 ])
 def test_invalid_ros_selection_is_refused_before_docker(
@@ -502,7 +508,7 @@ def test_g_plain_stop_exports_exact_container_logs_before_removal(tmp_path):
 @pytest.mark.parametrize("operation", ["stop", "reuse_exited"])
 def test_g_export_failure_keeps_container_and_never_starts_replacement(tmp_path, operation):
     environment = _g_environment(tmp_path, FAKE_COPY_FAIL="true", FAKE_INITIAL_EXITED="true")
-    completed = _invoke_g(environment, *(["stop"] if operation == "stop" else ["start", "--ros2-control"]))
+    completed = _invoke_g(environment, *(["stop"] if operation == "stop" else ["start"]))
     assert completed.returncode == 69, completed.stderr
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
     assert any(c.startswith("cp ") for c in calls)
@@ -527,7 +533,7 @@ def test_g_failed_start_returns_exact_metadata_and_leaves_ros_client_for_owner_c
             MANYFORGE_DEV_OPERATOR_INSTALL_ROOT=str(install), MANYFORGE_DEV_OPERATOR_CELL_ID="fixture_cell",
             MANYFORGE_DEV_OPERATOR_ADMISSION="canonical-empty-admission.fixture_cell.json",
             MANYFORGE_DEV_OPERATOR_PACKAGE_SHA256="b" * 64, ROS_DOMAIN_ID="17", ROS_STATIC_PEERS="one;two")
-        completed = _invoke_g(environment, "start", "--ros2-control", launcher=launcher)
+        completed = _invoke_g(environment, "start", launcher=launcher)
     assert completed.returncode == 69, completed.stderr
     row = json.loads(completed.stdout)
     assert row["container_id"] == "d" * 64 and row["running"] is False
@@ -545,7 +551,7 @@ def test_g_failed_start_returns_exact_metadata_and_leaves_ros_client_for_owner_c
 @pytest.mark.parametrize("operation", ["stop", "start", "status"])
 def test_g_refuses_foreign_occurrence_without_mutation(tmp_path, operation):
     environment = _g_environment(tmp_path, FAKE_ACTUAL_ID="f" * 64)
-    completed = _invoke_g(environment, operation, *(["--ros2-control"] if operation == "start" else []))
+    completed = _invoke_g(environment, operation)
     assert completed.returncode != 0
     assert "Refusing foreign" in completed.stderr
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
@@ -645,9 +651,12 @@ def test_plain_stop_stops_before_failed_capture_and_keeps_container(tmp_path):
 
 
 def test_failed_developer_start_uses_same_capture_path(tmp_path):
+    launcher = _copy_writable_launcher(tmp_path)
     root = tmp_path / "cache/runtime/manyforge-development-workbench"
-    completed, environment = _run_launcher(tmp_path, "start", FAKE_CONTAINER_PRESENT="false", FAKE_EXIT_AFTER_RUN="true",
+    environment = _fake_docker_environment(tmp_path, FAKE_WORKSPACE=str(launcher.parents[1]), FAKE_CONTAINER_PRESENT="false", FAKE_EXIT_AFTER_RUN="true",
         MANYFORGE_DEV_IMAGE="sha256:"+"e"*64, FAKE_ACTUAL_STATE_ROOT=str(root))
+    completed = subprocess.run(["bash", str(launcher), "start"], cwd=REPOSITORY_ROOT,
+        env=environment, capture_output=True, text=True, check=False)
     assert completed.returncode == 69
     assert Path(environment["FAKE_DOCKER_STOPPED"]).exists()
     assert Path(environment["FAKE_DOCKER_REMOVED"]).exists()
@@ -790,12 +799,15 @@ def test_repeated_legacy_capture_failures_replace_the_same_owned_partial(tmp_pat
 
 
 def test_symlinked_cache_ancestor_can_start_new_workbench(tmp_path):
+    launcher = _copy_writable_launcher(tmp_path)
     actual=tmp_path/"actual-storage"
     actual.mkdir()
     alias=tmp_path/"ssd-alias"
     alias.symlink_to(actual,target_is_directory=True)
-    completed,environment=_run_launcher(tmp_path,"start",FAKE_CONTAINER_PRESENT="false",
+    environment=_fake_docker_environment(tmp_path,FAKE_WORKSPACE=str(launcher.parents[1]),FAKE_CONTAINER_PRESENT="false",
         MANYFORGE_DEV_CACHE_BASE=str(alias/"cache"),MANYFORGE_DEV_IMAGE="sha256:"+"e"*64)
+    completed=subprocess.run(["bash",str(launcher),"start"],cwd=REPOSITORY_ROOT,
+        env=environment,capture_output=True,text=True,check=False)
     assert completed.returncode==0,completed.stderr
     assert (actual/"cache/runtime/manyforge-development-workbench").is_dir()
     assert "run " in Path(environment["FAKE_DOCKER_CALLS"]).read_text()
@@ -848,8 +860,10 @@ def test_repeated_mounted_log_failures_reuse_one_partial_and_keep_previous_tail(
 
 @pytest.mark.parametrize('user_file', [False, True])
 def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durable_root(tmp_path, user_file):
+    launcher = _copy_writable_launcher(tmp_path)
     root = tmp_path/'cache/runtime/manyforge-development-workbench'
-    environment = _fake_docker_environment(tmp_path, FAKE_ACTUAL_STATE_ROOT=str(root),
+    environment = _fake_docker_environment(tmp_path, FAKE_WORKSPACE=str(launcher.parents[1]),
+        FAKE_ACTUAL_STATE_ROOT=str(root),
         FAKE_INITIAL_EXITED='true', MANYFORGE_DEV_IMAGE='sha256:test')
     docker = tmp_path/'bin/docker'
     fake = docker.read_text().replace('|| ${FAKE_INITIAL_EXITED:-false} == true',
@@ -866,13 +880,13 @@ def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durab
     partial = root/'evidence'/('.mounted-'+'d'*64+'.partial')
     partial.mkdir(parents=True)
     mounts = [{'Type':'bind','Source':str(root),'Destination':'/tmp/manyforge-state'},
-        {'Type':'bind','Source':str(REPOSITORY_ROOT),'Destination':'/workspace'}]
+        {'Type':'bind','Source':environment['FAKE_WORKSPACE'],'Destination':'/workspace'}]
     (partial/'docker-inspect.json').write_text(json.dumps({'container_id':'d'*64,
         'image':'sha256:test','mounts':mounts,'state':{'running':False},'manyforge_export_kind':'console_tail'}))
     (partial/'docker.log').write_bytes(b'previous partial tail')
     if user_file:
         (partial/'operator-note.txt').write_bytes(b'useful user evidence')
-    completed = subprocess.run(['/bin/bash', str(LAUNCHER), 'start'], cwd=REPOSITORY_ROOT,
+    completed = subprocess.run(['/bin/bash', str(launcher), 'start'], cwd=REPOSITORY_ROOT,
         env=environment, capture_output=True, text=True, check=False)
     assert completed.returncode == 0, completed.stderr
     calls = Path(environment['FAKE_DOCKER_CALLS']).read_text().splitlines()

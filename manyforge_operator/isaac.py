@@ -882,9 +882,7 @@ class IsaacLauncher:
         environment = self._container_environment()
         command = ["env", *(f"{key}={value}" for key, value in environment.items()),
                    "bash", f"{remote.source_root}/scripts/compose-dev.sh", operation]
-        if operation == "start":
-            command.append("--ros2-control")
-        elif operation == "stop":
+        if operation == "stop":
             command.append("--keep-evidence")
         return shlex.join(command)
 

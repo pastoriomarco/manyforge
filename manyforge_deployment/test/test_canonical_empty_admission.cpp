@@ -34,6 +34,7 @@
 #include "canonical_empty_admission_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -130,6 +131,55 @@ TEST(CanonicalEmptyAdmission, NativeBootstrapOwnsInfrastructureWithoutAScenario)
   // Scenario. Cell placement changes its graph, not its process product.
   EXPECT_EQ(other.retained_bundle().value().compiled_products.runtime_unit_products,
             admission.retained_bundle().value().compiled_products.runtime_unit_products);
+}
+
+
+TEST(CanonicalEmptyAdmission, RosBootstrapOwnsInfrastructureWithoutAScenario) {
+  ScopedTrustedRoot root("ros-infrastructure");
+  const core::CellId cell("ros_runtime_owned_cell");
+  const auto profile = detail::ros2_control_execution_runtime_profile_document();
+  const auto admission = detail::generate_ros_empty_package(root.path(), cell, profile);
+  const auto &value = admission.retained_bundle().value();
+  const auto &graph = value.cell_graph;
+  EXPECT_EQ(graph.cell_id, cell);
+  ASSERT_EQ(graph.runtime_units.size(), 1U);
+  EXPECT_EQ(graph.runtime_units.front().runtime_profile_id.value(),
+            ros2_control_execution_runtime_contract::kRuntimeProfileId);
+  EXPECT_EQ(graph.runtime_units.front().runtime_unit_id.value(),
+            ros2_control_execution_runtime_contract::kCellHostRuntimeUnitId);
+  EXPECT_TRUE(graph.controllable_components.empty());
+  EXPECT_TRUE(graph.model_instances.empty());
+  EXPECT_TRUE(graph.control_domains.empty());
+  EXPECT_TRUE(graph.control_bindings.empty());
+  EXPECT_TRUE(graph.component_attachments.empty());
+  EXPECT_TRUE(value.desired_control_configurations.empty());
+  const auto configuration = ros2_control_execution_runtime_contract::require_configuration(
+      admission.retained_bundle(), graph.runtime_units.front().runtime_unit_id);
+  EXPECT_TRUE(configuration.controller_profiles.empty());
+  EXPECT_TRUE(configuration.initial_joint_positions_rad.empty());
+  EXPECT_FALSE(configuration.isaac_world.has_value());
+  const auto replay = detail::generate_ros_empty_package(root.path(), cell, profile);
+  EXPECT_EQ(replay.canonical_bytes(), admission.canonical_bytes());
+  ScopedTrustedRoot other_root("other-ros-infrastructure");
+  const auto other = detail::generate_ros_empty_package(
+      other_root.path(), core::CellId("other_ros_runtime"), profile);
+  EXPECT_NE(other.retained_bundle_id(), admission.retained_bundle_id());
+  EXPECT_EQ(other.retained_bundle().value().compiled_products.runtime_unit_products,
+            value.compiled_products.runtime_unit_products);
+}
+
+TEST(CanonicalEmptyAdmission, RosBootstrapRejectsNativeProfileBeforePublication) {
+  ScopedTrustedRoot root("ros-crossed-profile");
+  const core::CellId cell("ros_runtime_owned_cell");
+  try {
+    static_cast<void>(detail::generate_ros_empty_package(
+        root.path(), cell, detail::native_execution_runtime_profile_document()));
+    FAIL() << "ROS bootstrap must not substitute the native product";
+  } catch (const CanonicalEmptyAdmissionError &error) {
+    EXPECT_STREQ(error.what(), "ROS bootstrap requires the ROS execution profile");
+  }
+  EXPECT_FALSE(std::filesystem::exists(root.path() /
+      "canonical-empty-admission.ros_runtime_owned_cell.json"));
 }
 
 class ScopedRootSymlinkSubstitution final {

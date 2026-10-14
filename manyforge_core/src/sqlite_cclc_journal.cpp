@@ -8131,6 +8131,15 @@ bool SqliteCCLCJournal::Impl::AppendComponentIncidentDiagnostic(
   const auto original = ReadOpenComponentIncidentLocked(ControllableComponentId(row.Text(0)));
   if (!original || original->diagnostic_snapshot || (original->diagnostic && !snapshot))
     return false;
+  // A recorded absent capture is final evidence, not a reason to append the
+  // same failed capture on every subsequent driver pass.
+  if (original->diagnostic) {
+    const auto omission = original->diagnostic->details.find("snapshot_omitted_fields");
+    if (omission != original->diagnostic->details.end() &&
+        (omission->second == "diagnostic_too_large" ||
+         omission->second.ends_with(",diagnostic_too_large")))
+      return false;
+  }
   auto bounded_error = original->diagnostic.value_or(diagnostic);
   const auto* settings = snapshot ? snapshot->find_object_member("settings") : nullptr;
   const auto* configuration =
@@ -8214,8 +8223,8 @@ bool SqliteCCLCJournal::Impl::AppendComponentIncidentDiagnostic(
     return updated.size() > enrichment_budget || event.size() > kMaxComponentIncidentRecordBytes;
   };
   materialize();
-  // DX246: preserve the entire already-bounded tail. Optional settings text
-  // is omitted first, explicitly named through the existing ErrorDTO detail.
+  // Optional settings text is omitted first, explicitly named through the
+  // existing ErrorDTO detail; DX681 permits marked tail reduction only after it.
   std::string omitted;
   while (oversized()) {
     if (bounded_snapshot.is_null()) break;
@@ -8244,12 +8253,70 @@ bool SqliteCCLCJournal::Impl::AppendComponentIncidentDiagnostic(
     bounded_snapshot = replace_member(bounded_snapshot, "settings", std::move(settings));
     materialize();
   }
+  // DX681: after optional settings, reduce only the log tail. Identity and
+  // all other mandatory capture facts remain exact. Keep the latest output.
+  if (oversized() && !bounded_snapshot.is_null() &&
+      bounded_snapshot.find_object_member("output")->find_object_member("tail")->is_string()) {
+    const auto original_snapshot = bounded_snapshot;
+    const auto output = *bounded_snapshot.find_object_member("output");
+    const auto tail = output.find_object_member("tail")->as_string();
+    std::optional<content_identity::CanonicalValue> fitting_snapshot;
+    std::size_t low = 0U;
+    std::size_t high = tail.size();
+    while (low <= high) {
+      const auto middle = low + (high - low) / 2U;
+      auto begin = tail.size() - middle;
+      while (begin < tail.size() &&
+             (static_cast<unsigned char>(tail[begin]) & 0xc0U) == 0x80U)
+        ++begin;
+      const auto reduced_tail = "[truncated]" + tail.substr(begin);
+      auto reduced_output = replace_member(
+          output, "tail", content_identity::CanonicalValue(reduced_tail));
+      const auto lines = static_cast<std::size_t>(
+          std::count(reduced_tail.begin(), reduced_tail.end(), '\n')) +
+          (reduced_tail.back() == '\n' ? 0U : 1U);
+      reduced_output = replace_member(reduced_output, "line_count",
+                                      content_identity::CanonicalValue(static_cast<double>(lines)));
+      reduced_output = replace_member(reduced_output, "truncated",
+                                      content_identity::CanonicalValue(true));
+      bounded_snapshot = replace_member(original_snapshot, "output", std::move(reduced_output));
+      materialize();
+      if (!oversized()) {
+        fitting_snapshot = bounded_snapshot;
+        low = middle + 1U;
+      } else {
+        if (middle == 0U) break;
+        high = middle - 1U;
+      }
+    }
+    bounded_snapshot = fitting_snapshot.value_or(original_snapshot);
+    materialize();
+  }
   if (original->diagnostic) {
     const auto original_omission = original->diagnostic->details.find("snapshot_omitted_fields");
     Require(original_omission == original->diagnostic->details.end() ||
                 original_omission->second == omitted,
             "component_lifecycle_incident_invalid",
             "capture conflicts with original omission facts");
+  }
+  // DX684: no mandatory identity is shortened. When even the marked tail
+  // cannot fit, record that the rich capture is absent through the existing
+  // omission metadata, preserving the original incident code and message.
+  if (oversized() && !bounded_snapshot.is_null()) {
+    const auto existing = bounded_error.details.find("snapshot_omitted_fields");
+    Require(existing != bounded_error.details.end() ||
+                bounded_error.details.size() < kMaxLifecycleErrorDetails,
+            "component_lifecycle_incident_invalid",
+            "diagnostic_too_large cannot fit the existing diagnostic detail slots");
+    auto note = existing == bounded_error.details.end() ? std::string() : existing->second;
+    if (!note.empty()) note += ',';
+    note += "diagnostic_too_large";
+    Require(note.size() <= kMaxLifecycleErrorDetailValueBytes,
+            "component_lifecycle_incident_invalid",
+            "diagnostic_too_large cannot fit the existing omission metadata bound");
+    bounded_error.details["snapshot_omitted_fields"] = std::move(note);
+    bounded_snapshot = content_identity::CanonicalValue(nullptr);
+    materialize();
   }
   Require(ComponentIncidentDiagnosticIsValid(bounded_error) &&
               (bounded_snapshot.is_null() ||

@@ -150,7 +150,7 @@ set(
   "Path to the manyforge_scene source tree")
 if(NOT TARGET manyforge::scene)
   if(NOT EXISTS
-     "${MANYFORGE_SCENE_SOURCE_DIR}/include/manyforge_scene/canonical_empty_scene_owner.hpp")
+     "${MANYFORGE_SCENE_SOURCE_DIR}/include/manyforge_scene/logical_scene_owner.hpp")
     message(FATAL_ERROR
       "manyforge_headless owner publications require the logical-scene owner")
   endif()
@@ -200,10 +200,10 @@ target_link_libraries(manyforge_manager_daemon PRIVATE
 
 option(BUILD_TESTING "Build unit tests" ON)
 set(
-  MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST
+  MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST
   ""
   CACHE FILEPATH
-  "Optional selected native execution host for the real Manager Apply process test")
+  "Optional selected ROS execution host for the real Manager Apply process test")
 if(BUILD_TESTING)
   enable_testing()
   find_package(GTest REQUIRED)
@@ -453,36 +453,36 @@ if(BUILD_TESTING)
   add_custom_target(manyforge_headless_test_alarm_registry_package
     DEPENDS "${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_BUNDLE_IDS_FILE}")
 
-  if(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
-    if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}")
+  if(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST)
+    if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}")
       message(FATAL_ERROR
         "the selected native execution host for the Manager Apply process "
-        "test does not exist: ${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}")
+        "test does not exist: ${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}")
     endif()
     get_filename_component(
-      MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST
-      "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+      MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST
+      "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
       REALPATH)
     get_filename_component(
-      _MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT
-      "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+      _MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_TARGET_ROOT
+      "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
       DIRECTORY)
     set(
-      MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER
-      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/manyforge_roboplan_candidate_worker")
-    if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}")
+      MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER
+      "${_MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_TARGET_ROOT}/manyforge_roboplan_candidate_worker")
+    if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER}")
       message(FATAL_ERROR
         "the build-owned native candidate worker for the Manager Apply "
         "process test does not exist: "
-        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}")
+        "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER}")
     endif()
     set(
-      MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST
-      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/manyforge_native_execution_host_pick_place_planning_fixture")
-    if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST}")
+      MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST
+      "${_MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_TARGET_ROOT}/manyforge_ros2_control_execution_host_pick_place_planning_fixture")
+    if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST}")
       message(FATAL_ERROR
         "the compatible replacement native execution host does not exist: "
-        "${MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST}")
+        "${MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST}")
     endif()
     if(NOT TARGET manyforge_lite6_product)
       add_subdirectory(
@@ -530,9 +530,10 @@ if(BUILD_TESTING)
         "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT}"
         --metadata
         "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}"
+        --profile ros2-control
       DEPENDS
         manyforge_generate_headless_manager_apply_test_package
-        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+        "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
         "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
         "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
         ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
@@ -563,11 +564,11 @@ if(BUILD_TESTING)
         "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_PACKAGE_ROOT}"
         --metadata
         "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_METADATA}"
-        --profile assistant-native
+        --profile assistant-ros2-control
       DEPENDS
         manyforge_generate_headless_manager_apply_test_package
-        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
-        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}"
+        "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
+        "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER}"
         "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
         "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
         "${MANYFORGE_HEADLESS_TEST_ASSISTANT_INSTRUMENT_SOURCE}"
@@ -582,25 +583,7 @@ if(BUILD_TESTING)
       "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}/retained-package")
     set(MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA
       "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}/metadata.json")
-    add_custom_command(
-      OUTPUT "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}"
-      COMMAND "${CMAKE_COMMAND}" -E remove_directory
-        "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}"
-      COMMAND "${CMAKE_COMMAND}" -E make_directory
-        "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}"
-      COMMAND "$<TARGET_FILE:manyforge_generate_headless_manager_apply_test_package>"
-        --package-root "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT}"
-        --metadata "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}"
-        --profile gripper-only
-      DEPENDS
-        manyforge_generate_headless_manager_apply_test_package
-        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
-        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
-        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
-        ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
-      VERBATIM)
-    add_custom_target(manyforge_headless_test_gripper_only_package
-      DEPENDS "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}")
+    # Gripper-only reference remains NOT_RUN/A1; no unavailable native package is generated.
 
     # O1.4g uses a compatible pick/place host to materialize a second package.
     # Its semantic component declaration is admitted independently from the
@@ -628,9 +611,10 @@ if(BUILD_TESTING)
         "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT}"
         --metadata
         "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA}"
+        --profile ros2-control
       DEPENDS
         manyforge_generate_headless_manager_apply_test_package
-        "${MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST}"
+        "${MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST}"
         "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
         "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
         ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
@@ -745,68 +729,74 @@ if(BUILD_TESTING)
   target_compile_definitions(test_manager_daemon_process PRIVATE
     MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
     MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON="$<TARGET_FILE:manyforge_manager_daemon>")
-  if(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
+  if(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST)
     add_dependencies(test_manager_daemon_process
       manyforge_headless_test_manager_apply_package
-      manyforge_headless_test_assistant_native_package
-      manyforge_headless_test_gripper_only_package)
+      manyforge_headless_test_assistant_native_package)
     target_compile_definitions(test_manager_daemon_process PRIVATE
-      MANYFORGE_HEADLESS_TEST_PYTHON="${Python3_EXECUTABLE}"
-      MANYFORGE_HEADLESS_TEST_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
-      MANYFORGE_HEADLESS_TEST_PYTHON_MODULE_ROOT="${CMAKE_CURRENT_BINARY_DIR}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT}"
       MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA="${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}"
       MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT}"
-      MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
-      MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST}"
-      MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER="${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_WORKER}")
+      MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
+      MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST}"
+      MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER="${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER}")
     add_dependencies(test_manager_daemon_process
       manyforge_headless_test_manager_apply_replacement_package)
   endif()
-  # Test registration only: the existing ros-e2e lane supplies the native
-  # host from the same build directory as this production ROS host.
-  if(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
-    get_filename_component(_manager_ros_host_directory
-      "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}" DIRECTORY)
-    set(_manager_ros_host
-      "${_manager_ros_host_directory}/manyforge_ros2_control_execution_host")
-    if(EXISTS "${_manager_ros_host}")
-      file(REAL_PATH "${_manager_ros_host}" _manager_ros_host)
-      set(_manager_ros_fixture "${CMAKE_CURRENT_BINARY_DIR}/manager-ros-apply-fixture")
-      file(GLOB_RECURSE _manager_ros_fixture_models CONFIGURE_DEPENDS
-        LIST_DIRECTORIES false
-        "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper/*")
-      add_custom_command(
-        OUTPUT "${_manager_ros_fixture}/metadata.json"
-        COMMAND "${CMAKE_COMMAND}" -E env
-          "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/..:${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior"
-          "${Python3_EXECUTABLE}"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/test/prepare_activation_tool.py"
-          --tool "$<TARGET_FILE:manyforge_prepare_activation>"
-          --workspace "${CMAKE_CURRENT_SOURCE_DIR}/.."
-          --scenario examples/lite6_pick_and_place.scenario
-          --manager-ros-apply-fixture-root "${_manager_ros_fixture}"
-        DEPENDS manyforge_prepare_activation
-          "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/test/prepare_activation_tool.py"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/scenario.yaml"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/deployment.yaml"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/program.yaml"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/assignment.yaml"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_lite_gripper_pick_and_place.program.yaml"
-          ${_manager_ros_fixture_models}
-        VERBATIM)
-      add_custom_target(manyforge_headless_test_manager_ros_apply_fixture
-        DEPENDS "${_manager_ros_fixture}/metadata.json")
-      add_dependencies(test_manager_daemon_process
-        manyforge_headless_test_manager_ros_apply_fixture)
-      target_compile_definitions(test_manager_daemon_process PRIVATE
-        MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="${_manager_ros_host}"
-        MANYFORGE_HEADLESS_TEST_MANAGER_ROS_APPLY_FIXTURE="${_manager_ros_fixture}"
-        MANYFORGE_HEADLESS_TEST_ROS_LAUNCH_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_ros_bringup/launch/mock_control.launch.py")
+  # Register the actual selected ROS host directly.
+  set(_manager_ros_host "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}")
+  if(_manager_ros_host)
+    if(NOT EXISTS "${_manager_ros_host}")
+      message(FATAL_ERROR "the selected ROS execution host does not exist: ${_manager_ros_host}")
     endif()
+    file(REAL_PATH "${_manager_ros_host}" _manager_ros_host)
+    get_filename_component(_manager_ros_host_directory "${_manager_ros_host}" DIRECTORY)
+    set(_manager_ros_worker "${_manager_ros_host_directory}/manyforge_roboplan_candidate_worker")
+    if(NOT EXISTS "${_manager_ros_worker}")
+      message(FATAL_ERROR "the selected ROS candidate worker does not exist: ${_manager_ros_worker}")
+    endif()
+    file(REAL_PATH "${_manager_ros_worker}" _manager_ros_worker)
+    set(_manager_ros_fixture "${CMAKE_CURRENT_BINARY_DIR}/manager-ros-apply-fixture")
+    file(GLOB_RECURSE _manager_ros_fixture_models CONFIGURE_DEPENDS
+      LIST_DIRECTORIES false
+      "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper/*")
+    add_custom_command(
+      OUTPUT "${_manager_ros_fixture}/metadata.json"
+      COMMAND "${CMAKE_COMMAND}" -E env
+        "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/..:${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior"
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/test/prepare_activation_tool.py"
+        --tool "$<TARGET_FILE:manyforge_prepare_activation>"
+        --workspace "${CMAKE_CURRENT_SOURCE_DIR}/.."
+        --scenario examples/lite6_pick_and_place.scenario
+        --manager-ros-apply-fixture-root "${_manager_ros_fixture}"
+      DEPENDS manyforge_prepare_activation
+        "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_deployment/test/prepare_activation_tool.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/scenario.yaml"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/deployment.yaml"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/program.yaml"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_pick_and_place.scenario/assignment.yaml"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_lite_gripper_pick_and_place.program.yaml"
+        ${_manager_ros_fixture_models}
+      VERBATIM)
+    add_custom_target(manyforge_headless_test_manager_ros_apply_fixture
+      DEPENDS "${_manager_ros_fixture}/metadata.json")
+    add_dependencies(test_manager_daemon_process
+      manyforge_headless_test_manager_ros_apply_fixture)
+    target_compile_definitions(test_manager_daemon_process PRIVATE
+      MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="${_manager_ros_host}"
+      MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER="${_manager_ros_worker}"
+      MANYFORGE_HEADLESS_TEST_MANAGER_ROS_APPLY_FIXTURE="${_manager_ros_fixture}"
+      MANYFORGE_HEADLESS_TEST_ROS_LAUNCH_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_ros_bringup/launch/mock_control.launch.py")
+  endif()
+  if(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST OR _manager_ros_host)
+    target_compile_definitions(test_manager_daemon_process PRIVATE
+      MANYFORGE_HEADLESS_TEST_PYTHON="${Python3_EXECUTABLE}"
+      MANYFORGE_HEADLESS_TEST_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
+      MANYFORGE_HEADLESS_TEST_PYTHON_MODULE_ROOT="${CMAKE_CURRENT_BINARY_DIR}")
   endif()
   target_link_libraries(test_manager_daemon_process PRIVATE
     manyforge_headless_owner_publication

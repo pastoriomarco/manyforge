@@ -1,12 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstddef>
 #include <thread>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/controller_lifecycle_evaluator.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
-#include <manyforge_roboplan/retained_native_controller_lifecycle_port.hpp>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -163,117 +163,6 @@ using namespace manyforge::core;
     throw std::logic_error(sealed.error().message);
   }
   return std::move(sealed.value());
-}
-
-TEST(RetainedNativeControllerLifecyclePort,
-     ObservesExactFreshConstructionOwnedDirectState) {
-  FakeClock clock;
-  clock.set(1'000);
-  const auto expected = MakeExpectedDomain();
-  auto created = RetainedNativeControllerLifecyclePort::Create(
-      expected, {MakePhysicalBinding()}, clock, 500);
-  ASSERT_TRUE(created.ok()) << created.error().message;
-
-  const auto query = MakeControllerLifecycleObservationQuery(expected.value());
-  const auto first = created.value()->Observe(query);
-  ASSERT_TRUE(first.ok()) << first.error().message;
-  EXPECT_EQ(first.value().source_sequence, 1U);
-  EXPECT_EQ(first.value().observed_at_ns, 1'000);
-  EXPECT_EQ(first.value().valid_until_ns, 1'500);
-  ASSERT_TRUE(first.value().active_configuration.has_value());
-  EXPECT_EQ(first.value().active_configuration->activation_set_id,
-            ActivationSetId("arm_direct"));
-  ASSERT_EQ(first.value().controllers.size(), 1U);
-  EXPECT_EQ(first.value().controllers.front().activity,
-            ControllerLifecycleActivityDTO::kActive);
-  ASSERT_EQ(first.value().endpoints.size(), 1U);
-  EXPECT_TRUE(first.value().endpoints.front().ready);
-
-  const auto reconciliation =
-      ReconcileControllerLifecycle(expected.value(), first.value(), 1'001);
-  ASSERT_TRUE(reconciliation.ok()) << reconciliation.error().message;
-  EXPECT_EQ(reconciliation.value().disposition,
-            ControllerLifecycleReconciliationDispositionDTO::kReconciled);
-  const auto plan = BuildControllerLifecycleTransitionPlan(
-      expected.value(), first.value(), 1'001);
-  ASSERT_TRUE(plan.ok()) << plan.error().message;
-  EXPECT_TRUE(plan.value().steps.empty());
-
-  clock.advance(10);
-  const auto second = created.value()->Observe(query);
-  ASSERT_TRUE(second.ok()) << second.error().message;
-  EXPECT_EQ(second.value().source_sequence, 2U);
-  EXPECT_EQ(second.value().observed_at_ns, 1'010);
-}
-
-TEST(RetainedNativeControllerLifecyclePort,
-     RejectsAnyNonExactSourceQueryWithoutRestamping) {
-  FakeClock clock;
-  const auto expected = MakeExpectedDomain();
-  auto created = RetainedNativeControllerLifecyclePort::Create(
-      expected, {MakePhysicalBinding()}, clock, 500);
-  ASSERT_TRUE(created.ok());
-  auto query = MakeControllerLifecycleObservationQuery(expected.value());
-  query.source_runtime_epoch = RuntimeEpoch("runtime-epoch.stale");
-
-  const auto missing = created.value()->Observe(query);
-  ASSERT_FALSE(missing.ok());
-  EXPECT_EQ(missing.error().details.at("reason"),
-            "native_controller_query_mismatch");
-
-  const auto exact = created.value()->Observe(
-      MakeControllerLifecycleObservationQuery(expected.value()));
-  ASSERT_TRUE(exact.ok());
-  EXPECT_EQ(exact.value().source_sequence, 1U);
-}
-
-TEST(RetainedNativeControllerLifecyclePort,
-     RejectsIncompleteOrMismatchedPhysicalBindingCoverage) {
-  FakeClock clock;
-  const auto expected = MakeExpectedDomain();
-  auto missing =
-      RetainedNativeControllerLifecyclePort::Create(expected, {}, clock, 500);
-  ASSERT_FALSE(missing.ok());
-  EXPECT_EQ(missing.error().details.at("reason"),
-            "native_controller_binding_coverage_incomplete");
-
-  auto mismatched_value = MakePhysicalBinding().value();
-  mismatched_value.control_path->control_route_id = ControlRouteId("other");
-  auto mismatched_binding =
-      verify_runtime_participant_binding(std::move(mismatched_value));
-  ASSERT_TRUE(mismatched_binding.ok());
-  auto mismatched = RetainedNativeControllerLifecyclePort::Create(
-      expected, {std::move(mismatched_binding.value())}, clock, 500);
-  ASSERT_FALSE(mismatched.ok());
-  EXPECT_EQ(mismatched.error().details.at("reason"),
-            "native_controller_binding_identity_mismatch");
-}
-
-TEST(RetainedNativeControllerLifecyclePort,
-     NeverClaimsAControllerTransitionWasDispatched) {
-  FakeClock clock;
-  const auto expected = MakeExpectedDomain();
-  auto created = RetainedNativeControllerLifecyclePort::Create(
-      expected, {MakePhysicalBinding()}, clock, 500);
-  ASSERT_TRUE(created.ok());
-  ControllerLifecycleTransitionIntentDTO intent{
-      MakeControllerLifecycleObservationQuery(expected.value()),
-      1U,
-      0U,
-      {ControllerLifecycleTransitionKindDTO::kDeactivate,
-       {ControllerRoleId("native_execution")}},
-      100};
-  ASSERT_TRUE(intent.locally_valid());
-
-  const auto result =
-      created.value()->ApplyTransitionStep(intent, std::stop_token{});
-  EXPECT_EQ(result.dispatch_state,
-            ControllerLifecycleTransitionDispatchStateDTO::kNotDispatched);
-  EXPECT_FALSE(result.known_result.has_value());
-  ASSERT_TRUE(result.error.has_value());
-  EXPECT_EQ(result.error->details.at("reason"),
-            "native_controller_topology_immutable");
-  EXPECT_TRUE(result.locally_valid());
 }
 
 TEST(RetainedExternallyManagedLifecyclePorts,
@@ -485,11 +374,22 @@ TEST(RetainedExternallyManagedLifecyclePorts,
       RuntimeUnitId("runtime.native"),
       RuntimeEpoch("runtime-epoch.1"),
       ContentDigest("catalog-digest")};
+  const RetainedExternallyManagedDomainSnapshot external{
+      11U, ComponentLifecycleStateDTO::kActive, true,
+      {{LifecycleFactId("external.ready"),
+        {LifecycleFactValueKindDTO::kBoolean, true, std::nullopt, std::nullopt}}}};
+  std::size_t source_reads = 0U;
+  std::optional<ErrorDTO> source_error;
   auto created = RetainedExternallyManagedBrandLifecyclePort::Create(
       occurrence,
-      [](const ControlDomainId &, const TimePoint) {
-        return Result<RetainedExternallyManagedDomainSnapshot>::Ok(
-            {11U, ComponentLifecycleStateDTO::kActive, true, {}});
+      [&](const ControlDomainId &domain, const TimePoint now) {
+        ++source_reads;
+        EXPECT_EQ(domain, occurrence.control_domain_id);
+        EXPECT_EQ(now, clock.now());
+        if (source_error) {
+          return Result<RetainedExternallyManagedDomainSnapshot>::Err(*source_error);
+        }
+        return Result<RetainedExternallyManagedDomainSnapshot>::Ok(external);
       },
       clock, 1'000);
   ASSERT_TRUE(created.ok()) << created.error().message;
@@ -533,6 +433,51 @@ TEST(RetainedExternallyManagedLifecyclePorts,
   ASSERT_TRUE(result.error.has_value());
   EXPECT_EQ(result.error->details.at("reason"),
             "external_brand_lifecycle_observer_only");
+
+  EXPECT_EQ(observed.value().facts, external.facts);
+  for (std::uint64_t read = 1U; read <= 3U; ++read) {
+    const auto repeated = created.value()->Observe(query);
+    ASSERT_TRUE(repeated.ok()) << repeated.error().message;
+    EXPECT_EQ(repeated.value().source_sequence, observed.value().source_sequence + read);
+    EXPECT_EQ(repeated.value().observation_generation, observed.value().observation_generation);
+    EXPECT_EQ(repeated.value().observed_state, observed.value().observed_state);
+    EXPECT_EQ(repeated.value().facts, observed.value().facts);
+  }
+  EXPECT_EQ(source_reads, 4U);
+
+  // A source-issued failure must pass through with its original diagnostic.
+  source_error = ErrorDTO{"source_unavailable", "selected external source unavailable",
+                          {{"provider_instance_id", occurrence.provider_instance_id.value()}}};
+  const auto unavailable = created.value()->Observe(query);
+  ASSERT_FALSE(unavailable.ok());
+  EXPECT_EQ(unavailable.error().code, source_error->code);
+  EXPECT_EQ(unavailable.error().message, source_error->message);
+  EXPECT_EQ(unavailable.error().details, source_error->details);
+  EXPECT_EQ(source_reads, 5U);
+  source_error.reset();
+
+  auto foreign_domain = query;
+  foreign_domain.control_domain_id = ControlDomainId("foreign.domain");
+  const auto foreign_domain_result = created.value()->Observe(foreign_domain);
+  ASSERT_FALSE(foreign_domain_result.ok());
+  EXPECT_EQ(foreign_domain_result.error().details.at("reason"),
+            "external_brand_lifecycle_query_invalid");
+  EXPECT_EQ(source_reads, 5U);
+
+  auto foreign_epoch = query;
+  foreign_epoch.provider_runtime_epoch = RuntimeEpoch("foreign.epoch");
+  const auto foreign_epoch_result = created.value()->Observe(foreign_epoch);
+  ASSERT_FALSE(foreign_epoch_result.ok());
+  EXPECT_EQ(foreign_epoch_result.error().details.at("reason"),
+            "external_brand_lifecycle_query_invalid");
+  EXPECT_EQ(source_reads, 5U);
+
+  clock.set(-1);
+  const auto invalid_clock = created.value()->Observe(query);
+  ASSERT_FALSE(invalid_clock.ok());
+  EXPECT_EQ(invalid_clock.error().details.at("reason"),
+            "external_brand_lifecycle_query_invalid");
+  EXPECT_EQ(source_reads, 5U);
 }
 
 TEST(RetainedExternallyManagedLifecyclePorts,

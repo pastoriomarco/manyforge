@@ -41,15 +41,12 @@ CACHE_ROOT = Path("/runner")
 BUILD_ROOT = CACHE_ROOT / "build"
 STATE_ROOT = Path(os.environ.get("MANYFORGE_DEV_STATE_ROOT", "/tmp/manyforge-state"))
 HEADLESS_BUILD = BUILD_ROOT / "headless"
-ROBOPLAN_BUILD = BUILD_ROOT / "roboplan"
 DEPLOYMENT_AUTHORING_BUILD = BUILD_ROOT / "deployment-authoring"
 BOOTSTRAP_ROOT = CACHE_ROOT / "repository-bootstrap-package"
 # Installation configuration, independent of the optional startup project.
 # Preserve the existing workbench identity; never mint one per Load or restart.
 WORKBENCH_CELL_ID = "c1_build_authority_cell"
 BOOTSTRAP_ADMISSION = f"canonical-empty-admission.{WORKBENCH_CELL_ID}.json"
-NATIVE_EXECUTION_HOST = ROBOPLAN_BUILD / "manyforge_native_execution_host"
-NATIVE_CANDIDATE_WORKER = ROBOPLAN_BUILD / "manyforge_roboplan_candidate_worker"
 ACTIVATION_PREPARER = (
     DEPLOYMENT_AUTHORING_BUILD / "manyforge_prepare_activation"
 )
@@ -209,47 +206,7 @@ def _ensure_current_backend() -> Path:
     return extensions[0]
 
 
-def _ensure_current_native_backend() -> tuple[Path, Path]:
-    """Incrementally build the current workspace native execution owners."""
-
-    if not (ROBOPLAN_BUILD / "CMakeCache.txt").is_file():
-        _run(
-            (
-                "cmake",
-                "-G",
-                "Ninja",
-                "-S",
-                str(WORKSPACE / "manyforge_roboplan"),
-                "-B",
-                str(ROBOPLAN_BUILD),
-                "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
-                "-DBUILD_TESTING=OFF",
-                "-DMANYFORGE_BUILD_ROS2_CONTROL_RUNTIME=OFF",
-            )
-        )
-    _run(
-        (
-            "cmake",
-            "--build",
-            str(ROBOPLAN_BUILD),
-            "--parallel",
-            _build_jobs(),
-            "--target",
-            "manyforge_native_execution_host",
-            "manyforge_roboplan_candidate_worker",
-            "--",
-            "-k",
-            "0",
-        )
-    )
-    _regular_file(
-        NATIVE_EXECUTION_HOST, "current native execution host", executable=True
-    )
-    _regular_file(NATIVE_CANDIDATE_WORKER, "current candidate worker", executable=True)
-    return NATIVE_EXECUTION_HOST, NATIVE_CANDIDATE_WORKER
-
-
-def _ensure_current_ros_backend() -> tuple[Path, Path, Path]:
+def _ensure_current_ros_backend() -> tuple[Path, Path]:
     """Prepare the separately installed ROS product; never launch a provider."""
 
     build_root = BUILD_ROOT / "isaac"
@@ -269,18 +226,8 @@ def _ensure_current_ros_backend() -> tuple[Path, Path, Path]:
         (str(WORKSPACE / "scripts/ros/build-ros2-control-runtime.sh"),),
         env=environment,
     )
-    # One ROS-enabled graph also supplies the command-closed native bootstrap
-    # and shared planner worker, without recompiling their dependency closure.
-    _run(
-        (
-            "cmake", "--build", str(ros_build), "--parallel", _build_jobs(),
-            "--target", "manyforge_native_execution_host", "--", "-k", "0",
-        ),
-        env=environment,
-    )
     host = ros_build / "manyforge_ros2_control_execution_host"
     targets = (
-        ros_build / "manyforge_native_execution_host",
         ros_build / "manyforge_roboplan_candidate_worker",
         host,
     )
@@ -354,15 +301,16 @@ def _ensure_activation_preparer() -> Path:
 
 
 def _ensure_repository_bootstrap_package() -> Path:
-    """Materialize native infrastructure without selecting any Scenario."""
+    """Materialize selected infrastructure without selecting any Scenario."""
 
+    runtime = "ros2_control"
     profile = (
         WORKSPACE / "manyforge_deployment/resources/maintained/catalog/"
-        "runtime_profile/manyforge.native_execution_runtime.json"
+        f"runtime_profile/manyforge.{runtime}_execution_runtime.json"
     )
     # Cache placement only, not a semantic artifact identity. Never overwrite
     # an immutable admission created by an older compiler/profile.
-    digest = hashlib.sha256(f"native-workbench:{WORKBENCH_CELL_ID}\0".encode())
+    digest = hashlib.sha256(f"{runtime}-workbench:{WORKBENCH_CELL_ID}\0".encode())
     for source in (CANONICAL_EMPTY_GENERATOR, profile):
         with source.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -377,7 +325,7 @@ def _ensure_repository_bootstrap_package() -> Path:
             str(package_root),
             "--cell-id",
             WORKBENCH_CELL_ID,
-            "--native-runtime-profile",
+            "--ros-runtime-profile",
             str(profile),
         )
     )
@@ -667,7 +615,7 @@ class Workbench:
         composer_port: int,
         frontend_port: int,
         artifact_root: Path | None = None,
-        ros2_control: bool = False,
+        ros2_control: bool = True,
         bootstrap_project_path: str | None = None,
         operator_install_root: Path | None = None,
         operator_cell_id: str | None = None,
@@ -762,8 +710,6 @@ class Workbench:
         return command
 
     def _runtime_targets(self) -> tuple[Path, ...]:
-        if not self.ros2_control:
-            return _ensure_current_native_backend()
         return _ensure_current_ros_backend()
 
     def _simulation_control_arguments(self) -> tuple[str, ...]:
@@ -790,10 +736,12 @@ class Workbench:
                 "--isaac-pose-observer-executable", str(observer))
 
     def start(self) -> None:
+        if not self.ros2_control:
+            raise WorkbenchError("workbench requires ROS control; native execution is unavailable")
         if self.bootstrap_project_path is not None and (
             not self.ros2_control or self.project_path is not None
         ):
-            raise WorkbenchError("--bootstrap-project requires --ros2-control and excludes --project")
+            raise WorkbenchError("--bootstrap-project requires ROS control and excludes --project")
         operator_mode = self.operator_install_root is not None
         if operator_mode:
             if not self.ros2_control or self.project_path or self.bootstrap_project_path:
@@ -813,17 +761,13 @@ class Workbench:
         ros_capture: dict[str, Any] | None = None
         if self.ros2_control and not operator_mode:
             intended_project = self.bootstrap_project_path or self.project_path
-            if intended_project is None:
-                raise WorkbenchError(
-                    "--ros2-control requires --bootstrap-project or --project "
-                    "selecting the intended first Scenario"
+            if intended_project is not None:
+                ros_capture, source_path = _capture_ros_bootstrap_project(
+                    intended_project, allowed_root=self.artifact_root
                 )
-            ros_capture, source_path = _capture_ros_bootstrap_project(
-                intended_project, allowed_root=self.artifact_root
-            )
-            if self.project_path is not None:
-                self.project_path = source_path
-                self.scenario_id = ros_capture["scenario_id"]
+                if self.project_path is not None:
+                    self.project_path = source_path
+                    self.scenario_id = ros_capture["scenario_id"]
         for port in (
             self.headless_port,
             self.runner_port,
@@ -845,21 +789,6 @@ class Workbench:
         bootstrap_root: Path
         bootstrap_admission = self.operator_admission or BOOTSTRAP_ADMISSION
         cell_id = self.operator_cell_id or WORKBENCH_CELL_ID
-        if self.project_path is not None and not self.ros2_control:
-            from manyforge_composer.backend.scenario_artifacts import (
-                ScenarioArtifactError,
-                capture_scenario_artifact,
-            )
-
-            try:
-                project, project_path, _source_document_digest = capture_scenario_artifact(
-                    self.project_path,
-                    allowed_roots=[str(self.artifact_root)],
-                )
-            except ScenarioArtifactError as error:
-                raise WorkbenchError(str(error)) from error
-            self.project_path = project_path
-            self.scenario_id = project["scenario_id"]
         bootstrap_root = self.operator_install_root or (
             _ensure_ros_bootstrap_package(ros_capture, activation_preparer=activation_preparer)
             if ros_capture is not None else _ensure_repository_bootstrap_package()
@@ -1353,11 +1282,6 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--simulation-control-config", type=Path)
             command.add_argument("--isaac-site-settings", type=Path)
             command.add_argument("--package-aggregate-sha256")
-            command.add_argument(
-                "--ros2-control",
-                action="store_true",
-                help="prepare the development ROS execution product and simulation port",
-            )
     return parser
 
 
@@ -1394,7 +1318,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             runner_port=args.runner_port,
             composer_port=args.composer_port,
             frontend_port=args.frontend_port,
-            ros2_control=args.ros2_control,
             bootstrap_project_path=args.bootstrap_project,
             operator_install_root=args.operator_install_root,
             operator_cell_id=args.operator_cell_id,

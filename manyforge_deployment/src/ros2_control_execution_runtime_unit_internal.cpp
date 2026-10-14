@@ -1,4 +1,5 @@
 #include "ros2_control_execution_runtime_unit_internal.hpp"
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 #include "native_execution_runtime_unit_internal.hpp"
 
 #include <algorithm>
@@ -232,7 +233,7 @@ namespace {
 CanonicalValue ros2_control_execution_runtime_infrastructure_projection(
     const core::RuntimeUnitDTO &unit) {
   const auto &liveness =
-      native_execution_runtime_contract::manager_liveness_policy();
+      execution_runtime_contract::manager_liveness_policy();
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(
@@ -1227,7 +1228,7 @@ Configuration require_component_configuration(
     const core::ControllableComponentId &component_id) {
   auto result = require_configuration(bundle, runtime_unit_id);
   // Reuse the native exact binding-resource ownership and aggregate ordering.
-  native_execution_runtime_contract::Configuration motion;
+  execution_runtime_contract::Configuration motion;
   motion.initial_joint_positions_rad = result.initial_joint_positions_rad;
   motion.motion_target_limits = result.motion_target_limits;
   motion.gripper_target_configurations = result.gripper_target_configurations;

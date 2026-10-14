@@ -144,13 +144,25 @@ PINOCCHIO_PREFIX=$(dirname "$(dirname "$(dirname "${PINOCCHIO_CMAKE_DIR}")")")
 export CMAKE_PREFIX_PATH="${TOPIC_INSTALL}:/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}"
 
 mkdir -p "${ROBOPLAN_BUILD}" "${ROS_OVERLAY}"
-cmake -S "${CMAKE_SOURCE}" -B "${ROBOPLAN_BUILD}" \
+CMAKE_GENERATOR_ARGS=()
+if [[ -n "${CMAKE_GENERATOR:-}" ]]; then
+    CMAKE_GENERATOR_ARGS=(-G "$CMAKE_GENERATOR")
+fi
+cmake -S "${CMAKE_SOURCE}" -B "${ROBOPLAN_BUILD}" "${CMAKE_GENERATOR_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE="${MANYFORGE_ROS2_CONTROL_BUILD_TYPE:-Release}" \
     -DBUILD_TESTING="${MANYFORGE_ROS2_CONTROL_BUILD_TESTING:-OFF}" \
     -DMANYFORGE_BUILD_ROS2_CONTROL_RUNTIME=ON
+BUILD_KEEP_GOING_ARGS=()
+if [[ "${MANYFORGE_ROS2_CONTROL_BUILD_KEEP_GOING:-OFF}" == ON ]]; then
+    configured_generator=$(sed -n 's/^CMAKE_GENERATOR:INTERNAL=//p' "${ROBOPLAN_BUILD}/CMakeCache.txt")
+    case "$configured_generator" in
+        Ninja) BUILD_KEEP_GOING_ARGS=(-- -k 0) ;;
+        "Unix Makefiles") BUILD_KEEP_GOING_ARGS=(-- -k) ;;
+    esac
+fi
 cmake --build "${ROBOPLAN_BUILD}" \
     --target "${BUILD_TARGETS[@]}" \
-    --parallel "${BUILD_PARALLEL_LEVEL}"
+    --parallel "${BUILD_PARALLEL_LEVEL}" "${BUILD_KEEP_GOING_ARGS[@]}"
 
 # Keep cmeel's Boost/TinyXML stack out of the ament-only overlay.  The C++
 # runtime above consumes the qualified RoboPlan prefix; the ROS overlay below
@@ -187,8 +199,16 @@ for target in "${BUILD_TARGETS[@]}"; do
             test -x "${ROBOPLAN_BUILD}/manyforge_ros2_control_execution_host"
             test -x "${ROBOPLAN_BUILD}/manyforge_roboplan_candidate_worker"
             ;;
-        manyforge_ros2_control_execution_host|manyforge_roboplan_candidate_worker)
+        manyforge_ros2_control_execution_host|manyforge_roboplan_candidate_worker|\
+        manyforge_ros2_control_execution_host_pick_place_planning_fixture|\
+        manyforge_ros2_control_execution_host_admission_fixture)
             test -x "${ROBOPLAN_BUILD}/${target}"
+            ;;
+        manyforge_ros2_control_execution_host_projection_fixture)
+            # Package-local and integration entrypoints keep this fixture in
+            # their own directory; its basename is the real ROS host name.
+            test -x "${ROBOPLAN_BUILD}/ros_projection_host_fixture/manyforge_ros2_control_execution_host" ||
+                test -x "${ROBOPLAN_BUILD}/roboplan/ros_projection_host_fixture/manyforge_ros2_control_execution_host"
             ;;
     esac
 done

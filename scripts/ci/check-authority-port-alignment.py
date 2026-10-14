@@ -65,7 +65,7 @@ REQUIRED = (
     "manyforge_core/include/manyforge_core/collision/i_collision_query_engine.hpp",
     "manyforge_core/include/manyforge_core/collision/i_collision_diagnostic_comparator.hpp",
     "manyforge_core/include/manyforge_core/logical_scene_identity.hpp",
-    "manyforge_scene/include/manyforge_scene/canonical_empty_scene_owner.hpp",
+    "manyforge_scene/include/manyforge_scene/logical_scene_owner.hpp",
     "manyforge_roboplan/include/manyforge_roboplan/retained_planning_model_stage.hpp",
 )
 

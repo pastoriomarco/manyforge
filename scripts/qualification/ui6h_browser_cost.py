@@ -1,8 +1,7 @@
-"""Short software-browser/cycle cost check over the real isolated workbench.
+"""Historical UI6-H browser-cost qualification, with ROS product inputs.
 
-Consumes already-built native owners and a qualified retained package. Does
-not qualify hardware, maximum scene size or the maintainer's panel review.
-The optional Stop mode delegates to the existing full segmented latency gate.
+NOT_RUN: the old package/Scenario startup handoff still needs N4 migration to
+current Workbench APIs. These source joins do not qualify that workflow.
 """
 
 import argparse
@@ -40,7 +39,7 @@ def main():
     parser.add_argument(
         "--manual",
         action="store_true",
-        help="Measure one real native Joint preview/approval first",
+        help="Measure one real ROS Joint preview/approval first",
     )
     parser.add_argument(
         "--recovery",
@@ -102,7 +101,7 @@ runpy.run_module({module!r}, run_name='__main__')
             **{**vars(workbench.subprocess), "Popen": diagnostic_popen}
         )
     result = {
-        "scope": "isolated Lite6 native cycle, Firefox software WebGL, 1440x900; no Stop or hardware"
+        "scope": "isolated Lite6 ROS mock cycle, Firefox software WebGL, 1440x900; no Stop or hardware"
     }
     with TemporaryDirectory(prefix="h6b-") as temporary:
         root = Path(temporary)
@@ -110,31 +109,34 @@ runpy.run_module({module!r}, run_name='__main__')
         workbench.PACKAGE_ROOT = root / "package"
         shutil.copytree(args.package_root, workbench.PACKAGE_ROOT)
         workbench.HEADLESS_BUILD = args.build_root / "headless"
-        workbench.ROBOPLAN_BUILD = args.build_root / "roboplan"
+        workbench.BUILD_ROOT = args.build_root
         workbench.MANAGER_BINARY = workbench.HEADLESS_BUILD / "manyforge_manager_daemon"
-        host = workbench.ROBOPLAN_BUILD / "manyforge_native_execution_host"
-        worker = workbench.ROBOPLAN_BUILD / "manyforge_roboplan_candidate_worker"
-        workbench.NATIVE_EXECUTION_HOST, workbench.NATIVE_CANDIDATE_WORKER = (
-            host,
-            worker,
-        )
         # Locate the caller's already-built inputs, without changing owner wiring.
         workbench._import_package = lambda: None
         workbench._ensure_current_backend = lambda: next(
             workbench.HEADLESS_BUILD.glob("manyforge_headless_py*.so")
         )
-        workbench._ensure_current_native_backend = lambda: (host, worker)
+        current_ros_backend = workbench._ensure_current_ros_backend
+
+        def prebuilt_ros_backend():
+            # Reuse product validation and overlay import with the caller's
+            # prebuilt inputs. This qualification recipe performs no build.
+            build_run = workbench._run
+            def require_prebuilt(command, **_kwargs):
+                if command != (str(workbench.WORKSPACE / "scripts/ros/build-ros2-control-runtime.sh"),):
+                    raise RuntimeError("unexpected ROS build request")
+            try:
+                workbench._run = require_prebuilt
+                return current_ros_backend()
+            finally:
+                workbench._run = build_run
+
+        workbench._ensure_current_ros_backend = prebuilt_ros_backend
         workbench._ensure_activation_preparer = lambda: (
-            args.build_root / "deployment/manyforge_prepare_activation",
-            tuple(
-                (family, args.build_root / "deployment/generated" / directory)
-                for family, directory in (
-                    ("lite6_lite_gripper", "lite6_lite_gripper_structural"),
-                    ("ur10e_robotiq_2f_140", "ur10e_robotiq_2f_140_structural"),
-                    ("ur5_roboplan", "ur5_roboplan_structural"),
-                )
-            ),
+            args.build_root / "deployment/manyforge_prepare_activation"
         )
+        # NOT_RUN: this historical package/Scenario handoff is not the current
+        # authored-project startup. N4 owns its complete workflow migration.
         stack = workbench.Workbench(
             scenario_id="lite6_pick_and_place",
             headless_port=9101,

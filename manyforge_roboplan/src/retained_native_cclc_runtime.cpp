@@ -18,7 +18,6 @@
 #include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
 #include <manyforge_deployment/verified_controller_lifecycle_expected_domain.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
-#include <manyforge_roboplan/retained_native_controller_lifecycle_port.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -680,18 +679,6 @@ struct DerivedRuntimeClosure final {
         } else {
           port = core::Result<std::shared_ptr<core::IControllerLifecyclePort>>::
               Err(external.error());
-        }
-      } else {
-        auto native = RetainedNativeControllerLifecyclePort::Create(
-            expected.sealed(), std::move(domain_bindings), clock,
-            config.controller_observation_freshness_ns);
-        if (native.ok()) {
-          port =
-              core::Result<std::shared_ptr<core::IControllerLifecyclePort>>::Ok(
-                  std::move(native.value()));
-        } else {
-          port = core::Result<std::shared_ptr<core::IControllerLifecyclePort>>::
-              Err(native.error());
         }
       }
       if (!port.ok()) {
@@ -1453,7 +1440,9 @@ CreateRecoveredRetainedNativeCellCCLCRuntime(
     std::function<core::Result<core::RuntimeRouteConfigurationReadbackDTO>(
         const core::ActiveControlConfigurationDTO &)> adopt_predecessor,
     std::function<core::Result<void>()> reconcile_command_free_orphans,
-    std::function<core::Result<void>()> &reconcile_after_start) {
+    std::function<core::Result<void>()> &reconcile_after_start,
+    RetainedExternallyManagedDomainSnapshotSource
+        externally_managed_controller_snapshot_source) {
   reconcile_after_start = {};
   if (retained_bundle == nullptr || !adopt_predecessor ||
       !reconcile_command_free_orphans) {
@@ -1526,7 +1515,8 @@ CreateRecoveredRetainedNativeCellCCLCRuntime(
       lifecycle_catalog_source, std::move(brand_ports),
       std::move(physical_bindings),
       kernel_cell_admission_port, kernel_route_fence_port, route_owner, clock,
-      scheduler, std::move(current_configuration), {}, &readiness_owner);
+      scheduler, std::move(current_configuration),
+      std::move(externally_managed_controller_snapshot_source), &readiness_owner);
   if (!composition.ok())
     return composition;
   auto started = composition.value()->Start();

@@ -164,7 +164,7 @@ def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
         "build_headless_roboplan_producer_closure() {", 1
     )[0]
     producer = source.split("build_headless_roboplan_producer_closure() {", 1)[1].split(
-        "require_headless_native_packages() {", 1
+        "require_headless_runtime_packages() {", 1
     )[0]
     body = source.split("run_roboplan_tests() {", 1)[1].split("run_headless_cpp_tests() {", 1)[0]
 
@@ -172,7 +172,22 @@ def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
     assert configure.index("cmakeFiles-v1") < configure.index('cmake "$WORKSPACE')
     assert configure.index("toolchains-v1") < configure.index('cmake "$WORKSPACE')
     assert "tail -" not in configure
-    assert '--target "${producer_targets[@]}" -- "${BUILD_KEEP_GOING_ARGS[@]}"' in producer
+    assert "source_ros_integration_environment" in configure
+    assert "-DMANYFORGE_BUILD_ROS2_CONTROL_RUNTIME=ON" in configure
+    assert 'bash "$WORKSPACE/scripts/ros/build-ros2-control-runtime.sh"' in producer
+    assert "MANYFORGE_ROS2_CONTROL_BUILD_TESTING=ON" in producer
+    assert 'MANYFORGE_ROBOPLAN_BUILD_DIR="$build"' in producer
+    assert 'CMAKE_GENERATOR="$BUILD_GENERATOR"' in producer
+    assert "MANYFORGE_ROS2_CONTROL_BUILD_KEEP_GOING=ON" in producer
+    for target in (
+        "manyforge_ros2_control_execution_host",
+        "manyforge_ros2_control_execution_host_pick_place_planning_fixture",
+        "manyforge_ros2_control_execution_host_admission_fixture",
+        "manyforge_ros2_control_execution_host_projection_fixture",
+        "manyforge_roboplan_candidate_worker",
+    ):
+        assert f"--target {target}" in producer
+    assert 'source "$BUILD_DIR/isaac/ros-overlay/install/setup.bash"' in producer
     assert "tail -" not in producer
     assert "C++ retained RoboPlan product-consumer tests" in body
     assert "MANYFORGE_ENABLE_ROS2_CONTROL" not in body
@@ -200,14 +215,45 @@ def test_headless_required_process_cases_name_the_current_semantic_tests() -> No
 
 
 @pytest.mark.parametrize("generator", [None, "Ninja", "Unix Makefiles"])
-def test_headless_selector_builds_producer_closure_before_native_headless(
+def test_headless_selector_builds_ros_producer_closure_before_headless(
     tmp_path: Path,
     generator: str | None,
 ) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     build_root = tmp_path / "build"
+    build_root.mkdir()
     marker = tmp_path / "events"
+    workspace = tmp_path / "workspace"
+    setup = tmp_path / "ros-setup.bash"
+    setup.write_text('printf "%s\\n" ros-setup >> "$FAKE_LOG"\n')
+    topic = tmp_path / "topic"
+    data = tmp_path / "data"
+    for install in (topic, data):
+        install.mkdir()
+        (install / "setup.bash").write_text("")
+    (topic / "UPSTREAM_COMMIT").write_text(
+        "aa9f9ef9525a60f8becea322537dd1d6d1bf9123\n")
+    for relative in (
+        "scripts/test-all.sh", "scripts/ros/build-ros2-control-runtime.sh",
+        "scripts/lib/composable-cell-runtime-availability.sh",
+    ):
+        source = (_REPO_ROOT / relative).read_text()
+        source = source.replace('"/opt/ros/${ROS_DISTRO:-lyrical}/setup.bash"', str(setup))
+        source = source.replace('"/opt/ros/${ROS_DISTRO}/setup.bash"', str(setup))
+        source = source.replace("/opt/manyforge/topic_based_ros2_control/install", str(topic))
+        source = source.replace("/opt/manyforge/xarm_description/install", str(data))
+        target = workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source)
+    for relative in (
+        "manyforge_roboplan/CMakeLists.txt", "manyforge_ros2_control_execution/CMakeLists.txt",
+        "manyforge_cclc_msgs/package.xml", "manyforge_ros_bringup/package.xml",
+    ):
+        target = workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+    test_all = workspace / "scripts/test-all.sh"
 
     (fake_bin / "cmake").write_text(
         "#!/bin/sh\n"
@@ -218,12 +264,16 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         "    printf '%s\\n' producer-build >> \"$FAKE_LOG\"\n"
         '    printf \'producer-targets:%s\\n\' "$*" >> "$FAKE_LOG"\n'
         "    for output in \\\n"
-            "      manyforge_native_execution_host \\\n"
-            "      manyforge_native_execution_host_pick_place_fixture \\\n"
-            "      manyforge_native_execution_host_pick_place_planning_fixture \\\n"
+            "      manyforge_ros2_control_execution_host \\\n"
+            "      manyforge_ros2_control_execution_host_admission_fixture \\\n"
+            "      manyforge_ros2_control_execution_host_pick_place_planning_fixture \\\n"
             "      manyforge_roboplan_candidate_worker; do\n"
         '      : > "$root/$output"\n'
+        '      chmod +x "$root/$output"\n'
         "    done\n"
+        '    mkdir -p "$root/ros_projection_host_fixture"\n'
+        '    : > "$root/ros_projection_host_fixture/manyforge_ros2_control_execution_host"\n'
+        '    chmod +x "$root/ros_projection_host_fixture/manyforge_ros2_control_execution_host"\n'
         '  elif [ "$root" = "${MANYFORGE_BUILD_DIR}/headless" ]; then\n'
         "    printf '%s\\n' headless-build >> \"$FAKE_LOG\"\n"
         '    mkdir -p "$root/manager-apply-test-fixture" \\\n'
@@ -239,6 +289,18 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         "  fi\n"
         "  exit 0\n"
         "fi\n"
+        'if [ "$1" = "-S" ]; then\n'
+        '  source="$2"; shift 2; root="$2"; mkdir -p "$root"; cd "$root"\n'
+        '  selected_generator="${CMAKE_GENERATOR:-Unix Makefiles}"\n'
+        '  previous=; for argument in "$@"; do\n'
+        '    if [ "$previous" = "-G" ]; then selected_generator="$argument"; fi\n'
+        '    previous="$argument"\n'
+        '  done\n'
+        '  printf \'CMAKE_GENERATOR:INTERNAL=%s\\n\' "$selected_generator" > CMakeCache.txt\n'
+        "  printf '%s\\n' producer-configure >> \"$FAKE_LOG\"\n"
+        '  printf \'producer-args:%s\\n\' "$source $*" >> "$FAKE_LOG"\n'
+        '  exit 0\n'
+        "fi\n"
         "printf 'CMAKE_GENERATOR:INTERNAL=%s\\n' \"$3\" > CMakeCache.txt\n"
         'case "$1" in\n'
         "  */manyforge_roboplan)\n"
@@ -251,6 +313,19 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         encoding="utf-8",
     )
     (fake_bin / "cmake").chmod(0o755)
+    for name, body in (
+        ("find", 'printf "%s\\n" "$FAKE_PINOCCHIO_CONFIG"\n'),
+        ("ros2", 'case "$*" in\n'
+                 '  "pkg prefix topic_based_ros2_control") printf "%s\\n" "$FAKE_TOPIC_INSTALL";;\n'
+                 '  "pkg prefix xarm_description") printf "%s/xarm_description\\n" "$FAKE_DATA_INSTALL";;\n'
+                 '  *) exit 98;;\nesac\n'),
+        ("colcon", 'printf "ros-overlay-build\\n" >> "$FAKE_LOG"\n'
+                   'while [ "$1" != "--install-base" ]; do shift; done\n'
+                   'mkdir -p "$2"\n'
+                   'printf \'printf "ros-overlay-source\\n" >> "$FAKE_LOG"\\n\' > "$2/setup.bash"\n'),
+    ):
+        (fake_bin / name).write_text("#!/bin/sh\nset -eu\n" + body)
+        (fake_bin / name).chmod(0o755)
     (fake_bin / "ctest").write_text(
         "#!/bin/sh\n"
         "set -eu\n"
@@ -288,13 +363,17 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         "FAKE_LOG": str(marker),
         "MANYFORGE_BUILD_DIR": str(build_root),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "WORKSPACE": str(_REPO_ROOT),
+        "WORKSPACE": str(workspace),
+        "MANYFORGE_VENV": str(tmp_path / "no-venv"),
+        "FAKE_TOPIC_INSTALL": str(topic),
+        "FAKE_DATA_INSTALL": str(data),
+        "FAKE_PINOCCHIO_CONFIG": str(tmp_path / "cmeel.prefix/lib/cmake/pinocchio"),
     }
     environment.pop("CMAKE_GENERATOR", None)
     if generator is not None:
         environment["CMAKE_GENERATOR"] = generator
     completed = subprocess.run(
-        ["bash", str(_TEST_ALL), "headless"],
+        ["bash", str(test_all), "headless"],
         cwd=_REPO_ROOT,
         env=environment,
         capture_output=True,
@@ -302,27 +381,38 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         check=False,
     )
 
-    assert completed.returncode == 0
+    assert completed.returncode == 0, completed.stdout + completed.stderr
     events = marker.read_text(encoding="utf-8").splitlines()
     assert events.index("producer-configure") < events.index("producer-build")
+    assert events.index("producer-build") < events.index("ros-overlay-build")
+    assert events.index("ros-overlay-build") < events.index("ros-overlay-source")
+    assert events.index("ros-overlay-source") < events.index("headless-configure")
     assert events.index("producer-build") < events.index("headless-configure")
     assert events.index("headless-configure") < events.index("headless-build")
     producer_targets = next(event for event in events if event.startswith("producer-targets:"))
     assert "stop_qualification" not in producer_targets
-    assert "manyforge_roboplan_candidate_worker" in producer_targets
+    for target in (
+        "manyforge_ros2_control_execution_host",
+        "manyforge_ros2_control_execution_host_pick_place_planning_fixture",
+        "manyforge_ros2_control_execution_host_admission_fixture",
+        "manyforge_ros2_control_execution_host_projection_fixture",
+        "manyforge_roboplan_candidate_worker",
+    ):
+        assert target in producer_targets
     expected_generator = generator or "Ninja"
     producer_args = next(event for event in events if event.startswith("producer-args:"))
     assert f"-G {expected_generator}" in producer_args
     assert producer_targets.endswith("-- -k 0" if expected_generator == "Ninja" else "-- -k")
     headless_args = next(event for event in events if event.startswith("headless-args:"))
+    assert f"-G {expected_generator}" in headless_args
     assert (
-        "-DMANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="
-        f"{build_root}/roboplan/manyforge_native_execution_host"
+        "-DMANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="
+        f"{build_root}/roboplan/manyforge_ros2_control_execution_host"
     ) in headless_args
     assert sum(event.startswith("ctest:--output-on-failure") for event in events) == 1
 
     omitted = subprocess.run(
-        ["bash", str(_TEST_ALL), "headless"],
+        ["bash", str(test_all), "headless"],
         cwd=_REPO_ROOT,
         env={**environment, "FAKE_CTEST_OMIT_NATIVE": "1"},
         capture_output=True,

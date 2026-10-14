@@ -23,7 +23,7 @@
 #include <manyforge_roboplan/retained_native_cclc_runtime.hpp>
 #include <manyforge_roboplan/retained_native_cell_command_readiness_port.hpp>
 #include <manyforge_roboplan/retained_native_cell_runtime.hpp>
-#include <manyforge_roboplan/retained_native_brand_lifecycle_port.hpp>
+#include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -47,44 +47,38 @@ namespace deployment = manyforge::deployment;
 
 [[nodiscard]] std::string Sha(const char value);
 
-TEST(RetainedNativeCCLCRuntime, NativeAdapterOwnsProviderReadinessButNeverCommandPermission) {
+// Focused external-source observation coverage. The selected ROS runtime
+// handle owns pure health reads; Kernel/CCLC below owns command permission.
+TEST(RetainedNativeCCLCRuntime, ExternalAdapterObservesProviderReadinessWithoutMutationPermission) {
   using State = core::ComponentLifecycleStateDTO;
-  using Intent = core::ComponentLifecycleIntentKindDTO;
-  const core::ProviderManifestId manifest_id("manyforge.provider.native_control");
-  const core::ProviderManifestRevision manifest_revision(Sha('1'));
-  const core::LifecyclePredicateDTO active{
-      {State::kActive},
-      {{core::LifecycleFactId("native.test.ready"),
-        {core::LifecycleFactValueKindDTO::kBoolean, true, std::nullopt, std::nullopt}}}};
-  const core::LifecyclePredicateDTO prepared{{State::kPrepared}, {}};
-  const core::LifecyclePredicateDTO disabled{{State::kDisabled}, {}};
-  const auto catalog = core::MakeBrandLifecyclePlanCatalog(
-      manifest_id, manifest_revision,
-      {{Intent::kPrepare, State::kPrepared, std::nullopt, prepared, 10'000,
-        {{core::LifecyclePrimitiveId("native.control.prepare"), disabled, prepared}}},
-       {Intent::kEnable, State::kActive, std::nullopt, active, 10'000,
-        {{core::LifecyclePrimitiveId("native.control.enable"), prepared, active}}},
-       {Intent::kDisable, State::kDisabled, std::nullopt, disabled, 10'000,
-        {{core::LifecyclePrimitiveId("native.control.disable"), active, disabled}}}});
-  ASSERT_TRUE(catalog.ok()) << catalog.error().message;
   const core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
       core::ControlDomainId("domain.1"), core::ControlDomainRevision("domain.revision.1"),
-      core::ProviderInstanceId("provider.1"), manifest_id, manifest_revision,
+      core::ProviderInstanceId("provider.1"),
+      core::ProviderManifestId("manyforge.provider.ros2_control"),
+      core::ProviderManifestRevision(Sha('1')),
       core::RuntimeUnitId("runtime.1"), core::RuntimeEpoch("epoch.1"),
-      catalog.value().catalog_digest};
+      core::ContentDigest(Sha('2'))};
   core::FakeClock clock;
   clock.set(100);
-  // Route readiness is observed only; the adapter has no command-gate seam.
-  bool route_open = true;
-  bool engine_available = true;
-  const auto port = RetainedNativeBrandLifecyclePort::Create(
-      occurrence, catalog.value(), clock, 1000,
-      [&] {
-        return engine_available ? core::Result<void>::Ok()
-                                : core::Result<void>::Err(
-                                      {"native_engine_unavailable", "test source missing", {}});
-      },
-      [&] { return core::Result<bool>::Ok(route_open); }, State::kActive);
+  const RetainedExternallyManagedDomainSnapshot snapshot{
+      11U, State::kActive, true,
+      {{core::LifecycleFactId("external.test.ready"),
+        {core::LifecycleFactValueKindDTO::kBoolean, true, std::nullopt, std::nullopt}}},
+      std::nullopt};
+  unsigned source_reads = 0U;
+  bool source_available = true;
+  const core::ErrorDTO missing_source_error{
+      "test_source_unavailable", "test source missing", {{"source", "selected-external-owner"}}};
+  const auto port = RetainedExternallyManagedBrandLifecyclePort::Create(
+      occurrence,
+      [&](const core::ControlDomainId& domain, core::TimePoint now) {
+        ++source_reads;
+        EXPECT_EQ(domain, occurrence.control_domain_id);
+        EXPECT_EQ(now, clock.now());
+        return source_available
+            ? core::Result<RetainedExternallyManagedDomainSnapshot>::Ok(snapshot)
+            : core::Result<RetainedExternallyManagedDomainSnapshot>::Err(missing_source_error);
+      }, clock, 1000);
   ASSERT_TRUE(port.ok()) << port.error().message;
   const core::BrandLifecycleObservationQueryDTO query{
       core::LifecycleTransactionId("lifecycle.1"), core::LifecycleTransactionGeneration(1U),
@@ -92,115 +86,57 @@ TEST(RetainedNativeCCLCRuntime, NativeAdapterOwnsProviderReadinessButNeverComman
       occurrence.control_domain_revision, occurrence.provider_instance_id,
       occurrence.provider_manifest_id, occurrence.provider_manifest_revision,
       occurrence.provider_runtime_unit_id, occurrence.provider_runtime_epoch};
-  const auto dispatch = [&](const char* primitive, std::uint64_t generation) {
-    const core::BrandLifecyclePrimitiveIntentDTO request{
-        query.lifecycle_transaction_id, query.lifecycle_transaction_generation,
-        query.controllable_component_id, query.control_domain_id,
-        query.control_domain_revision, query.provider_instance_id,
-        query.provider_manifest_id, query.provider_manifest_revision,
-        query.provider_runtime_unit_id, query.provider_runtime_epoch,
-        core::LifecyclePrimitiveId(primitive),
-        core::LifecyclePrimitiveAttemptId("attempt.1"), generation, 10'000};
-    return port.value()->Dispatch(request, std::stop_token{});
-  };
-
-  for (int read = 0; read < 3; ++read) {
-    const auto health = port.value()->ReadLifecycleHealth(occurrence.control_domain_id, clock.now());
-    ASSERT_TRUE(health.ok()) << health.error().message;
-    EXPECT_EQ(health.value().observed_state, State::kActive);
-    ASSERT_EQ(health.value().facts.size(), 1U);
-    EXPECT_EQ(health.value().facts.front().lifecycle_fact_id,
-              core::LifecycleFactId("native.test.ready"));
-    EXPECT_EQ(health.value().facts.front().value.boolean_value, true);
-  }
-  EXPECT_FALSE(port.value()->ReadLifecycleHealth(core::ControlDomainId("foreign.domain"),
-                                                clock.now()).ok());
-  EXPECT_FALSE(port.value()->ReadLifecycleHealth(occurrence.control_domain_id, -1).ok());
   const auto first = port.value()->Observe(query);
   ASSERT_TRUE(first.ok()) << first.error().message;
   EXPECT_EQ(first.value().observed_state, State::kActive);
   EXPECT_EQ(first.value().source_sequence, 1U);
-  const auto pure = port.value()->ReadLifecycleHealth(occurrence.control_domain_id, clock.now());
-  ASSERT_TRUE(pure.ok());
-  EXPECT_EQ(pure.value().observed_state, first.value().observed_state);
-  EXPECT_EQ(pure.value().facts, first.value().facts);
-  const auto after_reads = port.value()->Observe(query);
-  ASSERT_TRUE(after_reads.ok());
-  EXPECT_EQ(after_reads.value().source_sequence, first.value().source_sequence + 1U);
-  EXPECT_EQ(after_reads.value().observation_generation, first.value().observation_generation);
-
-  engine_available = false;
-  const auto missing_engine = port.value()->ReadLifecycleHealth(occurrence.control_domain_id,
-                                                               clock.now());
-  ASSERT_FALSE(missing_engine.ok());
-  EXPECT_EQ(missing_engine.error().code, "native_engine_unavailable");
+  EXPECT_EQ(first.value().observation_generation, snapshot.source_generation);
+  EXPECT_EQ(first.value().facts, snapshot.facts);
+  for (int read = 0; read < 3; ++read) {
+    const auto repeated = port.value()->Observe(query);
+    ASSERT_TRUE(repeated.ok()) << repeated.error().message;
+    EXPECT_EQ(repeated.value().observed_state, first.value().observed_state);
+    EXPECT_EQ(repeated.value().facts, first.value().facts);
+    EXPECT_EQ(repeated.value().source_sequence,
+              first.value().source_sequence + static_cast<std::uint64_t>(read) + 1U);
+    EXPECT_EQ(repeated.value().observation_generation, first.value().observation_generation);
+  }
+  const auto reads_before_invalid = source_reads;
+  auto foreign_domain = query;
+  foreign_domain.control_domain_id = core::ControlDomainId("foreign.domain");
+  EXPECT_FALSE(port.value()->Observe(foreign_domain).ok());
+  auto foreign_epoch = query;
+  foreign_epoch.provider_runtime_epoch = core::RuntimeEpoch("foreign.epoch");
+  EXPECT_FALSE(port.value()->Observe(foreign_epoch).ok());
+  clock.set(-1);
   EXPECT_FALSE(port.value()->Observe(query).ok());
-  engine_available = true;
-  const auto stale = dispatch("native.control.disable", 2U);
-  EXPECT_EQ(stale.dispatch_state, core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(source_reads, reads_before_invalid);
+  clock.set(100);
+  source_available = false;
+  const auto missing_source = port.value()->Observe(query);
+  ASSERT_FALSE(missing_source.ok());
+  EXPECT_EQ(missing_source.error(), missing_source_error);
+  source_available = true;
 
-  // Disable and Prepare change only the provider's readiness state; the
-  // route stays installed and its readiness is untouched.
-  const auto off = dispatch("native.control.disable", first.value().observation_generation);
-  EXPECT_EQ(off.dispatch_state, core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown);
-  EXPECT_TRUE(route_open);
-  const auto disabled_observation = port.value()->Observe(query);
-  ASSERT_TRUE(disabled_observation.ok()) << disabled_observation.error().message;
-  EXPECT_EQ(disabled_observation.value().observed_state, State::kDisabled);
-
-  const auto prepared_result = dispatch("native.control.prepare",
-                                        disabled_observation.value().observation_generation);
-  EXPECT_EQ(prepared_result.dispatch_state,
-            core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown);
-  const auto prepared_observation = port.value()->Observe(query);
-  ASSERT_TRUE(prepared_observation.ok()) << prepared_observation.error().message;
-  EXPECT_EQ(prepared_observation.value().observed_state, State::kPrepared);
-
-  // Enable requires a current native route and reports honestly otherwise.
-  route_open = false;
-  const auto refused = dispatch("native.control.enable",
-                                prepared_observation.value().observation_generation);
+  const core::BrandLifecyclePrimitiveIntentDTO disable{
+      query.lifecycle_transaction_id, query.lifecycle_transaction_generation,
+      query.controllable_component_id, query.control_domain_id,
+      query.control_domain_revision, query.provider_instance_id,
+      query.provider_manifest_id, query.provider_manifest_revision,
+      query.provider_runtime_unit_id, query.provider_runtime_epoch,
+      core::LifecyclePrimitiveId("ros2_control.disable"),
+      core::LifecyclePrimitiveAttemptId("attempt.1"),
+      first.value().observation_generation, 10'000};
+  const auto reads_before_dispatch = source_reads;
+  const auto refused = port.value()->Dispatch(disable, std::stop_token{});
   EXPECT_EQ(refused.dispatch_state, core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
   EXPECT_EQ(refused.effect, core::LifecyclePrimitiveEffectDTO::kNone);
-  ASSERT_TRUE(refused.error.has_value());
-  EXPECT_EQ(refused.error->code, "native_lifecycle_route_not_current");
-  const auto still_prepared = port.value()->Observe(query);
-  ASSERT_TRUE(still_prepared.ok()) << still_prepared.error().message;
-  EXPECT_EQ(still_prepared.value().observed_state, State::kPrepared);
-  EXPECT_EQ(still_prepared.value().observation_generation,
-            prepared_observation.value().observation_generation);
-
-  route_open = true;
-  const auto on =
-      dispatch("native.control.enable", still_prepared.value().observation_generation);
-  EXPECT_EQ(on.dispatch_state, core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown);
-  const auto active_observation = port.value()->Observe(query);
-  ASSERT_TRUE(active_observation.ok()) << active_observation.error().message;
-  EXPECT_EQ(active_observation.value().observed_state, State::kActive);
-
-  // An Active provider without a current route is not an observation.
-  route_open = false;
-  EXPECT_FALSE(port.value()->Observe(query).ok());
-  const auto no_route = port.value()->ReadLifecycleHealth(occurrence.control_domain_id, clock.now());
-  ASSERT_FALSE(no_route.ok());
-  EXPECT_EQ(no_route.error().code, "native_brand_lifecycle_route_state_changed");
-
-  const auto strict_restart = RetainedNativeBrandLifecyclePort::Create(
-      occurrence, catalog.value(), clock, 1000,
-      [] { return core::Result<void>::Ok(); },
-      [&] { return core::Result<bool>::Ok(route_open); }, State::kActive);
-  EXPECT_FALSE(strict_restart.ok());
-  const auto recovering = RetainedNativeBrandLifecyclePort::Create(
-      occurrence, catalog.value(), clock, 1000,
-      [] { return core::Result<void>::Ok(); },
-      [&] { return core::Result<bool>::Ok(route_open); }, State::kActive, true);
-  ASSERT_TRUE(recovering.ok()) << recovering.error().message;
-  // Construction during closed route recovery is not an Active observation.
-  EXPECT_FALSE(recovering.value()->Observe(query).ok());
-  route_open = true;
-  const auto recovered = recovering.value()->Observe(query);
-  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
-  EXPECT_EQ(recovered.value().observed_state, State::kActive);
+  EXPECT_EQ(source_reads, reads_before_dispatch);
+  const auto after_dispatch = port.value()->Observe(query);
+  ASSERT_TRUE(after_dispatch.ok()) << after_dispatch.error().message;
+  EXPECT_EQ(after_dispatch.value().observed_state, first.value().observed_state);
+  EXPECT_EQ(after_dispatch.value().facts, first.value().facts);
+  EXPECT_EQ(after_dispatch.value().observation_generation, first.value().observation_generation);
 }
 
 [[nodiscard]] std::string Sha(const char value) {
@@ -761,6 +697,7 @@ class PreparingBrandPort final : public core::IBrandLifecyclePort {
 public:
   [[nodiscard]] core::Result<core::BrandLifecycleObservationDTO>
   Observe(const core::BrandLifecycleObservationQueryDTO &query) override {
+    std::lock_guard lock(lifecycle_mutex_);
     const auto sequence = next_sequence_.fetch_add(1U);
     const auto state = state_.load();
     return core::Result<core::BrandLifecycleObservationDTO>::Ok(
@@ -786,6 +723,7 @@ public:
   [[nodiscard]] core::BrandLifecyclePrimitiveResultDTO
   Dispatch(const core::BrandLifecyclePrimitiveIntentDTO &intent,
            std::stop_token cancellation) override {
+    std::lock_guard lock(lifecycle_mutex_);
     const bool prepare = intent.lifecycle_primitive_id ==
                          core::LifecyclePrimitiveId("prepare");
     const bool enable = intent.lifecycle_primitive_id ==
@@ -838,7 +776,15 @@ public:
     return dispatch_count_.load();
   }
 
+  [[nodiscard]] RetainedExternallyManagedDomainSnapshot controller_snapshot() const {
+    std::lock_guard lock(lifecycle_mutex_);
+    const auto state = state_.load();
+    return {dispatch_count_.load() + 1U, state,
+            state == core::ComponentLifecycleStateDTO::kActive, {}};
+  }
+
 private:
+  mutable std::mutex lifecycle_mutex_;
   std::atomic<std::uint64_t> next_sequence_{1U};
   std::atomic<std::size_t> dispatch_count_{0U};
   std::atomic<core::ComponentLifecycleStateDTO> state_{
@@ -2112,10 +2058,30 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
       return publication_owner.current_configuration(domain);
     };
 
+  // Sample the fake provider's actual lifecycle result, independently of the
+  // retained graph. Unchanged reads keep the same source generation.
+  const RetainedExternallyManagedDomainSnapshotSource controller_snapshot_source =
+      [brand_port, domain_id = occurrence.control_domain_id](
+          const core::ControlDomainId& domain, core::TimePoint now)
+          -> core::Result<RetainedExternallyManagedDomainSnapshot> {
+        if (domain != domain_id || now < 0) {
+          return core::Result<RetainedExternallyManagedDomainSnapshot>::Err(
+              {"controller_snapshot_unavailable", "read does not address the selected source",
+               {{"reason", "domain_or_clock_invalid"}}});
+        }
+        return core::Result<RetainedExternallyManagedDomainSnapshot>::Ok(
+            brand_port->controller_snapshot());
+      };
+  const auto initial_snapshot = brand_port->controller_snapshot();
+  EXPECT_EQ(initial_snapshot.component_state, core::ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_FALSE(initial_snapshot.exact_controller_configuration_active);
+  EXPECT_EQ(brand_port->controller_snapshot(), initial_snapshot);
+
   auto composition = CreateRetainedNativeCCLCRuntime(
       config, bundle, publication_store, publication.value(), artifacts,
       catalogs, {{occurrence, brand_port}}, {runtime.binding}, kernel_ports,
-      kernel_ports, publication_owner, clock, scheduler, std::move(current_configuration));
+      kernel_ports, publication_owner, clock, scheduler, std::move(current_configuration),
+      controller_snapshot_source);
   ASSERT_TRUE(composition.ok()) << composition.error().message;
   ASSERT_TRUE(composition.value()->Start().ok());
   const auto current_request_owner =
@@ -2152,6 +2118,10 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
   EXPECT_EQ(*lifecycle_status.value()->current_state,
             core::ComponentLifecycleStateDTO::kPrepared);
   EXPECT_EQ(brand_port->dispatch_count(), 1U);
+  const auto prepared_snapshot = brand_port->controller_snapshot();
+  EXPECT_EQ(prepared_snapshot.component_state, core::ComponentLifecycleStateDTO::kPrepared);
+  EXPECT_FALSE(prepared_snapshot.exact_controller_configuration_active);
+  EXPECT_EQ(prepared_snapshot.source_generation, initial_snapshot.source_generation + 1U);
 
   // This synthetic adapter fixture has no Manager Apply or native lifecycle
   // product. Its fake provider reaches Active before route selection so the
@@ -2176,6 +2146,10 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
   EXPECT_EQ(enabled_status.value()->current_state,
             core::ComponentLifecycleStateDTO::kActive);
   EXPECT_EQ(brand_port->dispatch_count(), 2U);
+  const auto active_snapshot = brand_port->controller_snapshot();
+  EXPECT_EQ(active_snapshot.component_state, core::ComponentLifecycleStateDTO::kActive);
+  EXPECT_TRUE(active_snapshot.exact_controller_configuration_active);
+  EXPECT_EQ(active_snapshot.source_generation, prepared_snapshot.source_generation + 1U);
 
   core::RouteSelectionIntentDTO route{
       {core::RequestId("route.native.readiness"), current_request_owner, "test",
@@ -2297,7 +2271,8 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
           ADD_FAILURE() << "Exact installed route must not be republished";
           return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
               {"unexpected_adoption", "route should already be current", {}});
-        }, [] { return core::Result<void>::Ok(); }, reconcile);
+        }, [] { return core::Result<void>::Ok(); }, reconcile,
+        controller_snapshot_source);
     EXPECT_EQ(readiness.publications, 1U);
     EXPECT_EQ(brand_port->dispatch_count(), 2U);
     if (test_case == ReadinessCase::kFailedRestart) {
@@ -2333,9 +2308,20 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
           ASSERT_TRUE(read.ok()) << read.error().message;
           EXPECT_FALSE(read.value().readiness.ready);
           ASSERT_TRUE(read.value().readiness.measured_state.error);
-          EXPECT_EQ(read.value().readiness.measured_state.error->details.at("reason"), "measured_inventory_unavailable");
+          const core::ErrorDTO expected_source_error{
+              "measured_source_unavailable",
+              test_case == ReadinessCase::kConstructionThrows
+                  ? "measured readiness construction is unavailable"
+                  : "test has no measured producer",
+              {{"reason", test_case == ReadinessCase::kConstructionThrows
+                              ? "measured_dependency_construction_failed"
+                              : "test_no_measured_producer"}}};
+          EXPECT_EQ(*read.value().readiness.measured_state.error,
+                    expected_source_error);
           ASSERT_FALSE(read.value().readiness.domains.empty());
           ASSERT_TRUE(read.value().readiness.domains.front().error);
+          EXPECT_EQ(*read.value().readiness.domains.front().error,
+                    expected_source_error);
           EXPECT_EQ(read.value().readiness.domains.front().error->details.at("reason"),
                     test_case == ReadinessCase::kConstructionThrows
                         ? "measured_dependency_construction_failed" : "test_no_measured_producer");

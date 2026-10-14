@@ -13,12 +13,10 @@
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_roboplan/retained_execution_state_sink.hpp>
-#include <manyforge_roboplan/retained_gripper_command_backend.hpp>
 #include <manyforge_roboplan/retained_native_component_owner.hpp>
 #include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
 #include <manyforge_roboplan/retained_native_gripper_route_publication_owner.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
-#include <manyforge_roboplan/roboplan_execution_backend.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -469,301 +467,6 @@ private:
   mutable bool release_read_{};
 };
 
-class RejectingScheduler final : public IScheduler {
-public:
-  ScheduleHandle schedule(TimePoint, std::function<void()>,
-                          SchedulerPriority) override {
-    throw std::runtime_error("injected schedule failure");
-  }
-  void cancel(ScheduleHandle) override {}
-};
-
-class InlineScheduler final : public IScheduler {
-public:
-  ScheduleHandle schedule(TimePoint, std::function<void()> callback,
-                          SchedulerPriority) override {
-    const auto handle = next_++;
-    callback();
-    return handle;
-  }
-  void cancel(ScheduleHandle) override {}
-
-private:
-  ScheduleHandle next_{1U};
-};
-
-class InlineThenThrowScheduler final : public IScheduler {
-public:
-  ScheduleHandle schedule(TimePoint, std::function<void()> callback,
-                          SchedulerPriority) override {
-    callback();
-    throw std::runtime_error("injected post-callback failure");
-  }
-  void cancel(ScheduleHandle) override {}
-};
-
-class AutoAdvanceClock final : public IClock {
-public:
-  TimePoint now() const override {
-    return current_.fetch_add(10'000'000, std::memory_order_acq_rel);
-  }
-
-private:
-  mutable std::atomic<TimePoint> current_{1};
-};
-
-[[nodiscard]] GripperCommandRequestDTO
-gripper_request(const RuntimeParticipantBinding &binding, double target,
-                double duration_s) {
-  const auto &value = binding.value();
-  return GripperCommandRequestDTO{
-      value.command_target_id.value(),
-      value.model_groups.empty()
-          ? std::string{}
-          : value.model_groups.front().compiled_group_name,
-      value.resources.front().compiled_resource_name,
-      target,
-      duration_s,
-      8.0,
-      "position",
-      value.resources.front().coordinate_kind == CoordinateKind::kAngular
-          ? "angular"
-          : "linear",
-      value.control_path->state_authority_id.value(),
-      "position_reached",
-      "optional",
-      "resolved_binding",
-      {"native_state"},
-      "commanded"};
-}
-
-[[nodiscard]] RetainedGripperPositionLimits
-gripper_limits(const RuntimeParticipantBinding &binding) {
-  return RetainedGripperPositionLimits{
-      binding.value().resources.front().coordinate_kind, -1.0, 1.0};
-}
-
-[[nodiscard]] ResolvedParticipantStopStageDTO
-gripper_stop_stage(const RuntimeParticipantBinding &binding,
-                   const bool controller_goal_cancel = false) {
-  const auto &value = binding.value();
-  const auto &path = *value.control_path;
-  const std::vector<ResourceId> resources{value.resources.front().resource_id};
-  const ResolvedStopRuntimeTargetDTO target{
-      path.provider_instance_id,
-      path.provider_manifest_id,
-      path.provider_manifest_revision,
-      path.provider_runtime_unit_id,
-      ProductId("product.native"),
-      ProductContractId("contract.native"),
-      ProductContractRevision("contract.revision"),
-      ContentDigest("target.digest"),
-      path.provider_runtime_epoch,
-      path.provider_runtime_epoch,
-      EndpointRoleId("state.stop"),
-      "state.stop",
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt};
-  auto evidence_target = target;
-  if (controller_goal_cancel) {
-    evidence_target.endpoint_role_id.reset();
-    evidence_target.logical_endpoint_symbol.reset();
-  }
-  const ResolvedStopEvidenceSourceDTO evidence_source{
-      controller_goal_cancel ? StopEvidenceSourceKind::kControllerGoalStatus
-                             : StopEvidenceSourceKind::kBindingStateAuthority,
-      evidence_target,
-      controller_goal_cancel ? std::optional<StateAuthorityId>{}
-                             : std::optional(path.state_authority_id),
-      controller_goal_cancel ? std::optional<StateAuthorityClass>{}
-                             : std::optional(path.state_authority_class),
-      std::nullopt};
-  const ResolvedStopEscalationStageDTO resolved_stage{
-      0U,
-      StopEscalationStageId(controller_goal_cancel ? "stage.gripper.cancel"
-                                                   : "stage.gripper.hard"),
-      controller_goal_cancel ? StopEscalationStageKind::kNominal
-                             : StopEscalationStageKind::kSoftwareHard,
-      ContainmentGranularity::kResource,
-      StopContainmentCommandDTO{
-          controller_goal_cancel
-              ? StopContainmentCommandKind::kControllerGoalCancel
-              : StopContainmentCommandKind::kRegistered,
-          std::nullopt,
-          controller_goal_cancel
-              ? std::optional<RegisteredStopCommandKindId>{}
-              : std::optional<
-                    RegisteredStopCommandKindId>{RegisteredStopCommandKindId(
-                    "manyforge.stop.software_hard")}},
-      std::nullopt,
-      ResolvedStopCommandQualificationDTO{},
-      target,
-      ResolvedStopResourceContainmentScopeDTO{path.activation_set_id,
-                                              resources},
-      StopEvidenceConjunction::kAllOf,
-      {ResolvedStopEvidenceRequirementDTO{
-          StopEvidenceRequirementDTO{
-              StopEvidenceItemId(controller_goal_cancel
-                                     ? "gripper.goal-terminal"
-                                     : "gripper.rest"),
-              controller_goal_cancel
-                  ? StopEvidenceRequirementKind::kControllerGoalTerminal
-                  : StopEvidenceRequirementKind::kMotionRest,
-              std::nullopt, std::nullopt,
-              StopEvidenceSourceRequirementDTO{
-                  controller_goal_cancel
-                      ? StopEvidenceSourceKind::kControllerGoalStatus
-                      : StopEvidenceSourceKind::kBindingStateAuthority,
-                  100'000'000,
-                  controller_goal_cancel
-                      ? std::optional<EndpointRoleId>{}
-                      : std::optional(EndpointRoleId("state.stop")),
-                  controller_goal_cancel
-                      ? std::vector<StateAuthorityClass>{}
-                      : std::vector{path.state_authority_class}},
-              StopEvidenceObservationDTO{
-                  controller_goal_cancel
-                      ? StopEvidenceObservationKind::kPostCommandSample
-                      : StopEvidenceObservationKind::kPostCommandDwell,
-                  controller_goal_cancel ? std::optional<std::int64_t>{}
-                                         : std::optional<std::int64_t>{0}}},
-          evidence_source}}};
-  const OperationId operation_id("operation.gripper.stop");
-  const OperationRevision operation_revision(1U);
-  const OperationParticipantId participant_id("participant.gripper");
-  return ResolvedParticipantStopStageDTO{
-      StopId("stop.gripper"),
-      StopGeneration(1U),
-      operation_id,
-      operation_revision,
-      participant_id,
-      ControllerGoalId("goal.gripper"),
-      ControllerGoalGeneration(1U),
-      value.controllable_component_id,
-      value.command_target_id,
-      value.capability_id,
-      path.control_domain_id,
-      path.control_domain_revision,
-      path.control_binding_id,
-      path.control_binding_revision,
-      path.active_control_configuration_id,
-      path.active_control_configuration_generation,
-      path.controller_topology_id,
-      path.topology_revision,
-      path.control_route_id,
-      std::nullopt,
-      std::nullopt,
-      path.provider_runtime_epoch,
-      resources,
-      ContainmentGranularity::kResource,
-      path.stop_evidence_policy_id,
-      path.stop_evidence_policy_revision,
-      PreparedParticipantStopPlanDTO{
-          ContentDigest("plan.digest"),
-          ResolvedStopBasePlanId("base.gripper"),
-          operation_id,
-          operation_revision,
-          participant_id,
-          value.program_id,
-          value.program_revision,
-          value.program_binding_id,
-          ProgramRunId("run.gripper"),
-          std::nullopt,
-          ParticipantStopProfilePurposeDTO::kOrdinary,
-          std::nullopt,
-          {PreparedStopStageCommandDTO{resolved_stage, std::nullopt,
-                                       std::nullopt}}},
-      0U,
-      ContentDigest("scope.digest")};
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     ExactPreparedGoalCancelIsANominalContainedStop) {
-  const auto binding = make_binding(CoordinateKind::kLinear);
-  const auto stage = gripper_stop_stage(binding, true);
-  const RemainingStopBudgetDTO budget{
-      stage.stop_id,
-      stage.stop_generation,
-      0,
-      std::nullopt};
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0});
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(
-      binding, channel, gripper_limits(binding), clock, scheduler);
-  auto request = gripper_request(binding, 0.02, 1.0);
-  request.addressed_identity = AddressedGripperCommandIdentityDTO{
-      stage.operation_id, stage.operation_revision, stage.participant_id,
-      stage.controller_goal_id, stage.controller_goal_generation};
-  const auto command = backend.command_gripper(request);
-  ASSERT_TRUE(command.accepted);
-
-  const auto result =
-      backend.TranslateStopStage(stage, budget, std::stop_token{});
-
-  EXPECT_EQ(result.attempt_disposition,
-            StopStageAttemptDispositionDTO::kDispatched);
-  EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
-  EXPECT_FALSE(result.error.has_value());
-  ASSERT_EQ(result.evidence_items.size(), 1U);
-  EXPECT_EQ(result.evidence_items.front().required_class,
-            StopEvidenceRequirementKind::kControllerGoalTerminal);
-  EXPECT_EQ(result.evidence_items.front().state,
-            StopEvidenceItemStateDTO::kSatisfied);
-  EXPECT_TRUE(result.controller_acknowledgement_sequence.has_value());
-  EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
-            GripperCommandState::kIdle);
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     StopStageReadAndPublishBlockersReturnBoundedTerminalFailures) {
-  const auto binding = make_binding(CoordinateKind::kLinear);
-  const auto stage = gripper_stop_stage(binding);
-  const RemainingStopBudgetDTO budget{
-      stage.stop_id,
-      stage.stop_generation,
-      0,
-      std::nullopt};
-  FakeClock clock;
-  ManualScheduler scheduler;
-
-  {
-    auto channel = std::make_shared<FakeRetainedStateChannel>(
-        binding, std::vector<double>{0.0});
-    channel->block_read();
-    RetainedGripperCommandBackend backend(
-        binding, channel, gripper_limits(binding), clock, scheduler);
-    const auto result =
-        backend.TranslateStopStage(stage, budget, std::stop_token{});
-    EXPECT_EQ(result.attempt_disposition,
-              StopStageAttemptDispositionDTO::kNotDispatched);
-    EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
-    ASSERT_TRUE(result.error.has_value());
-    EXPECT_EQ(result.error->details.at("reason"),
-              "stop_evidence_source_unavailable");
-  }
-
-  {
-    auto channel = std::make_shared<FakeRetainedStateChannel>(
-        binding, std::vector<double>{0.0});
-    channel->block_publish();
-    RetainedGripperCommandBackend backend(
-        binding, channel, gripper_limits(binding), clock, scheduler);
-    const auto result =
-        backend.TranslateStopStage(stage, budget, std::stop_token{});
-    EXPECT_EQ(result.attempt_disposition,
-              StopStageAttemptDispositionDTO::kDispatched);
-    EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
-    ASSERT_TRUE(result.error.has_value());
-    EXPECT_EQ(result.error->details.at("reason"), "fake_publication_deadline");
-  }
-}
-
 TEST(RetainedObservedStateChannelTest,
      BoundedReadAndPublishFailClosedUnderRouteContention) {
   auto binding = make_binding(CoordinateKind::kLinear, "gripper.target", true);
@@ -1113,521 +816,8 @@ TEST(RetainedExecutionStateSinkTest,
             ExecutionStateSinkStatus::kBusy);
 }
 
-[[nodiscard]] TrajectoryDTO trajectory(const RuntimeParticipantBinding &binding,
-                                       double duration_s = 0.02) {
-  const auto &value = binding.value();
-  std::vector<ResourceId> resources;
-  std::vector<std::string> joint_names;
-  for (const auto &resource : value.resources) {
-    resources.push_back(resource.resource_id);
-    joint_names.push_back(resource.compiled_resource_name);
-  }
-  return TrajectoryDTO{
-      std::move(resources),
-      std::move(joint_names),
-      {TrajectoryWaypointDTO{0.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}},
-       TrajectoryWaypointDTO{duration_s, {0.2, -0.3}, {0.0, 0.0}, {0.0, 0.0}}},
-      TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0}};
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     ProgressesLinearStateOnControllerLaneWithoutObserverSideEffects) {
-  auto binding = make_binding(CoordinateKind::kLinear);
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0});
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(
-      binding, channel, gripper_limits(binding), clock, scheduler);
-
-  const auto admitted =
-      backend.command_gripper(gripper_request(binding, 0.02, 1.0));
-  ASSERT_TRUE(admitted.accepted);
-  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::ControllerCommand);
-  const auto first = backend.get_gripper_status("gripper.target");
-  EXPECT_EQ(first.revision,
-            backend.get_gripper_status("gripper.target").revision);
-  EXPECT_EQ(channel->publish_calls(), 0);
-
-  clock.advance(500'000'000);
-  scheduler.advance_to(clock.now());
-  auto halfway = backend.get_gripper_status("gripper.target");
-  EXPECT_EQ(halfway.state, GripperCommandState::kExecuting);
-  EXPECT_NEAR(*halfway.current_position, 0.01, 1e-12);
-
-  clock.advance(500'000'000);
-  scheduler.advance_to(clock.now());
-  const auto completed = backend.get_gripper_status("gripper.target");
-  EXPECT_EQ(completed.state, GripperCommandState::kCompleted);
-  EXPECT_EQ(completed.projection_state, GripperProjectionState::kApplied);
-  const auto state = channel->current_controlled_state();
-  ASSERT_TRUE(state.ok());
-  ASSERT_EQ(state.value().positions.size(), 1U);
-  EXPECT_DOUBLE_EQ(
-      std::get<LinearPositionDTO>(state.value().positions[0]).value_m, 0.02);
-}
-
-TEST(
-    RetainedGripperCommandBackendTest,
-    ComponentLocalZeroDurationCommandEstablishesAddressedStateWithoutModelProjection) {
-  auto binding = make_binding(CoordinateKind::kLinear, "gripper.target", true);
-  auto channel = std::make_shared<RetainedObservedStateChannel>(
-      binding, nullptr,
-      RetainedObservedStateChannelConfig{
-          ObservedStateSourceKind::kPredictedState, "logical-gripper", 0, 1U});
-  FakeClock clock;
-  InlineScheduler scheduler;
-  RetainedGripperCommandBackend backend(binding, channel, std::nullopt, clock,
-                                        scheduler, 1);
-
-  EXPECT_FALSE(channel->current_controlled_state().ok());
-  const auto result =
-      backend.command_gripper(gripper_request(binding, 0.01, 0.0));
-
-  ASSERT_TRUE(result.accepted);
-  const auto status = backend.get_gripper_status("gripper.target");
-  EXPECT_EQ(status.state, GripperCommandState::kCompleted);
-  const auto state = channel->current_controlled_state();
-  ASSERT_TRUE(state.ok()) << state.error().message;
-  ASSERT_EQ(state.value().positions.size(), 1U);
-  EXPECT_DOUBLE_EQ(
-      std::get<LinearPositionDTO>(state.value().positions.front()).value_m,
-      0.01);
-  EXPECT_EQ(
-      channel
-          ->project_latest(clock.now(), RetainedStateProjectionMode::kBlocking)
-          .status,
-      RetainedStateProjectionStatus::kApplied);
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     ComponentLocalTimedCommandRequiresPreviouslyPublishedState) {
-  auto binding = make_binding(CoordinateKind::kLinear, "gripper.target", true);
-  auto channel = std::make_shared<RetainedObservedStateChannel>(
-      binding, nullptr,
-      RetainedObservedStateChannelConfig{
-          ObservedStateSourceKind::kPredictedState, "logical-gripper", 0, 1U});
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(binding, channel, std::nullopt, clock,
-                                        scheduler);
-
-  const auto result =
-      backend.command_gripper(gripper_request(binding, 0.01, 0.5));
-
-  ASSERT_FALSE(result.accepted);
-  ASSERT_TRUE(result.error.has_value());
-  EXPECT_EQ(result.error->details.at("reason"), "observed_state_not_published");
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     RejectsCrossedIdentityAndUnitBeforeScheduling) {
-  auto binding = make_binding(CoordinateKind::kLinear);
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0});
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(
-      binding, channel, gripper_limits(binding), clock, scheduler);
-  auto crossed = gripper_request(binding, 0.02, 1.0);
-  crossed.actuation_kind = "angular";
-
-  const auto preflight = backend.validate_gripper_command(crossed);
-  ASSERT_FALSE(preflight.ok());
-  EXPECT_EQ(preflight.error().code, "invalid_request");
-  EXPECT_EQ(preflight.error().details.at("reason"), "gripper_invalid_command");
-
-  const auto result = backend.command_gripper(crossed);
-
-  ASSERT_FALSE(result.accepted);
-  ASSERT_TRUE(result.error.has_value());
-  EXPECT_EQ(result.error->code, "gripper_invalid_command");
-  EXPECT_EQ(channel->publish_calls(), 0);
-
-  auto outside_limits = gripper_request(binding, 2.0, 1.0);
-  const auto limit_preflight = backend.validate_gripper_command(outside_limits);
-  ASSERT_FALSE(limit_preflight.ok());
-  EXPECT_EQ(limit_preflight.error().code, "invalid_request");
-  EXPECT_EQ(limit_preflight.error().details.at("reason"),
-            "gripper_position_limit_violation");
-  EXPECT_EQ(channel->publish_calls(), 0);
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     RejectsNonFiniteStartPositionBeforeScheduling) {
-  auto binding = make_binding(CoordinateKind::kLinear);
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{std::numeric_limits<double>::quiet_NaN()});
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(
-      binding, channel, gripper_limits(binding), clock, scheduler);
-
-  const auto result =
-      backend.command_gripper(gripper_request(binding, 0.02, 1.0));
-
-  ASSERT_FALSE(result.accepted);
-  ASSERT_TRUE(result.error.has_value());
-  EXPECT_EQ(result.error->code, "gripper_state_not_finite");
-  EXPECT_EQ(channel->publish_calls(), 0);
-  EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
-            GripperCommandState::kIdle);
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     InvalidationFencesCommandsButKeepsObservedStateFresh) {
-  auto binding = make_binding(CoordinateKind::kLinear);
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0});
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(
-      binding, channel, gripper_limits(binding), clock, scheduler);
-  const auto first =
-      backend.command_gripper(gripper_request(binding, 0.02, 1.0));
-  ASSERT_TRUE(first.accepted);
-
-  backend.invalidate_gripper_commands(GripperInvalidationReason::kStop);
-  clock.advance(1'000'000'000);
-  scheduler.advance_to(clock.now());
-  const auto reset = backend.get_gripper_status("gripper.target");
-  EXPECT_EQ(reset.state, GripperCommandState::kIdle);
-  EXPECT_NE(reset.generation, first.generation);
-  EXPECT_EQ(channel->publish_calls(), 1);
-  const auto observed_while_fenced = channel->current_state(clock.now());
-  ASSERT_TRUE(observed_while_fenced.ok());
-  EXPECT_EQ(observed_while_fenced.value().received_timestamp_ns, clock.now());
-  const auto fenced_preflight =
-      backend.validate_gripper_command(gripper_request(binding, 0.01, 0.0));
-  ASSERT_FALSE(fenced_preflight.ok());
-  EXPECT_EQ(fenced_preflight.error().code, "gripper_command_not_authorized");
-  EXPECT_FALSE(
-      backend.command_gripper(gripper_request(binding, 0.01, 0.0)).accepted);
-
-  backend.authorize_gripper_commands();
-  const auto replacement =
-      backend.command_gripper(gripper_request(binding, 0.01, 0.0));
-  ASSERT_TRUE(replacement.accepted);
-  const auto busy_preflight =
-      backend.validate_gripper_command(gripper_request(binding, 0.015, 0.0));
-  ASSERT_FALSE(busy_preflight.ok());
-  EXPECT_EQ(busy_preflight.error().code, "gripper_busy");
-  scheduler.advance_to(clock.now());
-  EXPECT_NE(replacement.generation, first.generation);
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     AuthorizationMaintainsFreshIdleStateUntilACommandTakesOwnership) {
-  auto binding = make_binding(CoordinateKind::kLinear);
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0});
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(
-      binding, channel, gripper_limits(binding), clock, scheduler);
-  const auto first =
-      backend.command_gripper(gripper_request(binding, 0.02, 1.0));
-  ASSERT_TRUE(first.accepted);
-
-  backend.invalidate_gripper_commands(GripperInvalidationReason::kReset);
-  clock.advance(25'000'000);
-  backend.authorize_gripper_commands();
-  ASSERT_EQ(channel->publish_calls(), 1);
-  EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
-            GripperCommandState::kIdle);
-
-  clock.advance(10'000'000);
-  scheduler.advance_to(clock.now());
-  ASSERT_EQ(channel->publish_calls(), 2);
-  auto observed = channel->current_state(clock.now());
-  ASSERT_TRUE(observed.ok());
-  EXPECT_EQ(observed.value().received_timestamp_ns, clock.now());
-
-  clock.advance(10'000'000);
-  scheduler.advance_to(clock.now());
-  ASSERT_EQ(channel->publish_calls(), 3);
-
-  const auto replacement =
-      backend.command_gripper(gripper_request(binding, 0.01, 1.0));
-  ASSERT_TRUE(replacement.accepted);
-  clock.advance(10'000'000);
-  scheduler.advance_to(clock.now());
-  EXPECT_EQ(channel->publish_calls(), 4);
-  EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
-            GripperCommandState::kExecuting);
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     TerminalProjectionRetryIsBoundedAndVisible) {
-  auto binding = make_binding(CoordinateKind::kLinear);
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0});
-  channel->make_projection_busy(10);
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(
-      binding, channel, gripper_limits(binding), clock, scheduler, 1);
-  ASSERT_TRUE(
-      backend.command_gripper(gripper_request(binding, 0.02, 0.0)).accepted);
-
-  for (int attempt = 0; attempt < 12; ++attempt) {
-    clock.advance(1);
-    scheduler.advance_to(clock.now());
-  }
-
-  const auto failed = backend.get_gripper_status("gripper.target");
-  EXPECT_EQ(failed.state, GripperCommandState::kFailed);
-  EXPECT_EQ(failed.projection_state, GripperProjectionState::kFailed);
-  ASSERT_TRUE(failed.error.has_value());
-  EXPECT_EQ(failed.error->code, "gripper_projection_failed");
-  EXPECT_EQ(channel->project_calls(), 10);
-  const auto failed_preflight =
-      backend.validate_gripper_command(gripper_request(binding, 0.01, 0.0));
-  ASSERT_FALSE(failed_preflight.ok());
-  EXPECT_EQ(failed_preflight.error().code, "gripper_projection_failed");
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     PreflightInvalidationAndStaleGraspLossCannotResurrectOldAuthority) {
-  auto binding = make_binding(CoordinateKind::kLinear);
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0});
-  channel->block_read();
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(
-      binding, channel, gripper_limits(binding), clock, scheduler);
-  auto pending = std::async(std::launch::async, [&] {
-    return backend.command_gripper(gripper_request(binding, 0.02, 1.0));
-  });
-  ASSERT_TRUE(channel->wait_for_read());
-  backend.invalidate_gripper_commands(GripperInvalidationReason::kReset);
-  channel->release_read();
-  const auto rejected = pending.get();
-  ASSERT_FALSE(rejected.accepted);
-  ASSERT_TRUE(rejected.error.has_value());
-  EXPECT_EQ(rejected.error->code, "gripper_command_not_authorized");
-
-  backend.authorize_gripper_commands();
-  const auto replacement =
-      backend.command_gripper(gripper_request(binding, 0.01, 1.0));
-  ASSERT_TRUE(replacement.accepted);
-  const auto stale = backend.mark_gripper_grasp_lost(
-      "gripper.target", rejected.command_id, rejected.generation,
-      "pressure_switch", "delayed loss", "grasp_confirmation_lost");
-  EXPECT_FALSE(stale.accepted);
-  EXPECT_EQ(backend.get_gripper_status("gripper.target").generation,
-            replacement.generation);
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     InvalidationLinearizesAgainstDequeuedStatePublication) {
-  auto binding = make_binding(CoordinateKind::kLinear);
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0});
-  channel->block_publish();
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(
-      binding, channel, gripper_limits(binding), clock, scheduler);
-
-  const auto admitted =
-      backend.command_gripper(gripper_request(binding, 0.02, 0.0));
-  ASSERT_TRUE(admitted.accepted);
-  auto callback = std::async(std::launch::async,
-                             [&] { scheduler.advance_to(clock.now()); });
-  ASSERT_TRUE(channel->wait_for_publish());
-
-  auto invalidate = std::async(std::launch::async, [&] {
-    backend.invalidate_gripper_commands(GripperInvalidationReason::kReset);
-  });
-  EXPECT_EQ(invalidate.wait_for(20ms), std::future_status::timeout);
-
-  channel->release_publish();
-  callback.get();
-  invalidate.get();
-  const auto calls_after_invalidation = channel->publish_calls();
-  clock.advance(1'000'000'000);
-  scheduler.advance_to(clock.now());
-  EXPECT_EQ(channel->publish_calls(), calls_after_invalidation + 1);
-  EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
-            GripperCommandState::kIdle);
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     GraspLossAdvancesGenerationAndPreservesEvidence) {
-  auto binding = make_binding(CoordinateKind::kLinear);
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0});
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RetainedGripperCommandBackend backend(
-      binding, channel, gripper_limits(binding), clock, scheduler);
-  const auto admitted =
-      backend.command_gripper(gripper_request(binding, 0.02, 1.0));
-  ASSERT_TRUE(admitted.accepted);
-
-  const auto lost = backend.mark_gripper_grasp_lost(
-      "gripper.target", admitted.command_id, admitted.generation,
-      "pressure_switch", "pressure lost", "grasp_confirmation_lost");
-
-  ASSERT_TRUE(lost.accepted);
-  EXPECT_NE(lost.generation, admitted.generation);
-  const auto status = backend.get_gripper_status("gripper.target");
-  EXPECT_EQ(status.state, GripperCommandState::kFailed);
-  EXPECT_EQ(status.evidence_state, "pressure_or_part_lost");
-  ASSERT_FALSE(status.evidence.empty());
-  EXPECT_EQ(status.evidence.back(), "pressure_switch");
-}
-
-TEST(RetainedGripperCommandBackendTest,
-     SchedulerFailureAndInlineSideEffectsHaveTruthfulAdmission) {
-  auto binding = make_binding(CoordinateKind::kLinear);
-  FakeClock clock;
-  {
-    auto channel = std::make_shared<FakeRetainedStateChannel>(
-        binding, std::vector<double>{0.0});
-    RejectingScheduler scheduler;
-    RetainedGripperCommandBackend backend(
-        binding, channel, gripper_limits(binding), clock, scheduler);
-    const auto result =
-        backend.command_gripper(gripper_request(binding, 0.02, 1.0));
-    ASSERT_FALSE(result.accepted);
-    ASSERT_TRUE(result.error.has_value());
-    EXPECT_EQ(result.error->code, "gripper_request_failed");
-  }
-  {
-    auto channel = std::make_shared<FakeRetainedStateChannel>(
-        binding, std::vector<double>{0.0});
-    channel->make_projection_busy(1);
-    InlineScheduler scheduler;
-    RetainedGripperCommandBackend backend(
-        binding, channel, gripper_limits(binding), clock, scheduler, 1);
-    const auto result =
-        backend.command_gripper(gripper_request(binding, 0.02, 0.0));
-    EXPECT_TRUE(result.accepted);
-    EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
-              GripperCommandState::kCompleted);
-  }
-  {
-    auto channel = std::make_shared<FakeRetainedStateChannel>(
-        binding, std::vector<double>{0.0});
-    InlineThenThrowScheduler scheduler;
-    RetainedGripperCommandBackend backend(
-        binding, channel, gripper_limits(binding), clock, scheduler);
-    const auto result =
-        backend.command_gripper(gripper_request(binding, 0.02, 0.0));
-    EXPECT_TRUE(result.accepted);
-    EXPECT_EQ(backend.get_gripper_status("gripper.target").state,
-              GripperCommandState::kCompleted);
-  }
-}
-
-TEST(RoboPlanExecutionBackendTest,
-     RejectsCrossedStateChannelAndLinearTrajectoryTarget) {
-  auto motion = make_binding(CoordinateKind::kAngular, "arm.target");
-  auto other = make_binding(CoordinateKind::kAngular, "other.target");
-  auto crossed = std::make_shared<FakeRetainedStateChannel>(
-      other, std::vector<double>{0.0, 0.0});
-  AutoAdvanceClock clock;
-  EXPECT_THROW(RoboPlanExecutionBackend(motion, crossed, clock),
-               std::invalid_argument);
-
-  auto linear = make_binding(CoordinateKind::kLinear);
-  auto linear_channel = std::make_shared<FakeRetainedStateChannel>(
-      linear, std::vector<double>{0.0});
-  EXPECT_THROW(RoboPlanExecutionBackend(linear, linear_channel, clock),
-               std::invalid_argument);
-}
-
-TEST(RoboPlanExecutionBackendTest,
-     ExecutesExactTrajectoryAndPublishesAuthoritativeTerminalState) {
-  auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0, 0.0});
-  AutoAdvanceClock clock;
-  RoboPlanExecutionBackend backend(binding, channel, clock);
-
-  const auto handle = backend.execute_trajectory(trajectory(binding));
-
-  ASSERT_NE(handle.execution_generation, 0U);
-  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000));
-  const auto snapshot = handle.get_snapshot();
-  EXPECT_EQ(snapshot.state, ExecutionState::kCompleted);
-  EXPECT_EQ(snapshot.joint_positions_rad, (std::vector<double>{0.2, -0.3}));
-  const auto state = channel->current_controlled_state();
-  ASSERT_TRUE(state.ok());
-  EXPECT_DOUBLE_EQ(
-      std::get<AngularPositionDTO>(state.value().positions[0]).value_rad, 0.2);
-  EXPECT_DOUBLE_EQ(
-      std::get<AngularPositionDTO>(state.value().positions[1]).value_rad, -0.3);
-  EXPECT_TRUE(backend.sync_observed_state_before_planning().ok());
-}
-
-TEST(RoboPlanExecutionBackendTest,
-     MaintainsFreshOwnerIssuedMotionStateWhileIdle) {
-  auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.1, -0.2});
-  FakeClock clock;
-  ManualScheduler scheduler;
-  RoboPlanExecutionBackend backend(binding, channel, clock, scheduler);
-
-  const int initial_publications = channel->publish_calls();
-  ASSERT_GT(initial_publications, 0);
-  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::RuntimeSafety);
-
-  clock.advance(10'000'000);
-  scheduler.advance_to(clock.now());
-  EXPECT_EQ(channel->publish_calls(), initial_publications + 1);
-  const auto observed = channel->current_state(clock.now());
-  ASSERT_TRUE(observed.ok());
-  EXPECT_EQ(observed.value().received_timestamp_ns, clock.now());
-  ASSERT_TRUE(observed.value().velocities.has_value());
-  ASSERT_EQ(observed.value().velocities->size(), 2U);
-  EXPECT_DOUBLE_EQ(
-      std::get<AngularVelocityDTO>((*observed.value().velocities)[0])
-          .value_rad_s,
-      0.0);
-  EXPECT_DOUBLE_EQ(
-      std::get<AngularVelocityDTO>((*observed.value().velocities)[1])
-          .value_rad_s,
-      0.0);
-}
-
-TEST(RoboPlanExecutionBackendTest,
-     ResetRemainsBoundedThroughTheAddressedStateChannel) {
-  auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0, 0.0});
-  FakeClock clock;
-  RoboPlanExecutionBackend backend(binding, channel, clock);
-  auto active = backend.execute_trajectory(trajectory(binding, 1.0));
-  EXPECT_TRUE(backend.reset().accepted);
-  EXPECT_EQ(backend.get_execution_snapshot().state, ExecutionState::kIdle);
-  (void)active;
-}
-
-TEST(RoboPlanExecutionBackendTest,
-     ProjectionContentionDoesNotDiscardOwnerIssuedState) {
-  auto binding = make_binding(CoordinateKind::kAngular, "arm.target");
-  auto channel = std::make_shared<FakeRetainedStateChannel>(
-      binding, std::vector<double>{0.0, 0.0});
-  channel->make_projection_busy(4);
-  AutoAdvanceClock clock;
-  RoboPlanExecutionBackend backend(binding, channel, clock);
-
-  auto handle = backend.execute_trajectory(trajectory(binding));
-  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000));
-  const auto state = channel->current_controlled_state();
-  ASSERT_TRUE(state.ok());
-  EXPECT_DOUBLE_EQ(
-      std::get<AngularPositionDTO>(state.value().positions[0]).value_rad, 0.2);
-  EXPECT_GT(channel->publish_calls(), 0);
-  EXPECT_GT(backend.scene_projection_metrics().misses_total, 0U);
-}
-
-class GripperRuntimeOwnerTestBackend final : public IGripperCommandBackend {
+class GripperRuntimeOwnerTestBackend final : public IGripperCommandBackend,
+                                           public IControlDomainExecutionPort {
  public:
   explicit GripperRuntimeOwnerTestBackend(std::string gripper_id) {
     status.gripper_id = std::move(gripper_id);
@@ -1652,6 +842,12 @@ class GripperRuntimeOwnerTestBackend final : public IGripperCommandBackend {
   }
 
   void authorize_gripper_commands() noexcept override {}
+
+  ParticipantStopStageResultDTO TranslateStopStage(
+      const ResolvedParticipantStopStageDTO&, const RemainingStopBudgetDTO&,
+      std::stop_token) override {
+    throw std::logic_error("gripper owner fixture does not execute Stop stages");
+  }
 
   void set_state(const GripperCommandState state) {
     std::lock_guard lock(mutex);
@@ -1900,19 +1096,40 @@ TEST(RetainedNativeGripperRuntimeTest, RouteRebindRefusesAnActiveOrMismatchedGri
   EXPECT_EQ(owner.state_channel(), candidate_channel);
 }
 
-TEST(RetainedNativeGripperRuntimeTest, NativeFactoryOwnsGripperBackendSchedulerAndStopPort) {
+TEST(RetainedNativeGripperRuntimeTest, SelectedBackendOwnerRetainsSchedulerAndStopPort) {
   auto binding = make_binding(CoordinateKind::kLinear, "gripper.target", true);
   auto state_channel =
       std::make_shared<FakeRetainedStateChannel>(binding, std::vector<double>{0.0});
   auto clock = std::make_shared<FakeClock>();
   auto scheduler = std::make_shared<ManualScheduler>();
+  auto selected_backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
+      binding.value().command_target_id.value());
+  const std::weak_ptr<GripperRuntimeOwnerTestBackend> backend_lifetime = selected_backend;
+  const std::weak_ptr<ManualScheduler> scheduler_lifetime = scheduler;
+  std::optional<RuntimeParticipantBinding> rebound_binding;
+  std::shared_ptr<IRetainedObservedStateChannel> rebound_channel;
 
-  auto owner = RetainedNativeGripperRuntime::CreateNative(binding, state_channel, clock, scheduler,
-                                                          std::nullopt, std::nullopt);
+  auto owner = std::make_unique<RetainedNativeGripperRuntime>(
+      RetainedNativeGripperRuntimeInput{
+          binding, selected_backend, clock, state_channel, selected_backend.get(),
+          std::nullopt, false,
+          [&](const RuntimeParticipantBinding& candidate,
+              const std::shared_ptr<IRetainedObservedStateChannel>& candidate_channel,
+              const std::optional<RuntimeParticipantStopReadiness>& readiness) {
+            EXPECT_FALSE(readiness.has_value());
+            rebound_binding = candidate;
+            rebound_channel = candidate_channel;
+            return Result<void>::Ok();
+          },
+          scheduler, std::nullopt});
+  selected_backend.reset();
+  scheduler.reset();
 
   ASSERT_NE(owner, nullptr);
-  auto* backend = dynamic_cast<RetainedGripperCommandBackend*>(owner->backend());
+  auto* backend = dynamic_cast<GripperRuntimeOwnerTestBackend*>(owner->backend());
   ASSERT_NE(backend, nullptr);
+  EXPECT_FALSE(backend_lifetime.expired());
+  EXPECT_FALSE(scheduler_lifetime.expired());
   ASSERT_NE(owner->participant_engine(), nullptr);
   EXPECT_NE(dynamic_cast<GripperParticipantEngine*>(owner->registration().engine), nullptr);
   EXPECT_EQ(owner->state_channel(), state_channel);
@@ -1923,6 +1140,9 @@ TEST(RetainedNativeGripperRuntimeTest, NativeFactoryOwnsGripperBackendSchedulerA
   auto candidate_channel =
       std::make_shared<FakeRetainedStateChannel>(candidate, std::vector<double>{0.0});
   ASSERT_TRUE(owner->RebindRoute(candidate, candidate_channel, std::nullopt).ok());
+  ASSERT_TRUE(rebound_binding.has_value());
+  EXPECT_EQ(rebound_binding->value(), candidate.value());
+  EXPECT_EQ(rebound_channel, candidate_channel);
   EXPECT_EQ(owner->backend(), backend);
   EXPECT_EQ(owner->binding().value(), candidate.value());
   EXPECT_EQ(owner->state_channel(), candidate_channel);
@@ -2234,12 +1454,18 @@ TEST(RetainedNativeGripperRuntimeTest,
   auto scheduler = std::make_shared<ManualScheduler>();
   auto wake = std::make_shared<RetainedObservationWake>();
 
-  auto owner = RetainedNativeGripperRuntime::CreateNativeWithOwnedStateChannel(
+  auto state_channel = std::make_shared<RetainedObservedStateChannel>(
       binding, nullptr,
       RetainedObservedStateChannelConfig{
           ObservedStateSourceKind::kPredictedState, "native.gripper.local",
           1'000, 1U},
-      clock, scheduler, wake, std::nullopt, std::nullopt);
+      clock.get(), wake);
+  auto selected_backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
+      binding.value().command_target_id.value());
+  auto owner = std::make_unique<RetainedNativeGripperRuntime>(
+      RetainedNativeGripperRuntimeInput{
+          binding, selected_backend, clock, state_channel, selected_backend.get(),
+          std::nullopt, false, {}, scheduler, std::nullopt});
 
   ASSERT_NE(owner, nullptr);
   auto channel =
@@ -2273,16 +1499,15 @@ TEST(RetainedNativeGripperRuntimeTest,
      OwnedChannelRejectsModelBackedBindingWithoutProjector) {
   auto binding = make_binding(CoordinateKind::kLinear, "gripper.model", false);
   auto clock = std::make_shared<FakeClock>();
-  auto scheduler = std::make_shared<ManualScheduler>();
   auto wake = std::make_shared<RetainedObservationWake>();
 
   EXPECT_THROW(
-      RetainedNativeGripperRuntime::CreateNativeWithOwnedStateChannel(
+      RetainedObservedStateChannel(
           binding, nullptr,
           RetainedObservedStateChannelConfig{
               ObservedStateSourceKind::kPredictedState,
               "native.gripper.model", 1'000, 1U},
-          clock, scheduler, wake, std::nullopt, std::nullopt),
+          clock.get(), wake),
       std::invalid_argument);
 }
 

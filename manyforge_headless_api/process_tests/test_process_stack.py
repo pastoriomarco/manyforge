@@ -21,7 +21,7 @@ from scripts.qualification.control_client_fixture import composer_snapshot_strea
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.manager import ManagerCommandClient
-from manyforge_headless_api.models import ManagerDeploymentCandidatePreviewRequest
+from manyforge_headless_api.models import ManagerDeploymentCandidatePreviewRequest, PreparedScenarioOrigin
 from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
 
 
@@ -178,12 +178,12 @@ class ProcessStack:
     def prepare_native_package(
         self, admission_filename: str, *, ros2_control: bool = False
     ) -> None:
-        """Install one exact retained package's native process executables.
+        """Install one exact retained package's selected process executables.
 
-        `ros2_control` also installs the ROS execution host beside Manager, for
-        cells whose runtime unit is the ros2_control mock lane. Its caller's
-        environment must already carry the sourced ROS bringup overlay, which
-        Manager's children inherit.
+        The selected product uses the ROS execution host beside Manager.
+        The caller's environment must carry the sourced ROS bringup overlay,
+        which Manager's children inherit. The legacy keyword is retained for
+        existing callers; executable selection always follows the ROS lane.
         """
 
         self.manager_admission_filename = admission_filename
@@ -194,15 +194,13 @@ class ProcessStack:
         installed_root.mkdir(exist_ok=True)
         installed_sources = {
             "manyforge_manager_daemon": self.manager_executable,
-            "manyforge_native_execution_host": _required_path("MANYFORGE_NATIVE_EXECUTION_HOST"),
+            "manyforge_ros2_control_execution_host": _required_path(
+                "MANYFORGE_ROS2_CONTROL_EXECUTION_HOST"
+            ),
             "manyforge_roboplan_candidate_worker": _required_path(
                 "MANYFORGE_ROBOPLAN_CANDIDATE_WORKER"
             ),
         }
-        if ros2_control:
-            installed_sources["manyforge_ros2_control_execution_host"] = _required_path(
-                "MANYFORGE_ROS2_CONTROL_EXECUTION_HOST"
-            )
         for installed_name, source in installed_sources.items():
             assert source.is_file() and os.access(source, os.X_OK)
             shutil.copy2(source, installed_root / installed_name)
@@ -693,9 +691,9 @@ def _assistant_stack(
             prepared_activation = dict(metadata["prepared_activations"][scenario_id])
             assert prepared_activation["program_id"] == fixture_program["program_id"]
             assert prepared_activation["node_environment_digest"] == environment_digest
-            metadata["source_document_digest"] = prepared_activation[
-                "source_document_digest"
-            ]
+            origin = PreparedScenarioOrigin.model_validate(prepared_activation["origin"])
+            assert origin.scenario_id == scenario_id
+            metadata["source_document_digest"] = origin.source_document_digest
             apply_body = {
                 "request_id": "assistant-native.process.apply",
                 "request_owner_epoch": initial["source"]["source_owner_epoch"],

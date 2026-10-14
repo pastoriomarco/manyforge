@@ -1,4 +1,5 @@
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 
 #include <algorithm>
 #include <map>
@@ -19,9 +20,9 @@ using TargetKey = std::pair<core::ControllableComponentId, core::CommandTargetId
 
 } // namespace
 
-native_execution_runtime_contract::Configuration
+execution_runtime_contract::Configuration
 detail::select_native_component_configuration(
-    native_execution_runtime_contract::Configuration result,
+    execution_runtime_contract::Configuration result,
     const core::CellGraphDTO &graph, const core::RuntimeUnitId &runtime_unit_id,
     const core::ControllableComponentId &component_id) {
   const auto component = std::find_if(

@@ -93,6 +93,12 @@ add_library(manyforge_core
   src/observed_robot_state_provider.cpp
   src/pose_math.cpp
   src/resource_addressed_execution_kernel.cpp
+  src/resource_addressed_kernel_admission.cpp
+  src/resource_addressed_kernel_runtime.cpp
+  src/resource_addressed_kernel_status.cpp
+  src/resource_addressed_kernel_operations.cpp
+  src/resource_addressed_kernel_events.cpp
+  src/resource_addressed_kernel_stop.cpp
   src/resolved_stop_base_plan_codec.cpp
   src/resolved_stop_base_plan_decoder.cpp
   src/prepared_participant_stop_plan_codec.cpp

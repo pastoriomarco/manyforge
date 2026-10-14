@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
@@ -31,21 +32,21 @@ inline constexpr std::string_view kCellHostRuntimeUnitId =
 inline constexpr std::string_view kStatusEndpointRoleId =
     "ros2_control_execution_status";
 inline constexpr std::string_view kProjectionEndpointRoleId =
-    "planner_scene_projection";
+    execution_runtime_contract::kProjectionEndpointRoleId;
 inline constexpr std::string_view kLogicalSceneEndpointRoleId =
-    "logical_scene_services";
+    execution_runtime_contract::kLogicalSceneEndpointRoleId;
 inline constexpr std::string_view kImplementationId =
     "manyforge.ros2_control_execution_host";
 inline constexpr std::string_view kProcessAdapterContractId =
-    "manyforge.installed_execution_target";
+    execution_runtime_contract::kProcessAdapterContractId;
 inline constexpr std::string_view kRetrievalContractId =
-    "manyforge.retained_raw_artifact";
+    execution_runtime_contract::kRetrievalContractId;
 inline constexpr std::string_view kStatusEndpointContractId =
     "manyforge.ros2_control_execution.status_direct";
 inline constexpr std::string_view kProjectionEndpointContractId =
-    "manyforge.planner_scene_projection.rpc";
+    execution_runtime_contract::kProjectionEndpointContractId;
 inline constexpr std::string_view kLogicalSceneEndpointContractId =
-    "manyforge.logical_scene.services";
+    execution_runtime_contract::kLogicalSceneEndpointContractId;
 // These are immutable public API identities, not endpoint-contract revisions.
 // Their semantic owner is the ros2_control execution host.
 inline constexpr std::string_view kRuntimeRoleApiContractId =
@@ -56,13 +57,14 @@ inline constexpr std::string_view kProjectionEndpointApiContractId =
     "manyforge.api.ros2_control.projection";
 inline constexpr std::string_view kLogicalSceneEndpointApiContractId =
     "manyforge.api.ros2_control.logical_scene";
-inline constexpr std::string_view kOperatingSystem = "linux";
+inline constexpr std::string_view kOperatingSystem =
+    execution_runtime_contract::kOperatingSystem;
 inline constexpr std::string_view kLaunchEnvironmentContract =
     "manyforge.ros2_control_execution_host.abi.v1";
 inline constexpr std::string_view kInstalledTargetId =
     "manyforge_ros2_control_execution_host";
 inline constexpr std::string_view kCandidateWorkerInstalledTargetId =
-    "manyforge_roboplan_candidate_worker";
+    execution_runtime_contract::kCandidateWorkerInstalledTargetId;
 
 struct Configuration final {
   /// Deployment-authored fault Stop profile of one motion target, read
@@ -103,7 +105,7 @@ struct Configuration final {
   std::uint32_t planner_rng_seed{};
   std::vector<double> initial_joint_positions_rad;
   std::vector<
-      native_execution_runtime_contract::Configuration::MotionTargetLimit>
+      execution_runtime_contract::Configuration::MotionTargetLimit>
       motion_target_limits;
   /// At most one per hosted motion target; absent targets have no fault
   /// Stop profile (as `main` without `default_fault_stop_profile`).
@@ -111,7 +113,7 @@ struct Configuration final {
   /// Authored gripper target configurations (offline mock profiles carry the
   /// native profiles' values unchanged; Isaac profiles have none).
   std::vector<
-      native_execution_runtime_contract::Configuration::GripperTargetConfiguration>
+      execution_runtime_contract::Configuration::GripperTargetConfiguration>
       gripper_target_configurations;
   std::uint32_t execution_tick_hz{};
   double collision_monitor_period_ms{};

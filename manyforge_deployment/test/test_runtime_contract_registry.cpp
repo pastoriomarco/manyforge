@@ -35,7 +35,7 @@ TEST(RuntimeContractRegistry, OldSealedRosProfileRefusesWithRecompileGuidance) {
 
 TEST(RuntimeContractRegistry, PackageAndEmbeddedOffersAreOneExactValue) {
   const auto &registry = runtime_contract_declaration_registry();
-  ASSERT_EQ(registry.contracts().size(), 3U);
+  ASSERT_EQ(registry.contracts().size(), 2U);
   ASSERT_EQ(registry.package_manifest_set().offers.size(),
             registry.contracts().size());
   ASSERT_TRUE(
@@ -95,7 +95,7 @@ TEST(RuntimeContractRegistry,
 }
 
 TEST(RuntimeContractRegistry,
-     NativeAndRos2ControlOffersIncludeCanonicalLogicalSceneCapabilities) {
+     Ros2ControlOfferRetainsCanonicalLogicalSceneCapabilitiesAfterNativeRetirement) {
   const auto &registry = runtime_contract_declaration_registry();
   const auto check_offer = [&](const auto &offer, std::size_t expected_size) {
     ASSERT_EQ(offer.provided_capabilities.size(), expected_size);
@@ -136,9 +136,8 @@ TEST(RuntimeContractRegistry,
         return row.offer().runtime_implementation_id.value() ==
                ros2_control_execution_runtime_contract::kImplementationId;
       });
-  ASSERT_NE(native, registry.contracts().end());
+  EXPECT_EQ(native, registry.contracts().end());
   ASSERT_NE(ros2_control, registry.contracts().end());
-  check_offer(native->offer(), 36U);
   check_offer(ros2_control->offer(), 39U);
   const auto has_operation_scale = [](const auto &offer) {
     return std::any_of(offer.provided_capabilities.begin(),
@@ -147,8 +146,20 @@ TEST(RuntimeContractRegistry,
                                 "execution.runtime_scale.operation_scoped";
                        });
   };
-  EXPECT_TRUE(has_operation_scale(native->offer()));
   EXPECT_FALSE(has_operation_scale(ros2_control->offer()));
+}
+
+TEST(RuntimeContractRegistry, RetiredNativeProductIsUnavailableBeforeAdmission) {
+  const auto &contracts = runtime_contract_declaration_registry().contracts();
+  EXPECT_EQ(std::find_if(contracts.begin(), contracts.end(), [](const auto &row) {
+              return row.runtime_profile_id().value() ==
+                     "manyforge.native_execution_runtime";
+            }), contracts.end());
+  EXPECT_THROW(static_cast<void>(detail::require_runtime_contract(
+      core::RuntimeProfileId("manyforge.native_execution_runtime"),
+      core::RuntimeProfileRevision("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+      core::ProductContractId(std::string(native_execution_runtime_contract::kProductContractId)),
+      core::ProductContractRevision("sha256:0000000000000000000000000000000000000000000000000000000000000000"))), RetainedBundleError);
 }
 
 TEST(RuntimeContractRegistry,

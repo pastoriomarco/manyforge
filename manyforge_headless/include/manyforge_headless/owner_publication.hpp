@@ -8,7 +8,7 @@
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
-#include <manyforge_scene/canonical_empty_scene_owner.hpp>
+#include <manyforge_scene/logical_scene_owner.hpp>
 
 #include <manyforge_headless/scene_runtime_state_owner.hpp>
 #include <manyforge_headless/source_contract.hpp>

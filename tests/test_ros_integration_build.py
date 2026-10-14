@@ -16,10 +16,10 @@ HELPER = ROOT / "scripts/ros/build-ros2-control-runtime.sh"
 PIN = "aa9f9ef9525a60f8becea322537dd1d6d1bf9123"
 
 
-def test_managed_native_host_and_worker_keep_the_same_artifact_directory() -> None:
+def test_managed_ros_host_and_worker_keep_the_same_artifact_directory() -> None:
     source = (ROOT / "scripts/ros/ros-integration/CMakeLists.txt").read_text()
     targets = source.split("set_target_properties(", 1)[1].split("PROPERTIES", 1)[0].split()
-    assert {"manyforge_native_execution_host", "manyforge_roboplan_candidate_worker"} <= set(targets)
+    assert {"manyforge_ros2_control_execution_host", "manyforge_roboplan_candidate_worker"} <= set(targets)
     assert 'RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"' in source
 
 
@@ -197,10 +197,15 @@ def test_graph_library_types_survive_identical_reconfigure(
         cmake += f"add_library({package} source.cpp)\n"
         if package == "manyforge_roboplan":
             for target in ("manyforge_ros2_control_execution_host",
-                           "manyforge_native_execution_host",
                            "manyforge_roboplan_candidate_worker"):
                 cmake += f"add_executable({target} source.cpp)\n"
         (directory / "CMakeLists.txt").write_text(cmake)
+        if package == "manyforge_ros2_control_execution":
+            # The report-only target is excluded from ALL, but CMake still
+            # requires its source to exist while configuring this small graph.
+            perf = directory / "test/perf/perf_ros2_control_hot_paths.cpp"
+            perf.parent.mkdir(parents=True)
+            perf.write_text("int main() { return 0; }\n")
         targets.append(package)
     with (graph / "CMakeLists.txt").open("a") as out:
         output = "".join(f"{target}=$<TARGET_PROPERTY:{target},TYPE>\n"

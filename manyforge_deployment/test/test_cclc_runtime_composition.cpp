@@ -906,6 +906,229 @@ struct InstalledContextFixture final {
   UnusedKernelPublicationOwner publication_owner;
 };
 
+struct InstalledEmptyContextFixture final {
+  InstalledEmptyContextFixture(std::shared_ptr<const RetainedBundle> retained,
+                               core::ActiveBundlePublicationReceiptDTO receipt,
+                               const std::filesystem::path& root,
+                               core::BuildOwnedLifecyclePlanCatalogSource source)
+      : bundle(std::move(retained)),
+        reader(std::move(receipt)),
+        artifacts(root),
+        catalogs(std::move(source)) {}
+  std::shared_ptr<const RetainedBundle> bundle;
+  ActivePublicationReader reader;
+  FilesystemVerifiedRetainedProductArtifactSource artifacts;
+  core::BuildOwnedLifecyclePlanCatalogSource catalogs;
+  UnusedKernelPublicationOwner publication_owner;
+};
+
+TEST(CCLCRuntimeComposition, ExchangesVerifiedNonemptyToEmptyOnSameFacadeAndRetainsDependencies) {
+  ScopedTrustedRoot root;
+  const auto empty_package = root.path() / "canonical-empty";
+  ASSERT_TRUE(std::filesystem::create_directory(empty_package));
+  const auto generated = detail::generate_canonical_empty_package(empty_package);
+  const FilesystemCanonicalEmptyRetainedBundleSource admission_source(empty_package);
+  const auto admission = admission_source.load_verified();
+  EXPECT_EQ(admission.admission_digest(), generated.admission_digest());
+  const FilesystemVerifiedRetainedBundleSource empty_source(empty_package);
+  const auto empty_bundle = empty_source.get_verified(admission.retained_bundle_id());
+  ASSERT_NE(empty_bundle, nullptr);
+  EXPECT_EQ(empty_bundle->canonical_bytes(), admission.retained_bundle().canonical_bytes());
+  const auto& empty_graph = empty_bundle->value().cell_graph;
+  ASSERT_TRUE(empty_graph.controllable_components.empty());
+  ASSERT_TRUE(empty_graph.control_domains.empty());
+  ASSERT_TRUE(empty_graph.control_bindings.empty());
+  ASSERT_TRUE(empty_bundle->value().desired_control_configurations.empty());
+
+  // Materialize a real populated predecessor for the same cell; no graph or
+  // retained identity is spliced to manufacture an empty successor.
+  const auto retained = test::materialize_lite6_retained_consumer_fixture_from(
+      root.path(), test::make_lite6_controllable_retention_fixture(false, false, 1U, false, false,
+                                                                   empty_graph.cell_id.value()));
+  const auto previous = publication(*retained.bundle);
+  const auto& graph = retained.bundle->value().cell_graph;
+  ASSERT_FALSE(graph.controllable_components.empty());
+  ASSERT_FALSE(graph.control_bindings.empty());
+  const auto& binding = graph.control_bindings.front();
+  const auto domain = std::find_if(
+      graph.control_domains.begin(), graph.control_domains.end(),
+      [&](const auto& row) { return row.control_domain_id == binding.control_domain_id; });
+  ASSERT_NE(domain, graph.control_domains.end());
+  const auto catalog = catalog_for(binding);
+  const std::vector<core::ResolvedLifecycleProviderOccurrenceDTO> providers{
+      {domain->control_domain_id, domain->control_domain_revision, binding.provider_instance_id,
+       binding.provider_manifest_id, binding.provider_manifest_revision,
+       binding.provider_runtime_unit_id, core::RuntimeEpoch("context.nonempty.epoch"),
+       catalog.catalog_digest}};
+  auto original =
+      std::make_shared<InstalledContextFixture>(retained.bundle, previous, root.path(), catalog);
+  UnusedKernelPorts kernel;
+  UnusedKernelPublicationOwner publication_owner;
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto composition = CCLCRuntimeComposition::Create(
+      configuration(root.path(), graph.cell_id, "empty-exchange"), retained.bundle,
+      original->reader, previous, original->artifacts, original->catalogs, providers,
+      controller_sources(*retained.bundle), {}, {}, {}, kernel, kernel, publication_owner, clock,
+      scheduler);
+  ASSERT_TRUE(composition.ok()) << composition.error().message;
+  ASSERT_TRUE(composition.value()->Start().ok());
+  // Join the unrelated startup follower so only this test's explicit pin
+  // controls pending exchange; owner, journal and transports stay running.
+  composition.value()->lifecycle_target_driver().Stop();
+  const auto owner = composition.value()->coordinator().request_owner_epoch();
+  const auto socket_path = composition.value()->open_request_socket_path();
+  struct stat socket_before {};
+  ASSERT_EQ(::stat(socket_path.c_str(), &socket_before), 0);
+
+  auto successor = publication(*empty_bundle);
+  successor.request.transaction_ref = core::NamedApplyPublicationTransactionDTO{
+      core::ApplyId("context.empty.apply"), core::ApplyGeneration(1U)};
+  successor.request.expected_previous_publication_generation = previous.publication_generation;
+  successor.publication_generation =
+      core::ActiveBundlePublicationGeneration(previous.publication_generation.value() + 1U);
+  successor.durable_public_pointer_content_digest = core::ContentDigest("context.empty.pointer");
+  ASSERT_TRUE(successor.valid());
+  auto catalogs = core::BuildOwnedLifecyclePlanCatalogSource::Make({});
+  ASSERT_TRUE(catalogs.ok()) << catalogs.error().message;
+  auto installed = std::make_shared<InstalledEmptyContextFixture>(
+      empty_bundle, successor, empty_package, std::move(catalogs.value()));
+  const std::weak_ptr<InstalledEmptyContextFixture> lifetime = installed;
+  const auto inputs = [&] {
+    return CCLCProductContextInputs{installed->bundle,
+                                    installed->reader,
+                                    successor,
+                                    installed->artifacts,
+                                    installed->catalogs,
+                                    {},
+                                    {},
+                                    {},
+                                    {},
+                                    {},
+                                    {},
+                                    nullptr,
+                                    installed->publication_owner,
+                                    installed};
+  };
+  auto unowned = inputs();
+  unowned.installed_product_lifetime.reset();
+  EXPECT_FALSE(composition.value()->PrepareProductContext(std::move(unowned)).ok());
+  auto wrong_predecessor = inputs();
+  wrong_predecessor.expected_publication.request.expected_previous_publication_generation =
+      core::ActiveBundlePublicationGeneration(previous.publication_generation.value() + 1U);
+  wrong_predecessor.expected_publication.publication_generation =
+      core::ActiveBundlePublicationGeneration(successor.publication_generation.value() + 1U);
+  ASSERT_TRUE(wrong_predecessor.expected_publication.valid());
+  const auto predecessor_refused =
+      composition.value()->PrepareProductContext(std::move(wrong_predecessor));
+  ASSERT_FALSE(predecessor_refused.ok());
+  EXPECT_EQ(predecessor_refused.error().details.at("reason"),
+            "prepared_product_predecessor_mismatch");
+  auto wrong_head = inputs();
+  wrong_head.expected_publication.durable_public_pointer_content_digest =
+      core::ContentDigest("foreign.empty.pointer");
+  const auto head_refused = composition.value()->PrepareProductContext(std::move(wrong_head));
+  ASSERT_FALSE(head_refused.ok());
+  EXPECT_EQ(head_refused.error().details.at("reason"),
+            "prepared_product_publication_mismatch");
+  auto wrong_bundle = inputs();
+  wrong_bundle.retained_bundle = retained.bundle;
+  EXPECT_FALSE(composition.value()->PrepareProductContext(std::move(wrong_bundle)).ok());
+
+  auto prepared = composition.value()->PrepareProductContext(inputs());
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  installed.reset();
+  ASSERT_FALSE(lifetime.expired());
+  {
+    auto old_pin = composition.value()->coordinator().AcquireProductPin();
+    ASSERT_TRUE(old_pin.ok());
+    EXPECT_FALSE(old_pin.value().context().identity->configured_components.empty());
+    const auto pending =
+        composition.value()->TryExchangeProductContext(*prepared.value(), owner, previous);
+    ASSERT_TRUE(pending.ok()) << pending.error().message;
+    EXPECT_EQ(pending.value().phase, core::ComponentLifecycleProductExchangePhase::kPending)
+        << pending.value().reason;
+    EXPECT_FALSE(composition.value()->coordinator().AcquireProductPin().ok());
+    EXPECT_FALSE(lifetime.expired());
+    EXPECT_EQ(old_pin.value().context().identity->publication, previous);
+    EXPECT_TRUE(old_pin.value()
+                    .context()
+                    .current_snapshot_source
+                    .ReadCurrentComponentSnapshot(
+                        graph.controllable_components.front().controllable_component_id)
+                    .ok());
+    const auto foreign_owner = composition.value()->TryExchangeProductContext(
+        *prepared.value(), core::RequestOwnerEpoch("foreign.empty.owner"), previous);
+    ASSERT_FALSE(foreign_owner.ok());
+    EXPECT_EQ(foreign_owner.error().details.at("reason"),
+              "prepared_product_predecessor_foreign");
+    auto foreign_previous = previous;
+    foreign_previous.durable_public_pointer_content_digest =
+        core::ContentDigest("foreign.predecessor.pointer");
+    EXPECT_FALSE(composition.value()
+                     ->TryExchangeProductContext(*prepared.value(), owner, foreign_previous)
+                     .ok());
+    EXPECT_TRUE(composition.value()->coordinator().AcquireProductPin().ok());
+  }
+  const auto completed =
+      composition.value()->TryExchangeProductContext(*prepared.value(), owner, previous);
+  ASSERT_TRUE(completed.ok()) << completed.error().message;
+  EXPECT_EQ(completed.value().phase, core::ComponentLifecycleProductExchangePhase::kCompleted)
+      << completed.value().reason;
+  EXPECT_EQ(completed.value().owner_epoch, owner);
+  EXPECT_EQ(completed.value().previous_publication, previous);
+  EXPECT_EQ(completed.value().current_publication, successor);
+  prepared.value().reset();
+  ASSERT_FALSE(lifetime.expired());
+  {
+    auto empty_pin = composition.value()->coordinator().AcquireProductPin();
+    ASSERT_TRUE(empty_pin.ok());
+    ASSERT_TRUE(empty_pin.value().context().identity);
+    EXPECT_EQ(empty_pin.value().context().identity->publication, successor);
+    EXPECT_TRUE(empty_pin.value().context().identity->configured_components.empty());
+    // Exercise the borrowed sources after both caller-owned lifetime handles
+    // have been released: removed membership is refused by the actual source.
+    EXPECT_FALSE(empty_pin.value()
+                     .context()
+                     .current_snapshot_source
+                     .ReadCurrentComponentSnapshot(
+                         graph.controllable_components.front().controllable_component_id)
+                     .ok());
+    EXPECT_FALSE(empty_pin.value()
+                     .context()
+                     .lifecycle_plan_catalog_source
+                     .LoadExactLifecyclePlanCatalog(binding.provider_manifest_id,
+                                                    binding.provider_manifest_revision,
+                                                    catalog.catalog_digest)
+                     .ok());
+  }
+  EXPECT_EQ(composition.value()->coordinator().request_owner_epoch(), owner);
+  EXPECT_TRUE(composition.value()->coordinator().accepting_new_requests());
+  EXPECT_TRUE(composition.value()->LoadOpenCellObserverIncident().ok());
+  EXPECT_EQ(composition.value()->open_request_socket_path(), socket_path);
+  struct stat socket_after {};
+  ASSERT_EQ(::stat(socket_path.c_str(), &socket_after), 0);
+  EXPECT_EQ(socket_after.st_dev, socket_before.st_dev);
+  EXPECT_EQ(socket_after.st_ino, socket_before.st_ino);
+  using manyforge::content_identity::CanonicalValue;
+  const auto response = manyforge::content_identity::parse_canonical_json(
+      Exchange(socket_path,
+               manyforge::content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+                   {"api_version", CanonicalValue(std::string(core::kCCLCOpenRequestApiVersion))},
+                   {"command", CanonicalValue("owner_identity")},
+                   {"payload", CanonicalValue(CanonicalValue::Object{})}}))));
+  const auto* ok = response.find_object_member("ok");
+  ASSERT_NE(ok, nullptr);
+  ASSERT_TRUE(ok->as_bool());
+  const auto* result = response.find_object_member("result");
+  ASSERT_NE(result, nullptr);
+  const auto* observed_owner = result->find_object_member("request_owner_epoch");
+  ASSERT_NE(observed_owner, nullptr);
+  EXPECT_EQ(observed_owner->as_string(), owner.value());
+  composition.value().reset();
+  EXPECT_TRUE(lifetime.expired());
+}
+
 TEST(CCLCRuntimeComposition,
      PreparesOneOwnedProductAndExchangesWithoutOwnerOrTransportRotation) {
   ScopedTrustedRoot root;
@@ -940,6 +1163,8 @@ TEST(CCLCRuntimeComposition,
       kernel, publication_owner, clock, scheduler);
   ASSERT_TRUE(composition.ok()) << composition.error().message;
   ASSERT_TRUE(composition.value()->Start().ok());
+  // Join the unrelated startup follower before testing explicit pin drain.
+  composition.value()->lifecycle_target_driver().Stop();
   const auto owner = composition.value()->coordinator().request_owner_epoch();
   auto successor = previous;
   successor.request.transaction_ref = core::NamedApplyPublicationTransactionDTO{
@@ -982,7 +1207,8 @@ TEST(CCLCRuntimeComposition,
         *prepared.value(), owner, previous);
     ASSERT_TRUE(pending.ok()) << pending.error().message;
     EXPECT_EQ(pending.value().phase,
-              core::ComponentLifecycleProductExchangePhase::kPending);
+              core::ComponentLifecycleProductExchangePhase::kPending)
+        << pending.value().reason;
     EXPECT_FALSE(composition.value()->coordinator().AcquireProductPin().ok());
     const auto refused = composition.value()->TryExchangeProductContext(
         *prepared.value(), core::RequestOwnerEpoch("foreign.context.owner"),
@@ -995,7 +1221,8 @@ TEST(CCLCRuntimeComposition,
       *prepared.value(), owner, previous);
   ASSERT_TRUE(completed.ok()) << completed.error().message;
   EXPECT_EQ(completed.value().phase,
-            core::ComponentLifecycleProductExchangePhase::kCompleted);
+            core::ComponentLifecycleProductExchangePhase::kCompleted)
+      << completed.value().reason;
   EXPECT_EQ(composition.value()->coordinator().request_owner_epoch(), owner);
   const auto pin = composition.value()->coordinator().AcquireProductPin();
   ASSERT_TRUE(pin.ok());

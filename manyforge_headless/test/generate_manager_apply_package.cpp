@@ -1,6 +1,7 @@
 #include <manyforge_deployment/cell_compiler.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
@@ -27,6 +28,7 @@
 #include "content_identity_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "retained_bundle_internal.hpp"
+#include "../../manyforge_roboplan/src/retained_ros2_control_lifecycle_plans_internal.hpp"
 
 namespace {
 
@@ -41,6 +43,7 @@ struct Arguments final {
   std::filesystem::path metadata_path;
   bool assistant_native;
   bool gripper_only;
+  bool ros2_control;
 };
 
 [[nodiscard]] bool SameExecutionHostInfrastructure(
@@ -89,15 +92,17 @@ void WriteDeploymentSource(
       std::string_view(argv[3]) != "--metadata" ||
       std::string_view(argv[4]).empty() ||
       (argc == 7 && (std::string_view(argv[5]) != "--profile" ||
-                     (std::string_view(argv[6]) != "assistant-native" &&
-                      std::string_view(argv[6]) != "gripper-only")))) {
+                     (std::string_view(argv[6]) != "assistant-ros2-control" &&
+                      std::string_view(argv[6]) != "gripper-only" &&
+                      std::string_view(argv[6]) != "ros2-control")))) {
     throw std::invalid_argument(
         "usage: generate_manager_apply_package --package-root <path> "
-        "--metadata <path> [--profile assistant-native|gripper-only]");
+        "--metadata <path> [--profile assistant-ros2-control|gripper-only|ros2-control]");
   }
   return {argv[2], argv[4],
-          argc == 7 && std::string_view(argv[6]) == "assistant-native",
-          argc == 7 && std::string_view(argv[6]) == "gripper-only"};
+          argc == 7 && std::string_view(argv[6]) == "assistant-ros2-control",
+          argc == 7 && std::string_view(argv[6]) == "gripper-only",
+          argc == 5 || (argc == 7 && std::string_view(argv[6]) != "gripper-only")};
 }
 
 [[nodiscard]] deployment::RetentionQualifiedDeployment CompileEmpty(
@@ -502,43 +507,97 @@ int main(int argc, char **argv) {
   try {
     const auto arguments = ParseArguments(argc, argv);
     std::filesystem::create_directories(arguments.package_root);
-    // The native host initializes components through CCLC with the generic
-    // native lifecycle only; each provider anchors those plans under its ID.
-    const auto native_plans = manyforge::core::MakeNativeControlLifecyclePlans();
-    const auto arm_lifecycle_semantic =
-        manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-            manyforge::core::ProviderManifestId("lite6_arm_provider"), native_plans);
-    const auto gripper_lifecycle_semantic =
-        manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-            manyforge::core::ProviderManifestId("lite6_gripper_provider"), native_plans);
-    if (!arm_lifecycle_semantic.ok() || !gripper_lifecycle_semantic.ok()) {
-      throw std::logic_error(
-          "Manager Apply fixture lifecycle catalogs are unavailable");
-    }
-    auto source =
-        arguments.gripper_only
-            ? deployment::test::
-                  make_lite6_native_gripper_only_cclc_product_retention_fixture(
-                      arm_lifecycle_semantic.value().value(),
-                      gripper_lifecycle_semantic.value().value())
-        : arguments.assistant_native
-            ? deployment::test::
-                  make_lite6_native_cclc_assistant_product_retention_fixture(
-                      arm_lifecycle_semantic.value().value(),
-                      gripper_lifecycle_semantic.value().value())
-            : deployment::test::
-                  make_lite6_native_cclc_product_retention_fixture(
-                      arm_lifecycle_semantic.value().value(),
-                      gripper_lifecycle_semantic.value().value());
-    if (!source.native_execution_runtime_profile.has_value()) {
-      throw std::logic_error(
-          "Manager Apply fixture lacks its native runtime profile");
+    auto source = [&]() {
+      if (arguments.ros2_control) {
+        const auto plans = manyforge::roboplan_backend::detail::
+            ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
+        const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+            core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
+        if (!semantic.ok()) {
+          throw std::logic_error("Manager Apply ROS lifecycle catalog is unavailable");
+        }
+        return arguments.assistant_native
+            ? deployment::test::make_lite6_ros2_control_cclc_assistant_product_retention_fixture(
+                  semantic.value().value())
+            : deployment::test::make_lite6_ros2_control_cclc_product_retention_fixture(
+                  semantic.value().value());
+      }
+      // The native host initializes components through CCLC with the generic
+      // native lifecycle only; each provider anchors those plans under its ID.
+      const auto native_plans = manyforge::core::MakeNativeControlLifecyclePlans();
+      const auto arm_lifecycle_semantic =
+          manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+              manyforge::core::ProviderManifestId("lite6_arm_provider"), native_plans);
+      const auto gripper_lifecycle_semantic =
+          manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+              manyforge::core::ProviderManifestId("lite6_gripper_provider"), native_plans);
+      if (!arm_lifecycle_semantic.ok() || !gripper_lifecycle_semantic.ok()) {
+        throw std::logic_error(
+            "Manager Apply fixture lifecycle catalogs are unavailable");
+      }
+      return
+          arguments.gripper_only
+              ? deployment::test::
+                    make_lite6_native_gripper_only_cclc_product_retention_fixture(
+                        arm_lifecycle_semantic.value().value(),
+                        gripper_lifecycle_semantic.value().value())
+          : arguments.assistant_native
+              ? deployment::test::
+                    make_lite6_native_cclc_assistant_product_retention_fixture(
+                        arm_lifecycle_semantic.value().value(),
+                        gripper_lifecycle_semantic.value().value())
+              : deployment::test::
+                    make_lite6_native_cclc_product_retention_fixture(
+                        arm_lifecycle_semantic.value().value(),
+                        gripper_lifecycle_semantic.value().value());
+    }();
+    const auto &selected_profile = arguments.ros2_control
+        ? source.ros2_control_execution_runtime_profile
+        : source.native_execution_runtime_profile;
+    if (!selected_profile.has_value()) {
+      throw std::logic_error(arguments.ros2_control
+          ? "Manager Apply fixture lacks its ROS runtime profile"
+          : "Manager Apply fixture lacks its native runtime profile");
     }
     const std::array<deployment::QualifiedRuntimeProfile, 1U> profiles{
-        *source.native_execution_runtime_profile};
-    const auto predecessor_source =
-        deployment::detail::derive_cell_scoped_canonical_empty_deployment(
-            source.qualified.deployment(), profiles);
+        *selected_profile};
+    const auto predecessor_source = [&]() {
+      auto empty = deployment::detail::derive_cell_scoped_canonical_empty_deployment(
+          source.qualified.deployment(), profiles);
+      if (!arguments.ros2_control) {
+        return empty;
+      }
+      // Produce a genuine zero-component ROS compiler input. The physical
+      // source's controller/profile/position rows are not empty-host settings.
+      auto root = empty.normalized_authored_root().as_object();
+      for (auto &[name, value] : root) {
+        if (name == "deployment_revision") {
+          value = deployment::CanonicalValue(std::string(kZeroDigest));
+        } else if (name == "graph") {
+          auto graph = value.as_object();
+          for (auto &[field, selected] : graph) {
+            if (field != "runtime_units") continue;
+            auto units = selected.as_array();
+            if (units.size() != 1U) {
+              throw std::logic_error("Manager Apply ROS fixture has no exact empty host");
+            }
+            auto unit = units.front().as_object();
+            for (auto &[key, entry] : unit) {
+              if (key == "configuration") {
+                entry = deployment::ros2_control_execution_runtime_contract::
+                    empty_host_configuration(std::nullopt);
+              }
+            }
+            units.front() = deployment::CanonicalValue(std::move(unit));
+            selected = deployment::CanonicalValue(std::move(units));
+          }
+          value = deployment::CanonicalValue(std::move(graph));
+        }
+      }
+      return deployment::compute_deployment_artifact_revision(
+          deployment::parse_strict_json_model_yaml(deployment::canonical_json(
+              deployment::CanonicalValue(std::move(root)))), profiles);
+    }();
     const deployment::test::Lite6ControllableCompilerInputArtifactSource
         input_source(source);
     deployment::FilesystemBuildManifestRepository manifests(
@@ -579,11 +638,20 @@ int main(int argc, char **argv) {
     }
     const auto &host_id =
         predecessor->value().cell_graph.runtime_units.front().runtime_unit_id;
-    static_cast<void>(deployment::native_execution_runtime_contract::
-                          require_configuration(*predecessor, host_id));
-    if (candidate != nullptr) {
+    if (arguments.ros2_control) {
+      static_cast<void>(deployment::ros2_control_execution_runtime_contract::
+                            require_configuration(*predecessor, host_id));
+      if (candidate != nullptr) {
+        static_cast<void>(deployment::ros2_control_execution_runtime_contract::
+                              require_configuration(*candidate, host_id));
+      }
+    } else {
       static_cast<void>(deployment::native_execution_runtime_contract::
-                            require_configuration(*candidate, host_id));
+                            require_configuration(*predecessor, host_id));
+      if (candidate != nullptr) {
+        static_cast<void>(deployment::native_execution_runtime_contract::
+                              require_configuration(*candidate, host_id));
+      }
     }
     const auto admission_filename =
         deployment::cell_scoped_canonical_empty_admission_filename(

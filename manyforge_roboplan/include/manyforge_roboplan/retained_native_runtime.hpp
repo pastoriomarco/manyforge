@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -8,6 +9,8 @@
 #include <manyforge_core/cache/trajectory_cache.hpp>
 #include <manyforge_core/types/component_lifecycle_readiness.hpp>
 #include <manyforge_core/execution_kernel.hpp>
+#include <manyforge_core/ports/iexecution_backend.hpp>
+#include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/ports/iplanning_scene_synchronizer.hpp>
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
@@ -17,9 +20,8 @@
 #include <manyforge_roboplan/native_runtime_support.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_focused_adapters.hpp>
-#include <manyforge_roboplan/retained_gripper_command_backend.hpp>
+#include <manyforge_roboplan/retained_gripper_position_limits.hpp>
 #include <manyforge_roboplan/retained_stop_surveillance_owner.hpp>
-#include <manyforge_roboplan/roboplan_execution_backend.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 #include <memory>
 #include <mutex>
@@ -44,7 +46,6 @@ struct RetainedNativeRuntimeConfig final {
   std::size_t request_replay_capacity{1024U};
   core::CacheConfig cache;
   core::ExecutionKernelConfig kernel;
-  RoboPlanExecutionBackendConfig execution;
   SimpleSchedulerConfig scheduler;
   core::Duration gripper_update_period_ns{10'000'000};
   /// Exact motion-resource order from the retained runtime-unit product.
@@ -289,7 +290,7 @@ struct RetainedNativeRuntimeInput final {
   core::PerJointDynamicsLimitsDTO direct_control_joint_limits{};
   /// Saved settings, resolved once against the immutable model at activation.
   std::optional<
-      deployment::native_execution_runtime_contract::OrdinaryMotionJerkSettings>
+      deployment::execution_runtime_contract::OrdinaryMotionJerkSettings>
       ordinary_motion_jerk{};
   /// Cell-wide render wake shared by independently owned robot channels.
   std::shared_ptr<RetainedObservationWake> observation_wake{};

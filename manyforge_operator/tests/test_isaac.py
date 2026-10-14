@@ -430,9 +430,9 @@ def _container_readback(launcher):
 def test_g_container_uses_existing_workbench_and_exact_inputs_without_host_ros(tmp_path):
     launcher = IsaacLauncher(_container_config(tmp_path))
     command = shlex.split(launcher._container_shell("start"))
-    assert command[-3:] == [launcher.config.remote.source_root + "/scripts/compose-dev.sh", "start", "--ros2-control"]
+    assert command[-2:] == [launcher.config.remote.source_root + "/scripts/compose-dev.sh", "start"]
     assert "--project" not in command and "--bootstrap-project" not in command
-    environment = dict(word.split("=", 1) for word in command[1:-4])
+    environment = dict(word.split("=", 1) for word in command[1:-3])
     assert environment["MANYFORGE_DEV_IMAGE"] == launcher.config.remote.container_image_id
     assert environment["MANYFORGE_DEV_LAUNCH_INPUT_DIGEST"] == launcher.config.input_digest()
     assert environment["MANYFORGE_DEV_RUNTIME_STATE_ROOT"] == launcher.config.remote.runtime_root

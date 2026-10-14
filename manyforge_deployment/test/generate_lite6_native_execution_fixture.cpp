@@ -25,7 +25,11 @@
 #include "content_identity_internal.hpp"
 #include "control_domain_control_internal.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
+#ifdef MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT
+#include "ur5_arm_only_retention_fixture.hpp"
+#endif
 #include "native_execution_runtime_unit_internal.hpp"
+#include "../../manyforge_roboplan/src/retained_ros2_control_lifecycle_plans_internal.hpp"
 
 namespace {
 
@@ -40,9 +44,14 @@ constexpr std::string_view kZeroDigest =
 
 enum class FixtureKind {
   kApplication,
+  kApplicationRos,
   kCCLCProduct,
+  kCCLCProductRos,
   kCCLCReadiness,
+  kCCLCReadinessRos,
+  kUr5ArmOnlyRos,
   kProjectionSuccessor,
+  kProjectionSuccessorRos,
   // A native cell whose one unit hosts only the gripper (no motion owner).
   kGripperOnly,
 };
@@ -58,8 +67,8 @@ struct GeneratorArguments final {
         "usage: generate_lite6_native_execution_fixture "
         "--output-root PATH "
         "[--fixture-kind "
-        "cclc-product|cclc-readiness|"
-        "projection-successor|gripper-only]");
+        "application-ros|cclc-product|cclc-product-ros|cclc-readiness|cclc-readiness-ros|ur5-arm-only-ros|"
+        "projection-successor|projection-successor-ros|gripper-only]");
   }
 
   std::map<std::string, std::filesystem::path, std::less<>> values;
@@ -89,12 +98,22 @@ struct GeneratorArguments final {
   const auto fixture_kind = take("--fixture-kind");
   FixtureKind selected_kind = FixtureKind::kApplication;
   if (fixture_kind.has_value()) {
-    if (fixture_kind->string() == "cclc-product") {
+    if (fixture_kind->string() == "application-ros") {
+      selected_kind = FixtureKind::kApplicationRos;
+    } else if (fixture_kind->string() == "cclc-product") {
       selected_kind = FixtureKind::kCCLCProduct;
+    } else if (fixture_kind->string() == "cclc-product-ros") {
+      selected_kind = FixtureKind::kCCLCProductRos;
     } else if (fixture_kind->string() == "cclc-readiness") {
       selected_kind = FixtureKind::kCCLCReadiness;
+    } else if (fixture_kind->string() == "cclc-readiness-ros") {
+      selected_kind = FixtureKind::kCCLCReadinessRos;
+    } else if (fixture_kind->string() == "ur5-arm-only-ros") {
+      selected_kind = FixtureKind::kUr5ArmOnlyRos;
     } else if (fixture_kind->string() == "projection-successor") {
       selected_kind = FixtureKind::kProjectionSuccessor;
+    } else if (fixture_kind->string() == "projection-successor-ros") {
+      selected_kind = FixtureKind::kProjectionSuccessorRos;
     } else if (fixture_kind->string() == "gripper-only") {
       selected_kind = FixtureKind::kGripperOnly;
     } else {
@@ -274,6 +293,42 @@ make_empty_scene(const core::CellId &cell_id) {
   });
 }
 
+// This mapper acts on authored compiler inputs before graph revision is minted.
+// The structural override supplies the real UR5 asset, roles and joint map.
+void map_ur5_arm_only_graph(deployment::CanonicalValue::Object &root) {
+  const std::map<std::string, std::string> identities{
+      {"lite6_arm", "ur5_arm"},
+      {"lite6_fixture_instance", "ur5_fixture_instance"},
+      {"lite6_arm_binding", "ur5_arm_binding"},
+      {"lite6_arm_domain", "ur5_arm_domain"},
+      {"lite6_ros2_control_execution", "ur5_ros2_control_execution"},
+      {"lite6_arm_provider_instance", "ur5_arm_provider_instance"},
+      {"lite6_commanded_sim_state", "ur5_commanded_sim_state"},
+      {"lite6_lite_gripper", "ur5_roboplan"},
+      {"lite6_joint_1", "ur5_joint_1"},
+      {"lite6_joint_2", "ur5_joint_2"},
+      {"lite6_joint_3", "ur5_joint_3"},
+      {"lite6_joint_4", "ur5_joint_4"},
+      {"lite6_joint_5", "ur5_joint_5"},
+      {"lite6_joint_6", "ur5_joint_6"},
+  };
+  const auto map_value = [&](auto &self, CanonicalValue &value) -> void {
+    if (value.is_string()) {
+      const auto found = identities.find(value.as_string());
+      if (found != identities.end()) value = CanonicalValue(found->second);
+    } else if (value.is_array()) {
+      auto rows = value.as_array();
+      for (auto &row : rows) self(self, row);
+      value = CanonicalValue(std::move(rows));
+    } else if (value.is_object()) {
+      auto members = value.as_object();
+      for (auto &[_, member] : members) self(self, member);
+      value = CanonicalValue(std::move(members));
+    }
+  };
+  for (auto &[_, value] : root) map_value(map_value, value);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -287,8 +342,62 @@ int main(int argc, char **argv) {
     std::filesystem::create_directories(manager_state_root);
 
     const bool gripper_only = arguments.fixture_kind == FixtureKind::kGripperOnly;
+    const bool readiness_fixture =
+        arguments.fixture_kind == FixtureKind::kCCLCReadiness ||
+        arguments.fixture_kind == FixtureKind::kCCLCReadinessRos ||
+        arguments.fixture_kind == FixtureKind::kUr5ArmOnlyRos;
     auto materialized = [&]() {
-      if (arguments.fixture_kind != FixtureKind::kCCLCReadiness) {
+      if (arguments.fixture_kind == FixtureKind::kUr5ArmOnlyRos) {
+#ifdef MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT
+        const auto plans = manyforge::roboplan_backend::detail::
+            ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
+        const auto digest = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+            core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
+        if (!digest.ok()) throw std::logic_error("ROS UR5 lifecycle anchor is unavailable");
+        const auto structural = deployment::test::make_ur5_arm_only_structural_retention_fixture();
+        auto controllable = deployment::test::make_lite6_controllable_retention_fixture(
+            false, false, 1U, false, true, "ur5_arm_only_ros_cell", false,
+            true, "resource", true, digest.value().value(), {}, true,
+            false, false, std::nullopt, false, deployment::test::kLite6ArmTargetId,
+            std::nullopt, std::nullopt, {}, {}, true, {},
+            "manyforge.provider.ros2_control", true, true,
+            &structural, map_ur5_arm_only_graph);
+        return deployment::test::materialize_lite6_retained_consumer_fixture_from(
+            package_root, std::move(controllable));
+#else
+        throw std::logic_error("UR5 arm-only fixture requires its genuine prepared model inputs");
+#endif
+      }
+      if (arguments.fixture_kind == FixtureKind::kApplicationRos ||
+          arguments.fixture_kind == FixtureKind::kCCLCProductRos ||
+          arguments.fixture_kind == FixtureKind::kProjectionSuccessorRos) {
+        const auto plans = manyforge::roboplan_backend::detail::
+            ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
+        const auto digest = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+            core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
+        if (!digest.ok()) {
+          throw std::logic_error("ROS aggregate lifecycle anchor is unavailable");
+        }
+        return deployment::test::
+            materialize_lite6_ros2_control_cclc_product_retained_consumer_fixture(
+                package_root, digest.value().value(), false,
+                arguments.fixture_kind == FixtureKind::kProjectionSuccessorRos
+                    ? std::optional<double>(0.1)
+                    : std::nullopt);
+      }
+      if (arguments.fixture_kind == FixtureKind::kCCLCReadinessRos) {
+        const auto plans = manyforge::roboplan_backend::detail::
+            ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
+        const auto digest = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+            core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
+        if (!digest.ok()) {
+          throw std::logic_error("ROS arm lifecycle anchor is unavailable");
+        }
+        return deployment::test::
+            materialize_lite6_ros2_control_arm_only_cclc_product_retained_consumer_fixture(
+                package_root, digest.value().value());
+      }
+      if (!readiness_fixture) {
         // The native host initializes every component through CCLC with the
         // generic native lifecycle (its only product), never the Lite6
         // real-robot vendor catalog. Each provider anchors those plans
@@ -346,8 +455,7 @@ int main(int argc, char **argv) {
       throw std::logic_error("native execution fixture model map is absent");
     }
 
-    const bool include_gripper =
-        arguments.fixture_kind != FixtureKind::kCCLCReadiness;
+    const bool include_gripper = !readiness_fixture;
     const bool include_arm = !gripper_only;
     const std::string program_bytes =
         make_program_bytes(bundle, include_arm, include_gripper);
@@ -372,7 +480,9 @@ int main(int argc, char **argv) {
             {core::ProgramComponentRoleAssignmentDTO{
                 core::ComponentRoleId("robot"),
                 core::ControllableComponentId(std::string(
-                    deployment::test::kLite6ControllableComponentId))}},
+                    arguments.fixture_kind == FixtureKind::kUr5ArmOnlyRos
+                        ? std::string_view("ur5_arm")
+                        : deployment::test::kLite6ControllableComponentId))}},
             std::move(target_assignments)},
         bundle, *model_map, catalog_store);
     deployment::FilesystemProgramRepository program_repository(package_root);
@@ -419,6 +529,8 @@ int main(int argc, char **argv) {
         {"cclc_product",
          CanonicalValue(arguments.fixture_kind == FixtureKind::kCCLCProduct ||
                         arguments.fixture_kind == FixtureKind::kProjectionSuccessor ||
+                        arguments.fixture_kind == FixtureKind::kCCLCProductRos ||
+                        arguments.fixture_kind == FixtureKind::kProjectionSuccessorRos ||
                         gripper_only)},
         {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
         {"retained_bundle_id", CanonicalValue(bundle.retained_bundle_id().value())},

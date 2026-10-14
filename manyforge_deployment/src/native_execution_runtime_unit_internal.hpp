@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -16,11 +17,11 @@ class CompilerQualifiedCellIr;
 
 namespace detail {
 
-[[nodiscard]] native_execution_runtime_contract::OrdinaryMotionJerkSettings
+[[nodiscard]] execution_runtime_contract::OrdinaryMotionJerkSettings
 decode_ordinary_motion_jerk_settings(const core::JsonObjectDTO& source);
 
 [[nodiscard]] std::vector<
-    native_execution_runtime_contract::Configuration::MotionTargetLimit>
+    execution_runtime_contract::Configuration::MotionTargetLimit>
 decode_execution_motion_target_limits(
     const core::JsonValueDTO::Array &motion_target_limits,
     bool include_ordinary_jerk);
@@ -29,7 +30,7 @@ decode_execution_motion_target_limits(
 /// runtime units), sorted by target; `label` names the configuration in
 /// diagnostics.
 [[nodiscard]] std::vector<
-    native_execution_runtime_contract::Configuration::GripperTargetConfiguration>
+    execution_runtime_contract::Configuration::GripperTargetConfiguration>
 decode_execution_gripper_target_configurations(
     const core::JsonValueDTO::Array &gripper_target_configurations,
     std::string_view label);
@@ -63,28 +64,28 @@ inline constexpr std::string_view kNativeExecutionRuntimeStatusEndpointRoleId =
     native_execution_runtime_contract::kStatusEndpointRoleId;
 inline constexpr std::string_view
     kNativeExecutionRuntimeProjectionEndpointRoleId =
-        native_execution_runtime_contract::kProjectionEndpointRoleId;
+        execution_runtime_contract::kProjectionEndpointRoleId;
 inline constexpr std::string_view
     kNativeExecutionRuntimeLogicalSceneEndpointRoleId =
-        native_execution_runtime_contract::kLogicalSceneEndpointRoleId;
+        execution_runtime_contract::kLogicalSceneEndpointRoleId;
 inline constexpr std::string_view kNativeExecutionRuntimeImplementationId =
     native_execution_runtime_contract::kImplementationId;
 inline constexpr std::string_view
     kNativeExecutionRuntimeProcessAdapterContractId =
-        native_execution_runtime_contract::kProcessAdapterContractId;
+        execution_runtime_contract::kProcessAdapterContractId;
 inline constexpr std::string_view kNativeExecutionRuntimeRetrievalContractId =
-    native_execution_runtime_contract::kRetrievalContractId;
+    execution_runtime_contract::kRetrievalContractId;
 inline constexpr std::string_view
     kNativeExecutionRuntimeStatusEndpointContractId =
         native_execution_runtime_contract::kStatusEndpointContractId;
 inline constexpr std::string_view
     kNativeExecutionRuntimeProjectionEndpointContractId =
-        native_execution_runtime_contract::kProjectionEndpointContractId;
+        execution_runtime_contract::kProjectionEndpointContractId;
 inline constexpr std::string_view
     kNativeExecutionRuntimeLogicalSceneEndpointContractId =
-        native_execution_runtime_contract::kLogicalSceneEndpointContractId;
+        execution_runtime_contract::kLogicalSceneEndpointContractId;
 inline constexpr std::string_view kNativeExecutionRuntimeOperatingSystem =
-    native_execution_runtime_contract::kOperatingSystem;
+    execution_runtime_contract::kOperatingSystem;
 inline constexpr std::string_view
     kNativeExecutionRuntimeLaunchEnvironmentContract =
         native_execution_runtime_contract::kLaunchEnvironmentContract;
@@ -129,7 +130,7 @@ void require_native_execution_runtime_manifest_matches(
 /// fields exist exactly when it hosts motion execution, and every motion
 /// limit or gripper configuration names a target it hosts. Callers establish
 /// bundle identity and closed-schema qualification first.
-[[nodiscard]] native_execution_runtime_contract::Configuration
+[[nodiscard]] execution_runtime_contract::Configuration
 decode_native_execution_runtime_configuration(
     const core::JsonObjectDTO &configuration, const core::CellGraphDTO &graph,
     const core::RuntimeUnitId &runtime_unit_id);
@@ -137,9 +138,9 @@ decode_native_execution_runtime_configuration(
 /// derivation. Inputs have already passed native configuration decoding and
 /// graph verification. The native adapter supports at most one motion target
 /// per component; additional non-motion capabilities remain independent.
-[[nodiscard]] native_execution_runtime_contract::Configuration
+[[nodiscard]] execution_runtime_contract::Configuration
 select_native_component_configuration(
-    native_execution_runtime_contract::Configuration configuration,
+    execution_runtime_contract::Configuration configuration,
     const core::CellGraphDTO &graph, const core::RuntimeUnitId &runtime_unit_id,
     const core::ControllableComponentId &component_id);
 void require_native_execution_runtime_product_matches_retained_bundle(

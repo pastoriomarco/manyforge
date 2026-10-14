@@ -585,10 +585,9 @@ function appliedResultFixture(): Record<string, unknown> {
     status: 'applied',
     confirmation_token: null,
     prepared_activation: {
-      schema_version: 'manyforge.prepared_activation_input.v5',
+      schema_version: 'manyforge.prepared_activation_input.v6',
       prepared_activation_id: digestC,
-      scenario_id: 'fixture',
-      source_document_digest: digestA,
+      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA },
       captured_input_digest: digestB,
       deployment_artifact_id: 'cell-a',
       deployment_revision: digestB,

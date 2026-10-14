@@ -213,6 +213,8 @@ CreateRecoveredRetainedNativeCellCCLCRuntime(
     std::function<core::Result<core::RuntimeRouteConfigurationReadbackDTO>(
         const core::ActiveControlConfigurationDTO &)> adopt_predecessor,
     std::function<core::Result<void>()> reconcile_command_free_orphans,
-    std::function<core::Result<void>()> &reconcile_after_start);
+    std::function<core::Result<void>()> &reconcile_after_start,
+    RetainedExternallyManagedDomainSnapshotSource
+        externally_managed_controller_snapshot_source = {});
 
 } // namespace manyforge::roboplan_backend

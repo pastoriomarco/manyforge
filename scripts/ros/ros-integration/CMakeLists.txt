@@ -26,15 +26,22 @@ add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_deployment" depl
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_ros2_control_execution" adapter)
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_roboplan" roboplan)
 # Preserve the runtime helper's established host/worker artifact locations.
-set_target_properties(manyforge_ros2_control_execution_host manyforge_native_execution_host
+set_target_properties(manyforge_ros2_control_execution_host
   manyforge_roboplan_candidate_worker
   PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-# The existing Headless process fixture resolves this test host beside the
-# native host and candidate worker. It exists only in BUILD_TESTING graphs.
-if(TARGET manyforge_native_execution_host_pick_place_planning_fixture)
-  set_target_properties(manyforge_native_execution_host_pick_place_planning_fixture
-    PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-endif()
+# The existing Headless process fixtures resolve real ROS test hosts beside
+# the ROS host and candidate worker. They exist only in BUILD_TESTING graphs.
+foreach(fixture IN ITEMS
+    manyforge_ros2_control_execution_host_pick_place_planning_fixture
+    manyforge_ros2_control_execution_host_admission_fixture)
+  if(TARGET ${fixture})
+    set_target_properties(${fixture}
+      PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  endif()
+endforeach()
+
+# The projection fixture keeps its own directory because its output basename
+# is the production host name. Never overwrite the production host here.
 
 # Report-only ROS hot-path measurement, invoked explicitly after cutover.
 # EXCLUDE_FROM_ALL keeps measurement out of ordinary builds and tests.

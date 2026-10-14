@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -1042,11 +1043,28 @@ TEST(ControllerLaunchSupervisor, StartHeaderBoundsDisplayButRetainsFullLaunchIde
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(100ms);
   auto command = mock_controller_launch_command(mock_artifacts(fake.root()));
-  command.identity = std::string(5000U, 'x');
+  command.identity.clear();
+  for (int repeat = 0; repeat < 1000; ++repeat) command.identity += "Café\\\"\n";
   const auto started = supervisor.ensure(command, fake.root() / "launch.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   const auto tail = started.process->output_snapshot().tail;
   EXPECT_NE(tail.find("[truncated]"), std::string::npos);
+  const auto field_begin = tail.find(" launch_identity=");
+  ASSERT_NE(field_begin, std::string::npos);
+  const auto value_begin = field_begin + std::string(" launch_identity=").size();
+  const auto value_end = tail.find('\n', value_begin);
+  ASSERT_NE(value_end, std::string::npos);
+  const auto rendered = tail.substr(value_begin, value_end - value_begin);
+  EXPECT_LE(rendered.size(), 4096U);
+  EXPECT_TRUE(rendered.ends_with("[truncated]\""));
+  std::istringstream quoted_field(rendered);
+  std::string decoded;
+  quoted_field >> std::quoted(decoded);
+  EXPECT_TRUE(quoted_field);
+  quoted_field >> std::ws;
+  EXPECT_TRUE(quoted_field.eof());
+  EXPECT_TRUE(decoded.ends_with("[truncated]"));
+
   EXPECT_EQ(tail.find(command.identity), std::string::npos);
   EXPECT_EQ(started.process->command().identity, command.identity);
   started.process->stop(100ms);
@@ -2402,11 +2420,28 @@ TEST(CellLaunchProcess, StartHeaderBoundsDisplayButRetainsFullLaunchIdentity) {
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(100ms);
   auto command = cell_command();
-  command.identity = std::string(5000U, 'x');
+  command.identity.clear();
+  for (int repeat = 0; repeat < 1000; ++repeat) command.identity += "Café\\\"\n";
   const auto process = supervisor.start_cell_process(command, fake.root() / "cell.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(process->pid(), ".args")));
   const auto tail = process->output_snapshot().tail;
   EXPECT_NE(tail.find("[truncated]"), std::string::npos);
+  const auto field_begin = tail.find(" launch_identity=");
+  ASSERT_NE(field_begin, std::string::npos);
+  const auto value_begin = field_begin + std::string(" launch_identity=").size();
+  const auto value_end = tail.find('\n', value_begin);
+  ASSERT_NE(value_end, std::string::npos);
+  const auto rendered = tail.substr(value_begin, value_end - value_begin);
+  EXPECT_LE(rendered.size(), 4096U);
+  EXPECT_TRUE(rendered.ends_with("[truncated]\""));
+  std::istringstream quoted_field(rendered);
+  std::string decoded;
+  quoted_field >> std::quoted(decoded);
+  EXPECT_TRUE(quoted_field);
+  quoted_field >> std::ws;
+  EXPECT_TRUE(quoted_field.eof());
+  EXPECT_TRUE(decoded.ends_with("[truncated]"));
+
   EXPECT_EQ(tail.find(command.identity), std::string::npos);
   EXPECT_EQ(process->command().identity, command.identity);
   process->stop(100ms);

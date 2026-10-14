@@ -12,30 +12,37 @@ int main(int argc, char** argv) {
       std::string_view(argv[1]) != "--output-root" ||
       std::string_view(argv[2]).empty() ||
       (argc == 7 && (std::string_view(argv[3]) != "--cell-id" ||
-                     std::string_view(argv[5]) != "--native-runtime-profile"))) {
+                     (std::string_view(argv[5]) != "--native-runtime-profile" &&
+                      std::string_view(argv[5]) != "--ros-runtime-profile")))) {
     std::cerr
         << "usage: manyforge_generate_canonical_empty_package "
-           "--output-root PATH [--cell-id ID --native-runtime-profile PATH]\n";
+           "--output-root PATH [--cell-id ID "
+           "(--native-runtime-profile|--ros-runtime-profile) PATH]\n";
     return 2;
   }
   try {
     if (argc == 7) {
+      const bool ros2_control = std::string_view(argv[5]) == "--ros-runtime-profile";
+      const std::string lane = ros2_control ? "ROS" : "native";
       const std::filesystem::path profile_path(argv[6]);
       if (std::filesystem::is_symlink(profile_path) ||
           !std::filesystem::is_regular_file(profile_path) ||
           std::filesystem::file_size(profile_path) > 1024U * 1024U) {
-        throw std::invalid_argument("native runtime profile must be a bounded plain file");
+        throw std::invalid_argument(lane + " runtime profile must be a bounded plain file");
       }
       std::ifstream input(profile_path, std::ios::binary);
-      if (!input) throw std::runtime_error("cannot read native runtime profile");
+      if (!input) throw std::runtime_error("cannot read " + lane + " runtime profile");
       std::string bytes(1024U * 1024U + 1U, '\0');
       input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
       bytes.resize(static_cast<std::size_t>(input.gcount()));
       if (input.bad() || bytes.empty() || bytes.size() > 1024U * 1024U) {
-        throw std::invalid_argument("native runtime profile read is empty, failed or oversized");
+        throw std::invalid_argument(lane + " runtime profile read is empty, failed or oversized");
       }
-      const auto admission = manyforge::deployment::detail::generate_native_empty_package(
-          std::filesystem::path(argv[2]), manyforge::core::CellId(argv[4]), bytes);
+      const auto admission = ros2_control
+          ? manyforge::deployment::detail::generate_ros_empty_package(
+                std::filesystem::path(argv[2]), manyforge::core::CellId(argv[4]), bytes)
+          : manyforge::deployment::detail::generate_native_empty_package(
+                std::filesystem::path(argv[2]), manyforge::core::CellId(argv[4]), bytes);
       std::cout << admission.canonical_bytes() << '\n';
       return 0;
     }

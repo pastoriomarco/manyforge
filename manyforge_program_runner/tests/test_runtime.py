@@ -5685,7 +5685,8 @@ def test_lifecycle_failure_before_or_after_claim_is_honest_and_resettable(monkey
         runtime.shutdown()
 
 
-def test_stop_wins_running_cas_after_last_abort_without_inventing_failure(monkeypatch, tmp_path):
+@pytest.mark.parametrize("host_failed", [False, True])
+def test_stop_wins_running_cas_after_last_abort_without_inventing_failure(monkeypatch, tmp_path, host_failed):
     monkeypatch.setattr("manyforge_program_runner.runtime.build_applied_program_run_admission",
                         lambda *_args, **_kwargs: _PreparedRunAdmission())
     class StopHeadless(_Headless):
@@ -5715,23 +5716,120 @@ def test_stop_wins_running_cas_after_last_abort_without_inventing_failure(monkey
                 "program_run_id": "program-cycle.1", "expected_owner_epoch": "runner.1",
                 "reason": "operator Stop before Running CAS"})
             assert runtime.stop_run("program-cycle.1", stop)["state"] == "stopping"
+            if host_failed:
+                terminal = _Snapshot("program-cycle.1", owner_id=runtime.owner_id,
+                                     owner_epoch=runtime.owner_epoch, state="failed", revision=2)
+                terminal._value.update(reason_code="controller_lost", message="Controller disappeared during Stop",
+                                       details={"reason": "controller endpoint lost"},
+                                       origin={"kind": "program_runner", "node_instance_id": None, "owner_api": None})
+                owner.rows["program-cycle.1"] = terminal
+                runtime._record_terminal_snapshot(terminal.to_dict())
         return project(snapshot)
     monkeypatch.setattr(runtime, "_project_run", stop_after_last_abort)
     try:
         with pytest.raises(ProgramRunnerError) as caught:
             runtime.start_run(_start_request())
         assert stopped
-        assert caught.value.code == "program_run_superseded_by_stop"
+        assert caught.value.code == ("program_run_started_then_failed" if host_failed else "program_run_superseded_by_stop")
         assert caught.value.details["program_run_id"] == "program-cycle.1"
         cycle = journal.read()
         assert len(admission.claims) == 1
         assert caught.value.details["claim_generation"] == cycle.claim["claim_generation"]
-        assert caught.value.details["stopped_by_operator"] is True
         assert caught.value.details["needs_reset"] is True
         assert cycle.state == "terminal_awaiting_reset" and cycle.failure is None
-        assert cycle.start_settlement["kind"] == "terminal_effects_settled"
-        assert cycle.start_settlement["terminal_run"]["state"] == "stopped"
+        if host_failed:
+            assert caught.value.details["cause_code"] == "controller_lost"
+            assert caught.value.details["cause_message"] == "Controller disappeared during Stop"
+            assert caught.value.details["reason"] == "controller endpoint lost"
+            assert caught.value.details["host_state"] == "failed"
+            assert caught.value.details["host_run_revision"] == 2
+            assert "transition is stale" not in str(caught.value)
+            assert journal.read_run_snapshot("program-cycle.1")["state"] == "failed"
+            assert cycle.start_settlement is None
+        else:
+            assert caught.value.details["stopped_by_operator"] is True
+            assert cycle.start_settlement["kind"] == "terminal_effects_settled"
+            assert cycle.start_settlement["terminal_run"]["state"] == "stopped"
         assert len(host.start_admissions) == 1 and host.scheduled == []
-        assert len(host.stop_calls) == 1
+        assert len(host.stop_calls) == (0 if host_failed else 1)
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("not_ready", [True, False])
+def test_scene_preparation_distinguishes_not_ready_from_real_generation_change(monkeypatch, tmp_path, not_ready):
+    class ObservedAdmission(_Admission):
+        def get(self):
+            return {"admission_generation": 35 if not_ready else 37,
+                    "authoring_allowed": not not_ready}
+    admission = ObservedAdmission()
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1")
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
+                             headless_client=_Headless(), execution_transport=_Headless(),
+                             admission_client=admission, cycle_journal=journal)
+    def no_scene_effect(**_kwargs):
+        raise AssertionError("Refused admission must not prepare the Scene")
+    monkeypatch.setattr(runtime, "_prepare_current_applied_scene", no_scene_effect)
+    runtime.start()
+    try:
+        with pytest.raises(ProgramRunnerError) as caught:
+            if not_ready:
+                runtime.reset_cycle(ProgramCycleResetRequest.model_validate({
+                    "request_id": "idle.reset.not-ready", "request_owner_epoch": "composer.1",
+                    "source_label": "operator", "correlation_id": None,
+                    "program_run_id": None, "expected_owner_epoch": "runner.1",
+                    "expected_cycle_generation": 1, "expected_claim_generation": None,
+                    "terminal_reference": None, "settlement_evidence_digest": None}))
+            else:
+                runtime.prepare_applied_scene(ProgramScenePreparationRequest.model_validate({
+                    "request_id": "scene.stale", "request_owner_epoch": "composer.1",
+                    "source_label": "operator", "correlation_id": None,
+                    "expected_applied_record_digest": _DIGEST_B,
+                    "expected_admission_generation": 35}))
+        assert caught.value.code == ("authoring_not_ready" if not_ready else "stale_generation")
+        assert caught.value.details == {"admission_generation": 35 if not_ready else 37,
+                                       "authoring_allowed": not not_ready,
+                                       "expected_admission_generation": 35}
+        cycle = journal.read()
+        assert cycle.state == "idle_after_reset" and cycle.cycle_generation == 1
+        assert cycle.claim is None and cycle.failure is None
+        assert admission.claims == [] and admission.releases == []
+    finally:
+        runtime.shutdown()
+
+
+def test_unknown_host_start_keeps_claim_and_unresolved_request_without_resending(monkeypatch, tmp_path):
+    monkeypatch.setattr("manyforge_program_runner.runtime.build_applied_program_run_admission",
+                        lambda *_args, **_kwargs: _PreparedRunAdmission())
+    class UnknownHost(_Host):
+        def start_run(self, admission, **_kwargs):
+            self.start_admissions.append(admission)
+            raise RuntimeError("Host start result was lost")
+    headless, admission = _Headless(), _Admission()
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1")
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
+                             headless_client=headless, execution_transport=headless,
+                             admission_client=admission, cycle_journal=journal)
+    runtime._host.shutdown()
+    owner = _ObservationOwner()
+    host = UnknownHost(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    runtime._owner, runtime._host = owner, host
+    runtime.start()
+    request = _start_request()
+    try:
+        with pytest.raises(ProgramRunnerError) as caught:
+            runtime.start_run(request)
+        assert caught.value.code == "program_cycle_reconciliation_required"
+        assert caught.value.details["program_run_id"] == "program-cycle.1"
+        cycle = journal.read()
+        assert cycle.state == "recovery_required" and cycle.reconciliation_required
+        assert cycle.claim["claim_generation"] == caught.value.details["claim_generation"]
+        assert cycle.terminal_reference is None and cycle.start_settlement is None
+        assert any(row["request_id"] == request.request_id for row in journal.pending_commands())
+        with pytest.raises(ProgramRunnerError) as repeated:
+            runtime.start_run(request)
+        assert repeated.value.code == "program_cycle_reconciliation_required"
+        assert len(host.start_admissions) == 1 and host.scheduled == []
+        assert admission.releases == []
     finally:
         runtime.shutdown()

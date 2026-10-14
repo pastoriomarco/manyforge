@@ -204,6 +204,32 @@ resolve_executable(const std::string &name) {
   return text;
 }
 
+// Bound the encoded quoted field without splitting an escape or losing its quote.
+[[nodiscard]] std::string bounded_log_field(const std::string_view value,
+                                           const std::size_t limit) {
+  auto rendered = log_field(value);
+  if (rendered.size() <= limit) return rendered;
+  std::size_t low = 0U;
+  std::size_t high = value.size();
+  std::string result = log_field("[truncated]");
+  while (low <= high) {
+    const auto middle = low + (high - low) / 2U;
+    auto end = middle;
+    while (end > 0U && end < value.size() &&
+           (static_cast<unsigned char>(value[end]) & 0xc0U) == 0x80U)
+      --end;
+    auto candidate = log_field(std::string(value.substr(0U, end)) + "[truncated]");
+    if (candidate.size() <= limit) {
+      result = std::move(candidate);
+      low = middle + 1U;
+    } else {
+      if (middle == 0U) break;
+      high = middle - 1U;
+    }
+  }
+  return result;
+}
+
 [[nodiscard]] std::uint64_t output_lines(const std::string_view text) {
   if (text.empty())
     return 0U;
@@ -801,7 +827,7 @@ void ControllerLaunchProcess::append_start_header() {
                     observed_utc_now() + cell_launch_fields(*cell) +
                     " pid=" + std::to_string(pid_) + " request_context=" +
                     log_field(start_context_) + " launch_identity=" +
-                    bounded_text(log_field(cell->identity), 4096U) + "\n");
+                    bounded_log_field(cell->identity, 4096U) + "\n");
     return;
   }
   const auto line =
@@ -809,7 +835,7 @@ void ControllerLaunchProcess::append_start_header() {
       " component=" + log_field(command().controllable_component_id) +
       " pid=" + std::to_string(pid_) +
       " request_context=" + log_field(start_context_) +
-      " launch_identity=" + bounded_text(log_field(command().identity), 4096U) + "\n";
+      " launch_identity=" + bounded_log_field(command().identity, 4096U) + "\n";
   output_->append(line);
 }
 
