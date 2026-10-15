@@ -91,7 +91,8 @@ namespace {
 }
 
 [[nodiscard]] ControllerLifecycleExpectedDomain ExpectedDomain(
-    const ResolvedStopBasePlanDTO& base, const RuntimeParticipantBinding& binding) {
+    const ResolvedStopBasePlanDTO& base, const RuntimeParticipantBinding& binding,
+    std::optional<GripperActuationKind> actuation = std::nullopt) {
   const auto& path = *binding.value().control_path;
   const DesiredControlBindingRouteDTO desired_route{
       path.control_binding_id, path.control_binding_revision, path.control_route_id};
@@ -146,6 +147,7 @@ namespace {
         {}}},
       {{path.control_binding_id, path.control_binding_revision, path.control_route_id,
         EndpointRoleId("endpoint.command"), "controller.command", true, false}}};
+  value.expected_bindings.front().gripper_actuation_kind = actuation;
   auto sealed = verify_controller_lifecycle_expected_domain(std::move(value));
   if (!sealed.ok()) {
     throw std::logic_error(sealed.error().message);
@@ -326,4 +328,52 @@ TEST(RuntimeParticipantStopReadinessTest, RejectsSubstitutedProviderOrRuntimeUni
 }
 
 }  // namespace
+
+TEST(RuntimeParticipantStopReadinessTest, PneumaticPlanRequiresExactIndependentlySealedBindingFact) {
+  auto candidate = BasePlan();
+  candidate.gripper_actuation_kind = GripperActuationKind::kPneumatic;
+  candidate.escalation_stages.erase(candidate.escalation_stages.begin() + 1,
+                                    candidate.escalation_stages.end());
+  candidate.containment_granularity = candidate.escalation_stages.back().containment_granularity;
+  const auto made = MakeResolvedStopBasePlan(candidate);
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  const auto binding = Binding(made.value());
+  const auto exact = ExpectedDomain(made.value(), binding, GripperActuationKind::kPneumatic);
+  const RuntimeParticipantStopReadinessDTO input{
+      binding.value().controllable_component_id, ComponentLifecycleGeneration(9U), exact.value(), made.value()};
+  const auto accepted = verify_runtime_participant_stop_readiness(input, binding, exact);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto absent = ExpectedDomain(made.value(), binding);
+  auto foreign = input;
+  foreign.expected_controller_domain = absent.value();
+  EXPECT_FALSE(verify_runtime_participant_stop_readiness(foreign, binding, absent).ok());
+  const auto position = ExpectedDomain(made.value(), binding, GripperActuationKind::kPositionCommanded);
+  foreign.expected_controller_domain = position.value();
+  EXPECT_FALSE(verify_runtime_participant_stop_readiness(foreign, binding, position).ok());
+  auto foreign_identity = made.value();
+  foreign_identity.control_binding_revision = ControlBindingRevision(
+      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  const auto resealed = MakeResolvedStopBasePlan(foreign_identity);
+  ASSERT_TRUE(resealed.ok());
+  foreign = input;
+  foreign.resolved_stop_base_plan = resealed.value();
+  EXPECT_FALSE(verify_runtime_participant_stop_readiness(foreign, binding, exact).ok());
+}
+
+TEST(RuntimeParticipantStopReadinessTest, ForgedPneumaticFactCannotReplaceOrdinaryBindingAuthority) {
+  const auto ordinary = BasePlan();
+  const auto binding = Binding(ordinary);
+  const auto expected = ExpectedDomain(ordinary, binding, GripperActuationKind::kPositionCommanded);
+  const RuntimeParticipantStopReadinessDTO input{
+      binding.value().controllable_component_id, ComponentLifecycleGeneration(1U), expected.value(), ordinary};
+  EXPECT_FALSE(verify_runtime_participant_stop_readiness(input, binding, expected).ok());
+  auto position = ordinary;
+  position.gripper_actuation_kind = GripperActuationKind::kPositionCommanded;
+  const auto made = MakeResolvedStopBasePlan(position);
+  ASSERT_TRUE(made.ok());
+  auto exact = input;
+  exact.resolved_stop_base_plan = made.value();
+  EXPECT_TRUE(verify_runtime_participant_stop_readiness(exact, binding, expected).ok());
+}
+
 }  // namespace manyforge::core

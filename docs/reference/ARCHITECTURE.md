@@ -1,22 +1,15 @@
 # ManyForge Architecture
 
-> **Current `dev` status:** the composable-cell cutover has one maintained
-> ManyForge-only native product through explicit Manager, CCLC, Headless,
-> Program-runner, and native execution owners. I7/L0 supplies declarative
-> lifecycle catalogs, deterministic lifecycle/recovery, complete-domain
-> controller-route transactions, verified readiness, and thin confirmed
-> clients. I8 supplies addressed multi-participant Prepare/Dispatch/Resume,
-> asynchronous coordinated controls, scoped Stop and Full Stop, collision
-> consequence routing, immutable certificates/fault latches, durable
-> surveillance/recovery, and command-free orphan reconciliation. The governance
-> contracts are ROS-free; the current product realization is native. Packaged
-> aggregate launch, external-agent provider loops, Isaac/ROS product launch,
-> real hardware, and generalized tools remain later
-> I9-I11 work. Sections describing those three-lane transports remain target or
-> historical reference unless they explicitly name the current native owner.
-> Composer's optional MCP adapter maps tools to the same owner routes as
-> other clients; it has no independent command or lifecycle authority. The
-> current viewer receives credited, current-only native observations.
+> **Current `dev` status:** the maintained execution host uses ROS controller
+> adapters for mock, Isaac and real components. The native simulator is removed;
+> governance contracts, shared planning and cell/runtime-unit ownership remain.
+> The addressed Kernel owns execution and Stop; Manager owns convergence and
+> runtime children; Headless and Program runner expose those owners; Composer
+> remains a client. ROS Workbench empty-ready and mock Phase A
+> `qualified-live02` are the current live evidence. Isaac, physical operation,
+> the complete Compose wrapper and an observed GUI journey are unqualified.
+> Native multi-unit references retained under DX-753 are compatibility and
+> discussion inputs, not qualification of multi-container ROS operation.
 
 A coherent, mid-depth map of how ManyForge is put together: the components, how
 a program flows through them, and — most importantly — which layer owns which

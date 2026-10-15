@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 import pytest
 
-from manyforge_behavior.node_availability import AvailabilityFact
+from manyforge_behavior.node_availability import AvailabilityFact, NodeExecutionReadiness
 from manyforge_behavior.orchestration_ports import (
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
@@ -108,6 +108,11 @@ def test_recovery_fences_join_program_and_execution_owner_contracts() -> None:
         )
 
 
+def _timer_only_program() -> dict[str, Any]:
+    return {"scene": [], "tree": {"node_id": "timer", "instance_id": "timer.1",
+                                 "parameters": {"duration_s": 5.0}, "children": []}}
+
+
 class _Headless:
     """Construction-complete transport whose unused effects fail loudly."""
 
@@ -148,6 +153,7 @@ class _Headless:
             "scenario_id": "cell-pick",
             "source_document_digest": _DIGEST_A,
             "program_revision": _DIGEST_A,
+            "program": _timer_only_program(),
             "retained_bundle_id": _DIGEST_A,
             "graph_revision": _DIGEST_B,
             "program_binding": {
@@ -1647,7 +1653,7 @@ def _bypass_reset_scene_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class _PreparedRunAdmission:
     def __init__(self) -> None:
-        self.program = SimpleNamespace(to_dict=lambda: {"scene": []})
+        self.program = SimpleNamespace(to_dict=_timer_only_program)
 
     def port_context(self, program_run_id: str) -> object:
         return SimpleNamespace(
@@ -5271,14 +5277,15 @@ def test_node_availability_uses_supplied_exact_facts_without_headless_callback(
         ),
     )
     captured: dict[str, Any] = {}
-    root = SimpleNamespace(node_id="root", children=())
+    root = SimpleNamespace(node_id="timer", parameters={"duration_s": 5.0}, children=())
     admitted = SimpleNamespace(
         applied_record_digest=_DIGEST_B,
         graph_revision=_DIGEST_A,
         program_binding_id=_DIGEST_B,
         retained_bundle_id=_DIGEST_A,
         scenario_id="cell-pick",
-        readiness=object(),
+        readiness=NodeExecutionReadiness(program_binding_id=_DIGEST_B,
+            binding_by_node={"timer": AvailabilityFact(True)}, owner_by_port=runtime._owner_availability),
         program=SimpleNamespace(
             program_id="program.1",
             program_revision=_DIGEST_A,
@@ -5297,7 +5304,7 @@ def test_node_availability_uses_supplied_exact_facts_without_headless_callback(
         "schema_version": "manyforge.node_execution_availability.v1",
         "environment_digest": runtime._environment.environment_digest,  # noqa: SLF001
         "program_binding_id": _DIGEST_B,
-        "required_node_ids": ["root"],
+        "required_node_ids": ["timer"],
         "portable_authoring_available": True,
         "execution_available": True,
         "reason_codes": [],
@@ -5316,6 +5323,8 @@ def test_node_availability_uses_supplied_exact_facts_without_headless_callback(
             "applied": {
                 "scenario_id": "cell-pick",
                 "source_document_digest": _DIGEST_A,
+                "program": _timer_only_program(),
+                "program_binding": {},
                 "retained_bundle_id": _DIGEST_A,
                 "graph_revision": _DIGEST_A,
                 "source": {
@@ -5371,6 +5380,8 @@ def test_node_availability_marks_only_native_ports_unavailable_without_owner(
 
     availability = runtime._current_node_owner_availability(  # noqa: SLF001
         {
+            "program": _timer_only_program(),
+            "program_binding": {},
             "retained_bundle_id": _DIGEST_A,
             "graph_revision": _DIGEST_A,
             "source": {"source_generation": 1},
@@ -5831,5 +5842,551 @@ def test_unknown_host_start_keeps_claim_and_unresolved_request_without_resending
         assert repeated.value.code == "program_cycle_reconciliation_required"
         assert len(host.start_admissions) == 1 and host.scheduled == []
         assert admission.releases == []
+    finally:
+        runtime.shutdown()
+
+
+# DX891: dependency follows used targets/nodes, not declared roles or site names.
+class _SimulationLaneHeadless(_Headless):
+    def __init__(self, graph: dict[str, Any]) -> None:
+        super().__init__()
+        self.graph = graph
+        self.graph_reads = 0
+
+    def manager_graph(self) -> dict[str, Any]:
+        self.graph_reads += 1
+        return deepcopy(self.graph)
+
+
+def _simulation_lane_fixture(*, lanes=("mock", "isaac"), simulation=None, admission=None, journal=None):
+    """Use real retained binding row shapes and the actual runtime catalog.
+
+    The second component is an explicit unit-test clone for mixed-lane cases;
+    this fixture does not claim to publish or reverify a compiled CAS artifact.
+    """
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    binding = json.loads((root / "manyforge_deployment/resources/"
+                         "program_binding_lite6_native.fixture.json").read_text())
+    binding["retained_bundle_id"], binding["graph_revision"] = _DIGEST_A, _DIGEST_B
+    component = deepcopy(binding["component_role_bindings"][0])
+    component.update(component_role_id="other_robot", controllable_component_id="robot.other")
+    binding["component_role_bindings"].append(component)
+    target = deepcopy(next(row for row in binding["target_role_bindings"] if row["target_role_id"] == "arm"))
+    target.update(target_role_id="other_arm", component_role_id="other_robot",
+                  controllable_component_id="robot.other")
+    binding["target_role_bindings"].append(target)
+    graph = {
+        "schema_version": "manyforge.manager_graph_projection.v1",
+        "source": {"available": True, "freshness": "fresh", "known_gaps": [],
+                   "source_owner_id": "manager.test", "source_owner_epoch": "manager.epoch.1"},
+        "retained_bundle_id": _DIGEST_A, "graph_revision": _DIGEST_B,
+        "cell_graph": {"graph_revision": _DIGEST_B,
+            "controllable_components": [
+                {"controllable_component_id": "lite6_arm", "runtime_unit_ids": ["cell.ros"]},
+                {"controllable_component_id": "robot.other", "runtime_unit_ids": ["cell.ros"]}],
+            "runtime_units": [{"runtime_unit_id": "cell.ros",
+                "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
+                "configuration": {"mode": "commanded_sim", "controller_profiles": [
+                    {"controllable_component_id": name,
+                     "mock_profile" if lane == "mock" else "isaac_profile":
+                         "lite6_lite_gripper" if lane == "mock" else "lite6"}
+                    for name, lane in zip(("lite6_arm", "robot.other"), lanes, strict=True)]}}]},
+    }
+    if "isaac" in lanes:
+        graph["cell_graph"]["runtime_units"][0]["configuration"]["isaac_world"] = "lite6_grf_ros2"
+    headless = _SimulationLaneHeadless(graph)
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="program-runner.test"),
+        headless_client=headless, execution_transport=headless,
+        simulation_control=simulation, admission_client=admission, cycle_journal=journal)
+    return runtime, headless, binding
+
+
+def _simulation_lane_program(*roles: str, node_id="motion.move_to_joint_target", **parameters):
+    children = [{"node_id": "gripper.command_position" if role == "gripper" else node_id,
+                 "instance_id": f"step.{index}",
+                 "parameters": {**parameters, "target_role": role}, "children": []}
+                for index, role in enumerate(roles)]
+    return {"tree": {"node_id": "sequence", "instance_id": "root",
+                     "parameters": {}, "children": children},
+            # Declared, unused roles must not become simulator dependencies.
+            "target_roles": {"arm": {}, "other_arm": {}, "gripper": {}}}
+
+
+def _simulation_node_program(node_id):
+    parameters = {"simulation.reset": {}, "simulation.set_state": {"state": "play"},
+                  "simulation.step": {"steps": 1},
+                  "simulation.set_entity_pose": {"scene_resource_id": "part", "pose": {
+                      "frame_ref": {"kind": "cell_frame"}, "position_m": [0.0, 0.0, 0.0],
+                      "orientation": {"rpy_deg": [0.0, 0.0, 0.0]}}}}[node_id]
+    return {"tree": {"node_id": node_id, "instance_id": "simulation",
+                     "parameters": parameters, "children": []},
+            "scene": [{"scene_resource_id": "part"}] if node_id == "simulation.set_entity_pose" else []}
+
+
+def _simulation_lane_requirement(runtime, binding, program):
+    return runtime._simulation_context_requirement(  # noqa: SLF001
+        program=program, program_binding=binding,
+        retained_bundle_id=_DIGEST_A, graph_revision=_DIGEST_B)
+
+
+def _simulation_lane_required(runtime, binding, program):
+    return _simulation_lane_requirement(runtime, binding, program)[0]
+
+
+@pytest.mark.parametrize(("lanes", "used_roles", "required"), [
+    (("mock", "mock"), ("arm",), False),
+    (("isaac", "isaac"), ("arm",), True),
+    (("mock", "isaac"), ("arm",), False),  # unused declared Isaac target
+    (("mock", "isaac"), ("gripper",), False),
+    (("mock", "isaac"), ("other_arm",), True),
+    (("mock", "isaac"), ("arm", "other_arm"), True),
+    (("isaac", "mock"), ("other_arm",), False),
+])
+def test_simulation_dependency_follows_only_actual_used_target_components(lanes, used_roles, required):
+    runtime, headless, binding = _simulation_lane_fixture(lanes=lanes)
+    try:
+        assert _simulation_lane_required(runtime, binding, _simulation_lane_program(*used_roles)) is required
+        assert headless.graph_reads == 1
+    finally:
+        runtime.shutdown()
+
+
+def test_used_native_runtime_does_not_become_a_mock_or_isaac_lane():
+    runtime, headless, binding = _simulation_lane_fixture()
+    unit = headless.graph["cell_graph"]["runtime_units"][0]
+    unit["runtime_profile_id"] = "manyforge.native_execution_runtime"
+    unit["configuration"] = {}
+    try:
+        assert _simulation_lane_required(runtime, binding, _simulation_lane_program("arm")) is False
+        assert headless.graph_reads == 1
+    finally:
+        runtime.shutdown()
+
+
+def test_pure_timer_program_has_no_simulator_dependency_or_manager_read():
+    runtime, headless, binding = _simulation_lane_fixture(simulation=_SimulationControl())
+    program = _timer_only_program()
+    try:
+        assert _simulation_lane_requirement(runtime, binding, program) == (
+            False, AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
+        assert headless.graph_reads == 0
+        assert runtime.health()["simulation_control_available"] is True
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("node_id", ["simulation.reset", "simulation.set_state", "simulation.step",
+                                     "simulation.set_entity_pose"])
+@pytest.mark.parametrize(("lanes", "eligible"), [
+    (("mock", "mock"), False), (("isaac", "isaac"), True), (("mock", "isaac"), True),
+])
+def test_actual_cell_global_simulator_capability_has_typed_cell_eligibility(node_id, lanes, eligible):
+    runtime, headless, binding = _simulation_lane_fixture(lanes=lanes, simulation=_SimulationControl())
+    program = _simulation_node_program(node_id)
+    try:
+        required, available = _simulation_lane_requirement(runtime, binding, program)
+        assert required is True
+        assert available == (AvailabilityFact(True) if eligible else
+                             AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
+        assert headless.graph_reads == 1
+        # This is configured ownership, not live simulator service evidence.
+        assert runtime.health()["simulation_control_available"] is True
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("case", ["stale", "unavailable", "gap", "bundle", "graph", "nested_graph",
+                                  "duplicate_profile", "foreign_profile", "both_profiles", "missing_profile",
+                                  "foreign_component_role", "duplicate_component_role", "duplicate_target_role",
+                                  "duplicate_graph_component", "foreign_graph_component", "duplicate_runtime",
+                                  "foreign_runtime", "missing_runtime_profile", "duplicate_runtime_owner"])
+def test_simulation_dependency_refuses_inexact_source_or_used_component_join(case):
+    runtime, headless, binding = _simulation_lane_fixture()
+    graph = headless.graph
+    if case == "stale":
+        graph["source"]["freshness"] = "stale"
+    elif case == "unavailable":
+        graph["source"]["available"] = False
+    elif case == "gap":
+        graph["source"]["known_gaps"] = ["missing_runtime"]
+    elif case == "bundle":
+        graph["retained_bundle_id"] = _DIGEST_B
+    elif case == "graph":
+        graph["graph_revision"] = _DIGEST_A
+    elif case == "nested_graph":
+        graph["cell_graph"]["graph_revision"] = _DIGEST_A
+    elif case in {"duplicate_profile", "foreign_profile", "both_profiles", "missing_profile"}:
+        rows = graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"]
+        if case == "duplicate_profile":
+            rows.append(deepcopy(rows[0]))
+        elif case == "foreign_profile":
+            rows[0]["controllable_component_id"] = "foreign.component"
+        elif case == "both_profiles":
+            rows[0]["isaac_profile"] = "lite6"
+        else:
+            del rows[0]["mock_profile"]
+    elif case == "foreign_component_role":
+        binding["target_role_bindings"][0]["component_role_id"] = "foreign.role"
+    elif case == "duplicate_component_role":
+        binding["component_role_bindings"].append(deepcopy(binding["component_role_bindings"][0]))
+    elif case == "duplicate_target_role":
+        binding["target_role_bindings"].append(deepcopy(binding["target_role_bindings"][0]))
+    elif case == "duplicate_graph_component":
+        graph["cell_graph"]["controllable_components"].append(
+            deepcopy(graph["cell_graph"]["controllable_components"][0]))
+    elif case == "foreign_graph_component":
+        graph["cell_graph"]["controllable_components"][0]["controllable_component_id"] = "foreign.component"
+    elif case == "duplicate_runtime":
+        graph["cell_graph"]["runtime_units"].append(deepcopy(graph["cell_graph"]["runtime_units"][0]))
+    elif case == "foreign_runtime":
+        graph["cell_graph"]["runtime_units"][0]["runtime_unit_id"] = "foreign.runtime"
+    elif case == "missing_runtime_profile":
+        del graph["cell_graph"]["runtime_units"][0]["runtime_profile_id"]
+    elif case == "duplicate_runtime_owner":
+        graph["cell_graph"]["controllable_components"][0]["runtime_unit_ids"].append("cell.ros")
+    try:
+        with pytest.raises(ProgramRunOwnerError):
+            _simulation_lane_required(runtime, binding, _simulation_lane_program("arm"))
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize(("parameters", "required", "reads"), [
+    ({}, True, 1),  # default state selects the condition; default target is Isaac
+    ({"expected_state": "idle"}, False, 0),  # inactive target requirement
+    ({"expected_state": "moving", "target_role": "arm"}, False, 1),
+    ({"expected_state": "moving", "target_role": "other_arm"}, True, 1),
+])
+def test_simulation_dependency_respects_conditional_and_defaulted_target_requirements(
+    monkeypatch, parameters, required, reads
+):
+    runtime, headless, binding = _simulation_lane_fixture()
+    try:
+        catalog = runtime._environment.catalog  # noqa: SLF001
+        original_get = catalog.get
+        entry = original_get("gripper.check_status")
+        # The retained catalog has real conditional feedback requirements, but
+        # no default target-role parameter. This unit-only catalog variation
+        # isolates that supported catalog rule without inventing a product node.
+        entry = replace(entry,
+            required_capabilities=(next(row for row in entry.required_capabilities
+                                        if row.when_equals == "moving"),),
+            parameters=tuple(replace(row, required=False, has_default=True,
+                                     default="other_arm" if row.id == "target_role" else "moving")
+                             for row in entry.parameters))
+        monkeypatch.setattr(catalog, "get", lambda node_id:
+                            entry if node_id == "gripper.check_status" else original_get(node_id))
+        program = {"tree": {"node_id": "gripper.check_status", "instance_id": "status",
+                            "parameters": parameters, "children": []}}
+        assert _simulation_lane_required(runtime, binding, program) is required
+        assert headless.graph_reads == reads
+    finally:
+        runtime.shutdown()
+
+
+def _simulation_lane_context(runtime, binding, *, scenario="not-in-isaac-site", role="arm", program=None):
+    from manyforge_behavior.orchestration_ports import ProgramRunPortContext
+
+    program = _simulation_lane_program(role) if program is None else deepcopy(program)
+    program.setdefault("scene", [])
+    program.update(program_id=binding["program_id"], program_revision=binding["program_revision"])
+    return ProgramRunPortContext(program_run_id="run.selected-lane", applied_record_digest=_DIGEST_B,
+        scenario_id=scenario, source_document_digest=_DIGEST_A,
+        program_id=binding["program_id"], program_revision=binding["program_revision"],
+        program_binding_id=binding["program_binding_id"], retained_bundle_id=_DIGEST_A,
+        graph_revision=_DIGEST_B, node_environment_digest=runtime._environment.environment_digest,
+        program=program, program_binding=binding)
+
+
+@pytest.mark.parametrize(("lane", "scenario", "mapped"), [
+    ("mock", "not-in-isaac-site", False),
+    ("isaac", "not-in-isaac-site", False),
+    ("isaac", "mapped-isaac-cell", True),
+])
+@pytest.mark.parametrize("program_kind", ["target", "entity"])
+def test_selected_context_keeps_real_isaac_site_mapping_strict_and_mock_independent(lane, scenario, mapped, program_kind):
+    from manyforge_program_runner.runtime import _SelectedSimulationContextPort
+    from manyforge_ros.program_simulation_port import (
+        SimulationProgramSiteConfig, SimulationProgramTaskPort, SimulationScenarioSiteConfig,
+    )
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("context selection must not issue a simulator command")
+
+    control = SimpleNamespace(reset=unexpected, set_simulation_state=unexpected,
+                              step=unexpected, set_entity_state=unexpected)
+    raw = SimulationProgramTaskPort(control, SimulationProgramSiteConfig(
+        service_prefix="/isaacsim", service_timeout_s=1.0,
+        scenarios=(SimulationScenarioSiteConfig(scenario_id="mapped-isaac-cell",
+                                               cell_frame_id="world", scene_entities=(
+                                                   {"part": "/World/part"} if program_kind == "entity" else {})),)))
+    runtime, headless, binding = _simulation_lane_fixture(
+        lanes=(lane, "isaac" if program_kind == "target" else "mock"), simulation=raw)
+    context = _simulation_lane_context(runtime, binding, scenario=scenario,
+        program=_simulation_node_program("simulation.set_entity_pose") if program_kind == "entity" else None)
+    selected = _SelectedSimulationContextPort(raw, lambda captured:
+        runtime._simulation_context_requirement(program=captured.program, program_binding=captured.program_binding,
+            retained_bundle_id=captured.retained_bundle_id, graph_revision=captured.graph_revision))
+    try:
+        if lane == "mock" and program_kind == "entity":
+            with pytest.raises(ProgramRunOwnerError, match="simulator"):
+                selected.bind(context)
+        elif lane == "isaac" and not mapped:
+            with pytest.raises(ValueError, match="has no exact simulator site mapping"):
+                selected.bind(context)
+        else:
+            selected.bind(context)
+            selected.unbind(context.program_run_id)
+        assert headless.graph_reads == 1
+        assert runtime.health()["simulation_control_available"] is True
+    finally:
+        runtime.shutdown()
+
+
+def test_one_runtime_rechecks_used_lane_after_each_current_graph_change():
+    simulation = _SimulationControl()
+    runtime, headless, binding = _simulation_lane_fixture(lanes=("mock", "mock"), simulation=simulation)
+    applied = {"program": _simulation_lane_program("arm"), "program_binding": binding,
+               "retained_bundle_id": _DIGEST_A, "graph_revision": _DIGEST_B}
+    profile = headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"][0]
+    try:
+        assert runtime._simulation_context_requirement(program=applied["program"],
+            program_binding=binding, retained_bundle_id=_DIGEST_A, graph_revision=applied["graph_revision"]) == (
+                False, AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
+        del profile["mock_profile"]
+        profile["isaac_profile"] = "lite6"
+        applied["graph_revision"] = binding["graph_revision"] = "sha256:" + "c" * 64
+        headless.graph["graph_revision"] = headless.graph["cell_graph"]["graph_revision"] = applied["graph_revision"]
+        headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["isaac_world"] = "lite6_grf_ros2"
+        assert runtime._simulation_context_requirement(program=applied["program"],
+            program_binding=binding, retained_bundle_id=_DIGEST_A, graph_revision=applied["graph_revision"]) == (
+                True, AvailabilityFact(True))
+        del profile["isaac_profile"]
+        profile["mock_profile"] = "lite6_lite_gripper"
+        applied["graph_revision"] = binding["graph_revision"] = "sha256:" + "d" * 64
+        headless.graph["graph_revision"] = headless.graph["cell_graph"]["graph_revision"] = applied["graph_revision"]
+        assert runtime._simulation_context_requirement(program=applied["program"],
+            program_binding=binding, retained_bundle_id=_DIGEST_A, graph_revision=applied["graph_revision"]) == (
+                False, AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
+        assert headless.graph_reads == 3
+        assert runtime.health()["simulation_control_available"] is True
+    finally:
+        runtime.shutdown()
+
+
+def test_used_isaac_target_requires_but_cannot_supply_an_unconfigured_simulator_owner():
+    runtime, _headless, binding = _simulation_lane_fixture(lanes=("isaac", "mock"))
+    try:
+        assert _simulation_lane_requirement(runtime, binding, _simulation_lane_program("arm")) == (
+            True, AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("with_target", [False, True])
+@pytest.mark.parametrize("node_id", ["simulation.reset", "simulation.set_entity_pose"])
+def test_mock_simulator_node_start_is_refused_before_claim_capture_or_host_start(monkeypatch, tmp_path, with_target, node_id):
+    admission = _Admission()
+    journal = ProgramCycleJournal(tmp_path / "mock-simulator.sqlite3", owner_epoch="program-runner.test")
+    runtime, headless, binding = _simulation_lane_fixture(lanes=("mock", "mock"),
+        simulation=_SimulationControl(), admission=admission, journal=journal)
+    program = _simulation_node_program(node_id)
+    simulator = program["tree"]
+    if with_target:
+        program["tree"] = _simulation_lane_program("arm")["tree"]
+    if with_target:
+        program["tree"]["children"].append(simulator)
+    applied = _Headless.program_applied(headless)
+    applied.update(program=program, program_binding=binding)
+    monkeypatch.setattr(headless, "program_applied", lambda: deepcopy(applied))
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Unavailable simulator capability must refuse before claims or Run effects")
+
+    monkeypatch.setattr(runtime._host, "start_run", forbidden)  # noqa: SLF001
+    monkeypatch.setattr(runtime, "_prepare_run_scene", forbidden)
+    monkeypatch.setattr("manyforge_program_runner.runtime.build_applied_program_run_admission", forbidden)
+    runtime.start()
+    try:
+        with pytest.raises(ProgramRunnerError) as refused:
+            runtime.start_run(_start_request())
+        assert refused.value.code == "program_run_admission_failed"
+        assert "simulator" in str(refused.value).lower()
+        assert journal.read().state == "idle_after_reset"
+        assert journal.read().claim is None and journal.read().program_run_id is None
+        assert admission.claims == [] and headless.registered_captures == []
+        assert headless.graph_reads == 1
+        assert runtime.health()["simulation_control_available"] is True
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize(("scope", "capability", "owner", "required"), [
+    ("cell_global", "simulator.control.reset", "kernel.command_target", False),
+    ("cell_global", "unrelated.global.capability", "simulator.control", None),
+    ("cell_global", "simulator.control.future", "simulator.control", None),
+    ("target_binding", "simulator.control.reset", "simulator.control", False),
+])
+def test_simulator_dependency_uses_exact_catalog_scope_capability_and_configured_owner(
+    monkeypatch, scope, capability, owner, required
+):
+    runtime, headless, binding = _simulation_lane_fixture(lanes=("mock", "isaac"),
+                                                         simulation=_SimulationControl())
+    try:
+        catalog = runtime._environment.catalog  # noqa: SLF001
+        original_get = catalog.get
+        original = original_get("simulation.reset")
+        # Actual catalog entries lack these mismatch cases. A local variation
+        # proves the approved predicate without introducing a product node.
+        requirement = replace(original.required_capabilities[0], scope=scope,
+                              capability_id=capability,
+                              target_parameter="target_role" if scope == "target_binding" else None)
+        entry = replace(original, required_capabilities=(requirement,),
+                        execution=replace(original.execution, owner_api=owner))
+        monkeypatch.setattr(catalog, "get", lambda node_id:
+                            entry if node_id == "simulation.reset" else original_get(node_id))
+        program = {"tree": {"node_id": "simulation.reset", "instance_id": "reset",
+                            "parameters": {"target_role": "arm"}, "children": []}}
+        if required is None:
+            # The owner/scope is authoritative; the known capability set is a
+            # consistency assertion, never permission to skip a future node.
+            with pytest.raises(ProgramRunOwnerError, match="capability"):
+                _simulation_lane_required(runtime, binding, program)
+            assert headless.graph_reads == 0
+        else:
+            assert _simulation_lane_required(runtime, binding, program) is required
+            assert headless.graph_reads == (0 if scope == "cell_global" and not required else 1)
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("program_kind", ["target", "simulator"])
+def test_positive_isaac_profile_requires_existing_sealed_world(program_kind):
+    runtime, headless, binding = _simulation_lane_fixture(lanes=("isaac", "mock"),
+                                                         simulation=_SimulationControl())
+    del headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["isaac_world"]
+    program = (_simulation_lane_program("arm") if program_kind == "target" else
+               {"tree": {"node_id": "simulation.reset", "instance_id": "reset",
+                         "parameters": {}, "children": []}})
+    try:
+        with pytest.raises(ProgramRunOwnerError):
+            _simulation_lane_requirement(runtime, binding, program)
+        assert headless.graph_reads == 1
+    finally:
+        runtime.shutdown()
+
+
+def test_world_string_alone_does_not_supply_simulator_capability():
+    runtime, headless, binding = _simulation_lane_fixture(lanes=("mock", "mock"),
+                                                         simulation=_SimulationControl())
+    headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["isaac_world"] = "lite6_grf_ros2"
+    program = {"tree": {"node_id": "simulation.reset", "instance_id": "reset",
+                        "parameters": {}, "children": []}}
+    try:
+        assert _simulation_lane_requirement(runtime, binding, program) == (
+            True, AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
+    finally:
+        runtime.shutdown()
+
+
+def test_context_bind_rechecks_current_source_and_unbinds_raw_owner():
+    from manyforge_program_runner.runtime import _SelectedSimulationContextPort
+
+    class Simulation(_SimulationControl):
+        def __init__(self):
+            super().__init__()
+            self.binds = []
+            self.unbinds = []
+
+        def bind(self, context):
+            self.binds.append(context.program_run_id)
+
+        def unbind(self, run_id):
+            self.unbinds.append(run_id)
+
+    simulation = Simulation()
+    runtime, headless, binding = _simulation_lane_fixture(lanes=("isaac", "mock"), simulation=simulation)
+    context = _simulation_lane_context(runtime, binding)
+    selected = _SelectedSimulationContextPort(simulation, lambda captured:
+        runtime._simulation_context_requirement(program=captured.program, program_binding=captured.program_binding,
+            retained_bundle_id=captured.retained_bundle_id, graph_revision=captured.graph_revision))
+    try:
+        assert _simulation_lane_requirement(runtime, binding, context.program)[0] is True
+        headless.graph["source"]["freshness"] = "stale"
+        with pytest.raises(ProgramRunOwnerError):
+            selected.bind(context)
+        assert simulation.binds == []
+        # Existing absent-context cleanup remains delegated even after refusal.
+        selected.unbind(context.program_run_id)
+        assert simulation.unbinds == [context.program_run_id]
+        assert headless.graph_reads == 2
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize(("lanes", "node_id", "available", "graph_reads"), [
+    (("mock", "isaac"), "motion.move_to_joint_target", True, 0),
+    (("mock", "mock"), "simulation.reset", False, 1),
+    (("mock", "mock"), "simulation.set_entity_pose", False, 1),
+    (("mock", "isaac"), "simulation.reset", True, 1),
+])
+def test_public_node_availability_projects_real_simulator_eligibility_without_target_poll_reads(
+    monkeypatch, tmp_path, lanes, node_id, available, graph_reads
+):
+    from manyforge_behavior.executable_node_resolver import build_executable_node_resolver
+
+    admission = _Admission()
+    journal = ProgramCycleJournal(tmp_path / "availability.sqlite3", owner_epoch="program-runner.test")
+    runtime, headless, binding = _simulation_lane_fixture(lanes=lanes, simulation=_SimulationControl(),
+                                                       admission=admission, journal=journal)
+    program = (_simulation_lane_program("arm") if node_id == "motion.move_to_joint_target" else
+               _simulation_node_program(node_id))
+    raw_node = (program["tree"]["children"][0] if node_id == "motion.move_to_joint_target" else program["tree"])
+    applied = _Headless.program_applied(headless)
+    applied.update(program=program, program_binding=binding)
+
+    def admit(_applied, **kwargs):
+        # Supply the same existing binding facts as admitted Program data; the
+        # real projector and runtime eligibility determine the negative result.
+        return SimpleNamespace(applied_record_digest=_DIGEST_B, graph_revision=_DIGEST_B,
+            program_binding_id=binding["program_binding_id"], retained_bundle_id=_DIGEST_A,
+            scenario_id="cell-pick", readiness=NodeExecutionReadiness(
+                program_binding_id=binding["program_binding_id"],
+                binding_by_node={row.row.node_id: AvailabilityFact(True) for row in
+                    build_executable_node_resolver(runtime._environment).dispositions},  # noqa: SLF001
+                owner_by_port=kwargs["owner_availability"]),
+            program=SimpleNamespace(program_id=binding["program_id"], program_revision=_DIGEST_A,
+                tree=SimpleNamespace(node_id=node_id, parameters=raw_node["parameters"], children=())))
+
+    monkeypatch.setattr("manyforge_program_runner.runtime.build_applied_program_run_admission", admit)
+    runtime.start()
+    try:
+        result = runtime.node_availability(ProgramNodeAvailabilityRequest.model_validate({"applied": applied}))
+        assert result["availability"]["execution_available"] is available
+        if not available:
+            assert "program_runtime_owner_unavailable" in result["availability"]["reason_codes"]
+        assert headless.graph_reads == graph_reads
+        assert runtime.health()["simulation_control_available"] is True
+        assert admission.claims == [] and headless.registered_captures == []
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("program_kind", ["target", "simulator"])
+def test_non_simulated_ros_configuration_is_explicitly_unsupported_for_m1(program_kind):
+    runtime, headless, binding = _simulation_lane_fixture(lanes=("isaac", "mock"),
+                                                         simulation=_SimulationControl())
+    # No future hardware mode is invented here: this explicit unit fixture
+    # exercises the M1 refusal for any non-commanded_sim ROS configuration.
+    headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["mode"] = "non_simulated_unit_fixture"
+    program = (_simulation_lane_program("arm") if program_kind == "target" else
+               _simulation_node_program("simulation.reset"))
+    try:
+        with pytest.raises(ProgramRunOwnerError, match="does not support non-simulated ROS modes"):
+            _simulation_lane_requirement(runtime, binding, program)
+        assert headless.graph_reads == 1
     finally:
         runtime.shutdown()

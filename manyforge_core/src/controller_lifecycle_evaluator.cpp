@@ -147,7 +147,8 @@ template <typename T>
   }
 
   const auto* selected = find_selected_activation(expected);
-  if (selected == nullptr || selected->active_controller_role_ids.empty()) {
+  if (selected == nullptr || (selected->active_controller_role_ids.empty() &&
+      expected.physical_expectation != ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone)) {
     return reject<void>("desired_activation_set_missing",
                         "desired activation set is missing or ambiguous");
   }

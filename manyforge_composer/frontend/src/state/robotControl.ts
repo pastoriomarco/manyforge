@@ -1531,6 +1531,26 @@ export function buildCartesianMotionIntent(
   }, requestId, settings);
 }
 
+/** The strict current descriptor is a projection, never command authority. */
+export function hasPneumaticGripperDescriptor(status: ExecutionOwnerStatus): boolean {
+  const gripper = status.directControlGripper;
+  if (gripper === null) return false;
+  const descriptor = gripper.targetDescriptor;
+  return descriptor.schemaVersion === 'manyforge.manual_control_gripper_descriptor.v3'
+    && descriptor.commandKind === 'gripper_position'
+    && descriptor.actuationKind === 'pneumatic'
+    && descriptor.graspConfirmationPolicy === 'not_required'
+    && ((descriptor.outputMode === 'commanded' && descriptor.completionPolicy === 'output_delivery')
+      || (descriptor.outputMode === 'none' && descriptor.completionPolicy === 'no_output'))
+    && descriptor.controllableComponentId === gripper.controllableComponentId
+    && descriptor.commandTargetId === gripper.commandTargetId
+    && descriptor.componentRoleId === gripper.componentRoleId
+    && descriptor.targetRoleId === gripper.targetRoleId
+    && descriptor.sourceCoordinateName === gripper.sourceCoordinateName
+    && descriptor.sourceKind === gripper.sourceKind
+    && descriptor.coordinateKind === gripper.coordinateKind;
+}
+
 export function buildGripperCommandIntent(
   status: ExecutionOwnerStatus,
   position: number,
@@ -1541,13 +1561,15 @@ export function buildGripperCommandIntent(
     throw new Error('The selected component has no gripper target.');
   }
   const descriptor = gripper.targetDescriptor;
+  const pneumatic = hasPneumaticGripperDescriptor(status);
   if (
-    status.observedGripper === null
+    !pneumatic
+    && status.observedGripper === null
     && gripper.sourceKind !== 'component_local'
   ) {
     throw new Error('Authoritative gripper state is unavailable.');
   }
-  if (status.observedGripper !== null && !status.observedGripper.complete) {
+  if (!pneumatic && status.observedGripper !== null && !status.observedGripper.complete) {
     throw new Error('Authoritative gripper state is incomplete.');
   }
   if (!gripperPositionIsValid(status, position)) {

@@ -313,6 +313,65 @@ TEST(ControllerRobotDescription, MockFormForEveryOfflineModel) {
   }
 }
 
+TEST(ControllerRobotDescription, NoOutputMockPreservesGeometryAndOnlyControlsArm) {
+  for (const auto& model : offline_models()) {
+    if (!model.gripper_joint.has_value()) continue;
+    SCOPED_TRACE(model.path);
+    const auto text = read_repository_file(model.path);
+    const auto initial = ramp(model.arm_joints.size());
+    auto request = mock_request(text, model.arm_joints, initial,
+                                MockGripperBinding{model.gripper_joint, std::nullopt}, true);
+    std::get<MockControllerLane>(request.lane).gripper_output_mode =
+        manyforge::core::GripperOutputMode::kNone;
+    const auto generated = generate_controller_robot_description(request);
+    expect_model_unchanged(text, generated, "ManyForgeMockSystem",
+                           model.source_ros2_control_count);
+    std::vector<ExpectedJoint> expected;
+    for (std::size_t index = 0; index < model.arm_joints.size(); ++index) {
+      expected.push_back({model.arm_joints[index], initial[index]});
+    }
+    expect_hardware(parse(generated).children.back(), "ManyForgeMockSystem",
+                    "mock_components/GenericSystem",
+                    {{"calculate_dynamics", "true"}}, expected);
+    // An actual supplied scalar may be validated, but it is no hardware seed.
+    std::get<MockControllerLane>(request.lane).gripper->projected_initial_position = 0.0125;
+    EXPECT_EQ(generate_controller_robot_description(request), generated);
+  }
+}
+
+TEST(ControllerRobotDescription, ExplicitCommandedPreservesTheDefaultDescription) {
+  for (const auto& model : offline_models()) {
+    SCOPED_TRACE(model.path);
+    const auto text = read_repository_file(model.path);
+    const auto initial = ramp(model.arm_joints.size());
+    const auto gripper = model.gripper_joint.has_value()
+        ? std::optional(MockGripperBinding{model.gripper_joint, 0.0125})
+        : std::nullopt;
+    auto request = mock_request(text, model.arm_joints, initial, gripper,
+                                model.gripper_joint.has_value());
+    const auto original = generate_controller_robot_description(request);
+    std::get<MockControllerLane>(request.lane).gripper_output_mode =
+        manyforge::core::GripperOutputMode::kCommanded;
+    EXPECT_EQ(generate_controller_robot_description(request), original);
+  }
+}
+
+TEST(ControllerRobotDescription, GripperOnlyMockPreservesEveryModelElement) {
+  for (const auto &model : offline_models()) {
+    if (!model.gripper_joint.has_value()) continue;
+    SCOPED_TRACE(model.path);
+    const auto text = read_repository_file(model.path);
+    const auto generated = generate_controller_robot_description(mock_request(
+        text, {}, {}, MockGripperBinding{model.gripper_joint, 0.0125}, true));
+    expect_model_unchanged(text, generated, "ManyForgeMockSystem",
+                           model.source_ros2_control_count);
+    expect_hardware(parse(generated).children.back(), "ManyForgeMockSystem",
+                    "mock_components/GenericSystem",
+                    {{"calculate_dynamics", "true"}},
+                    {{*model.gripper_joint, 0.0125}});
+  }
+}
+
 TEST(ControllerRobotDescription, IsaacFormForEveryOfflineModel) {
   for (const auto &model : offline_models()) {
     SCOPED_TRACE(model.path);
@@ -506,6 +565,92 @@ TEST(ControllerRobotDescription, FailsClosedOnInvalidInputs) {
                    "name=\"j1\" type=\"revolute\"/></robot>",
                    {"j1"}, {0.0}),
       "declares joint 'j1' more than once");
+}
+
+TEST(ControllerRobotDescription, GripperOnlyMockRefusesInventedOrInvalidState) {
+  const std::string text = kSynthetic;
+  expect_refused(mock_request(text, {}, {},
+                             MockGripperBinding{std::nullopt, std::nullopt}),
+                 "names no arm joint");
+  expect_refused(mock_request(text, {}, {0.0},
+                             MockGripperBinding{"finger", 0.02}),
+                 "initial arm positions without an arm binding");
+  expect_refused(mock_request(text, {}, {},
+                             MockGripperBinding{"missing", 0.02}),
+                 "is not a joint of the model");
+  expect_refused(mock_request(text, {}, {},
+                             MockGripperBinding{"fixed_tool", 0.02}),
+                 "is a fixed joint");
+  expect_refused(mock_request(text, {}, {},
+                             MockGripperBinding{"finger_mimic", 0.02}),
+                 "is a mimic follower");
+  expect_refused(mock_request(text, {}, {},
+                             MockGripperBinding{"finger", std::nullopt}),
+                 "has no retained model projection");
+  expect_refused(mock_request(
+                     text, {}, {},
+                     MockGripperBinding{
+                         "finger", std::numeric_limits<double>::quiet_NaN()}),
+                 "is not finite");
+  expect_refused(ControllerRobotDescriptionRequest{
+                     text, {},
+                     IsaacControllerLane{"Isaac", "/cmd", "/state", {}}},
+                 "names no arm joint");
+}
+
+TEST(ControllerRobotDescription, NoOutputRetainsJointValidationAndRefusesNoArmWriter) {
+  const std::string text = kSynthetic;
+  const auto no_output = [&](std::optional<MockGripperBinding> gripper,
+                             std::vector<std::string> arm = {"j1"},
+                             std::vector<double> initial = {0.0}) {
+    auto request = mock_request(text, arm, std::move(initial), std::move(gripper), true);
+    std::get<MockControllerLane>(request.lane).gripper_output_mode =
+        manyforge::core::GripperOutputMode::kNone;
+    return request;
+  };
+  expect_refused(no_output(std::nullopt), "model-backed gripper binding");
+  expect_refused(no_output(MockGripperBinding{std::nullopt, std::nullopt}),
+                 "model-backed gripper binding");
+  expect_refused(no_output(MockGripperBinding{"finger", std::nullopt}, {}, {}),
+                 "requires an arm");
+  expect_refused(no_output(MockGripperBinding{"missing", std::nullopt}),
+                 "is not a joint of the model");
+  expect_refused(no_output(MockGripperBinding{"fixed_tool", std::nullopt}), "is a fixed joint");
+  expect_refused(no_output(MockGripperBinding{"finger_mimic", std::nullopt}), "is a mimic follower");
+  expect_refused(no_output(MockGripperBinding{"j1", std::nullopt}), "is also an arm joint");
+  expect_refused(no_output(MockGripperBinding{
+                     "finger", std::numeric_limits<double>::quiet_NaN()}), "is not finite");
+  auto unknown = no_output(MockGripperBinding{"finger", std::nullopt});
+  std::get<MockControllerLane>(unknown.lane).gripper_output_mode =
+      static_cast<manyforge::core::GripperOutputMode>(99);
+  expect_refused(unknown, "invalid gripper output mode");
+}
+
+TEST(ControllerRobotDescription, NoOutputIsaacValidatesModelWithoutAddingInterfaces) {
+  const std::string text = kSynthetic;
+  ControllerRobotDescriptionRequest request{
+      text, {"j1", "j2"},
+      IsaacControllerLane{"Isaac", "/cmd", "/state", {0.5, -0.25}}};
+  const auto original = generate_controller_robot_description(request);
+  request.gripper_without_control_interfaces = MockGripperBinding{"finger", std::nullopt};
+  const auto generated = generate_controller_robot_description(request);
+  EXPECT_EQ(generated, original);
+  expect_model_unchanged(text, generated, "Isaac", 3U);
+  expect_hardware(parse(generated).children.back(), "Isaac",
+                  "topic_based_ros2_control/TopicBasedSystem",
+                  {{"joint_commands_topic", "/cmd"}, {"joint_states_topic", "/state"},
+                   {"trigger_joint_command_threshold", "-1"}, {"sum_wrapped_joint_states", "false"}},
+                  {{"j1", 0.5}, {"j2", -0.25}});
+  for (const auto* joint : {"missing", "fixed_tool", "finger_mimic", "j1"}) {
+    request.gripper_without_control_interfaces = MockGripperBinding{joint, std::nullopt};
+    EXPECT_THROW(static_cast<void>(generate_controller_robot_description(request)),
+                 ControllerRobotDescriptionError) << joint;
+  }
+  request.gripper_without_control_interfaces = MockGripperBinding{std::nullopt, std::nullopt};
+  expect_refused(request, "no model-backed source joint");
+  request.gripper_without_control_interfaces = MockGripperBinding{
+      "finger", std::numeric_limits<double>::infinity()};
+  expect_refused(request, "is not finite");
 }
 
 TEST(ControllerRobotDescription, JointNamesComeOnlyFromTheBindingSourceJoints) {

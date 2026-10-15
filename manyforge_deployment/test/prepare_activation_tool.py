@@ -711,6 +711,75 @@ def _rehash_request(request: dict[str, object]) -> None:
     )
 
 
+def _require_gripper_delivery_timeout_semantics(
+    args: argparse.Namespace, request: dict[str, object], root: Path
+) -> None:
+    """Prepare actual pneumatic/Position rows through the authored selector."""
+    root.mkdir()
+
+    def target(value: dict[str, object], component_id: str) -> dict[str, object]:
+        (component,) = [
+            row for row in value["deployment"]["components"]
+            if row["component_id"] == component_id
+        ]
+        (row,) = component["configuration"]["runtime_configuration"][
+            "gripper_target_configurations"
+        ]
+        assert row["controllable_component_id"] == component_id
+        assert row["command_target_id"] == "gripper"
+        return row
+
+    pneumatic = target(request, "lite6_robot")
+    position = target(request, "ur5e_robot")
+    assert pneumatic["actuation_kind"] == "pneumatic" and len(pneumatic) == 14
+    assert pneumatic["delivery_result_timeout_s"] == 1.0
+    assert position["actuation_kind"] == "position_commanded" and len(position) == 13
+    assert "delivery_result_timeout_s" not in position
+
+    for name, timeout in (("authored", 1.0), ("absent", None), ("override", 2.5)):
+        accepted = copy.deepcopy(request)
+        row = target(accepted, "lite6_robot")
+        if timeout is None:
+            del row["delivery_result_timeout_s"]
+        else:
+            row["delivery_result_timeout_s"] = timeout
+        _rehash_request(accepted)
+        prepared = _run(args, accepted, root / name)
+        assert prepared is not None
+        units = prepared["activation_payload"]["retained_bundle"]["cell_graph"][
+            "runtime_units"
+        ]
+        (unit,) = units
+        assert unit["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime"
+        retained = unit["configuration"]["gripper_target_configurations"]
+        assert retained == [row, position]
+
+    invalid_rows = []
+    for name, timeout in (
+        ("zero", 0.0), ("negative", -1.0), ("text", "1.0"),
+        ("boolean", True), ("null", None),
+    ):
+        rejected = copy.deepcopy(request)
+        target(rejected, "lite6_robot")["delivery_result_timeout_s"] = timeout
+        invalid_rows.append((name, rejected))
+    foreign_position = copy.deepcopy(request)
+    target(foreign_position, "ur5e_robot")["delivery_result_timeout_s"] = 1.0
+    invalid_rows.append(("position-timeout", foreign_position))
+    foreign_field = copy.deepcopy(request)
+    row = target(foreign_field, "lite6_robot")
+    row["foreign_timeout_s"] = row.pop("delivery_result_timeout_s")
+    invalid_rows.append(("foreign-fourteenth-field", foreign_field))
+    missing_base = copy.deepcopy(request)
+    del target(missing_base, "lite6_robot")["description"]
+    invalid_rows.append(("missing-base-field", missing_base))
+    for name, rejected in invalid_rows:
+        _rehash_request(rejected)
+        _run(
+            args, rejected, root / name,
+            expect_error="has invalid authored gripper target semantics",
+        )
+
+
 def _check_two_ros_robots(
     args: argparse.Namespace, request: dict[str, object], root: Path
 ) -> None:
@@ -930,7 +999,7 @@ def _check_ros_preparation(
     invalid_kind["deployment"]["components"][0]["configuration"]["runtime_kind"] = "native"
     _rehash_request(invalid_kind)
     _run(args, invalid_kind, root / "ros-kind-mismatch",
-         expect_error="native runtime configuration for ros2_control profile")
+         expect_error="configuration.runtime_kind is unsupported: native")
     invalid_config = copy.deepcopy(request)
     invalid_config["deployment"]["components"][0]["configuration"][
         "runtime_configuration"
@@ -1378,6 +1447,9 @@ def main() -> int:
             _run(args, request, temporary / "empty", expected_program_outcome_kind="no_program")
             return 0
         if args.intent_rejections:
+            _require_gripper_delivery_timeout_semantics(
+                args, request, temporary / "gripper-delivery-timeout"
+            )
             # Launch-time Program parameter overrides were removed; the former
             # request form is refused by version, never reinterpreted.
             removed_overrides = copy.deepcopy(request)
@@ -1463,7 +1535,7 @@ def main() -> int:
                 args,
                 mismatched_runtime_kind,
                 temporary / "mismatched-runtime-kind",
-                expect_error="native runtime configuration for ros2_control profile",
+                expect_error="configuration.runtime_kind is unsupported: native",
             )
 
             invalid_policies = copy.deepcopy(request)

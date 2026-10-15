@@ -1328,6 +1328,48 @@ TEST(SqliteCCLCJournal, RouteRecoveryClaimCannotChangeKindOrConfigurationAcrossR
   }
 }
 
+TEST(SqliteCCLCJournal, PneumaticNoneControllerQueryRoundTripsWithoutChangingRequiredEncoding) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 4U);
+  RequestOwnerEpoch owner("none.codec.owner");
+  ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, 4U).ok());
+  const auto prepared = PreparedRoute(owner);
+  const auto legacy = detail::EncodeRouteSelectionStatus(prepared.initial_status);
+  EXPECT_EQ(detail::DecodeRouteSelectionStatus(legacy), prepared.initial_status);
+  auto none = prepared.initial_status;
+  none.acceptance.controller_lifecycle_observation_query.physical_expectation =
+      ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone;
+  ASSERT_TRUE(none.locally_valid());
+  const auto encoded = detail::EncodeRouteSelectionStatus(none);
+  EXPECT_EQ(encoded.size(), legacy.size() + 5U); // only this typed query has the escape
+  EXPECT_EQ(detail::DecodeRouteSelectionStatus(encoded), none);
+  EXPECT_EQ(detail::EncodeRouteSelectionStatus(prepared.initial_status), legacy);
+  const auto domain = none.acceptance.controller_lifecycle_observation_query.control_domain_id.value();
+  std::string prefix(4U, '\0');
+  prefix.push_back(static_cast<char>(ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone));
+  for (std::size_t i = 0; i < 4U; ++i)
+    prefix.push_back(static_cast<char>((domain.size() >> (i * 8U)) & 0xffU));
+  prefix += domain;
+  const auto offset = encoded.find(prefix);
+  ASSERT_NE(offset, std::string::npos);
+  auto invalid = encoded;
+  invalid[offset + 4U] = static_cast<char>(255U);
+  EXPECT_THROW(detail::DecodeRouteSelectionStatus(invalid), std::invalid_argument);
+  auto foreign = none;
+  foreign.acceptance.controller_lifecycle_observation_query.source_runtime_epoch = RuntimeEpoch("");
+  EXPECT_FALSE(foreign.locally_valid());
+  EXPECT_THROW(detail::EncodeRouteSelectionStatus(foreign), std::invalid_argument);
+  ASSERT_TRUE(SeedRouteClaim(journal, owner, prepared).ok());
+  ASSERT_TRUE(journal.AcceptOrReplayRouteSelection(owner, none.accepted_intent,
+      none.acceptance, none).ok());
+  journal.Close();
+  SqliteCCLCJournal reopened(JournalPath(temporary), CellId("cell.1"), 4U);
+  const auto retained = reopened.LoadRetainedRouteSelectionStatus(none.acceptance.route_selection_transaction_id);
+  ASSERT_TRUE(retained.ok()) << retained.error().message;
+  ASSERT_TRUE(retained.value());
+  EXPECT_EQ(*retained.value(), none);
+}
+
 TEST(SqliteCCLCJournal, RouteCodecPreservesProgramNodeEvidenceAndRequiresAdmissionGeneration) {
   RequestOwnerEpoch owner("old.seed");
   auto prepared = PreparedRoute(owner);

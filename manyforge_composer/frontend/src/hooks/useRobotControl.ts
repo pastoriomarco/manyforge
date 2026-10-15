@@ -13,6 +13,7 @@ import {
   buildPreviewIntent,
   buildJointMotionIntent,
   buildGripperCommandIntent,
+  hasPneumaticGripperDescriptor,
   gripperTargetsForStatus,
   initialRobotControlState,
   operationStateIsTerminal,
@@ -190,6 +191,36 @@ export function acceptedRuntimeScaleStatus(
   };
 }
 
+/** Builds only an advisory query; it never selects or initializes a command draft. */
+export function buildManualAvailabilityIntent(
+  status: ExecutionOwnerStatus,
+  mode: RobotControlMode,
+  draftGripperPosition: number | null,
+  requestIdentity: string,
+): DirectControlOperationIntent {
+  if (mode !== 'gripper') {
+    if (status.observedMotion === null) throw new Error('Motion observation is unavailable.');
+    return buildJointMotionIntent(status, status.observedMotion.positionsRad, requestIdentity);
+  }
+  if (!hasPneumaticGripperDescriptor(status)) {
+    if (status.observedGripper === null) throw new Error('Gripper observation is unavailable.');
+    return buildGripperCommandIntent(status, status.observedGripper.position, requestIdentity);
+  }
+  if (draftGripperPosition !== null) {
+    try {
+      return buildGripperCommandIntent(status, draftGripperPosition, requestIdentity);
+    } catch {
+      // An invalid draft is never repaired. Only the query may use its configured preset.
+    }
+  }
+  const descriptor = status.directControlGripper!.targetDescriptor;
+  const presets = descriptor.namedPresets.filter((preset) => preset.name === descriptor.openStateRef);
+  if (descriptor.openStateRef === null || presets.length !== 1) {
+    throw new Error('The configured gripper open preset is unavailable or ambiguous.');
+  }
+  return buildGripperCommandIntent(status, presets[0].masterPosition, requestIdentity);
+}
+
 /** Cold ownership/hold revisions only; never pose samples or node tick status. */
 export function manualAvailabilityScopeFence(
   snapshot: ComposerHeadlessState | null,
@@ -208,6 +239,7 @@ export function manualAvailabilityScopeFence(
   return JSON.stringify([
     status.ownerEpoch, status.retainedBundleId, status.graphRevision,
     target.programBindingId, target.programRunId,
+    ...(mode === 'gripper' && hasPneumaticGripperDescriptor(selected) ? [target.targetDescriptor] : []),
     snapshot.authoringAdmission.admissionGeneration,
     cycle.programRunnerOwnerEpoch, cycle.cycleGeneration, cycle.state,
     cycle.executionControlRevision,
@@ -367,7 +399,19 @@ export function useRobotControl(
   const previewStatusRef = useRef(selectedStatus);
   previewStatusRef.current = selectedStatus;
   const availabilityStatusRef = useRef(selectedStatus);
-  availabilityStatusRef.current = selectedStatus;
+  const currentAvailabilityStatus = headlessSnapshot?.executionControlStatus == null
+    ? null
+    : selectedStatusForState({
+      status: headlessSnapshot.executionControlStatus,
+      selectedComponentId, selectedMotionTargetId, selectedGripperTargetId,
+    });
+  // A pneumatic transition must query the same snapshot as its scope fence.
+  // Missing/invalid current descriptors must never fall back to the old one.
+  const pneumaticAvailabilityTransition = state.mode === 'gripper'
+    && ((selectedStatus !== null && hasPneumaticGripperDescriptor(selectedStatus))
+      || (currentAvailabilityStatus !== null && hasPneumaticGripperDescriptor(currentAvailabilityStatus)));
+  availabilityStatusRef.current = pneumaticAvailabilityTransition
+    ? currentAvailabilityStatus : selectedStatus;
 
   useEffect(() => {
     // An old owner's response cannot block or reject a successor's draft.
@@ -377,6 +421,9 @@ export function useRobotControl(
     headlessSnapshot?.programCycle?.programRunnerOwnerEpoch,
     headlessSnapshot?.programCycle?.programRunId]);
 
+  const availabilityGripperDraft = selectedStatus !== null
+    && state.mode === 'gripper' && hasPneumaticGripperDescriptor(selectedStatus)
+    ? state.draftGripperPosition : null;
   useEffect(() => {
     if (!enabled || !observeProgramRun || !observeManualAvailability || availabilityScope === null) return;
     const status = availabilityStatusRef.current;
@@ -385,15 +432,9 @@ export function useRobotControl(
     let current = true;
     const read = async () => {
       try {
-        if (state.mode === 'gripper' && status.observedGripper === null) {
-          throw new Error('Gripper observation is unavailable.');
-        }
-        if (state.mode !== 'gripper' && status.observedMotion === null) {
-          throw new Error('Motion observation is unavailable.');
-        }
-        const intent = state.mode === 'gripper'
-          ? buildGripperCommandIntent(status, status.observedGripper!.position, requestId())
-          : buildJointMotionIntent(status, status.observedMotion!.positionsRad, requestId());
+        const intent = buildManualAvailabilityIntent(
+          status, state.mode, availabilityGripperDraft, requestId(),
+        );
         const result = await api.execution.manualAvailability(intent, controller.signal);
         if (current) setAvailability({ scope: availabilityScope, result, error: null });
       } catch (error: unknown) {
@@ -404,7 +445,7 @@ export function useRobotControl(
     void read();
     return () => { current = false; controller.abort(); };
   }, [enabled, observeProgramRun, observeManualAvailability, availabilityScope, availabilityRefresh,
-    state.mode]);
+    state.mode, availabilityGripperDraft]);
 
   useEffect(() => {
     if (observeProgramRun) dispatch({ type: 'manual_scope_changed' });

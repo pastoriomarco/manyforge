@@ -30,7 +30,7 @@
 #include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
@@ -855,7 +855,7 @@ NativeParentCandidate(const std::filesystem::path &root,
   deployment::FilesystemRetainedBundleRepository bundles(root);
   if (components) {
     auto fixture =
-        deployment::test::make_lite6_native_motion_retention_fixture_for_cell(
+        deployment::test::make_lite6_ros2_control_shared_consumer_retention_fixture(
             "runtime_only_cell");
     const deployment::test::Lite6ControllableCompilerInputArtifactSource source(
         fixture);
@@ -1005,7 +1005,7 @@ NativeParentReadFixture WriteNativeParent(
   convergence.runtime_units = BuildVerifiedRuntimeConvergencePlan(
       candidate, artifacts, "linux",
       {"posix.1-2017",
-       std::string(deployment::native_execution_runtime_contract::kLaunchEnvironmentContract)});
+       std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)});
   const auto runtime =
       journal
           .EnsureRuntimeConvergenceIntent(persisted.intent_digest, convergence)

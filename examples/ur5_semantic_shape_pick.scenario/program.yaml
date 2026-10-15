@@ -142,7 +142,7 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.4.0"
+    "content_version": "2.5.0"
   },
   "compatibility": {
     "assistant": "required",
@@ -331,8 +331,8 @@
             "target_role": "arm",
             "tcp_frame_role": "tcp",
             "tool_position": {
-              "kind": "linear_m",
-              "value_m": 0.0
+              "kind": "named_preset",
+              "name": "closed"
             },
             "tool_target_role": "gripper"
           },
@@ -383,10 +383,13 @@
         {
           "children": [],
           "instance_id": "close_gripper",
-          "node_id": "logic.set_value",
+          "node_id": "gripper.command_position",
           "parameters": {
-            "key": "gripper_closed",
-            "value": true
+            "position": {
+              "kind": "named_preset",
+              "name": "closed"
+            },
+            "target_role": "gripper"
           }
         },
         {
@@ -511,10 +514,13 @@
         {
           "children": [],
           "instance_id": "open_gripper",
-          "node_id": "logic.set_value",
+          "node_id": "gripper.command_position",
           "parameters": {
-            "key": "gripper_closed",
-            "value": false
+            "position": {
+              "kind": "named_preset",
+              "name": "open"
+            },
+            "target_role": "gripper"
           }
         },
         {

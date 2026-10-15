@@ -1358,6 +1358,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       std::vector<StopAffectedOperationRevisionDTO> affected_revisions;
       std::vector<PreparedParticipantStopPlanDTO> plans;
       std::vector<ResourceSlotStopFenceOwnerDTO> owner_rows;
+      std::vector<ResourceSlotStopFenceOwnerDTO> revision_only_rows;
       std::vector<OperationId> newly_fenced_operations;
       EmergencyStopAffectedStateSnapshotDTO affected_state;
       const bool exact_partial_capture =
@@ -1425,7 +1426,9 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         affected_revisions.push_back({operation_id, next_revision});
         newly_fenced_operations.push_back(operation_id);
         for (const auto& participant : operation->participants) {
-          if (!participant_selected(operation_id, participant.slot_owner.participant_id)) {
+          if (!participant_selected(operation_id, participant.slot_owner.participant_id) ||
+              participant.non_motion_transaction()) {
+            revision_only_rows.push_back({participant.slot_owner, participant.resources, next_revision});
             continue;
           }
           const auto& selected_stop_plan =
@@ -1445,6 +1448,10 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         }
       }
       std::sort(owner_rows.begin(), owner_rows.end(), [](const auto& left, const auto& right) {
+        return std::tie(left.expected_owner.operation_id, left.expected_owner.participant_id) <
+               std::tie(right.expected_owner.operation_id, right.expected_owner.participant_id);
+      });
+      std::sort(revision_only_rows.begin(), revision_only_rows.end(), [](const auto& left, const auto& right) {
         return std::tie(left.expected_owner.operation_id, left.expected_owner.participant_id) <
                std::tie(right.expected_owner.operation_id, right.expected_owner.participant_id);
       });
@@ -1493,12 +1500,12 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         accepted->requested_selector_digest = requested_selector_digest.value();
       }
       auto fenced =
-          owner_rows.empty() && orphan_resources.empty()
+          owner_rows.empty() && orphan_resources.empty() && revision_only_rows.empty()
               ? Result<ResourceSlotStopFenceResultDTO>::Ok(ResourceSlotStopFenceResultDTO{
                     slot_snapshot.operation_resource_generation, outcome.stop_generation, {}, {}})
               : resource_slots_->stop_fence_batch(ResourceSlotStopFenceRequestDTO{
                     slot_snapshot.operation_resource_generation, outcome.stop_generation,
-                    std::move(owner_rows), orphan_resources});
+                    std::move(owner_rows), orphan_resources, std::move(revision_only_rows)});
       if (!fenced.ok()) {
         motion_admission_closed_ = true;
         return Result<StopAcceptedDTO>::Err(fenced.error());
@@ -1515,7 +1522,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         }
         for (auto& participant : operation->participants) {
           if (!participant_selected(affected.operation_id, participant.slot_owner.participant_id) ||
-              participant.payload_kind != OperationParticipantPayloadKind::kMotion ||
+              participant.non_motion_transaction() ||
               participant.engine == nullptr || participant.preparation_id == 0U) {
             continue;
           }
@@ -1541,9 +1548,11 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
           operation->runtime_scale_status->updated_at_ns = accepted_at_ns;
         }
         for (auto& participant : operation->participants) {
-          if (!participant_selected(affected.operation_id, participant.slot_owner.participant_id)) {
+          if (!participant_selected(affected.operation_id, participant.slot_owner.participant_id) ||
+              participant.non_motion_transaction()) {
             continue;
           }
+          participant.stop_containment_owned = true;
           participant.stop_cancelled_pre_dispatch =
               participant.stop_cancelled_pre_dispatch ||
               (participant.payload_kind == OperationParticipantPayloadKind::kMotion
@@ -1555,6 +1564,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         // settlement. A participant that never crossed the dispatch barrier
         // is recorded below, but the operation remains Stopping until that
         // participant owner has committed the same no-effect outcome.
+        // Preserve each observed non-motion row while moving rows enter Stop.
         operation->state.state = OperationStateKind::kStopping;
         operation->state.active_stop_id = StopId(std::string(outcome.stop_id()));
         operation->state.active_stop_generation = outcome.stop_generation;
@@ -1566,20 +1576,23 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
                 [&](const auto& candidate) {
                   return candidate.slot_owner.participant_id == participant_state.participant_id;
                 });
-            participant_state.state = participant != operation->participants.end() &&
-                                              participant->stop_cancelled_pre_dispatch
-                                          ? OperationStateKind::kCancelledPreDispatch
-                                          : OperationStateKind::kStopping;
+            if (participant != operation->participants.end() &&
+                participant->stop_owns_reconciliation())
+              participant_state.state = participant != operation->participants.end() &&
+                                                participant->stop_cancelled_pre_dispatch
+                                            ? OperationStateKind::kCancelledPreDispatch
+                                            : OperationStateKind::kStopping;
             // Containment does not acknowledge or repair a retained fault.
           }
         }
         for (auto& participant : operation->participants) {
-          if (!participant_selected(affected.operation_id, participant.slot_owner.participant_id)) {
-            continue;
-          }
           participant.slot_owner.operation_revision = affected.operation_revision_after_acceptance;
-          participant.slot_state = ResourceSlotState::kStopping;
+          if (participant.stop_owns_reconciliation())
+            participant.slot_state = ResourceSlotState::kStopping;
         }
+        if (std::none_of(operation->participants.begin(), operation->participants.end(),
+                         [](const auto& row) { return row.stop_owns_reconciliation(); }))
+          operation->state.state = aggregate_participant_state(operation->state.participants);
         operation->stop_effect_in_flight = true;
         stamp_operation_capture_locked(*operation, operation->state);
         affected_state.operations.push_back(operation->state);
@@ -1645,7 +1658,9 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       cell_stop_generation_ = std::max(cell_stop_generation_, outcome.stop_generation);
       if (outcome.full_stop ||
           accepted->resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull) {
-        motion_admission_closed_ = true;
+        // Promotion/incident faults already made the restrictive assignment.
+        // A genuine FullStop alone closes motion while ordinary I/O survives.
+        motion_admission_closed_.close_for_stop();
       }
     }
 
@@ -1714,8 +1729,10 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
           auto& state = fence.node_states[index];
           if (state == ProgramNodeHoldStateDTO::kRunning &&
               program_node_effectful_locked(fence.program_run_id, index))
-            state = ProgramNodeHoldStateDTO::kStopping;
+            state = program_node_non_motion_locked(fence.program_run_id, index)
+                        ? ProgramNodeHoldStateDTO::kHeld : ProgramNodeHoldStateDTO::kStopping;
         }
+        fence_held_prepared_program_commands_locked(fence.program_run_id);
       }
     }
     if (ordinary != nullptr && malformed_ingress == nullptr && accepted.has_value()) {
@@ -2643,8 +2660,20 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
       projection.terminal_operation_states.reserve(transaction.operations.size());
       for (const auto& operation_id : transaction.operations) {
         auto* operation = find_active_operation_locked(operation_id);
-        if (operation == nullptr || !terminal(operation->state.state)) {
-          return false;
+        if (operation == nullptr) return false;
+        // Only the actual selected moving rows belong to this certificate.
+        // The full honest snapshot may still contain ordinary Executing work.
+        for (const auto& work : transaction.participants) {
+          if (work.operation_id != operation_id) continue;
+          const auto row = std::find_if(operation->state.participants.begin(),
+              operation->state.participants.end(), [&](const auto& candidate) {
+                return candidate.participant_id == work.plan.participant_id;
+              });
+          if (operation->state.active_stop_id != certificate.stop_id ||
+              operation->state.active_stop_generation != certificate.stop_generation ||
+              !work.terminal || !work.terminal_projection_complete ||
+              (work.contained && !work.settlement_not_required() && !work.participant_settlement_complete) ||
+              row == operation->state.participants.end() || !terminal(row->state)) return false;
         }
         stamp_operation_capture_locked(*operation, operation->state);
         projection.terminal_operation_states.push_back(operation->state);
@@ -2786,6 +2815,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           for (std::size_t index = 0U; index < operation->participants.size(); ++index) {
             const auto& active_participant = operation->participants[index];
             const auto& participant_state = operation->state.participants[index];
+            if (active_participant.non_motion_transaction()) continue;
             if (!transaction.participant_ids.empty() &&
                 !std::binary_search(transaction.participant_ids.begin(),
                                     transaction.participant_ids.end(),
@@ -2843,6 +2873,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                      false,
                                      std::nullopt,
                                      std::nullopt};
+            work.gripper_actuation = active_participant.gripper_actuation;
             work.retained_results.reserve(kMaxStopEscalationStages * 2U);
             if (runtime_collision_containment &&
                 active_participant.payload_kind == OperationParticipantPayloadKind::kMotion &&
@@ -3343,14 +3374,29 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             std::all_of(operation->state.participants.begin(), operation->state.participants.end(),
                         [](const auto& candidate) { return terminal(candidate.state); });
         if (all_participants_terminal) {
-          operation->state.state =
-              std::all_of(operation->state.participants.begin(),
-                          operation->state.participants.end(),
-                          [](const auto& candidate) {
-                            return candidate.state == OperationStateKind::kStopped;
-                          })
-                  ? OperationStateKind::kStopped
-                  : OperationStateKind::kInterventionRequired;
+          const bool has_pneumatic_transaction = std::any_of(
+              operation->participants.begin(), operation->participants.end(),
+              [](const auto& row) { return row.finishes_current_gripper_transaction(); });
+          operation->state.state = has_pneumatic_transaction
+              ? aggregate_participant_state(operation->state.participants)
+              : std::all_of(operation->state.participants.begin(),
+                            operation->state.participants.end(), [](const auto& candidate) {
+                              return candidate.state == OperationStateKind::kStopped;
+                            }) ? OperationStateKind::kStopped : OperationStateKind::kInterventionRequired;
+        } else {
+          // Once the selected moving rows have settled, ordinary siblings
+          // retain their truthful aggregate state independently of Stop.
+          const bool moving_settled = std::all_of(operation->participants.begin(),
+              operation->participants.end(), [&](const auto& candidate) {
+                if (!candidate.stop_owns_reconciliation()) return true;
+                const auto row = std::find_if(operation->state.participants.begin(),
+                    operation->state.participants.end(), [&](const auto& state) {
+                      return state.participant_id == candidate.slot_owner.participant_id;
+                    });
+                return row != operation->state.participants.end() && terminal(row->state);
+              });
+          if (moving_settled)
+            operation->state.state = aggregate_participant_state(operation->state.participants);
         }
         operation->state.updated_at_ns = now;
         // A production Stop backend can publish its terminal state before the
@@ -3437,6 +3483,14 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             }
             auto& pending = *operation->pending_control;
             if (pending.accepted.control != OperationControlKind::kReset) {
+              if (pending.accepted.control == OperationControlKind::kAcknowledgeCompleted &&
+                  operation->ordinary_pneumatic_acknowledgement() &&
+                  !pending.first_failure.has_value()) {
+                // Either the ordinary ACK callback or this exact certificate
+                // is last. Preserve the durable claim until both arrive.
+                settle_completed_control_locked(operation_id);
+                continue;
+              }
               if (pending.first_failure.has_value()) {
                 retain_terminal_capture(capture_control_failure_locked(*operation));
               }

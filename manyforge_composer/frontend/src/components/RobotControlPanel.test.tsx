@@ -5,6 +5,8 @@ import { RobotControlPanel, RobotControlPanelView } from './RobotControlPanel';
 import { useRobotControl } from '../hooks/useRobotControl';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { LogicalSceneProjection } from '../types/api';
+import { buildGripperCommandIntent, initialRobotControlState, robotControlReducer } from '../state/robotControl';
+import { gripperReceiptFixture, statusFixture } from '../testFixtures/robotControl';
 
 const controller = vi.hoisted(() => ({
   state: {
@@ -83,10 +85,11 @@ const controller = vi.hoisted(() => ({
         minPosition: 0,
         maxPosition: 0.04,
         targetDescriptor: {
-          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v2',
+          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v3',
           controllableComponentId: 'robot-1', commandTargetId: 'gripper', componentRoleId: 'controlled_component', targetRoleId: 'command_target',
           description: 'Test gripper', commandKind: 'gripper_position',
           actuationKind: 'position_commanded', transportKind: 'resolved_binding',
+          outputMode: 'commanded',
           controlInterfaceContractId: null, stateAuthorityId: null,
           stateAuthorityClass: null, completionPolicy: 'goal_fenced_target_reached',
           graspConfirmationPolicy: 'binding_feedback_required', sourceGroupName: 'gripper',
@@ -200,6 +203,73 @@ vi.mock('../hooks/useRobotControl', () => ({
 }));
 
 describe('RobotControlPanel layout', () => {
+  it.each(['commanded', 'none'] as const)(
+    'keeps pneumatic %s authoring and exact preview approval behind owner eligibility during Stop', (outputMode) => {
+      const status = statusFixture();
+      Object.assign(status.directControlGripper!.targetDescriptor, { actuationKind: 'pneumatic', outputMode,
+        completionPolicy: outputMode === 'none' ? 'no_output' : 'output_delivery',
+        graspConfirmationPolicy: 'not_required' });
+      status.observedGripper = null;
+      status.observedGrippers = [];
+      let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+      state = robotControlReducer(state, { type: 'select_mode', mode: 'gripper' });
+      state = robotControlReducer(state, { type: 'edit_gripper', position: 0.03 });
+      state = robotControlReducer(state, { type: 'preview_started', generation: state.generation,
+        intent: buildGripperCommandIntent(status, 0.03, 'manual-during-stop') });
+      state = robotControlReducer(state, { type: 'preview_resolved', generation: state.generation,
+        receipt: gripperReceiptFixture(status, 'manual-during-stop', 0.03) });
+      expect(state.phase).toBe('ready');
+      const panelController: ReturnType<typeof useRobotControl> = { ...useRobotControl(true), state, selectedStatus: status,
+        manualControlAllowed: true, manualControlUnavailableReason: null };
+      const program = { cycleState: 'running', state: { applied: null,
+        controls: { executionSelections: { groups: [{ groupId: 'cell', state: 'stopping' }] } } },
+      } as unknown as ProgramRuntimeController;
+      const render = () => renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} program={program} />);
+      expect(render()).not.toMatch(/class="approve-button"[^>]*disabled=""/);
+      panelController.manualControlAllowed = false;
+      panelController.manualControlUnavailableReason = 'Component not ready';
+      expect(render()).toMatch(/class="approve-button"[^>]*disabled=""/);
+      panelController.manualControlAllowed = true;
+      panelController.state = { ...state, phase: 'executing', operation: {
+        operationId: 'resident', operationRevision: 1, resident: true, state: 'executing', progress: 0,
+        activeStopId: null, activeStopGeneration: null, terminalError: null,
+      } };
+      expect(render()).toMatch(/class="approve-button"[^>]*disabled=""/);
+      panelController.state = { ...state, phase: 'blocked', preview: null };
+      expect(render()).toMatch(/class="approve-button"[^>]*disabled=""/);
+    },
+  );
+
+  it.each(['commanded', 'none'] as const)(
+    'describes pneumatic %s completion as a command transaction', (outputMode) => {
+      const previousMode = controller.state.mode;
+      const descriptor = controller.state.status.directControlGripper!.targetDescriptor;
+      const previous = { ...descriptor };
+      try {
+        controller.state.mode = 'gripper';
+        Object.assign(descriptor, { actuationKind: 'pneumatic', outputMode,
+          completionPolicy: outputMode === 'none' ? 'no_output' : 'output_delivery',
+          graspConfirmationPolicy: 'not_required' });
+        const markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+        expect(markup).toContain('Completion covers the command transaction, not grasp verification.');
+        expect(markup).not.toContain('Completion confirms the observed coordinate');
+      } finally {
+        Object.assign(descriptor, previous);
+        controller.state.mode = previousMode;
+      }
+    },
+  );
+
+  it('preserves the position completion explanation', () => {
+    const previousMode = controller.state.mode;
+    try {
+      controller.state.mode = 'gripper';
+      const markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+      expect(markup).toContain('Completion confirms the observed coordinate, not an object grasp.');
+      expect(markup).not.toContain('Completion covers the command transaction');
+    } finally { controller.state.mode = previousMode; }
+  });
+
   it('offers Applied stored goals, never Draft goals, and invalidates removed sources', () => {
     const state = controller.state as unknown as Record<string, unknown>;
     const previous = { ...state };

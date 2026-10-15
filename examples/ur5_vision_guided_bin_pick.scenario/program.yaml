@@ -191,7 +191,7 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.4.0"
+    "content_version": "2.5.0"
   },
   "compatibility": {
     "assistant": "required",
@@ -364,8 +364,8 @@
                         "target_role": "arm",
                         "tcp_frame_role": "tcp",
                         "tool_position": {
-                          "kind": "linear_m",
-                          "value_m": 0
+                          "kind": "named_preset",
+                          "name": "closed"
                         },
                         "tool_target_role": "gripper"
                       }
@@ -516,8 +516,8 @@
                         "target_role": "arm",
                         "tcp_frame_role": "tcp",
                         "tool_position": {
-                          "kind": "linear_m",
-                          "value_m": 0.01
+                          "kind": "named_preset",
+                          "name": "open"
                         },
                         "tool_target_role": "gripper"
                       }
@@ -707,8 +707,8 @@
                         "target_role": "arm",
                         "tcp_frame_role": "tcp",
                         "tool_position": {
-                          "kind": "linear_m",
-                          "value_m": 0
+                          "kind": "named_preset",
+                          "name": "closed"
                         },
                         "tool_target_role": "gripper"
                       }
@@ -859,8 +859,8 @@
                         "target_role": "arm",
                         "tcp_frame_role": "tcp",
                         "tool_position": {
-                          "kind": "linear_m",
-                          "value_m": 0.01
+                          "kind": "named_preset",
+                          "name": "open"
                         },
                         "tool_target_role": "gripper"
                       }

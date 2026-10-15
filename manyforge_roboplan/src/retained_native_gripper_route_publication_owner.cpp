@@ -1,7 +1,11 @@
+#include <manyforge_roboplan/retained_native_cell_runtime.hpp>
 #include <manyforge_roboplan/retained_native_gripper_route_publication_owner.hpp>
 
+#include <algorithm>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <set>
 #include <utility>
 
 namespace manyforge::roboplan_backend {
@@ -22,9 +26,11 @@ RetainedNativeGripperRoutePublicationOwner::
     RetainedNativeGripperRoutePublicationOwner(
         std::shared_ptr<RetainedNativeGripperRuntime> gripper,
         core::IClock& clock, core::ResourceAddressedExecutionKernel& kernel,
-        CellKernelCandidateBuilder cell_candidate_builder)
+        CellKernelCandidateBuilder cell_candidate_builder, RetainedNativeCellRuntime* cell_owner)
     : gripper_(std::move(gripper)), clock_(clock), kernel_(kernel),
-      cell_candidate_builder_(std::move(cell_candidate_builder)) {
+      cell_candidate_builder_(std::move(cell_candidate_builder)), cell_owner_(cell_owner) {
+  if (cell_owner_ && &cell_owner_->addressed_kernel() != &kernel_)
+    throw std::invalid_argument("gripper route seam names another stable cell Kernel");
   if (gripper_ == nullptr || gripper_->participant_engine() == nullptr) {
     throw std::invalid_argument(
         "native gripper route publication requires one retained gripper owner");
@@ -40,6 +46,45 @@ RetainedNativeGripperRoutePublicationOwner::
   }
 }
 
+void RetainedNativeGripperRoutePublicationOwner::BindParticipantPeers(
+    const std::shared_ptr<RetainedNativeGripperRoutePublicationOwner>& root,
+    std::map<core::ControlDomainId,
+        std::shared_ptr<RetainedNativeGripperRoutePublicationOwner>> peers) {
+  if (root.get() != this || !participant_peers_.empty() ||
+      transition_mutex_ != &mutex_)
+    throw std::invalid_argument("scalar route peer map requires its exact unjoined root");
+  const auto own = gripper_->binding();
+  for (const auto& [domain, peer] : peers) {
+    if (!peer || peer.get() == this || &peer->kernel_ != &kernel_ ||
+        &peer->clock_ != &clock_ || peer->cell_owner_ != cell_owner_ ||
+        !peer->participant_peers_.empty() || peer->transition_mutex_ != &peer->mutex_)
+      throw std::invalid_argument("scalar route peer map has a foreign or cyclic owner");
+    const auto binding = peer->gripper_->binding();
+    if (!binding.value().control_path ||
+        binding.value().control_path->control_domain_id != domain ||
+        (own.value().control_path && own.value().control_path->control_domain_id == domain))
+      throw std::invalid_argument("scalar route peer map repeats or misnames a domain owner");
+  }
+  for (const auto& [domain, peer] : peers) {
+    static_cast<void>(domain);
+    peer->transition_owner_ = root;
+    peer->transition_mutex_ = &mutex_;
+  }
+  participant_peers_.swap(peers);
+}
+
+core::Result<std::shared_ptr<void>>
+RetainedNativeGripperRoutePublicationOwner::PinTransitionOwner() const {
+  if (transition_mutex_ == &mutex_)
+    return core::Result<std::shared_ptr<void>>::Ok({});
+  auto owner = transition_owner_.lock();
+  if (!owner)
+    return route_publication_error<std::shared_ptr<void>>(
+        "route_publication_cell_owner_missing", "scalar route transition lost its exact cell owner",
+        core::ErrorCode::kMissingReference);
+  return core::Result<std::shared_ptr<void>>::Ok(std::move(owner));
+}
+
 core::Result<std::vector<core::RuntimeParticipantBinding>>
 RetainedNativeGripperRoutePublicationOwner::ReadCurrentPhysicalParticipants(
     const core::ActiveControlConfigurationDTO& configuration) const {
@@ -52,15 +97,34 @@ RetainedNativeGripperRoutePublicationOwner::ReadCurrentPhysicalParticipants(
         "native gripper physical read requires a valid reconciled configuration",
         core::ErrorCode::kInvalidRequest);
   }
-  if (configuration.binding_routes.size() != 1U) {
+  if (configuration.binding_routes.empty()) {
     return route_publication_error<
         std::vector<core::RuntimeParticipantBinding>>(
         "route_publication_gripper_scope_invalid",
-        "standalone gripper route publication requires exactly one selected binding",
+        "gripper route publication requires every exact installed binding",
         core::ErrorCode::kInvalidRequest);
   }
 
-  std::lock_guard lock(mutex_);
+  const auto owner_binding = gripper_->binding();
+  if (owner_binding.value().control_path &&
+      owner_binding.value().control_path->control_domain_id != configuration.control_domain_id) {
+    const auto peer = participant_peers_.find(configuration.control_domain_id);
+    if (peer != participant_peers_.end())
+      return peer->second->ReadCurrentPhysicalParticipants(configuration);
+  }
+  // Root transition -> scalar-local -> actual gripper mutex. Delegation above
+  // never holds the shared nonrecursive mutex while the peer acquires it.
+  const auto transition_owner = PinTransitionOwner();
+  if (!transition_owner.ok()) return core::Result<std::vector<core::RuntimeParticipantBinding>>::Err(transition_owner.error());
+  std::unique_lock transition_lock(*transition_mutex_);
+  std::unique_lock local_lock(mutex_, std::defer_lock);
+  if (transition_mutex_ != &mutex_) local_lock.lock();
+  const auto installed_owner = ValidateInstalledOwner(transition_owner.value());
+  if (!installed_owner.ok()) return core::Result<std::vector<core::RuntimeParticipantBinding>>::Err(installed_owner.error());
+  if (configuration.binding_routes.size() != gripper_->registrations().size())
+    return route_publication_error<std::vector<core::RuntimeParticipantBinding>> (
+        "route_publication_gripper_scope_invalid", "Selected route omits or adds an installed gripper binding",
+        core::ErrorCode::kInvalidRequest);
   const auto binding = gripper_->binding();
   const auto& value = binding.value();
   if (!value.control_path.has_value()) {
@@ -70,19 +134,23 @@ RetainedNativeGripperRoutePublicationOwner::ReadCurrentPhysicalParticipants(
         "retained gripper no longer has a current control path",
         core::ErrorCode::kMissingReference);
   }
-  const auto& path = *value.control_path;
-  const auto& selected = configuration.binding_routes.front();
-  if (path.control_domain_id != configuration.control_domain_id ||
-      path.control_binding_id != selected.control_binding_id ||
-      path.control_binding_revision != selected.control_binding_revision) {
-    return route_publication_error<
-        std::vector<core::RuntimeParticipantBinding>>(
-        "route_publication_physical_binding_missing",
-        "retained gripper does not own the selected physical binding",
-        core::ErrorCode::kMissingReference);
+  std::vector<core::RuntimeParticipantBinding> representatives;
+  for (const auto& registration : gripper_->registrations()) {
+    const auto& current = registration.binding.value();
+    if (!current.control_path)
+      return route_publication_error<std::vector<core::RuntimeParticipantBinding>>(
+          "route_publication_physical_binding_missing", "Gripper representative lost its control path");
+    const auto& route_path = *current.control_path;
+    const auto selected = std::find_if(configuration.binding_routes.begin(), configuration.binding_routes.end(),
+        [&](const auto& row) { return row.control_binding_id == route_path.control_binding_id; });
+    if (route_path.control_domain_id != configuration.control_domain_id ||
+        selected == configuration.binding_routes.end() ||
+        route_path.control_binding_revision != selected->control_binding_revision)
+      return route_publication_error<std::vector<core::RuntimeParticipantBinding>>(
+          "route_publication_physical_binding_missing", "Gripper does not own the complete selected binding set");
+    representatives.push_back(registration.binding);
   }
-  return core::Result<std::vector<core::RuntimeParticipantBinding>>::Ok(
-      {binding});
+  return core::Result<std::vector<core::RuntimeParticipantBinding>>::Ok(std::move(representatives));
 }
 
 core::Result<core::RuntimeRouteConfigurationReadbackDTO>
@@ -96,14 +164,33 @@ RetainedNativeGripperRoutePublicationOwner::
         "native gripper route publication has an invalid configuration",
         core::ErrorCode::kInvalidRequest);
   }
-  if (configuration.binding_routes.size() != 1U) {
+  if (configuration.binding_routes.empty()) {
     return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
         "route_publication_gripper_scope_invalid",
-        "standalone gripper route publication requires exactly one selected binding",
+        "gripper route publication requires every exact installed binding",
         core::ErrorCode::kInvalidRequest);
   }
 
-  std::lock_guard lock(mutex_);
+  const auto owner_binding = gripper_->binding();
+  if (owner_binding.value().control_path &&
+      owner_binding.value().control_path->control_domain_id != configuration.control_domain_id) {
+    const auto peer = participant_peers_.find(configuration.control_domain_id);
+    if (peer != participant_peers_.end())
+      return peer->second->PublishAndReadBackRouteConfiguration(configuration, std::move(participants));
+  }
+  // Root transition -> scalar-local -> actual gripper mutex. Delegation above
+  // never holds the shared nonrecursive mutex while the peer acquires it.
+  const auto transition_owner = PinTransitionOwner();
+  if (!transition_owner.ok()) return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(transition_owner.error());
+  std::unique_lock transition_lock(*transition_mutex_);
+  std::unique_lock local_lock(mutex_, std::defer_lock);
+  if (transition_mutex_ != &mutex_) local_lock.lock();
+  const auto installed_owner = ValidateInstalledOwner(transition_owner.value());
+  if (!installed_owner.ok()) return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(installed_owner.error());
+  if (configuration.binding_routes.size() != gripper_->registrations().size())
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO> (
+        "route_publication_gripper_scope_invalid", "Selected route omits or adds an installed gripper binding",
+        core::ErrorCode::kInvalidRequest);
   const auto old_binding = gripper_->binding();
   const auto old_readiness = gripper_->stop_readiness();
   const auto old_channel = gripper_->state_channel();
@@ -159,25 +246,61 @@ RetainedNativeGripperRoutePublicationOwner::
         "reconciled gripper publication requires the stable cell owner to build the complete Kernel registration set",
         core::ErrorCode::kInvalidRequest);
   }
-  if (participants.size() != 1U) {
+  if (participants.size() != configuration.binding_routes.size()) {
     return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
         "route_publication_participant_set_invalid",
-        "single-gripper reconciled publication requires exactly one readiness participant",
+        "gripper publication requires one readiness participant per selected binding",
         core::ErrorCode::kInvalidRequest);
   }
 
-  const auto& verified = participants.front();
+  const auto primary = std::find_if(participants.begin(), participants.end(), [&](const auto& row) {
+    return row.participant_binding.value().control_path &&
+        row.participant_binding.value().control_path->control_binding_id == old_binding.value().control_path->control_binding_id;
+  });
+  if (primary == participants.end())
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+        "route_publication_participant_set_invalid", "Readiness participants omit the primary command binding");
+  std::vector<core::RuntimeParticipantBinding> representatives;
+  std::vector<std::optional<core::RuntimeParticipantStopReadiness>> readiness;
+  std::vector<core::RouteReadinessPublicationRowDTO> expected_rows;
+  std::set<core::ControlBindingId> selected_ids;
+  for (const auto& row : participants) {
+    const auto& value = row.participant_binding.value();
+    if (!value.control_path)
+      return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+          "route_publication_participant_referent_mismatch", "Readiness alias has no control path");
+    const auto& path = *value.control_path;
+    const auto route = std::find_if(configuration.binding_routes.begin(), configuration.binding_routes.end(),
+        [&](const auto& item) { return item.control_binding_id == path.control_binding_id; });
+    const auto& qualified = row.stop_readiness.value();
+    if (!selected_ids.insert(path.control_binding_id).second || route == configuration.binding_routes.end() ||
+        path.control_binding_revision != route->control_binding_revision || path.control_route_id != route->control_route_id ||
+        path.control_domain_id != configuration.control_domain_id || path.control_domain_revision != configuration.control_domain_revision ||
+        path.controller_topology_id != configuration.controller_topology_id || path.topology_revision != configuration.topology_revision ||
+        path.activation_set_id != configuration.activation_set_id || path.active_control_configuration_id != configuration.active_control_configuration_id ||
+        path.active_control_configuration_generation != configuration.active_control_configuration_generation ||
+        path.provider_runtime_unit_id != configuration.source_runtime_unit_id || path.provider_runtime_epoch != configuration.source_runtime_epoch ||
+        row.readiness_row.controllable_component_id != value.controllable_component_id ||
+        row.readiness_row.component_lifecycle_generation != qualified.component_lifecycle_generation ||
+        row.readiness_row.control_binding_id != path.control_binding_id || row.readiness_row.control_binding_revision != path.control_binding_revision ||
+        row.readiness_row.resolved_stop_base_plan_id != qualified.resolved_stop_base_plan.resolved_stop_base_plan_id)
+      return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+          "route_publication_participant_referent_mismatch", "Readiness aliases differ from the complete selected route");
+    representatives.push_back(row.participant_binding);
+    readiness.push_back(row.stop_readiness);
+    expected_rows.push_back(row.readiness_row);
+  }
+  auto prepared_registrations = gripper_->PrepareRegistrations(representatives, readiness);
+  if (!prepared_registrations.ok())
+    return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(prepared_registrations.error());
+  std::sort(expected_rows.begin(), expected_rows.end(), core::CanonicalRouteReadinessPublicationRowLess);
+  const auto& verified = *primary;
   const auto& candidate_binding = verified.participant_binding;
   const auto& candidate_value = candidate_binding.value();
-  if (!candidate_value.control_path.has_value() ||
-      !verified.readiness_row.locally_valid()) {
-    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
-        "route_publication_participant_referent_mismatch",
-        "gripper readiness participant has no exact sealed route identity",
-        core::ErrorCode::kInvalidRequest);
-  }
   const auto& candidate_path = *candidate_value.control_path;
-  const auto& selected = configuration.binding_routes.front();
+  const auto selected_route = std::find_if(configuration.binding_routes.begin(), configuration.binding_routes.end(),
+      [&](const auto& row) { return row.control_binding_id == candidate_path.control_binding_id; });
+  const auto& selected = *selected_route;
   const auto& readiness_value = verified.stop_readiness.value();
   if (candidate_path.control_domain_id != configuration.control_domain_id ||
       candidate_path.control_domain_revision !=
@@ -333,6 +456,7 @@ RetainedNativeGripperRoutePublicationOwner::
   }
 
   const auto gripper_registration = gripper_->registration();
+  const auto& gripper_registrations = prepared_registrations.value();
   core::Result<KernelCandidate> cell_candidate =
       core::Result<KernelCandidate>::Err(core::ErrorDTO{
           std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
@@ -340,7 +464,7 @@ RetainedNativeGripperRoutePublicationOwner::
           {{"reason", "route_publication_gripper_cell_builder_failed"}}});
   try {
     cell_candidate = cell_candidate_builder_(configuration,
-                                              gripper_registration);
+                                              gripper_registrations);
   } catch (const std::exception& exception) {
     cell_candidate = core::Result<KernelCandidate>::Err(core::ErrorDTO{
         std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
@@ -404,6 +528,17 @@ RetainedNativeGripperRoutePublicationOwner::
       break;
     }
   }
+  for (const auto& expected : gripper_registrations) {
+    const auto matches = std::count_if(cell_candidate.value().registrations.begin(), cell_candidate.value().registrations.end(),
+        [&](const auto& row) {
+          return row.binding.value() == expected.binding.value() && row.engine == expected.engine &&
+              row.stop_execution_port == expected.stop_execution_port && row.stop_readiness.has_value() == expected.stop_readiness.has_value() &&
+              (!row.stop_readiness || row.stop_readiness->value() == expected.stop_readiness->value()) &&
+              row.intrinsic_direct_control == expected.intrinsic_direct_control &&
+              row.retained_default_stop_limits == expected.retained_default_stop_limits;
+        });
+    if (matches != 1) exact_gripper_registrations = 0;
+  }
   if (exact_gripper_registrations != 1U) {
     const auto rollback = rollback_physical_route(true, true);
     if (!rollback.ok()) {
@@ -420,6 +555,8 @@ RetainedNativeGripperRoutePublicationOwner::
         core::ErrorCode::kInvalidRequest);
   }
 
+  auto adopted_registrations = cell_candidate.value().registrations;
+  auto adopted_resolver = cell_candidate.value().participant_resolver;
   const auto published = kernel_.publish_runtime_route_configuration(
       configuration, std::move(cell_candidate.value().registrations),
       std::move(cell_candidate.value().participant_resolver));
@@ -440,8 +577,6 @@ RetainedNativeGripperRoutePublicationOwner::
       configuration.control_domain_id,
       configuration.active_control_configuration_id,
       configuration.active_control_configuration_generation);
-  const std::vector<core::RouteReadinessPublicationRowDTO> expected_rows{
-      verified.readiness_row};
   if (!readback.ok() || readback.value() != published.value() ||
       readback.value().active_configuration != configuration ||
       readback.value().readiness_rows != expected_rows ||
@@ -459,6 +594,12 @@ RetainedNativeGripperRoutePublicationOwner::
                                   rollback.error().message
                             : std::string{}));
   }
+  gripper_->AdoptVerifiedRegistrations(std::move(prepared_registrations.value()));
+  if (cell_owner_)
+    cell_owner_->AdoptVerifiedComponentReadinessSnapshot(
+        std::move(adopted_registrations), std::move(adopted_resolver));
+  if (cell_candidate.value().adopt_component_owners)
+    cell_candidate.value().adopt_component_owners();
   return readback;
 }
 
@@ -469,14 +610,33 @@ RetainedNativeGripperRoutePublicationOwner::
   if (!configuration.locally_valid() ||
       configuration.state !=
           core::ActiveControlConfigurationStateDTO::kReconciled ||
-      configuration.binding_routes.size() != 1U ||
+      configuration.binding_routes.empty() ||
       !cell_candidate_builder_) {
     return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
         "route_predecessor_gripper_input_invalid",
         "gripper predecessor adoption requires one exact retained route and cell builder",
         core::ErrorCode::kInvalidRequest);
   }
-  std::lock_guard lock(mutex_);
+  const auto owner_binding = gripper_->binding();
+  if (owner_binding.value().control_path &&
+      owner_binding.value().control_path->control_domain_id != configuration.control_domain_id) {
+    const auto peer = participant_peers_.find(configuration.control_domain_id);
+    if (peer != participant_peers_.end())
+      return peer->second->AdoptAndReadBackRouteConfigurationPredecessor(configuration);
+  }
+  // Root transition -> scalar-local -> actual gripper mutex. Delegation above
+  // never holds the shared nonrecursive mutex while the peer acquires it.
+  const auto transition_owner = PinTransitionOwner();
+  if (!transition_owner.ok()) return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(transition_owner.error());
+  std::unique_lock transition_lock(*transition_mutex_);
+  std::unique_lock local_lock(mutex_, std::defer_lock);
+  if (transition_mutex_ != &mutex_) local_lock.lock();
+  const auto installed_owner = ValidateInstalledOwner(transition_owner.value());
+  if (!installed_owner.ok()) return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(installed_owner.error());
+  if (configuration.binding_routes.size() != gripper_->registrations().size())
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO> (
+        "route_publication_gripper_scope_invalid", "Selected route omits or adds an installed gripper binding",
+        core::ErrorCode::kInvalidRequest);
   const auto old_binding = gripper_->binding();
   const auto old_readiness = gripper_->stop_readiness();
   const auto channel = gripper_->state_channel();
@@ -490,7 +650,12 @@ RetainedNativeGripperRoutePublicationOwner::
         core::ErrorCode::kMissingReference);
   }
   const auto& old_path = *old_binding.value().control_path;
-  const auto& selected = configuration.binding_routes.front();
+  const auto primary_route = std::find_if(configuration.binding_routes.begin(), configuration.binding_routes.end(),
+      [&](const auto& row) { return row.control_binding_id == old_path.control_binding_id; });
+  if (primary_route == configuration.binding_routes.end())
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+        "route_predecessor_gripper_binding_mismatch", "Durable route omits the primary command binding");
+  const auto& selected = *primary_route;
   if (old_path.control_domain_id != configuration.control_domain_id ||
       old_path.control_domain_revision !=
           configuration.control_domain_revision ||
@@ -521,6 +686,39 @@ RetainedNativeGripperRoutePublicationOwner::
         predecessor.error());
   }
 
+  std::vector<core::RuntimeParticipantBinding> representatives;
+  std::vector<std::optional<core::RuntimeParticipantStopReadiness>> cleared_readiness;
+  for (const auto& row : gripper_->registrations()) {
+    auto value = row.binding.value();
+    if (!value.control_path)
+      return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+          "route_predecessor_gripper_binding_mismatch", "Predecessor alias has no control path");
+    auto& path = *value.control_path;
+    const auto selected = std::find_if(configuration.binding_routes.begin(), configuration.binding_routes.end(),
+        [&](const auto& route) { return route.control_binding_id == path.control_binding_id; });
+    if (selected == configuration.binding_routes.end() || selected->control_binding_revision != path.control_binding_revision ||
+        path.control_domain_id != configuration.control_domain_id || path.control_domain_revision != configuration.control_domain_revision ||
+        path.controller_topology_id != configuration.controller_topology_id || path.topology_revision != configuration.topology_revision ||
+        path.provider_runtime_unit_id != configuration.source_runtime_unit_id || path.provider_runtime_epoch != old_path.provider_runtime_epoch)
+      return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+          "route_predecessor_gripper_binding_mismatch", "Durable predecessor crosses its complete installed alias set");
+    path.control_route_id = selected->control_route_id;
+    path.activation_set_id = configuration.activation_set_id;
+    path.active_control_configuration_id = configuration.active_control_configuration_id;
+    path.active_control_configuration_generation = configuration.active_control_configuration_generation;
+    path.runtime_scale_qualification.reset();
+    auto sealed = core::verify_runtime_participant_binding(std::move(value));
+    if (!sealed.ok()) return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(sealed.error());
+    representatives.push_back(std::move(sealed.value()));
+    cleared_readiness.push_back(std::nullopt);
+  }
+  auto prepared_registrations = gripper_->PrepareRegistrations(representatives, cleared_readiness);
+  if (!prepared_registrations.ok())
+    return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+        core::ErrorDTO{"route_predecessor_gripper_rebind_failed",
+                       prepared_registrations.error().message,
+                       {{"reason", prepared_registrations.error().code}}});
+
   const auto rollback = [&]() -> core::Result<void> {
     auto reverted_channel = concrete_channel->RebindRoute(old_binding, clock_.now());
     if (!reverted_channel.ok()) return reverted_channel;
@@ -549,7 +747,7 @@ RetainedNativeGripperRoutePublicationOwner::
           "gripper predecessor cell builder did not return",
           {{"reason", "route_predecessor_gripper_builder_failed"}}});
   try {
-    candidate = cell_candidate_builder_(configuration, gripper_->registration());
+    candidate = cell_candidate_builder_(configuration, prepared_registrations.value());
   } catch (const std::exception& error) {
     candidate = core::Result<KernelCandidate>::Err(core::ErrorDTO{
         std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
@@ -569,6 +767,8 @@ RetainedNativeGripperRoutePublicationOwner::
             (reverted.ok() ? std::string{}
                            : "; rollback failed: " + reverted.error().message));
   }
+  auto adopted_registrations = candidate.value().registrations;
+  auto adopted_resolver = candidate.value().participant_resolver;
   auto adopted = kernel_.adopt_runtime_route_configuration_predecessor(
       configuration, std::move(candidate.value().registrations),
       std::move(candidate.value().participant_resolver));
@@ -593,6 +793,12 @@ RetainedNativeGripperRoutePublicationOwner::
         readback.ok() ? "gripper predecessor did not read back command-closed"
                       : readback.error().message);
   }
+  gripper_->AdoptVerifiedRegistrations(std::move(prepared_registrations.value()));
+  if (cell_owner_)
+    cell_owner_->AdoptVerifiedComponentReadinessSnapshot(
+        std::move(adopted_registrations), std::move(adopted_resolver));
+  if (candidate.value().adopt_component_owners)
+    candidate.value().adopt_component_owners();
   return readback;
 }
 

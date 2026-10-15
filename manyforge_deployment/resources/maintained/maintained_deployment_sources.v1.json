@@ -40,6 +40,7 @@
         "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
         "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
         "execution_tick_hz": "retained_runtime_defaults.execution_tick_hz",
+        "gripper_target_configurations": "grippers",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
         "isaac_profile": "robot_config.robot_id",
         "mode": "adapters.execution.config.execution_state_source_mode",
@@ -58,6 +59,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
         "execution_tick_hz": 100,
+        "gripper_target_configurations": [{"actuation_kind": "pneumatic", "attach_frame": "link_tcp", "auxiliary_frames": ["lite_gripper_base_link"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "lite6_robot", "description": "UFACTORY lite pneumatic gripper through Isaac JointState effort commands.", "mount_frame": "link_eef", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "link_tcp", "touch_links": ["lite_gripper_base_link", "lite_gripper_left_finger", "lite_gripper_right_finger"], "delivery_result_timeout_s": 1.0}],
         "initial_joint_positions_rad": [0.0, 0.0, 1.57, 0.0, 0.0, 0.0],
         "isaac_profile": "lite6",
         "mode": "commanded_sim",
@@ -144,7 +146,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
         "execution_tick_hz": 100,
-        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "link_tcp", "auxiliary_frames": ["lite_gripper_base_link"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "lite6_robot", "description": "Native simulated UFACTORY lite pneumatic gripper.", "mount_frame": "link_eef", "open_state_ref": "open", "tcp_frame": "link_tcp", "touch_links": ["lite_gripper_base_link", "lite_gripper_left_finger", "lite_gripper_right_finger"]}],
+        "gripper_target_configurations": [{"actuation_kind": "pneumatic", "attach_frame": "link_tcp", "auxiliary_frames": ["lite_gripper_base_link"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "lite6_robot", "description": "Native simulated UFACTORY lite pneumatic gripper.", "mount_frame": "link_eef", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "link_tcp", "touch_links": ["lite_gripper_base_link", "lite_gripper_left_finger", "lite_gripper_right_finger"], "delivery_result_timeout_s": 1.0}],
         "initial_joint_positions_rad": [0.0, 0.0, 1.57, 0.0, 0.0, 0.0],
         "mock_profile": "lite6_lite_gripper",
         "mode": "commanded_sim",
@@ -208,6 +210,7 @@
         "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
         "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
         "execution_tick_hz": "retained_runtime_defaults.execution_tick_hz",
+        "gripper_target_configurations": "grippers",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
         "isaac_profile": "robot_config.robot_id",
         "mode": "adapters.execution.config.execution_state_source_mode",
@@ -226,6 +229,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 100.0,
         "execution_tick_hz": 100,
+        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Robotiq 2F-140 command through the standard ROS GripperCommand action.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
         "initial_joint_positions_rad": [2.63422544, -0.875980752, 1.551074106, -2.29231544, -1.560498884, -2.038544566],
         "isaac_profile": "ur10e",
         "mode": "commanded_sim",
@@ -309,6 +313,7 @@
         "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
         "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
         "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
+        "gripper_target_configurations": "grippers",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
         "mock_profile": "maintainer_decision.Q69.model_family_id",
         "mode": "maintainer_decision.Q63_Q66.offline_mock_lane",
@@ -319,6 +324,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
         "execution_tick_hz": 100,
+        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Native simulated Robotiq 2F-140 finger actuation.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
         "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
         "mock_profile": "ur10e_robotiq_2f_140",
         "mode": "commanded_sim",
@@ -380,6 +386,7 @@
         "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
         "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
         "execution_tick_hz": "retained_runtime_defaults.execution_tick_hz",
+        "gripper_target_configurations": "grippers",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
         "isaac_profile": "robot_config.robot_id",
         "mode": "adapters.execution.config.execution_state_source_mode",
@@ -398,6 +405,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 100.0,
         "execution_tick_hz": 100,
+        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Robotiq 2F-140 command through the standard ROS GripperCommand action.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
         "initial_joint_positions_rad": [2.63422544, -0.875980752, 1.551074106, -2.29231544, -1.560498884, -2.038544566],
         "isaac_profile": "ur10e",
         "mode": "commanded_sim",
@@ -481,6 +489,7 @@
         "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
         "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
         "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
+        "gripper_target_configurations": "grippers",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
         "mock_profile": "maintainer_decision.Q69.model_family_id",
         "mode": "maintainer_decision.Q63_Q66.offline_mock_lane",
@@ -491,6 +500,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
         "execution_tick_hz": 100,
+        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Native simulated Robotiq 2F-140 finger actuation.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
         "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
         "mock_profile": "ur10e_robotiq_2f_140",
         "mode": "commanded_sim",
@@ -648,7 +658,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
         "execution_tick_hz": 100,
-        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "robotiq_85_base_link", "auxiliary_frames": ["robotiq_85_base_link"], "closed_state_ref": "closed", "command_duration_s": 1.0, "command_target_id": "gripper", "controllable_component_id": "ur5e_robot", "description": "Native simulated Robotiq 2F-85 gripper.", "mount_frame": "tool0", "open_state_ref": "open", "tcp_frame": "robotiq_85_base_link", "touch_links": ["robotiq_85_base_link", "robotiq_85_left_finger_link", "robotiq_85_left_finger_tip_link", "robotiq_85_left_inner_knuckle_link", "robotiq_85_left_knuckle_link", "robotiq_85_right_finger_link", "robotiq_85_right_finger_tip_link", "robotiq_85_right_inner_knuckle_link", "robotiq_85_right_knuckle_link"]}],
+        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "robotiq_85_base_link", "auxiliary_frames": ["robotiq_85_base_link"], "closed_state_ref": "closed", "command_duration_s": 1.0, "command_target_id": "gripper", "controllable_component_id": "ur5e_robot", "description": "Native simulated Robotiq 2F-85 gripper.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "robotiq_85_base_link", "touch_links": ["robotiq_85_base_link", "robotiq_85_left_finger_link", "robotiq_85_left_finger_tip_link", "robotiq_85_left_inner_knuckle_link", "robotiq_85_left_knuckle_link", "robotiq_85_right_finger_link", "robotiq_85_right_finger_tip_link", "robotiq_85_right_inner_knuckle_link", "robotiq_85_right_knuckle_link"]}],
         "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
         "mock_profile": "ur5e_robotiq_2f_85",
         "mode": "commanded_sim",
@@ -1324,8 +1334,8 @@
       },
       "assistant_profile_id": "semantic_shape_selection",
       "historical_blob": "115ab078116696847a9c037f0b20d5b3e39b1741",
-      "model_family_id": "ur5_roboplan",
-      "runtime_restoration_profile_id": "ur5_mock_commanded_v0",
+      "model_family_id": "ur5e_robotiq_2f_85",
+      "runtime_restoration_profile_id": "ur5e_robotiq_mock_commanded_v0",
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {
@@ -1414,8 +1424,8 @@
       },
       "assistant_profile_id": "vision_bin_selection",
       "historical_blob": "332b8b6daa93cf4b0533e93a42736fd67b8654c5",
-      "model_family_id": "ur5_roboplan",
-      "runtime_restoration_profile_id": "ur5_mock_commanded_v0",
+      "model_family_id": "ur5e_robotiq_2f_85",
+      "runtime_restoration_profile_id": "ur5e_robotiq_mock_commanded_v0",
       "component_occurrence_id": "ur5_robot",
       "program_role_assignments": [
         {

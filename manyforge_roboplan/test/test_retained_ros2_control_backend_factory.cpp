@@ -228,6 +228,29 @@ commanded_gripper_binding(std::string component_id = "robot_1") {
   return std::move(sealed.value());
 }
 
+// These fixture rows supply the same strict actuation fact as the maintained
+// Lite 6 pneumatic and UR position source rows. Transport/profile strings are
+// never the production authority for actuation or output mode.
+[[nodiscard]]
+deployment::ros2_control_execution_runtime_contract::Configuration::
+    GripperTargetConfiguration
+    fixture_gripper_row(const std::string &component,
+                        const std::string &actuation) {
+  return {{core::ControllableComponentId(component),
+           core::CommandTargetId("gripper.target"),
+           "fixture gripper",
+           actuation,
+           "open",
+           "closed",
+           0.2,
+           {},
+           "mount",
+           "attach",
+           "tcp",
+           {}},
+          core::GripperOutputMode::kCommanded};
+}
+
 [[nodiscard]]
 deployment::ros2_control_execution_runtime_contract::Configuration
 isaac_runtime_configuration(std::string profile) {
@@ -235,6 +258,8 @@ isaac_runtime_configuration(std::string profile) {
   for (const char *component : {"robot_1", "robot_a", "robot_b", "robot.1"}) {
     result.controller_profiles.push_back(
         {core::ControllableComponentId(component), profile, std::nullopt});
+    result.gripper_target_configurations.push_back(fixture_gripper_row(
+        component, profile == "lite6" ? "pneumatic" : "position_commanded"));
   }
   result.planner_rng_seed = 12345U;
   result.initial_joint_positions_rad = {0.0};
@@ -354,7 +379,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_EQ(selected.gripper->state_joint_name, "source_gripper_joint");
   EXPECT_EQ(selected.gripper->group_id, "gripper");
   EXPECT_EQ(selected.gripper->joint_name, "gripper_joint");
-  EXPECT_EQ(selected.gripper->completion_policy, "dwell_elapsed");
+  EXPECT_EQ(selected.gripper->completion_policy, "output_delivery");
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
@@ -858,8 +883,9 @@ struct InitialRosInstallationFixture final {
       registration.engine =
           binding == &motion ? motion_engine.get() : gripper_engine.get();
       registration.stop_execution_port =
-          static_cast<core::IControlDomainExecutionPort *>(
-              handle->participant().get());
+          binding == &motion
+              ? static_cast<core::IControlDomainExecutionPort *>(handle->participant().get())
+              : static_cast<core::IControlDomainExecutionPort *>(gripper_engine.get());
       registrations.push_back(std::move(registration));
     }
   }
@@ -961,6 +987,262 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
 }
 
+[[nodiscard]] RetainedRos2ControlBackendConfig gripper_only_factory_config(
+    const std::string &component = "robot_1") {
+  RetainedRos2ControlBackendConfig config;
+  config.node_name = "manyforge_gripper_only_factory_fixture";
+  config.node_namespace = "/manyforge/" + component;
+  config.executor_thread_count = 1U;
+  config.defer_ros_start = true;
+  config.arm.gripper_controller = RetainedRos2ControlArmController{
+      config.node_namespace + "/controller_manager", "gripper_controller", "TestSystem"};
+  ros2_control_execution::Ros2GripperActionConfig gripper;
+  gripper.action_name = config.node_namespace + "/gripper_controller/gripper_cmd";
+  gripper.group_id = "gripper";
+  gripper.joint_name = "gripper_joint";
+  config.gripper = std::move(gripper);
+  return config;
+}
+
+struct GripperOnlyInstallationFixture final {
+  explicit GripperOnlyInstallationFixture(const std::string &component = "robot_1")
+      : tool(commanded_gripper_binding(component)) {}
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  core::RuntimeParticipantBinding tool{commanded_gripper_binding()};
+  std::shared_ptr<RetainedObservedStateChannel> channel = test_projected_channel(
+      tool, retained_ros2_control_gripper_state_config(tool), clock);
+  std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle =
+      std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  std::shared_ptr<core::IGripperCommandBackend> gripper =
+      make_retained_ros2_control_gripper_backend(
+          gripper_only_factory_config(tool.value().controllable_component_id.value()),
+          tool, channel, clock, scheduler, handle);
+  core::GripperParticipantEngine engine{*gripper, clock};
+  std::vector<core::RuntimeParticipantExecutionRegistration> registrations{
+      {tool, std::nullopt, {}, core::MotionInterruptNodeCategory::kGeneric,
+       &engine, &engine, std::nullopt, nullptr, std::nullopt, std::nullopt, std::nullopt}};
+  const core::ContentDigest identity{std::string("sha256:") + std::string(64, 'a')};
+  component_manager::ManagerSelectedRuntimeCompositionRequestDTO request{
+      identity, core::ApplyId("apply.gripper-only"), core::ApplyGeneration(1U),
+      {tool.value().retained_bundle_id, tool.value().graph_revision,
+       {core::SceneId(identity.value()), 1U, identity}},
+      core::ActiveBundlePublicationGeneration(1U), identity, identity, 1U,
+      core::RuntimeUnitId("runtime.ros2_control"), core::RuntimeEpoch("runtime-epoch.1"),
+      core::RuntimeEpoch("manager.1"), core::ConfigurationFenceId("fence.gripper-only"),
+      core::ConfigurationFenceGeneration(1U),
+      {{tool.value().controllable_component_id},
+       {{core::ControlDomainId("domain.gripper"), std::nullopt,
+         core::ControlDomainRevision("domain-revision")}},
+       {{core::ControlBindingId("binding.gripper"), std::nullopt,
+         core::ControlBindingRevision("binding-revision")}},
+       {core::ResourceId("robot.gripper.1")}},
+      component_manager::ManagerSelectedRuntimeCompositionPhase::kFinalize,
+      {{{tool.value().controllable_component_id, deployment::ApplyComponentDisposition::kAdd,
+         std::nullopt, identity, {}, {core::ControlDomainId("domain.gripper")}, {}}}, false, {}},
+      {core::RetainedBundleId("empty.bundle"), core::GraphRevision("empty.graph"),
+       {core::SceneId(identity.value()), 1U, identity}}};
+
+  component_manager::ManagerRuntimeComponentReceiptDTO receipt(
+      const RetainedRos2ControlRuntimeHandle *predecessor = nullptr,
+      const std::optional<std::string> &process_exit = std::nullopt) const {
+    return detail::ReadRos2ComponentReceipt(
+        request, tool.value().controllable_component_id, identity, *handle,
+        nullptr, gripper.get(), std::nullopt, tool, registrations, nullptr,
+        &engine, predecessor, process_exit);
+  }
+};
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     GripperOnlyInstallReceiptProvesItsActualCommandAndStopOwner) {
+  GripperOnlyInstallationFixture fixture;
+  ASSERT_TRUE(fixture.request.valid());
+  EXPECT_FALSE(fixture.handle->participant());
+  EXPECT_FALSE(fixture.handle->current_port());
+  EXPECT_TRUE(fixture.handle->OwnsGripper(fixture.gripper.get(), fixture.tool));
+  EXPECT_FALSE(fixture.handle->ReadOwnedControllerOccurrence().arm_binding_epoch);
+  ASSERT_EQ(fixture.registrations.size(), 1U);
+  EXPECT_EQ(fixture.registrations.front().engine, &fixture.engine);
+  EXPECT_EQ(fixture.registrations.front().stop_execution_port,
+            static_cast<core::IControlDomainExecutionPort *>(&fixture.engine));
+  const auto first = fixture.receipt();
+  EXPECT_TRUE(component_manager::ComponentReceiptsMatchRequest(fixture.request, {first}));
+  EXPECT_EQ(fixture.receipt(), first);
+  EXPECT_FALSE(first.predecessor_runtime_retained);
+  EXPECT_FALSE(first.product_binding_resealed);
+  auto &row = fixture.request.component_delta.components.front();
+  row.disposition = deployment::ApplyComponentDisposition::kRetain;
+  row.predecessor_runtime_identity = row.candidate_runtime_identity;
+  row.predecessor_domains = row.candidate_domains;
+  fixture.request.configuration_fence_scope = {};
+  const auto retained = fixture.receipt(fixture.handle.get());
+  EXPECT_TRUE(retained.predecessor_runtime_retained);
+  EXPECT_TRUE(component_manager::ComponentReceiptsMatchRequest(fixture.request, {retained}));
+  EXPECT_THROW(static_cast<void>(fixture.receipt(fixture.handle.get(),
+                   "controller launch exited with status 17")), std::invalid_argument);
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     GripperOnlyReceiptRejectsForeignAdapterEngineStopPortAndProduct) {
+  GripperOnlyInstallationFixture fixture;
+  GripperOnlyInstallationFixture foreign;
+  const auto original = fixture.request;
+  const auto read = [&](const core::IGripperCommandBackend *gripper,
+                        const core::IResolvedParticipantExecutionEngine *engine,
+                        const RetainedRos2ControlRuntimeHandle *predecessor = nullptr) {
+    return detail::ReadRos2ComponentReceipt(
+        fixture.request, fixture.tool.value().controllable_component_id,
+        fixture.identity, *fixture.handle, nullptr, gripper, std::nullopt,
+        fixture.tool, fixture.registrations, nullptr, engine, predecessor);
+  };
+  EXPECT_THROW(static_cast<void>(read(foreign.gripper.get(), &fixture.engine)),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(read(fixture.gripper.get(), &foreign.engine)),
+               std::invalid_argument);
+  fixture.registrations.front().stop_execution_port = &foreign.engine;
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.registrations.front().stop_execution_port = &fixture.engine;
+  fixture.registrations.push_back(fixture.registrations.front());
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.registrations.pop_back();
+  fixture.request.runtime_epoch = core::RuntimeEpoch("foreign.epoch");
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.request = original;
+  fixture.request.candidate_projection_revision.graph_revision = core::GraphRevision("foreign.graph");
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.request = original;
+  fixture.request.configuration_fence_scope.resources.clear();
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+  fixture.request = original;
+  auto &row = fixture.request.component_delta.components.front();
+  row.disposition = deployment::ApplyComponentDisposition::kRetain;
+  row.predecessor_runtime_identity = row.candidate_runtime_identity;
+  row.predecessor_domains = row.candidate_domains;
+  // Only the actual retained owner may reuse resources outside a fresh-install fence.
+  fixture.request.configuration_fence_scope = {};
+  ASSERT_TRUE(fixture.request.valid());
+  EXPECT_THROW(static_cast<void>(read(fixture.gripper.get(), &fixture.engine, nullptr)),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(read(fixture.gripper.get(), &fixture.engine, foreign.handle.get())),
+               std::invalid_argument);
+  EXPECT_TRUE(fixture.handle->OwnsGripper(fixture.gripper.get(), fixture.tool));
+  EXPECT_FALSE(fixture.handle->participant());
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     GripperOnlyFactoryRefusesForeignClockChannelAndMotionOccurrence) {
+  const auto binding = commanded_gripper_binding();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  const auto channel = test_projected_channel(
+      binding, retained_ros2_control_gripper_state_config(binding), clock);
+  const auto foreign = commanded_gripper_binding("robot_b");
+  const auto foreign_channel = test_projected_channel(
+      foreign, retained_ros2_control_gripper_state_config(foreign), clock);
+  for (const int invalid : {0, 1, 2, 3}) {
+    SCOPED_TRACE(invalid);
+    auto config = gripper_only_factory_config();
+    auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+    if (invalid == 0) config.measured_receiver_clock = std::make_shared<core::FakeClock>();
+    if (invalid == 2)
+      config.successor_occurrence = core::SelectedControllerOccurrenceDTO{
+          core::ExecutionBindingEpoch(2U), {{core::ControlDomainId("domain.gripper"), 2U}}};
+    if (invalid == 3)
+      config.successor_occurrence = core::SelectedControllerOccurrenceDTO{
+          std::nullopt, {{core::ControlDomainId("foreign.domain"), 2U}}};
+    EXPECT_THROW(static_cast<void>(make_retained_ros2_control_gripper_backend(
+                     config, binding, invalid == 1 ? foreign_channel : channel,
+                     clock, scheduler, handle)), std::invalid_argument);
+    EXPECT_FALSE(handle->node());
+    EXPECT_FALSE(handle->participant());
+    EXPECT_FALSE(handle->current_port());
+    EXPECT_TRUE(handle->ReadOwnedControllerOccurrence().domains.empty());
+  }
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     GripperOnlyResealPreservesOriginalOwnerAcrossPeerReplacement) {
+  GripperOnlyInstallationFixture survivor;
+  auto peer = std::make_unique<GripperOnlyInstallationFixture>("robot_b");
+  const auto owner = survivor.handle;
+  const auto *backend = survivor.gripper.get();
+  const auto occurrence = owner->ReadOwnedControllerOccurrence();
+  const auto *engine = survivor.registrations.front().engine;
+  const auto *stop_port = survivor.registrations.front().stop_execution_port;
+  auto retired = std::move(peer);
+  peer = std::make_unique<GripperOnlyInstallationFixture>("robot_b");
+  EXPECT_NE(peer->handle, retired->handle);
+  EXPECT_NE(peer->gripper.get(), retired->gripper.get());
+  retired.reset();
+  auto value = survivor.tool.value();
+  value.retained_bundle_id = core::RetainedBundleId("candidate.bundle");
+  value.graph_revision = core::GraphRevision("candidate.graph");
+  value.control_path->active_control_configuration_generation =
+      core::ActiveControlConfigurationGeneration(2U);
+  auto candidate = core::verify_runtime_participant_binding(value);
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  const auto channel = test_projected_channel(
+      candidate.value(), retained_ros2_control_gripper_state_config(candidate.value()), survivor.clock);
+  ASSERT_TRUE(owner->RebindGripperRoute(candidate.value(), channel).ok());
+  EXPECT_TRUE(owner->OwnsGripper(backend, candidate.value()));
+  EXPECT_FALSE(owner->OwnsGripper(backend, survivor.tool));
+  EXPECT_EQ(owner->ReadOwnedControllerOccurrence(), occurrence);
+  peer.reset();
+  EXPECT_EQ(survivor.handle, owner);
+  EXPECT_EQ(survivor.gripper.get(), backend);
+  EXPECT_EQ(survivor.registrations.front().engine, engine);
+  EXPECT_EQ(survivor.registrations.front().stop_execution_port, stop_port);
+  EXPECT_FALSE(owner->participant());
+  EXPECT_FALSE(owner->current_port());
+  const std::vector<std::function<void(core::RuntimeParticipantBindingDTO &)>> mutations{
+      [](auto &v) { v.control_path->provider_instance_id = core::ProviderInstanceId("foreign.provider"); },
+      [](auto &v) { v.control_path->control_binding_id = core::ControlBindingId("foreign.binding"); },
+      [](auto &v) { v.resources.front().resource_id = core::ResourceId("foreign.resource"); },
+      [](auto &v) { v.control_path->provider_runtime_epoch = core::RuntimeEpoch("foreign.epoch");
+                   v.runtime_unit_epochs.front().runtime_epoch = core::RuntimeEpoch("foreign.epoch"); }};
+  for (std::size_t i = 0; i < mutations.size(); ++i) {
+    SCOPED_TRACE(i);
+    auto foreign_value = candidate.value().value();
+    mutations[i](foreign_value);
+    auto foreign = core::verify_runtime_participant_binding(std::move(foreign_value));
+    ASSERT_TRUE(foreign.ok()) << foreign.error().message;
+    const auto foreign_channel = test_projected_channel(
+        foreign.value(), retained_ros2_control_gripper_state_config(foreign.value()), survivor.clock);
+    EXPECT_FALSE(owner->RebindGripperRoute(foreign.value(), foreign_channel).ok());
+    EXPECT_TRUE(owner->OwnsGripper(backend, candidate.value()));
+    EXPECT_EQ(owner->ReadOwnedControllerOccurrence(), occurrence);
+  }
+  ASSERT_TRUE(owner->RebindGripperRoute(survivor.tool, survivor.channel).ok());
+  EXPECT_TRUE(owner->OwnsGripper(backend, survivor.tool));
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     RetainingOnlyTheGripperOnlyBackendRetainsItsActualTransportAndClock) {
+  auto clock = std::make_shared<core::FakeClock>();
+  core::ManualScheduler scheduler;
+  const auto binding = commanded_gripper_binding();
+  auto channel = test_projected_channel(
+      binding, retained_ros2_control_gripper_state_config(binding), *clock);
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto config = gripper_only_factory_config();
+  config.measured_receiver_clock = clock;
+  auto backend = make_retained_ros2_control_gripper_backend(
+      config, binding, channel, *clock, scheduler, handle);
+  const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner = handle;
+  const std::weak_ptr<core::IClock> clock_lifetime = clock;
+  config.measured_receiver_clock.reset();
+  clock.reset();
+  handle.reset();
+  channel.reset();
+  EXPECT_FALSE(owner.expired());
+  EXPECT_FALSE(clock_lifetime.expired());
+  EXPECT_EQ(backend->get_gripper_status(binding.value().command_target_id.value()).state,
+            core::GripperCommandState::kIdle);
+  backend.reset();
+  EXPECT_TRUE(owner.expired());
+  EXPECT_TRUE(clock_lifetime.expired());
+}
+
 TEST(RetainedRos2ControlBackendFactoryTest,
      InitialInstallReceiptProvesActualOwnedParticipants) {
   InitialRosInstallationFixture fixture;
@@ -1013,6 +1295,105 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   ASSERT_FALSE(rebound.ok());
   EXPECT_EQ(rebound.error().details.at("reason"),
             "ros2_control_handle_already_bound");
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     InitialInstallReceiptRequiresCurrentGenerationForBothOwnedAdapters) {
+  InitialRosInstallationFixture fixture;
+  ASSERT_TRUE(fixture.request.valid());
+  const auto original_motion = fixture.motion;
+  const auto original_tool = fixture.tool;
+  const auto owner = fixture.handle;
+  const auto *const execution = fixture.backend;
+  const auto *const gripper = fixture.gripper;
+  const auto participant = owner->participant();
+  const auto port = owner->current_port();
+  const auto occurrence = owner->ReadOwnedControllerOccurrence();
+  const auto original_registrations = fixture.registrations;
+  ASSERT_EQ(original_registrations.size(), 2U);
+  EXPECT_NO_THROW(static_cast<void>(fixture.receipt()));
+
+  // Route adoption changes the accepted configuration generation while these
+  // same adapter objects and their physical bindings remain installed.
+  auto motion_value = original_motion.value();
+  motion_value.control_path->active_control_configuration_generation =
+      core::ActiveControlConfigurationGeneration(2U);
+  auto tool_value = original_tool.value();
+  tool_value.control_path->active_control_configuration_generation =
+      core::ActiveControlConfigurationGeneration(2U);
+  auto current_motion =
+      core::verify_runtime_participant_binding(std::move(motion_value));
+  auto current_tool =
+      core::verify_runtime_participant_binding(std::move(tool_value));
+  ASSERT_TRUE(current_motion.ok()) << current_motion.error().message;
+  ASSERT_TRUE(current_tool.ok()) << current_tool.error().message;
+  const auto channel = test_projected_channel(
+      current_tool.value(),
+      retained_ros2_control_gripper_state_config(current_tool.value()),
+      fixture.clock);
+  ASSERT_TRUE(owner->RebindMotionRoute(current_motion.value(), {}).ok());
+  ASSERT_TRUE(owner->RebindGripperRoute(current_tool.value(), channel).ok());
+  EXPECT_FALSE(owner->OwnsBackend(execution, original_motion, original_tool));
+  EXPECT_FALSE(owner->OwnsGripper(gripper, original_tool));
+  EXPECT_TRUE(owner->OwnsBackend(execution, current_motion.value(),
+                                 current_tool.value()));
+  EXPECT_TRUE(owner->OwnsGripper(gripper, current_tool.value()));
+  EXPECT_THROW(static_cast<void>(fixture.receipt()), std::invalid_argument);
+
+  // Current bindings do not make the still-generation-1 registrations current.
+  EXPECT_THROW(
+      static_cast<void>(detail::ReadRos2ComponentReceipt(
+          fixture.request, original_motion.value().controllable_component_id,
+          fixture.identity, *owner, execution, gripper, current_motion.value(),
+          current_tool.value(), fixture.registrations, fixture.motion_engine.get(),
+          fixture.gripper_engine.get(), nullptr)),
+      std::invalid_argument);
+
+  // The registrations retain their original owned engines and Stop ports;
+  // only the accepted binding generation follows the same route adoption.
+  for (auto &registration : fixture.registrations) {
+    if (registration.binding.value() == original_motion.value())
+      registration.binding = current_motion.value();
+    else {
+      ASSERT_EQ(registration.binding.value(), original_tool.value());
+      registration.binding = current_tool.value();
+    }
+  }
+  const auto read = [&](const core::RuntimeParticipantBinding &motion,
+                        const core::RuntimeParticipantBinding &tool) {
+    return detail::ReadRos2ComponentReceipt(
+        fixture.request, motion.value().controllable_component_id,
+        fixture.identity, *owner, execution, gripper, motion, tool,
+        fixture.registrations, fixture.motion_engine.get(),
+        fixture.gripper_engine.get(), nullptr);
+  };
+  EXPECT_THROW(static_cast<void>(read(original_motion, original_tool)),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(read(current_motion.value(), original_tool)),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(read(original_motion, current_tool.value())),
+               std::invalid_argument);
+  const auto receipt = read(current_motion.value(), current_tool.value());
+  EXPECT_TRUE(receipt.valid());
+  EXPECT_TRUE(component_manager::ComponentReceiptsMatchRequest(fixture.request,
+                                                               {receipt}));
+  EXPECT_FALSE(receipt.predecessor_runtime_retained);
+  EXPECT_FALSE(receipt.product_binding_resealed);
+  EXPECT_EQ(fixture.handle, owner);
+  EXPECT_EQ(fixture.backend, execution);
+  EXPECT_EQ(fixture.gripper, gripper);
+  EXPECT_EQ(owner->participant(), participant);
+  EXPECT_EQ(owner->current_port(), port);
+  EXPECT_EQ(owner->ReadOwnedControllerOccurrence(), occurrence);
+  ASSERT_EQ(fixture.registrations.size(), original_registrations.size());
+  for (std::size_t index = 0U; index < fixture.registrations.size(); ++index) {
+    EXPECT_EQ(fixture.registrations[index].engine,
+              original_registrations[index].engine);
+    EXPECT_EQ(fixture.registrations[index].stop_execution_port,
+              original_registrations[index].stop_execution_port);
+  }
+  // This unit proves the exact receipt invariant. The ordinary Manager Apply
+  // sequence separately exercises the production caller's current-pair choice.
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
@@ -1176,12 +1557,12 @@ TEST(RetainedRos2ControlBackendFactoryTest,
         fixture.motion_engine.get(), fixture.gripper_engine.get(), predecessor,
         process_exit);
   };
+  fixture.request.configuration_fence_scope = {};
   ASSERT_TRUE(fixture.request.valid());
   EXPECT_THROW(static_cast<void>(read(nullptr)), std::invalid_argument);
   InitialRosInstallationFixture foreign;
   EXPECT_THROW(static_cast<void>(read(foreign.handle.get())),
                std::invalid_argument);
-  fixture.request.configuration_fence_scope = {};
   const auto retained = read(fixture.handle.get());
   EXPECT_TRUE(retained.predecessor_runtime_retained);
   EXPECT_TRUE(retained.product_binding_resealed);
@@ -1211,8 +1592,13 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   row.predecessor_runtime_identity =
       core::ContentDigest(std::string("sha256:") + std::string(64, 'b'));
   row.replacement_reasons = {"runtime_units"};
-  EXPECT_THROW(static_cast<void>(read(fixture.handle.get())),
-               std::invalid_argument);
+  const auto actual_retained = read(fixture.handle.get());
+  EXPECT_TRUE(actual_retained.predecessor_runtime_retained);
+  EXPECT_EQ(actual_retained.disposition,
+            deployment::ApplyComponentDisposition::kReplace);
+  EXPECT_TRUE(actual_retained.product_binding_resealed);
+  EXPECT_TRUE(component_manager::ComponentReceiptsMatchRequest(
+      fixture.request, {actual_retained}));
   EXPECT_FALSE(read(foreign.handle.get()).predecessor_runtime_retained);
 }
 
@@ -1290,6 +1676,9 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   // Q68: a mixed cell (Lite 6 + UR10e) hosts both components in one ROS unit;
   // each one selects its own controller profile.
   deployment::ros2_control_execution_runtime_contract::Configuration runtime;
+  runtime.gripper_target_configurations = {
+      fixture_gripper_row("robot_a", "pneumatic"),
+      fixture_gripper_row("robot_b", "position_commanded")};
   runtime.planner_rng_seed = 12345U;
   runtime.initial_joint_positions_rad = {0.0, 0.0};
   runtime.execution_tick_hz = 100U;
@@ -1307,7 +1696,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
       runtime, commanded_binding("robot_b"), commanded_gripper_binding("robot_b"));
   EXPECT_EQ(lite6.arm.controller.hardware_component_name, "IsaacLite6TopicBasedSystem");
   EXPECT_EQ(ur10e.arm.controller.hardware_component_name, "IsaacUR10eTopicBasedSystem");
-  EXPECT_EQ(lite6.gripper->completion_policy, "dwell_elapsed");
+  EXPECT_EQ(lite6.gripper->completion_policy, "output_delivery");
   EXPECT_EQ(ur10e.gripper->completion_policy, "position_reached");
   // The offline mock lane is built by its own builder (phase 2b); an unknown
   // component has no profile at all.
@@ -1329,6 +1718,10 @@ mock_runtime_configuration(const std::string &mock_profile) {
   deployment::ros2_control_execution_runtime_contract::Configuration result;
   result.controller_profiles = {
       {core::ControllableComponentId("robot_1"), std::nullopt, mock_profile}};
+  if (mock_profile != "ur5_roboplan")
+    result.gripper_target_configurations.push_back(fixture_gripper_row(
+        "robot_1", mock_profile == "lite6_lite_gripper" ? "pneumatic"
+                                                       : "position_commanded"));
   result.planner_rng_seed = 12345U;
   result.initial_joint_positions_rad = {0.0};
   result.execution_tick_hz = 100U;
@@ -1569,8 +1962,9 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_EQ(config.gripper->transport_kind, "ros_gripper_command");
   EXPECT_EQ(config.gripper->action_name,
             "/manyforge/robot_1/lite_gripper_controller/gripper_cmd");
-  EXPECT_EQ(config.gripper->completion_policy, "position_reached");
-  EXPECT_DOUBLE_EQ(config.gripper->result_timeout_s, 5.0);
+  EXPECT_EQ(config.gripper->completion_policy, "output_delivery");
+  ASSERT_TRUE(config.gripper->result_timeout_s);
+  EXPECT_DOUBLE_EQ(*config.gripper->result_timeout_s, 1.0);
   EXPECT_EQ(config.gripper->command_joint_names,
             (std::vector<std::string>{"source_gripper_joint"}));
   EXPECT_EQ(config.gripper->state_joint_name, "source_gripper_joint");
@@ -1613,7 +2007,8 @@ TEST(RetainedRos2ControlBackendFactoryTest,
     EXPECT_EQ(config.gripper->action_name,
               "/manyforge/robot_1/robotiq_gripper_controller/gripper_cmd");
     EXPECT_EQ(config.gripper->completion_policy, "position_reached");
-    EXPECT_DOUBLE_EQ(config.gripper->result_timeout_s, 15.0);
+    ASSERT_TRUE(config.gripper->result_timeout_s);
+    EXPECT_DOUBLE_EQ(*config.gripper->result_timeout_s, 15.0);
   }
   const auto ur5 = make_retained_mock_ros2_control_backend_config(
       mock_runtime_configuration("ur5_roboplan"), commanded_binding(),
@@ -1662,6 +2057,199 @@ TEST(RetainedRos2ControlBackendFactoryTest, MockProfileConfigurationFailsClosed)
                    commanded_binding(), commanded_gripper_binding("robot_b"),
                    kMockCancel)),
                std::invalid_argument);
+}
+
+TEST(
+    RetainedRos2ControlBackendFactoryTest,
+    PneumaticNoneFactoryCompletesImmediatelyForZeroAndProgramDwellWithoutPhysicalTransport) {
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  const auto tool = commanded_gripper_binding();
+  auto channel = test_projected_channel(
+      tool, retained_ros2_control_gripper_state_config(tool), clock);
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto config = gripper_only_factory_config();
+  config.arm.gripper_controller.reset();
+  config.gripper->actuation_kind = core::GripperActuationKind::kPneumatic;
+  config.gripper->output_mode = core::GripperOutputMode::kNone;
+  config.gripper->action_name.clear();
+  config.gripper->transport_kind.clear();
+  config.gripper->completion_policy = "no_output";
+  auto backend = make_retained_ros2_control_gripper_backend(
+      config, tool, channel, clock, scheduler, handle);
+  ASSERT_NE(backend, nullptr);
+  EXPECT_EQ(backend->gripper_actuation_kind(tool.value().command_target_id.value()),
+            core::GripperActuationKind::kPneumatic);
+  EXPECT_EQ(backend->gripper_output_mode(tool.value().command_target_id.value()),
+            core::GripperOutputMode::kNone);
+  handle->StartBackend();
+  const auto local = handle->gripper_transport_readiness_snapshot();
+  ASSERT_TRUE(local.has_value());
+  EXPECT_TRUE(local->configured);
+  EXPECT_TRUE(local->logical_owner_ready);
+  EXPECT_TRUE(local->ready);
+  EXPECT_FALSE(local->command_path_ready);
+  EXPECT_FALSE(local->feedback_path_ready);
+  EXPECT_TRUE(local->transport_kind.empty());
+  EXPECT_TRUE(local->state_topic.empty());
+  EXPECT_EQ(local->feedback_messages_received, 0U);
+  EXPECT_FALSE(handle->participant());
+  EXPECT_FALSE(handle->current_port());
+  EXPECT_FALSE(handle->ReadOwnedControllerOccurrence().arm_binding_epoch);
+  std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner = handle;
+  handle.reset();
+  EXPECT_FALSE(owner.expired());
+
+  core::GripperCommandRequestDTO request;
+  request.gripper_id = tool.value().command_target_id.value();
+  request.group_id = "gripper";
+  request.joint_name = "gripper_joint";
+  request.completion_policy = "no_output";
+  request.grasp_confirmation_policy = "not_required";
+  for (const double dwell : {0.0, 0.25}) {
+    request.duration_s = dwell;
+    ASSERT_TRUE(backend->validate_gripper_command(request).ok());
+    const auto command = backend->command_gripper(request);
+    ASSERT_TRUE(command.accepted);
+    const auto completed = backend->get_gripper_status(request.gripper_id);
+    EXPECT_EQ(completed.state, core::GripperCommandState::kCompleted);
+    EXPECT_EQ(completed.command_id, command.command_id);
+    EXPECT_EQ(completed.generation, command.generation);
+    EXPECT_FALSE(completed.error.has_value());
+    EXPECT_EQ(completed.completion_policy, "no_output");
+    EXPECT_TRUE(completed.transport_kind.empty());
+    EXPECT_FALSE(completed.current_position.has_value());
+    EXPECT_FALSE(completed.observed_position.has_value());
+    EXPECT_EQ(completed.projection_state, core::GripperProjectionState::kNotRequired);
+    EXPECT_NE(std::find(completed.evidence.begin(), completed.evidence.end(),
+                        "pneumatic_no_output"), completed.evidence.end());
+    for (const char *physical : {"pneumatic_output_delivery_confirmed",
+                                 "ros_gripper_command_enqueued",
+                                 "isaac_gripper_command_published"})
+      EXPECT_EQ(std::find(completed.evidence.begin(), completed.evidence.end(),
+                          physical), completed.evidence.end());
+  }
+  EXPECT_EQ(clock.now(), 0);
+  EXPECT_EQ(scheduler.pending_count(core::SchedulerPriority::ControllerCommand),
+            0U);
+  backend.reset();
+  EXPECT_TRUE(owner.expired());
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     PneumaticNoneFactoryRetainsExactIdentityAndCommandedRequirements) {
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  const auto tool = commanded_gripper_binding();
+  const auto foreign = commanded_gripper_binding("robot_foreign");
+  const auto channel = test_projected_channel(
+      tool, retained_ros2_control_gripper_state_config(tool), clock);
+  const auto foreign_channel = test_projected_channel(
+      foreign, retained_ros2_control_gripper_state_config(foreign), clock);
+  auto none = gripper_only_factory_config();
+  none.arm.gripper_controller.reset();
+  none.gripper->actuation_kind = core::GripperActuationKind::kPneumatic;
+  none.gripper->output_mode = core::GripperOutputMode::kNone;
+  none.gripper->action_name.clear();
+  none.gripper->transport_kind.clear();
+  none.gripper->completion_policy = "no_output";
+  EXPECT_THROW(static_cast<void>(make_retained_ros2_control_gripper_backend(
+                   none, tool, foreign_channel, clock, scheduler,
+                   std::make_shared<RetainedRos2ControlRuntimeHandle>())),
+               std::invalid_argument);
+  auto physical = none;
+  physical.arm.gripper_controller = RetainedRos2ControlArmController{};
+  EXPECT_THROW(static_cast<void>(make_retained_ros2_control_gripper_backend(
+                   physical, tool, channel, clock, scheduler,
+                   std::make_shared<RetainedRos2ControlRuntimeHandle>())),
+               std::invalid_argument);
+  auto commanded = none;
+  commanded.gripper->output_mode = core::GripperOutputMode::kCommanded;
+  EXPECT_THROW(static_cast<void>(make_retained_ros2_control_gripper_backend(
+                   commanded, tool, channel, clock, scheduler,
+                   std::make_shared<RetainedRos2ControlRuntimeHandle>())),
+               std::invalid_argument);
+  commanded.arm.gripper_controller = gripper_only_factory_config().arm.gripper_controller;
+  EXPECT_THROW(static_cast<void>(make_retained_ros2_control_gripper_backend(
+                   commanded, tool, channel, clock, scheduler,
+                   std::make_shared<RetainedRos2ControlRuntimeHandle>())),
+               std::invalid_argument);
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     StrictSelectedPneumaticSourceMapsDefaultAndExplicitTimeoutAcrossProfiles) {
+  for (bool isaac : {false, true}) {
+    for (const std::optional<double> timeout :
+         {std::optional<double>{}, std::optional<double>{0.25},
+          std::optional<double>{5.0}, std::optional<double>{15.0}}) {
+      auto runtime = isaac ? isaac_runtime_configuration("lite6")
+                           : mock_runtime_configuration("lite6_lite_gripper");
+      auto &selected = runtime.gripper_target_configurations.front();
+      selected.delivery_result_timeout_s = timeout;
+      auto foreign = fixture_gripper_row("unselected", "pneumatic");
+      foreign.delivery_result_timeout_s = 91.0;
+      runtime.gripper_target_configurations.push_back(std::move(foreign));
+      const auto config =
+          isaac ? make_retained_isaac_ros2_control_backend_config(
+                      runtime, commanded_binding(), commanded_gripper_binding())
+                : make_retained_mock_ros2_control_backend_config(
+                      runtime, commanded_binding(), commanded_gripper_binding(),
+                      kMockCancel);
+      ASSERT_TRUE(config.gripper);
+      EXPECT_EQ(config.gripper->actuation_kind,
+                core::GripperActuationKind::kPneumatic);
+      EXPECT_EQ(config.gripper->completion_policy, "output_delivery");
+      ASSERT_TRUE(config.gripper->result_timeout_s);
+      EXPECT_DOUBLE_EQ(*config.gripper->result_timeout_s,
+                       timeout.value_or(1.0));
+      EXPECT_EQ(config.gripper->wait_for_action_server_timeout_s, 2.0);
+    }
+  }
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     StrictNoneSourceRetainsPositiveTimeoutMetadataWithoutCommandTransport) {
+  auto runtime = mock_runtime_configuration("lite6_lite_gripper");
+  auto &selected = runtime.gripper_target_configurations.front();
+  selected.output_mode = core::GripperOutputMode::kNone;
+  selected.delivery_result_timeout_s = 0.125;
+  const auto config = make_retained_mock_ros2_control_backend_config(
+      runtime, commanded_binding(), commanded_gripper_binding(), kMockCancel);
+  ASSERT_TRUE(config.gripper);
+  EXPECT_EQ(config.gripper->completion_policy, "no_output");
+  ASSERT_TRUE(config.gripper->result_timeout_s);
+  EXPECT_DOUBLE_EQ(*config.gripper->result_timeout_s, 0.125);
+  EXPECT_TRUE(config.gripper->transport_kind.empty());
+  EXPECT_TRUE(config.gripper->action_name.empty());
+  EXPECT_TRUE(config.gripper->command_topic.empty());
+  EXPECT_FALSE(config.arm.gripper_controller);
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     StrictPositionSourceKeepsExistingLite6FiveAndUrFifteenTimeouts) {
+  // The typed row owns actuation. A Position row keeps each lane's old profile
+  // timeout even for the Lite 6 profile; no numeric 5-to-1 heuristic is valid.
+  for (bool isaac : {false, true}) {
+    for (bool lite6 : {false, true}) {
+      auto runtime =
+          isaac ? isaac_runtime_configuration(lite6 ? "lite6" : "ur10e")
+                : mock_runtime_configuration(lite6 ? "lite6_lite_gripper"
+                                                   : "ur10e_robotiq_2f_140");
+      runtime.gripper_target_configurations.front().actuation_kind =
+          "position_commanded";
+      const auto config =
+          isaac ? make_retained_isaac_ros2_control_backend_config(
+                      runtime, commanded_binding(), commanded_gripper_binding())
+                : make_retained_mock_ros2_control_backend_config(
+                      runtime, commanded_binding(), commanded_gripper_binding(),
+                      kMockCancel);
+      ASSERT_TRUE(config.gripper);
+      ASSERT_TRUE(config.gripper->result_timeout_s);
+      EXPECT_DOUBLE_EQ(*config.gripper->result_timeout_s, lite6 ? 5.0 : 15.0);
+      EXPECT_EQ(config.gripper->actuation_kind,
+                core::GripperActuationKind::kPositionCommanded);
+    }
+  }
 }
 
 } // namespace

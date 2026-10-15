@@ -199,6 +199,18 @@ public:
           &successor_occurrence = std::nullopt,
       std::shared_ptr<core::IClock> clock_owner = {});
 
+  /// Bind a gripper-only component to its actual transport and controller.
+  /// No arm participant, execution binding epoch or motion adapter is created.
+  [[nodiscard]] core::Result<void> BindGripperOnly(
+      std::unique_ptr<ros2_control_execution::Ros2TransportResources> resources,
+      core::IClock& clock,
+      std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend> gripper,
+      const core::RuntimeParticipantBinding& binding,
+      RetainedRos2ControlArmController controller,
+      const std::optional<core::SelectedControllerOccurrenceDTO>& successor_occurrence = {},
+      std::shared_ptr<core::IClock> clock_owner = {},
+      std::optional<RetainedMeasuredJointStateLane> measured_lane = {});
+
   /// Exact owned arm epoch and canonical domain observation floors, including
   /// zero before an ordinary first observation. Unbound handles have no
   /// domains.
@@ -234,6 +246,13 @@ public:
       std::shared_ptr<core::IClock> receiver_clock,
       const core::RuntimeParticipantBinding &candidate_motion,
       const std::optional<core::RuntimeParticipantBinding> &candidate_gripper);
+
+  [[nodiscard]] core::Result<std::shared_ptr<PreparedMeasuredStateSources>>
+  StageMeasuredStateSources(
+      std::vector<core::MeasuredStateSourceDescriptor> descriptors,
+      std::shared_ptr<core::IClock> receiver_clock,
+      const std::optional<core::RuntimeParticipantBinding>& candidate_motion,
+      const std::optional<core::RuntimeParticipantBinding>& candidate_gripper);
 
   /// Installs the lane guard's hooks; only before `StartBackend`.
   void InstallGuardHooks(RetainedRos2ControlArmGuardHooks hooks);
@@ -284,6 +303,12 @@ public:
   [[nodiscard]] core::Result<void>
   RebindMotionRoute(core::RuntimeParticipantBinding binding,
                     std::vector<core::RuntimeParticipantBinding> aliases);
+  /// Display-only bridge follows the current verified route; it never feeds
+  /// authoritative state publication or readiness.
+  [[nodiscard]] core::Result<void> BindGripperDisplayChannel(
+      const std::shared_ptr<RetainedObservedStateChannel>& channel);
+  [[nodiscard]] core::Result<void> PublishGripperDisplayPosition(double position);
+
   [[nodiscard]] core::Result<void>
   RebindGripperRoute(core::RuntimeParticipantBinding binding,
                      std::shared_ptr<IRetainedObservedStateChannel> channel);
@@ -357,6 +382,7 @@ public:
 private:
   friend class RetainedRos2ControlRuntimeHandleTestAccess;
   struct ArmState;
+  struct GripperOnlyState;
   struct LifecycleHealthInputs;
   struct LifecycleClassification;
   class ArmPort;
@@ -406,10 +432,12 @@ private:
   core::IClock *clock_{};
   std::optional<RetainedRos2ControlArmTransport> arm_transport_;
   std::shared_ptr<ArmState> arm_;
+  std::shared_ptr<GripperOnlyState> gripper_only_;
   std::shared_ptr<core::ExecutionPortParticipant> participant_;
   std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend> gripper_;
   std::optional<core::RuntimeParticipantBinding> motion_binding_;
   std::optional<core::RuntimeParticipantBinding> gripper_binding_;
+  std::weak_ptr<RetainedObservedStateChannel> gripper_display_channel_;
   std::optional<RetainedRos2ControlArmGuardHooks> guard_hooks_;
   std::function<std::optional<std::string>()> process_fault_source_;
   std::function<core::Result<std::optional<std::string>>()>

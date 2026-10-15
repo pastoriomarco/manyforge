@@ -10,7 +10,7 @@
 
 namespace manyforge::deployment {
 namespace {
-namespace native = execution_runtime_contract;
+namespace execution = execution_runtime_contract;
 
 const core::JsonValueDTO &member(const core::JsonObjectDTO &object,
                                  std::string_view key) {
@@ -31,7 +31,7 @@ const T &value(const core::JsonObjectDTO &object, std::string_view key) {
 bool positive(double number) { return std::isfinite(number) && number > 0.0; }
 
 std::optional<std::string>
-invalid_settings(const native::OrdinaryMotionJerkSettings &settings) {
+invalid_settings(const execution::OrdinaryMotionJerkSettings &settings) {
   if (!positive(settings.preset_reference_time_s))
     return "ordinary jerk preset reference is invalid";
   std::set<std::string> seen;
@@ -65,9 +65,9 @@ core::Result<core::OrdinaryMotionJerkPolicy> invalid(std::string message) {
 }
 } // namespace
 
-native::OrdinaryMotionJerkSettings detail::decode_ordinary_motion_jerk_settings(
+execution::OrdinaryMotionJerkSettings detail::decode_ordinary_motion_jerk_settings(
     const core::JsonObjectDTO &source) {
-  native::OrdinaryMotionJerkSettings result{
+  execution::OrdinaryMotionJerkSettings result{
       value<bool>(source, "enabled"),
       value<double>(source, "preset_reference_time_s"),
       {}};
@@ -76,13 +76,13 @@ native::OrdinaryMotionJerkSettings detail::decode_ordinary_motion_jerk_settings(
     const auto *row = std::get_if<core::JsonObjectDTO>(&item.value);
     if (!row)
       throw RetainedBundleError("ordinary jerk settings require joint records");
-    native::JointJerkSetting setting{
+    execution::JointJerkSetting setting{
         value<std::string>(*row, "source_joint_name"), {}, {}};
     if (row->contains("override_rad_s3"))
       setting.override_rad_s3 = value<double>(*row, "override_rad_s3");
     if (row->contains("imported")) {
       const auto &imported = value<core::JsonObjectDTO>(*row, "imported");
-      setting.imported = native::ImportedJointJerkLimit{
+      setting.imported = execution::ImportedJointJerkLimit{
           value<double>(imported, "maximum_rad_s3"),
           value<bool>(imported, "enabled"),
           value<bool>(imported, "machine_required"),
@@ -97,7 +97,7 @@ native::OrdinaryMotionJerkSettings detail::decode_ordinary_motion_jerk_settings(
 }
 
 core::Result<core::OrdinaryMotionJerkPolicy>
-native::resolve_ordinary_motion_jerk_policy(
+execution::resolve_ordinary_motion_jerk_policy(
     const OrdinaryMotionJerkSettings &settings,
     std::span<const core::RuntimeResourceBindingDTO> resources,
     const core::JointLimitsDTO &model_limits) {

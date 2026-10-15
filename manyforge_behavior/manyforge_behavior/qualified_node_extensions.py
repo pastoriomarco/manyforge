@@ -22,7 +22,7 @@ def descriptor():
         "extension_id": PACKAGE_ID,
         "version": "0.1.0",
         "catalog_api_version": "manyforge.node_catalog.v2",
-        "catalog_content_version": "2.4.0",
+        "catalog_content_version": "2.5.0",
         "dependencies": ["manyforge_behavior"],
         "execution_contract": "read_only_single_invocation",
     }

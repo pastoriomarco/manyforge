@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { api } from '../api/client';
+import { api, ApiError } from '../api/client';
 import type {
   CCLCComponentSnapshot,
   CCLCOwnerIdentity,
@@ -18,6 +18,14 @@ import { readinessErrorPresentation } from '../state/componentLifecyclePresentat
 const POLL_INTERVAL_MS = 250;
 const OBSERVATION_INTERVAL_MS = 2000;
 let fallbackIdentitySequence = 0;
+
+// Only the activation observer consumes this marker. Other reads keep their
+// ordinary error path, and mutations are never wrapped or replayed.
+class ComponentReadChanged extends Error {
+  constructor(error: ApiError) {
+    super(error.message, { cause: error });
+  }
+}
 
 export interface CCLCController {
   componentId: string;
@@ -298,6 +306,7 @@ export function useCCLC(
   const readCurrent = useCallback(async (
     signal?: AbortSignal, addressedComponent?: string, publishSelected = true,
     validate?: (snapshot: CCLCComponentSnapshot, ownerEpoch: string, executionOwnerEpoch: string) => void,
+    observeComponentReadChanges = false,
   ) => {
     if (!enabled) throw new Error('CCLC client is unavailable');
     const identity = (addressedComponent ?? componentId).trim();
@@ -313,7 +322,14 @@ export function useCCLC(
       if (unavailableReason !== null) throw new Error(unavailableReason);
       const [owner, nextSnapshot] = await Promise.all([
         api.cclc.owner(signal),
-        api.cclc.component(identity, signal),
+        observeComponentReadChanges ? api.cclc.component(identity, signal).catch((reason: unknown) => {
+          if (observeComponentReadChanges && reason instanceof ApiError && reason.status === 409
+            && reason.structuredError?.code === 'component_lifecycle_facts_stale'
+            && reason.structuredError.details?.reason === 'component_read_changed') {
+            throw new ComponentReadChanged(reason);
+          }
+          throw reason;
+        }) : api.cclc.component(identity, signal),
       ]);
       signal?.throwIfAborted();
       const ownerEpoch = cclcRequestOwnerEpoch(owner, nextSnapshot, execution);
@@ -345,7 +361,8 @@ export function useCCLC(
       }
       return { snapshot: nextSnapshot, templates: nextTemplates, ownerEpoch, executionOwnerEpoch: execution.ownerEpoch };
     } catch (reason) {
-      if (!signal?.aborted && currentReads.current.get(identity) === marker) {
+      if (!(reason instanceof ComponentReadChanged)
+        && !signal?.aborted && currentReads.current.get(identity) === marker) {
         const message = reason instanceof Error ? reason.message : 'CCLC state is unavailable';
         setComponentHealth((previous) => ({ ...previous, [identity]: { snapshot: null, error: message } }));
         if (selectedRef.current === identity) {
@@ -438,50 +455,57 @@ export function useCCLC(
             graphRevision: snapshot.graphRevision, ownerEpoch: snapshot.readiness.requestOwnerEpoch,
             publicationGeneration: snapshot.publicationGeneration, activePublicPointerDigest: snapshot.activePublicPointerDigest } : null;
         const verify = async () => {
-          abort.signal.throwIfAborted();
-          if (configuredRef.current !== capturedConfigured) throw new Error('Activation stopped: configured components changed.');
-          if (applied !== null) {
-            const fresh = (await api.deploymentWorkspace.get(abort.signal)).managerApplied;
-            if (JSON.stringify(fresh) !== JSON.stringify(applied)) {
-              throw new Error('Activation stopped: applied configuration changed.');
+          while (true) {
+            try {
+              abort.signal.throwIfAborted();
+              if (configuredRef.current !== capturedConfigured) throw new Error('Activation stopped: configured components changed.');
+              if (applied !== null) {
+                const fresh = (await api.deploymentWorkspace.get(abort.signal)).managerApplied;
+                if (JSON.stringify(fresh) !== JSON.stringify(applied)) {
+                  throw new Error('Activation stopped: applied configuration changed.');
+                }
+              }
+              const current = await readCurrent(abort.signal, id, !sequence, (next, ownerEpoch, hostOwnerEpoch) => {
+                if (publication !== null && (next.publicationGeneration !== publication.generation
+                  || next.activePublicPointerDigest !== publication.pointerDigest)) {
+                  throw new Error('Activation stopped: applied publication changed.');
+                }
+                publication ??= { generation: next.publicationGeneration, pointerDigest: next.activePublicPointerDigest };
+                if (executionOwnerEpoch !== null && hostOwnerEpoch !== executionOwnerEpoch) {
+                  throw new Error('Activation stopped: execution owner changed.');
+                }
+                executionOwnerEpoch ??= hostOwnerEpoch;
+                if (ownerEpoch !== owner.requestOwnerEpoch
+                  || (order !== null && (next.retainedBundleId !== order.retainedBundleId
+                    || next.graphRevision !== order.graphRevision
+                    || !order.componentIds.includes(id)))) {
+                  throw new Error('Activation stopped: owner or component identity changed.');
+                }
+                const identity = {
+                  componentId: next.componentId,
+                  retainedBundleId: next.retainedBundleId,
+                  graphRevision: next.graphRevision,
+                  ownerEpoch,
+                  publicationGeneration: next.publicationGeneration,
+                  activePublicPointerDigest: next.activePublicPointerDigest,
+                };
+                if (binding !== null && (identity.componentId !== binding.componentId
+                  || identity.retainedBundleId !== binding.retainedBundleId
+                  || identity.graphRevision !== binding.graphRevision
+                  || identity.ownerEpoch !== binding.ownerEpoch
+                  || identity.publicationGeneration !== binding.publicationGeneration
+                  || identity.activePublicPointerDigest !== binding.activePublicPointerDigest)) {
+                  throw new Error('Activation stopped: owner or applied configuration changed.');
+                }
+                binding ??= identity;
+              }, true);
+              abort.signal.throwIfAborted();
+              return current;
+            } catch (reason) {
+              if (!(reason instanceof ComponentReadChanged)) throw reason;
+              await waitForObservation(abort.signal);
             }
           }
-          const current = await readCurrent(abort.signal, id, !sequence, (next, ownerEpoch, hostOwnerEpoch) => {
-            if (publication !== null && (next.publicationGeneration !== publication.generation
-              || next.activePublicPointerDigest !== publication.pointerDigest)) {
-              throw new Error('Activation stopped: applied publication changed.');
-            }
-            publication ??= { generation: next.publicationGeneration, pointerDigest: next.activePublicPointerDigest };
-            if (executionOwnerEpoch !== null && hostOwnerEpoch !== executionOwnerEpoch) {
-              throw new Error('Activation stopped: execution owner changed.');
-            }
-            executionOwnerEpoch ??= hostOwnerEpoch;
-            if (ownerEpoch !== owner.requestOwnerEpoch
-              || (order !== null && (next.retainedBundleId !== order.retainedBundleId
-                || next.graphRevision !== order.graphRevision
-                || !order.componentIds.includes(id)))) {
-              throw new Error('Activation stopped: owner or component identity changed.');
-            }
-            const identity = {
-              componentId: next.componentId,
-              retainedBundleId: next.retainedBundleId,
-              graphRevision: next.graphRevision,
-              ownerEpoch,
-              publicationGeneration: next.publicationGeneration,
-              activePublicPointerDigest: next.activePublicPointerDigest,
-            };
-            if (binding !== null && (identity.componentId !== binding.componentId
-              || identity.retainedBundleId !== binding.retainedBundleId
-              || identity.graphRevision !== binding.graphRevision
-              || identity.ownerEpoch !== binding.ownerEpoch
-              || identity.publicationGeneration !== binding.publicationGeneration
-              || identity.activePublicPointerDigest !== binding.activePublicPointerDigest)) {
-              throw new Error('Activation stopped: owner or applied configuration changed.');
-            }
-            binding ??= identity;
-          });
-          abort.signal.throwIfAborted();
-          return current;
         };
         setActivationProgress(`Activating ${id}`);
         await activateThroughOrdinaryLifecycle(verify, async (intent) => {

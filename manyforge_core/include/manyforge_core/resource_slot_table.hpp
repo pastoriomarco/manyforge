@@ -99,6 +99,8 @@ struct ResourceSlotStopFenceRequestDTO final {
   StopGeneration stop_generation{0U};
   std::vector<ResourceSlotStopFenceOwnerDTO> owners;
   std::vector<ResourceId> orphan_resources;
+  /// Exact non-fenced owners of revised operations. Preserve phase and Stop generation.
+  std::vector<ResourceSlotStopFenceOwnerDTO> revision_only_owners{};
 
   friend bool operator==(const ResourceSlotStopFenceRequestDTO&,
                          const ResourceSlotStopFenceRequestDTO&) = default;

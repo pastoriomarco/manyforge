@@ -36,6 +36,30 @@
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,
           "execution_tick_hz": 100,
+          "gripper_target_configurations": [
+            {
+              "actuation_kind": "pneumatic",
+              "attach_frame": "link_tcp",
+              "auxiliary_frames": [
+                "lite_gripper_base_link"
+              ],
+              "closed_state_ref": "closed",
+              "command_duration_s": 0.8,
+              "command_target_id": "gripper",
+              "controllable_component_id": "isaac_lite6_robot",
+              "delivery_result_timeout_s": 1.0,
+              "description": "UFACTORY lite pneumatic gripper through Isaac JointState effort commands.",
+              "mount_frame": "link_eef",
+              "open_state_ref": "open",
+              "output_mode": "commanded",
+              "tcp_frame": "link_tcp",
+              "touch_links": [
+                "lite_gripper_base_link",
+                "lite_gripper_left_finger",
+                "lite_gripper_right_finger"
+              ]
+            }
+          ],
           "initial_joint_positions_rad": [
             0.0,
             0.0,

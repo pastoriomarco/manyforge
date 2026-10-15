@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/active_control_configuration.hpp>
 #include <manyforge_core/types/controller_topology.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
@@ -173,6 +174,13 @@ struct ControllerLifecycleExpectedBindingDTO final {
   std::vector<ControllerInterfaceInstanceDTO> claimed_command_interfaces;
   std::vector<ControllerInterfaceInstanceDTO> claimed_state_interfaces;
 
+  /// Exact source-qualified logical resources for strict pneumatic none only.
+  /// Physical-required domains keep this empty and retain interface claims.
+  std::vector<ResourceId> logical_owner_resources{};
+
+  /// Strict source-qualified actuation; absence retains the ordinary hard floor.
+  std::optional<GripperActuationKind> gripper_actuation_kind{};
+
   [[nodiscard]] bool locally_valid() const noexcept;
 
   friend bool operator==(const ControllerLifecycleExpectedBindingDTO&,
@@ -185,6 +193,13 @@ struct ControllerLifecycleExpectedBindingDTO final {
   return std::tie(lhs.control_binding_id, lhs.control_binding_revision) <
          std::tie(rhs.control_binding_id, rhs.control_binding_revision);
 }
+
+/// DX791: selected strict pneumatic none has no physical ROS controller.
+/// Deployment seals that source case; this is never inferred from empty rows.
+enum class ControllerLifecyclePhysicalExpectation : std::uint8_t {
+  kRequired,
+  kNotApplicablePneumaticNone,
+};
 
 /// Complete independently verified expected closure for one control domain.
 struct ControllerLifecycleExpectedDomainDTO final {
@@ -204,6 +219,8 @@ struct ControllerLifecycleExpectedDomainDTO final {
   std::vector<ControllerLifecycleExpectedBindingDTO> expected_bindings;
   std::vector<ControllerLifecycleExpectedControllerDTO> expected_controllers;
   std::vector<ControllerLifecycleExpectedEndpointDTO> expected_endpoints;
+  ControllerLifecyclePhysicalExpectation physical_expectation{
+      ControllerLifecyclePhysicalExpectation::kRequired};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 
@@ -258,6 +275,8 @@ struct ControllerLifecycleObservationQueryDTO final {
   ContentDigest source_conformance_digest;
   RuntimeUnitId source_runtime_unit_id;
   RuntimeEpoch source_runtime_epoch;
+  ControllerLifecyclePhysicalExpectation physical_expectation{
+      ControllerLifecyclePhysicalExpectation::kRequired};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 

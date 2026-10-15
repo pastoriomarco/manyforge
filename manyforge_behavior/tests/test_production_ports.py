@@ -25,7 +25,7 @@ from manyforge_behavior.nodes.stop_policy import (
     OperatorMotionStopSnapshot,
     OperatorMotionStopState,
 )
-from manyforge_behavior.nodes.v2_owner import OwnerInvocationAdapter
+from manyforge_behavior.nodes.v2_owner import OwnerInvocationAdapter, OwnerTaskAdapter
 from manyforge_behavior.orchestration_ports import (
     CompositeProgramRunContextPort,
     FrameTransformError,
@@ -33,6 +33,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerInvocationHeldError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
+    OwnerTaskSettlementPendingError,
     OwnerTaskSnapshot,
     OwnerTaskState,
     ProgramRunPortContext,
@@ -70,6 +71,12 @@ class _Transport:
         self.released_scope_stops: list[tuple[str, str, int]] = []
         self.identity_reads = 0
         self.owner_epoch = "kernel.epoch.7"
+
+    def targets(self):
+        # Numeric commands now share the real descriptor prerequisite. The
+        # default fixture remains a configured position gripper.
+        _preset_transport(self, kind="linear_m")
+        return self.targets()
 
     def identity(self) -> dict[str, Any]:
         self.identity_reads += 1
@@ -2069,6 +2076,527 @@ def test_gripper_schema_comes_from_captured_program_binding() -> None:
     assert participant["payload"]["command_schema_revision"] == _DIGEST_E
 
 
+def _gripper_inputs(duration_s: float = 0.8) -> OwnerNodeInputs:
+    return OwnerNodeInputs(parameters={
+        "target_role": "gripper",
+        "position": {"kind": "linear_m", "value_m": 0.008},
+        "max_effort": {"kind": "linear_newton", "value_n": 10.0},
+        "command_duration_s": duration_s,
+        "completion_timeout_s": 30.0,
+    })
+
+
+def _final_pneumatic_failure(reason: str = "delivery_reply_lost") -> dict[str, Any]:
+    return {
+        "state": "failed",
+        "terminal_error": {
+            "code": "command_failed",
+            "message": "pneumatic output was not confirmed as sent",
+            "details": {"reason": reason, "pneumatic_transaction_final": "true"},
+        },
+    }
+
+
+def _preset_transport(transport=None, *, kind="angular_rad"):
+    transport = _Transport() if transport is None else transport
+    schema = {"command_schema_id": "gripper.command_position", "command_schema_revision": _DIGEST_E}
+    transport.preset_descriptor = {
+        "schema_version": "manyforge.manual_control_gripper_descriptor.v3",
+        "controllable_component_id": "tool.1", "command_target_id": "gripper.command",
+        "component_role_id": "manual_component", "target_role_id": "manual_target",
+        "source_kind": "model_role", "coordinate_kind": kind,
+        "unit": "rad" if kind == "angular_rad" else "m",
+        "min_position": 0.0, "max_position": 1.0,
+        "open_state_ref": "released", "closed_state_ref": "grasp",
+        "actuation_kind": "position_commanded", "output_mode": "commanded",
+        "completion_policy": "goal_fenced_target_reached",
+        "grasp_confirmation_policy": "binding_feedback_required",
+        "command_kind": "gripper_position", "command_duration_s": 0.8,
+        "description": "Fixture model-backed position gripper.",
+        "mount_frame": "gripper_mount", "attach_frame": "gripper_tcp", "tcp_frame": "gripper_tcp",
+        "touch_links": ["finger_link"], "auxiliary_frames": [], "mimic_followers": [],
+        "source_coordinate_name": "finger_joint", "source_group_name": "finger_group",
+        "state_authority_id": None, "state_authority_class": None,
+        "control_interface_contract_id": None, "transport_kind": "resolved_binding",
+        "contracts": {"command_schema": schema, "operation_capability_id": "tool.gripper.command",
+                      "operation_capability_definition_revision": _DIGEST_E,
+                      "control_path": None, "supporting_providers": []},
+        "named_presets": [
+            {"name": name, "master_position": value,
+             "coordinates": [{"source_coordinate_name": "finger_joint", "position": value}]}
+            for name, value in (("released", 0.8), ("grasp", 0.1), ("open", 0.2), ("closed", 0.3))
+        ],
+    }
+    transport.preset_envelope = {
+        "ok": True,
+        "identity": {"owner_epoch": "kernel.epoch.7", "graph_revision": _DIGEST_C,
+                     "retained_bundle_id": _DIGEST_B},
+        "targets": {
+            "schema_version": "manyforge.execution_targets.v3",
+            "components": [{"controllable_component_id": "tool.1", "targets": [{
+                "command_target_id": "gripper.command", "operation_capability_id": "tool.gripper.command",
+                "presentation": "gripper", "command": {
+                    **schema, "target_descriptor": transport.preset_descriptor,
+                },
+            }]}],
+        },
+    }
+    transport.target_reads = 0
+
+    def targets():
+        transport.target_reads += 1
+        return deepcopy(transport.preset_envelope)
+
+    transport.targets = targets
+    return transport
+
+
+@pytest.mark.parametrize("actuation,mode,completion,confirmation", [
+    ("position_commanded", "commanded", "goal_fenced_target_reached", "binding_feedback_required"),
+    ("pneumatic", "commanded", "output_delivery", "not_required"),
+    ("pneumatic", "none", "no_output", "not_required"),
+])
+@pytest.mark.parametrize("alias,value", [("open", 0.8), ("closed", 0.1)])
+def test_named_gripper_alias_consumes_exact_v3_mode_policy_matrix(
+    actuation, mode, completion, confirmation, alias, value,
+):
+    transport = _preset_transport(kind="linear_m")
+    transport.preset_descriptor.update({
+        "actuation_kind": actuation, "output_mode": mode,
+        "completion_policy": completion, "grasp_confirmation_policy": confirmation,
+    })
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_gripper_inputs().parameters)
+    parameters["position"] = {"kind": "named_preset", "name": alias}
+    port.operations.start("gripper.command_position", _identity(), OwnerNodeInputs(parameters=parameters))
+    position = transport.submissions[0]["participants"][0]["payload"]["command_value"]["position"]
+    assert position == {"kind": "linear_m", "value_m": value}
+    assert transport.target_reads == 1
+    # This adapter sends the existing numeric Kernel intent, including for
+    # no-output targets. The exact backend owner decides output delivery.
+    assert transport.controls == []
+
+
+@pytest.mark.parametrize("case", [
+    "old_version", "missing_mode", "null_mode", "unknown_mode", "position_none",
+    "missing_actuation", "unknown_actuation", "missing_completion", "wrong_completion",
+    "missing_confirmation", "wrong_confirmation", "unconfigured_model",
+])
+def test_named_gripper_alias_refuses_old_or_incomplete_v3_descriptor(case):
+    transport = _preset_transport()
+    descriptor = transport.preset_descriptor
+    if case == "old_version":
+        descriptor["schema_version"] = "manyforge.manual_control_gripper_descriptor.v2"
+    elif case == "missing_mode":
+        descriptor.pop("output_mode")
+    elif case == "null_mode":
+        descriptor["output_mode"] = None
+    elif case == "unknown_mode":
+        descriptor["output_mode"] = "off"
+    elif case == "position_none":
+        descriptor["output_mode"] = "none"
+    elif case == "missing_actuation":
+        descriptor.pop("actuation_kind")
+    elif case == "unknown_actuation":
+        descriptor["actuation_kind"] = "unknown"
+    elif case == "missing_completion":
+        descriptor.pop("completion_policy")
+    elif case == "wrong_completion":
+        descriptor["actuation_kind"] = "pneumatic"
+        descriptor["grasp_confirmation_policy"] = "not_required"
+    elif case == "missing_confirmation":
+        descriptor.pop("grasp_confirmation_policy")
+    elif case == "wrong_confirmation":
+        descriptor["grasp_confirmation_policy"] = "not_required"
+    else:
+        for field in ("actuation_kind", "output_mode", "description", "command_duration_s",
+                      "open_state_ref", "closed_state_ref", "mount_frame", "attach_frame", "tcp_frame"):
+            descriptor[field] = None
+        descriptor["touch_links"] = []
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_gripper_inputs().parameters)
+    parameters["position"] = {"kind": "named_preset", "name": "open"}
+    with pytest.raises(ProductionPortError):
+        port.operations.start("gripper.command_position", _identity(), OwnerNodeInputs(parameters=parameters))
+    assert transport.target_reads == 1
+    assert transport.submissions == []
+    assert transport.controls == []
+
+
+@pytest.mark.parametrize("kind", ["angular_rad", "linear_m"])
+@pytest.mark.parametrize("alias,value", [("open", 0.8), ("closed", 0.1)])
+def test_named_gripper_alias_resolves_configured_reference_once_per_attempt(kind, alias, value):
+    transport = _preset_transport(kind=kind)
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_gripper_inputs().parameters)
+    parameters["position"] = {"kind": "named_preset", "name": alias}
+    parameters["max_effort"] = (
+        {"kind": "angular_newton_meter", "value_nm": 1.0}
+        if kind == "angular_rad" else {"kind": "linear_newton", "value_n": 1.0}
+    )
+    identity = _identity("first-preset")
+    task = port.operations.start("gripper.command_position", identity, OwnerNodeInputs(parameters=parameters))
+    field = "value_rad" if kind == "angular_rad" else "value_m"
+    assert transport.submissions[0]["participants"][0]["payload"]["command_value"]["position"] == {
+        "kind": kind, field: value,
+    }
+    assert parameters["position"] == {"kind": "named_preset", "name": alias}
+    assert transport.target_reads == 1
+    transport.operations[task.task_id].update({"state": "completed", "operation_revision": 3})
+    port.operations.observe(task.task_id)
+    port.operations.acknowledge(task.task_id, identity)
+    selected = next(row for row in transport.preset_descriptor["named_presets"] if
+                    row["name"] == transport.preset_descriptor[f"{alias}_state_ref"])
+    selected["master_position"] = 0.5
+    selected["coordinates"][0]["position"] = 0.5
+    port.operations.start("gripper.command_position", _identity("next-preset"), OwnerNodeInputs(parameters=parameters))
+    assert transport.target_reads == 2
+    assert transport.submissions[1]["participants"][0]["payload"]["command_value"]["position"] == {
+        "kind": kind, field: 0.5,
+    }
+
+
+@pytest.mark.parametrize("case", [
+    "missing_reference", "missing_preset", "duplicate_preset", "nonfinite", "out_of_limits",
+    "unit", "source_kind", "target", "command_schema", "owner_epoch", "graph", "bundle",
+    "duplicate_component", "duplicate_target",
+])
+def test_named_gripper_alias_refuses_unverified_metadata_before_command(case):
+    transport = _preset_transport()
+    descriptor = transport.preset_descriptor
+    component = transport.preset_envelope["targets"]["components"][0]
+    if case == "missing_reference":
+        descriptor["open_state_ref"] = None
+    elif case == "missing_preset":
+        descriptor["named_presets"] = [row for row in descriptor["named_presets"] if row["name"] != "released"]
+    elif case == "duplicate_preset":
+        descriptor["named_presets"].append(deepcopy(descriptor["named_presets"][0]))
+    elif case in {"nonfinite", "out_of_limits"}:
+        descriptor["named_presets"][0]["master_position"] = float("nan") if case == "nonfinite" else 2.0
+    elif case == "unit":
+        descriptor["unit"] = "m"
+    elif case == "source_kind":
+        descriptor["source_kind"] = "component_local"
+    elif case == "target":
+        descriptor["command_target_id"] = "foreign"
+    elif case == "command_schema":
+        component["targets"][0]["command"]["command_schema_revision"] = _DIGEST_F
+    elif case in {"owner_epoch", "graph", "bundle"}:
+        field = {"owner_epoch": "owner_epoch", "graph": "graph_revision", "bundle": "retained_bundle_id"}[case]
+        transport.preset_envelope["identity"][field] = "foreign" if case == "owner_epoch" else _DIGEST_F
+    elif case == "duplicate_component":
+        transport.preset_envelope["targets"]["components"].append(deepcopy(component))
+    else:
+        component["targets"].append(deepcopy(component["targets"][0]))
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_gripper_inputs().parameters)
+    parameters["position"] = {"kind": "named_preset", "name": "open"}
+    with pytest.raises(ProductionPortError):
+        port.operations.start("gripper.command_position", _identity(), OwnerNodeInputs(parameters=parameters))
+    assert transport.target_reads == 1
+    assert transport.submissions == []
+    assert transport.controls == []
+
+
+def test_numeric_gripper_command_reads_descriptor_without_resolving_named_presets():
+    transport = _preset_transport(kind="linear_m")
+    # Numeric payloads do not consult aliases, even if presets are unavailable.
+    transport.preset_descriptor["named_presets"] = None
+    transport.preset_descriptor["open_state_ref"] = None
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
+    assert transport.target_reads == 1
+    assert transport.submissions[0]["participants"][0]["payload"]["command_value"]["position"] == {
+        "kind": "linear_m", "value_m": 0.008,
+    }
+
+
+def test_numeric_gripper_descriptor_unavailability_refuses_before_effect():
+    transport = _preset_transport()
+    transport.preset_envelope = None
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    with pytest.raises(Exception):
+        port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
+    assert transport.target_reads == 1
+    assert transport.submissions == []
+    assert transport.controls == []
+
+
+def test_named_gripper_keeps_resolved_epoch_for_owner_admission_cas():
+    transport = _preset_transport()
+    targets = transport.targets
+
+    def change_owner_after_read():
+        envelope = targets()
+        transport.owner_epoch = "kernel.epoch.replaced"
+        return envelope
+
+    def refuse_old_owner(body):
+        assert body["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
+        assert body["request_context"]["request_owner_epoch"] != transport.owner_epoch
+        return {"ok": False, "error": {
+            "code": "invalid_state_transition", "message": "request owner was replaced",
+            "details": {"reason": "request_owner_epoch_stale"},
+        }}
+
+    transport.targets, transport.submit = change_owner_after_read, refuse_old_owner
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_gripper_inputs().parameters)
+    parameters["position"] = {"kind": "named_preset", "name": "open"}
+    with pytest.raises(KernelOperationAdmissionRejectedError):
+        port.operations.start("gripper.command_position", _identity(), OwnerNodeInputs(parameters=parameters))
+    assert transport.target_reads == 1
+    assert transport.submissions == []
+    assert port._tasks == {}
+
+
+@pytest.mark.parametrize("duration_s", [0.0, 0.35])
+@pytest.mark.parametrize("succeeded", [True, False])
+@pytest.mark.parametrize("composite", ["sequence", "fallback", "retry"])
+def test_pneumatic_held_result_drains_without_successor_retry_or_resend(
+    duration_s, succeeded, composite,
+) -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    state = OperatorMotionStopState({
+        "command": (), "next": (), "root": ("command", "next"),
+    })
+
+    def action(instance):
+        return OwnerTaskAdapter(
+            name=instance,
+            node_id="gripper.command_position",
+            node_instance_id=instance,
+            port=port.operations,
+            owner_port_name="kernel_operations",
+            parameters=dict(_gripper_inputs(duration_s).parameters),
+            value_sources={},
+            attempt_source=SimpleNamespace(begin=lambda node: _identity(node)),
+            input_resolver=SimpleNamespace(snapshot=lambda **kwargs: SimpleNamespace(
+                parameters=kwargs["parameters"], blackboard={},
+            )),
+        )
+
+    command, next_action = action("command"), action("next")
+    leaves = [OperatorMotionStopPolicy(
+        child=child, node_instance_id=child.name, stop_state=state,
+    ) for child in (command, next_action)]
+    if composite == "sequence":
+        parent = py_trees.composites.Sequence("sequence", memory=True, children=leaves)
+    elif composite == "fallback":
+        parent = py_trees.composites.Selector("fallback", memory=True, children=leaves)
+    else:
+        parent = py_trees.decorators.Retry("retry", child=leaves[0], num_failures=2)
+    root = OperatorMotionStopPolicy(
+        child=parent, node_instance_id="root", stop_state=state, drain_children=True,
+    )
+    list(root.tick())
+    operation = transport.operations["operation-1"]
+    operation.update({"state": "executing", "operation_revision": 3})
+    port.scope.request_stop("program-run.1", "held-command", "operator Stop")
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    state.publish(OperatorMotionStopSnapshot(1, frozenset({"command", "next", "root"})))
+    list(root.tick())
+    assert command.has_active_task
+    assert len(transport.submissions) == 1
+    assert [row[0] for row in transport.controls] == ["stop_program_run"]
+    operation.update({
+        "state": "completed" if succeeded else "failed",
+        "operation_revision": 7,
+        "active_stop_id": "scope-stop-1",
+        "active_stop_generation": 1,
+        "participants": [{"state": "completed"}] if succeeded else [_final_pneumatic_failure()],
+    })
+    original_participants = deepcopy(operation["participants"])
+    list(root.tick())
+    assert leaves[0].presented_status is (
+        py_trees.common.Status.SUCCESS if succeeded else py_trees.common.Status.FAILURE
+    )
+    assert command.cached_control_state() == "settled"
+    assert next_action.status is py_trees.common.Status.INVALID
+    for _ in range(3):
+        list(root.tick())
+    assert len(transport.submissions) == 1
+    assert [row[0] for row in transport.controls] == ["stop_program_run", "acknowledge"]
+    assert transport.controls[-1][2]["expected_operation_revision"] == 7
+    assert transport.released_scope_stops == []
+    assert operation["participants"] == original_participants
+    assert transport.submissions[0]["participants"][0]["payload"]["caller_options"] == [
+        {"option_id": "command_duration_s", "value_s": duration_s},
+    ]
+
+
+@pytest.mark.parametrize("reason", [
+    "delivery_refused", "delivery_exception", "delivery_reply_lost", "delivery_timeout",
+])
+def test_final_pneumatic_failure_keeps_result_and_exact_ack_revision(reason) -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("pneumatic")
+    started = port.operations.start("gripper.command_position", identity, _gripper_inputs())
+    operation = transport.operations[started.task_id]
+    operation.update({
+        "state": "failed", "operation_revision": 7,
+        "participants": [_final_pneumatic_failure(reason), {"state": "completed"}],
+    })
+    observed = port.operations.observe(started.task_id)
+    assert observed.state is OwnerTaskState.FAILED
+    assert observed.settlement_proven is True
+    assert observed.reason_code == "command_failed"
+    assert observed.details == {"reason": reason}
+    assert observed.metadata["operation_revision"] == 7
+    reads = transport.operation_reads
+    operation.update({"state": "completed", "operation_revision": 8})
+    assert port.operations.observe(started.task_id) == observed
+    assert transport.operation_reads == reads
+    with pytest.raises(ProductionPortError, match="changed node attempt"):
+        port.operations.acknowledge(started.task_id, _identity("foreign"))
+    assert transport.controls == []
+    port.operations.acknowledge(started.task_id, identity)
+    assert [row[0] for row in transport.controls] == ["acknowledge"]
+    _, operation_id, body = transport.controls[0]
+    assert operation_id == started.task_id
+    assert body["expected_operation_revision"] == 7
+    assert body["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
+    assert transport.operation_reads == reads
+    assert len(transport.submissions) == 1
+
+
+@pytest.mark.parametrize("case", [
+    "empty", "position_failure", "active_sibling", "interrupted_sibling",
+    "unmarked_sibling", "boolean_marker", "intervention_required", "all_completed",
+])
+def test_pneumatic_settlement_marker_does_not_settle_other_failures(case) -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("gripper")
+    started = port.operations.start("gripper.command_position", identity, _gripper_inputs())
+    operation = transport.operations[started.task_id]
+    row = _final_pneumatic_failure()
+    participants = [row]
+    if case == "empty":
+        participants = []
+    elif case == "position_failure":
+        row["terminal_error"]["details"].pop("pneumatic_transaction_final")
+    elif case in {"active_sibling", "interrupted_sibling", "unmarked_sibling"}:
+        participants.append({"state": {
+            "active_sibling": "executing", "interrupted_sibling": "stopped",
+            "unmarked_sibling": "failed",
+        }[case]})
+    elif case == "boolean_marker":
+        row["terminal_error"]["details"]["pneumatic_transaction_final"] = True
+    elif case == "all_completed":
+        participants = [{"state": "completed"}]
+    operation.update({
+        "state": "intervention_required" if case == "intervention_required" else "failed",
+        "operation_revision": 3, "participants": participants,
+    })
+    observed = port.operations.observe(started.task_id)
+    assert observed.state is OwnerTaskState.FAILED
+    assert observed.settlement_proven is False
+    with pytest.raises(ProductionPortError, match="only a completed operation"):
+        port.operations.acknowledge(started.task_id, identity)
+    assert transport.controls == []
+
+
+def test_final_pneumatic_failure_unbind_consumes_exact_owner_result_without_reset() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    task = port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
+    transport.operations[task.task_id].update({
+        "state": "failed", "operation_revision": 5,
+        "participants": [_final_pneumatic_failure()],
+    })
+    port.unbind("program-run.1")
+    assert [row[0] for row in transport.controls] == ["acknowledge"]
+    assert transport.controls[0][2]["expected_operation_revision"] == 5
+    assert port._tasks == {}
+
+
+def test_final_pneumatic_failure_waits_for_owner_acknowledgement_without_resending() -> None:
+    class EffectInFlight(RuntimeError):
+        code = "operation_effect_in_flight"
+
+    class Pending(_Transport):
+        dispatch_returned = False
+
+        def acknowledge_completed(self, operation_id, body):
+            if not self.dispatch_returned:
+                raise EffectInFlight("the admitted dispatch has not returned")
+            return super().acknowledge_completed(operation_id, body)
+
+    transport = Pending()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("pneumatic")
+    task = port.operations.start("gripper.command_position", identity, _gripper_inputs())
+    operation = transport.operations[task.task_id]
+    operation.update({
+        "state": "failed", "operation_revision": 7,
+        "participants": [_final_pneumatic_failure()],
+    })
+    failed = port.operations.observe(task.task_id)
+    with pytest.raises(OwnerTaskSettlementPendingError):
+        port.operations.acknowledge(task.task_id, identity)
+    assert port.operations.observe(task.task_id) == failed
+    assert transport.controls == []
+    assert len(transport.submissions) == 1
+    transport.dispatch_returned = True
+    port.operations.acknowledge(task.task_id, identity)
+    assert [row[0] for row in transport.controls] == ["acknowledge"]
+    assert transport.controls[0][2]["expected_operation_revision"] == 7
+    assert port._tasks == {}
+
+
+def test_pneumatic_unknown_kernel_admission_reply_keeps_existing_exclusion() -> None:
+    transport = _LostAcceptanceReplyTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    task = port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
+    assert task.state is OwnerTaskState.FAILED
+    assert task.reason_code == "operation_admission_outcome_unknown"
+    assert task.settlement_proven is False
+    assert port.operations.observe(task.task_id) == task
+    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.UNKNOWN
+    assert len(transport.submit_attempts) == 1
+    assert len(transport.submissions) == 1
+    assert transport.controls == []
+
+
+def test_unadmitted_pneumatic_command_remains_held_without_a_send() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    state = OperatorMotionStopState({"command": ()})
+    state.publish(OperatorMotionStopSnapshot(1, frozenset({"command"})))
+    command = OwnerTaskAdapter(
+        name="command", node_id="gripper.command_position", node_instance_id="command",
+        port=port.operations, parameters=dict(_gripper_inputs().parameters), value_sources={},
+        attempt_source=SimpleNamespace(begin=lambda node: _identity(node)),
+        input_resolver=SimpleNamespace(snapshot=lambda **kwargs: SimpleNamespace(
+            parameters=kwargs["parameters"], blackboard={},
+        )),
+    )
+    leaf = OperatorMotionStopPolicy(child=command, node_instance_id="command", stop_state=state)
+    for _ in range(3):
+        list(leaf.tick())
+    assert leaf.status is py_trees.common.Status.RUNNING
+    assert command.status is py_trees.common.Status.INVALID
+    assert transport.submissions == []
+    assert transport.controls == []
+
+
 def test_stale_native_deployment_fails_before_dispatch() -> None:
     class _StaleTransport(_Transport):
         def identity(self) -> dict[str, Any]:
@@ -2551,6 +3079,45 @@ def test_place_intent_preserves_authored_pose_and_has_no_grasp_exception() -> No
         payload = intent[f"{phase}_operation"]["participants"][0]["payload"]
         assert payload["contact_policy_id"] is None
         assert payload["runtime_object_bindings"] == []
+
+
+@pytest.mark.parametrize("phase,alias,value", [("pick", "closed", 0.1), ("place", "open", 0.8)])
+@pytest.mark.parametrize("kind", ["angular_rad", "linear_m"])
+def test_named_planning_output_reuses_resolved_numeric_tool_position(phase, alias, value, kind):
+    transport = _preset_transport(_PickPlaceTransport(), kind=kind)
+    plan = transport.plan_pick if phase == "pick" else transport.plan_place
+
+    def change_presets_after_planning(intent):
+        result = plan(intent)
+        for row in transport.preset_descriptor["named_presets"]:
+            row["master_position"] = 0.5
+            row["coordinates"][0]["position"] = 0.5
+        return result
+
+    if phase == "pick":
+        transport.plan_pick = change_presets_after_planning
+    else:
+        transport.plan_place = change_presets_after_planning
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_pick_inputs().parameters)
+    parameters["tool_position"] = {"kind": "named_preset", "name": alias}
+    parameters["tool_max_effort"] = None
+    if phase == "place":
+        parameters["place_pose"] = {
+            "position_m": [0.4, 0.1, 0.2], "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
+        }
+    result = port.operations.start(f"planning.plan_{phase}_sequence", _identity(phase),
+                                   OwnerNodeInputs(parameters=parameters))
+    requests = transport.pick_requests if phase == "pick" else transport.place_requests
+    field = "value_rad" if kind == "angular_rad" else "value_m"
+    expected = {"kind": kind, field: value}
+    numeric = requests[0]["tool_operation"]["participants"][0]["payload"]["command_value"]["position"]
+    assert numeric == expected
+    assert result.output["tool_position"] == expected
+    assert transport.target_reads == 1
+    assert parameters["tool_position"] == {"kind": "named_preset", "name": alias}
+    assert transport.submissions == []
 
 
 def _scene_context() -> ProgramRunPortContext:
@@ -3861,3 +4428,261 @@ def test_idle_scene_restoration_reuses_the_exact_applied_program_convergence() -
     assert transport.submissions[-1]["operation"]["kind"] == "upsert_object"
     assert transport.objects["graspable"]["placement"]["pose_in_cell"]["position_m"]["x"] == 0.3
     port.release(context.program_run_id)
+
+
+@pytest.mark.parametrize("kind", ["position_commanded", "pneumatic"])
+@pytest.mark.parametrize("authored", [None, 0.0, 0.4])
+def test_gripper_attempt_captures_typed_default_and_override_once(kind, authored):
+    transport = _preset_transport(kind="linear_m")
+    if kind == "pneumatic":
+        transport.preset_descriptor.update(actuation_kind=kind, completion_policy="output_delivery",
+                                           grasp_confirmation_policy="not_required", command_duration_s=1.25)
+    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(_context())
+    parameters = dict(_gripper_inputs().parameters)
+    if authored is None:
+        parameters.pop("command_duration_s")
+    else:
+        parameters["command_duration_s"] = authored
+    # Position override validation remains the backend's existing responsibility.
+    started = port.operations.start("gripper.command_position", _identity(), OwnerNodeInputs(parameters=parameters))
+    timing = dict(started.metadata)
+    assert timing["gripper_actuation_kind"] == kind
+    assert timing["gripper_dwell_s"] == ((1.25 if authored is None else authored) if kind == "pneumatic" else None)
+    payload = transport.submissions[0]["participants"][0]["payload"]
+    assert payload["caller_options"] == [{"option_id": "command_duration_s", "value_s": authored or 0.0}]
+    transport.preset_descriptor["command_duration_s"] = 99.0
+    transport.preset_descriptor["actuation_kind"] = "foreign"
+    transport.operations[started.task_id].update(state="completed", operation_revision=3)
+    completed = port.operations.observe(started.task_id)
+    assert completed.metadata["gripper_dwell_s"] == timing["gripper_dwell_s"]
+    port.operations.acknowledge(started.task_id, _identity())
+    assert transport.target_reads == 1
+    transport.preset_descriptor["actuation_kind"] = kind
+    next_attempt = port.operations.start(
+        "gripper.command_position", _identity("next-duration"), OwnerNodeInputs(parameters=parameters),
+    )
+    assert transport.target_reads == 2
+    assert next_attempt.metadata["gripper_dwell_s"] == (
+        (99.0 if authored is None else authored) if kind == "pneumatic" else None
+    )
+
+
+@pytest.mark.parametrize("fault", ["missing_type", "policy", "duration_nan", "duration_negative", "owner", "graph", "bundle", "schema", "limits", "unit"])
+def test_numeric_gripper_reuses_verified_descriptor_and_refuses_before_effect(fault):
+    transport = _preset_transport(kind="linear_m")
+    descriptor = transport.preset_descriptor
+    if fault == "missing_type": descriptor.pop("actuation_kind")
+    elif fault == "policy": descriptor["completion_policy"] = "output_delivery"
+    elif fault == "duration_nan": descriptor["command_duration_s"] = float("nan")
+    elif fault == "duration_negative": descriptor["command_duration_s"] = -1.0
+    elif fault in {"owner", "graph", "bundle"}:
+        transport.preset_envelope["identity"][{"owner":"owner_epoch", "graph":"graph_revision", "bundle":"retained_bundle_id"}[fault]] = "foreign"
+    elif fault == "schema": descriptor["contracts"]["command_schema"] = {}
+    elif fault == "limits": descriptor["min_position"] = 2.0
+    else: descriptor["unit"] = "rad"
+    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(_context())
+    with pytest.raises(ProductionPortError):
+        port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
+    assert transport.submissions == transport.controls == []
+    assert transport.target_reads == 1
+
+
+def test_numeric_gripper_accepts_explicit_unconfigured_legacy_descriptor_without_dwell():
+    transport = _preset_transport(kind="linear_m")
+    for key in ("actuation_kind", "output_mode", "completion_policy", "grasp_confirmation_policy", "command_duration_s"):
+        transport.preset_descriptor[key] = None
+    transport.preset_descriptor["named_presets"] = None
+    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(_context())
+    started = port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
+    assert started.metadata["gripper_actuation_kind"] is None
+    assert started.metadata["gripper_dwell_s"] is None
+    assert transport.target_reads == 1
+
+
+@pytest.mark.parametrize("field", ["owner_epoch", "graph_revision", "retained_bundle_id"])
+def test_numeric_gripper_keeps_descriptor_owner_for_effect_submit_cas(field):
+    transport = _preset_transport(kind="linear_m")
+    read = transport.targets
+    def replace_after_read():
+        result = read()
+        transport.preset_envelope["identity"][field] = "foreign"
+        return result
+    def refuse_stale(body):
+        assert body["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
+        assert body["expected_graph_revision"] == _DIGEST_C
+        assert body["expected_retained_bundle_id"] == _DIGEST_B
+        return {"ok": False, "error": {"code": "invalid_state_transition", "message": "owner CAS refused", "details": {"reason":"stale_capture"}}}
+    transport.targets, transport.submit = replace_after_read, refuse_stale
+    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(_context())
+    with pytest.raises(KernelOperationAdmissionRejectedError):
+        port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
+    assert transport.submissions == transport.controls == []
+    assert port._tasks == {}
+
+
+class _HeldPreparationTransport(_Transport):
+    """Python transport projection fixture, not a simulated/native Kernel proof.
+
+    Core tests must independently prove reset is local/effect-free. This fake
+    exposes the real wire fields to test Behavior identity, hold and ordering.
+    """
+    def __init__(self):
+        super().__init__()
+        _preset_transport(self, kind="linear_m")
+        self.preset_descriptor.update(actuation_kind="pneumatic", completion_policy="output_delivery",
+                                      grasp_confirmation_policy="not_required", command_duration_s=0.25)
+        self.selection_revision = 0
+        self.held = False
+        self.last_control = None
+        self.cleanup_mode = "complete"
+        self.releases = 0
+        self.events = []
+
+    def submit(self, body):
+        result = super().submit(body)
+        opid = result["accepted"]["operation_id"]
+        result["accepted"].update(request_id=body["request_context"]["request_id"],
+                                 participant_assignments=[{"input_index":0,"participant_id":"participant.1"}])
+        self.operations[opid].update(program_binding_id=body["program_binding_id"], state="prepared", participants=[{
+            "participant_id":"participant.1", "payload_kind":"capability_command", "state":"prepared",
+            "terminal_error":None, "capability_id":"tool.gripper.command", "controllable_component_id":"tool.1",
+            "command_target_id":"gripper.command", "resources":["gripper.resource"],
+            "control_binding_id":"gripper.binding", "control_binding_revision":_DIGEST_E,
+            "controller_goal_id":"goal.1", "controller_goal_generation":1,
+        }])
+        return result
+
+    def read(self, opid):
+        result = super().read(opid)
+        return {**result, "owner_epoch": self.owner_epoch, "control_pending":False,
+                "last_control":deepcopy(self.last_control)}
+
+    def read_program_execution_scope(self, run_id):
+        return {"ok":True,"scope":{
+            "schema_version":"manyforge.program_execution_scope.v2", "program_run_id":run_id,
+            "request_owner_epoch":self.owner_epoch,"program_runner_owner_epoch":"runner.1","claim_generation":1,
+            "selection_revision":self.selection_revision,"held_node_indices":[0] if self.held else [],
+            "ready_node_indices":[],"stopping_node_indices":[],"faulted_node_indices":[],
+        }}
+
+    def reset(self, opid, body):
+        self.events.append("cleanup")
+        assert body["expected_operation_revision"] == 3
+        assert body["request_context"]["request_owner_epoch"] == self.owner_epoch
+        if self.cleanup_mode == "borrow":
+            raise RuntimeError("operation_effect_in_flight")
+        self.controls.append(("reset",opid,deepcopy(body)))
+        self.last_control = {
+            "operation_id":opid,"request_id":body["request_context"]["request_id"],"control":"reset",
+            "accepted_against_revision":3,"operation_revision_after_acceptance":4,"replay_status":"accepted_new",
+        }
+        self.operations[opid]["operation_revision"] = 4
+        self.resident[opid] = self.cleanup_mode == "pending"
+        if self.cleanup_mode == "lost_reply": raise RuntimeError("reset reply lost")
+        if self.cleanup_mode == "new_hold": self.selection_revision += 1
+        return {"ok":True,"accepted":deepcopy(self.last_control)}
+
+    def release_program_selection(self, request, expected):
+        self.events.append("release")
+        assert expected == self.selection_revision
+        assert not any(self.resident.values())
+        self.releases += 1; self.selection_revision += 1; self.held = False
+        return {"ok":True,"command":"release_program_selection",
+                "scope":self.read_program_execution_scope(request["program_run_id"])["scope"]}
+
+
+def _prepared_held_behavior():
+    from manyforge_behavior.nodes.v2_owner import GripperCommandAdapter
+    from manyforge_behavior.program_clock import ProgramClock
+    transport = _HeldPreparationTransport()
+    context = replace(_context(), program={"program_id":"lite6_program","program_revision":_DIGEST_A,
+        "tree":{"instance_id":"command","node_id":"gripper.command_position","parameters":{},"children":[]}})
+    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(context)
+    now = [100.0]; clock = ProgramClock(lambda: now[0])
+    def scope_snapshot():
+        return OperatorMotionStopSnapshot(transport.selection_revision,
+            frozenset({"command"}) if transport.held else frozenset())
+    state = OperatorMotionStopState({"command":()},read_scope=scope_snapshot,clock=clock.now)
+    attempts = []
+    def begin(node):
+        identity = _identity(f"attempt.{len(attempts)}")
+        identity = replace(identity,node_instance_id=node)
+        attempts.append(identity); return identity
+    parameters = dict(_gripper_inputs().parameters); parameters.pop("command_duration_s")
+    node = GripperCommandAdapter(name="command",node_id="gripper.command_position",node_instance_id="command",
+        port=port.operations,owner_port_name="kernel_operations",parameters=parameters,value_sources={},
+        attempt_source=SimpleNamespace(begin=begin),input_resolver=SimpleNamespace(snapshot=lambda **kw:SimpleNamespace(parameters=kw["parameters"],blackboard={})),
+        operator_stop_state=state,operator_stop_hold_scope="command",program_clock=clock)
+    held = OperatorMotionStopPolicy(child=node,node_instance_id="command",stop_state=state)
+    list(held.tick())
+    original = transport.operations["operation-1"]
+    original.update(state="cancelled_pre_dispatch",operation_revision=3)
+    original["participants"][0]["state"] = "cancelled_pre_dispatch"
+    transport.held=True;transport.selection_revision=1;state.refresh()
+    return transport,port,node,held,state,attempts,now
+
+
+def test_actual_behavior_owner_keeps_prepared_cancel_running_then_retires_before_resume():
+    transport,port,node,held,state,attempts,now = _prepared_held_behavior()
+    list(held.tick())
+    assert node.status is py_trees.common.Status.RUNNING
+    assert not node.presented_interrupted
+    assert node.presented_held
+    retained = port._tasks["operation-1"]
+    assert retained.operation.operation_id == "operation-1"
+    assert retained.terminal is None and retained.held_preparation is not None
+    assert transport.controls == []
+    for _ in range(3): list(held.tick())
+    assert len(transport.submissions) == 1  # Original preparation only; no output/resubmit.
+    port.scope.retire_held_preparations("program-run.1",frozenset({"command"}),1)
+    assert port._tasks == {} and not transport.resident["operation-1"]
+    assert transport.releases == 0
+    released = port.scope.release_selection({"program_run_id":"program-run.1"},1)
+    assert released["selection_revision"] == 2
+    state.refresh(); list(held.tick())
+    assert len(attempts) == len(transport.submissions) == 2
+    assert attempts[0] != attempts[1] and attempts[0].node_instance_id == attempts[1].node_instance_id
+    transport.operations["operation-2"].update(state="completed",operation_revision=5)
+    transport.operations["operation-2"]["participants"][0]["state"] = "completed"
+    list(held.tick())
+    assert node.status is py_trees.common.Status.RUNNING
+    now[0] = 100.25; list(held.tick())
+    assert node.status is py_trees.common.Status.SUCCESS
+    assert transport.events == ["cleanup","release"]
+    assert [item[0] for item in transport.controls] == ["reset","acknowledge"]
+
+
+@pytest.mark.parametrize("mode", ["pending","lost_reply","borrow","new_hold"])
+def test_held_preparation_unknown_cleanup_or_new_hold_keeps_node_running(mode):
+    transport,port,node,held,state,attempts,now = _prepared_held_behavior()
+    list(held.tick()); transport.cleanup_mode = mode
+    with pytest.raises(Exception):
+        port.scope.retire_held_preparations("program-run.1",frozenset({"command"}),1)
+    assert "operation-1" in port._tasks
+    assert transport.held and transport.releases == 0
+    list(held.tick())
+    assert node.status is py_trees.common.Status.RUNNING and len(attempts) == 1
+    assert len(transport.submissions) == 1
+    if mode == "lost_reply":
+        port.scope.retire_held_preparations("program-run.1",frozenset({"command"}),1)
+        assert [row[0] for row in transport.controls] == ["reset"]
+        assert port._tasks == {}
+
+
+@pytest.mark.parametrize("fault", ["owner","selection","participant","committed_sibling","wrong_binding"])
+def test_held_preparation_stale_or_mixed_projection_never_enters_cleanup(fault):
+    transport,port,node,held,state,attempts,now = _prepared_held_behavior()
+    if fault == "owner": transport.owner_epoch = "foreign"
+    elif fault == "selection": transport.selection_revision = 2
+    elif fault == "participant": transport.operations["operation-1"]["participants"][0]["participant_id"] = "foreign"
+    elif fault == "committed_sibling":
+        sibling=deepcopy(transport.operations["operation-1"]["participants"][0]);sibling["state"]="executing"
+        transport.operations["operation-1"]["participants"].append(sibling)
+    else: transport.operations["operation-1"]["program_binding_id"] = _DIGEST_F
+    list(held.tick())
+    if fault == "selection":
+        with pytest.raises(ProductionPortError):
+            port.scope.retire_held_preparations("program-run.1",frozenset({"command"}),1)
+    assert transport.controls == []
+    assert node.status is py_trees.common.Status.RUNNING
+    assert len(transport.submissions) == 1 and "operation-1" in port._tasks

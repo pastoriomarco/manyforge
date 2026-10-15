@@ -17,6 +17,10 @@ class VerifiedControllerLifecycleExpectedDomain;
 /// endpoint joins the verified retained product exactly. The source runtime
 /// identity is supplied by the CCLC-owned current runtime snapshot and is not
 /// discovered or substituted by this deployment reader.
+/// DX791: only a strict selected pneumatic `output_mode:none` row can seal
+/// physical-controller-not-applicable. Logical bindings/routes/endpoints and
+/// source identities remain exact; commanded and all other domains retain
+/// the unchanged required-physical-controller guards.
 [[nodiscard]] VerifiedControllerLifecycleExpectedDomain
 load_verified_controller_lifecycle_expected_domain(
     const RetainedBundle &retained_bundle,

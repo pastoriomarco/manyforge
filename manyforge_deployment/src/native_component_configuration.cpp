@@ -1,4 +1,3 @@
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 
 #include <algorithm>
@@ -94,6 +93,7 @@ detail::select_native_component_configuration(
   return result;
 }
 
+// DX-753: keep the exact held per-component identity projection.
 namespace native_execution_runtime_contract {
 
 Configuration require_component_configuration(

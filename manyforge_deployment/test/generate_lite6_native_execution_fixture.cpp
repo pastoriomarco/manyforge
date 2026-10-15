@@ -9,6 +9,8 @@
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_deployment/program_binding.hpp>
+#include <manyforge_deployment/model_source.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -20,15 +22,18 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "content_identity_internal.hpp"
 #include "control_domain_control_internal.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
+#ifdef MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT
+#include "robotiq_gripper_only_retention_fixture.hpp"
+#endif
 #ifdef MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT
 #include "ur5_arm_only_retention_fixture.hpp"
 #endif
-#include "native_execution_runtime_unit_internal.hpp"
 #include "../../manyforge_roboplan/src/retained_ros2_control_lifecycle_plans_internal.hpp"
 
 namespace {
@@ -43,22 +48,21 @@ constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 enum class FixtureKind {
-  kApplication,
   kApplicationRos,
-  kCCLCProduct,
   kCCLCProductRos,
-  kCCLCReadiness,
   kCCLCReadinessRos,
   kUr5ArmOnlyRos,
-  kProjectionSuccessor,
   kProjectionSuccessorRos,
-  // A native cell whose one unit hosts only the gripper (no motion owner).
+  // Existing gripper-only path is the explicit pneumatic commanded fixture.
   kGripperOnly,
+  kGripperOnlyNoneZero,
+  kGripperOnlyNoneDwell,
+  kRobotiqGripperOnlyPosition,
 };
 
 struct GeneratorArguments final {
   std::filesystem::path output_root;
-  FixtureKind fixture_kind{FixtureKind::kApplication};
+  FixtureKind fixture_kind{FixtureKind::kApplicationRos};
 };
 
 [[nodiscard]] GeneratorArguments parse_arguments(int argc, char **argv) {
@@ -67,8 +71,9 @@ struct GeneratorArguments final {
         "usage: generate_lite6_native_execution_fixture "
         "--output-root PATH "
         "[--fixture-kind "
-        "application-ros|cclc-product|cclc-product-ros|cclc-readiness|cclc-readiness-ros|ur5-arm-only-ros|"
-        "projection-successor|projection-successor-ros|gripper-only]");
+        "application-ros|cclc-product-ros|cclc-readiness-ros|ur5-arm-only-ros|"
+        "projection-successor-ros|gripper-only|gripper-only-none-zero|"
+        "gripper-only-none-dwell|gripper-only-robotiq-position]");
   }
 
   std::map<std::string, std::filesystem::path, std::less<>> values;
@@ -96,26 +101,26 @@ struct GeneratorArguments final {
         "native execution fixture output root is missing");
   }
   const auto fixture_kind = take("--fixture-kind");
-  FixtureKind selected_kind = FixtureKind::kApplication;
+  FixtureKind selected_kind = FixtureKind::kApplicationRos;
   if (fixture_kind.has_value()) {
     if (fixture_kind->string() == "application-ros") {
       selected_kind = FixtureKind::kApplicationRos;
-    } else if (fixture_kind->string() == "cclc-product") {
-      selected_kind = FixtureKind::kCCLCProduct;
     } else if (fixture_kind->string() == "cclc-product-ros") {
       selected_kind = FixtureKind::kCCLCProductRos;
-    } else if (fixture_kind->string() == "cclc-readiness") {
-      selected_kind = FixtureKind::kCCLCReadiness;
     } else if (fixture_kind->string() == "cclc-readiness-ros") {
       selected_kind = FixtureKind::kCCLCReadinessRos;
     } else if (fixture_kind->string() == "ur5-arm-only-ros") {
       selected_kind = FixtureKind::kUr5ArmOnlyRos;
-    } else if (fixture_kind->string() == "projection-successor") {
-      selected_kind = FixtureKind::kProjectionSuccessor;
     } else if (fixture_kind->string() == "projection-successor-ros") {
       selected_kind = FixtureKind::kProjectionSuccessorRos;
     } else if (fixture_kind->string() == "gripper-only") {
       selected_kind = FixtureKind::kGripperOnly;
+    } else if (fixture_kind->string() == "gripper-only-robotiq-position") {
+      selected_kind = FixtureKind::kRobotiqGripperOnlyPosition;
+    } else if (fixture_kind->string() == "gripper-only-none-zero") {
+      selected_kind = FixtureKind::kGripperOnlyNoneZero;
+    } else if (fixture_kind->string() == "gripper-only-none-dwell") {
+      selected_kind = FixtureKind::kGripperOnlyNoneDwell;
     } else {
       throw std::invalid_argument(
           "native execution fixture kind is unsupported");
@@ -147,7 +152,8 @@ void write_exact_file(const std::filesystem::path &path,
 
 [[nodiscard]] CanonicalValue make_program_root(const deployment::RetainedBundle& bundle,
                                                const bool include_arm,
-                                               const bool include_gripper) {
+                                               const bool include_gripper,
+                                               const bool robotiq_position = false) {
   CanonicalValue::Object target_roles;
   if (include_arm) target_roles.emplace_back(
       "arm",
@@ -185,6 +191,11 @@ void write_exact_file(const std::filesystem::path &path,
         {"parameters", CanonicalValue(CanonicalValue::Object{})},
         {"disposition", CanonicalValue("required")},
     })};
+    if (robotiq_position) gripper_capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id", CanonicalValue("tool.gripper.feedback")},
+        {"parameters", CanonicalValue(CanonicalValue::Object{})},
+        {"disposition", CanonicalValue("required")},
+    });
     target_roles.emplace_back(
         "gripper",
         CanonicalValue(CanonicalValue::Object{
@@ -196,15 +207,38 @@ void write_exact_file(const std::filesystem::path &path,
             {"required_collision_body_roles",
              CanonicalValue(CanonicalValue::Array{CanonicalValue("gripper_collision")})},
             {"required_model_roles",
-             CanonicalValue(CanonicalValue::Array{CanonicalValue("arm_model")})},
+             CanonicalValue(CanonicalValue::Array{CanonicalValue(
+                 robotiq_position ? "gripper_model" : "arm_model")})},
         }));
+  }
+  CanonicalValue::Array children;
+  if (robotiq_position) {
+    if (include_arm || !include_gripper)
+      throw std::logic_error("Robotiq Position Program requires only its scalar target");
+    for (const auto preset : {"closed", "open"}) {
+      children.emplace_back(CanonicalValue::Object{
+          {"node_id", CanonicalValue("gripper.command_position")},
+          {"instance_id", CanonicalValue(std::string("robotiq_") + preset)},
+          {"parameters", CanonicalValue(CanonicalValue::Object{
+              {"target_role", CanonicalValue("gripper")},
+              {"position", CanonicalValue(CanonicalValue::Object{
+                  {"kind", CanonicalValue("named_preset")},
+                  {"name", CanonicalValue(preset)},
+              })},
+              {"command_duration_s", CanonicalValue(1.0)},
+          })},
+          {"children", CanonicalValue(CanonicalValue::Array{})},
+      });
+    }
   }
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.program.v2")},
-      {"program_id", CanonicalValue("i6_native_joint_motion_program")},
+      {"program_id", CanonicalValue(robotiq_position
+          ? "i6_robotiq_position_gripper_program" : "i6_native_joint_motion_program")},
       {"program_revision", CanonicalValue(std::string(kZeroDigest))},
       {"program_profile", CanonicalValue("composable-cell-v1")},
-      {"name", CanonicalValue("I6 addressed native joint motion")},
+      {"name", CanonicalValue(robotiq_position
+          ? "I6 standalone Robotiq Position commands" : "I6 addressed native joint motion")},
       {"catalog",
        CanonicalValue(CanonicalValue::Object{
            {"api_version", CanonicalValue("manyforge.node_catalog.v2")},
@@ -233,15 +267,17 @@ void write_exact_file(const std::filesystem::path &path,
                                             CanonicalValue("selection.a"),
                                             CanonicalValue("selection.b")})},
                    {"parameters", CanonicalValue(CanonicalValue::Object{})},
-                   {"children", CanonicalValue(CanonicalValue::Array{})},
+                   {"children", CanonicalValue(std::move(children))},
                })},
   });
 }
 
 [[nodiscard]] std::string make_program_bytes(const deployment::RetainedBundle& bundle,
                                              const bool include_arm,
-                                             const bool include_gripper) {
-  CanonicalValue root = make_program_root(bundle, include_arm, include_gripper);
+                                             const bool include_gripper,
+                                             const bool robotiq_position = false) {
+  CanonicalValue root = make_program_root(bundle, include_arm, include_gripper,
+                                          robotiq_position);
   const std::string revision = deployment::detail::compute_content_identity(
       root, deployment::detail::ContentIdentitySpec{
                 .identity_domain = "program-revision",
@@ -341,12 +377,38 @@ int main(int argc, char **argv) {
     std::filesystem::create_directories(package_root);
     std::filesystem::create_directories(manager_state_root);
 
-    const bool gripper_only = arguments.fixture_kind == FixtureKind::kGripperOnly;
+    const bool robotiq_position =
+        arguments.fixture_kind == FixtureKind::kRobotiqGripperOnlyPosition;
+    const bool gripper_only = robotiq_position ||
+                              arguments.fixture_kind == FixtureKind::kGripperOnly ||
+                              arguments.fixture_kind == FixtureKind::kGripperOnlyNoneZero ||
+                              arguments.fixture_kind == FixtureKind::kGripperOnlyNoneDwell;
+    const auto gripper_output = (robotiq_position || arguments.fixture_kind == FixtureKind::kGripperOnly)
+                                    ? core::GripperOutputMode::kCommanded
+                                    : core::GripperOutputMode::kNone;
+    const double gripper_dwell_s = robotiq_position ? 1.0
+                                  : arguments.fixture_kind == FixtureKind::kGripperOnly
+                                      ? 0.8
+                                      : arguments.fixture_kind == FixtureKind::kGripperOnlyNoneDwell
+                                            ? 0.25 : 0.0;
     const bool readiness_fixture =
-        arguments.fixture_kind == FixtureKind::kCCLCReadiness ||
         arguments.fixture_kind == FixtureKind::kCCLCReadinessRos ||
         arguments.fixture_kind == FixtureKind::kUr5ArmOnlyRos;
     auto materialized = [&]() {
+      if (robotiq_position) {
+#ifdef MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT
+        const auto plans = manyforge::roboplan_backend::detail::
+            ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
+        const auto digest = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+            core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
+        if (!digest.ok()) throw std::logic_error("ROS Robotiq lifecycle anchor is unavailable");
+        return deployment::test::materialize_lite6_retained_consumer_fixture_from(
+            package_root, deployment::test::make_robotiq_gripper_only_retention_fixture(
+                              digest.value().value()));
+#else
+        throw std::logic_error("Robotiq Position fixture requires its genuine prepared model inputs");
+#endif
+      }
       if (arguments.fixture_kind == FixtureKind::kUr5ArmOnlyRos) {
 #ifdef MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT
         const auto plans = manyforge::roboplan_backend::detail::
@@ -397,44 +459,19 @@ int main(int argc, char **argv) {
             materialize_lite6_ros2_control_arm_only_cclc_product_retained_consumer_fixture(
                 package_root, digest.value().value());
       }
-      if (!readiness_fixture) {
-        // The native host initializes every component through CCLC with the
-        // generic native lifecycle (its only product), never the Lite6
-        // real-robot vendor catalog. Each provider anchors those plans
-        // under its own manifest ID.
-        const auto plans = core::MakeNativeControlLifecyclePlans();
-        const auto anchor = [&](std::string_view provider_id) {
-          const auto digest = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-              core::ProviderManifestId(std::string(provider_id)), plans);
-          if (!digest.ok()) {
-            throw std::logic_error("generic native lifecycle anchor is unavailable");
-          }
-          return digest.value().value();
-        };
-        if (gripper_only) {
-          return deployment::test::
-              materialize_lite6_native_gripper_only_cclc_product_retained_consumer_fixture(
-                  package_root, anchor("lite6_arm_provider"),
-                  anchor("lite6_gripper_provider"));
-        }
-        return deployment::test::materialize_lite6_native_cclc_product_retained_consumer_fixture(
-            package_root, anchor("lite6_arm_provider"), anchor("lite6_gripper_provider"), false,
-            // Runtime configuration changes the exact graph/model-map binding
-            // without changing component types, providers or host infrastructure.
-            arguments.fixture_kind == FixtureKind::kProjectionSuccessor
-                ? std::optional<double>(0.1)
-                : std::nullopt);
-      }
-      if (arguments.fixture_kind == FixtureKind::kCCLCReadiness) {
-        const auto plans = core::MakeNativeControlLifecyclePlans();
+      if (gripper_only) {
+        const auto plans = manyforge::roboplan_backend::detail::
+            ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
         const auto digest = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-            core::ProviderManifestId("lite6_arm_provider"), plans);
+            core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
         if (!digest.ok()) {
-          throw std::logic_error("arm-only native lifecycle anchor is unavailable");
+          throw std::logic_error("ROS gripper lifecycle anchor is unavailable");
         }
+        // DX796 H2: all selections are genuine pneumatic model-backed owners;
+        // commanded keeps delivery/controller requirements, none has no output.
         return deployment::test::
-            materialize_lite6_native_arm_only_cclc_product_retained_consumer_fixture(
-                package_root, digest.value().value());
+            materialize_lite6_ros2_control_pneumatic_gripper_retained_consumer_fixture(
+                package_root, digest.value().value(), gripper_output, gripper_dwell_s);
       }
       throw std::logic_error("native execution fixture kind is unhandled");
     }();
@@ -442,6 +479,32 @@ int main(int argc, char **argv) {
       throw std::logic_error("native execution fixture has no bundle");
     }
     const auto &bundle = *materialized.bundle;
+    if (gripper_only) {
+      const auto &graph = bundle.value().cell_graph;
+      if (graph.runtime_units.size() != 1U ||
+          graph.control_bindings.size() != (robotiq_position ? 2U : 1U) ||
+          graph.control_bindings.front().capability_id.value() != "tool.gripper.command") {
+        throw std::logic_error("gripper-only producer requires one actual scalar owner and no motion binding");
+      }
+      const auto config = deployment::ros2_control_execution_runtime_contract::require_configuration(
+          bundle, graph.runtime_units.front().runtime_unit_id);
+      if (config.gripper_target_configurations.size() != 1U ||
+          !config.initial_joint_positions_rad.empty() || !config.motion_target_limits.empty() ||
+          config.isaac_world.has_value() || config.controller_profiles.size() != 1U ||
+          config.controller_profiles.front().mock_profile != std::optional<std::string>(
+              robotiq_position ? "ur5e_robotiq_2f_85" : "lite6_lite_gripper")) {
+        throw std::logic_error("gripper-only producer lost its exact no-motion Mock configuration");
+      }
+      const auto &target = config.gripper_target_configurations.front();
+      if (target.actuation_kind != (robotiq_position ? "position_commanded" : "pneumatic") ||
+          (robotiq_position && target.delivery_result_timeout_s.has_value()) ||
+          target.output_mode != gripper_output ||
+          target.command_duration_s != gripper_dwell_s ||
+          target.controllable_component_id != graph.control_bindings.front().controllable_component_id ||
+          target.command_target_id != graph.control_bindings.front().command_target_id) {
+        throw std::logic_error("gripper-only producer retained a different actuation/output/duration target");
+      }
+    }
     const auto &products = bundle.value().compiled_products;
     if (products.symbol_role_maps.size() != 1U) {
       throw std::logic_error("native execution fixture has no sole model map");
@@ -455,10 +518,112 @@ int main(int argc, char **argv) {
       throw std::logic_error("native execution fixture model map is absent");
     }
 
+    if (robotiq_position) {
+      const auto &graph = bundle.value().cell_graph;
+      if (graph.model_instances.size() != 1U ||
+          graph.model_instances.front().model_asset_id.value() != "robotiq_2f_85" ||
+          graph.controllable_components.size() != 1U || graph.control_domains.size() != 1U ||
+          !graph.component_attachments.empty() || model_map->targets().size() != 1U ||
+          model_map->control_bindings().size() != 2U || model_map->coordinates().size() != 8U ||
+          std::count_if(model_map->coordinates().begin(), model_map->coordinates().end(),
+              [](const auto &row) { return row.coordinate_kind == deployment::UrdfCoordinateKind::kAngular; }) != 6 ||
+          std::count_if(model_map->coordinates().begin(), model_map->coordinates().end(),
+              [](const auto &row) { return row.coordinate_kind == deployment::UrdfCoordinateKind::kNone &&
+                                         row.joint_type == deployment::UrdfJointType::kFixed; }) != 2 ||
+          std::count_if(model_map->coordinates().begin(), model_map->coordinates().end(),
+              [](const auto &row) { return row.coordinate_kind != deployment::UrdfCoordinateKind::kNone &&
+                                         !row.mimic_source_compiled_joint_name.has_value(); }) != 1 ||
+          std::any_of(model_map->coordinates().begin(), model_map->coordinates().end(),
+              [](const auto &row) { return !row.source_joint_name.starts_with("robotiq_85_"); }))
+        throw std::logic_error("Robotiq fixture must retain only its actual scalar model and mimics");
+      deployment::FilesystemVerifiedRetainedPlanningModelSource planning_source(package_root);
+      const auto model = planning_source.get_verified({bundle.retained_bundle_id(),
+          products.planning_collision_model.product_id});
+      if (!model || model->model_source_urdfs().size() != 1U)
+        throw std::logic_error("Robotiq fixture loses its verified source model");
+      const auto documents = deployment::parse_model_documents_for_projection(
+          model->model_source_urdfs().front().urdf_bytes, std::nullopt);
+      const auto master = std::find_if(documents.urdf.joints.begin(), documents.urdf.joints.end(),
+          [](const auto &joint) { return joint.name == "robotiq_85_left_knuckle_joint"; });
+      if (documents.urdf.links.size() != 9U || documents.urdf.joints.size() != 8U ||
+          std::count_if(documents.urdf.joints.begin(), documents.urdf.joints.end(),
+              [](const auto &joint) { return joint.mimic.has_value(); }) != 5 ||
+          master == documents.urdf.joints.end() || master->mimic || !master->limit ||
+          master->limit->lower != 0.0 || master->limit->upper != 0.8 ||
+          master->limit->velocity != 0.5 || master->limit->effort != 50.0)
+        throw std::logic_error("Robotiq fixture must preserve its real source joints and limits");
+      // The global map retains fixed joints as structural rows. Validate all
+      // eight rows against the independently qualified source, including each
+      // mimic's exact source link and affine law; they are not eight actuators.
+      for (const auto &source : documents.urdf.joints) {
+        const auto coordinate = std::find_if(model_map->coordinates().begin(), model_map->coordinates().end(),
+            [&](const auto &row) { return row.source_joint_name == source.name; });
+        if (coordinate == model_map->coordinates().end() || coordinate->joint_type != source.type ||
+            coordinate->coordinate_kind != source.coordinate_kind ||
+            coordinate->mimic_source_compiled_joint_name.has_value() != source.mimic.has_value())
+          throw std::logic_error("Robotiq structural map differs from an actual source joint");
+        if (source.mimic) {
+          const auto parent = std::find_if(model_map->coordinates().begin(), model_map->coordinates().end(),
+              [&](const auto &row) { return row.source_joint_name == source.mimic->joint_name; });
+          if (parent == model_map->coordinates().end() ||
+              *coordinate->mimic_source_compiled_joint_name != parent->compiled_joint_name ||
+              coordinate->mimic_multiplier != source.mimic->multiplier ||
+              coordinate->mimic_offset != source.mimic->offset)
+            throw std::logic_error("Robotiq structural map changes a source mimic law");
+        }
+      }
+      const auto &projected_resources = model_map->control_bindings().front().resources;
+      if (projected_resources.size() != 1U || projected_resources.front().coordinates.size() != 6U)
+        throw std::logic_error("Robotiq fixture must have one six-coordinate scalar resource projection");
+      const auto &projection = projected_resources.front().coordinates;
+      if (projection.front().source_joint_name != "robotiq_85_left_knuckle_joint" ||
+          projection.front().derived_mimic ||
+          std::count_if(projection.begin(), projection.end(), [](const auto &row) { return row.derived_mimic; }) != 5 ||
+          std::any_of(projection.begin(), projection.end(), [](const auto &row) {
+            return row.coordinate_kind != deployment::UrdfCoordinateKind::kAngular;
+          }))
+        throw std::logic_error("Robotiq actuation projection must keep its actual angular master and five mimics");
+      const auto &binding = graph.control_bindings.front();
+      const auto &feedback = graph.control_bindings.back();
+      if (feedback.capability_id.value() != "tool.gripper.feedback" ||
+          feedback.controllable_component_id != binding.controllable_component_id ||
+          feedback.command_target_id != binding.command_target_id ||
+          feedback.control_domain_id != binding.control_domain_id ||
+          feedback.resource_bindings != binding.resource_bindings ||
+          feedback.provider_instance_id != binding.provider_instance_id ||
+          feedback.provider_runtime_unit_id != binding.provider_runtime_unit_id ||
+          feedback.controller_topology_id != binding.controller_topology_id ||
+          feedback.control_interface_contract_id != binding.control_interface_contract_id ||
+          model_map->control_bindings().front().resources != model_map->control_bindings().back().resources)
+        throw std::logic_error("Robotiq feedback must alias the same single physical command owner");
+      if (binding.resource_bindings.size() != 1U ||
+          binding.stop_evidence_policy_id.value() != "manyforge.gripper_position_cancellation")
+        throw std::logic_error("Robotiq Position fixture loses its scalar binding or Position Stop policy");
+      deployment::FilesystemVerifiedCatalogArtifactSource catalog_source(package_root);
+      const core::StopEvidencePolicyCatalogRecordRefDTO *policy = nullptr;
+      for (const auto &record : bundle.value().catalogs.records) {
+        const auto *row = std::get_if<core::StopEvidencePolicyCatalogRecordRefDTO>(&record);
+        if (row == nullptr || row->record_id != binding.stop_evidence_policy_id) continue;
+        if (policy != nullptr) throw std::logic_error("Robotiq Position Stop source is ambiguous");
+        policy = row;
+      }
+      if (policy == nullptr)
+        throw std::logic_error("Robotiq Position fixture loses its selected Stop catalog");
+      const auto bytes = catalog_source.get_verified(policy->content_addressed_store_key,
+                                                     policy->content_digest);
+      if (!bytes) throw std::logic_error("Robotiq Position Stop source is unavailable");
+      const auto parsed = deployment::parse_strict_json_model_yaml(*bytes);
+      const auto &stages = parsed.root().find_object_member("escalation_stages")->as_array();
+      if (stages.size() != 2U || std::count_if(stages.begin(), stages.end(), [](const auto &stage) {
+            return stage.find_object_member("stage_kind")->as_string() == "software_hard";
+          }) != 1)
+        throw std::logic_error("Robotiq Position fixture must keep exactly one software hard floor");
+    }
+
     const bool include_gripper = !readiness_fixture;
     const bool include_arm = !gripper_only;
     const std::string program_bytes =
-        make_program_bytes(bundle, include_arm, include_gripper);
+        make_program_bytes(bundle, include_arm, include_gripper, robotiq_position);
     const auto program =
         deployment::verify_program_binding_contract(program_bytes, bundle);
     deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
@@ -480,7 +645,8 @@ int main(int argc, char **argv) {
             {core::ProgramComponentRoleAssignmentDTO{
                 core::ComponentRoleId("robot"),
                 core::ControllableComponentId(std::string(
-                    arguments.fixture_kind == FixtureKind::kUr5ArmOnlyRos
+                    robotiq_position ? std::string_view("robotiq_gripper")
+                    : arguments.fixture_kind == FixtureKind::kUr5ArmOnlyRos
                         ? std::string_view("ur5_arm")
                         : deployment::test::kLite6ControllableComponentId))}},
             std::move(target_assignments)},
@@ -527,9 +693,7 @@ int main(int argc, char **argv) {
     CanonicalValue::Object manifest_members{
         {"api_version", CanonicalValue("manyforge.i6.native-execution-fixture.v1")},
         {"cclc_product",
-         CanonicalValue(arguments.fixture_kind == FixtureKind::kCCLCProduct ||
-                        arguments.fixture_kind == FixtureKind::kProjectionSuccessor ||
-                        arguments.fixture_kind == FixtureKind::kCCLCProductRos ||
+         CanonicalValue(arguments.fixture_kind == FixtureKind::kCCLCProductRos ||
                         arguments.fixture_kind == FixtureKind::kProjectionSuccessorRos ||
                         gripper_only)},
         {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
@@ -552,6 +716,13 @@ int main(int argc, char **argv) {
     if (gripper_only) {
       // No motion identity exists anywhere in a gripper-only cell.
       manifest_members.emplace_back("gripper_only", CanonicalValue(true));
+      // These fixture audit fields were checked against the typed retained
+      // configuration above; they are not an alternative runtime input.
+      manifest_members.emplace_back("gripper_actuation_kind", CanonicalValue(
+          robotiq_position ? "position_commanded" : "pneumatic"));
+      manifest_members.emplace_back("gripper_output_mode", CanonicalValue(
+          gripper_output == core::GripperOutputMode::kNone ? "none" : "commanded"));
+      manifest_members.emplace_back("gripper_command_duration_s", CanonicalValue(gripper_dwell_s));
     } else {
       manifest_members.emplace_back("target_role_id", CanonicalValue("arm"));
       manifest_members.emplace_back("execution_capability_id",

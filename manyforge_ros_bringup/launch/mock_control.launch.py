@@ -1,7 +1,7 @@
 """Run retained mock ros2_control artifacts under Manager ownership.
 
 The deployment generator owns joint order, startup pose and controller values.
-This launch starts observation and loads the arm controller inactive; the
+This launch starts observation and loads a configured arm controller inactive; the
 existing component lifecycle owner activates it and the optional authored gripper
 controller. Both load inactive. This launch owns
 no motion policy.
@@ -74,14 +74,17 @@ def launch_setup(context, *args, **kwargs):
             output="screen",
             ros_arguments=["--disable-external-lib-logs"],
         ),
-        Node(
-            package="controller_manager",
-            executable="spawner",
-            arguments=[arm_name, "--inactive", "--controller-manager", manager_path, "--param-file", str(controllers_path)],
-            output="screen",
-            ros_arguments=["--disable-external-lib-logs"],
-        ),
     ]
+    if arm_name:
+        nodes.append(
+            Node(
+                package="controller_manager",
+                executable="spawner",
+                arguments=[arm_name, "--inactive", "--controller-manager", manager_path, "--param-file", str(controllers_path)],
+                output="screen",
+                ros_arguments=["--disable-external-lib-logs"],
+            )
+        )
     if gripper_name:
         nodes.append(
             Node(
@@ -102,7 +105,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("controllers_file"),
             DeclareLaunchArgument("runtime_namespace"),
             DeclareLaunchArgument("controller_manager_name", default_value="controller_manager"),
-            DeclareLaunchArgument("arm_controller_name"),
+            DeclareLaunchArgument("arm_controller_name", default_value=""),
             DeclareLaunchArgument("gripper_controller_name", default_value=""),
             DeclareLaunchArgument("frame_prefix", default_value=""),
             OpaqueFunction(function=launch_setup),

@@ -5,7 +5,6 @@
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/content_identity.hpp>
-#include <manyforge_deployment/native_domain_topology.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <set>
@@ -184,13 +183,20 @@ LoadBundle(const deployment::IVerifiedRetainedBundleSource &source,
            "; restart the workbench container");
     std::set<core::ControllableComponentId> restart;
     for (const auto &row : inventory.value().process_occurrences) {
+      const bool no_launch = row.process_owner_kind ==
+          ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal;
+      if (no_launch) {
+        const auto verified = ValidateManagerPneumaticNoneProcessOwner(
+            predecessor, inventory_request, row);
+        Require(verified.ok(), verified.ok() ? std::string{} : verified.error().message);
+      }
       Require(row.process_presence != ProcessPresenceState::kUnknown &&
                   row.installed_runtime_identity,
               "actual_installed_state_unknown: installed process identity or "
               "presence is unknown; restart the workbench container");
       const auto wanted = deployment::derive_component_runtime_identity(
           candidate, row.controllable_component_id);
-      if (row.process_presence != ProcessPresenceState::kPresent ||
+      if ((!no_launch && row.process_presence != ProcessPresenceState::kPresent) ||
           wanted != row.installed_runtime_identity)
         restart.insert(row.controllable_component_id);
     }
@@ -203,7 +209,8 @@ LoadBundle(const deployment::IVerifiedRetainedBundleSource &source,
           inventory.value().process_occurrences.end(), [&](const auto &row) {
             return row.controllable_component_id ==
                        component.controllable_component_id &&
-                   row.process_presence == ProcessPresenceState::kPresent &&
+                   (row.process_presence == ProcessPresenceState::kPresent ||
+                    row.process_owner_kind == ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) &&
                    row.installed_runtime_identity == wanted;
           });
       Require(count <= 1, "actual_installed_state_unknown: component has "
@@ -465,6 +472,86 @@ void ReleaseAdmission(
 }
 
 } // namespace
+
+core::Result<void> ValidateManagerPneumaticNoneProcessOwner(
+    const deployment::RetainedBundle &predecessor,
+    const ManagerComponentProcessInventoryRequestDTO &request,
+    const ManagerComponentProcessOccurrenceDTO &row) {
+  try {
+    Require(deployment::verify_retained_bundle_identity(predecessor) && request.valid() && row.valid() &&
+                request.predecessor_projection_revision.retained_bundle_id == predecessor.retained_bundle_id() &&
+                request.predecessor_projection_revision.graph_revision == predecessor.value().cell_graph.graph_revision &&
+                row.process_owner_kind == ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal &&
+                row.pneumatic_none_owner && row.installed_runtime_identity &&
+                row.installed_runtime_identity == deployment::derive_component_runtime_identity(
+                    predecessor, row.controllable_component_id),
+            "actual_installed_state_unknown: pneumatic None occurrence differs from the immutable predecessor");
+    const auto &graph = predecessor.value().cell_graph;
+    const auto component = std::find_if(graph.controllable_components.begin(), graph.controllable_components.end(),
+        [&](const auto &entry) { return entry.controllable_component_id == row.controllable_component_id; });
+    Require(component != graph.controllable_components.end() &&
+                std::find(component->runtime_unit_ids.begin(), component->runtime_unit_ids.end(),
+                          request.runtime_unit_id) != component->runtime_unit_ids.end(),
+            "actual_installed_state_unknown: pneumatic None component belongs to another runtime owner");
+    const auto &proof = *row.pneumatic_none_owner;
+    const auto binding = std::find_if(graph.control_bindings.begin(), graph.control_bindings.end(),
+        [&](const auto &entry) { return entry.control_binding_id == proof.control_binding_id; });
+    Require(binding != graph.control_bindings.end() &&
+                binding->controllable_component_id == row.controllable_component_id &&
+                binding->command_target_id == proof.command_target_id &&
+                binding->control_binding_revision == proof.control_binding_revision &&
+                binding->provider_runtime_unit_id == request.runtime_unit_id &&
+                binding->capability_id == core::CapabilityId("tool.gripper.command"),
+            "actual_installed_state_unknown: pneumatic None target or binding differs from its installed owner");
+    // Decode the immutable selected ROS configuration through its existing
+    // strict reader. One local gripper cannot exempt any other physical target
+    // hosted by the same component from the unchanged process requirements.
+    const auto selected = deployment::ros2_control_execution_runtime_contract::require_component_configuration(
+        predecessor, request.runtime_unit_id, row.controllable_component_id);
+    Require(selected.motion_target_limits.empty() && !selected.gripper_target_configurations.empty() &&
+                std::all_of(selected.gripper_target_configurations.begin(), selected.gripper_target_configurations.end(),
+                    [&](const auto &target) {
+                      return target.controllable_component_id == row.controllable_component_id &&
+                             target.actuation_kind == "pneumatic" && target.output_mode == core::GripperOutputMode::kNone;
+                    }),
+            "actual_installed_state_unknown: pneumatic None occurrence has a physical controller requirement");
+    for (const auto &entry : graph.control_bindings) {
+      if (entry.controllable_component_id != row.controllable_component_id) continue;
+      const bool owner_alias = entry.capability_id == core::CapabilityId("tool.gripper.command") ||
+                               entry.capability_id == core::CapabilityId("tool.gripper.feedback");
+      // Feedback is the same goal-fenced command-progress owner, never a
+      // physical observation. Its own binding/capability identities remain
+      // exact verified graph facts sealed by installed_runtime_identity above.
+      // Only those distinct identities may differ from the command route.
+      Require(owner_alias && entry.provider_runtime_unit_id == request.runtime_unit_id &&
+                  entry.command_target_id == binding->command_target_id &&
+                  entry.control_domain_id == binding->control_domain_id &&
+                  entry.resource_bindings == binding->resource_bindings &&
+                  entry.control_interface_contract_id == binding->control_interface_contract_id &&
+                  entry.control_interface_revision == binding->control_interface_revision &&
+                  entry.controller_topology_id == binding->controller_topology_id &&
+                  entry.topology_revision == binding->topology_revision &&
+                  entry.legal_control_route_ids == binding->legal_control_route_ids &&
+                  entry.route_endpoint_projections == binding->route_endpoint_projections &&
+                  entry.provider_instance_id == binding->provider_instance_id &&
+                  entry.provider_manifest_id == binding->provider_manifest_id &&
+                  entry.provider_manifest_revision == binding->provider_manifest_revision &&
+                  entry.state_authority_id == binding->state_authority_id &&
+                  entry.state_authority_class == binding->state_authority_class &&
+                  entry.stop_evidence_policy_id == binding->stop_evidence_policy_id &&
+                  entry.stop_evidence_policy_revision == binding->stop_evidence_policy_revision &&
+                  entry.containment_granularity == binding->containment_granularity &&
+                  entry.runtime_scale_route_qualifications == binding->runtime_scale_route_qualifications &&
+                  std::count_if(selected.gripper_target_configurations.begin(), selected.gripper_target_configurations.end(),
+                      [&](const auto &target) { return target.command_target_id == entry.command_target_id; }) == 1,
+              "actual_installed_state_unknown: pneumatic None component has an unqualified target or provider binding");
+    }
+    return core::Result<void>::Ok();
+  } catch (const std::exception &error) {
+    return core::Result<void>::Err({"actual_installed_state_unknown", error.what(),
+                                  {{"reason", "pneumatic_none_owner_mismatch"}}});
+  }
+}
 
 bool ManagerNamedApplyRequestDTO::valid() const noexcept {
   const bool direct = expected_admission_generation.has_value() &&
@@ -1365,17 +1452,6 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   if (!apply_journal_
            .ReadFenceAttempt(intent.apply_id, intent.apply_generation)
            .has_value()) {
-    // Refuse an unsupported native layout before any predecessor teardown:
-    // this is a known pre-effect failure, never a candidate-initialization
-    // surprise after the predecessor is gone.
-    if (const auto topology =
-            deployment::VerifySupportedNativeDomainTopology(
-                candidate.value().cell_graph);
-        !topology.ok()) {
-      return retain_pre_effect_failure(topology.error().code,
-                                       topology.error().message,
-                                       ManagerApplyEffectDisposition::kKnown);
-    }
     const auto refusal = planned_maintenance_.Preflight(
         intent, intent.expected_active_projection_revision);
     if (refusal.has_value()) {

@@ -1,57 +1,19 @@
 # ManyForge
 
 Repository for a modular robot-execution framework built around headless C++
-semantic owners and thin authoring/operator clients. The maintained
-ManyForge-only native path is current on `dev` through explicit owner
-entrypoints, including generic component lifecycle/controller routes and
-addressed multi-participant execution, Stop, surveillance, and recovery.
-Packaged installation, the historical aggregate launcher, and the Isaac, ROS,
-external-agent, and real-robot product lanes are not yet available.
+semantic owners and thin authoring/operator clients. Execution uses the ROS
+host for offline mock, Isaac and real controller adapters. The native simulator
+and its executable have been removed; shared governance, planning, cell ownership
+and runtime-unit plumbing remain.
 
-> **`dev` migration status:** the composable-cell destructive implementation
-> window is active. I2's pure ROS-free compiler and `manyforge_core_py`
-> compiler/DTO projection are qualified at executable commit `0ee506a...`.
-> I3's retained deployment compiler is qualified at implementation freeze
-> `62df57c...`: deterministic planning/collision, viewer, control-domain,
-> reference runtime-unit, and projection-input products can be generated,
-> durably reloaded, and verified offline. I4 now owns the bounded internal M0
-> path that Applies canonical empty to the retained reference runtime, retains
-> it across Manager replacement, reconciles crash/restart, and shuts it down
-> explicitly. I5/H0 now exposes the independent Manager/headless API, CLI,
-> alarms/history, verified NodeEnvironment projection, and thin Composer read
-> clients. At I6/N3, one bounded native absolute joint-goal path first crossed
-> an independently restartable C++ owner, headless API, Behavior caller, and
-> Composer proxy; that checkpoint alone was not the complete native lane. N6-c1
-> and N6-c2 then added a bounded addressed
-> four-mode Robot Control workflow: joint goals, pose goals, Cartesian paths,
-> and gripper commands with source-local no-motion preview, explicit approval,
-> owner-issued progress, and operation Stop. That checkpoint completed the
-> maintained manual-control breadth but not yet the full product join. N6-c3
-> additionally
-> restores the strict Program
-> Draft/Saved workspace: environment-aware palette/tree/property/declaration
-> authoring plus bounded Open-as-Draft, Save, and Save-As. It does not Apply or
-> execute Programs. N6-c4 adds source-local scene/viewer authoring and one
-> exact owner-routed current-pose Commit without restoring dynamic viewer
-> truth. N6-c5 adds the strict bounded direct/`nemoclaw` assistant bridge,
-> Draft-only callbacks, and operator conversation/reconciliation surface; its
-> live model/launcher lane and external OpenClaw/Hermes adapters remain
-> unqualified. N7-a5.1-a5.4 now add exact Program admission and Apply, the
-> captured native motion/gripper/scene/model join, a fixed-pool Program tick
-> host, an independently restartable Program-runner process, and strict
-> Headless/Composer scenario, Applied, Run/status, and one-click Stop clients.
-> Composer remains observational, and closing any client never implies Stop.
-> N7 closes the maintained seven-input/eight-Program native path and
-> unchanged-source repeated-instance isolation through the Component Manager,
-> Headless API, Program runner, and thin Composer clients. I7/L0 adds the sole
-> generic lifecycle/controller-route owner and verified readiness publication.
-> I8 adds prepared multi-participant dispatch, asynchronous
-> Reset/Acknowledge, public scoped Stop and Full Stop, collision
-> containment, immutable terminal/fault truth, durable surveillance/recovery,
-> and scoped orphan reconciliation. Isaac and real operation remain I9/I10
-> work, and the historical aggregate launcher and packaged installation remain
-> unavailable. The historical launch recipes below are not valid bring-up
-> instructions for the current `dev` branch.
+> **Current `dev` qualification:** the ROS Workbench empty bootstrap reached
+> ready, and a combined mock check passed (2026-10-14).
+> These checks do not qualify Isaac or physical operation, the complete Compose
+> wrapper, or an observed GUI journey. The final M1 mock milestone, including
+> gripper-only execution, remains pending. Use
+> [`DEVELOPMENT_WORKBENCH.md`](docs/operations/DEVELOPMENT_WORKBENCH.md) for
+> the source-based development entrypoint. Historical aggregate launch and
+> packaged installation remain separate delivery work.
 
 > **For LLMs** (Claude, ChatGPT, agentic IDEs): read
 > [`AGENTS.md`](AGENTS.md) before making any change. It tells you what
@@ -164,7 +126,7 @@ Use the named retained or focused selectors above.
 
 The generic `all`/`integration` script selectors are not current product-suite
 qualification entrypoints. Current I7/I8 qualification uses the bounded CMake
-targets and maintained-native process workflows owned by those milestones.
+targets and focused ROS mock process workflows.
 The `bindings` selector builds and tests the qualified ROS-free
 `manyforge_core_py` compiler surface and generated API contract. I2 closed on
 the exact executable commit `0ee506a0d1c05006d2d0f5356cc93db17dca0b98`,
@@ -174,9 +136,8 @@ implementation freeze `62df57ca76b55991c8ac01d3a316dfc8a3b450aa`, tree
 `968422a59dd1216a0db07ec398c9f49b1a9ff7cc`, after cumulative Release,
 sanitizer, deterministic-regeneration, static-boundary, and adversarial
 qualification. I3's retained products are offline inputs to later owners; they
-do not by themselves start processes or restore a runtime. The explicit
-maintained native owners and their focused process suites are current. The
-historical aggregate, ROS/Isaac, and physical product-lane suites remain
+do not by themselves start processes or restore a runtime. The current ROS host and focused mock checks use those retained products.
+The historical aggregate, Isaac and physical product-lane qualification remain
 unavailable.
 
 The official full ROS Lyrical image supplies focused ROS development checks
@@ -191,8 +152,8 @@ docker compose --profile ros run --rm ros-jazzy ./scripts/test-ros.sh
 `Dockerfile.ros-lyrical-full` starts from pinned Ubuntu Noble and keeps ROS
 Python dependencies apt-managed. Its cache derivative adds pinned ccache
 tooling to an immutable local image; it does not define another runtime lane.
-The default development image remains ROS-free; ROS wrappers/adapters live in
-the `manyforge_ros` lane.
+ROS execution requires a source-matched full ROS image. ROS-free compiler and
+governance libraries remain transport-independent.
 
 The held image overrides are separate: `MANYFORGE_ISAAC_ROS_IMAGE` and
 `MANYFORGE_REAL_LITE6_ROS_BASE_IMAGE`, both defaulting to the existing laptop

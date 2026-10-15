@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import logging
 from pathlib import Path
@@ -36,6 +36,7 @@ from manyforge_behavior.orchestration_ports import (
     NodeAdapterPorts,
     OwnerTaskPort,
     ProgramRunScopeState,
+    ProgramRunPortContext,
 )
 from manyforge_behavior.orchestration_values import (
     ProgramValueError,
@@ -320,6 +321,28 @@ class _InflightStop:
     error: ProgramRunnerError | None = None
 
 
+class _SelectedSimulationContextPort:
+    """Bind the configured simulator only for this captured Program's dependency."""
+
+    def __init__(
+        self, port: Any, required: Callable[[ProgramRunPortContext], tuple[bool, AvailabilityFact]]
+    ) -> None:
+        self._port = port
+        self._required = required
+
+    def bind(self, context: ProgramRunPortContext) -> None:
+        required, availability = self._required(context)
+        if required:
+            if not availability.available:
+                raise ProgramRunOwnerError(
+                    "Cannot bind Program context: required simulator is unavailable for the applied cell or configured owner"
+                )
+            self._port.bind(context)
+
+    def unbind(self, program_run_id: str) -> None:
+        self._port.unbind(program_run_id)
+
+
 class ProgramRuntime:
     """Own Program lifecycle only; every effect remains in a focused owner."""
 
@@ -455,7 +478,15 @@ class ProgramRuntime:
         if self._assistant is not None:
             context_members.append(self._assistant)
         if self._simulation_control is not None:
-            context_members.append(self._simulation_control)  # type: ignore[arg-type]
+            context_members.append(_SelectedSimulationContextPort(
+                self._simulation_control,
+                lambda context: self._simulation_context_requirement(
+                    program=context.program,
+                    program_binding=context.program_binding,
+                    retained_bundle_id=context.retained_bundle_id,
+                    graph_revision=context.graph_revision,
+                ),
+            ))
         self._interventions = ProgramInterventionRegistry(
             maximum_retained_runs=config.maximum_retained_runs
         )
@@ -1067,6 +1098,179 @@ class ProgramRuntime:
             )
             for port_name in expected
         }
+
+    def _simulation_node_requirements(
+        self, node_id: str, parameters: Mapping[str, Any]
+    ) -> tuple[bool, frozenset[str]]:
+        entry = self._environment.catalog.get(node_id)
+        effective = {
+            parameter.id: parameter.default
+            for parameter in entry.parameters if parameter.has_default
+        }
+        effective.update(parameters)
+        simulator = False
+        targets: set[str] = set()
+        for requirement in entry.required_capabilities:
+            if (requirement.when_parameter is not None
+                and effective.get(requirement.when_parameter) != requirement.when_equals):
+                continue
+            if (entry.execution.owner_api == "simulator.control"
+                and requirement.scope == "cell_global"):
+                if requirement.capability_id not in {
+                    "simulator.control.reset", "simulator.control.pause",
+                    "simulator.control.play", "simulator.control.step",
+                    "simulator.entity_state.set",
+                }:
+                    raise ProgramRunOwnerError(
+                        "Configured simulator owner declares an unsupported cell-global capability: "
+                        + requirement.capability_id
+                    )
+                simulator = True
+            if requirement.scope == "target_binding":
+                role = effective.get(requirement.target_parameter)
+                if not isinstance(role, str) or not role:
+                    raise ProgramRunOwnerError("Program simulation dependency has no exact target role")
+                targets.add(role)
+        return simulator, frozenset(targets)
+
+    def _simulation_context_requirement(
+        self,
+        *,
+        program: Mapping[str, Any],
+        program_binding: Mapping[str, Any],
+        retained_bundle_id: str,
+        graph_revision: str,
+    ) -> tuple[bool, AvailabilityFact]:
+        """Separate captured dependency from current typed simulator eligibility."""
+
+        unavailable = AvailabilityFact(False, ("program_runtime_owner_unavailable",))
+        configured = AvailabilityFact(True) if self._simulation_control is not None else unavailable
+
+        def rows(value: Any) -> Sequence[Mapping[str, Any]]:
+            if not isinstance(value, (list, tuple)) or any(
+                not isinstance(row, Mapping) for row in value
+            ):
+                raise ProgramRunOwnerError("Program simulation dependency has invalid rows")
+            return value
+
+        tree = program.get("tree")
+        if not isinstance(tree, Mapping):
+            raise ProgramRunOwnerError("Program simulation dependency has no normalized tree")
+        target_roles: set[str] = set()
+        simulator_node = False
+        pending = [tree]
+        while pending:
+            node = pending.pop()
+            parameters = node.get("parameters", {})
+            if not isinstance(parameters, Mapping):
+                raise ProgramRunOwnerError("Program simulation dependency has invalid parameters")
+            simulator, targets = self._simulation_node_requirements(node["node_id"], parameters)
+            simulator_node |= simulator
+            target_roles.update(targets)
+            pending.extend(rows(node.get("children", ())))
+        if not simulator_node and not target_roles:
+            return False, unavailable
+
+        projection = self._headless.manager_graph()
+        source = projection.get("source")
+        if (projection.get("schema_version") != "manyforge.manager_graph_projection.v1"
+            or not isinstance(source, Mapping) or source.get("available") is not True
+            or source.get("freshness") != "fresh" or source.get("known_gaps") not in ([], ())
+            or projection.get("retained_bundle_id") != retained_bundle_id
+            or projection.get("graph_revision") != graph_revision):
+            raise ProgramRunOwnerError("Program simulation dependency has no fresh captured Manager graph")
+        graph = projection.get("cell_graph")
+        if not isinstance(graph, Mapping) or graph.get("graph_revision") != graph_revision:
+            raise ProgramRunOwnerError("Program simulation dependency has no captured retained graph")
+        graph_components = rows(graph.get("controllable_components"))
+        units = rows(graph.get("runtime_units"))
+
+        def ros_profiles(unit: Mapping[str, Any]) -> tuple[Mapping[str, Any], Sequence[Mapping[str, Any]]]:
+            configuration = unit.get("configuration")
+            if not isinstance(configuration, Mapping):
+                raise ProgramRunOwnerError("Program simulation dependency has invalid ROS configuration")
+            if configuration.get("mode") != "commanded_sim":
+                raise ProgramRunOwnerError(
+                    "Program simulator dependency does not support non-simulated ROS modes"
+                )
+            return configuration, rows(configuration.get("controller_profiles"))
+
+        def isaac_profile(profile: Mapping[str, Any], configuration: Mapping[str, Any]) -> bool:
+            isaac, mock = profile.get("isaac_profile"), profile.get("mock_profile")
+            if (("isaac_profile" in profile) == ("mock_profile" in profile)
+                or not isinstance(isaac if "isaac_profile" in profile else mock, str)
+                or not (isaac if "isaac_profile" in profile else mock)):
+                raise ProgramRunOwnerError("Program simulation dependency has invalid typed lane")
+            if "isaac_profile" not in profile:
+                return False
+            world = configuration.get("isaac_world")
+            if not isinstance(world, str) or not world:
+                raise ProgramRunOwnerError("Program simulation dependency has no declared Isaac world")
+            return True
+
+        if simulator_node:
+            # CELL_GLOBAL means the actual applied cell, not unused Program roles.
+            eligible = False
+            seen: set[str] = set()
+            for unit in units:
+                if unit.get("runtime_profile_id") != "manyforge.ros2_control_execution_runtime":
+                    continue
+                configuration, profiles = ros_profiles(unit)
+                for profile in profiles:
+                    component = profile.get("controllable_component_id")
+                    matches = [row for row in graph_components if row.get("controllable_component_id") == component]
+                    if (not isinstance(component, str) or component in seen or len(matches) != 1
+                        or unit.get("runtime_unit_id") not in matches[0].get("runtime_unit_ids", ())):
+                        raise ProgramRunOwnerError("Program global simulator profile has foreign runtime ownership")
+                    seen.add(component)
+                    eligible |= isaac_profile(profile, configuration)
+            return True, configured if eligible else unavailable
+
+        targets = rows(program_binding.get("target_role_bindings"))
+        components = rows(program_binding.get("component_role_bindings"))
+        selected: set[str] = set()
+        for role in target_roles:
+            matches = [row for row in targets if row.get("target_role_id") == role]
+            if len(matches) != 1:
+                raise ProgramRunOwnerError("Program simulation dependency has ambiguous target binding")
+            target = matches[0]
+            component = target.get("controllable_component_id")
+            matches = [row for row in components
+                       if row.get("component_role_id") == target.get("component_role_id")]
+            if (not isinstance(component, str) or not component or len(matches) != 1
+                or matches[0].get("controllable_component_id") != component
+                or not isinstance(target.get("command_target_id"), str)
+                or not target["command_target_id"]):
+                raise ProgramRunOwnerError("Program simulation dependency crosses its component binding")
+            selected.add(component)
+        required = False
+        for component in selected:
+            matches = [row for row in graph_components if row.get("controllable_component_id") == component]
+            if len(matches) != 1:
+                raise ProgramRunOwnerError("Program simulation dependency component is not current")
+            unit_ids = matches[0].get("runtime_unit_ids")
+            if (not isinstance(unit_ids, (list, tuple)) or not unit_ids
+                or any(not isinstance(value, str) or not value for value in unit_ids)
+                or len(set(unit_ids)) != len(unit_ids)):
+                raise ProgramRunOwnerError("Program simulation dependency has invalid runtime ownership")
+            seen_profile = False
+            for unit_id in unit_ids:
+                matches = [row for row in units if row.get("runtime_unit_id") == unit_id]
+                if len(matches) != 1:
+                    raise ProgramRunOwnerError("Program simulation dependency runtime is not current")
+                unit = matches[0]
+                profile_id = unit.get("runtime_profile_id")
+                if not isinstance(profile_id, str) or not profile_id:
+                    raise ProgramRunOwnerError("Program simulation dependency has no runtime profile")
+                if profile_id != "manyforge.ros2_control_execution_runtime":
+                    continue
+                configuration, profiles = ros_profiles(unit)
+                matches = [row for row in profiles if row.get("controllable_component_id") == component]
+                if len(matches) != 1 or seen_profile:
+                    raise ProgramRunOwnerError("Program simulation dependency has no unique ROS controller profile")
+                seen_profile = True
+                required |= isaac_profile(matches[0], configuration)
+        return required, configured if required else unavailable
 
     def _current_node_owner_availability(
         self,
@@ -2400,7 +2604,7 @@ class ProgramRuntime:
     def node_availability(
         self, request: ProgramNodeAvailabilityRequest
     ) -> dict[str, Any]:
-        """Project the exact availability already enforced by Run admission."""
+        """Project per-node execution facts; Start checks its full context separately."""
 
         if self._closed or not self._started:
             raise ProgramRunnerError(
@@ -2433,16 +2637,30 @@ class ProgramRuntime:
                 owner_availability=owner_availability,
             )
             required_node_ids: set[str] = set()
+            simulator_node = False
 
             def collect(node: Any) -> None:
+                nonlocal simulator_node
                 required_node_ids.add(node.node_id)
+                simulator, _targets = self._simulation_node_requirements(node.node_id, node.parameters)
+                simulator_node |= simulator
                 for child in node.children:
                     collect(child)
 
             collect(admitted.program.tree)
+            selected_owners = dict(admitted.readiness.owner_by_port)
+            selected_owners["simulator_control"] = AvailabilityFact(
+                False, ("program_runtime_owner_unavailable",)
+            )
+            if simulator_node:
+                _required, selected_owners["simulator_control"] = self._simulation_context_requirement(
+                    program=applied["program"], program_binding=applied["program_binding"],
+                    retained_bundle_id=admitted.retained_bundle_id,
+                    graph_revision=admitted.graph_revision,
+                )
             availability = project_node_execution_availability(
                 build_executable_node_resolver(self._environment),
-                admitted.readiness,
+                replace(admitted.readiness, owner_by_port=selected_owners),
                 required_node_ids=tuple(sorted(required_node_ids)),
             )
         except (ProgramRunOwnerError, TypeError, ValueError) as error:
@@ -2777,6 +2995,16 @@ class ProgramRuntime:
                         "program_run_draft_applied_mismatch",
                         "Draft and Applied Program revisions differ",
                     )
+                simulation_required, simulation_availability = self._simulation_context_requirement(
+                    program=applied["program"], program_binding=applied["program_binding"],
+                    retained_bundle_id=applied["retained_bundle_id"], graph_revision=applied["graph_revision"],
+                )
+                if simulation_required and not simulation_availability.available:
+                    raise ProgramRunOwnerError(
+                        "Cannot start Program: required simulator is unavailable for the applied cell or configured owner"
+                    )
+                selected_owners = dict(self._owner_availability)
+                selected_owners["simulator_control"] = simulation_availability
                 run_admission = build_applied_program_run_admission(
                     applied,
                     expected_scenario_id=request.scenario_id,
@@ -2784,7 +3012,7 @@ class ProgramRuntime:
                         request.source_document_digest
                     ),
                     environment=self._environment,
-                    owner_availability=self._owner_availability,
+                    owner_availability=selected_owners,
                 )
                 self._verify_required_components_active(applied)
                 # One identity spans the synchronous Program-cycle claim,

@@ -194,6 +194,7 @@ Relations(const core::RetainedBundleDTO &bundle,
 
 // -- Runtime identity --------------------------------------------------------
 
+// DX-753: retain exact per-component unit/source identity projection.
 [[nodiscard]] CanonicalValue RuntimeUnitProjection(
     const RetainedBundle &bundle, const core::ControllableComponentId &component,
     const std::set<std::string> &units) {

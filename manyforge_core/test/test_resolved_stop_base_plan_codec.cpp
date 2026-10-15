@@ -799,4 +799,74 @@ TEST(PreparedParticipantStopPlanCodec, RejectsPurposeCoverageAndSubstitutionConf
 }
 
 }  // namespace
+
+TEST(ResolvedStopBasePlanCodec, PneumaticFactSealsZeroFloorWithoutChangingAbsentGolden) {
+  const auto ordinary = Plan();
+  EXPECT_FALSE(ordinary.gripper_actuation_kind);
+  ASSERT_TRUE(EncodeResolvedStopBasePlan(ordinary).ok());
+  EXPECT_EQ(EncodeResolvedStopBasePlan(ordinary).value(), GoldenBytes());
+  auto candidate = Candidate();
+  candidate.gripper_actuation_kind = GripperActuationKind::kPneumatic;
+  candidate.escalation_stages.erase(candidate.escalation_stages.begin() + 1,
+                                    candidate.escalation_stages.end());
+  candidate.containment_granularity = candidate.escalation_stages.back().containment_granularity;
+  const auto made = MakeResolvedStopBasePlan(candidate);
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  const auto encoded = EncodeResolvedStopBasePlan(made.value());
+  ASSERT_TRUE(encoded.ok());
+  EXPECT_NE(encoded.value().find("\"gripper_actuation_kind\":\"pneumatic\""), std::string::npos);
+  const auto decoded = DecodeResolvedStopBasePlan(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), made.value());
+  EXPECT_NE(made.value().resolved_stop_base_plan_id, ordinary.resolved_stop_base_plan_id);
+  auto absent = candidate;
+  absent.gripper_actuation_kind.reset();
+  EXPECT_FALSE(MakeResolvedStopBasePlan(absent).ok());
+  auto position = candidate;
+  position.gripper_actuation_kind = GripperActuationKind::kPositionCommanded;
+  EXPECT_FALSE(MakeResolvedStopBasePlan(position).ok());
+  auto unknown = candidate;
+  unknown.gripper_actuation_kind = static_cast<GripperActuationKind>(255);
+  EXPECT_FALSE(MakeResolvedStopBasePlan(unknown).ok());
+  auto malformed = candidate;
+  malformed.escalation_stages.front().stage_index = 1U;
+  EXPECT_FALSE(MakeResolvedStopBasePlan(malformed).ok());
+  auto foreign_scope = candidate;
+  foreign_scope.containment_granularity = ContainmentGranularity::kControllerSet;
+  EXPECT_FALSE(MakeResolvedStopBasePlan(foreign_scope).ok());
+  auto foreign_class = candidate;
+  foreign_class.escalation_stages.front().command_qualification.stop_action_class =
+      StopActionClass::kSoftwareHard;
+  EXPECT_FALSE(MakeResolvedStopBasePlan(foreign_class).ok());
+  auto forged = made.value();
+  forged.resolved_stop_base_plan_id = ordinary.resolved_stop_base_plan_id;
+  EXPECT_FALSE(VerifyResolvedStopBasePlan(forged).ok());
+  EXPECT_FALSE(DecodeResolvedStopBasePlan(ReplaceOnce(encoded.value(),
+      "\"gripper_actuation_kind\":\"pneumatic\",", "")).ok());
+}
+
+TEST(ResolvedStopBasePlanCodec, ActuationKindWireIsClosedAndPositionKeepsHardFloor) {
+  auto position = Candidate();
+  position.gripper_actuation_kind = GripperActuationKind::kPositionCommanded;
+  const auto made = MakeResolvedStopBasePlan(position);
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  EXPECT_NE(made.value().resolved_stop_base_plan_id, Plan().resolved_stop_base_plan_id);
+  const auto bytes = EncodeResolvedStopBasePlan(made.value());
+  ASSERT_TRUE(bytes.ok());
+  const auto decoded = DecodeResolvedStopBasePlan(bytes.value());
+  ASSERT_TRUE(decoded.ok());
+  EXPECT_EQ(decoded.value(), made.value());
+  for (const auto replacement : {"null", "0", "\"unknown\""}) {
+    EXPECT_FALSE(DecodeResolvedStopBasePlan(ReplaceOnce(bytes.value(),
+        "\"gripper_actuation_kind\":\"position_commanded\"",
+        std::string("\"gripper_actuation_kind\":") + replacement)).ok());
+  }
+  EXPECT_FALSE(DecodeResolvedStopBasePlan(ReplaceOnce(bytes.value(),
+      "\"gripper_actuation_kind\":\"position_commanded\"",
+      "\"gripper_actuation_kind\":\"position_commanded\",\"gripper_actuation_kind\":\"position_commanded\"")).ok());
+  auto pneumatic_with_floor = Candidate();
+  pneumatic_with_floor.gripper_actuation_kind = GripperActuationKind::kPneumatic;
+  EXPECT_FALSE(MakeResolvedStopBasePlan(pneumatic_with_floor).ok());
+}
+
 }  // namespace manyforge::core

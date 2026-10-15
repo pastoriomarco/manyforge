@@ -91,7 +91,7 @@ struct Configuration final {
                            const DirectControlJointLimit &) = default;
   };
 
-  struct GripperTargetConfiguration final {
+  struct GripperTargetConfiguration {
     core::ControllableComponentId controllable_component_id;
     core::CommandTargetId command_target_id;
     std::string description;

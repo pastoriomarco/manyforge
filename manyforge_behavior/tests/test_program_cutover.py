@@ -101,6 +101,41 @@ def test_program_mapping_construction_rejects_non_v1_document() -> None:
         Program.from_dict({}, catalog)
 
 
+@pytest.mark.parametrize("alias", ["open", "closed"])
+def test_program_keeps_gripper_alias_symbolic_through_runtime_input_validation(alias) -> None:
+    from manyforge_behavior.orchestration_values import NodeAttemptInputResolver, ProgramValueStore
+
+    catalog = _catalog()
+    source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
+    position = {"kind": "named_preset", "name": alias}
+    source["tree"] = {
+        "node_id": "gripper.command_position", "instance_id": "named-command",
+        "parameters": {"target_role": "gripper", "position": position}, "children": [],
+    }
+    program = Program.from_dict(_identified(source), catalog)
+    assert program.to_dict()["tree"]["parameters"]["position"] == position
+    resolver = NodeAttemptInputResolver(
+        program=program, catalog=catalog, value_store=ProgramValueStore(program),
+    )
+    snapshot = resolver.snapshot(
+        node_id="gripper.command_position", node_instance_id="named-command",
+        parameters={"target_role": "gripper", "position": position}, value_sources={},
+    )
+    assert dict(snapshot.parameters["position"]) == position
+
+
+def test_program_refuses_nonsemantic_gripper_preset_name_before_runtime() -> None:
+    source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
+    source["tree"] = {
+        "node_id": "gripper.command_position", "instance_id": "named-command",
+        "parameters": {
+            "target_role": "gripper", "position": {"kind": "named_preset", "name": "released"},
+        }, "children": [],
+    }
+    with pytest.raises(ProgramValidationError):
+        Program.from_dict(_identified(source), _catalog())
+
+
 @pytest.mark.parametrize(
     "node_id",
     (

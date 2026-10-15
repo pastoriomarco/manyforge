@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -9,6 +10,18 @@
 #include <vector>
 
 namespace manyforge::core {
+
+/// Authored target actuation, separate from angular/linear command coordinates.
+enum class GripperActuationKind {
+  kPositionCommanded,
+  kPneumatic,
+};
+
+/// Strict authored output choice. Absence is not a no-output command.
+enum class GripperOutputMode {
+  kCommanded,
+  kNone,
+};
 
 enum class GripperCommandState {
   kIdle,
@@ -94,6 +107,11 @@ struct GripperCommandRequestDTO {
   /// fixed-duration mechanism rejects a duration that cannot fit this bound.
   double completion_timeout_s = 1.0;
   std::optional<AddressedGripperCommandIdentityDTO> addressed_identity = std::nullopt;
+  /// PRIVATE process-local proof supplied only by the genuine prepared owner.
+  /// Never serialized or retained by a provider. It checks the same resident
+  /// committed session without locks or a second admission handshake.
+  std::function<bool(const AddressedGripperCommandIdentityDTO&)> committed_owner_is_current;
+  std::optional<std::uint64_t> owner_lifecycle_generation;
 };
 
 struct GripperCommandResultDTO {
@@ -176,6 +194,12 @@ struct GripperCommandStatusDTO {
   std::string projection_reason;
   std::optional<ErrorDTO> error;
   std::optional<GripperGraspEvidenceDTO> grasp_evidence;
+  /// Local admission fence, independent of an admitted transaction generation.
+  std::uint64_t admission_generation{};
+  bool admission_closed{};
+  /// Destructive lifecycle generation; pneumatic Stop's admission-only fence
+  /// does not retire it. Reset/replacement/shutdown still do.
+  std::uint64_t lifecycle_generation{};
 };
 
 }  // namespace manyforge::core

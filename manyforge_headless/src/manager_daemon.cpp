@@ -25,7 +25,6 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -2486,9 +2485,7 @@ BuildBootstrapRuntimePlan(
     const deployment::IVerifiedRetainedProductArtifactSource &artifacts) {
   auto rows = component_manager::BuildVerifiedRuntimeConvergencePlan(
       admission.retained_bundle(), artifacts, "linux",
-      {std::string(deployment::native_execution_runtime_contract::
-                       kLaunchEnvironmentContract),
-       std::string(deployment::ros2_control_execution_runtime_contract::
+      {std::string(deployment::ros2_control_execution_runtime_contract::
                        kLaunchEnvironmentContract)});
   if (rows.empty()) {
     return std::nullopt;
@@ -2877,8 +2874,6 @@ public:
             config_.execution_state_root, config_.execution_run_root,
             verified_package_, verified_package_, "linux",
             std::vector<std::string>{
-                std::string(deployment::native_execution_runtime_contract::
-                                kLaunchEnvironmentContract),
                 std::string(
                     deployment::ros2_control_execution_runtime_contract::
                         kLaunchEnvironmentContract)},
@@ -2925,9 +2920,7 @@ public:
             runtime_adapter_router_, runtime_adapter_router_,
             planned_maintenance_,
             manager_runtime_epoch_, "linux",
-            {std::string(deployment::native_execution_runtime_contract::
-                             kLaunchEnvironmentContract),
-             std::string(deployment::ros2_control_execution_runtime_contract::
+            {std::string(deployment::ros2_control_execution_runtime_contract::
                              kLaunchEnvironmentContract)},
             [this] { return ElapsedNs(); },
             [] { return core::ApplyId(RandomToken("apply-")); },
@@ -2955,6 +2948,7 @@ public:
     RequireCurrentPackageGeneration();
     EnsureBootstrap();
     RequireCurrentPackageGeneration();
+    // DX-753: preserve native-named per-unit launch, inventory, epochs, liveness, Stop and fencing plumbing.
     // Native children are directly owned by this Manager process and therefore
     // never survive its restart. Recreate the runtime selected by the durable
     // public pointer before the progression lane resumes an incomplete Apply.
@@ -3594,8 +3588,7 @@ private:
     CanonicalValue::Array inventories;
     std::size_t count = 0U;
     for (const auto &unit : bundle->value().cell_graph.runtime_units) {
-      if (unit.runtime_profile_id.value() != deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId &&
-          unit.runtime_profile_id.value() != deployment::native_execution_runtime_contract::kRuntimeProfileId)
+      if (unit.runtime_profile_id.value() != deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId)
         continue;
       const auto *host = runtime->observations.observation(unit.runtime_unit_id.value());
       if (!host || host->process_presence() != component_manager::ProcessPresenceState::kPresent || host->runtime_epoch().empty())
@@ -3615,6 +3608,23 @@ private:
         if (row.controllable_component_id != component) continue;
         if (++count > component_manager::kMaximumComponentProcessInventoryEntries)
           return unavailable("the complete addressed process union exceeds its existing bound");
+        if (row.process_owner_kind == component_manager::ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) {
+          const auto verified = component_manager::ValidateManagerPneumaticNoneProcessOwner(*bundle, request, row);
+          if (!verified.ok()) return Offer::Err(verified.error());
+          const auto& proof = *row.pneumatic_none_owner;
+          // This is an installed logical owner, not a launch or a drain receipt.
+          // Preserve the exact physical row shape below for every physical row.
+          rows.emplace_back(CanonicalValue::Object{
+              {"controllable_component_id", CanonicalValue(row.controllable_component_id.value())},
+              {"process_owner_kind", CanonicalValue("pneumatic_none_local")},
+              {"pneumatic_none_owner", CanonicalValue(CanonicalValue::Object{
+                  {"command_target_id", CanonicalValue(proof.command_target_id.value())},
+                  {"control_binding_id", CanonicalValue(proof.control_binding_id.value())},
+                  {"control_binding_revision", CanonicalValue(proof.control_binding_revision.value())}})},
+              {"installed_runtime_identity", CanonicalValue(row.installed_runtime_identity->value())},
+              {"process_presence", CanonicalValue("absent")}});
+          continue;
+        }
         const auto state = [&] {
           switch (row.cleanup_state) {
             case core::ControllerLaunchCleanupState::kNotRequested: return "not_requested";
@@ -3721,14 +3731,38 @@ private:
                 "component bring-up preflight membership differs from the verified candidate");
         Require(component.process_presence != component_manager::ProcessPresenceState::kUnknown,
                 "component bring-up preflight cannot classify an unknown process owner");
-        const bool needed = component.process_presence == component_manager::ProcessPresenceState::kAbsent;
+        bool needed = component.process_presence == component_manager::ProcessPresenceState::kAbsent;
+        if (component.process_owner_kind == component_manager::ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) {
+          const auto predecessor = verified_package_.get_verified(
+              active.active_publication.request.candidate_retained_bundle_id);
+          Require(predecessor != nullptr,
+                  "component bring-up preflight has no verified immutable predecessor");
+          const component_manager::ManagerComponentProcessInventoryRequestDTO scope{
+              request.predecessor_projection_revision,
+              request.expected_predecessor_publication_generation,
+              request.expected_predecessor_public_pointer_digest,
+              request.runtime_unit_id, request.runtime_epoch, request.manager_runtime_epoch};
+          const component_manager::ManagerComponentProcessOccurrenceDTO local{
+              component.controllable_component_id, {}, 0,
+              component_manager::ProcessPresenceState::kAbsent,
+              core::ControllerLaunchCleanupState::kNotRequested, {},
+              component.installed_runtime_identity, component.process_owner_kind,
+              component.pneumatic_none_owner};
+          const auto verified = component_manager::ValidateManagerPneumaticNoneProcessOwner(
+              *predecessor, scope, local);
+          Require(verified.ok(), verified.ok() ? std::string{} : verified.error().message);
+          // Source-verified installed identity, never authored mode or absent
+          // process alone, decides whether this candidate needs bring-up.
+          needed = component.installed_runtime_identity != deployment::derive_component_runtime_identity(
+              candidate, component.controllable_component_id);
+        }
         if (needed) {
           needed_components.insert(component.controllable_component_id);
           original.needed_components.push_back(component.controllable_component_id);
         }
         rows.emplace_back(CanonicalValue::Object{
             {"controllable_component_id", CanonicalValue(component.controllable_component_id.value())},
-            {"process_presence", CanonicalValue(needed ? "absent" : "present")}});
+            {"process_presence", CanonicalValue(std::string(component_manager::ToString(component.process_presence)))}});
       }
       Require(expected.empty(), "component bring-up preflight omitted configured candidate components");
       if (original_inputs && !original.needed_components.empty())

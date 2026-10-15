@@ -204,6 +204,8 @@ set(
   ""
   CACHE FILEPATH
   "Optional selected ROS execution host for the real Manager Apply process test")
+set(MANYFORGE_HEADLESS_TEST_ROS_SETUP "" CACHE FILEPATH
+  "Chained built ROS overlay setup.bash for enabled Manager Python process tests")
 if(BUILD_TESTING)
   enable_testing()
   find_package(GTest REQUIRED)
@@ -490,10 +492,54 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_BINARY_DIR}/manyforge_lite6_product"
         EXCLUDE_FROM_ALL)
     endif()
+    # This graph owns its normal structural preparation. Do not borrow the
+    # RoboPlan graph's generated fixture or relabel an aggregate Lite6 package.
+    set(MANYFORGE_HEADLESS_TEST_ROBOTIQ_SOURCE_ROOT
+      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/resources/maintained/model_sources/robotiq_2f_85")
+    get_filename_component(MANYFORGE_HEADLESS_TEST_ROBOTIQ_RESOURCE_ROOT
+      "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/ur5e_robotiq_2f_85"
+      REALPATH)
+    set(MANYFORGE_HEADLESS_TEST_ROBOTIQ_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/generated/robotiq_2f_85_structural")
+    set(MANYFORGE_HEADLESS_TEST_ROBOTIQ_CATALOG_PATH
+      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/resources/maintained/model_assets/robotiq_2f_85.model_asset.json")
+    file(GLOB_RECURSE MANYFORGE_HEADLESS_TEST_ROBOTIQ_RESOURCE_INPUTS
+      CONFIGURE_DEPENDS LIST_DIRECTORIES false
+      "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_RESOURCE_ROOT}/meshes/robotiq_2f_85/*")
+    file(MAKE_DIRECTORY "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_FIXTURE_ROOT}")
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}"
+        "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/tools/prepare_structural_model.py"
+        --urdf "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_SOURCE_ROOT}/robotiq_2f_85.urdf"
+        --srdf "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_SOURCE_ROOT}/robotiq_2f_85.srdf"
+        --model-asset-id robotiq_2f_85
+        --accepted-package-uri-prefix
+          "package://manyforge_example_models/models/ur5e_robotiq_2f_85/"
+        --resource-root "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_RESOURCE_ROOT}"
+        --output-directory "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_FIXTURE_ROOT}"
+      RESULT_VARIABLE MANYFORGE_HEADLESS_TEST_ROBOTIQ_PREPARATION_RESULT
+      OUTPUT_VARIABLE MANYFORGE_HEADLESS_TEST_ROBOTIQ_PREPARATION_OUTPUT
+      ERROR_VARIABLE MANYFORGE_HEADLESS_TEST_ROBOTIQ_PREPARATION_ERROR)
+    if(NOT MANYFORGE_HEADLESS_TEST_ROBOTIQ_PREPARATION_RESULT EQUAL 0)
+      message(FATAL_ERROR
+        "headless standalone Robotiq fixture preparation failed:\n"
+        "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_PREPARATION_OUTPUT}"
+        "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_PREPARATION_ERROR}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/tools/prepare_structural_model.py"
+      "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_SOURCE_ROOT}/robotiq_2f_85.urdf"
+      "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_SOURCE_ROOT}/robotiq_2f_85.srdf"
+      ${MANYFORGE_HEADLESS_TEST_ROBOTIQ_RESOURCE_INPUTS})
+
     add_executable(manyforge_generate_headless_manager_apply_test_package
       test/generate_manager_apply_package.cpp)
     target_compile_definitions(
       manyforge_generate_headless_manager_apply_test_package PRIVATE
+      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_HEADLESS_TEST_ROBOTIQ_FIXTURE_ROOT}"
+      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_HEADLESS_TEST_ROBOTIQ_SOURCE_ROOT}"
+      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_RESOURCE_ROOT="${MANYFORGE_HEADLESS_TEST_ROBOTIQ_RESOURCE_ROOT}"
+      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_CATALOG_PATH="${MANYFORGE_HEADLESS_TEST_ROBOTIQ_CATALOG_PATH}"
       MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}"
       MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT}")
     target_include_directories(
@@ -577,12 +623,111 @@ if(BUILD_TESTING)
     add_custom_target(manyforge_headless_test_assistant_native_package
       DEPENDS "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_METADATA}")
 
+    # DX753: retain existing native-named fixture paths for the shared A1 references.
+    # DX768: genuine ROS gripper producer uses the approved logical Stop policy.
     set(MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT
       "${CMAKE_CURRENT_BINARY_DIR}/gripper-only-manager-test-fixture")
     set(MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT
       "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}/retained-package")
     set(MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA
       "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}/metadata.json")
+    add_custom_command(
+      OUTPUT "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}"
+      COMMAND "${CMAKE_COMMAND}" -E remove_directory
+        "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}"
+      COMMAND "$<TARGET_FILE:manyforge_generate_headless_manager_apply_test_package>"
+        --package-root "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT}"
+        --metadata "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}"
+        --profile gripper-only
+      DEPENDS
+        manyforge_generate_headless_manager_apply_test_package
+        "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
+        ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(manyforge_headless_test_gripper_only_package
+      DEPENDS "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}")
+
+    # Initial scalar pneumatic Apply includes its genuine feedback alias.
+    set(MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/pneumatic-commanded-feedback-manager-test-fixture")
+    set(MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_PACKAGE_ROOT
+      "${MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_FIXTURE_ROOT}/retained-package")
+    set(MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_METADATA
+      "${MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_FIXTURE_ROOT}/metadata.json")
+    add_custom_command(
+      OUTPUT "${MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_METADATA}"
+      COMMAND "${CMAKE_COMMAND}" -E remove_directory
+        "${MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_FIXTURE_ROOT}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "${MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_FIXTURE_ROOT}"
+      COMMAND "$<TARGET_FILE:manyforge_generate_headless_manager_apply_test_package>"
+        --package-root "${MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_PACKAGE_ROOT}"
+        --metadata "${MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_METADATA}"
+        --profile gripper-pneumatic-commanded
+      DEPENDS
+        manyforge_generate_headless_manager_apply_test_package
+        "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
+        ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(manyforge_headless_test_pneumatic_commanded_feedback_package
+      DEPENDS "${MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_METADATA}")
+
+    if(MANYFORGE_HEADLESS_BUILD_PYTHON)
+      if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_ROS_SETUP}" OR
+          IS_DIRECTORY "${MANYFORGE_HEADLESS_TEST_ROS_SETUP}")
+        message(FATAL_ERROR
+          "Manager Python process tests require MANYFORGE_HEADLESS_TEST_ROS_SETUP "
+          "to name the current chained built ROS overlay setup.bash")
+      endif()
+      file(REAL_PATH "${MANYFORGE_HEADLESS_TEST_ROS_SETUP}"
+        MANYFORGE_HEADLESS_TEST_ROS_SETUP)
+      set(MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_FIXTURE_ROOT
+        "${CMAKE_CURRENT_BINARY_DIR}/robotiq-position-manager-test-fixture")
+      set(MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_PACKAGE_ROOT
+        "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_FIXTURE_ROOT}/retained-package")
+      set(MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_METADATA
+        "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_FIXTURE_ROOT}/metadata.json")
+      add_custom_command(
+        OUTPUT "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_METADATA}"
+        COMMAND "${CMAKE_COMMAND}" -E remove_directory
+          "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_FIXTURE_ROOT}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory
+          "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_FIXTURE_ROOT}"
+        COMMAND "$<TARGET_FILE:manyforge_generate_headless_manager_apply_test_package>"
+          --package-root "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_PACKAGE_ROOT}"
+          --metadata "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_METADATA}"
+          --profile gripper-only-robotiq-position
+        DEPENDS manyforge_generate_headless_manager_apply_test_package
+          "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
+          "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER}"
+          "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_SOURCE_ROOT}/robotiq_2f_85.urdf"
+          "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_SOURCE_ROOT}/robotiq_2f_85.srdf"
+          "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_CATALOG_PATH}"
+          ${MANYFORGE_HEADLESS_TEST_ROBOTIQ_RESOURCE_INPUTS}
+        VERBATIM)
+      add_custom_target(manyforge_headless_test_robotiq_position_package ALL
+        DEPENDS "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_METADATA}")
+      add_dependencies(manyforge_headless_py
+        manyforge_manager_daemon manyforge_headless_test_canonical_empty_package
+        manyforge_headless_test_robotiq_position_package)
+      add_test(NAME manager_robotiq_position_process
+        COMMAND bash -c [=[set -e; source "$1"; shift; exec "$@"]=]
+          manager-robotiq-position "${MANYFORGE_HEADLESS_TEST_ROS_SETUP}"
+          "${Python3_EXECUTABLE}" -m pytest
+          "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_headless_api/process_tests/test_process_stack.py::test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled_command"
+          -p no:cacheprovider -v)
+      set_tests_properties(manager_robotiq_position_process PROPERTIES
+        ENVIRONMENT
+          "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}:${CMAKE_CURRENT_SOURCE_DIR}/..:${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior:$ENV{PYTHONPATH};MANYFORGE_MANAGER_DAEMON=$<TARGET_FILE:manyforge_manager_daemon>;MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT=${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT};MANYFORGE_ROBOTIQ_POSITION_PACKAGE_ROOT=${MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_PACKAGE_ROOT};MANYFORGE_ROBOTIQ_POSITION_METADATA=${MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_METADATA};MANYFORGE_ROS2_CONTROL_EXECUTION_HOST=${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST};MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER};MANYFORGE_PROCESS_TEST_EVIDENCE_ROOT=${CMAKE_CURRENT_BINARY_DIR}/manager-robotiq-position-evidence"
+        TIMEOUT 180 RUN_SERIAL TRUE)
+    endif()
+
     # Gripper-only reference remains NOT_RUN/A1; no unavailable native package is generated.
 
     # O1.4g uses a compatible pick/place host to materialize a second package.
@@ -732,12 +877,16 @@ if(BUILD_TESTING)
   if(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST)
     add_dependencies(test_manager_daemon_process
       manyforge_headless_test_manager_apply_package
-      manyforge_headless_test_assistant_native_package)
+      manyforge_headless_test_assistant_native_package
+      manyforge_headless_test_gripper_only_package
+      manyforge_headless_test_pneumatic_commanded_feedback_package)
     target_compile_definitions(test_manager_daemon_process PRIVATE
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT}"
       MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA="${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}"
       MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT}"
+      MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_METADATA="${MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_METADATA}"
+      MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_PACKAGE_ROOT}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT}"
       MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"

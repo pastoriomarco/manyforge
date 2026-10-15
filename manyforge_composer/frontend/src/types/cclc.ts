@@ -382,18 +382,34 @@ export interface ComponentProcessStopResult {
   error: CCLCTransactionStatus['error'];
 }
 
+export interface ControllerLaunchProcessOccurrence {
+  process_owner_kind?: never;
+  controllable_component_id: string; launch_identity: string; leader_pid: number;
+  process_presence: 'unknown' | 'absent' | 'present';
+  cleanup_state: 'not_requested' | 'pending' | 'unknown' | 'drained';
+  receipt: ComponentProcessStopResult['receipt']; installed_runtime_identity: string | null;
+}
+
+/** Manager verifies the immutable configuration and actual installed owner. */
+export interface PneumaticNoneLocalProcessOccurrence {
+  process_owner_kind: 'pneumatic_none_local';
+  controllable_component_id: string;
+  pneumatic_none_owner: {
+    command_target_id: string;
+    control_binding_id: string;
+    control_binding_revision: string;
+  };
+  installed_runtime_identity: string;
+  process_presence: 'absent';
+}
+
 export interface ComponentProcessStopOffer {
   controllable_component_id: string;
   process_inventories: Array<{
     request: Pick<ComponentProcessStopRequest, 'predecessor_projection_revision'
       | 'expected_predecessor_publication_generation' | 'expected_predecessor_public_pointer_digest'
       | 'runtime_unit_id' | 'runtime_epoch' | 'manager_runtime_epoch'>;
-    process_occurrences: Array<{
-      controllable_component_id: string; launch_identity: string; leader_pid: number;
-      process_presence: 'unknown' | 'absent' | 'present';
-      cleanup_state: 'not_requested' | 'pending' | 'unknown' | 'drained';
-      receipt: ComponentProcessStopResult['receipt']; installed_runtime_identity: string | null;
-    }>;
+    process_occurrences: Array<ControllerLaunchProcessOccurrence | PneumaticNoneLocalProcessOccurrence>;
     error: null;
   }>;
 }

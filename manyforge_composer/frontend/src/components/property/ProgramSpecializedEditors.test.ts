@@ -16,6 +16,7 @@ import {
   ProgramSpecializedEditor,
   toggleJointTargetRow,
 } from './ProgramSpecializedEditors';
+import { firstCatalogSchemaValidationMessage } from '../../utils/catalogSchema';
 
 const frameReferenceSchema: CatalogJsonSchema = {
   type: 'object',
@@ -113,6 +114,26 @@ const coordinateSchema: CatalogJsonSchema = {
     {
       if: { required: ['kind'], properties: { kind: { const: 'linear_m' } } },
       then: { required: ['value_m'], not: { required: ['value_rad'] } },
+    },
+  ],
+};
+
+const namedCoordinateSchema: CatalogJsonSchema = {
+  ...coordinateSchema,
+  properties: {
+    ...coordinateSchema.properties,
+    kind: { type: 'string', enum: ['angular_rad', 'linear_m', 'named_preset'] },
+    name: { type: 'string', enum: ['open', 'closed'] },
+  },
+  allOf: [
+    ...coordinateSchema.allOf!,
+    {
+      if: { required: ['kind'], properties: { kind: { const: 'named_preset' } } },
+      then: { required: ['name'], not: { anyOf: [{ required: ['value_rad'] }, { required: ['value_m'] }] } },
+    },
+    {
+      if: { not: { required: ['kind'], properties: { kind: { const: 'named_preset' } } } },
+      then: { not: { required: ['name'] } },
     },
   ],
 };
@@ -377,5 +398,44 @@ describe('Program specialized editor transitions', () => {
       coordinateSchema,
       'unsupported',
     )).toBeUndefined();
+  });
+
+  it('keeps open and closed as symbolic preset names and preserves numeric transitions', () => {
+    expect(completeCoordinateKindTransition(namedCoordinateSchema, 'named_preset'))
+      .toEqual({ kind: 'named_preset', name: 'open' });
+    for (const name of ['open', 'closed']) {
+      expect(completeCoordinateKindTransition(namedCoordinateSchema, 'named_preset', name))
+        .toEqual({ kind: 'named_preset', name });
+    }
+    expect(completeCoordinateKindTransition(namedCoordinateSchema, 'angular_rad'))
+      .toEqual({ kind: 'angular_rad', value_rad: 0 });
+    expect(completeCoordinateKindTransition(namedCoordinateSchema, 'linear_m'))
+      .toEqual({ kind: 'linear_m', value_m: 0 });
+    expect(completeCoordinateKindTransition(namedCoordinateSchema, 'named_preset', 'vendor_open'))
+      .toBeUndefined();
+    expect(completeCoordinateKindTransition(coordinateSchema, 'named_preset'))
+      .toBeUndefined();
+  });
+
+  it.each([
+    { kind: 'named_preset' },
+    { kind: 'named_preset', name: 'vendor_open' },
+    { kind: 'named_preset', name: 'open', value_m: 0.01 },
+    { kind: 'named_preset', name: 'closed', value_rad: 0.2 },
+    { kind: 'linear_m', value_m: 0.01, name: 'open' },
+  ])('rejects mixed or unsupported named-preset grammar: %j', (value) => {
+    expect(firstCatalogSchemaValidationMessage(namedCoordinateSchema, value, 'position'))
+      .not.toBeNull();
+  });
+
+  it.each(['open', 'closed'])('displays the stored %s preset without a numeric input', (name) => {
+    const markup = renderToStaticMarkup(createElement(ProgramSpecializedEditor, {
+      schema: namedCoordinateSchema, value: { kind: 'named_preset', name },
+      disabled: false, onCommit: () => undefined,
+    }));
+    expect(markup).toContain('aria-label="Gripper preset"');
+    expect(markup).toContain(`value="${name}" selected=""`);
+    expect(markup).toContain('bound gripper when the node runs');
+    expect(markup).not.toContain('type="number"');
   });
 });

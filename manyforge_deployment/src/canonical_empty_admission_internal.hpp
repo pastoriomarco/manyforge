@@ -50,7 +50,7 @@ read_canonical_empty_admission_if_present(
         "canonical-empty-admission.json");
 
 /// Deterministically derives a structurally empty deployment for the source
-/// cell while retaining its one exact native execution runtime declaration.
+/// cell while retaining its one exact ROS execution runtime declaration.
 [[nodiscard]] RevisionVerifiedDeploymentArtifact
 derive_cell_scoped_canonical_empty_deployment(
     const RevisionVerifiedDeploymentArtifact &first_deployment,
@@ -71,14 +71,7 @@ publish_cell_scoped_canonical_empty_admission(
 [[nodiscard]] CanonicalEmptyRetainedBundleAdmission
 generate_canonical_empty_package(const std::filesystem::path &output_root);
 
-/// Workbench startup infrastructure, independent of any selected Scenario.
-/// Retains only the native host, never a controller, model or Program.
-[[nodiscard]] CanonicalEmptyRetainedBundleAdmission
-generate_native_empty_package(const std::filesystem::path &output_root,
-                              const core::CellId &cell_id,
-                              std::string_view runtime_profile_bytes);
-
-/// The same workbench infrastructure producer for the qualified empty ROS host.
+/// Workbench startup infrastructure for the qualified empty ROS host.
 /// It owns no controller, model, Program or authored world.
 [[nodiscard]] CanonicalEmptyRetainedBundleAdmission
 generate_ros_empty_package(const std::filesystem::path &output_root,

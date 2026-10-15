@@ -44,9 +44,8 @@ class RetainedNativeComponentOwner final {
     if (runtime == nullptr || runtime->participant_engine() == nullptr) {
       throw std::invalid_argument("native gripper component has no execution owner");
     }
-    const auto registration = runtime->registration();
     validate_registrations(runtime->binding().value().controllable_component_id,
-                           {registration}, physical_bindings());
+                           runtime->registrations(), physical_bindings());
   }
 
   [[nodiscard]] core::ControllableComponentId component_id() const {
@@ -62,7 +61,7 @@ class RetainedNativeComponentOwner final {
       return component_registrations(
           *runtime, runtime->motion_binding.value().controllable_component_id);
     }
-    return {gripper_runtime()->registration()};
+    return gripper_runtime()->registrations();
   }
 
   [[nodiscard]] std::vector<core::RuntimeParticipantBinding>

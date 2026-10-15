@@ -36,7 +36,7 @@ ReadRos2ComponentReceipt(
     const RetainedRos2ControlRuntimeHandle &handle,
     const core::IExecutionBackend *execution,
     const core::IGripperCommandBackend *gripper,
-    const core::RuntimeParticipantBinding &motion,
+    const std::optional<core::RuntimeParticipantBinding> &motion,
     const std::optional<core::RuntimeParticipantBinding> &tool,
     const std::vector<core::RuntimeParticipantExecutionRegistration>
         &registrations,
@@ -63,16 +63,18 @@ ReadRos2ComponentReceipt(
     RefuseExitedRos2Retain(component_id, retained_process_exit);
 
   require(row->candidate_runtime_identity == installed_runtime_identity &&
-              execution != nullptr &&
-              handle.OwnsBackend(execution, motion, tool) &&
+              (motion ? (execution != nullptr && handle.OwnsBackend(execution, *motion, tool))
+                      : (execution == nullptr && !handle.participant() && !handle.motion_domain() && tool)) &&
               (tool ? handle.OwnsGripper(gripper, *tool) : gripper == nullptr),
           "ROS installed receipt has no exact live factory-bound adapters");
-  require(motion_engine != nullptr &&
+  require((motion ? motion_engine != nullptr : motion_engine == nullptr) &&
               (!tool ||
                (gripper_engine != nullptr && motion_engine != gripper_engine)),
           "ROS installed receipt has no distinct owned participant engines");
-  std::vector<const core::RuntimeParticipantBinding *> physical_bindings{
-      &motion};
+  require(motion || tool, "ROS installed component has no physical binding");
+  const auto& representative = motion ? *motion : *tool;
+  std::vector<const core::RuntimeParticipantBinding *> physical_bindings;
+  if (motion) physical_bindings.push_back(&*motion);
   if (tool)
     physical_bindings.push_back(&*tool);
   for (const auto *physical : physical_bindings) {
@@ -101,16 +103,17 @@ ReadRos2ComponentReceipt(
               "ROS installed participant resource is outside its Apply fence");
     }
     const auto expected_engine =
-        physical == &motion ? motion_engine : gripper_engine;
+        motion && physical == &*motion ? motion_engine : gripper_engine;
+    const auto* expected_stop = motion && physical == &*motion
+        ? static_cast<const core::IControlDomainExecutionPort*>(execution)
+        : dynamic_cast<const core::IControlDomainExecutionPort*>(gripper_engine);
     require(
         std::count_if(
             registrations.begin(), registrations.end(),
             [&](const auto &registration) {
               return registration.binding.value() == binding &&
                      registration.engine == expected_engine &&
-                     registration.stop_execution_port ==
-                         static_cast<const core::IControlDomainExecutionPort *>(
-                             execution);
+                     registration.stop_execution_port == expected_stop;
             }) == 1,
         "ROS installed participant has no unique owned execution/Stop "
         "registration");
@@ -120,21 +123,21 @@ ReadRos2ComponentReceipt(
     if (binding.controllable_component_id != component_id)
       continue;
     const bool is_motion =
-        binding.command_target_id == motion.value().command_target_id;
+        motion && binding.command_target_id == motion->value().command_target_id;
     require(
         binding.controllable_component_id == component_id &&
             binding.retained_bundle_id ==
                 request.candidate_projection_revision.retained_bundle_id &&
             binding.graph_revision ==
                 request.candidate_projection_revision.graph_revision &&
-            binding.runtime_unit_epochs == motion.value().runtime_unit_epochs &&
+            binding.runtime_unit_epochs == representative.value().runtime_unit_epochs &&
             (is_motion || (tool && binding.command_target_id ==
                                        tool->value().command_target_id)) &&
             registration.engine ==
                 (is_motion ? motion_engine : gripper_engine) &&
             registration.stop_execution_port ==
-                static_cast<const core::IControlDomainExecutionPort *>(
-                    execution),
+                (is_motion ? static_cast<const core::IControlDomainExecutionPort*>(execution)
+                           : dynamic_cast<const core::IControlDomainExecutionPort*>(gripper_engine)),
         "ROS installed registration crosses its owned component or adapter");
   }
   const bool product_changed =
@@ -146,7 +149,7 @@ ReadRos2ComponentReceipt(
       component_id,
       row->disposition,
       installed_runtime_identity,
-      motion.value().runtime_unit_epochs,
+      representative.value().runtime_unit_epochs,
       retained,
       retained && product_changed};
   require(receipt.valid(), "ROS installed receipt is invalid");

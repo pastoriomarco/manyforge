@@ -1,11 +1,11 @@
 # ManyForge operator runbook
 
-> **Current boundary (O1 implementation snapshot):** the `native` and split
-> `isaac` operator entrypoints, durable identities, recovery paths, and the
-> Composer deployment-composition client are implemented and container-tested.
-> Clean-source live qualification and `FV-O1` remain open; this document is
-> not a live availability claim until the dated O1 evidence names the exact
-> source/package/world identities and green runtime rows.
+> **Historical operator reference:** the `native` CLI profile name and dated
+> O1 records below are retained as restoration inputs (DX-753); the native
+> simulator executable is removed. Current ROS development uses
+> [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md). Workbench empty-ready
+> and mock Phase A `qualified-live02` do not qualify these installed-launcher
+> commands, the full Compose wrapper, an observed GUI journey, Isaac or hardware.
 
 ## 1. Preconditions and identity
 
@@ -88,11 +88,11 @@ loopback `9010`, and Program runner loopback `9011`. Keep the runtime host
 reachable from the laptop on a trusted LAN. Composer has no bearer-token
 semantics in this boundary; do not expose it beyond that trusted network.
 
-## 2. Native topology and commands
+## 2. Historical topology and commands
 
 The operator owns four processes on one runtime host: **Manager**, **Headless
 API**, **Program runner**, and **Composer**. Manager owns runtime convergence
-and, from the exact admitted retained bundle, owns the native execution-host
+and, from the exact admitted retained bundle, owns the ROS execution-host
 child and its private runtime channel. The operator does not fork or adopt
 that child separately. Headless and Program runner expose owner facts and
 intents; Composer is a stateless client. Composer binds `0.0.0.0:9000`;
@@ -100,7 +100,7 @@ Headless and Program runner bind loopback only.
 
 Set these to the actual source-matched installation. Every path is required
 by `start`; the hash values must be full lowercase SHA-256 strings. `MANAGER`
-must be colocated with the source-matched `manyforge_native_execution_host`
+must be colocated with the source-matched `manyforge_ros2_control_execution_host`
 and `manyforge_roboplan_candidate_worker` targets because Manager resolves
 those owned runtime targets from its executable directory. The admission
 filename is package-relative and selects the exact idle cell; it must exist

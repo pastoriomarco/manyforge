@@ -18,6 +18,8 @@
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/execution_port_participant.hpp>
+#include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/testing/fake_execution_port.hpp>
@@ -28,6 +30,7 @@
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/model_source.hpp>
 #include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_controller_lifecycle_expected_domain.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
@@ -500,7 +503,8 @@ require_fixture_one(const Range &values, Predicate predicate,
         std::nullopt,
     std::optional<core::ProgramCommandSchemaRefDTO> command_schema =
         std::nullopt,
-    std::optional<core::RuntimeEpoch> provider_runtime_epoch = std::nullopt) {
+    std::optional<core::RuntimeEpoch> provider_runtime_epoch = std::nullopt,
+    std::optional<core::CapabilityId> selected_capability = std::nullopt) {
   const auto &graph = bundle.value().cell_graph;
   const auto &component = require_fixture_one(
       graph.controllable_components,
@@ -512,7 +516,9 @@ require_fixture_one(const Range &values, Predicate predicate,
       graph.control_bindings,
       [&](const auto &candidate) {
         return candidate.controllable_component_id == component_id &&
-               candidate.command_target_id == target_id;
+               candidate.command_target_id == target_id &&
+               (!selected_capability ||
+                candidate.capability_id == *selected_capability);
       },
       "component target control binding");
   const auto &control_domain = require_fixture_one(
@@ -2261,6 +2267,234 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(unchanged.value(), gripper_read.value());
 }
 
+TEST(RetainedProductCrossConsumer,
+     PneumaticCommandedFeedbackAliasUsesConstructionOnlyAbsence) {
+  ScopedTemporaryRoot temporary;
+  const auto package_root = temporary.path() / "retained-package";
+  const auto staging_parent = temporary.path() / "private-stages";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+  ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
+  const auto materialized = deployment::test::
+      materialize_lite6_retained_consumer_fixture_from(
+          package_root,
+          deployment::test::make_lite6_controllable_retention_fixture(
+              false, false, 1U, true, true, {}, false, true, "resource", true,
+              {}, {}, true, true, false, std::nullopt, false,
+              deployment::test::kLite6ArmTargetId, std::nullopt, std::nullopt,
+              {}, {}, true, {}, "manyforge.provider.ros2_control", false, true,
+              nullptr, nullptr, false, false, "pneumatic", 0.8, "commanded"));
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto &bundle = *materialized.bundle;
+  const auto &products = bundle.value().compiled_products;
+  ASSERT_EQ(products.symbol_role_maps.size(), 1U);
+  const auto retained = load_lite6_planning_model(
+      package_root, {bundle.retained_bundle_id(),
+                     products.planning_collision_model.product_id});
+  const auto model_map = load_lite6_model_map(
+      package_root, {bundle.retained_bundle_id(),
+                     products.symbol_role_maps.front().product_id});
+  const core::ControllableComponentId component_id(
+      std::string(deployment::test::kLite6ControllableComponentId));
+  const core::CommandTargetId arm_target_id(
+      std::string(deployment::test::kLite6ArmTargetId));
+  const core::CommandTargetId gripper_target_id(
+      std::string(deployment::test::kLite6GripperTargetId));
+  const core::RuntimeEpoch epoch("pneumatic-alias-frame-epoch");
+  const auto arm = make_fixture_runtime_participant(
+      bundle, model_map, component_id, arm_target_id, std::nullopt,
+      std::nullopt, epoch);
+  const auto command = make_fixture_runtime_participant(
+      bundle, model_map, component_id, gripper_target_id, std::nullopt,
+      std::nullopt, epoch, core::CapabilityId("tool.gripper.command"));
+  const auto feedback = make_fixture_runtime_participant(
+      bundle, model_map, component_id, gripper_target_id, std::nullopt,
+      std::nullopt, epoch, core::CapabilityId("tool.gripper.feedback"));
+  ASSERT_TRUE(command.value().control_path.has_value());
+  ASSERT_TRUE(feedback.value().control_path.has_value());
+  const auto runtime_id = command.value().control_path->provider_runtime_unit_id;
+  EXPECT_EQ(feedback.value().control_path->provider_runtime_unit_id, runtime_id);
+  const auto configuration = deployment::ros2_control_execution_runtime_contract::
+      require_component_configuration(bundle, runtime_id, component_id);
+  const auto &configured = require_fixture_one(
+      configuration.gripper_target_configurations,
+      [&](const auto &row) {
+        return row.controllable_component_id == component_id &&
+               row.command_target_id == gripper_target_id;
+      }, "actual pneumatic command configuration");
+  ASSERT_EQ(configured.actuation_kind, "pneumatic");
+  ASSERT_EQ(configured.output_mode, core::GripperOutputMode::kCommanded);
+  const auto command_context = core::make_observed_state_query_context(command, 0);
+  const auto feedback_context = core::make_observed_state_query_context(feedback, 0);
+  ASSERT_TRUE(command_context.ok()) << command_context.error().message;
+  ASSERT_TRUE(feedback_context.ok()) << feedback_context.error().message;
+  ASSERT_NE(command_context.value().control_binding_id,
+            feedback_context.value().control_binding_id);
+  EXPECT_EQ(command_context.value().resources, feedback_context.value().resources);
+  EXPECT_EQ(command_context.value().joint_names, feedback_context.value().joint_names);
+  EXPECT_EQ(command_context.value().coordinate_kinds,
+            feedback_context.value().coordinate_kinds);
+  EXPECT_EQ(command_context.value().control_route_id,
+            feedback_context.value().control_route_id);
+
+  auto stage = RetainedPlanningModelStage::create_verified(retained, staging_parent);
+  auto scene = make_roboplan_scene(RoboPlanSceneInput{
+      "pneumatic_alias_frame_state", std::string(stage.loader_urdf_bytes()),
+      std::string(stage.srdf_bytes()), stage.package_paths(),
+      retained_joint_limit_rows(retained)});
+  auto projector = std::make_shared<RetainedKinematicStateProjector>(
+      RetainedKinematicStateProjector::create_verified(
+          scene, std::make_shared<std::mutex>(), bundle, model_map, retained,
+          std::vector<core::RuntimeParticipantBinding>{arm}, 0));
+  auto arm_channel = std::make_shared<RetainedObservedStateChannel>(
+      arm, projector, RetainedObservedStateChannelConfig{
+          core::ObservedStateSourceKind::kCommandedState,
+          "test/pneumatic-alias/actual-arm", 0, 1U});
+  ASSERT_TRUE(arm_channel->initialize_from_projection(10).applied());
+  const auto *arm_target = model_map.find_target(component_id, arm_target_id);
+  ASSERT_NE(arm_target, nullptr);
+  ASSERT_FALSE(arm_target->model_groups.empty());
+  auto collision_model = ManyForgeCollisionEngine::load_shared_model(
+      "pneumatic_alias_frame_state", stage.loader_urdf_path(), stage.srdf_path(),
+      stage.package_paths(), arm_target->model_groups.front().compiled_group_name);
+  const RetainedSceneFrameStateSourceInput arm_source{
+      arm_channel->query_context(), arm_channel->source_kind(),
+      std::shared_ptr<const core::IObservedStateProvider>(
+          arm_channel, arm_channel->addressed_publication())};
+  // No gripper channel, coordinate value or publication is supplied.
+  const RetainedSceneFrameStateSourceInput absence{
+      command_context.value(), core::ObservedStateSourceKind::kCommandedState,
+      nullptr, RetainedSceneFrameCoordinateAuthority::kUnavailablePneumatic};
+
+  // Reverse only traversal of genuine verified rows. All identities, retained
+  // paths and bundle checks still come from the same sealed model map.
+  struct ReversedMapTraversal final {
+    const deployment::VerifiedRetainedModelMap &verified;
+    std::vector<deployment::CompositionControlBindingCoordinateMap> rows;
+    const auto &query() const { return verified.query(); }
+    const auto &cell_frame() const { return verified.cell_frame(); }
+    const auto &targets() const { return verified.targets(); }
+    const auto &kinematic_frame_paths() const {
+      return verified.kinematic_frame_paths();
+    }
+    const auto &control_bindings() const { return rows; }
+    void require_same_bundle_as(
+        const deployment::VerifiedRetainedPlanningModel &planning) const {
+      verified.require_same_bundle_as(planning);
+    }
+  } reversed{model_map, model_map.control_bindings()};
+  std::reverse(reversed.rows.begin(), reversed.rows.end());
+  const auto command_map = std::find_if(
+      reversed.rows.begin(), reversed.rows.end(), [&](const auto &row) {
+        return row.control_binding_id == command_context.value().control_binding_id;
+      });
+  const auto feedback_map = std::find_if(
+      reversed.rows.begin(), reversed.rows.end(), [&](const auto &row) {
+        return row.control_binding_id == feedback_context.value().control_binding_id;
+      });
+  ASSERT_NE(command_map, reversed.rows.end());
+  ASSERT_NE(feedback_map, reversed.rows.end());
+  ASSERT_LT(feedback_map, command_map);
+  const auto create = [&](const auto &traversal,
+                          std::vector<RetainedSceneFrameStateSourceInput> sources) {
+    return RetainedSceneFrameResolver::create_verified(
+        collision_model, bundle, traversal, retained, runtime_id, epoch,
+        std::move(sources));
+  };
+  auto resolver = create(model_map, {arm_source, absence});
+  auto reversed_resolver = create(reversed, {arm_source, absence});
+  ASSERT_NE(resolver, nullptr);
+  ASSERT_NE(reversed_resolver, nullptr);
+  const auto logical_scene = make_projection_runtime_shadow_snapshot(
+      bundle.value().cell_graph.cell_id);
+  const core::ProjectionLeaseBindingDTO lease{
+      {bundle.retained_bundle_id(), bundle.value().cell_graph.graph_revision,
+       logical_scene.shared()->revision},
+      core::ProjectionLeaseId("pneumatic-alias-frame-lease")};
+  const core::SceneFrameResolutionQueryDTO query{
+      core::TargetCarrierSceneFrameRefDTO{component_id, arm_target_id,
+                                          core::FrameRoleId("tcp")}, lease};
+  const auto scene_before = scene->getCurrentJointPositions();
+  const auto resolved = resolver->Resolve(query, logical_scene.shared(), 10);
+  const auto reversed_resolved = reversed_resolver->Resolve(
+      query, logical_scene.shared(), 10);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  ASSERT_TRUE(reversed_resolved.ok()) << reversed_resolved.error().message;
+  EXPECT_EQ(reversed_resolved.value(), resolved.value());
+  for (const auto &state : resolved.value().kinematic_state_path_view.resource_states) {
+    EXPECT_NE(state.resource_id, command.value().resources.front().resource_id);
+  }
+  EXPECT_TRUE(scene->getCurrentJointPositions().isApprox(scene_before));
+  const std::vector<double> moved{0.0, -0.785, 0.785, 0.0, 1.57, 0.0};
+  ASSERT_TRUE(arm_channel->publish_state(
+      moved, std::vector<double>(moved.size(), 0.0), 20, 20).applied());
+  const auto after = resolver->Resolve(query, logical_scene.shared(), 20);
+  const auto reversed_after = reversed_resolver->Resolve(
+      query, logical_scene.shared(), 20);
+  ASSERT_TRUE(after.ok()) << after.error().message;
+  ASSERT_TRUE(reversed_after.ok()) << reversed_after.error().message;
+  EXPECT_EQ(reversed_after.value(), after.value());
+  EXPECT_FALSE(after.value().frame_pose_in_cell == resolved.value().frame_pose_in_cell);
+  EXPECT_TRUE(scene->getCurrentJointPositions().isApprox(scene_before));
+
+  const auto rejects_both_orders = [&](const auto &sources) {
+    EXPECT_THROW(static_cast<void>(create(model_map, sources)), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(create(reversed, sources)), std::invalid_argument);
+  };
+  rejects_both_orders(std::vector<RetainedSceneFrameStateSourceInput>{arm_source});
+  rejects_both_orders(std::vector<RetainedSceneFrameStateSourceInput>{absence});
+  const auto reject_marker = [&](auto marker) {
+    rejects_both_orders(std::vector<RetainedSceneFrameStateSourceInput>{
+        arm_source, std::move(marker)});
+  };
+  auto invalid = absence;
+  invalid.coordinate_authority =
+      RetainedSceneFrameCoordinateAuthority::kRequiredPublication;
+  reject_marker(invalid);
+  invalid = absence;
+  invalid.coordinate_authority = static_cast<RetainedSceneFrameCoordinateAuthority>(999);
+  reject_marker(invalid);
+  invalid = absence;
+  invalid.context.provider_instance_id = core::ProviderInstanceId("foreign-owner");
+  reject_marker(invalid);
+  invalid = absence;
+  invalid.context.runtime_epoch = core::RuntimeEpoch("foreign-epoch");
+  reject_marker(invalid);
+  invalid = absence;
+  invalid.context.control_route_id = core::ControlRouteId("foreign-route");
+  reject_marker(invalid);
+  invalid = absence;
+  invalid.context.controllable_component_id = core::ControllableComponentId("foreign-component");
+  reject_marker(invalid);
+  invalid = absence;
+  invalid.context.resources.front() = core::ResourceId("foreign-resource");
+  reject_marker(invalid);
+  invalid = absence;
+  invalid.context.control_binding_id = core::ControlBindingId("unused-command");
+  reject_marker(invalid);
+  invalid = absence;
+  invalid.context = feedback_context.value();
+  reject_marker(invalid);
+  invalid = absence;
+  invalid.context = arm_source.context;
+  reject_marker(invalid);
+  invalid = absence;
+  invalid.provider = arm_source.provider;
+  reject_marker(invalid);
+  rejects_both_orders(std::vector<RetainedSceneFrameStateSourceInput>{
+      arm_source, absence, absence});
+  auto unused = absence;
+  unused.context.control_binding_id = core::ControlBindingId("unused-command");
+  rejects_both_orders(std::vector<RetainedSceneFrameStateSourceInput>{
+      arm_source, absence, unused});
+  EXPECT_THROW(static_cast<void>(RetainedSceneFrameResolver::create(
+                   collision_model, RetainedSceneFrameResolverInput{
+                       bundle.retained_bundle_id(), bundle.value().cell_graph.graph_revision,
+                       model_map.cell_frame().cell_id,
+                       model_map.cell_frame().compiled_frame_name,
+                       model_map.kinematic_frame_paths(), {}, {}, {absence}, 10'000'000})),
+               std::invalid_argument);
+}
+
 TEST(
     RetainedProductCrossConsumer,
     SceneFrameResolverReadsDirectOrExternalOwnerPublicationNotMutablePlannerState) {
@@ -2429,6 +2663,117 @@ TEST(
   ASSERT_TRUE(external_neutral.ok()) << external_neutral.error().message;
   EXPECT_EQ(external_neutral.value(), neutral.value());
 
+  // The genuine ROS mixed fixture explicitly selects pneumatic actuation.
+  // Its seeded gripper channel remains owned, but is not FK authority.
+  ASSERT_TRUE(gripper_binding.value().control_path.has_value());
+  const auto pneumatic_configuration = deployment::
+      ros2_control_execution_runtime_contract::require_component_configuration(
+          *materialized.bundle,
+          gripper_binding.value().control_path->provider_runtime_unit_id,
+          component_id);
+  const auto &pneumatic_row = require_fixture_one(
+      pneumatic_configuration.gripper_target_configurations,
+      [&](const auto &row) {
+        return row.controllable_component_id == component_id &&
+               row.command_target_id == gripper_target_id;
+      },
+      "exact pneumatic scene-frame target configuration");
+  ASSERT_EQ(pneumatic_row.actuation_kind, "pneumatic");
+  ASSERT_EQ(pneumatic_row.output_mode, core::GripperOutputMode::kCommanded);
+  const RetainedSceneFrameStateSourceInput unavailable_gripper{
+      gripper_channel->query_context(), gripper_channel->source_kind(), nullptr,
+      RetainedSceneFrameCoordinateAuthority::kUnavailablePneumatic};
+  const auto with_gripper_source = [&](
+      RetainedSceneFrameStateSourceInput source) {
+    return RetainedSceneFrameResolver::create_verified(
+        collision_model, *materialized.bundle, model_map, retained,
+        local_runtime_unit_id, local_runtime_epoch,
+        {provided_state_sources.front(), std::move(source)});
+  };
+  const Eigen::VectorXd scene_before_absence = scene->getCurrentJointPositions();
+  auto pneumatic_resolver = with_gripper_source(unavailable_gripper);
+  ASSERT_NE(pneumatic_resolver, nullptr);
+  const auto pneumatic_tcp = pneumatic_resolver->Resolve(
+      query, logical_scene.shared(), 10);
+  ASSERT_TRUE(pneumatic_tcp.ok()) << pneumatic_tcp.error().message;
+  EXPECT_EQ(pneumatic_tcp.value(), neutral.value());
+  const auto pneumatic_gripper_tcp = pneumatic_resolver->Resolve(
+      core::SceneFrameResolutionQueryDTO{
+          core::TargetCarrierSceneFrameRefDTO{component_id, gripper_target_id,
+                                              core::FrameRoleId("tcp")},
+          projection_binding},
+      logical_scene.shared(), 10);
+  ASSERT_TRUE(pneumatic_gripper_tcp.ok())
+      << pneumatic_gripper_tcp.error().message;
+  EXPECT_EQ(pneumatic_gripper_tcp.value(), resolved_gripper_tcp.value());
+  EXPECT_TRUE(scene->getCurrentJointPositions().isApprox(scene_before_absence));
+
+  // Unmarked missing state still refuses, including legacy three-field inputs.
+  const RetainedSceneFrameStateSourceInput default_missing_gripper{
+      unavailable_gripper.context, unavailable_gripper.publication_source,
+      nullptr};
+  EXPECT_EQ(default_missing_gripper.coordinate_authority,
+            RetainedSceneFrameCoordinateAuthority::kRequiredPublication);
+  EXPECT_THROW(static_cast<void>(with_gripper_source(default_missing_gripper)),
+               std::invalid_argument);
+  auto invalid_absence = unavailable_gripper;
+  invalid_absence.provider = gripper_provider;
+  EXPECT_THROW(static_cast<void>(with_gripper_source(invalid_absence)),
+               std::invalid_argument);
+  invalid_absence = unavailable_gripper;
+  invalid_absence.coordinate_authority =
+      static_cast<RetainedSceneFrameCoordinateAuthority>(999);
+  EXPECT_THROW(static_cast<void>(with_gripper_source(invalid_absence)),
+               std::invalid_argument);
+  invalid_absence = unavailable_gripper;
+  invalid_absence.context.runtime_epoch = core::RuntimeEpoch("foreign-epoch");
+  EXPECT_THROW(static_cast<void>(with_gripper_source(invalid_absence)),
+               std::invalid_argument);
+  invalid_absence = unavailable_gripper;
+  invalid_absence.context.control_route_id = core::ControlRouteId("foreign-route");
+  EXPECT_THROW(static_cast<void>(with_gripper_source(invalid_absence)),
+               std::invalid_argument);
+  invalid_absence = unavailable_gripper;
+  invalid_absence.context.controllable_component_id =
+      core::ControllableComponentId("foreign-component");
+  EXPECT_THROW(static_cast<void>(with_gripper_source(invalid_absence)),
+               std::invalid_argument);
+  invalid_absence = unavailable_gripper;
+  invalid_absence.publication_source = core::ObservedStateSourceKind::kJointState;
+  EXPECT_THROW(static_cast<void>(with_gripper_source(invalid_absence)),
+               std::invalid_argument);
+  invalid_absence = unavailable_gripper;
+  ASSERT_FALSE(invalid_absence.context.coordinate_kinds.empty());
+  invalid_absence.context.coordinate_kinds.front() =
+      unavailable_gripper.context.coordinate_kinds.front() ==
+              core::CoordinateKind::kLinear
+          ? core::CoordinateKind::kAngular
+          : core::CoordinateKind::kLinear;
+  ASSERT_NE(invalid_absence.context.coordinate_kinds,
+            unavailable_gripper.context.coordinate_kinds);
+  EXPECT_THROW(static_cast<void>(with_gripper_source(invalid_absence)),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(RetainedSceneFrameResolver::create_verified(
+                   collision_model, *materialized.bundle, model_map, retained,
+                   local_runtime_unit_id, local_runtime_epoch,
+                   {provided_state_sources.front(), unavailable_gripper,
+                    unavailable_gripper})),
+               std::invalid_argument);
+  auto unavailable_arm = provided_state_sources.front();
+  unavailable_arm.provider.reset();
+  unavailable_arm.coordinate_authority =
+      RetainedSceneFrameCoordinateAuthority::kUnavailablePneumatic;
+  EXPECT_THROW(static_cast<void>(RetainedSceneFrameResolver::create_verified(
+                   collision_model, *materialized.bundle, model_map, retained,
+                   local_runtime_unit_id, local_runtime_epoch,
+                   {unavailable_arm, unavailable_gripper})),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(RetainedSceneFrameResolver::create_verified(
+                   collision_model, *materialized.bundle, model_map, retained,
+                   local_runtime_unit_id, local_runtime_epoch,
+                   {unavailable_gripper})),
+               std::invalid_argument);
+
   const Eigen::VectorXd planner_state_before =
       scene->getCurrentJointPositions();
   const std::vector<double> moved_positions{0.0, -0.785, 0.785, 0.0, 1.57, 0.0};
@@ -2441,6 +2786,10 @@ TEST(
 
   const auto moved = resolver->Resolve(query, logical_scene.shared(), 20);
   ASSERT_TRUE(moved.ok()) << moved.error().message;
+  const auto pneumatic_moved =
+      pneumatic_resolver->Resolve(query, logical_scene.shared(), 20);
+  ASSERT_TRUE(pneumatic_moved.ok()) << pneumatic_moved.error().message;
+  EXPECT_EQ(pneumatic_moved.value(), moved.value());
   const auto external_moved =
       external_resolver->Resolve(query, logical_scene.shared(), 20);
   ASSERT_TRUE(external_moved.ok()) << external_moved.error().message;
@@ -3569,6 +3918,11 @@ enum class Lite6AggregateCheck {
   kResealInventory,
   kRefreshCellModel,
   kDeploymentFaultStopProfile,
+  kDeploymentFaultStopProfileWithExtraJoints,
+  kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides,
+  kDeploymentFaultStopProfileWithSparseSettleOverrides,
+  kDeploymentFaultStopProfileMissingArmJoint,
+  kDeploymentFaultStopProfileWithoutArmJoints,
   kExecutionPortParticipant,
   kMissingSelectedBackend,
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
@@ -3750,6 +4104,13 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
 #endif
   const bool reseal_capability_inventory =
       check == Lite6AggregateCheck::kResealInventory;
+  const bool authored_fault_check =
+      check == Lite6AggregateCheck::kDeploymentFaultStopProfile ||
+      check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints ||
+      check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides ||
+      check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides ||
+      check == Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint ||
+      check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithoutArmJoints;
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
       temporary.path() / "retained-package";
@@ -4018,14 +4379,95 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     authored_fault.per_joint_max_deceleration.emplace(
         *resource.source_joint_name,
         core::CoordinateAccelerationDTO{core::AngularAccelerationDTO{7.0}});
-  if (check == Lite6AggregateCheck::kDeploymentFaultStopProfile) {
+  auto expected_arm_fault_limits = authored_fault.per_joint_max_deceleration;
+  if (authored_fault_check) {
+    if (check != Lite6AggregateCheck::kDeploymentFaultStopProfile) {
+      // The actual UR10e component profile has these six additional gripper
+      // joints. This owning constructor fixture uses its real Lite6 arm
+      // binding; it does not relabel that model as UR10e.
+      for (const auto *joint : {"finger_joint", "left_inner_finger_joint",
+                                "left_inner_knuckle_joint", "right_inner_finger_joint",
+                                "right_inner_knuckle_joint", "right_outer_knuckle_joint"}) {
+        authored_fault.per_joint_max_deceleration.emplace(
+            joint, core::AngularAccelerationDTO{13.0});
+      }
+    }
+    if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints ||
+        check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides ||
+        check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides) {
+      authored_fault.per_joint_settle_velocity_threshold.emplace();
+      for (const auto &[joint, _] : authored_fault.per_joint_max_deceleration) {
+        const bool arm = expected_arm_fault_limits.contains(joint);
+        authored_fault.per_joint_max_jerk.emplace(
+            joint, core::AngularJerkDTO{arm ? 11.0 : 23.0});
+        if (!arm || check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints ||
+            (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides &&
+             joint == *arm_binding.value().resources.front().source_joint_name))
+          authored_fault.per_joint_settle_velocity_threshold->emplace(
+              joint, core::AngularVelocityDTO{arm ? 0.005 : 0.004});
+      }
+    }
+    if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint) {
+      const auto missing = *arm_binding.value().resources.front().source_joint_name;
+      authored_fault.per_joint_max_deceleration.erase(missing);
+      expected_arm_fault_limits.erase(missing);
+    } else if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithoutArmJoints) {
+      for (const auto &resource : arm_binding.value().resources)
+        authored_fault.per_joint_max_deceleration.erase(*resource.source_joint_name);
+      expected_arm_fault_limits.clear();
+    }
     runtime_input.fault_stop_profile_from_deployment = true;
     runtime_input.deployment_fault_stop_profile = authored_fault;
   }
+  const auto original_authored_fault = authored_fault;
   // All constructor cases select the existing Core execution-port seam.
   core::ExecutionPortParticipant *port_participant = nullptr;
   runtime_input.motion_state_channel_config = selected_core_test_state_config(arm_binding);
   runtime_input.gripper_state_channel_config = selected_core_test_state_config(gripper_binding);
+  if (authored_fault_check) {
+    // These constructor checks need the same independently loaded/reloaded
+    // Stop authority as the existing measured-publication fixture below.
+    deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(package_root);
+    core::FilesystemResolvedStopBasePlanRepository plans(temporary.path());
+    const auto &path = *arm_binding.value().control_path;
+    const auto desired = std::find_if(
+        materialized.bundle->value().desired_control_configurations.begin(),
+        materialized.bundle->value().desired_control_configurations.end(),
+        [&](const auto &row) { return row.control_domain_id == path.control_domain_id; });
+    ASSERT_NE(desired, materialized.bundle->value().desired_control_configurations.end());
+    std::vector<core::ActiveControlConfigurationBindingRouteDTO> routes;
+    for (const auto &row : desired->binding_routes)
+      routes.push_back({row.control_binding_id, row.control_binding_revision, row.control_route_id});
+    const auto generation = path.active_control_configuration_generation;
+    core::ActiveControlConfigurationDTO configuration{
+        path.active_control_configuration_id, path.control_domain_id,
+        path.control_domain_revision, std::move(routes), desired->activation_set_id,
+        path.controller_topology_id, path.topology_revision,
+        path.provider_runtime_unit_id, path.provider_runtime_epoch, generation.value(),
+        {}, generation, core::ActiveControlConfigurationStateDTO::kReconciled};
+    for (const auto &resource : arm_binding.value().resources)
+      configuration.kinematic_resource_source_projections.push_back(
+          {resource.resource_id, {{path.control_binding_id, path.control_binding_revision}},
+           path.provider_instance_id, path.provider_manifest_id, path.provider_manifest_revision,
+           path.state_authority_id, path.state_authority_class,
+           runtime_input.motion_state_channel_config->source_kind});
+    std::sort(configuration.kinematic_resource_source_projections.begin(),
+              configuration.kinematic_resource_source_projections.end(),
+              [](const auto &left, const auto &right) {
+                return left.resource_id < right.resource_id;
+              });
+    ASSERT_TRUE(configuration.locally_valid());
+    const auto expected = deployment::load_verified_controller_lifecycle_expected_domain(
+        *materialized.bundle, artifacts, *desired,
+        configuration.source_runtime_unit_id, configuration.source_runtime_epoch);
+    const auto plan = deployment::resolve_verified_stop_base_plan(
+        *materialized.bundle, artifacts, expected, configuration, arm_binding);
+    auto readiness = deployment::store_and_verify_runtime_participant_stop_readiness(
+        *materialized.bundle, plan, core::ComponentLifecycleGeneration(1U),
+        expected, arm_binding, plans);
+    ASSERT_TRUE(readiness.ok()) << readiness.error().message;
+    runtime_input.motion_stop_readiness = std::move(readiness.value());
+  }
   if (check == Lite6AggregateCheck::kMissingSelectedBackend) {
     try {
       static_cast<void>(create_retained_native_runtime(
@@ -4382,14 +4824,111 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
                    std::string(deployment::test::kLite6ArmTargetId));
       });
   ASSERT_NE(motion_registration, runtime->participant_registrations.end());
-  if (check == Lite6AggregateCheck::kDeploymentFaultStopProfile) {
+  if (authored_fault_check) {
     auto expected_fault = authored_fault;
+    expected_fault.per_joint_max_deceleration = expected_arm_fault_limits;
+    if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints ||
+        check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides ||
+        check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides) {
+      expected_fault.per_joint_max_jerk.clear();
+      for (const auto &resource : arm_binding.value().resources)
+        expected_fault.per_joint_max_jerk.emplace(*resource.source_joint_name,
+                                                 core::AngularJerkDTO{11.0});
+      if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints) {
+        expected_fault.per_joint_settle_velocity_threshold.emplace();
+        expected_fault.per_joint_settle_velocity_threshold->clear();
+        for (const auto &resource : arm_binding.value().resources)
+          expected_fault.per_joint_settle_velocity_threshold->emplace(
+              *resource.source_joint_name, core::AngularVelocityDTO{0.005});
+      } else if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides) {
+        expected_fault.per_joint_settle_velocity_threshold.emplace();
+        expected_fault.per_joint_settle_velocity_threshold->clear();
+        expected_fault.per_joint_settle_velocity_threshold->emplace(
+            *arm_binding.value().resources.front().source_joint_name,
+            core::AngularVelocityDTO{0.005});
+      } else {
+        expected_fault.per_joint_settle_velocity_threshold.reset();
+      }
+      ASSERT_EQ(authored_fault.per_joint_max_deceleration.size(), 12U);
+      ASSERT_EQ(authored_fault.per_joint_max_jerk.size(), 12U);
+    }
     expected_fault.deceleration_time_s = core::kDefaultDecelerationTimeS;
     EXPECT_TRUE(runtime->motion_fault_stop_profile_from_deployment);
     EXPECT_EQ(runtime->motion_fault_stop_profile,
               std::optional<core::MotionInterruptStopProfileDTO>(expected_fault));
     EXPECT_EQ(motion_registration->default_fault_stop_profile,
               std::optional<core::MotionInterruptStopProfileDTO>(expected_fault));
+    EXPECT_EQ(authored_fault, original_authored_fault);
+    ASSERT_NE(port_participant, nullptr); // Missing limits did not add an Apply-time refusal.
+    ASSERT_TRUE(motion_registration->default_operator_stop_profile);
+    ASSERT_TRUE(motion_registration->stop_readiness);
+    const auto &nominal = motion_registration->stop_readiness->value()
+                              .resolved_stop_base_plan.escalation_stages.front();
+    ASSERT_TRUE(nominal.default_contract_parameters);
+    const auto decoded_operator = core::map_motion_controlled_stop_contract_parameters_to_profile(
+        *nominal.default_contract_parameters, arm_binding.value().resources, "operator_soft_on_path");
+    ASSERT_TRUE(decoded_operator.ok()) << decoded_operator.error().message;
+    const auto expected_operator =
+        core::resolve_motion_interrupt_stop_jerk_limits(decoded_operator.value());
+    ASSERT_TRUE(expected_operator.ok()) << expected_operator.error().message;
+    EXPECT_EQ(*motion_registration->default_operator_stop_profile, expected_operator.value());
+    EXPECT_NE(motion_registration->default_operator_stop_profile->per_joint_max_deceleration,
+              motion_registration->default_fault_stop_profile->per_joint_max_deceleration);
+    const core::PreparedParticipantStopPlanContextDTO context{
+        core::OperationId("fault-projection.operation"), core::OperationRevision(1U),
+        core::OperationParticipantId("fault-projection.participant"),
+        core::ProgramId("fault-projection.program"), core::ProgramRevision(std::string(kZeroDigest)),
+        core::ProgramBindingId(std::string(kZeroDigest)), core::ProgramRunId("fault-projection.run"),
+        motion_registration->default_fault_stop_profile,
+        core::ParticipantStopProfilePurposeDTO::kFault, std::nullopt,
+        motion_registration->stop_node_category};
+    const auto plan = core::MakePreparedParticipantStopPlan(
+        motion_registration->stop_readiness->value().resolved_stop_base_plan, context,
+        arm_binding.value().resources, motion_registration->retained_default_stop_limits);
+    const bool missing =
+        check == Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint ||
+        check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithoutArmJoints;
+    if (missing) {
+      ASSERT_FALSE(plan.ok());
+      EXPECT_EQ(plan.error().details.at("reason"),
+                check == Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint
+                    ? "motion_interrupt_stop_deceleration_coverage_mismatch"
+                    : "soft_on_path/spring_back_hold requires a non-empty per_joint_max_deceleration");
+    } else {
+      ASSERT_TRUE(plan.ok()) << plan.error().message;
+      EXPECT_EQ(plan.value().participant_stop_profile,
+                motion_registration->default_fault_stop_profile);
+      EXPECT_TRUE(core::VerifyPreparedParticipantStopPlan(
+          motion_registration->stop_readiness->value().resolved_stop_base_plan, plan.value(),
+          arm_binding.value().resources, motion_registration->retained_default_stop_limits,
+          motion_registration->stop_node_category).ok());
+      ASSERT_TRUE(plan.value().stage_commands.front().validated_contract_parameters);
+      const auto decoded = core::map_motion_controlled_stop_contract_parameters_to_profile(
+          *plan.value().stage_commands.front().validated_contract_parameters,
+          arm_binding.value().resources, "observed_fault_profile");
+      ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+      ASSERT_TRUE(decoded.value().per_joint_settle_velocity_threshold);
+      for (const auto &resource : arm_binding.value().resources) {
+        const auto retained = std::find_if(
+            motion_registration->retained_default_stop_limits.begin(),
+            motion_registration->retained_default_stop_limits.end(), [&](const auto &limit) {
+              return limit.resource_id == resource.resource_id;
+            });
+        ASSERT_NE(retained, motion_registration->retained_default_stop_limits.end());
+        auto expected_threshold = retained->settle_velocity_threshold;
+        if (expected_fault.per_joint_settle_velocity_threshold) {
+          const auto override_it = expected_fault.per_joint_settle_velocity_threshold->find(
+              *resource.source_joint_name);
+          if (override_it != expected_fault.per_joint_settle_velocity_threshold->end())
+            expected_threshold = override_it->second;
+        }
+        EXPECT_EQ(decoded.value().per_joint_settle_velocity_threshold->at(
+                      *resource.source_joint_name), expected_threshold);
+      }
+      ASSERT_EQ(expected_fault.per_joint_max_deceleration.size(), 6U);
+      for (const auto &[_, value] : expected_fault.per_joint_max_deceleration)
+        EXPECT_EQ(value, core::CoordinateAccelerationDTO{core::AngularAccelerationDTO{7.0}});
+    }
     return;
   }
   EXPECT_FALSE(runtime->motion_fault_stop_profile_from_deployment);
@@ -4869,6 +5408,36 @@ TEST(RetainedProductCrossConsumer,
      DeploymentAuthoredFaultStopProfileIsTheMotionFaultProfile) {
   check_selected_core_lite6_aggregate(
       Lite6AggregateCheck::kDeploymentFaultStopProfile);
+}
+
+TEST(RetainedProductCrossConsumer,
+     ComponentFaultStopProfileProjectsExtraJointsOntoActualArmResources) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints);
+}
+
+TEST(RetainedProductCrossConsumer,
+     ComponentFaultStopProfileWithOnlyExtraSettleOverridesUsesRetainedDefaults) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides);
+}
+
+TEST(RetainedProductCrossConsumer,
+     ComponentFaultStopProfileKeepsSparseSettleOverridesAndOtherRetainedDefaults) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides);
+}
+
+TEST(RetainedProductCrossConsumer,
+     ComponentFaultStopProfileMissingArmJointStillRefusesAtPrepare) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint);
+}
+
+TEST(RetainedProductCrossConsumer,
+     ComponentFaultStopProfileWithoutArmJointsStillRefusesAtPrepare) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kDeploymentFaultStopProfileWithoutArmJoints);
 }
 
 TEST(RetainedProductCrossConsumer,

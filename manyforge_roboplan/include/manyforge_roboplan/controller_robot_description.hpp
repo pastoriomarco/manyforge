@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/types/gripper.hpp>
 
 namespace manyforge::roboplan_backend {
 
@@ -53,9 +54,12 @@ struct MockControllerLane final {
   /// arm joints by order. No zero fallback: the size must match exactly.
   std::vector<double> initial_joint_positions_rad;
   std::optional<MockGripperBinding> gripper;
-  /// The mock profile needs a commanded gripper joint; without a model-backed
-  /// gripper binding generation fails.
+  /// With Commanded output, the mock profile needs a commanded gripper
+  /// joint; without a model-backed gripper binding generation fails.
   bool gripper_required{};
+  /// Strict selected output choice; None keeps the real model binding while
+  /// emitting no gripper control interfaces. It requires an arm in this writer.
+  core::GripperOutputMode gripper_output_mode{core::GripperOutputMode::kCommanded};
 };
 
 /// Isaac lane: `topic_based_ros2_control/TopicBasedSystem` with the lane's
@@ -73,9 +77,14 @@ struct IsaacControllerLane final {
 struct ControllerRobotDescriptionRequest final {
   /// Exact ManyForge model URDF text from the resolved model bundle.
   std::string_view model_urdf;
-  /// Ordered arm joints from the retained binding (never inferred).
+  /// Ordered arm joints from the retained binding (never inferred). Empty
+  /// only for a mock lane with a genuine model-backed gripper.
   std::vector<std::string> arm_joint_names;
   std::variant<MockControllerLane, IsaacControllerLane> lane;
+  /// Structural scalar facts for an explicitly selected no-output Isaac
+  /// gripper. These validate the model joint only and add no interfaces.
+  /// Absence does not select an output mode; ordinary requests leave it absent.
+  std::optional<MockGripperBinding> gripper_without_control_interfaces{};
 };
 
 /// Generate the controller `robot_description` URDF text. Throws

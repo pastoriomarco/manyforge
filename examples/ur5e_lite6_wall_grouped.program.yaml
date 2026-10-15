@@ -1,13 +1,13 @@
 api_version: manyforge.program.v2
 program_id: ur5e_lite6_wall_grouped
-program_revision: sha256:95032da65ef8f09e3f8cc0a120e604c6f55f35b496f096bba75835b70020ce60
+program_revision: sha256:8ae04083ffe371005821a5ebcc351b7437c0bc099c034fab2e0ffa6539ca2a74
 program_profile: composable-cell-v1
 name: ur5e_lite6_wall_grouped
 description: Two independent joint trajectories in the UR5e + Lite6 wall cell, in one shared control group
   without synchronized timing.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.4.0
+  content_version: 2.5.0
 compatibility:
   lanes:
   - manyforge-only

@@ -3501,3 +3501,374 @@ def test_key_writes_and_loads_use_the_full_declared_type_check() -> None:
         assert detail is not None and "(persistent_register)" in detail
         # A drop the register could not store still never loads the value.
         assert ("stored" in register.stored) is fail
+
+
+def _stop_parity_node(
+    instance_id: str,
+    node_id: str,
+    policy: str = "inherit",
+    children: Sequence[dict[str, Any]] = (),
+    groups: Sequence[str] = (),
+) -> dict[str, Any]:
+    # Exact authored Deployment fixture; actual Behavior resolves inheritance.
+    node = {
+        "node_id": node_id,
+        "instance_id": instance_id,
+        "parameters": (
+            {"target_role": "gripper", "position": {"kind": "linear_m", "value_m": 0.01}}
+            if node_id == "gripper.command_position" else {}
+        ),
+        "children": list(children),
+    }
+    if policy != "inherit":
+        node["operator_stop_policy"] = policy
+    if groups:
+        node["execution_groups"] = list(groups)
+    return node
+
+
+def _stop_parity_run(
+    tree: dict[str, Any], now: list[float], *, task: _TaskPort | None = None,
+    group_ids: Sequence[str] = ("child_only", "mixed", "whole"),
+) -> ExecutableProgramRun:
+    document = _minimal_document()
+    document["tree"] = tree
+    if task is not None:
+        if group_ids:
+            document["execution_groups"] = {
+                name: {"execution_policy": "independent"} for name in group_ids
+            }
+        document["target_roles"]["gripper"] = {
+            "component_role": "robot",
+            "required_capabilities": [
+                {"capability_id": capability, "parameters": {}, "disposition": "required"}
+                for capability in ("tool.gripper.command", "tool.gripper.feedback")
+            ],
+        }
+    program = Program.from_dict(_identified(document), _catalog())
+    return ExecutableProgramRun(
+        program=program,
+        environment=build_node_environment(),
+        capture=_capture(program),
+        readiness=_readiness(_DIGEST_A),
+        ports=_ports(task) if task is not None else NodeAdapterPorts(),
+        program_clock=ProgramClock(lambda: now[0]),
+    )
+
+@pytest.mark.parametrize(
+    ("selection_id", "selected", "commands_sent"),
+    [
+        ("child_only", frozenset({"a_child"}), True),
+        ("mixed", frozenset({"a_child", "c_branch"}), True),
+        ("whole", frozenset({"a_child", "b_sibling", "c_branch"}), False),
+    ],
+)
+def test_behavior_stop_policy_oracle_for_partial_and_whole_subtrees(
+    selection_id: str, selected: frozenset[str], commands_sent: bool
+) -> None:
+    # Exact tree, memberships and selections from Deployment's
+    # CapturesLocalPoliciesAndTopologyForPartialHeldSubtrees. Core admission
+    # uses the same selected ids; this test obtains the scheduling result by
+    # ticking the real resolver-built tree, including its Hold decorator.
+    child = _stop_parity_node("a_child", "gripper.command_position", "continue")
+    child["parameters"] = {
+        "target_role": "gripper", "position": {"kind": "linear_m", "value_m": 0.01}
+    }
+    child["execution_groups"] = ["child_only", "mixed", "whole"]
+    sibling = _stop_parity_node("b_sibling", "gripper.command_position", "continue")
+    sibling["parameters"] = deepcopy(child["parameters"])
+    sibling["execution_groups"] = ["whole"]
+    branch = _stop_parity_node("c_branch", "sequence", "hold", [child, sibling])
+    branch["execution_groups"] = ["mixed", "whole"]
+    now = [0.0]
+    task = _TaskPort()
+    run = _stop_parity_run(
+        _stop_parity_node("z_root", "sequence", children=[branch]),
+        now,
+        task=task,
+    )
+    nodes = run._authored_nodes  # noqa: SLF001
+    assert {
+        key for key, node in nodes.items()
+        if isinstance(node, OperatorMotionStopPolicy)
+    } == {"c_branch"}
+    state = run._operator_stop_state  # noqa: SLF001
+    state.publish(OperatorMotionStopSnapshot(1, selected))
+    assert state.snapshot().held_nodes == selected
+    assert run.tick_once() is (
+        py_trees.common.Status.SUCCESS if commands_sent else py_trees.common.Status.RUNNING
+    ), selection_id
+    expected = (
+        py_trees.common.Status.SUCCESS if commands_sent else py_trees.common.Status.INVALID
+    )
+    assert nodes["a_child"].status is expected, selection_id
+    assert nodes["b_sibling"].status is expected, selection_id
+    assert [identity.node_instance_id for _, identity, _ in task.starts] == (
+        ["a_child", "b_sibling"] if commands_sent else []
+    ), selection_id
+    assert all(node_id == "gripper.command_position" for node_id, _, _ in task.starts)
+    assert state.holds_subtree("c_branch") is (not commands_sent)
+    # The raw selected projection remains held even when Continue runs.
+    assert state.snapshot().held_nodes == selected
+
+
+@pytest.mark.parametrize(
+    ("selection_id", "selected"),
+    [
+        ("leaf_only", frozenset({"d_leaf"})),
+        ("mixed", frozenset({"b_composite", "d_leaf"})),
+        ("whole", frozenset({"a_root", "b_composite", "c_decorator", "d_leaf"})),
+    ],
+)
+def test_behavior_stop_policy_oracle_for_inherited_chain_and_leaf_default(
+    selection_id: str, selected: frozenset[str],
+) -> None:
+    # Same genuine catalog-command tree/groups as Deployment and Core.
+    tree = _stop_parity_node(
+        "a_root", "sequence", children=[_stop_parity_node(
+            "b_composite", "sequence", children=[_stop_parity_node(
+                "c_decorator", "inverter",
+                children=[_stop_parity_node(
+                    "d_leaf", "gripper.command_position",
+                    groups=["leaf_only", "mixed", "whole"],
+                )], groups=["whole"],
+            )], groups=["mixed", "whole"],
+        )], groups=["whole"],
+    )
+    task = _TaskPort()
+    run = _stop_parity_run(tree, [0.0], task=task, group_ids=("leaf_only", "mixed", "whole"))
+    nodes = run._authored_nodes  # noqa: SLF001
+    assert {
+        key for key, node in nodes.items()
+        if isinstance(node, OperatorMotionStopPolicy)
+    } == {"d_leaf"}
+    state = run._operator_stop_state  # noqa: SLF001
+    state.publish(OperatorMotionStopSnapshot(1, selected))
+    assert run.tick_once() is py_trees.common.Status.RUNNING, selection_id
+    assert not task.starts
+    assert nodes["d_leaf"].decorated.status is py_trees.common.Status.INVALID
+    assert nodes["d_leaf"].presented_held
+    assert state.snapshot().held_nodes == selected
+    # Releasing the exact hold dispatches the same real command adapter.
+    state.publish(OperatorMotionStopSnapshot(2))
+    assert run.tick_once() is py_trees.common.Status.FAILURE  # inverter
+    assert [identity.node_instance_id for _, identity, _ in task.starts] == ["d_leaf"]
+    assert task.starts[0][0] == "gripper.command_position"
+    assert nodes["d_leaf"].decorated.status is py_trees.common.Status.SUCCESS
+
+
+@pytest.mark.parametrize(
+    ("selection_id", "selected", "child_runs"),
+    [
+        ("child_only", frozenset({"b_explicit_continue"}), True),
+        ("branch_whole", frozenset({"a_inherited_hold", "b_explicit_continue"}), False),
+        ("mixed", frozenset({"z_root", "b_explicit_continue"}), True),
+        ("whole", frozenset({
+            "a_inherited_hold", "b_explicit_continue", "c_explicit_continue",
+            "d_inherited_continue", "e_default_leaf", "f_explicit_hold", "z_root",
+        }), False),
+    ],
+)
+def test_behavior_stop_policy_oracle_for_explicit_overrides_and_mixed_ancestors(
+    selection_id: str, selected: frozenset[str], child_runs: bool,
+) -> None:
+    tree = _stop_parity_node("z_root", "sequence", "hold", [
+        _stop_parity_node("a_inherited_hold", "sequence", children=[
+            _stop_parity_node(
+                "b_explicit_continue", "gripper.command_position", "continue",
+                groups=["branch_whole", "child_only", "mixed", "whole"],
+            ),
+        ], groups=["branch_whole", "whole"]),
+        _stop_parity_node("c_explicit_continue", "sequence", "continue", [
+            _stop_parity_node("d_inherited_continue", "inverter", children=[
+                _stop_parity_node("e_default_leaf", "gripper.command_position", groups=["whole"]),
+            ], groups=["whole"]),
+            _stop_parity_node("f_explicit_hold", "gripper.command_position", "hold", groups=["whole"]),
+        ], groups=["whole"]),
+    ], groups=["mixed", "whole"])
+    task = _TaskPort()
+    run = _stop_parity_run(
+        tree, [0.0], task=task, group_ids=("branch_whole", "child_only", "mixed", "whole"),
+    )
+    nodes = run._authored_nodes  # noqa: SLF001
+    assert {
+        key for key, node in nodes.items()
+        if isinstance(node, OperatorMotionStopPolicy)
+    } == {"a_inherited_hold", "e_default_leaf", "f_explicit_hold", "z_root"}
+    state = run._operator_stop_state  # noqa: SLF001
+    state.publish(OperatorMotionStopSnapshot(1, selected))
+    assert run.tick_once() is (
+        py_trees.common.Status.FAILURE if child_runs else py_trees.common.Status.RUNNING
+    ), selection_id
+    assert nodes["b_explicit_continue"].status is (
+        py_trees.common.Status.SUCCESS if child_runs else py_trees.common.Status.INVALID
+    )
+    # The inverter turns e's real successful command into Failure, so f is
+    # correctly not reached; no successor is manufactured for the matrix.
+    assert [identity.node_instance_id for _, identity, _ in task.starts] == (
+        ["b_explicit_continue", "e_default_leaf"] if child_runs else []
+    ), selection_id
+    assert all(node_id == "gripper.command_position" for node_id, _, _ in task.starts)
+    assert state.snapshot().held_nodes == selected
+
+
+def test_behavior_stop_policy_oracle_for_inherited_leaf_root_default() -> None:
+    # Root inherit resolves Continue for this actual catalog gripper leaf.
+    task = _TaskPort()
+    run = _stop_parity_run(
+        _stop_parity_node("root", "gripper.command_position"), [0.0],
+        task=task, group_ids=(),
+    )
+    node = run._authored_nodes["root"]  # noqa: SLF001
+    assert not isinstance(node, OperatorMotionStopPolicy)
+    state = run._operator_stop_state  # noqa: SLF001
+    state.publish(OperatorMotionStopSnapshot(1, frozenset({"root"})))
+    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert [identity.node_instance_id for _, identity, _ in task.starts] == ["root"]
+    assert task.starts[0][0] == "gripper.command_position"
+    assert state.snapshot().held_nodes == frozenset({"root"})
+
+
+# DX825/827/838 source-only tests. The original pre-oracle bodies and four
+# oracle selectors remain; D approved the narrow policy matrix refinement above.
+# These use actual Behavior runs
+# with Python fake owner observations; they are not Kernel/backend proof.
+def _program_dwell_run(now, *, dwell=2.0, mode=None, policy="hold", task=None):
+    document = _minimal_document()
+    document["target_roles"]["gripper"] = {
+        "component_role": "robot",
+        "required_capabilities": [
+            {"capability_id": capability, "parameters": {}, "disposition": "required"}
+            for capability in ("tool.gripper.command", "tool.gripper.feedback")
+        ],
+    }
+    parameters = {"target_role": "gripper", "position": {"kind": "linear_m", "value_m": 0.008}}
+    if mode is not None:
+        parameters["dwell_while_held"] = mode
+    document["tree"] = {"node_id": "gripper.command_position", "instance_id": "command",
+                        "parameters": parameters, "operator_stop_policy": policy, "children": []}
+    program = Program.from_dict(_identified(document), _catalog())
+    task = task or _TaskPort((OwnerTaskState.ACTIVE, OwnerTaskState.SUCCEEDED))
+    task.metadata = {"gripper_actuation_kind": "pneumatic", "gripper_dwell_s": dwell}
+    clock = ProgramClock(lambda: now[0])
+    run = ExecutableProgramRun(program=program, environment=build_node_environment(),
+        capture=_capture(program), readiness=_readiness(_DIGEST_A),
+        ports=NodeAdapterPorts(kernel_operations=task), program_clock=clock)
+    return run, task, clock
+
+
+def test_pneumatic_program_dwell_starts_at_first_observed_success_and_ack_once():
+    now = [100.0]
+    run, task, _clock = _program_dwell_run(now)
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    now[0] = 150.0  # Enqueue/active time is never backdated into dwell.
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    leaf = _leaf_node(run, "command")
+    assert leaf.cached_control_state() == "settled"
+    assert not leaf.has_active_task
+    now[0] = 151.9
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    now[0] = 152.0
+    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert len(task.starts) == len(task.acknowledgements) == 1
+    assert task.cancellations == []
+
+
+@pytest.mark.parametrize("mode", [None, "pause", "count"])
+@pytest.mark.parametrize("policy", ["hold", "continue"])
+def test_pneumatic_program_dwell_uses_timer_hold_and_continue_rules(mode, policy):
+    now = [100.0]
+    run, task, _clock = _program_dwell_run(now, mode=mode, policy=policy)
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    assert run.tick_once() is py_trees.common.Status.RUNNING  # Delivery at 100.
+    state = run._operator_stop_state
+    now[0] = 100.5
+    state.publish(OperatorMotionStopSnapshot(1, frozenset({"command"})))
+    now[0] = 105.0
+    result = run.tick_once()
+    if policy == "continue":
+        assert result is py_trees.common.Status.SUCCESS
+    else:
+        assert result is py_trees.common.Status.RUNNING
+        assert _leaf_node(run, "command").status is py_trees.common.Status.RUNNING
+        state.publish(OperatorMotionStopSnapshot(2))
+        if mode == "count":
+            assert run.tick_once() is py_trees.common.Status.SUCCESS
+        else:
+            now[0] = 106.4
+            assert run.tick_once() is py_trees.common.Status.RUNNING
+            now[0] = 106.5
+            assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert len(task.starts) == len(task.acknowledgements) == 1
+
+
+@pytest.mark.parametrize("ack_at", [101.0, 105.0])
+def test_pneumatic_program_dwell_overlaps_pending_ack_and_halt(ack_at):
+    now = [100.0]
+    class DelayedAck(_TaskPort):
+        def __init__(self):
+            super().__init__((OwnerTaskState.SUCCEEDED,))
+            self.allow_ack = False
+            self.ack_attempts = 0
+        def acknowledge(self, task_id, identity):
+            self.ack_attempts += 1
+            if not self.allow_ack:
+                raise OwnerTaskSettlementPendingError("actual cleanup pending")
+            super().acknowledge(task_id, identity)
+    task = DelayedAck()
+    run, task, clock = _program_dwell_run(now, task=task)
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    clock.freeze()
+    now[0] = 200.0
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    clock.resume()
+    now[0] += ack_at - 100.0
+    task.allow_ack = True
+    result = run.tick_once()
+    assert result is (py_trees.common.Status.SUCCESS if ack_at >= 102.0 else py_trees.common.Status.RUNNING)
+    if ack_at < 102.0:
+        now[0] = 202.0
+        assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert len(task.starts) == len(task.acknowledgements) == 1
+    attempts = task.ack_attempts
+    assert _leaf_node(run, "command").cached_control_state() == "settled"
+    assert task.ack_attempts == attempts
+
+
+@pytest.mark.parametrize("dwell", [0.0, 2.0])
+def test_pneumatic_program_dwell_zero_and_final_delivery_failure(dwell):
+    now = [100.0]
+    run, task, _clock = _program_dwell_run(now, dwell=dwell)
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    assert run.tick_once() is (py_trees.common.Status.SUCCESS if dwell == 0 else py_trees.common.Status.RUNNING)
+    failed = _TaskPort((OwnerTaskState.FAILED,))
+    run, failed, _clock = _program_dwell_run(now, dwell=dwell, task=failed)
+    assert run.tick_once() is py_trees.common.Status.FAILURE
+    assert failed.acknowledgements == []
+
+
+def test_position_command_keeps_owner_success_without_program_dwell():
+    now = [100.0]
+    run, task, _clock = _program_dwell_run(now)
+    task.metadata = {"gripper_actuation_kind": "position_commanded", "gripper_dwell_s": None}
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert len(task.acknowledgements) == 1
+
+
+def test_program_stop_invalidates_dwell_and_retry_has_fresh_attempt():
+    now = [100.0]
+    run, task, _clock = _program_dwell_run(now)
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    leaf = _leaf_node(run, "command")
+    original = leaf.attempt_identity
+    leaf.stop(py_trees.common.Status.INVALID)
+    assert task.cancellations == []  # Already delivered/ACKed owner has no effect to cancel.
+    now[0] = 200.0
+    assert _tick(leaf) is py_trees.common.Status.RUNNING
+    assert leaf.attempt_identity != original
+    assert len(task.starts) == 2
+    now[0] = 202.0
+    assert _tick(leaf) is py_trees.common.Status.SUCCESS
+    assert len(task.acknowledgements) == 2

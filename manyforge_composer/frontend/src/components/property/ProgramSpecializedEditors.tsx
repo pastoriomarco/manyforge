@@ -1148,6 +1148,7 @@ function CoordinateEditor({
 }) {
   const kinds = enumStrings(schema.properties?.kind);
   const kind = typeof value.kind === 'string' ? value.kind : kinds[0] ?? '';
+  const presetNames = enumStrings(schema.properties?.name);
   const valueField = kind === 'angular_rad'
     ? 'value_rad'
     : kind === 'linear_m'
@@ -1159,7 +1160,9 @@ function CoordinateEditor({
   return (
     <div className="program-specialized-editor" data-editor="gripper-coordinate">
       <p className="program-form-hint">
-        Program authoring stores only the catalog coordinate kind and value; live gripper range, presets, and direct control are unavailable here.
+        {kinds.includes('named_preset')
+          ? 'Program stores a coordinate value or preset name. Preset names resolve against the bound gripper when the node runs.'
+          : 'Program authoring stores only the catalog coordinate kind and value; live gripper range, presets, and direct control are unavailable here.'}
       </p>
       <label>
         Coordinate kind
@@ -1177,14 +1180,29 @@ function CoordinateEditor({
           ))}
         </select>
       </label>
-      <NumberField
+      {kind === 'named_preset' ? (
+        <label>
+          Preset
+          <select
+            aria-label="Gripper preset"
+            value={typeof value.name === 'string' ? value.name : presetNames[0] ?? ''}
+            disabled={disabled}
+            onChange={(event) => {
+              const next = completeCoordinateKindTransition(schema, kind, event.target.value);
+              if (next) onCommit(next);
+            }}
+          >
+            {presetNames.map((name) => <option key={name} value={name}>{name}</option>)}
+          </select>
+        </label>
+      ) : <NumberField
         label={`Value (${units})`}
         value={typeof value[valueField] === 'number' ? value[valueField] as number : 0}
         disabled={disabled}
         path={path === undefined ? undefined : `${path}.${valueField}`}
         schema={schema.properties?.[valueField] ?? NUMBER_SCHEMA}
         onCommit={(next) => onCommit({ kind, [valueField]: next })}
-      />
+      />}
     </div>
   );
 }
@@ -1192,7 +1210,16 @@ function CoordinateEditor({
 export function completeCoordinateKindTransition(
   schema: CatalogJsonSchema,
   kind: string,
+  presetName?: string,
 ): JsonObject | undefined {
+  if (kind === 'named_preset') {
+    const name = presetName ?? enumStrings(schema.properties?.name)[0];
+    if (name === undefined) return undefined;
+    const candidate: JsonObject = { kind, name };
+    return firstCatalogSchemaValidationMessage(schema, candidate, 'coordinate')
+      ? undefined
+      : candidate;
+  }
   const valueField = kind === 'angular_rad'
     ? 'value_rad'
     : kind === 'linear_m'

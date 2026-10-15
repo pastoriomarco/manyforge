@@ -21,6 +21,7 @@
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_focused_adapters.hpp>
 #include <manyforge_roboplan/retained_gripper_position_limits.hpp>
+#include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
 #include <manyforge_roboplan/retained_stop_surveillance_owner.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 #include <memory>
@@ -28,6 +29,7 @@
 #include <optional>
 #include <roboplan/core/scene.hpp>
 #include <utility>
+#include <span>
 #include <vector>
 
 namespace manyforge::core {
@@ -35,6 +37,7 @@ class GripperParticipantEngine;
 }
 
 namespace manyforge::roboplan_backend {
+class RetainedNativeGripperRoutePublicationOwner;
 
 class RetainedNativeCellRuntime;
 class RetainedNativeGripperRuntime;
@@ -107,13 +110,6 @@ using RetainedRuntimeBackendFactory = std::function<RetainedRuntimeBackendSet(
 using RetainedReferenceResolverFactory =
     std::function<std::shared_ptr<core::IReferencePoseResolver>(
         const std::vector<std::shared_ptr<RetainedObservedStateChannel>> &)>;
-
-/// Prepared leases for the existing runtime's exact measured route association.
-/// The callback enables the actual prepared producer and must not throw.
-struct RetainedPreparedRobotMeasuredSources final {
-  core::RobotMeasuredStateSourceView source_view;
-  std::function<void()> enable_publication;
-};
 
 /// A successful null payload is source absence, not a route-publication error.
 /// Err is reserved for invalid/failed preparation and exact association errors;
@@ -480,6 +476,17 @@ struct RetainedNativeRuntime final
   /// subordinate to any motion component.
   std::vector<std::shared_ptr<RetainedNativeGripperRuntime>>
       independent_gripper_peers;
+  /// Existing installed peer inventory, updated under the same route mutex.
+  /// The weak self alias supplies lifetime only, never a second inventory.
+  // The actual host installation borrows the process-stable cell Kernel and
+  // journal here; component retirement never owns/destroys that borrowed Kernel.
+  void BindCellRuntimeOwner(RetainedNativeCellRuntime& cell,
+                            const std::string& runtime_epoch,
+                            const std::string& cell_id);
+
+  void BindIndependentGripperPeers(
+      const std::shared_ptr<RetainedNativeRuntime>& root,
+      std::vector<std::shared_ptr<RetainedNativeGripperRuntime>> peers);
   /// Non-owning stable cell authority for managed component compositions.
   RetainedNativeCellRuntime *cell_runtime_owner{};
 
@@ -555,6 +562,10 @@ struct RetainedNativeRuntime final
       const std::shared_ptr<RetainedNativeRuntime> &owning_runtime) const;
 
 private:
+  friend class RetainedNativeGripperRoutePublicationOwner;
+  [[nodiscard]] core::Result<std::shared_ptr<RetainedNativeGripperRoutePublicationOwner>>
+  CurrentIndependentGripperRouteOwner(const core::ControlDomainId& domain) const;
+  std::weak_ptr<RetainedNativeRuntime> installed_self_;
   friend core::Result<void> reseal_retained_native_runtime_for_apply(
       RetainedNativeRuntime &runtime,
       RetainedNativeRuntimeResealInput input);

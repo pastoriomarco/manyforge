@@ -1,11 +1,10 @@
 # Controlled Stop — Internals Reference
 
-> **Current `dev` status:** I8/P5 is implemented in the maintained native
-> product. The addressed `ResourceAddressedExecutionKernel` is its sole Stop
-> owner. The ROS-free contracts and ros2_control adapter build surface are
-> current, but Isaac, ros2_control product launch, and real-robot operation
-> still require their I9/I10 gates. Historical adapter details below are kept
-> only where they remain algorithm or transport qualification input.
+> **Current `dev` status:** `ResourceAddressedExecutionKernel` is the sole
+> product Stop owner; the ROS controller adapters realize participant commands.
+> The native simulator is removed. Mock Phase A `qualified-live02` is current
+> focused live evidence, not Isaac or physical Stop/rest qualification. Historical
+> native transport details below remain algorithm or qualification references.
 
 Reference companion to [`operations/STOP_PROFILES.md`](../operations/STOP_PROFILES.md).
 This document describes the current I8 owner and the retained transport
@@ -184,7 +183,7 @@ identity from fresh state; it never resumes stale controller trajectory state.
 
 `plan_soft_on_path_stop(...)` is side-effect-free and returns a
 `SoftOnPathStopPlanDTO` containing the replacement trajectory plus structured
-diagnostics. It is used by both the ros2_control and native lanes.
+diagnostics. It is used by the ROS execution path; native-lane evidence is historical.
 
 Inputs:
 

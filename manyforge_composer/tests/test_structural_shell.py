@@ -52,13 +52,23 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     payload = catalog.json()
     assert len(payload["entries"]) == 49
     assert payload["apiVersion"] == "manyforge.node_catalog.v2"
-    assert payload["contentVersion"] == "2.4.0"
+    assert payload["contentVersion"] == "2.5.0"
     assert payload["catalogId"] == "manyforge_builtin"
     assert payload["catalogDigest"].startswith("sha256:")
     assert payload["environmentDigest"].startswith("sha256:")
     assert "generation" not in payload
     assert "sources" not in payload
     assert "effectiveCatalogHash" not in payload
+    gripper = next(entry for entry in payload["entries"] if entry["id"] == "gripper.command_position")
+    dwell = next(parameter for parameter in gripper["parameters"] if parameter["id"] == "dwell_while_held")
+    assert dwell["required"] is False
+    assert dwell["hasDefault"] is True
+    assert dwell["default"] == "pause"
+    assert dwell["schema"] == {"type": "string", "enum": ["count", "pause"]}
+    duration = next(parameter for parameter in gripper["parameters"] if parameter["id"] == "command_duration_s")
+    assert duration["required"] is False
+    assert duration["hasDefault"] is False
+    assert duration["schema"]["minimum"] == 0.0
     sequence = next(entry for entry in payload["entries"] if entry["id"] == "sequence")
     assert sequence["execution"] == {
         "blocking": False,

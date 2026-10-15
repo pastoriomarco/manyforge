@@ -638,6 +638,7 @@ def _assistant_stack(
     metadata_environment: str = "MANYFORGE_ASSISTANT_NATIVE_METADATA",
     package_environment: str = "MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT",
     startup_scenario: str | None = None,
+    cell_id: str = "i6_lite6_arm_gripper_aggregate_cell",
 ) -> Iterator[ProcessStack]:
     selected_package_root = package_root or _required_path(package_environment)
     retained_programs = sorted((selected_package_root / "programs" / "sha256").glob("*.json"))
@@ -645,7 +646,7 @@ def _assistant_stack(
     stack = ProcessStack(
         root,
         package_root=selected_package_root,
-        cell_id="i6_lite6_arm_gripper_aggregate_cell",
+        cell_id=cell_id,
         program_path=retained_programs[0],
         freshness_milliseconds=120000,
         enable_program_runner=True,
@@ -1483,3 +1484,478 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             )
             assert unavailable["ok"] is False
             assert unavailable["error"]["code"] == "deployment_candidate_rejected"
+
+
+def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled_command() -> None:
+    from tempfile import TemporaryDirectory
+    from typing import Any
+    import math
+    import sqlite3
+
+    from manyforge_headless_api.cclc import CCLCOpenRequestClient
+    from manyforge_headless_api.cell_admission import CellAdmissionClient
+    from manyforge_headless_api.execution import ExecutionCommandClient
+    from manyforge_headless_api.models import OperationIntentRequest, StopIntentRequest
+    from manyforge_roboplan.test.test_native_execution_path import (
+        TERMINAL_STATES, _direct_control_gripper_operation,
+        _status_target, _status_observation, _submit_native_cclc_lifecycle,
+    )
+
+    package = _required_path("MANYFORGE_ROBOTIQ_POSITION_PACKAGE_ROOT")
+    metadata = json.loads(_required_path("MANYFORGE_ROBOTIQ_POSITION_METADATA").read_text("utf-8"))
+    bundle = json.loads((package / "retained-bundles" / "sha256" /
+        (metadata["physical_candidate_retained_bundle_id"].removeprefix("sha256:") +
+         ".json")).read_text("utf-8"))
+    assert bundle["retained_bundle_id"] == metadata["physical_candidate_retained_bundle_id"]
+    graph = bundle["cell_graph"]
+    assert graph["graph_revision"] == metadata["physical_graph_revision"]
+    assert len(graph["controllable_components"]) == 1
+    bindings = {row["capability_id"]: row for row in graph["control_bindings"]}
+    assert len(bindings) == len(graph["control_bindings"])
+    assert set(bindings) == {"tool.gripper.command", "tool.gripper.feedback"}
+    command_binding = bindings["tool.gripper.command"]
+    feedback_binding = bindings["tool.gripper.feedback"]
+    alias_identity_fields = {"control_binding_id", "control_binding_revision",
+                             "capability_id", "capability_definition_revision"}
+    assert {key: value for key, value in command_binding.items()
+            if key not in alias_identity_fields} == {
+        key: value for key, value in feedback_binding.items()
+        if key not in alias_identity_fields
+    }
+    assert len(command_binding["resource_bindings"]) == 1
+    component_id = command_binding["controllable_component_id"]
+    expected_domain_ids = sorted({row["control_domain_id"] for row in bindings.values()})
+    assert expected_domain_ids == sorted(row["control_domain_id"] for row in graph["control_domains"])
+    assert len(graph["runtime_units"]) == 1
+    configuration = graph["runtime_units"][0]["configuration"]
+    assert configuration["controller_profiles"] == [{
+        "controllable_component_id": component_id, "frame_prefix": "",
+        "mock_profile": "ur5e_robotiq_2f_85",
+    }]
+    assert configuration["initial_joint_positions_rad"] == []
+    assert configuration["motion_target_limits"] == []
+    assert len(configuration["gripper_target_configurations"]) == 1
+    authored_target = configuration["gripper_target_configurations"][0]
+    assert authored_target["controllable_component_id"] == component_id
+    assert authored_target["command_target_id"] == command_binding["command_target_id"]
+    assert authored_target["actuation_kind"] == "position_commanded"
+    assert authored_target["output_mode"] == "commanded"
+
+    def position_target(snapshot: dict[str, Any]) -> dict[str, Any]:
+        assert snapshot["control_state"]["runtime_scale_control"] is None
+        assert snapshot["identity"]["retained_bundle_id"] == metadata["physical_candidate_retained_bundle_id"]
+        assert snapshot["identity"]["graph_revision"] == metadata["physical_graph_revision"]
+        components = snapshot["targets"]["components"]
+        assert len(components) == 1
+        component = components[0]
+        assert component["controllable_component_id"] == command_binding["controllable_component_id"]
+        rows = component["targets"]
+        targets = {row["operation_capability_id"]: row for row in rows}
+        assert len(targets) == len(rows)
+        assert set(targets) == {"tool.gripper.command", "tool.gripper.feedback"}
+        target = targets["tool.gripper.command"]
+        feedback = targets["tool.gripper.feedback"]
+        assert target["presentation"] == "gripper" and target["command"] is not None
+        assert feedback["presentation"] == "unsupported" and feedback["command"] is None
+        assert target["command_target_id"] == feedback["command_target_id"] == (
+            command_binding["command_target_id"]
+        )
+        assert _status_target(snapshot, presentation="gripper") == (component, target)
+        # Raw target inventory retains the feedback alias; the sole numeric
+        # observation still belongs to the actual direct command channel.
+        assert [(row["controllable_component_id"], row["command_target_id"],
+                 row["operation_capability_id"])
+                for row in snapshot["control_state"]["observed_targets"]] == [
+            (component["controllable_component_id"], target["command_target_id"],
+             "tool.gripper.command")
+        ]
+        descriptor = target["command"]["target_descriptor"]
+        resource = target["command"]["resource"]
+        path = descriptor["contracts"]["control_path"]
+        assert all(path[key] == command_binding[key] for key in path)
+        assert descriptor["schema_version"] == (
+            "manyforge.manual_control_gripper_descriptor.v3"
+        )
+        assert descriptor["actuation_kind"] == "position_commanded"
+        assert descriptor["output_mode"] == "commanded"
+        assert descriptor["completion_policy"] == "goal_fenced_target_reached"
+        assert descriptor["grasp_confirmation_policy"] == "binding_feedback_required"
+        assert descriptor["command_duration_s"] == pytest.approx(
+            authored_target["command_duration_s"]
+        )
+        assert descriptor["controllable_component_id"] == (
+            component["controllable_component_id"]
+        )
+        assert descriptor["command_target_id"] == target["command_target_id"]
+        for key in ("source_coordinate_name", "coordinate_kind", "min_position", "max_position"):
+            assert descriptor[key] == resource[key]
+        assert descriptor["source_coordinate_name"] == "robotiq_85_left_knuckle_joint"
+        assert descriptor["coordinate_kind"] == "angular_rad"
+        assert descriptor["min_position"] == pytest.approx(0.0)
+        assert descriptor["max_position"] == pytest.approx(0.8)
+        observed = _status_observation(snapshot, presentation="gripper")
+        assert observed["kind"] == "coordinate"
+        assert observed["complete"] is True
+        assert observed["source_coordinate_name"] == descriptor["source_coordinate_name"]
+        assert observed["source_epoch"] and not observed["source_epoch"].startswith("render.")
+        assert type(observed["sequence"]) is int and observed["sequence"] > 0
+        assert observed["position"]["kind"] == "angular_rad"
+        assert math.isfinite(observed["position"]["value_rad"])
+        return target
+
+    def preset_position(target: dict[str, Any], reference: str) -> float:
+        descriptor = target["command"]["target_descriptor"]
+        presets = [preset for preset in descriptor["named_presets"]
+                   if preset["name"] == descriptor[reference]]
+        assert len(presets) == 1
+        position = presets[0]["master_position"]
+        assert math.isfinite(position)
+        assert descriptor["min_position"] <= position <= descriptor["max_position"]
+        return position
+
+    def opposite_position(snapshot: dict[str, Any], target: dict[str, Any]) -> float:
+        observed = _status_observation(snapshot, presentation="gripper")
+        candidates = [preset_position(target, key)
+                      for key in ("open_state_ref", "closed_state_ref")]
+        assert candidates[0] != candidates[1]
+        return max(candidates, key=lambda value: abs(value - observed["position"]["value_rad"]))
+
+    def observed_reached(before: dict[str, Any], goal: float) -> None:
+        initial = _status_observation(before, presentation="gripper")
+        deadline = time.monotonic() + 5.0
+        while True:
+            current = client.diagnostics()["status"]
+            position_target(current)
+            assert current["identity"] == before["identity"]
+            observed = _status_observation(current, presentation="gripper")
+            assert observed["source_epoch"] == initial["source_epoch"]
+            if (observed["sequence"] > initial["sequence"] and
+                    observed["position"]["value_rad"] == pytest.approx(goal)):
+                return
+            assert time.monotonic() < deadline, current
+            time.sleep(0.005)
+
+    def completed_and_retired(
+        operation_id: str, allowed_states: frozenset[str] | set[str] = frozenset({"completed"}),
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + 5.0
+        first_terminal = None
+        while True:
+            projection = client.read(operation_id)
+            operation = projection["operation"]
+            assert operation["participants"][0]["resources"]
+            if operation["state"] in TERMINAL_STATES:
+                if first_terminal is None:
+                    first_terminal = operation["state"]
+                assert operation["state"] == first_terminal, projection
+                assert first_terminal in allowed_states, projection
+            else:
+                # The real command can finish before its first read. Never
+                # invent an Executing window or physical feedback evidence.
+                assert projection["resident"] is True, projection
+            if projection["resident"] is False:
+                break
+            assert time.monotonic() < deadline, projection
+            time.sleep(0.005)
+        expected_control = "reset" if operation["state"] == "stopped" else "acknowledge_completed"
+        assert projection["last_control"]["control"] == expected_control
+        assert projection["last_control"]["operation_id"] == operation_id
+        assert operation["operation_revision"] == projection["last_control"][
+            "operation_revision_after_acceptance"
+        ]
+        # The bounded journal coalesces earlier state observations. Its control
+        # acceptance captures the already clean terminal state and exact CAS;
+        # a separate retained terminal row is not required before Reset/ACK.
+        with sqlite3.connect(state_root / "operation-journal.sqlite3") as database:
+            records = [json.loads(row[0]) for row in database.execute(
+                "SELECT payload_json FROM journal_records "
+                "WHERE operation_id=? ORDER BY sequence", (operation_id,),
+            )]
+        admissions = [(index, record) for index, record in enumerate(records)
+                      if record.get("record_kind") == "operation_accepted"]
+        controls = [(index, record) for index, record in enumerate(records)
+                    if record.get("record_kind") == "control_accepted"]
+        assert len(admissions) == len(controls) == 1
+        admission_index, admission = admissions[0]
+        control_index, control = controls[0]
+        assert admission_index < control_index
+        accepted_state = admission["operation_state"]
+        terminal_state = control["operation_state"]
+        assert first_terminal == terminal_state["state"] == operation["state"]
+        assert terminal_state["state"] in allowed_states
+        assert terminal_state["operation_id"] == operation_id
+        assert int(terminal_state["journal_capture_order"]) > int(
+            accepted_state["journal_capture_order"]
+        )
+        owner_epoch = control["owner_epoch"]
+        assert owner_epoch == admission["owner_epoch"]
+        intent = control["intent"]
+        context = intent["request_context"]
+        assert context["source_label"] == "kernel.manual_settlement"
+        assert context["request_owner_epoch"] == owner_epoch
+        assert context["correlation_id"] == intent["operation_id"] == operation_id
+        assert intent["request_attribution"]["transport"] == "internal"
+        accepted = control["result"]
+        assert accepted["request_id"] == context["request_id"]
+        assert accepted["replay_status"] == "accepted_new"
+        assert accepted["control"] == expected_control
+        assert accepted["operation_id"] == operation_id
+        assert accepted["accepted_against_revision"] == intent["expected_operation_revision"]
+        assert accepted["operation_revision_after_acceptance"] == (
+            accepted["accepted_against_revision"] + 1
+        )
+        assert terminal_state["operation_revision"] == operation["operation_revision"] == (
+            accepted["operation_revision_after_acceptance"]
+        )
+        assert terminal_state["updated_at_ns"] == accepted["accepted_at_ns"]
+        assert accepted == projection["last_control"]
+        # effect_pending is a durable acceptance flag, not evidence of movement.
+        # Position ACK has no provider effect; normal Stopped Reset retains its
+        # existing scoped invalidation/authorization and retirement contract.
+        assert admission["effect_pending"] is True and control["effect_pending"] is True
+        identity_fields = (
+            "participant_id", "controller_goal_id", "controller_goal_generation",
+            "controllable_component_id", "command_target_id", "capability_id",
+            "control_domain_id", "control_domain_revision", "control_binding_id",
+            "control_binding_revision", "capability_provider_binding_id",
+            "capability_provider_binding_revision", "payload_kind", "resources",
+        )
+        assert len(accepted_state["participants"]) == len(operation["participants"]) == 1
+        owner = accepted_state["participants"][0]
+        assert owner["resources"] == [row["resource_id"]
+                                      for row in command_binding["resource_bindings"]]
+        for key in ("controllable_component_id", "command_target_id", "control_domain_id",
+                    "control_binding_id", "control_binding_revision"):
+            assert owner[key] == command_binding[key]
+        assert owner["capability_id"] == command_binding["capability_id"]
+        for record in records:
+            if "operation_state" not in record:
+                continue
+            state = record["operation_state"]
+            assert record["owner_epoch"] == owner_epoch
+            assert state["operation_id"] == operation_id
+            for key in ("program_binding_id", "program_run_id"):
+                assert state[key] == accepted_state[key] == operation[key]
+            assert len(state["participants"]) == 1
+            assert all(state["participants"][0][key] == owner[key] for key in identity_fields)
+            if state["state"] in TERMINAL_STATES:
+                assert state["state"] == first_terminal
+        assert all(operation["participants"][0][key] == owner[key] for key in identity_fields)
+        assert len(terminal_state["participants"]) == 1
+        assert terminal_state["participants"][0]["state"] == first_terminal
+        assert terminal_state["participants"][0]["terminal_error"] is None
+        assert operation["participants"][0]["terminal_error"] is None
+        assert CellAdmissionClient(run_root).get()["authoring_allowed"] is True
+        return projection
+
+    def lifecycle(intent_kind: str, request_id: str) -> dict[str, Any]:
+        if intent_kind in {"prepare", "enable"}:
+            deadline = time.monotonic() + 10.0
+            while True:
+                current = CCLCOpenRequestClient(run_root).component_snapshot(component_id)
+                assert current["retained_bundle_id"] == metadata["physical_candidate_retained_bundle_id"]
+                assert current["graph_revision"] == metadata["physical_graph_revision"]
+                assert sorted(row["control_domain_id"] for row in current["domains"]) == expected_domain_ids
+                readiness = current["readiness"]
+                if readiness["next_intent"] == intent_kind and readiness["ready"] is True:
+                    break
+                assert time.monotonic() < deadline, current
+                time.sleep(0.01)
+        return _submit_native_cclc_lifecycle(
+            run_root, intent_kind=intent_kind, request_id=request_id,
+            component_id=component_id,
+        )
+
+    # Reuse the existing Manager fixture's private preview/public Apply,
+    # Program Runner liveness, immutable artifacts and normal ProcessStack owner.
+    with TemporaryDirectory(prefix="mf-robotiq-") as temporary:
+        owner_root = Path(temporary)
+        try:
+            with _assistant_stack(
+                owner_root, package_root=package,
+                metadata_environment="MANYFORGE_ROBOTIQ_POSITION_METADATA",
+                package_environment="MANYFORGE_ROBOTIQ_POSITION_PACKAGE_ROOT",
+                startup_scenario="program_apply_fixture", cell_id=metadata["cell_id"],
+            ) as stack:
+                assert stack.fixture_metadata is not None
+                assert all(stack.fixture_metadata[key] == value for key, value in metadata.items())
+                state_root, run_root = stack.execution_state_root, stack.execution_run_root
+                client = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+                lifecycle("prepare", "robotiq.initial.prepare")
+                lifecycle("enable", "robotiq.initial.enable")
+                status = client.diagnostics()["status"]
+                target = position_target(status)
+                goal = opposite_position(status, target)
+                request = OperationIntentRequest.model_validate(
+                    _direct_control_gripper_operation(
+                        status, request_id="gripper-only.command", position=goal
+                    )
+                )
+                before_preview_events = client.events(status["identity"]["owner_epoch"], 0)["events"]
+                preview = client.preview_capability_command(request, trusted_principal_id=None)
+                assert preview["ok"] is True, preview
+                receipt = preview["preview_receipt"]
+                assert receipt["commit_eligible"] is True
+                assert receipt["target_position"] == pytest.approx(goal)
+                assert receipt["program_binding_id"] == target["command"]["manual_control"][
+                    "program_binding_id"
+                ]
+                assert receipt["request_owner_epoch"] == status["identity"]["owner_epoch"]
+                assert receipt["source_coordinate_name"] == target["command"]["resource"][
+                    "source_coordinate_name"
+                ]
+                assert receipt["coordinate_kind"] == target["command"]["resource"]["coordinate_kind"]
+                assert client.events(status["identity"]["owner_epoch"], 0)["events"] == before_preview_events
+                after_preview = client.diagnostics()["status"]
+                assert after_preview["identity"] == status["identity"]
+                assert position_target(after_preview)["command"] == target["command"]
+                initial_observed = _status_observation(status, presentation="gripper")
+                preview_observed = _status_observation(after_preview, presentation="gripper")
+                assert preview_observed["source_epoch"] == initial_observed["source_epoch"]
+                assert preview_observed["position"] == initial_observed["position"]
+                assert after_preview["control_state"]["manual_operations"] == status[
+                    "control_state"
+                ]["manual_operations"]
+                accepted = client.submit(request, trusted_principal_id=None)
+                assert accepted["ok"] is True, accepted
+                completed_and_retired(accepted["accepted"]["operation_id"])
+                observed_reached(status, goal)
+
+                # Addressed Position Stop uses this exact known operation. A natural
+                # completion race is not in-flight Stop proof or a cell-wide FullStop.
+                current = client.diagnostics()["status"]
+                target = position_target(current)
+                stop_intent = _direct_control_gripper_operation(
+                    current, request_id="gripper-only.stop-command",
+                    position=opposite_position(current, target),
+                )
+                stop_intent["participants"][0]["payload"]["caller_options"][0]["value_s"] = 2.0
+                started = client.submit(
+                    OperationIntentRequest.model_validate(stop_intent), trusted_principal_id=None,
+                )
+                assert started["ok"] is True, started
+                before_stop = client.read(started["accepted"]["operation_id"])
+                assert before_stop["operation"]["state"] not in TERMINAL_STATES or (
+                    before_stop["operation"]["state"] == "completed"
+                ), before_stop
+                stopped = client.stop(
+                    StopIntentRequest.model_validate({
+                        "request_context": {
+                            "request_id": "gripper-only.stop",
+                            "request_owner_epoch": current["identity"]["owner_epoch"],
+                            "source_label": "native-gripper-only-test",
+                        },
+                        "operations": [{
+                            "operation_id": started["accepted"]["operation_id"],
+                            "expected_operation_revision": before_stop["operation"]["operation_revision"],
+                            "expected_stop_generation": before_stop["operation"]["active_stop_generation"] or 0,
+                        }],
+                    }),
+                    trusted_principal_id=None,
+                )
+                assert stopped["ok"] is True, stopped
+                resolution = stopped["accepted"]
+                reasons = {"exact": "exact_current_scope",
+                           "stale_but_unambiguously_resolved": "stale_metadata_current_scope",
+                           "already_terminal_no_effect": "known_terminal_or_idle_no_effect"}
+                assert resolution["resolution_disposition"] in reasons, stopped
+                assert resolution["resolution_reason"] == reasons[resolution["resolution_disposition"]]
+                deadline = time.monotonic() + 3.0
+                while True:
+                    after_stop = client.diagnostics()["status"]
+                    stop_action = after_stop["control_state"]["cell_stop_action"]
+                    terminal = stop_action["latest_terminal"]
+                    if terminal is not None and terminal["certificate"]["stop_id"] == (
+                        stopped["accepted"]["stop_id"]
+                    ):
+                        break
+                    assert time.monotonic() < deadline, after_stop
+                    time.sleep(0.005)
+                assert terminal["certificate"]["stop_generation"] == stopped["accepted"]["stop_generation"]
+                # The terminal summary exposes a certificate reference; scope
+                # resolution belongs to the checked Stop acceptance above.
+                assert set(terminal["certificate"]) == {
+                    "stop_certificate_id", "stop_certificate_revision", "stop_id", "stop_generation",
+                }
+                assert terminal["certificate"]["stop_certificate_id"]
+                assert terminal["certificate"]["stop_certificate_revision"] > 0
+                assert terminal["result"] == "succeeded_nominal"
+                assert terminal["escalated"] is False
+                assert terminal["hard_stop_floor_used"] is False
+                assert stop_action["fault"] is None
+                stop_operation_id = started["accepted"]["operation_id"]
+                settled = completed_and_retired(stop_operation_id, {"stopped", "completed"})
+                matching_stages = [stage for stage in terminal["executed_stages"]
+                                   if stage["operation_id"] == stop_operation_id]
+                if settled["operation"]["state"] == "stopped":
+                    assert settled["operation"]["active_stop_id"] == stopped["accepted"]["stop_id"]
+                    assert matching_stages, terminal
+                    assert all(stage["outcome"] == "succeeded" for stage in matching_stages)
+                    # Core's existing clean manual settlement owns the normal Reset.
+                    assert settled["last_control"]["control"] == "reset"
+                else:
+                    observed_reached(current, stop_intent["participants"][0]["payload"][
+                        "command_value"
+                    ]["position"]["value_rad"])
+                    assert settled["last_control"]["control"] == "acknowledge_completed"
+
+                # A real Stopped Position command has now completed normal Reset and
+                # retirement. A naturally Completed command has its ordinary ACK.
+                after_stop = client.diagnostics()["status"]
+                target = position_target(after_stop)
+                continued_goal = opposite_position(after_stop, target)
+                continued = client.submit(
+                    OperationIntentRequest.model_validate(_direct_control_gripper_operation(
+                        after_stop, request_id="gripper-only.command-after-stop",
+                        position=continued_goal,
+                    )), trusted_principal_id=None,
+                )
+                assert continued["ok"] is True, continued
+                completed_and_retired(continued["accepted"]["operation_id"])
+                observed_reached(after_stop, continued_goal)
+
+                disabled = lifecycle(
+                    "disable", "gripper-only.disable",
+                )
+                assert disabled["current_state"] == "disabled", disabled
+                after = client.diagnostics()["status"]
+                target = position_target(after)
+                operations_before_refusal = after["control_state"]["manual_operations"]
+                refused = client.submit(
+                    OperationIntentRequest.model_validate(
+                        _direct_control_gripper_operation(
+                            after, request_id="gripper-only.disabled-command",
+                            position=preset_position(target, "closed_state_ref"),
+                        )
+                    ), trusted_principal_id=None,
+                )
+                assert refused["ok"] is False, refused
+                assert refused["error"]["details"]["reason"] == (
+                    "component_command_not_eligible"
+                ), refused
+                assert client.diagnostics()["status"]["control_state"][
+                    "manual_operations"
+                ] == operations_before_refusal
+                lifecycle(
+                    "prepare", "gripper-only.prepare-again",
+                )
+                lifecycle(
+                    "enable", "gripper-only.enable-again",
+                )
+                enabled = client.diagnostics()["status"]
+                target = position_target(enabled)
+                retried_goal = opposite_position(enabled, target)
+                retried = client.submit(
+                    OperationIntentRequest.model_validate(
+                        _direct_control_gripper_operation(
+                            enabled, request_id="gripper-only.command-after-enable",
+                            position=retried_goal,
+                        )
+                    ), trusted_principal_id=None,
+                )
+                assert retried["ok"] is True, retried
+                completed_and_retired(retried["accepted"]["operation_id"])
+                observed_reached(enabled, retried_goal)
+        except BaseException:
+            keep_failure_evidence(owner_root)
+            raise

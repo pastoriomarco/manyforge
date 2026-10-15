@@ -1,6 +1,7 @@
 #include "activation_deployment_compiler_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "stop_deceleration_coherence_internal.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,8 +22,6 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
-#include <manyforge_deployment/native_domain_topology.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
 namespace manyforge::deployment::detail {
@@ -34,13 +33,12 @@ using Object = CanonicalValue::Object;
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-constexpr std::array<std::string_view, 19U> kNativeArmCapabilities{{
+constexpr std::array<std::string_view, 18U> kRosArmCapabilities{{
     "execution.contact.geometric",
     "execution.contact.geometric_signed_penetration",
     "execution.feedback.phase_events",
     "execution.feedback.state_snapshots",
     "execution.reset",
-    "execution.runtime_scale.operation_scoped",
     "execution.stop.soft",
     "execution.trajectory.execute",
     "model.kinematics.fk",
@@ -59,30 +57,14 @@ constexpr std::array<std::string_view, 4U> kGripperCapabilities{{
     "model.kinematics.fk", "model.limits.joint", "tool.gripper.command",
     "tool.gripper.feedback",
 }};
-constexpr auto kRosArmCapabilities = [] {
-  std::array<std::string_view, kNativeArmCapabilities.size() - 1U> result{};
-  std::size_t index = 0U;
-  for (const auto capability : kNativeArmCapabilities) {
-    if (capability != "execution.runtime_scale.operation_scoped") {
-      result[index++] = capability;
-    }
-  }
-  return result;
-}();
-
 [[nodiscard]] std::span<const std::string_view>
-arm_capabilities(const bool ros2_control) {
-  return ros2_control
-             ? std::span<const std::string_view>(kRosArmCapabilities)
-             : std::span<const std::string_view>(kNativeArmCapabilities);
+arm_capabilities() {
+  return kRosArmCapabilities;
 }
 
 [[nodiscard]] std::string
 component_type_id(const ActivationComponentProfile &profile) {
-  return profile.model_asset_id +
-         (profile.runtime_kind == ActivationRuntimeKind::kRos2Control
-              ? ".fixed_scale.component"
-              : ".component");
+  return profile.model_asset_id + ".fixed_scale.component";
 }
 constexpr std::array<std::string_view, 14U> kCellCapabilities{{
     "collision.query.detailed",
@@ -313,14 +295,8 @@ source_joints(const ActivationComponentProfile &profile,
         {"resource_id", CanonicalValue(coordinate_resource_id(component, target, index))},
     });
   }
-  if (result.empty() && target == "gripper") {
-    result.emplace_back(Object{
-        {"resource_role_id", CanonicalValue("fingers")},
-        {"resource_id", CanonicalValue(std::string(component) +
-                                         ".gripper.logical_position")},
-    });
-  }
-  if (result.empty()) fail(std::string(component) + " has no arm resources");
+  if (result.empty()) fail(std::string(component) + " has no " +
+                           std::string(target) + " resources");
   return CanonicalValue(std::move(result));
 }
 
@@ -409,6 +385,52 @@ struct ComponentProjection final {
   Array bindings;
 };
 
+[[nodiscard]] std::string_view gripper_stop_policy_id(
+    const ActivationDeploymentComponent &component,
+    const CanonicalValue &configuration) {
+  const CanonicalValue *selected = nullptr;
+  for (const auto &row : array(member(configuration, "gripper_target_configurations",
+                                      "runtime configuration"),
+                                "gripper_target_configurations")) {
+    if (text(member(row, "controllable_component_id", "gripper target"),
+             "gripper component") != component.component_id ||
+        text(member(row, "command_target_id", "gripper target"),
+             "gripper target") != "gripper") {
+      continue;
+    }
+    if (selected != nullptr) {
+      fail(component.component_id + " repeats its gripper target configuration");
+    }
+    selected = &row;
+  }
+  if (selected == nullptr) {
+    fail(component.component_id + " has no exact authored gripper target configuration");
+  }
+  const auto &fields = object(*selected, "gripper target configuration");
+  const auto &actuation = text(member(*selected, "actuation_kind", "gripper target"),
+                               "gripper actuation kind");
+  const auto *duration = std::get_if<double>(
+      &member(*selected, "command_duration_s", "gripper target").storage());
+  const auto &output = text(member(*selected, "output_mode", "gripper target"),
+                            "gripper output mode");
+  const auto *timeout = selected->find_object_member("delivery_result_timeout_s");
+  const auto *timeout_seconds =
+      timeout == nullptr ? nullptr : std::get_if<double>(&timeout->storage());
+  if (fields.size() != (timeout == nullptr ? 13U : 14U) || duration == nullptr ||
+      !execution_gripper_command_duration_is_valid(actuation, *duration) ||
+      !ros_gripper_output_mode_is_valid(actuation, output) ||
+      (timeout != nullptr &&
+       (timeout_seconds == nullptr ||
+        !ros_gripper_delivery_result_timeout_is_valid(actuation,
+                                                     *timeout_seconds)))) {
+    fail(component.component_id + " has invalid authored gripper target semantics");
+  }
+  // The normal graph schema and strict applicability decoder verify the
+  // complete row before any retained product or runtime admission is published.
+  return actuation == "pneumatic" ? "manyforge.gripper_logical_cancellation"
+                                 : "manyforge.gripper_position_cancellation";
+}
+
 [[nodiscard]] ComponentProjection project_component(
     const ActivationDeploymentComponent &component,
     const ActivationComponentProfile &profile,
@@ -416,7 +438,7 @@ struct ComponentProjection final {
     std::string_view runtime_unit_id) {
   const bool ros2_control =
       profile.runtime_kind == ActivationRuntimeKind::kRos2Control;
-  const std::string prefix = ros2_control ? "ros2_control" : "native";
+  const std::string prefix = "ros2_control";
   // Authored portable identifiers permit punctuation that cannot name the
   // existing Isaac controller namespace. Refuse it before runtime launch.
   if (ros2_control &&
@@ -427,8 +449,7 @@ struct ComponentProjection final {
       core::CatalogRecordKind::kComponentType, component_type_id(profile));
   const auto &runtime_ref =
       catalog.require(core::CatalogRecordKind::kRuntimeProfile,
-                      ros2_control ? "manyforge.ros2_control_execution_runtime"
-                                   : "manyforge.native_execution_runtime");
+                      "manyforge.ros2_control_execution_runtime");
   static_cast<void>(runtime_ref);
   static_cast<void>(catalog.require(core::CatalogRecordKind::kModelAsset,
                                     profile.model_asset_id));
@@ -521,6 +542,9 @@ struct ComponentProjection final {
   Array bindings;
   for (const std::string_view target : {std::string_view("arm"),
                                         std::string_view("gripper")}) {
+    // DX783: arm-only models expose no synthetic gripper target or resource.
+    if (target == "gripper" && source_joints(profile, "fingers").empty())
+      continue;
     const std::string contract_id = std::string("manyforge.") + prefix + "_" +
                                     std::string(target) + "_position";
     const std::string topology_id = std::string("manyforge.") + prefix + "_" +
@@ -532,10 +556,8 @@ struct ComponentProjection final {
     const auto &stop = catalog.require(
         core::CatalogRecordKind::kStopEvidencePolicy,
         target == "arm" ? "manyforge.arm_motion_controlled_stop"
-                        : "manyforge.controller_goal_terminal");
-    const std::string provider_id = ros2_control
-                                        ? "manyforge.provider.ros2_control"
-                                        : "manyforge.provider.native_control";
+                        : gripper_stop_policy_id(component, runtime_configuration));
+    const std::string provider_id = "manyforge.provider.ros2_control";
     const auto &provider = catalog.require(
         core::CatalogRecordKind::kProviderManifest, provider_id);
     domains.emplace_back(Object{
@@ -545,15 +567,14 @@ struct ComponentProjection final {
         {"runtime_unit_ids",
          CanonicalValue(Array{CanonicalValue(std::string(runtime_unit_id))})},
         {"control_coordinator_endpoint_role",
-         CanonicalValue(ros2_control ? "ros2_control_execution_status"
-                                     : "native_execution_status")},
+         CanonicalValue("ros2_control_execution_status")},
         {"controller_topology_id", CanonicalValue(topology_id)},
         {"topology_revision", CanonicalValue(revision(topology))},
         {"containment_granularity", CanonicalValue("resource")},
     });
     const std::span<const std::string_view> capabilities =
         target == "arm"
-            ? arm_capabilities(ros2_control)
+            ? arm_capabilities()
             : std::span<const std::string_view>(kGripperCapabilities);
     for (const auto capability : capabilities) {
       const auto capability_selector = selector(catalog, capability);
@@ -606,7 +627,7 @@ struct ComponentProjection final {
               {"provider_instance_id",
                CanonicalValue(
                    component.component_id +
-                   (ros2_control ? ".ros2_control" : ".native_control"))},
+                   (".ros2_control"))},
               {"provider_runtime_unit_id",
                CanonicalValue(std::string(runtime_unit_id))},
               {"provider_manifest_id", CanonicalValue(provider_id)},
@@ -615,10 +636,9 @@ struct ComponentProjection final {
               {"state_authority_id",
                CanonicalValue(component.component_id + "." +
                               std::string(target) +
-                              (ros2_control ? ".commanded_sim_state"
-                                            : ".predicted_state"))},
+                              (".commanded_sim_state"))},
               {"state_authority_class",
-               CanonicalValue(ros2_control ? "commanded" : "predicted")},
+               CanonicalValue("commanded")},
               {"stop_evidence_policy_id",
                CanonicalValue(core::catalog_record_id_value(stop))},
               {"stop_evidence_policy_revision", CanonicalValue(revision(stop))},
@@ -754,6 +774,12 @@ CanonicalValue compile_activation_deployment(
          lacking->component_id + " (profile " + lacking->component_profile_id +
          ") has no ROS controller profile in the catalog");
   }
+  if (!ros2_control) {
+    const auto lacking = lacking_ros_controller_profile();
+    fail("component " + lacking->component_id + " (profile " +
+         lacking->component_profile_id +
+         ") has no ROS controller profile in the catalog");
+  }
   if (ros2_control) {
     if (const auto lacking = lacking_ros_controller_profile();
         lacking != component_profiles.end()) {
@@ -763,10 +789,7 @@ CanonicalValue compile_activation_deployment(
     }
   }
   const std::string runtime_profile_id =
-      ros2_control
-          ? std::string(
-                ros2_control_execution_runtime_contract::kRuntimeProfileId)
-          : std::string(native_execution_runtime_contract::kRuntimeProfileId);
+      std::string(ros2_control_execution_runtime_contract::kRuntimeProfileId);
   const auto &runtime_ref = catalog.require(
       core::CatalogRecordKind::kRuntimeProfile, runtime_profile_id);
   std::vector<QualifiedRuntimeProfile> selected_profiles;
@@ -793,10 +816,7 @@ CanonicalValue compile_activation_deployment(
         parse_strict_json_model_yaml(canonical_json(CanonicalValue(std::move(authored)))), selected_profiles).normalized_authored_root();
   }
   const std::string runtime_id =
-      ros2_control
-          ? std::string(ros2_control_execution_runtime_contract::kCellHostRuntimeUnitId)
-          : std::string(
-                native_execution_runtime_contract::kCellHostRuntimeUnitId);
+      std::string(ros2_control_execution_runtime_contract::kCellHostRuntimeUnitId);
   if (ros2_control) {
     std::map<std::string, std::string> frame_owners;
     bool shared_world_seen = false;
@@ -870,15 +890,11 @@ CanonicalValue compile_activation_deployment(
     // gripper target rows; the ROS runtime schema has no native
     // direct-control field.
     const MergedFields merged_fields =
-        ros2_control ? MergedFields{"initial_joint_positions_rad",
+        MergedFields{"initial_joint_positions_rad",
                                     "motion_target_limits",
                                     "default_fault_stop_profiles",
                                     "gripper_target_configurations",
-                                    "controller_profiles"}
-                     : MergedFields{"initial_joint_positions_rad",
-                                    "motion_target_limits",
-                                    "direct_control_joint_limits",
-                                    "gripper_target_configurations", ""};
+                                    "controller_profiles"};
     for (const std::string_view name : merged_fields) {
       if (name.empty()) continue;
       Array combined;
@@ -956,15 +972,6 @@ CanonicalValue compile_activation_deployment(
   const auto graph_parsed = parse_strict_json_model_yaml(canonical_json(graph));
   const auto typed = decode_cell_graph_candidate(graph_parsed);
   const auto intrinsic = validate_intrinsic_cell_graph_candidate(typed);
-  // The native provider composes one controllable component per domain;
-  // explain that limitation at compile time rather than at activation.
-  if (!ros2_control) {
-    if (const auto topology =
-            VerifySupportedNativeDomainTopology(intrinsic.graph());
-        !topology.ok()) {
-      fail(topology.error().message);
-    }
-  }
   const auto ready = prepare_cell_graph_identity(intrinsic, selected_profiles);
   const auto computed = compute_graph_revision(ready);
   const auto &computed_graph = computed.normalized_root();
@@ -979,16 +986,18 @@ CanonicalValue compile_activation_deployment(
         prepared_models[index].verified_asset.source_ir().urdf();
     for (const std::string_view target : {std::string_view("arm"),
                                           std::string_view("gripper")}) {
+      if (target == "gripper" && source_joints(profile, "fingers").empty())
+        continue;
       const std::string topology_id =
           std::string("manyforge.") +
-          (ros2_control ? "ros2_control_" : "native_") + std::string(target) +
+          ("ros2_control_") + std::string(target) +
           "_direct";
       const auto &topology = catalog.require(
           core::CatalogRecordKind::kControllerTopology, topology_id);
       const std::string domain = domain_id(component.component_id, target);
       const std::span<const std::string_view> capabilities =
           target == "arm"
-              ? arm_capabilities(ros2_control)
+              ? arm_capabilities()
               : std::span<const std::string_view>(kGripperCapabilities);
       Array routes;
       for (const auto capability : capabilities) {
@@ -1032,8 +1041,7 @@ CanonicalValue compile_activation_deployment(
           core::CatalogRecordKind::kComponentType, component_type_id(profile));
       const auto &planning =
           catalog.require(core::CatalogRecordKind::kProviderManifest,
-                          ros2_control ? "manyforge.provider.ros2_control"
-                                       : "manyforge.provider.native_planning");
+                          "manyforge.provider.ros2_control");
       for (const auto capability : capabilities) {
         const bool is_provider = capability.starts_with("model.") ||
                                  capability.starts_with("planning.") ||
@@ -1070,11 +1078,9 @@ CanonicalValue compile_activation_deployment(
                 {"provider_instance_id",
                  CanonicalValue(
                      component.component_id +
-                     (ros2_control ? ".ros2_control" : ".native_planning"))},
+                     (".ros2_control"))},
                 {"provider_manifest_id",
-                 CanonicalValue(ros2_control
-                                    ? "manyforge.provider.ros2_control"
-                                    : "manyforge.provider.native_planning")},
+                 CanonicalValue("manyforge.provider.ros2_control")},
                 {"provider_manifest_revision",
                  CanonicalValue(revision(planning))},
                 {"endpoint_bindings",
@@ -1099,7 +1105,8 @@ CanonicalValue compile_activation_deployment(
           continue;
         }
         const auto stage = [&](std::string_view stage_id, bool hard,
-                               CanonicalValue parameters) {
+                               CanonicalValue parameters,
+                               std::optional<CanonicalValue> contract = std::nullopt) {
           stop_stages.emplace_back(Object{
               {"control_domain_id", member(binding, "control_domain_id", "binding")},
               {"control_domain_revision", CanonicalValue(graph_revision(
@@ -1113,7 +1120,8 @@ CanonicalValue compile_activation_deployment(
               {"stop_evidence_policy_id", member(binding, "stop_evidence_policy_id", "binding")},
               {"stop_evidence_policy_revision", member(binding, "stop_evidence_policy_revision", "binding")},
               {"stop_escalation_stage_id", CanonicalValue(std::string(stage_id))},
-              {"provider_contract_ref", provider_contract_ref(hard)},
+              {"provider_contract_ref", contract.has_value() ? *contract
+                                                             : provider_contract_ref(hard)},
               {"default_contract_parameters", std::move(parameters)},
           });
         };
@@ -1215,7 +1223,21 @@ CanonicalValue compile_activation_deployment(
           }
           stage("motion_controlled_stop", false, CanonicalValue(std::move(controlled_parameters)));
         }
-        stage("software_hard", true, CanonicalValue(Object{}));
+        if (target == "arm") {
+          stage("software_hard", true, CanonicalValue(Object{}));
+        } else {
+          const CanonicalValue logical_contract(Object{
+              {"provider_contract_role_id", CanonicalValue("gripper_logical_cancel")},
+              {"contract_schema_id", CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+              {"contract_schema_revision", CanonicalValue(
+                  "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270")},
+          });
+          stage("gripper_logical_cancel", false, CanonicalValue(Object{}), logical_contract);
+          if (text(member(binding, "stop_evidence_policy_id", "binding"),
+                   "gripper Stop policy") == "manyforge.gripper_position_cancellation") {
+            stage("software_hard", true, CanonicalValue(Object{}));
+          }
+        }
       }
     }
     // Every native component uses the generic CCLC lifecycle provider.
@@ -1255,8 +1277,11 @@ CanonicalValue compile_activation_deployment(
     });
     providers.emplace_back(std::move(row));
   }
-  static_cast<void>(catalog.require(core::CatalogRecordKind::kCommandSchema,
-                                    "gripper.command_position"));
+  if (std::any_of(component_profiles.begin(), component_profiles.end(),
+                  [](const auto &profile) { return !source_joints(profile, "fingers").empty(); })) {
+    static_cast<void>(catalog.require(core::CatalogRecordKind::kCommandSchema,
+                                      "gripper.command_position"));
+  }
   std::sort(desired.begin(), desired.end(), by("control_domain_id"));
   std::sort(providers.begin(), providers.end(), by("capability_provider_binding_id"));
   std::sort(stop_stages.begin(), stop_stages.end(), [](const auto &left, const auto &right) {

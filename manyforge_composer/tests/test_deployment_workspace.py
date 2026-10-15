@@ -53,10 +53,8 @@ def test_scene_preparation_unavailable_keeps_typed_http_error() -> None:
 
 
 def _import_jerk_source():
-    # Ordinary-motion jerk is a native-runtime field; the maintained offline
-    # examples moved to the mock ROS lane (Q63-Q66), so the native import path
-    # uses the frozen pre-cutover native Lite 6 deployment until the native
-    # executor goes.
+    # DX753: this archival native Lite 6 Draft retains ordinary-motion jerk
+    # metadata for import validation; it does not select an execution backend.
     document = json.loads(
         (
             Path(__file__).resolve().parents[2]
@@ -226,10 +224,8 @@ def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
     source = json.loads(
         (
             Path(__file__).resolve().parents[2]
-            # Ordinary-motion jerk is a native-runtime field; the maintained
-            # offline examples moved to the mock ROS lane (Q63-Q66), so this
-            # native authoring path uses the frozen pre-cutover native Lite 6
-            # deployment until the native executor goes.
+            # DX753: archival native Draft metadata preserves ordinary-motion
+            # jerk authoring round trips without selecting an execution backend.
             / "manyforge_deployment/test/fixtures/native_execution/"
             "lite6_lite_gripper_pick_and_place.native.deployment.yaml"
         ).read_text()

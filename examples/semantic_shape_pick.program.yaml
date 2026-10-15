@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: semantic_shape_pick
-program_revision: sha256:2080f6e8877a5197ca9230dcf551cf2b6edefcb39ff5f3918564c4ad5f927ea8
+program_revision: sha256:49fdb4df42559940f4f7a0467e35abfbd55c53ae2d5beef20896555d8441cf68
 program_profile: composable-cell-v1
 name: semantic_shape_pick
 description: >-
@@ -11,7 +11,7 @@ description: >-
   remains visible in the Program.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.4.0
+  content_version: 2.5.0
 compatibility:
   lanes: [manyforge-only]
   assistant: required
@@ -265,7 +265,7 @@ tree:
           descend_velocity_scale: 0.3
           retreat_velocity_scale: 0.3
           planning_timeout_s: 5.0
-        tool_position: {kind: linear_m, value_m: 0.0}
+        tool_position: {kind: named_preset, name: closed}
         output_key: planning.pick_plan
         contact_policy_id: selected_object_grasp
       value_sources:
@@ -300,9 +300,11 @@ tree:
           reference: planning.pick_plan
           field: pick_pose
       children: []
-    - node_id: logic.set_value
+    - node_id: gripper.command_position
       instance_id: close_gripper
-      parameters: {key: gripper_closed, value: true}
+      parameters:
+        target_role: gripper
+        position: {kind: named_preset, name: closed}
       children: []
     - node_id: scene.attach_carried_object
       instance_id: attach_selected_object
@@ -360,9 +362,11 @@ tree:
           orientation: {rpy_deg: [180.0, 0.0, 0.0]}
         velocity_scale: 0.2
       children: []
-    - node_id: logic.set_value
+    - node_id: gripper.command_position
       instance_id: open_gripper
-      parameters: {key: gripper_closed, value: false}
+      parameters:
+        target_role: gripper
+        position: {kind: named_preset, name: open}
       children: []
     - node_id: scene.detach_carried_object
       instance_id: detach_selected_object

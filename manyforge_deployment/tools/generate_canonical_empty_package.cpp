@@ -12,18 +12,15 @@ int main(int argc, char** argv) {
       std::string_view(argv[1]) != "--output-root" ||
       std::string_view(argv[2]).empty() ||
       (argc == 7 && (std::string_view(argv[3]) != "--cell-id" ||
-                     (std::string_view(argv[5]) != "--native-runtime-profile" &&
-                      std::string_view(argv[5]) != "--ros-runtime-profile")))) {
+                     std::string_view(argv[5]) != "--ros-runtime-profile"))) {
     std::cerr
         << "usage: manyforge_generate_canonical_empty_package "
-           "--output-root PATH [--cell-id ID "
-           "(--native-runtime-profile|--ros-runtime-profile) PATH]\n";
+           "--output-root PATH [--cell-id ID --ros-runtime-profile PATH]\n";
     return 2;
   }
   try {
     if (argc == 7) {
-      const bool ros2_control = std::string_view(argv[5]) == "--ros-runtime-profile";
-      const std::string lane = ros2_control ? "ROS" : "native";
+      const std::string lane = "ROS";
       const std::filesystem::path profile_path(argv[6]);
       if (std::filesystem::is_symlink(profile_path) ||
           !std::filesystem::is_regular_file(profile_path) ||
@@ -38,11 +35,8 @@ int main(int argc, char** argv) {
       if (input.bad() || bytes.empty() || bytes.size() > 1024U * 1024U) {
         throw std::invalid_argument(lane + " runtime profile read is empty, failed or oversized");
       }
-      const auto admission = ros2_control
-          ? manyforge::deployment::detail::generate_ros_empty_package(
-                std::filesystem::path(argv[2]), manyforge::core::CellId(argv[4]), bytes)
-          : manyforge::deployment::detail::generate_native_empty_package(
-                std::filesystem::path(argv[2]), manyforge::core::CellId(argv[4]), bytes);
+      const auto admission = manyforge::deployment::detail::generate_ros_empty_package(
+          std::filesystem::path(argv[2]), manyforge::core::CellId(argv[4]), bytes);
       std::cout << admission.canonical_bytes() << '\n';
       return 0;
     }

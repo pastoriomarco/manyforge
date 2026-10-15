@@ -3,6 +3,7 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <optional>
 #include <set>
@@ -13,6 +14,10 @@
 #include <vector>
 
 #include "closed_schema_internal.hpp"
+#include "lite6_controllable_retention_fixture.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
+#include "manyforge_deployment/deployment_authoring.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/canonical_value.hpp"
 #include "manyforge_deployment/capability_definition_codec.hpp"
@@ -1557,6 +1562,219 @@ TEST(ClosedSchema,
           {"configurations", CanonicalValue(std::move(configurations))},
       })),
       ClosedSchemaError);
+}
+
+// Edit the actual fixture's authored runtime row before normal Draft identity
+// production. No test-specific schema, validation bypass or accepted proof.
+CanonicalValue with_ros_delivery_timeout(
+    const CanonicalValue &value, const std::optional<CanonicalValue> &timeout) {
+  if (value.is_array()) {
+    CanonicalValue::Array rows;
+    for (const auto &row : value.as_array())
+      rows.push_back(with_ros_delivery_timeout(row, timeout));
+    return CanonicalValue(std::move(rows));
+  }
+  if (!value.is_object()) return value;
+  const bool target = value.find_object_member("actuation_kind") != nullptr &&
+                      value.find_object_member("command_target_id") != nullptr;
+  CanonicalValue::Object fields;
+  for (const auto &[name, item] : value.as_object()) {
+    if (target && name == "delivery_result_timeout_s") continue;
+    fields.emplace_back(name, with_ros_delivery_timeout(item, timeout));
+  }
+  if (target && timeout.has_value())
+    fields.emplace_back("delivery_result_timeout_s", *timeout);
+  return CanonicalValue(std::move(fields));
+}
+
+TEST(ClosedSchema, RosDeliveryTimeoutPreservesAbsenceAndColdDecodedSource) {
+  for (const std::string_view kind : {"pneumatic", "position_commanded"}) {
+    const auto fixture =
+        test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+            {}, kind);
+    const auto &source = fixture.qualified.deployment().normalized_authored_root();
+    const auto absent = with_ros_delivery_timeout(source, std::nullopt);
+    const auto compiled_absent = compile_deployment_draft(canonical_json(absent));
+    EXPECT_EQ(verify_deployment_draft(compiled_absent.canonical_json).canonical_json,
+              compiled_absent.canonical_json);
+    const std::array profiles{*fixture.ros2_control_execution_runtime_profile};
+    // Independently parse and verify bytes again, then use the production cold
+    // retained row decoder. The original fixture DTO is not the decoded input.
+    const auto cold_absent = verify_deployment_artifact_revision(
+        parse_strict_json_model_yaml(compiled_absent.canonical_json), profiles);
+    const auto &unit = cold_absent.graph().graph().runtime_units.front();
+    const auto &rows = std::get<core::JsonValueDTO::Array>(
+        unit.configuration.at("gripper_target_configurations").value);
+    ASSERT_EQ(rows.size(), 1U);
+    EXPECT_EQ(std::get<core::JsonObjectDTO>(rows.front().value).size(), 13U);
+    const auto decoded =
+        detail::decode_ros2_control_execution_gripper_target_configurations(rows);
+    ASSERT_EQ(decoded.size(), 1U);
+    EXPECT_FALSE(decoded.front().delivery_result_timeout_s.has_value());
+    EXPECT_EQ(decoded.front().actuation_kind, kind);
+    EXPECT_DOUBLE_EQ(decoded.front().command_duration_s, 0.8);
+    EXPECT_EQ(decoded.front().output_mode, core::GripperOutputMode::kCommanded);
+    EXPECT_NO_THROW((void)detail::require_ros2_control_execution_runtime_required_rows(
+        cold_absent.graph().graph(), unit));
+
+    auto common = std::get<core::JsonObjectDTO>(rows.front().value);
+    common.erase("output_mode");
+    ASSERT_EQ(common.size(), 12U);
+    const auto archival = detail::decode_execution_gripper_target_configurations(
+        {core::JsonValueDTO{common}}, "archival Native configuration");
+    ASSERT_EQ(archival.size(), 1U);
+    EXPECT_DOUBLE_EQ(archival.front().command_duration_s, 0.8);
+    EXPECT_EQ(archival.front().actuation_kind, kind);
+    common.emplace("delivery_result_timeout_s", core::JsonValueDTO{2.5});
+    EXPECT_THROW((void)detail::decode_execution_gripper_target_configurations(
+                     {core::JsonValueDTO{common}}, "archival Native configuration"),
+                 RetainedBundleError);
+
+    if (kind != "pneumatic") continue;
+    for (const double seconds : {1.0, 2.5, 120.0}) {
+      const auto authored = with_ros_delivery_timeout(source, CanonicalValue(seconds));
+      const auto compiled = compile_deployment_draft(canonical_json(authored));
+      EXPECT_EQ(verify_deployment_draft(compiled.canonical_json).canonical_json,
+                compiled.canonical_json);
+      EXPECT_NE(compiled.graph_revision, compiled_absent.graph_revision);
+      EXPECT_NE(compiled.deployment_revision, compiled_absent.deployment_revision);
+      const auto cold = verify_deployment_artifact_revision(
+          parse_strict_json_model_yaml(compiled.canonical_json), profiles);
+      const auto &cold_unit = cold.graph().graph().runtime_units.front();
+      const auto &cold_rows = std::get<core::JsonValueDTO::Array>(
+          cold_unit.configuration.at("gripper_target_configurations").value);
+      const auto &raw = std::get<core::JsonObjectDTO>(cold_rows.front().value);
+      EXPECT_EQ(raw.size(), 14U);
+      EXPECT_DOUBLE_EQ(std::get<double>(raw.at("delivery_result_timeout_s").value),
+                       seconds);
+      const auto typed =
+          detail::decode_ros2_control_execution_gripper_target_configurations(cold_rows);
+      ASSERT_EQ(typed.size(), 1U);
+      ASSERT_TRUE(typed.front().delivery_result_timeout_s.has_value());
+      EXPECT_DOUBLE_EQ(*typed.front().delivery_result_timeout_s, seconds);
+      EXPECT_NO_THROW((void)detail::require_ros2_control_execution_runtime_required_rows(
+          cold.graph().graph(), cold_unit));
+    }
+  }
+}
+
+TEST(ClosedSchema, RosDeliveryTimeoutRejectsMalformedAndForeignPositionAtBothBoundaries) {
+  for (const std::string_view kind : {"pneumatic", "position_commanded"}) {
+    const auto fixture =
+        test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+            {}, kind);
+    const auto &source = fixture.qualified.deployment().normalized_authored_root();
+    const auto &graph = fixture.qualified.deployment().graph().graph();
+    const std::array invalid{CanonicalValue(0.0), CanonicalValue(-1.0),
+                             CanonicalValue("2.5"), CanonicalValue(true),
+                             CanonicalValue(nullptr)};
+    for (const auto &timeout : invalid) {
+      const auto authored = with_ros_delivery_timeout(source, timeout);
+      EXPECT_THROW((void)compile_deployment_draft(canonical_json(authored)),
+                   DeploymentArtifactCodecError);
+    }
+    for (const auto &timeout : std::vector<core::JsonValueDTO>{
+             core::JsonValueDTO{0.0}, core::JsonValueDTO{-1.0},
+             core::JsonValueDTO{std::numeric_limits<double>::quiet_NaN()},
+             core::JsonValueDTO{std::numeric_limits<double>::infinity()},
+             core::JsonValueDTO{-std::numeric_limits<double>::infinity()},
+             core::JsonValueDTO{std::string("2.5")}, core::JsonValueDTO{true},
+             core::JsonValueDTO{nullptr}}) {
+      auto unit = graph.runtime_units.front();
+      auto &rows = std::get<core::JsonValueDTO::Array>(
+          unit.configuration.at("gripper_target_configurations").value);
+      std::get<core::JsonObjectDTO>(rows.front().value).emplace(
+          "delivery_result_timeout_s", timeout);
+      EXPECT_THROW((void)detail::require_ros2_control_execution_runtime_required_rows(
+                       graph, unit), RetainedBundleError);
+      EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(
+                       rows), RetainedBundleError);
+    }
+    // Non-finite YAML must fail before a Draft can be accepted as well.
+    auto numeric = canonical_json(with_ros_delivery_timeout(source, CanonicalValue(2.5)));
+    const auto at = numeric.find("\"delivery_result_timeout_s\":2.5");
+    ASSERT_NE(at, std::string::npos);
+    for (const std::string_view token : {".nan", ".inf", "-.inf"}) {
+      auto malformed = numeric;
+      malformed.replace(at + std::string_view("\"delivery_result_timeout_s\":").size(),
+                        3U, token);
+      EXPECT_THROW((void)compile_deployment_draft(malformed), ArtifactCodecError);
+    }
+    if (kind == "position_commanded") {
+      const auto authored = with_ros_delivery_timeout(source, CanonicalValue(2.5));
+      EXPECT_THROW((void)compile_deployment_draft(canonical_json(authored)),
+                   DeploymentArtifactCodecError);
+      auto unit = graph.runtime_units.front();
+      auto &rows = std::get<core::JsonValueDTO::Array>(
+          unit.configuration.at("gripper_target_configurations").value);
+      std::get<core::JsonObjectDTO>(rows.front().value).emplace(
+          "delivery_result_timeout_s", core::JsonValueDTO{2.5});
+      EXPECT_THROW((void)detail::require_ros2_control_execution_runtime_required_rows(
+                       graph, unit), RetainedBundleError);
+      EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(
+                       rows), RetainedBundleError);
+    }
+    auto rows = std::get<core::JsonValueDTO::Array>(
+        graph.runtime_units.front().configuration.at("gripper_target_configurations").value);
+    std::get<core::JsonObjectDTO>(rows.front().value).emplace(
+        "foreign_timeout", core::JsonValueDTO{2.5});
+    auto foreign_unit = graph.runtime_units.front();
+    foreign_unit.configuration.at("gripper_target_configurations").value = rows;
+    EXPECT_THROW((void)detail::require_ros2_control_execution_runtime_required_rows(
+                     graph, foreign_unit), RetainedBundleError);
+    EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(rows),
+                 RetainedBundleError);
+  }
+}
+
+TEST(ClosedSchema, RosNoneRetainsPositiveTimeoutMetadataWithoutMaterializingDefault) {
+  const auto fixture = test::make_lite6_ros2_control_no_output_gripper_retention_fixture({}, 0.25);
+  const auto &source = fixture.qualified.deployment().normalized_authored_root();
+  const std::array profiles{*fixture.ros2_control_execution_runtime_profile};
+  for (const auto &timeout : {std::optional<CanonicalValue>{},
+                              std::optional<CanonicalValue>{CanonicalValue(2.5)}}) {
+    const auto compiled = compile_deployment_draft(
+        canonical_json(with_ros_delivery_timeout(source, timeout)));
+    const auto cold = verify_deployment_artifact_revision(
+        parse_strict_json_model_yaml(compiled.canonical_json), profiles);
+    const auto &rows = std::get<core::JsonValueDTO::Array>(
+        cold.graph().graph().runtime_units.front().configuration.at("gripper_target_configurations").value);
+    const auto typed = detail::decode_ros2_control_execution_gripper_target_configurations(rows);
+    ASSERT_EQ(typed.size(), 1U);
+    EXPECT_EQ(typed.front().output_mode, core::GripperOutputMode::kNone);
+    EXPECT_DOUBLE_EQ(typed.front().command_duration_s, 0.25);
+    EXPECT_EQ(typed.front().delivery_result_timeout_s,
+              timeout.has_value() ? std::optional<double>{2.5} : std::nullopt);
+  }
+}
+
+TEST(ClosedSchema, MaintainedPneumaticSourcesExplicitlyAuthorDeliveryTimeoutOnlyForPneumatic) {
+  const auto source = parse_strict_json_model_yaml(
+      read_resource("../maintained/maintained_deployment_sources.v1.json"));
+  std::size_t pneumatic = 0U;
+  std::size_t position = 0U;
+  for (const auto &profile : member(source.root(), "runtime_restoration_profiles").as_array()) {
+    const auto *runtime = profile.find_object_member("ros2_control_runtime");
+    if (runtime == nullptr) continue;
+    const auto *rows = runtime->find_object_member("gripper_target_configurations");
+    if (rows == nullptr) continue;
+    for (const auto &row : rows->as_array()) {
+      const auto *timeout = row.find_object_member("delivery_result_timeout_s");
+      if (member(row, "actuation_kind").as_string() == "pneumatic") {
+        ++pneumatic;
+        ASSERT_NE(timeout, nullptr);
+        EXPECT_DOUBLE_EQ(std::get<double>(timeout->storage()), 1.0);
+        EXPECT_EQ(row.as_object().size(), 14U);
+      } else {
+        ++position;
+        EXPECT_EQ(timeout, nullptr);
+        EXPECT_EQ(row.as_object().size(), 13U);
+      }
+      EXPECT_EQ(member(row, "output_mode").as_string(), "commanded");
+    }
+  }
+  EXPECT_EQ(pneumatic, 2U);
+  EXPECT_EQ(position, 5U);
 }
 
 } // namespace

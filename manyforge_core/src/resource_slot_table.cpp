@@ -509,12 +509,23 @@ Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
     const ResourceSlotStopFenceRequestDTO& request) {
   if (!request.stop_generation.nonzero() || request.owners.size() > kMaxKernelResourceSlots ||
       request.orphan_resources.size() > kMaxKernelResourceSlots ||
-      (request.owners.empty() && request.orphan_resources.empty())) {
+      request.revision_only_owners.size() > kMaxKernelResourceSlots ||
+      request.owners.size() + request.revision_only_owners.size() > kMaxKernelResourceSlots ||
+      (request.owners.empty() && request.orphan_resources.empty() &&
+       request.revision_only_owners.empty())) {
     return reject_value<ResourceSlotStopFenceResultDTO>(
         "batch Stop fence has an invalid generation or scope count",
         "resource_stop_fence_shape_invalid", ErrorCode::kInvalidRequest);
   }
-  if (!std::is_sorted(request.owners.begin(), request.owners.end(),
+  const auto canonical_owners = [](const auto& rows) {
+    return std::is_sorted(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+      return stop_fence_owner_key(left) < stop_fence_owner_key(right);
+    }) && std::adjacent_find(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+      return stop_fence_owner_key(left) == stop_fence_owner_key(right);
+    }) == rows.end();
+  };
+  if (!canonical_owners(request.revision_only_owners) ||
+      !std::is_sorted(request.owners.begin(), request.owners.end(),
                       [](const auto& left, const auto& right) {
                         return stop_fence_owner_key(left) < stop_fence_owner_key(right);
                       }) ||
@@ -530,6 +541,18 @@ Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
                                                         ErrorCode::kInvalidRequest);
   }
 
+  auto all_owners = request.owners;
+  all_owners.insert(all_owners.end(), request.revision_only_owners.begin(),
+                    request.revision_only_owners.end());
+  std::sort(all_owners.begin(), all_owners.end(), [](const auto& left, const auto& right) {
+    return stop_fence_owner_key(left) < stop_fence_owner_key(right);
+  });
+  if (!canonical_owners(all_owners)) {
+    return reject_value<ResourceSlotStopFenceResultDTO>(
+        "batch Stop fence repeats an owner", "resource_stop_fence_not_canonical",
+        ErrorCode::kInvalidRequest);
+  }
+
   std::size_t resource_count = request.orphan_resources.size();
   std::set<ResourceId> unique_resources(request.orphan_resources.begin(),
                                         request.orphan_resources.end());
@@ -540,8 +563,8 @@ Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
                                                         "resource_stop_fence_scope_invalid",
                                                         ErrorCode::kInvalidRequest);
   }
-  for (std::size_t index = 0U; index < request.owners.size(); ++index) {
-    const auto& row = request.owners[index];
+  for (std::size_t index = 0U; index < all_owners.size(); ++index) {
+    const auto& row = all_owners[index];
     if (!row.expected_owner.valid() || !row.next_operation_revision.nonzero() ||
         row.next_operation_revision <= row.expected_owner.operation_revision ||
         row.resources.empty() || row.resources.size() > kMaxKernelResourceSlots ||
@@ -563,10 +586,10 @@ Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
       }
     }
     if (index != 0U &&
-        request.owners[index - 1U].expected_owner.operation_id == row.expected_owner.operation_id &&
-        (request.owners[index - 1U].expected_owner.operation_revision !=
+        all_owners[index - 1U].expected_owner.operation_id == row.expected_owner.operation_id &&
+        (all_owners[index - 1U].expected_owner.operation_revision !=
              row.expected_owner.operation_revision ||
-         request.owners[index - 1U].next_operation_revision != row.next_operation_revision)) {
+         all_owners[index - 1U].next_operation_revision != row.next_operation_revision)) {
       return reject_value<ResourceSlotStopFenceResultDTO>(
           "one operation has inconsistent owner revisions in the batch Stop fence",
           "resource_stop_fence_operation_revision_inconsistent", ErrorCode::kInvalidRequest);
@@ -585,8 +608,8 @@ Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
   }
 
   std::vector<std::vector<std::size_t>> owner_indices;
-  owner_indices.reserve(request.owners.size());
-  for (const auto& row : request.owners) {
+  owner_indices.reserve(all_owners.size());
+  for (const auto& row : all_owners) {
     owner_indices.emplace_back();
     auto validation = validate_resource_set_locked(row.resources, owner_indices.back());
     if (!validation.ok()) {
@@ -598,7 +621,10 @@ Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
         return reject_value<ResourceSlotStopFenceResultDTO>(
             "batch Stop fence owner does not match the resource slot", "resource_owner_mismatch");
       }
-      if (slot.state != ResourceSlotState::kReserved &&
+      const bool revision_only = std::any_of(
+          request.revision_only_owners.begin(), request.revision_only_owners.end(),
+          [&](const auto& companion) { return companion.expected_owner == row.expected_owner; });
+      if (!revision_only && slot.state != ResourceSlotState::kReserved &&
           slot.state != ResourceSlotState::kDispatched &&
           slot.state != ResourceSlotState::kTerminal) {
         // A terminal observation does not prove that an in-flight provider
@@ -608,7 +634,7 @@ Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
             "batch Stop fence owner is not reserved, dispatched or terminal",
             "resource_stop_fence_state_invalid", ErrorCode::kInvalidStateTransition);
       }
-      if (request.stop_generation <= slot.stop_generation) {
+      if (!revision_only && request.stop_generation <= slot.stop_generation) {
         return reject_value<ResourceSlotStopFenceResultDTO>(
             "batch Stop generation does not advance the selected resource",
             "resource_stop_generation_stale");
@@ -641,8 +667,8 @@ Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
   ResourceSlotStopFenceResultDTO result;
   result.operation_resource_generation = operation_resource_generation_ + 1U;
   result.stop_generation = request.stop_generation;
-  result.revised_owners.reserve(request.owners.size());
-  for (const auto& row : request.owners) {
+  result.revised_owners.reserve(all_owners.size());
+  for (const auto& row : all_owners) {
     auto revised = row.expected_owner;
     revised.operation_revision = row.next_operation_revision;
     result.revised_owners.push_back(std::move(revised));
@@ -651,12 +677,16 @@ Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
 
   // All validation and every potentially throwing allocation/copy is complete.
   // The remaining scalar writes cannot expose a partially accepted fence.
-  for (std::size_t row_index = 0U; row_index < request.owners.size(); ++row_index) {
+  for (std::size_t row_index = 0U; row_index < all_owners.size(); ++row_index) {
     for (const auto slot_index : owner_indices[row_index]) {
       auto& slot = slots_[slot_index];
-      slot.state = ResourceSlotState::kStopping;
-      slot.owner->operation_revision = request.owners[row_index].next_operation_revision;
-      slot.stop_generation = request.stop_generation;
+      const bool fenced = std::any_of(request.owners.begin(), request.owners.end(),
+          [&](const auto& row) { return row.expected_owner == all_owners[row_index].expected_owner; });
+      if (fenced) {
+        slot.state = ResourceSlotState::kStopping;
+        slot.stop_generation = request.stop_generation;
+      }
+      slot.owner->operation_revision = all_owners[row_index].next_operation_revision;
     }
   }
   for (const auto index : orphan_indices) {

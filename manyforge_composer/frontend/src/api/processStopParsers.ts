@@ -37,6 +37,39 @@ function exactEcho(value: unknown, expected: unknown): boolean {
   return Object.keys(row).length === keys.length && keys.every((key) => key in row
     && exactEcho(row[key], (expected as ObjectValue)[key]));
 }
+function noneOwnerIdentity(value: unknown, label: string): string {
+  // The producer uses Core kMaxLifecycleIdentityBytes (128), not a PID or
+  // a controller-name surrogate for this independently verified owner.
+  if (typeof value !== 'string' || value.length === 0 || value.includes('\0')
+    || new TextEncoder().encode(value).length > 128) {
+    throw new Error(`${label} must be a bounded owner identity.`);
+  }
+  return value;
+}
+function noneOwnerDigest(value: unknown, label: string): void {
+  if (typeof value !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(value)) {
+    throw new Error(`${label} must be an exact owner digest.`);
+  }
+}
+function validateNoneScope(scope: ObjectValue): void {
+  for (const field of ['runtime_unit_id', 'runtime_epoch', 'manager_runtime_epoch']) {
+    noneOwnerIdentity(scope[field], `None process ${field}`);
+  }
+  noneOwnerDigest(scope.expected_predecessor_public_pointer_digest, 'None predecessor pointer');
+  const projection = object(scope.predecessor_projection_revision,
+    ['retained_bundle_id', 'graph_revision', 'scene_revision'], 'None predecessor projection');
+  for (const field of ['retained_bundle_id', 'graph_revision']) {
+    if (typeof projection[field] !== 'string' || projection[field].length === 0) {
+      throw new Error('None predecessor projection is invalid.');
+    }
+  }
+  const scene = object(projection.scene_revision, ['scene_id', 'revision_id', 'content_hash'], 'None predecessor Scene');
+  noneOwnerDigest(scene.scene_id, 'None predecessor Scene identity');
+  noneOwnerDigest(scene.content_hash, 'None predecessor Scene content');
+  if (!Number.isSafeInteger(scene.revision_id) || Number(scene.revision_id) < 1) {
+    throw new Error('None predecessor Scene revision is invalid.');
+  }
+}
 export function parseComponentProcessStopResult(
   value: unknown, expected: ComponentProcessStopRequest,
 ): ComponentProcessStopResult {
@@ -88,6 +121,7 @@ export function parseComponentProcessStopOffer(value: unknown, componentId: stri
     throw new Error('Process Stop offer does not match the component.');
   }
   let count = 0;
+  const noneOwners = new Set<string>();
   for (const value of offer.process_inventories) {
     const inventory = object(value, ['request', 'process_occurrences', 'error'], 'Process inventory');
     if (inventory.error !== null || !Array.isArray(inventory.process_occurrences)) throw new Error('Process inventory is unknown.');
@@ -97,6 +131,29 @@ export function parseComponentProcessStopOffer(value: unknown, componentId: stri
     if (!Number.isSafeInteger(scope.expected_predecessor_publication_generation)
       || Number(scope.expected_predecessor_publication_generation) < 1) throw new Error('Process publication is invalid.');
     for (const value of inventory.process_occurrences) {
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)
+        && 'process_owner_kind' in value) {
+        const row = object(value, ['controllable_component_id', 'process_owner_kind',
+          'pneumatic_none_owner', 'installed_runtime_identity', 'process_presence'], 'None process occurrence');
+        if (++count > 4096 || row.process_owner_kind !== 'pneumatic_none_local'
+          || row.controllable_component_id !== componentId || row.process_presence !== 'absent') {
+          throw new Error('None process occurrence is invalid.');
+        }
+        const owner = object(row.pneumatic_none_owner,
+          ['command_target_id', 'control_binding_id', 'control_binding_revision'], 'None process owner');
+        noneOwnerIdentity(row.controllable_component_id, 'None component');
+        for (const field of ['command_target_id', 'control_binding_id', 'control_binding_revision']) {
+          noneOwnerIdentity(owner[field], `None process ${field}`);
+        }
+        noneOwnerDigest(row.installed_runtime_identity, 'Installed None owner');
+        validateNoneScope(scope);
+        // Native inventory keys None by (component, empty launch, PID0).
+        // Changing binding proof cannot create another owner at this source.
+        const key = JSON.stringify([scope.runtime_unit_id, scope.runtime_epoch, scope.manager_runtime_epoch, componentId]);
+        if (noneOwners.has(key)) throw new Error('None process owner is duplicated.');
+        noneOwners.add(key);
+        continue;
+      }
       const row = object(value, ['controllable_component_id', 'launch_identity', 'leader_pid',
         'process_presence', 'cleanup_state', 'receipt', 'installed_runtime_identity'], 'Installed process occurrence');
       if (++count > 4096 || row.controllable_component_id !== componentId

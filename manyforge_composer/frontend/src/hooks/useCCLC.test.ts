@@ -1,6 +1,8 @@
 import { act, createElement, useEffect, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ApiError } from '../api/client';
+
 const apiMock = vi.hoisted(() => ({
   execution: { identity: vi.fn() }, deploymentWorkspace: { get: vi.fn() },
   cclc: { owner: vi.fn(), component: vi.fn(), routeTemplates: vi.fn(),
@@ -382,13 +384,13 @@ async function mountCCLC(configuredComponentIds?: readonly string[]) {
 
   const { createRoot } = await import('react-dom/client');
   hookRoot = createRoot(makeNode('div') as unknown as Element);
-  function Harness({ enabled }: { enabled: boolean }) {
-    const controller = useCCLC(enabled, 7, configuredComponentIds);
+  function Harness({ enabled, generation }: { enabled: boolean; generation: number }) {
+    const controller = useCCLC(enabled, generation, configuredComponentIds);
     useEffect(() => { hook = controller; }, [controller]);
     return null;
   }
-  const render = async (enabled: boolean) => {
-    await act(async () => { hookRoot?.render(createElement(Harness, { enabled })); });
+  const render = async (enabled: boolean, generation = 7) => {
+    await act(async () => { hookRoot?.render(createElement(Harness, { enabled, generation })); });
   };
   await render(true);
   await act(async () => { hook!.setComponentId('component.arm'); });
@@ -433,6 +435,198 @@ describe('mounted explicit activation API boundaries', () => {
     await act(async () => { hookRoot?.unmount(); });
     hookRoot = null; hook = null;
     vi.useRealTimers();
+  });
+
+  function componentReadChanged(
+    code = 'component_lifecycle_facts_stale', reason = 'component_read_changed', status = 409,
+  ) {
+    const message = 'the current component context changed during its read';
+    return new ApiError(message, status, {
+      detail: { code, message, details: { reason, admission_changed: 'true',
+        admission_generation_before: '21', admission_generation_after: '22',
+        authoring_allowed_before: 'false', authoring_allowed_after: 'true',
+        owner_changed: 'false', snapshot_changed: 'false', target_facts_changed: 'false' } },
+    });
+  }
+
+  it.each(['initial', 'before-prepare', 'after-prepare'] as const)(
+    'rereads a transient %s component GET from fresh context without replaying lifecycle effects', async (phase) => {
+      const render = await mountCCLC();
+      await render(true, 21);
+      let reads = 0;
+      let conflicted = false;
+      apiMock.cclc.component.mockImplementation(async (id: string) => {
+        reads += 1;
+        if (!conflicted && ((phase === 'initial' && reads === 1)
+          || (phase === 'before-prepare' && reads === 3)
+          || (phase === 'after-prepare' && state === 'prepared'))) {
+          conflicted = true;
+          throw componentReadChanged();
+        }
+        return { ...snapshot, componentId: id, lifecycleState: state, readiness: readiness(state),
+          lifecycleGeneration: conflicted ? 41 : snapshot.lifecycleGeneration };
+      });
+      let activation!: Promise<void>;
+      await act(async () => { activation = hook!.activate(); });
+      expect(conflicted).toBe(true);
+      expect(hook!.busy).toBe(true);
+      expect(hook!.error).toBeNull();
+      expect(hook!.componentHealth['component.arm']?.error).toBeNull();
+      const readsAtConflict = reads;
+      const effectsAtConflict = apiMock.cclc.submitLifecycle.mock.calls.length;
+      const identityReadsAtConflict = apiMock.execution.identity.mock.calls.length;
+      const ownerReadsAtConflict = apiMock.cclc.owner.mock.calls.length;
+      await render(true, 22);
+      await act(async () => { await vi.advanceTimersByTimeAsync(249); });
+      expect(reads).toBe(readsAtConflict);
+      expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledTimes(effectsAtConflict);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); await activation; });
+      expect(apiMock.execution.identity.mock.calls.length).toBeGreaterThan(identityReadsAtConflict);
+      expect(apiMock.cclc.owner.mock.calls.length).toBeGreaterThan(ownerReadsAtConflict);
+      expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent))
+        .toEqual(['prepare', 'enable']);
+      const freshRequest = apiMock.cclc.submitLifecycle.mock.calls[phase === 'after-prepare' ? 1 : 0][0];
+      expect(freshRequest.expected_component_lifecycle_generation).toBe(41);
+      expect(freshRequest.expected_admission_generation).toBe(22);
+      expect(freshRequest.request_context.request_owner_epoch).toBe('cclc-owner.1');
+      expect(hook!.snapshot?.lifecycleState).toBe('active');
+      expect(hook!.error).toBeNull();
+      expect(hook!.activationUnresolved).toBe(false);
+    },
+  );
+
+  it('rereads an activation-sequence conflict without losing its captured applied order', async () => {
+    await mountCCLC();
+    apiMock.cclc.component.mockRejectedValueOnce(componentReadChanged());
+    let activation!: Promise<void>;
+    await act(async () => { activation = hook!.activateSequence(); });
+    const appliedReads = apiMock.deploymentWorkspace.get.mock.calls.length;
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); await activation; });
+    expect(apiMock.deploymentWorkspace.get.mock.calls.length).toBeGreaterThan(appliedReads);
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent))
+      .toEqual(['prepare', 'enable']);
+    expect(apiMock.cclc.submitLifecycle.mock.calls.every(([request]) => (
+      request.controllable_component_id === 'component.other'
+    ))).toBe(true);
+    expect(hook!.error).toBeNull();
+    expect(hook!.activationProgress).toBe('Activation sequence completed.');
+  });
+
+  it('refuses a changed applied order before rereading a sequence conflict', async () => {
+    await mountCCLC();
+    apiMock.cclc.component.mockRejectedValueOnce(componentReadChanged());
+    let activation!: Promise<void>;
+    await act(async () => { activation = hook!.activateSequence(); });
+    apiMock.deploymentWorkspace.get.mockResolvedValue({ managerApplied: {
+      scenarioId: 'fixture', deploymentRevision: 'deployment.replacement',
+      activationOrder: { retainedBundleId: snapshot.retainedBundleId,
+        graphRevision: snapshot.graphRevision, componentIds: ['component.arm'] },
+    } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); await activation; });
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    expect(hook!.error).toContain('applied configuration changed');
+    expect(hook!.busy).toBe(false);
+  });
+
+  it('keeps persistent component-read conflicts effect-free until explicit Cancel', async () => {
+    await mountCCLC();
+    apiMock.cclc.component.mockClear();
+    apiMock.cclc.component.mockRejectedValue(componentReadChanged());
+    let activation!: Promise<void>;
+    await act(async () => { activation = hook!.activate(); });
+    expect(apiMock.cclc.component).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(249); });
+    expect(apiMock.cclc.component).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(apiMock.cclc.component).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    expect(hook!.busy).toBe(true);
+    expect(hook!.error).toBeNull();
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    await act(async () => { hook!.cancelActivation(); await activation; });
+    expect(hook!.busy).toBe(false);
+    expect(hook!.error).toContain('cancelled');
+    expect(hook!.activationUnresolved).toBe(false);
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['other-code', 'different_code', 'component_read_changed', 409],
+    ['other-reason', 'component_lifecycle_facts_stale', 'different_reason', 409],
+    ['other-status', 'component_lifecycle_facts_stale', 'component_read_changed', 500],
+  ] as const)('surfaces %s component GET errors without retrying', async (_label, code, reason, status) => {
+    await mountCCLC();
+    apiMock.cclc.component.mockClear();
+    const failure = componentReadChanged(code, reason, status);
+    apiMock.cclc.component.mockRejectedValue(failure);
+    await act(async () => { await hook!.activate(); });
+    expect(apiMock.cclc.component).toHaveBeenCalledTimes(1);
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    expect(hook!.error).toBe(failure.message);
+    expect(hook!.busy).toBe(false);
+  });
+
+  it.each(['owner', 'route-templates', 'lifecycle-mutation'] as const)(
+    'never retries the same conflict reported by %s instead of the component GET', async (source) => {
+      if (source === 'route-templates') state = 'prepared';
+      await mountCCLC();
+      const failure = componentReadChanged();
+      if (source === 'owner') apiMock.cclc.owner.mockRejectedValue(failure);
+      else if (source === 'route-templates') apiMock.cclc.routeTemplates.mockRejectedValue(failure);
+      else apiMock.cclc.submitLifecycle.mockRejectedValue(failure);
+      await act(async () => { await hook!.activate(); });
+      expect(hook!.error).toBe(failure.message);
+      expect(hook!.busy).toBe(false);
+      expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledTimes(source === 'lifecycle-mutation' ? 1 : 0);
+      expect(hook!.activationUnresolved).toBe(source === 'lifecycle-mutation');
+      if (source === 'lifecycle-mutation') {
+        expect(hook!.pendingActivationRequest).toBe(apiMock.cclc.submitLifecycle.mock.calls[0][0]);
+        expect(hook!.activationProgress).toContain('unknown request outcome');
+      }
+    },
+  );
+
+  it.each(['host-owner', 'cclc-owner', 'publication'] as const)(
+    'preserves exact %s refusal after a transient component GET conflict', async (change) => {
+      await mountCCLC();
+      apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, componentId: id,
+        lifecycleState: state, readiness: readiness(state, false) }));
+      let activation!: Promise<void>;
+      await act(async () => { activation = hook!.activate(); });
+      apiMock.cclc.component.mockRejectedValueOnce(componentReadChanged());
+      await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+      expect(hook!.busy).toBe(true);
+      expect(hook!.error).toBeNull();
+      if (change === 'host-owner') {
+        apiMock.execution.identity.mockResolvedValue({ ...execution, ownerEpoch: 'replacement-host' });
+      } else if (change === 'cclc-owner') {
+        apiMock.cclc.owner.mockResolvedValue({ requestOwnerEpoch: 'replacement-cclc' });
+      } else {
+        apiMock.execution.identity.mockResolvedValue({ ...execution, activePublicationGeneration: 2 });
+      }
+      apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, componentId: id,
+        lifecycleState: state, readiness: { ...readiness(state),
+          requestOwnerEpoch: change === 'cclc-owner' ? 'replacement-cclc' : 'cclc-owner.1' },
+        ...(change === 'publication' ? { publicationGeneration: 2, activePublicPointerDigest: 'pointer.2' } : {}) }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(250); await activation; });
+      expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+      expect(hook!.error).toContain(change === 'publication' ? 'applied publication changed'
+        : change === 'host-owner' ? 'execution owner changed' : 'owner or component identity changed');
+      expect(hook!.busy).toBe(false);
+    },
+  );
+
+  it('keeps ordinary explicit Refresh conflicts on the existing error path', async () => {
+    await mountCCLC();
+    apiMock.cclc.component.mockClear();
+    const failure = componentReadChanged();
+    apiMock.cclc.component.mockRejectedValue(failure);
+    await act(async () => { await hook!.refresh(); });
+    expect(apiMock.cclc.component).toHaveBeenCalledTimes(1);
+    expect(hook!.readUnavailableReason).toBe(failure.message);
+    expect(hook!.snapshot).toBeNull();
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
   });
 
   it.each(['prepare', 'enable'])('refuses same-owner configuration exchange on the exact %s submission read', async (intent) => {

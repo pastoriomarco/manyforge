@@ -23,7 +23,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = "sha256:5431cf57379b786ab05dccf2252ffa27cd6441ce32edbe76a7eef0f5ea995529"
+EXPECTED_CATALOG_DIGEST = "sha256:946dcdf51bfdae12e2ff6effed9e1ab3e9c437360ac7c600bf91cd25e6675eb3"
 
 
 def _catalog_data() -> dict[str, object]:
@@ -62,6 +62,63 @@ def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
         )
         == 49
     )
+
+
+@pytest.mark.parametrize("node_id,parameter_id", [
+    ("gripper.command_position", "position"),
+    ("planning.plan_pick_sequence", "tool_position"),
+    ("planning.plan_place_sequence", "tool_position"),
+])
+@pytest.mark.parametrize("value,valid", [
+    ({"kind": "named_preset", "name": "open"}, True),
+    ({"kind": "named_preset", "name": "closed"}, True),
+    ({"kind": "angular_rad", "value_rad": 0.2}, True),
+    ({"kind": "linear_m", "value_m": 0.008}, True),
+    ({"kind": "named_preset"}, False),
+    ({"kind": "named_preset", "name": "released"}, False),
+    ({"kind": "named_preset", "name": "open", "value_m": 0.0}, False),
+    ({"kind": "linear_m", "value_m": 0.0, "name": "open"}, False),
+    ({"kind": "angular_rad", "value_rad": 0.1, "value_m": 0.0}, False),
+])
+def test_gripper_position_schema_keeps_numeric_and_strict_semantic_aliases(
+    node_id, parameter_id, value, valid,
+) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    parameter = next(row for row in catalog.get(node_id).parameters if row.id == parameter_id)
+    issues = validate_value(parameter.schema, value, registry=catalog.schema_registry)
+    assert (not issues) is valid
+
+
+def test_gripper_program_dwell_policy_is_optional_pause_default() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    assert catalog.content_version == "2.5.0"
+    gripper = catalog.get("gripper.command_position")
+    policy = next(parameter for parameter in gripper.parameters if parameter.id == "dwell_while_held")
+    assert policy.required is False
+    assert policy.has_default is True
+    assert policy.default == "pause"
+    assert catalog.schema_registry.resolve(policy.schema).enum_values == ("count", "pause")
+    duration = next(parameter for parameter in gripper.parameters if parameter.id == "command_duration_s")
+    assert duration.required is False
+    assert duration.has_default is False
+    assert not validate_value(duration.schema, 0.0, registry=catalog.schema_registry)
+
+
+@pytest.mark.parametrize("value,valid", [
+    ("count", True), ("pause", True), ("continue", False), ("", False),
+    (None, False), (False, False), (0, False), (1.0, False),
+])
+def test_gripper_dwell_policy_uses_the_closed_enum(value, valid) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    policy = next(parameter for parameter in catalog.get("gripper.command_position").parameters
+                  if parameter.id == "dwell_while_held")
+    assert (not validate_value(policy.schema, value, registry=catalog.schema_registry)) is valid
+
+
+def test_recomputed_previous_catalog_version_is_not_an_alias(tmp_path: Path) -> None:
+    path = _write_recomputed(tmp_path, lambda data: data.__setitem__("content_version", "2.4.0"))
+    with pytest.raises(CatalogValidationError, match="content_version must be '2.5.0'"):
+        NodeCatalog(path)
 
 
 def test_catalog_exposes_structured_v2_semantics() -> None:

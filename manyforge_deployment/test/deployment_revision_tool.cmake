@@ -154,9 +154,8 @@ foreach(choice IN ITEMS on off)
 endforeach()
 
 # The same CLI imports explicit angular MoveIt limits without activating them.
-# Ordinary-motion jerk is a native-runtime field: since the maintained offline
-# examples moved to the mock ROS lane (Q63-Q66), the import is exercised on the
-# frozen pre-cutover native Lite 6 deployment until the native executor goes.
+# DX753: archival native Draft metadata retains ordinary-motion jerk import
+# and revision checks without selecting an execution backend.
 file(READ "${CMAKE_CURRENT_LIST_DIR}/fixtures/native_execution/lite6_lite_gripper_pick_and_place.native.deployment.yaml"
      current_stop_source)
 set(imported_path "${MANYFORGE_TEST_BINARY_DIR}/imported-jerk.yaml")

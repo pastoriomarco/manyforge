@@ -4,6 +4,7 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
+import { parseCCLCStatusEnvelope } from '../api/cclcParsers';
 import { CCLCPanelView } from './CCLCPanel';
 import type { CCLCController } from '../hooks/useCCLC';
 import type { CCLCReadinessDomain } from '../types/cclc';
@@ -51,7 +52,62 @@ function controller(): CCLCController {
   };
 }
 
+function failedLifecycleController(details: Record<string, string>): CCLCController {
+  const current = controller();
+  current.pendingTransaction = { kind: 'lifecycle', id: 'lifecycle.7' };
+  current.transaction = parseCCLCStatusEnvelope({ status: {
+    acceptance: {
+      accepted_at_ns: 100, component_lifecycle_generation: 4,
+      lifecycle_transaction_generation: 7, lifecycle_transaction_id: 'lifecycle.7',
+      request_id: 'request.7', timeout_duration_ns: 1_000_000,
+    },
+    accepted_at_ns: 100,
+    controllable_component_id: 'component.arm',
+    current_state: 'prepared',
+    domains: [],
+    error: {
+      code: 'component_lifecycle_transition_missing',
+      message: 'no lifecycle primitive is eligible for the fresh observation',
+      details: { reason: 'no_transition_satisfied', ...details },
+    },
+    latest_updated_at_ns: 110,
+    phase: 'failed',
+    previous_state: 'prepared',
+    reconciliation_required: false,
+    remaining_duration_ns: 0,
+    status_owner_epoch: 'cclc.epoch.1',
+    status_sequence: 2,
+    terminal_result: 'failed_known_no_effect',
+  } }, 'lifecycle');
+  return current;
+}
+
 describe('CCLC presentation', () => {
+  it('shows the parsed primitive cause below the unchanged generic failure as safe text', () => {
+    const current = failedLifecycleController({
+      primitive_message: 'Switch rejected <script>alert(1)</script> & arm_controller',
+    });
+    const html = renderToStaticMarkup(createElement(CCLCPanelView, { enabled: true,
+      mutationAvailable: true, mutationUnavailableReason: null, controller: current }));
+    expect(html).toContain('component_lifecycle_transition_missing: no lifecycle primitive is eligible for the fresh observation (no_transition_satisfied)');
+    expect(html).toContain('<p class="muted">Switch rejected &lt;script&gt;alert(1)&lt;/script&gt; &amp; arm_controller</p>');
+    expect(html).not.toContain('<script>');
+    expect(current.submitLifecycle).not.toHaveBeenCalled();
+    expect(current.submitRoute).not.toHaveBeenCalled();
+  });
+
+  it('keeps the failure row unchanged when the primitive cause is absent or empty', () => {
+    const current = failedLifecycleController({});
+    const render = () => renderToStaticMarkup(createElement(CCLCPanelView, { enabled: true,
+      mutationAvailable: true, mutationUnavailableReason: null, controller: current }));
+    const absent = render();
+    // Empty wire details remain parser errors; the view also tolerates an empty local value.
+    for (const primitiveMessage of ['', '   ']) {
+      current.transaction!.error!.details.primitive_message = primitiveMessage;
+      expect(render()).toBe(absent);
+    }
+  });
+
   it('renders no activation step while preserving faults, transport and refusal diagnostics', () => {
     const current = controller();
     const domain: CCLCReadinessDomain = {

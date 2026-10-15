@@ -26,7 +26,8 @@ QualifyRetainedRobotMeasuredGeometry(
     const deployment::VerifiedRetainedModelMap &model_map,
     std::span<const core::ControllableComponentId> configured_robot_ids,
     std::span<const core::RuntimeParticipantBinding> compiled_physical_bindings,
-    std::span<const core::RequiredRobotMeasuredStateSource> descriptor_rows) {
+    std::span<const core::RequiredRobotMeasuredStateSource> descriptor_rows,
+    std::span<const core::RuntimeParticipantBinding> vetted_pneumatic_bindings = {}) {
   using Result =
       core::Result<std::vector<core::ConfiguredRobotMeasuredStateRequirement>>;
   using CoordinateKey = std::pair<core::ModelInstanceId, std::string>;
@@ -305,6 +306,47 @@ QualifyRetainedRobotMeasuredGeometry(
         });
     robot->sources.push_back(source);
   }
+  // Qualify all direct/mimic geometry above before selecting measured rows.
+  // Only exact strict-authored pneumatic bindings supplied by the product
+  // owner are display-only; unavailable sources never reduce membership.
+  std::set<std::pair<core::ControllableComponentId, core::ResourceId>> display_resources;
+  std::set<BindingKey> pneumatic_rows;
+  for (const auto& pneumatic : vetted_pneumatic_bindings) {
+    const auto& value = pneumatic.value();
+    if (!value.control_path || value.capability_id.value() != "tool.gripper.command" ||
+        !membership.contains(value.controllable_component_id) ||
+        !pneumatic_rows.emplace(value.controllable_component_id, value.command_target_id,
+            value.control_path->control_binding_id).second ||
+        std::none_of(compiled_physical_bindings.begin(), compiled_physical_bindings.end(),
+            [&](const auto& physical) { return physical.value() == value; }))
+      return fail("pneumatic_display_binding_not_exact", value.controllable_component_id);
+    for (const auto& resource : value.resources) {
+      if (std::any_of(compiled_physical_bindings.begin(), compiled_physical_bindings.end(),
+          [&](const auto& other) {
+            return (other.value().controllable_component_id != value.controllable_component_id ||
+                    other.value().command_target_id != value.command_target_id) &&
+                std::any_of(other.value().resources.begin(), other.value().resources.end(),
+                    [&](const auto& row) { return row.resource_id == resource.resource_id; });
+          }))
+        return fail("pneumatic_display_resource_aliases_other_target", value.controllable_component_id);
+      display_resources.emplace(value.controllable_component_id, resource.resource_id);
+    }
+  }
+  for (auto& robot : robots) {
+    for (const auto& source : robot.sources)
+      if (std::any_of(source.descriptor.publication.query_context.resources.begin(),
+          source.descriptor.publication.query_context.resources.end(), [&](const auto& resource) {
+            return display_resources.contains({robot.component_id, resource});
+          }))
+        return fail("pneumatic_display_has_measured_source", robot.component_id);
+    std::erase_if(robot.required_resources, [&](const auto& resource) {
+      return display_resources.contains({robot.component_id, resource});
+    });
+    std::erase_if(robot.geometry_coordinates, [&](const auto& coordinate) {
+      return display_resources.contains({robot.component_id, coordinate.resource_id});
+    });
+  }
+  std::erase_if(robots, [](const auto& robot) { return robot.required_resources.empty(); });
   return Result::Ok(std::move(robots));
 }
 

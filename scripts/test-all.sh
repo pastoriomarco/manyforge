@@ -205,6 +205,7 @@ build_manyforge_headless() {
         -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
         -Dpybind11_DIR="$pybind11_cmake_dir" \
         -DMANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="$ros_execution_host" \
+        -DMANYFORGE_HEADLESS_TEST_ROS_SETUP="$BUILD_DIR/isaac/ros-overlay/install/setup.bash" \
         -DMANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
 }
@@ -522,6 +523,8 @@ run_headless_python_tests() {
         MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$build/canonical-empty-test-package" \
         MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT="$build/assistant-native-test-fixture/retained-package" \
         MANYFORGE_ASSISTANT_NATIVE_METADATA="$build/assistant-native-test-fixture/metadata.json" \
+        MANYFORGE_ROBOTIQ_POSITION_PACKAGE_ROOT="$build/robotiq-position-manager-test-fixture/retained-package" \
+        MANYFORGE_ROBOTIQ_POSITION_METADATA="$build/robotiq-position-manager-test-fixture/metadata.json" \
         MANYFORGE_MANAGER_APPLY_PACKAGE_ROOT="$build/manager-apply-test-fixture/retained-package" \
         MANYFORGE_MANAGER_APPLY_METADATA="$build/manager-apply-test-fixture/metadata.json" \
         MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/ui6i-dual-scenario-fixture/retained-package" \

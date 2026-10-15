@@ -219,6 +219,7 @@ list(
   MANYFORGE_COMPILER_SOURCE_INPUTS
   # These C0 transport/test artifacts are downstream of the native compiler
   # and must not feed its own build identity through the recursive glob above.
+# DX-753: retain the shared Program-binding fixture under its existing native name.
   "${CMAKE_CURRENT_SOURCE_DIR}/resources/program_binding_lite6_native.fixture.json"
   "${CMAKE_CURRENT_SOURCE_DIR}/resources/program_binding_transport.v1.json"
   "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_program_binding_transport.py"
@@ -570,6 +571,7 @@ manyforge_embed_closed_schema(
   empty_runtime_configuration
   resources/closed_schema/value/manyforge.value_schema.runtime.empty.v1.yaml
   mf_empty_cfg)
+# DX-753: archival Draft/import validation retains the Native value schema.
 manyforge_embed_closed_schema(
   kEmbeddedNativeExecutionRuntimeConfigurationSchema
   native_execution_runtime_configuration
@@ -649,7 +651,6 @@ add_library(manyforge_deployment_verification_core
   src/assistant_settings_codec.cpp
   src/apply_affected_scope.cpp
   src/apply_component_delta.cpp
-  src/native_domain_topology.cpp
   src/artifact_codec.cpp
   src/composed_model_symbol_role_map_verifier.cpp
   src/control_domain_control_internal.cpp
@@ -874,7 +875,6 @@ add_library(manyforge_deployment
   src/component_type_codec.cpp
   src/composed_model_symbol_role_map_internal.cpp
   src/mf2_joint_name_internal.cpp
-  src/native_execution_runtime_unit_emitter.cpp
   src/ros2_control_execution_runtime_unit_emitter.cpp
   src/posix_durability_internal.cpp
   src/program_binding_compiler.cpp
@@ -1294,7 +1294,10 @@ if(BUILD_TESTING)
     FIXTURES_SETUP ProgramCapturePackage TIMEOUT 120)
 
   add_executable(test_program_binding_compiler
-    test/test_program_binding_compiler.cpp)
+    test/test_program_binding_compiler.cpp
+    # A1's genuine gripper-only fixture uses the same pure lifecycle anchor.
+    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_catalog_codec.cpp"
+    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_validity.cpp")
   target_compile_definitions(test_program_binding_compiler PRIVATE
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
     MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
@@ -1338,6 +1341,11 @@ if(BUILD_TESTING)
 
   add_executable(test_cell_applicability
     test/test_cell_applicability.cpp)
+  target_include_directories(test_cell_applicability PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_compile_definitions(test_cell_applicability PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
   target_link_libraries(test_cell_applicability PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_cell_applicability
@@ -1361,9 +1369,15 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_cell_compiler
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  add_executable(test_closed_schema test/test_closed_schema.cpp)
+  add_executable(test_closed_schema
+    test/test_closed_schema.cpp
+    # The genuine gripper fixture shares the pure lifecycle anchor/validation.
+    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_catalog_codec.cpp"
+    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_validity.cpp")
   target_compile_definitions(test_closed_schema PRIVATE
-    MANYFORGE_CLOSED_SCHEMA_RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resources/closed_schema")
+    MANYFORGE_CLOSED_SCHEMA_RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resources/closed_schema"
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
   target_include_directories(test_closed_schema PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_closed_schema PRIVATE
@@ -1412,6 +1426,9 @@ if(BUILD_TESTING)
     test/test_deployment_artifact_codec.cpp)
   target_include_directories(test_deployment_artifact_codec PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_compile_definitions(test_deployment_artifact_codec PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
   target_link_libraries(test_deployment_artifact_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_deployment_artifact_codec

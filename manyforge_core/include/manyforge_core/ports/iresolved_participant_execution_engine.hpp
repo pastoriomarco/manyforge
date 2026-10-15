@@ -109,6 +109,18 @@ class IResolvedParticipantExecutionEngine {
   virtual Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
       const OperationId& operation_id, const ControlBindingId& control_binding_id) const = 0;
 
+  /// Read-only selected target actuation. Existing non-gripper engines retain
+  /// their position/motion behavior; the genuine gripper owner supplies its
+  /// strictly configured target mode before prepared or Stop work is built.
+  virtual GripperActuationKind gripper_actuation_kind(const std::string&) const {
+    return GripperActuationKind::kPositionCommanded;
+  }
+  /// Existing engines retain commanded output; only strict authored targets
+  /// may expose the explicit pneumatic none choice.
+  virtual GripperOutputMode gripper_output_mode(const std::string&) const {
+    return GripperOutputMode::kCommanded;
+  }
+
   virtual GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) = 0;
   virtual Result<void> validate_gripper_command(const GripperCommandRequestDTO& request) const = 0;
   virtual GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const = 0;

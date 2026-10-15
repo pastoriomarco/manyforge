@@ -37,6 +37,7 @@ from manyforge_behavior.nodes.control_flow import (
 from manyforge_behavior.nodes.v2_owner import (
     OwnerInvocationAdapter,
     OwnerTaskAdapter,
+    GripperCommandAdapter,
     GripperStatusWaitAdapter,
 )
 from manyforge_behavior.nodes.v2_pure import (
@@ -292,7 +293,14 @@ def _owner_task_builder(
 ) -> NodeAdapterBuilder:
     def build(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
         port = _required_port(context, port_name)
-        return OwnerTaskAdapter(
+        gripper_command = node_id == "gripper.command_position"
+        adapter = GripperCommandAdapter if gripper_command else OwnerTaskAdapter
+        timing = ({
+            "program_clock": _required_program_clock(context),
+            "operator_stop_hold_scope": context.operator_stop_hold_scope,
+        } if gripper_command else {})
+        return adapter(
+            **timing,
             name=context.name,
             node_id=node_id,
             node_instance_id=context.node_instance_id,

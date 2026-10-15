@@ -13,12 +13,14 @@
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/retained_native_cell_runtime.hpp>
 #include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
+#include <manyforge_roboplan/retained_native_gripper_route_publication_owner.hpp>
 #include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 
 namespace manyforge::roboplan_backend {
@@ -1056,6 +1058,53 @@ make_kernel_participant_resolver(
 
 } // namespace
 
+void RetainedNativeGripperRoutePublicationOwner::BindMotionRoot(
+    const std::shared_ptr<RetainedNativeRuntime>& root) {
+  if (!root || root->active_addressed_kernel() != &kernel_ ||
+      root->clock.get() != &clock_ || !participant_peers_.empty() ||
+      transition_mutex_ != &mutex_)
+    throw std::invalid_argument("scalar route owner requires its exact existing motion root");
+  transition_owner_ = root;
+  transition_is_motion_root_ = true;
+  transition_mutex_ = &root->route_publication_mutex_;
+}
+
+core::Result<void> RetainedNativeGripperRoutePublicationOwner::ValidateInstalledOwner(
+    const std::shared_ptr<void>& transition_owner) const {
+  // Caller holds the same transition mutex as installed peer-list writers.
+  // The prior lookup released it before delegation, so validate again before
+  // any channel/backend rebind; a removed/replaced scalar cannot be revived.
+  if (transition_is_motion_root_) {
+    const auto root = std::static_pointer_cast<RetainedNativeRuntime>(transition_owner);
+    if (!root || std::count(root->independent_gripper_peers.begin(),
+        root->independent_gripper_peers.end(), gripper_) != 1)
+      return route_publication_error<void>("route_publication_physical_owner_changed",
+          "scalar route no longer names the installed owner", core::ErrorCode::kMissingReference);
+  }
+  if (cell_owner_) {
+    const auto actual = gripper_->registrations();
+    const auto& rows = cell_owner_->participant_registrations();
+    for (const auto& expected : actual) {
+      const auto matches = std::count_if(rows.begin(), rows.end(), [&](const auto& row) {
+        return row.binding.value() == expected.binding.value() && row.engine == expected.engine &&
+            row.stop_execution_port == expected.stop_execution_port &&
+            row.stop_readiness.has_value() == expected.stop_readiness.has_value() &&
+            (!row.stop_readiness || row.stop_readiness->value() == expected.stop_readiness->value());
+      });
+      if (matches != 1)
+        return route_publication_error<void>("route_publication_physical_owner_changed",
+            "scalar registration set is no longer the exact installed owner", core::ErrorCode::kMissingReference);
+    }
+    if (std::count_if(rows.begin(), rows.end(), [&](const auto& row) {
+          return row.engine == gripper_->participant_engine() &&
+              row.binding.value().controllable_component_id == gripper_->binding().value().controllable_component_id;
+        }) != static_cast<std::ptrdiff_t>(actual.size()))
+      return route_publication_error<void>("route_publication_physical_owner_changed",
+          "installed scalar has unexpected logical registrations", core::ErrorCode::kMissingReference);
+  }
+  return core::Result<void>::Ok();
+}
+
 core::RuntimeParticipantAdmissionResolver
 make_retained_cell_kernel_participant_resolver(
     RetainedRuntimeParticipantResolver binding_resolver,
@@ -1138,6 +1187,25 @@ create_retained_native_runtime_participants(
         throw std::invalid_argument(
             "Deployment fault Stop profile is invalid: " +
             resolved.error().message);
+      }
+      // The component-authored map may also name gripper/mimic joints.
+      // Like the operator profile's retained resource projection, select only
+      // this participant's actual source joints, keeping its own fault values.
+      // Missing arm limits remain absent for the existing strict Prepare check.
+      const auto &resources = input.motion_binding.value().resources;
+      const auto outside_participant = [&](const auto &limit) {
+        return std::none_of(resources.begin(), resources.end(), [&](const auto &resource) {
+          return resource.source_joint_name.has_value() &&
+                 *resource.source_joint_name == limit.first;
+        });
+      };
+      std::erase_if(resolved.value().per_joint_max_deceleration, outside_participant);
+      std::erase_if(resolved.value().per_joint_max_jerk, outside_participant);
+      if (resolved.value().per_joint_settle_velocity_threshold.has_value()) {
+        std::erase_if(*resolved.value().per_joint_settle_velocity_threshold,
+                      outside_participant);
+        if (resolved.value().per_joint_settle_velocity_threshold->empty())
+          resolved.value().per_joint_settle_velocity_threshold.reset();
       }
       motion_fault_stop_profile = std::move(resolved.value());
     }
@@ -1425,25 +1493,6 @@ create_retained_native_runtime_participants(
         "retained runtime execution adapter set is incomplete or owns a "
         "second state authority");
   }
-  if (runtime->gripper_binding.has_value() &&
-      runtime->gripper_stop_execution_port == nullptr) {
-    throw std::invalid_argument(
-        "retained runtime gripper adapter has no Stop execution port");
-  }
-  if (runtime->gripper_binding.has_value()) {
-    const auto *execution_stop =
-        static_cast<core::IControlDomainExecutionPort *>(
-            runtime->execution.get());
-    const auto *gripper_owned_stop =
-        dynamic_cast<core::IControlDomainExecutionPort *>(
-            runtime->gripper.get());
-    if (runtime->gripper_stop_execution_port != execution_stop &&
-        runtime->gripper_stop_execution_port != gripper_owned_stop) {
-      throw std::invalid_argument(
-          "retained runtime gripper Stop port is not owned by its adapter "
-          "set");
-    }
-  }
   if (const auto rebound = runtime->rebind_motion_route(
           runtime->motion_binding, runtime->motion_binding_aliases);
       !rebound.ok()) {
@@ -1524,6 +1573,28 @@ create_retained_native_runtime_participants(
     runtime->gripper_participant_engine =
         std::make_shared<core::GripperParticipantEngine>(*runtime->gripper,
                                                          *runtime->clock);
+    if (runtime->gripper_stop_execution_port == nullptr)
+      runtime->gripper_stop_execution_port = runtime->gripper_participant_engine.get();
+  }
+  if (runtime->gripper_binding.has_value() &&
+      runtime->gripper_stop_execution_port == nullptr) {
+    throw std::invalid_argument(
+        "retained runtime gripper adapter has no Stop execution port");
+  }
+  if (runtime->gripper_binding.has_value()) {
+    const auto *execution_stop =
+        static_cast<core::IControlDomainExecutionPort *>(
+            runtime->execution.get());
+    const auto *gripper_owned_stop =
+        dynamic_cast<core::IControlDomainExecutionPort *>(
+            runtime->gripper.get());
+    if (runtime->gripper_stop_execution_port != execution_stop &&
+        runtime->gripper_stop_execution_port != gripper_owned_stop &&
+        runtime->gripper_stop_execution_port != runtime->gripper_participant_engine.get()) {
+      throw std::invalid_argument(
+          "retained runtime gripper Stop port is not owned by its adapter "
+          "set");
+    }
   }
 
   std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
@@ -2511,7 +2582,8 @@ struct CellParticipantSet final {
   for (const auto &gripper : root->independent_gripper_peers) {
     if (gripper == nullptr)
       throw std::logic_error("cell route has a missing independent gripper");
-    result.registrations.push_back(gripper->registration());
+    const auto aliases = gripper->registrations();
+    result.registrations.insert(result.registrations.end(), aliases.begin(), aliases.end());
     result.physical_bindings.push_back(gripper->binding());
   }
   return result;
@@ -2569,6 +2641,121 @@ RetainedNativeRuntime::participant_engine_for(const bool motion) const {
   return gripper_participant_engine.get();
 }
 
+void RetainedNativeRuntime::BindCellRuntimeOwner(
+    RetainedNativeCellRuntime& cell, const std::string& runtime_epoch,
+    const std::string& cell_id) {
+  auto& runtime = *this;
+  auto* const stable_kernel_owner = &cell.addressed_kernel();
+  auto* const stable_operation_journal = &cell.operation_journal();
+  runtime.cell_addressed_kernel = stable_kernel_owner;
+  runtime.cell_operation_journal = stable_operation_journal;
+  runtime.addressed_request_owner_epoch =
+      core::RequestOwnerEpoch("kernel-owner-" + runtime_epoch);
+  runtime.addressed_cell_id = core::CellId(cell_id);
+  for (const auto &peer : runtime.participant_peers) {
+    peer->cell_addressed_kernel = stable_kernel_owner;
+    peer->cell_operation_journal = stable_operation_journal;
+    peer->addressed_request_owner_epoch =
+        runtime.addressed_request_owner_epoch;
+    peer->addressed_cell_id = runtime.addressed_cell_id;
+  }
+}
+
+void RetainedNativeRuntime::BindIndependentGripperPeers(
+    const std::shared_ptr<RetainedNativeRuntime>& root,
+    std::vector<std::shared_ptr<RetainedNativeGripperRuntime>> peers) {
+  if (root.get() != this)
+    throw std::invalid_argument("scalar topology must bind its exact retained root");
+  std::lock_guard lock(route_publication_mutex_);
+  independent_gripper_peers.swap(peers);
+  installed_self_ = root;
+}
+
+core::Result<std::shared_ptr<RetainedNativeGripperRoutePublicationOwner>>
+RetainedNativeRuntime::CurrentIndependentGripperRouteOwner(const core::ControlDomainId& domain) const {
+  using Result = core::Result<std::shared_ptr<RetainedNativeGripperRoutePublicationOwner>>;
+  std::lock_guard lock(route_publication_mutex_);
+  std::shared_ptr<RetainedNativeGripperRuntime> selected;
+  for (const auto& gripper : independent_gripper_peers) {
+    if (!gripper) return Result::Err({"missing_reference", "installed scalar peer is absent", {}});
+    const auto binding = gripper->binding();
+    if (!binding.value().control_path || binding.value().control_path->control_domain_id != domain) continue;
+    if (selected) return Result::Err({"invalid_request", "scalar domain has multiple actual owners", {}});
+    selected = gripper;
+  }
+  if (!selected) return Result::Ok(nullptr);
+  bool arm_owns_domain = false;
+  const auto note_arm_domains = [&](const RetainedNativeRuntime& runtime) {
+    for (const auto& binding : runtime.control_binding_representatives)
+      if (binding.value().control_path && binding.value().control_path->control_domain_id == domain)
+        arm_owns_domain = true;
+  };
+  note_arm_domains(*this);
+  for (const auto& peer : participant_peers) note_arm_domains(*peer);
+  if (arm_owns_domain) return Result::Err(
+      {"invalid_request", "scalar domain aliases an existing arm-component owner", {}});
+  auto root = installed_self_.lock();
+  if (!root || root.get() != this || !root->cell_runtime_owner || !root->clock ||
+      root->active_addressed_kernel() != &root->cell_runtime_owner->addressed_kernel())
+    return Result::Err({"missing_reference", "scalar route lost its exact installed root", {}});
+  const std::weak_ptr<RetainedNativeRuntime> weak_root = root;
+  auto candidate = [weak_root, selected](const auto&, const auto& replacement)
+      -> core::Result<RetainedNativeGripperRoutePublicationOwner::KernelCandidate> {
+    using CandidateResult = core::Result<RetainedNativeGripperRoutePublicationOwner::KernelCandidate>;
+    // The route owner has reacquired this same mutex and verified the selected
+    // installed owner before any physical rebind. Re-read current data here;
+    // no captured predecessor bundle/model/factory survives an Apply.
+    auto current = weak_root.lock();
+    if (!current || !current->cell_runtime_owner || !current->participant_resolver_factory ||
+        std::count(current->independent_gripper_peers.begin(), current->independent_gripper_peers.end(), selected) != 1)
+      return CandidateResult::Err({"missing_reference", "scalar candidate lost its installed owner or factory", {}});
+    auto rows = current->cell_runtime_owner->participant_registrations();
+    if (replacement.size() != selected->registrations().size())
+      return CandidateResult::Err({"missing_reference", "scalar candidate omits installed aliases", {}});
+    for (const auto& next : replacement) {
+      const auto old = std::find_if(rows.begin(), rows.end(), [&](const auto& row) {
+        return row.engine == selected->participant_engine() &&
+               row.binding.value().controllable_component_id == next.binding.value().controllable_component_id &&
+               row.binding.value().command_target_id == next.binding.value().command_target_id &&
+               row.binding.value().control_path && next.binding.value().control_path &&
+               row.binding.value().control_path->control_binding_id == next.binding.value().control_path->control_binding_id &&
+               row.binding.value().capability_id == next.binding.value().capability_id;
+      });
+      if (old == rows.end()) return CandidateResult::Err(
+          {"missing_reference", "scalar candidate has no actual installed registration", {}});
+      *old = next;
+    }
+    const auto primary = std::find_if(replacement.begin(), replacement.end(), [&](const auto& row) {
+      return row.binding.value().capability_id == selected->binding().value().capability_id;
+    });
+    if (primary == replacement.end()) return CandidateResult::Err(
+        {"missing_reference", "scalar candidate has no primary command registration", {}});
+    std::vector<core::RuntimeParticipantBinding> physical;
+    for_each_cell_runtime(*current, [&](RetainedNativeRuntime& runtime) {
+      physical.push_back(runtime.motion_binding);
+      if (runtime.gripper_binding) physical.push_back(*runtime.gripper_binding);
+    });
+    for (const auto& gripper : current->independent_gripper_peers)
+      physical.push_back(gripper == selected ? primary->binding : gripper->binding());
+    auto binding_resolver = current->participant_resolver_factory(std::move(physical));
+    if (!binding_resolver) return CandidateResult::Err(
+        {"missing_reference", "current scalar participant resolver factory returned no resolver", {}});
+    auto resolver = make_retained_cell_kernel_participant_resolver(std::move(binding_resolver), rows);
+    auto cache = rows;
+    auto cached_resolver = resolver;
+    std::function<void()> adopt = [current = std::move(current), cache = std::move(cache),
+        cached_resolver = std::move(cached_resolver)]() mutable noexcept {
+      current->participant_registrations.swap(cache);
+      current->participant_resolver.swap(cached_resolver);
+    };
+    return CandidateResult::Ok({std::move(rows), std::move(resolver), std::move(adopt)});
+  };
+  auto route = std::make_shared<RetainedNativeGripperRoutePublicationOwner>(
+      selected, *root->clock, *root->active_addressed_kernel(), std::move(candidate), root->cell_runtime_owner);
+  route->BindMotionRoot(root);
+  return Result::Ok(std::move(route));
+}
+
 core::Result<std::vector<core::RuntimeParticipantBinding>>
 RetainedNativeRuntime::ReadCurrentPhysicalParticipants(
     const core::ActiveControlConfigurationDTO &configuration) const {
@@ -2581,6 +2768,11 @@ RetainedNativeRuntime::ReadCurrentPhysicalParticipants(
         "native route publication requested an invalid configuration",
         core::ErrorCode::kInvalidRequest);
   }
+  const auto* root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  auto scalar = root->CurrentIndependentGripperRouteOwner(configuration.control_domain_id);
+  if (!scalar.ok()) return core::Result<std::vector<core::RuntimeParticipantBinding>>::Err(scalar.error());
+  if (scalar.value()) return scalar.value()->ReadCurrentPhysicalParticipants(configuration);
+
   const auto owns_domain = [&](const auto &runtime) {
     return std::any_of(
         runtime.control_binding_representatives.begin(),
@@ -2744,6 +2936,26 @@ core::Result<void> validate_prepared_measured_sources(
     const core::RuntimeParticipantBinding &motion,
     const std::optional<core::RuntimeParticipantBinding> &gripper,
     const std::vector<core::ActiveControlConfigurationDTO> &configurations) {
+  std::vector<core::RuntimeParticipantBinding> physical{motion};
+  if (gripper) physical.push_back(*gripper);
+  return ValidateRetainedPreparedMeasuredSources(
+      prepared, motion.value().controllable_component_id, physical, configurations);
+}
+
+void enable_prepared_measured_sources(
+    const RetainedPreparedRobotMeasuredSources &prepared) noexcept {
+  // Composition supplies the actual no-throw gate. A throwing callback violates
+  // that construction contract and cannot become a partial association commit.
+  prepared.enable_publication();
+}
+
+} // namespace
+
+core::Result<void> ValidateRetainedPreparedMeasuredSources(
+    const RetainedPreparedRobotMeasuredSources &prepared,
+    const core::ControllableComponentId &component,
+    std::span<const core::RuntimeParticipantBinding> physical_bindings,
+    const std::vector<core::ActiveControlConfigurationDTO> &configurations) {
   const auto unavailable = [] {
     return measured_source_unavailable<void>(
         "measured_prepared_scope_mismatch",
@@ -2751,7 +2963,7 @@ core::Result<void> validate_prepared_measured_sources(
   };
   if (!prepared.enable_publication ||
       prepared.source_view.component_id !=
-          motion.value().controllable_component_id)
+          component)
     return unavailable();
   for (const auto &source : prepared.source_view.sources) {
     auto valid = source.descriptor.validate();
@@ -2828,21 +3040,15 @@ core::Result<void> validate_prepared_measured_sources(
                                });
           });
     };
-    if (!matches(motion) && !(gripper && matches(*gripper)))
+    if (std::none_of(physical_bindings.begin(), physical_bindings.end(), matches))
       return unavailable();
   }
   return core::Result<void>::Ok();
 }
 
-void enable_prepared_measured_sources(
-    const RetainedPreparedRobotMeasuredSources &prepared) noexcept {
-  // Composition supplies the actual no-throw gate. A throwing callback violates
-  // that construction contract and cannot become a partial association commit.
-  prepared.enable_publication();
-}
-
-core::Result<void> validate_measured_readiness_snapshot(
-    const RetainedNativeRuntime &runtime,
+core::Result<void> ValidateRetainedMeasuredReadinessSnapshot(
+    const core::ControllableComponentId& component,
+    std::span<const core::RuntimeParticipantBinding> physical_bindings,
     const core::ComponentLifecycleCurrentSnapshotDTO &snapshot,
     const MeasuredRouteReadbacks &readbacks) {
   const auto unavailable = [] {
@@ -2852,11 +3058,11 @@ core::Result<void> validate_measured_readiness_snapshot(
   };
   if (!snapshot.locally_valid() ||
       snapshot.controllable_component_id !=
-          runtime.motion_binding.value().controllable_component_id)
+          component)
     return unavailable();
   const auto &publication = snapshot.active_publication_receipt.request;
   std::set<core::ControlDomainId> domains;
-  for (const auto &binding : runtime.control_binding_representatives) {
+  for (const auto &binding : physical_bindings) {
     const auto &value = binding.value();
     if (value.controllable_component_id != snapshot.controllable_component_id ||
         value.retained_bundle_id != publication.candidate_retained_bundle_id ||
@@ -2892,7 +3098,7 @@ core::Result<void> validate_measured_readiness_snapshot(
       return unavailable();
     std::vector<core::ExpectedControlBindingRevisionDTO> bindings;
     std::vector<core::ResourceId> resources;
-    for (const auto &representative : runtime.control_binding_representatives) {
+    for (const auto &representative : physical_bindings) {
       const auto &value = representative.value();
       const auto &path = *value.control_path;
       if (path.control_domain_id != scope.control_domain_id)
@@ -2944,6 +3150,15 @@ core::Result<void> validate_measured_readiness_snapshot(
       return unavailable();
   }
   return core::Result<void>::Ok();
+}
+
+namespace {
+core::Result<void> validate_measured_readiness_snapshot(
+    const RetainedNativeRuntime& runtime,
+    const core::ComponentLifecycleCurrentSnapshotDTO& snapshot,
+    const MeasuredRouteReadbacks& readbacks) {
+  return ValidateRetainedMeasuredReadinessSnapshot(runtime.motion_binding.value().controllable_component_id,
+      runtime.control_binding_representatives, snapshot, readbacks);
 }
 
 } // namespace
@@ -3159,6 +3374,11 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         "native route publication has an invalid configuration",
         core::ErrorCode::kInvalidRequest);
   }
+  const auto* root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  auto scalar = root->CurrentIndependentGripperRouteOwner(configuration.control_domain_id);
+  if (!scalar.ok()) return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(scalar.error());
+  if (scalar.value()) return scalar.value()->PublishAndReadBackRouteConfiguration(configuration, std::move(participants));
+
   const auto owns_domain = [&](const auto &runtime) {
     return std::any_of(
         runtime.control_binding_representatives.begin(),
@@ -3787,6 +4007,9 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
                           std::vector<core::RuntimeParticipantExecutionRegistration>>>
         staged;
     std::vector<core::RuntimeParticipantBinding> physical_bindings;
+    std::vector<std::tuple<std::shared_ptr<RetainedNativeGripperRuntime>,
+        std::optional<core::RuntimeParticipantStopReadiness>,
+        std::vector<core::RuntimeParticipantExecutionRegistration>>> staged_grippers;
     std::optional<core::Result<void>> failure;
     for_each_cell_runtime(*this, [&](RetainedNativeRuntime &runtime) {
       if (failure.has_value()) return;
@@ -3807,6 +4030,31 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
     if (failure.has_value()) {
       return core::Result<core::ComponentCommandReadinessDTO>::Err(
           failure->error());
+    }
+    // Existing independent scalar owners participate in the same complete
+    // cell snapshot. Stage their caches before publishing, just like arms.
+    for (const auto& gripper : cell_root->independent_gripper_peers) {
+      if (!gripper)
+        return route_publication_error<core::ComponentCommandReadinessDTO>(
+            "component_readiness_physical_binding_missing", "cell readiness lost a scalar owner");
+      const auto registration = gripper->registration();
+      auto rebound = rebind_component_registrations(
+          gripper->registrations(), publication.controllable_component_id,
+          publication.component_lifecycle_generation);
+      if (!rebound.ok()) return core::Result<core::ComponentCommandReadinessDTO>::Err(rebound.error());
+      auto& complete = staged.front().second;
+      std::optional<core::RuntimeParticipantStopReadiness> primary_readiness;
+      for (const auto& candidate : rebound.value()) {
+        const auto previous = std::find_if(complete.begin(), complete.end(), [&](const auto& row) {
+          return row.binding.value() == candidate.binding.value();
+        });
+        if (previous != complete.end()) *previous = candidate;
+        else complete.push_back(candidate);
+        if (candidate.binding.value() == registration.binding.value()) primary_readiness = candidate.stop_readiness;
+      }
+      physical_bindings.push_back(registration.binding);
+      if (registration.binding.value().controllable_component_id == publication.controllable_component_id)
+        staged_grippers.emplace_back(gripper, std::move(primary_readiness), std::move(rebound.value()));
     }
     const auto &cell_registrations = staged.front().second;
     std::vector<core::RuntimeParticipantExecutionRegistration>
@@ -3843,6 +4091,13 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
     }
     auto kernel_resolver = make_kernel_participant_resolver(
         std::move(binding_resolver), std::move(cell_physical_registrations));
+    auto staged_root_resolver = kernel_resolver;
+    std::vector<core::RuntimeParticipantExecutionRegistration> stable_registrations;
+    core::RuntimeParticipantAdmissionResolver stable_resolver;
+    if (cell_root->cell_runtime_owner) {
+      stable_registrations = cell_registrations;
+      stable_resolver = kernel_resolver;
+    }
     auto published =
         kernel->publish_component_command_readiness(publication, kernel_resolver);
     if (!published.ok()) {
@@ -3863,9 +4118,14 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
     for (auto &[runtime, registrations] : staged) {
       runtime->participant_registrations = std::move(registrations);
     }
-    cell_root->participant_resolver = kernel_resolver;
-    if (cell_root != this) {
-      participant_resolver = std::move(kernel_resolver);
+    cell_root->participant_resolver.swap(staged_root_resolver);
+    if (cell_root != this) participant_resolver.swap(kernel_resolver);
+    if (cell_root->cell_runtime_owner)
+      cell_root->cell_runtime_owner->AdoptVerifiedComponentReadinessSnapshot(
+          std::move(stable_registrations), std::move(stable_resolver));
+    for (auto& [gripper, readiness, registrations] : staged_grippers) {
+      gripper->AdoptVerifiedReadiness(std::move(readiness));
+      gripper->AdoptVerifiedRegistrations(std::move(registrations));
     }
     return readback;
   } catch (const std::exception &exception) {
@@ -3900,15 +4160,16 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
            (!left.stop_readiness || left.stop_readiness->value() == right.stop_readiness->value()) &&
            same_registration_after_product_reseal(left, right);
   };
-  const auto actual_count = std::count_if(root->participant_registrations.begin(),
-      root->participant_registrations.end(), [&](const auto &row) {
+  const auto& complete = root->cell_runtime_owner
+      ? root->cell_runtime_owner->participant_registrations() : root->participant_registrations;
+  const auto actual_count = std::count_if(complete.begin(),
+      complete.end(), [&](const auto &row) {
         return row.binding.value().controllable_component_id == component;
       });
   if (static_cast<std::size_t>(actual_count) != installed.size() ||
       std::any_of(installed.begin(), installed.end(), [&](const auto &row) {
         return row.binding.value().controllable_component_id != component ||
-               std::none_of(root->participant_registrations.begin(),
-                   root->participant_registrations.end(),
+               std::none_of(complete.begin(), complete.end(),
                    [&](const auto &current) { return exact(current, row); });
       })) {
     return route_publication_error<core::ComponentCommandReadinessDTO>(
@@ -3927,6 +4188,15 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
       }
     }
   });
+  for (const auto& gripper : root->independent_gripper_peers) {
+    if (!gripper) { cache_exact = false; continue; }
+    for (const auto& row : gripper->registrations()) {
+      if (row.binding.value().controllable_component_id == component &&
+          std::none_of(installed.begin(), installed.end(),
+                       [&](const auto& current) { return exact(current, row); }))
+        cache_exact = false;
+    }
+  }
   if (!cache_exact) {
     return route_publication_error<core::ComponentCommandReadinessDTO>(
         "selected_successor_runtime_inventory_changed",
@@ -4015,6 +4285,11 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
         "native restart predecessor is not one reconciled configuration",
         core::ErrorCode::kInvalidRequest);
   }
+  const auto* root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  auto scalar = root->CurrentIndependentGripperRouteOwner(configuration.control_domain_id);
+  if (!scalar.ok()) return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(scalar.error());
+  if (scalar.value()) return scalar.value()->AdoptAndReadBackRouteConfigurationPredecessor(configuration);
+
   const auto owns_domain = [&](const auto &runtime) {
     return std::any_of(
         runtime.control_binding_representatives.begin(),

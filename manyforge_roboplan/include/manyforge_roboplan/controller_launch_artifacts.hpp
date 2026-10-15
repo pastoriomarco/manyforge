@@ -95,6 +95,7 @@ struct MockControllerArtifactsInput final {
   std::map<std::string, double, std::less<>> max_deceleration_on_cancel_rad_s2;
   /// The gripper binding as the mock lane sees it; absent without a gripper.
   std::optional<MockGripperBinding> gripper;
+  core::GripperOutputMode gripper_output_mode{core::GripperOutputMode::kCommanded};
 };
 
 /// One Isaac lane component (Q47/Q73: fixed profile initial values).
@@ -118,6 +119,8 @@ struct ControllerLaunchArtifactsRequest final {
   /// Q82: the retained deployment frame prefix, passed literally; empty
   /// passes no prefix.
   std::string frame_prefix{};
+  /// Explicit no-output Isaac gripper's model facts, validation only.
+  std::optional<MockGripperBinding> gripper_without_control_interfaces{};
 };
 
 enum class ControllerLaunchLane { kMock, kIsaac };
@@ -135,6 +138,7 @@ struct ControllerLaunchArtifacts final {
   /// Exact effective controller configuration retained from generation memory.
   std::string controllers_yaml;
   std::string runtime_namespace;
+  /// Empty only for a genuine gripper-only mock component.
   std::string arm_controller_name;
   std::optional<std::string> gripper_controller_name;
   std::string frame_prefix;
@@ -151,7 +155,8 @@ struct ControllerLaunchArtifacts final {
     const std::vector<std::string> &arm_joint_names,
     const std::map<std::string, double, std::less<>>
         &max_deceleration_on_cancel_rad_s2,
-    const std::optional<std::string> &gripper_joint_name);
+    const std::optional<std::string> &gripper_joint_name,
+    core::GripperOutputMode gripper_output_mode = core::GripperOutputMode::kCommanded);
 
 /// The retained Isaac controller file of one Isaac profile, unchanged.
 [[nodiscard]] std::string_view retained_isaac_controllers_yaml(
@@ -185,11 +190,20 @@ struct ComponentControllerLaunchInput final {
       controlled_stop_max_deceleration_rad_s2;
   /// Q82: this component's retained deployment frame prefix.
   std::string frame_prefix;
+  /// Caller supplies the strict selected pneumatic output choice. None never
+  /// follows from a missing binding and does not create physical gripper output.
+  core::GripperOutputMode gripper_output_mode{core::GripperOutputMode::kCommanded};
 };
 
 /// Write one ROS component's controller launch artifacts at activation.
 [[nodiscard]] ControllerLaunchArtifacts write_component_controller_launch_artifacts(
     const core::RuntimeParticipantBinding &motion_binding,
+    const ComponentControllerLaunchInput &input);
+
+/// The optional-motion join. Without motion, requires a genuine scalar,
+/// model-backed mock gripper binding; its exact component owns the artifacts.
+[[nodiscard]] ControllerLaunchArtifacts write_component_controller_launch_artifacts(
+    const std::optional<core::RuntimeParticipantBinding> &motion_binding,
     const ComponentControllerLaunchInput &input);
 
 /// One-line JSON evidence record of written artifacts (paths, hashes, launch

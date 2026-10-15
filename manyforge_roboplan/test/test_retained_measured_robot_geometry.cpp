@@ -34,21 +34,16 @@ class GeometryFixture final {
 public:
   explicit GeometryFixture(bool with_feedback_alias = false)
       : package_root_(root_.path()),
-        bundle_(
-            with_feedback_alias
-                ? deployment::test::
-                      materialize_lite6_retained_consumer_fixture_from(
-                          package_root_,
-                          deployment::test::
-                              make_lite6_controllable_retention_fixture(
-                                  false, false, 1U, true, true, {}, false,
-                                  false, "resource", false, {}, {}, false,
-                                  true))
-                          .bundle
-                : deployment::test::
-                      materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
-                          package_root_)
-                          .bundle),
+        bundle_(deployment::test::materialize_lite6_retained_consumer_fixture_from(
+                    package_root_,
+                    deployment::test::make_lite6_controllable_retention_fixture(
+                        false, false, 1U, true, true, {}, false, false,
+                        "resource", false, {}, {}, true, with_feedback_alias,
+                        false, std::nullopt, false,
+                        deployment::test::kLite6ArmTargetId, std::nullopt,
+                        std::nullopt, {}, {}, true, {},
+                        "manyforge.provider.ros2_control", false, true))
+                    .bundle),
         map_(load_map()) {
     project_bindings(bundle_->value()
                          .cell_graph.controllable_components.front()
@@ -550,6 +545,55 @@ TEST(RetainedMeasuredRobotGeometry,
             original.value().front().component_id);
   EXPECT_EQ(result.value().front().required_resources,
             original.value().front().required_resources);
+}
+
+TEST(RetainedMeasuredRobotGeometry, VettedPneumaticGeometryPreservesCompleteArmRequirements) {
+  GeometryFixture fixture;
+  const auto tool = std::find_if(fixture.bindings.begin(), fixture.bindings.end(), [](const auto& binding) {
+    return binding.value().capability_id.value() == "tool.gripper.command";
+  });
+  ASSERT_NE(tool, fixture.bindings.end());
+  const std::vector<core::RuntimeParticipantBinding> pneumatic{*tool};
+  const auto original = fixture.qualify();
+  ASSERT_TRUE(original.ok());
+  const auto measured = QualifyRetainedRobotMeasuredGeometry(fixture.map(), fixture.ids,
+      fixture.bindings, {}, pneumatic);
+  ASSERT_TRUE(measured.ok()) << measured.error().message;
+  ASSERT_EQ(measured.value().size(), 1U);
+  auto expected = original.value().front().required_resources;
+  std::erase_if(expected, [&](const auto& resource) {
+    return std::any_of(tool->value().resources.begin(), tool->value().resources.end(),
+        [&](const auto& row) { return row.resource_id == resource; });
+  });
+  EXPECT_EQ(measured.value().front().required_resources, expected);
+  EXPECT_EQ(measured.value().front().geometry_coordinates.size(), expected.size());
+  const auto arm = std::find_if(fixture.bindings.begin(), fixture.bindings.end(), [&](const auto& binding) {
+    return binding.value().command_target_id != tool->value().command_target_id;
+  });
+  ASSERT_NE(arm, fixture.bindings.end());
+  fixture.bindings.erase(arm);
+  EXPECT_FALSE(QualifyRetainedRobotMeasuredGeometry(fixture.map(), fixture.ids,
+      fixture.bindings, {}, pneumatic).ok());
+}
+
+TEST(RetainedMeasuredRobotGeometry, PneumaticExclusionRejectsForeignDuplicateAndMeasuredEvidence) {
+  GeometryFixture fixture;
+  const auto tool = std::find_if(fixture.bindings.begin(), fixture.bindings.end(), [](const auto& binding) {
+    return binding.value().capability_id.value() == "tool.gripper.command";
+  });
+  ASSERT_NE(tool, fixture.bindings.end());
+  const std::vector<core::RuntimeParticipantBinding> pneumatic{*tool};
+  auto foreign = tool->value();
+  foreign.retained_bundle_id = core::RetainedBundleId("foreign.bundle");
+  const auto sealed = core::verify_runtime_participant_binding(std::move(foreign));
+  ASSERT_TRUE(sealed.ok());
+  EXPECT_FALSE(QualifyRetainedRobotMeasuredGeometry(fixture.map(), fixture.ids,
+      fixture.bindings, {}, std::vector<core::RuntimeParticipantBinding>{sealed.value()}).ok());
+  EXPECT_FALSE(QualifyRetainedRobotMeasuredGeometry(fixture.map(), fixture.ids,
+      fixture.bindings, {}, std::vector<core::RuntimeParticipantBinding>{*tool, *tool}).ok());
+  const std::vector<core::RequiredRobotMeasuredStateSource> source{fixture.source(*tool)};
+  EXPECT_FALSE(QualifyRetainedRobotMeasuredGeometry(fixture.map(), fixture.ids,
+      fixture.bindings, source, pneumatic).ok());
 }
 
 } // namespace

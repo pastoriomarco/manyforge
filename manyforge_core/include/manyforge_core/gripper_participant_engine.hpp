@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <manyforge_core/kernel_event_publisher.hpp>
+#include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
 #include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
 #include <manyforge_core/ports/iresolved_prepared_participant_execution_engine.hpp>
@@ -16,11 +17,14 @@ namespace manyforge::core {
 /// All aliases of one physical gripper share this instance. The addressed owner
 /// still reserves resources and owns physical Stop/certificates.
 class GripperParticipantEngine final : public IResolvedParticipantExecutionEngine,
-                                       public IResolvedPreparedParticipantExecutionEngine {
+                                       public IResolvedPreparedParticipantExecutionEngine,
+                                       public IControlDomainExecutionPort {
  public:
   GripperParticipantEngine(IGripperCommandBackend& backend, IClock& clock);
   ~GripperParticipantEngine() override;
 
+  GripperActuationKind gripper_actuation_kind(const std::string& target) const override;
+  GripperOutputMode gripper_output_mode(const std::string& target) const override;
   GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override;
   Result<void> validate_gripper_command(const GripperCommandRequestDTO& request) const override;
   GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const override;
@@ -36,6 +40,9 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
       std::uint64_t preparation_id, const ContentDigest& digest, const ControllerGoalId& goal,
       ControllerGoalGeneration generation) override;
   Result<void> CancelPreparedCapabilityCommand(std::uint64_t preparation_id) override;
+  ParticipantStopStageResultDTO TranslateStopStage(
+      const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+      std::stop_token cancellation) override;
   AddressedParticipantStopFenceDisposition fence_addressed_participant_stop(
       std::uint64_t execution_id) noexcept override;
   Result<AddressedParticipantStopSettlementDTO> settle_addressed_participant_stop(
@@ -52,9 +59,7 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
     return {false, unsupported_error()};
   }
   AcknowledgeCompletedResultDTO acknowledge_completed(
-      std::uint64_t, std::optional<std::uint64_t> = std::nullopt) override {
-    return {false, unsupported_error()};
-  }
+      std::uint64_t, std::optional<std::uint64_t> = std::nullopt) override;
   Result<ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
       const ResolvedRuntimeScaleCommandDTO&) override {
     return unsupported<ResolvedRuntimeScaleAcceptedDTO>();
@@ -92,7 +97,7 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
   std::uint64_t next_execution_id_{1U};  // guarded by prepared_command_session_mutex_
   std::atomic<std::uint64_t> control_command_epoch_{1U};
   mutable std::mutex prepared_command_session_mutex_;
-  std::shared_ptr<PreparedCapabilityCommandSession> active_prepared_command_session_;
+  std::atomic<std::shared_ptr<PreparedCapabilityCommandSession>> active_prepared_command_session_;
   KernelEventPublisher event_publisher_;
 };
 

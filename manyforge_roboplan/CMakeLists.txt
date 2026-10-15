@@ -260,17 +260,6 @@ target_link_libraries(manyforge_roboplan_controller_launch_process
   PUBLIC manyforge_roboplan_controller_launch_artifacts
   PRIVATE Threads::Threads)
 
-add_library(manyforge_roboplan_native_gripper
-  src/retained_native_gripper_runtime.cpp
-  src/retained_native_gripper_route_publication_owner.cpp)
-target_include_directories(manyforge_roboplan_native_gripper PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
-target_link_libraries(manyforge_roboplan_native_gripper PUBLIC
-  manyforge_roboplan_native_state_projection
-  manyforge_roboplan_native_runtime_support
-  manyforge_deployment)
-
 add_library(manyforge_roboplan_native_focused_adapters
   src/retained_focused_adapters.cpp)
 target_include_directories(
@@ -332,6 +321,8 @@ target_link_libraries(manyforge_roboplan_planner_backend PUBLIC
 
 add_library(manyforge_roboplan_native_runtime
   src/isaac_arm_guard.cpp
+  src/retained_native_gripper_runtime.cpp
+  src/retained_native_gripper_route_publication_owner.cpp
   src/retained_native_runtime.cpp
   src/retained_native_cell_runtime.cpp
   src/retained_stop_surveillance_owner.cpp)
@@ -341,8 +332,10 @@ target_include_directories(manyforge_roboplan_native_runtime PUBLIC
 target_compile_definitions(manyforge_roboplan_native_runtime PRIVATE
   COAL_DISABLE_HPP_FCL_WARNINGS)
 target_link_libraries(manyforge_roboplan_native_runtime PUBLIC
+  manyforge_roboplan_native_state_projection
+  manyforge_roboplan_native_runtime_support
+  manyforge_deployment
   manyforge_roboplan_native_focused_adapters
-  manyforge_roboplan_native_gripper
   manyforge_roboplan_planner_backend
   manyforge_roboplan_collision_projection
   manyforge_collision
@@ -350,6 +343,10 @@ target_link_libraries(manyforge_roboplan_native_runtime PUBLIC
   manyforge_core_sqlite_operation_journal
   manyforge::deployment_resolved_stop_base_plan_resolver
   PRIVATE manyforge::content_identity)
+
+# Scalar routes use the same cell/root and measured-source implementation.
+add_library(manyforge_roboplan_native_gripper ALIAS
+  manyforge_roboplan_native_runtime)
 
 if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
   if(NOT TARGET manyforge_ros2_control_execution)
@@ -848,6 +845,12 @@ if(BUILD_TESTING)
       test/test_retained_native_cell_runtime.cpp)
     target_link_libraries(test_retained_native_cell_runtime PRIVATE
       manyforge_roboplan_native_runtime GTest::gtest_main)
+    if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
+      target_link_libraries(test_retained_native_cell_runtime PRIVATE
+        manyforge_roboplan_ros2_control_runtime)
+      target_compile_definitions(test_retained_native_cell_runtime PRIVATE
+        MANYFORGE_A1_ROS_GRIPPER_CELL_TEST=1)
+    endif()
 
     add_executable(test_retained_native_controller_lifecycle_port
       test/test_retained_native_controller_lifecycle_port.cpp)
@@ -1108,6 +1111,21 @@ if(BUILD_TESTING)
     set(_MANYFORGE_UR5_ARM_ONLY_CATALOG_PATH
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/resources/maintained/model_assets/ur5_roboplan.model_asset.json")
 
+    # Standalone Position qualification uses the already-normalized Robotiq
+    # subtree and the existing mesh resource root, with no arm coordinates.
+    set(_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_SOURCE_ROOT
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/resources/maintained/model_sources/robotiq_2f_85")
+    set(_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_RESOURCE_ROOT "${_MANYFORGE_ROBOPLAN_UR5E_SOURCE_ROOT}")
+    _manyforge_prepare_roboplan_model_fixture(
+      "${_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_SOURCE_ROOT}"
+      "${_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_RESOURCE_ROOT}"
+      robotiq_2f_85 robotiq_2f_85.urdf robotiq_2f_85.srdf
+      "package://manyforge_example_models/models/ur5e_robotiq_2f_85/"
+      _MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT
+      _MANYFORGE_ROBOTIQ_GRIPPER_ONLY_RESOURCE_INPUTS)
+    set(_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_CATALOG_PATH
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/resources/maintained/model_assets/robotiq_2f_85.model_asset.json")
+
     # Deployment owns this deterministic test-only generator. It publishes
     # exact retained bytes and compiler maps, without importing any RoboPlan,
     # collision-engine, Composer, or Pinocchio consumer API.
@@ -1163,6 +1181,10 @@ if(BUILD_TESTING)
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test/generate_lite6_native_execution_fixture.cpp")
     target_compile_definitions(
       generate_lite6_native_execution_fixture_tool PRIVATE
+      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT}"
+      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_SOURCE_ROOT}"
+      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_RESOURCE_ROOT="${_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_RESOURCE_ROOT}"
+      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_CATALOG_PATH="${_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_CATALOG_PATH}"
       MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT}"
       MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_UR5_ARM_ONLY_SOURCE_ROOT}"
       MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_RESOURCE_ROOT="${_MANYFORGE_UR5_ARM_ONLY_RESOURCE_ROOT}"
@@ -1241,10 +1263,38 @@ if(BUILD_TESTING)
 
     endif()
 
-    # Gripper-only source and assertions remain NOT_RUN until A1's independent
-    # cell owner can qualify the existing supported topology.
+    # M1 standalone Position source uses a genuine Robotiq-only retained model.
+    # Historical pneumatic CLI selections remain separate R5 fixture inputs.
+    if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
+    # Retain native-named output paths used by the owning process test.
     set(_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT
       "${CMAKE_CURRENT_BINARY_DIR}/lite6_native_gripper_only_fixture")
+    set(_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST
+      "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}/manifest.json")
+    add_custom_command(
+      OUTPUT "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E rm -rf
+        "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E make_directory
+        "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+      COMMAND
+        "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
+        --output-root "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+        --fixture-kind gripper-only-robotiq-position
+      DEPENDS
+        generate_lite6_native_execution_fixture_tool
+        manyforge_ros2_control_execution_host
+        "${_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT}/model.urdf"
+        "${_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT}/model.srdf"
+        "${_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_CATALOG_PATH}"
+        ${_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(generate_lite6_native_gripper_only_fixture ALL
+      DEPENDS "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST}")
+
+    endif()
 
     # Focused single-domain fixture for the CCLC repository-readiness test.
     # It exercises the ordinary retained product path without pulling the
@@ -1392,6 +1442,7 @@ if(BUILD_TESTING)
     add_dependencies(test_retained_native_runtime_unit_adapter
       generate_ur5_arm_only_ros_fixture
       generate_lite6_native_execution_fixture
+      generate_lite6_native_gripper_only_fixture
       generate_lite6_native_cclc_readiness_fixture
       generate_lite6_native_projection_successor_fixture
       manyforge_ros2_control_execution_host

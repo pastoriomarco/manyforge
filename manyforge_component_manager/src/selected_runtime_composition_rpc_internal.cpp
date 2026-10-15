@@ -1,5 +1,6 @@
 #include "selected_runtime_composition_rpc_internal.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -39,6 +40,10 @@ constexpr std::uint8_t kProcessStopResultTag = 15U;
 constexpr std::uint8_t kInspectionPlanningTail = 2U;
 constexpr std::string_view kInspectionPlanningRequestMagic = "MFNSRC4-INSPECT-PLANNING-REQUEST-V1";
 constexpr std::string_view kInspectionPlanningResultMagic = "MFNSRC4-INSPECT-PLANNING-RESULT-V2";
+
+constexpr std::uint8_t kPneumaticNoneOwnersTail = 4U;
+constexpr std::string_view kInstalledNoneOwnersMagic = "MFNSRC4-INSTALLED-PNEUMATIC-NONE-V1";
+constexpr std::string_view kInspectionNoneOwnersMagic = "MFNSRC4-INSPECT-PNEUMATIC-NONE-V1";
 
 constexpr std::uint8_t kObserverRetirementTail = 3U;
 constexpr std::string_view kObserverRetirementMagic = "MFNSRC4-OBSERVER-RETIREMENT-V1";
@@ -621,7 +626,7 @@ void WriteInspectionPlanningResultTail(Writer &writer,
 
 void ReadInspectionPlanningResultTail(Reader &reader,
     ManagerComponentBringUpInspectionResultDTO &result) {
-  if (reader.AtEnd()) return;
+  if (reader.AtEnd() || reader.Peek() == kPneumaticNoneOwnersTail) return;
   if (reader.Byte() != kInspectionPlanningTail || reader.String() != kInspectionPlanningResultMagic)
     Fail("component planning result extension is not a closed supported value");
   result.request.planning_component_id = ReadStrong<core::ControllableComponentId>(reader);
@@ -639,6 +644,99 @@ void ReadInspectionPlanningResultTail(Reader &reader,
       std::move(selection), ReadVector<core::ExpectedControlDomainRevisionDTO>(reader, ReadPlanningDomain),
       static_cast<core::LifecycleTargetStateDTO>(reader.Byte()),
       static_cast<core::ComponentLifecycleIntentKindDTO>(reader.Byte())};
+}
+
+void WritePneumaticNoneOwner(Writer &writer,
+                              const ManagerPneumaticNoneProcessOwnerDTO &owner) {
+  WriteStrong(writer, owner.command_target_id);
+  WriteStrong(writer, owner.control_binding_id);
+  WriteStrong(writer, owner.control_binding_revision);
+}
+
+ManagerPneumaticNoneProcessOwnerDTO ReadPneumaticNoneOwner(Reader &reader) {
+  return {ReadStrong<core::CommandTargetId>(reader),
+          ReadStrong<core::ControlBindingId>(reader),
+          ReadStrong<core::ControlBindingRevision>(reader)};
+}
+
+void WriteInstalledNoneOwnersTail(Writer &writer,
+    const std::vector<ManagerComponentProcessOccurrenceDTO> &rows) {
+  const auto count = std::count_if(rows.begin(), rows.end(), [](const auto &row) {
+    return row.process_owner_kind == ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal;
+  });
+  if (count == 0) return;
+  writer.Byte(kPneumaticNoneOwnersTail);
+  writer.String(kInstalledNoneOwnersMagic);
+  writer.U32(static_cast<std::uint32_t>(count));
+  for (std::size_t index = 0; index < rows.size(); ++index) {
+    const auto &row = rows[index];
+    if (row.process_owner_kind != ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) continue;
+    writer.U32(static_cast<std::uint32_t>(index));
+    writer.Byte(static_cast<std::uint8_t>(row.process_owner_kind));
+    WritePneumaticNoneOwner(writer, *row.pneumatic_none_owner);
+  }
+}
+
+void ReadInstalledNoneOwnersTail(Reader &reader,
+    std::vector<ManagerComponentProcessOccurrenceDTO> &rows) {
+  if (reader.AtEnd()) return;
+  if (reader.Byte() != kPneumaticNoneOwnersTail || reader.String() != kInstalledNoneOwnersMagic)
+    Fail("installed None owner extension is not a closed supported value");
+  const auto count = reader.U32();
+  if (count == 0 || count > kMaximumCollectionEntries || count > rows.size())
+    Fail("installed None owner collection exceeds its exact row bounds");
+  std::optional<std::uint32_t> previous;
+  for (std::uint32_t entry = 0; entry < count; ++entry) {
+    const auto index = reader.U32();
+    if (index >= rows.size() || (previous && index <= *previous))
+      Fail("installed None owner indexes are not unique canonical row references");
+    previous = index;
+    if (reader.Byte() != static_cast<std::uint8_t>(ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal))
+      Fail("installed None owner kind is not supported");
+    rows[index].process_owner_kind = ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal;
+    rows[index].pneumatic_none_owner = ReadPneumaticNoneOwner(reader);
+  }
+}
+
+void WriteInspectionNoneOwnersTail(Writer &writer,
+    const std::vector<ManagerComponentProcessObservationDTO> &rows) {
+  const auto count = std::count_if(rows.begin(), rows.end(), [](const auto &row) {
+    return row.process_owner_kind == ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal;
+  });
+  if (count == 0) return;
+  writer.Byte(kPneumaticNoneOwnersTail);
+  writer.String(kInspectionNoneOwnersMagic);
+  writer.U32(static_cast<std::uint32_t>(count));
+  for (std::size_t index = 0; index < rows.size(); ++index) {
+    const auto &row = rows[index];
+    if (row.process_owner_kind != ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) continue;
+    writer.U32(static_cast<std::uint32_t>(index));
+    writer.Byte(static_cast<std::uint8_t>(row.process_owner_kind));
+    WritePneumaticNoneOwner(writer, *row.pneumatic_none_owner);
+    WriteStrong(writer, *row.installed_runtime_identity);
+  }
+}
+
+void ReadInspectionNoneOwnersTail(Reader &reader,
+    std::vector<ManagerComponentProcessObservationDTO> &rows) {
+  if (reader.AtEnd()) return;
+  if (reader.Byte() != kPneumaticNoneOwnersTail || reader.String() != kInspectionNoneOwnersMagic)
+    Fail("inspection None owner extension is not a closed supported value");
+  const auto count = reader.U32();
+  if (count == 0 || count > kMaximumCollectionEntries || count > rows.size())
+    Fail("inspection None owner collection exceeds its exact row bounds");
+  std::optional<std::uint32_t> previous;
+  for (std::uint32_t entry = 0; entry < count; ++entry) {
+    const auto index = reader.U32();
+    if (index >= rows.size() || (previous && index <= *previous))
+      Fail("inspection None owner indexes are not unique canonical row references");
+    previous = index;
+    if (reader.Byte() != static_cast<std::uint8_t>(ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal))
+      Fail("inspection None owner kind is not supported");
+    rows[index].process_owner_kind = ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal;
+    rows[index].pneumatic_none_owner = ReadPneumaticNoneOwner(reader);
+    rows[index].installed_runtime_identity = ReadStrong<core::ContentDigest>(reader);
+  }
 }
 
 void WriteProcessObservations(
@@ -694,7 +792,8 @@ void WriteCellObserverTail(Writer &writer,
 
 [[nodiscard]] std::optional<ManagerCellObserverObservationDTO>
 ReadCellObserverTail(Reader &reader) {
-  if (reader.AtEnd() || reader.Peek() == kInspectionPlanningTail) return std::nullopt;
+  if (reader.AtEnd() || reader.Peek() == kInspectionPlanningTail ||
+      reader.Peek() == kPneumaticNoneOwnersTail) return std::nullopt;
   if (!reader.Boolean()) Fail("observer extension must be present or omitted");
   ManagerCellObserverObservationDTO observer{
       ReadStrong<core::CellId>(reader), reader.String(), reader.String()};
@@ -1011,6 +1110,7 @@ std::string EncodeSelectedRuntimeCompositionRpcResponse(
           if (value.cell_observer)
             WriteCellObserverTail(writer, *value.cell_observer);
           WriteInspectionPlanningResultTail(writer, value);
+          WriteInspectionNoneOwnersTail(writer, value.configured_components);
           return std::move(writer).Finish();
         } else if constexpr (std::is_same_v<
                                  Value,
@@ -1024,6 +1124,7 @@ std::string EncodeSelectedRuntimeCompositionRpcResponse(
           writer.Boolean(value.error.has_value());
           if (value.error)
             WriteError(writer, *value.error);
+          WriteInstalledNoneOwnersTail(writer, value.process_occurrences);
           return std::move(writer).Finish();
         } else if constexpr (std::is_same_v<
                                  Value, ManagerComponentProcessStopResultDTO>) {
@@ -1066,6 +1167,7 @@ DecodeSelectedRuntimeCompositionRpcResponse(const std::string_view bytes) {
             reader, ReadInstalledOccurrence)};
     if (reader.Boolean())
       result.error = ReadError(reader);
+    ReadInstalledNoneOwnersTail(reader, result.process_occurrences);
     reader.Finish();
     if (!result.valid())
       Fail("decoded installed process inventory is invalid");
@@ -1112,6 +1214,7 @@ DecodeSelectedRuntimeCompositionRpcResponse(const std::string_view bytes) {
     ManagerComponentBringUpInspectionResultDTO result{
         std::move(request), std::move(observations), ReadCellObserverTail(reader)};
     ReadInspectionPlanningResultTail(reader, result);
+    ReadInspectionNoneOwnersTail(reader, result.configured_components);
     reader.Finish();
     if (!result.valid()) {
       Fail("decoded component inspection result is invalid");

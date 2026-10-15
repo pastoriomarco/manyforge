@@ -33,7 +33,7 @@
 #include <limits>
 #include <manyforge_component_manager/native_execution_runtime_unit_admission.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <map>
 #include <memory>
@@ -50,6 +50,7 @@
 
 extern char **environ;
 
+// DX-753: preserve native-named unit maps, launch, epochs, inventory, liveness and Stop plumbing.
 namespace manyforge::component_manager {
 namespace {
 

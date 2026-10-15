@@ -15,6 +15,8 @@
 
 namespace manyforge::roboplan_backend {
 
+struct MockControllerProfileFacts;
+
 /// Construct a secondary measured query from one verified physical binding
 /// and its exact reconciled route. This never changes execution/Stop authority
 /// or creates an observation. A genuine source callback supplies the sample.
@@ -57,6 +59,29 @@ make_retained_isaac_ros2_control_backend_config(
         &runtime_configuration,
     const core::RuntimeParticipantBinding &motion_binding,
     const std::optional<core::RuntimeParticipantBinding> &gripper_binding);
+
+/// Read only the strict authored row for this exact selected component/target.
+/// Coordinate kind and transport names never select actuator semantics.
+[[nodiscard]] core::GripperActuationKind retained_ros2_control_gripper_actuation_kind(
+    const deployment::ros2_control_execution_runtime_contract::Configuration& configuration,
+    const core::RuntimeParticipantBinding& binding);
+
+/// Apply the strict selected output choice after physical lane construction.
+/// None removes command transport; it never turns missing configuration into a no-op.
+void configure_retained_gripper_output_mode(
+    RetainedRos2ControlBackendConfig& config,
+    const deployment::ros2_control_execution_runtime_contract::Configuration& configuration,
+    const core::RuntimeParticipantBinding& binding);
+
+/// Populate the existing stock Mock GripperCommand transport from the exact
+/// binding/profile/controller facts. No motion participant is constructed.
+/// The arm builder and the no-motion owner share these unchanged lane values.
+void configure_retained_mock_gripper_action(
+    RetainedRos2ControlBackendConfig& config,
+    const core::RuntimeParticipantBinding& gripper,
+    const MockControllerProfileFacts& profile,
+    std::string_view runtime_namespace,
+    const std::string& controller_manager);
 
 /// Expand one closed offline mock profile (catalog `mock_profile`) into the
 /// ROS execution configuration of its component, structured as the Isaac

@@ -674,7 +674,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<std::optional<ResolvedManualProgramHandover>>
   resolve_manual_program_handover(const RuntimeParticipantExecutionRegistration& registration);
   [[nodiscard]] Result<void> validate_manual_program_handover_locked(
-      const ResolvedManualProgramHandover& handover) const;
+      const ResolvedManualProgramHandover& handover,
+      const RuntimeParticipantExecutionRegistration* manual_registration = nullptr) const;
   struct ReplayEntry;
   struct ControlReplayEntry;
   struct StopReplayEntry;
@@ -751,7 +752,13 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> validate_program_node_claim(
       const ProgramNodeAdmissionEvidenceDTO& evidence) const;
   [[nodiscard]] Result<void> validate_program_execution_scope_locked(
-      const OperationIntentDTO& intent) const;
+      const OperationIntentDTO& intent, std::optional<bool> non_motion_only = {},
+      bool intrinsic_direct_control = false) const;
+  [[nodiscard]] bool program_node_effectively_running_locked(
+      const ProgramRunId& program_run_id, std::size_t index) const;
+  [[nodiscard]] bool program_node_non_motion_locked(
+      const ProgramRunId& program_run_id, std::size_t index) const;
+  void fence_held_prepared_program_commands_locked(const ProgramRunId& program_run_id);
   [[nodiscard]] Result<void> reconcile_manual_operation_admission_locked();
   [[nodiscard]] Result<void> validate_manual_operation_settlement(
       const CellAdmissionClaimDTO& claim, const CellAdmissionClaimReleaseDTO& release) const;
@@ -782,6 +789,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       std::unique_lock<std::mutex>& state_lock, OperationStateDTO& state,
       const RuntimeScaleStatusDTO* scale, const char* reason,
       std::span<const PreparedMotionDiagnosticsDTO> diagnostics = {});
+  [[nodiscard]] Result<bool> confirm_prepared_command_no_effect(
+      const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
+      std::uint64_t preparation_id);
+  [[nodiscard]] Result<void> discard_uncommitted_ordinary_preparations(
+      const OperationId& operation_id, IResolvedParticipantExecutionEngine* failing_engine = nullptr,
+      std::optional<ErrorDTO> failure = {});
   [[nodiscard]] Result<void> advance_prepared_motion(const OperationId& operation_id,
                                                      IResolvedParticipantExecutionEngine* engine);
   [[nodiscard]] Result<void> advance_prepared_capability_command(
@@ -1025,7 +1038,22 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
     std::optional<ControllableComponentId> controllable_component_id;
   };
   std::vector<RememberedIncidentContainment> incident_containments_;
-  bool motion_admission_closed_{};
+  // Boolean compatibility keeps every existing moving reader and restrictive
+  // writer unchanged. Only an explicit FullStop records the narrower cause.
+  class MotionAdmissionClosure final {
+   public:
+    operator bool() const noexcept { return closed_; }
+    MotionAdmissionClosure& operator=(const bool closed) noexcept {
+      closed_ = restrictive_ = closed;
+      return *this;
+    }
+    void close_for_stop() noexcept { closed_ = true; }
+    [[nodiscard]] bool restrictive() const noexcept { return restrictive_; }
+   private:
+    bool closed_{};
+    bool restrictive_{};
+  };
+  MotionAdmissionClosure motion_admission_closed_{};
   std::optional<RetainedOperatorAlarmAttentionDTO> operator_alarm_attention_;
 };
 

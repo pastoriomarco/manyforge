@@ -186,6 +186,21 @@
       "provider_contract_ref": {
         "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
         "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
+        "provider_contract_role_id": "gripper_logical_cancel"
+      },
+      "stop_command_support": {
+        "command_endpoint_role_ids": [],
+        "command_kind": "logical_cancel"
+      },
+      "stop_evidence_support": {
+        "evidence_endpoint_role_ids": [],
+        "evidence_kind": "logical_cancellation_no_continuing_effect"
+      }
+    },
+    {
+      "provider_contract_ref": {
+        "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
+        "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
         "provider_contract_role_id": "software_hard_stop"
       },
       "stop_command_support": {
@@ -221,5 +236,5 @@
     }
   ],
   "provider_manifest_id": "manyforge.provider.ros2_control",
-  "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232"
+  "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3"
 }

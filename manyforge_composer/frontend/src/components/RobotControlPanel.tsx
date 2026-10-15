@@ -1135,7 +1135,9 @@ export function RobotControlPanelView({
               {state.mode === 'gripper' && gripper !== null && (
                 <div className="robot-control-gripper-editor">
                 <p className="robot-control-pose-note hint">
-                  Completion confirms the observed coordinate, not an object grasp.
+                  {gripper.targetDescriptor.actuationKind === 'pneumatic'
+                    ? 'Completion covers the command transaction, not grasp verification.'
+                    : 'Completion confirms the observed coordinate, not an object grasp.'}
                 </p>
                 {gripper.targetDescriptor.namedPresets.length > 0 && (
                   <label className="robot-control-preset">

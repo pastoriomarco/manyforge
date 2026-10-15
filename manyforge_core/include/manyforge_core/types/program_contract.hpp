@@ -52,10 +52,35 @@ struct ProgramNodeTargetEffectDTO final {
                          const ProgramNodeTargetEffectDTO&) = default;
 };
 
+enum class ProgramOperatorStopPolicy : std::uint8_t {
+  kInherit = 0,
+  kHold,
+  kContinue,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(ProgramOperatorStopPolicy value) noexcept {
+  switch (value) {
+    case ProgramOperatorStopPolicy::kInherit:
+      return "inherit";
+    case ProgramOperatorStopPolicy::kHold:
+      return "hold";
+    case ProgramOperatorStopPolicy::kContinue:
+      return "continue";
+  }
+  return {};
+}
+
 struct ProgramExecutionNodeDTO final {
   ProgramNodeInstanceId instance_id;
   std::string owner_api;
   std::vector<ProgramNodeTargetEffectDTO> target_effects;
+  /// Node-local Behavior resolution from this exact tree and qualified catalog.
+  /// Closed Hold/Continue; ancestors are evaluated against the current held
+  /// subtree selection, not folded into this immutable policy.
+  ProgramOperatorStopPolicy effective_operator_stop_policy{ProgramOperatorStopPolicy::kHold};
+  /// Parent in the same canonical nodes vector; absent for the tree root.
+  /// The existing held-node projection supplies dynamic subtree coverage.
+  std::optional<std::uint32_t> parent_node_index{};
 
   friend bool operator==(const ProgramExecutionNodeDTO&, const ProgramExecutionNodeDTO&) = default;
 };
@@ -143,24 +168,6 @@ struct ProgramRunExecutionCaptureDTO final {
   /// and cannot populate either this reference or the execution table.
   std::shared_ptr<const ProgramBindingDTO> binding{};
 };
-
-enum class ProgramOperatorStopPolicy : std::uint8_t {
-  kInherit = 0,
-  kHold,
-  kContinue,
-};
-
-[[nodiscard]] constexpr std::string_view to_string(ProgramOperatorStopPolicy value) noexcept {
-  switch (value) {
-    case ProgramOperatorStopPolicy::kInherit:
-      return "inherit";
-    case ProgramOperatorStopPolicy::kHold:
-      return "hold";
-    case ProgramOperatorStopPolicy::kContinue:
-      return "continue";
-  }
-  return {};
-}
 
 /// Largest authored finite failure-retry budget; zero means Unlimited.
 inline constexpr std::uint8_t kMaxProgramRecoveryRetries = 255U;

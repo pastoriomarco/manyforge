@@ -5,6 +5,7 @@
 #include <manyforge_core/ports/icontroller_lifecycle_port.hpp>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -410,5 +411,82 @@ TEST(ControllerLifecycleContracts, InterfaceInstancesUsePortableV1TokenGrammar) 
       (ControllerInterfaceInstanceDTO{ResourceId("joint.1"), "-position"}).locally_valid());
 }
 
+TEST(ControllerLifecycleEvaluator, ExplicitPneumaticNoneHasNoPhysicalControllerAndKeepsExactLogicalRoute) {
+  auto expected = Expected(true);
+  expected.controller_topology.controllers.clear();
+  expected.controller_topology.chain_edges.clear();
+  expected.expected_controllers.clear();
+  for (auto& activation : expected.controller_topology.activation_sets) {
+    activation.active_controller_role_ids.clear();
+    activation.active_chain_edges.clear();
+  }
+  for (auto& route : expected.controller_topology.legal_routes) route.ordered_controller_role_ids.clear();
+  for (auto& binding : expected.expected_bindings) {
+    std::set<ResourceId> resources;
+    for (const auto& row : binding.claimed_command_interfaces) resources.insert(row.resource_id);
+    for (const auto& row : binding.claimed_state_interfaces) resources.insert(row.resource_id);
+    binding.logical_owner_resources.assign(resources.begin(), resources.end());
+    binding.claimed_command_interfaces.clear();
+    binding.claimed_state_interfaces.clear();
+  }
+  EXPECT_FALSE(expected.locally_valid()); // default Required never accepts empty physical closure
+  expected.physical_expectation = ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone;
+  ASSERT_TRUE(expected.locally_valid());
+  auto unknown_actuation = expected;
+  unknown_actuation.expected_bindings.front().gripper_actuation_kind =
+      static_cast<GripperActuationKind>(255);
+  EXPECT_FALSE(unknown_actuation.locally_valid());
+  auto missing_resources = expected;
+  missing_resources.expected_bindings.front().logical_owner_resources.clear();
+  EXPECT_FALSE(missing_resources.locally_valid());
+  auto duplicate_resources = expected;
+  duplicate_resources.expected_bindings.front().logical_owner_resources.push_back(
+      duplicate_resources.expected_bindings.front().logical_owner_resources.front());
+  EXPECT_FALSE(duplicate_resources.locally_valid());
+  auto observation = Observation(expected, {}, {});
+  std::vector<ActiveControlConfigurationBindingRouteDTO> routes;
+  for (const auto& route : expected.desired_configuration.binding_routes)
+    routes.push_back({route.control_binding_id, route.control_binding_revision, route.control_route_id});
+  observation.active_configuration = ControllerLifecycleObservedConfigurationDTO{
+      expected.desired_configuration.activation_set_id, std::move(routes)};
+  ASSERT_TRUE(observation.locally_valid());
+  const auto reconciled = ReconcileControllerLifecycle(expected, observation, 50);
+  ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+  EXPECT_EQ(reconciled.value().disposition, ControllerLifecycleReconciliationDispositionDTO::kReconciled);
+  const auto plan = BuildControllerLifecycleTransitionPlan(expected, observation, 50);
+  ASSERT_TRUE(plan.ok()) << plan.error().message;
+  EXPECT_TRUE(plan.value().steps.empty());
+  EXPECT_TRUE(plan.value().locally_valid());
+  auto foreign = observation;
+  const ControllerLifecycleTransitionIntentDTO physical_intent{
+      observation.query, observation.source_sequence, 0U,
+      {ControllerLifecycleTransitionKindDTO::kActivate, {ControllerRoleId("physical.controller")}}, 100};
+  EXPECT_FALSE(physical_intent.locally_valid());
+  foreign.query.source_runtime_epoch = RuntimeEpoch("foreign.epoch");
+  EXPECT_FALSE(ReconcileControllerLifecycle(expected, foreign, 50).ok());
+  foreign = observation;
+  foreign.query.physical_expectation = ControllerLifecyclePhysicalExpectation::kRequired;
+  EXPECT_FALSE(foreign.locally_valid());
+  foreign = observation;
+  foreign.endpoints.front().ready = false;
+  const auto unavailable = ReconcileControllerLifecycle(expected, foreign, 50);
+  ASSERT_TRUE(unavailable.ok());
+  EXPECT_NE(unavailable.value().disposition, ControllerLifecycleReconciliationDispositionDTO::kReconciled);
+}
+
 }  // namespace
+
+TEST(ControllerLifecycleEvaluator, ExpectedBindingActuationFactRejectsUnknownEnums) {
+  for (const auto kind : {GripperActuationKind::kPositionCommanded, GripperActuationKind::kPneumatic}) {
+    auto expected = Expected(true);
+    expected.expected_bindings.front().gripper_actuation_kind = kind;
+    EXPECT_TRUE(expected.expected_bindings.front().locally_valid());
+    EXPECT_TRUE(expected.locally_valid());
+  }
+  auto expected = Expected(true);
+  expected.expected_bindings.front().gripper_actuation_kind = static_cast<GripperActuationKind>(255);
+  EXPECT_FALSE(expected.expected_bindings.front().locally_valid());
+  EXPECT_FALSE(expected.locally_valid());
+}
+
 }  // namespace manyforge::core

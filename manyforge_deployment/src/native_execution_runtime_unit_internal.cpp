@@ -1,21 +1,21 @@
 #include "native_execution_runtime_unit_internal.hpp"
-#include <manyforge_deployment/execution_runtime_contract.hpp>
-#include "execution_runtime_contract_identity_internal.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 #include <limits>
-#include <set>
 #include <string>
 #include <tuple>
-#include <type_traits>
 #include <utility>
+#include <variant>
+#include <vector>
 
-#include "manyforge_deployment/artifact_codec.hpp"
-#include "manyforge_deployment/closed_schema.hpp"
-#include "manyforge_deployment/content_identity.hpp"
-#include "manyforge_deployment/runtime_contract_registry.hpp"
+#include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/closed_schema.hpp>
+#include <manyforge_deployment/content_identity.hpp>
+
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment::detail {
@@ -166,172 +166,6 @@ canonical_to_json_value(const CanonicalValue &value) {
   }
 }
 
-using execution_runtime_contract_identity::contract_revision;
-
-} // namespace
-
-[[nodiscard]] const core::ManagerLivenessPolicyDTO&
-manager_liveness_policy_value();
-
-namespace {
-
-[[nodiscard]] CanonicalValue
-native_execution_runtime_infrastructure_projection(
-    const core::RuntimeUnitId &runtime_unit_id) {
-  const core::RuntimeProfileId runtime_profile_id{
-      std::string(kNativeExecutionRuntimeProfileId)};
-  const core::RuntimeProfileRevision runtime_profile_revision(
-      native_execution_runtime_profile_revision());
-  const core::ProductContractId product_contract_id{
-      std::string(kNativeExecutionRuntimeProductContractId)};
-  const auto product_contract_revision =
-      native_execution_runtime_product_contract_revision();
-  const auto &contract = require_runtime_contract(
-      runtime_profile_id, runtime_profile_revision, product_contract_id,
-      product_contract_revision);
-  const auto& liveness = manager_liveness_policy_value();
-  return CanonicalValue(CanonicalValue::Object{
-      {"api_version",
-       CanonicalValue(std::string(kNativeExecutionRuntimeManifestApiVersion))},
-      {"runtime_unit_id", CanonicalValue(runtime_unit_id.value())},
-      {"runtime_product_id", CanonicalValue(native_execution_runtime_product_id(
-                                 runtime_unit_id))},
-      {"configuration", CanonicalValue(CanonicalValue::Object{})},
-      {"manager_liveness_policy",
-       CanonicalValue(CanonicalValue::Object{
-           {"runtime_policy_id",
-            CanonicalValue(liveness.runtime_policy_id.value())},
-           {"runtime_policy_revision",
-            CanonicalValue(liveness.runtime_policy_revision.value())},
-           {"heartbeat_period_ns",
-            CanonicalValue(
-                static_cast<double>(liveness.heartbeat_period_ns))},
-           {"expiry_timeout_ns",
-            CanonicalValue(static_cast<double>(liveness.expiry_timeout_ns))},
-           {"local_safe_state_contract_id",
-            CanonicalValue(liveness.local_safe_state_contract_id.value())},
-           {"local_safe_state_contract_revision",
-            CanonicalValue(
-                liveness.local_safe_state_contract_revision.value())},
-       })},
-      {"runtime_profile",
-       CanonicalValue(CanonicalValue::Object{
-           {"runtime_profile_id",
-            CanonicalValue(runtime_profile_id.value())},
-           {"runtime_profile_revision",
-            CanonicalValue(runtime_profile_revision.value())},
-           {"implementation_id", CanonicalValue(std::string(
-                                     kNativeExecutionRuntimeImplementationId))},
-           {"implementation_revision",
-            CanonicalValue(native_execution_runtime_implementation_revision())},
-       })},
-      {"process_adapter",
-       CanonicalValue(CanonicalValue::Object{
-           {"lifecycle_control", CanonicalValue("manager_managed")},
-           {"process_adapter_contract_id",
-            CanonicalValue(
-                std::string(kNativeExecutionRuntimeProcessAdapterContractId))},
-           {"process_adapter_contract_revision",
-            CanonicalValue(
-                native_execution_runtime_process_adapter_revision())},
-           {"retrieval_contract_id",
-            CanonicalValue(
-                std::string(kNativeExecutionRuntimeRetrievalContractId))},
-           {"retrieval_contract_revision",
-            CanonicalValue(
-                native_execution_runtime_retrieval_contract_revision())},
-       })},
-      {"runtime_role_mappings",
-       CanonicalValue(CanonicalValue::Array{
-           CanonicalValue(CanonicalValue::Object{
-               {"runtime_role_id",
-                CanonicalValue(std::string(kNativeExecutionRuntimeRoleId))},
-               {"implementation_role_id",
-                CanonicalValue(
-                    std::string(kNativeExecutionRuntimeImplementationId))},
-           }),
-       })},
-      {"source_endpoint_mappings",
-       CanonicalValue(CanonicalValue::Array{
-           CanonicalValue(CanonicalValue::Object{
-               {"source_endpoint_role_id",
-                CanonicalValue(std::string(
-                    kNativeExecutionRuntimeLogicalSceneEndpointRoleId))},
-               {"endpoint_contract_id",
-                CanonicalValue(std::string(
-                    kNativeExecutionRuntimeLogicalSceneEndpointContractId))},
-               {"endpoint_contract_revision",
-                CanonicalValue(
-                    native_execution_runtime_logical_scene_endpoint_revision())},
-               {"transport", CanonicalValue("adapter_private")},
-           }),
-           CanonicalValue(CanonicalValue::Object{
-               {"source_endpoint_role_id",
-                CanonicalValue(
-                    std::string(kNativeExecutionRuntimeStatusEndpointRoleId))},
-               {"endpoint_contract_id",
-                CanonicalValue(std::string(
-                    kNativeExecutionRuntimeStatusEndpointContractId))},
-               {"endpoint_contract_revision",
-                CanonicalValue(
-                    native_execution_runtime_status_endpoint_revision())},
-               {"transport", CanonicalValue("adapter_private")},
-           }),
-           CanonicalValue(CanonicalValue::Object{
-               {"source_endpoint_role_id",
-                CanonicalValue(std::string(
-                    kNativeExecutionRuntimeProjectionEndpointRoleId))},
-               {"endpoint_contract_id",
-                CanonicalValue(std::string(
-                    kNativeExecutionRuntimeProjectionEndpointContractId))},
-               {"endpoint_contract_revision",
-                CanonicalValue(
-                    native_execution_runtime_projection_endpoint_revision())},
-               {"transport", CanonicalValue("adapter_private")},
-           }),
-       })},
-      {"launchable_artifact",
-       CanonicalValue(CanonicalValue::Object{
-           {"artifact_role_id",
-            CanonicalValue(std::string(
-                kNativeExecutionRuntimeLaunchDescriptorArtifactRole))},
-           {"media_type",
-            CanonicalValue(
-                std::string(kNativeExecutionRuntimeLaunchDescriptorMediaType))},
-           {"content_digest",
-            CanonicalValue(
-                sha256_digest(native_execution_runtime_launch_descriptor()))},
-       })},
-      {"platform_constraints",
-       CanonicalValue(CanonicalValue::Object{
-           {"operating_system", CanonicalValue(std::string(
-                                    kNativeExecutionRuntimeOperatingSystem))},
-           {"launch_environment_contract",
-            CanonicalValue(
-                std::string(kNativeExecutionRuntimeLaunchEnvironmentContract))},
-       })},
-      {"runtime_contract_offer",
-       runtime_contract_offer_projection(contract.offer())},
-  });
-}
-
-} // namespace
-
-CanonicalValue
-native_execution_runtime_manifest_projection(const core::RuntimeUnitDTO &unit) {
-  static_cast<void>(require_qualified_runtime_configuration(unit.configuration));
-  if (unit.runtime_profile_id.value() != kNativeExecutionRuntimeProfileId ||
-      unit.runtime_profile_revision.value() !=
-          native_execution_runtime_profile_revision() ||
-      !unit.dependency_runtime_unit_ids.empty()) {
-    fail_retained_bundle(
-        "runtime unit differs from the stable native execution profile");
-  }
-  return native_execution_runtime_infrastructure_projection(
-      unit.runtime_unit_id);
-}
-
-namespace {
 
 [[nodiscard]] const core::RuntimeUnitDTO &
 require_retained_runtime_unit(const core::RetainedBundleDTO &bundle,
@@ -348,44 +182,9 @@ require_retained_runtime_unit(const core::RetainedBundleDTO &bundle,
   return *found;
 }
 
-[[nodiscard]] const core::RetainedRuntimeUnitProductsDTO &
-require_runtime_product_group(const core::RetainedBundleDTO &bundle,
-                              const core::RuntimeUnitId &runtime_unit_id) {
-  const auto found =
-      std::find_if(bundle.compiled_products.runtime_unit_products.begin(),
-                   bundle.compiled_products.runtime_unit_products.end(),
-                   [&](const auto &group) {
-                     return group.runtime_unit_id == runtime_unit_id;
-                   });
-  if (found == bundle.compiled_products.runtime_unit_products.end() ||
-      found->products.size() != 1U) {
-    fail_retained_bundle(
-        "native execution product has no exact retained product group");
-  }
-  return *found;
-}
-
-[[nodiscard]] const core::RetainedArtifactRefDTO &
-require_artifact(const core::RetainedProductDTO &product,
-                 std::string_view role) {
-  const core::RetainedArtifactRefDTO *match = nullptr;
-  for (const auto &artifact : product.artifact_refs) {
-    if (artifact.artifact_role_id.value() != role) {
-      continue;
-    }
-    if (match != nullptr) {
-      fail_retained_bundle("native execution product repeats an artifact role");
-    }
-    match = &artifact;
-  }
-  if (match == nullptr) {
-    fail_retained_bundle("native execution product omits an artifact role");
-  }
-  return *match;
-}
-
 } // namespace
 
+// DX-753: archival Draft/import metadata only; live Native admission is withdrawn.
 std::string native_execution_runtime_profile_document() {
   CanonicalValue identity(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.runtime_profile.v1")},
@@ -450,6 +249,7 @@ std::string native_execution_runtime_profile_revision() {
   return revision;
 }
 
+// DX-753: held component-identity schema validation only.
 bool native_execution_runtime_configuration_is_qualified(
     const core::JsonObjectDTO &configuration) noexcept {
   try {
@@ -457,217 +257,6 @@ bool native_execution_runtime_configuration_is_qualified(
     return true;
   } catch (...) {
     return false;
-  }
-}
-
-const core::ManagerLivenessPolicyDTO& manager_liveness_policy_value() {
-  return execution_runtime_contract::manager_liveness_policy();
-}
-
-std::string native_execution_runtime_implementation_revision() {
-  return contract_revision(
-      "runtime-implementation",
-      "native-execution-host;deployment-bound-startup;operation-bound-program;"
-      "projection-handoff-v1;private-rpc-v1;runtime-manifest-v2;"
-      "stable-host-infrastructure;composition-owned-controller-configuration;"
-      "retained-runtime-config-v2;"
-      "logical-scene-services-v1;manager-managed-product-composition;"
-      "build-owned-candidate-worker;sha256-projection-content;"
-      "atomic-resource-table-admission;"
-      "resource-derived-active-configurations;"
-      "runtime-contract-offer-correlation-v2;"
-      "retained-manager-liveness-receiver-v2;"
-      "isolated-manager-liveness-transport-v1");
-}
-
-std::string native_execution_runtime_process_adapter_revision() {
-  return contract_revision(
-      "process-adapter",
-      "manager-managed;installed-target;fixed-argv;direct-child-epoch;"
-      "dual-inherited-seqpacket-channels;same-user-direct-parent;"
-      "command-fenced-readiness;runtime-contract-offer-digest-echo;"
-      "fixed-sibling-candidate-worker;isolated-manager-liveness-rpc-v1");
-}
-
-std::string native_execution_runtime_retrieval_contract_revision() {
-  return contract_revision(
-      "retrieval-contract",
-      "retained-raw-artifact;digest-and-size-verified-launch-descriptor");
-}
-
-std::string native_execution_runtime_status_endpoint_revision() {
-  return contract_revision(
-      "status-endpoint",
-      "adapter-private;native-execution-status-v2;direct-child-epoch;"
-      "source-sequence;phase;health;product;configuration;roles;fence;"
-      "runtime-contract-offer-digest");
-}
-
-std::string native_execution_runtime_projection_endpoint_revision() {
-  return contract_revision(
-      "projection-endpoint",
-      "planner-scene-projection-rpc-v1;exact-native-binding;bounded-framing;"
-      "request-replay;health;stage;activate;retire;discard;rebuild;lease;"
-      "sha256-content-identity");
-}
-
-std::string native_execution_runtime_logical_scene_endpoint_revision() {
-  return contract_revision(
-      "logical-scene-endpoint",
-      "adapter-private;logical-scene-services-v1;reference;query;shape;"
-      "compare-and-commit-edit;collision;trace;exact-revision-and-lease");
-}
-
-std::string native_execution_runtime_launch_descriptor() {
-  return canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.installed_target_launch.v1")},
-      {"implementation_id",
-       CanonicalValue(std::string(kNativeExecutionRuntimeImplementationId))},
-      {"implementation_revision",
-       CanonicalValue(native_execution_runtime_implementation_revision())},
-      {"target_id",
-       CanonicalValue(std::string(kNativeExecutionRuntimeInstalledTargetId))},
-  }));
-}
-
-std::string native_execution_runtime_product_id(
-    const core::RuntimeUnitId &runtime_unit_id) {
-  require_retained_portable_identity(runtime_unit_id.value(),
-                                     "runtime_unit_id");
-  std::string preimage("manyforge.runtime-unit-product-id.v1");
-  preimage.push_back('\0');
-  preimage.append(runtime_unit_id.value());
-  return "runtime_unit_configuration_" + sha256_digest(preimage).substr(7U);
-}
-
-CanonicalValue parse_and_verify_native_execution_runtime_manifest(
-    std::string_view canonical_bytes) {
-  if (canonical_bytes.empty() ||
-      canonical_bytes.size() > kMaxNativeExecutionRuntimeManifestBytes) {
-    fail_retained_bundle(
-        "native execution runtime manifest is empty or exceeds its bound");
-  }
-  CanonicalValue root;
-  try {
-    root = parse_strict_json_model_yaml(canonical_bytes).root();
-  } catch (const std::exception &error) {
-    fail_retained_bundle(
-        std::string("native execution runtime manifest is invalid: ") +
-        error.what());
-  }
-  if (canonical_json(root) != canonical_bytes) {
-    fail_retained_bundle(
-        "native execution runtime manifest is not canonical JSON");
-  }
-  const auto &object =
-      require_object(root, "native_execution_runtime_manifest");
-  const auto &api =
-      require_string(require_member(object, "api_version",
-                                    "native_execution_runtime_manifest"),
-                     "native_execution_runtime_manifest.api_version");
-  const auto &runtime_unit_id =
-      require_string(require_member(object, "runtime_unit_id",
-                                    "native_execution_runtime_manifest"),
-                     "native_execution_runtime_manifest.runtime_unit_id");
-  require_retained_portable_identity(runtime_unit_id, "runtime_unit_id");
-  if (require_member(object, "configuration",
-                     "native_execution_runtime_manifest") !=
-      CanonicalValue(CanonicalValue::Object{})) {
-    fail_retained_bundle(
-        "native execution runtime manifest configuration must be empty");
-  }
-  if (api != kNativeExecutionRuntimeManifestApiVersion ||
-      root != native_execution_runtime_infrastructure_projection(
-                  core::RuntimeUnitId(runtime_unit_id))) {
-    fail_retained_bundle(
-        "native execution runtime manifest differs from its closed contract");
-  }
-  return root;
-}
-
-void require_native_execution_runtime_product_matches_retained_bundle(
-    std::string_view manifest_bytes, std::string_view launch_descriptor_bytes,
-    const core::RetainedBundleDTO &retained_bundle,
-    const core::RuntimeUnitId &runtime_unit_id) {
-  const auto manifest =
-      parse_and_verify_native_execution_runtime_manifest(manifest_bytes);
-  if (launch_descriptor_bytes != native_execution_runtime_launch_descriptor() ||
-      launch_descriptor_bytes.size() >
-          kMaxNativeExecutionLaunchDescriptorBytes) {
-    fail_retained_bundle(
-        "native execution launch descriptor differs from the build-owned "
-        "artifact");
-  }
-  const auto &unit =
-      require_retained_runtime_unit(retained_bundle, runtime_unit_id);
-  if (unit.runtime_profile_id.value() != kNativeExecutionRuntimeProfileId ||
-      unit.runtime_profile_revision.value() !=
-          native_execution_runtime_profile_revision() ||
-      !unit.dependency_runtime_unit_ids.empty() ||
-      !native_execution_runtime_configuration_is_qualified(
-          unit.configuration) ||
-      manifest != native_execution_runtime_manifest_projection(unit)) {
-    fail_retained_bundle(
-        "native execution manifest differs from its retained graph/profile");
-  }
-  const auto &group =
-      require_runtime_product_group(retained_bundle, runtime_unit_id);
-  const auto &product = group.products.front();
-  if (product.product_id.value() !=
-          native_execution_runtime_product_id(runtime_unit_id) ||
-      product.product_kind !=
-          core::RetainedProductKind::kRuntimeUnitConfiguration ||
-      product.product_contract_id.value() !=
-          kNativeExecutionRuntimeProductContractId ||
-      product.product_contract_revision !=
-          native_execution_runtime_product_contract_revision() ||
-      product.artifact_refs.size() != 2U) {
-    fail_retained_bundle(
-        "native execution retained product has an incoherent identity");
-  }
-  const auto &manifest_ref =
-      require_artifact(product, kNativeExecutionRuntimeManifestArtifactRole);
-  const auto &launch_ref = require_artifact(
-      product, kNativeExecutionRuntimeLaunchDescriptorArtifactRole);
-  if (manifest_ref.media_type != kNativeExecutionRuntimeManifestMediaType ||
-      manifest_ref.content_digest.value() != sha256_digest(manifest_bytes) ||
-      manifest_ref.byte_size != manifest_bytes.size() ||
-      launch_ref.media_type !=
-          kNativeExecutionRuntimeLaunchDescriptorMediaType ||
-      launch_ref.content_digest.value() != sha256_digest(launch_descriptor_bytes) ||
-      launch_ref.byte_size != launch_descriptor_bytes.size()) {
-    fail_retained_bundle(
-        "native execution product artifact table differs from its bytes");
-  }
-  bool source_found = false;
-  for (const auto &source : retained_bundle.provenance.source_records) {
-    std::visit(
-        [&](const auto &typed) {
-          using Source = std::remove_cvref_t<decltype(typed)>;
-          if constexpr (Source::kRecordKind ==
-                        core::CatalogRecordKind::kRuntimeProfile) {
-            if (typed.record_id == unit.runtime_profile_id &&
-                typed.revision == unit.runtime_profile_revision) {
-              if (source_found) {
-                fail_retained_bundle(
-                    "native execution runtime profile source is duplicated");
-              }
-              source_found = true;
-            }
-          }
-        },
-        source);
-  }
-  const auto output = std::find_if(
-      retained_bundle.provenance.output_records.begin(),
-      retained_bundle.provenance.output_records.end(),
-      [&](const auto &row) { return row.product_id == product.product_id; });
-  if (!source_found ||
-      output == retained_bundle.provenance.output_records.end() ||
-      output->product_kind != product.product_kind ||
-      output->content_digest != retained_product_output_digest(product)) {
-    fail_retained_bundle(
-        "native execution product lacks exact source/output provenance");
   }
 }
 
@@ -733,6 +322,13 @@ decode_execution_motion_target_limits(
   return result;
 }
 
+bool execution_gripper_command_duration_is_valid(
+    const std::string_view actuation_kind, const double duration_s) noexcept {
+  return std::isfinite(duration_s) && duration_s <= 60.0 &&
+         ((actuation_kind == "pneumatic" && duration_s >= 0.0) ||
+          (actuation_kind == "position_commanded" && duration_s > 0.0));
+}
+
 std::vector<
     execution_runtime_contract::Configuration::GripperTargetConfiguration>
 decode_execution_gripper_target_configurations(
@@ -744,7 +340,7 @@ decode_execution_gripper_target_configurations(
       gripper_target_configurations.size());
   for (const auto &entry : gripper_target_configurations) {
     const auto *object = std::get_if<core::JsonObjectDTO>(&entry.value);
-    if (object == nullptr || (object->size() != 12U && object->size() != 13U)) {
+    if (object == nullptr || object->size() != 12U) {
       throw RetainedBundleError(
           std::string(label) + " has an invalid gripper target configuration");
     }
@@ -798,14 +394,9 @@ decode_execution_gripper_target_configurations(
     const auto component_id = string_member("controllable_component_id");
     const auto target_id = string_member("command_target_id");
     const auto actuation_kind = string_member("actuation_kind");
-    if (object->size() != 12U) {
-      throw RetainedBundleError(
-          std::string(label) + " has an unknown gripper target field");
-    }
-    if (duration_s == nullptr || !std::isfinite(*duration_s) ||
-        *duration_s <= 0.0 || *duration_s > 60.0 ||
-        (actuation_kind != "position_commanded" &&
-         actuation_kind != "pneumatic")) {
+    if (duration_s == nullptr ||
+        !execution_gripper_command_duration_is_valid(actuation_kind,
+                                                     *duration_s)) {
       throw RetainedBundleError(
           std::string(label) + " has invalid gripper target semantics");
     }
@@ -838,6 +429,7 @@ decode_execution_gripper_target_configurations(
   return result;
 }
 
+// DX-753: retain the exact decoder for held per-component Apply scope.
 execution_runtime_contract::Configuration
 decode_native_execution_runtime_configuration(
     const core::JsonObjectDTO &configuration, const core::CellGraphDTO &graph,
@@ -1058,57 +650,7 @@ decode_native_execution_runtime_configuration(
 } // namespace manyforge::deployment::detail
 
 namespace manyforge::deployment::native_execution_runtime_contract {
-
-CanonicalValue empty_host_configuration() {
-  return CanonicalValue(CanonicalValue::Object{
-      {"mode", CanonicalValue("simulated")},
-      {"planner_rng_seed", CanonicalValue(12345.0)},
-      {"execution_tick_hz", CanonicalValue(100.0)},
-      {"collision_monitor_period_ms", CanonicalValue(50.0)},
-      {"initial_joint_positions_rad", CanonicalValue(CanonicalValue::Array{})},
-      {"motion_target_limits", CanonicalValue(CanonicalValue::Array{})},
-      {"direct_control_joint_limits", CanonicalValue(CanonicalValue::Array{})},
-      {"gripper_target_configurations", CanonicalValue(CanonicalValue::Array{})},
-  });
-}
-
-CanonicalValue empty_host_deployment(
-    const core::CellId &cell_id, const CanonicalValue &runtime_profile_reference,
-    std::string_view deployment_id, std::string_view name) {
-  using Object = CanonicalValue::Object;
-  using Array = CanonicalValue::Array;
-  const auto *profile = runtime_profile_reference.find_object_member("record_id");
-  const auto *revision = runtime_profile_reference.find_object_member("record_revision");
-  if (profile == nullptr || revision == nullptr || !profile->is_string() ||
-      profile->as_string() != kRuntimeProfileId || !revision->is_string()) {
-    throw RetainedBundleError("empty native Deployment requires its qualified runtime profile");
-  }
-  return CanonicalValue(Object{
-      {"api_version", CanonicalValue("manyforge.deployment.v1")},
-      {"deployment_artifact_id", CanonicalValue(std::string(deployment_id))},
-      {"deployment_revision", CanonicalValue("sha256:" + std::string(64U, '0'))},
-      {"cell_id", CanonicalValue(cell_id.value())},
-      {"name", CanonicalValue(std::string(name))},
-      {"catalogs", CanonicalValue(Object{{"records", CanonicalValue(Array{runtime_profile_reference})}})},
-      {"graph", CanonicalValue(Object{
-          {"runtime_units", CanonicalValue(Array{CanonicalValue(Object{
-              {"runtime_unit_id", CanonicalValue(std::string(kCellHostRuntimeUnitId))},
-              {"runtime_profile_id", *profile},
-              {"runtime_profile_revision", *revision},
-              {"dependency_runtime_unit_ids", CanonicalValue(Array{})},
-              {"configuration", empty_host_configuration()},
-          })})},
-          {"model_instances", CanonicalValue(Array{})},
-          {"controllable_components", CanonicalValue(Array{})},
-          {"control_domains", CanonicalValue(Array{})},
-          {"control_bindings", CanonicalValue(Array{})},
-          {"component_attachments", CanonicalValue(Array{})},
-      })},
-      {"desired_control_configurations", CanonicalValue(Array{})},
-      {"capability_provider_bindings", CanonicalValue(Array{})},
-  });
-}
-
+// DX-753: retain exact held component-projection guards, not positive admission.
 Configuration
 require_configuration(const RetainedBundle &retained_bundle,
                       const core::RuntimeUnitId &runtime_unit_id) {
@@ -1131,10 +673,6 @@ require_configuration(const RetainedBundle &retained_bundle,
 
   return detail::decode_native_execution_runtime_configuration(
       unit.configuration, retained_bundle.value().cell_graph, runtime_unit_id);
-}
-
-std::string implementation_revision() {
-  return detail::native_execution_runtime_implementation_revision();
 }
 
 } // namespace manyforge::deployment::native_execution_runtime_contract

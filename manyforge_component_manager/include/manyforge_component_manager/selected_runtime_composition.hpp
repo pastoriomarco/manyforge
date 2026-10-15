@@ -243,6 +243,24 @@ struct ManagerComponentProcessInventoryRequestDTO final {
              const ManagerComponentProcessInventoryRequestDTO &) = default;
 };
 
+/// Physical launch remains the default. The local kind is observation of an
+/// actually installed strict pneumatic+None owner; it is never inferred from
+/// missing process/feedback or candidate mode. Independent host/Manager joins
+/// against the immutable predecessor remain required before any policy use.
+enum class ManagerComponentProcessOwnerKindDTO : std::uint8_t {
+  kControllerLaunch = 0,
+  kPneumaticNoneLocal = 1,
+};
+
+struct ManagerPneumaticNoneProcessOwnerDTO final {
+  manyforge::core::CommandTargetId command_target_id;
+  manyforge::core::ControlBindingId control_binding_id;
+  manyforge::core::ControlBindingRevision control_binding_revision;
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool operator==(const ManagerPneumaticNoneProcessOwnerDTO &,
+                         const ManagerPneumaticNoneProcessOwnerDTO &) = default;
+};
+
 struct ManagerComponentProcessOccurrenceDTO final {
   manyforge::core::ControllableComponentId controllable_component_id;
   std::string launch_identity;
@@ -253,6 +271,9 @@ struct ManagerComponentProcessOccurrenceDTO final {
       manyforge::core::ControllerLaunchCleanupState::kNotRequested};
   std::optional<manyforge::core::ControllerLaunchGroupDrainReceipt> receipt{};
   std::optional<manyforge::core::ContentDigest> installed_runtime_identity{};
+  ManagerComponentProcessOwnerKindDTO process_owner_kind{
+      ManagerComponentProcessOwnerKindDTO::kControllerLaunch};
+  std::optional<ManagerPneumaticNoneProcessOwnerDTO> pneumatic_none_owner{};
   [[nodiscard]] bool valid() const noexcept;
   friend bool
   operator==(const ManagerComponentProcessOccurrenceDTO &,
@@ -292,6 +313,12 @@ struct ManagerComponentBringUpInspectionRequestDTO final {
 struct ManagerComponentProcessObservationDTO final {
   manyforge::core::ControllableComponentId controllable_component_id;
   ProcessPresenceState process_presence{ProcessPresenceState::kUnknown};
+  ManagerComponentProcessOwnerKindDTO process_owner_kind{
+      ManagerComponentProcessOwnerKindDTO::kControllerLaunch};
+  std::optional<ManagerPneumaticNoneProcessOwnerDTO> pneumatic_none_owner{};
+  /// Actual installed predecessor identity only; never a candidate promise.
+  /// Required for local None, absent for physical observations.
+  std::optional<manyforge::core::ContentDigest> installed_runtime_identity{};
   [[nodiscard]] bool valid() const noexcept;
   friend bool operator==(const ManagerComponentProcessObservationDTO &,
                          const ManagerComponentProcessObservationDTO &) = default;

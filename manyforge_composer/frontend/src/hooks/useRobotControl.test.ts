@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
-import { ApiError } from '../api/client';
+import { act, createElement, useEffect } from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { api, ApiError } from '../api/client';
 
 import type { RuntimeScaleControlStatus } from '../types/robotControl';
 import {
@@ -9,9 +10,12 @@ import {
   runtimeScaleControlScopeFence,
   runtimeScaleFlushDelay,
   manualAvailabilityScopeFence,
+  buildManualAvailabilityIntent,
+  useRobotControl,
 } from './useRobotControl';
 import { statusFixture } from '../testFixtures/robotControl';
 import type { ComposerHeadlessState } from '../types/headless';
+import { buildPreviewIntent, initialRobotControlState, robotControlReducer } from '../state/robotControl';
 
 it('manual availability follows owner and hold changes, not observed poses or node ticks', () => {
   const snapshot = {
@@ -34,6 +38,90 @@ it('manual availability follows owner and hold changes, not observed poses or no
   const held = manualAvailabilityScopeFence(snapshot, 'joint');
   snapshot.executionControlStatus!.ownerEpoch = 'replacement';
   expect(manualAvailabilityScopeFence(snapshot, 'joint')).not.toBe(held);
+});
+
+function pneumaticStatus(outputMode: 'commanded' | 'none' = 'commanded') {
+  const status = statusFixture();
+  const descriptor = status.directControlGripper!.targetDescriptor;
+  Object.assign(descriptor, { actuationKind: 'pneumatic', outputMode,
+    completionPolicy: outputMode === 'none' ? 'no_output' : 'output_delivery',
+    graspConfirmationPolicy: 'not_required', openStateRef: 'configured-open',
+    namedPresets: [{ name: 'configured-open', masterPosition: 0.037,
+      coordinates: [{ sourceCoordinateName: descriptor.sourceCoordinateName, position: 0.037 }] }],
+  });
+  status.observedGripper = null;
+  status.observedGrippers = [];
+  return status;
+}
+
+it.each(['commanded', 'none'] as const)(
+  'queries pneumatic %s from a valid draft then the exact configured preset without authoring', (outputMode) => {
+    const status = pneumaticStatus(outputMode);
+    const before = structuredClone(status);
+    const position = (draft: number | null) => buildManualAvailabilityIntent(
+      status, 'gripper', draft, 'availability-only',
+    ).participants[0].payload;
+    expect(position(0.013)).toMatchObject({ command_value: {
+      position: { kind: 'linear_m', value_m: 0.013 },
+    } });
+    for (const invalidDraft of [null, NaN, Infinity, -0.01, 0.05]) {
+      expect(position(invalidDraft)).toMatchObject({ command_value: {
+        position: { kind: 'linear_m', value_m: 0.037 },
+      } });
+    }
+    expect(status).toEqual(before);
+    const state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+    expect(state.draftGripperPosition).toBeNull();
+    expect(state.intent).toBeNull();
+    expect(state.preview).toBeNull();
+    expect(() => buildPreviewIntent({ ...state, mode: 'gripper' }, 'actual-preview'))
+      .toThrow(/Enter an initial component-local gripper target/);
+  },
+);
+
+it('refuses query-only preset guessing and preserves position/motion observation prerequisites', () => {
+  for (const edit of [
+    (descriptor: NonNullable<ReturnType<typeof pneumaticStatus>['directControlGripper']>['targetDescriptor']) => { descriptor.openStateRef = null; },
+    (descriptor: NonNullable<ReturnType<typeof pneumaticStatus>['directControlGripper']>['targetDescriptor']) => {
+      descriptor.openStateRef = 'missing';
+    },
+    (descriptor: NonNullable<ReturnType<typeof pneumaticStatus>['directControlGripper']>['targetDescriptor']) => {
+      descriptor.namedPresets.push({ ...descriptor.namedPresets[0] });
+    },
+    (descriptor: NonNullable<ReturnType<typeof pneumaticStatus>['directControlGripper']>['targetDescriptor']) => {
+      descriptor.namedPresets[0].masterPosition = NaN;
+    },
+    (descriptor: NonNullable<ReturnType<typeof pneumaticStatus>['directControlGripper']>['targetDescriptor']) => {
+      descriptor.namedPresets[0].masterPosition = 0.05;
+    },
+  ]) {
+    const status = pneumaticStatus();
+    // A literal preset named open is deliberately irrelevant to the configured ref.
+    status.directControlGripper!.targetDescriptor.namedPresets.push({ name: 'open', masterPosition: 0,
+      coordinates: [{ sourceCoordinateName: 'finger_joint', position: 0 }] });
+    edit(status.directControlGripper!.targetDescriptor);
+    expect(() => buildManualAvailabilityIntent(status, 'gripper', null, 'refused')).toThrow();
+  }
+  const position = statusFixture();
+  position.observedGripper = null;
+  expect(() => buildManualAvailabilityIntent(position, 'gripper', 0.02, 'position'))
+    .toThrow(/Gripper observation is unavailable/);
+  position.observedMotion = null;
+  expect(() => buildManualAvailabilityIntent(position, 'joint', null, 'motion'))
+    .toThrow(/Motion observation is unavailable/);
+});
+
+it('fences pneumatic availability on the current descriptor and addressed target', () => {
+  const snapshot = { executionControlStatus: pneumaticStatus(), authoringAdmission: { admissionGeneration: 1 },
+    programCycle: { programRunnerOwnerEpoch: 'runner.1', cycleGeneration: 1, state: 'running',
+      executionControlRevision: 1, runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
+  } as unknown as ComposerHeadlessState;
+  const before = manualAvailabilityScopeFence(snapshot, 'gripper');
+  snapshot.executionControlStatus!.directControlGripper!.targetDescriptor.openStateRef = 'changed-ref';
+  expect(manualAvailabilityScopeFence(snapshot, 'gripper')).not.toBe(before);
+  const sourceChanged = manualAvailabilityScopeFence(snapshot, 'gripper');
+  snapshot.executionControlStatus!.directControlGripper!.programBindingId = 'new-binding';
+  expect(manualAvailabilityScopeFence(snapshot, 'gripper')).not.toBe(sourceChanged);
 });
 
 it('keeps known target rejection local without hiding transport or protocol failures', () => {
@@ -252,4 +340,139 @@ describe('persistent runtime-scale transport cadence', () => {
       applicationState: 'applied',
     });
   });
+});
+
+
+describe('pneumatic manual availability observation', () => {
+  let root: import('react-dom/client').Root;
+  let latest: ReturnType<typeof useRobotControl>;
+  const pending: Array<{ intent: Parameters<typeof api.execution.manualAvailability>[0];
+    signal: AbortSignal | undefined; resolve: (value: Awaited<ReturnType<typeof api.execution.manualAvailability>>) => void }> = [];
+  function Harness({ snapshot }: { snapshot: ComposerHeadlessState }) {
+    const result = useRobotControl(true, true, true, snapshot);
+    useEffect(() => { latest = result; }, [result]);
+    return null;
+  }
+  async function render(snapshot: ComposerHeadlessState) {
+    await act(async () => root.render(createElement(Harness, { snapshot })));
+  }
+  beforeEach(async () => {
+    const document = Object.assign(new EventTarget(), {
+      nodeType: 9, activeElement: null, defaultView: {},
+    });
+    const makeNode = (tag: string) => Object.assign(new EventTarget(), {
+      nodeType: 1, nodeName: tag.toUpperCase(), tagName: tag.toUpperCase(),
+      namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: document, style: {},
+      appendChild: vi.fn(), removeChild: vi.fn(), insertBefore: vi.fn(),
+      setAttribute: vi.fn(), removeAttribute: vi.fn(),
+    });
+    Object.assign(document, { createElement: makeNode, documentElement: makeNode('html') });
+    const browser = Object.assign(new EventTarget(), { document, HTMLIFrameElement: class {},
+      setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout });
+    document.defaultView = browser;
+    vi.stubGlobal('window', browser);
+    vi.stubGlobal('document', document);
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    const { createRoot } = await import('react-dom/client');
+    root = createRoot(makeNode('div') as unknown as Element);
+    pending.length = 0;
+    vi.spyOn(api.execution, 'manualAvailability').mockImplementation((intent, signal) => (
+      new Promise((resolve) => pending.push({ intent, signal, resolve }))
+    ));
+    vi.spyOn(api.execution, 'previewCapabilityCommand');
+    vi.spyOn(api.execution, 'previewMotion');
+  });
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+  it('refuses a missing current observation when a pneumatic target becomes Position', async () => {
+    const snapshot = { executionControlStatus: pneumaticStatus(), authoringAdmission: { admissionGeneration: 1 },
+      programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: 'program.1', cycleGeneration: 1,
+        state: 'running', executionControlRevision: 1,
+        runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
+    } as unknown as ComposerHeadlessState;
+    await render(snapshot);
+    await act(async () => { latest.selectMode('gripper'); latest.setManualPanelVisible(true); });
+    expect(pending).toHaveLength(1);
+    const successor = structuredClone(snapshot);
+    successor.executionControlStatus!.directControlGripper!.programBindingId = 'position.successor';
+    Object.assign(successor.executionControlStatus!.directControlGripper!.targetDescriptor, {
+      actuationKind: 'position_commanded', outputMode: 'commanded',
+      completionPolicy: 'goal_fenced_target_reached', graspConfirmationPolicy: 'binding_feedback_required',
+    });
+    await render(successor);
+    expect(pending[0].signal!.aborted).toBe(true);
+    expect(pending).toHaveLength(1);
+    expect(latest.manualControlAllowed).toBe(false);
+    expect(latest.manualControlUnavailableReason).toBe('Gripper observation is unavailable.');
+    await act(async () => pending[0].resolve({ requestId: pending[0].intent.request_context.request_id,
+      requestOwnerEpoch: pending[0].intent.request_context.request_owner_epoch,
+      intentDigest: 'sha256:obsolete-query', available: true, unavailableReason: null,
+      cleanupRequired: false, manualHandover: null }));
+    expect(latest.manualControlAllowed).toBe(false);
+    expect(latest.state.draftGripperPosition).toBeNull();
+  });
+  it.each(['commanded', 'none'] as const)(
+    'ignores a late %s query across a source/target change during Stop without drafting or previewing', async (mode) => {
+      const snapshot = { executionControlStatus: pneumaticStatus(mode), authoringAdmission: { admissionGeneration: 1 },
+        programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: 'program.1', cycleGeneration: 1,
+          state: 'running', executionControlRevision: 1,
+          runtimeControls: { executionSelections: { selectionRevision: 1,
+            groups: [{ groupId: 'cell', state: 'stopping' }] } } },
+      } as unknown as ComposerHeadlessState;
+      await render(snapshot);
+      await act(async () => {
+        latest.selectMode('gripper');
+        latest.setManualPanelVisible(true);
+      });
+      expect(pending).toHaveLength(1);
+      expect(pending[0].intent.request_context.request_owner_epoch).toBe(snapshot.executionControlStatus!.ownerEpoch);
+      expect(pending[0].intent.program_binding_id).toBe(snapshot.executionControlStatus!.directControlGripper!.programBindingId);
+      expect(pending[0].intent.participants[0].payload).toMatchObject({ command_value: {
+        position: { kind: 'linear_m', value_m: 0.037 },
+      } });
+      const successor = structuredClone(snapshot);
+      successor.executionControlStatus!.ownerEpoch = 'owner.successor';
+      successor.executionControlStatus!.directControlGripper!.programBindingId = 'binding.successor';
+      const successorPreset = successor.executionControlStatus!.directControlGripper!.targetDescriptor.namedPresets[0];
+      successorPreset.masterPosition = 0.033;
+      successorPreset.coordinates[0].position = 0.033;
+      await render(successor);
+      expect(pending[0].signal!.aborted).toBe(true);
+      // Scope synchronization may cancel an intermediate successor query.
+      // Every such request must still address the current snapshot exactly.
+      const successorQueries = pending.slice(1);
+      const liveQueries = successorQueries.filter((query) => !query.signal!.aborted);
+      expect(liveQueries).toHaveLength(1);
+      const currentQuery = liveQueries[0];
+      expect(currentQuery).toBe(successorQueries.at(-1));
+      for (const query of successorQueries) {
+        expect(query.intent.request_context.request_owner_epoch).toBe('owner.successor');
+        expect(query.intent.program_binding_id).toBe('binding.successor');
+        expect(query.intent.participants[0].payload).toMatchObject({ command_value: {
+          position: { kind: 'linear_m', value_m: 0.033 },
+        } });
+      }
+      const answer = (query: typeof currentQuery, available: boolean) => ({
+        requestId: query.intent.request_context.request_id,
+        requestOwnerEpoch: query.intent.request_context.request_owner_epoch,
+        intentDigest: 'sha256:availability-only', available,
+        unavailableReason: available ? null : 'component_not_ready', cleanupRequired: false, manualHandover: null });
+      for (const obsolete of pending.filter((query) => query !== currentQuery)) {
+        expect(obsolete.signal!.aborted).toBe(true);
+        await act(async () => obsolete.resolve(answer(obsolete, true)));
+        expect(latest.manualControlAllowed).toBe(false);
+      }
+      await act(async () => currentQuery.resolve(answer(currentQuery, false)));
+      expect(latest.manualControlAllowed).toBe(false);
+      expect(latest.manualControlUnavailableReason).toBe('component not ready');
+      expect(latest.state.draftGripperPosition).toBeNull();
+      expect(latest.state.intent).toBeNull();
+      expect(latest.state.preview).toBeNull();
+      expect(api.execution.previewCapabilityCommand).not.toHaveBeenCalled();
+      expect(api.execution.previewMotion).not.toHaveBeenCalled();
+    },
+  );
 });

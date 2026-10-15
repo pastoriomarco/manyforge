@@ -17,7 +17,6 @@
 #include "content_identity_internal.hpp"
 #include "manyforge_deployment/cell_compiler.hpp"
 #include "manyforge_deployment/content_identity.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
@@ -1112,7 +1111,11 @@ std::string emit_control_domain_control(
     const core::ControlDomainId& control_domain_id) {
   const std::string bytes =
       canonical_json(control_domain_projection(compiler_ir, control_domain_id));
-  const CanonicalValue parsed = parse_and_verify_control_domain_control(bytes);
+  const CanonicalValue parsed = parse_and_verify_control_domain_control(
+      bytes, &compiler_ir.applicability().composition().graph(),
+      compiler_ir.applicability()
+          .composition()
+          .control_binding_coordinate_maps());
   if (canonical_json(parsed) != bytes) {
     throw std::logic_error("control-domain control emitter produced noncanonical bytes");
   }
@@ -1122,7 +1125,11 @@ std::string emit_control_domain_control(
 void require_control_domain_control_matches(std::string_view canonical_bytes,
                                             const CompilerQualifiedCellIr& compiler_ir,
                                             const core::ControlDomainId& control_domain_id) {
-  const CanonicalValue parsed = parse_and_verify_control_domain_control(canonical_bytes);
+  const CanonicalValue parsed = parse_and_verify_control_domain_control(
+      canonical_bytes, &compiler_ir.applicability().composition().graph(),
+      compiler_ir.applicability()
+          .composition()
+          .control_binding_coordinate_maps());
   if (parsed != control_domain_projection(compiler_ir, control_domain_id)) {
     fail_retained_bundle(
         "control-domain control artifact differs from the exact compiler "

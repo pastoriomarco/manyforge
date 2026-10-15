@@ -99,13 +99,6 @@ void validate_row(const RuntimeContractDeclaration& row) {
                  detail::reference_runtime_product_contract_revision();
     }
     if (row.runtime_profile_id().value() ==
-        detail::kNativeExecutionRuntimeProfileId) {
-      return row.runtime_product_id().value() ==
-                 detail::kNativeExecutionRuntimeProductContractId &&
-             row.runtime_product_revision() ==
-                 detail::native_execution_runtime_product_contract_revision();
-    }
-    if (row.runtime_profile_id().value() ==
         detail::kRos2ControlExecutionRuntimeProfileId) {
       return row.runtime_product_id().value() ==
                  detail::kRos2ControlExecutionRuntimeProductContractId &&
@@ -125,13 +118,6 @@ void validate_row(const RuntimeContractDeclaration& row) {
                  detail::reference_runtime_profile_revision() &&
              row.offer().runtime_implementation_id.value() ==
                  detail::kReferenceRuntimeImplementationId;
-    }
-    if (row.runtime_profile_id().value() ==
-        detail::kNativeExecutionRuntimeProfileId) {
-      return row.runtime_profile_revision().value() ==
-                 detail::native_execution_runtime_profile_revision() &&
-             row.offer().runtime_implementation_id.value() ==
-                 detail::kNativeExecutionRuntimeImplementationId;
     }
     if (row.runtime_profile_id().value() ==
         detail::kRos2ControlExecutionRuntimeProfileId) {
@@ -197,11 +183,7 @@ void validate_row(const RuntimeContractDeclaration& row) {
           row.runtime_profile_id().value() ==
                   detail::kReferenceRuntimeProfileId
               ? std::string(detail::kReferenceRuntimeStatusEndpointRoleId)
-              : row.runtime_profile_id().value() ==
-                        detail::kNativeExecutionRuntimeProfileId
-                    ? std::string(
-                          detail::kNativeExecutionRuntimeStatusEndpointRoleId)
-                    : std::string(
+              : std::string(
                           detail::
                               kRos2ControlExecutionRuntimeStatusEndpointRoleId)) ==
       endpoint_roles.end()) {
@@ -215,14 +197,6 @@ void validate_row(const RuntimeContractDeclaration& row) {
         std::string(detail::kReferenceRuntimeRoleId));
     expected_endpoint_roles.insert(
         std::string(detail::kReferenceRuntimeStatusEndpointRoleId));
-  } else if (row.runtime_profile_id().value() ==
-             detail::kNativeExecutionRuntimeProfileId) {
-    expected_runtime_roles.insert(
-        std::string(detail::kNativeExecutionRuntimeRoleId));
-    expected_endpoint_roles = {
-        std::string(detail::kNativeExecutionRuntimeLogicalSceneEndpointRoleId),
-        std::string(detail::kNativeExecutionRuntimeProjectionEndpointRoleId),
-        std::string(detail::kNativeExecutionRuntimeStatusEndpointRoleId)};
   } else if (row.runtime_profile_id().value() ==
              detail::kRos2ControlExecutionRuntimeProfileId) {
     expected_runtime_roles.insert(
@@ -483,14 +457,6 @@ const RuntimeContractDeclaration& require_runtime_contract_for_unit(
         core::ProductContractId(
             std::string(detail::kReferenceRuntimeProductContractId)),
         detail::reference_runtime_product_contract_revision());
-  }
-  if (runtime_unit.runtime_profile_id.value() ==
-      detail::kNativeExecutionRuntimeProfileId) {
-    return require_runtime_contract(
-        runtime_unit.runtime_profile_id, runtime_unit.runtime_profile_revision,
-        core::ProductContractId(
-            std::string(detail::kNativeExecutionRuntimeProductContractId)),
-        detail::native_execution_runtime_product_contract_revision());
   }
   if (runtime_unit.runtime_profile_id.value() ==
       detail::kRos2ControlExecutionRuntimeProfileId) {

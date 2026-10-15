@@ -450,6 +450,35 @@ describe('Program authoring panels', () => {
     expect(markup).not.toContain('Value source');
   });
 
+  it('uses the generic gripper dwell enum default without authoring it on display', () => {
+    const entry: CatalogEntry = { ...timer, id: 'gripper.command_position', parameters: [{
+      id: 'dwell_while_held', required: false, hasDefault: true, default: 'pause',
+      schema: { type: 'string', enum: ['count', 'pause'] }, schemaHash: timer.parameters[0].schemaHash,
+    }] };
+    const node: ProgramTreeNode = {
+      node_id: entry.id, instance_id: 'gripper', parameters: {
+        command_duration_s: 0.25, position: { kind: 'named_preset', name: 'closed' },
+      }, children: [],
+    };
+    const render = (selected: ProgramTreeNode) => renderToStaticMarkup(<ProgramPropertyEditor
+      roots={[selected]} selectedId="gripper" catalogEntries={[entry]}
+      program={authoringProgram([selected], [])}
+      busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
+    />);
+    const before = JSON.stringify(node);
+    const markup = render(node);
+    expect(markup).toMatch(/<option value="&quot;pause&quot;" selected="">pause<\/option>/);
+    expect(markup).not.toMatch(/<option value="&quot;count&quot;" selected=""/);
+    expect(JSON.stringify(node)).toBe(before);
+    expect(node.parameters).not.toHaveProperty('dwell_while_held');
+    const mutation = buildProgramParameterMutation(node, 'dwell_while_held', { kind: 'literal', value: 'count' });
+    expect(mutation.args.parameters).toEqual({ ...node.parameters, dwell_while_held: 'count' });
+    const counted = { ...node, parameters: { ...node.parameters, dwell_while_held: 'count' } };
+    expect(render(counted)).toMatch(/<option value="&quot;count&quot;" selected="">count<\/option>/);
+    expect(render({ ...node, parameters: { ...node.parameters, dwell_while_held: 'invalid' } }))
+      .toContain('Catalog-invalid value:');
+  });
+
   it('offers the current robot pose or joints for a move goal', () => {
     const poseEntry: CatalogEntry = { ...timer, id: 'motion.move_to_pose', parameters: [
       { id: 'target_role', required: true, schema: { type: 'string' },

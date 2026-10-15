@@ -13,6 +13,8 @@
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
+#include <manyforge_deployment/apply_affected_scope.hpp>
+#include <manyforge_deployment/apply_component_delta.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <memory>
@@ -172,41 +174,6 @@ MaterializeRuntimePackage(const std::filesystem::path &root,
 }
 
 [[nodiscard]] RuntimePackage
-MaterializeNativeRuntimePackage(const std::filesystem::path &root,
-                                bool shared_domain = false) {
-  static_cast<void>(std::filesystem::create_directories(root));
-  auto fixture = shared_domain
-      ? deployment::test::make_lite6_controllable_retention_fixture(
-            false, false, 2U, false, true, "runtime_only_cell", false,
-            false, "resource", false, {}, {}, false, false, false,
-            std::nullopt, true)
-      : deployment::test::make_lite6_native_motion_retention_fixture_for_cell(
-            "runtime_only_cell");
-  const deployment::test::Lite6ControllableCompilerInputArtifactSource
-      input_source(fixture);
-  deployment::FilesystemBuildManifestRepository manifests(root);
-  deployment::FilesystemCatalogArtifactStore catalogs(root);
-  deployment::FilesystemRawArtifactStore raw_artifacts(root);
-  deployment::FilesystemRetainedBundleRepository bundles(root);
-  auto bundle = deployment::detail::RetainedBundleMaterializer::
-      materialize_store_and_reload_production(
-          fixture.qualified, manifests, input_source,
-          fixture.structural_preparations(), catalogs, raw_artifacts,
-          bundles);
-  if (bundle == nullptr) {
-    throw std::runtime_error(
-        "native runtime-convergence fixture produced no retained bundle");
-  }
-  return {
-      std::move(bundle),
-      std::make_unique<deployment::FilesystemVerifiedRetainedBundleSource>(
-          root),
-      std::make_unique<
-          deployment::FilesystemVerifiedRetainedProductArtifactSource>(root),
-  };
-}
-
-[[nodiscard]] RuntimePackage
 MaterializeRosRuntimePackage(const std::filesystem::path &root,
                              bool empty = false,
                              std::string_view motion_limit_target =
@@ -269,6 +236,47 @@ MaterializeRosRuntimePackage(const std::filesystem::path &root,
       std::make_unique<deployment::FilesystemVerifiedRetainedBundleSource>(root),
       std::make_unique<deployment::FilesystemVerifiedRetainedProductArtifactSource>(root),
   };
+}
+
+[[nodiscard]] RuntimePackage MaterializeNoneInventoryPackage(
+    const std::filesystem::path &root, std::string_view output_mode = "none",
+    std::string_view actuation_kind = "pneumatic", bool empty = false, bool include_arm = false,
+    bool feedback_alias = false) {
+  auto fixture = (include_arm || feedback_alias)
+      ? deployment::test::make_lite6_controllable_retention_fixture(
+          false, false, 1U, true, true, {}, false, true, "resource", true,
+          {}, {}, true, feedback_alias, !include_arm, std::nullopt, false,
+          deployment::test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, {}, true, {},
+          "manyforge.provider.ros2_control", true, true, nullptr, nullptr,
+          false, false, actuation_kind, 0.2, output_mode)
+      : deployment::test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+          {}, actuation_kind, 0.2, nullptr, output_mode);
+  const deployment::test::Lite6ControllableCompilerInputArtifactSource inputs(fixture);
+  auto qualified = fixture.qualified;
+  if (empty) {
+    const std::vector<deployment::QualifiedRuntimeProfile> profiles{*fixture.ros2_control_execution_runtime_profile};
+    auto authored = deployment::detail::derive_cell_scoped_canonical_empty_deployment(
+        fixture.qualified.deployment(), profiles);
+    const auto composition = deployment::compose_cell_occurrences(authored.graph(), {}, {});
+    const auto overlay = deployment::select_site_overlay_for_deployment(
+        authored.applicability_inputs().value().site_overlay_ref,
+        authored.applicability_inputs().value().external_resources, nullptr);
+    const auto applicable = deployment::qualify_cell_applicability(
+        composition, authored.applicability_inputs(), profiles, {}, {}, {}, {}, {}, {}, {}, {}, overlay);
+    qualified = deployment::qualify_deployment_for_retention(authored, deployment::compile_cell_ir(applicable));
+  }
+  deployment::FilesystemBuildManifestRepository manifests(root);
+  deployment::FilesystemCatalogArtifactStore catalogs(root);
+  deployment::FilesystemRawArtifactStore artifacts(root);
+  deployment::FilesystemRetainedBundleRepository bundles(root);
+  auto bundle = deployment::detail::RetainedBundleMaterializer::materialize_store_and_reload_production(
+      qualified, manifests, inputs,
+      empty ? std::span<const deployment::BuildQualifiedStructuralModelPreparation>{}
+            : fixture.structural_preparations(), catalogs, artifacts, bundles);
+  if (!bundle) throw std::runtime_error("None inventory fixture produced no verified retained bundle");
+  return {std::move(bundle),
+          std::make_unique<deployment::FilesystemVerifiedRetainedBundleSource>(root),
+          std::make_unique<deployment::FilesystemVerifiedRetainedProductArtifactSource>(root)};
 }
 
 [[nodiscard]] ManagerApplyIntentDTO
@@ -979,6 +987,21 @@ public:
         InspectInstalledComponentProcesses(request);
   }
 
+  [[nodiscard]] Result<ManagerComponentProcessStopResultDTO>
+  StopComponentProcess(const ManagerComponentProcessStopRequestDTO &) override {
+    ++component_stop_calls;
+    return Result<ManagerComponentProcessStopResultDTO>::Err(
+        {"fixture_unexpected_process_stop", "no child process Stop was expected", {}});
+  }
+  [[nodiscard]] Result<ManagerComponentProcessStopResultDTO>
+  ReadComponentProcessStop(const ManagerComponentProcessStopReadRequestDTO &) override {
+    ++component_stop_read_calls;
+    return Result<ManagerComponentProcessStopResultDTO>::Err(
+        {"fixture_unexpected_process_stop", "no child drain receipt was expected", {}});
+  }
+  int component_stop_calls{};
+  int component_stop_read_calls{};
+
   std::function<Result<ManagerComponentProcessInventoryResultDTO>(
       const ManagerComponentProcessInventoryRequestDTO &)> installed_processes;
 
@@ -1663,14 +1686,14 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   ScopedPackageRoot candidate_root;
   ScopedPackageRoot state_root;
   auto predecessor =
-      MaterializeNativeRuntimePackage(native_root.path());
+      MaterializeRosRuntimePackage(native_root.path());
   auto candidate = MaterializeRuntimePackage(candidate_root.path());
   ASSERT_EQ(predecessor.bundle->value().cell_graph.cell_id,
             candidate.bundle->value().cell_graph.cell_id);
   ASSERT_EQ(predecessor.bundle->value().cell_graph.runtime_units.size(), 1U);
   ASSERT_EQ(predecessor.bundle->value().cell_graph.runtime_units.front()
                 .runtime_profile_id.value(),
-            deployment::native_execution_runtime_contract::
+            deployment::ros2_control_execution_runtime_contract::
                 kRuntimeProfileId);
 
   auto intent = ApplyIntent(*predecessor.bundle);
@@ -1699,7 +1722,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   ManagerApplyRuntimeConvergenceCoordinator coordinator(
       journal, publication, *predecessor.artifact_source, runtime_ports,
       runtime_ports, "linux",
-      {std::string(deployment::native_execution_runtime_contract::
+      {std::string(deployment::ros2_control_execution_runtime_contract::
                        kLaunchEnvironmentContract)},
       [] { return 1'000U; });
 
@@ -1740,7 +1763,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
     ASSERT_TRUE(product.has_value());
     ASSERT_TRUE(product->manager_liveness_policy().has_value());
     EXPECT_EQ(*product->manager_liveness_policy(),
-              deployment::native_execution_runtime_contract::manager_liveness_policy());
+              deployment::execution_runtime_contract::manager_liveness_policy());
   }
   EXPECT_TRUE(VerifyNativeExecutionHostContinuity(
       *predecessor.bundle, *candidate.bundle, *predecessor.artifact_source).ok());
@@ -1751,15 +1774,16 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   ScopedPackageRoot root;
   ScopedPackageRoot state_root;
   const auto predecessor = MaterializeRosRuntimePackage(root.path(), true);
-  const auto removed = MaterializeRuntimePackage(root.path());
-  const auto replaced = MaterializeNativeRuntimePackage(root.path());
+  const auto removed = MaterializeRuntimePackage(root.path(), true);
+  const auto replaced = MaterializeRuntimePackage(root.path());
   const auto drifted = MaterializeRosRuntimePackage(root.path(), false, "unhosted_arm");
-  // An installed native fence owner cannot turn into a ROS owner during Apply.
-  const auto native_to_ros = VerifyNativeExecutionHostContinuity(
-      *replaced.bundle, *predecessor.bundle, *predecessor.artifact_source);
-  ASSERT_FALSE(native_to_ros.ok());
-  EXPECT_EQ(native_to_ros.error().details.at("reason"),
-            "candidate_native_host_missing");
+  // Native-to-ROS positive-family setup retires with the native executor.
+  // The surviving ROS-to-POSIX replacement preserves before-effect refusal.
+  EXPECT_TRUE(removed.bundle->value().cell_graph.runtime_units.empty());
+  ASSERT_EQ(replaced.bundle->value().cell_graph.runtime_units.size(), 1U);
+  EXPECT_EQ(replaced.bundle->value().cell_graph.runtime_units.front()
+                .runtime_profile_id.value(),
+            deployment::detail::kReferenceRuntimeProfileId);
   for (const auto *candidate : {&removed, &replaced}) {
     auto intent = ApplyIntent(*predecessor.bundle);
     intent.candidate_retained_bundle_id = candidate->bundle->retained_bundle_id();
@@ -1965,70 +1989,6 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(publication_store.publish_calls, 0);
 }
 
-TEST(ManagerNamedApplyCoordinator,
-     SharedNativeDomainIsRefusedBeforeFenceOrPredecessorEffects) {
-  ScopedPackageRoot package_root;
-  ScopedPackageRoot state_root;
-  auto previous = MaterializeRuntimePackage(package_root.path());
-  auto candidate = MaterializeNativeRuntimePackage(package_root.path(), true);
-  const auto predecessor = PredecessorPublication(ApplyIntent(*previous.bundle));
-  const auto intent = ApplyIntent(*candidate.bundle);
-  const auto database = state_root.path() / "unsupported-topology.sqlite3";
-  SqliteManagerApplyJournal journal(database, intent.cell_id);
-  SqliteManagerApplyJournal reader(database, intent.cell_id);
-  ScriptedPublicationStore publication_store(predecessor, &reader);
-  FixedActiveRuntimePlanSource active_plan_source(
-      predecessor, BuildVerifiedRuntimeConvergencePlan(
-          *previous.bundle, *previous.artifact_source, "linux", {"posix.1-2017"}));
-  ScriptedRuntimePorts runtime_ports(reader);
-  MaintenanceSceneOwner scene_owner(predecessor.request.candidate_projection_revision);
-  AggregateFencePort kernel_fence(reader, predecessor);
-  ScriptedRuntimeCompositionPort runtime_composition;
-  ScriptedCellAdmissionPort cell_admission;
-  AlwaysIdleMaintenanceGate maintenance_gate;
-  ManagerPlannedMaintenanceCoordinator maintenance(active_plan_source, maintenance_gate);
-  ManagerNamedApplyCoordinator coordinator(
-      journal, active_plan_source, *candidate.bundle_source,
-      *candidate.artifact_source, publication_store, scene_owner, nullptr,
-      kernel_fence, cell_admission, runtime_composition, runtime_ports,
-      runtime_ports, maintenance, RuntimeEpoch("manager.topology.1"),
-      "linux", {"posix.1-2017"}, [] { return 1'000U; },
-      [] { return ApplyId("apply.topology.1"); },
-      [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
-  const ManagerNamedApplyRequestDTO request{
-      intent.request_context, candidate.bundle->value().deployment_artifact_id,
-      candidate.bundle->value().deployment_revision,
-      predecessor.request.candidate_retained_bundle_id,
-      predecessor.request.candidate_graph_revision, candidate.bundle->retained_bundle_id(),
-      intent.prepared_activation, AdmissionGeneration(7U), std::nullopt};
-  const auto accepted = coordinator.AcceptOrReplay(request);
-  ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
-  const auto failed = coordinator.RecoverIncompleteApply();
-  ASSERT_TRUE(failed.has_value());
-  ASSERT_EQ(failed->state, ManagerNamedApplyResultState::kFailed);
-  ASSERT_TRUE(failed->terminal_outcome.has_value());
-  ASSERT_TRUE(failed->terminal_outcome->failure.has_value());
-  EXPECT_EQ(failed->terminal_outcome->failure->failure_code,
-            "native_shared_domain_unsupported");
-  EXPECT_EQ(failed->terminal_outcome->failure->effect_disposition,
-            ManagerApplyEffectDisposition::kKnown);
-  EXPECT_FALSE(journal.ReadFenceAttempt(accepted.apply_id, accepted.apply_generation).has_value());
-  EXPECT_EQ(kernel_fence.acquire_calls, 0);
-  EXPECT_EQ(kernel_fence.release_calls, 0);
-  EXPECT_EQ(runtime_ports.stop_calls, 0);
-  EXPECT_EQ(runtime_ports.ensure_calls, 0);
-  EXPECT_EQ(runtime_composition.calls, 0);
-  EXPECT_EQ(scene_owner.begin_calls, 0);
-  EXPECT_EQ(scene_owner.CurrentProjectionRevision(), predecessor.request.candidate_projection_revision);
-  EXPECT_EQ(publication_store.publish_calls, 0);
-  EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
-  ASSERT_TRUE(cell_admission.last_release.has_value());
-  const auto replay = coordinator.AcceptOrReplay(request);
-  EXPECT_TRUE(replay.request_replayed);
-  EXPECT_EQ(replay.state, ManagerNamedApplyResultState::kFailed);
-  EXPECT_EQ(kernel_fence.acquire_calls, 0);
-  EXPECT_EQ(runtime_ports.stop_calls, 0);
-}
 
 TEST(ManagerNamedApplyCoordinator,
      LinkedBringUpParentReplayAndRecoveryOnlyObserveRetainedFacts) {
@@ -4372,4 +4332,306 @@ TEST(ManagerNamedApplyCoordinator,
 }
 
 } // namespace
+
+namespace {
+
+[[nodiscard]] ManagerComponentProcessOccurrenceDTO NoneInventoryOccurrence(
+    const deployment::RetainedBundle &bundle) {
+  const auto &bindings = bundle.value().cell_graph.control_bindings;
+  const auto gripper = std::find_if(bindings.begin(), bindings.end(),
+      [](const auto &binding) { return binding.capability_id == CapabilityId("tool.gripper.command"); });
+  const auto &binding = gripper == bindings.end() ? bindings.front() : *gripper;
+  return {binding.controllable_component_id, {}, 0, ProcessPresenceState::kAbsent,
+          ControllerLaunchCleanupState::kNotRequested, std::nullopt,
+          deployment::derive_component_runtime_identity(bundle, binding.controllable_component_id),
+          ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal,
+          ManagerPneumaticNoneProcessOwnerDTO{binding.command_target_id, binding.control_binding_id,
+                                             binding.control_binding_revision}};
+}
+
+[[nodiscard]] ManagerComponentProcessInventoryRequestDTO NoneInventoryRequest(
+    const deployment::RetainedBundle &bundle) {
+  const auto publication = PredecessorPublication(ApplyIntent(bundle));
+  return {publication.request.candidate_projection_revision, publication.publication_generation,
+          publication.durable_public_pointer_content_digest,
+          bundle.value().cell_graph.control_bindings.front().provider_runtime_unit_id,
+          RuntimeEpoch("none-host.original"), RuntimeEpoch("none-manager.original")};
+}
+
+} // namespace
+
+TEST(ManagerNamedApplyCoordinator, NoneProcessOwnerRequiresExactImmutablePneumaticComponentClosure) {
+  ScopedPackageRoot root;
+  const auto none = MaterializeNoneInventoryPackage(root.path());
+  const auto request = NoneInventoryRequest(*none.bundle);
+  const auto exact = NoneInventoryOccurrence(*none.bundle);
+  ASSERT_TRUE(request.valid());
+  ASSERT_TRUE(exact.valid());
+  ASSERT_TRUE(ValidateManagerPneumaticNoneProcessOwner(*none.bundle, request, exact).ok());
+  EXPECT_TRUE(exact.launch_identity.empty());
+  EXPECT_EQ(exact.leader_pid, 0);
+  EXPECT_EQ(exact.process_presence, ProcessPresenceState::kAbsent);
+  EXPECT_FALSE(exact.receipt);
+  const auto reject = [&](auto row) {
+    EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*none.bundle, request, row).ok());
+  };
+  auto foreign = exact;
+  foreign.installed_runtime_identity = ContentDigest(std::string(kDigestOne));
+  ASSERT_TRUE(foreign.valid());
+  reject(foreign);
+  foreign = exact;
+  foreign.pneumatic_none_owner->command_target_id = CommandTargetId("foreign-target");
+  ASSERT_TRUE(foreign.valid());
+  reject(foreign);
+  foreign = exact;
+  foreign.pneumatic_none_owner->control_binding_id = ControlBindingId("foreign-binding");
+  ASSERT_TRUE(foreign.valid());
+  reject(foreign);
+  foreign = exact;
+  foreign.pneumatic_none_owner->control_binding_revision = ControlBindingRevision("foreign-revision");
+  ASSERT_TRUE(foreign.valid());
+  reject(foreign);
+  auto foreign_source = request;
+  foreign_source.runtime_unit_id = RuntimeUnitId("foreign-runtime");
+  ASSERT_TRUE(foreign_source.valid());
+  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*none.bundle, foreign_source, exact).ok());
+  const auto commanded = MaterializeNoneInventoryPackage(root.path(), "commanded");
+  const auto position = MaterializeNoneInventoryPackage(root.path(), "commanded", "position_commanded");
+  // Each negative first matches its own real sealed runtime identity and graph:
+  // the strict output/actuation check, rather than a foreign digest, refuses it.
+  for (const auto &package : {&commanded, &position}) {
+    const auto physical_row = NoneInventoryOccurrence(*package->bundle);
+    ASSERT_TRUE(physical_row.valid());
+    EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(
+        *package->bundle, NoneInventoryRequest(*package->bundle), physical_row).ok());
+  }
+  const auto arm_and_none = MaterializeNoneInventoryPackage(root.path(), "none", "pneumatic", false, true);
+  const auto mixed_row = NoneInventoryOccurrence(*arm_and_none.bundle);
+  ASSERT_TRUE(mixed_row.valid());
+  const auto mixed_config = deployment::ros2_control_execution_runtime_contract::require_component_configuration(
+      *arm_and_none.bundle, NoneInventoryRequest(*arm_and_none.bundle).runtime_unit_id,
+      mixed_row.controllable_component_id);
+  ASSERT_FALSE(mixed_config.motion_target_limits.empty());
+  ASSERT_EQ(mixed_config.gripper_target_configurations.front().output_mode, GripperOutputMode::kNone);
+  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(
+      *arm_and_none.bundle, NoneInventoryRequest(*arm_and_none.bundle), mixed_row).ok());
+  const auto arm = MaterializeRosRuntimePackage(root.path());
+  auto arm_row = NoneInventoryOccurrence(*arm.bundle);
+  ASSERT_TRUE(arm_row.valid());
+  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(
+      *arm.bundle, NoneInventoryRequest(*arm.bundle), arm_row).ok());
+}
+
+TEST(ManagerNamedApplyCoordinator, NoneFeedbackAliasRequiresItsExactVerifiedCommandOwner) {
+  ScopedPackageRoot root;
+  const auto package = MaterializeNoneInventoryPackage(root.path(), "none", "pneumatic", false, false, true);
+  const auto row = NoneInventoryOccurrence(*package.bundle);
+  const auto request = NoneInventoryRequest(*package.bundle);
+  const auto &bindings = package.bundle->value().cell_graph.control_bindings;
+  ASSERT_EQ(bindings.size(), 2U);
+  const auto command = std::find_if(bindings.begin(), bindings.end(),
+      [](const auto &entry) { return entry.capability_id == CapabilityId("tool.gripper.command"); });
+  const auto feedback = std::find_if(bindings.begin(), bindings.end(),
+      [](const auto &entry) { return entry.capability_id == CapabilityId("tool.gripper.feedback"); });
+  ASSERT_NE(command, bindings.end());
+  ASSERT_NE(feedback, bindings.end());
+  EXPECT_NE(command->control_binding_id, feedback->control_binding_id);
+  ASSERT_NE(command->control_binding_revision, feedback->control_binding_revision);
+  EXPECT_EQ(command->command_target_id, feedback->command_target_id);
+  EXPECT_EQ(command->resource_bindings, feedback->resource_bindings);
+  EXPECT_EQ(command->provider_instance_id, feedback->provider_instance_id);
+  EXPECT_EQ(command->provider_manifest_revision, feedback->provider_manifest_revision);
+  EXPECT_EQ(command->provider_runtime_unit_id, feedback->provider_runtime_unit_id);
+  ASSERT_TRUE(row.valid());
+  const auto validated = ValidateManagerPneumaticNoneProcessOwner(*package.bundle, request, row);
+  ASSERT_TRUE(validated.ok()) << validated.error().message;
+  EXPECT_EQ(row.process_presence, ProcessPresenceState::kAbsent);
+  EXPECT_EQ(row.leader_pid, 0);
+  EXPECT_TRUE(row.launch_identity.empty());
+  EXPECT_FALSE(row.receipt);
+  // Even a real, independently qualified feedback binding cannot substitute
+  // for the exact command-binding proof of the installed local owner.
+  auto forged = row;
+  forged.pneumatic_none_owner->control_binding_id = feedback->control_binding_id;
+  forged.pneumatic_none_owner->control_binding_revision = feedback->control_binding_revision;
+  ASSERT_TRUE(forged.valid());
+  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, request, forged).ok());
+  forged = row;
+  forged.pneumatic_none_owner->control_binding_revision = feedback->control_binding_revision;
+  ASSERT_TRUE(forged.valid());
+  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, request, forged).ok());
+  forged = row;
+  forged.pneumatic_none_owner->command_target_id = CommandTargetId("foreign-progress-target");
+  ASSERT_TRUE(forged.valid());
+  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, request, forged).ok());
+}
+
+TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExactFenceWithoutChildProcessEffects) {
+  for (const int variant : {0, 1, 2, 3}) {
+    SCOPED_TRACE(variant);
+    ScopedPackageRoot root;
+    ScopedPackageRoot state;
+    const bool feedback_alias = variant == 3;
+    auto previous = MaterializeNoneInventoryPackage(root.path(), "none", "pneumatic", false, false, feedback_alias);
+    auto candidate = (variant == 0 || feedback_alias)
+        ? MaterializeNoneInventoryPackage(root.path(), "none", "pneumatic", false, false, feedback_alias)
+        : MaterializeNoneInventoryPackage(root.path(), variant == 1 ? "commanded" : "none", "pneumatic", variant == 2);
+    const auto row = NoneInventoryOccurrence(*previous.bundle);
+    const auto inventory = NoneInventoryRequest(*previous.bundle);
+    ASSERT_TRUE(ValidateManagerPneumaticNoneProcessOwner(*previous.bundle, inventory, row).ok());
+    const auto delta = deployment::derive_apply_component_delta(*previous.bundle, *candidate.bundle);
+    ASSERT_EQ(delta.components.size(), 1U);
+    EXPECT_EQ(delta.components.front().disposition, (variant == 0 || feedback_alias) ? deployment::ApplyComponentDisposition::kRetain
+        : variant == 1 ? deployment::ApplyComponentDisposition::kReplace : deployment::ApplyComponentDisposition::kRemove);
+    const auto continuity = VerifyNativeExecutionHostContinuity(
+        *previous.bundle, *candidate.bundle, *candidate.artifact_source);
+    ASSERT_TRUE(continuity.ok()) << continuity.error().message;
+    const auto predecessor = PredecessorPublication(ApplyIntent(*previous.bundle));
+    SqliteManagerApplyJournal journal(state.path() / "none.sqlite3", previous.bundle->value().cell_graph.cell_id);
+    SqliteManagerApplyJournal reader(state.path() / "none.sqlite3", journal.cell_id());
+    ScriptedPublicationStore publication(predecessor, &reader);
+    FixedActiveRuntimePlanSource plan(predecessor, BuildVerifiedRuntimeConvergencePlan(
+        *previous.bundle, *previous.artifact_source, "linux",
+        {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)}));
+    ScriptedRuntimePorts runtime(reader);
+    runtime.ReplaceProcess(inventory.runtime_epoch.value()); // The existing host, not a gripper child.
+    runtime.report_available = false; // Stop at actual host convergence, before Scene effects.
+    AggregateFencePort fence(reader, predecessor);
+    fence.original_execution_host = ExecutionHostEpochDTO{inventory.runtime_unit_id, inventory.runtime_epoch,
+        RequestOwnerEpoch("none-host.owner"), ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
+    const auto expected_fence_scope = deployment::derive_apply_configuration_fence_scope(
+        *previous.bundle, *candidate.bundle);
+    ASSERT_TRUE(expected_fence_scope.valid());
+    for (const auto &domain : expected_fence_scope.domains) {
+      if (!domain.predecessor_control_domain_revision) continue;
+      const auto &desired = previous.bundle->value().desired_control_configurations;
+      const auto configured = std::find_if(desired.begin(), desired.end(), [&](const auto &value) {
+        return value.control_domain_id == domain.control_domain_id &&
+            value.control_domain_revision == *domain.predecessor_control_domain_revision;
+      });
+      ASSERT_TRUE(configured != desired.end());
+      // Existing scripted host observation grammar, qualified by this exact
+      // predecessor's configured domain; no candidate/None-mode inference.
+      fence.predecessor_configurations.push_back({
+          configured->control_domain_id,
+          ActiveControlConfigurationId("predecessor." + configured->control_domain_id.value()),
+          ActiveControlConfigurationGeneration(1U)});
+    }
+    const ConfigurationFenceAdmissionQueryDTO admission_query{
+        expected_fence_scope, inventory.manager_runtime_epoch};
+    ASSERT_TRUE(admission_query.valid());
+    ASSERT_TRUE(fence.ObserveAdmission(admission_query).matches(admission_query));
+    MaintenanceSceneOwner scene_owner(predecessor.request.candidate_projection_revision);
+    ScriptedRuntimeCompositionPort composition;
+    composition.installed_processes = [inventory, row](const auto &request) {
+      if (request != inventory) return Result<ManagerComponentProcessInventoryResultDTO>::Err(
+          {"fixture_foreign_inventory", "wrong original request", {}});
+      return Result<ManagerComponentProcessInventoryResultDTO>::Ok({request, {row}, std::nullopt});
+    };
+    ScriptedCellAdmissionPort admission;
+    AlwaysIdleMaintenanceGate gate;
+    ManagerPlannedMaintenanceCoordinator maintenance(plan, gate);
+    ManagerNamedApplyCoordinator coordinator(journal, plan, *candidate.bundle_source, *candidate.artifact_source,
+        publication, scene_owner, nullptr, fence, admission, composition, runtime, runtime, maintenance,
+        inventory.manager_runtime_epoch, "linux",
+        {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
+        [] { return 1'000U; }, [] { return ApplyId("apply.none-inventory"); },
+        [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
+    auto prototype = ApplyIntent(*candidate.bundle);
+    const ManagerNamedApplyRequestDTO request{prototype.request_context,
+        candidate.bundle->value().deployment_artifact_id, candidate.bundle->value().deployment_revision,
+        previous.bundle->retained_bundle_id(), previous.bundle->value().cell_graph.graph_revision,
+        candidate.bundle->retained_bundle_id(), prototype.prepared_activation,
+        admission.GetAuthoringAdmission().admission_generation, std::nullopt};
+    const auto accepted = coordinator.AcceptOrReplay(request);
+    ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
+    const auto progress = coordinator.RecoverIncompleteApply();
+    ASSERT_TRUE(progress);
+    ASSERT_EQ(progress->state, ManagerNamedApplyResultState::kPending)
+        << (progress->terminal_outcome && progress->terminal_outcome->failure
+            ? progress->terminal_outcome->failure->failure_message : "no failure");
+    const auto attempt = journal.ReadFenceAttempt(accepted.apply_id, accepted.apply_generation);
+    ASSERT_TRUE(attempt);
+    EXPECT_EQ(attempt->fence_intent.scope,
+              deployment::derive_apply_configuration_fence_scope(*previous.bundle, *candidate.bundle));
+    EXPECT_EQ(fence.acquire_calls, 1);
+    EXPECT_EQ(runtime.start_effect_calls, 0);
+    EXPECT_EQ(runtime.stop_calls, 0);
+    EXPECT_EQ(composition.component_stop_calls, 0);
+    EXPECT_EQ(composition.component_stop_read_calls, 0);
+    EXPECT_EQ(composition.child_submit_calls, 0);
+    EXPECT_EQ(composition.child_read_calls, 0);
+    EXPECT_EQ(composition.calls, 0);
+    EXPECT_EQ(scene_owner.begin_calls, 0);
+    EXPECT_EQ(publication.publish_calls, 0);
+    EXPECT_EQ(row.process_presence, ProcessPresenceState::kAbsent);
+    EXPECT_FALSE(row.receipt);
+    EXPECT_TRUE(coordinator.AcceptOrReplay(request).request_replayed);
+    EXPECT_EQ(fence.acquire_calls, 1);
+  }
+}
+
+TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBeforeFenceAndEffects) {
+  for (const int variant : {0, 1, 2, 3, 4}) {
+    SCOPED_TRACE(variant);
+    ScopedPackageRoot root;
+    ScopedPackageRoot state;
+    const auto package = MaterializeNoneInventoryPackage(root.path());
+    const auto inventory = NoneInventoryRequest(*package.bundle);
+    const auto exact = NoneInventoryOccurrence(*package.bundle);
+    ASSERT_TRUE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, inventory, exact).ok());
+    const auto predecessor = PredecessorPublication(ApplyIntent(*package.bundle));
+    SqliteManagerApplyJournal journal(state.path() / "foreign-none.sqlite3", package.bundle->value().cell_graph.cell_id);
+    SqliteManagerApplyJournal reader(state.path() / "foreign-none.sqlite3", journal.cell_id());
+    ScriptedPublicationStore publication(predecessor, &reader);
+    FixedActiveRuntimePlanSource plan(predecessor, BuildVerifiedRuntimeConvergencePlan(
+        *package.bundle, *package.artifact_source, "linux",
+        {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)}));
+    ScriptedRuntimePorts runtime(reader);
+    AggregateFencePort fence(reader, predecessor);
+    fence.original_execution_host = ExecutionHostEpochDTO{inventory.runtime_unit_id, inventory.runtime_epoch,
+        RequestOwnerEpoch("none-host.owner"), ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
+    MaintenanceSceneOwner scene_owner(predecessor.request.candidate_projection_revision);
+    ScriptedRuntimeCompositionPort composition;
+    composition.installed_processes = [inventory, exact, variant](const auto &request) {
+      auto response = inventory;
+      auto row = exact;
+      if (variant == 0) response.runtime_epoch = RuntimeEpoch("foreign-host");
+      if (variant == 1) response.manager_runtime_epoch = RuntimeEpoch("foreign-manager");
+      if (variant == 2) row.pneumatic_none_owner->control_binding_revision = ControlBindingRevision("foreign-binding");
+      if (variant == 3) row.installed_runtime_identity = ContentDigest(std::string(kDigestOne));
+      if (variant == 4) response.runtime_unit_id = RuntimeUnitId("foreign-source");
+      EXPECT_EQ(request, inventory);
+      return Result<ManagerComponentProcessInventoryResultDTO>::Ok({response, {row}, std::nullopt});
+    };
+    ScriptedCellAdmissionPort admission;
+    AlwaysIdleMaintenanceGate gate;
+    ManagerPlannedMaintenanceCoordinator maintenance(plan, gate);
+    ManagerNamedApplyCoordinator coordinator(journal, plan, *package.bundle_source, *package.artifact_source,
+        publication, scene_owner, nullptr, fence, admission, composition, runtime, runtime, maintenance,
+        inventory.manager_runtime_epoch, "linux",
+        {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
+        [] { return 1'000U; }, [] { return ApplyId("apply.foreign-none"); },
+        [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
+    const auto prototype = ApplyIntent(*package.bundle);
+    const ManagerNamedApplyRequestDTO request{prototype.request_context,
+        package.bundle->value().deployment_artifact_id, package.bundle->value().deployment_revision,
+        package.bundle->retained_bundle_id(), package.bundle->value().cell_graph.graph_revision,
+        package.bundle->retained_bundle_id(), prototype.prepared_activation,
+        admission.GetAuthoringAdmission().admission_generation, std::nullopt};
+    ASSERT_EQ(coordinator.AcceptOrReplay(request).state, ManagerNamedApplyResultState::kPending);
+    const auto result = coordinator.RecoverIncompleteApply();
+    ASSERT_TRUE(result && result->terminal_outcome && result->terminal_outcome->failure);
+    EXPECT_EQ(result->state, ManagerNamedApplyResultState::kUnknownEffect);
+    EXPECT_EQ(result->terminal_outcome->failure->failure_code, "apply_fence_evidence_failed");
+    EXPECT_EQ(fence.acquire_calls, 0);
+    EXPECT_EQ(runtime.ensure_calls, 0);
+    EXPECT_EQ(composition.component_stop_calls, 0);
+    EXPECT_EQ(composition.component_stop_read_calls, 0);
+    EXPECT_EQ(composition.calls, 0);
+    EXPECT_EQ(scene_owner.begin_calls, 0);
+    EXPECT_EQ(publication.publish_calls, 0);
+  }
+}
+
 } // namespace manyforge::component_manager

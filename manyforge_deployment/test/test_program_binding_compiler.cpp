@@ -15,6 +15,7 @@
 #include <variant>
 #include <vector>
 
+#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_deployment/content_identity.hpp>
@@ -28,9 +29,10 @@
 
 #include "content_identity_internal.hpp"
 #include "canonical_empty_admission_internal.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
+#include "../../manyforge_roboplan/src/retained_ros2_control_lifecycle_plans_internal.hpp"
 
 namespace {
 
@@ -69,10 +71,9 @@ using manyforge::deployment::test::kLite6ArmTargetId;
 using manyforge::deployment::test::kLite6ControllableComponentId;
 using manyforge::deployment::test::kLite6GripperTargetId;
 using manyforge::deployment::test::
-    materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture;
+    materialize_lite6_ros2_control_observed_retained_consumer_fixture;
 using manyforge::deployment::test::
-    materialize_lite6_native_motion_retained_consumer_fixture;
-using manyforge::deployment::test::materialize_lite6_retained_consumer_fixture;
+    materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell;
 
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -112,12 +113,23 @@ struct BindingCompilerContext final {
 
 [[nodiscard]] BindingCompilerContext
 make_context(const std::filesystem::path &root,
-             bool aggregate_gripper = false) {
-  const auto materialized =
-      aggregate_gripper
-          ? materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
-                root)
-          : materialize_lite6_retained_consumer_fixture(root);
+             bool aggregate_gripper = false, bool gripper_only = false) {
+  const auto materialized = [&] {
+    if (!gripper_only) {
+      return materialize_lite6_ros2_control_observed_retained_consumer_fixture(
+          root, aggregate_gripper);
+    }
+    const auto plans = manyforge::roboplan_backend::detail::
+        ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
+    const auto semantic = manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+        manyforge::core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
+    if (!semantic.ok()) {
+      throw std::logic_error("test ROS gripper lifecycle catalog is unavailable");
+    }
+    return manyforge::deployment::test::
+        materialize_lite6_ros2_control_gripper_only_cclc_product_retained_consumer_fixture(
+            root, semantic.value().value());
+  }();
   const FilesystemVerifiedRetainedBundleSource bundle_source(root);
   auto bundle =
       bundle_source.get_verified(materialized.bundle->retained_bundle_id());
@@ -137,9 +149,10 @@ make_context(const std::filesystem::path &root,
 }
 
 [[nodiscard]] BindingCompilerContext
-make_native_motion_context(const std::filesystem::path &root) {
+make_ros_motion_context(const std::filesystem::path &root) {
   const auto materialized =
-      materialize_lite6_native_motion_retained_consumer_fixture(root);
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
+          root, "i6_lite6_native_motion_cell");
   const FilesystemVerifiedRetainedBundleSource bundle_source(root);
   auto bundle =
       bundle_source.get_verified(materialized.bundle->retained_bundle_id());
@@ -485,7 +498,7 @@ TEST(ProgramBindingCompilerTest,
 
   ScopedTrustedRoot direct_root;
   const BindingCompilerContext direct_context =
-      make_native_motion_context(direct_root.path());
+      make_ros_motion_context(direct_root.path());
   FilesystemCatalogArtifactStore direct_catalog_store(direct_root.path());
   const auto direct = compile_direct_control_motion_program_binding(
       manyforge::core::ControllableComponentId(
@@ -500,7 +513,7 @@ TEST(ProgramBindingCompilerTest,
      DerivesDeterministicDirectControlMotionBindingWithoutScenarioProgram) {
   ScopedTrustedRoot root;
   const BindingCompilerContext context =
-      make_native_motion_context(root.path());
+      make_ros_motion_context(root.path());
   FilesystemCatalogArtifactStore catalog_store(root.path());
 
   const auto first = compile_direct_control_motion_program_binding(
@@ -569,7 +582,7 @@ TEST(ProgramBindingCompilerTest,
      DirectControlMotionBindingRejectsUnknownComponentOrTarget) {
   ScopedTrustedRoot root;
   const BindingCompilerContext context =
-      make_native_motion_context(root.path());
+      make_ros_motion_context(root.path());
   FilesystemCatalogArtifactStore catalog_store(root.path());
 
   EXPECT_THROW(
@@ -648,7 +661,7 @@ TEST(ProgramBindingCompilerTest,
      DiscoversDirectControlTargetsWithoutAnAuthoredProgram) {
   ScopedTrustedRoot motion_root;
   const BindingCompilerContext motion_context =
-      make_native_motion_context(motion_root.path());
+      make_ros_motion_context(motion_root.path());
   FilesystemCatalogArtifactStore motion_catalog_store(motion_root.path());
   const auto first_motion = compile_direct_control_program_binding_inventory(
       *motion_context.bundle, motion_context.model_map, motion_catalog_store);
@@ -663,7 +676,7 @@ TEST(ProgramBindingCompilerTest,
 
   ScopedTrustedRoot gripper_root;
   const BindingCompilerContext gripper_context =
-      make_context(gripper_root.path(), true);
+      make_context(gripper_root.path(), true, true);
   FilesystemCatalogArtifactStore gripper_catalog_store(gripper_root.path());
   const auto first_gripper = compile_direct_control_program_binding_inventory(
       *gripper_context.bundle, gripper_context.model_map,
@@ -677,6 +690,59 @@ TEST(ProgramBindingCompilerTest,
   ASSERT_EQ(second_gripper.gripper.size(), 1U);
   EXPECT_EQ(first_gripper.gripper.front()->canonical_bytes(),
             second_gripper.gripper.front()->canonical_bytes());
+}
+
+TEST(ProgramBindingCompilerTest, ScalarPeersRetainDistinctDirectProgramsAndResources) {
+  const auto plans = manyforge::roboplan_backend::detail::
+      ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
+  const auto semantic = manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+      manyforge::core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
+  ASSERT_TRUE(semantic.ok());
+  for (const bool arm_root : {false, true}) {
+    SCOPED_TRACE(arm_root ? "real arm root plus independent scalar" : "two scalars without motion");
+    ScopedTrustedRoot root;
+    const auto materialized = manyforge::deployment::test::
+        materialize_lite6_ros2_control_scalar_peer_retained_consumer_fixture(
+            root.path(), semantic.value().value(), arm_root);
+    const FilesystemVerifiedRetainedBundleSource bundles(root.path());
+    const auto bundle = bundles.get_verified(materialized.bundle->retained_bundle_id());
+    ASSERT_NE(bundle, nullptr);
+    ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
+    const FilesystemVerifiedRetainedModelMapSource maps(root.path());
+    const auto model_map = maps.get_verified(RetainedModelMapQuery{
+        bundle->retained_bundle_id(), bundle->value().compiled_products.symbol_role_maps.front().product_id});
+    ASSERT_TRUE(model_map.has_value());
+    FilesystemCatalogArtifactStore catalogs(root.path());
+    const auto inventory = compile_direct_control_program_binding_inventory(*bundle, *model_map, catalogs);
+    const auto repeated = compile_direct_control_program_binding_inventory(*bundle, *model_map, catalogs);
+    ASSERT_EQ(inventory.gripper.size(), 2U);
+    ASSERT_EQ(repeated.gripper.size(), 2U);
+    EXPECT_EQ(inventory.motion.size(), arm_root ? 1U : 0U);
+    std::set<manyforge::core::ProgramBindingId> program_ids;
+    std::set<manyforge::core::ControllableComponentId> components;
+    std::set<manyforge::core::ResourceId> resources;
+    for (std::size_t index = 0; index < inventory.gripper.size(); ++index) {
+      const auto &program = inventory.gripper[index];
+      ASSERT_NE(program, nullptr);
+      EXPECT_EQ(program->canonical_bytes(), repeated.gripper[index]->canonical_bytes());
+      EXPECT_TRUE(program_ids.insert(program->program_binding_id()).second);
+      ASSERT_EQ(program->value().target_role_bindings.size(), 1U);
+      const auto &target = program->value().target_role_bindings.front();
+      EXPECT_TRUE(components.insert(target.controllable_component_id).second);
+      EXPECT_EQ(target.command_target_id.value(), kLite6GripperTargetId);
+      ASSERT_EQ(target.resource_role_bindings.size(), 1U);
+      ASSERT_EQ(target.resource_role_bindings.front().resource_ids.size(), 1U);
+      EXPECT_TRUE(resources.insert(target.resource_role_bindings.front().resource_ids.front()).second);
+      ASSERT_EQ(target.capability_bindings.size(), 1U);
+      EXPECT_EQ(target.capability_bindings.front().capability_id.value(), "tool.gripper.command");
+      ASSERT_TRUE(target.capability_bindings.front().command_schema.has_value());
+      EXPECT_EQ(target.capability_bindings.front().command_schema->command_schema_id.value(),
+                manyforge::core::kGripperPositionCommandSchemaId);
+    }
+    EXPECT_EQ(program_ids.size(), 2U);
+    EXPECT_EQ(components.size(), 2U);
+    EXPECT_EQ(resources.size(), 2U);
+  }
 }
 
 TEST(ProgramBindingCompilerTest, RejectsIncompleteAndUnknownRoleAssignments) {
@@ -1446,9 +1512,9 @@ TEST(ProgramBindingCompilerTest, PreparedOriginIsClosedAndScenarioAccessIsChecke
 TEST(ProgramBindingCompilerTest, SealedEmptyReadbackRequiresTheActualAdmission) {
   namespace d = manyforge::deployment;
   ScopedTrustedRoot package;
-  const auto admission = d::detail::generate_native_empty_package(
+  const auto admission = d::detail::generate_ros_empty_package(
       package.path(), manyforge::core::CellId("prepared_empty_cell"),
-      d::detail::native_execution_runtime_profile_document());
+      d::detail::ros2_control_execution_runtime_profile_document());
   const d::FilesystemVerifiedCatalogArtifactSource catalog(package.path());
   const d::FilesystemVerifiedRawArtifactSource raw(package.path());
   const auto prepared = d::assemble_sealed_canonical_empty_activation(admission, catalog, raw);
@@ -1472,9 +1538,9 @@ TEST(ProgramBindingCompilerTest, SealedEmptyReadbackRequiresTheActualAdmission) 
   ASSERT_NE(replay, nullptr);
   EXPECT_EQ(replay->prepared_activation_id(), prepared.prepared_activation_id());
   ScopedTrustedRoot foreign;
-  const auto other = d::detail::generate_native_empty_package(
+  const auto other = d::detail::generate_ros_empty_package(
       foreign.path(), manyforge::core::CellId("other_prepared_empty_cell"),
-      d::detail::native_execution_runtime_profile_document());
+      d::detail::ros2_control_execution_runtime_profile_document());
   EXPECT_THROW(static_cast<void>(repository.get_verified(prepared.prepared_activation_id(), &other)),
                d::PreparedActivationInputError);
   // Rehashed, structurally coherent JSON is still not an actual admission.

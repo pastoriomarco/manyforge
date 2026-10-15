@@ -22,11 +22,19 @@ struct RetainedTargetSceneFrameInput final {
   core::ResolvedComponentModelFrameDTO frame;
 };
 
+enum class RetainedSceneFrameCoordinateAuthority {
+  kRequiredPublication,
+  // Host-selected strict pneumatic binding: no coordinate observation exists.
+  kUnavailablePneumatic,
+};
+
 struct RetainedSceneFrameStateSourceInput final {
   core::ObservedStateQueryContextDTO context;
   core::ObservedStateSourceKind publication_source{
       core::ObservedStateSourceKind::kPredictedState};
   std::shared_ptr<const core::IObservedStateProvider> provider;
+  RetainedSceneFrameCoordinateAuthority coordinate_authority{
+      RetainedSceneFrameCoordinateAuthority::kRequiredPublication};
 };
 
 struct RetainedSceneFrameComponentAttachmentInput final {
@@ -168,8 +176,23 @@ public:
     const auto source_group_covers =
         [&](const RetainedSceneFrameStateSourceInput &source,
             const core::ObservedStateQueryContextDTO &context,
-            const bool local) {
-          return source.provider &&
+            const bool local, const bool allow_feedback_alias = false) {
+          const bool unavailable_pneumatic =
+              source.coordinate_authority ==
+                  RetainedSceneFrameCoordinateAuthority::kUnavailablePneumatic;
+          if (source.coordinate_authority !=
+                  RetainedSceneFrameCoordinateAuthority::kRequiredPublication &&
+              !unavailable_pneumatic) {
+            return false;
+          }
+          return (unavailable_pneumatic
+                      ? !source.provider &&
+                            source.context.capability_id.value() ==
+                                "tool.gripper.command" &&
+                            (context.capability_id.value() == "tool.gripper.command" ||
+                             (allow_feedback_alias &&
+                              context.capability_id.value() == "tool.gripper.feedback"))
+                      : static_cast<bool>(source.provider)) &&
                  source_matches_authority(context.state_authority_class,
                                           source.publication_source) &&
                  source.context.controllable_component_id ==
@@ -385,6 +408,8 @@ public:
           throw std::invalid_argument(
               "scene-frame state provider differs from its retained binding");
         }
+        // Keep checked command absence available for same-owner feedback
+        // aliases during construction; remove it before creating live sources.
         input.state_sources.push_back(std::move(*provided));
         provided_state_sources.erase(provided);
       } else {
@@ -394,14 +419,50 @@ public:
         const auto covered_by_direct_source =
             std::any_of(input.state_sources.begin(), input.state_sources.end(),
                         [&](const auto &source) {
-                          return source_group_covers(source, context, local);
+                          return source.coordinate_authority ==
+                                     RetainedSceneFrameCoordinateAuthority::kRequiredPublication &&
+                                 source_group_covers(source, context, local);
                         }) ||
             std::any_of(provided_state_sources.begin(),
                         provided_state_sources.end(),
                         [&](const auto &source) {
-                          return source_group_covers(source, context, local);
+                          return source.coordinate_authority ==
+                                     RetainedSceneFrameCoordinateAuthority::kRequiredPublication &&
+                                 source_group_covers(source, context, local);
                         });
-        if (covered_by_direct_source) {
+        const auto same_pneumatic_command_owner = [&](const auto &source) {
+          if (source.coordinate_authority !=
+                  RetainedSceneFrameCoordinateAuthority::kUnavailablePneumatic ||
+              context.capability_id.value() != "tool.gripper.feedback" ||
+              source.context.control_route_id != context.control_route_id ||
+              !source_group_covers(source, context, local, true)) {
+            return false;
+          }
+          const auto command = std::find_if(
+              graph.control_bindings.begin(), graph.control_bindings.end(),
+              [&](const auto &candidate) {
+                return candidate.control_binding_id ==
+                           source.context.control_binding_id &&
+                       candidate.control_binding_revision ==
+                           source.context.control_binding_revision &&
+                       candidate.capability_id.value() == "tool.gripper.command" &&
+                       candidate.controllable_component_id ==
+                           context.controllable_component_id &&
+                       candidate.command_target_id == context.command_target_id;
+              });
+          return command != graph.control_bindings.end() &&
+                 command->provider_runtime_unit_id ==
+                     graph_binding->provider_runtime_unit_id;
+        };
+        // A feedback map may precede its command map. The command marker must
+        // still pass exact binding validation and be consumed before return.
+        const bool covered_by_pneumatic_command =
+            std::any_of(input.state_sources.begin(), input.state_sources.end(),
+                        same_pneumatic_command_owner) ||
+            std::any_of(provided_state_sources.begin(),
+                        provided_state_sources.end(),
+                        same_pneumatic_command_owner);
+        if (covered_by_direct_source || covered_by_pneumatic_command) {
           continue;
         }
         throw std::invalid_argument(
@@ -411,6 +472,11 @@ public:
     if (!provided_state_sources.empty()) {
       throw std::invalid_argument("scene-frame state provider is unused");
     }
+    // Construction-only absence never reaches the live FK/provider list.
+    std::erase_if(input.state_sources, [](const auto &source) {
+      return source.coordinate_authority ==
+             RetainedSceneFrameCoordinateAuthority::kUnavailablePneumatic;
+    });
     return create(std::move(shared_model), std::move(input));
   }
 

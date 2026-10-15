@@ -67,6 +67,7 @@
         },
         "runtime_kind": "ros2_control"
       },
+      "frame_prefix": "",
       "model_source": {
         "package_roots": {
           "manyforge_example_models": {
@@ -200,6 +201,7 @@
         },
         "runtime_kind": "ros2_control"
       },
+      "frame_prefix": "",
       "model_source": {
         "package_roots": {
           "manyforge_example_models": {

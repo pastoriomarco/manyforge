@@ -132,7 +132,11 @@ participant_resources(const core::RuntimeParticipantBindingDTO &binding) {
              expected.desired_configuration.activation_set_id &&
          path.provider_runtime_unit_id == expected.source_runtime_unit_id &&
          path.provider_runtime_epoch == expected.source_runtime_epoch &&
-         participant_resources(physical) == binding_resources(expected_binding);
+         participant_resources(physical) ==
+             (expected.physical_expectation == core::ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone
+                  ? std::set<core::ResourceId>(expected_binding.logical_owner_resources.begin(),
+                                              expected_binding.logical_owner_resources.end())
+                  : binding_resources(expected_binding));
 }
 
 [[nodiscard]] core::Result<void> verify_physical_binding_coverage(

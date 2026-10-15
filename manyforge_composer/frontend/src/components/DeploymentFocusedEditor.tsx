@@ -53,9 +53,11 @@ interface GripperTargetConfigurationDraft {
   targetId: string;
   description: string;
   actuationKind: 'position_commanded' | 'pneumatic';
+  outputMode: 'commanded' | 'none';
   openStateRef: string;
   closedStateRef: string;
   commandDurationS: number;
+  deliveryResultTimeoutS?: number;
   touchLinks: string[];
   mountFrame: string;
   attachFrame: string;
@@ -192,9 +194,11 @@ function gripperTargetConfigurations(
       const targetId = row?.command_target_id;
       const description = row?.description;
       const actuationKind = row?.actuation_kind;
+      const outputMode = row?.output_mode;
       const openStateRef = row?.open_state_ref;
       const closedStateRef = row?.closed_state_ref;
       const commandDurationS = numberValue(row?.command_duration_s);
+      const deliveryResultTimeoutS = row?.delivery_result_timeout_s;
       const touchLinks = row?.touch_links;
       const mountFrame = row?.mount_frame;
       const attachFrame = row?.attach_frame;
@@ -205,9 +209,15 @@ function gripperTargetConfigurations(
         || typeof targetId !== 'string'
         || typeof description !== 'string'
         || (actuationKind !== 'position_commanded' && actuationKind !== 'pneumatic')
+        || (outputMode !== 'commanded' && outputMode !== 'none')
         || typeof openStateRef !== 'string'
         || typeof closedStateRef !== 'string'
         || commandDurationS === null
+        || (deliveryResultTimeoutS !== undefined
+          && (actuationKind !== 'pneumatic'
+            || typeof deliveryResultTimeoutS !== 'number'
+            || !Number.isFinite(deliveryResultTimeoutS)
+            || deliveryResultTimeoutS <= 0))
         || !Array.isArray(touchLinks)
         || touchLinks.some((item) => typeof item !== 'string')
         || typeof mountFrame !== 'string'
@@ -223,9 +233,11 @@ function gripperTargetConfigurations(
         targetId,
         description,
         actuationKind,
+        outputMode,
         openStateRef,
         closedStateRef,
         commandDurationS,
+        ...(deliveryResultTimeoutS === undefined ? {} : { deliveryResultTimeoutS }),
         touchLinks: touchLinks as string[],
         mountFrame,
         attachFrame,
@@ -244,9 +256,12 @@ function gripperConfigurationValue(
     command_target_id: draft.targetId,
     description: draft.description.trim(),
     actuation_kind: draft.actuationKind,
+    output_mode: draft.outputMode,
     open_state_ref: draft.openStateRef,
     closed_state_ref: draft.closedStateRef,
     command_duration_s: draft.commandDurationS,
+    ...(draft.actuationKind === 'pneumatic' && draft.deliveryResultTimeoutS !== undefined
+      ? { delivery_result_timeout_s: draft.deliveryResultTimeoutS } : {}),
     touch_links: [...draft.touchLinks].sort(),
     mount_frame: draft.mountFrame,
     attach_frame: draft.attachFrame,
@@ -1390,18 +1405,27 @@ function GripperSection({
     && JSON.stringify(gripperConfigurationValue(source))
       !== JSON.stringify(gripperConfigurationValue(normalizedDraft));
   const validate = (value: GripperTargetConfigurationDraft): string | null => {
+    if (value.outputMode !== 'commanded' && value.outputMode !== 'none') {
+      return 'Choose Send command or No output.';
+    }
+    if (value.outputMode === 'none' && value.actuationKind !== 'pneumatic') {
+      return 'No output is available only for pneumatic grippers.';
+    }
     if (
       value.description.trim() === ''
       || value.openStateRef === ''
       || value.closedStateRef === ''
       || !Number.isFinite(value.commandDurationS)
-      || value.commandDurationS <= 0
+      || value.commandDurationS < 0
+      || (value.actuationKind !== 'pneumatic' && value.commandDurationS === 0)
       || value.commandDurationS > 60
       || value.touchLinks.length === 0
       || value.mountFrame === ''
       || value.attachFrame === ''
       || value.tcpFrame === ''
-    ) return 'Complete every required field and use a motion time above 0 and at most 60 s.';
+    ) return value.actuationKind === 'pneumatic'
+      ? 'Complete every required field and use a motion time from 0 to 60 s.'
+      : 'Complete every required field and use a motion time above 0 and at most 60 s.';
     if (
       descriptor !== null
       && (!descriptor.namedPresets.some((preset) => preset.name === value.openStateRef)
@@ -1449,6 +1473,7 @@ function GripperSection({
               <span><small>Group / command joint</small><strong>{descriptor.sourceGroupName ?? 'not declared'} / {descriptor.sourceCoordinateName}</strong></span>
               <span><small>Range</small><strong>{format(descriptor.minPosition)} to {format(descriptor.maxPosition)} {descriptor.unit}</strong></span>
               <span><small>Command / actuation</small><strong>{descriptor.commandKind.replaceAll('_', ' ')} / {descriptor.actuationKind?.replaceAll('_', ' ') ?? 'not configured'}</strong></span>
+              <span><small>Output</small><strong>{descriptor.outputMode === 'commanded' ? 'Send command' : descriptor.outputMode === 'none' ? 'No output' : 'not configured'}</strong></span>
               <span><small>Transport</small><strong>{descriptor.transportKind.replaceAll('_', ' ')} · {descriptor.controlInterfaceContractId ?? 'no resolved interface'}</strong></span>
               <span><small>State authority</small><strong>{descriptor.stateAuthorityClass ?? 'unavailable'} · {descriptor.stateAuthorityId ?? descriptor.sourceKind.replaceAll('_', ' ')}</strong></span>
               <span><small>Completion policy</small><strong>{descriptor.completionPolicy.replaceAll('_', ' ')}</strong></span>
@@ -1486,6 +1511,22 @@ function GripperSection({
                     </select>
                   </label>
                   <label className="deployment-focused-field">
+                    <span>Output</span>
+                    <select
+                      value={draft.outputMode}
+                      disabled={disabled}
+                      onChange={(event) => setDraft({
+                        ...draft,
+                        outputMode: event.target.value as GripperTargetConfigurationDraft['outputMode'],
+                      })}
+                    >
+                      <option value="commanded">Send command</option>
+                      {(draft.actuationKind === 'pneumatic' || draft.outputMode === 'none') && (
+                        <option value="none" disabled={draft.actuationKind !== 'pneumatic'}>No output</option>
+                      )}
+                    </select>
+                  </label>
+                  <label className="deployment-focused-field">
                     <span>Open state</span>
                     <select
                       value={draft.openStateRef}
@@ -1510,11 +1551,11 @@ function GripperSection({
                     </select>
                   </label>
                   <label className="deployment-focused-field">
-                    <span>Motion time</span>
+                    <span>{draft.actuationKind === 'pneumatic' ? 'Program dwell' : 'Motion time'}</span>
                     <span className="deployment-number-with-unit">
                       <input
                         type="number"
-                        min="0.000001"
+                        min={draft.actuationKind === 'pneumatic' ? '0' : '0.000001'}
                         max="60"
                         step="any"
                         value={draft.commandDurationS}

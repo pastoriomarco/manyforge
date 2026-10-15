@@ -10,7 +10,7 @@
 
 namespace manyforge::deployment::detail {
 
-enum class ActivationRuntimeKind { kNative, kRos2Control };
+enum class ActivationRuntimeKind { kRos2Control = 1 };
 
 /// Exact repository-owned semantics selected by one authored component.
 ///

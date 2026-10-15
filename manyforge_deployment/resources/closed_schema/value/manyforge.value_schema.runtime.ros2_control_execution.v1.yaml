@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-schema_revision: sha256:c4e6e1a1418852f773520a2c3c02ffde66883e2dca3963a218bf28e2356ca16c
+schema_revision: sha256:20f76c1fa9f103c6f008029505639a45ec6f9166305156b31d43056235544483
 schema_purpose: value
 root_definition_id: ros2_control_execution_runtime_configuration
 definitions:
@@ -347,6 +347,28 @@ definitions:
                         values:
                           - position_commanded
                           - pneumatic
+                - field_id: output_mode
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: enum
+                        values:
+                          - commanded
+                          - none
+                - field_id: delivery_result_timeout_s
+                  presence: optional
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: number
+                    constraints:
+                      - kind: exclusive_minimum
+                        value: 0
                 - field_id: open_state_ref
                   presence: required
                   default:
@@ -375,7 +397,7 @@ definitions:
                     kind: scalar
                     scalar_type: number
                     constraints:
-                      - kind: exclusive_minimum
+                      - kind: minimum
                         value: 0
                       - kind: maximum
                         value: 60

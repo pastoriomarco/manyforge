@@ -36,7 +36,6 @@
 #include "manyforge_deployment/runtime_contract_registry.hpp"
 #include "manyforge_deployment/runtime_profile_codec.hpp"
 #include "manyforge_deployment/stop_evidence_policy_codec.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
 #include "retained_bundle_internal.hpp"
@@ -128,23 +127,6 @@ require_reference_runtime_contract() {
     throw std::logic_error(
         "build-qualified reference runtime product contract is absent or "
         "incoherent");
-  }
-  return *contract;
-}
-
-[[nodiscard]] const BuildQualifiedProductContract &
-require_native_execution_runtime_contract() {
-  const auto *contract = build_qualified_product_contract_registry().find(
-      core::ProductContractId(
-          std::string(detail::native_execution_runtime_product_contract_id())),
-      detail::native_execution_runtime_product_contract_revision());
-  if (contract == nullptr ||
-      contract->product_kind() !=
-          core::RetainedProductKind::kRuntimeUnitConfiguration ||
-      contract->placement() != ProductPlacement::kRuntimeUnit) {
-    throw std::logic_error(
-        "build-qualified native execution runtime product contract is absent "
-        "or incoherent");
   }
   return *contract;
 }
@@ -876,13 +858,6 @@ void require_qualified_structural_subset_before_store(
     const bool exact_execution_runtime_units = std::all_of(
         graph.runtime_units.begin(), graph.runtime_units.end(),
         [](const core::RuntimeUnitDTO &unit) {
-          const bool native_execution =
-              unit.runtime_profile_id.value() ==
-                  detail::kNativeExecutionRuntimeProfileId &&
-              unit.runtime_profile_revision.value() ==
-                  detail::native_execution_runtime_profile_revision() &&
-              detail::native_execution_runtime_configuration_is_qualified(
-                  unit.configuration);
           const bool ros2_control_execution =
               unit.runtime_profile_id.value() ==
                   detail::kRos2ControlExecutionRuntimeProfileId &&
@@ -890,7 +865,7 @@ void require_qualified_structural_subset_before_store(
                   detail::ros2_control_execution_runtime_profile_revision() &&
               detail::ros2_control_execution_runtime_configuration_is_qualified(
                   unit.configuration);
-          return (native_execution || ros2_control_execution) &&
+          return ros2_control_execution &&
                  unit.dependency_runtime_unit_ids.empty();
         });
     if (!has_runtime_units || !exact_execution_runtime_units ||
@@ -989,13 +964,6 @@ void require_qualified_structural_subset_before_store(
         unit.runtime_profile_revision.value() ==
             detail::reference_runtime_profile_revision() &&
         unit.configuration.empty();
-    const bool exact_native_host =
-        unit.runtime_profile_id.value() ==
-            detail::kNativeExecutionRuntimeProfileId &&
-        unit.runtime_profile_revision.value() ==
-            detail::native_execution_runtime_profile_revision() &&
-        detail::native_execution_runtime_configuration_is_qualified(
-            unit.configuration);
     const bool exact_ros2_control_host =
         unit.runtime_profile_id.value() ==
             detail::kRos2ControlExecutionRuntimeProfileId &&
@@ -1003,7 +971,7 @@ void require_qualified_structural_subset_before_store(
             detail::ros2_control_execution_runtime_profile_revision() &&
         detail::ros2_control_execution_runtime_configuration_is_qualified(
             unit.configuration);
-    if ((!exact_reference && !exact_native_host && !exact_ros2_control_host) ||
+    if ((!exact_reference && !exact_ros2_control_host) ||
         !unit.dependency_runtime_unit_ids.empty() ||
         applicability.runtime_profiles().size() != 1U ||
         !composition.component_types().empty() ||
@@ -1024,9 +992,6 @@ void require_qualified_structural_subset_before_store(
     }
     if (exact_reference) {
       static_cast<void>(detail::emit_reference_runtime_manifest(
-          qualified.compiler_ir(), unit.runtime_unit_id));
-    } else if (exact_native_host) {
-      static_cast<void>(detail::emit_native_execution_runtime_manifest(
           qualified.compiler_ir(), unit.runtime_unit_id));
     } else {
       static_cast<void>(detail::emit_ros2_control_execution_runtime_manifest(
@@ -1538,32 +1503,6 @@ prepare_planning_collision_product_before_store(
       product_id = core::ProductId(
           detail::reference_runtime_product_id(unit.runtime_unit_id));
     } else if (unit.runtime_profile_id.value() ==
-                   detail::kNativeExecutionRuntimeProfileId &&
-               unit.runtime_profile_revision.value() ==
-                   detail::native_execution_runtime_profile_revision()) {
-      kind = detail::PreparedRuntimeUnitKind::kNativeExecution;
-      qualified_runtime_contract = &require_native_execution_runtime_contract();
-      manifest = detail::emit_native_execution_runtime_manifest(
-          qualified.compiler_ir(), unit.runtime_unit_id);
-      detail::require_native_execution_runtime_manifest_matches(
-          manifest, qualified.compiler_ir(), unit.runtime_unit_id);
-      launchable = detail::native_execution_runtime_launch_descriptor();
-      if (launchable.empty() ||
-          launchable.size() >
-              detail::kMaxNativeExecutionLaunchDescriptorBytes) {
-        throw std::logic_error(
-            "build-owned native execution launch descriptor exceeds its "
-            "bound");
-      }
-      manifest_role = detail::kNativeExecutionRuntimeManifestArtifactRole;
-      manifest_media_type = detail::kNativeExecutionRuntimeManifestMediaType;
-      launchable_role =
-          detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole;
-      launchable_media_type =
-          detail::kNativeExecutionRuntimeLaunchDescriptorMediaType;
-      product_id = core::ProductId(
-          detail::native_execution_runtime_product_id(unit.runtime_unit_id));
-    } else if (unit.runtime_profile_id.value() ==
                    detail::kRos2ControlExecutionRuntimeProfileId &&
                unit.runtime_profile_revision.value() ==
                    detail::ros2_control_execution_runtime_profile_revision()) {
@@ -1773,7 +1712,8 @@ void require_verified_current_bundle_artifacts(
     const RetainedBundle &bundle,
     const PreparedPlanningCollisionProduct &prepared,
     ICatalogArtifactStore &catalog_artifact_store,
-    IRawArtifactStore &artifact_store) {
+    IRawArtifactStore &artifact_store,
+    std::span<const CompositionControlBindingCoordinateMap> coordinate_maps) {
   const auto &value = bundle.value();
   if (value.catalogs.schema_artifacts != prepared.schema_artifacts ||
       value.provenance.source_records != prepared.source_records ||
@@ -1834,6 +1774,30 @@ void require_verified_current_bundle_artifacts(
     require_verified_product_artifact_readback(*products.viewer_model,
                                                artifact_store);
   }
+  for (const auto &product : products.symbol_role_maps) {
+    require_verified_product_artifact_readback(product, artifact_store);
+    if (product.artifact_refs.size() != 1U ||
+        product.artifact_refs.front().artifact_role_id.value() !=
+            detail::kComposedModelSymbolRoleMapArtifactRole) {
+      throw std::logic_error(
+          "reloaded symbol/role-map product has an incoherent artifact set");
+    }
+    const auto bytes = artifact_store.get_verified(
+        product.artifact_refs.front().content_addressed_store_key,
+        product.artifact_refs.front().content_digest,
+        product.artifact_refs.front().byte_size);
+    if (!bytes.has_value() || !prepared.symbol_role_map.has_value() ||
+        *bytes != *prepared.symbol_role_map) {
+      throw std::runtime_error(
+          "reloaded symbol/role-map product differs from its prepared bytes");
+    }
+    (void)detail::parse_and_verify_composed_model_symbol_role_map(*bytes);
+  }
+  if (products.symbol_role_maps.empty() !=
+      !prepared.symbol_role_map.has_value()) {
+    throw std::logic_error(
+        "reloaded bundle changed symbol/role-map product presence");
+  }
   if (products.control_domain_products.size() !=
       prepared.control_domain_artifacts.size()) {
     throw std::logic_error(
@@ -1874,8 +1838,8 @@ void require_verified_current_bundle_artifacts(
       }
       if (artifact->artifact_role_id.value() ==
           detail::kControlDomainControlArtifactRole) {
-        static_cast<void>(
-            detail::parse_and_verify_control_domain_control(*bytes));
+        static_cast<void>(detail::parse_and_verify_control_domain_control(
+            *bytes, &value.cell_graph, coordinate_maps));
         saw_control = true;
       }
     }
@@ -1883,30 +1847,6 @@ void require_verified_current_bundle_artifacts(
       throw std::logic_error(
           "reloaded control-domain product omitted its control artifact");
     }
-  }
-  for (const auto &product : products.symbol_role_maps) {
-    require_verified_product_artifact_readback(product, artifact_store);
-    if (product.artifact_refs.size() != 1U ||
-        product.artifact_refs.front().artifact_role_id.value() !=
-            detail::kComposedModelSymbolRoleMapArtifactRole) {
-      throw std::logic_error(
-          "reloaded symbol/role-map product has an incoherent artifact set");
-    }
-    const auto bytes = artifact_store.get_verified(
-        product.artifact_refs.front().content_addressed_store_key,
-        product.artifact_refs.front().content_digest,
-        product.artifact_refs.front().byte_size);
-    if (!bytes.has_value() || !prepared.symbol_role_map.has_value() ||
-        *bytes != *prepared.symbol_role_map) {
-      throw std::runtime_error(
-          "reloaded symbol/role-map product differs from its prepared bytes");
-    }
-    (void)detail::parse_and_verify_composed_model_symbol_role_map(*bytes);
-  }
-  if (products.symbol_role_maps.empty() !=
-      !prepared.symbol_role_map.has_value()) {
-    throw std::logic_error(
-        "reloaded bundle changed symbol/role-map product presence");
   }
   if (products.runtime_unit_products.size() !=
       prepared.runtime_unit_artifacts.size()) {
@@ -1929,14 +1869,10 @@ void require_verified_current_bundle_artifacts(
     const std::string_view manifest_role =
         expected.kind == detail::PreparedRuntimeUnitKind::kReference
             ? detail::kReferenceRuntimeManifestArtifactRole
-        : expected.kind == detail::PreparedRuntimeUnitKind::kNativeExecution
-            ? detail::kNativeExecutionRuntimeManifestArtifactRole
             : detail::kRos2ControlExecutionRuntimeManifestArtifactRole;
     const std::string_view launchable_role =
         expected.kind == detail::PreparedRuntimeUnitKind::kReference
             ? detail::kReferenceRuntimeLaunchableArtifactRole
-        : expected.kind == detail::PreparedRuntimeUnitKind::kNativeExecution
-            ? detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole
             : detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole;
     std::optional<std::string> manifest;
     std::optional<std::string> launchable;
@@ -1962,10 +1898,6 @@ void require_verified_current_bundle_artifacts(
     }
     if (expected.kind == detail::PreparedRuntimeUnitKind::kReference) {
       detail::require_reference_runtime_product_matches_retained_bundle(
-          *manifest, *launchable, value, group.runtime_unit_id);
-    } else if (expected.kind ==
-               detail::PreparedRuntimeUnitKind::kNativeExecution) {
-      detail::require_native_execution_runtime_product_matches_retained_bundle(
           *manifest, *launchable, value, group.runtime_unit_id);
     } else {
       detail::
@@ -2237,24 +2169,6 @@ detail::RetainedBundleMaterializer::materialize_prepared(
       product_id = core::ProductId(
           detail::reference_runtime_product_id(input.runtime_unit_id));
       break;
-    case detail::PreparedRuntimeUnitKind::kNativeExecution:
-      detail::require_native_execution_runtime_manifest_matches(
-          input.manifest_bytes, qualified.compiler_ir(), input.runtime_unit_id);
-      if (input.launchable_bytes !=
-          detail::native_execution_runtime_launch_descriptor()) {
-        throw std::logic_error(
-            "prepared native execution launch descriptor changed before "
-            "retention");
-      }
-      manifest_role = detail::kNativeExecutionRuntimeManifestArtifactRole;
-      manifest_media_type = detail::kNativeExecutionRuntimeManifestMediaType;
-      launchable_role =
-          detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole;
-      launchable_media_type =
-          detail::kNativeExecutionRuntimeLaunchDescriptorMediaType;
-      product_id = core::ProductId(
-          detail::native_execution_runtime_product_id(input.runtime_unit_id));
-      break;
     case detail::PreparedRuntimeUnitKind::kRos2ControlExecution:
       detail::require_ros2_control_execution_runtime_manifest_matches(
           input.manifest_bytes, qualified.compiler_ir(), input.runtime_unit_id);
@@ -2412,7 +2326,11 @@ detail::RetainedBundleMaterializer::materialize_store_and_reload_production(
         "semantic bundle");
   }
   require_verified_current_bundle_artifacts(
-      *reloaded, prepared, catalog_artifact_store, artifact_store);
+      *reloaded, prepared, catalog_artifact_store, artifact_store,
+      qualified.compiler_ir()
+          .applicability()
+          .composition()
+          .control_binding_coordinate_maps());
   return reloaded;
 }
 

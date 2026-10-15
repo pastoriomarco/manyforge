@@ -19,7 +19,6 @@
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/deployment_artifact_codec.hpp"
-#include "manyforge_deployment/native_execution_runtime_contract.hpp"
 #include "manyforge_deployment/ros2_control_execution_runtime_contract.hpp"
 #include "package_admission_profile_internal.hpp"
 #include "posix_durability_internal.hpp"
@@ -46,14 +45,8 @@ struct CanonicalEmptyExecutionRuntimeContract final {
   std::string_view launch_environment_contract;
 };
 
-constexpr std::array<CanonicalEmptyExecutionRuntimeContract, 2U>
+constexpr std::array<CanonicalEmptyExecutionRuntimeContract, 1U>
     kCanonicalEmptyExecutionRuntimeContracts{{
-        {native_execution_runtime_contract::kRuntimeProfileId,
-         native_execution_runtime_contract::kProductContractId,
-         native_execution_runtime_contract::kRuntimeRoleId,
-         native_execution_runtime_contract::kProcessAdapterContractId,
-         native_execution_runtime_contract::kOperatingSystem,
-         native_execution_runtime_contract::kLaunchEnvironmentContract},
         {ros2_control_execution_runtime_contract::kRuntimeProfileId,
          ros2_control_execution_runtime_contract::kProductContractId,
          ros2_control_execution_runtime_contract::kRuntimeRoleId,

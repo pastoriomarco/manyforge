@@ -226,6 +226,23 @@ void require_commandable_joint(const ModelScan &model, const std::string &name,
   return value;
 }
 
+void validate_gripper_model_binding(
+    const ModelScan& model, const std::vector<std::string>& arm_joint_names,
+    const MockGripperBinding& gripper) {
+  if (!gripper.source_joint_name.has_value()) {
+    fail("the no-output gripper binding has no model-backed source joint");
+  }
+  const auto& joint = *gripper.source_joint_name;
+  require_commandable_joint(model, joint, "gripper");
+  if (std::find(arm_joint_names.begin(), arm_joint_names.end(), joint) != arm_joint_names.end()) {
+    fail("gripper joint '" + joint + "' is also an arm joint");
+  }
+  if (gripper.projected_initial_position.has_value()) {
+    static_cast<void>(finite_value(*gripper.projected_initial_position, joint,
+                                  "the retained model projection"));
+  }
+}
+
 struct GeneratedJoint final {
   std::string name;
   double initial_value{};
@@ -295,26 +312,39 @@ mock_section(const ModelScan &model,
   if (lane.hardware_component_name.empty()) {
     fail("the mock lane has no hardware component name");
   }
-  auto joints = paired_arm_joints(model, arm_joint_names,
-                                  lane.initial_joint_positions_rad,
-                                  "the deployment");
   const bool model_backed_gripper =
       lane.gripper.has_value() && lane.gripper->source_joint_name.has_value();
+  if (lane.gripper_output_mode != core::GripperOutputMode::kCommanded &&
+      lane.gripper_output_mode != core::GripperOutputMode::kNone) {
+    fail("the mock lane has an invalid gripper output mode");
+  }
+  const bool no_gripper_output =
+      lane.gripper_output_mode == core::GripperOutputMode::kNone;
+  if (no_gripper_output && (arm_joint_names.empty() || !model_backed_gripper)) {
+    fail("no-output controller generation requires an arm and a model-backed gripper binding");
+  }
+  std::vector<GeneratedJoint> joints;
+  if (arm_joint_names.empty() && model_backed_gripper) {
+    if (!lane.initial_joint_positions_rad.empty()) {
+      fail("the deployment has initial arm positions without an arm binding");
+    }
+  } else {
+    joints = paired_arm_joints(model, arm_joint_names,
+                              lane.initial_joint_positions_rad,
+                              "the deployment");
+  }
   if (model_backed_gripper) {
     const auto &gripper_joint = *lane.gripper->source_joint_name;
-    require_commandable_joint(model, gripper_joint, "gripper");
-    if (std::find(arm_joint_names.begin(), arm_joint_names.end(),
-                  gripper_joint) != arm_joint_names.end()) {
-      fail("gripper joint '" + gripper_joint + "' is also an arm joint");
-    }
-    if (!lane.gripper->projected_initial_position.has_value()) {
+    validate_gripper_model_binding(model, arm_joint_names, *lane.gripper);
+    if (!lane.gripper->projected_initial_position.has_value() &&
+        !no_gripper_output) {
       fail("gripper joint '" + gripper_joint +
            "' has no retained model projection for its initial value");
     }
-    joints.push_back(GeneratedJoint{
-        gripper_joint,
-        finite_value(*lane.gripper->projected_initial_position, gripper_joint,
-                     "the retained model projection")});
+    if (!no_gripper_output) {
+      joints.push_back(GeneratedJoint{
+          gripper_joint, *lane.gripper->projected_initial_position});
+    }
   } else if (lane.gripper_required) {
     fail(lane.gripper.has_value()
              ? "the mock profile requires a gripper, but the gripper binding "
@@ -369,6 +399,10 @@ isaac_section(const ModelScan &model,
 std::string generate_controller_robot_description(
     const ControllerRobotDescriptionRequest &request) {
   const auto model = scan_model(request.model_urdf);
+  if (request.gripper_without_control_interfaces.has_value()) {
+    validate_gripper_model_binding(model, request.arm_joint_names,
+                                   *request.gripper_without_control_interfaces);
+  }
   const auto section = std::visit(
       [&](const auto &lane) {
         using Lane = std::decay_t<decltype(lane)>;

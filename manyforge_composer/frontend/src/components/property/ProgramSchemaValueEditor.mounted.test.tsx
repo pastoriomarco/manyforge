@@ -115,6 +115,96 @@ const POSE: JsonValue = {
   orientation: { rpy_deg: [0, 0, 0] },
 };
 
+const GRIPPER_POSITION_SCHEMA: CatalogJsonSchema = {
+  type: 'object', additionalProperties: false, required: ['kind'],
+  properties: {
+    kind: { type: 'string', enum: ['angular_rad', 'linear_m', 'named_preset'] },
+    name: { type: 'string', enum: ['open', 'closed'] },
+    value_m: { type: 'number' },
+    value_rad: { type: 'number' },
+  },
+  allOf: [
+    ...[['angular_rad', 'value_rad'], ['linear_m', 'value_m'], ['named_preset', 'name']]
+      .flatMap(([kind, field]) => [
+        { if: { required: ['kind'], properties: { kind: { const: kind } } },
+          then: { required: [field] } },
+        { if: { not: { required: ['kind'], properties: { kind: { const: kind } } } },
+          then: { not: { required: [field] } } },
+      ]),
+  ],
+};
+
+describe('a mounted symbolic gripper coordinate editor', () => {
+  it.each([
+    ['gripper.command_position', 'position'],
+    ['planning.plan_pick_sequence', 'tool_position'],
+    ['planning.plan_place_sequence', 'tool_position'],
+  ])('keeps preset names in %s.%s until runtime resolution', async (nodeId, parameterId) => {
+    const { host, created } = stubDom();
+    const committed: JsonValue[] = [];
+    const entry: CatalogEntry = { ...setValue, id: nodeId, parameters: [{
+      id: parameterId, required: true, schema: GRIPPER_POSITION_SCHEMA,
+      schemaHash: 'sha256:coordinate-position', hasDefault: false,
+    }] };
+    function Host() {
+      const [value, setStored] = useState<JsonValue>({ kind: 'linear_m', value_m: 0.01 });
+      return <ProgramSchemaValueEditor schema={GRIPPER_POSITION_SCHEMA} value={value}
+        disabled={false} path={parameterId}
+        context={{ entry, node: { node_id: nodeId, instance_id: 'gripper-node',
+          parameters: { [parameterId]: value }, children: [] }, parameterId, program }}
+        onCommit={(next) => { committed.push(next); setStored(next); }} />;
+    }
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    const control = (label: string) => {
+      const props = created.map(reactProps).filter((props) => props?.['aria-label'] === label).at(-1);
+      if (props === undefined) throw new Error(`No mounted control ${label}`);
+      return props;
+    };
+    const choose = async (label: string, value: string) => {
+      await act(() => control(label).onChange!({ target: { value } }));
+    };
+    try {
+      await act(() => root.render(<Host />));
+      expect(committed).toEqual([]);
+      await choose('Coordinate kind', 'named_preset');
+      expect(committed).toEqual([{ kind: 'named_preset', name: 'open' }]);
+      expect(control('Gripper preset').value).toBe('open');
+      await choose('Gripper preset', 'closed');
+      expect(committed.at(-1)).toEqual({ kind: 'named_preset', name: 'closed' });
+      expect(control('Gripper preset').value).toBe('closed');
+      const beforeInvalid = committed.length;
+      await choose('Gripper preset', 'vendor_open');
+      expect(committed).toHaveLength(beforeInvalid);
+      await choose('Coordinate kind', 'angular_rad');
+      expect(committed.at(-1)).toEqual({ kind: 'angular_rad', value_rad: 0 });
+      expect(control('Value (rad)').value).toBe('0');
+      for (const value of committed) {
+        expect(firstCatalogSchemaValidationMessage(GRIPPER_POSITION_SCHEMA, value, parameterId))
+          .toBeNull();
+      }
+    } finally { await act(() => root.unmount()); }
+  });
+
+  it.each(['open', 'closed'])('shows an existing %s name without authoring on mount', async (name) => {
+    const { host, created } = stubDom();
+    const onCommit = vi.fn();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    try {
+      await act(() => root.render(<ProgramSchemaValueEditor schema={GRIPPER_POSITION_SCHEMA}
+        value={{ kind: 'named_preset', name }} disabled={true} path="position"
+        context={{ entry: setValue, node: { node_id: 'gripper.command_position',
+          instance_id: 'gripper-node', parameters: {}, children: [] }, parameterId: 'position', program }}
+        onCommit={onCommit} />));
+      const preset = created.map(reactProps).find((props) => props?.['aria-label'] === 'Gripper preset');
+      expect(preset?.value).toBe(name);
+      expect(preset?.disabled).toBe(true);
+      expect(onCommit).not.toHaveBeenCalled();
+    } finally { await act(() => root.unmount()); }
+  });
+});
+
 interface Mounted {
   /** The mounted control with this aria-label or id (the most recently created). */
   control: (name: string) => FakeNode;

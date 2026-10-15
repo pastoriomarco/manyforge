@@ -37,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -755,6 +756,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     return next_command_validation;
   }
 
+  GripperActuationKind gripper_actuation_kind(const std::string&) const override {
+    return configured_gripper_actuation;
+  }
   GripperCommandStatusDTO get_gripper_status(const std::string&) const override {
     ++get_gripper_status_calls;
     return gripper_status;
@@ -969,6 +973,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::atomic<int> command_calls{};
   mutable std::atomic<int> validate_command_calls{};
   std::function<void()> validate_command_hook;
+  GripperActuationKind configured_gripper_actuation{GripperActuationKind::kPositionCommanded};
   mutable std::atomic<int> get_gripper_status_calls{};
   std::atomic<int> stop_gripper_calls{};
   std::atomic<int> reset_gripper_calls{};
@@ -10321,6 +10326,1647 @@ TEST(ResourceAddressedExecutionKernelTest, RejectsStaleEpochBeforeResolutionOrSu
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
 }
 
+namespace {
+template <typename Engine>
+RuntimeParticipantExecutionRegistration LogicalGripperRegistration(
+    const RuntimeParticipantBinding& binding, Engine& gripper) {
+  auto row = registration(binding, gripper);
+  // The same participant closes its genuine command generation. Pneumatic
+  // fixtures retain only their logical fence; position retains its hard floor.
+  auto logical_plan = row.stop_readiness->value().resolved_stop_base_plan;
+  logical_plan.resolved_stop_base_plan_id = ResolvedStopBasePlanId("pending");
+  const auto actuation = gripper.gripper_actuation_kind(binding.value().command_target_id.value());
+  if (actuation == GripperActuationKind::kPneumatic) {
+    logical_plan.gripper_actuation_kind = actuation;
+    logical_plan.escalation_stages.erase(logical_plan.escalation_stages.begin() + 1,
+                                         logical_plan.escalation_stages.end());
+    logical_plan.containment_granularity = logical_plan.escalation_stages.back().containment_granularity;
+  }
+  auto& stage = logical_plan.escalation_stages.front();
+  const ProviderContractRefDTO contract{
+    ProviderContractRoleId("gripper_logical_cancel"),
+    SchemaId("manyforge.value_schema.provider_contract.empty.v1"),
+    SchemaRevision("sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270")};
+  stage.containment_command = {StopContainmentCommandKind::kLogicalCancel, contract, {}};
+  // The genuine empty.v1 schema and compiled gripper_logical_cancel stage
+  // both specify an empty object, not absent provider-contract parameters.
+  stage.default_contract_parameters = JsonObjectDTO{};
+  stage.command_qualification = {};
+  stage.command_target.endpoint_role_id.reset();
+  stage.command_target.logical_endpoint_symbol.reset();
+  stage.evidence_requirements.erase(stage.evidence_requirements.begin() + 1,
+                                    stage.evidence_requirements.end());
+  auto& logical = stage.evidence_requirements.front();
+  logical.requirement = {
+    StopEvidenceItemId("logical_cancel_fenced"),
+    StopEvidenceRequirementKind::kLogicalCancellationNoContinuingEffect, contract, {},
+    {StopEvidenceSourceKind::kCommandTargetStatus, 100'000'000LL, {}, {}},
+    {StopEvidenceObservationKind::kCommandResult, {}}};
+  logical.resolved_source = {StopEvidenceSourceKind::kCommandTargetStatus,
+                 stage.command_target, {}, {}, {}};
+  const auto sealed = MakeResolvedStopBasePlan(std::move(logical_plan));
+  if (!sealed.ok()) throw std::logic_error(sealed.error().message);
+  auto expected = controller_domain_for(row.binding, sealed.value()).value();
+  if (actuation == GripperActuationKind::kPneumatic)
+    expected.expected_bindings.front().gripper_actuation_kind = actuation;
+  const auto domain = verify_controller_lifecycle_expected_domain(std::move(expected));
+  if (!domain.ok()) throw std::logic_error(domain.error().message);
+  const auto readiness = verify_runtime_participant_stop_readiness(
+    {row.binding.value().controllable_component_id, ComponentLifecycleGeneration(1U),
+     domain.value().value(), sealed.value()}, row.binding, domain.value());
+  if (!readiness.ok()) throw std::logic_error(readiness.error().message);
+  row.stop_readiness = readiness.value();
+  row.stop_execution_port = &gripper;
+  return row;
+}
+}  // namespace
+
+// Typed pneumatic adapter over the genuine Core prepared owner. This is a
+// unit provider, not a ROS transport/device acknowledgement fixture.
+class FinalPneumaticTestBackend final : public IGripperCommandBackend {
+ public:
+  mutable std::mutex mutex;
+  GripperCommandStatusDTO status;
+  std::atomic<int> commands{};
+  std::atomic<int> closes{};
+  std::atomic<int> opens{};
+  std::atomic<bool> actual_owner_proof{};
+  bool reject_delivery{};
+  std::atomic_bool refuse_validation{};
+  Result<void> validate_gripper_command(const GripperCommandRequestDTO&) const override {
+    if (refuse_validation)
+      return Result<void>::Err(ErrorDTO{"actual_prepare_refused", "Actual pneumatic preparation refused", {}});
+    return Result<void>::Ok();
+  }
+  std::function<void()> return_hook;
+  FinalPneumaticTestBackend() {
+    status.lifecycle_generation = 42U;
+    status.admission_generation = 7U;
+  }
+  GripperActuationKind gripper_actuation_kind(const std::string&) const override {
+    return GripperActuationKind::kPneumatic;
+  }
+  GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override {
+    {
+      std::lock_guard lock(mutex);
+      actual_owner_proof = request.addressed_identity && request.committed_owner_is_current &&
+          request.owner_lifecycle_generation == status.lifecycle_generation &&
+          request.committed_owner_is_current(*request.addressed_identity);
+      if (!actual_owner_proof) return {false, 0U, 0U,
+          ErrorDTO{"private_owner_missing", "No genuine committed owner", {}}};
+      ++commands;
+      status.gripper_id = request.gripper_id;
+      status.command_id = 41U;
+      status.generation = 73U;
+      status.state = reject_delivery ? GripperCommandState::kFailed : GripperCommandState::kExecuting;
+      ++status.revision;
+      if (reject_delivery)
+        status.error = ErrorDTO{"pneumatic_delivery_timeout", "Delivery not confirmed", {}};
+    }
+    if (return_hook) return_hook();
+    if (reject_delivery) return {false, 41U, 73U,
+        ErrorDTO{"pneumatic_delivery_timeout", "Delivery not confirmed", {}}};
+    return {true, 41U, 73U, std::nullopt};
+  }
+  GripperCommandStatusDTO get_gripper_status(const std::string&) const override {
+    if (status_read_hook) status_read_hook();
+    std::lock_guard lock(mutex);
+    return status;
+  }
+  std::function<void()> status_read_hook;
+  void finish(const bool failed) {
+    std::lock_guard lock(mutex);
+    status.state = failed ? GripperCommandState::kFailed : GripperCommandState::kCompleted;
+    status.error = failed ? std::optional(ErrorDTO{"pneumatic_delivery_failed", "Actual final failure", {}})
+                          : std::nullopt;
+    ++status.revision;
+  }
+  GripperCommandResultDTO mark_gripper_grasp_lost(const std::string&, std::uint64_t,
+      std::uint64_t, const std::string&, const std::string&, const std::string&) override { return {}; }
+  void invalidate_gripper_commands(const GripperInvalidationReason reason) noexcept override {
+    std::lock_guard lock(mutex);
+    ++closes;
+    ++status.admission_generation;
+    status.admission_closed = true;
+    ++status.revision;
+    if (reason != GripperInvalidationReason::kStop) ++status.lifecycle_generation;
+    // A pneumatic Stop never reverses the admitted transaction or erases its result.
+  }
+  void authorize_gripper_commands() noexcept override {
+    std::lock_guard lock(mutex);
+    ++opens;
+    status.admission_closed = false;
+  }
+};
+
+
+class PreparedGripperForwarder final : public IResolvedPreparedParticipantExecutionEngine {
+ public:
+  PreparedGripperForwarder(GripperParticipantEngine& owner, std::function<void()> before)
+      : owner_(owner), before_(std::move(before)) {}
+  Result<std::uint64_t> PrepareMotion(ResolvedPreparedMotionExecutionRequestDTO value) override {
+    return owner_.PrepareMotion(std::move(value));
+  }
+  Result<ResolvedPreparedMotionExecutionSnapshotDTO> ObservePreparedMotion(std::uint64_t id) const override {
+    return owner_.ObservePreparedMotion(id);
+  }
+  Result<void> DispatchPreparedMotion(std::uint64_t id, const ContentDigest& digest) override {
+    return owner_.DispatchPreparedMotion(id, digest);
+  }
+  Result<void> CancelPreparedMotion(std::uint64_t id) override { return owner_.CancelPreparedMotion(id); }
+  Result<std::uint64_t> PrepareCapabilityCommand(ResolvedPreparedCapabilityCommandExecutionRequestDTO value) override {
+    if (prepare_hook) prepare_hook();
+    auto prepared = owner_.PrepareCapabilityCommand(std::move(value));
+    if (prepared.ok()) last_preparation_id.store(prepared.value());
+    if (after_prepare_hook) after_prepare_hook();
+    return prepared;
+  }
+  Result<ResolvedPreparedCapabilityCommandSnapshotDTO> ObservePreparedCapabilityCommand(std::uint64_t id) const override {
+    if (observe_hook) observe_hook();
+    if (observation_unavailable)
+      return Result<ResolvedPreparedCapabilityCommandSnapshotDTO>::Err(
+          ErrorDTO{"actual_observation_unavailable", "Owner observation is temporarily unavailable", {}});
+    auto observed = owner_.ObservePreparedCapabilityCommand(id);
+    if (observed.ok() && observation_foreign_identity) ++observed.value().preparation_id;
+    return observed;
+  }
+  Result<GripperCommandResultDTO> DispatchPreparedCapabilityCommand(std::uint64_t id,
+      const ContentDigest& digest, const ControllerGoalId& goal, ControllerGoalGeneration generation) override {
+    before_();
+    return owner_.DispatchPreparedCapabilityCommand(id, digest, goal, generation);
+  }
+  Result<void> CancelPreparedCapabilityCommand(std::uint64_t id) override {
+    if (cancel_hook) cancel_hook();
+    return owner_.CancelPreparedCapabilityCommand(id);
+  }
+  std::function<void()> prepare_hook;
+  std::function<void()> after_prepare_hook;
+  std::function<void()> cancel_hook;
+  std::function<void()> observe_hook;
+  std::atomic<std::uint64_t> last_preparation_id{};
+  std::atomic_bool observation_unavailable{};
+  std::atomic_bool observation_foreign_identity{};
+ private:
+  GripperParticipantEngine& owner_;
+  std::function<void()> before_;
+};
+
+// Failure-only reads of existing retained truth; no polling, effects or retry.
+std::string PneumaticStopDiagnostic(ResourceAddressedExecutionKernel& kernel,
+    const StopId& stop_id, GripperParticipantEngine& owner,
+    FinalPneumaticTestBackend& backend) {
+  std::ostringstream text;
+  const auto append_error = [&](const ErrorDTO& error) {
+    text << " error=" << error.code << ":" << error.message;
+    for (const auto& [key, value] : error.details) text << " [" << key << "=" << value << "]";
+  };
+  const auto status = kernel.get_stop_status(stop_id);
+  if (!status.ok()) append_error(status.error());
+  else {
+    const auto& value = status.value();
+    text << " stop=" << value.accepted.stop_id.value()
+         << " generation=" << value.accepted.stop_generation.value()
+         << " state=" << static_cast<int>(value.state)
+         << " certificate=" << value.stop_certificate.has_value()
+         << " replay=" << static_cast<int>(value.accepted.replay_status)
+         << " resolution=" << static_cast<int>(value.accepted.resolution_disposition)
+         << "/" << static_cast<int>(value.accepted.resolution_reason)
+         << " selector=" << value.accepted.requested_selector_digest.value()
+         << " scope_digest=" << value.accepted.captured_scope_digest.value()
+         << " accepted_at=" << value.accepted.accepted_at_ns;
+    for (const auto& affected : value.accepted.affected_operation_revisions)
+      text << " accepted_operation=" << affected.operation_id.value()
+           << "/" << affected.operation_revision_after_acceptance.value();
+    for (const auto& entry : value.scope_entries) {
+      text << " scope(disposition=" << static_cast<int>(entry.disposition)
+           << ",dispatch=" << static_cast<int>(entry.dispatch_state);
+      if (const auto* facts = std::get_if<StopParticipantScopeFactsDTO>(&entry.facts))
+        text << ",target=" << facts->command_target_id.value()
+             << ",revision=" << facts->operation_revision_after_acceptance.value()
+             << ",settlement=" << static_cast<int>(facts->terminal_settlement);
+      text << ")";
+    }
+    for (const auto& attempt : value.attempted_stage_results) {
+      text << " attempt(stage=" << attempt.result.request.stage_index
+           << ",authority=" << static_cast<int>(attempt.authority)
+           << ",outcome=" << static_cast<int>(attempt.result.outcome)
+           << ",disposition=" << static_cast<int>(attempt.result.attempt_disposition)
+           << ",revision=" << attempt.result.request.operation_revision.value();
+      if (attempt.result.error) append_error(*attempt.result.error);
+      for (const auto& evidence : attempt.result.evidence_items) {
+        text << " evidence=" << evidence.evidence_item_id.value()
+             << "/" << static_cast<int>(evidence.state);
+        if (evidence.error) append_error(*evidence.error);
+      }
+      text << ")";
+    }
+    if (value.fault_latch)
+      text << " status_latch=" << value.fault_latch->latch_id.value()
+           << ":" << value.fault_latch->reason_code;
+  }
+  const auto latch = kernel.get_stop_fault_latch();
+  text << " kernel_latch=" << latch.has_value();
+  if (latch) text << ":" << latch->reason_code;
+  const auto observed = backend.get_gripper_status("gripper.target");
+  text << " backend(closes=" << backend.closes.load() << ",opens=" << backend.opens.load()
+       << ",state=" << static_cast<int>(observed.state)
+       << ",command=" << observed.command_id << ",generation=" << observed.generation
+       << ",closed=" << observed.admission_closed << ",admission=" << observed.admission_generation
+       << ",revision=" << observed.revision << ")";
+  const auto session = owner.ObservePreparedCapabilityCommand(1U);
+  if (!session.ok()) append_error(session.error());
+  else {
+    text << " session(preparation=" << session.value().preparation_id
+         << ",state=" << static_cast<int>(session.value().state)
+         << ",dispatch_result=" << session.value().dispatch_result.has_value() << ")";
+    if (session.value().error) append_error(*session.value().error);
+  }
+  return text.str();
+}
+
+TEST(ResourceAddressedExecutionKernelTest, PneumaticZeroMovingCertificateRetainsActualDispatchAndOrdinaryResult) {
+  for (const bool failed_result : {false, true}) {
+    SCOPED_TRACE(failed_result);
+    FinalPneumaticTestBackend backend;
+    FakeClock clock;
+    ManualScheduler scheduler;
+    GripperParticipantEngine gripper(backend, clock);
+    const ProgramCommandSchemaRefDTO schema{
+        CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+        CoordinateKind::kLinear, schema), gripper);
+    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    HeldSettlementCall returned;
+    backend.return_hook = returned.Blocker();
+    auto execution = std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
+    ASSERT_TRUE(returned.Entered());
+    EXPECT_TRUE(backend.actual_owner_proof);
+    const auto stopped = kernel.full_stop(FullStopIntentDTO{
+        {RequestId("pneumatic.stop"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}}, StopGeneration(0U), {}});
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    const bool certified = wait_until([&] {
+      const auto result = kernel.get_stop_status(stopped.value().stop_id);
+      return result.ok() && result.value().stop_certificate.has_value();
+    });
+    std::string stop_diagnostic;
+    if (!certified) {
+      stop_diagnostic = PneumaticStopDiagnostic(kernel, stopped.value().stop_id, gripper, backend);
+      returned.Release();
+    }
+    ASSERT_TRUE(certified) << stop_diagnostic;
+    EXPECT_FALSE(kernel.get_stop_fault_latch());
+    const auto certified_status = kernel.get_stop_status(stopped.value().stop_id);
+    ASSERT_TRUE(certified_status.ok() && certified_status.value().stop_certificate);
+    EXPECT_TRUE(certified_status.value().scope_entries.empty());
+    EXPECT_TRUE(certified_status.value().attempted_stage_results.empty());
+    const auto pending_slots = kernel.resource_snapshot();
+    ASSERT_EQ(pending_slots.size(), 1U);
+    ASSERT_TRUE(pending_slots.front().owner);
+    EXPECT_EQ(pending_slots.front().state, ResourceSlotState::kDispatched);
+    EXPECT_EQ(pending_slots.front().stop_generation, StopGeneration(0U));
+    const auto pending = kernel.get_operation_state(pending_slots.front().owner->operation_id);
+    ASSERT_TRUE(pending.ok());
+    EXPECT_NE(pending.value().state, OperationStateKind::kCompleted);
+    EXPECT_NE(pending.value().state, OperationStateKind::kStopped);
+    EXPECT_FALSE(kernel.acknowledge_completed({
+        {RequestId("pneumatic.pending.ack"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}},
+        pending.value().operation_id, pending.value().operation_revision, {}}).ok());
+    const auto retained = backend.get_gripper_status("gripper.target");
+    EXPECT_EQ(retained.state, GripperCommandState::kExecuting);
+    EXPECT_EQ(retained.command_id, 41U);
+    EXPECT_EQ(retained.generation, 73U);
+    EXPECT_FALSE(retained.admission_closed);
+    EXPECT_EQ(backend.commands, 1);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+    returned.Release();
+    const auto accepted = execution.get();
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    backend.finish(failed_result);
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    const auto state = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(state.ok());
+    EXPECT_EQ(state.value().state, failed_result ? OperationStateKind::kFailed : OperationStateKind::kCompleted);
+    ASSERT_EQ(state.value().participants.size(), 1U);
+    if (failed_result) {
+      ASSERT_TRUE(state.value().participants.front().terminal_error);
+      EXPECT_EQ(state.value().participants.front().terminal_error->details.at("pneumatic_transaction_final"), "true");
+    }
+    const auto acknowledged = kernel.acknowledge_completed(control_request(
+        "pneumatic.ack", accepted.value(), state.value().operation_revision.value()));
+    ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      const auto slots = kernel.resource_snapshot();
+      return std::all_of(slots.begin(), slots.end(), [](const auto& slot) {
+        return slot.state == ResourceSlotState::kFree && !slot.owner;
+      });
+    }));
+    EXPECT_EQ(backend.opens, 0);
+    EXPECT_FALSE(backend.get_gripper_status("gripper.target").admission_closed);
+    EXPECT_EQ(backend.closes, 0);  // no Reset/cancel is hidden in acknowledgement
+    EXPECT_EQ(backend.commands, 1);
+    EXPECT_FALSE(kernel.get_stop_fault_latch());
+
+    // A fresh request commits a fresh real private owner after ordinary ACK.
+    backend.return_hook = {};
+    backend.actual_owner_proof = false;
+    const auto next = kernel.execute(command_operation("pneumatic.after-stop"));
+    ASSERT_TRUE(next.ok()) << next.error().message;
+    EXPECT_NE(next.value().operation_id, accepted.value().operation_id);
+    EXPECT_TRUE(backend.actual_owner_proof);
+    EXPECT_EQ(backend.commands, 2);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+    const auto executing_next = backend.get_gripper_status("gripper.target");
+    EXPECT_FALSE(executing_next.admission_closed);
+    EXPECT_EQ(executing_next.lifecycle_generation, retained.lifecycle_generation);
+    backend.finish(false);
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    const auto next_state = kernel.get_operation_state(next.value().operation_id);
+    ASSERT_TRUE(next_state.ok());
+    ASSERT_EQ(next_state.value().state, OperationStateKind::kCompleted);
+    ASSERT_TRUE(kernel.acknowledge_completed(control_request(
+        "pneumatic.after-stop.ack", next.value(), next_state.value().operation_revision.value())).ok());
+    ASSERT_TRUE(wait_until([&] {
+      const auto slots = kernel.resource_snapshot();
+      return std::all_of(slots.begin(), slots.end(), [](const auto& slot) {
+        return slot.state == ResourceSlotState::kFree && !slot.owner;
+      });
+    }));
+    EXPECT_FALSE(backend.get_gripper_status("gripper.target").admission_closed);
+    EXPECT_EQ(backend.opens, 0);
+    EXPECT_EQ(backend.closes, 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, StopCertifiesMovingScopeWhilePneumaticDeliveryRemainsOrdinary) {
+  for (const bool finish_while_containing_motion : {false, true}) {
+    SCOPED_TRACE(finish_while_containing_motion);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine arm;
+    FinalPneumaticTestBackend backend;
+    GripperParticipantEngine gripper(backend, clock);
+    const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto motion = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+        CoordinateKind::kLinear, schema), "2");
+    ResourceAddressedExecutionKernel kernel({registration(motion, arm), LogicalGripperRegistration(command, gripper)},
+        clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    const auto accepted = kernel.execute(coordinated_motion_command_operation("mixed.pneumatic"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    arm.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    HeldSettlementCall stage;
+    arm.translate_stop_stage_hook = stage.Blocker();
+    const auto stopped = kernel.full_stop({{RequestId("mixed.pneumatic.stop"),
+        RequestOwnerEpoch("kernel.epoch.1"), "test", {}}, StopGeneration(0U), {}});
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    ASSERT_TRUE(stage.Entered());
+    const auto pending = kernel.get_stop_status(stopped.value().stop_id);
+    ASSERT_TRUE(pending.ok());
+    EXPECT_FALSE(pending.value().stop_certificate);
+    const auto motion_reads = arm.status_read_calls.load();
+    if (finish_while_containing_motion) backend.finish(false);
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    EXPECT_EQ(arm.status_read_calls.load(), motion_reads);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.commands, 1);
+    const auto observed = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(observed.ok());
+    const auto output_row = std::find_if(observed.value().participants.begin(), observed.value().participants.end(),
+        [](const auto& row) { return row.payload_kind == OperationParticipantPayloadKind::kCapabilityCommand; });
+    ASSERT_NE(output_row, observed.value().participants.end());
+    EXPECT_EQ(output_row->state, finish_while_containing_motion ? OperationStateKind::kCompleted : OperationStateKind::kExecuting);
+    EXPECT_FALSE(kernel.acknowledge_completed(control_request("mixed.pending.ack", accepted.value(),
+        observed.value().operation_revision.value())).ok());
+    stage.Release();
+    ASSERT_TRUE(wait_until([&] {
+      const auto value = kernel.get_stop_status(stopped.value().stop_id);
+      return value.ok() && value.value().stop_certificate;
+    })) << PneumaticStopDiagnostic(kernel, stopped.value().stop_id, gripper, backend);
+    const auto completed_stop = kernel.get_stop_status(stopped.value().stop_id);
+    ASSERT_TRUE(completed_stop.ok() && completed_stop.value().stop_certificate);
+    const auto certificate = kernel.get_stop_certificate(completed_stop.value().stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(certificate.ok());
+    ASSERT_EQ(certificate.value().scope_entries.size(), 1U);
+    const auto* moving = std::get_if<StopParticipantScopeFactsDTO>(&certificate.value().scope_entries.front().facts);
+    ASSERT_NE(moving, nullptr);
+    EXPECT_EQ(moving->command_target_id, motion.value().command_target_id);
+    const auto after = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(after.ok());
+    EXPECT_EQ(after.value().state, finish_while_containing_motion ? OperationStateKind::kStopped : OperationStateKind::kExecuting);
+    const auto slots = kernel.resource_snapshot();
+    for (const auto& slot : slots) {
+      ASSERT_TRUE(slot.owner);
+      EXPECT_EQ(slot.owner->operation_revision, after.value().operation_revision);
+      if (slot.owner->participant_id == output_row->participant_id) {
+        EXPECT_EQ(slot.state, finish_while_containing_motion ? ResourceSlotState::kTerminal : ResourceSlotState::kDispatched);
+        EXPECT_EQ(slot.stop_generation, StopGeneration(0U));
+      }
+    }
+    if (!finish_while_containing_motion) {
+      EXPECT_FALSE(kernel.acknowledge_completed(control_request("mixed.certified.pending.ack", accepted.value(),
+          after.value().operation_revision.value())).ok());
+      backend.finish(false);
+      ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+      EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().state, OperationStateKind::kStopped);
+    }
+    EXPECT_FALSE(kernel.get_stop_fault_latch());
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, MovingSettlementFaultPreservesOwedPneumaticSuccessAndFailure) {
+  for (const bool failed : {false, true}) {
+    SCOPED_TRACE(failed);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine arm;
+    arm.participant_stop_settlement_error = ErrorDTO{"actual_moving_settlement_failed",
+        "Moving owner settlement failed", {{"reason", "actual_moving_settlement_failed"}}};
+    FinalPneumaticTestBackend backend;
+    GripperParticipantEngine output(backend, clock);
+    const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+        CoordinateKind::kLinear, schema), "2");
+    ResourceAddressedExecutionKernel kernel({registration(moving, arm), LogicalGripperRegistration(command, output)},
+        clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    const auto accepted = kernel.execute(coordinated_motion_command_operation("moving.fault.owed.output"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    arm.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    const auto stopped = kernel.full_stop({{RequestId("moving.fault.stop"), RequestOwnerEpoch("kernel.epoch.1"),
+        "test", {}}, StopGeneration(0U), {}});
+    ASSERT_TRUE(stopped.ok());
+    ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
+    const auto fault = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(fault.ok());
+    ASSERT_EQ(fault.value().state, OperationStateKind::kInterventionRequired);
+    ASSERT_EQ(fault.value().participants.front().state, OperationStateKind::kInterventionRequired);
+    const auto cause = fault.value().participants.front().terminal_error;
+    ASSERT_TRUE(cause);
+    EXPECT_EQ(cause->code, "actual_moving_settlement_failed");
+    EXPECT_EQ(fault.value().participants.back().state, OperationStateKind::kExecuting);
+    const auto latch = kernel.get_stop_fault_latch();
+    backend.finish(failed);
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    const auto final = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(final.ok());
+    EXPECT_EQ(final.value().state, OperationStateKind::kInterventionRequired);
+    EXPECT_EQ(final.value().participants.front().terminal_error, cause);
+    EXPECT_EQ(final.value().participants.back().state, failed ? OperationStateKind::kFailed : OperationStateKind::kCompleted);
+    EXPECT_EQ(final.value().active_stop_id, fault.value().active_stop_id);
+    EXPECT_EQ(final.value().active_stop_generation, fault.value().active_stop_generation);
+    EXPECT_EQ(kernel.get_stop_fault_latch(), latch);
+    for (const auto& slot : kernel.resource_snapshot()) {
+      EXPECT_EQ(slot.state, ResourceSlotState::kTerminal);
+      ASSERT_TRUE(slot.owner);
+      EXPECT_EQ(slot.owner->operation_id, accepted.value().operation_id);
+    }
+    EXPECT_FALSE(kernel.acknowledge_completed(control_request("fault.must.not.ack", accepted.value(),
+        final.value().operation_revision.value())).ok());
+    EXPECT_EQ(backend.commands, 1);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, CoordinatedStopBeforeBarrierDisposesRemainingOrdinaryPreparations) {
+  for (const bool initial_moving_prepare : {false, true}) {
+    SCOPED_TRACE(initial_moving_prepare);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine arm;
+    FinalPneumaticTestBackend backend;
+    GripperParticipantEngine output(backend, clock);
+    HeldSettlementCall prepare;
+    PreparedGripperForwarder forwarder(output, [] {});
+    if (initial_moving_prepare) arm.prepare_motion_hook = prepare.Blocker();
+    else forwarder.prepare_hook = prepare.Blocker();
+    const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+        CoordinateKind::kLinear, schema), "2");
+    auto ordinary = LogicalGripperRegistration(command, output);
+    ordinary.prepared_motion_engine = &forwarder;
+    ResourceAddressedExecutionKernel kernel({registration(moving, arm), ordinary}, clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto executing = std::async(std::launch::async, [&] {
+      return kernel.execute(coordinated_motion_command_operation("precommit.stop"));
+    });
+    ASSERT_TRUE(prepare.Entered());
+    const auto stopped = kernel.full_stop({{RequestId("precommit.stop.capture"), RequestOwnerEpoch("kernel.epoch.1"),
+        "test", {}}, StopGeneration(0U), {}});
+    ASSERT_TRUE(stopped.ok());
+    if (!initial_moving_prepare) backend.refuse_validation = true;
+    prepare.Release();
+    const auto accepted = executing.get();
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      const auto observed = kernel.reconcile_subordinate_state();
+      if (!observed.ok()) return false;
+      const auto state = kernel.get_operation_state(accepted.value().operation_id);
+      return state.ok() && state.value().participants.back().state ==
+          (initial_moving_prepare ? OperationStateKind::kCancelledPreDispatch : OperationStateKind::kInterventionRequired);
+    }));
+    const auto state = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(state.ok());
+    if (!initial_moving_prepare) {
+      ASSERT_TRUE(state.value().participants.back().terminal_error);
+      EXPECT_EQ(state.value().participants.back().terminal_error->code, "actual_prepare_refused");
+    }
+    EXPECT_EQ(backend.commands, 0);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+    for (const auto& slot : kernel.resource_snapshot()) {
+      if (slot.owner && slot.owner->participant_id == state.value().participants.back().participant_id) {
+        EXPECT_EQ(slot.state, ResourceSlotState::kTerminal);
+      }
+    }
+    ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
+    const auto settled = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(settled.ok());
+    EXPECT_EQ(settled.value().participants.front().state, OperationStateKind::kStopped);
+    EXPECT_EQ(settled.value().active_stop_id, stopped.value().stop_id);
+    EXPECT_FALSE(output.ObservePreparedCapabilityCommand(1U).ok());
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ReleasedCoordinatedBarrierDoesNotStrandLaterOrdinaryTarget) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm;
+  FinalPneumaticTestBackend backend;
+  GripperParticipantEngine output(backend, clock);
+  HeldSettlementCall first_dispatch;
+  arm.execute_return_hook = first_dispatch.Blocker();
+  const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+      CoordinateKind::kLinear, schema), "2");
+  ResourceAddressedExecutionKernel kernel({registration(moving, arm), LogicalGripperRegistration(command, output)},
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto executing = std::async(std::launch::async, [&] {
+    return kernel.execute(coordinated_motion_command_operation("barrier.already.released"));
+  });
+  ASSERT_TRUE(first_dispatch.Entered());
+  ASSERT_EQ(output.ObservePreparedCapabilityCommand(1U).value().state,
+            ResolvedPreparedCapabilityCommandStateDTO::kPrepared);
+  const auto stopped = kernel.full_stop({{RequestId("barrier.already.released.stop"), RequestOwnerEpoch("kernel.epoch.1"),
+      "test", {}}, StopGeneration(0U), {}});
+  ASSERT_TRUE(stopped.ok());
+  EXPECT_EQ(backend.commands, 0);
+  first_dispatch.Release();
+  const auto accepted = executing.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  std::string failed_dispatch_diagnostic;
+  if (backend.commands != 1) {
+    std::ostringstream detail;
+    detail << PneumaticStopDiagnostic(kernel, stopped.value().stop_id, output, backend);
+    const auto observed = kernel.get_operation_projection(accepted.value().operation_id);
+    if (observed.ok()) {
+      detail << " operation=" << static_cast<int>(observed.value().operation.state)
+             << " revision=" << observed.value().operation.operation_revision.value()
+             << " resident=" << observed.value().resident
+             << " control_pending=" << observed.value().control_pending;
+      for (const auto& row : observed.value().operation.participants) {
+        detail << " participant=" << row.participant_id.value()
+               << ":" << static_cast<int>(row.state);
+        if (row.terminal_error) {
+          detail << " error=" << row.terminal_error->code << ":" << row.terminal_error->message;
+          for (const auto& [key, value] : row.terminal_error->details)
+            detail << " [" << key << "=" << value << "]";
+        }
+      }
+    }
+    for (const auto& row : kernel.resource_snapshot())
+      detail << " slot=" << row.resource_id.value() << ":" << static_cast<int>(row.state)
+             << " stop_generation=" << row.stop_generation.value();
+    failed_dispatch_diagnostic = detail.str();
+  }
+  EXPECT_EQ(backend.commands, 1) << failed_dispatch_diagnostic;
+  backend.finish(false);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
+  EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().participants.back().state,
+            OperationStateKind::kCompleted);
+  EXPECT_EQ(backend.closes, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, PneumaticCallbackReconcilesDuringMovingStopWithoutPolling) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm, output;
+  output.configured_gripper_actuation = GripperActuationKind::kPneumatic;
+  const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto motion = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+      CoordinateKind::kLinear, schema), "2");
+  output.gripper_status.gripper_id = command.value().command_target_id.value();
+  ResourceAddressedExecutionKernel kernel({registration(motion, arm), LogicalGripperRegistration(command, output)},
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(coordinated_motion_command_operation("mixed.callback"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  arm.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  HeldSettlementCall stage;
+  arm.translate_stop_stage_hook = stage.Blocker();
+  const auto stopped = kernel.full_stop({{RequestId("mixed.callback.stop"), RequestOwnerEpoch("kernel.epoch.1"),
+      "test", {}}, StopGeneration(0U), {}});
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(stage.Entered());
+  const auto arm_reads = arm.status_read_calls.load();
+  output.gripper_status.state = GripperCommandState::kCompleted;
+  output.deliver_event({KernelEventType::kStateTransition, 73U, 0,
+      ExecutionState::kExecuting, ExecutionState::kCompleted, {}, {}});
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().participants.back().state, OperationStateKind::kCompleted);
+  EXPECT_EQ(arm.status_read_calls.load(), arm_reads);
+  EXPECT_EQ(output.addressed_stop_fence_calls, 0);
+  EXPECT_EQ(output.translate_stop_stage_calls, 0);
+  EXPECT_FALSE(kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate);
+  stage.Release();
+  ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ForeignCommandTargetIdentityOrGenerationCannotTerminalizeOwner) {
+  for (const int foreign : {0, 1, 2}) {
+    SCOPED_TRACE(foreign);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine output;
+    output.configured_gripper_actuation = GripperActuationKind::kPneumatic;
+    const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto command = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(command, output)}, clock, scheduler,
+        default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    const auto accepted = kernel.execute(command_operation("foreign.command"));
+    ASSERT_TRUE(accepted.ok());
+    const auto exact = output.gripper_status;
+    output.gripper_status.state = GripperCommandState::kCompleted;
+    if (foreign == 0) output.gripper_status.gripper_id = "foreign.target";
+    if (foreign == 1) ++output.gripper_status.command_id;
+    if (foreign == 2) ++output.gripper_status.generation;
+    output.deliver_event({KernelEventType::kStateTransition, 73U, 0,
+        ExecutionState::kExecuting, ExecutionState::kCompleted, {}, {}});
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().state, OperationStateKind::kExecuting);
+    EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kDispatched);
+    output.gripper_status = exact;
+    output.gripper_status.state = GripperCommandState::kCompleted;
+    output.deliver_event({KernelEventType::kStateTransition, 73U, 0,
+        ExecutionState::kExecuting, ExecutionState::kCompleted, {}, {}});
+    EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().state, OperationStateKind::kCompleted);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, IntrinsicManualPneumaticRemainsIndependentOfActiveMovingStop) {
+  for (const bool accept_before_stop : {false, true}) {
+    SCOPED_TRACE(accept_before_stop);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine arm;
+    FinalPneumaticTestBackend backend;
+    GripperParticipantEngine owner(backend, clock);
+    const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto motion = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto command = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    auto direct = LogicalGripperRegistration(command, owner);
+    direct.intrinsic_direct_control = true;
+    HeldSettlementCall before_entry;
+    PreparedGripperForwarder forwarder(owner, before_entry.Blocker());
+    if (accept_before_stop) direct.prepared_motion_engine = &forwarder;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({registration(motion, arm), direct}, clock, scheduler, default_journal, config);
+    ASSERT_TRUE(ready_cell_admission(kernel).ok());
+    const auto moving = kernel.execute(motion_operation("manual.peer.arm"));
+    ASSERT_TRUE(moving.ok());
+    arm.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    HeldSettlementCall stage;
+    arm.translate_stop_stage_hook = stage.Blocker();
+    auto manual = command_operation("manual.pneumatic");
+    manual.program_run_id = ProgramRunId("manual.run");
+    ASSERT_FALSE(manual.participants.front().execution_scope);
+    std::optional<std::future<Result<OperationAcceptedDTO>>> admitted_before;
+    if (accept_before_stop) {
+      admitted_before.emplace(std::async(std::launch::async, [&] { return kernel.execute(manual); }));
+      ASSERT_TRUE(before_entry.Entered());
+    }
+    const auto stopped = kernel.stop(stop_request("manual.peer.stop", moving.value(), moving.value().operation_revision.value()));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    ASSERT_TRUE(stage.Entered());
+    if (!accept_before_stop) {
+      const auto available = kernel.get_manual_control_availability(manual);
+      ASSERT_TRUE(available.ok());
+      EXPECT_TRUE(available.value().available);
+      EXPECT_FALSE(available.value().handover);
+      EXPECT_FALSE(available.value().cleanup_required);
+      // Recovery exclusion and foreign source identity remain independent refusals.
+      ASSERT_TRUE(kernel.SetRouteRecoveryPending(true).ok());
+      EXPECT_FALSE(kernel.execute(manual).ok());
+      ASSERT_TRUE(kernel.SetRouteRecoveryPending(false).ok());
+      auto foreign = manual;
+      foreign.request_context.request_owner_epoch = RequestOwnerEpoch("foreign.owner");
+      EXPECT_FALSE(kernel.execute(foreign).ok());
+    }
+    before_entry.Release();
+    const auto accepted = admitted_before ? admitted_before->get() : kernel.execute(manual);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    EXPECT_EQ(backend.commands, 1);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_FALSE(kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate);
+    auto busy = manual;
+    busy.request_context.request_id = RequestId("manual.busy");
+    EXPECT_FALSE(kernel.execute(busy).ok());
+    backend.finish(false);
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().state, OperationStateKind::kCompleted);
+    ASSERT_TRUE(wait_until([&] { return kernel.reconcile_manual_operation_admission().ok() &&
+        !kernel.get_operation_projection(accepted.value().operation_id).value().resident; }));
+    EXPECT_EQ(backend.opens, 0);
+    EXPECT_FALSE(kernel.get_stop_fault_latch());
+    stage.Release();
+    ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
+  }
+}
+
+namespace {
+ProgramRunExecutionCaptureDTO pneumatic_policy_capture(const RuntimeParticipantBinding& physical) {
+  auto capture = program_execution_capture();
+  auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
+  binding->target_role_bindings.front().target_role_id = TargetRoleId("gripper");
+  binding->target_role_bindings.front().command_target_id = physical.value().command_target_id;
+  binding->target_role_bindings.front().controllable_component_id = physical.value().controllable_component_id;
+  binding->target_role_bindings.front().resource_role_bindings = {
+      {physical.value().resources.front().resource_role_id,
+       {physical.value().resources.front().resource_id},
+       {physical.value().resources.front().compiled_resource_name}}};
+  auto table = std::make_shared<ProgramExecutionTableDTO>();
+  const std::vector<ProgramNodeTargetEffectDTO> effects{
+      {TargetRoleId("gripper"), CapabilityId("tool.gripper.command"), true},
+      {TargetRoleId("gripper"), CapabilityId("tool.gripper.feedback"), false}};
+  // Exact source/Behavior fixture: z_root sequence inherit -> c_branch sequence
+  // Hold -> a_child,b_sibling gripper.command_position Continue (.01 linear_m).
+  table->nodes = {
+      {ProgramNodeInstanceId("a_child"), "kernel.command_target", effects, ProgramOperatorStopPolicy::kContinue, 2U},
+      {ProgramNodeInstanceId("b_sibling"), "kernel.command_target", effects, ProgramOperatorStopPolicy::kContinue, 2U},
+      {ProgramNodeInstanceId("c_branch"), "orchestration.control_flow", {}, ProgramOperatorStopPolicy::kHold, 3U},
+      {ProgramNodeInstanceId("z_root"), "orchestration.control_flow", {}, ProgramOperatorStopPolicy::kContinue, {}}};
+  table->named_selections = {{"child_only", {0U}}, {"mixed", {0U, 2U}}, {"whole", {0U, 1U, 2U}}};
+  capture.table = std::move(table);
+  capture.binding = std::move(binding);
+  return capture;
+}
+OperationIntentDTO pneumatic_policy_operation(std::string request) {
+  auto intent = command_operation(std::move(request));
+  auto& command = std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload);
+  command.command_value = GripperPositionCommandValueDTO{LinearPositionDTO{0.01}, std::nullopt};
+  command.caller_options.clear();
+  intent.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("a_child"), "a_child.attempt.1"};
+  return intent;
+}
+}  // namespace
+
+TEST(ResourceAddressedExecutionKernelTest, PneumaticAdmissionMatchesActualBehaviorPartialHeldSubtreeOracle) {
+  for (const std::string candidate : {"a_child", "b_sibling"}) {
+  for (const std::string selection : {"child_only", "mixed", "whole"}) {
+    SCOPED_TRACE(candidate);
+    SCOPED_TRACE(selection);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FinalPneumaticTestBackend backend;
+    GripperParticipantEngine owner(backend, clock);
+    const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(physical, owner)}, clock, scheduler,
+        default_journal, config);
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_policy_capture(physical)).ok());
+    const auto ready = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(ready.ok());
+    EXPECT_FALSE(kernel.execute(pneumatic_policy_operation("before.run")).ok());
+    ASSERT_TRUE(kernel.start_program_selection(program_selection_request("policy.start", "all"),
+        ready.value().selection_revision).ok());
+    const auto stopped = kernel.stop_program_selection(program_selection_request("policy.stop", selection));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    // The selected held projection stays truthful, including local Continue.
+    ASSERT_TRUE(stopped.value().state);
+    EXPECT_TRUE(std::any_of(stopped.value().state->held_nodes.begin(), stopped.value().state->held_nodes.end(),
+        [](const auto& row) { return row.node_index == 0U && row.state == ProgramNodeHoldStateDTO::kHeld; }));
+    auto command_intent = pneumatic_policy_operation("after.selection");
+    command_intent.participants.front().execution_scope = ProgramNodeExecutionScopeDTO{
+        ProgramNodeInstanceId(candidate), candidate + ".attempt.1"};
+    const auto accepted = kernel.execute(command_intent);
+    EXPECT_EQ(accepted.ok(), selection != "whole");
+    EXPECT_EQ(backend.commands, selection == "whole" ? 0 : 1);
+    if (accepted.ok()) {
+      backend.finish(false);
+      ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+      EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().state, OperationStateKind::kCompleted);
+    }
+  }
+  }
+}
+
+// Integrate after pneumatic_policy_capture/pneumatic_policy_operation and their
+// existing primary oracle test. Depends on the frozen real pneumatic owner,
+// claim/start/selection helpers; adds no production interface or include.
+namespace {
+ProgramRunExecutionCaptureDTO
+pneumatic_inheritance_matrix_capture(const RuntimeParticipantBinding &physical,
+                                     const std::string &fixture) {
+  auto capture = pneumatic_policy_capture(physical);
+  auto table = std::make_shared<ProgramExecutionTableDTO>();
+  const std::vector<ProgramNodeTargetEffectDTO> effects{
+      {TargetRoleId("gripper"), CapabilityId("tool.gripper.command"), true},
+      {TargetRoleId("gripper"), CapabilityId("tool.gripper.feedback"), false}};
+  if (fixture == "chain") {
+    // Exact real-gripper CapturesBehaviorStopPolicyDefaultsAndCatalogKinds:
+    // a_root -> b_composite -> c_decorator(inverter) -> d_leaf(gripper
+    // inherit).
+    table->nodes = {{ProgramNodeInstanceId("a_root"),
+                     "orchestration.control_flow",
+                     {},
+                     ProgramOperatorStopPolicy::kContinue,
+                     {}},
+                    {ProgramNodeInstanceId("b_composite"),
+                     "orchestration.control_flow",
+                     {},
+                     ProgramOperatorStopPolicy::kContinue,
+                     0U},
+                    {ProgramNodeInstanceId("c_decorator"),
+                     "orchestration.control_flow",
+                     {},
+                     ProgramOperatorStopPolicy::kContinue,
+                     1U},
+                    {ProgramNodeInstanceId("d_leaf"), "kernel.command_target",
+                     effects, ProgramOperatorStopPolicy::kHold, 2U}};
+    table->named_selections = {
+        {"leaf_only", {3U}}, {"mixed", {1U, 3U}}, {"whole", {0U, 1U, 2U, 3U}}};
+  } else if (fixture == "explicit") {
+    // Exact real-gripper
+    // CapturesLocalExplicitOverridesWithoutFoldingHoldAncestors.
+    table->nodes = {
+        {ProgramNodeInstanceId("a_inherited_hold"),
+         "orchestration.control_flow",
+         {},
+         ProgramOperatorStopPolicy::kHold,
+         6U},
+        {ProgramNodeInstanceId("b_explicit_continue"), "kernel.command_target",
+         effects, ProgramOperatorStopPolicy::kContinue, 0U},
+        {ProgramNodeInstanceId("c_explicit_continue"),
+         "orchestration.control_flow",
+         {},
+         ProgramOperatorStopPolicy::kContinue,
+         6U},
+        {ProgramNodeInstanceId("d_inherited_continue"),
+         "orchestration.control_flow",
+         {},
+         ProgramOperatorStopPolicy::kContinue,
+         2U},
+        {ProgramNodeInstanceId("e_default_leaf"), "kernel.command_target",
+         effects, ProgramOperatorStopPolicy::kHold, 3U},
+        {ProgramNodeInstanceId("f_explicit_hold"), "kernel.command_target",
+         effects, ProgramOperatorStopPolicy::kHold, 2U},
+        {ProgramNodeInstanceId("z_root"),
+         "orchestration.control_flow",
+         {},
+         ProgramOperatorStopPolicy::kHold,
+         {}}};
+    table->named_selections = {{"branch_whole", {0U, 1U}},
+                               {"child_only", {1U}},
+                               {"mixed", {1U, 6U}},
+                               {"whole", {0U, 1U, 2U, 3U, 4U, 5U, 6U}}};
+  } else {
+    // Catalog leaf root with omitted inherit: local Continue, no Hold wrapper.
+    table->nodes = {{ProgramNodeInstanceId("root"),
+                     "kernel.command_target",
+                     effects,
+                     ProgramOperatorStopPolicy::kContinue,
+                     {}}};
+  }
+  capture.table = std::move(table);
+  return capture;
+}
+} // namespace
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PneumaticAdmissionMatchesActualBehaviorInheritanceAndOverrideOracle) {
+  struct Case final {
+    std::string fixture;
+    std::string selection;
+    std::string node;
+    bool admitted;
+  };
+  // Expected outcomes come from the actual ExecutableProgramRun oracle tests,
+  // not from a test-local copy of policy or subtree resolution. Commands use
+  // actual catalog gripper leaves and the same .01 linear_m payload throughout.
+  const Case cases[] = {
+      {"chain", "leaf_only", "d_leaf", false},
+      {"chain", "mixed", "d_leaf", false},
+      {"chain", "whole", "d_leaf", false},
+      {"explicit", "child_only", "b_explicit_continue", true},
+      {"explicit", "branch_whole", "b_explicit_continue", false},
+      {"explicit", "mixed", "b_explicit_continue", true},
+      {"explicit", "whole", "b_explicit_continue", false},
+      {"root", "all", "root", true}};
+  for (const auto &test_case : cases) {
+    SCOPED_TRACE(test_case.fixture + ":" + test_case.selection);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FinalPneumaticTestBackend backend;
+    GripperParticipantEngine owner(backend, clock);
+    const ProgramCommandSchemaRefDTO schema{
+        CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(
+            std::string(kGripperPositionCommandSchemaRevision))};
+    const auto physical =
+        make_binding("gripper", "gripper.target", "tool.gripper.command",
+                     CoordinateKind::kLinear, schema);
+    ResourceAddressedExecutionKernelConfig config{
+        RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel(
+        {LogicalGripperRegistration(physical, owner)}, clock, scheduler,
+        default_journal, config);
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    const auto capture =
+        pneumatic_inheritance_matrix_capture(physical, test_case.fixture);
+    ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+    auto operation = pneumatic_policy_operation("matrix.command");
+    operation.participants.front().execution_scope =
+        ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId(test_case.node),
+                                     test_case.node + ".attempt.1"};
+    // Real effectful rows still require initial Run, even a root Continue.
+    EXPECT_FALSE(kernel.execute(operation).ok());
+    EXPECT_EQ(backend.commands, 0);
+    const auto initial =
+        kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(initial.ok());
+    ASSERT_TRUE(kernel
+                    .start_program_selection(
+                        program_selection_request("matrix.start", "all"),
+                        initial.value().selection_revision)
+                    .ok());
+    const auto held = kernel.stop_program_selection(
+        program_selection_request("matrix.stop", test_case.selection));
+    ASSERT_TRUE(held.ok()) << held.error().message;
+    ASSERT_TRUE(held.value().state);
+    const auto leaf = std::find_if(
+        capture.table->nodes.begin(), capture.table->nodes.end(),
+        [&](const auto &node) {
+          return node.instance_id == ProgramNodeInstanceId(test_case.node);
+        });
+    ASSERT_NE(leaf, capture.table->nodes.end());
+    const auto index =
+        static_cast<std::uint32_t>(leaf - capture.table->nodes.begin());
+    EXPECT_TRUE(
+        std::any_of(held.value().state->held_nodes.begin(),
+                    held.value().state->held_nodes.end(), [&](const auto &row) {
+                      return row.node_index == index &&
+                             row.state == ProgramNodeHoldStateDTO::kHeld;
+                    }));
+    operation.request_context.request_id = RequestId("matrix.after.hold");
+    const auto accepted = kernel.execute(operation);
+    EXPECT_EQ(accepted.ok(), test_case.admitted);
+    EXPECT_EQ(backend.commands, test_case.admitted ? 1 : 0);
+    if (accepted.ok()) {
+      backend.finish(false);
+      ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+      EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id)
+                    .value()
+                    .state,
+                OperationStateKind::kCompleted);
+    }
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+    EXPECT_FALSE(kernel.get_stop_fault_latch());
+  }
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest, FullStopAllowsIntrinsicManualPneumaticDuringMovingContainment) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm;
+  FinalPneumaticTestBackend backend;
+  GripperParticipantEngine owner(backend, clock);
+  const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto motion = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto command = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  auto direct = LogicalGripperRegistration(command, owner);
+  direct.intrinsic_direct_control = true;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({registration(motion, arm), direct}, clock, scheduler, default_journal, config);
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const auto moving = kernel.execute(motion_operation("full.manual.arm"));
+  ASSERT_TRUE(moving.ok());
+  arm.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  HeldSettlementCall stage;
+  arm.translate_stop_stage_hook = stage.Blocker();
+  const auto stopped = kernel.full_stop(FullStopIntentDTO{
+      {RequestId("full.manual.stop"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}}, StopGeneration(0U), {}});
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(stage.Entered());
+  EXPECT_FALSE(kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate);
+  EXPECT_FALSE(kernel.get_stop_fault_latch());
+  auto manual = command_operation("full.manual.pneumatic");
+  manual.program_run_id = ProgramRunId("manual.run");
+  const auto available = kernel.get_manual_control_availability(manual);
+  ASSERT_TRUE(available.ok());
+  EXPECT_TRUE(available.value().available);
+  EXPECT_FALSE(available.value().handover);
+  // Neither unresolved identity nor a moving payload acquires the pneumatic exception.
+  auto unknown = manual;
+  unknown.request_context.request_id = RequestId("full.manual.unknown");
+  unknown.participants.front().target_role_id = TargetRoleId("unknown");
+  const auto refused_unknown = kernel.execute(unknown);
+  ASSERT_FALSE(refused_unknown.ok());
+  EXPECT_EQ(refused_unknown.error().details.at("reason"), "motion_admission_closed");
+  const auto refused_motion = kernel.execute(motion_operation("full.manual.moving.refused"));
+  ASSERT_FALSE(refused_motion.ok());
+  EXPECT_EQ(refused_motion.error().details.at("reason"), "motion_admission_closed");
+  const auto accepted = kernel.execute(manual);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(backend.commands, 1);
+  EXPECT_TRUE(backend.actual_owner_proof);
+  backend.finish(false);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().state, OperationStateKind::kCompleted);
+  ASSERT_TRUE(wait_until([&] { return kernel.reconcile_manual_operation_admission().ok() &&
+      !kernel.get_operation_projection(accepted.value().operation_id).value().resident; }));
+  EXPECT_EQ(backend.closes, 0);
+  EXPECT_EQ(backend.opens, 0);
+  stage.Release();
+  ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest, FullStopKeepsPositionGripperAdmissionClosed) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine position;
+  const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  auto direct = LogicalGripperRegistration(physical, position);
+  direct.intrinsic_direct_control = true;
+  ASSERT_EQ(position.gripper_actuation_kind("gripper.target"), GripperActuationKind::kPositionCommanded);
+  ASSERT_FALSE(direct.stop_readiness->value().resolved_stop_base_plan.gripper_actuation_kind.has_value());
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, default_journal, config);
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const auto stopped = kernel.full_stop(FullStopIntentDTO{
+      {RequestId("full.position.stop"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}}, StopGeneration(0U), {}});
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
+  EXPECT_FALSE(kernel.get_stop_fault_latch());
+  auto manual = command_operation("full.position.refused");
+  manual.program_run_id = ProgramRunId("manual.run");
+  const auto available = kernel.get_manual_control_availability(manual);
+  ASSERT_TRUE(available.ok());
+  EXPECT_FALSE(available.value().available);
+  const auto refused = kernel.execute(manual);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "motion_admission_closed");
+  EXPECT_EQ(position.prepare_command_calls, 0);
+  EXPECT_EQ(position.command_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, FullStopAllowsSourceDerivedContinueWithRawHeldProjection) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FinalPneumaticTestBackend backend;
+  GripperParticipantEngine owner(backend, clock);
+  const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(physical, owner)}, clock, scheduler, default_journal, config);
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_inheritance_matrix_capture(physical, "root")).ok());
+  const auto initial = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(initial.ok());
+  ASSERT_TRUE(kernel.start_program_selection(program_selection_request("full.continue.start", "all"),
+      initial.value().selection_revision).ok());
+  const auto held = kernel.stop_program_selection(program_selection_request("full.continue.hold", "all"));
+  ASSERT_TRUE(held.ok());
+  const auto stopped = kernel.full_stop(FullStopIntentDTO{
+      {RequestId("full.continue.stop"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}}, StopGeneration(0U), {}});
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
+  const auto scope = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(scope.ok());
+  ASSERT_EQ(scope.value().held_nodes.size(), 1U);
+  EXPECT_EQ(scope.value().held_nodes.front().state, ProgramNodeHoldStateDTO::kHeld);
+  auto operation = pneumatic_policy_operation("full.continue.command");
+  operation.participants.front().execution_scope = ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("root"), "root.attempt.1"};
+  const auto accepted = kernel.execute(operation);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(backend.commands, 1);
+  EXPECT_TRUE(backend.actual_owner_proof);
+  backend.finish(false);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().state, OperationStateKind::kCompleted);
+  EXPECT_EQ(kernel.get_program_execution_scope(ProgramRunId("run.1")).value().held_nodes.front().state,
+      ProgramNodeHoldStateDTO::kHeld);
+  EXPECT_FALSE(kernel.get_stop_fault_latch());
+  EXPECT_EQ(backend.closes, 0);
+  EXPECT_EQ(backend.opens, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     LaterUnlatchedPublicationFailureAfterCertifiedFullStopClosesManualPneumatic) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FinalPneumaticTestBackend backend;
+  GripperParticipantEngine owner(backend, clock);
+  std::atomic<int> prepare_calls{};
+  PreparedGripperForwarder forwarder(owner, [] {});
+  forwarder.prepare_hook = [&] { ++prepare_calls; };
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                     CoordinateKind::kLinear, schema);
+  auto direct = LogicalGripperRegistration(physical, owner);
+  direct.intrinsic_direct_control = true;
+  direct.prepared_motion_engine = &forwarder;
+  ResourceAddressedExecutionKernelConfig config{
+      RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  ASSERT_FALSE(kernel.get_stop_fault_latch().has_value());
+
+  const auto stopped = kernel.full_stop(FullStopIntentDTO{
+      {RequestId("publication-fault.full-stop"), RequestOwnerEpoch("kernel.epoch.1"),
+       "test", std::nullopt}, StopGeneration(0U), {}});
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  })) << PneumaticStopDiagnostic(kernel, stopped.value().stop_id, owner, backend);
+  ASSERT_FALSE(kernel.get_stop_fault_latch().has_value());
+  EXPECT_EQ(prepare_calls, 0);
+  EXPECT_EQ(backend.commands, 0);
+  EXPECT_EQ(backend.closes, 0);
+  EXPECT_EQ(backend.opens, 0);
+
+  // A normal FullStop alone permits this real intrinsic direct-control target.
+  auto manual = command_operation("publication-fault.manual");
+  manual.program_run_id = ProgramRunId("manual.run");
+  ASSERT_FALSE(manual.participants.front().execution_scope.has_value());
+  const auto before_fault = kernel.get_manual_control_availability(manual);
+  ASSERT_TRUE(before_fault.ok()) << before_fault.error().message;
+  ASSERT_TRUE(before_fault.value().available);
+
+  // Reinstall the same exact physical registration. No changed participant,
+  // forged latch or private admission mutation is needed to reach this writer.
+  int commit_calls = 0;
+  const auto published = kernel.reconfigure_runtime_product({direct}, {}, [&] {
+    ++commit_calls;
+    return Result<void>::Err(ErrorDTO{
+        "actual_publication_refused", "Actual runtime publication was refused", {}});
+  });
+  ASSERT_FALSE(published.ok());
+  EXPECT_EQ(commit_calls, 1);
+  EXPECT_EQ(published.error().details.at("reason"),
+            "runtime_product_publication_commit_failed");
+  ASSERT_FALSE(kernel.get_stop_fault_latch().has_value());
+  const auto retained_stop = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(retained_stop.ok());
+  ASSERT_TRUE(retained_stop.value().stop_certificate.has_value());
+
+  const auto refused = kernel.execute(manual);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "motion_admission_closed");
+  EXPECT_EQ(commit_calls, 1);
+  EXPECT_EQ(prepare_calls, 0);
+  EXPECT_EQ(backend.commands, 0);
+  EXPECT_EQ(backend.closes, 0);
+  EXPECT_EQ(backend.opens, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, PreparedPneumaticHoldCancelsBeforeEngineCommit) {
+  for (const std::string selection : {"child_only", "whole"}) {
+    SCOPED_TRACE(selection);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FinalPneumaticTestBackend backend;
+    GripperParticipantEngine owner(backend, clock);
+    HeldSettlementCall before_entry;
+    PreparedGripperForwarder forwarder(owner, before_entry.Blocker());
+    const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    auto row = LogicalGripperRegistration(physical, owner);
+    row.prepared_motion_engine = &forwarder;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, default_journal, config);
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_policy_capture(physical)).ok());
+    const auto initial = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(initial.ok());
+    ASSERT_TRUE(kernel.start_program_selection(program_selection_request("race.run", "all"),
+        initial.value().selection_revision).ok());
+    auto executing = std::async(std::launch::async, [&] {
+      return kernel.execute(pneumatic_policy_operation("race.prepared"));
+    });
+    ASSERT_TRUE(before_entry.Entered());
+    ASSERT_EQ(owner.ObservePreparedCapabilityCommand(1U).value().state,
+              ResolvedPreparedCapabilityCommandStateDTO::kPrepared);
+    const auto held = kernel.stop_program_selection(program_selection_request("race.hold", selection));
+    ASSERT_TRUE(held.ok()) << held.error().message;
+    EXPECT_EQ(backend.commands, 0);
+    const bool prevented = selection == "whole";
+    EXPECT_EQ(owner.ObservePreparedCapabilityCommand(1U).value().state,
+        prevented ? ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch
+                  : ResolvedPreparedCapabilityCommandStateDTO::kPrepared);
+    before_entry.Release();
+    const auto accepted = executing.get();
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    EXPECT_EQ(backend.commands, prevented ? 0 : 1);
+    if (prevented) {
+      ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+      const auto cancelled = kernel.get_operation_state(accepted.value().operation_id);
+      ASSERT_TRUE(cancelled.ok());
+      EXPECT_EQ(cancelled.value().state, OperationStateKind::kCancelledPreDispatch);
+      ASSERT_TRUE(held.value().fresh_containment);
+      ASSERT_TRUE(wait_until([&] {
+        return kernel.get_stop_status(held.value().fresh_containment->stop_id).value().stop_certificate.has_value();
+      }));
+      // Retirement/fresh Resume is a separately held source seam. The real
+      // canceled reservation remains owned here; no operator Reset is inferred.
+    }
+    if (!prevented) {
+      backend.finish(false);
+      ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    }
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+    EXPECT_FALSE(kernel.get_stop_fault_latch());
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, EnginePrecommitCancellationRetiresLocallyBeforeFreshSelectedResume) {
+  for (const int observation : {0, 1, 2}) {
+    SCOPED_TRACE(observation);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FinalPneumaticTestBackend backend;
+    GripperParticipantEngine owner(backend, clock);
+    HeldSettlementCall before_entry;
+    PreparedGripperForwarder forwarder(owner, before_entry.Blocker());
+    const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    auto row = LogicalGripperRegistration(physical, owner);
+    row.prepared_motion_engine = &forwarder;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, default_journal, config);
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_policy_capture(physical)).ok());
+    const auto initial = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(initial.ok());
+    ASSERT_TRUE(kernel.start_program_selection(program_selection_request("proof.start", "all"),
+        initial.value().selection_revision).ok());
+    const auto original_intent = pneumatic_policy_operation("proof.original");
+    auto executing = std::async(std::launch::async, [&] { return kernel.execute(original_intent); });
+    ASSERT_TRUE(before_entry.Entered());
+    const auto held = kernel.stop_program_selection(program_selection_request("proof.hold", "whole"));
+    ASSERT_TRUE(held.ok() && held.value().state && held.value().fresh_containment);
+    const auto actual = owner.ObservePreparedCapabilityCommand(1U);
+    ASSERT_TRUE(actual.ok());
+    EXPECT_EQ(actual.value().state, ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch);
+    EXPECT_FALSE(actual.value().dispatch_result);
+    EXPECT_EQ(backend.commands, 0);
+    // Kernel dispatch permission already crossed, but the actual engine did
+    // not commit. That historical permission is preserved by the production body.
+    forwarder.observation_unavailable = observation == 1;
+    forwarder.observation_foreign_identity = observation == 2;
+    before_entry.Release();
+    const auto accepted = executing.get();
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    if (observation != 0) {
+      ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+      const auto unknown = kernel.get_operation_state(accepted.value().operation_id);
+      ASSERT_TRUE(unknown.ok());
+      EXPECT_NE(unknown.value().state, OperationStateKind::kCancelledPreDispatch);
+      EXPECT_NE(unknown.value().state, OperationStateKind::kCompleted);
+      EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kDispatched);
+      EXPECT_EQ(backend.commands, 0);
+    }
+    forwarder.observation_unavailable = false;
+    forwarder.observation_foreign_identity = false;
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    ASSERT_TRUE(wait_until([&] {
+      return kernel.get_stop_status(held.value().fresh_containment->stop_id).value().stop_certificate.has_value();
+    }));
+    const auto cancelled = kernel.get_operation_projection(accepted.value().operation_id);
+    ASSERT_TRUE(cancelled.ok());
+    ASSERT_TRUE(cancelled.value().resident);
+    ASSERT_EQ(cancelled.value().operation.state, OperationStateKind::kCancelledPreDispatch);
+    EXPECT_FALSE(cancelled.value().operation.participants.front().terminal_error);
+    const auto cleanup = control_request("proof.local.retirement", accepted.value(),
+        cancelled.value().operation.operation_revision.value());
+    auto wrong_epoch = cleanup;
+    wrong_epoch.request_context.request_owner_epoch = RequestOwnerEpoch("foreign.owner");
+    EXPECT_FALSE(kernel.reset(wrong_epoch).ok());
+    auto stale = cleanup;
+    stale.request_context.request_id = RequestId("proof.stale.cleanup");
+    stale.expected_operation_revision = OperationRevision(cleanup.expected_operation_revision.value() + 1U);
+    EXPECT_FALSE(kernel.reset(stale).ok());
+    // This is the Resume owner's existing local no-target control, not an
+    // operator Reset. Public readback is required before selected release.
+    const auto retired = kernel.reset(cleanup);
+    ASSERT_TRUE(retired.ok()) << retired.error().message;
+    const auto history = kernel.get_operation_projection(accepted.value().operation_id);
+    ASSERT_TRUE(history.ok());
+    EXPECT_FALSE(history.value().resident);
+    EXPECT_FALSE(history.value().control_pending);
+    ASSERT_TRUE(history.value().last_control);
+    EXPECT_EQ(history.value().last_control->request_id, cleanup.request_context.request_id);
+    EXPECT_EQ(history.value().operation.state, OperationStateKind::kCancelledPreDispatch);
+    EXPECT_EQ(backend.commands, 0);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+    ASSERT_TRUE(kernel.reset(cleanup).ok());  // Exact control replay remains local.
+    ASSERT_TRUE(kernel.stop_program_selection(program_selection_request("proof.newer.hold", "whole")).ok());
+    EXPECT_FALSE(kernel.release_program_selection(program_selection_request("proof.stale.resume", "whole"),
+        held.value().state->selection_revision).ok());
+    EXPECT_EQ(backend.commands, 0);
+    const auto newest = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(newest.ok());
+    ASSERT_TRUE(kernel.release_program_selection(program_selection_request("proof.actual.resume", "whole"),
+        newest.value().selection_revision).ok());
+    auto fresh = pneumatic_policy_operation("proof.fresh");
+    fresh.participants.front().execution_scope->node_attempt_id = "a_child.attempt.2";
+    const auto fresh_accepted = kernel.execute(fresh);
+    ASSERT_TRUE(fresh_accepted.ok()) << fresh_accepted.error().message;
+    EXPECT_NE(fresh_accepted.value().operation_id, accepted.value().operation_id);
+    EXPECT_EQ(backend.commands, 1);
+    const auto old_replay = kernel.execute(original_intent);
+    ASSERT_TRUE(old_replay.ok());
+    EXPECT_EQ(old_replay.value().operation_id, accepted.value().operation_id);
+    EXPECT_EQ(old_replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+    EXPECT_EQ(backend.commands, 1);
+    backend.finish(false);
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    EXPECT_EQ(kernel.get_operation_state(fresh_accepted.value().operation_id).value().state, OperationStateKind::kCompleted);
+    EXPECT_FALSE(kernel.get_stop_fault_latch());
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, PneumaticDefaultHoldAndPositionRetainTheirSelectedAdmissionRefusals) {
+  for (const bool pneumatic_default_hold : {false, true}) {
+    SCOPED_TRACE(pneumatic_default_hold);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    engine.configured_gripper_actuation = pneumatic_default_hold ? GripperActuationKind::kPneumatic
+                                                                : GripperActuationKind::kPositionCommanded;
+    const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(physical, engine)}, clock, scheduler,
+        default_journal, config);
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    auto capture = pneumatic_policy_capture(physical);
+    auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+    if (pneumatic_default_hold)
+      table->nodes.front().effective_operator_stop_policy = ProgramOperatorStopPolicy::kHold;
+    capture.table = table;
+    ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+    const auto ready = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(ready.ok());
+    ASSERT_TRUE(kernel.start_program_selection(program_selection_request("negative.start", "all"),
+        ready.value().selection_revision).ok());
+    ASSERT_TRUE(kernel.stop_program_selection(program_selection_request("negative.hold", "child_only")).ok());
+    EXPECT_FALSE(kernel.execute(pneumatic_policy_operation("negative.execute")).ok());
+    EXPECT_EQ(engine.prepare_command_calls, 0);
+    EXPECT_EQ(engine.command_calls, 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, CapturedPolicyRejectsMalformedClosedPolicyAndParentTopology) {
+  for (const int malformed : {0, 1, 2}) {
+    SCOPED_TRACE(malformed);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({registration(make_binding("arm", "arm",
+        "execution.trajectory.execute", CoordinateKind::kAngular), engine)}, clock, scheduler, default_journal, config);
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    auto capture = program_execution_capture();
+    auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+    if (malformed == 0) table->nodes.front().effective_operator_stop_policy = ProgramOperatorStopPolicy::kInherit;
+    if (malformed == 1) table->nodes.front().parent_node_index = static_cast<std::uint32_t>(table->nodes.size());
+    if (malformed == 2) { table->nodes.front().parent_node_index = 1U; table->nodes.back().parent_node_index = 0U; }
+    capture.table = std::move(table);
+    EXPECT_FALSE(kernel.register_program_run_capture(std::move(capture)).ok());
+    EXPECT_EQ(engine.prepare_motion_calls, 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, UnconfirmedPneumaticDeliveryIsFinalConsumableFailure) {
+  FinalPneumaticTestBackend backend;
+  backend.reject_delivery = true;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  GripperParticipantEngine gripper(backend, clock);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+      CoordinateKind::kLinear, schema), gripper);
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(command_operation());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().state, OperationStateKind::kFailed);
+  ASSERT_TRUE(state.value().participants.front().terminal_error);
+  EXPECT_EQ(state.value().participants.front().terminal_error->code, "pneumatic_delivery_timeout");
+  EXPECT_EQ(state.value().participants.front().terminal_error->details.at("pneumatic_transaction_final"), "true");
+  EXPECT_FALSE(kernel.get_stop_fault_latch());
+  backend.finish(false);  // a late provider Success cannot rewrite the Kernel final Failure
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().state, OperationStateKind::kFailed);
+  ASSERT_TRUE(kernel.acknowledge_completed(control_request(
+      "pneumatic.failure.ack", accepted.value(), state.value().operation_revision.value())).ok());
+  EXPECT_EQ(backend.opens, 0);
+  EXPECT_EQ(backend.closes, 0);  // no cell Reset, physical cancel or fault path
+  EXPECT_EQ(backend.commands, 1);
+  ASSERT_TRUE(wait_until([&] {
+    const auto slots = kernel.resource_snapshot();
+    return std::all_of(slots.begin(), slots.end(), [](const auto& slot) {
+      return slot.state == ResourceSlotState::kFree && !slot.owner;
+    });
+  }));
+  backend.reject_delivery = false;
+  const auto next = kernel.execute(command_operation("pneumatic.rewrite"));
+  ASSERT_TRUE(next.ok()) << next.error().message;
+  EXPECT_EQ(backend.commands, 2);  // the next command rewrites without Reset
+  EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().state,
+            OperationStateKind::kFailed);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, FinalPneumaticFailureRemainsFinalWhileCoordinatedSiblingExecutes) {
+  FinalPneumaticTestBackend first_backend, second_backend;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  GripperParticipantEngine first_engine(first_backend, clock), second_engine(second_backend, clock);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  const auto second = coordinated_occurrence(first, "2");
+  ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(first, first_engine),
+      LogicalGripperRegistration(second, second_engine)}, clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(coordinated_command_operation("pneumatic.two"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  first_backend.finish(true);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto failed = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(failed.ok());
+  ASSERT_EQ(failed.value().participants.size(), 2U);
+  EXPECT_EQ(failed.value().participants.front().state, OperationStateKind::kFailed);
+  EXPECT_EQ(failed.value().participants.back().state, OperationStateKind::kExecuting);
+  const auto original_error = failed.value().participants.front().terminal_error;
+  first_backend.finish(false);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto late = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(late.ok());
+  EXPECT_EQ(late.value().participants.front().state, OperationStateKind::kFailed);
+  EXPECT_EQ(late.value().participants.front().terminal_error, original_error);
+  second_backend.finish(false);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().state, OperationStateKind::kFailed);
+  EXPECT_EQ(first_backend.commands, 1);
+  EXPECT_EQ(second_backend.commands, 1);
+  EXPECT_FALSE(kernel.get_stop_fault_latch());
+}
+
+TEST(ResourceAddressedExecutionKernelTest, PneumaticAcknowledgementDoesNotReopenSharedPositionAdmission) {
+  // Genuine Core owners share this unit provider's one admission fence. The
+  // position sibling has no admitted transaction in this test; no physical
+  // transport/cancel acknowledgement is claimed.
+  class SharedBackend final : public IGripperCommandBackend {
+   public:
+    FinalPneumaticTestBackend pneumatic;
+    bool position_closed{};
+    GripperCommandStatusDTO position;
+    SharedBackend() {
+      position.gripper_id = "position.target";
+      position.command_id = 55U;
+      position.generation = 89U;
+      position.revision = 1U;
+      position.state = GripperCommandState::kIdle;
+    }
+    GripperActuationKind gripper_actuation_kind(const std::string& id) const override {
+      return id == position.gripper_id ? GripperActuationKind::kPositionCommanded : GripperActuationKind::kPneumatic;
+    }
+    GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override {
+      if (request.gripper_id != position.gripper_id) return pneumatic.command_gripper(request);
+      if (position_closed) return {false, 0U, 0U,
+          ErrorDTO{"gripper_admission_closed", "Shared Stop remains in force", {}}};
+      return {true, position.command_id, position.generation, std::nullopt};
+    }
+    GripperCommandStatusDTO get_gripper_status(const std::string& id) const override {
+      return id == position.gripper_id ? position : pneumatic.get_gripper_status(id);
+    }
+    GripperCommandResultDTO mark_gripper_grasp_lost(const std::string&, std::uint64_t,
+        std::uint64_t, const std::string&, const std::string&, const std::string&) override { return {}; }
+    void invalidate_gripper_commands(const GripperInvalidationReason reason) noexcept override {
+      if (reason != GripperInvalidationReason::kStop) pneumatic.invalidate_gripper_commands(reason);
+      position_closed = true;
+      position.state = GripperCommandState::kIdle;
+      ++position.generation;
+      ++position.revision;
+    }
+    void authorize_gripper_commands() noexcept override {
+      pneumatic.authorize_gripper_commands();
+      position_closed = false;
+    }
+  } backend;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  GripperParticipantEngine pneumatic_owner(backend, clock), position_owner(backend, clock);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto binding = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(binding, pneumatic_owner)},
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  // A real Position command's existing scoped Stop closes its moving gate.
+  GripperCommandRequestDTO position_before;
+  position_before.gripper_id = "position.target";
+  ASSERT_TRUE(position_owner.command_gripper(position_before).accepted);
+  backend.position.state = GripperCommandState::kExecuting;
+  ASSERT_TRUE(position_owner.stop_gripper("position.target", backend.position.command_id,
+                                         backend.position.generation).ok());
+  const auto accepted = kernel.execute(command_operation("pneumatic.shared"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto stop = kernel.full_stop(FullStopIntentDTO{
+      {RequestId("pneumatic.shared.stop"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}}, StopGeneration(0U), {}});
+  ASSERT_TRUE(stop.ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_stop_status(stop.value().stop_id);
+    return state.ok() && state.value().stop_certificate;
+  })) << PneumaticStopDiagnostic(kernel, stop.value().stop_id, pneumatic_owner, backend.pneumatic);
+  backend.pneumatic.finish(true);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  ASSERT_EQ(state.value().state, OperationStateKind::kFailed);
+  ASSERT_TRUE(kernel.acknowledge_completed(control_request("pneumatic.shared.ack", accepted.value(),
+      state.value().operation_revision.value())).ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto slots = kernel.resource_snapshot();
+    return std::all_of(slots.begin(), slots.end(), [](const auto& row) {
+      return row.state == ResourceSlotState::kFree && !row.owner;
+    });
+  }));
+  EXPECT_TRUE(backend.position_closed);
+  EXPECT_FALSE(backend.pneumatic.get_gripper_status("gripper.target").admission_closed);
+  EXPECT_EQ(backend.pneumatic.opens, 0);
+  GripperCommandRequestDTO position_request;
+  position_request.gripper_id = "position.target";
+  EXPECT_FALSE(position_owner.command_gripper(position_request).accepted);
+  const auto current = backend.get_gripper_status("position.target");
+  ASSERT_TRUE(position_owner.reset_gripper("position.target", current.command_id, current.generation).ok());
+  EXPECT_TRUE(position_owner.command_gripper(position_request).accepted);
+  EXPECT_EQ(backend.pneumatic.opens, 1); // established explicit Reset, not pneumatic ACK
+}
+
 TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactBackendCommand) {
   for (const bool hold_dispatch_return : {false, true}) {
     SCOPED_TRACE(hold_dispatch_return);
@@ -10332,6 +11978,7 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
       std::atomic<int> commands{};
       std::atomic<int> invalidations{};
       std::function<void()> return_hook;
+      bool refuse_local_fence{};
       GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override {
         {
           std::lock_guard lock(mutex);
@@ -10341,6 +11988,7 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
           status.command_id = 41U;  // deliberately not preparation id 1
           status.generation = 73U;
           status.state = GripperCommandState::kExecuting;
+          ++status.revision;
         }
         if (return_hook) return_hook();
         return {true, 41U, 73U, std::nullopt};
@@ -10357,8 +12005,11 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
       }
       void invalidate_gripper_commands(GripperInvalidationReason) noexcept override {
         std::lock_guard lock(mutex);
-        status.state = GripperCommandState::kIdle;
-        ++status.generation;
+        if (!refuse_local_fence) {
+          status.state = GripperCommandState::kIdle;
+          ++status.generation;
+          ++status.revision;
+        }
         ++invalidations;
       }
       void authorize_gripper_commands() noexcept override {}
@@ -10366,17 +12017,11 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
     FakeClock clock;
     ManualScheduler scheduler;
     GripperParticipantEngine gripper(backend, clock);
-    FakeParticipantEngine stop_port;
-    stop_port.translate_stop_stage_hook = [&] {
-      backend.invalidate_gripper_commands(GripperInvalidationReason::kStop);
-    };
     const ProgramCommandSchemaRefDTO schema{
         CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    auto row = registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
-                                         CoordinateKind::kLinear, schema),
-                            gripper);
-    row.stop_execution_port = &stop_port;
+    auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                                        CoordinateKind::kLinear, schema), gripper);
     ResourceAddressedExecutionKernel kernel(
         {row}, clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
@@ -10423,6 +12068,30 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
                 ResolvedPreparedCapabilityCommandStateDTO::kDispatchRequested);
       EXPECT_EQ(backend.invalidations.load(), 1);
       EXPECT_FALSE(kernel.get_stop_fault_latch());
+    }
+    const auto stop_readback = kernel.get_stop_status(stopped.value().stop_id);
+    ASSERT_TRUE(stop_readback.ok());
+    const auto attempt = std::find_if(
+        stop_readback.value().attempted_stage_results.begin(),
+        stop_readback.value().attempted_stage_results.end(), [](const auto& item) {
+          return item.authority == StopStageResultAuthorityDTO::kAuthoritative &&
+                 item.result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded;
+        });
+    ASSERT_NE(attempt, stop_readback.value().attempted_stage_results.end());
+    EXPECT_FALSE(attempt->result.controller_acknowledgement_sequence);
+    ASSERT_EQ(attempt->result.evidence_items.size(), 1U);
+    EXPECT_EQ(attempt->result.evidence_items.front().required_class,
+              StopEvidenceRequirementKind::kLogicalCancellationNoContinuingEffect);
+    const RemainingStopBudgetDTO budget{stopped.value().stop_id,
+                                         attempt->result.request.stop_generation, 0, {}};
+    EXPECT_EQ(gripper.TranslateStopStage(attempt->result.request, budget, {}), attempt->result);
+    const int fenced_invalidations = backend.invalidations.load();
+    for (const bool foreign_goal : {true, false}) {
+      auto foreign = attempt->result.request;
+      if (foreign_goal) foreign.controller_goal_id = ControllerGoalId("foreign.goal");
+      else foreign.provider_runtime_epoch = RuntimeEpoch("foreign.provider.epoch");
+      EXPECT_TRUE(gripper.TranslateStopStage(foreign, budget, {}).error);
+      EXPECT_EQ(backend.invalidations.load(), fenced_invalidations);
     }
     dispatch_return.Release();
     const auto accepted = executing.get();
@@ -10473,7 +12142,131 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
                      .ok());
     EXPECT_EQ(backend.commands.load(), 1);
     EXPECT_EQ(backend.invalidations.load(), 2);
+    // A thrown backend dispatch is uncertainty, never pre-dispatch absence.
+    // Keep the actual observed target executing and refuse typed containment.
+    GripperParticipantEngine uncertain(backend, clock);
+    const auto uncertain_preparation = uncertain.PrepareCapabilityCommand(request);
+    ASSERT_TRUE(uncertain_preparation.ok());
+    backend.return_hook = [] { throw std::runtime_error("actual dispatch return unavailable"); };
+    const auto uncertain_return = uncertain.DispatchPreparedCapabilityCommand(
+        uncertain_preparation.value(), snapshot.participant->prepared_contract_digest,
+        *snapshot.controller_goal_id, *snapshot.controller_goal_generation);
+    ASSERT_TRUE(uncertain_return.ok());
+    EXPECT_FALSE(uncertain_return.value().accepted);
+    EXPECT_TRUE(uncertain_return.value().error);
+    EXPECT_EQ(uncertain.ObservePreparedCapabilityCommand(uncertain_preparation.value()).value().state,
+              ResolvedPreparedCapabilityCommandStateDTO::kDispatchFailed);
+    const auto refused = uncertain.TranslateStopStage(attempt->result.request, budget, {});
+    EXPECT_EQ(refused.attempt_disposition, StopStageAttemptDispositionDTO::kNotDispatched);
+    EXPECT_EQ(refused.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+    EXPECT_TRUE(refused.error);
+    EXPECT_FALSE(refused.controller_acknowledgement_sequence);
+    EXPECT_EQ(backend.get_gripper_status(backend.last_request.gripper_id).state,
+              GripperCommandState::kExecuting);
+    EXPECT_EQ(backend.invalidations.load(), 2);
+    backend.return_hook = {};
+    // DX758: failed local fencing is distinct from unavailable cancel data.
+    GripperParticipantEngine unfenced(backend, clock);
+    const auto unfenced_preparation = unfenced.PrepareCapabilityCommand(request);
+    ASSERT_TRUE(unfenced_preparation.ok());
+    const auto unfenced_dispatch = unfenced.DispatchPreparedCapabilityCommand(
+        unfenced_preparation.value(), snapshot.participant->prepared_contract_digest,
+        *snapshot.controller_goal_id, *snapshot.controller_goal_generation);
+    ASSERT_TRUE(unfenced_dispatch.ok() && unfenced_dispatch.value().accepted);
+    backend.refuse_local_fence = true;
+    const auto local_refusal = unfenced.TranslateStopStage(attempt->result.request, budget, {});
+    EXPECT_EQ(local_refusal.attempt_disposition, StopStageAttemptDispositionDTO::kDispatched);
+    EXPECT_EQ(local_refusal.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(local_refusal.error);
+    EXPECT_EQ(local_refusal.error->details.at("reason"), "gripper_stop_generation_unavailable");
+    EXPECT_FALSE(local_refusal.controller_acknowledgement_sequence);
+    ASSERT_EQ(local_refusal.evidence_items.size(), 1U);
+    EXPECT_EQ(local_refusal.evidence_items.front().state, StopEvidenceItemStateDTO::kMissing);
+    EXPECT_FALSE(local_refusal.evidence_items.front().evidence);
+    EXPECT_EQ(backend.invalidations.load(), 3);
   }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, GripperStopFencesTheActualReleasedButUnenteredDispatch) {
+  for (const auto actuation : {GripperActuationKind::kPositionCommanded}) {
+    SCOPED_TRACE(static_cast<int>(actuation));
+    class Backend final : public IGripperCommandBackend {
+     public:
+      GripperActuationKind actuation{GripperActuationKind::kPositionCommanded};
+      GripperActuationKind gripper_actuation_kind(const std::string&) const override { return actuation; }
+      int commands{};
+      int invalidations{};
+      GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO&) override {
+        ++commands;
+        return {true, 41U, 73U, {}};
+      }
+      GripperCommandStatusDTO get_gripper_status(const std::string& id) const override {
+        GripperCommandStatusDTO value;
+        value.gripper_id = id;
+        return value;
+      }
+      GripperCommandResultDTO mark_gripper_grasp_lost(const std::string&, std::uint64_t,
+          std::uint64_t, const std::string&, const std::string&, const std::string&) override { return {}; }
+      void invalidate_gripper_commands(GripperInvalidationReason) noexcept override { ++invalidations; }
+      void authorize_gripper_commands() noexcept override {}
+    } backend;
+    backend.actuation = actuation;
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeOperationJournal journal;
+    GripperParticipantEngine gripper(backend, clock);
+    HeldSettlementCall before_entry;
+    PreparedGripperForwarder forwarder(gripper, before_entry.Blocker());
+    const ProgramCommandSchemaRefDTO schema{
+        CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                                        CoordinateKind::kLinear, schema), gripper);
+    row.prepared_motion_engine = &forwarder;
+    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto executing = std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
+    const bool entered = before_entry.Entered();
+    if (!entered) before_entry.Release();
+    ASSERT_TRUE(entered);
+    EXPECT_EQ(gripper.ObservePreparedCapabilityCommand(1U).value().state,
+              ResolvedPreparedCapabilityCommandStateDTO::kPrepared);
+    const auto stopped = kernel.full_stop(FullStopIntentDTO{
+        {RequestId("stop.real-gripper-entry-gap"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}},
+        StopGeneration(0U), {}});
+    if (!stopped.ok()) before_entry.Release();
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    const bool certified = wait_until([&] {
+      auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    });
+    if (!certified) before_entry.Release();
+    ASSERT_TRUE(certified);
+    EXPECT_EQ(gripper.ObservePreparedCapabilityCommand(1U).value().state,
+              ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch);
+    EXPECT_EQ(backend.commands, 0);
+    EXPECT_EQ(backend.invalidations, 0);
+    EXPECT_FALSE(kernel.get_stop_fault_latch());
+    before_entry.Release();
+    const auto returned = executing.get();
+    EXPECT_EQ(backend.commands, 0);
+    EXPECT_EQ(backend.invalidations, 0);
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(status.value().stop_certificate);
+    EXPECT_TRUE(status.value().attempted_stage_results.empty());
+    const auto session = gripper.ObservePreparedCapabilityCommand(1U);
+    ASSERT_TRUE(session.ok());
+    EXPECT_FALSE(session.value().dispatch_result);
+    EXPECT_EQ(session.value().state, ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch);
+    EXPECT_EQ(gripper.get_recovery_assessment().source_id, "addressed_participant_cancelled_before_dispatch");
+    ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 1U);
+    const auto terminal = kernel.get_operation_state(stopped.value().affected_operation_revisions.front().operation_id);
+    ASSERT_TRUE(terminal.ok());
+    EXPECT_EQ(terminal.value().state, OperationStateKind::kStopped);
+    (void)returned;  // The exact Stop owns the terminal, not the rejected late Dispatch return.
+  }
+
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -21004,5 +22797,551 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.execute_calls, 0);
 }
 #endif
+
+
+TEST(ResourceAddressedExecutionKernelTest, OrdinaryPrepareFailureAndStopWaitForTheSameBlockedWriter) {
+  using namespace std::chrono_literals;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm;
+  arm.defer_prepare_completion = true;
+  FinalPneumaticTestBackend backend;
+  GripperParticipantEngine output(backend, clock);
+  HeldSettlementCall prepare, writer;
+  PreparedGripperForwarder forwarder(output, [] {});
+  forwarder.prepare_hook = prepare.Blocker();
+  std::promise<void> actual_prepare_returned;
+  forwarder.after_prepare_hook = [&] { actual_prepare_returned.set_value(); };
+  FakeOperationJournal journal;
+  journal.record_hook = [block = writer.Blocker()](std::string_view kind) {
+    if (kind == "state:coordinated_participant_prepared_waiting") block();
+  };
+  const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+      CoordinateKind::kLinear, schema), "2");
+  auto ordinary = LogicalGripperRegistration(command, output);
+  ordinary.prepared_motion_engine = &forwarder;
+  ResourceAddressedExecutionKernel kernel({registration(moving, arm), ordinary}, clock, scheduler, journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto executing = std::async(std::launch::async, [&] {
+    return kernel.execute(coordinated_motion_command_operation("failure.waiting.writer"));
+  });
+  ASSERT_TRUE(prepare.Entered());
+  auto prepared_motion = std::async(std::launch::async, [&] { return arm.complete_preparation(); });
+  ASSERT_TRUE(writer.Entered());
+  backend.refuse_validation = true;
+  prepare.Release();
+  ASSERT_EQ(actual_prepare_returned.get_future().wait_for(10s), std::future_status::ready);
+  // The owner has returned a real refusal while the operation's writer is
+  // occupied. Stop is accepted before that writer is allowed to return.
+  // This observes the external ordering, not a private mutex waiter count.
+  EXPECT_EQ(executing.wait_for(10ms), std::future_status::timeout);
+  const auto stopped = kernel.full_stop({{RequestId("failure.waiting.writer.stop"),
+      RequestOwnerEpoch("kernel.epoch.1"), "test", {}}, StopGeneration(0U), {}});
+  ASSERT_TRUE(stopped.ok());
+  EXPECT_EQ(backend.commands, 0);
+  writer.Release();
+  ASSERT_TRUE(prepared_motion.get().ok());
+  const auto accepted = executing.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto reconciled = kernel.reconcile_subordinate_state();
+    const auto state = kernel.get_operation_state(accepted.value().operation_id);
+    return reconciled.ok() && state.ok() &&
+        state.value().participants.back().state == OperationStateKind::kInterventionRequired;
+  }));
+  ASSERT_TRUE(wait_until([&] {
+    return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value();
+  }));
+  const auto state = kernel.get_operation_state(accepted.value().operation_id).value();
+  ASSERT_TRUE(state.participants.back().terminal_error);
+  EXPECT_EQ(state.participants.back().terminal_error->code, "actual_prepare_refused");
+  EXPECT_EQ(state.participants.front().state, OperationStateKind::kStopped);
+  EXPECT_EQ(state.active_stop_id, stopped.value().stop_id);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.state, ResourceSlotState::kTerminal);
+    EXPECT_EQ(slot.owner->operation_id, accepted.value().operation_id);
+  }
+  EXPECT_EQ(arm.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(backend.commands, 0);
+  EXPECT_EQ(backend.closes, 0);
+  EXPECT_EQ(backend.opens, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelOperatorAlarmTest, ContinueCommandFinalAlarmRefusalDuringZeroMovingStopIsDisposed) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FinalPneumaticTestBackend backend;
+  GripperParticipantEngine output(backend, clock);
+  HeldSettlementCall prepare, writer;
+  PreparedGripperForwarder forwarder(output, [] {});
+  forwarder.prepare_hook = prepare.Blocker();
+  FakeOperationJournal journal;
+  journal.record_hook = [block = writer.Blocker()](std::string_view kind) {
+    if (kind == "state:subordinate_command_prepared") block();
+  };
+  const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  auto registration = LogicalGripperRegistration(physical, output);
+  registration.prepared_motion_engine = &forwarder;
+  auto config = attention_config();
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({registration}, clock, scheduler, journal, config);
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_policy_capture(physical)).ok());
+  const auto ready = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(ready.ok());
+  ASSERT_TRUE(kernel.start_program_selection(program_selection_request("alarm.continue.start", "all"),
+      ready.value().selection_revision).ok());
+  auto executing = std::async(std::launch::async, [&] {
+    return kernel.execute(pneumatic_policy_operation("alarm.continue.command"));
+  });
+  ASSERT_TRUE(prepare.Entered());
+  // Exact source/oracle partial selection: raw Held a_child is effective
+  // Continue because its Hold parent's subtree is not wholly held.
+  const auto stopped = kernel.stop_program_selection(program_selection_request("alarm.continue.stop", "child_only"));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  prepare.Release();
+  ASSERT_TRUE(writer.Entered());
+  std::vector<std::string> affected;
+  for (const auto& resource : physical.value().resources) affected.push_back(resource.resource_id.value());
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(2U,
+      {alarm_member("late.output", OperatorAlarmAttentionGateDTO::kAcknowledgement, affected)})).ok());
+  writer.Release();
+  const auto accepted = executing.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  ASSERT_EQ(state.value().participants.size(), 1U);
+  EXPECT_TRUE(state.value().active_stop_id);
+  EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(state.value().participants.front().state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(state.value().participants.front().terminal_error);
+  EXPECT_EQ(state.value().participants.front().terminal_error->code, "unacknowledged_operator_alarms");
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.state, ResourceSlotState::kTerminal);
+    EXPECT_EQ(slot.stop_generation, StopGeneration(0U));
+  }
+  const auto prepared = output.ObservePreparedCapabilityCommand(1U);
+  ASSERT_TRUE(prepared.ok());
+  EXPECT_EQ(prepared.value().state, ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch);
+  EXPECT_FALSE(prepared.value().dispatch_result);
+  EXPECT_EQ(backend.commands, 0);
+  EXPECT_EQ(backend.closes, 0);
+  EXPECT_EQ(backend.opens, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, FailedMovingStopDisposesLaterExcludedPreparedCommandWithoutSending) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm;
+  arm.next_stop_result = {false, ErrorDTO{"actual_moving_stop_failed", "Moving hard stop failed", {}}};
+  FinalPneumaticTestBackend backend;
+  GripperParticipantEngine output(backend, clock);
+  HeldSettlementCall first_dispatch;
+  arm.execute_return_hook = first_dispatch.Blocker();
+  const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+      CoordinateKind::kLinear, schema), "2");
+  ResourceAddressedExecutionKernel kernel({registration(moving, arm), LogicalGripperRegistration(command, output)},
+      clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto executing = std::async(std::launch::async, [&] {
+    return kernel.execute(coordinated_motion_command_operation("fault.before.later.command"));
+  });
+  ASSERT_TRUE(first_dispatch.Entered());
+  const auto before = output.ObservePreparedCapabilityCommand(1U);
+  ASSERT_TRUE(before.ok());
+  ASSERT_EQ(before.value().state, ResolvedPreparedCapabilityCommandStateDTO::kPrepared);
+  // Ordinary exhausted Stop is participant-scoped under Q29. The genuine
+  // component incident supplies the independent cell-admission closure.
+  const auto stopped = kernel.RequestComponentIncidentContainment(
+      ComponentIncidentContainmentIntentDTO{"fault.before.later.command.incident",
+          moving.value().controllable_component_id, LifecycleBlockingCauseClassDTO::kProviderLost});
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(wait_until([&] {
+    return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value() &&
+           kernel.get_stop_fault_latch().has_value();
+  }));
+  const auto stop_before_return = kernel.get_stop_status(stopped.value().stop_id).value();
+  EXPECT_EQ(backend.commands, 0);
+  first_dispatch.Release();
+  const auto accepted = executing.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto after = kernel.get_operation_state(accepted.value().operation_id).value();
+  ASSERT_EQ(after.participants.size(), 2U);
+  EXPECT_EQ(after.state, OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(after.participants.back().state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(after.participants.back().terminal_error);
+  EXPECT_EQ(after.participants.back().terminal_error->details.at("reason"), "motion_admission_closed");
+  const auto cancelled = output.ObservePreparedCapabilityCommand(1U);
+  ASSERT_TRUE(cancelled.ok());
+  EXPECT_EQ(cancelled.value().state, ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch);
+  EXPECT_FALSE(cancelled.value().dispatch_result);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.state, ResourceSlotState::kTerminal);
+    EXPECT_EQ(slot.owner->operation_id, accepted.value().operation_id);
+  }
+  EXPECT_EQ(kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate,
+            stop_before_return.stop_certificate);
+  EXPECT_TRUE(kernel.get_stop_fault_latch());
+  EXPECT_EQ(backend.commands, 0);
+  EXPECT_EQ(backend.closes, 0);
+  EXPECT_EQ(backend.opens, 0);
+}
+
+// Append inside the existing test translation unit's anonymous namespace.
+// Requires only forwarder-local-fixture.patch. This is authored, unexecuted
+// Core unit source over the genuine prepared GripperParticipantEngine.
+TEST(ResourceAddressedExecutionKernelTest, PreparedCancellationRetryRetainsOwnerUntilActualCancelAndObserveReturn) {
+  for (const bool block_observe : {false, true}) {
+    SCOPED_TRACE(block_observe);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FinalPneumaticTestBackend backend;
+    GripperParticipantEngine owner(backend, clock);
+    HeldSettlementCall before_dispatch, retry_call;
+    PreparedGripperForwarder forwarder(owner, before_dispatch.Blocker());
+    const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command",
+        CoordinateKind::kLinear, schema);
+    auto row = LogicalGripperRegistration(physical, owner);
+    row.prepared_motion_engine = &forwarder;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, default_journal, config);
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_policy_capture(physical)).ok());
+    start_program_motion(kernel);
+    const auto original = pneumatic_policy_operation("retry.borrow.original");
+    auto executing = std::async(std::launch::async, [&] { return kernel.execute(original); });
+    ASSERT_TRUE(before_dispatch.Entered());
+    const auto preparation_id = forwarder.last_preparation_id.load();
+    ASSERT_NE(preparation_id, 0U);
+    const auto held = kernel.stop_program_selection(program_selection_request("retry.borrow.hold", "whole"));
+    ASSERT_TRUE(held.ok() && held.value().fresh_containment);
+    const auto actual_cancel = owner.ObservePreparedCapabilityCommand(preparation_id);
+    ASSERT_TRUE(actual_cancel.ok());
+    EXPECT_EQ(actual_cancel.value().state, ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch);
+    EXPECT_FALSE(actual_cancel.value().dispatch_result);
+    forwarder.observation_unavailable = true;
+    before_dispatch.Release();
+    const auto accepted = executing.get();
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      const auto stop = kernel.get_stop_status(held.value().fresh_containment->stop_id);
+      return stop.ok() && stop.value().stop_certificate.has_value();
+    }));
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    const auto unknown = kernel.get_operation_projection(accepted.value().operation_id);
+    ASSERT_TRUE(unknown.ok() && unknown.value().resident);
+    EXPECT_NE(unknown.value().operation.state, OperationStateKind::kCancelledPreDispatch);
+    EXPECT_NE(unknown.value().operation.state, OperationStateKind::kCompleted);
+    const auto original_slots = kernel.resource_snapshot();
+    ASSERT_EQ(original_slots.size(), 1U);
+    ASSERT_TRUE(original_slots.front().owner);
+    EXPECT_NE(original_slots.front().state, ResourceSlotState::kFree);
+
+    // Only an actual retry owner call is held, never a manufactured Kernel
+    // borrow. The same returned preparation ID reaches the real owner.
+    forwarder.observation_unavailable = false;
+    if (block_observe) forwarder.observe_hook = retry_call.Blocker();
+    else forwarder.cancel_hook = retry_call.Blocker();
+    auto retrying = std::async(std::launch::async, [&] { return kernel.reconcile_subordinate_state(); });
+    ASSERT_TRUE(retry_call.Entered());
+    const auto during = kernel.get_operation_projection(accepted.value().operation_id);
+    ASSERT_TRUE(during.ok() && during.value().resident);
+    const auto concurrent_request = control_request("retry.borrow.concurrent.reset", accepted.value(),
+        during.value().operation.operation_revision.value());
+    auto resetting = std::async(std::launch::async, [&] { return kernel.reset(concurrent_request); });
+    // Cancel is outside the proof writer; Observe may hold that writer, so
+    // Reset may remain pending until the actual Observe call returns.
+    if (!block_observe) {
+      EXPECT_EQ(resetting.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    }
+    std::optional<Result<OperationControlAcceptedDTO>> early_reset;
+    if (resetting.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+      early_reset.emplace(resetting.get());
+      ASSERT_FALSE(early_reset->ok());
+      EXPECT_EQ(early_reset->error().details.at("reason"), "operation_effect_in_flight");
+    }
+    const auto retained = kernel.get_operation_projection(accepted.value().operation_id);
+    ASSERT_TRUE(retained.ok() && retained.value().resident);
+    const auto borrowed_slots = kernel.resource_snapshot();
+    ASSERT_EQ(borrowed_slots.size(), 1U);
+    EXPECT_EQ(borrowed_slots.front().owner, original_slots.front().owner);
+    EXPECT_EQ(borrowed_slots.front().state, original_slots.front().state);
+    EXPECT_EQ(backend.commands, 0);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+
+    retry_call.Release();
+    ASSERT_TRUE(retrying.get().ok());
+    if (!early_reset) early_reset.emplace(resetting.get());
+    const auto permanent = owner.ObservePreparedCapabilityCommand(preparation_id);
+    ASSERT_TRUE(permanent.ok());
+    EXPECT_EQ(permanent.value().state, ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch);
+    EXPECT_FALSE(permanent.value().dispatch_result);
+    const auto after_return = kernel.get_operation_projection(accepted.value().operation_id);
+    ASSERT_TRUE(after_return.ok());
+    if (after_return.value().resident) {
+      // A concurrent refusal/stale CAS retains the exact owner. Only now,
+      // after the real call and positive proof, may local retirement occur.
+      ASSERT_EQ(after_return.value().operation.state, OperationStateKind::kCancelledPreDispatch);
+      const auto cleanup = kernel.reset(control_request("retry.borrow.local.retirement", accepted.value(),
+          after_return.value().operation.operation_revision.value()));
+      ASSERT_TRUE(cleanup.ok()) << cleanup.error().message;
+    } else {
+      // Writer-serialized Reset may complete only after Observe returned.
+      ASSERT_TRUE(early_reset->ok());
+      ASSERT_TRUE(after_return.value().last_control);
+      EXPECT_EQ(after_return.value().last_control->request_id, concurrent_request.request_context.request_id);
+    }
+    const auto history = kernel.get_operation_projection(accepted.value().operation_id);
+    ASSERT_TRUE(history.ok());
+    EXPECT_FALSE(history.value().resident);
+    EXPECT_FALSE(history.value().control_pending);
+    for (const auto& slot : kernel.resource_snapshot()) {
+      EXPECT_EQ(slot.state, ResourceSlotState::kFree);
+      EXPECT_FALSE(slot.owner);
+    }
+    EXPECT_EQ(backend.commands, 0);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+  }
+}
+
+// Append inside the existing anonymous namespace, after the typed pneumatic
+// fixtures. Uses forwarder-local-fixture.patch only to capture actual Prepare ID.
+// This reachable unscoped/F2-fault case has historical release=false for the
+// pneumatic row. It does NOT claim the publicly unreachable scoped mixed
+// CommonStart/historical-release=true case described in limitations.md.
+TEST(ResourceAddressedExecutionKernelTest, MixedResetRetainsUnknownOrdinaryPreparationAndSkipsProvenNoEffectOwner) {
+  for (const bool initially_unknown : {false, true}) {
+    SCOPED_TRACE(initially_unknown);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine arm;
+    arm.next_stop_result = StopResultDTO{false,
+        ErrorDTO{"actual_moving_stop_failed", "Actual moving provider refuses containment", {}}};
+    FinalPneumaticTestBackend backend;
+    GripperParticipantEngine owner(backend, clock);
+    HeldSettlementCall first_dispatch, moving_reset;
+    arm.execute_return_hook = first_dispatch.Blocker();
+    PreparedGripperForwarder forwarder(owner, [] {});
+    const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto physical = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+        CoordinateKind::kLinear, schema), "2");
+    auto ordinary = LogicalGripperRegistration(physical, owner);
+    ordinary.prepared_motion_engine = &forwarder;
+    ResourceAddressedExecutionKernel kernel({registration(moving, arm), ordinary}, clock, scheduler,
+        default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto executing = std::async(std::launch::async, [&] {
+      return kernel.execute(coordinated_motion_command_operation("mixed.reset.actual.fault"));
+    });
+    ASSERT_TRUE(first_dispatch.Entered());
+    const auto preparation_id = forwarder.last_preparation_id.load();
+    ASSERT_NE(preparation_id, 0U);
+    const auto prepared = owner.ObservePreparedCapabilityCommand(preparation_id);
+    ASSERT_TRUE(prepared.ok());
+    ASSERT_EQ(prepared.value().state, ResolvedPreparedCapabilityCommandStateDTO::kPrepared);
+    ASSERT_FALSE(prepared.value().dispatch_result);
+    const auto stopped = kernel.RequestComponentIncidentContainment(
+        ComponentIncidentContainmentIntentDTO{"mixed.reset.actual.incident",
+            moving.value().controllable_component_id, LifecycleBlockingCauseClassDTO::kProviderLost});
+    ASSERT_TRUE(stopped.ok());
+    // The actual component incident closes admission. An ordinary failed
+    // software-hard stage alone does not latch the cell under preserved Q29.
+    ASSERT_TRUE(wait_until([&] {
+      const auto stop = kernel.get_stop_status(stopped.value().stop_id);
+      return stop.ok() && stop.value().stop_certificate.has_value() && kernel.get_stop_fault_latch().has_value();
+    }));
+    forwarder.observation_unavailable = initially_unknown;
+    first_dispatch.Release();
+    const auto accepted = executing.get();
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    const auto actual_cancel = owner.ObservePreparedCapabilityCommand(preparation_id);
+    ASSERT_TRUE(actual_cancel.ok());
+    EXPECT_EQ(actual_cancel.value().state, ResolvedPreparedCapabilityCommandStateDTO::kCancelledPreDispatch);
+    EXPECT_FALSE(actual_cancel.value().dispatch_result);
+    EXPECT_EQ(backend.commands, 0);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+    const auto original = kernel.get_operation_projection(accepted.value().operation_id);
+    ASSERT_TRUE(original.ok() && original.value().resident);
+    if (initially_unknown) {
+      const auto refused = kernel.reset(control_request("mixed.reset.unknown", accepted.value(),
+          original.value().operation.operation_revision.value()));
+      ASSERT_FALSE(refused.ok());
+      EXPECT_EQ(refused.error().details.at("reason"), "operation_effect_in_flight");
+      EXPECT_EQ(arm.certified_reset_calls, 0);
+      EXPECT_TRUE(kernel.get_operation_projection(accepted.value().operation_id).value().resident);
+      for (const auto& slot : kernel.resource_snapshot()) {
+        ASSERT_TRUE(slot.owner);
+        EXPECT_EQ(slot.owner->operation_id, accepted.value().operation_id);
+        EXPECT_NE(slot.state, ResourceSlotState::kFree);
+      }
+      forwarder.observation_unavailable = false;
+      ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    }
+    const auto proven = kernel.get_operation_projection(accepted.value().operation_id);
+    ASSERT_TRUE(proven.ok() && proven.value().resident);
+    ASSERT_EQ(proven.value().operation.participants.size(), 2U);
+    // The original moving fault and ordinary final refusal are truthful
+    // terminal causes, not fake errors added to make aggregate reduction work.
+    EXPECT_EQ(proven.value().operation.state, OperationStateKind::kInterventionRequired);
+    const auto& ordinary_row = proven.value().operation.participants.back();
+    EXPECT_EQ(ordinary_row.payload_kind, OperationParticipantPayloadKind::kCapabilityCommand);
+    EXPECT_EQ(ordinary_row.state, OperationStateKind::kInterventionRequired);
+    ASSERT_TRUE(ordinary_row.terminal_error);
+    EXPECT_EQ(ordinary_row.terminal_error->details.at("reason"), "motion_admission_closed");
+
+    // Restore only the real unit provider's next containment outcome for the
+    // explicit user Reset. Kernel faults and admission remain owner-controlled.
+    arm.next_stop_result = StopResultDTO{true, std::nullopt};
+    arm.reset_effect_hook = moving_reset.Blocker();
+    const auto request = control_request("mixed.reset.proven", accepted.value(),
+        proven.value().operation.operation_revision.value());
+    auto resetting = std::async(std::launch::async, [&] { return kernel.reset(request); });
+    ASSERT_TRUE(moving_reset.Entered());
+    EXPECT_TRUE(kernel.get_operation_projection(accepted.value().operation_id).value().resident);
+    for (const auto& slot : kernel.resource_snapshot()) {
+      ASSERT_TRUE(slot.owner);
+      EXPECT_EQ(slot.owner->operation_id, accepted.value().operation_id);
+      EXPECT_NE(slot.state, ResourceSlotState::kFree);
+    }
+    EXPECT_EQ(arm.certified_reset_calls, 1);
+    EXPECT_EQ(backend.commands, 0);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+    moving_reset.Release();
+    const auto reset = resetting.get();
+    ASSERT_TRUE(reset.ok()) << reset.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      const auto history = kernel.get_operation_projection(accepted.value().operation_id);
+      return history.ok() && !history.value().resident && !history.value().control_pending;
+    }));
+    for (const auto& slot : kernel.resource_snapshot()) {
+      EXPECT_EQ(slot.state, ResourceSlotState::kFree);
+      EXPECT_FALSE(slot.owner);
+    }
+    EXPECT_EQ(arm.certified_reset_calls, 1);
+    EXPECT_EQ(backend.commands, 0);
+    EXPECT_EQ(backend.closes, 0);  // No pneumatic Reset invalidation.
+    EXPECT_EQ(backend.opens, 0);   // No pneumatic authorization.
+  }
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest, OrdinaryPneumaticAckRetiresOnceAcrossStopOrderingAndRealReturn) {
+  for (const bool stop_first : {false, true}) {
+    for (const bool hold_acceptance : {false, true}) {
+      SCOPED_TRACE(stop_first);
+      SCOPED_TRACE(hold_acceptance);
+      FakeClock clock;
+      ManualScheduler scheduler;
+      FakeOperationJournal journal;
+      FinalPneumaticTestBackend backend;
+      GripperParticipantEngine owner(backend, clock);
+      const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+          CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+      const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+      ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(physical, owner)}, clock, scheduler,
+          journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      const auto accepted = kernel.execute(command_operation("ordinary.ack.stop.ordering"));
+      ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+      EXPECT_EQ(backend.commands, 1);
+      const auto stop = [&] {
+        const auto stopped = kernel.full_stop({{RequestId("ordinary.ack.stop"), RequestOwnerEpoch("kernel.epoch.1"),
+            "test", {}}, StopGeneration(0U), {}});
+        EXPECT_TRUE(stopped.ok());
+        if (stopped.ok()) {
+          EXPECT_TRUE(wait_until([&] {
+            return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value();
+          }));
+          const auto status = kernel.get_stop_status(stopped.value().stop_id);
+          EXPECT_TRUE(status.ok());
+          if (status.ok()) {
+            EXPECT_TRUE(status.value().scope_entries.empty());
+            EXPECT_TRUE(status.value().attempted_stage_results.empty());
+          }
+        }
+      };
+      if (stop_first) stop();
+      backend.finish(false);
+      ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+      const auto completed = kernel.get_operation_projection(accepted.value().operation_id);
+      ASSERT_TRUE(completed.ok() && completed.value().resident);
+      ASSERT_EQ(completed.value().operation.state, OperationStateKind::kCompleted);
+      HeldSettlementCall ack_return;
+      std::atomic<int> actual_ack_reads{};
+      backend.status_read_hook = [&, block = ack_return.Blocker()] {
+        ++actual_ack_reads;
+        if (!hold_acceptance) block();
+      };
+      if (hold_acceptance) journal.control_acceptance_hook = ack_return.Blocker();
+      const auto request = control_request("ordinary.ack.once", accepted.value(),
+          completed.value().operation.operation_revision.value());
+      auto acknowledging = std::async(std::launch::async, [&] { return kernel.acknowledge_completed(request); });
+      ASSERT_TRUE(ack_return.Entered());
+      if (!stop_first) stop();
+      const auto borrowed = kernel.get_operation_projection(accepted.value().operation_id);
+      ASSERT_TRUE(borrowed.ok() && borrowed.value().resident);
+      EXPECT_TRUE(borrowed.value().control_pending);
+      for (const auto& row : kernel.resource_snapshot()) {
+        ASSERT_TRUE(row.owner);
+        EXPECT_EQ(row.owner->operation_id, accepted.value().operation_id);
+        EXPECT_EQ(row.state, ResourceSlotState::kTerminal);
+      }
+      EXPECT_EQ(backend.commands, 1);
+      EXPECT_EQ(backend.opens, 0);
+      EXPECT_EQ(backend.closes, 0);
+      // Actual ordinary result consumption or its durable acceptance is
+      // still held. Neither Stop order releases this exact owner early.
+      ack_return.Release();
+      const auto acknowledged = acknowledging.get();
+      ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
+      ASSERT_TRUE(wait_until([&] {
+        const auto history = kernel.get_operation_projection(accepted.value().operation_id);
+        return history.ok() && !history.value().resident && !history.value().control_pending;
+      }));
+      const auto history = kernel.get_operation_projection(accepted.value().operation_id);
+      ASSERT_TRUE(history.ok() && history.value().last_control);
+      EXPECT_EQ(history.value().operation.state, OperationStateKind::kCompleted);
+      EXPECT_EQ(history.value().last_control->request_id, request.request_context.request_id);
+      const auto replay = kernel.acknowledge_completed(request);
+      ASSERT_TRUE(replay.ok());
+      EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+      EXPECT_EQ(replay.value().operation_revision_after_acceptance,
+                acknowledged.value().operation_revision_after_acceptance);
+      EXPECT_EQ(actual_ack_reads, 1);
+      {
+        std::lock_guard lock(journal.mutex);
+        EXPECT_EQ(std::count(journal.calls.begin(), journal.calls.end(), "control_accepted"), 1);
+      }
+      for (const auto& row : kernel.resource_snapshot()) {
+        EXPECT_EQ(row.state, ResourceSlotState::kFree);
+        EXPECT_FALSE(row.owner);
+      }
+      EXPECT_EQ(backend.commands, 1);
+      EXPECT_EQ(backend.opens, 0);
+      EXPECT_EQ(backend.closes, 0);
+    }
+  }
+}
 
 }  // namespace

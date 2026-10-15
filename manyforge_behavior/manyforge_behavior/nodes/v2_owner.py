@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 from typing import Any
 
 import py_trees
@@ -621,6 +622,74 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 self._record_owner_error("owner_cancellation_failed", exc)
 
 
+class GripperCommandAdapter(OwnerTaskAdapter):
+    """Consume real delivery, then dwell on the run's existing Program clock."""
+
+    def __init__(
+        self,
+        *,
+        program_clock: ProgramClock,
+        operator_stop_state: OperatorMotionStopState | None = None,
+        operator_stop_hold_scope: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(operator_stop_state=operator_stop_state, **kwargs)
+        self._dwell_time = AttemptTime(
+            program_clock,
+            operator_stop_state=(operator_stop_state if operator_stop_hold_scope is not None else None),
+            operator_stop_hold_scope=operator_stop_hold_scope,
+        )
+        self._dwell_s: float | None = None
+        self._timing_captured = False
+        self._dwell_started = False
+        self._draining_dwell = False
+
+    def initialise(self) -> None:
+        super().initialise()
+        self._dwell_s = None
+        self._timing_captured = False
+        self._dwell_started = False
+
+    def _settle(self, task: OwnerTaskSnapshot) -> py_trees.common.Status:
+        if not self._timing_captured:
+            # Production captures these facts from the exact retained descriptor
+            # before submit. Neither policy names nor missing metadata select IO.
+            if task.metadata.get("gripper_actuation_kind") == "pneumatic":
+                dwell = task.metadata.get("gripper_dwell_s")
+                if (type(dwell) not in (int, float) or not math.isfinite(dwell)
+                    or dwell < 0):
+                    self._record_owner_failure("owner_result_invalid", "invalid captured Program dwell")
+                    return py_trees.common.Status.FAILURE
+                self._dwell_s = float(dwell)
+            self._timing_captured = True
+        if (task.state is OwnerTaskState.SUCCEEDED
+            and self._dwell_s is not None and not self._dwell_started):
+            # First observed actual Success, before ACK (which may still pend).
+            # This local observation time is not a backend delivery timestamp.
+            self._dwell_time.start(exclude_held=(self._inputs or {}).get("dwell_while_held", "pause") == "pause")
+            self._dwell_started = True
+        result = super()._settle(task)
+        if (result is py_trees.common.Status.SUCCESS and self._dwell_s is not None
+            and (self._draining_dwell or self._dwell_time.elapsed() < self._dwell_s)):
+            return py_trees.common.Status.RUNNING
+        return result
+
+    def observe_while_operator_stop_held(self) -> None:
+        # Delivery/ACK still drain while held. A due dwell is reported only
+        # when normal scheduling is permitted again, like the existing Timer.
+        self._draining_dwell = True
+        try:
+            super().observe_while_operator_stop_held()
+        finally:
+            self._draining_dwell = False
+
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        super().terminate(new_status)
+        if new_status is py_trees.common.Status.INVALID:
+            self._dwell_s = None
+            self._dwell_started = False
+
+
 class OwnerInvocationAdapter(_OwnerAdapter):
     """Issue one bounded synchronous owner request per node attempt."""
 
@@ -808,4 +877,4 @@ class GripperStatusWaitAdapter(_OwnerAdapter):
         return py_trees.common.Status.RUNNING
 
 
-__all__ = ["OwnerInvocationAdapter", "OwnerTaskAdapter", "GripperStatusWaitAdapter"]
+__all__ = ["OwnerInvocationAdapter", "OwnerTaskAdapter", "GripperCommandAdapter", "GripperStatusWaitAdapter"]

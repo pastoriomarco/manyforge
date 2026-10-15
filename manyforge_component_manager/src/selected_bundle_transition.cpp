@@ -76,8 +76,31 @@ bool ManagerComponentProcessInventoryRequestDTO::valid() const noexcept {
          identity(manager_runtime_epoch);
 }
 
+bool ManagerPneumaticNoneProcessOwnerDTO::valid() const noexcept {
+  const auto identity = [](const auto &value) {
+    return !value.empty() &&
+           value.value().size() <= manyforge::core::kMaxLifecycleIdentityBytes &&
+           value.value().find('\0') == std::string::npos;
+  };
+  return identity(command_target_id) && identity(control_binding_id) &&
+         identity(control_binding_revision);
+}
+
 bool ManagerComponentProcessOccurrenceDTO::valid() const noexcept {
   using namespace manyforge::core;
+  if (process_owner_kind == ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) {
+    return !controllable_component_id.empty() &&
+           controllable_component_id.value().size() <= kMaxLifecycleIdentityBytes &&
+           controllable_component_id.value().find('\0') == std::string::npos &&
+           launch_identity.empty() && leader_pid == 0 &&
+           process_presence == ProcessPresenceState::kAbsent &&
+           cleanup_state == ControllerLaunchCleanupState::kNotRequested && !receipt &&
+           installed_runtime_identity &&
+           IsExactLowercaseSha256Digest(installed_runtime_identity->value()) &&
+           pneumatic_none_owner && pneumatic_none_owner->valid();
+  }
+  if (process_owner_kind != ManagerComponentProcessOwnerKindDTO::kControllerLaunch ||
+      pneumatic_none_owner) return false;
   if (controllable_component_id.empty() ||
       controllable_component_id.value().size() > kMaxLifecycleIdentityBytes ||
       launch_identity.empty() ||
@@ -134,6 +157,17 @@ bool ManagerComponentBringUpInspectionRequestDTO::valid() const noexcept {
 }
 
 bool ManagerComponentProcessObservationDTO::valid() const noexcept {
+  if (process_owner_kind == ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) {
+    return !controllable_component_id.empty() &&
+           controllable_component_id.value().size() <= manyforge::core::kMaxLifecycleIdentityBytes &&
+           controllable_component_id.value().find('\0') == std::string::npos &&
+           process_presence == ProcessPresenceState::kAbsent &&
+           pneumatic_none_owner && pneumatic_none_owner->valid() &&
+           installed_runtime_identity &&
+           manyforge::core::IsExactLowercaseSha256Digest(installed_runtime_identity->value());
+  }
+  if (process_owner_kind != ManagerComponentProcessOwnerKindDTO::kControllerLaunch ||
+      pneumatic_none_owner || installed_runtime_identity) return false;
   return !controllable_component_id.empty() &&
          (process_presence == ProcessPresenceState::kUnknown ||
           process_presence == ProcessPresenceState::kAbsent ||

@@ -445,4 +445,29 @@ TEST(FilesystemResolvedStopBasePlanRepository,
 }
 
 }  // namespace
+
+TEST(FilesystemResolvedStopBasePlanRepository, ReopensTypedPneumaticPlanAndRefusesForeignContent) {
+  TemporaryDirectory root;
+  auto candidate = GoldenPlan();
+  candidate.gripper_actuation_kind = GripperActuationKind::kPneumatic;
+  candidate.escalation_stages.erase(candidate.escalation_stages.begin() + 1,
+                                    candidate.escalation_stages.end());
+  candidate.containment_granularity = candidate.escalation_stages.back().containment_granularity;
+  const auto made = MakeResolvedStopBasePlan(candidate);
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  {
+    FilesystemResolvedStopBasePlanRepository repository(root.path());
+    const auto stored = repository.PutIfAbsent(candidate);
+    ASSERT_TRUE(stored.ok()) << stored.error().message;
+    EXPECT_EQ(stored.value(), made.value().resolved_stop_base_plan_id);
+    EXPECT_EQ(ReadFile(PlanPath(root.path(), stored.value())), Encoded(made.value()));
+  }
+  FilesystemResolvedStopBasePlanRepository reopened(root.path());
+  const auto retained = reopened.LoadVerified(made.value().resolved_stop_base_plan_id);
+  ASSERT_TRUE(retained.ok()) << retained.error().message;
+  EXPECT_EQ(retained.value(), made.value());
+  WriteFile(PlanPath(root.path(), made.value().resolved_stop_base_plan_id), GoldenBytes());
+  EXPECT_FALSE(reopened.LoadVerified(made.value().resolved_stop_base_plan_id).ok());
+}
+
 }  // namespace manyforge::core

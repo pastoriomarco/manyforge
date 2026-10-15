@@ -12,7 +12,7 @@ namespace manyforge::core {
 namespace {
 [[nodiscard]] bool prepared_command_matches_private_request(
     const PreparedOperationParticipantDTO& participant, const RuntimeParticipantBindingDTO& binding,
-    const GripperCommandRequestDTO& request) noexcept {
+    const GripperCommandRequestDTO& request, GripperActuationKind actuation, GripperOutputMode output) noexcept {
   const auto* command = std::get_if<PreparedCapabilityCommandDTO>(&participant.payload);
   if (command == nullptr || binding.resources.size() != 1U || !binding.control_path.has_value() ||
       participant.command_target_id != binding.command_target_id) {
@@ -48,8 +48,11 @@ namespace {
          request.max_effort == effort && request.commanded_state == "position" &&
          request.actuation_kind == (kind == CoordinateKind::kAngular ? "angular" : "linear") &&
          request.state_authority == binding.control_path->state_authority_id.value() &&
-         request.completion_policy == "goal_fenced_target_reached" &&
-         request.grasp_confirmation_policy == "binding_feedback_required" &&
+         request.completion_policy == (actuation == GripperActuationKind::kPneumatic
+                                         ? (output == GripperOutputMode::kNone ? "no_output" : "output_delivery")
+                                         : "goal_fenced_target_reached") &&
+         request.grasp_confirmation_policy == (actuation == GripperActuationKind::kPneumatic
+                                                  ? "not_required" : "binding_feedback_required") &&
          request.transport_kind == "resolved_binding" &&
          request.evidence == std::vector<std::string>{"command_terminal"} &&
          request.evidence_state == "required_pending" &&
@@ -62,9 +65,12 @@ struct GripperParticipantEngine::PreparedCapabilityCommandSession final {
       : authority(std::move(supplied)) {}
 
   ResolvedPreparedCapabilityCommandExecutionRequestDTO authority;
+  GripperActuationKind actuation{GripperActuationKind::kPositionCommanded};
+  bool ordinary_result_acknowledged{};
+  std::uint64_t owner_lifecycle_generation{};
   mutable std::mutex mutex;
   std::uint64_t preparation_id{};
-  ResolvedPreparedCapabilityCommandStateDTO state{
+  std::atomic<ResolvedPreparedCapabilityCommandStateDTO> state{
       ResolvedPreparedCapabilityCommandStateDTO::kPreparationFailed};
   std::optional<PrepareParticipantResultDTO> backend_prepare_result;
   std::optional<ControllerGoalId> controller_goal_id;
@@ -72,6 +78,7 @@ struct GripperParticipantEngine::PreparedCapabilityCommandSession final {
   std::optional<GripperCommandResultDTO> dispatch_result;
   std::optional<AddressedParticipantStopSettlementDTO> stop_settlement;
   bool stop_recovery_consumed{};
+  std::optional<ParticipantStopStageResultDTO> translated_stop;
   std::optional<ErrorDTO> error;
 };
 
@@ -101,6 +108,45 @@ SubscriptionHandle GripperParticipantEngine::subscribe_events(EventCallback call
 void GripperParticipantEngine::unsubscribe_events(SubscriptionHandle handle) {
   event_publisher_.unsubscribe(handle);
 }
+GripperActuationKind GripperParticipantEngine::gripper_actuation_kind(
+    const std::string& target) const {
+  return backend_.gripper_actuation_kind(target);
+}
+GripperOutputMode GripperParticipantEngine::gripper_output_mode(const std::string& target) const {
+  return backend_.gripper_output_mode(target);
+}
+AcknowledgeCompletedResultDTO GripperParticipantEngine::acknowledge_completed(
+    const std::uint64_t preparation_id, const std::optional<std::uint64_t> expected_epoch) {
+  std::shared_ptr<PreparedCapabilityCommandSession> session;
+  {
+    std::lock_guard lock(prepared_command_session_mutex_);
+    session = active_prepared_command_session_.load();
+  }
+  if (!session) return {false, unsupported_error()};
+  std::lock_guard lock(session->mutex);
+  if (session->actuation != GripperActuationKind::kPneumatic ||
+      session->preparation_id != preparation_id ||
+      (expected_epoch && *expected_epoch != control_command_epoch_.load()))
+    return {false, unsupported_error()};
+  if (session->ordinary_result_acknowledged) return {true, std::nullopt};
+  bool final = session->state == ResolvedPreparedCapabilityCommandStateDTO::kDispatchFailed;
+  if (session->state == ResolvedPreparedCapabilityCommandStateDTO::kDispatched &&
+      session->dispatch_result && session->dispatch_result->accepted &&
+      !session->dispatch_result->error) {
+    const auto status = backend_.get_gripper_status(session->authority.command_request.gripper_id);
+    final = status.command_id == session->dispatch_result->command_id &&
+            status.generation == session->dispatch_result->generation &&
+            (status.state == GripperCommandState::kCompleted || status.state == GripperCommandState::kFailed);
+  }
+  if (!final) return {false, ErrorDTO{kErrorInvalidRequest,
+      "Pneumatic command has not reached its final exit condition",
+      {{"reason", "pneumatic_command_not_final"}}}};
+  // Consume the ordinary result only. Admission closed by a shared Stop
+  // remains closed; only the established Reset/recovery path may reopen it.
+  // Pneumatic delivery Failure itself never closes backend admission.
+  session->ordinary_result_acknowledged = true;
+  return {true, std::nullopt};
+}
 GripperCommandResultDTO GripperParticipantEngine::command_gripper(
     const GripperCommandRequestDTO& request) {
   return backend_.command_gripper(request);
@@ -115,6 +161,10 @@ GripperCommandStatusDTO GripperParticipantEngine::get_gripper_status(const std::
 Result<std::uint64_t> GripperParticipantEngine::stop_gripper(const std::string& id,
                                                              const std::uint64_t command_id,
                                                              const std::uint64_t generation) {
+  if (backend_.gripper_actuation_kind(id) == GripperActuationKind::kPneumatic)
+    return Result<std::uint64_t>::Err(ErrorDTO{kErrorInvalidRequest,
+        "Pneumatic output transactions do not participate in Stop containment",
+        {{"reason", "pneumatic_stop_not_applicable"}}});
   const auto before = backend_.get_gripper_status(id);
   if (before.gripper_id != id || command_id == 0U || before.command_id != command_id ||
       before.generation != generation || before.state != GripperCommandState::kExecuting)
@@ -149,7 +199,7 @@ AddressedParticipantStopFenceDisposition GripperParticipantEngine::fence_address
   std::shared_ptr<PreparedCapabilityCommandSession> session;
   {
     std::lock_guard lock(prepared_command_session_mutex_);
-    session = active_prepared_command_session_;
+    session = active_prepared_command_session_.load();
   }
   if (!session || execution_id == 0U) return AddressedParticipantStopFenceDisposition::kUnknown;
   std::lock_guard lock(session->mutex);
@@ -180,9 +230,15 @@ Result<std::uint64_t> GripperParticipantEngine::PrepareCapabilityCommand(
   if (!verified.ok()) {
     return Result<std::uint64_t>::Err(verified.error());
   }
+  const auto actuation = gripper_actuation_kind(request.binding.value().command_target_id.value());
+  const auto output = gripper_output_mode(request.binding.value().command_target_id.value());
+  if (output == GripperOutputMode::kNone && actuation != GripperActuationKind::kPneumatic)
+    return Result<std::uint64_t>::Err(ErrorDTO{kErrorInvalidRequest,
+        "No output is only supported for a strict pneumatic target",
+        {{"reason", "gripper_output_mode_invalid"}}});
   if (!std::holds_alternative<PreparedCapabilityCommandDTO>(request.participant->payload) ||
       !prepared_command_matches_private_request(*request.participant, request.binding.value(),
-                                                request.command_request)) {
+                                                request.command_request, actuation, output)) {
     return Result<std::uint64_t>::Err(
         ErrorDTO{kErrorInvalidRequest,
                  "Prepared capability command differs from its compiled private request",
@@ -207,13 +263,14 @@ Result<std::uint64_t> GripperParticipantEngine::PrepareCapabilityCommand(
                  "Prepared capability-command session allocation failed",
                  {{"reason", "prepared_command_session_allocation_failed"}}});
   }
+  session->actuation = actuation;
   session->state = ResolvedPreparedCapabilityCommandStateDTO::kPrepared;
   session->backend_prepare_result = std::move(prepared.value());
 
   std::lock_guard active_lock(prepared_command_session_mutex_);
-  if (active_prepared_command_session_) {
-    std::lock_guard prior_lock(active_prepared_command_session_->mutex);
-    const auto& prior = *active_prepared_command_session_;
+  if (const auto active = active_prepared_command_session_.load()) {
+    std::lock_guard prior_lock(active->mutex);
+    const auto& prior = *active;
     if (prior.authority.participant &&
         prior.authority.participant->prepared_contract_digest ==
             session->authority.participant->prepared_contract_digest) {
@@ -255,7 +312,7 @@ GripperParticipantEngine::ObservePreparedCapabilityCommand(
   std::shared_ptr<PreparedCapabilityCommandSession> session;
   {
     std::lock_guard lock(prepared_command_session_mutex_);
-    session = active_prepared_command_session_;
+    session = active_prepared_command_session_.load();
   }
   if (!session) {
     return Result<ResolvedPreparedCapabilityCommandSnapshotDTO>::Err(
@@ -284,7 +341,7 @@ Result<GripperCommandResultDTO> GripperParticipantEngine::DispatchPreparedCapabi
   std::shared_ptr<PreparedCapabilityCommandSession> session;
   {
     std::lock_guard lock(prepared_command_session_mutex_);
-    session = active_prepared_command_session_;
+    session = active_prepared_command_session_.load();
   }
   if (!session) {
     return Result<GripperCommandResultDTO>::Err(
@@ -321,6 +378,10 @@ Result<GripperCommandResultDTO> GripperParticipantEngine::DispatchPreparedCapabi
     }
     session->controller_goal_id = controller_goal_id;
     session->controller_goal_generation = controller_goal_generation;
+    if (session->actuation == GripperActuationKind::kPneumatic)
+      session->owner_lifecycle_generation = backend_.get_gripper_status(
+          session->authority.command_request.gripper_id).lifecycle_generation;
+    // DX786: this exact owner transition is admission, before owed preflight.
     session->state = ResolvedPreparedCapabilityCommandStateDTO::kDispatchRequested;
   }
 
@@ -332,6 +393,24 @@ Result<GripperCommandResultDTO> GripperParticipantEngine::DispatchPreparedCapabi
                                            session->authority.participant->operation_revision,
                                            session->authority.participant->participant_id,
                                            controller_goal_id, controller_goal_generation};
+    if (session->actuation == GripperActuationKind::kPneumatic) {
+      command_request.owner_lifecycle_generation = session->owner_lifecycle_generation;
+      command_request.committed_owner_is_current = [this, session](const auto& identity) {
+        // Provider calls this only during the same synchronous command call.
+        // No engine/session mutex is acquired under backend authority; the
+        // atomic resident/phase reads avoid the inverse lock order.
+        // The immutable goal/authority fields were published by the release
+        // transition; no provider may retain this closure after the call.
+        return active_prepared_command_session_.load() == session &&
+            session->state.load() == ResolvedPreparedCapabilityCommandStateDTO::kDispatchRequested &&
+            session->authority.participant &&
+            session->authority.participant->operation_id == identity.operation_id &&
+            session->authority.participant->operation_revision == identity.operation_revision &&
+            session->authority.participant->participant_id == identity.participant_id &&
+            session->controller_goal_id == identity.controller_goal_id &&
+            session->controller_goal_generation == identity.controller_goal_generation;
+      };
+    }
     dispatched = command_gripper(command_request);
   } catch (const std::exception& exception) {
     dispatched = GripperCommandResultDTO{
@@ -359,12 +438,179 @@ Result<GripperCommandResultDTO> GripperParticipantEngine::DispatchPreparedCapabi
   return Result<GripperCommandResultDTO>::Ok(std::move(dispatched));
 }
 
+ParticipantStopStageResultDTO GripperParticipantEngine::TranslateStopStage(
+    const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+    std::stop_token cancellation) {
+  ParticipantStopStageResultDTO result{
+      stage,
+      StopStageAttemptDispositionDTO::kNotDispatched,
+      ParticipantStopStageOutcomeDTO::kFailed,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      0,
+      {},
+      std::nullopt};
+  std::shared_ptr<PreparedCapabilityCommandSession> session;
+  {
+    std::lock_guard lock(prepared_command_session_mutex_);
+    session = active_prepared_command_session_.load();
+  }
+  const auto refuse = [&](const std::string& reason, const std::string& message) {
+    result.error = ErrorDTO{kErrorExecutionRejected, message, {{"reason", reason}}};
+    if (stage.stage_index < stage.participant_stop_plan.stage_commands.size()) {
+      for (const auto& expected : stage.participant_stop_plan.stage_commands[stage.stage_index]
+                                       .resolved_stage.evidence_requirements) {
+        StopEvidenceItemDTO item{
+            expected.requirement.evidence_item_id,
+            expected.requirement.evidence_kind,
+            StopEvidenceItemStateDTO::kMissing,
+            expected.resolved_source,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            result.error};
+        result.evidence_items.push_back(std::move(item));
+      }
+    }
+    return result;
+  };
+  if (!session)
+    return refuse("gripper_stop_session_missing", "Gripper Stop has no resident preparation");
+  std::lock_guard lock(session->mutex);
+  const auto& authority = session->authority;
+  const auto& participant = authority.participant;
+  if (!participant ||
+      participant->operation_id != stage.operation_id ||
+      participant->operation_revision != stage.operation_revision ||
+      participant->participant_id != stage.participant_id ||
+      session->controller_goal_id != stage.controller_goal_id ||
+      session->controller_goal_generation != stage.controller_goal_generation)
+    return refuse("gripper_stop_command_mismatch", "Gripper Stop names another prepared command");
+  const auto valid = ValidateResolvedParticipantStopStage(
+      stage, budget, authority.stop_readiness.value().resolved_stop_base_plan, authority.binding,
+      authority.retained_default_stop_limits, authority.stop_node_category, participant->resources);
+  if (!valid.ok()) {
+    return refuse("gripper_stop_stage_invalid", valid.error().message);
+  }
+  if (session->translated_stop) {
+    if (session->translated_stop->request == stage) return *session->translated_stop;
+    const auto& prior = *session->translated_stop;
+    if (prior.request.stop_id != stage.stop_id || prior.request.stop_generation != stage.stop_generation ||
+        prior.outcome == ParticipantStopStageOutcomeDTO::kSucceeded ||
+        prior.request.stage_index >= stage.stage_index)
+      return refuse("gripper_stop_identity_conflict", "Another Stop already fenced this command");
+  }
+  if (cancellation.stop_requested())
+    return refuse("gripper_stop_cancelled_before_effect", "Gripper Stop was cancelled before effect");
+  const bool pneumatic = session->actuation == GripperActuationKind::kPneumatic;
+  if (pneumatic)
+    return refuse("pneumatic_stop_not_applicable",
+                  "Pneumatic output transactions do not participate in Stop containment");
+  if (session->state != ResolvedPreparedCapabilityCommandStateDTO::kDispatchRequested &&
+      session->state != ResolvedPreparedCapabilityCommandStateDTO::kDispatched &&
+      !(pneumatic && session->state == ResolvedPreparedCapabilityCommandStateDTO::kDispatchFailed))
+    return refuse("gripper_stop_command_not_dispatched", "Gripper Stop has no dispatched command");
+  const auto& command = stage.participant_stop_plan.stage_commands.at(stage.stage_index).resolved_stage;
+  const bool logical = command.containment_command.command_kind == StopContainmentCommandKind::kLogicalCancel;
+  const bool position_hard = !pneumatic &&
+      command.stage_kind == StopEscalationStageKind::kSoftwareHard &&
+      command.containment_command.command_kind == StopContainmentCommandKind::kRegistered &&
+      command.containment_command.registered_command_kind_id ==
+          RegisteredStopCommandKindId("manyforge.stop.software_hard");
+  if ((!logical && !position_hard) || command.evidence_requirements.empty() ||
+      std::any_of(command.evidence_requirements.begin(), command.evidence_requirements.end(),
+                  [](const auto& item) {
+                    return item.requirement.evidence_kind !=
+                               StopEvidenceRequirementKind::kLogicalCancellationNoContinuingEffect ||
+                           item.requirement.source_requirement.source_kind !=
+                               StopEvidenceSourceKind::kCommandTargetStatus ||
+                           item.requirement.observation_semantics.observation_kind !=
+                               StopEvidenceObservationKind::kCommandResult;
+                  }))
+    return refuse("gripper_stop_policy_mismatch", "Gripper Stop requires its logical-cancellation policy");
+  const auto& id = authority.command_request.gripper_id;
+  const auto started = clock_.now();
+  const auto before = backend_.get_gripper_status(id);
+  if (before.gripper_id != id)
+    return refuse("gripper_stop_target_unavailable", "Gripper Stop target status is unavailable");
+  if (!pneumatic && session->dispatch_result &&
+      (!session->dispatch_result->accepted || session->dispatch_result->error ||
+       before.command_id != session->dispatch_result->command_id ||
+       before.generation != session->dispatch_result->generation))
+    return refuse("gripper_stop_backend_command_mismatch", "Gripper Stop target names another backend command");
+
+  // The maintained ROS backend's status locks are leaf map/runtime locks;
+  // invalidation drops them before scheduler/cancel calls, whose callbacks
+  // do not enter this engine. No arbitrary backend implementation is assumed.
+  // Q58/Q70: close the genuine command generation and request cancel, without
+  // awaiting its transport reply or the still-returning command dispatch.
+  backend_.invalidate_gripper_commands(GripperInvalidationReason::kStop);
+  result.attempt_disposition = StopStageAttemptDispositionDTO::kDispatched;
+  const auto after = backend_.get_gripper_status(id);
+  const auto observed = clock_.now();
+  if (observed >= started) result.receiver_elapsed_duration_ns = observed - started;
+  const bool fenced = pneumatic
+      ? after.admission_closed && after.admission_generation > before.admission_generation &&
+            after.command_id == before.command_id && after.generation == before.generation
+      : after.command_id == before.command_id && after.generation > before.generation &&
+            after.state != GripperCommandState::kExecuting;
+  if (after.gripper_id != id || !fenced || after.revision == 0U || observed < started) {
+    auto failed = refuse("gripper_stop_generation_unavailable",
+                         "Gripper command target did not publish its generation fence");
+    session->translated_stop = failed;
+    return failed;
+  }
+  JsonObjectDTO facts{
+      {"controller_goal_id", JsonValueDTO{stage.controller_goal_id.value()}},
+      {"controller_goal_generation", JsonValueDTO{std::to_string(stage.controller_goal_generation.value())}},
+      {"gripper_id", JsonValueDTO{id}},
+      {"backend_command_id", JsonValueDTO{std::to_string(after.command_id)}},
+      {"previous_generation", JsonValueDTO{std::to_string(before.generation)}},
+      {"fenced_generation", JsonValueDTO{std::to_string(after.generation)}},
+      {"admission_generation", JsonValueDTO{std::to_string(after.admission_generation)}},
+      {"no_further_commands", JsonValueDTO{true}},
+      {"admitted_transaction_preserved", JsonValueDTO{pneumatic}},
+      {"dispatch_result_available", JsonValueDTO{session->dispatch_result.has_value()}},
+      {"cancel_dispatch", JsonValueDTO{std::string("unavailable")}},
+      {"cancel_dispatch_reason", JsonValueDTO{std::string("backend_does_not_publish_cancel_dispatch_status")}},
+  };
+  for (const auto& expected : command.evidence_requirements) {
+    StopEvidenceItemDTO item{
+        expected.requirement.evidence_item_id,
+        expected.requirement.evidence_kind,
+        StopEvidenceItemStateDTO::kSatisfied,
+        expected.resolved_source,
+        stage.provider_runtime_epoch,
+        after.revision,
+        0,  // This owner's direct status observation above.
+        JsonValueDTO{facts},
+        std::nullopt};
+    result.evidence_items.push_back(std::move(item));
+  }
+  // Deliberately no controller ACK or motion-rest projection: this is only
+  // the actual logical command fence. Kernel retains the dispatch-return hold.
+  result.outcome = ParticipantStopStageOutcomeDTO::kSucceeded;
+  const auto checked = ValidateParticipantStopStageResult(
+      result, authority.stop_readiness.value().resolved_stop_base_plan, authority.binding,
+      authority.retained_default_stop_limits, authority.stop_node_category, participant->resources);
+  if (!checked.ok()) {
+    result.outcome = ParticipantStopStageOutcomeDTO::kFailed;
+    result.error = checked.error();
+  }
+  session->translated_stop = result;
+  return result;
+}
+
 Result<void> GripperParticipantEngine::CancelPreparedCapabilityCommand(
     const std::uint64_t preparation_id) {
   std::shared_ptr<PreparedCapabilityCommandSession> session;
   {
     std::lock_guard lock(prepared_command_session_mutex_);
-    session = active_prepared_command_session_;
+    session = active_prepared_command_session_.load();
   }
   if (!session) {
     return Result<void>::Err(ErrorDTO{kErrorMissingReference,
@@ -429,7 +675,7 @@ GripperParticipantEngine::settle_addressed_participant_stop(
   std::shared_ptr<PreparedCapabilityCommandSession> command_session;
   {
     std::lock_guard lock(prepared_command_session_mutex_);
-    command_session = active_prepared_command_session_;
+    command_session = active_prepared_command_session_.load();
   }
   if (request.payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
       command_session) {
@@ -538,7 +784,7 @@ KernelRecoveryAssessmentDTO GripperParticipantEngine::get_recovery_assessment() 
   std::shared_ptr<PreparedCapabilityCommandSession> command_session;
   {
     std::lock_guard lock(prepared_command_session_mutex_);
-    command_session = active_prepared_command_session_;
+    command_session = active_prepared_command_session_.load();
   }
   if (command_session) {
     std::lock_guard session_lock(command_session->mutex);
@@ -553,7 +799,7 @@ KernelRecoveryActionResultDTO GripperParticipantEngine::apply_recovery_action(
   std::shared_ptr<PreparedCapabilityCommandSession> command_session;
   {
     std::lock_guard lock(prepared_command_session_mutex_);
-    command_session = active_prepared_command_session_;
+    command_session = active_prepared_command_session_.load();
   }
   if (command_session) {
     std::optional<KernelRecoveryAssessmentDTO> addressed_assessment;

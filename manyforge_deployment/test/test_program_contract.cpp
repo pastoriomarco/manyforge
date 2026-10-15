@@ -937,6 +937,292 @@ selection_node(std::string instance, CanonicalValue groups,
   return CanonicalValue(std::move(result));
 }
 
+[[nodiscard]] CanonicalValue
+stop_policy_node(std::string instance, std::string node_id,
+                 std::string policy = "inherit",
+                 CanonicalValue::Array children = {}) {
+  CanonicalValue::Object result{
+      {"node_id", CanonicalValue(node_id)},
+      {"instance_id", CanonicalValue(std::move(instance))},
+      {"parameters",
+       CanonicalValue(
+           node_id == "timer"
+               ? CanonicalValue::Object{{"duration_s", CanonicalValue(0.1)}}
+               : CanonicalValue::Object{})},
+      {"children", CanonicalValue(std::move(children))},
+  };
+  if (policy != "inherit")
+    result.emplace_back("operator_stop_policy",
+                        CanonicalValue(std::move(policy)));
+  return CanonicalValue(std::move(result));
+}
+
+[[nodiscard]] CanonicalValue
+gripper_stop_policy_node(std::string instance, std::string policy = "continue",
+                         const std::vector<std::string> &groups = {}) {
+  auto node = stop_policy_node(std::move(instance), "gripper.command_position",
+                               std::move(policy))
+                  .as_object();
+  replace_member(node, "parameters",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"target_role", CanonicalValue("gripper")},
+                     {"position", CanonicalValue(CanonicalValue::Object{
+                                      {"kind", CanonicalValue("linear_m")},
+                                      {"value_m", CanonicalValue(0.01)}})},
+                 }));
+  if (!groups.empty())
+    node.emplace_back("execution_groups", text_array(groups));
+  return CanonicalValue(std::move(node));
+}
+
+[[nodiscard]] CanonicalValue gripper_stop_policy_program(
+    const ProgramOptions &options, CanonicalValue tree,
+    CanonicalValue groups = CanonicalValue(CanonicalValue::Object{})) {
+  auto program = with_tree(options, std::move(tree)).as_object();
+  mutate_object_member(program, "target_roles", [](auto &targets) {
+    targets.emplace_back(
+        "gripper",
+        CanonicalValue(CanonicalValue::Object{
+            {"component_role", CanonicalValue("robot")},
+            {"required_capabilities",
+             CanonicalValue(CanonicalValue::Array{
+                 CanonicalValue(CanonicalValue::Object{
+                     {"capability_id", CanonicalValue("tool.gripper.command")},
+                     {"parameters", CanonicalValue(CanonicalValue::Object{})},
+                     {"disposition", CanonicalValue("required")}}),
+                 CanonicalValue(CanonicalValue::Object{
+                     {"capability_id", CanonicalValue("tool.gripper.feedback")},
+                     {"parameters", CanonicalValue(CanonicalValue::Object{})},
+                     {"disposition", CanonicalValue("required")}})})},
+        }));
+  });
+  if (!groups.as_object().empty())
+    program.emplace_back("execution_groups", std::move(groups));
+  return with_program_revision(CanonicalValue(std::move(program)));
+}
+
+[[nodiscard]] CanonicalValue
+grouped_stop_policy_node(std::string instance, std::string node_id,
+                         std::string policy, CanonicalValue::Array children,
+                         const std::vector<std::string> &groups) {
+  auto node = stop_policy_node(std::move(instance), std::move(node_id),
+                               std::move(policy), std::move(children))
+                  .as_object();
+  node.emplace_back("execution_groups", text_array(groups));
+  return CanonicalValue(std::move(node));
+}
+
+void expect_catalog_gripper_effects(
+    const manyforge::core::ProgramExecutionNodeDTO &node) {
+  EXPECT_EQ(node.owner_api, "kernel.command_target");
+  ASSERT_EQ(node.target_effects.size(), 2U);
+  EXPECT_EQ(node.target_effects[0].target_role_id, TargetRoleId("gripper"));
+  EXPECT_EQ(node.target_effects[0].capability_id,
+            CapabilityId("tool.gripper.command"));
+  EXPECT_TRUE(node.target_effects[0].effectful);
+  EXPECT_EQ(node.target_effects[1].target_role_id, TargetRoleId("gripper"));
+  EXPECT_EQ(node.target_effects[1].capability_id,
+            CapabilityId("tool.gripper.feedback"));
+  EXPECT_FALSE(node.target_effects[1].effectful);
+}
+
+TEST(ProgramContractTest, CapturesBehaviorStopPolicyDefaultsAndCatalogKinds) {
+  using Policy = manyforge::core::ProgramOperatorStopPolicy;
+  const auto bundle = maintained_motion_bundle();
+  const auto options = valid_options(*bundle);
+  const auto contract = verify_program_binding_contract(
+      canonical_json(gripper_stop_policy_program(
+          options,
+          grouped_stop_policy_node(
+              "a_root", "sequence", "inherit",
+              {grouped_stop_policy_node(
+                  "b_composite", "sequence", "inherit",
+                  {grouped_stop_policy_node(
+                      "c_decorator", "inverter", "inherit",
+                      {gripper_stop_policy_node(
+                          "d_leaf", "inherit",
+                          {"leaf_only", "mixed", "whole"})},
+                      {"whole"})},
+                  {"mixed", "whole"})},
+              {"whole"}),
+          execution_group_definitions({{"leaf_only", "independent"},
+                                       {"mixed", "independent"},
+                                       {"whole", "independent"}}))),
+      *bundle);
+  const auto &table = contract->execution_table();
+  const auto &nodes = table.nodes;
+  ASSERT_EQ(nodes.size(), 4U);
+  EXPECT_TRUE(contract->value().node_policies.empty());
+  for (std::size_t index = 0U; index < nodes.size(); ++index) {
+    EXPECT_EQ(nodes[index].effective_operator_stop_policy,
+              index == 3U ? Policy::kHold : Policy::kContinue);
+    if (index == 0U)
+      EXPECT_FALSE(nodes[index].parent_node_index.has_value());
+    else
+      EXPECT_EQ(nodes[index].parent_node_index, index - 1U);
+  }
+  expect_catalog_gripper_effects(nodes[3]);
+  ASSERT_EQ(table.named_selections.size(), 3U);
+  EXPECT_EQ(table.named_selections[0].node_indices,
+            (std::vector<std::uint32_t>{3U}));
+  EXPECT_EQ(table.named_selections[1].node_indices,
+            (std::vector<std::uint32_t>{1U, 3U}));
+  EXPECT_EQ(table.named_selections[2].node_indices,
+            (std::vector<std::uint32_t>{0U, 1U, 2U, 3U}));
+  // Root inheritance takes precedence for an actual catalog gripper leaf.
+  const auto leaf_root = verify_program_binding_contract(
+      canonical_json(gripper_stop_policy_program(
+          options, gripper_stop_policy_node("root", "inherit"))),
+      *bundle);
+  ASSERT_EQ(leaf_root->execution_table().nodes.size(), 1U);
+  const auto &root_node = leaf_root->execution_table().nodes.front();
+  EXPECT_EQ(root_node.effective_operator_stop_policy, Policy::kContinue);
+  EXPECT_FALSE(root_node.parent_node_index.has_value());
+  expect_catalog_gripper_effects(root_node);
+}
+
+TEST(ProgramContractTest,
+     CapturesLocalExplicitOverridesWithoutFoldingHoldAncestors) {
+  using Policy = manyforge::core::ProgramOperatorStopPolicy;
+  const auto bundle = maintained_motion_bundle();
+  const auto contract = verify_program_binding_contract(
+      canonical_json(gripper_stop_policy_program(
+          valid_options(*bundle),
+          grouped_stop_policy_node(
+              "z_root", "sequence", "hold",
+              {grouped_stop_policy_node(
+                   "a_inherited_hold", "sequence", "inherit",
+                   {gripper_stop_policy_node(
+                       "b_explicit_continue", "continue",
+                       {"branch_whole", "child_only", "mixed", "whole"})},
+                   {"branch_whole", "whole"}),
+               grouped_stop_policy_node(
+                   "c_explicit_continue", "sequence", "continue",
+                   {grouped_stop_policy_node(
+                        "d_inherited_continue", "inverter", "inherit",
+                        {gripper_stop_policy_node("e_default_leaf", "inherit",
+                                                  {"whole"})},
+                        {"whole"}),
+                    gripper_stop_policy_node("f_explicit_hold", "hold",
+                                             {"whole"})},
+                   {"whole"})},
+              {"mixed", "whole"}),
+          execution_group_definitions({{"branch_whole", "independent"},
+                                       {"child_only", "independent"},
+                                       {"mixed", "independent"},
+                                       {"whole", "independent"}}))),
+      *bundle);
+  const auto &table = contract->execution_table();
+  const auto &nodes = table.nodes;
+  ASSERT_EQ(nodes.size(), 7U);
+  const std::vector<Policy> policies{
+      Policy::kHold, Policy::kContinue, Policy::kContinue, Policy::kContinue,
+      Policy::kHold, Policy::kHold,     Policy::kHold};
+  const std::vector<std::uint32_t> parents{6U, 0U, 6U, 2U, 3U, 2U};
+  for (std::size_t index = 0U; index < nodes.size(); ++index) {
+    EXPECT_EQ(nodes[index].effective_operator_stop_policy, policies[index]);
+    if (index < parents.size())
+      EXPECT_EQ(nodes[index].parent_node_index, parents[index]);
+    else
+      EXPECT_FALSE(nodes[index].parent_node_index.has_value());
+  }
+  for (const auto index : {1U, 4U, 5U})
+    expect_catalog_gripper_effects(nodes[index]);
+  ASSERT_EQ(table.named_selections.size(), 4U);
+  EXPECT_EQ(table.named_selections[0].node_indices,
+            (std::vector<std::uint32_t>{0U, 1U}));
+  EXPECT_EQ(table.named_selections[1].node_indices,
+            (std::vector<std::uint32_t>{1U}));
+  EXPECT_EQ(table.named_selections[2].node_indices,
+            (std::vector<std::uint32_t>{1U, 6U}));
+  EXPECT_EQ(table.named_selections[3].node_indices,
+            (std::vector<std::uint32_t>{0U, 1U, 2U, 3U, 4U, 5U, 6U}));
+  const manyforge::core::ProgramExecutionNodeDTO legacy_node{
+      manyforge::core::ProgramNodeInstanceId("legacy"), "kernel.operation", {}};
+  EXPECT_EQ(legacy_node.effective_operator_stop_policy, Policy::kHold);
+  EXPECT_FALSE(legacy_node.parent_node_index.has_value());
+}
+
+TEST(ProgramContractTest,
+     CapturesLocalPoliciesAndTopologyForPartialHeldSubtrees) {
+  using Policy = manyforge::core::ProgramOperatorStopPolicy;
+  const auto bundle = maintained_motion_bundle();
+  auto child = gripper_stop_policy_node("a_child").as_object();
+  child.emplace_back("execution_groups",
+                     text_array({"child_only", "mixed", "whole"}));
+  auto sibling = gripper_stop_policy_node("b_sibling").as_object();
+  sibling.emplace_back("execution_groups", text_array({"whole"}));
+  auto branch = stop_policy_node("c_branch", "sequence", "hold",
+                                 {CanonicalValue(std::move(child)),
+                                  CanonicalValue(std::move(sibling))})
+                    .as_object();
+  branch.emplace_back("execution_groups", text_array({"mixed", "whole"}));
+  auto program =
+      with_tree(valid_options(*bundle),
+                stop_policy_node("z_root", "sequence", "inherit",
+                                 {CanonicalValue(std::move(branch))}))
+          .as_object();
+  mutate_object_member(program, "target_roles", [](auto &targets) {
+    targets.emplace_back(
+        "gripper",
+        CanonicalValue(CanonicalValue::Object{
+            {"component_role", CanonicalValue("robot")},
+            {"required_capabilities",
+             CanonicalValue(CanonicalValue::Array{
+                 CanonicalValue(CanonicalValue::Object{
+                     {"capability_id", CanonicalValue("tool.gripper.command")},
+                     {"parameters", CanonicalValue(CanonicalValue::Object{})},
+                     {"disposition", CanonicalValue("required")}}),
+                 CanonicalValue(CanonicalValue::Object{
+                     {"capability_id", CanonicalValue("tool.gripper.feedback")},
+                     {"parameters", CanonicalValue(CanonicalValue::Object{})},
+                     {"disposition", CanonicalValue("required")}})})},
+        }));
+  });
+  program.emplace_back("execution_groups", execution_group_definitions(
+                                               {{"child_only", "independent"},
+                                                {"mixed", "independent"},
+                                                {"whole", "independent"}}));
+  const auto contract = verify_program_binding_contract(
+      canonical_json(with_program_revision(CanonicalValue(std::move(program)))),
+      *bundle);
+  const auto &table = contract->execution_table();
+  ASSERT_EQ(table.nodes.size(), 4U);
+  EXPECT_EQ(table.nodes[0].effective_operator_stop_policy, Policy::kContinue);
+  EXPECT_EQ(table.nodes[1].effective_operator_stop_policy, Policy::kContinue);
+  EXPECT_EQ(table.nodes[2].effective_operator_stop_policy, Policy::kHold);
+  EXPECT_EQ(table.nodes[3].effective_operator_stop_policy, Policy::kContinue);
+  for (const auto index : {0U, 1U}) {
+    const auto &node = table.nodes[index];
+    EXPECT_EQ(node.owner_api, "kernel.command_target");
+    ASSERT_EQ(node.target_effects.size(), 2U);
+    EXPECT_EQ(node.target_effects[0].target_role_id, TargetRoleId("gripper"));
+    EXPECT_EQ(node.target_effects[0].capability_id,
+              CapabilityId("tool.gripper.command"));
+    EXPECT_TRUE(node.target_effects[0].effectful);
+    EXPECT_EQ(node.target_effects[1].target_role_id, TargetRoleId("gripper"));
+    EXPECT_EQ(node.target_effects[1].capability_id,
+              CapabilityId("tool.gripper.feedback"));
+    EXPECT_FALSE(node.target_effects[1].effectful);
+  }
+  EXPECT_EQ(table.nodes[0].parent_node_index, 2U);
+  EXPECT_EQ(table.nodes[1].parent_node_index, 2U);
+  EXPECT_EQ(table.nodes[2].parent_node_index, 3U);
+  EXPECT_FALSE(table.nodes[3].parent_node_index.has_value());
+  ASSERT_EQ(table.named_selections.size(), 3U);
+  EXPECT_EQ(table.named_selections[0].group_id, "child_only");
+  EXPECT_EQ(table.named_selections[0].node_indices,
+            (std::vector<std::uint32_t>{0U}));
+  EXPECT_EQ(table.named_selections[1].group_id, "mixed");
+  EXPECT_EQ(table.named_selections[1].node_indices,
+            (std::vector<std::uint32_t>{0U, 2U}));
+  EXPECT_EQ(table.named_selections[2].group_id, "whole");
+  EXPECT_EQ(table.named_selections[2].node_indices,
+            (std::vector<std::uint32_t>{0U, 1U, 2U}));
+  // Admission must join these exact current selections with the parent edges:
+  // only `whole` holds the branch's full subtree and blocks its Continue child.
+}
+
 TEST(ProgramContractTest,
      CapturesOverlappingInheritedAndNeverStartedNodeSelections) {
   ScopedTrustedRoot root;

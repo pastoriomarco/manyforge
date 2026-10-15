@@ -127,6 +127,7 @@ void MarkComponent(const core::CellGraphDTO &graph,
   }
 }
 
+// DX-753: preserve compiled per-component Apply scope during the multi-unit discussion.
 using NativeComponentConfigurations =
     std::map<core::ControllableComponentId,
              execution_runtime_contract::Configuration>;

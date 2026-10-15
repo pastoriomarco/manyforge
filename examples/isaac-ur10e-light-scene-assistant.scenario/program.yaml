@@ -2,7 +2,7 @@
   "api_version": "manyforge.program.v2",
   "catalog": {
     "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.4.0"
+    "content_version": "2.5.0"
   },
   "compatibility": {
     "assistant": "optional",

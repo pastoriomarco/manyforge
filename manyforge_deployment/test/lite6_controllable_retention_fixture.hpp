@@ -161,7 +161,7 @@ provider_contract_role_id(const CanonicalValue &declaration) {
 [[nodiscard]] inline CanonicalValue gripper_target_configuration(
     std::string_view controllable_component_id, bool ros2_control_execution = false) {
   CanonicalValue::Object gripper_configuration{
-        {"actuation_kind", CanonicalValue("position_commanded")},
+        {"actuation_kind", CanonicalValue(ros2_control_execution ? "pneumatic" : "position_commanded")},
         {"attach_frame", CanonicalValue("link_tcp")},
         {"auxiliary_frames", CanonicalValue(CanonicalValue::Array{
                                  CanonicalValue("lite_gripper_base_link")})},
@@ -183,6 +183,8 @@ provider_contract_role_id(const CanonicalValue &declaration) {
                             CanonicalValue("lite_gripper_left_finger"),
                             CanonicalValue("lite_gripper_right_finger")})},
     };
+  if (ros2_control_execution)
+    gripper_configuration.emplace_back("output_mode", CanonicalValue("commanded"));
   return CanonicalValue(std::move(gripper_configuration));
 }
 
@@ -253,7 +255,7 @@ native_execution_configuration(std::string_view controllable_component_id,
         std::nullopt, std::string_view component_id = kLite6ControllableComponentId,
     std::string_view frame_prefix = {},
     std::optional<double> initial_joint1_position_rad = std::nullopt,
-    bool include_gripper = false) {
+    bool include_gripper = false, bool motion = true) {
   CanonicalValue::Object configuration{
       {"mode", CanonicalValue("commanded_sim")},
       {"isaac_world", CanonicalValue("lite6_grf_ros2")},
@@ -295,6 +297,14 @@ native_execution_configuration(std::string_view controllable_component_id,
       {"runtime_dynamic_body_max_age_cap_ms", CanonicalValue(1000.0)},
       {"validation_collision_workers", CanonicalValue(4.0)},
   };
+  if (!motion) {
+    for (auto &[name, value] : configuration) {
+      if (name == "initial_joint_positions_rad" ||
+          name == "motion_target_limits") {
+        value = CanonicalValue(CanonicalValue::Array{});
+      }
+    }
+  }
   if (default_fault_stop_profiles.has_value()) {
     configuration.emplace_back("default_fault_stop_profiles",
                                *default_fault_stop_profiles);
@@ -414,6 +424,7 @@ struct QualifiedControlCatalog final {
   /// when the arm selects the independently qualified controlled-Stop policy.
   std::optional<QualifiedStopEvidencePolicy> gripper_stop;
   std::optional<QualifiedCapabilityDefinition> gripper_feedback{};
+  std::optional<QualifiedCapabilityDefinition> observed_state_capability{};
 };
 
 struct AssistantOverlayFixture final {
@@ -570,7 +581,8 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                         std::string_view lifecycle_semantic_digest = {},
                         bool ros2_control_execution = false,
                         std::string_view provider_id = "lite6_arm_provider",
-                        bool include_lifecycle_recover = false) {
+                        bool include_lifecycle_recover = false,
+                        bool include_observed_state = false) {
   const std::string_view primary_capability_id =
       native_motion ? "execution.trajectory.execute" : "state.observed.current";
   const auto *descriptor =
@@ -606,6 +618,46 @@ qualify_control_catalog(bool chained, bool native_motion = false,
   };
   auto capability = resolve_and_qualify_capability_definition(
       capability_ref, capability_key, capability_bytes);
+
+  std::optional<QualifiedCapabilityDefinition> observed_state_capability;
+  std::optional<std::string> observed_state_bytes;
+  if (include_observed_state) {
+    const auto *descriptor =
+        core::find_builtin_capability_definition("state.observed.current");
+    if (descriptor == nullptr) {
+      throw std::logic_error(
+          "Lite6 control fixture requires its primary capability");
+    }
+    CanonicalValue::Object observed_capability_root{
+        {"api_version",
+         CanonicalValue(std::string(core::kCapabilityDefinitionApiVersion))},
+        {"capability_id", CanonicalValue(std::string("state.observed.current"))},
+        {"scope",
+         CanonicalValue(std::string(core::to_string(descriptor->scope)))},
+        {"provider_binding_kind", CanonicalValue(std::string(core::to_string(
+                                      descriptor->provider_binding_kind)))},
+        {"capability_definition_revision",
+         CanonicalValue(std::string(descriptor->capability_definition_revision))},
+    };
+    const std::string observed_capability_bytes =
+        canonical_json(CanonicalValue(std::move(observed_capability_root)));
+    const core::ContentDigest observed_capability_digest(sha256_digest(observed_capability_bytes));
+    const core::ContentAddressedStoreKey observed_capability_key(
+        catalog_key("capability", observed_capability_digest.value()));
+    const core::CapabilityDefinitionCatalogRecordRefDTO observed_capability_ref{
+        core::CapabilityId(std::string("state.observed.current")),
+        core::CapabilityDefinitionRevision(
+            std::string(descriptor->capability_definition_revision)),
+        core::SchemaId(std::string(core::kCapabilityDefinitionApiVersion)),
+        schema_revision_for(core::CatalogRecordKind::kCapabilityDefinition),
+        observed_capability_digest,
+        observed_capability_key,
+    };
+    observed_state_capability = resolve_and_qualify_capability_definition(
+        observed_capability_ref, observed_capability_key, observed_capability_bytes);
+
+    observed_state_bytes = observed_capability_bytes;
+  }
 
   std::vector<QualifiedCapabilityDefinition> lifecycle_capabilities;
   std::vector<std::string> lifecycle_capability_bytes;
@@ -760,6 +812,13 @@ qualify_control_catalog(bool chained, bool native_motion = false,
     });
   }
 
+  if (observed_state_capability.has_value()) {
+    target_capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id", CanonicalValue(observed_state_capability->value().capability_id.value())},
+        {"capability_definition_revision", CanonicalValue(observed_state_capability->value().capability_definition_revision.value())},
+    });
+  }
+
   const std::string component_bytes = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
           {"api_version",
@@ -844,6 +903,8 @@ qualify_control_catalog(bool chained, bool native_motion = false,
   component_capabilities.insert(component_capabilities.end(),
                                 planner_capabilities.begin(),
                                 planner_capabilities.end());
+  if (observed_state_capability.has_value())
+    component_capabilities.push_back(*observed_state_capability);
   auto component_type = resolve_and_qualify_component_type(
       component_ref, component_key, component_bytes, component_capabilities);
 
@@ -1084,6 +1145,13 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                capability.value().capability_definition_revision.value())},
           {"required_endpoint_role_ids", text_array({"command", "state"})},
       })};
+  if (observed_state_capability.has_value()) {
+    offered_capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id", CanonicalValue(observed_state_capability->value().capability_id.value())},
+        {"capability_definition_revision", CanonicalValue(observed_state_capability->value().capability_definition_revision.value())},
+        {"required_endpoint_role_ids", text_array({"command", "state"})},
+    });
+  }
   if (!lifecycle_semantic_digest.empty()) {
     append_lifecycle_capability_offers(offered_capabilities,
                                       include_lifecycle_recover);
@@ -1342,6 +1410,10 @@ qualify_control_catalog(bool chained, bool native_motion = false,
   artifacts.push_back(catalog_artifact("catalog://capability/" +
                                            std::string(primary_capability_id),
                                        capability_bytes, capability));
+  if (observed_state_capability.has_value()) {
+    artifacts.push_back(catalog_artifact("catalog://capability/state.observed.current",
+                                         *observed_state_bytes, *observed_state_capability));
+  }
   artifacts.push_back(
       catalog_artifact("catalog://component_type/lite6_arm_component",
                        component_bytes, component_type));
@@ -1411,6 +1483,8 @@ qualify_control_catalog(bool chained, bool native_motion = false,
       std::move(native_execution_runtime_profile),
       std::move(ros2_control_execution_runtime_profile),
       std::nullopt,
+      std::nullopt,
+      std::move(observed_state_capability),
   };
 }
 
@@ -1420,7 +1494,9 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
                               std::string_view lifecycle_semantic_digest = {},
                               bool gripper_feedback = false,
                               bool gripper_only = false,
-                              bool ros2_control_execution = false) {
+                              bool ros2_control_execution = false,
+                              std::string_view ros_gripper_actuation_kind = "pneumatic",
+                              void (*component_input_mapper)(CanonicalValue::Object &) = nullptr) {
   const std::string_view gripper_provider_id =
       ros2_control_execution ? "manyforge.provider.ros2_control"
                              : "lite6_gripper_provider";
@@ -1538,6 +1614,8 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
   })};
   std::vector<QualifiedCapabilityDefinition> capabilities;
   if (!gripper_only) capabilities.push_back(catalog.capability);
+  if (catalog.observed_state_capability.has_value())
+    capabilities.push_back(*catalog.observed_state_capability);
   capabilities.push_back(gripper_capability);
   CanonicalValue::Array gripper_capabilities;
   const auto append_gripper_capability = [&](const auto &capability) {
@@ -1563,6 +1641,12 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
                             .capability_definition_revision.value())},
     });
     if (!gripper_only) capabilities.push_back(planner_capability);
+  }
+  if (catalog.observed_state_capability.has_value()) {
+    arm_capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id", CanonicalValue(catalog.observed_state_capability->value().capability_id.value())},
+        {"capability_definition_revision", CanonicalValue(catalog.observed_state_capability->value().capability_definition_revision.value())},
+    });
   }
   CanonicalValue component_document(CanonicalValue::Object{
           {"api_version",
@@ -1683,6 +1767,13 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
     }
     component_document = CanonicalValue(std::move(members));
   }
+  if (component_input_mapper != nullptr) {
+    auto members = component_document.as_object();
+    component_input_mapper(members);
+    component_document = CanonicalValue(std::move(members));
+  }
+  const std::string component_id =
+      component_document.find_object_member("component_type_id")->as_string();
   const std::string component_bytes = revisioned_document(
       component_document,
       "catalog-record-revision/component_type", core::kComponentTypeApiVersion,
@@ -1691,8 +1782,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
   const core::ContentAddressedStoreKey component_key(
       catalog_key("component", component_digest.value()));
   const core::ComponentTypeCatalogRecordRefDTO component_ref{
-      core::ComponentTypeId(gripper_only ? "lite6_gripper_component"
-                                         : "lite6_arm_gripper_component"),
+      core::ComponentTypeId(component_id),
       core::ComponentTypeRevision(
           revision_from_document(component_bytes, "component_type_revision")),
       core::SchemaId(std::string(core::kComponentTypeApiVersion)),
@@ -1833,8 +1923,29 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
     append_lifecycle_capability_offers(gripper_offers, ros2_control_execution);
   }
   sort_capability_offers(gripper_offers);
+  const auto logical_cancel_contract_ref = [] {
+    return CanonicalValue(CanonicalValue::Object{
+        {"provider_contract_role_id", CanonicalValue("gripper_logical_cancel")},
+        {"contract_schema_id", CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+        {"contract_schema_revision", CanonicalValue(std::string(kEmptyProviderContractSchemaRevision))},
+    });
+  };
   CanonicalValue::Array gripper_contracts;
   if (stoppable) {
+    if (ros2_control_execution) {
+      // DX768: the genuine A1 logical-cancellation policy is approved.
+      gripper_contracts.emplace_back(CanonicalValue::Object{
+          {"provider_contract_ref", logical_cancel_contract_ref()},
+          {"stop_command_support", CanonicalValue(CanonicalValue::Object{
+              {"command_kind", CanonicalValue("logical_cancel")},
+              {"command_endpoint_role_ids", CanonicalValue(CanonicalValue::Array{})},
+          })},
+          {"stop_evidence_support", CanonicalValue(CanonicalValue::Object{
+              {"evidence_kind", CanonicalValue("logical_cancellation_no_continuing_effect")},
+              {"evidence_endpoint_role_ids", CanonicalValue(CanonicalValue::Array{})},
+          })},
+      });
+    }
     gripper_contracts.emplace_back(CanonicalValue::Object{
         {"provider_contract_ref",
          CanonicalValue(CanonicalValue::Object{
@@ -1921,6 +2032,67 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
   auto provider = resolve_and_qualify_provider_manifest(
       provider_ref, provider_key, provider_bytes);
 
+  if (ros2_control_execution && stoppable) {
+    // DX768: qualify the approved A1 policy through the ordinary catalog path.
+    const auto identity = parse_strict_json_model_yaml(R"POLICY({"api_version":"manyforge.stop_evidence_policy.v2","containment_granularity":"resource","disposition":"stoppable","escalation_stages":[{"containment_command":{"command":{"command_kind":"logical_cancel","provider_contract_ref":{"contract_schema_id":"manyforge.value_schema.provider_contract.empty.v1","contract_schema_revision":"sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270","provider_contract_role_id":"gripper_logical_cancel"}}},"containment_granularity":"resource","evidence_conjunction":"all_of","evidence_requirements":[{"evidence":{"evidence_kind":"logical_cancellation_no_continuing_effect","provider_contract_ref":{"contract_schema_id":"manyforge.value_schema.provider_contract.empty.v1","contract_schema_revision":"sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270","provider_contract_role_id":"gripper_logical_cancel"}},"evidence_item_id":"logical_cancel_fenced","observation_semantics":{"observation_kind":"command_result"},"source_requirement":{"freshness_budget_ns":100000000,"source_kind":"command_target_status"}}],"stage_kind":"nominal","stop_escalation_stage_id":"gripper_logical_cancel"}],"stop_evidence_policy_id":"manyforge.gripper_logical_cancellation"})POLICY");
+    const bool position_gripper = ros_gripper_actuation_kind == "position_commanded";
+    if (!position_gripper && ros_gripper_actuation_kind != "pneumatic")
+      throw std::logic_error("ROS gripper fixture has unknown authored actuation");
+    const std::string_view policy_id = position_gripper
+        ? "manyforge.gripper_position_cancellation"
+        : "manyforge.gripper_logical_cancellation";
+    auto policy_root = identity.root().as_object();
+    for (auto &[name, value] : policy_root) {
+      if (name == "stop_evidence_policy_id") value = CanonicalValue(std::string(policy_id));
+      if (name != "escalation_stages" || !position_gripper) continue;
+      auto stages = value.as_array();
+      auto hard = stages.front().as_object();
+      for (auto &[field, selected] : hard) {
+        if (field == "stage_kind" || field == "stop_escalation_stage_id")
+          selected = CanonicalValue("software_hard");
+        else if (field == "containment_command")
+          selected = CanonicalValue(CanonicalValue::Object{{"command", CanonicalValue(CanonicalValue::Object{
+              {"command_kind", CanonicalValue("registered")},
+              {"registered_command_kind_id", CanonicalValue("manyforge.stop.software_hard")},
+              {"provider_contract_ref", CanonicalValue(CanonicalValue::Object{
+                  {"provider_contract_role_id", CanonicalValue("software_hard_stop")},
+                  {"contract_schema_id", CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+                  {"contract_schema_revision", CanonicalValue(std::string(kEmptyProviderContractSchemaRevision))},
+              })},
+          })}});
+        else if (field == "evidence_requirements") {
+          auto requirements = selected.as_array();
+          auto requirement = requirements.front().as_object();
+          for (auto &[key, setting] : requirement)
+            if (key == "evidence_item_id") setting = CanonicalValue("hard_cancel_fenced");
+          requirements.front() = CanonicalValue(std::move(requirement));
+          selected = CanonicalValue(std::move(requirements));
+        }
+      }
+      stages.emplace_back(std::move(hard));
+      value = CanonicalValue(std::move(stages));
+    }
+    const auto stop_bytes = revisioned_document(
+        CanonicalValue(std::move(policy_root)), "catalog-record-revision/stop_evidence_policy",
+        core::kStopEvidencePolicyApiVersion, "stop_evidence_policy_revision");
+    const core::ContentDigest digest(sha256_digest(stop_bytes));
+    const core::ContentAddressedStoreKey key(catalog_key("stop", digest.value()));
+    const core::StopEvidencePolicyCatalogRecordRefDTO reference{
+        core::StopEvidencePolicyId(std::string(policy_id)),
+        core::StopEvidencePolicyRevision(revision_from_document(stop_bytes, "stop_evidence_policy_revision")),
+        core::SchemaId(std::string(core::kStopEvidencePolicyApiVersion)),
+        schema_revision_for(core::CatalogRecordKind::kStopEvidencePolicy), digest, key,
+    };
+    auto stop = resolve_and_qualify_stop_evidence_policy(reference, key, stop_bytes);
+    if (catalog.gripper_stop.has_value()) {
+      const auto old_key = catalog.gripper_stop->reference().content_addressed_store_key;
+      std::erase_if(catalog.artifacts, [&](const auto &artifact) { return artifact.store_key == old_key; });
+    }
+    catalog.artifacts.push_back(catalog_artifact(
+        "catalog://stop_policy/" + std::string(policy_id), stop_bytes, stop));
+    catalog.gripper_stop = std::move(stop);
+  }
+
   const auto old_component_key =
       catalog.component_type.reference().content_addressed_store_key;
   catalog.artifacts.erase(
@@ -1933,9 +2105,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
       catalog_artifact("catalog://command_schema/gripper.command_position",
                        command_schema_bytes, command_schema));
   catalog.artifacts.push_back(
-      catalog_artifact(gripper_only
-                           ? "catalog://component_type/lite6_gripper_component"
-                           : "catalog://component_type/lite6_arm_gripper_component",
+      catalog_artifact("catalog://component_type/" + component_id,
                        component_bytes, component_type));
   catalog.artifacts.push_back(
       catalog_artifact("catalog://control_interface/lite6_gripper_position",
@@ -1971,9 +2141,14 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
     bool ros_mock_peers = true,
     std::string_view empty_ros_configuration_field = {},
     bool ros_mock_first = false,
-    void (*graph_input_mapper)(CanonicalValue::Object &) = nullptr) {
+    void (*graph_input_mapper)(CanonicalValue::Object &) = nullptr,
+    bool independent_scalar_peer = false,
+    const QualifiedComponentType *scalar_peer_type = nullptr,
+    std::string_view ros_gripper_actuation_kind = "pneumatic",
+    std::optional<double> ros_gripper_dwell_s = std::nullopt,
+    std::string_view ros_gripper_output_mode = "commanded") {
   const bool aggregate = catalog.gripper_capability.has_value();
-  if (gripper_only && (!aggregate || instance_count != 1U)) {
+  if (gripper_only && (!aggregate || (instance_count != 1U && !independent_scalar_peer))) {
     throw std::logic_error(
         "Lite6 gripper-only fixture requires the one aggregate gripper");
   }
@@ -1990,7 +2165,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
         "Lite6 control fixture instance count is outside its test bound");
   }
   if (aggregate &&
-      (instance_count != 1U || !catalog.gripper_command_schema.has_value() ||
+      ((instance_count != 1U && !independent_scalar_peer) || !catalog.gripper_command_schema.has_value() ||
        !catalog.gripper_contract.has_value() ||
        !catalog.gripper_topology.has_value() ||
        !catalog.gripper_provider.has_value())) {
@@ -2010,6 +2185,9 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
   bindings.reserve(instance_count);
 
   for (std::size_t instance = 0U; instance < instance_count; ++instance) {
+    const bool scalar_only = gripper_only || (independent_scalar_peer && instance > 0U);
+    const auto &component_type = instance > 0U && scalar_peer_type != nullptr
+                                     ? *scalar_peer_type : catalog.component_type;
     const std::string model_instance_id =
         indexed_id(kLite6ControllableModelInstanceId, instance);
     const std::string component_id =
@@ -2059,19 +2237,19 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
                    ros_motion_limit_target_id, ros_default_fault_stop_profiles,
                    component_id, instance == 0U ? first_ros_frame_prefix : component_id + "/",
                    instance == 0U ? initial_joint1_position_rad : std::nullopt,
-                   aggregate)
+                   aggregate, !scalar_only)
              : native_execution_configuration(
-                   component_id, aggregate, !gripper_only,
+                   component_id, aggregate, !scalar_only,
                    initial_joint1_position_rad)},
     });
     components.emplace_back(CanonicalValue::Object{
         {"controllable_component_id", CanonicalValue(component_id)},
         {"component_type_id",
          CanonicalValue(
-             catalog.component_type.value().component_type_id.value())},
+             component_type.value().component_type_id.value())},
         {"component_type_revision",
          CanonicalValue(
-             catalog.component_type.value().component_type_revision.value())},
+             component_type.value().component_type_revision.value())},
         {"model_role_bindings",
          CanonicalValue(
              CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
@@ -2084,7 +2262,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
     });
     // A gripper-only cell installs the same component type with its arm
     // target unbound: no arm domain, binding, route or planner.
-    if (!gripper_only) domains.emplace_back(CanonicalValue::Object{
+    if (!scalar_only) domains.emplace_back(CanonicalValue::Object{
         {"control_domain_id", CanonicalValue(domain_id)},
         {"control_domain_revision", CanonicalValue(std::string(kZeroDigest))},
         {"runtime_unit_ids", text_array({runtime_unit_id})},
@@ -2154,6 +2332,15 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
         {"containment_granularity",
          CanonicalValue(std::string(containment_granularity))},
     };
+    if (catalog.observed_state_capability.has_value() && !scalar_only) {
+      auto observed_binding = arm_binding;
+      for (auto &[name, value] : observed_binding) {
+        if (name == "control_binding_id") value = CanonicalValue(binding_id + "_observed_state");
+        else if (name == "capability_id") value = CanonicalValue(catalog.observed_state_capability->value().capability_id.value());
+        else if (name == "capability_definition_revision") value = CanonicalValue(catalog.observed_state_capability->value().capability_definition_revision.value());
+      }
+      bindings.emplace_back(std::move(observed_binding));
+    }
     if (native_motion) {
       arm_binding.emplace_back(
           "runtime_scale_route_qualifications",
@@ -2169,7 +2356,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
                   {"freshness_budget_ns", CanonicalValue(100'000'000.0)},
               })}));
     }
-    if (!gripper_only) bindings.emplace_back(std::move(arm_binding));
+    if (!scalar_only) bindings.emplace_back(std::move(arm_binding));
     if (aggregate) {
       const auto &gripper_capability = *catalog.gripper_capability;
       const auto &gripper_contract = *catalog.gripper_contract;
@@ -2180,7 +2367,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
                                      : catalog.stop;
       domains.emplace_back(CanonicalValue::Object{
           {"control_domain_id",
-           CanonicalValue(std::string(kLite6GripperDomainId))},
+           CanonicalValue(indexed_id(kLite6GripperDomainId, instance))},
           {"control_domain_revision", CanonicalValue(std::string(kZeroDigest))},
           {"runtime_unit_ids", text_array({runtime_unit_id})},
           {"control_coordinator_endpoint_role", CanonicalValue("coordinator")},
@@ -2193,7 +2380,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
       });
       bindings.emplace_back(CanonicalValue::Object{
           {"control_binding_id",
-           CanonicalValue(std::string(kLite6GripperBindingId))},
+           CanonicalValue(indexed_id(kLite6GripperBindingId, instance))},
           {"control_binding_revision",
            CanonicalValue(std::string(kZeroDigest))},
           {"controllable_component_id", CanonicalValue(component_id)},
@@ -2205,12 +2392,12 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
            CanonicalValue(gripper_capability.value()
                               .capability_definition_revision.value())},
           {"control_domain_id",
-           CanonicalValue(std::string(kLite6GripperDomainId))},
+           CanonicalValue(indexed_id(kLite6GripperDomainId, instance))},
           {"resource_bindings",
            CanonicalValue(
                CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
                    {"resource_role_id", CanonicalValue("fingers")},
-                   {"resource_id", CanonicalValue("lite6_gripper_joint")},
+                   {"resource_id", CanonicalValue(resource_prefix + "_gripper_joint")},
                })})},
           {"control_interface_contract_id",
            CanonicalValue(
@@ -2232,7 +2419,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
                    {"state_endpoint_role_ids", text_array({"state"})},
                })})},
           {"provider_instance_id",
-           CanonicalValue("lite6_gripper_provider_instance")},
+           CanonicalValue(indexed_id("lite6_gripper_provider_instance", instance))},
           {"provider_runtime_unit_id", CanonicalValue(runtime_unit_id)},
           {"provider_manifest_id",
            CanonicalValue(
@@ -2241,9 +2428,9 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
            CanonicalValue(
                gripper_provider.value().provider_manifest_revision.value())},
           {"state_authority_id",
-           CanonicalValue(ros2_control_execution ? "lite6_gripper_commanded_state"
+           CanonicalValue(indexed_id(ros2_control_execution ? "lite6_gripper_commanded_state"
                          : native_motion ? "lite6_gripper_predicted_state"
-                                         : "lite6_gripper_measured_state")},
+                                         : "lite6_gripper_measured_state", instance))},
           {"state_authority_class",
            CanonicalValue(ros2_control_execution ? "commanded"
                          : native_motion ? "predicted" : "measured")},
@@ -2262,7 +2449,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
         auto feedback_binding = bindings.back().as_object();
         for (auto &[name, value] : feedback_binding) {
           if (name == "control_binding_id") {
-            value = CanonicalValue("lite6_gripper_feedback");
+            value = CanonicalValue(indexed_id("lite6_gripper_feedback", instance));
           } else if (name == "capability_id") {
             value = CanonicalValue(feedback.value().capability_id.value());
           } else if (name == "capability_definition_revision") {
@@ -2287,6 +2474,20 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
             selected = CanonicalValue(CanonicalValue::Array{});
           if (field == "isaac_world")
             selected = CanonicalValue(std::string(isaac_world));
+          if (field == "gripper_target_configurations") {
+            auto rows = selected.as_array();
+            for (auto &row : rows) {
+              auto fields = row.as_object();
+              for (auto &[key, setting] : fields) {
+                if (key == "actuation_kind") setting = CanonicalValue(std::string(ros_gripper_actuation_kind));
+                if (key == "output_mode") setting = CanonicalValue(std::string(ros_gripper_output_mode));
+                if (key == "command_duration_s" && ros_gripper_dwell_s.has_value())
+                  setting = CanonicalValue(*ros_gripper_dwell_s);
+              }
+              row = CanonicalValue(std::move(fields));
+            }
+            selected = CanonicalValue(std::move(rows));
+          }
           if (field == "controller_profiles" &&
               ((ros_mock_peers && index > 0U) ||
                (ros_mock_first && index == 0U))) {
@@ -2468,7 +2669,8 @@ make_applicability_inputs(
     for (std::size_t index = 0U; index < graph.graph().control_bindings.size();
          ++index) {
       const auto &binding = graph.graph().control_bindings[index];
-      if (binding.command_target_id.value() != kLite6ArmTargetId) {
+      if (binding.command_target_id.value() != kLite6ArmTargetId ||
+          binding.capability_id.value() != "execution.trajectory.execute") {
         continue;
       }
       const auto component =
@@ -2572,6 +2774,41 @@ make_applicability_inputs(
               "Lite6 Stop parameter binding has no exact control domain");
         }
         for (const auto &route_id : binding.legal_control_route_ids) {
+          if (binding.stop_evidence_policy_id.value() == "manyforge.gripper_logical_cancellation" ||
+              binding.stop_evidence_policy_id.value() == "manyforge.gripper_position_cancellation") {
+            stop_stage_parameters.emplace_back(CanonicalValue::Object{
+                {"control_domain_id", CanonicalValue(domain->control_domain_id.value())},
+                {"control_domain_revision", CanonicalValue(domain->control_domain_revision.value())},
+                {"control_binding_id", CanonicalValue(binding.control_binding_id.value())},
+                {"control_binding_revision", CanonicalValue(binding.control_binding_revision.value())},
+                {"controller_topology_id", CanonicalValue(binding.controller_topology_id.value())},
+                {"topology_revision", CanonicalValue(binding.topology_revision.value())},
+                {"control_route_id", CanonicalValue(route_id.value())},
+                {"stop_evidence_policy_id", CanonicalValue(binding.stop_evidence_policy_id.value())},
+                {"stop_evidence_policy_revision", CanonicalValue(binding.stop_evidence_policy_revision.value())},
+                {"stop_escalation_stage_id", CanonicalValue("gripper_logical_cancel")},
+                {"provider_contract_ref", CanonicalValue(CanonicalValue::Object{
+                    {"provider_contract_role_id", CanonicalValue("gripper_logical_cancel")},
+                    {"contract_schema_id", CanonicalValue("manyforge.value_schema.provider_contract.empty.v1")},
+                    {"contract_schema_revision", CanonicalValue(std::string(kEmptyProviderContractSchemaRevision))},
+                })},
+                {"default_contract_parameters", CanonicalValue(CanonicalValue::Object{})},
+            });
+            if (binding.stop_evidence_policy_id.value() == "manyforge.gripper_position_cancellation") {
+              auto hard = stop_stage_parameters.back().as_object();
+              for (auto &[name, value] : hard) {
+                if (name == "stop_escalation_stage_id") value = CanonicalValue("software_hard");
+                if (name == "provider_contract_ref") {
+                  auto contract = value.as_object();
+                  for (auto &[field, selected] : contract)
+                    if (field == "provider_contract_role_id") selected = CanonicalValue("software_hard_stop");
+                  value = CanonicalValue(std::move(contract));
+                }
+              }
+              stop_stage_parameters.emplace_back(std::move(hard));
+            }
+            continue;
+          }
           if (qualified_motion_controlled_stop &&
               binding.command_target_id.value() == kLite6ArmTargetId) {
             CanonicalValue::Array resource_limits;
@@ -2745,16 +2982,33 @@ make_lite6_controllable_retention_fixture(
     bool include_lifecycle_recover = false,
     bool ros_mock_first = false,
     const Lite6StructuralRetentionFixture *structural_override = nullptr,
-    void (*graph_input_mapper)(CanonicalValue::Object &) = nullptr) {
+    void (*graph_input_mapper)(CanonicalValue::Object &) = nullptr,
+    bool include_observed_state = false,
+    bool independent_scalar_peer = false,
+    std::string_view ros_gripper_actuation_kind = "pneumatic",
+    std::optional<double> ros_gripper_dwell_s = std::nullopt,
+    std::string_view ros_gripper_output_mode = "commanded",
+    void (*component_input_mapper)(CanonicalValue::Object &) = nullptr) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
+  if (component_input_mapper != nullptr &&
+      (!gripper_only || !ros2_control_execution || structural_override == nullptr ||
+       ros_gripper_actuation_kind != "position_commanded")) {
+    throw std::logic_error(
+        "standalone component mapping requires its genuine Position structural override");
+  }
+  if (independent_scalar_peer &&
+      (!ros2_control_execution || !aggregate_gripper || instance_count != 2U ||
+       chained || shared_native_domain || assistant_enabled || include_observed_state)) {
+    throw std::logic_error("scalar-peer fixture requires two genuine ROS components");
+  }
   if (gripper_only &&
       (!aggregate_gripper || !native_motion || !stoppable ||
-       !qualified_motion_controlled_stop || ros2_control_execution)) {
+       !qualified_motion_controlled_stop)) {
     throw std::logic_error(
         "Lite6 gripper-only fixture derives from the native CCLC product "
         "with its own gripper Stop policy");
   }
-  if (aggregate_gripper && (chained || instance_count != 1U)) {
+  if (aggregate_gripper && (chained || (instance_count != 1U && !independent_scalar_peer))) {
     throw std::logic_error(
         "Lite6 aggregate fixture currently selects one direct native "
         "component");
@@ -2768,12 +3022,18 @@ make_lite6_controllable_retention_fixture(
     throw std::logic_error(
         "gripper feedback fixture requires the native gripper owner");
   }
-  if (ros2_control_execution && (!native_motion || chained)) {
+  if (ros2_control_execution && !native_motion) {
     throw std::logic_error(
         "ros2_control execution fixture requires direct addressed arms");
   }
+  // DX823: the existing chained catalog can qualify retained metadata on a
+  // genuine ROS source. This fixture does not qualify chained runtime Stop.
+  if (ros2_control_execution && chained && stoppable) {
+    throw std::logic_error(
+        "ROS chained catalog fixture does not qualify runtime Stop");
+  }
   if (qualified_motion_controlled_stop &&
-      (!stoppable || !native_motion || chained || instance_count != 1U)) {
+      (!stoppable || !native_motion || chained || (instance_count != 1U && !independent_scalar_peer))) {
     throw std::logic_error(
         "qualified controlled-Stop fixture requires one direct stoppable "
         "arm");
@@ -2786,7 +3046,7 @@ make_lite6_controllable_retention_fixture(
       qualified_motion_controlled_stop, arm_lifecycle_semantic_digest,
       ros2_control_execution,
       shared_native_domain ? "manyforge.provider.native_control" : direct_provider_id,
-      include_lifecycle_recover);
+      include_lifecycle_recover, include_observed_state);
   if (aggregate_gripper && stoppable && qualified_motion_controlled_stop) {
     auto gripper_stop_catalog = fixture_detail::qualify_control_catalog(
         false, true, true, "resource", false, {}, false);
@@ -2803,17 +3063,38 @@ make_lite6_controllable_retention_fixture(
     catalog.artifacts.push_back(*artifact);
     catalog.gripper_stop = std::move(gripper_stop_catalog.stop);
   }
+  std::optional<QualifiedComponentType> scalar_peer_type;
+  std::optional<Lite6InputArtifact> scalar_peer_type_artifact;
+  if (independent_scalar_peer && !gripper_only) {
+    const auto peer_catalog = fixture_detail::add_aggregate_gripper_catalog(
+        catalog, stoppable, gripper_lifecycle_semantic_digest,
+        gripper_feedback, true, ros2_control_execution, ros_gripper_actuation_kind);
+    scalar_peer_type = peer_catalog.component_type;
+    const auto key = scalar_peer_type->reference().content_addressed_store_key;
+    const auto found = std::find_if(peer_catalog.artifacts.begin(), peer_catalog.artifacts.end(),
+        [&](const auto &artifact) { return artifact.store_key == key; });
+    if (found == peer_catalog.artifacts.end()) {
+      throw std::logic_error("scalar peer loses its genuine component catalog source");
+    }
+    scalar_peer_type_artifact = *found;
+  }
   if (aggregate_gripper) {
     catalog = fixture_detail::add_aggregate_gripper_catalog(
         std::move(catalog), stoppable, gripper_lifecycle_semantic_digest,
-        gripper_feedback, gripper_only, ros2_control_execution);
+        gripper_feedback, gripper_only, ros2_control_execution,
+        ros_gripper_actuation_kind, component_input_mapper);
+  }
+  if (scalar_peer_type_artifact.has_value()) {
+    catalog.artifacts.push_back(*scalar_peer_type_artifact);
   }
   const auto graph = fixture_detail::make_graph(
       structural, catalog, instance_count, cell_id, containment_granularity,
       gripper_only, initial_joint1_position_rad, shared_native_domain,
       ros_motion_limit_target_id, ros_default_fault_stop_profiles,
       first_ros_frame_prefix, isaac_world, ros_mock_peers,
-      empty_ros_configuration_field, ros_mock_first, graph_input_mapper);
+      empty_ros_configuration_field, ros_mock_first, graph_input_mapper,
+      independent_scalar_peer, scalar_peer_type.has_value() ? &*scalar_peer_type : nullptr,
+      ros_gripper_actuation_kind, ros_gripper_dwell_s, ros_gripper_output_mode);
   const std::optional<fixture_detail::AssistantOverlayFixture>
       assistant_overlay =
           assistant_enabled
@@ -2836,6 +3117,9 @@ make_lite6_controllable_retention_fixture(
   // planner capabilities have no selected provider or graph binding here.
   std::vector<core::CatalogRecordRefDTO> catalog_records{
       structural.catalog_reference, catalog.component_type.reference()};
+  if (scalar_peer_type.has_value()) {
+    catalog_records.push_back(scalar_peer_type->reference());
+  }
   if (!gripper_only) {
     catalog_records.push_back(catalog.capability.reference());
     catalog_records.push_back(catalog.contract.reference());
@@ -2855,6 +3139,8 @@ make_lite6_controllable_retention_fixture(
   }
   if (catalog.gripper_feedback.has_value())
     catalog_records.push_back(catalog.gripper_feedback->reference());
+  if (catalog.observed_state_capability.has_value())
+    catalog_records.push_back(catalog.observed_state_capability->reference());
   if (!gripper_only) {
     for (const auto &planner_capability : catalog.planner_capabilities) {
       catalog_records.push_back(planner_capability.reference());
@@ -2920,9 +3206,12 @@ make_lite6_controllable_retention_fixture(
     for (auto &[name, value] : deployment_members) {
       if (name == "deployment_artifact_id")
         value = CanonicalValue(structural.catalog_reference.record_id.value() +
-                               "_arm_only_ros_fixture");
+                               (component_input_mapper != nullptr ? "_gripper_only_ros_fixture"
+                                             : "_arm_only_ros_fixture"));
       else if (name == "name")
-        value = CanonicalValue("UR5 arm-only ROS protocol fixture");
+        value = CanonicalValue(component_input_mapper != nullptr
+                                   ? "Standalone Robotiq Position ROS fixture"
+                                   : "UR5 arm-only ROS protocol fixture");
     }
   }
   if (inputs.normalized_policies().has_value()) {
@@ -2950,8 +3239,8 @@ make_lite6_controllable_retention_fixture(
 
   const std::array<SourceVerifiedModelAsset, 1U> assets{
       structural.verified_asset};
-  const std::array<QualifiedComponentType, 1U> component_types{
-      catalog.component_type};
+  std::vector<QualifiedComponentType> component_types{catalog.component_type};
+  if (scalar_peer_type.has_value()) component_types.push_back(*scalar_peer_type);
   const auto composition =
       compose_cell_occurrences(
           deployment.graph(),
@@ -2976,6 +3265,8 @@ make_lite6_controllable_retention_fixture(
   std::vector<QualifiedCommandSchema> command_schemas;
   std::vector<QualifiedCapabilityDefinition> capabilities;
   if (!gripper_only) capabilities.push_back(catalog.capability);
+  if (!gripper_only && catalog.observed_state_capability.has_value())
+    capabilities.push_back(*catalog.observed_state_capability);
   std::vector<QualifiedControlInterfaceContract> contracts;
   std::vector<QualifiedControllerTopology> topologies;
   std::vector<QualifiedProviderManifest> providers;
@@ -3079,6 +3370,17 @@ make_lite6_chained_controllable_retention_fixture() {
   return make_lite6_controllable_retention_fixture(true);
 }
 
+/// DX823: genuine ROS source plus existing two-controller catalog/sealer data.
+/// No controller launch, chained runtime, or Stop qualification is claimed.
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_chained_catalog_retention_fixture() {
+  return make_lite6_controllable_retention_fixture(
+      true, false, 1U, false, true, {}, false, false, "resource", false, {}, {},
+      true, false, false, std::nullopt, false, kLite6ArmTargetId, std::nullopt,
+      std::nullopt, {}, {}, true, {}, "manyforge.provider.ros2_control", false,
+      true);
+}
+
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_stoppable_controllable_retention_fixture(
     std::string_view containment_granularity = "resource") {
@@ -3141,6 +3443,17 @@ make_lite6_ros2_control_arm_only_cclc_product_retention_fixture(
       {}, "manyforge.provider.ros2_control", true, true);
 }
 
+/// Actual ROS controlled-Stop arm; the legacy Native helper remains archival.
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_stop_qualified_ros_motion_retention_fixture(
+    const std::optional<double> arm_max_stop_time_s = std::nullopt) {
+  return make_lite6_controllable_retention_fixture(
+      false, false, 1U, false, true, {}, false, true, "resource", true, {}, {},
+      true, false, false, std::nullopt, false, kLite6ArmTargetId, std::nullopt,
+      arm_max_stop_time_s, {}, {}, true, {}, "manyforge.provider.ros2_control",
+      false, true);
+}
+
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_stop_qualified_native_motion_retention_fixture(
     const std::optional<double> arm_max_stop_time_s = std::nullopt) {
@@ -3181,6 +3494,48 @@ make_lite6_native_cclc_product_retention_fixture(
       false, false, 1U, true, true, {}, false, true, "resource", true,
       arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest, false,
       gripper_feedback, false, initial_joint1_position_rad);
+}
+
+/// Genuine ROS Mock gripper owner: no arm binding, participant, seed or TCP limits.
+/// DX768: genuine A1 fixture uses the approved logical-cancellation policy.
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+    std::string_view lifecycle_semantic_digest,
+    std::string_view actuation_kind = "pneumatic",
+    std::optional<double> dwell_s = std::nullopt,
+    void (*graph_input_mapper)(CanonicalValue::Object &) = nullptr,
+    std::string_view output_mode = "commanded") {
+  return make_lite6_controllable_retention_fixture(
+      false, false, 1U, true, true, {}, false, true, "resource", true,
+      lifecycle_semantic_digest, lifecycle_semantic_digest, true,
+      false, true, std::nullopt, false, kLite6ArmTargetId,
+      std::nullopt, std::nullopt, {}, {}, true, {},
+      "manyforge.provider.ros2_control", true, true, nullptr, graph_input_mapper,
+      false, false, actuation_kind, dwell_s, output_mode);
+}
+
+/// Two genuine Mock components on the configured ROS unit. The second
+/// component is scalar-only; the first may have its actual arm plus gripper.
+/// Scalar product routing remains separately held for maintainer discussion.
+/// Same genuine model/target and local owner, explicitly without output.
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_no_output_gripper_retention_fixture(
+    std::string_view lifecycle_semantic_digest, double dwell_s = 0.0) {
+  return make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+      lifecycle_semantic_digest, "pneumatic", dwell_s, nullptr, "none");
+}
+
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_scalar_peer_retention_fixture(
+    std::string_view lifecycle_semantic_digest, bool arm_root = false) {
+  return make_lite6_controllable_retention_fixture(
+      false, false, 2U, true, true,
+      arm_root ? "i6_ros_arm_scalar_peer_cell" : "i6_ros_two_scalar_cell",
+      false, true, "resource", true,
+      lifecycle_semantic_digest, lifecycle_semantic_digest, true,
+      false, !arm_root, std::nullopt, false, kLite6ArmTargetId,
+      std::nullopt, std::nullopt, {}, {}, true, {},
+      "manyforge.provider.ros2_control", true, true, nullptr, nullptr, false, true);
 }
 
 /// A gripper-only native cell: the aggregate component with its arm target
@@ -3274,6 +3629,18 @@ make_lite6_ros2_control_shared_consumer_retention_fixture(
       stoppable, "resource", stoppable, {}, {}, true, false, false,
       std::nullopt, false, kLite6ArmTargetId, std::nullopt, std::nullopt,
       {}, {}, true, {}, "manyforge.provider.ros2_control", false, true);
+}
+
+/// Genuine ROS execution owner with a distinct retained read-only StateObserved binding.
+/// This qualifies compiler/binding inputs, not actual state transport.
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_observed_consumer_retention_fixture(bool aggregate_gripper = false) {
+  return make_lite6_controllable_retention_fixture(
+      false, false, 1U, aggregate_gripper, true, {}, false,
+      false, "resource", false, {}, {}, true, false, false,
+      std::nullopt, false, kLite6ArmTargetId, std::nullopt, std::nullopt,
+      {}, {}, true, {}, "manyforge.provider.ros2_control", false, true,
+      nullptr, nullptr, true);
 }
 
 class Lite6ControllableCompilerInputArtifactSource final

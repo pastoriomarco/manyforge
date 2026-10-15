@@ -36,7 +36,6 @@
 #include "manyforge_deployment/provider_manifest_codec.hpp"
 #include "manyforge_deployment/retained_bundle.hpp"
 #include "manyforge_deployment/stop_evidence_policy_codec.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "posix_durability_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
@@ -1622,6 +1621,30 @@ load_retained_control_catalog_closure(
   return result;
 }
 
+[[nodiscard]] std::optional<VerifiedRetainedModelMap>
+read_control_source_model_map(const std::filesystem::path &raw_data,
+                              const RetainedBundle &bundle) {
+  const auto &products = bundle.value().compiled_products.symbol_role_maps;
+  if (products.empty())
+    return std::nullopt;
+  if (products.size() != 1U || products.front().artifact_refs.size() != 1U)
+    detail::fail_retained_bundle(
+        "cold control source has no unique model-map product/artifact");
+  const auto &product = products.front();
+  const auto &artifact = product.artifact_refs.front();
+  const auto bytes = read_verified_raw_reference(
+      raw_data, artifact.content_addressed_store_key, artifact.content_digest,
+      artifact.byte_size, "cold control source model-map artifact");
+  auto verified = detail::RetainedModelMapVerificationAuthority::verify(
+      bundle,
+      RetainedModelMapQuery{bundle.retained_bundle_id(), product.product_id},
+      bytes);
+  if (!verified.has_value())
+    detail::fail_retained_bundle(
+        "cold control source model-map verification failed");
+  return verified;
+}
+
 void require_verified_product_artifacts(
     const std::filesystem::path &raw_data,
     const core::RetainedProductDTO &product,
@@ -1630,7 +1653,9 @@ void require_verified_product_artifacts(
     const core::RuntimeUnitId *runtime_unit_subject = nullptr,
     std::span<const QualifiedStopEvidencePolicy> stop_policies = {},
     std::span<const QualifiedControllerTopology> controller_topologies = {},
-    std::span<const QualifiedProviderManifest> provider_manifests = {}) {
+    std::span<const QualifiedProviderManifest> provider_manifests = {},
+    std::span<const CompositionControlBindingCoordinateMap> coordinate_maps =
+        {}) {
   std::optional<std::string> runtime_manifest;
   std::optional<std::string> runtime_launchable;
   std::optional<std::string> control_domain_control;
@@ -1676,11 +1701,6 @@ void require_verified_product_artifacts(
         detail::fail_retained_bundle(
             "runtime-unit product is missing its envelope subject");
       }
-      const bool native_execution =
-          product.product_contract_id.value() ==
-              detail::kNativeExecutionRuntimeProductContractId &&
-          product.product_contract_revision ==
-              detail::native_execution_runtime_product_contract_revision();
       const bool ros2_control_execution =
           product.product_contract_id.value() ==
               detail::kRos2ControlExecutionRuntimeProductContractId &&
@@ -1688,25 +1708,19 @@ void require_verified_product_artifacts(
               detail::
                   ros2_control_execution_runtime_product_contract_revision();
       const std::string_view manifest_role =
-          native_execution ? detail::kNativeExecutionRuntimeManifestArtifactRole
-          : ros2_control_execution
+          ros2_control_execution
               ? detail::kRos2ControlExecutionRuntimeManifestArtifactRole
               : detail::kReferenceRuntimeManifestArtifactRole;
       const std::string_view manifest_media =
-          native_execution ? detail::kNativeExecutionRuntimeManifestMediaType
-          : ros2_control_execution
+          ros2_control_execution
               ? detail::kRos2ControlExecutionRuntimeManifestMediaType
               : detail::kReferenceRuntimeManifestMediaType;
       const std::string_view launchable_role =
-          native_execution
-              ? detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole
-          : ros2_control_execution
+          ros2_control_execution
               ? detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole
               : detail::kReferenceRuntimeLaunchableArtifactRole;
       const std::string_view launchable_media =
-          native_execution
-              ? detail::kNativeExecutionRuntimeLaunchDescriptorMediaType
-          : ros2_control_execution
+          ros2_control_execution
               ? detail::kRos2ControlExecutionRuntimeLaunchDescriptorMediaType
               : detail::kReferenceRuntimeLaunchableMediaType;
       if (artifact.artifact_role_id.value() == manifest_role) {
@@ -1744,7 +1758,7 @@ void require_verified_product_artifacts(
                 ? std::optional<std::string_view>(*stop_commissioning_evidence)
                 : std::nullopt},
         bundle, *control_domain_subject, stop_policies, controller_topologies,
-        provider_manifests);
+        provider_manifests, coordinate_maps);
   }
   if (product.product_kind ==
       core::RetainedProductKind::kRuntimeUnitConfiguration) {
@@ -1753,14 +1767,6 @@ void require_verified_product_artifacts(
           "runtime-unit product omits its manifest or launchable artifact");
     }
     if (product.product_contract_id.value() ==
-            detail::kNativeExecutionRuntimeProductContractId &&
-        product.product_contract_revision ==
-            detail::native_execution_runtime_product_contract_revision()) {
-      detail::require_native_execution_runtime_product_matches_retained_bundle(
-          *runtime_manifest, *runtime_launchable, bundle,
-          *runtime_unit_subject);
-    } else if (
-        product.product_contract_id.value() ==
             detail::kRos2ControlExecutionRuntimeProductContractId &&
         product.product_contract_revision ==
             detail::
@@ -1800,6 +1806,15 @@ void require_verified_bundle_references(
   if (products.viewer_model.has_value()) {
     require_verified_product_artifacts(raw_data, *products.viewer_model, value);
   }
+  for (const auto &product : products.symbol_role_maps) {
+    require_verified_product_artifacts(raw_data, product, value);
+  }
+  const auto model_map = read_control_source_model_map(raw_data, bundle);
+  const auto coordinate_maps =
+      model_map.has_value()
+          ? std::span<const CompositionControlBindingCoordinateMap>(
+                model_map->control_bindings())
+          : std::span<const CompositionControlBindingCoordinateMap>{};
   for (const auto &group : products.control_domain_products) {
     const RetainedControlCatalogClosure domain_catalogs =
         select_control_catalogs_for_domain(control_catalogs, value.cell_graph,
@@ -1808,11 +1823,8 @@ void require_verified_bundle_references(
       require_verified_product_artifacts(
           raw_data, product, value, &group.control_domain_id, nullptr,
           domain_catalogs.stop_policies, domain_catalogs.controller_topologies,
-          domain_catalogs.provider_manifests);
+          domain_catalogs.provider_manifests, coordinate_maps);
     }
-  }
-  for (const auto &product : products.symbol_role_maps) {
-    require_verified_product_artifacts(raw_data, product, value);
   }
   for (const auto &group : products.runtime_unit_products) {
     for (const auto &product : group.products) {
@@ -2248,6 +2260,36 @@ detail::RetainedModelMapVerificationAuthority::verify(
       std::move(decoded.targets));
 }
 
+std::optional<VerifiedRetainedModelMap>
+detail::RetainedModelMapVerificationAuthority::verify(
+    const RetainedBundle &bundle,
+    const IVerifiedRetainedProductArtifactSource &artifact_source) {
+  const auto &products = bundle.value().compiled_products.symbol_role_maps;
+  if (products.empty())
+    return std::nullopt;
+  if (products.size() != 1U || products.front().artifact_refs.size() != 1U)
+    detail::fail_retained_bundle(
+        "retained control source has no unique model-map product/artifact");
+  const auto &product = products.front();
+  const auto &artifact = product.artifact_refs.front();
+  const RetainedProductArtifactQuery query{
+      bundle.retained_bundle_id(), product.product_id, product.product_kind,
+      core::ArtifactRoleId(
+          std::string(detail::kComposedModelSymbolRoleMapArtifactRole))};
+  const auto loaded = artifact_source.get_verified(query);
+  if (!loaded.has_value())
+    return std::nullopt;
+  if (loaded->query() != query || loaded->artifact_ref() != artifact ||
+      loaded->product_contract_id() != product.product_contract_id ||
+      loaded->product_contract_revision() != product.product_contract_revision)
+    detail::fail_retained_bundle("retained control source model-map artifact "
+                                 "differs from its exact product");
+  return verify(
+      bundle,
+      RetainedModelMapQuery{bundle.retained_bundle_id(), product.product_id},
+      loaded->bytes());
+}
+
 const CompositionTargetResolution *VerifiedRetainedModelMap::find_target(
     const core::ControllableComponentId &component_id,
     const core::CommandTargetId &command_target_id) const noexcept {
@@ -2636,10 +2678,17 @@ FilesystemVerifiedRetainedProductArtifactSource::get_verified(
     const RetainedControlCatalogClosure domain_catalogs =
         select_control_catalogs_for_domain(
             control_catalogs, bundle->value().cell_graph, *subject);
+    const auto model_map =
+        read_control_source_model_map(paths.raw_data, *bundle);
+    const auto coordinate_maps =
+        model_map.has_value()
+            ? std::span<const CompositionControlBindingCoordinateMap>(
+                  model_map->control_bindings())
+            : std::span<const CompositionControlBindingCoordinateMap>{};
     require_verified_product_artifacts(
         paths.raw_data, *product, bundle->value(), subject, nullptr,
         domain_catalogs.stop_policies, domain_catalogs.controller_topologies,
-        domain_catalogs.provider_manifests);
+        domain_catalogs.provider_manifests, coordinate_maps);
   } else if (product->product_kind ==
              core::RetainedProductKind::kRuntimeUnitConfiguration) {
     const core::RuntimeUnitId *subject = nullptr;
@@ -2684,11 +2733,6 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
         "runtime-unit verification found an incoherent product group");
   }
   const auto &product = group->products.front();
-  const bool native_execution =
-      product.product_contract_id.value() ==
-          detail::kNativeExecutionRuntimeProductContractId &&
-      product.product_contract_revision ==
-          detail::native_execution_runtime_product_contract_revision();
   const bool ros2_control_execution =
       product.product_contract_id.value() ==
           detail::kRos2ControlExecutionRuntimeProductContractId &&
@@ -2699,19 +2743,16 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
           detail::kReferenceRuntimeProductContractId &&
       product.product_contract_revision ==
           detail::reference_runtime_product_contract_revision();
-  if (!native_execution && !ros2_control_execution && !reference) {
+  if (!ros2_control_execution && !reference) {
     detail::fail_retained_bundle(
         "runtime-unit product has no build-qualified verifier");
   }
   const std::string_view manifest_role =
-      native_execution ? detail::kNativeExecutionRuntimeManifestArtifactRole
-      : ros2_control_execution
+      ros2_control_execution
           ? detail::kRos2ControlExecutionRuntimeManifestArtifactRole
           : detail::kReferenceRuntimeManifestArtifactRole;
   const std::string_view launchable_role =
-      native_execution
-          ? detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole
-      : ros2_control_execution
+      ros2_control_execution
           ? detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole
           : detail::kReferenceRuntimeLaunchableArtifactRole;
   const RetainedProductArtifactQuery manifest_query{
@@ -2740,11 +2781,7 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
     detail::fail_retained_bundle(
         "runtime-unit artifact source did not return the exact product pair");
   }
-  if (native_execution) {
-    detail::require_native_execution_runtime_product_matches_retained_bundle(
-        manifest->bytes(), launchable->bytes(), bundle.value(),
-        runtime_unit_id);
-  } else if (ros2_control_execution) {
+  if (ros2_control_execution) {
     detail::
         require_ros2_control_execution_runtime_product_matches_retained_bundle(
             manifest->bytes(), launchable->bytes(), bundle.value(),
@@ -2760,63 +2797,42 @@ std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(
       manifest->artifact_ref().content_digest, product.product_contract_id,
       product.product_contract_revision, launchable->artifact_ref(),
       std::string(launchable->bytes()),
-      native_execution
-          ? std::string(detail::kNativeExecutionRuntimeOperatingSystem)
-      : ros2_control_execution
+      ros2_control_execution
           ? std::string(detail::kRos2ControlExecutionRuntimeOperatingSystem)
           : std::string(detail::kReferenceRuntimeOperatingSystem),
-      native_execution
-          ? std::string(
-                detail::kNativeExecutionRuntimeLaunchEnvironmentContract)
-      : ros2_control_execution
+      ros2_control_execution
           ? std::string(
                 detail::kRos2ControlExecutionRuntimeLaunchEnvironmentContract)
           : std::string(detail::kReferenceRuntimeShellContract),
-      native_execution ? std::string(detail::kNativeExecutionRuntimeRoleId)
-      : ros2_control_execution
+      ros2_control_execution
           ? std::string(detail::kRos2ControlExecutionRuntimeRoleId)
           : std::string(detail::kReferenceRuntimeRoleId),
-      native_execution
-          ? std::string(detail::kNativeExecutionRuntimeStatusEndpointRoleId)
-      : ros2_control_execution
+      ros2_control_execution
           ? std::string(
                 detail::kRos2ControlExecutionRuntimeStatusEndpointRoleId)
           : std::string(detail::kReferenceRuntimeStatusEndpointRoleId),
-      native_execution
-          ? std::string(detail::kNativeExecutionRuntimeStatusEndpointContractId)
-      : ros2_control_execution
+      ros2_control_execution
           ? std::string(
                 detail::kRos2ControlExecutionRuntimeStatusEndpointContractId)
           : std::string(detail::kReferenceRuntimeStatusEndpointContractId),
-      native_execution
-          ? detail::native_execution_runtime_status_endpoint_revision()
-      : ros2_control_execution
+      ros2_control_execution
           ? detail::ros2_control_execution_runtime_status_endpoint_revision()
           : detail::reference_runtime_status_endpoint_revision(),
-      (native_execution || ros2_control_execution) ? "adapter_private"
-                                                   : "stdout_line",
-      native_execution
-          ? std::string(detail::kNativeExecutionRuntimeProcessAdapterContractId)
-      : ros2_control_execution
+      ros2_control_execution ? "adapter_private" : "stdout_line",
+      ros2_control_execution
           ? std::string(
                 detail::kRos2ControlExecutionRuntimeProcessAdapterContractId)
           : std::string(detail::kReferenceRuntimeProcessAdapterContractId),
-      native_execution
-          ? detail::native_execution_runtime_process_adapter_revision()
-      : ros2_control_execution
+      ros2_control_execution
           ? detail::ros2_control_execution_runtime_process_adapter_revision()
           : detail::reference_runtime_process_adapter_revision(),
-      native_execution
-          ? std::string(detail::kNativeExecutionRuntimeRetrievalContractId)
-      : ros2_control_execution
+      ros2_control_execution
           ? std::string(detail::kRos2ControlExecutionRuntimeRetrievalContractId)
           : std::string(detail::kReferenceRuntimeRetrievalContractId),
-      native_execution
-          ? detail::native_execution_runtime_retrieval_contract_revision()
-      : ros2_control_execution
+      ros2_control_execution
           ? detail::ros2_control_execution_runtime_retrieval_contract_revision()
           : detail::reference_runtime_retrieval_contract_revision(),
-      (native_execution || ros2_control_execution)
+      ros2_control_execution
           ? std::optional<core::ManagerLivenessPolicyDTO>(
                 execution_runtime_contract::manager_liveness_policy())
           : std::nullopt);

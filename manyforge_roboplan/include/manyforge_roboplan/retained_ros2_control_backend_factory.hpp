@@ -69,4 +69,14 @@ make_retained_ros2_control_backend_factory(
     RetainedRos2ControlBackendConfig config,
     std::shared_ptr<RetainedRos2ControlRuntimeHandle> runtime_handle = {});
 
+/// Same owned ROS transport for a component with only its scalar gripper.
+/// The actual gripper controller/profile facts are supplied without an arm.
+[[nodiscard]] std::shared_ptr<core::IGripperCommandBackend>
+make_retained_ros2_control_gripper_backend(
+    RetainedRos2ControlBackendConfig config,
+    const core::RuntimeParticipantBinding& binding,
+    const std::shared_ptr<RetainedObservedStateChannel>& state_channel,
+    core::IClock& clock, core::IScheduler& scheduler,
+    const std::shared_ptr<RetainedRos2ControlRuntimeHandle>& runtime_handle);
+
 } // namespace manyforge::roboplan_backend

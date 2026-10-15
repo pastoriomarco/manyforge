@@ -1,6 +1,7 @@
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <initializer_list>
 #include <iterator>
@@ -84,6 +85,20 @@ template <typename Value>
       std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
       std::move(message),
       {{"reason", std::move(reason)}}};
+}
+
+[[nodiscard]] std::string bounded_switch_detail(std::string text) {
+  constexpr std::size_t limit = 256U;
+  constexpr std::string_view marker = "[truncated]";
+  if (text.size() <= limit)
+    return text;
+  auto end = limit - marker.size();
+  // Reuse the controller-launch diagnostic's complete UTF-8 prefix rule.
+  while (end > 0U && (static_cast<unsigned char>(text[end]) & 0xc0U) == 0x80U)
+    --end;
+  text.resize(end);
+  text += marker;
+  return text;
 }
 
 [[nodiscard]] RetainedRos2ControlSwitchResult not_sent(std::string reason,
@@ -359,6 +374,15 @@ struct RetainedRos2ControlRuntimeHandle::ArmState final {
 // Aliasing reader leases own the channel, including its real receiver clock.
 // The callback retains no handle or executor whose last destruction could drain
 // the callback's own executor thread.
+struct RetainedRos2ControlRuntimeHandle::GripperOnlyState final {
+  RetainedRos2ControlArmController controller;
+  bool physical_controller_required{true};
+  std::optional<RetainedMeasuredJointStateLane> measured_lane;
+  std::shared_ptr<ros2_control_execution::SelectedRosEndpointFacts> activity_endpoints;
+  rclcpp::Subscription<ActivityMessage>::SharedPtr activity_subscription;
+  rclcpp::Client<SwitchService>::SharedPtr switch_client;
+};
+
 struct PreparedMeasuredStateSources::Storage final {
   struct Channel final {
     std::unique_ptr<core::AddressedObservedStatePublication> publication;
@@ -404,21 +428,32 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
     std::shared_ptr<core::IClock> receiver_clock,
     const core::RuntimeParticipantBinding &candidate_motion,
     const std::optional<core::RuntimeParticipantBinding> &candidate_gripper) {
+  return StageMeasuredStateSources(std::move(descriptors), std::move(receiver_clock),
+      std::optional(candidate_motion), candidate_gripper);
+}
+
+core::Result<std::shared_ptr<PreparedMeasuredStateSources>>
+RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
+    std::vector<core::MeasuredStateSourceDescriptor> descriptors,
+    std::shared_ptr<core::IClock> receiver_clock,
+    const std::optional<core::RuntimeParticipantBinding> &candidate_motion,
+    const std::optional<core::RuntimeParticipantBinding> &candidate_gripper) {
   using Sources = std::shared_ptr<PreparedMeasuredStateSources>;
   using Readers = std::vector<std::shared_ptr<const core::IObservedStateProvider>>;
   std::lock_guard lock(mutex_);
-  if (!resources_ || !arm_ || !receiver_clock ||
+  if (!resources_ || (!arm_ && !gripper_only_) || !receiver_clock ||
       clock_ != receiver_clock.get() || weak_from_this().expired())
     return reject<Sources>(
         "measured_state_owner_mismatch",
         "Measured source requires the bound node and its exact owning clock.");
-  if (!motion_binding_ ||
+  if (motion_binding_.has_value() != candidate_motion.has_value() ||
       candidate_gripper.has_value() != gripper_binding_.has_value())
     return reject<Sources>(
         "measured_state_candidate_owner_mismatch",
         "Measured candidate must retain the bound motion and tool owners.");
-  const auto motion_difference = measured_candidate_physical_owner_difference(
-      *motion_binding_, candidate_motion);
+  const auto motion_difference = candidate_motion
+      ? measured_candidate_physical_owner_difference(*motion_binding_, *candidate_motion)
+      : std::string_view{};
   const auto gripper_difference =
       candidate_gripper ? measured_candidate_physical_owner_difference(
                               *gripper_binding_, *candidate_gripper)
@@ -430,11 +465,12 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
         "measured_state_candidate_owner_mismatch",
         "Measured candidate differs from the bound physical owner: " +
             std::string(difference));
-  if (!arm_->transport.measured_joint_state_lane)
+  const auto& measured_lane = arm_ ? arm_->transport.measured_joint_state_lane : gripper_only_->measured_lane;
+  if (!measured_lane)
     return reject<Sources>(
         "measured_state_lane_unavailable",
         "Bound lane has no qualified continuous measured source.");
-  const auto &lane = *arm_->transport.measured_joint_state_lane;
+  const auto &lane = *measured_lane;
   if (lane.absolute_topic.empty() || lane.absolute_topic.front() != '/' ||
       lane.freshness_budget_ns <= 0 ||
       lane.measured_state_authority_id.value() !=
@@ -477,7 +513,7 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
               return false;
           return true;
         };
-    if ((!matches(&candidate_motion) &&
+    if ((!matches(candidate_motion ? &*candidate_motion : nullptr) &&
          !matches(candidate_gripper ? &*candidate_gripper : nullptr)) ||
         config.source_precedence.front().source_id != lane.absolute_topic ||
         config.source_precedence.front().authority_profile_id !=
@@ -504,16 +540,20 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
   if (!replacement->channels.empty()) {
     const std::weak_ptr<PreparedMeasuredStateSources::Storage> weak_channels =
         replacement;
+    // Keep only the scalar's exact facts, never a handle/executor owner whose
+    // last release could drain this callback's own executor.
+    const auto activity_endpoints =
+        gripper_only_ ? gripper_only_->activity_endpoints : nullptr;
     try {
       replacement->subscription = replacement->node->create_subscription<
           sensor_msgs::msg::JointState>(
           lane.absolute_topic, rclcpp::SensorDataQoS().keep_last(1),
-          [weak_channels](
+          [weak_channels, activity_endpoints](
               const sensor_msgs::msg::JointState::ConstSharedPtr message) {
             const auto channels = weak_channels.lock();
             if (!channels)
               return;
-            std::lock_guard publication_lock(channels->mutex);
+            std::unique_lock publication_lock(channels->mutex);
             if (!channels->active)
               return;
             const auto received = channels->clock->now();
@@ -554,6 +594,12 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
                                            std::span<const double>{},
                   source_time, received);
             }
+            publication_lock.unlock();
+            // This existing NRT sample checkpoint also sees graph edges after
+            // the latched activity's matched callback. Refresh's unchanged
+            // clean/event fast path performs no SDK graph query when steady.
+            if (activity_endpoints)
+              activity_endpoints->Refresh();
           });
     } catch (const std::exception &error) {
       // A valid commanded route must not gain a measured transport admission
@@ -587,8 +633,74 @@ RetainedRos2ControlRuntimeHandle::~RetainedRos2ControlRuntimeHandle() {
   sample_observer_ = {};
   participant_.reset();
   arm_.reset();
+  gripper_only_.reset();
   gripper_.reset();
   resources_.reset();
+}
+
+
+core::Result<void> RetainedRos2ControlRuntimeHandle::BindGripperOnly(
+    std::unique_ptr<ros2_control_execution::Ros2TransportResources> resources,
+    core::IClock& clock,
+    std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend> gripper,
+    const core::RuntimeParticipantBinding& binding,
+    RetainedRos2ControlArmController controller,
+    const std::optional<core::SelectedControllerOccurrenceDTO>& successor_occurrence,
+    std::shared_ptr<core::IClock> clock_owner,
+    std::optional<RetainedMeasuredJointStateLane> measured_lane) {
+  const auto reject_owned = [&](const char* reason, const char* message) {
+    if (gripper) gripper->shutdown();
+    if (resources) resources->quiesce();
+    gripper.reset();
+    resources.reset();
+    return reject<void>(reason, message);
+  };
+  const bool no_output = gripper &&
+      gripper->gripper_output_mode(binding.value().command_target_id.value()) == core::GripperOutputMode::kNone &&
+      gripper->gripper_actuation_kind(binding.value().command_target_id.value()) == core::GripperActuationKind::kPneumatic;
+  const bool controller_valid = no_output
+      ? controller.controller_manager.empty() && controller.controller_name.empty() && controller.hardware_component_name.empty()
+      : !controller.controller_manager.empty() && !controller.controller_name.empty() && !controller.hardware_component_name.empty();
+  if (!resources || !gripper || !binding.value().control_path || !controller_valid ||
+      (clock_owner && clock_owner.get() != &clock))
+    return reject_owned("ros2_control_gripper_only_binding_invalid",
+                        "Gripper-only transport requires its exact binding/controller/clock");
+  const auto domain = binding.value().control_path->control_domain_id;
+  DomainGenerationState generation;
+  if (successor_occurrence) {
+    if (!successor_occurrence->locally_valid() || successor_occurrence->arm_binding_epoch ||
+        successor_occurrence->domains.size() != 1U ||
+        successor_occurrence->domains.front().control_domain_id != domain ||
+        successor_occurrence->domains.front().observation_generation == 0U)
+      return reject_owned("ros2_control_handle_successor_invalid",
+                          "Gripper successor requires its exact no-arm domain occurrence");
+    generation.publication_generation = successor_occurrence->domains.front().observation_generation;
+  }
+  auto owner = std::make_shared<GripperOnlyState>();
+  owner->controller = std::move(controller);
+  owner->physical_controller_required = !no_output;
+  owner->measured_lane = std::move(measured_lane);
+  if (owner->physical_controller_required) {
+    // StageMeasuredStateSources precedes StartBackend and captures this same
+    // facts object without retaining this handle. No subscription starts here.
+    owner->activity_endpoints =
+        std::make_shared<ros2_control_execution::SelectedRosEndpointFacts>(
+            resources->node(), owner->controller.controller_manager + "/activity",
+            "controller_manager_msgs/msg/ControllerManagerActivity");
+  }
+  std::lock_guard lock(mutex_);
+  if (resources_ || arm_ || gripper_only_)
+    return reject_owned("ros2_control_handle_already_bound", "ROS runtime handle is already bound");
+  clock_owner_ = std::move(clock_owner);
+  clock_ = &clock;
+  resources_ = std::move(resources);
+  gripper_ = std::move(gripper);
+  gripper_binding_ = binding;
+  gripper_domain_id_ = domain;
+  gripper_id_ = binding.value().command_target_id.value();
+  domain_generations_.emplace(domain, std::move(generation));
+  gripper_only_ = std::move(owner);
+  return core::Result<void>::Ok();
 }
 
 core::Result<void> RetainedRos2ControlRuntimeHandle::Bind(
@@ -884,6 +996,35 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::RebindMotionRoute(
   return core::Result<void>::Ok();
 }
 
+core::Result<void> RetainedRos2ControlRuntimeHandle::BindGripperDisplayChannel(
+    const std::shared_ptr<RetainedObservedStateChannel>& channel) {
+  std::lock_guard lock(mutex_);
+  if (!gripper_binding_ || !channel || channel->binding().value() != gripper_binding_->value())
+    return reject<void>("ros2_control_gripper_display_binding_mismatch",
+                        "Display channel must name the current exact gripper binding");
+  gripper_display_channel_ = channel;
+  return core::Result<void>::Ok();
+}
+
+core::Result<void> RetainedRos2ControlRuntimeHandle::PublishGripperDisplayPosition(
+    const double position) {
+  std::shared_ptr<RetainedObservedStateChannel> channel;
+  std::optional<core::RuntimeParticipantBinding> binding;
+  {
+    std::lock_guard lock(mutex_);
+    channel = gripper_display_channel_.lock();
+    binding = gripper_binding_;
+  }
+  if (!channel || !binding || binding->value().resources.size() != 1U)
+    return reject<void>("ros2_control_gripper_display_source_unavailable",
+                        "Display has no current exact scalar gripper channel");
+  const std::array<std::string, 1U> names{binding->value().resources.front().compiled_resource_name};
+  const std::array<double, 1U> positions{position};
+  // Route validation is inside the channel: a concurrent rebind refuses this
+  // old snapshot instead of attributing coordinates to a successor identity.
+  return channel->update_render_positions(*binding, names, positions);
+}
+
 core::Result<void> RetainedRos2ControlRuntimeHandle::RebindGripperRoute(
     core::RuntimeParticipantBinding binding,
     std::shared_ptr<IRetainedObservedStateChannel> channel) {
@@ -902,6 +1043,13 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::RebindGripperRoute(
     return reject<void>(
         "ros2_control_gripper_route_rebind_mismatch",
         "ROS gripper route crosses its addressed state authority");
+  if (!gripper_display_channel_.expired()) {
+    auto display = std::dynamic_pointer_cast<RetainedObservedStateChannel>(channel);
+    if (!display)
+      return reject<void>("ros2_control_gripper_display_source_unavailable",
+                          "Rebound display requires the actual retained channel");
+    gripper_display_channel_ = std::move(display);
+  }
   gripper_binding_ = std::move(binding);
   return core::Result<void>::Ok();
 }
@@ -912,13 +1060,56 @@ void RetainedRos2ControlRuntimeHandle::StartBackend() {
     std::rethrow_exception(start_failure_);
   if (start_attempted_)
     return;
-  if (!arm_ || resources_ == nullptr)
+  if ((!arm_ && !gripper_only_) || resources_ == nullptr)
     throw std::logic_error("ROS initial installation has no live backend");
   start_attempted_ = true;
   try {
     if (gripper_)
       gripper_->complete_ros_configuration();
     const auto node = resources_->node();
+    if (gripper_only_) {
+      if (!gripper_only_->physical_controller_required) {
+        // No ROS command endpoint, controller observer or switch client exists
+        // for the strict local none owner. Its existing node owns lifetime only.
+        resources_->start();
+        return;
+      }
+      const auto controller = gripper_only_->controller;
+      const std::weak_ptr<RetainedRos2ControlRuntimeHandle> weak = weak_from_this();
+      const auto endpoint = gripper_only_->activity_endpoints;
+      rclcpp::SubscriptionOptions options;
+      options.event_callbacks.matched_callback = [weak, endpoint](rclcpp::MatchedInfo& info) {
+        endpoint->ObserveMatchedCount(info.current_count);
+        endpoint->Refresh();
+        if (const auto self = weak.lock(); self && info.current_count == 0) {
+          self->ObserveActivity({}, RetainedRos2ControlArmActivity{});
+        }
+      };
+      gripper_only_->activity_subscription = node->create_subscription<ActivityMessage>(
+          controller.controller_manager + "/activity", rclcpp::QoS(1).reliable().transient_local(),
+          [weak, controller](const ActivityMessage::ConstSharedPtr message) {
+            const auto self = weak.lock();
+            if (!self) return;
+            RetainedRos2ControlArmActivity activity;
+            activity.controller_manager_present = true;
+            activity.observed = true;
+            for (const auto& row : message->controllers) {
+              if (row.name != controller.controller_name) continue;
+              activity.controller_loaded =
+                  row.state.id == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE ||
+                  row.state.id == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+              activity.controller_active = row.state.id == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+            }
+            for (const auto& row : message->hardware_components)
+              if (row.name == controller.hardware_component_name)
+                activity.hardware_active = row.state.id == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+            self->ObserveActivity({}, activity);
+          }, options);
+      gripper_only_->switch_client = node->create_client<SwitchService>(
+          controller.controller_manager + "/switch_controller");
+      resources_->start();
+      return;
+    }
     const auto &controller = arm_->transport.controller;
     const auto gripper_controller = arm_->transport.gripper_controller;
     const std::weak_ptr<RetainedRos2ControlRuntimeHandle> weak =
@@ -1059,10 +1250,9 @@ void RetainedRos2ControlRuntimeHandle::RefreshEndpointFacts() {
   std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> adapter;
   {
     std::lock_guard lock(mutex_);
-    if (!arm_)
-      return;
-    activity = arm_->activity_endpoints;
-    adapter = arm_->adapter;
+    if (!arm_ && !gripper_only_) return;
+    activity = arm_ ? arm_->activity_endpoints : gripper_only_->activity_endpoints;
+    adapter = arm_ ? arm_->adapter : nullptr;
   }
   // No owner/command lock spans SDK graph reads.
   if (activity)
@@ -1077,10 +1267,9 @@ RetainedRos2ControlRuntimeHandle::ReadEndpointDiagnostic() const {
   std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> adapter;
   {
     std::lock_guard lock(mutex_);
-    if (!arm_)
-      return std::nullopt;
-    activity = arm_->activity_endpoints;
-    adapter = arm_->adapter;
+    if ((!arm_ && !gripper_only_) || !start_attempted_) return std::nullopt;
+    activity = arm_ ? arm_->activity_endpoints : gripper_only_->activity_endpoints;
+    adapter = arm_ ? arm_->adapter : nullptr;
   }
   // Before StartBackend there is no installed CM observation checkpoint.
   // Preserve the existing unstarted-lane classification.
@@ -1106,8 +1295,10 @@ void RetainedRos2ControlRuntimeHandle::ObserveActivity(
     RetainedRos2ControlArmActivity activity,
     std::optional<RetainedRos2ControlArmActivity> gripper_activity) {
   std::lock_guard lock(mutex_);
-  if (!arm_)
+  if (!arm_) {
+    if (gripper_only_ && gripper_activity) gripper_activity_ = *gripper_activity;
     return;
+  }
   arm_->activity = activity;
   if (gripper_activity)
     gripper_activity_ = *gripper_activity;
@@ -1181,15 +1372,17 @@ RetainedRos2ControlSwitchResult RetainedRos2ControlRuntimeHandle::SendSwitch(
     const bool activate, const std::stop_token cancellation,
     const std::optional<std::string> selected_controller) {
   rclcpp::Client<SwitchService>::SharedPtr client;
+  rclcpp::Node::SharedPtr node;
   std::string controller;
   {
     std::lock_guard lock(mutex_);
-    if (!arm_ || !arm_->switch_client)
+    if ((!arm_ || !arm_->switch_client) && (!gripper_only_ || !gripper_only_->switch_client))
       return not_sent("ros2_control_switch_unavailable",
                       "the controller-manager switch client is not started");
-    client = arm_->switch_client;
+    client = arm_ ? arm_->switch_client : gripper_only_->switch_client;
+    node = resources_->node();
     controller = selected_controller.value_or(
-        arm_->transport.controller.controller_name);
+        arm_ ? arm_->transport.controller.controller_name : gripper_only_->controller.controller_name);
   }
   if (!client->service_is_ready())
     return not_sent("ros2_control_switch_service_unavailable",
@@ -1212,12 +1405,28 @@ RetainedRos2ControlSwitchResult RetainedRos2ControlRuntimeHandle::SendSwitch(
     }
   }
   const auto response = future.get();
-  if (!response || !response->ok)
-    return {RetainedRos2ControlSwitchOutcome::kFailed,
-            switch_error(activate ? "ros2_control_activation_refused"
-                                  : "ros2_control_deactivation_refused",
-                         "the controller manager refused the controller "
-                         "switch")};
+  if (!response || !response->ok) {
+    auto error = switch_error(activate ? "ros2_control_activation_refused"
+                                      : "ros2_control_deactivation_refused",
+                             "the controller manager refused the controller switch");
+    if (response) {
+      const auto action = bounded_switch_detail(activate ? "activate" : "deactivate");
+      const auto name = bounded_switch_detail(controller);
+      const auto service = bounded_switch_detail(client->get_service_name());
+      const auto response_message = bounded_switch_detail(response->message);
+      error.details.emplace("switch_action", action);
+      error.details.emplace("controller_name", name);
+      error.details.emplace("controller_service", service);
+      if (!response_message.empty())
+        error.details.emplace("controller_response_message", response_message);
+      // One actual refused response, one bounded warning. Cached health reads
+      // and missing responses do not emit or manufacture controller text.
+      RCLCPP_WARN(node->get_logger(),
+                  "Controller-manager switch refused: action=%s controller=%s service=%s response=%s",
+                  action.c_str(), name.c_str(), service.c_str(), response_message.c_str());
+    }
+    return {RetainedRos2ControlSwitchOutcome::kFailed, std::move(error)};
+  }
   return {RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
 }
 
@@ -1359,8 +1568,21 @@ RetainedRos2ControlRuntimeHandle::PrepareGripperController() {
   if (auto error = ReadEndpointDiagnostic())
     return {RetainedRos2ControlSwitchOutcome::kNotSent, std::move(error)};
   std::lock_guard lock(mutex_);
-  if (!arm_ || !arm_->transport.gripper_controller ||
-      !gripper_activity_.controller_manager_present ||
+  if (gripper_ && gripper_id_ &&
+      gripper_->gripper_actuation_kind(*gripper_id_) == core::GripperActuationKind::kPneumatic &&
+      gripper_->gripper_output_mode(*gripper_id_) == core::GripperOutputMode::kNone) {
+    const auto owner = gripper_->gripper_transport_readiness(*gripper_id_);
+    if (!owner.configured || !owner.logical_owner_ready)
+      return not_sent("ros2_control_gripper_logical_owner_unavailable",
+                      "The exact no-output gripper owner is not configured and ready");
+    // This is the same configured logical owner, not a fabricated loaded CM
+    // controller. CCLC already closed command eligibility under its claim.
+    gripper_requested_ = core::ComponentLifecycleStateDTO::kPrepared;
+    return {RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
+  }
+  if ((!arm_ || !arm_->transport.gripper_controller) && !gripper_only_)
+    return not_sent("ros2_control_gripper_controller_unbound", "No exact gripper controller is bound");
+  if (!gripper_activity_.controller_manager_present ||
       !gripper_activity_.observed || !gripper_activity_.controller_loaded ||
       !gripper_activity_.hardware_active)
     return not_sent(
@@ -1386,10 +1608,25 @@ RetainedRos2ControlRuntimeHandle::SwitchGripperController(
   bool needs_switch;
   {
     std::lock_guard lock(mutex_);
-    if (!arm_ || !arm_->transport.gripper_controller)
+    if (gripper_ && gripper_id_ &&
+        gripper_->gripper_actuation_kind(*gripper_id_) == core::GripperActuationKind::kPneumatic &&
+        gripper_->gripper_output_mode(*gripper_id_) == core::GripperOutputMode::kNone) {
+      if (cancellation.stop_requested())
+        return not_sent("ros2_control_switch_cancelled",
+                        "No-output gripper lifecycle request was cancelled before its local change");
+      const auto owner = gripper_->gripper_transport_readiness(*gripper_id_);
+      if (!owner.configured || !owner.logical_owner_ready)
+        return not_sent("ros2_control_gripper_logical_owner_unavailable",
+                        "The exact no-output gripper owner is not configured and ready");
+      gripper_requested_ = activate ? core::ComponentLifecycleStateDTO::kActive
+                                    : core::ComponentLifecycleStateDTO::kDisabled;
+      return {RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
+    }
+    if ((!arm_ || !arm_->transport.gripper_controller) && !gripper_only_)
       return not_sent("ros2_control_gripper_controller_unbound",
                       "no exact controller-manager gripper is bound");
-    controller = arm_->transport.gripper_controller->controller_name;
+    controller = arm_ ? arm_->transport.gripper_controller->controller_name
+                      : gripper_only_->controller.controller_name;
     needs_switch = activate || !gripper_activity_.observed ||
                    gripper_activity_.controller_active;
   }
@@ -1417,8 +1654,11 @@ RetainedRos2ControlRuntimeHandle::lifecycle_primitive_dispatcher() {
       bool gripper_domain = false;
       {
         std::lock_guard lock(self->mutex_);
-        gripper_domain = self->arm_ &&
-                         self->arm_->transport.gripper_controller &&
+        gripper_domain = ((self->arm_ && self->arm_->transport.gripper_controller) ||
+                          self->gripper_only_ ||
+                          (self->gripper_ && self->gripper_id_ &&
+                           self->gripper_->gripper_actuation_kind(*self->gripper_id_) == core::GripperActuationKind::kPneumatic &&
+                           self->gripper_->gripper_output_mode(*self->gripper_id_) == core::GripperOutputMode::kNone)) &&
                          self->gripper_domain_id_ == domain;
       }
       if (gripper_domain) {
@@ -1531,7 +1771,7 @@ core::Result<RetainedRos2ControlRuntimeHandle::LifecycleHealthInputs>
 RetainedRos2ControlRuntimeHandle::CaptureLifecycleHealthInputs(
     const core::ControlDomainId &domain, const core::TimePoint now_ns) const {
   std::lock_guard lock(mutex_);
-  if (!arm_ || now_ns < 0 || domain.empty())
+  if ((!arm_ && !gripper_only_) || now_ns < 0 || domain.empty())
     return reject<LifecycleHealthInputs>(
         "ros2_control_lifecycle_source_unavailable",
         "ROS runtime lifecycle source is unbound or unavailable");
@@ -1540,14 +1780,17 @@ RetainedRos2ControlRuntimeHandle::CaptureLifecycleHealthInputs(
   inputs.is_gripper = gripper_ != nullptr && gripper_domain_id_ == domain;
   inputs.gripper = gripper_.get();
   inputs.gripper_id = gripper_id_;
-  inputs.activity = arm_->activity;
+  inputs.activity = arm_ ? arm_->activity : RetainedRos2ControlArmActivity{};
   inputs.gripper_activity = gripper_activity_;
   inputs.gripper_requested = gripper_requested_;
-  inputs.cm_gripper = arm_->transport.gripper_controller.has_value();
-  inputs.requested = arm_->requested;
-  inputs.bound = arm_->bound;
-  inputs.activation_client_discovered = arm_->activation_client_discovered;
-  inputs.adapter = arm_->adapter;
+  inputs.cm_gripper = (gripper_only_ && gripper_only_->physical_controller_required) ||
+      (arm_ && arm_->transport.gripper_controller.has_value());
+  if (arm_) {
+    inputs.requested = arm_->requested;
+    inputs.bound = arm_->bound;
+    inputs.activation_client_discovered = arm_->activation_client_discovered;
+    inputs.adapter = arm_->adapter;
+  }
   if (guard_hooks_)
     inputs.fault_hook = guard_hooks_->fault;
   inputs.process_fault_source = process_fault_source_;
@@ -1683,14 +1926,27 @@ RetainedRos2ControlRuntimeHandle::ComputeLifecycleHealth(
   } else if (is_gripper && gripper_id.has_value()) {
     const auto &snapshot = *inputs.gripper_snapshot;
     signature = gripper_signature(snapshot);
-    transport_ready = snapshot.ready;
-    ready = snapshot.ready;
-    loaded = snapshot.ready;
+    const bool local_none = snapshot.output_mode == core::GripperOutputMode::kNone;
+    const bool owner_ready = local_none ? snapshot.configured && snapshot.logical_owner_ready : snapshot.ready;
+    // The existing no-CM owner path reports its loaded logical control owner.
+    // Physical expectation is separately sealed not-applicable for this exact
+    // None domain; physical command/feedback path flags remain false.
+    transport_ready = owner_ready;
+    ready = owner_ready;
+    loaded = owner_ready;
     fault_present = !snapshot.configured;
-    cause = gripper_transport_cause(snapshot);
-    state = snapshot.ready  ? State::kActive
+    cause = local_none ? (owner_ready ? Cause::kNone : Cause::kAvailability) : gripper_transport_cause(snapshot);
+    state = owner_ready     ? State::kActive
             : fault_present ? State::kFaulted
                             : State::kDegraded;
+    if (local_none) {
+      // Retain the existing no-CM initial active owner, then report only the
+      // real local lifecycle request. No physical controller activity exists.
+      if (owner_ready && gripper_requested != State::kDeclared)
+        state = gripper_requested;
+      ready = owner_ready && state == State::kActive;
+      signature += ":logical:" + std::string(core::to_string(gripper_requested));
+    }
     if (cm_gripper) {
       transport_ready = gripper_activity.controller_manager_present &&
                         gripper_activity.observed;

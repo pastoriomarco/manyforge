@@ -1897,6 +1897,9 @@ class ProgramRunOwner:
                 for item in batch:
                     self._recover_stopped_item(run, item, request_id, reason)
                     cleanup_accepted = True
+                self._scope.retire_held_preparations(
+                    program_run_id, selected, expected_selection_revision,
+                )
                 with self._lock:
                     entry = self._entry(program_run_id)
                     if entry.run is not run or entry.revision != run_revision:

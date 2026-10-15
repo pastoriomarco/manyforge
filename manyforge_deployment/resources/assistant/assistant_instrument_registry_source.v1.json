@@ -5866,6 +5866,36 @@
                           "properties": {
                             "parameters": {
                               "required": [
+                                "dwell_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "dwell_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
                                 "max_effort"
                               ]
                             }
@@ -5934,6 +5964,13 @@
                       "completion_timeout_s": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
+                      },
+                      "dwell_while_held": {
+                        "enum": [
+                          "count",
+                          "pause"
+                        ],
+                        "type": "string"
                       },
                       "max_effort": {
                         "additionalProperties": false,
@@ -6076,6 +6113,44 @@
                           },
                           {
                             "if": {
+                              "properties": {
+                                "kind": {
+                                  "const": "named_preset"
+                                }
+                              },
+                              "required": [
+                                "kind"
+                              ]
+                            },
+                            "then": {
+                              "required": [
+                                "name"
+                              ]
+                            }
+                          },
+                          {
+                            "if": {
+                              "not": {
+                                "properties": {
+                                  "kind": {
+                                    "const": "named_preset"
+                                  }
+                                },
+                                "required": [
+                                  "kind"
+                                ]
+                              }
+                            },
+                            "then": {
+                              "not": {
+                                "required": [
+                                  "name"
+                                ]
+                              }
+                            }
+                          },
+                          {
+                            "if": {
                               "not": {
                                 "properties": {
                                   "kind": {
@@ -6121,7 +6196,15 @@
                           "kind": {
                             "enum": [
                               "angular_rad",
-                              "linear_m"
+                              "linear_m",
+                              "named_preset"
+                            ],
+                            "type": "string"
+                          },
+                          "name": {
+                            "enum": [
+                              "open",
+                              "closed"
                             ],
                             "type": "string"
                           },
@@ -6152,6 +6235,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "completion_timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "dwell_while_held": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_effort": {
@@ -8118,6 +8204,36 @@
                           "properties": {
                             "parameters": {
                               "required": [
+                                "dwell_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "dwell_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
                                 "max_effort"
                               ]
                             }
@@ -8227,6 +8343,13 @@
                       "completion_timeout_s": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
+                      },
+                      "dwell_while_held": {
+                        "enum": [
+                          "count",
+                          "pause"
+                        ],
+                        "type": "string"
                       },
                       "max_effort": {
                         "additionalProperties": false,
@@ -8369,6 +8492,44 @@
                           },
                           {
                             "if": {
+                              "properties": {
+                                "kind": {
+                                  "const": "named_preset"
+                                }
+                              },
+                              "required": [
+                                "kind"
+                              ]
+                            },
+                            "then": {
+                              "required": [
+                                "name"
+                              ]
+                            }
+                          },
+                          {
+                            "if": {
+                              "not": {
+                                "properties": {
+                                  "kind": {
+                                    "const": "named_preset"
+                                  }
+                                },
+                                "required": [
+                                  "kind"
+                                ]
+                              }
+                            },
+                            "then": {
+                              "not": {
+                                "required": [
+                                  "name"
+                                ]
+                              }
+                            }
+                          },
+                          {
+                            "if": {
                               "not": {
                                 "properties": {
                                   "kind": {
@@ -8414,7 +8575,15 @@
                           "kind": {
                             "enum": [
                               "angular_rad",
-                              "linear_m"
+                              "linear_m",
+                              "named_preset"
+                            ],
+                            "type": "string"
+                          },
+                          "name": {
+                            "enum": [
+                              "open",
+                              "closed"
                             ],
                             "type": "string"
                           },
@@ -8448,6 +8617,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "completion_timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "dwell_while_held": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_effort": {
@@ -12510,6 +12682,36 @@
                           "properties": {
                             "parameters": {
                               "required": [
+                                "dwell_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "dwell_while_held"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
                                 "max_effort"
                               ]
                             }
@@ -12619,6 +12821,13 @@
                       "completion_timeout_s": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
+                      },
+                      "dwell_while_held": {
+                        "enum": [
+                          "count",
+                          "pause"
+                        ],
+                        "type": "string"
                       },
                       "max_effort": {
                         "additionalProperties": false,
@@ -12761,6 +12970,44 @@
                           },
                           {
                             "if": {
+                              "properties": {
+                                "kind": {
+                                  "const": "named_preset"
+                                }
+                              },
+                              "required": [
+                                "kind"
+                              ]
+                            },
+                            "then": {
+                              "required": [
+                                "name"
+                              ]
+                            }
+                          },
+                          {
+                            "if": {
+                              "not": {
+                                "properties": {
+                                  "kind": {
+                                    "const": "named_preset"
+                                  }
+                                },
+                                "required": [
+                                  "kind"
+                                ]
+                              }
+                            },
+                            "then": {
+                              "not": {
+                                "required": [
+                                  "name"
+                                ]
+                              }
+                            }
+                          },
+                          {
+                            "if": {
                               "not": {
                                 "properties": {
                                   "kind": {
@@ -12806,7 +13053,15 @@
                           "kind": {
                             "enum": [
                               "angular_rad",
-                              "linear_m"
+                              "linear_m",
+                              "named_preset"
+                            ],
+                            "type": "string"
+                          },
+                          "name": {
+                            "enum": [
+                              "open",
+                              "closed"
                             ],
                             "type": "string"
                           },
@@ -12840,6 +13095,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "completion_timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "dwell_while_held": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_effort": {
@@ -18487,6 +18745,36 @@
                       "properties": {
                         "parameters": {
                           "required": [
+                            "dwell_while_held"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "dwell_while_held"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
                             "max_effort"
                           ]
                         }
@@ -18584,6 +18872,13 @@
                   "completion_timeout_s": {
                     "exclusiveMinimum": 0.0,
                     "type": "number"
+                  },
+                  "dwell_while_held": {
+                    "enum": [
+                      "count",
+                      "pause"
+                    ],
+                    "type": "string"
                   },
                   "max_effort": {
                     "additionalProperties": false,
@@ -18726,6 +19021,44 @@
                       },
                       {
                         "if": {
+                          "properties": {
+                            "kind": {
+                              "const": "named_preset"
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ]
+                        },
+                        "then": {
+                          "required": [
+                            "name"
+                          ]
+                        }
+                      },
+                      {
+                        "if": {
+                          "not": {
+                            "properties": {
+                              "kind": {
+                                "const": "named_preset"
+                              }
+                            },
+                            "required": [
+                              "kind"
+                            ]
+                          }
+                        },
+                        "then": {
+                          "not": {
+                            "required": [
+                              "name"
+                            ]
+                          }
+                        }
+                      },
+                      {
+                        "if": {
                           "not": {
                             "properties": {
                               "kind": {
@@ -18771,7 +19104,15 @@
                       "kind": {
                         "enum": [
                           "angular_rad",
-                          "linear_m"
+                          "linear_m",
+                          "named_preset"
+                        ],
+                        "type": "string"
+                      },
+                      "name": {
+                        "enum": [
+                          "open",
+                          "closed"
                         ],
                         "type": "string"
                       },
@@ -18802,6 +19143,9 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "completion_timeout_s": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "dwell_while_held": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "max_effort": {

@@ -1905,9 +1905,70 @@ describe('parseCatalogResponse', () => {
       'catalog.apiVersion must be the literal "manyforge.node_catalog.v2"',
     );
   });
+
+  it('retains the shared named-coordinate schema in command, pick and place catalog fields', () => {
+    const schema = { type: 'object', additionalProperties: false, required: ['kind'],
+      properties: {
+        kind: { type: 'string', enum: ['angular_rad', 'linear_m', 'named_preset'] },
+        name: { type: 'string', enum: ['open', 'closed'] },
+        value_m: { type: 'number' }, value_rad: { type: 'number' },
+      },
+      allOf: [['angular_rad', 'value_rad'], ['linear_m', 'value_m'], ['named_preset', 'name']]
+        .flatMap(([kind, field]) => [
+          { if: { required: ['kind'], properties: { kind: { const: kind } } }, then: { required: [field] } },
+          { if: { not: { required: ['kind'], properties: { kind: { const: kind } } } }, then: { not: { required: [field] } } },
+        ]),
+    };
+    const fields = [
+      ['gripper.command_position', 'position'],
+      ['planning.plan_pick_sequence', 'tool_position'],
+      ['planning.plan_place_sequence', 'tool_position'],
+    ];
+    const wire = { apiVersion: 'manyforge.node_catalog.v2', contentVersion: '1.0.0',
+      catalogId: 'manyforge_builtin', catalogDigest: 'sha256:catalog', environmentDigest: 'sha256:environment',
+      entries: fields.map(([id, field]) => ({
+        id, name: id, category: 'gripper', description: '', stability: 'stable', kind: 'leaf',
+        childrenMin: 0, childrenMax: 0,
+        parameters: [{ id: field, required: true, schema, schemaHash: 'sha256:coordinate-position', hasDefault: false }],
+        requiredCapabilities: [], execution: { blocking: true, cancellable: true, ownerApi: 'execution.kernel' },
+        runners: {}, tags: [], minProgramProfile: null, blackboard: { reads: [], writes: [] },
+        ownerContext: null, outcomes: {}, eventFamily: null,
+      })),
+    };
+    for (const response of [wire, JSON.parse(JSON.stringify(wire))]) {
+      const parsed = parseCatalogResponse(response);
+      expect(parsed.entries.map((entry) => [entry.id, entry.parameters[0].id])).toEqual(fields);
+      for (const entry of parsed.entries) expect(entry.parameters[0].schema).toEqual(schema);
+    }
+  });
 });
 
 describe('Program workspace parsers', () => {
+  it.each([
+    ['gripper.command_position', 'position', 'open'],
+    ['gripper.command_position', 'position', 'closed'],
+    ['planning.plan_pick_sequence', 'tool_position', 'open'],
+    ['planning.plan_pick_sequence', 'tool_position', 'closed'],
+    ['planning.plan_place_sequence', 'tool_position', 'open'],
+    ['planning.plan_place_sequence', 'tool_position', 'closed'],
+  ])('preserves the symbolic %s.%s preset %s in Program and authoring round trips', (nodeId, field, name) => {
+    const fixture = workspaceFixture();
+    const draft = fixture.draft as Record<string, unknown>;
+    const program = draft.program as Record<string, unknown>;
+    const authoring = draft.authoring as Record<string, unknown>;
+    const tree = { node_id: nodeId, instance_id: 'gripper-step',
+      parameters: { [field]: { kind: 'named_preset', name } }, children: [] };
+    program.tree = tree;
+    authoring.forest = [tree];
+    for (const wire of [fixture, JSON.parse(JSON.stringify(fixture))]) {
+      const parsed = parseProgramWorkspaceResponse(wire);
+      expect(parsed.draft.program?.tree.parameters[field])
+        .toEqual({ kind: 'named_preset', name });
+      expect(parsed.draft.authoring?.forest[0].parameters[field])
+        .toEqual({ kind: 'named_preset', name });
+    }
+  });
+
   it('accepts and retains the backend workspace identity on both response contracts', () => {
     for (const [fixture, parse] of [
       [workspaceFixture(), parseProgramWorkspaceResponse],
@@ -3203,7 +3264,7 @@ describe('addressed Robot Control parsers', () => {
           },
           target_role_id: 'command_target',
           target_descriptor: {
-            schema_version: 'manyforge.manual_control_gripper_descriptor.v2',
+            schema_version: 'manyforge.manual_control_gripper_descriptor.v3',
             controllable_component_id: 'robot-a',
             command_target_id: 'gripper',
             component_role_id: 'controlled_component',
@@ -3211,6 +3272,7 @@ describe('addressed Robot Control parsers', () => {
             description: 'Test gripper',
             command_kind: 'gripper_position',
             actuation_kind: 'position_commanded',
+            output_mode: 'commanded',
             transport_kind: 'resolved_binding',
             control_interface_contract_id: 'interface-1',
             state_authority_id: 'state.gripper',
@@ -3488,12 +3550,110 @@ describe('addressed Robot Control parsers', () => {
     // The direct-control binding is per target, never a runtime identity.
     expect(scoped.directControl!.programBindingId).toBe(motionTarget.program_binding_id);
 
+    // Pneumatic dwell may be zero; position duration stays strictly positive.
+    // The snapshot and paired targets/control delta use the same descriptor rule.
+    for (const [actuationKind, outputMode] of [
+      ['position_commanded', 'commanded'], ['pneumatic', 'commanded'], ['pneumatic', 'none'],
+    ] as const) {
+      for (const duration of [0, 0.5, 60, -0.1, 60.1, NaN, Infinity, -Infinity, null]) {
+        const configuredDuration = structuredClone(response);
+        Object.assign(configuredDuration.status.direct_control_gripper.target_descriptor, {
+          actuation_kind: actuationKind,
+          output_mode: outputMode,
+          command_duration_s: duration,
+          completion_policy: actuationKind === 'pneumatic'
+            ? outputMode === 'none' ? 'no_output' : 'output_delivery'
+            : 'goal_fenced_target_reached',
+          grasp_confirmation_policy: actuationKind === 'pneumatic' ? 'not_required' : 'binding_feedback_required',
+        });
+        const durationWire = composed(configuredDuration);
+        const parseSnapshot = () => parseExecutionOwnerStatus(durationWire);
+        const parseDelta = () => parseExecutionControlStatus(
+          { ...targetsResponse, targets: durationWire.status.targets },
+          { ...controlResponse, control_state: durationWire.status.control_state },
+        );
+        const valid = duration !== null && Number.isFinite(duration)
+          && duration >= 0 && duration <= 60
+          && (actuationKind === 'pneumatic' || duration > 0);
+        for (const parse of [parseSnapshot, parseDelta]) {
+          const label = `${actuationKind} ${outputMode} duration ${String(duration)}`;
+          if (valid) {
+            expect(parse().directControlGripper!.targetDescriptor.commandDurationS, label)
+              .toBe(duration);
+          } else {
+            expect(parse, label).toThrow(StructuralContractError);
+          }
+        }
+      }
+    }
+
+    const incompleteZeroDwell = structuredClone(response);
+    Object.assign(incompleteZeroDwell.status.direct_control_gripper.target_descriptor, {
+      actuation_kind: 'pneumatic', command_duration_s: 0, source_group_name: null,
+      completion_policy: 'output_delivery', grasp_confirmation_policy: 'not_required',
+    });
+    expect(() => parseExecutionOwnerStatus(composed(incompleteZeroDwell)))
+      .toThrow(/one complete, internally consistent gripper configuration/);
+
+    // Output mode and policies are exact actuation-dependent facts, not a
+    // generic extension of the descriptor's qualified semantics.
+    for (const [actuation, output, completion, grasp, valid] of [
+      ['position_commanded', 'commanded', 'goal_fenced_target_reached', 'binding_feedback_required', true],
+      ['pneumatic', 'commanded', 'output_delivery', 'not_required', true],
+      ['pneumatic', 'commanded', 'delivered_then_dwell', 'not_required', false],
+      ['pneumatic', 'none', 'dwell_elapsed', 'not_required', false],
+      ['pneumatic', 'none', 'no_output', 'not_required', true],
+      ['position_commanded', 'none', 'no_output', 'not_required', false],
+      ['position_commanded', 'commanded', 'output_delivery', 'not_required', false],
+      ['pneumatic', 'none', 'output_delivery', 'not_required', false],
+      ['pneumatic', 'commanded', 'no_output', 'not_required', false],
+      ['pneumatic', 'commanded', 'goal_fenced_target_reached', 'binding_feedback_required', false],
+      ['pneumatic', 'none', 'no_output', 'binding_feedback_required', false],
+      ['pneumatic', 'default', 'output_delivery', 'not_required', false],
+      ['pneumatic', false, 'output_delivery', 'not_required', false],
+      ['pneumatic', null, 'output_delivery', 'not_required', false],
+    ] as const) {
+      const outputFixture = structuredClone(response);
+      Object.assign(outputFixture.status.direct_control_gripper.target_descriptor, {
+        actuation_kind: actuation, output_mode: output,
+        completion_policy: completion, grasp_confirmation_policy: grasp,
+      });
+      const outputWire = composed(outputFixture);
+      for (const parse of [
+        () => parseExecutionOwnerStatus(outputWire),
+        () => parseExecutionControlStatus(
+          { ...targetsResponse, targets: outputWire.status.targets },
+          { ...controlResponse, control_state: outputWire.status.control_state },
+        ),
+      ]) {
+        if (valid) {
+          const descriptor = parse().directControlGripper!.targetDescriptor;
+          expect(descriptor.outputMode).toBe(output);
+          expect(descriptor.completionPolicy).toBe(completion);
+          expect(descriptor.graspConfirmationPolicy).toBe(grasp);
+          expect(descriptor.transportKind).toBe('resolved_binding');
+          expect(descriptor.controlInterfaceContractId).toBe('interface-1');
+        } else {
+          expect(parse).toThrow(StructuralContractError);
+        }
+      }
+    }
+    const missingOutput = structuredClone(response);
+    delete (missingOutput.status.direct_control_gripper.target_descriptor as Record<string, unknown>).output_mode;
+    expect(() => parseExecutionOwnerStatus(composed(missingOutput))).toThrow(StructuralContractError);
+    const oldDescriptor = structuredClone(response);
+    oldDescriptor.status.direct_control_gripper.target_descriptor.schema_version
+      = 'manyforge.manual_control_gripper_descriptor.v2';
+    expect(() => parseExecutionOwnerStatus(composed(oldDescriptor)))
+      .toThrow(/supported gripper descriptor/);
+
     // Retained ROS targets can derive an SRDF group and presets without an
     // optional authored tool configuration, in both snapshots and deltas.
     const modelOnly = structuredClone(response);
     Object.assign(modelOnly.status.direct_control_gripper.target_descriptor, {
       description: null,
       actuation_kind: null,
+      output_mode: null,
       command_duration_s: null,
       open_state_ref: null,
       closed_state_ref: null,
@@ -3505,6 +3665,7 @@ describe('addressed Robot Control parsers', () => {
     });
     const modelOnlyWire = composed(modelOnly);
     const modelOnlyStatus = parseExecutionOwnerStatus(modelOnlyWire);
+    expect(modelOnlyStatus.directControlGripper!.targetDescriptor.outputMode).toBeNull();
     expect(modelOnlyStatus.directControlGripper!.targetDescriptor.sourceGroupName)
       .toBe('gripper');
     expect(modelOnlyStatus.directControlGripper!.targetDescriptor.namedPresets)

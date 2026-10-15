@@ -38,8 +38,7 @@ struct PreparedControlDomainArtifact final {
 
 enum class PreparedRuntimeUnitKind {
   kReference,
-  kNativeExecution,
-  kRos2ControlExecution,
+  kRos2ControlExecution = 2,
 };
 
 struct PreparedRuntimeUnitArtifact final {

@@ -655,7 +655,7 @@ template <typename Enum>
                 "stop_evidence_policy_revision",
                 "containment_granularity",
                 "escalation_stages"},
-               {}, "resolved Stop base plan");
+               {"gripper_actuation_kind"}, "resolved Stop base plan");
   if (text(member(value, "api_version", "base plan"), "api_version") !=
       kResolvedStopBasePlanApiVersion) {
     fail_decode("resolved Stop base-plan API version is unsupported");
@@ -666,6 +666,13 @@ template <typename Enum>
   stages.reserve(stage_rows.size());
   for (const auto& row : stage_rows) {
     stages.push_back(decode_stage(row));
+  }
+  std::optional<GripperActuationKind> actuation;
+  if (const auto* kind = optional_member(value, "gripper_actuation_kind")) {
+    const auto& spelling = text(*kind, "gripper_actuation_kind");
+    if (spelling == "pneumatic") actuation = GripperActuationKind::kPneumatic;
+    else if (spelling == "position_commanded") actuation = GripperActuationKind::kPositionCommanded;
+    else fail_decode("resolved Stop plan gripper actuation kind is invalid");
   }
   return {
       ResolvedStopBasePlanId(text(member(value, "resolved_stop_base_plan_id", "base plan"),
@@ -703,7 +710,8 @@ template <typename Enum>
       StopEvidencePolicyRevision(text(member(value, "stop_evidence_policy_revision", "base plan"),
                                       "stop_evidence_policy_revision")),
       containment_granularity(member(value, "containment_granularity", "base plan")),
-      std::move(stages)};
+      std::move(stages),
+      actuation};
 }
 
 }  // namespace

@@ -8,6 +8,11 @@
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
 #include <manyforge_deployment/deployment_authoring.hpp>
 #include <optional>
+#include <limits>
+
+#include "lite6_controllable_retention_fixture.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 #include <set>
 #include <span>
 #include <string>
@@ -614,6 +619,142 @@ TEST(DeploymentArtifactCodec,
         parse_strict_json_model_yaml(authored),
         std::span<const QualifiedRuntimeProfile>{});
   });
+}
+
+} // namespace
+} // namespace manyforge::deployment
+
+namespace manyforge::deployment {
+namespace {
+
+// Rewrite authored input before normal nested/outer revision computation.
+CanonicalValue authored_gripper_field(const CanonicalValue &value,
+                                      std::string_view field,
+                                      const CanonicalValue &replacement,
+                                      bool remove_field = false) {
+  if (value.is_array()) {
+    CanonicalValue::Array rows;
+    for (const auto &row : value.as_array())
+      rows.push_back(authored_gripper_field(row, field, replacement, remove_field));
+    return CanonicalValue(std::move(rows));
+  }
+  if (!value.is_object()) return value;
+  const bool gripper_row = value.find_object_member("actuation_kind") != nullptr &&
+                           value.find_object_member("command_target_id") != nullptr;
+  CanonicalValue::Object fields;
+  for (const auto &[name, item] : value.as_object()) {
+    if (gripper_row && name == field && remove_field) continue;
+    fields.emplace_back(name, gripper_row && name == field
+                                 ? replacement
+                                 : authored_gripper_field(item, field, replacement, remove_field));
+  }
+  return CanonicalValue(std::move(fields));
+}
+
+TEST(DeploymentArtifactCodec, RosGripperDwellPreservesDraftAndRetainedBoundaries) {
+  for (const std::string_view kind : {"pneumatic", "position_commanded"}) {
+    const auto fixture = test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+        {}, kind);
+    const auto &source = fixture.qualified.deployment().normalized_authored_root();
+    for (const double duration : {0.0, 0.5, 60.0, -0.1, 60.1}) {
+      SCOPED_TRACE(std::string(kind) + ":" + std::to_string(duration));
+      const auto authored = authored_gripper_field(
+          source, "command_duration_s", CanonicalValue(duration));
+      const bool accepted = duration >= 0.0 && duration <= 60.0 &&
+                            (kind == "pneumatic" || duration > 0.0);
+      if (!accepted) {
+        EXPECT_THROW((void)compile_deployment_draft(canonical_json(authored)),
+                     DeploymentArtifactCodecError);
+        EXPECT_THROW((void)verify_deployment_draft(canonical_json(authored)),
+                     DeploymentArtifactCodecError);
+        continue;
+      }
+      const auto compiled = compile_deployment_draft(canonical_json(authored));
+      const auto verified = verify_deployment_draft(compiled.canonical_json);
+      EXPECT_EQ(verified.canonical_json, compiled.canonical_json);
+      EXPECT_EQ(verified.deployment_revision, compiled.deployment_revision);
+      auto rows = std::get<core::JsonValueDTO::Array>(
+          fixture.qualified.deployment().graph().graph().runtime_units.front()
+              .configuration.at("gripper_target_configurations").value);
+      ASSERT_EQ(rows.size(), 1U);
+      auto &fields = std::get<core::JsonObjectDTO>(rows.front().value);
+      fields.at("command_duration_s").value = duration;
+      const auto decoded = detail::decode_ros2_control_execution_gripper_target_configurations(rows);
+      ASSERT_EQ(decoded.size(), 1U);
+      EXPECT_EQ(decoded.front().actuation_kind, kind);
+      EXPECT_DOUBLE_EQ(decoded.front().command_duration_s, duration);
+    }
+    // This was permitted by Draft schema validation already. The narrow dwell
+    // hook must not import the strict retained row's nonempty-description rule.
+    const auto empty_description = authored_gripper_field(
+        source, "description", CanonicalValue(""));
+    EXPECT_NO_THROW((void)compile_deployment_draft(canonical_json(empty_description)));
+  }
+  for (const double duration : {std::numeric_limits<double>::quiet_NaN(),
+                                std::numeric_limits<double>::infinity(),
+                                -std::numeric_limits<double>::infinity()}) {
+    EXPECT_FALSE(detail::execution_gripper_command_duration_is_valid("pneumatic", duration));
+    EXPECT_FALSE(detail::execution_gripper_command_duration_is_valid("position_commanded", duration));
+  }
+  EXPECT_FALSE(detail::execution_gripper_command_duration_is_valid("unknown", 0.5));
+}
+
+TEST(DeploymentArtifactCodec, RosGripperOutputChoiceIsExplicitAndPositionAlwaysCommanded) {
+  for (const std::string_view kind : {"pneumatic", "position_commanded"}) {
+    const auto fixture = test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture({}, kind);
+    const auto &source = fixture.qualified.deployment().normalized_authored_root();
+    for (const std::string_view mode : {"commanded", "none", "unknown"}) {
+      SCOPED_TRACE(std::string(kind) + ":" + std::string(mode));
+      const auto authored = authored_gripper_field(source, "output_mode", CanonicalValue(std::string(mode)));
+      auto rows = std::get<core::JsonValueDTO::Array>(
+          fixture.qualified.deployment().graph().graph().runtime_units.front()
+              .configuration.at("gripper_target_configurations").value);
+      std::get<core::JsonObjectDTO>(rows.front().value).at("output_mode").value = std::string(mode);
+      const bool accepted = mode == "commanded" || (kind == "pneumatic" && mode == "none");
+      if (!accepted) {
+        EXPECT_THROW((void)compile_deployment_draft(canonical_json(authored)), DeploymentArtifactCodecError);
+        EXPECT_THROW((void)verify_deployment_draft(canonical_json(authored)), DeploymentArtifactCodecError);
+        EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(rows),
+                     RetainedBundleError);
+        continue;
+      }
+      const auto compiled = compile_deployment_draft(canonical_json(authored));
+      EXPECT_EQ(verify_deployment_draft(compiled.canonical_json).canonical_json, compiled.canonical_json);
+      if (mode == "none") {
+        EXPECT_NE(compiled.graph_revision, fixture.qualified.deployment().graph().graph().graph_revision.value());
+        EXPECT_NE(compiled.deployment_revision, fixture.qualified.deployment().deployment_revision().value());
+      }
+      const auto decoded = detail::decode_ros2_control_execution_gripper_target_configurations(rows);
+      ASSERT_EQ(decoded.size(), 1U);
+      EXPECT_EQ(decoded.front().output_mode, mode == "none" ? core::GripperOutputMode::kNone
+                                                            : core::GripperOutputMode::kCommanded);
+    }
+    const auto missing = authored_gripper_field(source, "output_mode", CanonicalValue(), true);
+    EXPECT_THROW((void)compile_deployment_draft(canonical_json(missing)), DeploymentArtifactCodecError);
+    EXPECT_THROW((void)verify_deployment_draft(canonical_json(missing)), DeploymentArtifactCodecError);
+    auto common = std::get<core::JsonValueDTO::Array>(
+        fixture.qualified.deployment().graph().graph().runtime_units.front()
+            .configuration.at("gripper_target_configurations").value);
+    std::get<core::JsonObjectDTO>(common.front().value).erase("output_mode");
+    EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(common),
+                 RetainedBundleError);
+    // Archival data still has exactly its twelve fields; no ROS output default
+    // or live Native admission is restored by its common pure extraction.
+    EXPECT_NO_THROW((void)detail::decode_execution_gripper_target_configurations(
+        common, "ros2_control runtime configuration"));
+  }
+  for (const double dwell : {0.0, 0.25}) {
+    const auto fixture = test::make_lite6_ros2_control_no_output_gripper_retention_fixture({}, dwell);
+    const auto &unit = fixture.qualified.deployment().graph().graph().runtime_units.front();
+    const auto rows = std::get<core::JsonValueDTO::Array>(unit.configuration.at("gripper_target_configurations").value);
+    const auto decoded = detail::decode_ros2_control_execution_gripper_target_configurations(rows);
+    ASSERT_EQ(decoded.size(), 1U);
+    EXPECT_EQ(decoded.front().output_mode, core::GripperOutputMode::kNone);
+    EXPECT_DOUBLE_EQ(decoded.front().command_duration_s, dwell);
+    EXPECT_EQ(decoded.front().actuation_kind, "pneumatic");
+    EXPECT_TRUE(fixture.qualified.deployment().graph().graph().control_bindings.size() == 1U);
+    EXPECT_TRUE(std::get<core::JsonValueDTO::Array>(unit.configuration.at("motion_target_limits").value).empty());
+  }
 }
 
 } // namespace

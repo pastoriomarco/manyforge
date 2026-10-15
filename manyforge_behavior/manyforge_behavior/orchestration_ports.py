@@ -561,6 +561,17 @@ class ProgramRunScopePort(Protocol):
         """Contain a captured selection; return the accepted current scope."""
         ...
 
+    def retire_held_preparations(
+        self, program_run_id: str, selected_node_ids: frozenset[str],
+        expected_selection_revision: int,
+    ) -> None:
+        """Retire exact cancelled unsent preparations before selected release.
+
+        Unknown cleanup raises and retains the existing owner and node holds.
+        This internal hook neither releases selection nor performs operator Reset.
+        """
+        ...
+
     def release_selection(
         self, request: Mapping[str, Any], expected_selection_revision: int
     ) -> Mapping[str, Any]:

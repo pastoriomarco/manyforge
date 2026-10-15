@@ -1,6 +1,7 @@
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
@@ -702,6 +703,47 @@ RetainedObservedStateChannel::current_bound_state(
   }
   return core::Result<RetainedBoundObservedState>::Ok(
       RetainedBoundObservedState{current_binding_, std::move(state.value())});
+}
+
+core::Result<void> RetainedObservedStateChannel::update_render_positions(
+    const core::RuntimeParticipantBinding &expected_binding,
+    const std::span<const std::string> compiled_joint_names,
+    const std::span<const double> positions_si) {
+  std::lock_guard route_lock(route_rebind_mutex_);
+  if (expected_binding.value() != current_binding_.value()) {
+    return core::Result<void>::Err(channel_error(
+        "retained_render_binding_mismatch",
+        "render coordinates do not belong to the current retained binding"));
+  }
+  const auto &canonical_names = projection_context_.joint_names;
+  if (compiled_joint_names.size() != canonical_names.size() ||
+      positions_si.size() != canonical_names.size() ||
+      std::any_of(positions_si.begin(), positions_si.end(),
+                  [](const double value) { return !std::isfinite(value); }) ||
+      std::any_of(canonical_names.begin(), canonical_names.end(),
+                  [&](const auto &name) {
+                    return std::count(compiled_joint_names.begin(),
+                                      compiled_joint_names.end(), name) != 1;
+                  })) {
+    return core::Result<void>::Err(channel_error(
+        "retained_render_coordinates_mismatch",
+        "render coordinates must be finite and cover the exact retained names"));
+  }
+  record_render_positions(compiled_joint_names, positions_si);
+  return core::Result<void>::Ok();
+}
+
+core::Result<RetainedBoundRenderState>
+RetainedObservedStateChannel::current_bound_render_state() const {
+  std::lock_guard route_lock(route_rebind_mutex_);
+  if (!render_positions_valid_) {
+    return core::Result<RetainedBoundRenderState>::Err(channel_error(
+        "retained_render_positions_unavailable",
+        "retained target has no render coordinates"));
+  }
+  return core::Result<RetainedBoundRenderState>::Ok(RetainedBoundRenderState{
+      current_binding_, projection_context_.joint_names, last_render_positions_,
+      render_wake_->incarnation(), render_wake_->generation()});
 }
 
 core::Result<core::ObservedStateSnapshotDTO>

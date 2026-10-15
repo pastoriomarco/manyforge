@@ -576,6 +576,74 @@ def test_held_manual_start_requires_context_and_native_decision(context_present)
     assert len(submitted) == int(context_present)
 
 
+@pytest.mark.parametrize("native_ok", [True, False])
+def test_idle_manual_gripper_start_during_cell_stop_forwards_exact_native_decision(native_ok):
+    from manyforge_headless_api.tests.test_execution_events import _direct_command_request
+
+    submitted = []
+    native_result = (
+        {"ok": True, "accepted": {"operation_id": "manual.pneumatic"}}
+        if native_ok else {"ok": False, "error": {"code": "component_not_ready"}}
+    )
+
+    class Service:
+        @staticmethod
+        def program_cycle_status():
+            return {
+                "program_runner_owner_epoch": "runner.1",
+                "execution_control_revision": 7,
+                "cycle_generation": 3,
+                "program_run_id": None,
+                "state": "idle_after_reset",
+                "allowed_commands": [
+                    {"command_kind": "operation_start", "allowed": True,
+                     "disabled_reason": None}
+                ],
+                "runtime_controls": {
+                    "execution_selections": {
+                        "groups": [{"group_id": "cell", "state": "stopping"}]
+                    }
+                },
+            }
+
+        @staticmethod
+        def execution_submit(request, attribution):
+            submitted.append((request, attribution))
+            return native_result
+
+    payload = _direct_command_request().model_dump(mode="json")
+    payload["expected_execution_owner_epoch"] = "kernel.1"
+    ingress, _ = _ingress(_Clock())
+    try:
+        request = _request(ingress, kind="operation_start").model_copy(
+            update={"payload": payload}
+        )
+    finally:
+        ingress.close()
+    result, response = HeadlessExecutionControlDispatch(Service())(
+        request,
+        ExecutionIngressStamp(
+            transport_kind="websocket", receiver_incarnation="receiver.1",
+            received_server_sequence=1, received_monotonic_ns=1,
+        ),
+    )
+    assert len(submitted) == 1
+    forwarded = submitted[0][0].model_dump(mode="json")
+    assert forwarded["participants"] == payload["participants"]
+    for key in (
+        "program_id", "program_revision", "program_binding_id", "program_run_id",
+        "expected_graph_revision", "expected_retained_bundle_id", "expected_scene_revision",
+    ):
+        assert forwarded[key] == payload[key]
+    assert forwarded.get("manual_handover") is None
+    assert forwarded["request_context"]["request_owner_epoch"] == "kernel.1"
+    assert response is native_result
+    assert result.disposition == ("received" if native_ok else "rejected")
+    assert result.code == (
+        "operation_start_received" if native_ok else "component_not_ready"
+    )
+
+
 def test_standalone_native_control_does_not_require_a_program_runner() -> None:
     class Service:
         program_runner = None

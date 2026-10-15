@@ -473,8 +473,295 @@ void require_no_exclusive_ros_controller_topic_collision(
   }
 }
 
+bool ros_gripper_output_mode_is_valid(const std::string_view actuation_kind,
+                                      const std::string_view output_mode) noexcept {
+  return (actuation_kind == "pneumatic" &&
+          (output_mode == "commanded" || output_mode == "none")) ||
+         (actuation_kind == "position_commanded" && output_mode == "commanded");
+}
+
+bool ros_gripper_delivery_result_timeout_is_valid(
+    const std::string_view actuation_kind, const double timeout_s) noexcept {
+  return actuation_kind == "pneumatic" && std::isfinite(timeout_s) &&
+         timeout_s > 0.0;
+}
+
+namespace {
+
+// Shared by strict retained extraction and the pre-Draft required-row hook.
+// This leaves the archival neutral twelve-field decoder unchanged.
+std::optional<double> require_ros_gripper_delivery_result_timeout(
+    const core::JsonObjectDTO &fields, const std::string_view actuation_kind) {
+  const auto timeout = fields.find("delivery_result_timeout_s");
+  const bool present = timeout != fields.end();
+  if (fields.size() != (present ? 14U : 13U)) {
+    fail_retained_bundle(
+        "ros2_control runtime has an invalid gripper target configuration");
+  }
+  if (!present) {
+    return std::nullopt;
+  }
+  const auto *seconds = std::get_if<double>(&timeout->second.value);
+  if (seconds == nullptr ||
+      !ros_gripper_delivery_result_timeout_is_valid(actuation_kind, *seconds)) {
+    fail_retained_bundle(
+        "ros2_control runtime has invalid pneumatic delivery result timeout");
+  }
+  return *seconds;
+}
+
+} // namespace
+
+std::vector<ros2_control_execution_runtime_contract::Configuration::GripperTargetConfiguration>
+decode_ros2_control_execution_gripper_target_configurations(
+    const core::JsonValueDTO::Array &rows) {
+  using Typed = ros2_control_execution_runtime_contract::Configuration::GripperTargetConfiguration;
+  std::vector<Typed> result;
+  result.reserve(rows.size());
+  for (const auto &row : rows) {
+    const auto *fields = std::get_if<core::JsonObjectDTO>(&row.value);
+    if (fields == nullptr) {
+      fail_retained_bundle("ros2_control runtime has an invalid gripper target configuration");
+    }
+    const auto output = fields->find("output_mode");
+    const auto actuation = fields->find("actuation_kind");
+    const auto *mode = output == fields->end() ? nullptr
+                                              : std::get_if<std::string>(&output->second.value);
+    const auto *kind = actuation == fields->end() ? nullptr
+                                                : std::get_if<std::string>(&actuation->second.value);
+    if (mode == nullptr || kind == nullptr || !ros_gripper_output_mode_is_valid(*kind, *mode)) {
+      fail_retained_bundle("ros2_control runtime has invalid gripper output semantics");
+    }
+    const auto delivery_timeout =
+        require_ros_gripper_delivery_result_timeout(*fields, *kind);
+    auto common = *fields;
+    common.erase("output_mode");
+    common.erase("delivery_result_timeout_s");
+    auto decoded = decode_execution_gripper_target_configurations(
+        core::JsonValueDTO::Array{core::JsonValueDTO{std::move(common)}},
+        "ros2_control runtime configuration");
+    result.push_back(Typed{std::move(decoded.front()), *mode == "none"
+                            ? core::GripperOutputMode::kNone
+                            : core::GripperOutputMode::kCommanded, delivery_timeout});
+  }
+  std::sort(result.begin(), result.end(), [](const auto &left, const auto &right) {
+    return std::tie(left.controllable_component_id, left.command_target_id) <
+           std::tie(right.controllable_component_id, right.command_target_id);
+  });
+  if (std::adjacent_find(result.begin(), result.end(), [](const auto &left, const auto &right) {
+        return left.controllable_component_id == right.controllable_component_id &&
+               left.command_target_id == right.command_target_id;
+      }) != result.end()) {
+    fail_retained_bundle("ros2_control runtime repeats a gripper target configuration");
+  }
+  return result;
+}
+
+std::optional<core::GripperActuationKind> classify_ros_gripper_actuation_kind(
+    const core::CellGraphDTO &graph, const core::ControlBindingDTO &binding,
+    std::span<const CompositionControlBindingCoordinateMap> coordinate_maps) {
+  const auto fail = [](std::string_view message) {
+    fail_retained_bundle(message);
+  };
+  const auto exact = std::find_if(
+      graph.control_bindings.begin(), graph.control_bindings.end(),
+      [&](const auto &candidate) {
+        return candidate.control_binding_id == binding.control_binding_id;
+      });
+  if (exact == graph.control_bindings.end() || *exact != binding ||
+      std::count_if(graph.control_bindings.begin(),
+                    graph.control_bindings.end(), [&](const auto &candidate) {
+                      return candidate.control_binding_id ==
+                             binding.control_binding_id;
+                    }) != 1)
+    fail("gripper actuation source has no exact unique graph binding");
+  const auto command = std::find_if(
+      graph.control_bindings.begin(), graph.control_bindings.end(),
+      [&](const auto &candidate) {
+        return candidate.controllable_component_id ==
+                   binding.controllable_component_id &&
+               candidate.command_target_id == binding.command_target_id &&
+               candidate.capability_id.value() == "tool.gripper.command";
+      });
+  if (command == graph.control_bindings.end())
+    return std::nullopt;
+  const auto unit = std::find_if(
+      graph.runtime_units.begin(), graph.runtime_units.end(),
+      [&](const auto &candidate) {
+        return candidate.runtime_unit_id == binding.provider_runtime_unit_id;
+      });
+  if (unit == graph.runtime_units.end() ||
+      std::count_if(graph.runtime_units.begin(), graph.runtime_units.end(),
+                    [&](const auto &candidate) {
+                      return candidate.runtime_unit_id ==
+                             binding.provider_runtime_unit_id;
+                    }) != 1)
+    fail("gripper actuation source has no exact runtime unit");
+  if (unit->runtime_profile_id.value() != kRos2ControlExecutionRuntimeProfileId)
+    return std::nullopt; // DX753: archival/native and other providers retain
+                         // their floor.
+  const auto component = std::find_if(
+      graph.controllable_components.begin(),
+      graph.controllable_components.end(), [&](const auto &candidate) {
+        return candidate.controllable_component_id ==
+               binding.controllable_component_id;
+      });
+  if (component == graph.controllable_components.end() ||
+      std::find(component->runtime_unit_ids.begin(),
+                component->runtime_unit_ids.end(),
+                unit->runtime_unit_id) == component->runtime_unit_ids.end())
+    fail("gripper actuation source does not host its exact component");
+  const auto coordinates = std::find_if(
+      coordinate_maps.begin(), coordinate_maps.end(),
+      [&](const auto &candidate) {
+        return candidate.control_binding_id == binding.control_binding_id;
+      });
+  if (coordinates == coordinate_maps.end() ||
+      std::count_if(coordinate_maps.begin(), coordinate_maps.end(),
+                    [&](const auto &candidate) {
+                      return candidate.control_binding_id ==
+                             binding.control_binding_id;
+                    }) != 1 ||
+      coordinates->controllable_component_id !=
+          binding.controllable_component_id ||
+      coordinates->command_target_id != binding.command_target_id)
+    fail("gripper actuation source has no exact verified binding coordinate "
+         "map");
+  std::set<std::pair<core::ResourceRoleId, core::ResourceId>>
+      expected_resources;
+  for (const auto &resource : binding.resource_bindings)
+    expected_resources.emplace(resource.resource_role_id, resource.resource_id);
+  std::set<std::pair<core::ResourceRoleId, core::ResourceId>> mapped_resources;
+  for (const auto &resource : coordinates->resources) {
+    if (!mapped_resources
+             .emplace(resource.resource_role_id, resource.resource_id)
+             .second)
+      fail("gripper actuation source repeats a coordinate resource");
+    for (const auto &coordinate : resource.coordinates) {
+      const bool owned_model = std::any_of(
+          component->model_role_bindings.begin(),
+          component->model_role_bindings.end(), [&](const auto &role) {
+            return role.model_instance_id == coordinate.model_instance_id;
+          });
+      if (!owned_model ||
+          std::none_of(graph.model_instances.begin(),
+                       graph.model_instances.end(), [&](const auto &model) {
+                         return model.model_instance_id ==
+                                coordinate.model_instance_id;
+                       }))
+        fail("gripper actuation coordinate belongs to a foreign model "
+             "occurrence");
+    }
+  }
+  if (mapped_resources != expected_resources)
+    fail("gripper actuation source coordinate resources differ from the "
+         "binding");
+  if (std::none_of(
+          coordinates->resources.begin(), coordinates->resources.end(),
+          [](const auto &resource) { return !resource.coordinates.empty(); }))
+    return std::nullopt; // Preserve the existing component-local model
+                         // boundary.
+  const auto resources = [](const auto &selected) {
+    std::set<core::ResourceId> result;
+    for (const auto &resource : selected.resource_bindings) {
+      if (resource.resource_id.empty() ||
+          !result.insert(resource.resource_id).second)
+        fail_retained_bundle(
+            "gripper actuation source repeats or omits a resource");
+    }
+    return result;
+  };
+  if (command->provider_runtime_unit_id != binding.provider_runtime_unit_id ||
+      command->provider_instance_id != binding.provider_instance_id ||
+      command->provider_manifest_id != binding.provider_manifest_id ||
+      command->provider_manifest_revision !=
+          binding.provider_manifest_revision ||
+      resources(binding).empty() || resources(*command) != resources(binding))
+    fail("gripper actuation source differs from its exact command "
+         "owner/resources");
+  const auto found = unit->configuration.find("gripper_target_configurations");
+  const auto *rows =
+      found == unit->configuration.end()
+          ? nullptr
+          : std::get_if<core::JsonValueDTO::Array>(&found->second.value);
+  if (rows == nullptr)
+    fail("model-backed ROS gripper binding has no strict authored target "
+         "configuration");
+  const auto configurations =
+      decode_ros2_control_execution_gripper_target_configurations(*rows);
+  const ros2_control_execution_runtime_contract::Configuration::
+      GripperTargetConfiguration *selected = nullptr;
+  for (const auto &configuration : configurations) {
+    const bool hosted = std::any_of(
+        graph.control_bindings.begin(), graph.control_bindings.end(),
+        [&](const auto &candidate) {
+          return candidate.provider_runtime_unit_id == unit->runtime_unit_id &&
+                 candidate.capability_id.value() == "tool.gripper.command" &&
+                 candidate.controllable_component_id ==
+                     configuration.controllable_component_id &&
+                 candidate.command_target_id == configuration.command_target_id;
+        });
+    if (!hosted)
+      fail("ROS gripper target configuration belongs to no hosted command "
+           "binding");
+    if (configuration.controllable_component_id ==
+            binding.controllable_component_id &&
+        configuration.command_target_id == binding.command_target_id) {
+      if (selected != nullptr)
+        fail("ROS gripper actuation source duplicates its target");
+      selected = &configuration;
+    }
+  }
+  if (selected == nullptr)
+    fail("model-backed ROS gripper binding lacks one exact authored target "
+         "configuration");
+  if (selected->actuation_kind == "pneumatic")
+    return core::GripperActuationKind::kPneumatic;
+  if (selected->actuation_kind == "position_commanded")
+    return core::GripperActuationKind::kPositionCommanded;
+  fail_retained_bundle(
+      "ROS gripper target configuration has unknown actuation semantics");
+}
+
 bool require_ros2_control_execution_runtime_required_rows(
     const core::CellGraphDTO &graph, const core::RuntimeUnitDTO &unit) {
+  // This hook also runs while compiling/verifying a Draft, immediately after
+  // schema normalization. Keep position-positive validation at that boundary
+  // while allowing DX777's zero pneumatic dwell, without imposing unrelated
+  // retained-decoder requirements on authoring.
+  if (const auto found = unit.configuration.find("gripper_target_configurations");
+      found != unit.configuration.end()) {
+    const auto *rows = std::get_if<core::JsonValueDTO::Array>(&found->second.value);
+    if (rows == nullptr) {
+      fail_retained_bundle(
+          "ros2_control runtime configuration has invalid gripper target configurations");
+    }
+    for (const auto &row : *rows) {
+      const auto *fields = std::get_if<core::JsonObjectDTO>(&row.value);
+      if (fields == nullptr) {
+        fail_retained_bundle(
+            "ros2_control runtime configuration has an invalid gripper target configuration");
+      }
+      const auto actuation = fields->find("actuation_kind");
+      const auto duration = fields->find("command_duration_s");
+      const auto *kind = actuation == fields->end()
+                             ? nullptr
+                             : std::get_if<std::string>(&actuation->second.value);
+      const auto *seconds = duration == fields->end()
+                                ? nullptr
+                                : std::get_if<double>(&duration->second.value);
+      const auto output = fields->find("output_mode");
+      const auto *mode = output == fields->end() ? nullptr
+                                                : std::get_if<std::string>(&output->second.value);
+      if (kind == nullptr || seconds == nullptr || mode == nullptr ||
+          !execution_gripper_command_duration_is_valid(*kind, *seconds) ||
+          !ros_gripper_output_mode_is_valid(*kind, *mode)) {
+        fail_retained_bundle(
+            "ros2_control runtime configuration has invalid gripper target semantics");
+      }
+      (void)require_ros_gripper_delivery_result_timeout(*fields, *kind);
+    }
+  }
   const bool empty_host = std::none_of(
       graph.controllable_components.begin(), graph.controllable_components.end(),
       [&](const auto &component) {
@@ -483,6 +770,12 @@ bool require_ros2_control_execution_runtime_required_rows(
                component.runtime_unit_ids.end();
       });
   if (!empty_host) {
+    const bool has_motion = std::any_of(
+        graph.control_bindings.begin(), graph.control_bindings.end(),
+        [&](const auto &binding) {
+          return binding.provider_runtime_unit_id == unit.runtime_unit_id &&
+                 binding.capability_id.value() == "execution.trajectory.execute";
+        });
     for (const std::string_view field : {"controller_profiles",
                                          "initial_joint_positions_rad",
                                          "motion_target_limits"}) {
@@ -490,6 +783,14 @@ bool require_ros2_control_execution_runtime_required_rows(
       const auto *rows = member == unit.configuration.end()
                              ? nullptr
                              : std::get_if<core::JsonValueDTO::Array>(&member->second.value);
+      if (!has_motion && field != "controller_profiles") {
+        if (rows == nullptr || !rows->empty()) {
+          fail_retained_bundle("ros2_control runtime requires empty " +
+                               std::string(field) +
+                               " without a hosted motion target");
+        }
+        continue;
+      }
       if (rows == nullptr || rows->empty()) {
         fail_retained_bundle("ros2_control runtime requires nonempty " +
                              std::string(field) + " for hosted components");
@@ -1096,12 +1397,19 @@ require_configuration(const RetainedBundle &retained_bundle,
       detail::decode_execution_motion_target_limits(*motion_limits, false);
   std::set<std::pair<core::ControllableComponentId, core::CommandTargetId>>
       expected;
+  std::set<std::pair<core::ControllableComponentId, core::CommandTargetId>>
+      expected_grippers;
   for (const auto &binding :
        retained_bundle.value().cell_graph.control_bindings) {
     if (binding.provider_runtime_unit_id == runtime_unit_id &&
         binding.capability_id.value() == "execution.trajectory.execute") {
       expected.emplace(binding.controllable_component_id,
                        binding.command_target_id);
+    }
+    if (binding.provider_runtime_unit_id == runtime_unit_id &&
+        binding.capability_id.value() == "tool.gripper.command") {
+      expected_grippers.emplace(binding.controllable_component_id,
+                                binding.command_target_id);
     }
   }
   std::set<std::pair<core::ControllableComponentId, core::CommandTargetId>>
@@ -1117,6 +1425,10 @@ require_configuration(const RetainedBundle &retained_bundle,
   }
   std::set<core::ControllableComponentId> hosted_components;
   for (const auto &[component, target] : expected) {
+    static_cast<void>(target);
+    hosted_components.insert(component);
+  }
+  for (const auto &[component, target] : expected_grippers) {
     static_cast<void>(target);
     hosted_components.insert(component);
   }
@@ -1143,8 +1455,7 @@ require_configuration(const RetainedBundle &retained_bundle,
           "configurations");
     }
     result.gripper_target_configurations =
-        detail::decode_execution_gripper_target_configurations(
-            *rows, "ros2_control runtime configuration");
+        detail::decode_ros2_control_execution_gripper_target_configurations(*rows);
     for (const auto &gripper : result.gripper_target_configurations) {
       const bool hosted = std::any_of(
           retained_bundle.value().cell_graph.control_bindings.begin(),
@@ -1161,6 +1472,19 @@ require_configuration(const RetainedBundle &retained_bundle,
             "ros2_control runtime gripper configuration names a target this "
             "unit does not host");
       }
+    }
+  }
+  if (!empty_host && expected.empty()) {
+    std::set<std::pair<core::ControllableComponentId, core::CommandTargetId>>
+        configured_grippers;
+    for (const auto &gripper : result.gripper_target_configurations) {
+      configured_grippers.emplace(gripper.controllable_component_id,
+                                  gripper.command_target_id);
+    }
+    if (configured_grippers != expected_grippers) {
+      throw RetainedBundleError(
+          "ros2_control runtime without motion must contain exactly one "
+          "configuration for every gripper target and no unknown target");
     }
   }
   if (const auto found = unit.configuration.find("default_fault_stop_profiles");
@@ -1231,12 +1555,19 @@ Configuration require_component_configuration(
   execution_runtime_contract::Configuration motion;
   motion.initial_joint_positions_rad = result.initial_joint_positions_rad;
   motion.motion_target_limits = result.motion_target_limits;
-  motion.gripper_target_configurations = result.gripper_target_configurations;
+  for (const auto &gripper : result.gripper_target_configurations) {
+    motion.gripper_target_configurations.push_back(
+        static_cast<const execution_runtime_contract::Configuration::GripperTargetConfiguration &>(gripper));
+  }
   motion = detail::select_native_component_configuration(
       std::move(motion), bundle.value().cell_graph, runtime_unit_id, component_id);
   result.initial_joint_positions_rad = std::move(motion.initial_joint_positions_rad);
   result.motion_target_limits = std::move(motion.motion_target_limits);
-  result.gripper_target_configurations = std::move(motion.gripper_target_configurations);
+  // The neutral selector verifies ownership/order; preserve the typed output
+  // choice on the ROS rows instead of round-tripping through its base payload.
+  std::erase_if(result.gripper_target_configurations, [&](const auto &row) {
+    return row.controllable_component_id != component_id;
+  });
   const auto unrelated = [&](const auto &row) {
     return row.controllable_component_id != component_id;
   };

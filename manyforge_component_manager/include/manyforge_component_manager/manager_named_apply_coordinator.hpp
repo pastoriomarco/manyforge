@@ -21,6 +21,16 @@
 
 namespace manyforge::component_manager {
 
+/// Read-only semantic join for one actual local pneumatic+None occurrence.
+/// The caller first validates the actual inventory response against this exact
+/// expected request, including the live host/publication/Manager epochs. This
+/// function neither discovers an owner nor turns authored mode into presence.
+[[nodiscard]] manyforge::core::Result<void>
+ValidateManagerPneumaticNoneProcessOwner(
+    const manyforge::deployment::RetainedBundle &verified_predecessor,
+    const ManagerComponentProcessInventoryRequestDTO &expected_inventory_request,
+    const ManagerComponentProcessOccurrenceDTO &occurrence);
+
 class ManagerNamedApplyCoordinatorError : public std::runtime_error {
 public:
   using std::runtime_error::runtime_error;

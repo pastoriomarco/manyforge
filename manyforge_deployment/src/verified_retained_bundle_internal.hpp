@@ -20,6 +20,12 @@ class RetainedModelMapVerificationAuthority final {
   [[nodiscard]] static std::optional<VerifiedRetainedModelMap> verify(
       const RetainedBundle &bundle, const RetainedModelMapQuery &query,
       std::string_view artifact_bytes);
+
+  /// Borrow the existing sealed map through the exact retained artifact source.
+  /// DX820: the source context is established before cold control verification.
+  [[nodiscard]] static std::optional<VerifiedRetainedModelMap>
+  verify(const RetainedBundle &bundle,
+         const IVerifiedRetainedProductArtifactSource &artifact_source);
 };
 
 struct QualifiedRetainedProductArtifactRole final {
@@ -65,15 +71,6 @@ reference_runtime_product_contract_revision();
 reference_runtime_product_artifact_roles() noexcept;
 [[nodiscard]] const CanonicalValue&
 reference_runtime_product_contract_descriptor();
-
-[[nodiscard]] std::string_view
-native_execution_runtime_product_contract_id() noexcept;
-[[nodiscard]] const core::ProductContractRevision &
-native_execution_runtime_product_contract_revision();
-[[nodiscard]] std::span<const QualifiedRetainedProductArtifactRole>
-native_execution_runtime_product_artifact_roles() noexcept;
-[[nodiscard]] const CanonicalValue &
-native_execution_runtime_product_contract_descriptor();
 
 [[nodiscard]] std::string_view
 ros2_control_execution_runtime_product_contract_id() noexcept;

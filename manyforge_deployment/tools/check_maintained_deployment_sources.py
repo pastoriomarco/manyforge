@@ -278,28 +278,28 @@ _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
 ]
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
     "lite6_isaac_commanded_v0": (
-        "6f98cdd29116ce939ad35a0b8aaa1b66c8d839c1bddb9eeddd6b98b4ffb000a7"
+        "04b1228ba7445e40263b25c5b11f7b01c91f7e0488a0cf7676cf24bb0e43d1eb"
     ),
     "lite6_mock_commanded_v0": (
-        "8c7b7839a4cb349bbead974ec949c453559d9f9c9697446d88dd2826477941b2"
+        "bf2fc3cc208cec7b06b5f0d0ad51b480b714b2838db3369d5927668b2f45e0f2"
     ),
     "ur10e_robotiq_assistant_isaac_commanded_v0": (
-        "366f75e72576a463da26595e7167b202a9621e7c69c49f4bad403934d90f34b4"
+        "ea331688311119f5a916d319217e59886311ce8eb552fe46a653e26acef2718e"
     ),
     "ur10e_robotiq_assistant_mock_commanded_v0": (
-        "cfcb6a43cbd5ec738d683a639d2e536ce98c13acb9924d16cb37f5be4b41fd6d"
+        "9d7d5c5b2251cad2aa03e01a8caf78e95fab8e6b4e28dfd2697e0b0fb2a26f83"
     ),
     "ur10e_robotiq_isaac_commanded_v0": (
-        "418afdd6eb7d45dbcabce7ca686f1dee41c3099e2ca7770d2c7f469b219efb23"
+        "74191a954caf9ece5ebea937a818103bae155ca85c50085fd3f9ff3e11598bc3"
     ),
     "ur10e_robotiq_mock_commanded_v0": (
-        "604c5de89e11e39b6a5767c719d0e9e42381879fdce068c8f16bb5908080ef20"
+        "570a0ad7edb3c35179e37cd0e2878c7479cc90cab73478c5e39446cb3734b1f4"
     ),
     "ur5_mock_commanded_v0": (
         "2d05adb391ce8fe9e2d59cc41d8a0ebba6e090e0395964afe303985e8612dee5"
     ),
     "ur5e_robotiq_mock_commanded_v0": (
-        "b39f02f42614ece09918444333c0f17792803d0966301472ae36d6a33a8c96d8"
+        "090fcfe8c60a145b0a2e4e9346548bcde140aaea21846678069b2e16eeb2d014"
     ),
 }
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
@@ -323,8 +323,8 @@ _EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS: Final = {
     "examples/pick_and_place_ur10e_robotiq.deployment.yaml": (
         "ur10e_robotiq_mock_commanded_v0"
     ),
-    "examples/semantic_shape_pick.deployment.yaml": "ur5_mock_commanded_v0",
-    "examples/vision_guided_bin_pick.deployment.yaml": "ur5_mock_commanded_v0",
+    "examples/semantic_shape_pick.deployment.yaml": "ur5e_robotiq_mock_commanded_v0",
+    "examples/vision_guided_bin_pick.deployment.yaml": "ur5e_robotiq_mock_commanded_v0",
     "examples/vision_guided_pose_pick.deployment.yaml": "ur5_mock_commanded_v0",
     "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml": (
         "lite6_isaac_commanded_v0"
@@ -1882,7 +1882,12 @@ def validate(source: Path, root: Path) -> None:
             else _RUNTIME_RESTORATION_SOURCE_FIELDS
         )
         if profile_id in {
+            "lite6_isaac_commanded_v0",
             "lite6_mock_commanded_v0",
+            "ur10e_robotiq_assistant_isaac_commanded_v0",
+            "ur10e_robotiq_assistant_mock_commanded_v0",
+            "ur10e_robotiq_isaac_commanded_v0",
+            "ur10e_robotiq_mock_commanded_v0",
             "ur5e_robotiq_mock_commanded_v0",
         }:
             expected_source_fields = {

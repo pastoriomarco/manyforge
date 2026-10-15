@@ -5,18 +5,16 @@
 #include <limits>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <sstream>
 #include <string>
 #include <utility>
 
+// DX-753: preserve native-named per-unit admission and launch plumbing for the held multi-unit discussion.
 namespace manyforge::component_manager {
 namespace {
 
-namespace native_contract =
-    manyforge::deployment::native_execution_runtime_contract;
 namespace ros2_control_contract =
     manyforge::deployment::ros2_control_execution_runtime_contract;
 

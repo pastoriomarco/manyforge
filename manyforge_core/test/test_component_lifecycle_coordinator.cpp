@@ -452,7 +452,7 @@ class FakeCatalogSource final : public ICCLCLifecyclePlanCatalogSource {
   mutable std::atomic<std::size_t> load_count_{0U};
 };
 
-enum class DispatchMode { kKnownSuccess, kUncertain };
+enum class DispatchMode { kKnownSuccess, kUncertain, kKnownFailure, kForeignDomainFailure };
 
 class FakeBrandPort final : public IBrandLifecyclePort {
  public:
@@ -460,13 +460,15 @@ class FakeBrandPort final : public IBrandLifecyclePort {
                 DispatchMode mode = DispatchMode::kKnownSuccess,
                 std::uint64_t first_observation_generation = 1U,
                 std::vector<LifecycleFactDTO> facts = {},
-                std::function<void()> before_dispatch_result = {})
+                std::function<void()> before_dispatch_result = {},
+                std::optional<ErrorDTO> dispatch_error = std::nullopt)
       : journal_(journal),
         observations_(std::move(observations)),
         mode_(mode),
         first_observation_generation_(first_observation_generation),
         facts_(std::move(facts)),
-        before_dispatch_result_(std::move(before_dispatch_result)) {}
+        before_dispatch_result_(std::move(before_dispatch_result)),
+        dispatch_error_(std::move(dispatch_error)) {}
 
   [[nodiscard]] Result<BrandLifecycleObservationDTO> Observe(
       const BrandLifecycleObservationQueryDTO& query) override {
@@ -517,10 +519,13 @@ class FakeBrandPort final : public IBrandLifecyclePort {
               std::nullopt,
               ErrorDTO{"response_lost", "dispatch response lost", {}}};
     }
+    const bool failed = mode_ == DispatchMode::kKnownFailure ||
+                        mode_ == DispatchMode::kForeignDomainFailure;
     return {intent.lifecycle_transaction_id,
             intent.lifecycle_transaction_generation,
             intent.controllable_component_id,
-            intent.control_domain_id,
+            mode_ == DispatchMode::kForeignDomainFailure ? ControlDomainId("foreign.domain")
+                                                       : intent.control_domain_id,
             intent.control_domain_revision,
             intent.provider_instance_id,
             intent.provider_manifest_id,
@@ -531,9 +536,10 @@ class FakeBrandPort final : public IBrandLifecyclePort {
             intent.lifecycle_primitive_attempt_id,
             intent.expected_observation_generation,
             LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown,
-            LifecyclePrimitiveEffectDTO::kObserved,
-            LifecyclePrimitiveKnownResultDTO::kSucceeded,
-            std::nullopt};
+            failed ? LifecyclePrimitiveEffectDTO::kPossible : LifecyclePrimitiveEffectDTO::kObserved,
+            failed ? LifecyclePrimitiveKnownResultDTO::kFailed
+                   : LifecyclePrimitiveKnownResultDTO::kSucceeded,
+            failed ? dispatch_error_ : std::nullopt};
   }
 
   [[nodiscard]] std::size_t dispatch_count() const noexcept {
@@ -561,6 +567,7 @@ class FakeBrandPort final : public IBrandLifecyclePort {
   std::uint64_t first_observation_generation_;
   std::vector<LifecycleFactDTO> facts_;
   std::function<void()> before_dispatch_result_;
+  std::optional<ErrorDTO> dispatch_error_;
   mutable std::mutex mutex_;
   std::size_t observe_count_ = 0U;
   std::atomic<std::size_t> dispatch_count_{0U};
@@ -1010,6 +1017,14 @@ TEST(ComponentLifecycleCoordinator,
   ASSERT_EQ(status.value()->domains.size(), 2U);
   EXPECT_EQ(first_port->dispatch_count(), 1U);
   EXPECT_EQ(second_port->dispatch_count(), 1U);
+  EXPECT_FALSE(status.value()->domains.front().error);
+  ASSERT_EQ(status.value()->domains.front().primitive_attempts.size(), 1U);
+  EXPECT_EQ(status.value()->domains.front().primitive_attempts.front().known_result,
+            LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(status.value()->error);
+  EXPECT_EQ(status.value()->error->details,
+            (decltype(status.value()->error->details){
+                {"reason", "observation_unchanged_after_uncertain_dispatch"}}));
   EXPECT_TRUE(reservations.snapshot().empty());
 }
 
@@ -3261,6 +3276,182 @@ TEST(ComponentLifecycleCoordinator, ConcurrentDuplicateJoinsBeforeAnotherPreflig
 }
 
 TEST(ComponentLifecycleCoordinator,
+     FailedPrimitiveCauseSurvivesNoEffectReconciliationAndDurableStatus) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot(), Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  const ErrorDTO refusal{
+      "execution_rejected", "the controller manager refused the controller switch",
+      {{"reason", "ros2_control_activation_refused"},
+       {"controller_response_message", "controller requires its hardware interface"},
+       {"controller_name", "gripper_controller"}, {"switch_action", "activate"},
+       {"controller_service", "/cell/controller_manager/switch_controller"}}};
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared},
+      DispatchMode::kKnownFailure, 1U, std::vector<LifecycleFactDTO>{}, std::function<void()>{},
+      refusal);
+  FakeResolver resolver(port);
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const auto accepted =
+      coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance);
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok());
+  ASSERT_TRUE(status.value());
+  const auto& final = *status.value();
+  EXPECT_EQ(final.phase, ComponentLifecycleTransactionPhaseDTO::kFailed);
+  EXPECT_EQ(final.terminal_result, ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);
+  EXPECT_FALSE(final.reconciliation_required);
+  ASSERT_TRUE(final.error);
+  EXPECT_EQ(final.error->code, "component_lifecycle_primitive_known_no_effect");
+  EXPECT_EQ(final.error->message,
+            "fresh reconciliation proved that the prepared primitive had no relevant effect");
+  EXPECT_EQ(final.error->details.at("reason"), "observation_unchanged_after_uncertain_dispatch");
+  EXPECT_EQ(final.error->details.at("primitive_code"), refusal.code);
+  EXPECT_EQ(final.error->details.at("primitive_reason"), refusal.details.at("reason"));
+  EXPECT_EQ(final.error->details.at("primitive_message"),
+            refusal.details.at("controller_response_message"));
+  for (const auto* key : {"controller_name", "switch_action", "controller_service"}) {
+    EXPECT_EQ(final.error->details.at(key), refusal.details.at(key));
+  }
+  EXPECT_EQ(final.error->details.size(), kMaxLifecycleErrorDetails);
+  ASSERT_EQ(final.domains.size(), 1U);
+  const auto& domain = final.domains.front();
+  EXPECT_EQ(domain.action_state, ComponentLifecycleDomainActionStateDTO::kFailed);
+  EXPECT_EQ(domain.effect, ComponentLifecycleDomainEffectDTO::kKnownNoEffect);
+  EXPECT_EQ(domain.error, final.error);
+  ASSERT_TRUE(domain.reconciliation_evidence);
+  EXPECT_EQ(domain.reconciliation_evidence->postcondition_result,
+            LifecyclePostconditionResultDTO::kNotSatisfied);
+  ASSERT_EQ(domain.primitive_attempts.size(), 1U);
+  EXPECT_EQ(domain.primitive_attempts.front().error, refusal);
+  EXPECT_EQ(final.error->details.at("primitive_attempt_id"),
+            domain.primitive_attempts.front().lifecycle_primitive_attempt_id.value());
+  const auto retained = journal.LoadRetainedLifecycleStatus(final.acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(retained.ok());
+  ASSERT_TRUE(retained.value());
+  EXPECT_EQ(*retained.value(), final);
+  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(detail::EncodeComponentLifecycleStatus(final)),
+            final);
+  EXPECT_TRUE(final.locally_valid());
+  EXPECT_EQ(port->dispatch_count(), 1U);
+  EXPECT_TRUE(reservations.snapshot().empty());
+}
+
+TEST(ComponentLifecycleCoordinator, FailedPrimitiveMessageFallbackIsUtf8Bounded) {
+  for (const bool empty_response : {false, true}) {
+    SCOPED_TRACE(empty_response);
+    ScopedTemporaryDirectory temporary;
+    SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                              8U);
+    CCLCDomainReservationTable reservations;
+    FakeSnapshotSource snapshots({Snapshot(), Snapshot()});
+    FakeCatalogSource catalogs(PrepareCatalog());
+    // The three-byte character crosses the existing 256-byte detail boundary.
+    const auto expected_prefix = std::string(255U, 'm');
+    ErrorDTO refusal{"execution_rejected", expected_prefix + "\xE2\x82\xAC" + "tail",
+                     {{"reason", "ros2_control_deactivation_refused"}}};
+    if (empty_response) {
+      refusal.details.emplace("controller_response_message", "");
+    }
+    auto port = std::make_shared<FakeBrandPort>(
+        journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared},
+        DispatchMode::kKnownFailure, 1U, std::vector<LifecycleFactDTO>{}, std::function<void()>{},
+        refusal);
+    FakeResolver resolver(port);
+    FakeCellAdmissionPort kernel;
+    FakeClock clock;
+    clock.set(100);
+    ManualScheduler scheduler;
+    ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                              resolver, kernel, clock, scheduler);
+    ASSERT_TRUE(coordinator.Start().ok());
+    const auto accepted =
+        coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(accepted.value().acceptance);
+    ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+    const auto status =
+        coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(status.value());
+    ASSERT_TRUE(status.value()->error);
+    EXPECT_EQ(status.value()->error->details.at("primitive_message"), expected_prefix);
+    EXPECT_EQ(status.value()->domains.front().primitive_attempts.front().error, refusal);
+    for (const auto& [key, value] : status.value()->error->details) {
+      EXPECT_LE(key.size(), kMaxLifecycleErrorDetailKeyBytes);
+      EXPECT_LE(value.size(), kMaxLifecycleErrorDetailValueBytes);
+    }
+    EXPECT_LE(status.value()->error->details.size(), kMaxLifecycleErrorDetails);
+    EXPECT_TRUE(status.value()->locally_valid());
+    EXPECT_EQ(detail::DecodeComponentLifecycleStatus(
+                  detail::EncodeComponentLifecycleStatus(*status.value())), *status.value());
+  }
+}
+
+TEST(ComponentLifecycleCoordinator, NoEffectReconciliationDoesNotPromoteUnknownOrForeignFailure) {
+  for (const auto mode : {DispatchMode::kUncertain, DispatchMode::kForeignDomainFailure}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    ScopedTemporaryDirectory temporary;
+    SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                              8U);
+    CCLCDomainReservationTable reservations;
+    FakeSnapshotSource snapshots({Snapshot(), Snapshot()});
+    FakeCatalogSource catalogs(PrepareCatalog());
+    const ErrorDTO foreign{"execution_rejected", "foreign controller refused",
+                           {{"reason", "foreign_refusal"}, {"controller_name", "other_controller"},
+                            {"controller_response_message", "do not promote"}}};
+    auto port = std::make_shared<FakeBrandPort>(
+        journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared},
+        mode, 1U, std::vector<LifecycleFactDTO>{}, std::function<void()>{}, foreign);
+    FakeResolver resolver(port);
+    FakeCellAdmissionPort kernel;
+    FakeClock clock;
+    clock.set(100);
+    ManualScheduler scheduler;
+    ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                              resolver, kernel, clock, scheduler);
+    ASSERT_TRUE(coordinator.Start().ok());
+    const auto accepted =
+        coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(accepted.value().acceptance);
+    ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+    const auto status =
+        coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(status.value());
+    ASSERT_TRUE(status.value()->error);
+    EXPECT_EQ(status.value()->terminal_result,
+              ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);
+    EXPECT_EQ(status.value()->error->code, "component_lifecycle_primitive_known_no_effect");
+    EXPECT_EQ(status.value()->error->details,
+              (decltype(status.value()->error->details){
+                  {"reason", "observation_unchanged_after_uncertain_dispatch"}}));
+    ASSERT_EQ(status.value()->domains.front().primitive_attempts.size(), 1U);
+    const auto& result = status.value()->domains.front().primitive_attempts.front();
+    EXPECT_FALSE(result.known_result);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->code,
+              mode == DispatchMode::kUncertain ? "response_lost"
+                                               : "component_lifecycle_adapter_result_invalid");
+    EXPECT_EQ(port->dispatch_count(), 1U);
+  }
+}
+
+TEST(ComponentLifecycleCoordinator,
      UncertainDispatchReconcilesFromFreshObservationWithoutRedispatch) {
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
@@ -3765,6 +3956,88 @@ TEST(ComponentLifecycleCoordinator,
   EXPECT_TRUE(coordinator.accepting_new_requests());
 }
 
+TEST(ComponentLifecycleCoordinator, RecoveryRetainsTheActualFailedPrimitiveCauseWithoutRedispatch) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  const auto begun = journal.BeginOwnerEpoch(RequestOwnerEpoch("cclc-owner.1"), 1, 8U);
+  ASSERT_TRUE(begun.ok());
+  const auto owner = begun.value().request_owner_epoch;
+  const auto seed = SeedPreparedBrandRecovery(journal, owner, PrepareCatalog(), "lifecycle.1");
+  const auto& intent = seed.primitive;
+  const ErrorDTO refusal{"execution_rejected", "the controller manager refused the controller switch",
+                         {{"reason", "ros2_control_activation_refused"},
+                          {"controller_response_message", "controller unavailable"},
+                          {"controller_name", "gripper_controller"}, {"switch_action", "activate"}}};
+  const BrandLifecyclePrimitiveResultDTO failed{
+      intent.lifecycle_transaction_id, intent.lifecycle_transaction_generation,
+      intent.controllable_component_id, intent.control_domain_id, intent.control_domain_revision,
+      intent.provider_instance_id, intent.provider_manifest_id, intent.provider_manifest_revision,
+      intent.provider_runtime_unit_id, intent.provider_runtime_epoch, intent.lifecycle_primitive_id,
+      intent.lifecycle_primitive_attempt_id, intent.expected_observation_generation,
+      LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown, LifecyclePrimitiveEffectDTO::kPossible,
+      LifecyclePrimitiveKnownResultDTO::kFailed, refusal};
+  ASSERT_TRUE(failed.matches(intent));
+  const auto prepared = journal.LoadRetainedLifecycleStatus(seed.acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(prepared.ok());
+  ASSERT_TRUE(prepared.value());
+  auto completed = *prepared.value();
+  ++completed.status_sequence;
+  completed.phase = ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown;
+  completed.reconciliation_required = true;
+  completed.error = refusal;
+  auto& domain = completed.domains.front();
+  domain.primitive_attempts.push_back(failed);
+  domain.action_state = ComponentLifecycleDomainActionStateDTO::kOutcomeUnknown;
+  domain.effect = ComponentLifecycleDomainEffectDTO::kEffectUncertain;
+  domain.error = refusal;
+  ASSERT_TRUE(completed.locally_valid());
+  auto attempt = PreparedPrimitiveAttempt(intent);
+  attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
+  attempt.lifecycle_primitive_result = failed;
+  ASSERT_TRUE(journal.RecordEffectCompleted(owner, attempt, completed).ok());
+
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared},
+      DispatchMode::kKnownSuccess, 2U);
+  FakeResolver resolver(port);
+  FakeCellAdmissionPort kernel;
+  kernel.RetainClaim(seed.claim);
+  FakeClock clock;
+  clock.set(500);
+  ManualScheduler scheduler;
+  auto config = Config();
+  config.request_owner_epoch = RequestOwnerEpoch("cclc-owner.2");
+  ComponentLifecycleCoordinator coordinator(config, journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status = coordinator.LoadLifecycleStatus(seed.acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok());
+  ASSERT_TRUE(status.value());
+  EXPECT_EQ(status.value()->terminal_result,
+            ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);
+  ASSERT_TRUE(status.value()->error);
+  EXPECT_EQ(status.value()->error->code, "component_lifecycle_primitive_known_no_effect");
+  EXPECT_EQ(status.value()->error->message,
+            "fresh owner-recovery evidence proved no relevant primitive effect");
+  EXPECT_EQ(status.value()->error->details.at("reason"),
+            "state_only_observation_unchanged_after_owner_replacement");
+  EXPECT_EQ(status.value()->error->details.at("primitive_code"), refusal.code);
+  EXPECT_EQ(status.value()->error->details.at("primitive_message"), "controller unavailable");
+  EXPECT_EQ(status.value()->error->details.at("primitive_attempt_id"),
+            intent.lifecycle_primitive_attempt_id.value());
+  EXPECT_EQ(status.value()->domains.front().primitive_attempts.front(), failed);
+  EXPECT_EQ(status.value()->domains.front().error, status.value()->error);
+  EXPECT_EQ(port->dispatch_count(), 0U);
+  const auto retained = journal.LoadRetainedLifecycleStatus(seed.acceptance.lifecycle_transaction_id);
+  ASSERT_TRUE(retained.ok());
+  EXPECT_EQ(retained.value(), status.value());
+}
+
 struct RecoveredBrandClassificationCase final {
   std::string_view name;
   ComponentLifecycleStateDTO observed_state;
@@ -3813,6 +4086,12 @@ TEST_P(RecoveredBrandClassificationTest, ClassifiesFreshEvidenceWithoutRedispatc
   EXPECT_EQ(status.value()->phase, GetParam().expected_phase);
   EXPECT_EQ(status.value()->terminal_result, GetParam().expected_terminal);
   EXPECT_EQ(status.value()->domains.front().effect, GetParam().expected_effect);
+  if (GetParam().expected_effect == ComponentLifecycleDomainEffectDTO::kKnownNoEffect) {
+    ASSERT_TRUE(status.value()->error);
+    EXPECT_EQ(status.value()->error->details,
+              (decltype(status.value()->error->details){
+                  {"reason", "state_only_observation_unchanged_after_owner_replacement"}}));
+  }
   EXPECT_EQ(port->dispatch_count(), 0U);
   EXPECT_EQ(port->observation_count(), 1U);
   ASSERT_EQ(status.value()->domains.front().primitive_attempts.size(), 1U);
@@ -4583,6 +4862,16 @@ TEST(ComponentLifecycleCoordinator, CloseRetirementUsesActualScopedJournalAndRep
   EXPECT_TRUE(open.ReadLifecycleOwnerSettlement(intent.scope).ok());
   auto next = NextProductPublication(previous);
   next.durable_public_pointer_content_digest = ContentDigest(Sha('d'));
+  const auto fact = journal.LoadCurrentComponentLifecycleFact(ControllableComponentId("component.1"));
+  ASSERT_TRUE(fact.ok()) << fact.error().message;
+  ASSERT_TRUE(fact.value().durable_generation.has_value());
+  auto successor_snapshot = Snapshot("close.successor.snapshot", ComponentLifecycleStateDTO::kDeclared,
+                                     *fact.value().durable_generation);
+  successor_snapshot.active_publication_receipt = next;
+  const auto snapshot_digest = ComputeComponentLifecycleCurrentSnapshotDigest(successor_snapshot);
+  ASSERT_TRUE(snapshot_digest.ok()) << snapshot_digest.error().message;
+  successor_snapshot.snapshot_digest = snapshot_digest.value();
+  snapshots.SetSnapshot(std::move(successor_snapshot));
   const auto successor = ProductContextFor(snapshots, catalogs, resolver, next);
   const auto exchange = coordinator.TryExchangeProductContext(old_context, successor, coordinator.request_owner_epoch(), previous);
   ASSERT_TRUE(exchange.ok()) << exchange.error().message;

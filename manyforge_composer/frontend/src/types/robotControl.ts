@@ -96,7 +96,7 @@ export interface ManualControlMotionDescriptor {
 }
 
 export interface ManualControlGripperDescriptor {
-  schemaVersion: 'manyforge.manual_control_gripper_descriptor.v2';
+  schemaVersion: 'manyforge.manual_control_gripper_descriptor.v3';
   controllableComponentId: string;
   commandTargetId: string;
   componentRoleId: string;
@@ -104,12 +104,13 @@ export interface ManualControlGripperDescriptor {
   description: string | null;
   commandKind: 'gripper_position';
   actuationKind: 'position_commanded' | 'pneumatic' | null;
+  outputMode: 'commanded' | 'none' | null;
   transportKind: 'resolved_binding';
   controlInterfaceContractId: string | null;
   stateAuthorityId: string | null;
   stateAuthorityClass: 'measured' | 'commanded' | 'predicted' | null;
-  completionPolicy: 'goal_fenced_target_reached';
-  graspConfirmationPolicy: 'binding_feedback_required';
+  completionPolicy: 'goal_fenced_target_reached' | 'output_delivery' | 'no_output';
+  graspConfirmationPolicy: 'binding_feedback_required' | 'not_required';
   sourceGroupName: string | null;
   sourceCoordinateName: string;
   sourceKind: ResourceSourceKind;

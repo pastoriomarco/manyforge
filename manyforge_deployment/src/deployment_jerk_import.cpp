@@ -91,6 +91,7 @@ CanonicalValue MergeJoint(const CanonicalValue &previous,
 }
 } // namespace
 
+// DX-753: retain archived native cold-import guards without admitting a native runtime product.
 CompiledDeploymentDraft import_moveit_angular_jerk_limits(
     std::string_view source, std::string_view moveit_source,
     std::string_view source_id, std::string_view runtime_unit_id,

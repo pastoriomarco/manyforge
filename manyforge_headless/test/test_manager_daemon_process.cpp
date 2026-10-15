@@ -1181,7 +1181,9 @@ std::string ApplyRequest(
     // "receipt" echoes the previewed impact digest (explicit acceptance), an
     // empty value accepts nothing, anything else is sent verbatim.
     const std::string_view accepted_impact = "receipt",
-    const std::string_view prepared_activation_id_override = {}) {
+    const std::string_view prepared_activation_id_override = {},
+    const deployment::CanonicalEmptyRetainedBundleAdmission *sealed_admission =
+        nullptr) {
   using content_identity::CanonicalValue;
   std::string resolved_graph_revision(expected_graph_revision);
   std::string resolved_retained_bundle_id(expected_retained_bundle_id);
@@ -1254,7 +1256,8 @@ std::string ApplyRequest(
           const auto prepared =
               deployment::FilesystemPreparedActivationRepository(
                   directory.activation_root())
-                  .get_verified(core::ContentDigest(prepared_activation_id));
+                  .get_verified(core::ContentDigest(prepared_activation_id),
+                                sealed_admission);
           if (prepared == nullptr) {
             throw std::runtime_error(
                 "Manager Apply fixture prepared activation is unavailable");
@@ -2606,9 +2609,8 @@ TEST(ManagerDaemonProcess,
 
 TEST(ManagerDaemonProcess,
      GripperOnlyNativeApplyPublishesAControllableCellWithoutMotion) {
-  GTEST_SKIP() << "NOT_RUN/A1: selected ROS product requires a nonempty matching motion-target limit; gripper-only cell support awaits A1";
   const auto fixture = ReadGripperOnlyManagerApplyFixtureMetadata();
-  DaemonDirectory directory;
+  DaemonDirectory directory(true);
   std::filesystem::copy(MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT,
                         directory.apply_package_root(),
                         std::filesystem::copy_options::recursive);
@@ -2656,7 +2658,7 @@ TEST(ManagerDaemonProcess,
   }
   ASSERT_NE(applied.find("\"state\":\"succeeded\""),
             std::string::npos)
-      << applied;
+      << applied << "\nmanager stderr:\n" << ReadStartupStderr(directory);
   const auto ready = WaitForExecutionReady(
       directory, fixture.physical_candidate_retained_bundle_id);
   EXPECT_FALSE(ready.owner_epoch.empty());
@@ -2666,6 +2668,207 @@ TEST(ManagerDaemonProcess,
   ASSERT_NE(status.find("\"ok\":true"), std::string::npos) << status;
   EXPECT_NE(status.find("tool.gripper.command"), std::string::npos)
       << status;
+  EXPECT_EQ(status.find("execution.trajectory.execute"), std::string::npos)
+      << status;
+
+  // The first physical Apply used the selected-product path, not the current
+  // bootstrap builder. Empty installation must retain that exact ownership
+  // through the interval before the public pointer switches to empty.
+  const auto native_children = ReadDirectChildren(manager.pid());
+  ASSERT_FALSE(native_children.empty());
+  const deployment::FilesystemCanonicalEmptyRetainedBundleSource empty_source(
+      directory.apply_package_root(), fixture.admission_filename);
+  const auto empty_admission = empty_source.load_verified();
+  const deployment::FilesystemVerifiedCatalogArtifactSource empty_catalog(
+      directory.apply_package_root());
+  const deployment::FilesystemVerifiedRawArtifactSource empty_raw(
+      directory.apply_package_root());
+  const auto empty_prepared = deployment::assemble_sealed_canonical_empty_activation(
+      empty_admission, empty_catalog, empty_raw);
+  ASSERT_TRUE(daemon_activations.put_if_absent(empty_prepared));
+  const auto empty_submitted = SendCommand(directory.socket_path(), ApplyRequest(
+      directory, initial->source_owner_epoch,
+      WaitForAuthoringAdmission(directory).admission_generation,
+      empty_admission.deployment_artifact_id().value(),
+      empty_admission.deployment_revision().value(), "current-graph",
+      "current-bundle", "manager-gripper-only-empty.2", {}, false, "receipt",
+      empty_prepared.prepared_activation_id().value(), &empty_admission));
+  ASSERT_NE(empty_submitted.find("\"apply_id\""), std::string::npos)
+      << empty_submitted;
+  auto emptied = empty_submitted;
+  const auto empty_status_request = ApplyStatusRequest(empty_submitted);
+  const auto empty_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (emptied.find("\"state\":\"succeeded\"") == std::string::npos &&
+         std::chrono::steady_clock::now() < empty_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    emptied = SendCommand(directory.socket_path(), empty_status_request);
+  }
+  ASSERT_NE(emptied.find("\"state\":\"succeeded\""), std::string::npos)
+      << emptied << "\nmanager stderr:\n" << ReadStartupStderr(directory);
+  EXPECT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
+  const auto empty_current = manager_source.Read();
+  ASSERT_TRUE(empty_current.has_value());
+  EXPECT_EQ(empty_current->source_owner_epoch, initial->source_owner_epoch);
+  const auto &empty_active = RequiredMember(empty_current->payload, "active");
+  EXPECT_EQ(RequiredMember(empty_active, "canonical_empty"),
+            content_identity::CanonicalValue(true));
+  EXPECT_EQ(RequiredText(empty_active, "retained_bundle_id"),
+            empty_admission.retained_bundle_id().value());
+  EXPECT_EQ(RequiredText(empty_active, "graph_revision"),
+            empty_admission.graph_revision().value());
+  EXPECT_EQ(ReadDirectChildren(manager.pid()), native_children);
+  EXPECT_EQ(ReadStartupStderr(directory).find(
+                "native composition phase: materializing runtime"),
+            std::string::npos);
+
+  // A fresh explicit Apply still owns the normal selected-product route.
+  // Use the actual empty predecessor and a new request, never retry a mutation.
+  const auto reapplied_submission = SendCommand(directory.socket_path(), ApplyRequest(
+      directory, empty_current->source_owner_epoch,
+      WaitForAuthoringAdmission(directory).admission_generation,
+      fixture.physical_deployment_artifact_id,
+      fixture.physical_deployment_revision,
+      empty_admission.graph_revision().value(),
+      empty_admission.retained_bundle_id().value(),
+      "manager-gripper-only-reapply.3", {}, false, "receipt",
+      fixture.prepared_activation_id));
+  ASSERT_NE(reapplied_submission.find("\"apply_id\""), std::string::npos)
+      << reapplied_submission;
+  EXPECT_NE(ApplyStatusRequest(reapplied_submission), empty_status_request);
+  auto reapplied = reapplied_submission;
+  const auto reapply_status_request = ApplyStatusRequest(reapplied_submission);
+  const auto reapply_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (reapplied.find("\"state\":\"succeeded\"") == std::string::npos &&
+         std::chrono::steady_clock::now() < reapply_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    reapplied = SendCommand(directory.socket_path(), reapply_status_request);
+  }
+  ASSERT_NE(reapplied.find("\"state\":\"succeeded\""), std::string::npos)
+      << reapplied << "\nmanager stderr:\n" << ReadStartupStderr(directory);
+  const auto reopened = WaitForExecutionReady(
+      directory, fixture.physical_candidate_retained_bundle_id);
+  EXPECT_EQ(reopened.owner_epoch, ready.owner_epoch);
+  EXPECT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
+  EXPECT_EQ(ReadDirectChildren(manager.pid()), native_children);
+  EXPECT_EQ(ReadStartupStderr(directory).find(
+                "native composition phase: materializing runtime"),
+            std::string::npos);
+}
+
+TEST(
+    ManagerDaemonProcess,
+    PneumaticCommandedFeedbackAliasInitialApplyPublishesAControllableCellWithoutMotion) {
+  const auto fixture = ReadGripperOnlyManagerApplyFixtureMetadata(
+      MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_METADATA);
+  DaemonDirectory directory(true);
+  std::filesystem::copy(
+      MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_PACKAGE_ROOT,
+      directory.apply_package_root(), std::filesystem::copy_options::recursive);
+  // Inspect the actual generated product: the command and feedback bindings
+  // share one pneumatic target, so this exercises the scalar alias closure.
+  const deployment::FilesystemVerifiedRetainedBundleSource bundles(
+      directory.apply_package_root());
+  const auto candidate = bundles.get_verified(
+      core::RetainedBundleId(fixture.physical_candidate_retained_bundle_id));
+  ASSERT_NE(candidate, nullptr);
+  const auto &graph = candidate->value().cell_graph;
+  ASSERT_EQ(graph.controllable_components.size(), 1U);
+  ASSERT_EQ(graph.runtime_units.size(), 1U);
+  ASSERT_EQ(graph.control_bindings.size(), 2U);
+  const auto configuration = deployment::
+      ros2_control_execution_runtime_contract::require_configuration(
+          *candidate, graph.runtime_units.front().runtime_unit_id);
+  ASSERT_EQ(configuration.gripper_target_configurations.size(), 1U);
+  const auto &gripper = configuration.gripper_target_configurations.front();
+  EXPECT_EQ(gripper.actuation_kind, "pneumatic");
+  EXPECT_EQ(gripper.output_mode, core::GripperOutputMode::kCommanded);
+  ASSERT_EQ(configuration.controller_profiles.size(), 1U);
+  EXPECT_EQ(configuration.controller_profiles.front().mock_profile,
+            std::optional<std::string>("lite6_lite_gripper"));
+  const auto command_binding = std::find_if(
+      graph.control_bindings.begin(), graph.control_bindings.end(),
+      [](const auto &binding) {
+        return binding.capability_id.value() == "tool.gripper.command";
+      });
+  const auto feedback_binding = std::find_if(
+      graph.control_bindings.begin(), graph.control_bindings.end(),
+      [](const auto &binding) {
+        return binding.capability_id.value() == "tool.gripper.feedback";
+      });
+  ASSERT_NE(command_binding, graph.control_bindings.end());
+  ASSERT_NE(feedback_binding, graph.control_bindings.end());
+  EXPECT_EQ(command_binding->controllable_component_id,
+            graph.controllable_components.front().controllable_component_id);
+  EXPECT_EQ(command_binding->controllable_component_id,
+            gripper.controllable_component_id);
+  EXPECT_EQ(command_binding->command_target_id, gripper.command_target_id);
+  EXPECT_EQ(feedback_binding->controllable_component_id,
+            command_binding->controllable_component_id);
+  EXPECT_EQ(feedback_binding->command_target_id,
+            command_binding->command_target_id);
+  EXPECT_EQ(feedback_binding->control_domain_id,
+            command_binding->control_domain_id);
+  EXPECT_EQ(feedback_binding->provider_runtime_unit_id,
+            command_binding->provider_runtime_unit_id);
+  EXPECT_EQ(feedback_binding->resource_bindings,
+            command_binding->resource_bindings);
+
+  const deployment::FilesystemPreparedActivationRepository package_activations(
+      directory.apply_package_root());
+  const auto prepared = package_activations.get_verified(
+      core::ContentDigest(fixture.prepared_activation_id));
+  ASSERT_NE(prepared, nullptr);
+  const deployment::FilesystemPreparedActivationRepository daemon_activations(
+      directory.activation_root());
+  ASSERT_TRUE(daemon_activations.put_if_absent(*prepared));
+  const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
+  ProgramRunnerProcess program_runner(directory, fixture.cell_id);
+  ManagerProcess manager(directory, directory.apply_package_root().string(),
+                         fixture.admission_filename, installed_manager.string(),
+                         program_runner.socket_path().string());
+  manager.WaitReady(directory);
+
+  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
+                                             "manager-source.json");
+  const auto initial = manager_source.Read();
+  ASSERT_TRUE(initial.has_value());
+  const auto request = ApplyRequest(
+      directory, initial->source_owner_epoch,
+      WaitForAuthoringAdmission(directory).admission_generation,
+      fixture.physical_deployment_artifact_id,
+      fixture.physical_deployment_revision, fixture.predecessor_graph_revision,
+      fixture.predecessor_retained_bundle_id,
+      "manager-pneumatic-commanded-feedback-apply.1", {}, false, "receipt",
+      fixture.prepared_activation_id);
+  const auto submitted = SendCommand(directory.socket_path(), request);
+  ASSERT_NE(submitted.find("\"apply_id\""), std::string::npos) << submitted;
+  auto applied = submitted;
+  const auto status_request = ApplyStatusRequest(submitted);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    applied = SendCommand(directory.socket_path(), status_request);
+  }
+  ASSERT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos)
+      << applied << "\nmanager stderr:\n"
+      << ReadStartupStderr(directory);
+  const auto ready = WaitForExecutionReady(
+      directory, fixture.physical_candidate_retained_bundle_id);
+  EXPECT_FALSE(ready.owner_epoch.empty());
+  const auto current = manager_source.Read();
+  ASSERT_TRUE(current.has_value());
+  EXPECT_EQ(RequiredText(RequiredMember(current->payload, "active"),
+                         "retained_bundle_id"),
+            fixture.physical_candidate_retained_bundle_id);
+  const auto status = SendCommand(
+      directory.execution_socket_path(),
+      R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+  ASSERT_NE(status.find("\"ok\":true"), std::string::npos) << status;
+  EXPECT_NE(status.find("tool.gripper.command"), std::string::npos) << status;
   EXPECT_EQ(status.find("execution.trajectory.execute"), std::string::npos)
       << status;
 }

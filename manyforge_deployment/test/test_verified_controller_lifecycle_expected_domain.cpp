@@ -63,21 +63,32 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
   ASSERT_EQ(retained.bundle->value().desired_control_configurations.size(), 1U);
   const auto &desired =
       retained.bundle->value().desired_control_configurations.front();
+  const auto &graph = retained.bundle->value().cell_graph;
+  const auto domain = std::find_if(
+      graph.control_domains.begin(), graph.control_domains.end(),
+      [&](const auto &candidate) {
+        return candidate.control_domain_id == desired.control_domain_id;
+      });
+  ASSERT_NE(domain, graph.control_domains.end());
+  ASSERT_EQ(domain->runtime_unit_ids.size(), 1U);
+  const auto source_runtime_unit_id = domain->runtime_unit_ids.front();
+  EXPECT_EQ(source_runtime_unit_id,
+            core::RuntimeUnitId(
+                std::string(test::kLite6Ros2ControlExecutionRuntimeId)));
   const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
 
   const auto verified = load_verified_controller_lifecycle_expected_domain(
-      *retained.bundle, source, desired,
-      core::RuntimeUnitId(std::string(test::kLite6NativeExecutionRuntimeId)),
+      *retained.bundle, source, desired, source_runtime_unit_id,
       core::RuntimeEpoch("runtime.controller_manager.epoch.1"));
   const auto &value = verified.value();
+  for (const auto &binding : value.expected_bindings)
+    EXPECT_FALSE(binding.gripper_actuation_kind.has_value());
   EXPECT_EQ(value.control_domain_id, desired.control_domain_id);
   EXPECT_EQ(value.control_domain_revision, desired.control_domain_revision);
   EXPECT_EQ(value.controller_topology_id, desired.controller_topology_id);
   EXPECT_EQ(value.topology_revision, desired.topology_revision);
   EXPECT_EQ(value.desired_configuration, desired);
-  EXPECT_EQ(value.source_runtime_unit_id,
-            core::RuntimeUnitId(
-                std::string(test::kLite6NativeExecutionRuntimeId)));
+  EXPECT_EQ(value.source_runtime_unit_id, source_runtime_unit_id);
   EXPECT_EQ(value.source_runtime_epoch,
             core::RuntimeEpoch("runtime.controller_manager.epoch.1"));
   ASSERT_EQ(value.expected_controllers.size(), 1U);
@@ -94,9 +105,7 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
       core::ControlRouteId("route.not_retained");
   EXPECT_THROW(
       static_cast<void>(load_verified_controller_lifecycle_expected_domain(
-          *retained.bundle, source, stale_route,
-          core::RuntimeUnitId(
-              std::string(test::kLite6NativeExecutionRuntimeId)),
+          *retained.bundle, source, stale_route, source_runtime_unit_id,
           core::RuntimeEpoch("runtime.controller_manager.epoch.1"))),
       RetainedBundleError);
 
@@ -104,9 +113,7 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
   incomplete.binding_routes.clear();
   EXPECT_THROW(
       static_cast<void>(load_verified_controller_lifecycle_expected_domain(
-          *retained.bundle, source, incomplete,
-          core::RuntimeUnitId(
-              std::string(test::kLite6NativeExecutionRuntimeId)),
+          *retained.bundle, source, incomplete, source_runtime_unit_id,
           core::RuntimeEpoch("runtime.controller_manager.epoch.1"))),
       RetainedBundleError);
 
@@ -126,9 +133,7 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
   const AbsentArtifactSource absent;
   EXPECT_THROW(
       static_cast<void>(load_verified_controller_lifecycle_expected_domain(
-          *retained.bundle, absent, desired,
-          core::RuntimeUnitId(
-              std::string(test::kLite6NativeExecutionRuntimeId)),
+          *retained.bundle, absent, desired, source_runtime_unit_id,
           core::RuntimeEpoch("runtime.controller_manager.epoch.1"))),
       RetainedBundleError);
 }
@@ -137,15 +142,27 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
      ChainedProductPreservesCompleteTopologyOrderAndSelectedEndpoints) {
   ScopedTrustedRoot root;
   const auto retained = test::materialize_lite6_retained_consumer_fixture_from(
-      root.path(), test::make_lite6_chained_controllable_retention_fixture());
+      root.path(),
+      test::make_lite6_ros2_control_chained_catalog_retention_fixture());
   ASSERT_EQ(retained.bundle->value().desired_control_configurations.size(), 1U);
   const auto &desired =
       retained.bundle->value().desired_control_configurations.front();
+  const auto &graph = retained.bundle->value().cell_graph;
+  const auto domain = std::find_if(
+      graph.control_domains.begin(), graph.control_domains.end(),
+      [&](const auto &candidate) {
+        return candidate.control_domain_id == desired.control_domain_id;
+      });
+  ASSERT_NE(domain, graph.control_domains.end());
+  ASSERT_EQ(domain->runtime_unit_ids.size(), 1U);
+  const auto source_runtime_unit_id = domain->runtime_unit_ids.front();
+  EXPECT_EQ(source_runtime_unit_id,
+            core::RuntimeUnitId(
+                std::string(test::kLite6Ros2ControlExecutionRuntimeId)));
   const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
 
   const auto verified = load_verified_controller_lifecycle_expected_domain(
-      *retained.bundle, source, desired,
-      core::RuntimeUnitId(std::string(test::kLite6NativeExecutionRuntimeId)),
+      *retained.bundle, source, desired, source_runtime_unit_id,
       core::RuntimeEpoch("runtime.controller_manager.epoch.7"));
   const auto &value = verified.value();
   ASSERT_EQ(value.controller_topology.controllers.size(), 2U);
@@ -164,6 +181,59 @@ TEST(VerifiedControllerLifecycleExpectedDomainTest,
                endpoint.control_route_id ==
                    desired.binding_routes.front().control_route_id;
       }));
+}
+
+TEST(
+    VerifiedControllerLifecycleExpectedDomainTest,
+    StrictActuationFactSealsCommandAndFeedbackAliasesWithoutInferringFromPhysicalMode) {
+  for (const std::string_view kind : {"position_commanded", "pneumatic"}) {
+    for (const std::string_view mode : {"commanded", "none"}) {
+      if (kind == "position_commanded" && mode == "none")
+        continue;
+      ScopedTrustedRoot root;
+      const auto fixture = test::make_lite6_controllable_retention_fixture(
+          false, false, 1U, true, true, {}, false, true, "resource", true, {},
+          {}, true, true, true, std::nullopt, false, test::kLite6ArmTargetId,
+          std::nullopt, std::nullopt, {}, {}, true, {},
+          "manyforge.provider.ros2_control", true, true, nullptr, nullptr,
+          false, false, kind, 0.25, mode);
+      const auto retained =
+          test::materialize_lite6_retained_consumer_fixture_from(root.path(),
+                                                                 fixture);
+      const auto &graph = retained.bundle->value().cell_graph;
+      ASSERT_EQ(graph.runtime_units.size(), 1U);
+      ASSERT_EQ(retained.bundle->value().desired_control_configurations.size(),
+                1U);
+      const auto &desired =
+          retained.bundle->value().desired_control_configurations.front();
+      const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
+      const auto expected = load_verified_controller_lifecycle_expected_domain(
+          *retained.bundle, source, desired,
+          graph.runtime_units.front().runtime_unit_id,
+          core::RuntimeEpoch("runtime.strict.gripper.epoch"));
+      ASSERT_EQ(expected.value().expected_bindings.size(), 2U);
+      EXPECT_EQ(expected.value().physical_expectation,
+                mode == "none"
+                    ? core::ControllerLifecyclePhysicalExpectation::
+                          kNotApplicablePneumaticNone
+                    : core::ControllerLifecyclePhysicalExpectation::kRequired);
+      for (const auto &binding : expected.value().expected_bindings) {
+        const auto source_binding = std::find_if(
+            graph.control_bindings.begin(), graph.control_bindings.end(),
+            [&](const auto &candidate) {
+              return candidate.control_binding_id == binding.control_binding_id;
+            });
+        ASSERT_NE(source_binding, graph.control_bindings.end());
+        EXPECT_TRUE(
+            source_binding->capability_id.value() == "tool.gripper.command" ||
+            source_binding->capability_id.value() == "tool.gripper.feedback");
+        EXPECT_EQ(binding.gripper_actuation_kind,
+                  kind == "pneumatic"
+                      ? std::optional(core::GripperActuationKind::kPneumatic)
+                      : std::nullopt);
+      }
+    }
+  }
 }
 
 } // namespace

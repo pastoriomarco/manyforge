@@ -83,6 +83,7 @@ bool SelectsRuntimeProfile(const CanonicalValue& root, const std::string_view pr
 
 std::vector<QualifiedRuntimeProfile> SelectedBuildProfiles(const CanonicalValue& root) {
   std::vector<QualifiedRuntimeProfile> profiles;
+  // DX-753: retain pure archival Draft/import schema validation, not runtime admission.
   if (SelectsRuntimeProfile(root, detail::kNativeExecutionRuntimeProfileId)) {
     profiles.push_back(
         QualifiedRuntimeProfileForBuild(detail::native_execution_runtime_profile_document(),
@@ -96,6 +97,7 @@ std::vector<QualifiedRuntimeProfile> SelectedBuildProfiles(const CanonicalValue&
   return profiles;
 }
 
+// DX-753: retain archived native cold-jerk validation without restoring native profile admission.
 CompiledDeploymentDraft Result(const RevisionVerifiedDeploymentArtifact& deployment) {
   // Reject internally contradictory settings at authoring time. Model/target
   // resolution still belongs to activation; no model is loaded for a Draft.

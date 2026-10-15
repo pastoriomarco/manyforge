@@ -747,6 +747,276 @@ TEST(ControllerLaunchArtifactsHost,
                                                  "authored/custom"}));
 }
 
+TEST(ControllerLaunchArtifacts, GripperOnlyYamlRejectsArmLimitsAndMissingController) {
+  const auto lite6 = mock_controller_profile_facts("lite6_lite_gripper");
+  EXPECT_THROW(static_cast<void>(generate_mock_controllers_yaml(
+                   lite6, "tool", {}, {{"joint1", 10.0}}, "right_finger_joint")),
+               ControllerLaunchArtifactError);
+  EXPECT_THROW(static_cast<void>(generate_mock_controllers_yaml(
+                   lite6, "tool", {}, {}, std::nullopt)),
+               ControllerLaunchArtifactError);
+  EXPECT_THROW(static_cast<void>(generate_mock_controllers_yaml(
+                   mock_controller_profile_facts("ur5_roboplan"), "tool", {}, {},
+                   "right_finger_joint")),
+               ControllerLaunchArtifactError);
+}
+
+TEST(ControllerLaunchArtifactsHost, GenuineGripperOnlyMockUsesExistingProfiles) {
+  const TemporaryRoot root;
+  for (const auto &profile : offline_profiles()) {
+    if (!profile.gripper_joint.has_value()) continue;
+    SCOPED_TRACE(profile.mock_profile);
+    auto component = mock_component(root.path(), "tool", profile, "tool/", 10.0);
+    component.input.initial_joint_positions_rad.clear();
+    component.input.controlled_stop_max_deceleration_rad_s2.clear();
+    const auto written = write_component_controller_launch_artifacts(
+        std::optional<core::RuntimeParticipantBinding>{}, component.input);
+    EXPECT_EQ(written.controllable_component_id, "tool");
+    EXPECT_EQ(written.controller_profile, profile.mock_profile);
+    EXPECT_TRUE(written.arm_controller_name.empty());
+    EXPECT_EQ(written.gripper_controller_name, profile.gripper_controller);
+    const auto yaml = read_file(written.controllers_file);
+    EXPECT_EQ(yaml, written.controllers_yaml);
+    EXPECT_EQ(written.controllers_sha256,
+              manyforge::content_identity::sha256_digest(yaml));
+    EXPECT_NE(yaml.find("/manyforge/tool/controller_manager:"), std::string::npos);
+    EXPECT_NE(yaml.find("    joint_state_broadcaster:"), std::string::npos);
+    EXPECT_NE(yaml.find("    update_rate: " +
+                        std::to_string(static_cast<int>(
+                            mock_controller_lane_rates(profile.mock_profile)
+                                .controller_update_rate_hz))),
+              std::string::npos);
+    EXPECT_NE(yaml.find("position_controllers/GripperActionController"),
+              std::string::npos);
+    EXPECT_NE(yaml.find("    joint: " + *profile.gripper_joint), std::string::npos);
+    EXPECT_EQ(yaml.find("JointTrajectoryController"), std::string::npos);
+    EXPECT_EQ(yaml.find(profile.arm_controller), std::string::npos);
+    // ros__parameters is a required ROS key; only template tokens are unresolved.
+    EXPECT_NE(yaml.find("  ros__parameters:\n"), std::string::npos);
+    for (const auto* token : {"__arm_controller__", "__joint__",
+                              "__gripper_controller__", "__gripper_joint__"}) {
+      EXPECT_EQ(yaml.find(token), std::string::npos) << token;
+    }
+    const auto description = read_file(written.robot_description_file);
+    const auto section = description.find("  <ros2_control");
+    ASSERT_NE(section, std::string::npos);
+    const auto hardware = description.substr(section);
+    EXPECT_EQ(count(hardware, "<joint name="), 1U);
+    EXPECT_NE(hardware.find("<joint name=\"" + *profile.gripper_joint + "\">"),
+              std::string::npos);
+    EXPECT_EQ(written.robot_description_sha256,
+              manyforge::content_identity::sha256_digest(description));
+    EXPECT_EQ(written.launch_arguments,
+              (std::vector<std::string>{
+                  "robot_description_file:=" + written.robot_description_file.string(),
+                  "controllers_file:=" + written.controllers_file.string(),
+                  "runtime_namespace:=/manyforge/tool",
+                  "controller_manager_name:=controller_manager",
+                  "gripper_controller_name:=" + *profile.gripper_controller,
+                  "frame_prefix:=tool/"}));
+  }
+}
+
+TEST(ControllerLaunchArtifactsHost, OptionalMotionPreservesExistingArmArtifacts) {
+  const TemporaryRoot root;
+  for (const auto &profile : offline_profiles()) {
+    SCOPED_TRACE(profile.mock_profile);
+    const auto component = mock_component(root.path(), "robot", profile, "robot/", 10.0);
+    const auto existing = write_host(component);
+    const auto optional = write_component_controller_launch_artifacts(
+        std::optional<core::RuntimeParticipantBinding>{component.motion},
+        component.input);
+    EXPECT_EQ(optional.robot_description_sha256, existing.robot_description_sha256);
+    EXPECT_EQ(optional.controllers_sha256, existing.controllers_sha256);
+    EXPECT_EQ(optional.controllers_yaml, existing.controllers_yaml);
+    EXPECT_EQ(optional.arm_controller_name, existing.arm_controller_name);
+    EXPECT_EQ(optional.gripper_controller_name, existing.gripper_controller_name);
+    EXPECT_EQ(optional.launch_arguments, existing.launch_arguments);
+    EXPECT_EQ(controller_launch_artifacts_evidence(optional),
+              controller_launch_artifacts_evidence(existing));
+  }
+}
+
+TEST(ControllerLaunchArtifactsHost, GripperOnlyInputRefusesMissingOrForeignArmFacts) {
+  const TemporaryRoot root;
+  const auto profiles = offline_profiles();
+  auto component = mock_component(root.path(), "tool", profiles.at(0), "", 10.0);
+  component.input.initial_joint_positions_rad.clear();
+  component.input.controlled_stop_max_deceleration_rad_s2.clear();
+  const auto absent = std::optional<core::RuntimeParticipantBinding>{};
+  const auto refused = [&](const ComponentControllerLaunchInput &input) {
+    EXPECT_THROW(static_cast<void>(
+                     write_component_controller_launch_artifacts(absent, input)),
+                 ControllerLaunchArtifactError);
+  };
+  auto invalid = component.input;
+  invalid.gripper_binding.reset();
+  refused(invalid);
+  invalid = component.input;
+  invalid.gripper_binding = gripper_binding("tool", std::nullopt);
+  refused(invalid);
+  invalid = component.input;
+  invalid.gripper_binding = participant_binding(
+      "tool", "gripper", "execution.trajectory.execute",
+      {{"tool.gripper.coordinate.000000", "right_finger_joint"}});
+  refused(invalid);
+  invalid = component.input;
+  invalid.gripper_binding = participant_binding(
+      "tool", "gripper", "tool.gripper.command",
+      {{"tool.gripper.first", "right_finger_joint"},
+       {"tool.gripper.second", "left_finger_joint"}});
+  refused(invalid);
+  invalid = component.input;
+  invalid.gripper_projected_position.reset();
+  refused(invalid);
+  invalid = component.input;
+  invalid.gripper_binding = gripper_binding("tool", "missing_joint");
+  refused(invalid);
+  invalid = component.input;
+  invalid.initial_joint_positions_rad = {0.0};
+  refused(invalid);
+  invalid = component.input;
+  invalid.controlled_stop_max_deceleration_rad_s2.emplace_back(
+      manyforge::core::ResourceId("other.arm.coordinate.000000"), 10.0);
+  refused(invalid);
+  invalid = component.input;
+  invalid.mock_profile = "ur5_roboplan";
+  refused(invalid);
+  invalid = component.input;
+  invalid.isaac_profile = "lite6";
+  refused(invalid);
+  invalid = component.input;
+  invalid.mock_profile.reset();
+  refused(invalid);
+  invalid = component.input;
+  invalid.gripper_binding = gripper_binding("foreign", "right_finger_joint");
+  EXPECT_THROW(static_cast<void>(write_component_controller_launch_artifacts(
+                   std::optional<core::RuntimeParticipantBinding>{component.motion},
+                   invalid)),
+               ControllerLaunchArtifactError);
+}
+
+TEST(ControllerLaunchArtifactsHost, NoOutputMockKeepsArmAndOmitsPhysicalGripper) {
+  const TemporaryRoot root;
+  for (const auto& profile : offline_profiles()) {
+    if (!profile.gripper_joint.has_value()) continue;
+    SCOPED_TRACE(profile.mock_profile);
+    auto component = mock_component(root.path(), "robot", profile, "robot/", 10.0);
+    const auto commanded = write_host(component);
+    std::vector<std::string> arm_arguments;
+    for (const auto& argument : commanded.launch_arguments) {
+      if (!argument.starts_with("gripper_controller_name:=")) arm_arguments.push_back(argument);
+    }
+    component.input.gripper_output_mode = core::GripperOutputMode::kNone;
+    component.input.gripper_projected_position.reset();
+    const auto none = write_host(component);
+    EXPECT_EQ(none.arm_controller_name, commanded.arm_controller_name);
+    EXPECT_EQ(none.controller_profile, commanded.controller_profile);
+    EXPECT_EQ(none.runtime_namespace, commanded.runtime_namespace);
+    EXPECT_FALSE(none.gripper_controller_name.has_value());
+    EXPECT_EQ(none.launch_arguments, arm_arguments);
+    const auto yaml = read_file(none.controllers_file);
+    EXPECT_NE(yaml.find("  ros__parameters:\n"), std::string::npos);
+    EXPECT_NE(yaml.find("    joint_state_broadcaster:"), std::string::npos);
+    EXPECT_NE(yaml.find("/**/" + profile.arm_controller + ":"), std::string::npos);
+    EXPECT_EQ(yaml.find(*profile.gripper_controller), std::string::npos);
+    EXPECT_EQ(yaml.find("GripperActionController"), std::string::npos);
+    EXPECT_EQ(yaml.find(*profile.gripper_joint), std::string::npos);
+    for (const auto& joint : profile.arm) {
+      EXPECT_NE(yaml.find(joint + ": {"), std::string::npos);
+    }
+    const auto description = read_file(none.robot_description_file);
+    const auto section = description.find("  <ros2_control");
+    ASSERT_NE(section, std::string::npos);
+    const auto hardware = description.substr(section);
+    EXPECT_EQ(count(hardware, "<joint name="), profile.arm.size());
+    EXPECT_EQ(hardware.find(*profile.gripper_joint), std::string::npos);
+    for (const auto& joint : profile.arm) {
+      EXPECT_NE(hardware.find("<joint name=\"" + joint + "\">"), std::string::npos);
+    }
+    EXPECT_EQ(none.robot_description_sha256,
+              manyforge::content_identity::sha256_digest(description));
+    EXPECT_EQ(none.controllers_sha256, manyforge::content_identity::sha256_digest(yaml));
+    component.input.gripper_output_mode = core::GripperOutputMode::kCommanded;
+    component.input.gripper_projected_position = 0.0042;
+    const auto explicit_commanded = write_host(component);
+    EXPECT_EQ(explicit_commanded.controllers_yaml, commanded.controllers_yaml);
+    EXPECT_EQ(explicit_commanded.robot_description_sha256, commanded.robot_description_sha256);
+    EXPECT_EQ(explicit_commanded.launch_arguments, commanded.launch_arguments);
+  }
+}
+
+TEST(ControllerLaunchArtifactsHost, NoOutputRefusesMissingForeignOrInvalidBinding) {
+  const TemporaryRoot root;
+  auto component = mock_component(root.path(), "robot", offline_profiles().front(), "", 10.0);
+  component.input.gripper_output_mode = core::GripperOutputMode::kNone;
+  const auto refused = [&](const ComponentControllerLaunchInput& input) {
+    EXPECT_THROW(static_cast<void>(write_component_controller_launch_artifacts(component.motion, input)),
+                 ControllerLaunchArtifactError);
+  };
+  auto invalid = component.input;
+  invalid.gripper_binding.reset();
+  refused(invalid);
+  invalid = component.input;
+  invalid.gripper_binding = gripper_binding("robot", std::nullopt);
+  refused(invalid);
+  invalid = component.input;
+  invalid.gripper_binding = gripper_binding("foreign", "right_finger_joint");
+  refused(invalid);
+  invalid = component.input;
+  invalid.gripper_binding = gripper_binding("robot", "missing");
+  refused(invalid);
+  invalid = component.input;
+  invalid.gripper_binding = gripper_binding("robot", "joint1");
+  refused(invalid);
+  invalid = component.input;
+  invalid.gripper_output_mode = static_cast<core::GripperOutputMode>(99);
+  refused(invalid);
+  EXPECT_THROW(static_cast<void>(write_component_controller_launch_artifacts(
+                   std::optional<core::RuntimeParticipantBinding>{}, component.input)),
+               ControllerLaunchArtifactError);
+  EXPECT_FALSE(std::filesystem::exists(root.path() / "robot"));
+}
+
+TEST(ControllerLaunchArtifactsHost, NoOutputIsaacKeepsTheActualArmArtifacts) {
+  const TemporaryRoot root;
+  const auto profile = offline_profiles().front();
+  auto component = mock_component(root.path(), "robot", profile, "robot/", 10.0);
+  component.input.mock_profile.reset();
+  component.input.isaac_profile = "lite6";
+  component.input.isaac_lane = IsaacControllerLane{
+      "IsaacLite6TopicBasedSystem", "/isaac_joint_commands", "/isaac_joint_states",
+      {0.0, 0.0, 1.57, 0.0, 0.0, 0.0}};
+  const auto commanded = write_host(component);
+  component.input.gripper_output_mode = core::GripperOutputMode::kNone;
+  component.input.gripper_projected_position.reset();
+  const auto none = write_host(component);
+  EXPECT_EQ(none.robot_description_sha256, commanded.robot_description_sha256);
+  EXPECT_EQ(none.controllers_sha256, commanded.controllers_sha256);
+  EXPECT_EQ(none.launch_environment, commanded.launch_environment);
+  EXPECT_EQ(none.arm_controller_name, commanded.arm_controller_name);
+  EXPECT_FALSE(none.gripper_controller_name.has_value());
+  component.input.gripper_binding = gripper_binding("robot", "missing");
+  EXPECT_THROW(static_cast<void>(write_host(component)), ControllerLaunchArtifactError);
+}
+
+TEST(ControllerLaunchArtifacts, NoOutputYamlKeepsArmLimitsAndRequiresExplicitJoint) {
+  const auto profile = mock_controller_profile_facts("lite6_lite_gripper");
+  const auto limits = cancel_limits(kUFactoryArm, 10.0);
+  EXPECT_THROW(static_cast<void>(generate_mock_controllers_yaml(
+                   profile, "robot", kUFactoryArm, limits, std::nullopt,
+                   core::GripperOutputMode::kNone)), ControllerLaunchArtifactError);
+  EXPECT_THROW(static_cast<void>(generate_mock_controllers_yaml(
+                   profile, "robot", {}, {}, "right_finger_joint",
+                   core::GripperOutputMode::kNone)), ControllerLaunchArtifactError);
+  EXPECT_THROW(static_cast<void>(generate_mock_controllers_yaml(
+                   profile, "robot", kUFactoryArm, {}, "right_finger_joint",
+                   core::GripperOutputMode::kNone)), ControllerLaunchArtifactError);
+  EXPECT_THROW(static_cast<void>(generate_mock_controllers_yaml(
+                   profile, "robot", kUFactoryArm, limits, "right_finger_joint",
+                   static_cast<core::GripperOutputMode>(99))), ControllerLaunchArtifactError);
+}
+
 TEST(ControllerLaunchArtifactsHost, HostInputsFailClosed) {
   const TemporaryRoot root;
   const auto profiles = offline_profiles();

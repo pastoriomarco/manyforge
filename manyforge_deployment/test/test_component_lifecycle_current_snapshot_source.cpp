@@ -271,7 +271,7 @@ protected:
   static void SetUpTestSuite() {
     root_ = std::make_unique<ScopedTrustedRoot>();
     fixture_ = std::make_unique<test::DurableLite6RetainedConsumerFixture>(
-        test::materialize_lite6_retained_consumer_fixture(root_->path()));
+        test::materialize_lite6_ros2_control_retained_consumer_fixture(root_->path()));
   }
 
   static void TearDownTestSuite() {
@@ -483,7 +483,7 @@ TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
        OneComponentLifecycleProviderMayCoverMultipleControlDomains) {
   ScopedTrustedRoot root;
   const auto retained = test::
-      materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
+      materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(
           root.path());
   const auto &graph = retained.bundle->value().cell_graph;
   ASSERT_EQ(graph.controllable_components.size(), 1U);

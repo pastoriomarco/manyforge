@@ -3,12 +3,14 @@
 #include <cstdint>
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+#include <utility>
 
 namespace manyforge::deployment {
 
@@ -110,11 +112,30 @@ struct Configuration final {
   /// At most one per hosted motion target; absent targets have no fault
   /// Stop profile (as `main` without `default_fault_stop_profile`).
   std::vector<FaultStopProfile> default_fault_stop_profiles;
-  /// Authored gripper target configurations (offline mock profiles carry the
-  /// native profiles' values unchanged; Isaac profiles have none).
-  std::vector<
-      execution_runtime_contract::Configuration::GripperTargetConfiguration>
-      gripper_target_configurations;
+  /// DX791: active ROS rows require an explicit output choice. The unchanged
+  /// neutral base is also used by pure archival Native decoding; no absent
+  /// authored ROS field is interpreted as commanded output.
+  struct GripperTargetConfiguration final
+      : execution_runtime_contract::Configuration::GripperTargetConfiguration {
+    core::GripperOutputMode output_mode;
+    /// ROS-only pneumatic delivery bound. Absence preserves the source row and
+    /// resolves to 1.0 s for pneumatic at backend configuration. Position rows
+    /// reject this field. None retains positive metadata but has no delivery
+    /// deadline or transport.
+    std::optional<double> delivery_result_timeout_s;
+
+    GripperTargetConfiguration(
+        execution_runtime_contract::Configuration::GripperTargetConfiguration value,
+        core::GripperOutputMode mode,
+        std::optional<double> delivery_timeout = std::nullopt)
+        : execution_runtime_contract::Configuration::GripperTargetConfiguration(
+              std::move(value)), output_mode(mode),
+          delivery_result_timeout_s(delivery_timeout) {}
+
+    friend bool operator==(const GripperTargetConfiguration &,
+                           const GripperTargetConfiguration &) = default;
+  };
+  std::vector<GripperTargetConfiguration> gripper_target_configurations;
   std::uint32_t execution_tick_hz{};
   double collision_monitor_period_ms{};
   std::optional<double> runtime_collision_immediate_query_budget_ms;

@@ -173,12 +173,13 @@ def _stable_active_configuration(
 
 
 def _submit_native_cclc_lifecycle(
-    execution_run_root: Path, *, intent_kind: str, request_id: str
+    execution_run_root: Path, *, intent_kind: str, request_id: str,
+    component_id: str = "lite6_arm",
 ) -> dict[str, Any]:
     client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=5.0)
     admission = CellAdmissionClient(execution_run_root, timeout_seconds=5.0)
     owner_epoch = client.owner_identity()["request_owner_epoch"]
-    snapshot = client.component_snapshot("lite6_arm")
+    snapshot = client.component_snapshot(component_id)
     expected_domains = [
         {
             "control_domain_id": domain["control_domain_id"],
@@ -220,31 +221,37 @@ def _submit_native_cclc_lifecycle(
 
 
 def _qualify_native_cclc_product(
-    execution_run_root: Path, *, gripper_only: bool = False
+    execution_run_root: Path, *, gripper_only: bool = False,
+    component_id: str = "lite6_arm",
+    expected_domain_ids: list[str] | None = None,
 ) -> None:
     _submit_native_cclc_lifecycle(
         execution_run_root,
         intent_kind="prepare",
         request_id="process.lifecycle.prepare",
+        component_id=component_id,
     )
     # This fixture was published without Manager Apply. Establish its routes
     # through ordinary CCLC before Enable opens command admission.
     _submit_native_cclc_routes(
         execution_run_root,
+        component_id=component_id,
         expected_domain_ids=(
-            ["lite6_gripper_domain"]
-            if gripper_only
-            else ["lite6_arm_domain", "lite6_gripper_domain"]
+            (["lite6_gripper_domain"]
+             if gripper_only
+             else ["lite6_arm_domain", "lite6_gripper_domain"])
+            if expected_domain_ids is None else expected_domain_ids
         ),
     )
     _submit_native_cclc_lifecycle(
         execution_run_root,
         intent_kind="enable",
         request_id="process.lifecycle.enable",
+        component_id=component_id,
     )
 
     client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=5.0)
-    final_snapshot = client.component_snapshot("lite6_arm")
+    final_snapshot = client.component_snapshot(component_id)
     if final_snapshot["component_lifecycle_state"] != "active":
         raise RuntimeError(
             f"native CCLC product did not become active: {final_snapshot}"
@@ -256,6 +263,7 @@ def _submit_native_cclc_routes(
     *,
     request_prefix: str = "process.route",
     expected_domain_ids: list[str] | None = None,
+    component_id: str = "lite6_arm",
 ) -> None:
     client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=5.0)
     admission = CellAdmissionClient(execution_run_root, timeout_seconds=5.0)
@@ -267,7 +275,7 @@ def _submit_native_cclc_routes(
             "source_label": "native-process-qualification",
         }
 
-    template_set = client.route_templates("lite6_arm")
+    template_set = client.route_templates(component_id)
     domain_ids = sorted(
         row["desired_configuration"]["control_domain_id"]
         for row in template_set["templates"]
@@ -280,7 +288,7 @@ def _submit_native_cclc_routes(
         )
     for domain_id in domain_ids:
         owner_epoch = client.owner_identity()["request_owner_epoch"]
-        template_set = client.route_templates("lite6_arm")
+        template_set = client.route_templates(component_id)
         template = next(
             row
             for row in template_set["templates"]
@@ -314,7 +322,7 @@ def _submit_native_cclc_routes(
             label=f"route {domain_id}",
         )
 
-    final_snapshot = client.component_snapshot("lite6_arm")
+    final_snapshot = client.component_snapshot(component_id)
     if any(
         domain["active_control_configuration"] is None
         for domain in final_snapshot["domains"]
@@ -324,13 +332,15 @@ def _submit_native_cclc_routes(
         )
 
 
-def _wait_for_cclc_component(execution_run_root: Path) -> dict[str, Any]:
+def _wait_for_cclc_component(
+    execution_run_root: Path, *, component_id: str = "lite6_arm",
+) -> dict[str, Any]:
     client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=1.0)
     deadline = time.monotonic() + 10.0
     last_error = ""
     while time.monotonic() < deadline:
         try:
-            return client.component_snapshot("lite6_arm")
+            return client.component_snapshot(component_id)
         except HeadlessApiError as error:
             last_error = f"{error.code}: {error}"
         time.sleep(0.01)
@@ -388,6 +398,7 @@ def _wait_for_current_cclc_routes(
     execution_run_root: Path,
     *,
     expected_state: str = "active",
+    component_id: str = "lite6_arm",
 ) -> dict[str, Any]:
     client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=1.0)
     execution = ExecutionCommandClient(execution_run_root, timeout_seconds=1.0)
@@ -395,7 +406,7 @@ def _wait_for_current_cclc_routes(
     last_snapshot: dict[str, Any] | None = None
     while time.monotonic() < deadline:
         try:
-            last_snapshot = client.component_snapshot("lite6_arm")
+            last_snapshot = client.component_snapshot(component_id)
             identity = execution.identity()["identity"]
             if (
                 _cclc_routes_are_current(last_snapshot, expected_state=expected_state)
@@ -426,6 +437,8 @@ def _start_host(
     host_environment: str = "MANYFORGE_NATIVE_EXECUTION_HOST",
     qualify_cclc: bool = True,
     include_gripper_target: bool = True,
+    component_id: str = "lite6_arm",
+    expected_domain_ids: list[str] | None = None,
 ) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
     if fake_worker_marker is not None:
@@ -497,9 +510,13 @@ def _start_host(
             if response.get("ok") is True:
                 if manifest.get("cclc_product") is True and qualify_cclc:
                     try:
-                        snapshot = _wait_for_cclc_component(execution_run_root)
+                        snapshot = _wait_for_cclc_component(
+                            execution_run_root, component_id=component_id
+                        )
                         if snapshot.get("component_lifecycle_state") == "active":
-                            _wait_for_current_cclc_routes(execution_run_root)
+                            _wait_for_current_cclc_routes(
+                                execution_run_root, component_id=component_id
+                            )
                         else:
                             while (
                                 client.identity()["identity"][
@@ -512,8 +529,12 @@ def _start_host(
                             _qualify_native_cclc_product(
                                 execution_run_root,
                                 gripper_only=manifest.get("gripper_only") is True,
+                                component_id=component_id,
+                                expected_domain_ids=expected_domain_ids,
                             )
-                            _wait_for_current_cclc_routes(execution_run_root)
+                            _wait_for_current_cclc_routes(
+                                execution_run_root, component_id=component_id
+                            )
                     except Exception as error:
                         _stop_host(process)
                         detail = (
@@ -3988,163 +4009,36 @@ def test_gripper_only_motion_updates_the_shared_native_observation_stream(
         _stop_host(process)
 
 
-def test_managed_gripper_only_cell_has_no_motion_target_and_refuses_disabled_command(
+def test_robotiq_position_direct_cli_without_manager_refuses_missing_cell_time(
     tmp_path: Path,
 ) -> None:
-    pytest.skip(
-        "NOT_RUN/A1: selected ROS product requires a nonempty matching motion-target limit; gripper-only cell support awaits A1"
-    )
     fixture_root = tmp_path / "fixture"
     shutil.copytree(
-        _required_path("MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT"),
-        fixture_root,
+        _required_path("MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT"), fixture_root,
     )
     manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
     assert manifest["gripper_only"] is True
+    assert manifest["gripper_actuation_kind"] == "position_commanded"
     state_root, run_root = tmp_path / "state", tmp_path / "run"
     state_root.mkdir()
     run_root.mkdir()
-    process = _start_host(fixture_root, state_root, run_root, manifest)
-    client = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+    # M1 uses the Manager's stable cell time/Kernel owner. The retiring direct
+    # CLI remains explicitly closed; no alternate clock or owner is invented.
+    process = None
     try:
-        status = client.diagnostics()["status"]
-        assert status["control_state"]["runtime_scale_control"] is None
-        assert [
-            target["presentation"]
-            for component in status["targets"]["components"]
-            for target in component["targets"]
-        ] == ["gripper"]
-        _, target = _status_target(status, presentation="gripper")
-        goal = target["command"]["resource"]["max_position"]
-        accepted = client.submit(
-            OperationIntentRequest.model_validate(
-                _direct_control_gripper_operation(
-                    status, request_id="gripper-only.command", position=goal
-                )
-            ),
-            trusted_principal_id=None,
-        )
-        assert accepted["ok"] is True, accepted
-        operation_id = accepted["accepted"]["operation_id"]
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            terminal = client.read(operation_id)
-            if terminal["resident"] is False:
-                break
-            time.sleep(0.005)
-        assert terminal["operation"]["state"] == "completed", terminal
-
-        # A motion-less cell still has a real Stop path for its gripper.
-        stop_intent = _direct_control_gripper_operation(
-            status,
-            request_id="gripper-only.stop-command",
-            position=target["command"]["resource"]["min_position"],
-        )
-        stop_payload = stop_intent["participants"][0]["payload"]
-        stop_payload["completion_timeout_s"] = 3.0
-        stop_payload["caller_options"][0]["value_s"] = 2.0
-        started = client.submit(
-            OperationIntentRequest.model_validate(stop_intent),
-            trusted_principal_id=None,
-        )
-        assert started["ok"] is True, started
-        stopped_operation_id = started["accepted"]["operation_id"]
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            in_flight = client.read(stopped_operation_id)
-            if in_flight["operation"]["state"] == "executing":
-                break
-            time.sleep(0.005)
-        assert in_flight["operation"]["state"] == "executing", in_flight
-        stopped = client.stop(
-            StopIntentRequest.model_validate(
-                {
-                    "request_context": {
-                        "request_id": "gripper-only.stop",
-                        "request_owner_epoch": status["identity"]["owner_epoch"],
-                        "source_label": "native-gripper-only-test",
-                    },
-                    "operations": [
-                        {
-                            "operation_id": stopped_operation_id,
-                            "expected_operation_revision": in_flight["operation"][
-                                "operation_revision"
-                            ],
-                            "expected_stop_generation": 0,
-                        }
-                    ],
-                }
-            ),
-            trusted_principal_id=None,
-        )
-        assert stopped["ok"] is True, stopped
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            stopped_status = client.read(stopped_operation_id)
-            if (
-                stopped_status["operation"]["state"] == "stopped"
-                and stopped_status["resident"] is False
-            ):
-                break
-            time.sleep(0.005)
-        assert stopped_status["operation"]["state"] == "stopped", stopped_status
-        assert stopped_status["resident"] is False, stopped_status
-
-        disabled = _submit_native_cclc_lifecycle(
-            run_root, intent_kind="disable", request_id="gripper-only.disable"
-        )
-        assert disabled["current_state"] == "disabled", disabled
-        after = client.diagnostics()["status"]
-        assert [
-            target["presentation"]
-            for component in after["targets"]["components"]
-            for target in component["targets"]
-        ] == ["gripper"]
-        operations_before_refusal = after["control_state"]["manual_operations"]
-        refused = client.submit(
-            OperationIntentRequest.model_validate(
-                _direct_control_gripper_operation(
-                    after,
-                    request_id="gripper-only.disabled-command",
-                    position=target["command"]["resource"]["min_position"],
-                )
-            ),
-            trusted_principal_id=None,
-        )
-        assert refused["ok"] is False, refused
-        assert refused["error"]["details"]["reason"] == (
-            "component_command_not_eligible"
-        ), refused
-        assert client.diagnostics()["status"]["control_state"][
-            "manual_operations"
-        ] == operations_before_refusal
-        _submit_native_cclc_lifecycle(
-            run_root, intent_kind="prepare", request_id="gripper-only.prepare-again"
-        )
-        _submit_native_cclc_lifecycle(
-            run_root, intent_kind="enable", request_id="gripper-only.enable-again"
-        )
-        enabled = client.diagnostics()["status"]
-        retried = client.submit(
-            OperationIntentRequest.model_validate(
-                _direct_control_gripper_operation(
-                    enabled,
-                    request_id="gripper-only.command-after-enable",
-                    position=target["command"]["resource"]["max_position"],
-                )
-            ),
-            trusted_principal_id=None,
-        )
-        assert retried["ok"] is True, retried
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            retried_status = client.read(retried["accepted"]["operation_id"])
-            if retried_status["operation"]["state"] == "completed":
-                break
-            time.sleep(0.005)
-        assert retried_status["operation"]["state"] == "completed", retried_status
+        with pytest.raises(RuntimeError, match=(
+            r"(?s)status 70.*ROS gripper-only component requires its exact physical "
+            r"target and stable cell time"
+        )):
+            process = _start_host(
+                fixture_root, state_root, run_root, manifest,
+                host_environment="MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST",
+                qualify_cclc=False,
+            )
     finally:
-        _stop_host(process)
+        if process is not None:
+            _stop_host(process)
+
 
 
 def test_cell_admission_crosses_real_execution_seqpacket_surface(

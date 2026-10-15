@@ -17,6 +17,10 @@
 namespace manyforge::deployment {
 namespace {
 
+// DX753: archived identities test refusal without restoring Native admission APIs.
+constexpr std::string_view kRetiredNativeImplementationId = "manyforge.native_execution_host";
+constexpr std::string_view kRetiredNativeProductContractId = "manyforge.native_execution_runtime_unit";
+
 TEST(RuntimeContractRegistry, OldSealedRosProfileRefusesWithRecompileGuidance) {
   const auto &contracts = runtime_contract_declaration_registry().contracts();
   const auto current = std::find_if(contracts.begin(), contracts.end(), [](const auto &row) {
@@ -128,7 +132,7 @@ TEST(RuntimeContractRegistry,
       registry.contracts().begin(), registry.contracts().end(),
       [](const auto &row) {
         return row.offer().runtime_implementation_id.value() ==
-               native_execution_runtime_contract::kImplementationId;
+               kRetiredNativeImplementationId;
       });
   const auto ros2_control = std::find_if(
       registry.contracts().begin(), registry.contracts().end(),
@@ -158,7 +162,7 @@ TEST(RuntimeContractRegistry, RetiredNativeProductIsUnavailableBeforeAdmission) 
   EXPECT_THROW(static_cast<void>(detail::require_runtime_contract(
       core::RuntimeProfileId("manyforge.native_execution_runtime"),
       core::RuntimeProfileRevision("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
-      core::ProductContractId(std::string(native_execution_runtime_contract::kProductContractId)),
+      core::ProductContractId(std::string(kRetiredNativeProductContractId)),
       core::ProductContractRevision("sha256:0000000000000000000000000000000000000000000000000000000000000000"))), RetainedBundleError);
 }
 

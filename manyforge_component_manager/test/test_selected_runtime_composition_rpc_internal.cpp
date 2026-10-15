@@ -2265,5 +2265,263 @@ TEST(
   EXPECT_FALSE(ComponentReceiptsMatchRequest(authored_retain, {foreign}));
 }
 
+[[nodiscard]] ManagerPneumaticNoneProcessOwnerDTO NoneProcessOwnerProof() {
+  return {CommandTargetId("gripper.target"), ControlBindingId("gripper.binding"),
+          ControlBindingRevision("gripper.binding.revision")};
+}
+
+[[nodiscard]] ManagerComponentProcessOccurrenceDTO NoneInventoryRow(
+    std::string component = "gripper.1") {
+  return {ControllableComponentId(std::move(component)), "", 0,
+          ProcessPresenceState::kAbsent, ControllerLaunchCleanupState::kNotRequested,
+          std::nullopt, ContentDigest(std::string(kDigestTwo)),
+          ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal, NoneProcessOwnerProof()};
+}
+
+[[nodiscard]] ManagerComponentProcessObservationDTO NoneInspectionRow() {
+  return {ControllableComponentId("gripper.1"), ProcessPresenceState::kAbsent,
+          ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal, NoneProcessOwnerProof(),
+          ContentDigest(std::string(kDigestTwo))};
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal, PhysicalInventoryDefaultPreservesExactLegacyBytes) {
+  ManagerComponentProcessInventoryResultDTO result{InstalledInventoryRequest(),
+      {{ControllableComponentId("component-1"), "exact-launch", 105,
+        ProcessPresenceState::kUnknown, ControllerLaunchCleanupState::kUnknown}}};
+  const std::string golden(
+      "\x4d\x46\x4e\x53\x52\x43\x34\x00\x11\x00\x00\x00\x08\x62\x75\x6e"
+      "\x64\x6c\x65\x2d\x30\x00\x00\x00\x07\x67\x72\x61\x70\x68\x2d\x30"
+      "\x00\x00\x00\x47\x73\x68\x61\x32\x35\x36\x3a\x31\x31\x31\x31\x31"
+      "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
+      "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
+      "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
+      "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x00\x00\x00\x00\x00"
+      "\x00\x00\x03\x00\x00\x00\x47\x73\x68\x61\x32\x35\x36\x3a\x31\x31"
+      "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
+      "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
+      "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
+      "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x00\x00"
+      "\x00\x00\x00\x00\x00\x05\x00\x00\x00\x47\x73\x68\x61\x32\x35\x36"
+      "\x3a\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
+      "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
+      "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
+      "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
+      "\x31\x00\x00\x00\x0e\x72\x75\x6e\x74\x69\x6d\x65\x2e\x6b\x65\x72"
+      "\x6e\x65\x6c\x00\x00\x00\x0f\x72\x75\x6e\x74\x69\x6d\x65\x2d\x65"
+      "\x70\x6f\x63\x68\x2d\x31\x00\x00\x00\x0f\x6d\x61\x6e\x61\x67\x65"
+      "\x72\x2d\x65\x70\x6f\x63\x68\x2d\x31\x00\x00\x00\x01\x00\x00\x00"
+      "\x0b\x63\x6f\x6d\x70\x6f\x6e\x65\x6e\x74\x2d\x31\x00\x00\x00\x0c"
+      "\x65\x78\x61\x63\x74\x2d\x6c\x61\x75\x6e\x63\x68\x00\x00\x00\x69"
+      "\x00\x02\x00\x00\x00",
+      373U);
+  EXPECT_EQ(EncodeSelectedRuntimeCompositionRpcResponse(result), golden);
+  const auto decoded = std::get<ManagerComponentProcessInventoryResultDTO>(
+      DecodeSelectedRuntimeCompositionRpcResponse(golden));
+  EXPECT_EQ(decoded, result);
+  EXPECT_EQ(decoded.process_occurrences[0].process_owner_kind,
+            ManagerComponentProcessOwnerKindDTO::kControllerLaunch);
+  EXPECT_FALSE(decoded.process_occurrences[0].pneumatic_none_owner);
+  // Explicit default is the same old physical branch, without a new tail.
+  result.process_occurrences[0].process_owner_kind =
+      ManagerComponentProcessOwnerKindDTO::kControllerLaunch;
+  EXPECT_EQ(EncodeSelectedRuntimeCompositionRpcResponse(result), golden);
+  result.process_occurrences[0].leader_pid = 0;
+  EXPECT_FALSE(result.valid());
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal, NoneInventoryRoundTripsActualOwnerWithoutProcessOrDrain) {
+  const ManagerComponentProcessInventoryResultDTO result{InstalledInventoryRequest(),
+      {{ControllableComponentId("arm.1"), "actual-arm-launch", 101,
+        ProcessPresenceState::kPresent, ControllerLaunchCleanupState::kNotRequested},
+       NoneInventoryRow(),
+       {ControllableComponentId("retired.1"), "retired-launch", 102,
+        ProcessPresenceState::kAbsent, ControllerLaunchCleanupState::kDrained,
+        ControllerLaunchGroupDrainReceipt{102, "retired.1", "retired-launch", "observed"}}}};
+  ASSERT_TRUE(result.valid());
+  const auto bytes = EncodeSelectedRuntimeCompositionRpcResponse(result);
+  EXPECT_EQ(std::get<ManagerComponentProcessInventoryResultDTO>(
+                DecodeSelectedRuntimeCompositionRpcResponse(bytes)), result);
+  const auto &none = result.process_occurrences[1];
+  EXPECT_TRUE(none.launch_identity.empty());
+  EXPECT_EQ(none.leader_pid, 0);
+  EXPECT_EQ(none.process_presence, ProcessPresenceState::kAbsent);
+  EXPECT_EQ(none.cleanup_state, ControllerLaunchCleanupState::kNotRequested);
+  EXPECT_FALSE(none.receipt);
+  const auto request = result.request;
+  const ManagerComponentProcessStopRequestDTO impossible_stop{
+      {RequestId("stop-none"), RequestOwnerEpoch("owner"), "test", std::nullopt},
+      request.predecessor_projection_revision, request.expected_predecessor_publication_generation,
+      request.expected_predecessor_public_pointer_digest, request.runtime_unit_id,
+      request.runtime_epoch, request.manager_runtime_epoch, none.controllable_component_id,
+      none.launch_identity, none.leader_pid};
+  EXPECT_FALSE(impossible_stop.valid());
+  EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcRequest(impossible_stop), std::invalid_argument);
+  // Valid shape is observation only: foreign scope and owner identity remain
+  // distinct values for the independent Manager predecessor/installed join.
+  auto foreign = result;
+  foreign.request.runtime_epoch = RuntimeEpoch("foreign-host");
+  foreign.process_occurrences[1].installed_runtime_identity = ContentDigest(std::string(kDigestThree));
+  EXPECT_NE(std::get<ManagerComponentProcessInventoryResultDTO>(DecodeSelectedRuntimeCompositionRpcResponse(
+      EncodeSelectedRuntimeCompositionRpcResponse(foreign))), result);
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal, NoneRowsRejectPhysicalFactsForeignKindsAndIncompleteProof) {
+  const auto original = NoneInventoryRow();
+  ASSERT_TRUE(original.valid());
+  for (int mutation = 0; mutation < 16; ++mutation) {
+    auto row = original;
+    switch (mutation) {
+      case 0: row.process_owner_kind = static_cast<ManagerComponentProcessOwnerKindDTO>(255); break;
+      case 1: row.process_owner_kind = ManagerComponentProcessOwnerKindDTO::kControllerLaunch; break;
+      case 2: row.launch_identity = "fake-launch"; break;
+      case 3: row.leader_pid = 123; break;
+      case 4: row.process_presence = ProcessPresenceState::kPresent; break;
+      case 5: row.process_presence = ProcessPresenceState::kUnknown; break;
+      case 6: row.cleanup_state = ControllerLaunchCleanupState::kDrained; break;
+      case 7: row.cleanup_state = ControllerLaunchCleanupState::kPending; break;
+      case 8: row.receipt = ControllerLaunchGroupDrainReceipt{123, "gripper.1", "fake", "now"}; break;
+      case 9: row.installed_runtime_identity.reset(); break;
+      case 10: row.installed_runtime_identity = ContentDigest("not-a-digest"); break;
+      case 11: row.pneumatic_none_owner.reset(); break;
+      case 12: row.pneumatic_none_owner->command_target_id = CommandTargetId(""); break;
+      case 13: row.pneumatic_none_owner->control_binding_id = ControlBindingId(""); break;
+      case 14: row.pneumatic_none_owner->control_binding_revision = ControlBindingRevision(std::string(kMaxLifecycleIdentityBytes + 1, 'x')); break;
+      case 15: row.pneumatic_none_owner->command_target_id = CommandTargetId(std::string("target\0foreign", 14)); break;
+    }
+    EXPECT_FALSE(row.valid()) << mutation;
+    EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(
+        ManagerComponentProcessInventoryResultDTO{InstalledInventoryRequest(), {row}}),
+        std::invalid_argument) << mutation;
+  }
+  auto duplicate = ManagerComponentProcessInventoryResultDTO{InstalledInventoryRequest(), {original, original}};
+  EXPECT_FALSE(duplicate.valid());
+  EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(duplicate), std::invalid_argument);
+  auto physical = original;
+  physical.process_owner_kind = ManagerComponentProcessOwnerKindDTO::kControllerLaunch;
+  physical.launch_identity = "actual-launch";
+  physical.leader_pid = 42;
+  physical.process_presence = ProcessPresenceState::kPresent;
+  EXPECT_FALSE(physical.valid()); // None proof cannot accompany physical mode.
+  physical.pneumatic_none_owner.reset();
+  EXPECT_TRUE(physical.valid());
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal, CandidateNoneObservationIsActualAbsentOwnerNeverCandidateInstallation) {
+  auto request = InspectionRequest();
+  request.planning_component_id = ControllableComponentId("arm.1");
+  const auto facts = PlanningFacts();
+  ManagerCellObserverObservationDTO observer{CellId("cell"), "source", "base",
+      ProcessPresenceState::kPresent};
+  const ManagerComponentBringUpInspectionResultDTO result{request,
+      {{ControllableComponentId("arm.1"), ProcessPresenceState::kPresent}, NoneInspectionRow()}, observer, facts};
+  ASSERT_TRUE(result.valid());
+  const auto exact = EncodeSelectedRuntimeCompositionRpcResponse(result);
+  EXPECT_EQ(std::get<ManagerComponentBringUpInspectionResultDTO>(DecodeSelectedRuntimeCompositionRpcResponse(exact)), result);
+  for (int mutation = 0; mutation < 7; ++mutation) {
+    auto wrong = result;
+    auto &row = wrong.configured_components[1];
+    if (mutation == 0) row.process_presence = ProcessPresenceState::kPresent;
+    if (mutation == 1) row.process_presence = ProcessPresenceState::kUnknown;
+    if (mutation == 2) row.pneumatic_none_owner.reset();
+    if (mutation == 3) row.installed_runtime_identity.reset();
+    if (mutation == 4) row.installed_runtime_identity = ContentDigest("foreign");
+    if (mutation == 5) row.process_owner_kind = static_cast<ManagerComponentProcessOwnerKindDTO>(255);
+    if (mutation == 6) row.process_owner_kind = ManagerComponentProcessOwnerKindDTO::kControllerLaunch;
+    EXPECT_FALSE(wrong.valid()) << mutation;
+    EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(wrong), std::invalid_argument) << mutation;
+  }
+  // A new candidate with no actual installed owner is plain absent. Removing
+  // optional owner evidence cannot turn process absence into presence/readiness.
+  const ManagerComponentBringUpInspectionResultDTO no_owner{InspectionRequest(),
+      {{ControllableComponentId("gripper.1"), ProcessPresenceState::kAbsent}}};
+  ASSERT_TRUE(no_owner.valid());
+  const auto ordinary = std::get<ManagerComponentBringUpInspectionResultDTO>(
+      DecodeSelectedRuntimeCompositionRpcResponse(EncodeSelectedRuntimeCompositionRpcResponse(no_owner)));
+  EXPECT_EQ(ordinary, no_owner);
+  EXPECT_EQ(ordinary.configured_components[0].process_owner_kind, ManagerComponentProcessOwnerKindDTO::kControllerLaunch);
+  EXPECT_FALSE(ordinary.configured_components[0].installed_runtime_identity);
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal, NoneOwnerTailsAreClosedIndexedAndResultDirectionOnly) {
+  constexpr std::string_view installed_magic = "MFNSRC4-INSTALLED-PNEUMATIC-NONE-V1";
+  constexpr std::string_view inspection_magic = "MFNSRC4-INSPECT-PNEUMATIC-NONE-V1";
+  const ManagerComponentProcessInventoryResultDTO result{InstalledInventoryRequest(),
+      {NoneInventoryRow("gripper.1"), NoneInventoryRow("gripper.2")}};
+  const auto bytes = EncodeSelectedRuntimeCompositionRpcResponse(result);
+  const auto magic_at = bytes.find(installed_magic);
+  ASSERT_NE(magic_at, std::string::npos);
+  const auto tail_at = magic_at - 5U;
+  const auto count_at = magic_at + installed_magic.size();
+  const auto first_index = count_at + 4U;
+  const auto kind_at = first_index + 4U;
+  const auto proof = *result.process_occurrences[0].pneumatic_none_owner;
+  const auto second_index = kind_at + 1U + 12U + proof.command_target_id.value().size() +
+      proof.control_binding_id.value().size() + proof.control_binding_revision.value().size();
+  const auto set_u32 = [](std::string &data, const std::size_t at, std::uint32_t value) {
+    for (int i = 3; i >= 0; --i) { data[at + i] = static_cast<char>(value & 255U); value >>= 8U; }
+  };
+  const auto rejects = [](const std::string &data) {
+    EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(data), std::invalid_argument);
+  };
+  for (auto cut = tail_at; cut < bytes.size(); ++cut) rejects(bytes.substr(0U, cut));
+  auto bad = bytes;
+  bad[kind_at] = static_cast<char>(255); rejects(bad);
+  bad[kind_at] = 0; rejects(bad); // A redundant physical tail is not canonical.
+  bad = bytes; set_u32(bad, count_at, 0); rejects(bad);
+  bad = bytes; set_u32(bad, count_at, kMaximumComponentProcessInventoryEntries + 1U); rejects(bad);
+  bad = bytes; set_u32(bad, first_index, 2); rejects(bad);
+  bad = bytes; set_u32(bad, second_index, 0); rejects(bad);
+  bad = bytes; set_u32(bad, first_index, 1); set_u32(bad, second_index, 0); rejects(bad);
+  bad = bytes; bad[tail_at] = 5; rejects(bad);
+  bad = bytes; bad[magic_at] = 'X'; rejects(bad);
+  bad = bytes; bad[bad.find("gripper.target")] = '\0'; rejects(bad);
+  rejects(bytes + bytes.substr(tail_at));
+  const auto request = EncodeSelectedRuntimeCompositionRpcRequest(result.request);
+  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequestVariant(request + bytes.substr(tail_at)), std::invalid_argument);
+  const ManagerComponentBringUpInspectionResultDTO inspection{InspectionRequest(), {NoneInspectionRow()}};
+  const auto inspection_bytes = EncodeSelectedRuntimeCompositionRpcResponse(inspection);
+  const auto inspect_magic_at = inspection_bytes.find(inspection_magic);
+  ASSERT_NE(inspect_magic_at, std::string::npos);
+  const auto inspect_tail = inspect_magic_at - 5U;
+  const auto inspect_count = inspect_magic_at + inspection_magic.size();
+  bad = inspection_bytes; bad[inspect_count + 8U] = static_cast<char>(255); rejects(bad);
+  bad = inspection_bytes; set_u32(bad, inspect_count, 0); rejects(bad);
+  bad = inspection_bytes; set_u32(bad, inspect_count + 4U, 1); rejects(bad);
+  rejects(inspection_bytes.substr(0, inspection_bytes.size() - 1U));
+  const ManagerComponentBringUpInspectionResultDTO plain{InspectionRequest(),
+      {{ControllableComponentId("gripper.1"), ProcessPresenceState::kAbsent}}};
+  rejects(EncodeSelectedRuntimeCompositionRpcResponse(plain) + bytes.substr(tail_at));
+  rejects(bytes.substr(0, tail_at) + inspection_bytes.substr(inspect_tail));
+  rejects(inspection_bytes + inspection_bytes.substr(inspect_tail));
+  const auto stripped = std::get<ManagerComponentBringUpInspectionResultDTO>(
+      DecodeSelectedRuntimeCompositionRpcResponse(inspection_bytes.substr(0, inspect_tail)));
+  EXPECT_EQ(stripped, plain);
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal, NoneOwnerProofAndPacketBoundsRemainStrict) {
+  auto proof = NoneProcessOwnerProof();
+  proof.command_target_id = CommandTargetId(std::string(kMaxLifecycleIdentityBytes, 't'));
+  proof.control_binding_id = ControlBindingId(std::string(kMaxLifecycleIdentityBytes, 'b'));
+  proof.control_binding_revision = ControlBindingRevision(std::string(kMaxLifecycleIdentityBytes, 'r'));
+  EXPECT_TRUE(proof.valid());
+  proof.control_binding_id = ControlBindingId(std::string(kMaxLifecycleIdentityBytes + 1U, 'b'));
+  EXPECT_FALSE(proof.valid());
+  auto row = NoneInventoryRow();
+  row.controllable_component_id = ControllableComponentId(std::string(kMaxLifecycleIdentityBytes + 1U, 'c'));
+  EXPECT_FALSE(row.valid());
+  ManagerComponentProcessInventoryResultDTO inventory{InstalledInventoryRequest(), {NoneInventoryRow()}};
+  inventory.process_occurrences.resize(kMaximumComponentProcessInventoryEntries + 1U, NoneInventoryRow());
+  EXPECT_FALSE(inventory.valid());
+  EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(inventory), std::invalid_argument);
+  inventory.process_occurrences.clear();
+  for (std::size_t index = 0; index < kMaximumComponentProcessInventoryEntries; ++index) {
+    inventory.process_occurrences.push_back(NoneInventoryRow("component-" + std::to_string(10000U + index)));
+  }
+  ASSERT_TRUE(inventory.valid());
+  EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(inventory), std::invalid_argument);
+  std::string oversized(kMaximumSelectedRuntimeCompositionRpcPacketBytes + 1U, 'x');
+  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(oversized), std::invalid_argument);
+}
+
 } // namespace
 } // namespace manyforge::component_manager::detail

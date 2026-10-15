@@ -151,6 +151,7 @@ def build_deployment(root: Path) -> dict[str, Any]:
             {"profiles": []},
             refs,
             {},
+            sources,
         )
 
     lite6 = occurrence(

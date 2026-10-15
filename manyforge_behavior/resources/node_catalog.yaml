@@ -1,8 +1,8 @@
 # Generated extension composition; edit extension entries in their package descriptor.
 api_version: manyforge.node_catalog.v2
-content_version: 2.4.0
+content_version: 2.5.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:30003afcdf6cb6de7bc84272e0ae717d9d972539bb4ae115a8515e9c97d0e010
+catalog_digest: sha256:946dcdf51bfdae12e2ff6effed9e1ab3e9c437360ac7c600bf91cd25e6675eb3
 schema_types:
   coordinate_position:
     type: object
@@ -15,6 +15,7 @@ schema_types:
         values:
         - angular_rad
         - linear_m
+        - named_preset
       value_rad:
         type: float
         required_when:
@@ -27,6 +28,15 @@ schema_types:
           kind: linear_m
         allowed_when:
           kind: linear_m
+      name:
+        type: enum
+        values:
+        - open
+        - closed
+        required_when:
+          kind: named_preset
+        allowed_when:
+          kind: named_preset
   coordinate_effort_limit:
     type: object
     additional_properties: false
@@ -2419,6 +2429,14 @@ entries:
       type: float
       constraints:
         min_inclusive: 0.0
+  - id: dwell_while_held
+    required: false
+    default: pause
+    schema:
+      type: enum
+      values:
+      - count
+      - pause
   - id: completion_timeout_s
     required: false
     default: 30.0

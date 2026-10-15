@@ -405,13 +405,13 @@ function manualControlGripperDescriptorAt(
     'control_interface_contract_id', 'controllable_component_id',
     'coordinate_kind', 'description', 'grasp_confirmation_policy',
     'max_position', 'mimic_followers', 'min_position', 'mount_frame',
-    'named_presets', 'open_state_ref', 'schema_version',
+    'named_presets', 'open_state_ref', 'output_mode', 'schema_version',
     'source_coordinate_name', 'source_group_name', 'source_kind',
     'state_authority_class', 'state_authority_id', 'target_role_id',
     'tcp_frame', 'touch_links', 'transport_kind', 'unit',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.manual_control_gripper_descriptor.v2') {
+  if (schemaVersion !== 'manyforge.manual_control_gripper_descriptor.v3') {
     return fail(`${path}.schema_version`, 'the supported gripper descriptor');
   }
   const coordinateKind = stringAt(record.coordinate_kind, `${path}.coordinate_kind`);
@@ -459,6 +459,7 @@ function manualControlGripperDescriptorAt(
   const maxPosition = nullableNumberAt(record.max_position, `${path}.max_position`);
   const description = nullableStringAt(record.description, `${path}.description`);
   const actuationKind = nullableStringAt(record.actuation_kind, `${path}.actuation_kind`);
+  const outputMode = nullableStringAt(record.output_mode, `${path}.output_mode`);
   const commandDurationS = nullableNumberAt(record.command_duration_s, `${path}.command_duration_s`);
   const openStateRef = nullableStringAt(record.open_state_ref, `${path}.open_state_ref`);
   const closedStateRef = nullableStringAt(record.closed_state_ref, `${path}.closed_state_ref`);
@@ -494,11 +495,18 @@ function manualControlGripperDescriptorAt(
     record.grasp_confirmation_policy,
     `${path}.grasp_confirmation_policy`,
   );
+  const qualifiedPolicies = actuationKind === 'pneumatic'
+    ? graspConfirmationPolicy === 'not_required'
+      && ((outputMode === 'commanded' && completionPolicy === 'output_delivery')
+        || (outputMode === 'none' && completionPolicy === 'no_output'))
+    : completionPolicy === 'goal_fenced_target_reached'
+      && graspConfirmationPolicy === 'binding_feedback_required'
+      && outputMode !== 'none';
   if (
     commandKind !== 'gripper_position'
     || transportKind !== 'resolved_binding'
-    || completionPolicy !== 'goal_fenced_target_reached'
-    || graspConfirmationPolicy !== 'binding_feedback_required'
+    || !qualifiedPolicies
+    || (outputMode !== null && outputMode !== 'commanded' && outputMode !== 'none')
     || (actuationKind !== null
       && actuationKind !== 'position_commanded'
       && actuationKind !== 'pneumatic')
@@ -510,7 +518,7 @@ function manualControlGripperDescriptorAt(
     return fail(path, 'the exact qualified gripper command semantics');
   }
   const authoredValues = [
-    description, actuationKind, commandDurationS, openStateRef, closedStateRef,
+    description, actuationKind, outputMode, commandDurationS, openStateRef, closedStateRef,
     mountFrame, attachFrame, tcpFrame,
   ];
   // A retained SRDF group and its presets can exist without authored tool
@@ -524,7 +532,8 @@ function manualControlGripperDescriptorAt(
       || sourceGroupName === null
       || description?.trim() === ''
       || commandDurationS === null
-      || commandDurationS <= 0
+      || commandDurationS < 0
+      || (actuationKind !== 'pneumatic' && commandDurationS === 0)
       || commandDurationS > 60
       || touchLinks.length === 0
       || !namedPresets.some((preset) => preset.name === openStateRef)
@@ -578,12 +587,13 @@ function manualControlGripperDescriptorAt(
     description,
     commandKind,
     actuationKind: actuationKind as ManualControlGripperDescriptor['actuationKind'],
+    outputMode: outputMode as ManualControlGripperDescriptor['outputMode'],
     transportKind,
     controlInterfaceContractId,
     stateAuthorityId,
     stateAuthorityClass: stateAuthorityClass as ManualControlGripperDescriptor['stateAuthorityClass'],
-    completionPolicy,
-    graspConfirmationPolicy,
+    completionPolicy: completionPolicy as ManualControlGripperDescriptor['completionPolicy'],
+    graspConfirmationPolicy: graspConfirmationPolicy as ManualControlGripperDescriptor['graspConfirmationPolicy'],
     sourceGroupName,
     sourceCoordinateName: stringAt(record.source_coordinate_name, `${path}.source_coordinate_name`),
     sourceKind: sourceKind as ResourceSourceKind,

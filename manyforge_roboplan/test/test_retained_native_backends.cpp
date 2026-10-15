@@ -1,10 +1,17 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <manyforge_core/resolved_stop_base_plan_codec.hpp>
+#include <manyforge_core/types/command_schema.hpp>
+#include <manyforge_core/types/manager_liveness.hpp>
+#include <manyforge_core/types/stop_control.hpp>
 #include <future>
 #include <limits>
 #include <manyforge_core/runtime_participant_binding.hpp>
@@ -653,6 +660,201 @@ TEST(RetainedObservedStateChannelTest,
   EXPECT_GT(channel.render_change_generation(), before);
 }
 
+TEST(RetainedObservedStateChannelTest,
+     RenderOnlyCoordinatesNeverCreateAuthoritativeState) {
+  const auto binding =
+      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
+  const auto names = channel.query_context().joint_names;
+  const auto authoritative_before = channel.current_state(100);
+  ASSERT_FALSE(authoritative_before.ok());
+  const bool fresh_before = channel.wait_for_fresh_state(0ns);
+  EXPECT_FALSE(channel.current_bound_render_state().ok());
+  const auto generation_before = channel.render_change_generation();
+
+  const std::array expected{0.025};
+  ASSERT_TRUE(channel.update_render_positions(binding, names, expected).ok());
+  const auto rendered = channel.current_bound_render_state();
+  ASSERT_TRUE(rendered.ok());
+  EXPECT_EQ(rendered.value().binding.value(), binding.value());
+  EXPECT_EQ(rendered.value().compiled_joint_names, names);
+  EXPECT_EQ(rendered.value().positions_si, std::vector<double>{0.025});
+  EXPECT_EQ(rendered.value().render_incarnation, channel.render_incarnation());
+  EXPECT_GT(rendered.value().render_generation, generation_before);
+  EXPECT_TRUE(channel.wait_for_render_change(generation_before, 0ns));
+  const auto authoritative_after = channel.current_state(100);
+  ASSERT_FALSE(authoritative_after.ok());
+  EXPECT_EQ(authoritative_after.error().details,
+            authoritative_before.error().details);
+  EXPECT_FALSE(channel.current_state_bounded(100, 101, {}).ok());
+  EXPECT_FALSE(channel.current_controlled_state().ok());
+  EXPECT_EQ(channel.wait_for_fresh_state(0ns), fresh_before);
+}
+
+TEST(RetainedObservedStateChannelTest,
+     RenderFeedbackAndInstantFallbackPreserveAuthoritativeSample) {
+  const auto binding =
+      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
+  const auto names = channel.query_context().joint_names;
+  const std::array initial{0.0}, velocity{0.0};
+  ASSERT_TRUE(channel.publish_state(initial, velocity, 100, 100).applied());
+  const auto owner_before = channel.current_state(100);
+  ASSERT_TRUE(owner_before.ok());
+  const auto initial_generation = channel.render_change_generation();
+
+  // The caller selects feedback or admission fallback. Both use only the
+  // render cache; the fallback is already at the target on the first read.
+  const std::array feedback{0.007}, expected{0.025};
+  ASSERT_TRUE(channel.update_render_positions(binding, names, feedback).ok());
+  const auto measured_display = channel.current_bound_render_state();
+  ASSERT_TRUE(measured_display.ok());
+  EXPECT_EQ(measured_display.value().positions_si,
+            std::vector<double>{0.007});
+  ASSERT_TRUE(channel.update_render_positions(binding, names, expected).ok());
+  const auto expected_display = channel.current_bound_render_state();
+  ASSERT_TRUE(expected_display.ok());
+  EXPECT_EQ(expected_display.value().positions_si,
+            std::vector<double>{0.025});
+  EXPECT_GT(expected_display.value().render_generation,
+            measured_display.value().render_generation);
+  EXPECT_GT(measured_display.value().render_generation, initial_generation);
+  ASSERT_TRUE(channel.update_render_positions(binding, names, expected).ok());
+  EXPECT_EQ(channel.render_change_generation(),
+            expected_display.value().render_generation);
+
+  const auto owner_after = channel.current_state(100);
+  ASSERT_TRUE(owner_after.ok());
+  EXPECT_EQ(owner_after.value(), owner_before.value());
+}
+
+TEST(RetainedObservedStateChannelTest,
+     RenderWritesRejectForeignBindingNamesAndNonfiniteValues) {
+  const auto binding = make_binding(CoordinateKind::kLinear, "gripper.target",
+                                    true, "route.native");
+  const auto rebound = make_binding(CoordinateKind::kLinear, "gripper.target",
+                                    true, "route.successor");
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
+  const auto names = channel.query_context().joint_names;
+  const std::array initial{0.0}, velocity{0.0}, moved{0.025};
+  ASSERT_TRUE(channel.publish_state(initial, velocity, 100, 100).applied());
+  ASSERT_TRUE(channel.RebindRoute(rebound, 101).ok());
+  const auto generation = channel.render_change_generation();
+  EXPECT_FALSE(channel.update_render_positions(binding, names, moved).ok());
+  const auto foreign =
+      make_binding(CoordinateKind::kLinear, "foreign.target", true);
+  EXPECT_FALSE(channel.update_render_positions(foreign, names, moved).ok());
+  auto foreign_model_dto = rebound.value();
+  foreign_model_dto.model_bindings.front().model_revision =
+      ModelRevision("foreign-model-revision");
+  for (auto &frame : foreign_model_dto.frame_bindings)
+    frame.model_revision = ModelRevision("foreign-model-revision");
+  const auto foreign_model =
+      verify_runtime_participant_binding(std::move(foreign_model_dto));
+  ASSERT_TRUE(foreign_model.ok());
+  EXPECT_FALSE(channel.update_render_positions(foreign_model.value(), names,
+                                              moved).ok());
+  EXPECT_FALSE(channel.update_render_positions(
+                          rebound, std::vector<std::string>{"foreign.finger"},
+                          moved).ok());
+  EXPECT_FALSE(channel.update_render_positions(rebound, {}, {}).ok());
+  const std::array nonfinite{std::numeric_limits<double>::quiet_NaN()};
+  EXPECT_FALSE(
+      channel.update_render_positions(rebound, names, nonfinite).ok());
+  EXPECT_EQ(channel.render_change_generation(), generation);
+  const auto preserved = channel.current_bound_render_state();
+  ASSERT_TRUE(preserved.ok());
+  EXPECT_EQ(preserved.value().binding.value(), rebound.value());
+  EXPECT_EQ(preserved.value().positions_si, std::vector<double>{0.0});
+  ASSERT_TRUE(channel.update_render_positions(rebound, names, moved).ok());
+}
+
+TEST(RetainedObservedStateChannelTest,
+     RenderWritesReorderExactNamesAndRejectPartialOrDuplicateSamples) {
+  auto dto = make_binding(CoordinateKind::kLinear, "gripper.target", true)
+                 .value();
+  auto second = dto.resources.front();
+  second.resource_id = ResourceId("resource.finger.second");
+  second.resource_role_id = ResourceRoleId("second_finger");
+  second.compiled_resource_name = "resource.finger.second";
+  dto.resources.push_back(std::move(second));
+  const auto binding = verify_runtime_participant_binding(std::move(dto));
+  ASSERT_TRUE(binding.ok());
+  RetainedObservedStateChannel channel(
+      binding.value(), nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
+  const auto canonical_names = channel.query_context().joint_names;
+  ASSERT_EQ(canonical_names.size(), 2U);
+  const std::array reversed_names{canonical_names[1], canonical_names[0]};
+  const std::array reversed_positions{0.02, 0.01};
+  ASSERT_TRUE(channel.update_render_positions(binding.value(), reversed_names,
+                                             reversed_positions).ok());
+  const auto rendered = channel.current_bound_render_state();
+  ASSERT_TRUE(rendered.ok());
+  EXPECT_EQ(rendered.value().compiled_joint_names, canonical_names);
+  EXPECT_EQ(rendered.value().positions_si,
+            (std::vector<double>{0.01, 0.02}));
+  const std::array duplicate_names{canonical_names[0], canonical_names[0]};
+  EXPECT_FALSE(channel.update_render_positions(binding.value(), duplicate_names,
+                                              reversed_positions).ok());
+  EXPECT_FALSE(channel.update_render_positions(
+                          binding.value(),
+                          std::span<const std::string>(canonical_names).first(1),
+                          std::span<const double>(reversed_positions).first(1))
+                   .ok());
+  EXPECT_EQ(channel.render_change_generation(),
+            rendered.value().render_generation);
+}
+
+TEST(RetainedObservedStateChannelTest,
+     RenderReadPairsCoordinatesAndGenerationDuringConcurrentUpdates) {
+  const auto binding =
+      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
+  const auto names = channel.query_context().joint_names;
+  const std::array initial{0.0};
+  ASSERT_TRUE(channel.update_render_positions(binding, names, initial).ok());
+  const auto initial_generation = channel.render_change_generation();
+  std::atomic<bool> done{false};
+  std::thread publisher([&] {
+    for (std::uint64_t index = 1U; index <= 2000U; ++index) {
+      const std::array position{static_cast<double>(index) * 0.001};
+      EXPECT_TRUE(channel.update_render_positions(binding, names, position).ok());
+    }
+    done.store(true, std::memory_order_release);
+  });
+  std::size_t reads = 0U;
+  while (!done.load(std::memory_order_acquire) || reads == 0U) {
+    const auto rendered = channel.current_bound_render_state();
+    const bool coherent =
+        rendered.ok() && rendered.value().binding.value() == binding.value() &&
+        rendered.value().compiled_joint_names == names &&
+        rendered.value().positions_si.size() == 1U &&
+        rendered.value().positions_si.front() ==
+            static_cast<double>(rendered.value().render_generation -
+                                initial_generation) * 0.001;
+    EXPECT_TRUE(coherent);
+    if (!coherent) break;
+    ++reads;
+  }
+  publisher.join();
+  EXPECT_GT(reads, 0U);
+  EXPECT_FALSE(channel.current_state(100).ok());
+}
+
 TEST(RetainedObservedStateChannelTest, SharedWakePublishesGripperOnlyChangesAndHasOnePendingToken) {
   auto wake = std::make_shared<RetainedObservationWake>();
   const auto config = RetainedObservedStateChannelConfig{
@@ -819,11 +1021,39 @@ TEST(RetainedExecutionStateSinkTest,
 class GripperRuntimeOwnerTestBackend final : public IGripperCommandBackend,
                                            public IControlDomainExecutionPort {
  public:
-  explicit GripperRuntimeOwnerTestBackend(std::string gripper_id) {
+  explicit GripperRuntimeOwnerTestBackend(
+      std::string gripper_id,
+      GripperActuationKind actuation = GripperActuationKind::kPositionCommanded,
+      GripperOutputMode output = GripperOutputMode::kCommanded)
+      : actuation_(actuation), output_(output) {
     status.gripper_id = std::move(gripper_id);
   }
 
-  GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO&) override { return {}; }
+  GripperActuationKind gripper_actuation_kind(const std::string&) const override {
+    return actuation_;
+  }
+  GripperOutputMode gripper_output_mode(const std::string&) const override {
+    return output_;
+  }
+
+  Result<void> validate_gripper_command(const GripperCommandRequestDTO&) const override {
+    ++validate_calls;
+    return Result<void>::Ok();
+  }
+
+  GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO&) override {
+    ++command_calls;
+    if (!accept_commands) return {};
+    std::lock_guard lock(mutex);
+    status.state = GripperCommandState::kCompleted;
+    status.command_id = 1U;
+    status.generation = 1U;
+    return {true, status.command_id, status.generation, std::nullopt};
+  }
+
+  mutable std::atomic<int> validate_calls{};
+  std::atomic<int> command_calls{};
+  bool accept_commands{};
 
   GripperCommandStatusDTO get_gripper_status(const std::string&) const override {
     std::lock_guard lock(mutex);
@@ -862,6 +1092,8 @@ class GripperRuntimeOwnerTestBackend final : public IGripperCommandBackend,
  private:
   mutable std::mutex mutex;
   GripperCommandStatusDTO status;
+  const GripperActuationKind actuation_;
+  const GripperOutputMode output_;
 };
 
 [[nodiscard]] RuntimeParticipantBinding make_next_publication_gripper_binding(
@@ -963,7 +1195,8 @@ TEST(RetainedNativeGripperRuntimeTest,
   const auto before = owner.registration();
   ASSERT_NE(before.engine, nullptr);
   EXPECT_NE(dynamic_cast<GripperParticipantEngine*>(before.engine), nullptr);
-  EXPECT_EQ(before.stop_execution_port, nullptr);
+  EXPECT_EQ(before.stop_execution_port,
+            static_cast<IControlDomainExecutionPort*>(owner.participant_engine()));
   EXPECT_FALSE(before.stop_readiness.has_value());
   EXPECT_FALSE(before.participant_policy.has_value());
   EXPECT_TRUE(before.intrinsic_direct_control);
@@ -1309,9 +1542,9 @@ TEST(RetainedNativeGripperRoutePublicationOwnerTest,
     RetainedNativeGripperRoutePublicationOwner owner(
         gripper, *clock, kernel,
         [](const ActiveControlConfigurationDTO&,
-           const RuntimeParticipantExecutionRegistration& registration) {
+           const std::vector<RuntimeParticipantExecutionRegistration>& registrations) {
           RetainedNativeGripperRoutePublicationOwner::KernelCandidate candidate;
-          candidate.registrations.push_back(registration);
+          candidate.registrations = registrations;
           return Result<RetainedNativeGripperRoutePublicationOwner::KernelCandidate>::Ok(
               std::move(candidate));
         });
@@ -1396,7 +1629,7 @@ TEST(RetainedNativeGripperRoutePublicationOwnerTest,
     RetainedNativeGripperRoutePublicationOwner owner(
         gripper, *clock, kernel,
         [&builder_calls](const ActiveControlConfigurationDTO&,
-           const RuntimeParticipantExecutionRegistration&) {
+           const std::vector<RuntimeParticipantExecutionRegistration>&) {
           ++builder_calls;
           return Result<RetainedNativeGripperRoutePublicationOwner::KernelCandidate>::Err(
               ErrorDTO{"test_builder_failed", "injected cell candidate failure", {}});
@@ -1418,26 +1651,66 @@ TEST(RetainedNativeGripperRoutePublicationOwnerTest,
     EXPECT_EQ(gripper->state_channel(), state_channel);
     EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
 
+    const auto routes_before_activation = rebound_routes;
+    const auto builders_before_activation = builder_calls;
+    const auto rows_before_activation = gripper->registrations();
+    const auto channel_before_activation = gripper->state_channel();
+    const auto context_before_activation = state_channel->query_context();
+    const auto admission_before_activation = kernel.GetAuthoringAdmission();
+    EXPECT_FALSE(admission_before_activation.authoring_allowed);
     auto changed_activation = predecessor;
     changed_activation.activation_set_id = ActivationSetId("activation.foreign");
     const auto refused_activation =
         owner.AdoptAndReadBackRouteConfigurationPredecessor(changed_activation);
     ASSERT_FALSE(refused_activation.ok());
+    EXPECT_EQ(refused_activation.error().code, "route_predecessor_gripper_rebind_failed");
     ASSERT_TRUE(refused_activation.error().details.contains("reason"));
     EXPECT_EQ(refused_activation.error().details.at("reason"),
-              "route_predecessor_gripper_rebind_failed");
+              "native_gripper_alias_owner_mismatch");
+    EXPECT_EQ(refused_activation.error().message,
+              "Gripper representatives lost their exact primary command owner");
     EXPECT_EQ(builder_calls, 1);
+    EXPECT_EQ(builder_calls, builders_before_activation);
+    EXPECT_EQ(rebound_routes, routes_before_activation);
     EXPECT_EQ(rebound_routes,
               (std::vector<ControlRouteId>{
                   predecessor.binding_routes.front().control_route_id,
-                  current_binding.value().control_path->control_route_id,
                   current_binding.value().control_path->control_route_id}));
     EXPECT_EQ(gripper->binding().value(), current_binding.value());
+    EXPECT_EQ(gripper->state_channel(), channel_before_activation);
+    EXPECT_EQ(gripper->state_channel(), state_channel);
+    EXPECT_EQ(state_channel->query_context(), context_before_activation);
     EXPECT_EQ(state_channel->query_context(),
               make_observed_state_query_context(
                   current_binding,
                   state_channel->query_context().freshness_budget_ns)
                   .value());
+    const auto rows_after_activation = gripper->registrations();
+    ASSERT_EQ(rows_before_activation.size(), 1U);
+    ASSERT_EQ(rows_after_activation.size(), rows_before_activation.size());
+    const auto& before_row = rows_before_activation.front();
+    const auto& after_row = rows_after_activation.front();
+    EXPECT_EQ(after_row.binding.value(), before_row.binding.value());
+    EXPECT_EQ(after_row.engine, before_row.engine);
+    EXPECT_EQ(after_row.stop_execution_port, before_row.stop_execution_port);
+    EXPECT_EQ(after_row.prepared_motion_engine, before_row.prepared_motion_engine);
+    EXPECT_EQ(after_row.stop_node_category, before_row.stop_node_category);
+    EXPECT_EQ(after_row.intrinsic_direct_control, before_row.intrinsic_direct_control);
+    EXPECT_EQ(after_row.deployment_maximum_tcp_linear_speed_mps,
+              before_row.deployment_maximum_tcp_linear_speed_mps);
+    EXPECT_TRUE(before_row.retained_default_stop_limits.empty());
+    EXPECT_TRUE(after_row.retained_default_stop_limits.empty());
+    EXPECT_FALSE(before_row.stop_readiness);
+    EXPECT_FALSE(after_row.stop_readiness);
+    EXPECT_FALSE(before_row.participant_policy);
+    EXPECT_FALSE(after_row.participant_policy);
+    EXPECT_FALSE(before_row.default_operator_stop_profile);
+    EXPECT_FALSE(after_row.default_operator_stop_profile);
+    EXPECT_FALSE(before_row.default_fault_stop_profile);
+    EXPECT_FALSE(after_row.default_fault_stop_profile);
+    EXPECT_TRUE(before_row.direct_control_joint_limits.empty());
+    EXPECT_TRUE(after_row.direct_control_joint_limits.empty());
+    EXPECT_EQ(kernel.GetAuthoringAdmission(), admission_before_activation);
     EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
   }
   std::error_code ignored;
@@ -1509,6 +1782,722 @@ TEST(RetainedNativeGripperRuntimeTest,
               "native.gripper.model", 1'000, 1U},
           clock.get(), wake),
       std::invalid_argument);
+}
+
+[[nodiscard]] RuntimeParticipantBinding seal_gripper_alias_test_binding(
+    RuntimeParticipantBindingDTO value) {
+  auto sealed = verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) throw std::logic_error(sealed.error().message);
+  return std::move(sealed.value());
+}
+
+[[nodiscard]] std::string gripper_alias_test_digest(char digit) {
+  return "sha256:" + std::string(64U, digit);
+}
+
+[[nodiscard]] RuntimeParticipantBinding make_gripper_alias_command_binding() {
+  auto value = make_binding(CoordinateKind::kLinear, "gripper.target", true).value();
+  value.capability_id = CapabilityId("tool.gripper.command");
+  // Canonical unit-fixture digests follow the existing Core Stop golden.
+  // Generic make_binding remains a permissive binding-only fixture.
+  value.program_revision = ProgramRevision(gripper_alias_test_digest('1'));
+  value.program_binding_id = ProgramBindingId(gripper_alias_test_digest('2'));
+  value.retained_bundle_id = RetainedBundleId(gripper_alias_test_digest('8'));
+  value.graph_revision = GraphRevision(gripper_alias_test_digest('9'));
+  value.control_path->control_domain_revision = ControlDomainRevision(gripper_alias_test_digest('c'));
+  value.control_path->control_binding_revision = ControlBindingRevision(gripper_alias_test_digest('d'));
+  value.control_path->topology_revision = TopologyRevision(gripper_alias_test_digest('e'));
+  value.control_path->stop_evidence_policy_revision = StopEvidencePolicyRevision(gripper_alias_test_digest('f'));
+  value.control_path->provider_manifest_revision = ProviderManifestRevision(gripper_alias_test_digest('2'));
+  value.command_schema = ProgramCommandSchemaRefDTO{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  return seal_gripper_alias_test_binding(std::move(value));
+}
+
+[[nodiscard]] RuntimeParticipantBinding make_gripper_feedback_alias(
+    const RuntimeParticipantBinding& command) {
+  auto value = command.value();
+  value.capability_id = CapabilityId("tool.gripper.feedback");
+  value.command_schema.reset();
+  value.capability_definition_revision = CapabilityDefinitionRevision("feedback-capability-revision");
+  value.control_path->control_binding_id = ControlBindingId(
+      command.value().control_path->control_binding_id.value() + ".feedback");
+  value.control_path->control_binding_revision = ControlBindingRevision(gripper_alias_test_digest('a'));
+  // The actual producer clones the same interface, target, resources and
+  // physical owner. Feedback is another logical binding, not another engine.
+  return seal_gripper_alias_test_binding(std::move(value));
+}
+
+[[nodiscard]] ActiveControlConfigurationDTO gripper_alias_configuration(
+    const RuntimeParticipantBinding& command, const RuntimeParticipantBinding& feedback) {
+  auto configuration = gripper_route_configuration(command);
+  const auto& path = *feedback.value().control_path;
+  configuration.binding_routes.push_back(
+      {path.control_binding_id, path.control_binding_revision, path.control_route_id});
+  std::sort(configuration.binding_routes.begin(), configuration.binding_routes.end(),
+      [](const auto& left, const auto& right) { return left.control_binding_id < right.control_binding_id; });
+  return configuration;
+}
+
+void expect_same_gripper_alias_rows(
+    const std::vector<RuntimeParticipantExecutionRegistration>& actual,
+    const std::vector<RuntimeParticipantExecutionRegistration>& expected) {
+  ASSERT_EQ(actual.size(), expected.size());
+  for (std::size_t index = 0; index < actual.size(); ++index) {
+    EXPECT_EQ(actual[index].binding.value(), expected[index].binding.value());
+    EXPECT_EQ(actual[index].engine, expected[index].engine);
+    EXPECT_EQ(actual[index].stop_execution_port, expected[index].stop_execution_port);
+    EXPECT_EQ(actual[index].intrinsic_direct_control, expected[index].intrinsic_direct_control);
+    EXPECT_EQ(actual[index].stop_readiness.has_value(), expected[index].stop_readiness.has_value());
+    if (actual[index].stop_readiness && expected[index].stop_readiness) {
+      EXPECT_EQ(actual[index].stop_readiness->value(), expected[index].stop_readiness->value());
+    }
+  }
+}
+
+// This is the existing Core golden-plan unit fixture, requalified for each
+// exact alias through public content-addressing/domain/readiness verifiers.
+// It is not a physical controller readiness or live Deployment qualification.
+[[nodiscard]] ResolvedStopBasePlanDTO gripper_alias_stop_plan_for(
+    const RuntimeParticipantBinding& participant, const IGripperCommandBackend& backend) {
+  const auto path =
+      std::filesystem::path(__FILE__).parent_path().parent_path().parent_path() /
+      "manyforge_core" / "test" / "golden" / "resolved_stop_base_plan.v1.json";
+  std::ifstream stream(path, std::ios::binary);
+  std::string bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+  if (bytes.ends_with('\n')) {
+    bytes.pop_back();
+  }
+  auto decoded = DecodeResolvedStopBasePlan(bytes);
+  if (!decoded.ok()) {
+    throw std::logic_error(decoded.error().message);
+  }
+
+  auto plan = std::move(decoded.value());
+  const auto& binding = participant.value();
+  const auto& control = *binding.control_path;
+  plan.resolved_stop_base_plan_id = ResolvedStopBasePlanId("pending");
+  plan.retained_bundle_id = binding.retained_bundle_id;
+  plan.graph_revision = binding.graph_revision;
+  plan.control_domain_id = control.control_domain_id;
+  plan.control_domain_revision = control.control_domain_revision;
+  plan.control_binding_id = control.control_binding_id;
+  plan.control_binding_revision = control.control_binding_revision;
+  plan.controller_topology_id = control.controller_topology_id;
+  plan.topology_revision = control.topology_revision;
+  plan.control_route_id = control.control_route_id;
+  plan.activation_set_id = control.activation_set_id;
+  plan.active_control_configuration_id = control.active_control_configuration_id;
+  plan.active_control_configuration_generation = control.active_control_configuration_generation;
+  plan.source_runtime_unit_id = control.provider_runtime_unit_id;
+  plan.source_runtime_epoch = control.provider_runtime_epoch;
+  plan.stop_evidence_policy_id = control.stop_evidence_policy_id;
+  plan.stop_evidence_policy_revision = control.stop_evidence_policy_revision;
+
+  std::vector<ResourceId> resources;
+  resources.reserve(binding.resources.size());
+  for (const auto& resource : binding.resources) {
+    resources.push_back(resource.resource_id);
+  }
+  for (auto& stage : plan.escalation_stages) {
+    std::visit([&](auto& scope) { scope.activation_set_id = control.activation_set_id; },
+               stage.containment_scope);
+    const auto capability_target =
+        stage.containment_command.command_kind == StopContainmentCommandKind::kRegistered ||
+        stage.containment_command.command_kind ==
+            StopContainmentCommandKind::kCapabilityCommandCancel ||
+        stage.containment_command.command_kind == StopContainmentCommandKind::kSafeOutputCommand ||
+        stage.containment_command.command_kind == StopContainmentCommandKind::kLogicalCancel;
+    if (capability_target && !binding.supporting_capability_provider_paths.empty()) {
+      const auto& provider = binding.supporting_capability_provider_paths.front();
+      stage.command_target.provider_instance_id = provider.provider_instance_id;
+      stage.command_target.provider_manifest_id = provider.provider_manifest_id;
+      stage.command_target.provider_manifest_revision = provider.provider_manifest_revision;
+      stage.command_target.runtime_unit_id = provider.provider_runtime_unit_id;
+      stage.command_target.provider_runtime_epoch = provider.provider_runtime_epoch;
+      stage.command_target.runtime_unit_epoch = provider.provider_runtime_epoch;
+    } else {
+      stage.command_target.provider_instance_id = control.provider_instance_id;
+      stage.command_target.provider_manifest_id = control.provider_manifest_id;
+      stage.command_target.provider_manifest_revision = control.provider_manifest_revision;
+      stage.command_target.runtime_unit_id = control.provider_runtime_unit_id;
+      stage.command_target.provider_runtime_epoch = control.provider_runtime_epoch;
+      stage.command_target.runtime_unit_epoch = control.provider_runtime_epoch;
+    }
+  }
+  plan.escalation_stages.front().containment_granularity = control.containment_granularity;
+  plan.escalation_stages.front().containment_scope =
+      ResolvedStopResourceContainmentScopeDTO{control.activation_set_id, resources};
+  // Match the existing Core LogicalGripperRegistration fixture: this actual
+  // local gripper engine supplies its own cancellation/effect fence. A
+  // component-local scalar is not a fabricated motion-controller joint.
+  auto& nominal = plan.escalation_stages.front();
+  const ProviderContractRefDTO contract{
+      ProviderContractRoleId("gripper_logical_cancel"),
+      SchemaId("manyforge.value_schema.provider_contract.empty.v1"),
+      SchemaRevision("sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270")};
+  nominal.containment_command = {StopContainmentCommandKind::kLogicalCancel, contract, {}};
+  nominal.default_contract_parameters = JsonObjectDTO{};
+  nominal.command_qualification = {};
+  nominal.command_target.endpoint_role_id.reset();
+  nominal.command_target.logical_endpoint_symbol.reset();
+  nominal.evidence_requirements.erase(nominal.evidence_requirements.begin() + 1,
+                                      nominal.evidence_requirements.end());
+  auto& logical = nominal.evidence_requirements.front();
+  logical.requirement = {
+      StopEvidenceItemId("logical_cancel_fenced"),
+      StopEvidenceRequirementKind::kLogicalCancellationNoContinuingEffect, contract, {},
+      {StopEvidenceSourceKind::kCommandTargetStatus, 100'000'000LL, {}, {}},
+      {StopEvidenceObservationKind::kCommandResult, {}}};
+  logical.resolved_source = {StopEvidenceSourceKind::kCommandTargetStatus,
+                            nominal.command_target, {}, {}, {}};
+  const auto actuation = backend.gripper_actuation_kind(binding.command_target_id.value());
+  if (actuation == GripperActuationKind::kPneumatic) {
+    plan.gripper_actuation_kind = actuation;
+    plan.escalation_stages.erase(plan.escalation_stages.begin() + 1,
+                                plan.escalation_stages.end());
+  }
+  // Position retains the real golden hard stage; pneumatic has only its
+  // source-qualified nominal fence. Seal the actual final scope in either case.
+  plan.containment_granularity = plan.escalation_stages.back().containment_granularity;
+  auto made = MakeResolvedStopBasePlan(std::move(plan));
+  if (!made.ok()) {
+    throw std::logic_error(made.error().message + ": " + made.error().details.at("reason"));
+  }
+  return std::move(made.value());
+}
+
+[[nodiscard]] ControllerLifecycleExpectedDomain gripper_alias_controller_domain_for(
+    const RuntimeParticipantBinding& participant, const ResolvedStopBasePlanDTO& plan,
+    const IGripperCommandBackend& backend,
+    std::vector<RuntimeParticipantBinding> domain_members = {}) {
+  // Every binding routed in the participant's domain. A single-component
+  // domain has only the participant itself.
+  if (domain_members.empty()) domain_members.push_back(participant);
+  std::sort(domain_members.begin(), domain_members.end(), [](const auto& lhs, const auto& rhs) {
+    return lhs.value().control_path->control_binding_id <
+           rhs.value().control_path->control_binding_id;
+  });
+  const auto& binding = participant.value();
+  const auto& control = *binding.control_path;
+  const ControllerRoleId controller_role("hardware");
+  std::vector<ControllerInterfaceInstanceDTO> all_interfaces;
+  std::vector<DesiredControlBindingRouteDTO> routes;
+  std::vector<ControllerLifecycleExpectedBindingDTO> binding_interfaces;
+  std::vector<ControllerLifecycleExpectedEndpointDTO> endpoint_bindings;
+  for (const auto& member : domain_members) {
+    const auto& path = *member.value().control_path;
+    std::vector<ControllerInterfaceInstanceDTO> interfaces;
+    for (const auto& resource : member.value().resources) {
+      interfaces.push_back(ControllerInterfaceInstanceDTO{resource.resource_id, "position"});
+    }
+    all_interfaces.insert(all_interfaces.end(), interfaces.begin(), interfaces.end());
+    routes.push_back({path.control_binding_id, path.control_binding_revision, path.control_route_id});
+    binding_interfaces.push_back({path.control_binding_id, path.control_binding_revision,
+                                  path.control_interface_contract_id,
+                                  path.control_interface_revision, interfaces, interfaces});
+    const auto actuation = backend.gripper_actuation_kind(member.value().command_target_id.value());
+    if (actuation == GripperActuationKind::kPneumatic)
+      binding_interfaces.back().gripper_actuation_kind = actuation;
+    endpoint_bindings.push_back({path.control_binding_id, path.control_binding_revision,
+                                 path.control_route_id, EndpointRoleId("endpoint.command"),
+                                 "controller.command", true, false});
+  }
+  std::sort(all_interfaces.begin(), all_interfaces.end(), [](const auto& lhs, const auto& rhs) {
+    return lhs.resource_id < rhs.resource_id;
+  });
+  all_interfaces.erase(std::unique(all_interfaces.begin(), all_interfaces.end()),
+                       all_interfaces.end());
+  ControllerLifecycleExpectedDomainDTO value{
+      control.control_domain_id,
+      control.control_domain_revision,
+      control.controller_topology_id,
+      control.topology_revision,
+      ProductId("test.control.product"),
+      ProductContractId("manyforge.control-domain-control.v2"),
+      ProductContractRevision(gripper_alias_test_digest('1')),
+      ContentDigest(gripper_alias_test_digest('2')),
+      ContentDigest(gripper_alias_test_digest('3')),
+      plan.source_runtime_unit_id,
+      plan.source_runtime_epoch,
+      {control.controller_topology_id,
+       control.topology_revision,
+       {{controller_role,
+         {{control.control_interface_contract_id,
+           control.control_interface_revision,
+           {ControllerClaimDirection::kCommand, ControllerClaimDirection::kState}}},
+         {},
+         {}}},
+       {},
+       {{control.activation_set_id, {controller_role}, {}}},
+       {{control.control_route_id,
+         control.control_interface_contract_id,
+         control.control_interface_revision,
+         {controller_role},
+         {control.activation_set_id}}}},
+      {control.control_domain_id,
+       control.control_domain_revision,
+       control.controller_topology_id,
+       control.topology_revision,
+       control.activation_set_id,
+       std::move(routes)},
+      std::move(binding_interfaces),
+      {{controller_role,
+        ControllerImplementationId("implementation.hardware"),
+        ControllerImplementationRevision(gripper_alias_test_digest('4')),
+        "controller_interface.ControllerInterface",
+        ContentDigest(gripper_alias_test_digest('5')),
+        all_interfaces,
+        all_interfaces,
+        {},
+        {}}},
+      std::move(endpoint_bindings)};
+  auto sealed = verify_controller_lifecycle_expected_domain(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
+TEST(RetainedNativeGripperRuntimeTest, CommandAndFeedbackAliasesKeepOneEngineAndOneCommandAuthority) {
+  for (const auto output : {GripperOutputMode::kCommanded, GripperOutputMode::kNone}) {
+    SCOPED_TRACE(output == GripperOutputMode::kNone ? "pneumatic None" : "pneumatic Commanded");
+    const auto command = make_gripper_alias_command_binding();
+    const auto feedback = make_gripper_feedback_alias(command);
+    const std::vector<RuntimeParticipantBinding> representatives{command, feedback};
+    auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
+        command.value().command_target_id.value(), GripperActuationKind::kPneumatic, output);
+    auto clock = std::make_shared<FakeClock>();
+    auto channel = std::make_shared<FakeRetainedStateChannel>(command, std::vector<double>{0.0});
+    auto runtime = std::make_shared<RetainedNativeGripperRuntime>(RetainedNativeGripperRuntimeInput{
+        command, backend, clock, channel,
+        output == GripperOutputMode::kNone ? nullptr : backend.get(),
+        std::nullopt, true, {}, {}, std::nullopt, {}, representatives});
+    const auto primary = runtime->registration();
+    const auto rows = runtime->registrations();
+    ASSERT_EQ(rows.size(), 2U);
+    EXPECT_EQ(primary.binding.value(), command.value());
+    EXPECT_EQ(rows[0].binding.value(), command.value());
+    EXPECT_EQ(rows[1].binding.value(), feedback.value());
+    EXPECT_EQ(rows[0].engine, primary.engine);
+    EXPECT_EQ(rows[1].engine, primary.engine);
+    EXPECT_EQ(primary.engine, runtime->participant_engine());
+    EXPECT_EQ(runtime->backend(), backend.get());
+    EXPECT_TRUE(rows[0].intrinsic_direct_control);
+    EXPECT_FALSE(rows[1].intrinsic_direct_control);
+    EXPECT_FALSE(rows[0].stop_readiness);
+    EXPECT_FALSE(rows[1].stop_readiness);
+    EXPECT_EQ(rows[0].stop_execution_port, rows[1].stop_execution_port);
+    EXPECT_EQ(rows[0].stop_execution_port,
+              output == GripperOutputMode::kNone
+                  ? static_cast<IControlDomainExecutionPort*>(runtime->participant_engine())
+                  : static_cast<IControlDomainExecutionPort*>(backend.get()));
+    const auto staged = runtime->PrepareRegistrations(representatives, {std::nullopt, std::nullopt});
+    ASSERT_TRUE(staged.ok()) << staged.error().message;
+    expect_same_gripper_alias_rows(staged.value(), rows);
+    RetainedNativeComponentOwner component(runtime);
+    const auto physical = component.physical_bindings();
+    ASSERT_EQ(physical.size(), 1U);
+    EXPECT_EQ(physical.front().value(), command.value());
+    const auto logical = component.registrations();
+    ASSERT_EQ(logical.size(), 2U);
+    EXPECT_FALSE(logical[1].binding.value().command_schema);
+    EXPECT_FALSE(logical[1].intrinsic_direct_control);
+    expect_same_gripper_alias_rows(logical, rows);
+  }
+}
+
+TEST(RetainedNativeGripperRuntimeTest, ForeignOrUnexpectedFeedbackCannotChangeTheInstalledAliasOwner) {
+  const auto command = make_gripper_alias_command_binding();
+  const auto feedback = make_gripper_feedback_alias(command);
+  auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(command.value().command_target_id.value());
+  auto clock = std::make_shared<FakeClock>();
+  auto channel = std::make_shared<FakeRetainedStateChannel>(command, std::vector<double>{0.0});
+  RetainedNativeGripperRuntime runtime(RetainedNativeGripperRuntimeInput{
+      command, backend, clock, channel, backend.get(), std::nullopt, true, {}, {}, std::nullopt,
+      {}, {command, feedback}});
+  const auto before = runtime.registrations();
+  for (int mutation = 0; mutation < 13; ++mutation) {
+    SCOPED_TRACE(mutation);
+    auto value = feedback.value();
+    switch (mutation) {
+      case 0: value.controllable_component_id = ControllableComponentId("foreign.component"); break;
+      case 1: value.command_target_id = CommandTargetId("foreign.target"); break;
+      case 2: value.resources[0].resource_id = ResourceId("foreign.resource"); break;
+      case 3: value.control_path->provider_instance_id = ProviderInstanceId("foreign.provider"); break;
+      case 4: value.control_path->provider_runtime_epoch = RuntimeEpoch("foreign.epoch");
+              value.runtime_unit_epochs[0].runtime_epoch = RuntimeEpoch("foreign.epoch"); break;
+      case 5: value.control_path->control_route_id = ControlRouteId("foreign.route"); break;
+      case 6: value.control_path->active_control_configuration_generation = ActiveControlConfigurationGeneration(2U); break;
+      case 7: value.control_path->control_binding_revision = ControlBindingRevision("foreign.binding.revision"); break;
+      case 8: value.control_path->control_binding_id = ControlBindingId("unexpected.feedback"); break;
+      case 9: value.capability_id = CapabilityId("tool.unexpected.feedback"); break;
+      case 10: value.control_path->control_interface_contract_id = ControlInterfaceContractId("foreign.interface"); break;
+      case 11: value.graph_revision = GraphRevision("foreign.graph"); break;
+      case 12: value.control_path->active_control_configuration_id = ActiveControlConfigurationId("foreign.configuration"); break;
+    }
+    const auto foreign = seal_gripper_alias_test_binding(std::move(value));
+    const auto refused = runtime.PrepareRegistrations({command, foreign}, {std::nullopt, std::nullopt});
+    EXPECT_FALSE(refused.ok());
+    expect_same_gripper_alias_rows(runtime.registrations(), before);
+    EXPECT_EQ(runtime.binding().value(), command.value());
+    EXPECT_EQ(runtime.state_channel(), channel);
+  }
+  EXPECT_FALSE(runtime.PrepareRegistrations({command, feedback, feedback},
+      {std::nullopt, std::nullopt, std::nullopt}).ok());
+  EXPECT_FALSE(runtime.PrepareRegistrations({command, feedback}, {std::nullopt}).ok());
+  EXPECT_FALSE(runtime.PrepareRegistrations({feedback}, {std::nullopt}).ok());
+  expect_same_gripper_alias_rows(runtime.registrations(), before);
+}
+
+
+TEST(RetainedNativeGripperRuntimeTest,
+     FeedbackAddressedCommandIsRefusedBeforeBackendOrResourceReservation) {
+  // Owning Core unit fixture, not retained Deployment provenance. The
+  // configured backend supplies actuation independently to both seals.
+  for (const auto configured_actuation : {GripperActuationKind::kPositionCommanded,
+                                          GripperActuationKind::kPneumatic}) {
+    SCOPED_TRACE(configured_actuation == GripperActuationKind::kPneumatic
+                     ? "pneumatic" : "position_commanded");
+    const auto command = make_gripper_alias_command_binding();
+    const auto feedback = make_gripper_feedback_alias(command);
+    ASSERT_TRUE(command.value().command_schema);
+    ASSERT_FALSE(feedback.value().command_schema);
+    const std::vector<RuntimeParticipantBinding> representatives{command, feedback};
+    auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
+        command.value().command_target_id.value(), configured_actuation);
+    const auto command_plan = gripper_alias_stop_plan_for(command, *backend);
+    const auto expected = gripper_alias_controller_domain_for(command, command_plan, *backend, representatives);
+    const auto actual_actuation = backend->gripper_actuation_kind(command.value().command_target_id.value());
+    const bool pneumatic = actual_actuation == GripperActuationKind::kPneumatic;
+    EXPECT_EQ(command_plan.gripper_actuation_kind.has_value(), pneumatic);
+    if (pneumatic) {
+      EXPECT_EQ(command_plan.gripper_actuation_kind, actual_actuation);
+    }
+    EXPECT_EQ(std::count_if(command_plan.escalation_stages.begin(), command_plan.escalation_stages.end(),
+                           [](const auto& stage) { return stage.stage_kind == StopEscalationStageKind::kSoftwareHard; }),
+              pneumatic ? 0 : 1);
+    EXPECT_EQ(command_plan.containment_granularity,
+              command_plan.escalation_stages.back().containment_granularity);
+    EXPECT_EQ(command_plan.escalation_stages.front().containment_command.command_kind,
+              StopContainmentCommandKind::kLogicalCancel);
+    ASSERT_TRUE(command_plan.escalation_stages.front().default_contract_parameters);
+    EXPECT_EQ(*command_plan.escalation_stages.front().default_contract_parameters, JsonObjectDTO{});
+    for (const auto& binding : expected.value().expected_bindings) {
+      EXPECT_EQ(binding.gripper_actuation_kind.has_value(), pneumatic);
+      if (pneumatic) {
+        EXPECT_EQ(binding.gripper_actuation_kind, actual_actuation);
+      }
+    }
+    std::vector<std::optional<RuntimeParticipantStopReadiness>> readiness;
+    for (const auto& binding : representatives) {
+      auto verified = verify_runtime_participant_stop_readiness(
+          {binding.value().controllable_component_id, ComponentLifecycleGeneration(1U),
+           expected.value(), gripper_alias_stop_plan_for(binding, *backend)}, binding, expected);
+      ASSERT_TRUE(verified.ok()) << verified.error().message;
+      readiness.push_back(std::move(verified.value()));
+    }
+    auto clock = std::make_shared<FakeClock>();
+    auto scheduler = std::make_shared<ManualScheduler>();
+    backend->accept_commands = true;
+    auto channel = std::make_shared<FakeRetainedStateChannel>(command, std::vector<double>{0.0});
+    RetainedNativeGripperRuntime runtime(RetainedNativeGripperRuntimeInput{
+        command, backend, clock, channel, backend.get(), readiness.front(), true,
+        {}, scheduler, std::nullopt, {}, representatives});
+    auto registrations = runtime.PrepareRegistrations(representatives, readiness);
+    ASSERT_TRUE(registrations.ok()) << registrations.error().message;
+    ASSERT_EQ(registrations.value().size(), 2U);
+    EXPECT_EQ(registrations.value()[0].engine, registrations.value()[1].engine);
+    EXPECT_FALSE(registrations.value()[1].intrinsic_direct_control);
+    const auto cell = CellId("cell.gripper.alias.command");
+    const auto epoch = RequestOwnerEpoch("owner.gripper.alias.command");
+    const auto path = std::filesystem::temp_directory_path() /
+        ("manyforge-gripper-alias-command-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) + ".sqlite");
+    {
+      SqliteOperationJournal journal(path, cell, 16U);
+      // This synthetic owner has no external heartbeat receivers. As in the
+      // Core intrinsic-manual tests, cell readiness is explicit owner input.
+      ResourceAddressedExecutionKernelConfig config{
+          epoch, cell, 16U, {}, nullptr, command.value().graph_revision};
+      config.manager_liveness_required_set = ManagerLivenessRequiredSetDTO{
+          cell, command.value().retained_bundle_id,
+          ComputeRequiredRuntimeSetDigest({}), RuntimeUnitId("manager.gripper.alias"),
+          RuntimeEpoch("manager.gripper.alias.1"),
+          RequestOwnerEpoch("manager.gripper.alias.1"), {}};
+      ResourceAddressedExecutionKernel kernel(registrations.value(), *clock, *scheduler,
+          journal, config);
+      ASSERT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
+      const CellAdmissionReadinessSnapshotDTO ready{
+          true,
+          ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner.gripper.alias"), 1U,
+                                ProgramCycleStateDTO::kIdleAfterReset, std::nullopt,
+                                std::nullopt, std::nullopt},
+          true, 1U, 1U, true, true, 0U, 0U, 0U};
+      const auto admission = kernel.UpdateCellAdmissionReadiness(ready);
+      ASSERT_TRUE(admission.ok()) << admission.error().message;
+      ASSERT_TRUE(admission.value().authoring_allowed);
+      const auto& value = command.value();
+      const auto& schema = *value.command_schema;
+      OperationIntentDTO intent{
+          {RequestId("request.feedback.command"), epoch, "alias owner test", std::nullopt},
+          value.program_id, value.program_revision, value.program_binding_id,
+          ProgramRunId("run.gripper.alias"), value.graph_revision, value.retained_bundle_id,
+          std::nullopt,
+          {{value.component_role_id, value.target_role_id, feedback.value().capability_id,
+            std::nullopt, CapabilityCommandIntentDTO{
+                schema.command_schema_id, schema.command_schema_revision,
+                GripperPositionCommandValueDTO{LinearPositionDTO{0.02}, std::nullopt},
+                2.0, {}}}},
+          OperationCoordinationPolicy::kIndependent};
+      const auto before = kernel.resource_table_snapshot();
+      const auto refused = kernel.execute(intent);
+      ASSERT_FALSE(refused.ok());
+      ASSERT_TRUE(refused.error().details.contains("reason"));
+      EXPECT_EQ(refused.error().details.at("reason"), "runtime_command_mapping_incomplete");
+      EXPECT_EQ(backend->validate_calls.load(), 0);
+      EXPECT_EQ(backend->command_calls.load(), 0);
+      EXPECT_EQ(kernel.resource_table_snapshot(), before);
+      for (const auto& slot : kernel.resource_snapshot()) EXPECT_EQ(slot.state, ResourceSlotState::kFree);
+      EXPECT_FALSE(runtime.participant_engine()->ObservePreparedCapabilityCommand(1U).ok());
+
+      // The genuine command sibling remains registered with its exact schema;
+      // the same real retained engine must prepare and dispatch it successfully.
+      intent.request_context.request_id = RequestId("request.primary.command");
+      intent.participants.front().required_capability_id = value.capability_id;
+      const auto accepted = kernel.execute(intent);
+      ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+      EXPECT_GT(backend->validate_calls.load(), 0);
+      EXPECT_EQ(backend->command_calls.load(), 1);
+      const auto prepared = runtime.participant_engine()->ObservePreparedCapabilityCommand(1U);
+      ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+      EXPECT_EQ(prepared.value().state, ResolvedPreparedCapabilityCommandStateDTO::kDispatched);
+      const auto replay = kernel.execute(intent);
+      ASSERT_TRUE(replay.ok()) << replay.error().message;
+      EXPECT_EQ(replay.value().operation_id, accepted.value().operation_id);
+      EXPECT_EQ(backend->command_calls.load(), 1);
+    }
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    std::filesystem::remove(path.string() + "-wal", ignored);
+    std::filesystem::remove(path.string() + "-shm", ignored);
+  }
+}
+
+
+[[nodiscard]] RuntimeParticipantBinding make_gripper_alias_peer_binding(
+    const RuntimeParticipantBinding& command) {
+  auto value = command.value();
+  value.component_role_id = ComponentRoleId("peer");
+  value.target_role_id = TargetRoleId("peer.gripper");
+  value.controllable_component_id = ControllableComponentId("peer.component");
+  value.command_target_id = CommandTargetId("peer.target");
+  value.resources.front().resource_id = ResourceId("peer.finger");
+  value.resources.front().compiled_resource_name = "peer.finger";
+  auto& path = *value.control_path;
+  path.control_domain_id = ControlDomainId("domain.peer");
+  path.control_binding_id = ControlBindingId("binding.peer");
+  path.control_route_id = ControlRouteId("route.peer");
+  path.active_control_configuration_id = ActiveControlConfigurationId("active.peer");
+  return seal_gripper_alias_test_binding(std::move(value));
+}
+
+TEST(RetainedNativeGripperRoutePublicationOwnerTest,
+     AliasPredecessorReadbackPreservesBothBindingsAndUnaffectedCellPeer) {
+  for (const auto output : {GripperOutputMode::kCommanded, GripperOutputMode::kNone}) {
+    SCOPED_TRACE(output == GripperOutputMode::kNone ? "pneumatic None" : "pneumatic Commanded");
+    const auto durable = make_gripper_alias_command_binding();
+    const auto durable_feedback = make_gripper_feedback_alias(durable);
+    const auto predecessor = gripper_alias_configuration(durable, durable_feedback);
+    const auto current = make_restarted_gripper_binding(durable);
+    const auto current_feedback = make_gripper_feedback_alias(current);
+    const auto peer_binding = make_gripper_alias_peer_binding(current);
+    auto clock = std::make_shared<FakeClock>();
+    clock->set(100);
+    auto scheduler = std::make_shared<ManualScheduler>();
+    auto channel = make_gripper_restart_state_channel(current, *clock);
+    auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
+        current.value().command_target_id.value(), GripperActuationKind::kPneumatic, output);
+    std::vector<ControlRouteId> rebound_routes;
+    auto runtime = std::make_shared<RetainedNativeGripperRuntime>(RetainedNativeGripperRuntimeInput{
+        current, backend, clock, channel, nullptr, std::nullopt, true,
+        [&](const RuntimeParticipantBinding& candidate,
+            const std::shared_ptr<IRetainedObservedStateChannel>& actual_channel,
+            const std::optional<RuntimeParticipantStopReadiness>& readiness) {
+          EXPECT_EQ(actual_channel, channel);
+          EXPECT_FALSE(readiness);
+          rebound_routes.push_back(candidate.value().control_path->control_route_id);
+          return Result<void>::Ok();
+        }, scheduler, std::nullopt, {}, {current, current_feedback}});
+    auto peer_backend = std::make_shared<GripperRuntimeOwnerTestBackend>("peer.target");
+    auto peer_channel = make_gripper_restart_state_channel(peer_binding, *clock);
+    RetainedNativeGripperRuntime peer(RetainedNativeGripperRuntimeInput{
+        peer_binding, peer_backend, clock, peer_channel, nullptr, std::nullopt,
+        true, {}, scheduler, std::nullopt});
+    const auto peer_registration = peer.registration();
+    auto installed = runtime->registrations();
+    installed.push_back(peer_registration);
+    const auto original_engine = runtime->participant_engine();
+    const auto cell = CellId("cell.gripper.alias.recovery");
+    const auto path = std::filesystem::temp_directory_path() /
+        ("manyforge-gripper-alias-recovery-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) + ".sqlite");
+    {
+      SqliteOperationJournal journal(path, cell, 16U);
+      ResourceAddressedExecutionKernel kernel(installed, *clock, *scheduler, journal,
+          {RequestOwnerEpoch("owner.gripper.alias.recovery"), cell, 16U, {}, nullptr,
+           current.value().graph_revision});
+      auto peer_configuration = gripper_route_configuration(peer_binding);
+      peer_configuration.state = ActiveControlConfigurationStateDTO::kExternalOrUnknownUnreconciled;
+      const auto peer_before = kernel.publish_runtime_route_configuration(peer_configuration);
+      ASSERT_TRUE(peer_before.ok()) << peer_before.error().message;
+      int builder_calls = 0;
+      int adopted_caches = 0;
+      RetainedNativeGripperRoutePublicationOwner owner(runtime, *clock, kernel,
+          [&](const ActiveControlConfigurationDTO& configuration,
+              const std::vector<RuntimeParticipantExecutionRegistration>& aliases) {
+            ++builder_calls;
+            EXPECT_EQ(configuration, predecessor);
+            EXPECT_EQ(aliases.size(), 2U);
+            for (const auto& alias : aliases) {
+              EXPECT_EQ(alias.engine, original_engine);
+              EXPECT_FALSE(alias.stop_readiness);
+              EXPECT_EQ(alias.binding.value().control_path->provider_runtime_epoch,
+                        RuntimeEpoch("runtime-epoch.2"));
+            }
+            RetainedNativeGripperRoutePublicationOwner::KernelCandidate candidate;
+            candidate.registrations = aliases;
+            candidate.registrations.push_back(peer_registration);
+            candidate.adopt_component_owners = [&] { ++adopted_caches; };
+            return Result<RetainedNativeGripperRoutePublicationOwner::KernelCandidate>::Ok(
+                std::move(candidate));
+          });
+      const auto current_configuration = gripper_alias_configuration(current, current_feedback);
+      const auto read = owner.ReadCurrentPhysicalParticipants(current_configuration);
+      ASSERT_TRUE(read.ok()) << read.error().message;
+      ASSERT_EQ(read.value().size(), 2U);
+      EXPECT_EQ(read.value()[0].value(), current.value());
+      EXPECT_EQ(read.value()[1].value(), current_feedback.value());
+      auto missing = current_configuration;
+      missing.binding_routes.pop_back();
+      EXPECT_FALSE(owner.ReadCurrentPhysicalParticipants(missing).ok());
+      auto foreign = current_configuration;
+      foreign.binding_routes.back().control_binding_revision = ControlBindingRevision("foreign.alias.revision");
+      EXPECT_FALSE(owner.ReadCurrentPhysicalParticipants(foreign).ok());
+      EXPECT_EQ(builder_calls, 0);
+
+      ASSERT_TRUE(kernel.SetRouteRecoveryPending(true).ok());
+      const auto adopted = owner.AdoptAndReadBackRouteConfigurationPredecessor(predecessor);
+      ASSERT_TRUE(adopted.ok()) << adopted.error().message;
+      EXPECT_EQ(builder_calls, 1);
+      EXPECT_EQ(adopted_caches, 1);
+      EXPECT_EQ(adopted.value().active_configuration, predecessor);
+      EXPECT_TRUE(adopted.value().readiness_rows.empty());
+      EXPECT_FALSE(adopted.value().operation_admission_open);
+      EXPECT_EQ(rebound_routes, (std::vector<ControlRouteId>{ControlRouteId("route.native")}));
+      const auto rows = runtime->registrations();
+      ASSERT_EQ(rows.size(), 2U);
+      for (const auto& row : rows) {
+        EXPECT_EQ(row.engine, original_engine);
+        EXPECT_FALSE(row.stop_readiness);
+        EXPECT_EQ(row.binding.value().control_path->active_control_configuration_id,
+                  predecessor.active_control_configuration_id);
+        EXPECT_EQ(row.binding.value().control_path->active_control_configuration_generation,
+                  predecessor.active_control_configuration_generation);
+        EXPECT_EQ(row.binding.value().control_path->provider_runtime_epoch, RuntimeEpoch("runtime-epoch.2"));
+        EXPECT_EQ(row.binding.value().control_path->control_route_id, ControlRouteId("route.native"));
+      }
+      EXPECT_TRUE(rows[0].intrinsic_direct_control);
+      EXPECT_FALSE(rows[1].intrinsic_direct_control);
+      EXPECT_FALSE(rows[1].binding.value().command_schema);
+      EXPECT_EQ(rows[1].binding.value().control_path->control_binding_id,
+                durable_feedback.value().control_path->control_binding_id);
+      const auto readback = kernel.runtime_route_configuration_readback(
+          predecessor.control_domain_id, predecessor.active_control_configuration_id,
+          predecessor.active_control_configuration_generation);
+      ASSERT_TRUE(readback.ok()) << readback.error().message;
+      EXPECT_EQ(readback.value(), adopted.value());
+      const auto peer_after = kernel.runtime_route_configuration_readback(
+          peer_configuration.control_domain_id, peer_configuration.active_control_configuration_id,
+          peer_configuration.active_control_configuration_generation);
+      ASSERT_TRUE(peer_after.ok()) << peer_after.error().message;
+      EXPECT_EQ(peer_after.value(), peer_before.value());
+      EXPECT_EQ(peer.registration().binding.value(), peer_binding.value());
+      EXPECT_EQ(peer.registration().engine, peer_registration.engine);
+      EXPECT_EQ(peer_backend->command_calls.load(), 0);
+      EXPECT_EQ(backend->command_calls.load(), 0);
+      EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
+    }
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    std::filesystem::remove(path.string() + "-wal", ignored);
+    std::filesystem::remove(path.string() + "-shm", ignored);
+  }
+}
+
+TEST(RetainedNativeGripperRoutePublicationOwnerTest,
+     FailedAliasCellCandidateRollsBackEveryAliasBeforeCacheAdoption) {
+  const auto durable = make_gripper_alias_command_binding();
+  const auto predecessor = gripper_alias_configuration(durable, make_gripper_feedback_alias(durable));
+  const auto current = make_restarted_gripper_binding(durable);
+  const auto feedback = make_gripper_feedback_alias(current);
+  auto clock = std::make_shared<FakeClock>();
+  clock->set(100);
+  auto scheduler = std::make_shared<ManualScheduler>();
+  auto channel = make_gripper_restart_state_channel(current, *clock);
+  auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(current.value().command_target_id.value());
+  std::vector<ControlRouteId> rebound_routes;
+  auto runtime = std::make_shared<RetainedNativeGripperRuntime>(RetainedNativeGripperRuntimeInput{
+      current, backend, clock, channel, nullptr, std::nullopt, true,
+      [&](const RuntimeParticipantBinding& candidate,
+          const std::shared_ptr<IRetainedObservedStateChannel>&,
+          const std::optional<RuntimeParticipantStopReadiness>& readiness) {
+        EXPECT_FALSE(readiness);
+        rebound_routes.push_back(candidate.value().control_path->control_route_id);
+        return Result<void>::Ok();
+      }, scheduler, std::nullopt, {}, {current, feedback}});
+  const auto before = runtime->registrations();
+  const auto context_before = channel->query_context();
+  const auto cell = CellId("cell.gripper.alias.failed.recovery");
+  const auto path = std::filesystem::temp_directory_path() /
+      ("manyforge-gripper-alias-failure-" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()) + ".sqlite");
+  {
+    SqliteOperationJournal journal(path, cell, 16U);
+    ResourceAddressedExecutionKernel kernel(before, *clock, *scheduler, journal,
+        {RequestOwnerEpoch("owner.gripper.alias.failed.recovery"), cell, 16U, {}, nullptr,
+         current.value().graph_revision});
+    int builder_calls = 0;
+    RetainedNativeGripperRoutePublicationOwner owner(runtime, *clock, kernel,
+        [&](const ActiveControlConfigurationDTO&,
+            const std::vector<RuntimeParticipantExecutionRegistration>& aliases) {
+          ++builder_calls;
+          EXPECT_EQ(aliases.size(), 2U);
+          return Result<RetainedNativeGripperRoutePublicationOwner::KernelCandidate>::Err(
+              {"test_alias_builder_failed", "injected complete-cell builder failure", {}});
+        });
+    ASSERT_TRUE(kernel.SetRouteRecoveryPending(true).ok());
+    const auto refused = owner.AdoptAndReadBackRouteConfigurationPredecessor(predecessor);
+    ASSERT_FALSE(refused.ok());
+    ASSERT_TRUE(refused.error().details.contains("reason"));
+    EXPECT_EQ(refused.error().details.at("reason"), "route_predecessor_gripper_builder_failed");
+    EXPECT_EQ(builder_calls, 1);
+    EXPECT_EQ(rebound_routes, (std::vector<ControlRouteId>{ControlRouteId("route.native"),
+                                                        ControlRouteId("route.successor")}));
+    expect_same_gripper_alias_rows(runtime->registrations(), before);
+    EXPECT_EQ(runtime->binding().value(), current.value());
+    EXPECT_EQ(runtime->state_channel(), channel);
+    EXPECT_EQ(channel->query_context(), context_before);
+    EXPECT_FALSE(kernel.runtime_route_configuration_readback(predecessor.control_domain_id,
+        predecessor.active_control_configuration_id, predecessor.active_control_configuration_generation).ok());
+    EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
+    EXPECT_EQ(backend->command_calls.load(), 0);
+  }
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+  std::filesystem::remove(path.string() + "-wal", ignored);
+  std::filesystem::remove(path.string() + "-shm", ignored);
 }
 
 } // namespace

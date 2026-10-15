@@ -119,9 +119,9 @@ struct Composition final {
   // These external CCLC dependencies are declared before the composition so
   // reverse member destruction retires CCLC first, then readiness/route owner,
   // while the runtime and stable cell Kernel remain alive.
-  std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>
+  std::shared_ptr<deployment::IRouteConfigurationKernelPublicationOwner>
       cclc_cell_route_publication_owner;
-  std::unique_ptr<RetainedNativeCellCommandReadinessPort>
+  std::shared_ptr<RetainedNativeCellCommandReadinessPort>
       cclc_cell_command_readiness_port;
   std::unique_ptr<deployment::CCLCRuntimeComposition> cclc_runtime;
   std::function<core::Result<void>()> cclc_cell_route_reconciler;

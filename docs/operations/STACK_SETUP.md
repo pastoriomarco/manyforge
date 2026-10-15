@@ -2,14 +2,12 @@
 
 # ManyForge Stack Setup
 
-> **Temporarily unavailable on `dev`:** the composable-cell destructive
-> migration has intentionally taken product-lane startup offline. This runbook
-> records the last qualified baseline until N and the lane-specific I/R
-> restoration gates pass. The H0 source candidate supplies observation only;
-> it does not restore product-lane startup.
-> Unless explicitly identified as current structural/offline tooling,
-> present-tense commands, services, and availability claims below describe
-> that baseline rather than the current branch.
+> **Current `dev` boundary:** use
+> [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md) for the ROS development
+> entrypoint. Workbench empty-ready and mock Phase A `qualified-live02` have run;
+> the full Compose wrapper, observed GUI journey, Isaac and physical operation
+> remain unqualified. The native simulator is removed. Commands and services
+> below describe historical aggregate-launch restoration inputs.
 
 Historical operational runbook for bringing up ManyForge locally, with or
 without an assistant provider. This file intentionally stays compact and
@@ -102,7 +100,7 @@ precedence.
 
 ### Robot execution lanes
 
-#### ManyForge-only native
+#### Historical ManyForge-only native
 
 No LLM, no NemoClaw/OpenClaw dependency.
 
@@ -136,9 +134,10 @@ Set `LOAD_ARTIFACTS=false` only when you intentionally want to load them
 manually.
 
 The `composer-ros` service uses the full ROS-capable image with host
-networking so DDS can discover Isaac/robot endpoints. The default
-Composer services remain ROS-free and continue to use native simulated
-execution unless a deployment selects another adapter.
+networking so DDS can discover Isaac/robot endpoints. The former native
+simulated execution path is removed. Current development
+uses the ROS host through the Workbench; this historical Compose recipe has
+not been qualified as the complete current wrapper.
 
 The shipped `manyforge_ros2_control_execution` C++ adapter owns
 FollowJointTrajectory dispatch, feedback/settling, bounded stop/reset, and the
@@ -152,7 +151,7 @@ Use when:
 
 - validating ROS 2 controller endpoint discovery
 - testing Isaac Sim / ros2_control execution wiring
-- qualifying trajectory execution outside the native simulated backend
+- historical trajectory execution qualification through ROS controllers
 
 #### Supervised physical robot
 

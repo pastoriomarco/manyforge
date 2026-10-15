@@ -101,6 +101,18 @@ export async function closeScenario({ expected, signal, admissionGeneration,
     const processes = await api.cclc.componentProcessStopOffer(id);
     for (const inventory of processes.process_inventories) {
       for (const occurrence of inventory.process_occurrences) {
+        if (occurrence.process_owner_kind === 'pneumatic_none_local') {
+          const predecessor = current.status.active.publication;
+          const revision = inventory.request.predecessor_projection_revision;
+          if (!sameJson({ ...revision, scene_revision: { ...revision.scene_revision } }, predecessor.projection_revision)
+            || inventory.request.expected_predecessor_publication_generation !== predecessor.publication_generation
+            || inventory.request.expected_predecessor_public_pointer_digest !== predecessor.durable_public_pointer_content_digest) {
+            throw new Error('Applied configuration changed during Close.');
+          }
+          // The parsed Manager proof names an installed logical owner, with no
+          // child launch to Stop or drain. Lifecycle retirement still ran above.
+          continue;
+        }
         if (occurrence.cleanup_state === 'drained') continue;
         const request = { ...inventory.request, request_context: {
           request_id: identity(), request_owner_epoch: offer.scope.request_owner_epoch, source_label: 'composer_ui',

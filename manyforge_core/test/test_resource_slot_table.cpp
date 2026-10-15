@@ -795,4 +795,75 @@ TEST(ResourceSlotTableTest, SeparatesApplyStagedAndRoutePublishedConfigurations)
             active_configurations("active.cclc"));
 }
 
+TEST(ResourceSlotTableTest, StopFenceRevisesAllNonFencedSiblingsWithoutChangingTheirPhase) {
+  ResourceSlotTable table({ResourceId("arm.a"), ResourceId("arm.b"), ResourceId("output")});
+  const auto moving = owner("mixed", "a");
+  const auto unselected_motion = owner("mixed", "b");
+  const auto pneumatic = owner("mixed", "c");
+  ASSERT_TRUE(table.reserve_batch({reservation_owner(moving, {ResourceId("arm.a")}),
+      reservation_owner(unselected_motion, {ResourceId("arm.b")}),
+      reservation_owner(pneumatic, {ResourceId("output")})}).ok());
+  ASSERT_TRUE(table.transition(pneumatic, {ResourceId("output")}, ResourceSlotState::kDispatched).ok());
+  const auto before = table.coherent_snapshot();
+  const auto fenced = table.stop_fence_batch({before.operation_resource_generation, StopGeneration(3U),
+      {stop_fence_owner(moving, {ResourceId("arm.a")})}, {},
+      {stop_fence_owner(unselected_motion, {ResourceId("arm.b")}),
+       stop_fence_owner(pneumatic, {ResourceId("output")})}});
+  ASSERT_TRUE(fenced.ok()) << fenced.error().message;
+  const auto after = table.coherent_snapshot();
+  EXPECT_EQ(after.operation_resource_generation, before.operation_resource_generation + 1U);
+  ASSERT_EQ(after.slots.size(), 3U);
+  EXPECT_EQ(after.slots[0].state, ResourceSlotState::kStopping);
+  EXPECT_EQ(after.slots[0].stop_generation, StopGeneration(3U));
+  for (std::size_t index = 0U; index < after.slots.size(); ++index) {
+    ASSERT_TRUE(after.slots[index].owner);
+    EXPECT_EQ(after.slots[index].owner->operation_revision, OperationRevision(2U));
+    if (index != 0U) {
+      EXPECT_EQ(after.slots[index].state, before.slots[index].state);
+      EXPECT_EQ(after.slots[index].stop_generation, before.slots[index].stop_generation);
+    }
+  }
+  // Subsequent ordinary control consumes one coherent old revision.
+  std::vector<ResourceSlotReservationOwnerDTO> rows;
+  for (const auto& slot : after.slots) rows.push_back({*slot.owner, {slot.resource_id}});
+  EXPECT_TRUE(table.revise_owner_batch(rows, OperationRevision(3U)).ok());
+}
+
+TEST(ResourceSlotTableTest, RevisionOnlyStopFenceSupportsGenuineZeroMovingScope) {
+  ResourceSlotTable table({ResourceId("output")});
+  const auto output = owner();
+  ASSERT_TRUE(table.reserve(output, {ResourceId("output")}).ok());
+  ASSERT_TRUE(table.transition(output, {ResourceId("output")}, ResourceSlotState::kDispatched).ok());
+  const auto before = table.coherent_snapshot();
+  const auto revised = table.stop_fence_batch({before.operation_resource_generation, StopGeneration(2U),
+      {}, {}, {stop_fence_owner(output, {ResourceId("output")})}});
+  ASSERT_TRUE(revised.ok()) << revised.error().message;
+  const auto after = table.coherent_snapshot();
+  EXPECT_EQ(after.operation_resource_generation, before.operation_resource_generation + 1U);
+  EXPECT_EQ(after.slots.front().state, before.slots.front().state);
+  EXPECT_EQ(after.slots.front().stop_generation, before.slots.front().stop_generation);
+  EXPECT_EQ(after.slots.front().owner->operation_revision, OperationRevision(2U));
+}
+
+TEST(ResourceSlotTableTest, StopFenceCompanionFailureConservesEverySlotAndGeneration) {
+  for (const int invalid : {0, 1, 2, 3}) {
+    SCOPED_TRACE(invalid);
+    ResourceSlotTable table({ResourceId("a"), ResourceId("b")});
+    const auto first = owner("mixed", "a");
+    const auto second = owner("mixed", "b");
+    ASSERT_TRUE(table.reserve_batch({reservation_owner(first, {ResourceId("a")}),
+                                    reservation_owner(second, {ResourceId("b")})}).ok());
+    const auto before = table.coherent_snapshot();
+    ResourceSlotStopFenceRequestDTO request{before.operation_resource_generation, StopGeneration(1U),
+        {stop_fence_owner(first, {ResourceId("a")})}, {},
+        {stop_fence_owner(second, {ResourceId("b")})}};
+    if (invalid == 0) request.revision_only_owners.front().resources = {ResourceId("a")};
+    if (invalid == 1) request.revision_only_owners.front().expected_owner.control_route_id = ControlRouteId("foreign");
+    if (invalid == 2) request.revision_only_owners.front().next_operation_revision = OperationRevision(3U);
+    if (invalid == 3) request.revision_only_owners.front().resources = {ResourceId("missing")};
+    EXPECT_FALSE(table.stop_fence_batch(request).ok());
+    EXPECT_EQ(table.coherent_snapshot(), before);
+  }
+}
+
 }  // namespace

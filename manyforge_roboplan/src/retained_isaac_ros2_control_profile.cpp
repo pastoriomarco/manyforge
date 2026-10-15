@@ -472,7 +472,104 @@ make_retained_isaac_ros2_control_backend_config(
   gripper_config.result_timeout_s = profile.gripper_result_timeout_s;
 
   config.gripper = std::move(gripper_config);
+  configure_retained_gripper_output_mode(config, runtime_configuration, gripper);
   return config;
+}
+
+core::GripperActuationKind retained_ros2_control_gripper_actuation_kind(
+    const deployment::ros2_control_execution_runtime_contract::Configuration& configuration,
+    const core::RuntimeParticipantBinding& binding) {
+  const auto matches = [&](const auto& row) {
+    return row.controllable_component_id == binding.value().controllable_component_id &&
+           row.command_target_id == binding.value().command_target_id;
+  };
+  const auto found = std::find_if(configuration.gripper_target_configurations.begin(),
+      configuration.gripper_target_configurations.end(), matches);
+  if (found == configuration.gripper_target_configurations.end() ||
+      std::count_if(configuration.gripper_target_configurations.begin(),
+          configuration.gripper_target_configurations.end(), matches) != 1)
+    throw std::invalid_argument("retained ROS gripper requires one exact authored actuation row");
+  if (found->actuation_kind == "pneumatic") return core::GripperActuationKind::kPneumatic;
+  if (found->actuation_kind == "position_commanded") return core::GripperActuationKind::kPositionCommanded;
+  throw std::invalid_argument("retained ROS gripper actuation kind is not supported");
+}
+
+void configure_retained_gripper_output_mode(
+    RetainedRos2ControlBackendConfig& config,
+    const deployment::ros2_control_execution_runtime_contract::Configuration& configuration,
+    const core::RuntimeParticipantBinding& binding) {
+  const auto matches = [&](const auto& row) {
+    return row.controllable_component_id == binding.value().controllable_component_id &&
+           row.command_target_id == binding.value().command_target_id;
+  };
+  const auto found = std::find_if(configuration.gripper_target_configurations.begin(),
+      configuration.gripper_target_configurations.end(), matches);
+  if (!config.gripper || found == configuration.gripper_target_configurations.end() ||
+      std::count_if(configuration.gripper_target_configurations.begin(),
+          configuration.gripper_target_configurations.end(), matches) != 1)
+    throw std::invalid_argument("retained ROS gripper requires one exact authored output row");
+  config.gripper->actuation_kind = retained_ros2_control_gripper_actuation_kind(configuration, binding);
+  config.gripper->output_mode = found->output_mode;
+  if (config.gripper->actuation_kind ==
+      core::GripperActuationKind::kPneumatic) {
+    config.gripper->result_timeout_s =
+        found->delivery_result_timeout_s.value_or(1.0);
+    config.gripper->completion_policy =
+        found->output_mode == core::GripperOutputMode::kNone
+            ? "no_output"
+            : "output_delivery";
+  }
+  if (found->output_mode == core::GripperOutputMode::kCommanded) return;
+  if (found->output_mode != core::GripperOutputMode::kNone ||
+      config.gripper->actuation_kind != core::GripperActuationKind::kPneumatic)
+    throw std::invalid_argument("retained ROS no output requires its strict pneumatic target");
+  config.gripper->transport_kind.clear();
+  config.gripper->action_name.clear();
+  config.gripper->command_topic.clear();
+  config.gripper->command_joint_names.clear();
+  config.gripper->completion_policy = "no_output";
+  config.arm.gripper_controller.reset();
+}
+
+void configure_retained_mock_gripper_action(
+    RetainedRos2ControlBackendConfig& config,
+    const core::RuntimeParticipantBinding& gripper,
+    const MockControllerProfileFacts& profile,
+    const std::string_view runtime_namespace,
+    const std::string& controller_manager) {
+  if (gripper.value().resources.size() != 1U ||
+      gripper.value().resources.front().compiled_resource_name.empty() ||
+      !gripper.value().resources.front().source_joint_name.has_value() ||
+      gripper.value().resources.front().source_joint_name->empty() ||
+      !profile.gripper_controller_name.has_value()) {
+    throw std::invalid_argument(
+        "retained mock ROS gripper has no exact model-backed joint");
+  }
+  ros2_control_execution::Ros2GripperActionConfig gripper_config;
+  // Q74/Q79: the stock GripperActionController's GripperCommand action.
+  gripper_config.transport_kind = "ros_gripper_command";
+  gripper_config.action_name = scoped_name(
+      runtime_namespace, *profile.gripper_controller_name + "/gripper_cmd");
+  config.arm.gripper_controller = RetainedRos2ControlArmController{
+      controller_manager,
+      *profile.gripper_controller_name,
+      std::string(profile.hardware_component_name)};
+  gripper_config.command_joint_names = {
+      *gripper.value().resources.front().source_joint_name};
+  gripper_config.state_joint_name =
+      *gripper.value().resources.front().source_joint_name;
+  gripper_config.group_id =
+      sole_compiled_group(gripper, "retained mock ROS gripper binding");
+  gripper_config.joint_name =
+      gripper.value().resources.front().compiled_resource_name;
+  gripper_config.completion_policy = "position_reached";
+  // Open/closed positions and efforts drive only the Isaac effort topic
+  // transport; the action transport carries the request's own target.
+  gripper_config.publish_nominal_position = false;
+  gripper_config.state_freshness_timeout_s = 1.0;
+  gripper_config.wait_for_action_server_timeout_s = 2.0;
+  gripper_config.result_timeout_s = profile.gripper_result_timeout_s;
+  config.gripper = std::move(gripper_config);
 }
 
 RetainedRos2ControlBackendConfig
@@ -566,40 +663,9 @@ make_retained_mock_ros2_control_backend_config(
         compiled_joints[index], found->second);
   }
   if (gripper_binding.has_value()) {
-    const auto &gripper = *gripper_binding;
-    if (gripper.value().resources.size() != 1U ||
-        gripper.value().resources.front().compiled_resource_name.empty() ||
-        !gripper.value().resources.front().source_joint_name.has_value() ||
-        gripper.value().resources.front().source_joint_name->empty() ||
-        !profile.gripper_controller_name.has_value()) {
-      throw std::invalid_argument(
-          "retained mock ROS gripper has no exact model-backed joint");
-    }
-    ros2_control_execution::Ros2GripperActionConfig gripper_config;
-    // Q74/Q79: the stock GripperActionController's GripperCommand action.
-    gripper_config.transport_kind = "ros_gripper_command";
-    gripper_config.action_name = scoped_name(
-        runtime_namespace, *profile.gripper_controller_name + "/gripper_cmd");
-    config.arm.gripper_controller = RetainedRos2ControlArmController{
-        config.arm.controller.controller_manager,
-        *profile.gripper_controller_name,
-        std::string(profile.hardware_component_name)};
-    gripper_config.command_joint_names = {
-        *gripper.value().resources.front().source_joint_name};
-    gripper_config.state_joint_name =
-        *gripper.value().resources.front().source_joint_name;
-    gripper_config.group_id =
-        sole_compiled_group(gripper, "retained mock ROS gripper binding");
-    gripper_config.joint_name =
-        gripper.value().resources.front().compiled_resource_name;
-    gripper_config.completion_policy = "position_reached";
-    // Open/closed positions and efforts drive only the Isaac effort topic
-    // transport; the action transport carries the request's own target.
-    gripper_config.publish_nominal_position = false;
-    gripper_config.state_freshness_timeout_s = 1.0;
-    gripper_config.wait_for_action_server_timeout_s = 2.0;
-    gripper_config.result_timeout_s = profile.gripper_result_timeout_s;
-    config.gripper = std::move(gripper_config);
+    configure_retained_mock_gripper_action(config, *gripper_binding, profile,
+        runtime_namespace, config.arm.controller.controller_manager);
+    configure_retained_gripper_output_mode(config, runtime_configuration, *gripper_binding);
   }
   return config;
 }

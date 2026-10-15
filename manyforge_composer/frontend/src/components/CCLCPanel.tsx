@@ -126,6 +126,7 @@ export function CCLCPanelView({
     onDismiss: dismissError,
   });
   const [confirmation, setConfirmation] = useState<PendingConfirmation | null>(null);
+  const primitiveMessage = transaction?.error?.details.primitive_message;
   const routeUnavailableReason = snapshot === null
     ? 'Current component state is unavailable.'
     : busy
@@ -317,6 +318,7 @@ export function CCLCPanelView({
                   ? ` (${transaction.error.details.reason})` : '')
               : ''}
           </span>
+          {primitiveMessage?.trim() ? <p className="muted">{primitiveMessage}</p> : null}
           {(error !== null || transaction?.reconciliationRequired) && (
             <button type="button" disabled={busy} onClick={() => void reconcileTransaction()}>
               Reconcile

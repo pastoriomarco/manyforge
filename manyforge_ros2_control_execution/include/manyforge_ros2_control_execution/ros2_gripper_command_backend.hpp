@@ -18,6 +18,7 @@
 #include <chrono>
 #include <control_msgs/action/gripper_command.hpp>
 #include <cstdint>
+#include <functional>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
 #include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/time/iclock.hpp>
@@ -49,7 +50,7 @@ struct Ros2GripperActionConfig {
   // used by the execution-state projection sink.
   std::string state_joint_name;
   // Optional execution-state sink projection metadata. When set, the ROS
-  // gripper command/status path also updates the declared gripper group so
+  // position-commanded gripper path also updates the declared gripper group so
   // Composer's FK/link-pose scene state renders the gripper through the same
   // robot-state path as the arm.
   std::string group_id;
@@ -62,7 +63,14 @@ struct Ros2GripperActionConfig {
   bool publish_nominal_position = false;
   double state_freshness_timeout_s = 1.0;
   double wait_for_action_server_timeout_s = 2.0;
-  double result_timeout_s = 5.0;
+  // Omission uses the typed default: pneumatic 1s, position 5s.
+  std::optional<double> result_timeout_s;
+  core::GripperActuationKind actuation_kind{
+      core::GripperActuationKind::kPositionCommanded};
+  /// Pneumatic display only; never an authoritative execution-state
+  /// publication.
+  std::function<core::Result<void>(double)> publish_display_position;
+  core::GripperOutputMode output_mode{core::GripperOutputMode::kCommanded};
 };
 
 /// One bounded, non-blocking readiness read for a configured gripper
@@ -75,12 +83,17 @@ struct Ros2GripperTransportReadinessSnapshot {
   bool configured{};
   bool command_path_ready{};
   bool feedback_path_ready{};
-  // Physical transport readiness; command admission belongs to the owner.
+  // Physical transport readiness for commanded output, or explicit local
+  // owner readiness for none; command admission belongs to the owner.
   bool ready{};
   std::uint64_t feedback_publisher_count{};
   std::uint64_t feedback_messages_received{};
   std::uint64_t feedback_samples_matched{};
   std::vector<std::string> reason_codes;
+
+  core::GripperOutputMode output_mode{core::GripperOutputMode::kCommanded};
+  // A configured local owner, independent of any physical transport path.
+  bool logical_owner_ready{};
 
   friend bool
   operator==(const Ros2GripperTransportReadinessSnapshot &,
@@ -106,6 +119,10 @@ public:
   gripper_transport_readiness(const std::string &gripper_id) const;
   [[nodiscard]] core::Result<void> validate_gripper_command(
       const core::GripperCommandRequestDTO &request) const override;
+  core::GripperActuationKind
+  gripper_actuation_kind(const std::string &gripper_id) const override;
+  [[nodiscard]] core::GripperOutputMode
+  gripper_output_mode(const std::string &gripper_id) const override;
   core::GripperCommandResultDTO
   command_gripper(const core::GripperCommandRequestDTO &request) override;
   core::GripperCommandResultDTO mark_gripper_grasp_lost(
@@ -151,6 +168,7 @@ private:
     double target_position = 0.0;
     double duration_s = 0.0;
     core::TimePoint started_at_ns = 0;
+    std::optional<core::TimePoint> delivered_at_ns;
     std::optional<core::TimePoint> deadline_at_ns;
     std::string commanded_state;
     std::string actuation_kind;
@@ -170,6 +188,11 @@ private:
     std::string error;
     std::string reason_code;
   };
+
+  void advance_pneumatic_locked(GripperRuntime &runtime) const;
+  void confirm_pneumatic_delivery_locked(GripperRuntime &runtime);
+  void publish_pneumatic_display(const std::shared_ptr<GripperRuntime> &runtime,
+                                 double fallback_position) noexcept;
 
   std::optional<double>
   scene_group_joint_position(const std::string &group_id,
@@ -213,7 +236,9 @@ private:
   // per-runtime leaf lock.
   mutable std::mutex gripper_authority_mutex_;
   std::uint64_t gripper_authority_generation_ = 1;
-  bool gripper_admission_blocked_ = false;
+  std::uint64_t gripper_lifecycle_generation_ = 1;
+  bool gripper_admission_blocked_ = false; // Destructive lifecycle fence.
+  bool gripper_motion_admission_blocked_ = false; // Stop affects motion only.
   mutable std::mutex gripper_map_mutex_;
   std::unordered_map<std::string, std::shared_ptr<GripperRuntime>> grippers_;
   std::atomic<std::uint64_t> next_gripper_command_id_{1};

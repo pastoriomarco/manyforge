@@ -74,11 +74,12 @@ value_schemas:
     schema_revision: sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785
     relative_path: value/manyforge.value_schema.runtime.empty.v1.yaml
     qualification: qualified
+  # DX-753: retain archival native schema for shared Draft/import validation.
   - schema_id: manyforge.value_schema.runtime.native_execution.v1
     schema_revision: sha256:97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48
     relative_path: value/manyforge.value_schema.runtime.native_execution.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-    schema_revision: sha256:c4e6e1a1418852f773520a2c3c02ffde66883e2dca3963a218bf28e2356ca16c
+    schema_revision: sha256:20f76c1fa9f103c6f008029505639a45ec6f9166305156b31d43056235544483
     relative_path: value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml
     qualification: qualified

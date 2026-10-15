@@ -31,6 +31,7 @@
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/model_source.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -48,6 +49,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "../../manyforge_component_manager/src/manager_liveness_rpc_internal.hpp"
@@ -1909,8 +1911,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,
-     GripperOnlyManagedCompositionNeedsNoMotionProjectionAcrossRestart) {
-  GTEST_SKIP() << "NOT_RUN/A1: selected ROS product requires a nonempty matching motion-target limit; gripper-only cell support awaits A1";
+     StandaloneRobotiqPositionCompositionNeedsNoArmProjectionAcrossRestart) {
   NativeFixture fixture(MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT);
   const auto manifest = deployment::parse_strict_json_model_yaml(
       ReadFile(fixture.root / "manifest.json"));
@@ -1919,9 +1920,182 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_NE(gripper_only, nullptr);
   ASSERT_TRUE(gripper_only->is_bool());
   ASSERT_TRUE(gripper_only->as_bool());
+  ASSERT_EQ(TextMember(manifest.root(), "gripper_actuation_kind"), "position_commanded");
+  ASSERT_EQ(TextMember(manifest.root(), "gripper_output_mode"), "commanded");
   for (const auto field : {"target_role_id", "execution_capability_id",
                            "planning_capability_ids", "source_joint_names"}) {
     EXPECT_EQ(manifest.root().find_object_member(field), nullptr) << field;
+  }
+  // Cold readers must recover only the genuine standalone Robotiq source,
+  // one independent angular command resource and its five real mimic joints.
+  const auto &graph = fixture.bundle->value().cell_graph;
+  ASSERT_EQ(graph.model_instances.size(), 1U);
+  EXPECT_EQ(graph.model_instances.front().model_asset_id.value(), "robotiq_2f_85");
+  ASSERT_EQ(graph.controllable_components.size(), 1U);
+  EXPECT_EQ(graph.controllable_components.front().controllable_component_id.value(), "robotiq_gripper");
+  ASSERT_EQ(graph.control_bindings.size(), 2U);
+  const auto &command_binding = graph.control_bindings.front();
+  const auto &feedback_binding = graph.control_bindings.back();
+  EXPECT_EQ(feedback_binding.capability_id.value(), "tool.gripper.feedback");
+  EXPECT_EQ(feedback_binding.controllable_component_id, command_binding.controllable_component_id);
+  EXPECT_EQ(feedback_binding.command_target_id, command_binding.command_target_id);
+  EXPECT_EQ(feedback_binding.control_domain_id, command_binding.control_domain_id);
+  EXPECT_EQ(feedback_binding.resource_bindings, command_binding.resource_bindings);
+  EXPECT_EQ(feedback_binding.provider_instance_id, command_binding.provider_instance_id);
+  EXPECT_EQ(feedback_binding.provider_runtime_unit_id, command_binding.provider_runtime_unit_id);
+  EXPECT_EQ(feedback_binding.controller_topology_id, command_binding.controller_topology_id);
+  EXPECT_EQ(feedback_binding.control_interface_contract_id, command_binding.control_interface_contract_id);
+  EXPECT_EQ(feedback_binding.control_interface_revision, command_binding.control_interface_revision);
+  EXPECT_EQ(feedback_binding.topology_revision, command_binding.topology_revision);
+  EXPECT_EQ(feedback_binding.provider_manifest_id, command_binding.provider_manifest_id);
+  EXPECT_EQ(feedback_binding.provider_manifest_revision, command_binding.provider_manifest_revision);
+  EXPECT_EQ(feedback_binding.legal_control_route_ids, command_binding.legal_control_route_ids);
+  EXPECT_EQ(feedback_binding.route_endpoint_projections, command_binding.route_endpoint_projections);
+  EXPECT_EQ(feedback_binding.state_authority_id, command_binding.state_authority_id);
+  EXPECT_EQ(feedback_binding.state_authority_class, command_binding.state_authority_class);
+  EXPECT_EQ(feedback_binding.stop_evidence_policy_id, command_binding.stop_evidence_policy_id);
+  EXPECT_EQ(feedback_binding.stop_evidence_policy_revision, command_binding.stop_evidence_policy_revision);
+  EXPECT_EQ(feedback_binding.containment_granularity, command_binding.containment_granularity);
+  EXPECT_EQ(graph.control_bindings.front().capability_id.value(), "tool.gripper.command");
+  EXPECT_EQ(graph.control_bindings.front().stop_evidence_policy_id.value(),
+            "manyforge.gripper_position_cancellation");
+  ASSERT_EQ(graph.control_domains.size(), 1U);
+  EXPECT_EQ(command_binding.control_domain_id, graph.control_domains.front().control_domain_id);
+  EXPECT_EQ(command_binding.provider_runtime_unit_id, graph.runtime_units.front().runtime_unit_id);
+  EXPECT_TRUE(graph.component_attachments.empty());
+  const auto configuration = contract::require_configuration(
+      *fixture.bundle, graph.runtime_units.front().runtime_unit_id);
+  EXPECT_TRUE(configuration.initial_joint_positions_rad.empty());
+  EXPECT_TRUE(configuration.motion_target_limits.empty());
+  EXPECT_FALSE(configuration.isaac_world.has_value());
+  ASSERT_EQ(configuration.controller_profiles.size(), 1U);
+  EXPECT_EQ(configuration.controller_profiles.front().controllable_component_id,
+            command_binding.controllable_component_id);
+  EXPECT_EQ(configuration.controller_profiles.front().mock_profile,
+            std::optional<std::string>("ur5e_robotiq_2f_85"));
+  ASSERT_EQ(configuration.gripper_target_configurations.size(), 1U);
+  const auto &authored = configuration.gripper_target_configurations.front();
+  EXPECT_EQ(authored.actuation_kind, "position_commanded");
+  EXPECT_EQ(authored.output_mode, core::GripperOutputMode::kCommanded);
+  EXPECT_EQ(authored.command_duration_s, 1.0);
+  EXPECT_FALSE(authored.delivery_result_timeout_s.has_value());
+  EXPECT_EQ(authored.mount_frame, "robotiq_85_base_link");
+  EXPECT_EQ(authored.attach_frame, "robotiq_85_base_link");
+  EXPECT_EQ(authored.tcp_frame, "robotiq_85_base_link");
+  EXPECT_EQ(authored.touch_links.size(), 9U);
+  const auto &products = fixture.bundle->value().compiled_products;
+  ASSERT_EQ(products.symbol_role_maps.size(), 1U);
+  deployment::FilesystemVerifiedRetainedModelMapSource maps(fixture.root / "retained-package");
+  const auto model_map = maps.get_verified({fixture.bundle->retained_bundle_id(),
+      products.symbol_role_maps.front().product_id});
+  ASSERT_TRUE(model_map.has_value());
+  ASSERT_EQ(model_map->targets().size(), 1U);
+  ASSERT_EQ(model_map->control_bindings().size(), 2U);
+  EXPECT_EQ(model_map->control_bindings().front().control_binding_id, command_binding.control_binding_id);
+  EXPECT_EQ(model_map->control_bindings().back().control_binding_id, feedback_binding.control_binding_id);
+  EXPECT_EQ(model_map->control_bindings().front().resources,
+            model_map->control_bindings().back().resources);
+  ASSERT_EQ(model_map->model_occurrences().size(), 1U);
+  EXPECT_EQ(model_map->model_occurrences().front().owner_model_role_id,
+            std::optional(core::ModelRoleId("gripper_model")));
+  const auto &resources = model_map->control_bindings().front().resources;
+  ASSERT_EQ(resources.size(), 1U);
+  ASSERT_EQ(resources.front().coordinates.size(), 6U);
+  EXPECT_EQ(resources.front().coordinates.front().source_joint_name,
+            "robotiq_85_left_knuckle_joint");
+  EXPECT_FALSE(resources.front().coordinates.front().derived_mimic);
+  EXPECT_EQ(resources.front().coordinates.front().coordinate_kind,
+            deployment::UrdfCoordinateKind::kAngular);
+  EXPECT_EQ(std::count_if(resources.front().coordinates.begin(), resources.front().coordinates.end(),
+      [](const auto &row) { return row.derived_mimic; }), 5);
+  for (const auto &row : resources.front().coordinates)
+    EXPECT_EQ(row.coordinate_kind, deployment::UrdfCoordinateKind::kAngular);
+  ASSERT_EQ(model_map->coordinates().size(), 8U);
+  EXPECT_EQ(std::count_if(model_map->coordinates().begin(), model_map->coordinates().end(),
+      [](const auto &row) { return row.coordinate_kind == deployment::UrdfCoordinateKind::kAngular; }), 6);
+  EXPECT_EQ(std::count_if(model_map->coordinates().begin(), model_map->coordinates().end(),
+      [](const auto &row) { return row.coordinate_kind == deployment::UrdfCoordinateKind::kNone &&
+                                 row.joint_type == deployment::UrdfJointType::kFixed; }), 2);
+  EXPECT_EQ(std::count_if(model_map->coordinates().begin(), model_map->coordinates().end(),
+      [](const auto &row) { return row.coordinate_kind != deployment::UrdfCoordinateKind::kNone &&
+                                 !row.mimic_source_compiled_joint_name.has_value(); }), 1);
+  EXPECT_EQ(std::count_if(model_map->coordinates().begin(), model_map->coordinates().end(),
+      [](const auto &row) { return row.mimic_source_compiled_joint_name.has_value(); }), 5);
+  for (const auto &row : model_map->coordinates())
+    EXPECT_TRUE(row.source_joint_name.starts_with("robotiq_85_")) << row.source_joint_name;
+  deployment::FilesystemVerifiedRetainedPlanningModelSource planning_source(fixture.root / "retained-package");
+  const auto model = planning_source.get_verified({fixture.bundle->retained_bundle_id(),
+      products.planning_collision_model.product_id});
+  ASSERT_TRUE(model.has_value());
+  ASSERT_EQ(model->model_source_urdfs().size(), 1U);
+  const auto source_documents = deployment::parse_model_documents_for_projection(
+      model->model_source_urdfs().front().urdf_bytes, std::nullopt);
+  EXPECT_EQ(source_documents.urdf.links.size(), 9U);
+  ASSERT_EQ(source_documents.urdf.joints.size(), 8U);
+  const auto master = std::find_if(source_documents.urdf.joints.begin(), source_documents.urdf.joints.end(),
+      [](const auto &joint) { return joint.name == "robotiq_85_left_knuckle_joint"; });
+  ASSERT_NE(master, source_documents.urdf.joints.end());
+  ASSERT_TRUE(master->limit.has_value());
+  EXPECT_EQ(master->limit->lower, 0.0);
+  EXPECT_EQ(master->limit->upper, 0.8);
+  EXPECT_EQ(master->limit->velocity, 0.5);
+  EXPECT_EQ(master->limit->effort, 50.0);
+  EXPECT_FALSE(master->mimic.has_value());
+  EXPECT_EQ(std::count_if(source_documents.urdf.joints.begin(), source_documents.urdf.joints.end(),
+      [](const auto &joint) { return joint.mimic.has_value(); }), 5);
+  for (const auto &joint : source_documents.urdf.joints) {
+    const auto coordinate = std::find_if(model_map->coordinates().begin(), model_map->coordinates().end(),
+        [&](const auto &row) { return row.source_joint_name == joint.name; });
+    ASSERT_NE(coordinate, model_map->coordinates().end()) << joint.name;
+    EXPECT_EQ(coordinate->joint_type, joint.type) << joint.name;
+    EXPECT_EQ(coordinate->coordinate_kind, joint.coordinate_kind) << joint.name;
+    ASSERT_EQ(coordinate->mimic_source_compiled_joint_name.has_value(), joint.mimic.has_value()) << joint.name;
+    if (joint.mimic) {
+      const auto parent = std::find_if(model_map->coordinates().begin(), model_map->coordinates().end(),
+          [&](const auto &row) { return row.source_joint_name == joint.mimic->joint_name; });
+      ASSERT_NE(parent, model_map->coordinates().end()) << joint.name;
+      EXPECT_EQ(*coordinate->mimic_source_compiled_joint_name, parent->compiled_joint_name);
+      EXPECT_EQ(coordinate->mimic_multiplier, joint.mimic->multiplier);
+      EXPECT_EQ(coordinate->mimic_offset, joint.mimic->offset);
+    }
+  }
+  for (const auto &link : source_documents.urdf.links)
+    EXPECT_TRUE(link.name.starts_with("robotiq_85_")) << link.name;
+  deployment::FilesystemVerifiedCatalogArtifactSource catalogs(fixture.root / "retained-package");
+  const core::StopEvidencePolicyCatalogRecordRefDTO *policy = nullptr;
+  for (const auto &record : fixture.bundle->value().catalogs.records) {
+    const auto *row = std::get_if<core::StopEvidencePolicyCatalogRecordRefDTO>(&record);
+    if (row == nullptr || row->record_id != graph.control_bindings.front().stop_evidence_policy_id) continue;
+    ASSERT_EQ(policy, nullptr);
+    policy = row;
+  }
+  ASSERT_NE(policy, nullptr);
+  const auto policy_bytes = catalogs.get_verified(policy->content_addressed_store_key, policy->content_digest);
+  ASSERT_TRUE(policy_bytes.has_value());
+  const auto policy_document = deployment::parse_strict_json_model_yaml(*policy_bytes);
+  const auto *stages = policy_document.root().find_object_member("escalation_stages");
+  ASSERT_NE(stages, nullptr);
+  ASSERT_EQ(stages->as_array().size(), 2U);
+  EXPECT_EQ(std::count_if(stages->as_array().begin(), stages->as_array().end(), [](const auto &stage) {
+    return TextMember(stage, "stage_kind") == "software_hard";
+  }), 1);
+  const auto program = deployment::parse_strict_json_model_yaml(ReadFile(fixture.root / "program.json"));
+  const auto *tree = program.root().find_object_member("tree");
+  ASSERT_NE(tree, nullptr);
+  const auto *children = tree->find_object_member("children");
+  ASSERT_NE(children, nullptr);
+  ASSERT_EQ(children->as_array().size(), 2U);
+  for (std::size_t index = 0; index < 2U; ++index) {
+    const auto &node = children->as_array()[index];
+    EXPECT_EQ(TextMember(node, "node_id"), "gripper.command_position");
+    const auto *parameters = node.find_object_member("parameters");
+    ASSERT_NE(parameters, nullptr);
+    EXPECT_EQ(TextMember(*parameters, "target_role"), "gripper");
+    const auto *position = parameters->find_object_member("position");
+    ASSERT_NE(position, nullptr);
+    EXPECT_EQ(TextMember(*position, "kind"), "named_preset");
+    EXPECT_EQ(TextMember(*position, "name"), index == 0U ? "closed" : "open");
+    EXPECT_EQ(parameters->find_object_member("command_duration_s")->as_number(), 1.0);
   }
   static_cast<void>(PublishActiveFixture(fixture));
   auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT);
@@ -1976,18 +2150,66 @@ TEST(RetainedNativeRuntimeUnitAdapter,
     ASSERT_NE(components, nullptr);
     ASSERT_TRUE(components->is_array());
     ASSERT_EQ(components->as_array().size(), 1U);
+    EXPECT_EQ(TextMember(components->as_array().front(), "controllable_component_id"),
+              command_binding.controllable_component_id.value());
     const auto *target_rows =
         components->as_array().front().find_object_member("targets");
     ASSERT_NE(target_rows, nullptr);
     ASSERT_TRUE(target_rows->is_array());
-    ASSERT_EQ(target_rows->as_array().size(), 1U);
-    const auto &target = target_rows->as_array().front();
+    // Raw catalog aliases remain visible: feedback has no second manual
+    // actuator. Select the command by capability, independently of row order.
+    ASSERT_EQ(target_rows->as_array().size(), 2U);
+    std::map<std::string, const CanonicalValue *> aliases;
+    for (const auto &row : target_rows->as_array()) {
+      EXPECT_EQ(TextMember(row, "command_target_id"), command_binding.command_target_id.value());
+      const auto capability = TextMember(row, "operation_capability_id");
+      ASSERT_TRUE(capability == "tool.gripper.command" || capability == "tool.gripper.feedback");
+      ASSERT_TRUE(aliases.emplace(capability, &row).second);
+    }
+    ASSERT_EQ(aliases.size(), 2U);
+    const auto &target = *aliases.at("tool.gripper.command");
+    const auto &feedback_target = *aliases.at("tool.gripper.feedback");
+    EXPECT_EQ(TextMember(feedback_target, "presentation"), "unsupported");
+    const auto *feedback_command = feedback_target.find_object_member("command");
+    ASSERT_NE(feedback_command, nullptr);
+    EXPECT_TRUE(feedback_command->is_null());
     EXPECT_EQ(TextMember(target, "presentation"), "gripper");
     EXPECT_EQ(TextMember(target, "operation_capability_id"),
               "tool.gripper.command");
     const auto *command = target.find_object_member("command");
     ASSERT_NE(command, nullptr);
     ASSERT_TRUE(command->is_object());
+    const auto *descriptor = command->find_object_member("target_descriptor");
+    ASSERT_NE(descriptor, nullptr);
+    EXPECT_EQ(TextMember(*descriptor, "controllable_component_id"),
+              command_binding.controllable_component_id.value());
+    EXPECT_EQ(TextMember(*descriptor, "command_target_id"), command_binding.command_target_id.value());
+    EXPECT_EQ(TextMember(*descriptor, "schema_version"),
+              "manyforge.manual_control_gripper_descriptor.v3");
+    EXPECT_EQ(TextMember(*descriptor, "actuation_kind"), "position_commanded");
+    EXPECT_EQ(TextMember(*descriptor, "output_mode"), "commanded");
+    EXPECT_EQ(TextMember(*descriptor, "completion_policy"), "goal_fenced_target_reached");
+    EXPECT_EQ(TextMember(*descriptor, "grasp_confirmation_policy"),
+              "binding_feedback_required");
+    EXPECT_EQ(TextMember(*descriptor, "coordinate_kind"), "angular_rad");
+    EXPECT_EQ(TextMember(*descriptor, "source_coordinate_name"), "robotiq_85_left_knuckle_joint");
+    EXPECT_EQ(descriptor->find_object_member("min_position")->as_number(), 0.0);
+    EXPECT_EQ(descriptor->find_object_member("max_position")->as_number(), 0.8);
+    const auto *followers = descriptor->find_object_member("mimic_followers");
+    ASSERT_NE(followers, nullptr);
+    EXPECT_EQ(followers->as_array().size(), 5U);
+    EXPECT_EQ(TextMember(*descriptor, "source_group_name"), "robotiq_2f_85_gripper");
+    const auto *presets = descriptor->find_object_member("named_presets");
+    ASSERT_NE(presets, nullptr);
+    ASSERT_EQ(presets->as_array().size(), 2U);
+    std::set<std::string> preset_names;
+    for (const auto &preset : presets->as_array()) {
+      const auto name = TextMember(preset, "name");
+      ASSERT_TRUE(name == "closed" || name == "open");
+      EXPECT_TRUE(preset_names.insert(name).second);
+      EXPECT_EQ(preset.find_object_member("master_position")->as_number(),
+                name == "closed" ? 0.8 : 0.0);
+    }
     const auto *manual = command->find_object_member("manual_control");
     ASSERT_NE(manual, nullptr);
     ASSERT_TRUE(manual->is_object());
@@ -2000,10 +2222,26 @@ TEST(RetainedNativeRuntimeUnitAdapter,
     const auto *observed = control->find_object_member("observed_targets");
     ASSERT_NE(observed, nullptr);
     ASSERT_TRUE(observed->is_array());
+    // Observations follow the one installed physical command channel;
+    // the raw feedback alias does not create a second state owner.
     ASSERT_EQ(observed->as_array().size(), 1U);
+    EXPECT_EQ(TextMember(observed->as_array().front(), "controllable_component_id"),
+              command_binding.controllable_component_id.value());
+    EXPECT_EQ(TextMember(observed->as_array().front(), "command_target_id"),
+              command_binding.command_target_id.value());
     EXPECT_EQ(TextMember(observed->as_array().front(),
                          "operation_capability_id"),
               "tool.gripper.command");
+    const auto *coordinate_observation =
+        observed->as_array().front().find_object_member("observed");
+    ASSERT_NE(coordinate_observation, nullptr);
+    // This is the retained Position observation channel. Initial projection
+    // is not a receipt of a command or measured reached feedback; the separate
+    // Manager/CCLC qualification owns those actual effects.
+    ASSERT_FALSE(coordinate_observation->is_null());
+    EXPECT_EQ(TextMember(*coordinate_observation, "kind"), "coordinate");
+    EXPECT_EQ(TextMember(*coordinate_observation, "source_coordinate_name"),
+              "robotiq_85_left_knuckle_joint");
     EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
   }

@@ -299,7 +299,7 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "isaac_lite6_robot.arm.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:f2cba86c5c2f3e2a3832010cb02203db1eedc7651ae581df7f96abd09c2230fd",
+      "capability_provider_binding_revision": "sha256:91d4947c1d95942e28faecc33a898321fe5c7b35760ae026a5738b8839015104",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -310,13 +310,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "controllable_component_id": "isaac_lite6_robot"
       }
     },
@@ -324,7 +324,7 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "isaac_lite6_robot.arm.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:20375d9b91c19f19ed9f5980eab1a5e996c511799c1d37c308496a2d7da0f0d0",
+      "capability_provider_binding_revision": "sha256:4d0b1d345a72a6f12edb483027bc4a7dfdf39401e04777621036760dd852a826",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -335,13 +335,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "controllable_component_id": "isaac_lite6_robot"
       }
     },
@@ -349,7 +349,7 @@
       "capability_definition_revision": "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00",
       "capability_id": "planning.motion.cartesian_path",
       "capability_provider_binding_id": "isaac_lite6_robot.arm.planning-motion-cartesian_path.provider",
-      "capability_provider_binding_revision": "sha256:5194eedc28f986ed3822d5780efc7f974eb58d769a7b487e3812b4040b67bc25",
+      "capability_provider_binding_revision": "sha256:4609001f08aabc87c2abe513a557a8b15db79a3c77e8ea9b6fbd0707f64ae954",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -360,13 +360,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "controllable_component_id": "isaac_lite6_robot"
       }
     },
@@ -374,7 +374,7 @@
       "capability_definition_revision": "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
       "capability_id": "planning.motion.joint_goal",
       "capability_provider_binding_id": "isaac_lite6_robot.arm.planning-motion-joint_goal.provider",
-      "capability_provider_binding_revision": "sha256:99431f775f8a134a421eb944c47e3eefa197e66f23c7ebf7b7d98d78580615ef",
+      "capability_provider_binding_revision": "sha256:693bac677a4a52a5cbec389e4f740bab6aa126d01eb15549752924825da7fdda",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -385,13 +385,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "controllable_component_id": "isaac_lite6_robot"
       }
     },
@@ -399,7 +399,7 @@
       "capability_definition_revision": "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148",
       "capability_id": "planning.motion.pose_goal",
       "capability_provider_binding_id": "isaac_lite6_robot.arm.planning-motion-pose_goal.provider",
-      "capability_provider_binding_revision": "sha256:f6bf093e530bcd2b7fb81ea2bc6e97c530d82916328cebc307429a2ac1ae4974",
+      "capability_provider_binding_revision": "sha256:96b07d17532c1425e76bc9cc2400d1f2de9cd08923195fa2784d012dce0c5e66",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -410,13 +410,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "controllable_component_id": "isaac_lite6_robot"
       }
     },
@@ -424,7 +424,7 @@
       "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
       "capability_id": "planning.profile.balanced",
       "capability_provider_binding_id": "isaac_lite6_robot.arm.planning-profile-balanced.provider",
-      "capability_provider_binding_revision": "sha256:c7346070a53d2b5db1fec9e17fe5e2ff118de2229ab1be5e36aa98be94b08f79",
+      "capability_provider_binding_revision": "sha256:96cbb555f9f3e367f7e666a631dd951adc95012f2e31dc3838024c801d1f4953",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -435,13 +435,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "controllable_component_id": "isaac_lite6_robot"
       }
     },
@@ -449,7 +449,7 @@
       "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
       "capability_id": "planning.profile.first_feasible",
       "capability_provider_binding_id": "isaac_lite6_robot.arm.planning-profile-first_feasible.provider",
-      "capability_provider_binding_revision": "sha256:93d85098b9eb37f76264bbaa43e8115f304c4dd295ba237dcfbd6cd65fc334f7",
+      "capability_provider_binding_revision": "sha256:3bf276921cd59d8d663bbf565fda08c4e9526cdc1ace8fa8730971e4f514ef39",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -460,13 +460,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "controllable_component_id": "isaac_lite6_robot"
       }
     },
@@ -474,7 +474,7 @@
       "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
       "capability_id": "planning.profile.quality_bounded",
       "capability_provider_binding_id": "isaac_lite6_robot.arm.planning-profile-quality_bounded.provider",
-      "capability_provider_binding_revision": "sha256:48f264add91cac190d2f88ae5ce96d751db7710169cd2c3ed35b038a3bfb755f",
+      "capability_provider_binding_revision": "sha256:4aa36b4fafca7222dae17c5d78cb284c2c855da43f9e3cfa88da88740229ff9e",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -485,13 +485,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "controllable_component_id": "isaac_lite6_robot"
       }
     },
@@ -499,7 +499,7 @@
       "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
       "capability_id": "planning.trajectory.time_parameterized",
       "capability_provider_binding_id": "isaac_lite6_robot.arm.planning-trajectory-time_parameterized.provider",
-      "capability_provider_binding_revision": "sha256:3387a230cf2773c8e75eac89ae99bfa446624f999c13731d7d5b300bc08d317c",
+      "capability_provider_binding_revision": "sha256:f7e4721ee2334f485f7ae2dabb14745004f33d01df2154fbd086e2e0f47c624e",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -510,13 +510,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "controllable_component_id": "isaac_lite6_robot"
       }
     },
@@ -524,7 +524,7 @@
       "capability_definition_revision": "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653",
       "capability_id": "validation.trajectory.non_collision",
       "capability_provider_binding_id": "isaac_lite6_robot.arm.validation-trajectory-non_collision.provider",
-      "capability_provider_binding_revision": "sha256:406de5e93c79918d478026d68252a6bacf6c362faa0f3d3095166572ab78e540",
+      "capability_provider_binding_revision": "sha256:27fd628bd017c9b1e3f78253400bfe23794315de940e6e6d6720f832a5d4f8d9",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -535,13 +535,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "controllable_component_id": "isaac_lite6_robot"
       }
     },
@@ -549,7 +549,7 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "isaac_lite6_robot.gripper.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:27fb0b4797fedce7b092c3679f84c852c044d2daad1dc406e1c72d2176bcff93",
+      "capability_provider_binding_revision": "sha256:0a84f0338e5d5c46beae7c9d3b103a185f88cc507150d3a17b1e807221d46e87",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -560,13 +560,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "gripper",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:107ec999a95003d524753b7158cf689de3a15d280e7d7811bd4e5b67a48ffd4c",
+        "control_binding_revision": "sha256:7da8051b5f3482ea8f6c2ecc390e907459a1d93a668a6d3f239f3a57ebebc31f",
         "controllable_component_id": "isaac_lite6_robot"
       }
     },
@@ -574,7 +574,7 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "isaac_lite6_robot.gripper.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:275a2be1a615f6834fb0d900e5a2fc52f7a6d31db570d6a3a1422f7d678d4368",
+      "capability_provider_binding_revision": "sha256:07d640e9b8be27452954ab60b30b0162141fd60974801abfb25199b74d49a974",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -585,13 +585,13 @@
       ],
       "provider_instance_id": "isaac_lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+      "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
       "scope": "target_binding",
       "target": {
         "command_target_id": "gripper",
         "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
         "control_binding_id": "isaac_lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:107ec999a95003d524753b7158cf689de3a15d280e7d7811bd4e5b67a48ffd4c",
+        "control_binding_revision": "sha256:7da8051b5f3482ea8f6c2ecc390e907459a1d93a668a6d3f239f3a57ebebc31f",
         "controllable_component_id": "isaac_lite6_robot"
       }
     }
@@ -1022,20 +1022,20 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/provider_manifest/manyforge.provider.ros2_control/85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
-        "content_digest": "sha256:fc15a2eee345dceaadb94654e9e47b170d89310966a678e8e03a2ff3e22d7026",
+        "content_addressed_store_key": "catalog/maintained/provider_manifest/manyforge.provider.ros2_control/cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
+        "content_digest": "sha256:5721fc4259f1cd19706946bbc184dc497b4d449fee47c855a7a025c8e08c81ba",
         "record_id": "manyforge.provider.ros2_control",
         "record_kind": "provider_manifest",
-        "record_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+        "record_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
         "schema_id": "manyforge.provider_manifest.v1",
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/d736dfddeb0f8848d621375b955d72fa717ed61e8f45082663a19bd07a6490f0",
-        "content_digest": "sha256:6f2f891fbaf9240c2ad24eb5e9afb5567b4c34a3db1a955a3c59d331bc5b56c1",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/1633c7226de6d49382aed9868d2bc5285a7b2dbf294455b137f0f52caf4f31eb",
+        "content_digest": "sha256:5f07324b2c8eb913caa79211461ae186278e68e6c1dde767744738225ed875a5",
         "record_id": "manyforge.ros2_control_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:d736dfddeb0f8848d621375b955d72fa717ed61e8f45082663a19bd07a6490f0",
+        "record_revision": "sha256:1633c7226de6d49382aed9868d2bc5285a7b2dbf294455b137f0f52caf4f31eb",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1049,11 +1049,11 @@
         "schema_revision": "sha256:d55eb024cdd03360b1833671b656c962b2608227a1f1b47ed67cc019b5442f13"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/stop_evidence_policy/manyforge.controller_goal_terminal/7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
-        "content_digest": "sha256:482f9c87840ab7f97034ded54ad29087f8831cf3d5565ba2112cea3d5c854581",
-        "record_id": "manyforge.controller_goal_terminal",
+        "content_addressed_store_key": "catalog/maintained/stop_evidence_policy/manyforge.gripper_logical_cancellation/0e22817d03b2c68f3a338483b87ea016646435531a21980b18c05ecbe01cb4cc",
+        "content_digest": "sha256:609d45896cc9017b300e8b98f460a5282b02c0001ec593b7e47a3bcd1a2db4e0",
+        "record_id": "manyforge.gripper_logical_cancellation",
         "record_kind": "stop_evidence_policy",
-        "record_revision": "sha256:7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
+        "record_revision": "sha256:0e22817d03b2c68f3a338483b87ea016646435531a21980b18c05ecbe01cb4cc",
         "schema_id": "manyforge.stop_evidence_policy.v2",
         "schema_revision": "sha256:d55eb024cdd03360b1833671b656c962b2608227a1f1b47ed67cc019b5442f13"
       }
@@ -1073,7 +1073,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_lite6_lite_gripper_pick_and_place",
-  "deployment_revision": "sha256:04ef3538d3dbcd48ae1ab6aa4d64aa661c551509ca99ee33d0a19725765e7654",
+  "deployment_revision": "sha256:ea47ae8532d4bdf2edb1c055d70db11720ff7b886dfaf0e45d123fb0c47a8596",
   "description": "Retained Isaac commanded-simulation pick-and-place deployment for UFACTORY Lite6 with the articulated lite pneumatic gripper and the source-matched ROS 2 control execution product.",
   "desired_control_configurations": [
     {
@@ -1081,42 +1081,42 @@
       "binding_routes": [
         {
           "control_binding_id": "isaac_lite6_robot.arm.execution-contact-geometric",
-          "control_binding_revision": "sha256:3f53d1ac7968ed49613448f5917a1be88d60566aecd66a0b1ffe8a2840480c50",
+          "control_binding_revision": "sha256:8277d493afcf0f89eec3426bbe818e979c2f12790bd744540fbc3f9850069903",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "isaac_lite6_robot.arm.execution-contact-geometric_signed_penetration",
-          "control_binding_revision": "sha256:46d4ae6789aef9dfebecbe0ea81b89d416590a9793b713f1593d0ba68fd2cf7c",
+          "control_binding_revision": "sha256:94eaef0c2e2829e2ed62e70032c1a18955445d6d2fdbca55128c0f54cbcc66d1",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "isaac_lite6_robot.arm.execution-feedback-phase_events",
-          "control_binding_revision": "sha256:b51b6acdbe9bf0e34652f2e64f66d3f0b1dabef4cde71aca8e2aa650c1e5db6d",
+          "control_binding_revision": "sha256:5703458c39033db1aff17c8b832d66d5293149d51bfc8a7b8821809087799e2c",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "isaac_lite6_robot.arm.execution-feedback-state_snapshots",
-          "control_binding_revision": "sha256:9618ea2a8b1e846a5ff2c78e61b1a1daf5db97c546838dab12a8fe22fe25fbdc",
+          "control_binding_revision": "sha256:b91c8323df0798fbc577515e0da81cdae49f2c4cb98a5a0f09054356310f1fe2",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "isaac_lite6_robot.arm.execution-reset",
-          "control_binding_revision": "sha256:61bf32f51e43b1dd772d8770663ee2da3417e606d4619d3cb152b589ea3436a8",
+          "control_binding_revision": "sha256:86230c62a314416c64690ce0b7f58a844f78644d19f44c64cee450fdafec5fc0",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "isaac_lite6_robot.arm.execution-stop-soft",
-          "control_binding_revision": "sha256:d61b8fc87cb5102a3d0c1e0ed88327f978c9476f388f002ec377f1e58625b484",
+          "control_binding_revision": "sha256:c11f218ffdf1f3f68b9cf253f4bdfb6b815a300974cccd4c419270fb44fb83e1",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-          "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+          "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "isaac_lite6_robot.arm.state-observed-current",
-          "control_binding_revision": "sha256:14a461972b6bbc65efb77a25e78ec97324366dbef2838a01360c63dc1190ae2c",
+          "control_binding_revision": "sha256:4185e409bf31e2bdca157528b1dce7637f2d605f10f7e0d6af8b4ccbcb84fc51",
           "control_route_id": "arm_position"
         }
       ],
@@ -1130,12 +1130,12 @@
       "binding_routes": [
         {
           "control_binding_id": "isaac_lite6_robot.gripper.tool-gripper-command",
-          "control_binding_revision": "sha256:107ec999a95003d524753b7158cf689de3a15d280e7d7811bd4e5b67a48ffd4c",
+          "control_binding_revision": "sha256:7da8051b5f3482ea8f6c2ecc390e907459a1d93a668a6d3f239f3a57ebebc31f",
           "control_route_id": "gripper_position"
         },
         {
           "control_binding_id": "isaac_lite6_robot.gripper.tool-gripper-feedback",
-          "control_binding_revision": "sha256:ec25ca26f8d62a87c62597a5d70278e088f243497744e22fe9be53ddc7700979",
+          "control_binding_revision": "sha256:1ab6a06b4b840cdeb6f249fc1f29b9f31f289c51097e46f2546324546b798c43",
           "control_route_id": "gripper_position"
         }
       ],
@@ -1154,7 +1154,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "isaac_lite6_robot.arm.execution-contact-geometric",
-        "control_binding_revision": "sha256:3f53d1ac7968ed49613448f5917a1be88d60566aecd66a0b1ffe8a2840480c50",
+        "control_binding_revision": "sha256:8277d493afcf0f89eec3426bbe818e979c2f12790bd744540fbc3f9850069903",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1165,7 +1165,7 @@
         ],
         "provider_instance_id": "isaac_lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+        "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1216,7 +1216,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "isaac_lite6_robot.arm.execution-contact-geometric_signed_penetration",
-        "control_binding_revision": "sha256:46d4ae6789aef9dfebecbe0ea81b89d416590a9793b713f1593d0ba68fd2cf7c",
+        "control_binding_revision": "sha256:94eaef0c2e2829e2ed62e70032c1a18955445d6d2fdbca55128c0f54cbcc66d1",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1227,7 +1227,7 @@
         ],
         "provider_instance_id": "isaac_lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+        "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1278,7 +1278,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "isaac_lite6_robot.arm.execution-feedback-phase_events",
-        "control_binding_revision": "sha256:b51b6acdbe9bf0e34652f2e64f66d3f0b1dabef4cde71aca8e2aa650c1e5db6d",
+        "control_binding_revision": "sha256:5703458c39033db1aff17c8b832d66d5293149d51bfc8a7b8821809087799e2c",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1289,7 +1289,7 @@
         ],
         "provider_instance_id": "isaac_lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+        "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1340,7 +1340,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "isaac_lite6_robot.arm.execution-feedback-state_snapshots",
-        "control_binding_revision": "sha256:9618ea2a8b1e846a5ff2c78e61b1a1daf5db97c546838dab12a8fe22fe25fbdc",
+        "control_binding_revision": "sha256:b91c8323df0798fbc577515e0da81cdae49f2c4cb98a5a0f09054356310f1fe2",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1351,7 +1351,7 @@
         ],
         "provider_instance_id": "isaac_lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+        "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1402,7 +1402,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "isaac_lite6_robot.arm.execution-reset",
-        "control_binding_revision": "sha256:61bf32f51e43b1dd772d8770663ee2da3417e606d4619d3cb152b589ea3436a8",
+        "control_binding_revision": "sha256:86230c62a314416c64690ce0b7f58a844f78644d19f44c64cee450fdafec5fc0",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1413,7 +1413,7 @@
         ],
         "provider_instance_id": "isaac_lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+        "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1464,7 +1464,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "isaac_lite6_robot.arm.execution-stop-soft",
-        "control_binding_revision": "sha256:d61b8fc87cb5102a3d0c1e0ed88327f978c9476f388f002ec377f1e58625b484",
+        "control_binding_revision": "sha256:c11f218ffdf1f3f68b9cf253f4bdfb6b815a300974cccd4c419270fb44fb83e1",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1475,7 +1475,7 @@
         ],
         "provider_instance_id": "isaac_lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+        "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1526,7 +1526,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1537,7 +1537,7 @@
         ],
         "provider_instance_id": "isaac_lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+        "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1599,7 +1599,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "isaac_lite6_robot.arm.state-observed-current",
-        "control_binding_revision": "sha256:14a461972b6bbc65efb77a25e78ec97324366dbef2838a01360c63dc1190ae2c",
+        "control_binding_revision": "sha256:4185e409bf31e2bdca157528b1dce7637f2d605f10f7e0d6af8b4ccbcb84fc51",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1610,7 +1610,7 @@
         ],
         "provider_instance_id": "isaac_lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+        "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1661,7 +1661,7 @@
         "command_target_id": "gripper",
         "containment_granularity": "resource",
         "control_binding_id": "isaac_lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:107ec999a95003d524753b7158cf689de3a15d280e7d7811bd4e5b67a48ffd4c",
+        "control_binding_revision": "sha256:7da8051b5f3482ea8f6c2ecc390e907459a1d93a668a6d3f239f3a57ebebc31f",
         "control_domain_id": "isaac_lite6_robot.gripper.control",
         "control_interface_contract_id": "manyforge.ros2_control_gripper_position",
         "control_interface_revision": "sha256:c2842924f7caea9978d19db8cd6a3d9eb45700cc77008e36e7edf7b1fae79d6e",
@@ -1672,7 +1672,7 @@
         ],
         "provider_instance_id": "isaac_lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+        "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1693,8 +1693,8 @@
         ],
         "state_authority_class": "commanded",
         "state_authority_id": "isaac_lite6_robot.gripper.commanded_sim_state",
-        "stop_evidence_policy_id": "manyforge.controller_goal_terminal",
-        "stop_evidence_policy_revision": "sha256:7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
+        "stop_evidence_policy_id": "manyforge.gripper_logical_cancellation",
+        "stop_evidence_policy_revision": "sha256:0e22817d03b2c68f3a338483b87ea016646435531a21980b18c05ecbe01cb4cc",
         "topology_revision": "sha256:18c0f8df032cfbbd1bbfe7723252d4ddde6eb3ac9670ccba9597cec059af287b"
       },
       {
@@ -1703,7 +1703,7 @@
         "command_target_id": "gripper",
         "containment_granularity": "resource",
         "control_binding_id": "isaac_lite6_robot.gripper.tool-gripper-feedback",
-        "control_binding_revision": "sha256:ec25ca26f8d62a87c62597a5d70278e088f243497744e22fe9be53ddc7700979",
+        "control_binding_revision": "sha256:1ab6a06b4b840cdeb6f249fc1f29b9f31f289c51097e46f2546324546b798c43",
         "control_domain_id": "isaac_lite6_robot.gripper.control",
         "control_interface_contract_id": "manyforge.ros2_control_gripper_position",
         "control_interface_revision": "sha256:c2842924f7caea9978d19db8cd6a3d9eb45700cc77008e36e7edf7b1fae79d6e",
@@ -1714,7 +1714,7 @@
         ],
         "provider_instance_id": "isaac_lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:85c86f4e7c4f2584e61b25e0d1a1a5cc1ddbf5d1fa63ca921172794d62d2c232",
+        "provider_manifest_revision": "sha256:cc7c458eafef241807a2e90416a639d41aa1ebe92522938e1d7efc317ef208c3",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1735,8 +1735,8 @@
         ],
         "state_authority_class": "commanded",
         "state_authority_id": "isaac_lite6_robot.gripper.commanded_sim_state",
-        "stop_evidence_policy_id": "manyforge.controller_goal_terminal",
-        "stop_evidence_policy_revision": "sha256:7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
+        "stop_evidence_policy_id": "manyforge.gripper_logical_cancellation",
+        "stop_evidence_policy_revision": "sha256:0e22817d03b2c68f3a338483b87ea016646435531a21980b18c05ecbe01cb4cc",
         "topology_revision": "sha256:18c0f8df032cfbbd1bbfe7723252d4ddde6eb3ac9670ccba9597cec059af287b"
       }
     ],
@@ -1848,6 +1848,30 @@
             }
           ],
           "execution_tick_hz": 100,
+          "gripper_target_configurations": [
+            {
+              "actuation_kind": "pneumatic",
+              "attach_frame": "link_tcp",
+              "auxiliary_frames": [
+                "lite_gripper_base_link"
+              ],
+              "closed_state_ref": "closed",
+              "command_duration_s": 0.8,
+              "command_target_id": "gripper",
+              "controllable_component_id": "isaac_lite6_robot",
+              "delivery_result_timeout_s": 1,
+              "description": "UFACTORY lite pneumatic gripper through Isaac JointState effort commands.",
+              "mount_frame": "link_eef",
+              "open_state_ref": "open",
+              "output_mode": "commanded",
+              "tcp_frame": "link_tcp",
+              "touch_links": [
+                "lite_gripper_base_link",
+                "lite_gripper_left_finger",
+                "lite_gripper_right_finger"
+              ]
+            }
+          ],
           "initial_joint_positions_rad": [
             0,
             0,
@@ -1869,7 +1893,7 @@
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
-        "runtime_profile_revision": "sha256:d736dfddeb0f8848d621375b955d72fa717ed61e8f45082663a19bd07a6490f0",
+        "runtime_profile_revision": "sha256:1633c7226de6d49382aed9868d2bc5285a7b2dbf294455b137f0f52caf4f31eb",
         "runtime_unit_id": "robot_cell.ros2_control_execution"
       }
     ]
@@ -1889,7 +1913,7 @@
     "stop_stage_parameters": [
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-contact-geometric",
-        "control_binding_revision": "sha256:3f53d1ac7968ed49613448f5917a1be88d60566aecd66a0b1ffe8a2840480c50",
+        "control_binding_revision": "sha256:8277d493afcf0f89eec3426bbe818e979c2f12790bd744540fbc3f9850069903",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -1980,7 +2004,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-contact-geometric",
-        "control_binding_revision": "sha256:3f53d1ac7968ed49613448f5917a1be88d60566aecd66a0b1ffe8a2840480c50",
+        "control_binding_revision": "sha256:8277d493afcf0f89eec3426bbe818e979c2f12790bd744540fbc3f9850069903",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -1998,7 +2022,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-contact-geometric_signed_penetration",
-        "control_binding_revision": "sha256:46d4ae6789aef9dfebecbe0ea81b89d416590a9793b713f1593d0ba68fd2cf7c",
+        "control_binding_revision": "sha256:94eaef0c2e2829e2ed62e70032c1a18955445d6d2fdbca55128c0f54cbcc66d1",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2089,7 +2113,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-contact-geometric_signed_penetration",
-        "control_binding_revision": "sha256:46d4ae6789aef9dfebecbe0ea81b89d416590a9793b713f1593d0ba68fd2cf7c",
+        "control_binding_revision": "sha256:94eaef0c2e2829e2ed62e70032c1a18955445d6d2fdbca55128c0f54cbcc66d1",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2107,7 +2131,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-feedback-phase_events",
-        "control_binding_revision": "sha256:b51b6acdbe9bf0e34652f2e64f66d3f0b1dabef4cde71aca8e2aa650c1e5db6d",
+        "control_binding_revision": "sha256:5703458c39033db1aff17c8b832d66d5293149d51bfc8a7b8821809087799e2c",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2198,7 +2222,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-feedback-phase_events",
-        "control_binding_revision": "sha256:b51b6acdbe9bf0e34652f2e64f66d3f0b1dabef4cde71aca8e2aa650c1e5db6d",
+        "control_binding_revision": "sha256:5703458c39033db1aff17c8b832d66d5293149d51bfc8a7b8821809087799e2c",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2216,7 +2240,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-feedback-state_snapshots",
-        "control_binding_revision": "sha256:9618ea2a8b1e846a5ff2c78e61b1a1daf5db97c546838dab12a8fe22fe25fbdc",
+        "control_binding_revision": "sha256:b91c8323df0798fbc577515e0da81cdae49f2c4cb98a5a0f09054356310f1fe2",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2307,7 +2331,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-feedback-state_snapshots",
-        "control_binding_revision": "sha256:9618ea2a8b1e846a5ff2c78e61b1a1daf5db97c546838dab12a8fe22fe25fbdc",
+        "control_binding_revision": "sha256:b91c8323df0798fbc577515e0da81cdae49f2c4cb98a5a0f09054356310f1fe2",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2325,7 +2349,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-reset",
-        "control_binding_revision": "sha256:61bf32f51e43b1dd772d8770663ee2da3417e606d4619d3cb152b589ea3436a8",
+        "control_binding_revision": "sha256:86230c62a314416c64690ce0b7f58a844f78644d19f44c64cee450fdafec5fc0",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2416,7 +2440,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-reset",
-        "control_binding_revision": "sha256:61bf32f51e43b1dd772d8770663ee2da3417e606d4619d3cb152b589ea3436a8",
+        "control_binding_revision": "sha256:86230c62a314416c64690ce0b7f58a844f78644d19f44c64cee450fdafec5fc0",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2434,7 +2458,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-stop-soft",
-        "control_binding_revision": "sha256:d61b8fc87cb5102a3d0c1e0ed88327f978c9476f388f002ec377f1e58625b484",
+        "control_binding_revision": "sha256:c11f218ffdf1f3f68b9cf253f4bdfb6b815a300974cccd4c419270fb44fb83e1",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2525,7 +2549,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-stop-soft",
-        "control_binding_revision": "sha256:d61b8fc87cb5102a3d0c1e0ed88327f978c9476f388f002ec377f1e58625b484",
+        "control_binding_revision": "sha256:c11f218ffdf1f3f68b9cf253f4bdfb6b815a300974cccd4c419270fb44fb83e1",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2543,7 +2567,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2634,7 +2658,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:716e1a4633275a1a64c8621f7807253bebfb30d61f99945ae9e3369916d85cd7",
+        "control_binding_revision": "sha256:426134ce6e822383b8fc4f0ae7b7c0af4e7a29d93267155e003fcec10ef5b30b",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2652,7 +2676,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.state-observed-current",
-        "control_binding_revision": "sha256:14a461972b6bbc65efb77a25e78ec97324366dbef2838a01360c63dc1190ae2c",
+        "control_binding_revision": "sha256:4185e409bf31e2bdca157528b1dce7637f2d605f10f7e0d6af8b4ccbcb84fc51",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2743,7 +2767,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.arm.state-observed-current",
-        "control_binding_revision": "sha256:14a461972b6bbc65efb77a25e78ec97324366dbef2838a01360c63dc1190ae2c",
+        "control_binding_revision": "sha256:4185e409bf31e2bdca157528b1dce7637f2d605f10f7e0d6af8b4ccbcb84fc51",
         "control_domain_id": "isaac_lite6_robot.arm.control",
         "control_domain_revision": "sha256:afc22e608d19320aa9470a944c3ebce5b41d9d30ce965e24b33faecebadbb06a",
         "control_route_id": "arm_position",
@@ -2761,7 +2785,7 @@
       },
       {
         "control_binding_id": "isaac_lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:107ec999a95003d524753b7158cf689de3a15d280e7d7811bd4e5b67a48ffd4c",
+        "control_binding_revision": "sha256:7da8051b5f3482ea8f6c2ecc390e907459a1d93a668a6d3f239f3a57ebebc31f",
         "control_domain_id": "isaac_lite6_robot.gripper.control",
         "control_domain_revision": "sha256:92b3b9e6f56b527383e4548265b36b04b01a63f7490fd93ab57d008c1c53be3a",
         "control_route_id": "gripper_position",
@@ -2770,16 +2794,16 @@
         "provider_contract_ref": {
           "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
           "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
-          "provider_contract_role_id": "software_hard_stop"
+          "provider_contract_role_id": "gripper_logical_cancel"
         },
-        "stop_escalation_stage_id": "software_hard",
-        "stop_evidence_policy_id": "manyforge.controller_goal_terminal",
-        "stop_evidence_policy_revision": "sha256:7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
+        "stop_escalation_stage_id": "gripper_logical_cancel",
+        "stop_evidence_policy_id": "manyforge.gripper_logical_cancellation",
+        "stop_evidence_policy_revision": "sha256:0e22817d03b2c68f3a338483b87ea016646435531a21980b18c05ecbe01cb4cc",
         "topology_revision": "sha256:18c0f8df032cfbbd1bbfe7723252d4ddde6eb3ac9670ccba9597cec059af287b"
       },
       {
         "control_binding_id": "isaac_lite6_robot.gripper.tool-gripper-feedback",
-        "control_binding_revision": "sha256:ec25ca26f8d62a87c62597a5d70278e088f243497744e22fe9be53ddc7700979",
+        "control_binding_revision": "sha256:1ab6a06b4b840cdeb6f249fc1f29b9f31f289c51097e46f2546324546b798c43",
         "control_domain_id": "isaac_lite6_robot.gripper.control",
         "control_domain_revision": "sha256:92b3b9e6f56b527383e4548265b36b04b01a63f7490fd93ab57d008c1c53be3a",
         "control_route_id": "gripper_position",
@@ -2788,11 +2812,11 @@
         "provider_contract_ref": {
           "contract_schema_id": "manyforge.value_schema.provider_contract.empty.v1",
           "contract_schema_revision": "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270",
-          "provider_contract_role_id": "software_hard_stop"
+          "provider_contract_role_id": "gripper_logical_cancel"
         },
-        "stop_escalation_stage_id": "software_hard",
-        "stop_evidence_policy_id": "manyforge.controller_goal_terminal",
-        "stop_evidence_policy_revision": "sha256:7e983479075e0373a58aba38166da5096e27d4f9dd05ac69f843af3744b0dc91",
+        "stop_escalation_stage_id": "gripper_logical_cancel",
+        "stop_evidence_policy_id": "manyforge.gripper_logical_cancellation",
+        "stop_evidence_policy_revision": "sha256:0e22817d03b2c68f3a338483b87ea016646435531a21980b18c05ecbe01cb4cc",
         "topology_revision": "sha256:18c0f8df032cfbbd1bbfe7723252d4ddde6eb3ac9670ccba9597cec059af287b"
       }
     ]

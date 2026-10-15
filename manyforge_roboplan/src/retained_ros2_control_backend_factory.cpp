@@ -219,6 +219,17 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
                 "ros2_control gripper config differs from retained resources");
           }
           sink_bindings.push_back({gripper_group, gripper_channel, true});
+          // The pneumatic backend never calls this authoritative sink; its
+          // concrete display callback below uses the separate render cache.
+          if (selected.gripper->actuation_kind == core::GripperActuationKind::kPneumatic) {
+            const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner = runtime_handle;
+            selected.gripper->publish_display_position = [owner](const double position) {
+              const auto current = owner.lock();
+              return current ? current->PublishGripperDisplayPosition(position)
+                  : core::Result<void>::Err({"gripper_display_owner_unavailable",
+                      "Display owner has retired", {}});
+            };
+          }
         } else if (selected.gripper.has_value()) {
           throw std::invalid_argument(
               "ros2_control product config contains an unbound gripper");
@@ -259,6 +270,11 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
             std::move(selected.measured_receiver_clock));
         if (!bound.ok()) {
           throw std::invalid_argument(bound.error().message);
+        }
+
+        if (gripper_binding && selected.gripper->actuation_kind == core::GripperActuationKind::kPneumatic) {
+          const auto display = runtime_handle->BindGripperDisplayChannel(gripper_channel);
+          if (!display.ok()) throw std::invalid_argument(display.error().message);
         }
 
         // Item 20: the commanded state is the controller's own reference,
@@ -309,9 +325,8 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
         if (gripper_binding.has_value()) {
           result.gripper = std::shared_ptr<core::IGripperCommandBackend>(
               runtime_handle, gripper_pointer);
-          // The gripper's Stop stages name the arm participant (as `main`'s
-          // ROS lane named the motion backend).
-          result.gripper_stop_execution_port = owned_participant.get();
+          // RetainedNativeGripperRuntime registers its same Core gripper
+          // participant as the logical-cancellation Stop port.
           result.rebind_gripper_route =
               [runtime_handle](
                   core::RuntimeParticipantBinding binding,
@@ -329,6 +344,63 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
             };
         return result;
       };
+}
+
+std::shared_ptr<core::IGripperCommandBackend>
+make_retained_ros2_control_gripper_backend(
+    RetainedRos2ControlBackendConfig config,
+    const core::RuntimeParticipantBinding& binding,
+    const std::shared_ptr<RetainedObservedStateChannel>& channel,
+    core::IClock& clock, core::IScheduler& scheduler,
+    const std::shared_ptr<RetainedRos2ControlRuntimeHandle>& handle) {
+  const bool no_output = config.gripper && config.gripper->output_mode == core::GripperOutputMode::kNone &&
+      config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic;
+  if (!handle || !channel || !config.gripper || (!no_output && !config.arm.gripper_controller) ||
+      (no_output && config.arm.gripper_controller) || config.isaac_guard || !binding.value().control_path ||
+      binding.value().control_path->state_authority_class != core::StateAuthorityClass::kCommanded ||
+      channel->binding().value() != binding.value() || binding.value().resources.size() != 1U)
+    throw std::invalid_argument("ROS gripper-only backend requires its exact commanded binding/transport");
+  const auto group = sole_compiled_group(binding, "ROS gripper-only binding");
+  if (config.gripper->group_id != group ||
+      config.gripper->joint_name != binding.value().resources.front().compiled_resource_name)
+    throw std::invalid_argument("ROS gripper-only config differs from retained resources");
+  const bool pneumatic = config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic;
+  // Keep the existing transport sink closure. Pneumatic command/feedback
+  // paths never publish through it; they use the display callback only.
+  std::vector<RetainedExecutionStateSinkBinding> sinks{{group, channel, true}};
+  if (pneumatic) {
+    const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner = handle;
+    config.gripper->publish_display_position = [owner](const double position) {
+      const auto current = owner.lock();
+      return current ? current->PublishGripperDisplayPosition(position)
+          : core::Result<void>::Err({"gripper_display_owner_unavailable",
+              "Display owner has retired", {}});
+    };
+  }
+  auto sink = std::make_shared<RetainedExecutionStateSink>(clock, std::move(sinks));
+  auto resources = std::make_unique<ros2_control_execution::Ros2TransportResources>(
+      config.node_name, config.node_namespace, config.executor_thread_count, sink, group, clock);
+  auto gripper = std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
+      *resources, sink, clock, scheduler, true);
+  gripper->configure_gripper_action(binding.value().command_target_id.value(), *config.gripper);
+  auto* const backend = gripper.get();
+  const auto bound = handle->BindGripperOnly(
+      std::move(resources), clock, std::move(gripper), binding,
+      config.arm.gripper_controller.value_or(RetainedRos2ControlArmController{}),
+      config.successor_occurrence, std::move(config.measured_receiver_clock),
+      no_output ? std::nullopt : std::optional(RetainedMeasuredJointStateLane{config.node_namespace + "/joint_states",
+          static_cast<core::Duration>(config.gripper->state_freshness_timeout_s * 1e9),
+          core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
+          std::string(kMeasuredJointStateProfileId)}));
+  if (!bound.ok()) throw std::invalid_argument(bound.error().message);
+  if (pneumatic) {
+    const auto display = handle->BindGripperDisplayChannel(channel);
+    if (!display.ok()) throw std::invalid_argument(display.error().message);
+  }
+  if (!config.defer_ros_start) handle->StartBackend();
+  // Aliasing ownership keeps the actual transport, scheduler borrowing and
+  // controller observations alive until the component owner drains.
+  return std::shared_ptr<core::IGripperCommandBackend>(handle, backend);
 }
 
 } // namespace manyforge::roboplan_backend

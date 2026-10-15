@@ -543,6 +543,16 @@ class _SharedOperation:
 
 
 @dataclass(slots=True)
+class _HeldPreparation:
+    selection_revision: int
+    scope_identity: tuple[str, str, int]
+    operation: Mapping[str, Any]
+    reset_request: Mapping[str, Any] | None = None
+    reset_submitted: bool = False
+    reset_acceptance: Mapping[str, Any] | None = None
+
+
+@dataclass(slots=True)
 class _OperationTask:
     identity: NodeAttemptIdentity
     node_id: str
@@ -551,6 +561,10 @@ class _OperationTask:
     terminal: OwnerTaskSnapshot | None = None
     held_before_admission: bool = False
     unknown_admission: _UnknownOperationAdmission | None = None
+    gripper_timing: tuple[str | None, float | None] | None = None
+    submitted_intent: Mapping[str, Any] | None = None
+    acceptance: Mapping[str, Any] | None = None
+    held_preparation: _HeldPreparation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1000,11 +1014,13 @@ class NativeKernelProgramPort:
                 raise ProductionPortError(
                     "cannot unbind a Program run with active native operations"
                 )
-            if snapshot.state is OwnerTaskState.SUCCEEDED:
+            if snapshot.state is OwnerTaskState.SUCCEEDED or (
+                snapshot.state is OwnerTaskState.FAILED and snapshot.settlement_proven
+            ):
                 completed.append(task)
         # A sequence may settle between its final owner transition and the
-        # next tree tick. Consume successful evidence now. Interrupted/failed
-        # operations keep only their small identity row until Program Reset
+        # next tree tick. Consume successful or final pneumatic evidence now.
+        # Other interrupted/failed operations keep their identity until Reset
         # releases the corresponding resident Kernel operation.
         for task in completed:
             assert task.operation is not None
@@ -1181,11 +1197,125 @@ class NativeKernelProgramPort:
         )
         return participant, intent
 
+    def _gripper_descriptor(
+        self,
+        context: _BoundContext,
+        target: _TargetBinding,
+        *,
+        expected_owner_epoch: str,
+    ) -> Mapping[str, Any]:
+        """Read the already bound target's retained configuration before effects."""
+        if expected_owner_epoch != context.request_owner_epoch:
+            raise ProductionPortError("gripper descriptor owner changed since Program capture")
+        envelope = self._kernel.targets()
+        owner = _mapping(envelope.get("identity"), field="preset owner identity")
+        if (
+            owner.get("owner_epoch") != expected_owner_epoch
+            or owner.get("graph_revision") != context.capture.graph_revision
+            or owner.get("retained_bundle_id") != context.capture.retained_bundle_id
+        ):
+            raise ProductionPortError("gripper preset owner and captured deployment disagree")
+        inventory = _mapping(envelope.get("targets"), field="execution targets")
+        if inventory.get("schema_version") != "manyforge.execution_targets.v3":
+            raise ProductionPortError("gripper preset target inventory is unsupported")
+        components = [
+            _mapping(row, field="preset component")
+            for row in _sequence(inventory.get("components"), field="preset components")
+        ]
+        selected = [row for row in components if
+                    row.get("controllable_component_id") == target.controllable_component_id]
+        if len(selected) != 1:
+            raise ProductionPortError("gripper preset has no unique bound component")
+        targets = [
+            _mapping(row, field="preset target")
+            for row in _sequence(selected[0].get("targets"), field="preset targets")
+        ]
+        selected_targets = [row for row in targets if
+                            row.get("command_target_id") == target.command_target_id
+                            and row.get("operation_capability_id") == "tool.gripper.command"]
+        if len(selected_targets) != 1 or selected_targets[0].get("presentation") != "gripper":
+            raise ProductionPortError("gripper preset has no unique bound command target")
+        command = _mapping(selected_targets[0].get("command"), field="preset command")
+        descriptor = _mapping(command.get("target_descriptor"), field="gripper preset descriptor")
+        schema = _mapping(target.capabilities["tool.gripper.command"].get("command_schema"),
+                          field="captured gripper command schema")
+        contracts = _mapping(descriptor.get("contracts"), field="preset contracts")
+        if (
+            descriptor.get("schema_version") != "manyforge.manual_control_gripper_descriptor.v3"
+            or descriptor.get("controllable_component_id") != target.controllable_component_id
+            or descriptor.get("command_target_id") != target.command_target_id
+            or descriptor.get("source_kind") != "model_role"
+            or command.get("command_schema_id") != schema.get("command_schema_id")
+            or command.get("command_schema_revision") != schema.get("command_schema_revision")
+            or contracts.get("command_schema") != schema
+        ):
+            raise ProductionPortError("gripper preset descriptor crosses its retained binding")
+        # Nulls are the existing explicitly unconfigured legacy descriptor,
+        # never an inferred pneumatic kind. Missing fields are not that class.
+        fields = ("actuation_kind", "output_mode", "completion_policy",
+                  "grasp_confirmation_policy", "command_duration_s")
+        if any(key not in descriptor for key in fields):
+            raise ProductionPortError("gripper descriptor omits configured semantics")
+        configuration = tuple(descriptor[key] for key in fields[:4])
+        if configuration == (None, None, None, None):
+            if descriptor["command_duration_s"] is not None:
+                raise ProductionPortError("unconfigured gripper has a configured duration")
+        elif configuration not in (
+            ("position_commanded", "commanded", "goal_fenced_target_reached", "binding_feedback_required"),
+            ("pneumatic", "commanded", "output_delivery", "not_required"),
+            ("pneumatic", "none", "no_output", "not_required"),
+        ):
+            raise ProductionPortError("gripper descriptor has no complete configured output semantics")
+        else:
+            duration = _number(descriptor["command_duration_s"], field="gripper command duration")
+            if duration < 0 or (configuration[0] == "position_commanded" and duration == 0):
+                raise ProductionPortError("gripper configured duration is invalid")
+        lower = _number(descriptor.get("min_position"), field="gripper minimum position")
+        upper = _number(descriptor.get("max_position"), field="gripper maximum position")
+        if lower > upper or (descriptor.get("coordinate_kind"), descriptor.get("unit")) not in {
+            ("angular_rad", "rad"), ("linear_m", "m"),
+        }:
+            raise ProductionPortError("gripper descriptor limits or coordinate unit are invalid")
+        return descriptor
+
+    @staticmethod
+    def _named_gripper_position(
+        descriptor: Mapping[str, Any], position: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if (set(position) != {"kind", "name"}
+            or not isinstance(position.get("name"), str)
+            or position["name"] not in {"open", "closed"}):
+            raise ProductionPortError("gripper named preset must be the open or closed alias")
+        if descriptor["actuation_kind"] is None:
+            raise ProductionPortError("gripper preset has no complete configured output semantics")
+        reference = _text(descriptor.get(f"{position['name']}_state_ref"), field="gripper state reference")
+        presets = [
+            _mapping(row, field="named gripper preset")
+            for row in _sequence(descriptor.get("named_presets"), field="named gripper presets")
+        ]
+        matches = [row for row in presets if row.get("name") == reference]
+        if len(matches) != 1:
+            raise ProductionPortError("gripper alias has no unique configured model preset")
+        value = _number(matches[0].get("master_position"), field="gripper preset master position")
+        lower = _number(descriptor.get("min_position"), field="gripper minimum position")
+        upper = _number(descriptor.get("max_position"), field="gripper maximum position")
+        if not lower <= value <= upper:
+            raise ProductionPortError("gripper preset is outside its retained limits")
+        kind = descriptor.get("coordinate_kind")
+        if kind == "angular_rad" and descriptor.get("unit") == "rad":
+            return {"kind": "angular_rad", "value_rad": value}
+        if kind == "linear_m" and descriptor.get("unit") == "m":
+            return {"kind": "linear_m", "value_m": value}
+        raise ProductionPortError("gripper preset coordinate kind and unit disagree")
+
     def _gripper_payload(
         self,
         parameters: Mapping[str, Any],
         identity: NodeAttemptIdentity,
-    ) -> tuple[_BoundContext, _TargetBinding, dict[str, Any]]:
+        *,
+        expected_owner_epoch: str,
+        capture_timing: bool = False,
+    ) -> tuple[_BoundContext, _TargetBinding, dict[str, Any], tuple[str | None, float | None]]:
         context = self._context(identity.program_run_id)
         target_role_id = _text(parameters.get("target_role"), field="target_role")
         target = self._target(context, target_role_id, "tool.gripper.command")
@@ -1197,6 +1327,21 @@ class NativeKernelProgramPort:
             field="command_schema_revision",
         )
         position = dict(_mapping(parameters.get("position"), field="position"))
+        actuation, dwell = None, None
+        # Numeric planning preflight shares this payload builder, but is not
+        # itself a Program gripper command. Preserve that existing read scope.
+        if capture_timing or position.get("kind") == "named_preset":
+            descriptor = self._gripper_descriptor(
+                context, target, expected_owner_epoch=expected_owner_epoch,
+            )
+            actuation = descriptor["actuation_kind"]
+            if capture_timing and actuation == "pneumatic":
+                dwell = _number(parameters.get("command_duration_s", descriptor["command_duration_s"]),
+                                field="gripper Program dwell")
+                if dwell < 0:
+                    raise ProductionPortError("pneumatic Program dwell cannot be negative")
+            if position.get("kind") == "named_preset":
+                position = self._named_gripper_position(descriptor, position)
         max_effort_value = parameters.get("max_effort")
         max_effort = (
             None
@@ -1223,6 +1368,7 @@ class NativeKernelProgramPort:
                     }
                 ],
             },
+            (actuation, dwell),
         )
 
     @staticmethod
@@ -1541,7 +1687,7 @@ class NativeKernelProgramPort:
                 motion=retreat_motion,
             ),
         }
-        _tool_context, _tool_target, tool_payload = self._gripper_payload(
+        _tool_context, _tool_target, tool_payload, _tool_timing = self._gripper_payload(
             {
                 "target_role": tool_role_id,
                 "position": parameters.get("tool_position"),
@@ -1550,6 +1696,7 @@ class NativeKernelProgramPort:
                 "completion_timeout_s": parameters.get("tool_completion_timeout_s", 30.0),
             },
             identity,
+            expected_owner_epoch=owner_epoch,
         )
         operations = {
             phase: self._phase_operation(
@@ -1788,7 +1935,9 @@ class NativeKernelProgramPort:
                         inputs.parameters.get("base_frame_role"),
                         field="base_frame_role",
                     ),
-                    tool_position=inputs.parameters.get("tool_position"),
+                    tool_position=intent["tool_operation"]["participants"][0]["payload"][
+                        "command_value"
+                    ]["position"],
                 ),
                 metadata=metadata,
                 settlement_proven=True,
@@ -1824,11 +1973,18 @@ class NativeKernelProgramPort:
             "planning.plan_place_sequence",
         }:
             return self._start_pick_place_planning(node_id, identity, inputs)
+        preset_owner_status: tuple[str, dict[str, Any]] | None = None
+        gripper_timing = None
         if node_id in _MOTION_NODE_IDS:
             context, target, payload = self._motion_payload(node_id, inputs.parameters, identity)
             capability_id = "execution.trajectory.execute"
         elif node_id == "gripper.command_position":
-            context, target, payload = self._gripper_payload(inputs.parameters, identity)
+            context = self._context(identity.program_run_id)
+            self._require_scope_open(identity.program_run_id)
+            preset_owner_status = self._owner_status(context)
+            context, target, payload, gripper_timing = self._gripper_payload(
+                inputs.parameters, identity, expected_owner_epoch=preset_owner_status[0], capture_timing=True,
+            )
             capability_id = "tool.gripper.command"
         else:
             raise ProductionPortError(f"Kernel operation port does not implement {node_id!r}")
@@ -1852,7 +2008,7 @@ class NativeKernelProgramPort:
             "payload": payload,
         }
         self._require_scope_open(identity.program_run_id)
-        owner_epoch, scene_revision = self._owner_status(context)
+        owner_epoch, scene_revision = preset_owner_status or self._owner_status(context)
         request_id = _request_identity(
             "program-node", identity.program_run_id, identity.node_attempt_id
         )
@@ -1914,7 +2070,11 @@ class NativeKernelProgramPort:
             frozenset({identity.node_attempt_id}),
             frozenset({operation_id}),
         )
-        task = _OperationTask(identity, node_id, operation_id, shared)
+        task = _OperationTask(
+            identity, node_id, operation_id, shared, gripper_timing=gripper_timing,
+            submitted_intent=(deepcopy(operation_intent) if gripper_timing is not None else None),
+            acceptance=(deepcopy(dict(accepted_value)) if gripper_timing is not None else None),
+        )
         with self._lock:
             current = self._tasks.get(operation_id)
             if current is not None and current != task:
@@ -1926,8 +2086,15 @@ class NativeKernelProgramPort:
         return OwnerTaskSnapshot(
             task_id=operation_id,
             state=OwnerTaskState.ACTIVE,
-            metadata={"operation_id": operation_id},
+            metadata={"operation_id": operation_id, **self._gripper_metadata(task)},
         )
+
+    @staticmethod
+    def _gripper_metadata(task: _OperationTask) -> dict[str, Any]:
+        if task.gripper_timing is None:
+            return {}
+        kind, dwell = task.gripper_timing
+        return {"gripper_actuation_kind": kind, "gripper_dwell_s": dwell}
 
     @staticmethod
     def _operation_intent(
@@ -1956,6 +2123,34 @@ class NativeKernelProgramPort:
             "participants": [dict(participant) for participant in participants],
             "coordination_policy": coordination_policy,
         }
+
+    @staticmethod
+    def _settled_pneumatic_failure(operation: Mapping[str, Any]) -> bool:
+        # The Kernel marks final failures from its captured typed actuation.
+        # A node name, transport, or an unmarked error cannot establish this.
+        if operation.get("state") != ExecutionState.FAILED.value:
+            return False
+        participants = operation.get("participants")
+        if not isinstance(participants, list) or not participants:
+            return False
+        has_failure = False
+        for participant in participants:
+            if not isinstance(participant, Mapping):
+                return False
+            state = participant.get("state")
+            if state == ExecutionState.COMPLETED.value:
+                continue
+            if state != ExecutionState.FAILED.value:
+                return False
+            error = participant.get("terminal_error")
+            details = error.get("details") if isinstance(error, Mapping) else None
+            if (
+                not isinstance(details, Mapping)
+                or details.get("pneumatic_transaction_final") != "true"
+            ):
+                return False
+            has_failure = True
+        return has_failure
 
     @staticmethod
     def _terminal_error(
@@ -1992,6 +2187,103 @@ class NativeKernelProgramPort:
             return None
         return assessment
 
+    def _held_preparation_scope(
+        self, task: _OperationTask, *, require_settled: bool = False,
+    ) -> tuple[Mapping[str, Any], bool]:
+        context = self._context(task.identity.program_run_id)
+        self._owner_status(context)
+        scope = self.scope.execution_scope(task.identity.program_run_id)
+        runner = _text(scope.get("program_runner_owner_epoch"), field="scope runner epoch")
+        claim, revision = scope.get("claim_generation"), scope.get("selection_revision")
+        if (scope.get("schema_version") != "manyforge.program_execution_scope.v2"
+            or type(claim) is not int or claim < 1
+            or type(revision) is not int or revision < 0):
+            raise ProductionPortError("held preparation scope identity is incomplete")
+        # Same immutable tree/canonical order used by ExecutableProgramRun.
+        pending = [context.capture.program.get("tree")]
+        nodes = []
+        while pending:
+            node = _mapping(pending.pop(), field="captured Program tree")
+            nodes.append(_text(node.get("instance_id"), field="captured node ID"))
+            pending.extend(_sequence(node.get("children"), field="captured children"))
+        nodes.sort()
+        if len(nodes) != len(set(nodes)) or task.identity.node_instance_id not in nodes:
+            raise ProductionPortError("held preparation is outside the captured Program")
+        phases = {}
+        for field in ("held_node_indices", "stopping_node_indices", "faulted_node_indices"):
+            indices = scope.get(field)
+            if (not isinstance(indices, (list, tuple))
+                or any(type(i) is not int or not 0 <= i < len(nodes) for i in indices)
+                or list(indices) != sorted(set(indices))):
+                raise ProductionPortError("held preparation scope indices are invalid")
+            phases[field] = set(indices)
+        identity = (scope["request_owner_epoch"], runner, claim)
+        if (task.operation is None or identity[0] != task.operation.request_owner_epoch
+            or (task.held_preparation is not None
+                and task.held_preparation.scope_identity != identity)):
+            raise ProductionPortError("held preparation scope owner changed")
+        index = nodes.index(task.identity.node_instance_id)
+        settling = phases["stopping_node_indices"] | phases["faulted_node_indices"]
+        held = index in phases["held_node_indices"]
+        return scope, (held and index not in settling if require_settled else held or index in settling)
+
+    def _require_cancelled_preparation(
+        self, task: _OperationTask, envelope: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        operation, _resident = self._resettable_operation(envelope, task)
+        context = self._context(task.identity.program_run_id)
+        intent, accepted = task.submitted_intent, task.acceptance
+        if (task.gripper_timing is None or task.gripper_timing[0] != "pneumatic"
+            or task.operation is None or intent is None or accepted is None
+            or envelope.get("owner_epoch") != task.operation.request_owner_epoch
+            or operation.get("program_binding_id") != context.capture.program_binding_id
+            or operation.get("state") != ExecutionState.CANCELLED_PRE_DISPATCH.value
+            or accepted.get("operation_id") != task.operation.operation_id
+            or accepted.get("request_id") != intent["request_context"]["request_id"]
+            or task.operation.member_task_ids != frozenset({task.task_id})):
+            raise ProductionPortError("held preparation has no exact original no-effect identity")
+        revision = operation.get("operation_revision")
+        rows, assignments = operation.get("participants"), accepted.get("participant_assignments")
+        if (type(revision) is not int or revision < 1
+            or not isinstance(rows, (list, tuple)) or len(rows) != 1
+            or not isinstance(assignments, (list, tuple)) or len(assignments) != 1):
+            raise ProductionPortError("held preparation has no complete no-effect participants")
+        row, assignment = _mapping(rows[0], field="held participant"), _mapping(assignments[0], field="accepted participant")
+        original = intent["participants"][0]
+        target = self._target(context, original["target_role_id"], "tool.gripper.command")
+        if (assignment.get("input_index") != 0
+            or not isinstance(assignment.get("participant_id"), str) or not assignment["participant_id"]
+            or row.get("participant_id") != assignment["participant_id"]
+            or row.get("payload_kind") != "capability_command"
+            or row.get("state") != ExecutionState.CANCELLED_PRE_DISPATCH.value
+            or "terminal_error" not in row or row["terminal_error"] is not None
+            or row.get("controllable_component_id") != target.controllable_component_id
+            or row.get("command_target_id") != target.command_target_id
+            or row.get("capability_id") != "tool.gripper.command"
+            or not isinstance(row.get("resources"), (list, tuple)) or not row["resources"]):
+            raise ProductionPortError("held preparation participant is not exact cancelled capability work")
+        return operation
+
+    def _observe_held_preparation(self, task: _OperationTask, envelope: Mapping[str, Any]) -> None:
+        # This keeps the original accepted owner task in the existing map.
+        # HeldError changes only the wrapper's scheduling pointer, not history.
+        try:
+            scope, held = self._held_preparation_scope(task)
+            if not held:
+                if task.held_preparation is None:
+                    return
+                raise ProductionPortError("pending preparation lost its held selection")
+            operation = self._require_cancelled_preparation(task, envelope)
+            if task.held_preparation is None:
+                task.held_preparation = _HeldPreparation(
+                    scope["selection_revision"],
+                    (scope["request_owner_epoch"], scope["program_runner_owner_epoch"], scope["claim_generation"]),
+                    deepcopy(dict(operation)),
+                )
+        except Exception as error:
+            raise OwnerTaskObservationUnavailableError("cancelled preparation is not yet proven held/no-effect") from error
+        raise OwnerInvocationHeldError(scope["selection_revision"])
+
     def _observation(self, task: _OperationTask) -> tuple[dict[str, Any], OwnerTaskSnapshot]:
         shared = task.operation
         if shared is None:
@@ -2008,10 +2300,17 @@ class NativeKernelProgramPort:
             or operation.get("program_run_id") != task.identity.program_run_id
         ):
             raise ProductionPortError("native operation observation changed identity")
+        if (task.held_preparation is not None or (
+            task.gripper_timing is not None and task.gripper_timing[0] == "pneumatic"
+            and operation.get("state") == ExecutionState.CANCELLED_PRE_DISPATCH.value)):
+            self._observe_held_preparation(task, envelope)
+        if task.terminal is not None:
+            return operation, task.terminal
         state = operation.get("state")
         metadata = {
             "operation_id": shared.operation_id,
             "operation_revision": operation.get("operation_revision"),
+            **self._gripper_metadata(task),
         }
         stop_id = operation.get("active_stop_id")
         stop_generation = operation.get("active_stop_generation")
@@ -2061,9 +2360,20 @@ class NativeKernelProgramPort:
                 reason_code=reason_code,
                 message=message,
                 details=details,
+                settlement_proven=self._settled_pneumatic_failure(operation),
             )
         else:
             raise ProductionPortError("native operation has an unknown state")
+        if snapshot.state is OwnerTaskState.FAILED and snapshot.settlement_proven:
+            revision = operation.get("operation_revision")
+            if type(revision) is not int or revision < 1:
+                raise ProductionPortError("native operation revision is invalid")
+            with self._lock:
+                if self._tasks.get(task.task_id) is task:
+                    if task.terminal is None:
+                        task.terminal = snapshot
+                        shared.completed_revision = revision
+                    snapshot = task.terminal
         return operation, snapshot
 
     def _apply_operation_recovery(
@@ -2297,7 +2607,7 @@ class NativeKernelProgramPort:
         task = self._task(task_id)
         if task.identity != identity:
             raise ProductionPortError("operation acknowledgement changed node attempt")
-        if task.terminal is not None:
+        if task.terminal is not None and task.operation is None:
             if not task.terminal.settlement_proven:
                 raise ProductionPortError("terminal local task has no settlement proof")
             with self._lock:
@@ -2318,7 +2628,9 @@ class NativeKernelProgramPort:
                 return
         if revision is None:
             operation, snapshot = self._observation(task)
-            if snapshot.state is not OwnerTaskState.SUCCEEDED:
+            if snapshot.state is not OwnerTaskState.SUCCEEDED and not (
+                snapshot.state is OwnerTaskState.FAILED and snapshot.settlement_proven
+            ):
                 raise ProductionPortError("only a completed operation can be acknowledged")
             revision = operation.get("operation_revision")
         if type(revision) is not int or revision < 1:
@@ -2609,6 +2921,92 @@ class NativeKernelProgramPort:
         if type(resident) is not bool:
             raise ProductionPortError("native operation residency is invalid")
         return operation, resident
+
+    @staticmethod
+    def _require_preparation_reset_receipt(
+        accepted: object, task: _OperationTask, pending: _HeldPreparation,
+    ) -> None:
+        value = _mapping(accepted, field="preparation retirement acceptance")
+        assert task.operation is not None and pending.reset_request is not None
+        revision = pending.reset_request["expected_operation_revision"]
+        if (value.get("operation_id") != task.operation.operation_id
+            or value.get("request_id") != pending.reset_request["request_context"]["request_id"]
+            or value.get("control") != "reset"
+            or type(value.get("accepted_against_revision")) is not int
+            or value["accepted_against_revision"] != revision
+            or type(value.get("operation_revision_after_acceptance")) is not int
+            or value["operation_revision_after_acceptance"] <= revision
+            or value.get("replay_status") not in {"accepted_new", "replayed_exact"}):
+            raise ProductionPortError("preparation retirement did not confirm the exact control")
+
+    def _retire_held_preparations(
+        self, program_run_id: str, selected_node_ids: frozenset[str],
+        expected_selection_revision: int,
+    ) -> None:
+        # ProgramRunOwner resolves the actual selected nodes. This method has
+        # no group parser, selection release, backend Reset or new timeout.
+        with self._lock:
+            tasks = tuple(task for task in self._tasks.values()
+                          if task.identity.program_run_id == program_run_id
+                          and task.identity.node_instance_id in selected_node_ids
+                          and task.held_preparation is not None)
+        for task in tasks:
+            pending, shared = task.held_preparation, task.operation
+            assert pending is not None and shared is not None
+            scope, held = self._held_preparation_scope(task, require_settled=True)
+            if (not held or type(expected_selection_revision) is not int
+                or expected_selection_revision < pending.selection_revision
+                or scope["selection_revision"] != expected_selection_revision):
+                raise ProductionPortError("preparation cleanup identifies a stale or unsettled hold")
+            envelope = self._kernel.operation(shared.operation_id)
+            operation, resident = self._resettable_operation(envelope, task)
+            if envelope.get("owner_epoch") != shared.request_owner_epoch:
+                raise ProductionPortError("preparation cleanup owner changed")
+            if pending.reset_request is None:
+                self._require_cancelled_preparation(task, envelope)
+                if operation != pending.operation or not resident:
+                    raise ProductionPortError("preparation cleanup no longer identifies original resident work")
+                pending.reset_request = {
+                    "request_context": {
+                        "request_id": _request_identity("program-held-preparation", program_run_id, shared.operation_id),
+                        "request_owner_epoch": shared.request_owner_epoch,
+                        "source_label": "manyforge_behavior",
+                        "correlation_id": program_run_id,
+                    },
+                    "operation_id": shared.operation_id,
+                    "expected_operation_revision": operation["operation_revision"],
+                    "reason": "Selected Resume retires cancelled unsent preparation",
+                }
+            if resident:
+                # Existing Kernel reset owns the permanent no-effect proof and
+                # refuses active/unknown borrows. It must never fall through to
+                # provider Reset for this exact class (DX843 private guard).
+                # Retries of explicit Resume use this same deterministic body.
+                pending.reset_submitted = True
+                result = self._kernel.reset(shared.operation_id, pending.reset_request)
+                self._require_preparation_reset_receipt(result.get("accepted"), task, pending)
+                pending.reset_acceptance = dict(result["accepted"])
+                envelope = self._kernel.operation(shared.operation_id)
+                operation, resident = self._resettable_operation(envelope, task)
+            if (not pending.reset_submitted or resident
+                or envelope.get("owner_epoch") != shared.request_owner_epoch
+                or operation.get("program_binding_id") != pending.operation["program_binding_id"]
+                or envelope.get("control_pending") is not False):
+                raise ProductionPortError("preparation retirement remains unconfirmed")
+            self._require_preparation_reset_receipt(envelope.get("last_control"), task, pending)
+            if (pending.reset_acceptance is not None
+                and envelope["last_control"]["operation_revision_after_acceptance"]
+                != pending.reset_acceptance["operation_revision_after_acceptance"]):
+                raise ProductionPortError("preparation retirement control was superseded")
+            # The real control receipt and history remain in the Kernel. Recheck
+            # the selection after cleanup; a newer Stop always wins release.
+            scope, held = self._held_preparation_scope(task, require_settled=True)
+            if not held or scope["selection_revision"] != expected_selection_revision:
+                raise ProductionPortError("Program hold changed during preparation retirement")
+            with self._lock:
+                if self._tasks.get(task.task_id) is not task:
+                    raise ProductionPortError("preparation owner changed during retirement")
+                self._tasks.pop(task.task_id)
 
     def _reset_scope(self, program_run_id: str) -> ProgramRunScopeSnapshot:
         tasks, local_tasks = self._run_operation_tasks(program_run_id)
@@ -3399,6 +3797,14 @@ class _NativeKernelProgramScopePort:
 
     def stop_selection(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._owner._kernel.stop_program_selection(request)
+
+    def retire_held_preparations(
+        self, program_run_id: str, selected_node_ids: frozenset[str],
+        expected_selection_revision: int,
+    ) -> None:
+        self._owner._retire_held_preparations(
+            program_run_id, selected_node_ids, expected_selection_revision,
+        )
 
     def release_selection(
         self, request: Mapping[str, Any], expected_selection_revision: int

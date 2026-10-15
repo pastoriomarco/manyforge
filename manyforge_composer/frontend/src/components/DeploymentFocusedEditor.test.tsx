@@ -1,14 +1,18 @@
+import { act } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
-import type { SourceModelProjection } from '../types/api';
+import type { JsonValue, SourceModelProjection } from '../types/api';
+import type { ManualControlGripperDescriptor } from '../types/robotControl';
 import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
 import { statusFixture } from '../testFixtures/robotControl';
 
 const digest = `sha256:${'1'.repeat(64)}`;
 
-function controller(): DeploymentWorkspaceController {
+function controller(
+  actuationKind: 'position_commanded' | 'pneumatic' = 'position_commanded',
+): DeploymentWorkspaceController {
   return {
     workspace: {
       schemaVersion: 'manyforge.composer_deployment_workspace.v1',
@@ -42,7 +46,7 @@ function controller(): DeploymentWorkspaceController {
                   controllable_component_id: 'robot',
                   command_target_id: 'gripper',
                   description: 'Native test gripper',
-                  actuation_kind: 'position_commanded',
+                  actuation_kind: actuationKind,
                   open_state_ref: 'open',
                   closed_state_ref: 'closed',
                   command_duration_s: 0.8,
@@ -127,7 +131,291 @@ function controller(): DeploymentWorkspaceController {
   };
 }
 
+afterEach(() => vi.unstubAllGlobals());
+
+function rosGripperController(
+  actuationKind: 'position_commanded' | 'pneumatic',
+  outputMode: 'commanded' | 'none' = 'commanded',
+) {
+  const value = controller(actuationKind);
+  const graph = value.workspace!.draft.document!.graph as Record<string, JsonValue>;
+  const runtime = (graph.runtime_units as Array<Record<string, JsonValue>>)[0];
+  const configuration = runtime.configuration as Record<string, JsonValue>;
+  runtime.runtime_unit_id = 'robot.ros2_control_execution';
+  configuration.mode = 'commanded_sim';
+  configuration.controller_profiles = [{
+    controllable_component_id: 'robot', mock_profile: 'lite6_lite_gripper',
+  }];
+  const row = (configuration.gripper_target_configurations as Array<Record<string, JsonValue>>)[0];
+  row.output_mode = outputMode;
+  return value;
+}
+
+// Use the existing mounted-test pattern: real React state and handlers on a
+// minimal DOM host, without introducing another browser/test dependency.
+type FakeNode = Record<string, unknown>;
+type Props = Record<string, unknown> & {
+  onChange?: (event: unknown) => void;
+  onClick?: () => void;
+};
+function mountedHost() {
+  const elements: FakeNode[] = [];
+  const document: FakeNode = {
+    nodeType: 9, activeElement: null, defaultView: {},
+    addEventListener: () => undefined, removeEventListener: () => undefined,
+    createTextNode: (text: string) => ({ nodeType: 3, nodeValue: text, ownerDocument: document }),
+  };
+  const node = (tag: string): FakeNode => {
+    const element = {
+      nodeType: 1, nodeName: tag.toUpperCase(), tagName: tag.toUpperCase(),
+      namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: document, style: {}, options: [],
+      addEventListener: () => undefined, removeEventListener: () => undefined,
+      appendChild: () => undefined, insertBefore: () => undefined, removeChild: () => undefined,
+      setAttribute: () => undefined, removeAttribute: () => undefined,
+    };
+    elements.push(element);
+    return element;
+  };
+  document.createElement = node;
+  document.documentElement = node('html');
+  const window = { document, HTMLIFrameElement: class {} };
+  document.defaultView = window;
+  vi.stubGlobal('window', window);
+  vi.stubGlobal('document', document);
+  vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+  const find = (match: (props: Props) => boolean) => {
+    const found = elements.map((element) => element[
+      Object.keys(element).find((key) => key.startsWith('__reactProps$'))!
+    ] as Props | undefined).find((props) => props !== undefined && match(props));
+    if (found === undefined) throw new Error('Mounted control not found');
+    return found;
+  };
+  return { host: node('div'), find };
+}
+
+async function mountGripper(
+  actuationKind: 'position_commanded' | 'pneumatic',
+  outputMode: 'commanded' | 'none' = 'commanded',
+  timeoutSource?: JsonValue,
+) {
+  const value = rosGripperController(actuationKind, outputMode);
+  const graph = value.workspace!.draft.document!.graph as Record<string, JsonValue>;
+  const runtime = (graph.runtime_units as Array<Record<string, JsonValue>>)[0];
+  const configuration = runtime.configuration as Record<string, JsonValue>;
+  const sourceRow = (configuration.gripper_target_configurations as Array<Record<string, JsonValue>>)[0];
+  if (timeoutSource !== undefined) sourceRow.delivery_result_timeout_s = timeoutSource;
+  vi.mocked(value.mutate).mockResolvedValue(value.workspace);
+  const descriptor: ManualControlGripperDescriptor = {
+    ...statusFixture().directControlGripper!.targetDescriptor,
+    controllableComponentId: 'robot', actuationKind, outputMode,
+    completionPolicy: actuationKind === 'pneumatic'
+      ? outputMode === 'none' ? 'no_output' : 'output_delivery'
+      : 'goal_fenced_target_reached',
+    graspConfirmationPolicy: actuationKind === 'pneumatic' ? 'not_required' : 'binding_feedback_required',
+    namedPresets: [
+      { name: 'closed', masterPosition: 0, coordinates: [] },
+      { name: 'open', masterPosition: 0.04, coordinates: [] },
+    ],
+  };
+  const { host, find } = mountedHost();
+  const { createRoot } = await import('react-dom/client');
+  const root = createRoot(host as unknown as Element);
+  await act(() => root.render(<DeploymentFocusedEditor controller={value}
+    sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[descriptor]} />));
+  const field = (label: string) => {
+    const row = find((props) => props.className === 'deployment-focused-field' && Array.isArray(props.children)
+      && (props.children[0] as { props?: Props })?.props?.children === label);
+    return (row.children as Array<{ props: Props }>)[1].props;
+  };
+  const duration = () => (field(field('Actuation kind').value === 'pneumatic'
+    ? 'Program dwell' : 'Motion time').children as Array<{ props: Props }>)[0].props;
+  const setDuration = (durationS: number) => act(() => duration().onChange?.({
+    target: { value: String(durationS) },
+  }));
+  const update = () => act(() => {
+    find((props) => props.children === 'Update gripper Draft').onClick?.();
+  });
+  return { value, sourceRow, find, field, duration, setDuration, update,
+    unmount: () => act(() => root.unmount()) };
+}
+
 describe('DeploymentFocusedEditor', () => {
+  it.each(['commanded', 'none'] as const)(
+    'preserves explicit pneumatic timeout through edits and %s output changes', async (mode) => {
+      const mounted = await mountGripper('pneumatic', mode, 2.5);
+      try {
+        expect(mounted.field('Program dwell')).toBeDefined();
+        expect(() => mounted.field('Motion time')).toThrow('Mounted control not found');
+        expect(() => mounted.field('Delivery result timeout')).toThrow('Mounted control not found');
+        await mounted.setDuration(0.25);
+        await mounted.update();
+        expect(mounted.value.mutate).toHaveBeenLastCalledWith(
+          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
+          'set', { ...mounted.sourceRow, command_duration_s: 0.25 },
+        );
+        const otherMode = mode === 'none' ? 'commanded' : 'none';
+        await act(() => mounted.field('Output').onChange?.({ target: { value: otherMode } }));
+        await mounted.update();
+        expect(mounted.value.mutate).toHaveBeenLastCalledWith(
+          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
+          'set', { ...mounted.sourceRow, output_mode: otherMode, command_duration_s: 0.25 },
+        );
+      } finally { await mounted.unmount(); }
+    },
+  );
+
+  it.each(['position_commanded', 'pneumatic'] as const)(
+    'retains timeout omission and the existing row fields for %s', async (kind) => {
+      const mounted = await mountGripper(kind);
+      try {
+        expect(Object.keys(mounted.sourceRow)).toHaveLength(13);
+        await mounted.setDuration(0.25);
+        await mounted.update();
+        expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
+          'set', { ...mounted.sourceRow, command_duration_s: 0.25 },
+        );
+      } finally { await mounted.unmount(); }
+    },
+  );
+
+  it('drops the pneumatic-only timeout on an intentional switch to position', async () => {
+    const mounted = await mountGripper('pneumatic', 'commanded', 2.5);
+    try {
+      await act(() => mounted.field('Actuation kind').onChange?.({ target: { value: 'position_commanded' } }));
+      expect(mounted.field('Motion time')).toBeDefined();
+      await mounted.update();
+      const positionRow = { ...mounted.sourceRow };
+      delete positionRow.delivery_result_timeout_s;
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
+        'set', { ...positionRow, actuation_kind: 'position_commanded' },
+      );
+    } finally { await mounted.unmount(); }
+  });
+
+  it.each([0, -1, null, '2.5', true, NaN, Infinity, -Infinity])(
+    'does not repair an invalid authored pneumatic timeout %s', async (timeout) => {
+      const mounted = await mountGripper('pneumatic', 'commanded', timeout);
+      try {
+        expect(() => mounted.field('Program dwell')).toThrow('Mounted control not found');
+        expect(mounted.value.mutate).not.toHaveBeenCalled();
+        expect(mounted.sourceRow.delivery_result_timeout_s).toBe(timeout);
+      } finally { await mounted.unmount(); }
+    },
+  );
+
+  it('does not silently strip a foreign timeout from an authored position row', async () => {
+    const mounted = await mountGripper('position_commanded', 'commanded', 2.5);
+    try {
+      expect(() => mounted.field('Motion time')).toThrow('Mounted control not found');
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+      expect(mounted.sourceRow.delivery_result_timeout_s).toBe(2.5);
+    } finally { await mounted.unmount(); }
+  });
+
+  it.each([0, 0.8])('writes explicit pneumatic no-output with dwell %s', async (duration) => {
+    const mounted = await mountGripper('pneumatic');
+    try {
+      expect(mounted.field('Output').value).toBe('commanded');
+      await act(() => mounted.field('Output').onChange?.({ target: { value: 'none' } }));
+      await mounted.setDuration(duration);
+      await mounted.update();
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
+        'set', expect.objectContaining({ output_mode: 'none', actuation_kind: 'pneumatic',
+          command_duration_s: duration, open_state_ref: 'open', closed_state_ref: 'closed',
+          mount_frame: 'tool0', tcp_frame: 'tool0' }),
+      );
+      await act(() => mounted.field('Output').onChange?.({ target: { value: 'commanded' } }));
+      // Keep the duration changed from the owner's row so the Draft write is requested.
+      await mounted.setDuration(0.1);
+      await mounted.update();
+      expect(mounted.value.mutate).toHaveBeenLastCalledWith(
+        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
+        'set', expect.objectContaining({ output_mode: 'commanded', command_duration_s: 0.1 }),
+      );
+    } finally { await mounted.unmount(); }
+  });
+
+  it('requires explicit commanded output after changing pneumatic-none to position', async () => {
+    const mounted = await mountGripper('pneumatic', 'none');
+    try {
+      await act(() => mounted.field('Actuation kind').onChange?.({ target: { value: 'position_commanded' } }));
+      expect(mounted.field('Output').value).toBe('none');
+      await mounted.update();
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+      expect(mounted.find((props) => props.role === 'alert').children)
+        .toBe('No output is available only for pneumatic grippers.');
+      await act(() => mounted.field('Output').onChange?.({ target: { value: 'commanded' } }));
+      await mounted.update();
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
+        'set', expect.objectContaining({ output_mode: 'commanded', actuation_kind: 'position_commanded' }),
+      );
+    } finally { await mounted.unmount(); }
+  });
+
+  it('does not submit an unsupported output choice', async () => {
+    const mounted = await mountGripper('pneumatic');
+    try {
+      await act(() => mounted.field('Output').onChange?.({ target: { value: 'default' } }));
+      await mounted.update();
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+      expect(mounted.find((props) => props.role === 'alert').children)
+        .toBe('Choose Send command or No output.');
+    } finally { await mounted.unmount(); }
+  });
+
+  it.each([
+    ['pneumatic', 0, true],
+    ['pneumatic', 60, true],
+    ['position_commanded', 0, false],
+    ['position_commanded', 0.1, true],
+    ['position_commanded', 60, true],
+    ...(['pneumatic', 'position_commanded'] as const).flatMap((kind) => (
+      [-0.1, 60.1, NaN, Infinity, -Infinity].map((duration) => [kind, duration, false] as const)
+    )),
+  ] as const)('validates %s duration %s before Draft mutation', async (kind, duration, valid) => {
+    const mounted = await mountGripper(kind);
+    try {
+      expect(mounted.duration().min).toBe(kind === 'pneumatic' ? '0' : '0.000001');
+      expect(mounted.duration().max).toBe('60');
+      await mounted.setDuration(duration);
+      await mounted.update();
+      if (valid) {
+        expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+          ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
+          'set',
+          expect.objectContaining({ actuation_kind: kind, command_duration_s: duration }),
+        );
+      } else {
+        expect(mounted.value.mutate).not.toHaveBeenCalled();
+        expect(mounted.find((props) => props.role === 'alert').children).toContain(
+          kind === 'pneumatic' ? 'from 0 to 60 s' : 'above 0 and at most 60 s',
+        );
+      }
+    } finally { await mounted.unmount(); }
+  });
+
+  it('revalidates zero dwell when the authored actuation kind changes', async () => {
+    const mounted = await mountGripper('pneumatic');
+    try {
+      await mounted.setDuration(0);
+      await act(() => mounted.field('Actuation kind').onChange?.({ target: { value: 'position_commanded' } }));
+      expect(mounted.duration().min).toBe('0.000001');
+      await mounted.update();
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+      await act(() => mounted.field('Actuation kind').onChange?.({ target: { value: 'pneumatic' } }));
+      expect(mounted.duration().min).toBe('0');
+      await mounted.update();
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
+        'set', expect.objectContaining({ actuation_kind: 'pneumatic', command_duration_s: 0 }),
+      );
+    } finally { await mounted.unmount(); }
+  });
+
   it('renders authored intent without requiring a compiled graph projection', () => {
     const value = controller();
     value.workspace!.draft.document = {
@@ -467,15 +755,16 @@ describe('DeploymentFocusedEditor', () => {
   it('joins one authored gripper row to exact owner semantics', () => {
     const markup = renderToStaticMarkup(
       <DeploymentFocusedEditor
-        controller={controller()}
+        controller={rosGripperController('position_commanded')}
         sourceModel={{ status: 'loading' }}
         motionDescriptors={[]}
         gripperDescriptors={[{
-          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v2',
+          schemaVersion: 'manyforge.manual_control_gripper_descriptor.v3',
           controllableComponentId: 'robot', commandTargetId: 'gripper',
           componentRoleId: 'robot', targetRoleId: 'gripper',
           description: 'Native test gripper', commandKind: 'gripper_position',
           actuationKind: 'position_commanded', transportKind: 'resolved_binding',
+          outputMode: 'commanded',
           controlInterfaceContractId: 'native.gripper',
           stateAuthorityId: 'native.predicted', stateAuthorityClass: 'predicted',
           completionPolicy: 'goal_fenced_target_reached',

@@ -1,11 +1,13 @@
 #pragma once
 
 #include <cstddef>
+#include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/stop_control.hpp>
 #include <manyforge_core/types/stop_evidence_policy.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
+#include <manyforge_deployment/cell_composition.hpp>
 #include <span>
 #include <optional>
 #include <string>
@@ -43,8 +45,13 @@ inline constexpr std::size_t kMaxControlDomainControlBytes = 16U * 1024U * 1024U
     const core::ControlDomainId& control_domain_id);
 
 /// Parse and independently verify one canonical closed artifact.
+/// DX817: only an exact strict source graph can qualify pneumatic no-floor;
+/// absence preserves the historical physical/default hard-floor requirement.
 [[nodiscard]] CanonicalValue parse_and_verify_control_domain_control(
-    std::string_view canonical_bytes);
+    std::string_view canonical_bytes,
+    const core::CellGraphDTO *source_graph = nullptr,
+    std::span<const CompositionControlBindingCoordinateMap> coordinate_maps =
+        {});
 
 /// Complete byte closure of one retained v2 control-domain product.
 struct ControlDomainControlArtifactClosure final {
@@ -63,19 +70,24 @@ void require_control_domain_control_matches(std::string_view canonical_bytes,
 /// This is the read-only package-admission check used when compiler IR is no
 /// longer available.
 void require_control_domain_control_matches_retained_bundle(
-    std::string_view canonical_bytes, const core::RetainedBundleDTO& retained_bundle,
-    const core::ControlDomainId& control_domain_id,
+    std::string_view canonical_bytes,
+    const core::RetainedBundleDTO &retained_bundle,
+    const core::ControlDomainId &control_domain_id,
     std::span<const QualifiedStopEvidencePolicy> stop_policies = {},
     std::span<const QualifiedControllerTopology> controller_topologies = {},
-    std::span<const QualifiedProviderManifest> provider_manifests = {});
+    std::span<const QualifiedProviderManifest> provider_manifests = {},
+    std::span<const CompositionControlBindingCoordinateMap> coordinate_maps =
+        {});
 
 void require_control_domain_control_matches_retained_bundle(
-    const ControlDomainControlArtifactClosure& artifacts,
-    const core::RetainedBundleDTO& retained_bundle,
-    const core::ControlDomainId& control_domain_id,
+    const ControlDomainControlArtifactClosure &artifacts,
+    const core::RetainedBundleDTO &retained_bundle,
+    const core::ControlDomainId &control_domain_id,
     std::span<const QualifiedStopEvidencePolicy> stop_policies = {},
     std::span<const QualifiedControllerTopology> controller_topologies = {},
-    std::span<const QualifiedProviderManifest> provider_manifests = {});
+    std::span<const QualifiedProviderManifest> provider_manifests = {},
+    std::span<const CompositionControlBindingCoordinateMap> coordinate_maps =
+        {});
 
 /// Canonical declarative subset shared by the compiler projection and the
 /// independently requalified durable catalog comparison.

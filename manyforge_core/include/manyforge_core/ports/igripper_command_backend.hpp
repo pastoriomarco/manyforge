@@ -23,6 +23,16 @@ class IGripperCommandBackend {
     return Result<void>::Ok();
   }
 
+  /// Strict selected-target configuration; command coordinate tags are not actuation.
+  virtual GripperActuationKind gripper_actuation_kind(const std::string&) const {
+    return GripperActuationKind::kPositionCommanded;
+  }
+  /// Existing engines retain commanded output; only strict authored targets
+  /// may expose the explicit pneumatic none choice.
+  virtual GripperOutputMode gripper_output_mode(const std::string&) const {
+    return GripperOutputMode::kCommanded;
+  }
+
   virtual GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) = 0;
 
   virtual GripperCommandStatusDTO get_gripper_status(const std::string& gripper_id) const = 0;

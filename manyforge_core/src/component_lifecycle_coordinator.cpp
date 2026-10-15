@@ -49,6 +49,64 @@ ScopeExit(Function) -> ScopeExit<Function>;
   return {std::move(code), std::move(message), {{"reason", std::move(reason)}}};
 }
 
+// Preserve only the current failed primitive's cause. A successful, unknown, or
+// foreign result is not evidence for this reconciliation failure.
+[[nodiscard]] ErrorDTO with_failed_primitive_details(
+    ErrorDTO error, const ComponentLifecycleStatusDTO& status,
+    const ComponentLifecycleDomainStatusDTO& domain, const LifecyclePrimitiveId& primitive_id) {
+  if (domain.primitive_attempts.empty() || !domain.resolved_provider_occurrence.has_value()) {
+    return error;
+  }
+  const auto& result = domain.primitive_attempts.back();
+  const auto& provider = *domain.resolved_provider_occurrence;
+  if (!result.locally_valid() ||
+      result.known_result != LifecyclePrimitiveKnownResultDTO::kFailed || !result.error ||
+      result.lifecycle_transaction_id != status.acceptance.lifecycle_transaction_id ||
+      result.lifecycle_transaction_generation !=
+          status.acceptance.lifecycle_transaction_generation ||
+      result.controllable_component_id != status.accepted_intent.controllable_component_id ||
+      result.control_domain_id != domain.control_domain_id ||
+      result.control_domain_revision != provider.control_domain_revision ||
+      result.provider_instance_id != provider.provider_instance_id ||
+      result.provider_manifest_id != provider.provider_manifest_id ||
+      result.provider_manifest_revision != provider.provider_manifest_revision ||
+      result.provider_runtime_unit_id != provider.provider_runtime_unit_id ||
+      result.provider_runtime_epoch != provider.provider_runtime_epoch ||
+      result.lifecycle_primitive_id != primitive_id) {
+    return error;
+  }
+  const auto bounded = [](std::string value) {
+    if (value.size() > kMaxLifecycleErrorDetailValueBytes) {
+      auto end = kMaxLifecycleErrorDetailValueBytes;
+      while (end > 0U && (static_cast<unsigned char>(value[end]) & 0xC0U) == 0x80U) {
+        --end;
+      }
+      value.resize(end);
+    }
+    return value;
+  };
+  const auto& cause = *result.error;
+  error.details.emplace("primitive_code", bounded(cause.code));
+  const auto reason = cause.details.find("reason");
+  if (reason != cause.details.end()) {
+    error.details.emplace("primitive_reason", bounded(reason->second));
+  }
+  const auto response = cause.details.find("controller_response_message");
+  error.details.emplace(
+      "primitive_message",
+      bounded(response != cause.details.end() && !response->second.empty() ? response->second
+                                                                         : cause.message));
+  for (const auto* key : {"controller_name", "switch_action", "controller_service"}) {
+    const auto detail = cause.details.find(key);
+    if (detail != cause.details.end()) {
+      error.details.emplace(key, bounded(detail->second));
+    }
+  }
+  error.details.emplace("primitive_attempt_id",
+                        bounded(result.lifecycle_primitive_attempt_id.value()));
+  return error;
+}
+
 [[nodiscard]] Result<std::uint64_t> NextEffectSequence(std::uint64_t current) {
   if (current == std::numeric_limits<std::uint64_t>::max()) {
     return Result<std::uint64_t>::Err(coordinator_error(
@@ -5357,12 +5415,12 @@ class ComponentLifecycleCoordinator::Impl final {
       FailRecoveredBeforeEffect(runtime);
       return;
     }
+    const auto domain_index =
+        static_cast<std::size_t>(pending_domain - runtime->status.domains.begin());
     if (!AdoptRecoveredStatus(runtime)) {
       return;
     }
-    ReconcileRecoveredBrandObservation(
-        runtime, static_cast<std::size_t>(pending_domain - runtime->status.domains.begin()),
-        cancellation);
+    ReconcileRecoveredBrandObservation(runtime, domain_index, cancellation);
   }
 
   void CompleteRecoveredBrandPrepareAsUncertain(const std::shared_ptr<RuntimeState>& runtime,
@@ -5543,9 +5601,11 @@ class ComponentLifecycleCoordinator::Impl final {
         reconciled_domain.action_state = ComponentLifecycleDomainActionStateDTO::kFailed;
         reconciled_domain.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
         reconciled_domain.error =
-            coordinator_error("component_lifecycle_primitive_known_no_effect",
-                              "fresh owner-recovery evidence proved no relevant primitive effect",
-                              "state_only_observation_unchanged_after_owner_replacement");
+            with_failed_primitive_details(
+                coordinator_error("component_lifecycle_primitive_known_no_effect",
+                                  "fresh owner-recovery evidence proved no relevant primitive effect",
+                                  "state_only_observation_unchanged_after_owner_replacement"),
+                runtime->status, domain, transition->lifecycle_primitive_id);
         reconciled.reconciliation_required = false;
         reconciled.error = reconciled_domain.error;
         break;
@@ -6071,10 +6131,12 @@ class ComponentLifecycleCoordinator::Impl final {
         case UncertainEffectResolution::kKnownNoEffect:
           reconciled_domain.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
           reconciled_domain.action_state = ComponentLifecycleDomainActionStateDTO::kFailed;
-          reconciled_domain.error = coordinator_error(
-              "component_lifecycle_primitive_known_no_effect",
-              "fresh reconciliation proved that the prepared primitive had no relevant effect",
-              "observation_unchanged_after_uncertain_dispatch");
+          reconciled_domain.error = with_failed_primitive_details(
+              coordinator_error(
+                  "component_lifecycle_primitive_known_no_effect",
+                  "fresh reconciliation proved that the prepared primitive had no relevant effect",
+                  "observation_unchanged_after_uncertain_dispatch"),
+              runtime->status, domain, runtime->verifying_transition->lifecycle_primitive_id);
           reconciled.reconciliation_required = false;
           reconciled.error = reconciled_domain.error;
           break;

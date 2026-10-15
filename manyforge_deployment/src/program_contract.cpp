@@ -2164,9 +2164,12 @@ void verify_node_value_sources(const CanonicalValue::Object &node,
   std::map<std::string, NodeShape> shapes;
   std::size_t membership_count = 0U;
   std::size_t effect_count = 0U;
-  const auto visit = [&](auto &&self, const CanonicalValue &value,
-                         const std::vector<std::string> &inherited,
-                         const std::string &parent_instance_id) -> void {
+  const auto visit =
+      [&](auto &&self, const CanonicalValue &value,
+          const std::vector<std::string> &inherited,
+          const std::string &parent_instance_id,
+          const core::ProgramOperatorStopPolicy inherited_stop_policy,
+          const std::optional<std::uint32_t> parent_node_index) -> void {
     const auto &node = require_object(value, "program.tree");
     const auto &instance = require_string(
         require_member(node, "instance_id", "tree"), "instance_id");
@@ -2210,6 +2213,24 @@ void verify_node_value_sources(const CanonicalValue::Object &node,
     if (definition == catalog.entries.end())
       fail(path + ": node is absent from the qualified catalog");
     const auto &entry = require_object(definition->second, "catalog.entry");
+    const auto &kind =
+        require_string(require_member(entry, "kind", path), path);
+    const auto *authored_stop_policy =
+        find_member(node, "operator_stop_policy");
+    auto stop_policy = authored_stop_policy == nullptr
+                           ? core::ProgramOperatorStopPolicy::kInherit
+                           : parse_stop_policy(*authored_stop_policy, path);
+    if (stop_policy == core::ProgramOperatorStopPolicy::kInherit) {
+      stop_policy = !parent_node_index.has_value()
+                        ? core::ProgramOperatorStopPolicy::kContinue
+                        : ((kind == "composite" || kind == "decorator")
+                               ? inherited_stop_policy
+                               : core::ProgramOperatorStopPolicy::kHold);
+    }
+    // Match Behavior's node-local resolution. A Hold ancestor blocks only
+    // when its whole subtree is in the current authoritative held selection.
+    selected->effective_operator_stop_policy = stop_policy;
+    selected->parent_node_index = parent_node_index;
     const auto &execution =
         require_object(require_member(entry, "execution", path), path);
     selected->owner_api =
@@ -2224,10 +2245,11 @@ void verify_node_value_sources(const CanonicalValue::Object &node,
     effect_count += selected->target_effects.size();
     for (const auto &child :
          require_array(require_member(node, "children", path), path)) {
-      self(self, child, groups, instance);
+      self(self, child, groups, instance, stop_policy, index);
     }
   };
-  visit(visit, tree, {}, {});
+  visit(visit, tree, {}, {}, core::ProgramOperatorStopPolicy::kContinue,
+        std::nullopt);
   std::set<std::uint32_t> coordinated_nodes;
   for (auto &[name, indices] : selections) {
     std::sort(indices.begin(), indices.end());

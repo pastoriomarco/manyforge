@@ -1605,6 +1605,22 @@ TEST(BuildManifestAuthority,
   }
 }
 
+TEST(BuildManifestAuthority, RejectsPreviousCatalogContentVersion) {
+  const auto current = detail::BuildManifestTestAccess::current_candidate(
+      BuildManifestKind::kNodeEnvironment);
+  const CanonicalValue catalog = member(current, "catalog");
+  EXPECT_EQ(text_member(catalog, "content_version"), "2.5.0");
+  const CanonicalValue candidate = reidentify(
+      replace_member(current, "catalog",
+                     replace_member(catalog, "content_version",
+                                    CanonicalValue(std::string("2.4.0")))),
+      BuildManifestKind::kNodeEnvironment);
+  EXPECT_THROW(
+      static_cast<void>(detail::BuildManifestTestAccess::qualify_candidate(
+          BuildManifestKind::kNodeEnvironment, candidate)),
+      BuildManifestError);
+}
+
 TEST(BuildManifestAuthority,
      RejectsAllUnicodeControlCharactersIncludingC1Controls) {
   const auto current = detail::BuildManifestTestAccess::current_candidate(

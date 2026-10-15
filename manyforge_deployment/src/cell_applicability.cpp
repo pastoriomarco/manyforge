@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/gripper.hpp>
 #include <map>
 #include <set>
 #include <string>
@@ -17,8 +18,11 @@
 
 #include "cell_applicability_budget_internal.hpp"
 #include "manyforge_deployment/content_identity.hpp"
+#include "manyforge_deployment/verified_retained_bundle.hpp"
 #include "manyforge_deployment/site_overlay_resolution.hpp"
 #include "mf1_name_internal.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -1091,6 +1095,7 @@ struct BindingContext final {
   const core::ProviderCapabilityOfferDTO *offer;
   const QualifiedStopEvidencePolicy *stop_policy;
   BoundResourceMap resources;
+  std::optional<core::GripperActuationKind> gripper_actuation_kind;
   std::optional<LogicalBindingInterfaceTemplate> interface_template;
 };
 
@@ -1201,6 +1206,25 @@ void require_target_capability(
   }
 }
 
+[[nodiscard]] std::optional<core::GripperActuationKind>
+qualify_gripper_actuation_kind(
+    const core::CellGraphDTO &graph, const core::ControlBindingDTO &binding,
+    const CompositionControlBindingCoordinateMap &coordinate_map) {
+  const bool model_backed = std::any_of(
+      coordinate_map.resources.begin(), coordinate_map.resources.end(),
+      [](const auto &resource) { return !resource.coordinates.empty(); });
+  if (!model_backed) {
+    // Generic component-local and archival subjects retain their old floor.
+    return std::nullopt;
+  }
+  try {
+    return detail::classify_ros_gripper_actuation_kind(
+        graph, binding, std::span(&coordinate_map, 1U));
+  } catch (const RetainedBundleError &error) {
+    fail(error.what());
+  }
+}
+
 [[nodiscard]] std::vector<BindingContext>
 qualify_binding_contexts(const CompositionQualifiedCellIr &composition,
                          const QualifiedIndexes &indexes) {
@@ -1266,7 +1290,9 @@ qualify_binding_contexts(const CompositionQualifiedCellIr &composition,
         binding, type_target, coordinate_map, contract.value());
     result.push_back({&binding, &domain, &coordinate_map, &capability,
                       &contract, &topology, &manifest, &offer, &stop_policy,
-                      std::move(resources), std::nullopt});
+                      std::move(resources),
+                      qualify_gripper_actuation_kind(graph, binding, coordinate_map),
+                      std::nullopt});
   }
   return result;
 }
@@ -2572,6 +2598,10 @@ resource_coordinate_kind(const BindingContext &context,
 
 [[nodiscard]] bool
 binding_affects_motion_resources(const BindingContext &context) noexcept {
+  if (context.gripper_actuation_kind.has_value()) {
+    return *context.gripper_actuation_kind ==
+           core::GripperActuationKind::kPositionCommanded;
+  }
   return std::any_of(
       context.coordinate_map->resources.begin(),
       context.coordinate_map->resources.end(), [](const auto &resource) {
@@ -2934,12 +2964,29 @@ qualify_stop_applicability(
       if (policy.escalation_stages.empty()) {
         fail("qualified stoppable policy lost its escalation chain");
       }
-      if (binding_affects_motion_resources(context) &&
+      if (context.gripper_actuation_kind.has_value()) {
+        for (const auto &stage : policy.escalation_stages) {
+          for (const auto &requirement : stage.evidence_requirements) {
+            if (requirement.evidence_kind == core::StopEvidenceRequirementKind::kMotionRest ||
+                requirement.evidence_kind ==
+                    core::StopEvidenceRequirementKind::kControllerGoalTerminal) {
+              fail("ROS gripper Stop policy must not require rest or controller-terminal evidence");
+            }
+          }
+        }
+      }
+      const auto hard_count =
           std::count_if(policy.escalation_stages.begin(),
                         policy.escalation_stages.end(), [](const auto &stage) {
                           return stage.stage_kind ==
                                  core::StopEscalationStageKind::kSoftwareHard;
-                        }) != 1) {
+                        });
+      const bool pneumatic = context.gripper_actuation_kind ==
+                             core::GripperActuationKind::kPneumatic;
+      if (pneumatic && hard_count != 0)
+        fail("pneumatic gripper Stop policy must not contain a software-hard "
+             "floor");
+      if (binding_affects_motion_resources(context) && hard_count != 1) {
         fail("stoppable angular/linear motion binding requires exactly one "
              "distinct software-hard floor");
       }

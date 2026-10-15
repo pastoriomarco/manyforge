@@ -165,6 +165,66 @@ using namespace manyforge::core;
   return std::move(sealed.value());
 }
 
+// Sealed-model/port resource proof; deployment owns the strict pneumatic/None
+// discriminator. This does not qualify a physical controller or device.
+TEST(RetainedExternallyManagedLifecyclePorts,
+     ExplicitNoneRetainsExactLogicalResourcesWithoutPhysicalClaims) {
+  auto value = MakeExpectedDomain().value();
+  value.physical_expectation =
+      ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone;
+  value.controller_topology.controllers.clear();
+  value.controller_topology.chain_edges.clear();
+  value.expected_controllers.clear();
+  for (auto &activation : value.controller_topology.activation_sets) {
+    activation.active_controller_role_ids.clear();
+    activation.active_chain_edges.clear();
+  }
+  for (auto &route : value.controller_topology.legal_routes)
+    route.ordered_controller_role_ids.clear();
+  auto &expected_binding = value.expected_bindings.front();
+  expected_binding.logical_owner_resources = {ResourceId("robot.joint.1")};
+  expected_binding.claimed_command_interfaces.clear();
+  expected_binding.claimed_state_interfaces.clear();
+  auto sealed = verify_controller_lifecycle_expected_domain(value);
+  ASSERT_TRUE(sealed.ok()) << sealed.error().message;
+  FakeClock clock;
+  clock.set(1'000);
+  const auto source = [](const ControlDomainId &, const TimePoint) {
+    return Result<RetainedExternallyManagedDomainSnapshot>::Ok(
+        {1U, ComponentLifecycleStateDTO::kActive, true, {}});
+  };
+  auto created = RetainedExternallyManagedControllerLifecyclePort::Create(
+      sealed.value(), {MakePhysicalBinding()}, source, clock, 500);
+  ASSERT_TRUE(created.ok()) << created.error().message;
+  auto query = MakeControllerLifecycleObservationQuery(sealed.value().value());
+  auto observed = created.value()->Observe(query);
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  EXPECT_TRUE(observed.value().controllers.empty());
+  EXPECT_TRUE(observed.value().active_chain_edges.empty());
+  ASSERT_EQ(observed.value().endpoints.size(), 1U);
+  EXPECT_TRUE(observed.value().endpoints.front().ready);
+  auto reconciled = ReconcileControllerLifecycle(
+      sealed.value().value(), observed.value(), 1'001);
+  ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+  EXPECT_EQ(reconciled.value().disposition,
+            ControllerLifecycleReconciliationDispositionDTO::kReconciled);
+
+  auto foreign_value = MakePhysicalBinding().value();
+  foreign_value.resources.front().resource_id = ResourceId("foreign.resource");
+  auto foreign = verify_runtime_participant_binding(std::move(foreign_value));
+  ASSERT_TRUE(foreign.ok()) << foreign.error().message;
+  EXPECT_FALSE(RetainedExternallyManagedControllerLifecyclePort::Create(
+      sealed.value(), {foreign.value()}, source, clock, 500).ok());
+  auto missing = value;
+  missing.expected_bindings.front().logical_owner_resources.clear();
+  EXPECT_FALSE(verify_controller_lifecycle_expected_domain(std::move(missing)).ok());
+  auto required = value;
+  required.physical_expectation = ControllerLifecyclePhysicalExpectation::kRequired;
+  EXPECT_FALSE(verify_controller_lifecycle_expected_domain(std::move(required)).ok());
+  query.source_runtime_epoch = RuntimeEpoch("foreign.epoch");
+  EXPECT_FALSE(created.value()->Observe(query).ok());
+}
+
 TEST(RetainedExternallyManagedLifecyclePorts,
      ExactExternalControllerStateReconcilesWithoutMutationAuthority) {
   FakeClock clock;

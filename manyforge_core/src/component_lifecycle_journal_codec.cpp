@@ -779,6 +779,12 @@ void PutRouteIntent(Writer& writer, const RouteSelectionIntentDTO& value,
 
 void PutControllerObservationQuery(Writer& writer,
                                    const ControllerLifecycleObservationQueryDTO& value) {
+  if (value.physical_expectation == ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone) {
+    // Empty is never a valid legacy domain identity. Required queries retain
+    // their exact eleven-field bytes; only the new typed case has a prefix.
+    writer.String("");
+    writer.EnumValue(value.physical_expectation);
+  }
   writer.Identity(value.control_domain_id);
   writer.Identity(value.control_domain_revision);
   writer.Identity(value.controller_topology_id);
@@ -793,7 +799,15 @@ void PutControllerObservationQuery(Writer& writer,
 }
 
 [[nodiscard]] ControllerLifecycleObservationQueryDTO GetControllerObservationQuery(Reader& reader) {
-  return {reader.Identity<ControlDomainId>(),
+  auto domain = reader.Identity<ControlDomainId>();
+  auto expectation = ControllerLifecyclePhysicalExpectation::kRequired;
+  if (domain.empty()) {
+    expectation = reader.EnumValue<ControllerLifecyclePhysicalExpectation>();
+    if (expectation != ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone)
+      throw CodecFailure("controller observation physical expectation is unknown");
+    domain = reader.Identity<ControlDomainId>();
+  }
+  return {std::move(domain),
           reader.Identity<ControlDomainRevision>(),
           reader.Identity<ControllerTopologyId>(),
           reader.Identity<TopologyRevision>(),
@@ -803,7 +817,7 @@ void PutControllerObservationQuery(Writer& writer,
           reader.Identity<ContentDigest>(),
           reader.Identity<ContentDigest>(),
           reader.Identity<RuntimeUnitId>(),
-          reader.Identity<RuntimeEpoch>()};
+          reader.Identity<RuntimeEpoch>(), expectation};
 }
 
 void PutControllerInterfaceInstance(Writer& writer, const ControllerInterfaceInstanceDTO& value) {

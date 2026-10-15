@@ -8,6 +8,7 @@ const apiMock = vi.hoisted(() => ({ manager: { status: vi.fn(), canonicalEmptySe
     componentProcessStopOffer: vi.fn(), stopComponentProcess: vi.fn(), componentProcessStopResult: vi.fn() } }));
 vi.mock('../api/client', () => ({ api: apiMock }));
 import { closeScenario } from './scenarioClose';
+import { parseComponentProcessStopOffer } from '../api/processStopParsers';
 
 const scene = { scene_id: 'scene', revision_id: 1, content_hash: 'hash' };
 const active: ManagerActiveProjection = { canonicalEmpty: false, retainedBundleId: 'bundle.current',
@@ -79,6 +80,91 @@ it('unknown process Stop leaves replacement unrequested without resending Stop',
   apiMock.cclc.stopComponentProcess.mockResolvedValue({ state: 'unknown', error: { message: 'Old host drain unknown' }, receipt: null });
   await expect(closeScenario(inputs())).rejects.toThrow('Old host drain unknown');
   expect(apiMock.cclc.stopComponentProcess).toHaveBeenCalledTimes(1);
+  expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
+});
+
+function noneCloseFixture() {
+  const exactScene = { scene_id: `sha256:${'3'.repeat(64)}`, revision_id: 1,
+    content_hash: `sha256:${'4'.repeat(64)}` };
+  const pointer = `sha256:${'5'.repeat(64)}`;
+  const predecessor: ManagerActiveProjection = { ...active,
+    cellGraph: { controllable_components: [{ controllable_component_id: 'gripper' }] },
+    publication: { ...active.publication, durable_public_pointer_content_digest: pointer,
+      projection_revision: { retained_bundle_id: active.retainedBundleId,
+        graph_revision: active.graphRevision, scene_revision: exactScene } } };
+  const successor: ManagerActiveProjection = { ...empty, publication: { ...empty.publication,
+    projection_revision: { retained_bundle_id: empty.retainedBundleId,
+      graph_revision: empty.graphRevision, scene_revision: exactScene } } };
+  const ownerScope = { ...scope, active_public_pointer_digest: pointer };
+  const offer = { controllable_component_id: 'gripper', process_inventories: [{
+    request: { ...processScope, expected_predecessor_public_pointer_digest: pointer,
+      predecessor_projection_revision: { retained_bundle_id: predecessor.retainedBundleId,
+        graph_revision: predecessor.graphRevision, scene_revision: { ...exactScene } } },
+    process_occurrences: [{ controllable_component_id: 'gripper', process_owner_kind: 'pneumatic_none_local',
+      pneumatic_none_owner: { command_target_id: 'gripper', control_binding_id: 'binding.gripper',
+        control_binding_revision: 'binding.revision.1' },
+      installed_runtime_identity: `sha256:${'6'.repeat(64)}`, process_presence: 'absent' }], error: null,
+  }] };
+  apiMock.manager.status.mockReset().mockResolvedValueOnce(projection(predecessor))
+    .mockResolvedValue(projection(successor));
+  apiMock.cclc.targetRetirementOffer.mockResolvedValue({ scope: ownerScope, targets: [] });
+  apiMock.cclc.retireTargets.mockResolvedValue({ replay_status: 'accepted_new', scope: ownerScope, retired_targets: [] });
+  apiMock.cclc.ownerSettlement.mockResolvedValue({ scope: ownerScope, settled: true });
+  apiMock.cclc.component.mockResolvedValue({ ...component, componentId: 'gripper', activePublicPointerDigest: pointer });
+  apiMock.cclc.componentProcessStopOffer.mockImplementation(async () => parseComponentProcessStopOffer(offer, 'gripper'));
+  return { request: { ...inputs(), expected: predecessor }, offer, successor };
+}
+
+it('retires and disables a verified None owner without a physical Stop or drain receipt', async () => {
+  const fixture = noneCloseFixture();
+  expect(await closeScenario(fixture.request)).toEqual(fixture.successor);
+  expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(1);
+  expect(apiMock.cclc.ownerSettlement).toHaveBeenCalledTimes(1);
+  expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledTimes(1);
+  expect(apiMock.cclc.submitLifecycle.mock.calls[0][0]).toMatchObject({ controllable_component_id: 'gripper', intent: 'disable' });
+  expect(apiMock.cclc.stopComponentProcess).not.toHaveBeenCalled();
+  expect(apiMock.cclc.componentProcessStopResult).not.toHaveBeenCalled();
+  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+  expect(fixture.request.waitForObservation).toHaveBeenCalledTimes(1);
+});
+
+it('still stops and drains every physical occurrence beside a verified None owner', async () => {
+  const fixture = noneCloseFixture();
+  const inventory = fixture.offer.process_inventories[0];
+  const mixed = { ...fixture.offer, process_inventories: [{ ...inventory,
+    process_occurrences: [...inventory.process_occurrences, {
+      controllable_component_id: 'gripper', launch_identity: 'actual-launch', leader_pid: 42,
+      process_presence: 'absent', cleanup_state: 'not_requested', receipt: null, installed_runtime_identity: null,
+    }] }] };
+  apiMock.cclc.componentProcessStopOffer.mockImplementation(async () => parseComponentProcessStopOffer(mixed, 'gripper'));
+  expect(await closeScenario(fixture.request)).toEqual(fixture.successor);
+  expect(apiMock.cclc.stopComponentProcess).toHaveBeenCalledTimes(1);
+  expect(apiMock.cclc.stopComponentProcess.mock.calls[0][0]).toMatchObject({
+    controllable_component_id: 'gripper', launch_identity: 'actual-launch', leader_pid: 42,
+  });
+  expect(apiMock.cclc.componentProcessStopResult).toHaveBeenCalledTimes(1);
+});
+
+it.each(['bundle', 'graph', 'publication', 'pointer', 'scene'])(
+  'refuses a foreign None %s scope before requesting empty Apply', async (field) => {
+    const fixture = noneCloseFixture();
+    const scope = fixture.offer.process_inventories[0].request;
+    if (field === 'bundle') scope.predecessor_projection_revision.retained_bundle_id = 'other.bundle';
+    if (field === 'graph') scope.predecessor_projection_revision.graph_revision = 'other.graph';
+    if (field === 'publication') scope.expected_predecessor_publication_generation += 1;
+    if (field === 'pointer') scope.expected_predecessor_public_pointer_digest = `sha256:${'7'.repeat(64)}`;
+    if (field === 'scene') scope.predecessor_projection_revision.scene_revision.revision_id += 1;
+    await expect(closeScenario(fixture.request)).rejects.toThrow('Applied configuration changed during Close.');
+    expect(apiMock.cclc.stopComponentProcess).not.toHaveBeenCalled();
+    expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
+  },
+);
+
+it('does not infer no-output from a malformed or unverified owner occurrence', async () => {
+  const fixture = noneCloseFixture();
+  fixture.offer.process_inventories[0].process_occurrences[0].installed_runtime_identity = 'unknown';
+  await expect(closeScenario(fixture.request)).rejects.toThrow('exact owner digest');
+  expect(apiMock.cclc.stopComponentProcess).not.toHaveBeenCalled();
   expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
 });
 it.each(['failed', 'unknown_effect'])('a %s empty Apply cannot complete Close', async (state) => {

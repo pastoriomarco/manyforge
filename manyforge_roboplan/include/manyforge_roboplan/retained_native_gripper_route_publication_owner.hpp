@@ -5,10 +5,14 @@
 #include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
 #include <functional>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
+
+class RetainedNativeCellRuntime;
+struct RetainedNativeRuntime;
 
 /// CCLC route-publication owner for one independently retained native
 /// gripper. Reconciled publication verifies the gripper backend, complete
@@ -23,17 +27,34 @@ class RetainedNativeGripperRoutePublicationOwner final
     /// unaffected peer participant and alias.
     std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
     core::RuntimeParticipantAdmissionResolver participant_resolver;
+    // Pre-staged cache mirrors; invoked only after exact successful readback.
+    // The owning callback performs allocation-free, no-throw swaps.
+    std::function<void()> adopt_component_owners{};
   };
 
   using CellKernelCandidateBuilder = std::function<
       core::Result<KernelCandidate>(
           const core::ActiveControlConfigurationDTO& configuration,
-          const core::RuntimeParticipantExecutionRegistration& gripper_registration)>;
+          const std::vector<core::RuntimeParticipantExecutionRegistration>& gripper_registrations)>;
 
   RetainedNativeGripperRoutePublicationOwner(
       std::shared_ptr<RetainedNativeGripperRuntime> gripper,
       core::IClock& clock, core::ResourceAddressedExecutionKernel& kernel,
-      CellKernelCandidateBuilder cell_candidate_builder = {});
+      CellKernelCandidateBuilder cell_candidate_builder = {},
+      RetainedNativeCellRuntime* cell_owner = nullptr);
+
+  /// Construction-only joins. Domain maps are immutable before CCLC uses
+  /// this owner; peers borrow the same existing transition mutex and Kernel.
+  void BindMotionRoot(const std::shared_ptr<RetainedNativeRuntime>& root);
+  void BindParticipantPeers(
+      const std::shared_ptr<RetainedNativeGripperRoutePublicationOwner>& root,
+      std::map<core::ControlDomainId,
+          std::shared_ptr<RetainedNativeGripperRoutePublicationOwner>> peers);
+  /// The no-motion readiness candidate retains this owner while holding the
+  /// same mutex through its synchronous publish/readback/adoption call.
+  [[nodiscard]] std::mutex& CellTransitionMutex() const noexcept {
+    return *transition_mutex_;
+  }
 
   [[nodiscard]] core::Result<
       std::vector<core::RuntimeParticipantBinding>>
@@ -60,7 +81,18 @@ class RetainedNativeGripperRoutePublicationOwner final
   /// The stable Kernel owner must outlive this route-publication seam.
   core::ResourceAddressedExecutionKernel& kernel_;
   CellKernelCandidateBuilder cell_candidate_builder_;
+  // Same Kernel owner; must outlive this route seam. Adoption is a no-fail swap.
+  RetainedNativeCellRuntime* cell_owner_{};
+  [[nodiscard]] core::Result<std::shared_ptr<void>> PinTransitionOwner() const;
+  [[nodiscard]] core::Result<void> ValidateInstalledOwner(
+      const std::shared_ptr<void>& transition_owner) const;
+  std::map<core::ControlDomainId,
+      std::shared_ptr<RetainedNativeGripperRoutePublicationOwner>> participant_peers_;
+  // Weak back-reference prevents root -> peer -> root ownership cycles.
+  std::weak_ptr<void> transition_owner_;
+  bool transition_is_motion_root_{};
   mutable std::mutex mutex_;
+  std::mutex* transition_mutex_{&mutex_};
 };
 
 }  // namespace manyforge::roboplan_backend

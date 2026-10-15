@@ -742,6 +742,12 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     const auto &binding = observed_binding.value();
     const auto &resolved = owner->resolved;
     const auto &target = resolved.target.target_role();
+    const auto* gripper_backend = selected.runtime ? selected.runtime->gripper.get()
+        : selected.gripper_runtime ? selected.gripper_runtime->backend() : nullptr;
+    if (gripper_backend && gripper_backend->gripper_actuation_kind(binding.command_target_id.value()) ==
+            core::GripperActuationKind::kPneumatic)
+      return ErrorResponse("gripper_state_unavailable",
+          "Pneumatic finger coordinates are display-only, not qualified gripper state");
     const auto observed = channel->current_state(
         selected.cell_runtime != nullptr ? selected.cell_runtime->clock()->now()
                                          : selected.runtime->clock->now());
@@ -1188,6 +1194,13 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     }
     Require(gripper_channel != nullptr,
             "selected gripper observed-state channel is absent");
+    const auto* gripper_backend = composition.runtime ? composition.runtime->gripper.get()
+        : composition.gripper_runtime->backend();
+    Require(gripper_backend != nullptr, "selected gripper has no configured backend");
+    if (gripper_backend->gripper_actuation_kind(
+            composition.direct_control_gripper_binding->value().command_target_id.value()) ==
+        core::GripperActuationKind::kPneumatic)
+      return CurrentControlState{std::move(motion_state), std::nullopt};
     Require(
         composition.direct_control_gripper_binding->value().resources.size() ==
             1U,
@@ -1734,6 +1747,7 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     struct ObservationSource final {
       std::shared_ptr<RetainedObservedStateChannel> channel;
       core::ControllableComponentId controllable_component_id;
+      bool pneumatic_display{};
     };
     std::vector<ObservationSource> sources;
     sources.reserve(2U * (1U + composition.participant_compositions.size()));
@@ -1741,14 +1755,49 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     rows.reserve(2U * (1U + composition.participant_compositions.size()));
     const auto append_target = [&](
         const std::shared_ptr<IRetainedObservedStateChannel> &selected_channel,
-        const core::ControllableComponentId &owner_component_id) {
+        const core::ControllableComponentId &owner_component_id,
+        const bool pneumatic_display = false) {
       capture_wake_channel(selected_channel);
       sources.push_back(ObservationSource{
           std::static_pointer_cast<RetainedObservedStateChannel>(
               selected_channel),
-          owner_component_id});
+          owner_component_id, pneumatic_display});
     };
     const auto project_target = [&](const ObservationSource &source) {
+      if (source.pneumatic_display) {
+        const auto render = source.channel->current_bound_render_state();
+        if (!render.ok()) Fail("selected pneumatic display is unavailable: " + render.error().message);
+        const auto& binding = render.value().binding.value();
+        Require(binding.controllable_component_id == source.controllable_component_id &&
+                    binding.control_path && binding.resources.size() == render.value().positions_si.size() &&
+                    binding.resources.size() == render.value().compiled_joint_names.size(),
+                "pneumatic display crosses its exact retained binding");
+        CanonicalValue::Array names, compiled, kinds, positions;
+        for (std::size_t i = 0; i < binding.resources.size(); ++i) {
+          const auto& resource = binding.resources[i];
+          Require(resource.source_joint_name && resource.compiled_resource_name ==
+                      render.value().compiled_joint_names[i] && std::isfinite(render.value().positions_si[i]),
+                  "pneumatic display has invalid retained coordinates");
+          names.emplace_back(*resource.source_joint_name);
+          compiled.emplace_back(resource.compiled_resource_name);
+          kinds.emplace_back(resource.coordinate_kind == core::CoordinateKind::kAngular ? "angular" : "linear");
+          positions.emplace_back(render.value().positions_si[i]);
+        }
+        rows.push_back(ObservationRow{
+            {binding.controllable_component_id.value(), binding.command_target_id.value(), binding.capability_id.value()},
+            CanonicalValue(CanonicalValue::Object{
+                {"command_target_id", CanonicalValue(binding.command_target_id.value())},
+                {"compiled_joint_names", CanonicalValue(std::move(compiled))},
+                {"controllable_component_id", CanonicalValue(binding.controllable_component_id.value())},
+                {"operation_capability_id", CanonicalValue(binding.capability_id.value())},
+                {"coordinate_kinds", CanonicalValue(std::move(kinds))},
+                {"positions_si", CanonicalValue(std::move(positions))},
+                {"source_epoch", CanonicalValue("render." + std::to_string(render.value().render_incarnation))},
+                {"source_joint_names", CanonicalValue(std::move(names))},
+                {"source_sequence", CanonicalValue(static_cast<double>(render.value().render_generation))},
+            })});
+        return;
+      }
       const auto now = composition.cell_runtime != nullptr
                            ? composition.cell_runtime->clock()->now()
                        : composition.runtime != nullptr &&
@@ -1909,7 +1958,10 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
         }
         if (owner.direct_control_gripper_binding.has_value()) {
           append_target(owner.runtime->gripper_state_channel,
-                        owner.controllable_component_id);
+                        owner.controllable_component_id,
+                        owner.runtime->gripper->gripper_actuation_kind(
+                            owner.direct_control_gripper_binding->value().command_target_id.value()) ==
+                            core::GripperActuationKind::kPneumatic);
         }
         Require(owner.direct_control_motion_binding.has_value() ||
                     owner.direct_control_gripper_binding.has_value(),
@@ -1920,7 +1972,10 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
                   owner.direct_control_gripper_binding.has_value(),
               "gripper-only native owner has a non-gripper target");
       append_target(owner.gripper_runtime->state_channel(),
-                    owner.controllable_component_id);
+                    owner.controllable_component_id,
+                    owner.gripper_runtime->backend()->gripper_actuation_kind(
+                        owner.direct_control_gripper_binding->value().command_target_id.value()) ==
+                        core::GripperActuationKind::kPneumatic);
     };
 
     append_owner(composition);
@@ -2384,7 +2439,9 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
           {"preview_receipt",
            CapabilityCommandPreviewReceiptValue(
                preview.value(), *command.operation, *command.operation_digest,
-               target_composition->runtime->gripper_position_limits,
+               target_composition->runtime
+                   ? target_composition->runtime->gripper_position_limits
+                   : target_composition->gripper_runtime->position_limits(),
                owner_epoch_)},
       });
     }
@@ -2901,7 +2958,8 @@ void ExecutionCommandSurface::RunReconciliationLane(std::stop_token stop_token) 
           if (composition_access_.current != nullptr) {
             auto &composition = *composition_access_.current;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-            const auto now = composition.runtime->clock->now();
+            const auto now = composition.runtime ? composition.runtime->clock->now()
+                : composition.cell_runtime->clock()->now();
 #else
             const auto cell_clock = composition.cell_runtime != nullptr
                                         ? composition.cell_runtime->clock()
@@ -2918,12 +2976,13 @@ void ExecutionCommandSurface::RunReconciliationLane(std::stop_token stop_token) 
                     kRecoveryObservationPeriodNs) {
               last_recovery_observation = now;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-              const bool has_route_reconciler = static_cast<bool>(
-                  composition.runtime->reconcile_controller_routes);
-              const auto routes =
-                  has_route_reconciler
-                      ? composition.runtime->reconcile_controller_routes()
-                      : core::Result<void>::Ok();
+              const bool has_route_reconciler = composition.runtime
+                  ? static_cast<bool>(composition.runtime->reconcile_controller_routes)
+                  : static_cast<bool>(composition.cclc_cell_route_reconciler);
+              const auto routes = has_route_reconciler
+                  ? (composition.runtime ? composition.runtime->reconcile_controller_routes()
+                                         : composition.cclc_cell_route_reconciler())
+                  : core::Result<void>::Ok();
 #else
               const bool has_route_reconciler =
                   static_cast<bool>(composition.cclc_cell_route_reconciler) ||

@@ -23,7 +23,6 @@
 #include "manyforge_deployment/controller_topology_codec.hpp"
 #include "manyforge_deployment/provider_manifest_codec.hpp"
 #include "manyforge_deployment/stop_evidence_policy_codec.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
@@ -286,6 +285,10 @@ verify_claims(const CanonicalValue &value, std::string_view path,
 
 struct BindingFacts final {
   std::string revision;
+  std::string component_id;
+  std::string target_id;
+  std::string interface_id;
+  std::string interface_revision;
   std::string stop_policy_id;
   std::string stop_policy_revision;
   std::string containment;
@@ -367,6 +370,13 @@ verify_bindings(const CanonicalValue &value) {
         containment != "control_domain") {
       fail_retained_bundle(path + " has unknown containment granularity");
     }
+    facts.component_id =
+        require_identity_member(row, "controllable_component_id", path);
+    facts.target_id = require_identity_member(row, "command_target_id", path);
+    facts.interface_id =
+        require_identity_member(row, "control_interface_contract_id", path);
+    facts.interface_revision =
+        require_digest_member(row, "control_interface_revision", path);
     facts.stop_policy_id =
         require_identity_member(row, "stop_evidence_policy_id", path);
     facts.stop_policy_revision =
@@ -1048,7 +1058,9 @@ void verify_stop_applicability(
     const std::map<std::string, BindingFacts, std::less<>> &bindings,
     const std::map<std::string, ControllerFacts, std::less<>> &controllers,
     const std::map<std::string, ActivationFacts, std::less<>> &activations,
-    const std::map<std::string, RouteFacts, std::less<>> &routes) {
+    const std::map<std::string, RouteFacts, std::less<>> &routes,
+    const core::CellGraphDTO *source_graph,
+    std::span<const CompositionControlBindingCoordinateMap> coordinate_maps) {
   const auto &rows = require_array(value, "control.stop_applicability");
   if (rows.size() != routes.size() ||
       rows.size() > core::kMaxDeploymentApplicabilityRows) {
@@ -1145,6 +1157,80 @@ void verify_stop_applicability(
             binding->second.containment) {
       fail_retained_bundle(path +
                            " differs from its exact domain/binding subject");
+    }
+    std::optional<core::GripperActuationKind> actuation;
+    if (source_graph != nullptr) {
+      const auto source = std::find_if(
+          source_graph->control_bindings.begin(),
+          source_graph->control_bindings.end(), [&](const auto &candidate) {
+            return candidate.control_binding_id.value() == binding_id;
+          });
+      if (source == source_graph->control_bindings.end() ||
+          std::count_if(
+              source_graph->control_bindings.begin(),
+              source_graph->control_bindings.end(), [&](const auto &candidate) {
+                return candidate.control_binding_id.value() == binding_id;
+              }) != 1)
+        fail_retained_bundle(path + " has no unique source graph binding");
+      const auto domain = std::find_if(
+          source_graph->control_domains.begin(),
+          source_graph->control_domains.end(), [&](const auto &candidate) {
+            return candidate.control_domain_id.value() == domain_id;
+          });
+      if (domain == source_graph->control_domains.end() ||
+          std::count_if(source_graph->control_domains.begin(),
+                        source_graph->control_domains.end(),
+                        [&](const auto &candidate) {
+                          return candidate.control_domain_id.value() ==
+                                 domain_id;
+                        }) != 1 ||
+          domain->control_domain_revision.value() != domain_revision ||
+          domain->controller_topology_id.value() != topology_id ||
+          domain->topology_revision.value() != topology_revision ||
+          std::find(domain->runtime_unit_ids.begin(),
+                    domain->runtime_unit_ids.end(),
+                    source->provider_runtime_unit_id) ==
+              domain->runtime_unit_ids.end() ||
+          std::none_of(source->legal_control_route_ids.begin(),
+                       source->legal_control_route_ids.end(),
+                       [&](const auto &id) { return id.value() == route_id; }))
+        fail_retained_bundle(path +
+                             " differs from its exact source domain/route");
+      const auto &facts = binding->second;
+      std::set<std::string, std::less<>> resources;
+      for (const auto &resource : source->resource_bindings)
+        resources.insert(resource.resource_id.value());
+      if (source->control_binding_revision.value() != facts.revision ||
+          source->controllable_component_id.value() != facts.component_id ||
+          source->command_target_id.value() != facts.target_id ||
+          source->control_interface_contract_id.value() != facts.interface_id ||
+          source->control_interface_revision.value() !=
+              facts.interface_revision ||
+          source->control_domain_id.value() != domain_id ||
+          source->controller_topology_id.value() != topology_id ||
+          source->topology_revision.value() != topology_revision ||
+          source->capability_id.value() != facts.capability_id ||
+          source->capability_definition_revision.value() !=
+              facts.capability_revision ||
+          source->provider_instance_id.value() != facts.provider_instance_id ||
+          source->provider_runtime_unit_id.value() !=
+              facts.provider_runtime_unit_id ||
+          source->provider_manifest_id.value() != facts.provider_manifest_id ||
+          source->provider_manifest_revision.value() !=
+              facts.provider_manifest_revision ||
+          source->state_authority_id.value() != facts.state_authority_id ||
+          core::to_string(source->state_authority_class) !=
+              facts.state_authority_class ||
+          source->stop_evidence_policy_id.value() != facts.stop_policy_id ||
+          source->stop_evidence_policy_revision.value() !=
+              facts.stop_policy_revision ||
+          core::to_string(source->containment_granularity) !=
+              facts.containment ||
+          resources != facts.resource_ids)
+        fail_retained_bundle(path +
+                             " differs from its exact source graph binding");
+      actuation = classify_ros_gripper_actuation_kind(*source_graph, *source,
+                                                      coordinate_maps);
     }
     if (disposition == "not_stoppable") {
       continue;
@@ -1728,7 +1814,9 @@ void verify_stop_applicability(
         binding->second.containment == "resource"         ? 0
         : binding->second.containment == "controller_set" ? 1
                                                           : 2;
-    if (software_hard_count != 1U ||
+    const auto required_hard_count =
+        actuation == core::GripperActuationKind::kPneumatic ? 0U : 1U;
+    if (software_hard_count != required_hard_count ||
         previous_granularity != top_level_granularity) {
       fail_retained_bundle(stop_path + " has an invalid software-hard count or "
                                        "coarsest containment projection");
@@ -2410,8 +2498,9 @@ std::string control_domain_control_product_id(
   return "control_domain_control_" + digest.substr(7U);
 }
 
-CanonicalValue
-parse_and_verify_control_domain_control(std::string_view canonical_bytes) {
+CanonicalValue parse_and_verify_control_domain_control(
+    std::string_view canonical_bytes, const core::CellGraphDTO *source_graph,
+    std::span<const CompositionControlBindingCoordinateMap> coordinate_maps) {
   if (canonical_bytes.empty() ||
       canonical_bytes.size() > kMaxControlDomainControlBytes) {
     fail_retained_bundle(
@@ -2504,7 +2593,7 @@ parse_and_verify_control_domain_control(std::string_view canonical_bytes) {
   verify_stop_applicability(
       require_member(object, "stop_applicability", "control"), domain_id,
       domain_revision, topology_id, topology_revision, bindings, controllers,
-      activations, routes);
+      activations, routes, source_graph, coordinate_maps);
   static_cast<void>(verify_commissioned_stop_interfaces(object));
   verify_desired_configuration(
       require_member(object, "desired_configuration", "control"), domain_id,
@@ -2522,11 +2611,12 @@ void require_control_domain_control_matches_retained_bundle(
     const core::ControlDomainId &control_domain_id,
     std::span<const QualifiedStopEvidencePolicy> stop_policies,
     std::span<const QualifiedControllerTopology> controller_topologies,
-    std::span<const QualifiedProviderManifest> provider_manifests) {
+    std::span<const QualifiedProviderManifest> provider_manifests,
+    std::span<const CompositionControlBindingCoordinateMap> coordinate_maps) {
   require_retained_control_artifact_anchor(canonical_bytes, retained_bundle,
                                            control_domain_id);
-  const CanonicalValue root =
-      parse_and_verify_control_domain_control(canonical_bytes);
+  const CanonicalValue root = parse_and_verify_control_domain_control(
+      canonical_bytes, &retained_bundle.cell_graph, coordinate_maps);
   const auto &object = require_object(root, "control");
   const auto source_bindings =
       verify_bindings(require_member(object, "bindings", "control"));
@@ -2796,13 +2886,16 @@ void require_control_domain_control_matches_retained_bundle(
     const core::ControlDomainId &control_domain_id,
     std::span<const QualifiedStopEvidencePolicy> stop_policies,
     std::span<const QualifiedControllerTopology> controller_topologies,
-    std::span<const QualifiedProviderManifest> provider_manifests) {
+    std::span<const QualifiedProviderManifest> provider_manifests,
+    std::span<const CompositionControlBindingCoordinateMap> coordinate_maps) {
   require_control_domain_control_matches_retained_bundle(
       artifacts.control_domain_control, retained_bundle, control_domain_id,
-      stop_policies, controller_topologies, provider_manifests);
+      stop_policies, controller_topologies, provider_manifests,
+      coordinate_maps);
 
-  const CanonicalValue root =
-      parse_and_verify_control_domain_control(artifacts.control_domain_control);
+  const CanonicalValue root = parse_and_verify_control_domain_control(
+      artifacts.control_domain_control, &retained_bundle.cell_graph,
+      coordinate_maps);
   const auto &control = require_object(root, "control");
   const auto commissioned = verify_commissioned_stop_interfaces(control);
   if (commissioned.has_value() !=

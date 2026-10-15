@@ -139,6 +139,67 @@ def test_optional_authored_gripper_starts_inactive_on_the_same_manager(tmp_path,
     )
 
 
+@pytest.mark.parametrize("gripper_name", ["lite_gripper_controller", "robotiq_gripper_controller"])
+def test_gripper_only_spawns_real_gripper_without_an_arm(tmp_path, gripper_name):
+    module = _module()
+    context = _context(tmp_path, gripper_name=gripper_name, frame_prefix="tool/")
+    # Match the gripper-only generator output: actual commanded model joint.
+    description_path = tmp_path / "retained.urdf"
+    description_path.write_text(
+        description_path.read_text().replace('name="arm"', 'name="tool"')
+        .replace('name="joint1"', 'name="right_finger_joint"'),
+        encoding="utf-8",
+    )
+    del context.launch_configurations["arm_controller_name"]
+    declaration = next(
+        action for action in module.generate_launch_description().entities
+        if isinstance(action, DeclareLaunchArgument) and action.name == "arm_controller_name"
+    )
+    declaration.execute(context)
+    assert context.launch_configurations["arm_controller_name"] == ""
+    nodes = module.launch_setup(context)
+    assert len(nodes) == 4
+    assert nodes[2]._Node__arguments == [
+        "joint_state_broadcaster", "--controller-manager", "/fixture/arm/control",
+    ]
+    assert nodes[3]._Node__arguments == [
+        gripper_name, "--inactive", "--controller-manager", "/fixture/arm/control",
+        "--param-file", str(tmp_path / "controllers.yaml"),
+    ]
+    parameters = evaluate_parameters(context, nodes[0]._Node__parameters)[0]
+    assert parameters["robot_description"] == description_path.read_text()
+    assert parameters["frame_prefix"] == "tool/"
+    assert parameters["use_sim_time"] is False
+    assert evaluate_parameters(context, nodes[1]._Node__parameters)[0] == (
+        tmp_path / "controllers.yaml"
+    )
+
+
+def test_arm_with_no_gripper_output_keeps_structural_fingers_and_arm_spawner(tmp_path):
+    module = _module()
+    context = _context(tmp_path)
+    description = tmp_path / "retained.urdf"
+    payload = description.read_text().replace(
+        '</robot>',
+        '<link name="finger"/><joint name="right_finger_joint" type="prismatic">'
+        '<parent link="base"/><child link="finger"/>'
+        '<limit lower="0" upper="0.04" effort="5" velocity="0.1"/>'
+        '</joint></robot>',
+    )
+    description.write_text(payload, encoding="utf-8")
+    nodes = module.launch_setup(context)
+    assert len(nodes) == 4
+    assert nodes[3]._Node__arguments == [
+        "arm_controller", "--inactive", "--controller-manager", "/fixture/arm/control",
+        "--param-file", str(tmp_path / "controllers.yaml"),
+    ]
+    retained = evaluate_parameters(context, nodes[0]._Node__parameters)[0]["robot_description"]
+    assert retained == payload
+    assert 'joint name="right_finger_joint" type="prismatic"' in retained
+    assert all(node._Node__arguments[0] in ["joint_state_broadcaster", "arm_controller"]
+               for node in nodes if node._Node__node_executable == "spawner")
+
+
 @pytest.mark.parametrize(
     "plugin",
     ["uf_robot_hardware/UFRobotSystemHardware", "topic_based_ros2_control/TopicBasedSystem"],

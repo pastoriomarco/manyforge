@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "control_domain_control_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace manyforge::deployment {
@@ -594,6 +595,60 @@ struct RouteTables final {
   return result;
 }
 
+// The retained artifact proves the complete logical route first. Only this
+// exact strict source case can remove physical-controller expectations.
+[[nodiscard]] bool selected_pneumatic_none_domain(
+    const RetainedBundle &bundle, const core::ControlDomainId &domain_id,
+    const core::RuntimeUnitId &source_runtime_unit_id) {
+  const auto &graph = bundle.value().cell_graph;
+  const auto unit = std::find_if(graph.runtime_units.begin(), graph.runtime_units.end(),
+                                [&](const auto &row) {
+    return row.runtime_unit_id == source_runtime_unit_id;
+  });
+  if (unit == graph.runtime_units.end() ||
+      unit->runtime_profile_id.value() != detail::kRos2ControlExecutionRuntimeProfileId) {
+    return false;
+  }
+  const core::ControlBindingDTO *command = nullptr;
+  for (const auto &binding : graph.control_bindings) {
+    if (binding.control_domain_id != domain_id ||
+        binding.capability_id.value() != "tool.gripper.command") continue;
+    if (command != nullptr) fail("gripper domain repeats its command binding");
+    command = &binding;
+  }
+  if (command == nullptr) return false;
+  const auto config = ros2_control_execution_runtime_contract::require_configuration(
+      bundle, source_runtime_unit_id);
+  const ros2_control_execution_runtime_contract::Configuration::GripperTargetConfiguration *target = nullptr;
+  for (const auto &row : config.gripper_target_configurations) {
+    if (row.controllable_component_id == command->controllable_component_id &&
+        row.command_target_id == command->command_target_id) {
+      if (target != nullptr) fail("gripper domain repeats its exact configured target");
+      target = &row;
+    }
+  }
+  // An absent optional row keeps the established physical-required path.
+  // Only an exact matched strict None row may remove those expectations.
+  if (target == nullptr) return false;
+  if (target->output_mode != core::GripperOutputMode::kNone) return false;
+  if (target->actuation_kind != "pneumatic" ||
+      command->provider_runtime_unit_id != source_runtime_unit_id) {
+    fail("no-output domain does not select its strict pneumatic runtime owner");
+  }
+  for (const auto &binding : graph.control_bindings) {
+    if (binding.control_domain_id != domain_id) continue;
+    if (binding.controllable_component_id != command->controllable_component_id ||
+        binding.command_target_id != command->command_target_id ||
+        binding.provider_runtime_unit_id != command->provider_runtime_unit_id ||
+        binding.provider_instance_id != command->provider_instance_id ||
+        binding.provider_manifest_id != command->provider_manifest_id ||
+        binding.provider_manifest_revision != command->provider_manifest_revision) {
+      fail("no-output gripper domain contains a foreign physical owner");
+    }
+  }
+  return true;
+}
+
 [[nodiscard]] const core::RetainedProductDTO &
 require_control_product(const RetainedBundle &retained_bundle,
                         const core::ControlDomainId &control_domain_id) {
@@ -776,11 +831,16 @@ load_verified_controller_lifecycle_expected_domain(
     fail("exact retained control artifact is absent or mismatched");
   }
 
+  const auto model_map = detail::RetainedModelMapVerificationAuthority::verify(
+      retained_bundle, artifact_source);
+  if (!model_map.has_value())
+    fail("exact retained binding model map is absent");
+  const auto &coordinate_maps = model_map->control_bindings();
   detail::require_control_domain_control_matches_retained_bundle(
       loaded->bytes(), retained_bundle.value(),
-      desired_configuration.control_domain_id);
-  const CanonicalValue root =
-      detail::parse_and_verify_control_domain_control(loaded->bytes());
+      desired_configuration.control_domain_id, {}, {}, {}, coordinate_maps);
+  const CanonicalValue root = detail::parse_and_verify_control_domain_control(
+      loaded->bytes(), &retained_bundle.value().cell_graph, coordinate_maps);
 
   const core::ControlDomainId control_domain_id(
       text(member(root, "control_domain_id", "control"),
@@ -851,6 +911,66 @@ load_verified_controller_lifecycle_expected_domain(
       value.expected_controllers.size() !=
           value.controller_topology.controllers.size()) {
     fail("decoded expected-domain closure is incomplete");
+  }
+  for (auto &expected_binding : value.expected_bindings) {
+    const auto &graph = retained_bundle.value().cell_graph;
+    const auto source =
+        std::find_if(graph.control_bindings.begin(),
+                     graph.control_bindings.end(), [&](const auto &candidate) {
+                       return candidate.control_binding_id ==
+                                  expected_binding.control_binding_id &&
+                              candidate.control_binding_revision ==
+                                  expected_binding.control_binding_revision;
+                     });
+    if (source == graph.control_bindings.end() ||
+        source->control_domain_id != control_domain_id)
+      fail("Stop actuation source lost its exact expected binding");
+    const auto actuation = detail::classify_ros_gripper_actuation_kind(
+        graph, *source, coordinate_maps);
+    // DX817: preserve all old arm/position/default serialized identities.
+    if (actuation == core::GripperActuationKind::kPneumatic)
+      expected_binding.gripper_actuation_kind = actuation;
+  }
+  if (selected_pneumatic_none_domain(retained_bundle, control_domain_id,
+                                      value.source_runtime_unit_id)) {
+    // DX791: preserve verified logical bindings/routes/endpoints and source
+    // identities, but never turn their abstract topology into a fake CM.
+    value.physical_expectation =
+        core::ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone;
+    value.controller_topology.controllers.clear();
+    value.controller_topology.chain_edges.clear();
+    for (auto &activation : value.controller_topology.activation_sets) {
+      activation.active_controller_role_ids.clear();
+      activation.active_chain_edges.clear();
+    }
+    for (auto &route : value.controller_topology.legal_routes)
+      route.ordered_controller_role_ids.clear();
+    for (auto &binding : value.expected_bindings) {
+      std::set<core::ResourceId> verified_resources;
+      for (const auto &claim : binding.claimed_command_interfaces)
+        verified_resources.insert(claim.resource_id);
+      for (const auto &claim : binding.claimed_state_interfaces)
+        verified_resources.insert(claim.resource_id);
+      const auto &graph_bindings = retained_bundle.value().cell_graph.control_bindings;
+      const auto retained = std::find_if(graph_bindings.begin(), graph_bindings.end(),
+                                        [&](const auto &candidate) {
+        return candidate.control_binding_id == binding.control_binding_id &&
+               candidate.control_binding_revision == binding.control_binding_revision &&
+               candidate.control_interface_contract_id == binding.control_interface_contract_id &&
+               candidate.control_interface_revision == binding.control_interface_revision;
+      });
+      if (retained == graph_bindings.end() || retained->control_domain_id != control_domain_id)
+        fail("no-output logical resources lost their retained binding");
+      std::set<core::ResourceId> retained_resources;
+      for (const auto &resource : retained->resource_bindings)
+        retained_resources.insert(resource.resource_id);
+      if (verified_resources.empty() || verified_resources != retained_resources)
+        fail("no-output logical resources differ from the complete retained binding");
+      binding.logical_owner_resources.assign(verified_resources.begin(), verified_resources.end());
+      binding.claimed_command_interfaces.clear();
+      binding.claimed_state_interfaces.clear();
+    }
+    value.expected_controllers.clear();
   }
   auto sealed =
       core::verify_controller_lifecycle_expected_domain(std::move(value));

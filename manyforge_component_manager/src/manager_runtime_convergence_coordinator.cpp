@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <exception>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
@@ -470,6 +471,7 @@ manyforge::core::Result<void> VerifyNativeExecutionHostContinuity(
         &artifact_source) {
   using manyforge::core::ErrorDTO;
   using manyforge::core::RuntimeUnitDTO;
+  // DX-753: preserve held per-unit continuity identity and all epoch/offer guards.
   using manyforge::deployment::native_execution_runtime_contract::
       kRuntimeProfileId;
 

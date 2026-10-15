@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
 #include <manyforge_core/types/json_value.hpp>
 #include <manyforge_core/types/retained_artifact.hpp>
@@ -162,6 +163,9 @@ struct ResolvedStopBasePlanDTO final {
   StopEvidencePolicyRevision stop_evidence_policy_revision;
   ContainmentGranularity containment_granularity{ContainmentGranularity::kResource};
   std::vector<ResolvedStopEscalationStageDTO> escalation_stages;
+
+  /// Strict source-qualified actuation; absence retains the ordinary hard floor.
+  std::optional<GripperActuationKind> gripper_actuation_kind{};
 
   friend bool operator==(const ResolvedStopBasePlanDTO&, const ResolvedStopBasePlanDTO&) = default;
 };

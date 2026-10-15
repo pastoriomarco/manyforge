@@ -437,6 +437,13 @@ class _ScopePort:
         ):
             raise self.attention_refusal
 
+    def retire_held_preparations(
+        self, program_run_id, selected_node_ids, expected_selection_revision,
+    ):
+        # This stand-in retains no accepted native preparations. Production
+        # cleanup is exercised separately through NativeKernelProgramPort.
+        return None
+
     def release_selection(self, request, expected_selection_revision):
         self.last_selection_release = request
         if self.attention_refusal is not None:
@@ -4371,3 +4378,91 @@ def test_run_status_refuses_unbounded_or_orphan_failure_fields() -> None:
         replace(snapshot, reason_code="x", details={"path": "duration_s"})
     with pytest.raises(ValueError, match="reason code"):
         replace(snapshot, origin=origin)
+
+
+def _program_dwell_admission(admission, policy="hold"):
+    document = admission.program.to_dict()
+    document["target_roles"]["gripper"] = {
+        "component_role": "robot",
+        "required_capabilities": [
+            {"capability_id": capability, "parameters": {}, "disposition": "required"}
+            for capability in ("tool.gripper.command", "tool.gripper.feedback")
+        ],
+    }
+    document["tree"] = {"node_id":"gripper.command_position","instance_id":"command",
+        "parameters":{"target_role":"gripper","position":{"kind":"linear_m","value_m":0.008}},"operator_stop_policy":policy,"children":[]}
+    document["program_revision"] = compute_content_identity(document,own_field="program_revision",
+        identity_domain="program-revision",api_version="manyforge.program.v2")
+    program = Program.from_dict(document,admission.environment.catalog)
+    return _admission_for_program(admission,program,[row.to_dict() for row in program_node_policies(program)])
+
+
+def test_program_owner_halt_preserves_delivery_settled_dwell_attempt():
+    from manyforge_behavior.nodes.stop_policy import OperatorMotionStopPolicy
+    class DwellPort(_TaskPort):
+        def start(self, *args):
+            result = super().start(*args)
+            return replace(result,metadata={"gripper_actuation_kind":"pneumatic","gripper_dwell_s":2.0})
+    now=[100.0]
+    owner,admission,task,scope,events = _fixture(initial_task_state=OwnerTaskState.SUCCEEDED,
+        task_factory=lambda events:DwellPort(events,OwnerTaskState.SUCCEEDED),program_clock_source=lambda:now[0])
+    run_id=owner.start(_program_dwell_admission(admission, "continue")).capture.program_run_id
+    assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+    run=owner._runs[run_id].run
+    wrapped=run._authored_nodes["command"]
+    node=wrapped.decorated if isinstance(wrapped,OperatorMotionStopPolicy) else wrapped
+    attempt=node.attempt_identity
+    assert node.cached_control_state() == "settled" and not node.has_active_task
+    now[0]=101.0
+    assert owner.full_stop(run_id).state is ProgramRunState.FULL_STOPPING
+    now[0]=150.0
+    assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
+    now[0]=400.0
+    assert owner.resume_full_stop(run_id,request_id="execute-after-halt").state is ProgramRunState.RUNNING
+    assert node.attempt_identity is attempt
+    now[0]=400.9
+    assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+    now[0]=401.0
+    assert owner.advance_once(run_id).state is ProgramRunState.SUCCEEDED
+    assert task.starts == 1 and task.cancels == 0
+    assert events.count("leaf_acknowledge") == 1
+
+
+@pytest.mark.parametrize("cleanup", ["complete","pending","new_hold"])
+def test_program_owner_retires_held_preparation_before_exact_selected_release(cleanup):
+    from manyforge_behavior.orchestration_ports import OwnerInvocationHeldError
+    class UnsentPort(_TaskPort):
+        pending_preparation = False
+        def observe(self, task_id):
+            self.pending_preparation = True
+            raise OwnerInvocationHeldError(scope.selection_revision)
+    owner,admission,task,scope,events = _fixture(initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=lambda events:UnsentPort(events,OwnerTaskState.ACTIVE))
+    run_id=owner.start(_program_dwell_admission(admission)).capture.program_run_id
+    assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+    scope.state=ProgramRunScopeState.SETTLED
+    owner.stop_motion(run_id,group_id="all")
+    assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+    before=owner.read(run_id)
+    assert task.pending_preparation and task.starts == 1
+    def retire(actual_run, selected, revision):
+        assert actual_run == run_id and selected == frozenset({"command"})
+        assert revision == scope.selection_revision
+        assert task.pending_preparation
+        events.append("preparation_cleanup")
+        if cleanup == "pending": raise RuntimeError("readback still resident")
+        task.pending_preparation=False
+        if cleanup == "new_hold": scope.selection_revision+=1
+    scope.retire_held_preparations=retire
+    args=dict(expected_run_revision=before.run_revision,expected_selection_revision=scope.selection_revision,
+              request_id="resume-unsent",group_id="all",reason=None)
+    if cleanup == "complete":
+        owner.resume_motion(run_id,**args)
+        assert events.index("preparation_cleanup") < events.index("scope_stop_release")
+        assert scope.release_requests == 1
+        assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+        assert task.starts == 2
+    else:
+        with pytest.raises(ProgramRunOwnerError): owner.resume_motion(run_id,**args)
+        assert scope.release_requests == 0 and scope.held
+        assert task.starts == 1

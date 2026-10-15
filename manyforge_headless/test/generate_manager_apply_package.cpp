@@ -1,6 +1,5 @@
 #include <manyforge_deployment/cell_compiler.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
@@ -17,6 +16,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -27,6 +27,7 @@
 #include "canonical_empty_admission_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
+#include "robotiq_gripper_only_retention_fixture.hpp"
 #include "retained_bundle_internal.hpp"
 #include "../../manyforge_roboplan/src/retained_ros2_control_lifecycle_plans_internal.hpp"
 
@@ -43,7 +44,10 @@ struct Arguments final {
   std::filesystem::path metadata_path;
   bool assistant_native;
   bool gripper_only;
-  bool ros2_control;
+  // Present only for the three explicit pneumatic command Programs.
+  std::optional<double> pneumatic_dwell_s;
+  bool pneumatic_no_output;
+  bool robotiq_position;
 };
 
 [[nodiscard]] bool SameExecutionHostInfrastructure(
@@ -94,15 +98,29 @@ void WriteDeploymentSource(
       (argc == 7 && (std::string_view(argv[5]) != "--profile" ||
                      (std::string_view(argv[6]) != "assistant-ros2-control" &&
                       std::string_view(argv[6]) != "gripper-only" &&
+                      std::string_view(argv[6]) != "gripper-only-robotiq-position" &&
+                      std::string_view(argv[6]) != "gripper-pneumatic-commanded" &&
+                      std::string_view(argv[6]) != "gripper-pneumatic-none-zero" &&
+                      std::string_view(argv[6]) != "gripper-pneumatic-none-dwell" &&
                       std::string_view(argv[6]) != "ros2-control")))) {
     throw std::invalid_argument(
         "usage: generate_manager_apply_package --package-root <path> "
-        "--metadata <path> [--profile assistant-ros2-control|gripper-only|ros2-control]");
+        "--metadata <path> [--profile assistant-ros2-control|gripper-only|ros2-control|"
+        "gripper-pneumatic-commanded|gripper-pneumatic-none-zero|"
+        "gripper-pneumatic-none-dwell|gripper-only-robotiq-position]");
   }
-  return {argv[2], argv[4],
-          argc == 7 && std::string_view(argv[6]) == "assistant-ros2-control",
-          argc == 7 && std::string_view(argv[6]) == "gripper-only",
-          argc == 5 || (argc == 7 && std::string_view(argv[6]) != "gripper-only")};
+  const auto profile = argc == 7 ? std::string_view(argv[6]) : std::string_view{};
+  std::optional<double> pneumatic_dwell_s;
+  if (profile == "gripper-pneumatic-commanded") pneumatic_dwell_s = 0.8;
+  if (profile == "gripper-pneumatic-none-zero") pneumatic_dwell_s = 0.0;
+  if (profile == "gripper-pneumatic-none-dwell") pneumatic_dwell_s = 0.25;
+  return {argv[2], argv[4], profile == "assistant-ros2-control",
+          profile == "gripper-only" || profile == "gripper-only-robotiq-position" ||
+              pneumatic_dwell_s.has_value(),
+          pneumatic_dwell_s,
+          profile == "gripper-pneumatic-none-zero" ||
+              profile == "gripper-pneumatic-none-dwell",
+          profile == "gripper-only-robotiq-position"};
 }
 
 [[nodiscard]] deployment::RetentionQualifiedDeployment CompileEmpty(
@@ -210,7 +228,9 @@ void WriteMetadata(
 
 [[nodiscard]] std::string ProgramBytes(const deployment::RetainedBundle &bundle,
                                        const bool initial_scene,
-                                       const bool gripper_only) {
+                                       const bool gripper_only,
+                                       const std::optional<double> pneumatic_dwell_s,
+                                       const bool robotiq_position = false) {
   const auto arm_binding =
       std::find_if(bundle.value().cell_graph.control_bindings.begin(),
                    bundle.value().cell_graph.control_bindings.end(),
@@ -335,6 +355,152 @@ void WriteMetadata(
     }
     root = deployment::CanonicalValue(std::move(fields));
   }
+  if (pneumatic_dwell_s.has_value()) {
+    if (!gripper_only) {
+      throw std::logic_error("pneumatic command Program requires its gripper role");
+    }
+    using Value = deployment::CanonicalValue;
+    auto fields = root.as_object();
+    for (auto &[field, value] : fields) {
+      if (field == "target_roles") {
+        auto targets = value.as_object();
+        auto gripper = targets.front().second.as_object();
+        for (auto &[name, selected] : gripper) {
+          if (name == "required_capabilities") {
+            auto capabilities = selected.as_array();
+            capabilities.push_back(deployment::parse_strict_json_model_yaml(R"({
+              "capability_id":"tool.gripper.feedback", "parameters":{},
+              "disposition":"required"
+            })").root());
+            selected = Value(std::move(capabilities));
+          }
+        }
+        targets.front().second = Value(std::move(gripper));
+        value = Value(std::move(targets));
+      } else if (field == "tree" && *pneumatic_dwell_s > 0.0) {
+        // Genuine Program time creates the two observation windows. Command
+        // delivery itself is never extended by this qualification fixture.
+        const auto command = [&](const char *instance_id, const char *preset,
+                                 const char *policy) {
+          return Value(Value::Object{
+              {"children", Value(Value::Array{})},
+              {"instance_id", Value(instance_id)},
+              {"node_id", Value("gripper.command_position")},
+              {"operator_stop_policy", Value(policy)},
+              {"parameters", Value(Value::Object{
+                  {"command_duration_s", Value(*pneumatic_dwell_s)},
+                  {"dwell_while_held", Value("pause")},
+                  {"position", Value(Value::Object{
+                      {"kind", Value("named_preset")},
+                      {"name", Value(preset)},
+                  })},
+                  {"target_role", Value("gripper")},
+              })},
+          });
+        };
+        const auto timer = [](const char *instance_id, const char *policy) {
+          return Value(Value::Object{
+              {"children", Value(Value::Array{})},
+              {"instance_id", Value(instance_id)},
+              {"node_id", Value("timer")},
+              {"operator_stop_policy", Value(policy)},
+              {"parameters", Value(Value::Object{
+                  {"duration_s", Value(5.0)},
+                  {"duration_while_held", Value("pause")},
+              })},
+          });
+        };
+        value = Value(Value::Object{
+            {"children", Value(Value::Array{
+                command("pneumatic_close", "closed", "continue"),
+                timer("pneumatic_continue_timer", "continue"),
+                command("pneumatic_open_continue", "open", "continue"),
+                command("pneumatic_close_held", "closed", "hold"),
+                timer("pneumatic_finish_timer", "hold"),
+            })},
+            {"instance_id", Value("root")},
+            {"node_id", Value("sequence")},
+            {"operator_stop_policy", Value("continue")},
+            {"parameters", Value(Value::Object{})},
+        });
+      } else if (field == "tree") {
+        value = Value(Value::Object{
+            {"children", Value(Value::Array{Value(Value::Object{
+                {"children", Value(Value::Array{})},
+                {"instance_id", Value("pneumatic_close")},
+                {"node_id", Value("gripper.command_position")},
+                {"parameters", Value(Value::Object{
+                    {"command_duration_s", Value(*pneumatic_dwell_s)},
+                    {"position", Value(Value::Object{
+                        {"kind", Value("named_preset")},
+                        {"name", Value("closed")},
+                    })},
+                    {"target_role", Value("gripper")},
+                })},
+            })})},
+            {"instance_id", Value("root")},
+            {"node_id", Value("sequence")},
+            {"parameters", Value(Value::Object{})},
+        });
+      }
+    }
+    root = Value(std::move(fields));
+  }
+  if (robotiq_position) {
+    if (!gripper_only || pneumatic_dwell_s.has_value())
+      throw std::logic_error("standalone Position Program requires its dedicated scalar selection");
+    using Value = deployment::CanonicalValue;
+    auto fields = root.as_object();
+    for (auto &[field, value] : fields) {
+      if (field == "name") {
+        value = Value("Standalone Robotiq Position Manager fixture");
+      } else if (field == "target_roles") {
+        auto targets = value.as_object();
+        if (targets.size() != 1U || targets.front().first != "gripper")
+          throw std::logic_error("standalone Position Program requires only its gripper role");
+        auto gripper = targets.front().second.as_object();
+        for (auto &[name, selected] : gripper) {
+          if (name == "required_model_roles") {
+            selected = Value(Value::Array{Value("gripper_model")});
+          } else if (name == "required_capabilities") {
+            auto capabilities = selected.as_array();
+            capabilities.emplace_back(Value::Object{
+                {"capability_id", Value("tool.gripper.feedback")},
+                {"parameters", Value(Value::Object{})},
+                {"disposition", Value("required")},
+            });
+            selected = Value(std::move(capabilities));
+          }
+        }
+        targets.front().second = Value(std::move(gripper));
+        value = Value(std::move(targets));
+      } else if (field == "tree") {
+        Value::Array children;
+        for (const auto preset : {"closed", "open"}) {
+          children.emplace_back(Value::Object{
+              {"children", Value(Value::Array{})},
+              {"instance_id", Value(std::string("robotiq_") + preset)},
+              {"node_id", Value("gripper.command_position")},
+              {"parameters", Value(Value::Object{
+                  {"command_duration_s", Value(1.0)},
+                  {"position", Value(Value::Object{
+                      {"kind", Value("named_preset")},
+                      {"name", Value(preset)},
+                  })},
+                  {"target_role", Value("gripper")},
+              })},
+          });
+        }
+        value = Value(Value::Object{
+            {"children", Value(std::move(children))},
+            {"instance_id", Value("root")},
+            {"node_id", Value("sequence")},
+            {"parameters", Value(Value::Object{})},
+        });
+      }
+    }
+    root = Value(std::move(fields));
+  }
   const auto revision = deployment::detail::compute_content_identity(
       root, deployment::detail::ContentIdentitySpec{
                 .identity_domain = "program-revision",
@@ -355,7 +521,9 @@ void WriteMetadata(
     const std::filesystem::path &package_root,
     const std::shared_ptr<const deployment::RetainedBundle> &bundle,
     const bool initial_scene = false,
-    const bool gripper_only = false) {
+    const bool gripper_only = false,
+    const std::optional<double> pneumatic_dwell_s = std::nullopt,
+    const bool robotiq_position = false) {
   if (bundle == nullptr ||
       bundle->value().compiled_products.symbol_role_maps.size() != 1U) {
     throw std::logic_error("assistant-native bundle has no sole model map");
@@ -372,7 +540,8 @@ void WriteMetadata(
     throw std::logic_error("assistant-native model map did not reopen");
   }
   const auto program = deployment::verify_program_binding_contract(
-      ProgramBytes(*bundle, initial_scene, gripper_only), *bundle);
+      ProgramBytes(*bundle, initial_scene, gripper_only, pneumatic_dwell_s,
+                   robotiq_position), *bundle);
   deployment::FilesystemCatalogArtifactStore catalogs(package_root);
   using Value = deployment::CanonicalValue;
   Value::Array targets;
@@ -398,7 +567,8 @@ void WriteMetadata(
            {"component_role_id", Value("robot")},
            {"controllable_component_id",
             Value(std::string(
-                deployment::test::kLite6ControllableComponentId))},
+                robotiq_position ? deployment::test::kRobotiqGripperOnlyComponentId
+                                 : deployment::test::kLite6ControllableComponentId))},
        })})},
       {"target_roles", Value(std::move(targets))},
   });
@@ -508,65 +678,52 @@ int main(int argc, char **argv) {
     const auto arguments = ParseArguments(argc, argv);
     std::filesystem::create_directories(arguments.package_root);
     auto source = [&]() {
-      if (arguments.ros2_control) {
-        const auto plans = manyforge::roboplan_backend::detail::
-            ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
-        const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-            core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
-        if (!semantic.ok()) {
-          throw std::logic_error("Manager Apply ROS lifecycle catalog is unavailable");
-        }
-        return arguments.assistant_native
-            ? deployment::test::make_lite6_ros2_control_cclc_assistant_product_retention_fixture(
-                  semantic.value().value())
-            : deployment::test::make_lite6_ros2_control_cclc_product_retention_fixture(
-                  semantic.value().value());
+      const auto plans = manyforge::roboplan_backend::detail::
+          ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
+      const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+          core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
+      if (!semantic.ok()) {
+        throw std::logic_error("Manager Apply ROS lifecycle catalog is unavailable");
       }
-      // The native host initializes components through CCLC with the generic
-      // native lifecycle only; each provider anchors those plans under its ID.
-      const auto native_plans = manyforge::core::MakeNativeControlLifecyclePlans();
-      const auto arm_lifecycle_semantic =
-          manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-              manyforge::core::ProviderManifestId("lite6_arm_provider"), native_plans);
-      const auto gripper_lifecycle_semantic =
-          manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-              manyforge::core::ProviderManifestId("lite6_gripper_provider"), native_plans);
-      if (!arm_lifecycle_semantic.ok() || !gripper_lifecycle_semantic.ok()) {
-        throw std::logic_error(
-            "Manager Apply fixture lifecycle catalogs are unavailable");
+      if (arguments.robotiq_position) {
+        return deployment::test::make_robotiq_gripper_only_retention_fixture(
+            semantic.value().value());
       }
-      return
-          arguments.gripper_only
-              ? deployment::test::
-                    make_lite6_native_gripper_only_cclc_product_retention_fixture(
-                        arm_lifecycle_semantic.value().value(),
-                        gripper_lifecycle_semantic.value().value())
-          : arguments.assistant_native
-              ? deployment::test::
-                    make_lite6_native_cclc_assistant_product_retention_fixture(
-                        arm_lifecycle_semantic.value().value(),
-                        gripper_lifecycle_semantic.value().value())
-              : deployment::test::
-                    make_lite6_native_cclc_product_retention_fixture(
-                        arm_lifecycle_semantic.value().value(),
-                        gripper_lifecycle_semantic.value().value());
+      if (arguments.pneumatic_dwell_s.has_value()) {
+        // The command node also requires the genuine feedback capability.
+        // This is the existing single-gripper constructor with that qualified
+        // read binding enabled, not a second actuator or synthetic observation.
+        return deployment::test::make_lite6_controllable_retention_fixture(
+            false, false, 1U, true, true, {}, false, true, "resource", true,
+            semantic.value().value(), semantic.value().value(), true,
+            true, true, std::nullopt, false, deployment::test::kLite6ArmTargetId,
+            std::nullopt, std::nullopt, {}, {}, true, {},
+            "manyforge.provider.ros2_control", true, true, nullptr, nullptr,
+            false, false, "pneumatic", arguments.pneumatic_dwell_s,
+            arguments.pneumatic_no_output ? "none" : "commanded");
+      }
+      if (arguments.gripper_only) {
+        // Preserve the canonical pre-migration position fixture and timer
+        // Program; pneumatic command coverage uses the explicit new profiles.
+        return deployment::test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+            semantic.value().value(), "position_commanded", std::nullopt,
+            nullptr, "commanded");
+      }
+      return arguments.assistant_native
+          ? deployment::test::make_lite6_ros2_control_cclc_assistant_product_retention_fixture(
+                semantic.value().value())
+          : deployment::test::make_lite6_ros2_control_cclc_product_retention_fixture(
+                semantic.value().value());
     }();
-    const auto &selected_profile = arguments.ros2_control
-        ? source.ros2_control_execution_runtime_profile
-        : source.native_execution_runtime_profile;
+    const auto &selected_profile = source.ros2_control_execution_runtime_profile;
     if (!selected_profile.has_value()) {
-      throw std::logic_error(arguments.ros2_control
-          ? "Manager Apply fixture lacks its ROS runtime profile"
-          : "Manager Apply fixture lacks its native runtime profile");
+      throw std::logic_error("Manager Apply fixture lacks its ROS runtime profile");
     }
     const std::array<deployment::QualifiedRuntimeProfile, 1U> profiles{
         *selected_profile};
     const auto predecessor_source = [&]() {
       auto empty = deployment::detail::derive_cell_scoped_canonical_empty_deployment(
           source.qualified.deployment(), profiles);
-      if (!arguments.ros2_control) {
-        return empty;
-      }
       // Produce a genuine zero-component ROS compiler input. The physical
       // source's controller/profile/position rows are not empty-host settings.
       auto root = empty.normalized_authored_root().as_object();
@@ -638,20 +795,70 @@ int main(int argc, char **argv) {
     }
     const auto &host_id =
         predecessor->value().cell_graph.runtime_units.front().runtime_unit_id;
-    if (arguments.ros2_control) {
+    static_cast<void>(deployment::ros2_control_execution_runtime_contract::
+                          require_configuration(*predecessor, host_id));
+    if (candidate != nullptr) {
       static_cast<void>(deployment::ros2_control_execution_runtime_contract::
-                            require_configuration(*predecessor, host_id));
-      if (candidate != nullptr) {
-        static_cast<void>(deployment::ros2_control_execution_runtime_contract::
-                              require_configuration(*candidate, host_id));
+                            require_configuration(*candidate, host_id));
+    }
+    if (arguments.pneumatic_dwell_s.has_value()) {
+      const auto configuration = deployment::ros2_control_execution_runtime_contract::
+          require_configuration(*physical_candidate, host_id);
+      const auto expected_mode = arguments.pneumatic_no_output
+          ? core::GripperOutputMode::kNone : core::GripperOutputMode::kCommanded;
+      if (!configuration.initial_joint_positions_rad.empty() ||
+          !configuration.motion_target_limits.empty() ||
+          configuration.gripper_target_configurations.size() != 1U) {
+        throw std::logic_error("pneumatic Manager fixture lost its no-motion shape");
       }
-    } else {
-      static_cast<void>(deployment::native_execution_runtime_contract::
-                            require_configuration(*predecessor, host_id));
-      if (candidate != nullptr) {
-        static_cast<void>(deployment::native_execution_runtime_contract::
-                              require_configuration(*candidate, host_id));
+      const auto &gripper = configuration.gripper_target_configurations.front();
+      if (gripper.controllable_component_id.value() !=
+              deployment::test::kLite6ControllableComponentId ||
+          gripper.command_target_id.value() != deployment::test::kLite6GripperTargetId ||
+          gripper.actuation_kind != "pneumatic" ||
+          gripper.output_mode != expected_mode ||
+          gripper.command_duration_s != *arguments.pneumatic_dwell_s) {
+        throw std::logic_error("pneumatic Manager fixture changed its strict authored row");
       }
+    }
+    if (arguments.robotiq_position) {
+      const auto &graph = physical_candidate->value().cell_graph;
+      const auto configuration = deployment::ros2_control_execution_runtime_contract::
+          require_configuration(*physical_candidate, host_id);
+      if (graph.model_instances.size() != 1U ||
+          graph.model_instances.front().model_asset_id.value() != "robotiq_2f_85" ||
+          graph.controllable_components.size() != 1U || graph.control_domains.size() != 1U ||
+          graph.control_bindings.size() != 2U || !graph.component_attachments.empty() ||
+          !configuration.initial_joint_positions_rad.empty() ||
+          !configuration.motion_target_limits.empty() || configuration.isaac_world ||
+          configuration.controller_profiles.size() != 1U ||
+          configuration.controller_profiles.front().mock_profile !=
+              std::optional<std::string>("ur5e_robotiq_2f_85") ||
+          configuration.gripper_target_configurations.size() != 1U)
+        throw std::logic_error("Robotiq Manager fixture loses its genuine no-arm shape");
+      const auto &command = graph.control_bindings.front();
+      const auto &feedback = graph.control_bindings.back();
+      const auto &gripper = configuration.gripper_target_configurations.front();
+      if (command.capability_id.value() != "tool.gripper.command" ||
+          feedback.capability_id.value() != "tool.gripper.feedback" ||
+          command.controllable_component_id.value() != deployment::test::kRobotiqGripperOnlyComponentId ||
+          feedback.controllable_component_id != command.controllable_component_id ||
+          command.command_target_id.value() != "gripper" ||
+          feedback.command_target_id != command.command_target_id ||
+          feedback.control_domain_id != command.control_domain_id ||
+          command.resource_bindings.size() != 1U ||
+          feedback.resource_bindings != command.resource_bindings ||
+          feedback.provider_instance_id != command.provider_instance_id ||
+          feedback.provider_runtime_unit_id != command.provider_runtime_unit_id ||
+          gripper.controllable_component_id != command.controllable_component_id ||
+          gripper.command_target_id != command.command_target_id ||
+          gripper.actuation_kind != "position_commanded" ||
+          gripper.output_mode != core::GripperOutputMode::kCommanded ||
+          gripper.command_duration_s != 1.0 || gripper.delivery_result_timeout_s ||
+          gripper.mount_frame != "robotiq_85_base_link" ||
+          gripper.attach_frame != "robotiq_85_base_link" ||
+          gripper.tcp_frame != "robotiq_85_base_link" || gripper.touch_links.size() != 9U)
+        throw std::logic_error("Robotiq Manager fixture changes its single physical owner or Position configuration");
     }
     const auto admission_filename =
         deployment::cell_scoped_canonical_empty_admission_filename(
@@ -663,7 +870,8 @@ int main(int argc, char **argv) {
     if (arguments.assistant_native || arguments.gripper_only) {
       const auto program = PublishAssistantNativeProgram(
           arguments.package_root, physical_candidate, false,
-          arguments.gripper_only);
+          arguments.gripper_only, arguments.pneumatic_dwell_s,
+          arguments.robotiq_position);
       WriteAssistantNativeMetadata(
           arguments.metadata_path, admission, *physical_candidate, program,
           admission_filename,

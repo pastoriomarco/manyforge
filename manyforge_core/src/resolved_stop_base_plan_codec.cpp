@@ -609,6 +609,11 @@ void validate_base_identities(const ResolvedStopBasePlanDTO& plan) {
 
 void validate_plan(const ResolvedStopBasePlanDTO& plan) {
   validate_base_identities(plan);
+  if (plan.gripper_actuation_kind &&
+      *plan.gripper_actuation_kind != GripperActuationKind::kPositionCommanded &&
+      *plan.gripper_actuation_kind != GripperActuationKind::kPneumatic) {
+    fail("resolved Stop plan gripper actuation kind is invalid");
+  }
   if (plan.escalation_stages.empty() || plan.escalation_stages.size() > kMaxStopEscalationStages) {
     fail("resolved Stop plan has no bounded escalation chain");
   }
@@ -682,7 +687,9 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
       }
     }
   }
-  if (software_hard_count != 1U || previous_scope == nullptr ||
+  const std::size_t expected_hard_count =
+      plan.gripper_actuation_kind == GripperActuationKind::kPneumatic ? 0U : 1U;
+  if (software_hard_count != expected_hard_count || previous_scope == nullptr ||
       scope_granularity(*previous_scope) != plan.containment_granularity) {
     fail("resolved Stop plan lacks its exact hard floor or top scope");
   }
@@ -1028,6 +1035,11 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
       {"containment_granularity",
        CanonicalValue(std::string(to_string(plan.containment_granularity)))},
       {"escalation_stages", CanonicalValue(std::move(stages))}};
+  if (plan.gripper_actuation_kind) {
+    fields.emplace_back("gripper_actuation_kind", CanonicalValue(
+        *plan.gripper_actuation_kind == GripperActuationKind::kPneumatic
+            ? "pneumatic" : "position_commanded"));
+  }
   if (include_own_id) {
     fields.emplace_back("resolved_stop_base_plan_id",
                         CanonicalValue(plan.resolved_stop_base_plan_id.value()));

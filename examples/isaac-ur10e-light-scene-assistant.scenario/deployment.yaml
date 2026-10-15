@@ -39,6 +39,37 @@
         "runtime_configuration": {
           "collision_monitor_period_ms": 100.0,
           "execution_tick_hz": 100,
+          "gripper_target_configurations": [
+            {
+              "actuation_kind": "position_commanded",
+              "attach_frame": "grasp_frame",
+              "auxiliary_frames": [
+                "gripper_frame"
+              ],
+              "closed_state_ref": "closed",
+              "command_duration_s": 0.8,
+              "command_target_id": "gripper",
+              "controllable_component_id": "isaac_ur10e_assistant_robot",
+              "description": "Robotiq 2F-140 command through the standard ROS GripperCommand action.",
+              "mount_frame": "tool0",
+              "open_state_ref": "open",
+              "output_mode": "commanded",
+              "tcp_frame": "grasp_frame",
+              "touch_links": [
+                "left_inner_finger",
+                "left_inner_finger_pad",
+                "left_inner_knuckle",
+                "left_outer_finger",
+                "left_outer_knuckle",
+                "right_inner_finger",
+                "right_inner_finger_pad",
+                "right_inner_knuckle",
+                "right_outer_finger",
+                "right_outer_knuckle",
+                "robotiq_base_link"
+              ]
+            }
+          ],
           "initial_joint_positions_rad": [
             2.63422544,
             -0.875980752,

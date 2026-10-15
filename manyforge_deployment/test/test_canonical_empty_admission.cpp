@@ -30,10 +30,10 @@
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/closed_schema.hpp>
 
 #include "canonical_empty_admission_internal.hpp"
 #include "content_identity_internal.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment {
@@ -107,33 +107,6 @@ class ScopedTrustedRoot final {
   std::filesystem::path path_;
 };
 
-TEST(CanonicalEmptyAdmission, NativeBootstrapOwnsInfrastructureWithoutAScenario) {
-  ScopedTrustedRoot root("native-infrastructure");
-  const core::CellId cell("runtime_owned_cell");
-  const auto profile = detail::native_execution_runtime_profile_document();
-  const auto admission = detail::generate_native_empty_package(root.path(), cell, profile);
-  const auto &graph = admission.retained_bundle().value().cell_graph;
-  EXPECT_EQ(graph.cell_id, cell);
-  ASSERT_EQ(graph.runtime_units.size(), 1U);
-  EXPECT_TRUE(graph.controllable_components.empty());
-  EXPECT_TRUE(graph.model_instances.empty());
-  EXPECT_TRUE(graph.control_domains.empty());
-  EXPECT_TRUE(graph.control_bindings.empty());
-  EXPECT_TRUE(graph.component_attachments.empty());
-  EXPECT_TRUE(admission.retained_bundle().value().desired_control_configurations.empty());
-  const auto replay = detail::generate_native_empty_package(root.path(), cell, profile);
-  EXPECT_EQ(replay.canonical_bytes(), admission.canonical_bytes());
-  ScopedTrustedRoot other_root("other-native-infrastructure");
-  const auto other = detail::generate_native_empty_package(
-      other_root.path(), core::CellId("other_runtime"), profile);
-  EXPECT_NE(other.retained_bundle_id(), admission.retained_bundle_id());
-  // Infrastructure is the same installed host, not equipment selected by a
-  // Scenario. Cell placement changes its graph, not its process product.
-  EXPECT_EQ(other.retained_bundle().value().compiled_products.runtime_unit_products,
-            admission.retained_bundle().value().compiled_products.runtime_unit_products);
-}
-
-
 TEST(CanonicalEmptyAdmission, RosBootstrapOwnsInfrastructureWithoutAScenario) {
   ScopedTrustedRoot root("ros-infrastructure");
   const core::CellId cell("ros_runtime_owned_cell");
@@ -171,9 +144,38 @@ TEST(CanonicalEmptyAdmission, RosBootstrapOwnsInfrastructureWithoutAScenario) {
 TEST(CanonicalEmptyAdmission, RosBootstrapRejectsNativeProfileBeforePublication) {
   ScopedTrustedRoot root("ros-crossed-profile");
   const core::CellId cell("ros_runtime_owned_cell");
+  // Author an unsupported native identity using the surviving qualified
+  // configuration schema. No native product factory or publication is used.
+  auto candidate = parse_strict_json_model_yaml(
+      detail::ros2_control_execution_runtime_profile_document()).root().as_object();
+  for (auto& [name, value] : candidate) {
+    if (name == "runtime_profile_id") {
+      value = CanonicalValue("manyforge.native_execution_runtime");
+    }
+  }
+  const auto* schema = build_qualified_closed_schema_registry()
+                           .find_catalog_schema_family(
+                               core::CatalogRecordKind::kRuntimeProfile);
+  ASSERT_NE(schema, nullptr);
+  ASSERT_NE(schema->compiled_schema(), nullptr);
+  const auto normalized = validate_and_normalize_unqualified_artifact_candidate(
+      *schema->compiled_schema(), parse_strict_json_model_yaml(
+          canonical_json(CanonicalValue(std::move(candidate)))));
+  const std::string revision = detail::compute_content_identity(
+      normalized.normalized_root(),
+      {detail::catalog_record_identity_domain("runtime_profile"),
+       "manyforge.runtime_profile.v1", "runtime_profile_revision"});
+  auto profile_members = normalized.normalized_root().as_object();
+  for (auto& [name, value] : profile_members) {
+    if (name == "runtime_profile_revision") {
+      value = CanonicalValue(revision);
+    }
+  }
+  const std::string native_candidate =
+      canonical_json(CanonicalValue(std::move(profile_members)));
   try {
     static_cast<void>(detail::generate_ros_empty_package(
-        root.path(), cell, detail::native_execution_runtime_profile_document()));
+        root.path(), cell, native_candidate));
     FAIL() << "ROS bootstrap must not substitute the native product";
   } catch (const CanonicalEmptyAdmissionError &error) {
     EXPECT_STREQ(error.what(), "ROS bootstrap requires the ROS execution profile");

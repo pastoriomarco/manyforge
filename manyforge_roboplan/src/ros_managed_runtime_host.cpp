@@ -33,6 +33,7 @@
 #include <limits>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_component_manager/isaac_site_settings.hpp>
+#include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
@@ -119,6 +120,7 @@
 #include "execution_host_scene_bridge.hpp"
 #include "execution_host_surface.hpp"
 #include "ros_host_composition.hpp"
+#include <manyforge_roboplan/retained_native_gripper_route_publication_owner.hpp>
 
 #include "cell_admission_command_codec.hpp"
 #include "kernel_apply_fence_rpc_internal.hpp"
@@ -808,7 +810,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
 [[nodiscard]] CanonicalValue BuildManualControlGripperDescriptor(
     const core::RuntimeParticipantBinding &gripper_binding,
     const std::optional<RetainedGripperPositionLimits> &gripper_limits,
-    const std::vector<deployment::execution_runtime_contract::
+    const std::vector<deployment::ros2_control_execution_runtime_contract::
                           Configuration::GripperTargetConfiguration>
         &gripper_target_configurations,
     const deployment::VerifiedRetainedModelMap &model_map,
@@ -1001,6 +1003,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
   CanonicalValue::Array auxiliary_frames;
   std::optional<std::string> description;
   std::optional<std::string> actuation_kind;
+  std::optional<std::string> output_mode;
   std::optional<std::string> open_state_ref;
   std::optional<std::string> closed_state_ref;
   std::optional<double> command_duration_s;
@@ -1010,6 +1013,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
   if (has_authored_configuration) {
     description = authored_configuration->description;
     actuation_kind = authored_configuration->actuation_kind;
+    output_mode = authored_configuration->output_mode == core::GripperOutputMode::kNone ? "none" : "commanded";
     open_state_ref = authored_configuration->open_state_ref;
     closed_state_ref = authored_configuration->closed_state_ref;
     command_duration_s = authored_configuration->command_duration_s;
@@ -1042,6 +1046,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
                                                                  : "linear_m";
   return CanonicalValue(CanonicalValue::Object{
       {"actuation_kind", CanonicalNullableText(actuation_kind)},
+      {"output_mode", CanonicalNullableText(output_mode)},
       {"attach_frame", CanonicalNullableText(attach_frame)},
       {"auxiliary_frames", CanonicalValue(std::move(auxiliary_frames))},
       {"closed_state_ref", CanonicalNullableText(closed_state_ref)},
@@ -1049,7 +1054,9 @@ CanonicalNullableText(const std::optional<std::string> &value) {
       {"command_duration_s", CanonicalNullableNumber(command_duration_s)},
       {"command_kind", CanonicalValue("gripper_position")},
       {"component_role_id", CanonicalValue(gripper.component_role_id.value())},
-      {"completion_policy", CanonicalValue("goal_fenced_target_reached")},
+      {"completion_policy", CanonicalValue(actuation_kind == "pneumatic"
+          ? (output_mode == "none" ? "no_output" : "output_delivery")
+          : "goal_fenced_target_reached")},
       {"control_interface_contract_id",
        CanonicalNullableText(control_interface_contract_id)},
       {"contracts", ManualControlContractValue(gripper)},
@@ -1058,7 +1065,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
       {"coordinate_kind", CanonicalValue(coordinate_kind)},
       {"description", CanonicalNullableText(description)},
       {"grasp_confirmation_policy",
-       CanonicalValue("binding_feedback_required")},
+       CanonicalValue(actuation_kind == "pneumatic" ? "not_required" : "binding_feedback_required")},
       {"mimic_followers", CanonicalValue(std::move(followers))},
       {"max_position", gripper_limits.has_value()
                            ? CanonicalValue(gripper_limits->upper_position)
@@ -1070,7 +1077,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
       {"named_presets", CanonicalValue(std::move(presets))},
       {"open_state_ref", CanonicalNullableText(open_state_ref)},
       {"schema_version",
-       CanonicalValue("manyforge.manual_control_gripper_descriptor.v2")},
+       CanonicalValue("manyforge.manual_control_gripper_descriptor.v3")},
       {"source_coordinate_name",
        CanonicalValue(resource.source_joint_name.has_value()
                           ? *resource.source_joint_name
@@ -1104,7 +1111,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
     const std::vector<deployment::execution_runtime_contract::
                           Configuration::DirectControlJointLimit>
         &direct_control_joint_limits,
-    const std::vector<deployment::execution_runtime_contract::
+    const std::vector<deployment::ros2_control_execution_runtime_contract::
                           Configuration::GripperTargetConfiguration>
         &gripper_target_configurations,
     const deployment::VerifiedRetainedModelMap &model_map,
@@ -1372,6 +1379,131 @@ IndexNativeComponentCompositions(const Composition &cell) {
   return result;
 }
 
+// Exact existing scalar owner/configuration facts distinguish an intentionally
+// absent physical launch from a lost Commanded/arm process. Never infer None
+// from a null process, a target name, or unavailable feedback.
+[[nodiscard]] bool IsLocalNoOutputGripperOwner(const Composition& owner) {
+  if (owner.runtime || !owner.gripper_runtime || !owner.direct_control_gripper_binding)
+    return false;
+  const auto binding = owner.gripper_runtime->binding();
+  const auto* backend = owner.gripper_runtime->backend();
+  const auto& target = binding.value().command_target_id.value();
+  return backend && binding.value().controllable_component_id ==
+                        owner.direct_control_gripper_binding->value().controllable_component_id &&
+         binding.value().command_target_id ==
+             owner.direct_control_gripper_binding->value().command_target_id &&
+         backend->gripper_actuation_kind(target) == core::GripperActuationKind::kPneumatic &&
+         backend->gripper_output_mode(target) == core::GripperOutputMode::kNone;
+}
+
+struct VerifiedLocalNoneProcessOwner final {
+  std::shared_ptr<RetainedNativeGripperRuntime> runtime;
+  std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle;
+  core::RuntimeParticipantBinding binding;
+  core::RuntimeRouteConfigurationReadbackDTO route;
+  component_manager::ManagerComponentProcessOccurrenceDTO occurrence;
+};
+
+[[nodiscard]] VerifiedLocalNoneProcessOwner ReadVerifiedLocalNoneProcessOwner(
+    const Composition& owner,
+    const component_manager::ManagerComponentProcessInventoryRequestDTO& request) {
+  Require(IsLocalNoOutputGripperOwner(owner) && !owner.controller_process &&
+              owner.bundle && owner.cell_runtime && owner.ros2_control_runtime_handle &&
+              owner.active_addressed_kernel() == &owner.cell_runtime->addressed_kernel(),
+          "local None process occurrence has no exact installed logical owner");
+  const auto registration = owner.gripper_runtime->registration();
+  const auto& binding = registration.binding;
+  const auto& value = binding.value();
+  const auto* backend = owner.gripper_runtime->backend();
+  const auto* actual_backend = dynamic_cast<const ros2_control_execution::Ros2GripperCommandBackend*>(backend);
+  Require(actual_backend && value.control_path &&
+              registration.engine == owner.gripper_runtime->participant_engine() &&
+              registration.stop_execution_port == owner.gripper_runtime->participant_engine() &&
+              registration.stop_readiness &&
+              registration.stop_readiness->value().expected_controller_domain.physical_expectation ==
+                  core::ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone &&
+              owner.ros2_control_runtime_handle->OwnsGripper(backend, binding) &&
+              value.retained_bundle_id == request.predecessor_projection_revision.retained_bundle_id &&
+              value.graph_revision == request.predecessor_projection_revision.graph_revision &&
+              value.runtime_unit_epochs == std::vector<core::RuntimeUnitEpochBindingDTO>{
+                  {request.runtime_unit_id, request.runtime_epoch}},
+          "local None process occurrence crosses its actual binding/engine/Stop owner");
+  const auto logical = actual_backend->gripper_transport_readiness(value.command_target_id.value());
+  Require(logical.configured && logical.logical_owner_ready &&
+              logical.output_mode == core::GripperOutputMode::kNone,
+          "local None process occurrence has no current configured logical backend");
+  const auto& path = *value.control_path;
+  std::vector<core::ActiveControlConfigurationBindingRouteDTO> expected_routes;
+  std::vector<core::RouteReadinessPublicationRowDTO> expected_readiness;
+  std::set<core::ControlBindingId> actual_ids;
+  const auto registrations = owner.gripper_runtime->registrations();
+  const auto& source_bindings = owner.bundle->value().cell_graph.control_bindings;
+  for (const auto& row : registrations) {
+    const auto& alias = row.binding.value();
+    Require(alias.control_path && retained_bindings_share_backend_owner(binding, row.binding) &&
+                row.engine == registration.engine && row.stop_execution_port == registration.stop_execution_port &&
+                row.stop_readiness && row.stop_readiness->value().expected_controller_domain.physical_expectation ==
+                    core::ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone &&
+                (alias.capability_id == value.capability_id ||
+                 (alias.capability_id.value() == "tool.gripper.feedback" && !alias.command_schema && !row.intrinsic_direct_control)),
+            "local None occurrence has an alias outside its exact command owner");
+    const auto& alias_path = *alias.control_path;
+    Require(actual_ids.insert(alias_path.control_binding_id).second &&
+                std::count_if(source_bindings.begin(), source_bindings.end(), [&](const auto& source) {
+                  return source.control_binding_id == alias_path.control_binding_id &&
+                      source.control_binding_revision == alias_path.control_binding_revision &&
+                      source.controllable_component_id == alias.controllable_component_id &&
+                      source.command_target_id == alias.command_target_id && source.capability_id == alias.capability_id &&
+                      source.capability_definition_revision == alias.capability_definition_revision &&
+                      source.control_domain_id == alias_path.control_domain_id &&
+                      source.provider_runtime_unit_id == request.runtime_unit_id;
+                }) == 1,
+            "local None occurrence has an unknown or duplicated source binding");
+    expected_routes.push_back({alias_path.control_binding_id, alias_path.control_binding_revision, alias_path.control_route_id});
+    expected_readiness.push_back({alias.controllable_component_id,
+        row.stop_readiness->value().component_lifecycle_generation,
+        alias_path.control_binding_id, alias_path.control_binding_revision,
+        row.stop_readiness->value().resolved_stop_base_plan.resolved_stop_base_plan_id});
+  }
+  Require(std::count_if(source_bindings.begin(), source_bindings.end(), [&](const auto& source) {
+            return source.controllable_component_id == value.controllable_component_id;
+          }) == static_cast<std::ptrdiff_t>(registrations.size()),
+          "local None occurrence omits source-declared component bindings");
+  std::sort(expected_routes.begin(), expected_routes.end(), [](const auto& left, const auto& right) {
+    return left.control_binding_id < right.control_binding_id;
+  });
+  std::sort(expected_readiness.begin(), expected_readiness.end(), core::CanonicalRouteReadinessPublicationRowLess);
+  auto route = owner.active_addressed_kernel()->current_runtime_route_configuration(path.control_domain_id);
+  Require(route.ok() && route.value(),
+          "local None process occurrence has no installed Kernel route");
+  const auto& configuration = route.value()->active_configuration;
+  Require(configuration.state == core::ActiveControlConfigurationStateDTO::kReconciled &&
+              configuration.control_domain_id == path.control_domain_id &&
+              configuration.control_domain_revision == path.control_domain_revision &&
+              configuration.controller_topology_id == path.controller_topology_id &&
+              configuration.topology_revision == path.topology_revision &&
+              configuration.activation_set_id == path.activation_set_id &&
+              configuration.active_control_configuration_id == path.active_control_configuration_id &&
+              configuration.active_control_configuration_generation == path.active_control_configuration_generation &&
+              configuration.source_runtime_unit_id == request.runtime_unit_id &&
+              configuration.source_runtime_epoch == request.runtime_epoch &&
+              configuration.binding_routes == expected_routes &&
+              route.value()->readiness_rows == expected_readiness,
+          "local None process occurrence differs from the exact Kernel route/Stop readback");
+  component_manager::ManagerComponentProcessOccurrenceDTO occurrence{
+      value.controllable_component_id, {}, 0, component_manager::ProcessPresenceState::kAbsent,
+      core::ControllerLaunchCleanupState::kNotRequested, {},
+      deployment::derive_component_runtime_identity(*owner.bundle, value.controllable_component_id),
+      component_manager::ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal,
+      component_manager::ManagerPneumaticNoneProcessOwnerDTO{
+          value.command_target_id, path.control_binding_id, path.control_binding_revision}};
+  const auto verified = component_manager::ValidateManagerPneumaticNoneProcessOwner(
+      *owner.bundle, request, occurrence);
+  Require(verified.ok(), verified.ok() ? std::string{} : verified.error().message);
+  return {owner.gripper_runtime, owner.ros2_control_runtime_handle, binding,
+          std::move(*route.value()), std::move(occurrence)};
+}
+
 [[nodiscard]] std::optional<std::string> RetainedControllerLaunchExit(
     const std::shared_ptr<ControllerLaunchProcess> &process) {
   if (!process)
@@ -1586,16 +1718,26 @@ ReadNativeInstalledComponentReceipts(
     const auto *actual_predecessor = FindActualRetainedComponentOwner(
         component_id, *installed->second, predecessor, other_predecessors);
     const auto &view = *installed->second;
-    Require(view.runtime != nullptr &&
+    Require((view.runtime != nullptr || view.gripper_runtime != nullptr) &&
                 view.ros2_control_runtime_handle != nullptr,
             "ROS installed receipt has no owned runtime handle");
+    // Successful route installation can advance the live configuration
+    // generation beyond the Composition's construction-time manual bindings.
+    // Receipt ownership uses the current runtime bindings and registrations.
+    const std::optional<core::RuntimeParticipantBinding> current_motion =
+        view.runtime ? std::optional(view.runtime->motion_binding) : std::nullopt;
+    const std::optional<core::RuntimeParticipantBinding> current_tool =
+        view.runtime ? view.runtime->gripper_binding
+                     : std::optional(view.gripper_runtime->binding());
     auto receipt = detail::ReadRos2ComponentReceipt(
         request, component_id, *runtime_identity,
-        *view.ros2_control_runtime_handle, view.runtime->execution.get(),
-        view.runtime->gripper.get(), view.runtime->motion_binding,
-        view.runtime->gripper_binding, view.component_registrations(),
-        view.runtime->participant_engine_for(true),
-        view.runtime->participant_engine_for(false),
+        *view.ros2_control_runtime_handle,
+        view.runtime ? view.runtime->execution.get() : nullptr,
+        view.runtime ? view.runtime->gripper.get() : view.gripper_runtime->backend(),
+        current_motion, current_tool,
+        view.component_registrations(),
+        view.runtime ? view.runtime->participant_engine_for(true) : nullptr,
+        view.runtime ? view.runtime->participant_engine_for(false) : view.gripper_runtime->participant_engine(),
         actual_predecessor
             ? actual_predecessor->ros2_control_runtime_handle.get()
             : nullptr,
@@ -2377,6 +2519,45 @@ ResealRetainedNativeCandidateRegistrations(
   return result;
 }
 
+[[nodiscard]] RetainedSceneFrameCoordinateAuthority
+SceneFrameCoordinateAuthority(
+    const deployment::RetainedBundle &bundle,
+    const core::RuntimeParticipantBinding &binding) {
+  const auto required = RetainedSceneFrameCoordinateAuthority::kRequiredPublication;
+  const auto &value = binding.value();
+  if (value.capability_id.value() != "tool.gripper.command")
+    return required;
+  Require(value.control_path.has_value(),
+          "scene-frame gripper has no exact retained control path");
+  const auto &runtime_id = value.control_path->provider_runtime_unit_id;
+  const auto &units = bundle.value().cell_graph.runtime_units;
+  const auto runtime = std::find_if(units.begin(), units.end(), [&](const auto &row) {
+    return row.runtime_unit_id == runtime_id;
+  });
+  Require(runtime != units.end(),
+          "scene-frame gripper has no retained provider runtime");
+  if (runtime->runtime_profile_id.value() !=
+      deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId)
+    return required;
+  const auto configuration =
+      deployment::ros2_control_execution_runtime_contract::require_component_configuration(
+          bundle, runtime_id, value.controllable_component_id);
+  return retained_ros2_control_gripper_actuation_kind(configuration, binding) ==
+                 core::GripperActuationKind::kPneumatic
+             ? RetainedSceneFrameCoordinateAuthority::kUnavailablePneumatic
+             : required;
+}
+
+[[nodiscard]] RetainedSceneFrameStateSourceInput
+SceneFrameSource(const RetainedObservedStateChannel &channel,
+                 std::shared_ptr<const core::IObservedStateProvider> provider,
+                 const RetainedSceneFrameCoordinateAuthority authority) {
+  return {channel.query_context(), channel.source_kind(),
+          authority == RetainedSceneFrameCoordinateAuthority::kRequiredPublication
+              ? std::move(provider) : nullptr,
+          authority};
+}
+
 [[nodiscard]] std::unique_ptr<Composition>
 BuildRetainedProductComposition(CompositionBuildInput input) {
   Require(input.selected_component_id.has_value() &&
@@ -2465,10 +2646,10 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
                     [](const auto &resource) {
                       return resource.source_joint_name.has_value();
                     })) {
-      state_sources.push_back(RetainedSceneFrameStateSourceInput{
-          old_channel->query_context(), old_channel->source_kind(),
+      state_sources.push_back(SceneFrameSource(*old_channel,
           std::shared_ptr<const core::IObservedStateProvider>(
-              old_channel, old_channel->addressed_publication())});
+              old_channel, old_channel->addressed_publication()),
+          SceneFrameCoordinateAuthority(*input.bundle, *physical.gripper)));
     }
     auto frame_resolver = RetainedSceneFrameResolver::create_verified(
         input.collision_shared_model, *input.bundle, input.model_map,
@@ -2510,6 +2691,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
         input.publication_generation, std::nullopt,
         physical.status_gripper_role);
     composition->gripper_runtime = predecessor->second.gripper_runtime;
+    composition->ros2_control_runtime_handle = predecessor->second.ros2_control_runtime_handle;
     composition->candidate_tool_state_projector =
         std::move(candidate_tool_projector);
     composition->target_resolver = std::move(target_resolver);
@@ -2615,13 +2797,14 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
                           return resource.source_joint_name.has_value();
                         }),
             "retained native state channel mixes model and local resources");
-    state_sources.push_back(RetainedSceneFrameStateSourceInput{
-        channel->query_context(), channel->source_kind(),
+    state_sources.push_back(SceneFrameSource(*channel,
         std::shared_ptr<const core::IObservedStateProvider>(
-            channel, channel->addressed_publication())});
+            channel, channel->addressed_publication()),
+        SceneFrameCoordinateAuthority(*input.bundle, channel_binding)));
   };
   add_state_source(predecessor->second.runtime->motion_state_channel);
-  add_state_source(predecessor->second.runtime->gripper_state_channel);
+  if (predecessor->second.runtime->gripper_state_channel)
+    add_state_source(predecessor->second.runtime->gripper_state_channel);
   auto frame_resolver = RetainedSceneFrameResolver::create_verified(
       input.collision_shared_model, *input.bundle, input.model_map,
       *retained_model, *input.runtime_unit_id, input.runtime_epoch,
@@ -2728,6 +2911,203 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
 
 
 [[nodiscard]] std::unique_ptr<Composition>
+BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBindingSet physical) {
+  Require(!physical.motion && physical.gripper && physical.gripper_program &&
+              physical.status_gripper_role && input.shared_clock && input.shared_scheduler,
+          "ROS gripper-only component requires its exact physical target and stable cell time");
+  const auto binding = *physical.gripper;
+  const auto& value = binding.value();
+  Require(value.resources.size() == 1U && value.model_groups.size() == 1U &&
+              value.resources.front().source_joint_name && value.control_path,
+          "ROS gripper-only component requires one genuine model-backed scalar joint");
+  const auto local = input.runtime_unit_id.value_or(value.runtime_unit_epochs.front().runtime_unit_id);
+  const auto configuration = deployment::ros2_control_execution_runtime_contract::require_configuration(
+      *input.bundle, local);
+  const auto* selected = deployment::ros2_control_execution_runtime_contract::find_controller_profile(
+      configuration, value.controllable_component_id);
+  const auto authored = std::find_if(configuration.gripper_target_configurations.begin(),
+      configuration.gripper_target_configurations.end(), [&](const auto& row) {
+        return row.controllable_component_id == value.controllable_component_id &&
+               row.command_target_id == value.command_target_id;
+      });
+  Require(authored != configuration.gripper_target_configurations.end(),
+          "ROS gripper-only component has no exact authored gripper configuration");
+  const bool no_output = authored->output_mode == core::GripperOutputMode::kNone;
+  Require(!no_output || authored->actuation_kind == "pneumatic",
+          "No output requires its strict pneumatic gripper target");
+  Require(selected && (no_output || (selected->mock_profile && !selected->isaac_profile)),
+          "ROS gripper-only component requires its selected Mock controller profile");
+  std::optional<MockControllerProfileFacts> profile;
+  if (!no_output) {
+    profile = mock_controller_profile_facts(*selected->mock_profile);
+    Require(profile->gripper_required && profile->gripper_controller_name,
+            "ROS gripper-only profile has no real gripper controller");
+  }
+  const deployment::FilesystemVerifiedRetainedPlanningModelSource model_source(input.package_root);
+  const auto model = model_source.get_verified({input.bundle->retained_bundle_id(),
+      input.bundle->value().compiled_products.planning_collision_model.product_id});
+  Require(model.has_value() && input.collision_shared_model,
+          "ROS gripper-only component has no verified cell geometry");
+  auto stage = std::make_shared<const RetainedPlanningModelStage>(
+      RetainedPlanningModelStage::create_verified(*model, input.execution_run_root));
+  auto projected = BuildCandidateRetainedModelScene("manyforge_ros_gripper_host", *stage,
+      *model, *input.bundle, input.model_map, {binding});
+  const auto joint = projected.scene->getJointInfo(value.resources.front().compiled_resource_name);
+  Require(joint && joint->limits.min_position.size() == 1U && joint->limits.max_position.size() == 1U,
+          "ROS gripper-only component has no exact scalar model limits");
+  const RetainedGripperPositionLimits limits{value.resources.front().coordinate_kind,
+      joint->limits.min_position[0], joint->limits.max_position[0]};
+  auto channel = std::make_shared<RetainedObservedStateChannel>(binding, projected.state_projector,
+      retained_ros2_control_gripper_state_config(binding), input.shared_clock.get(), input.observation_wake);
+  Require(channel->initialize_from_projection(input.shared_clock->now()).applied(),
+          "ROS gripper-only component could not seed its genuine model projection");
+  const auto observed = projected.state_projector->current_state(
+      value.control_path->control_binding_id, value.control_path->control_binding_revision);
+  Require(observed.ok() && observed.value().positions.size() == 1U,
+          "ROS gripper-only component has no exact projected initial scalar");
+  const auto& position = observed.value().positions.front();
+  const double initial = std::holds_alternative<core::AngularPositionDTO>(position)
+      ? std::get<core::AngularPositionDTO>(position).value_rad : std::get<core::LinearPositionDTO>(position).value_m;
+  const auto instance = std::find_if(input.bundle->value().cell_graph.model_instances.begin(),
+      input.bundle->value().cell_graph.model_instances.end(), [&](const auto& row) {
+        return row.model_instance_id == value.model_groups.front().model_instance_id;
+      });
+  Require(instance != input.bundle->value().cell_graph.model_instances.end(),
+          "ROS gripper-only source model instance is missing");
+  const auto source = std::find_if(model->model_source_urdfs().begin(), model->model_source_urdfs().end(),
+      [&](const auto& row) { return row.model_asset_id == instance->model_asset_id &&
+                                  row.model_revision == instance->model_revision; });
+  Require(source != model->model_source_urdfs().end(), "ROS gripper-only source URDF is missing");
+  struct UnadoptedLaunch final {
+    const ControllerLaunchSupervisor::Ensured* receipt{};
+    ~UnadoptedLaunch() {
+      if (receipt) static_cast<void>(host_controller_launch_supervisor().discard_candidate(*receipt));
+    }
+  };
+  std::optional<ControllerLaunchSupervisor::Ensured> launch;
+  UnadoptedLaunch owned_launch{};
+  if (!no_output) {
+    ComponentControllerLaunchInput artifacts;
+    artifacts.artifacts_root = input.execution_run_root / "controller-launch-artifacts" /
+        value.controllable_component_id.value();
+    artifacts.model_urdf = source->urdf_bytes;
+    artifacts.gripper_binding = binding;
+    artifacts.gripper_projected_position = initial;
+    artifacts.mock_profile = selected->mock_profile;
+    artifacts.frame_prefix = selected->frame_prefix;
+    const auto written = write_component_controller_launch_artifacts(
+        std::optional<core::RuntimeParticipantBinding>{}, artifacts);
+    const auto command = mock_controller_launch_command(written);
+    const auto acquired = host_controller_launch_supervisor().ensure(command, written.directory,
+        input.controller_request_context.empty() ? "Bootstrap runtime=" + local.value() +
+        " epoch=" + input.runtime_epoch.value() : input.controller_request_context);
+    UnadoptedLaunch acquired_guard{&acquired};
+    launch = acquired; // the local receipt remains guarded if this copy throws
+    owned_launch.receipt = &*launch;
+    acquired_guard.receipt = nullptr;
+  }
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  if (launch) handle->InstallControllerProcessFaultSource(
+      ControllerLaunchSupervisor::fault_source(launch->process, CachedControllerLaunchReadinessSource(handle)),
+      [process = launch->process] { return core::Result<std::optional<std::string>>::Ok(
+          ProjectControllerLaunchFault(process->ReadCachedFaultState())); });
+  RetainedRos2ControlBackendConfig config;
+  config.node_name = "manyforge_ros2_control_execution_backend";
+  config.node_namespace = controller_runtime_namespace(value.controllable_component_id.value());
+  config.executor_thread_count = 3U;
+  if (no_output) {
+    ros2_control_execution::Ros2GripperActionConfig local;
+    local.group_id = value.model_groups.front().compiled_group_name;
+    local.joint_name = value.resources.front().compiled_resource_name;
+    local.state_joint_name = *value.resources.front().source_joint_name;
+    config.gripper = std::move(local);
+  } else {
+    configure_retained_mock_gripper_action(config, binding, *profile,
+        config.node_namespace, config.node_namespace + "/controller_manager");
+  }
+  configure_retained_gripper_output_mode(config, configuration, binding);
+  config.defer_ros_start = input.managed_component_delta.has_value();
+  config.measured_receiver_clock = input.shared_clock;
+  auto backend = make_retained_ros2_control_gripper_backend(std::move(config), binding, channel,
+      *input.shared_clock, *input.shared_scheduler, handle);
+  RetainedNativeGripperRuntimeInput gripper_input{
+      binding, std::move(backend), input.shared_clock, channel, nullptr, {}, true,
+      [handle](const auto& target, const auto& state, const auto&) {
+        return handle->RebindGripperRoute(target, state);
+      }, input.shared_scheduler, limits};
+  const RetainedMeasuredJointStateLane measured_lane{
+      controller_runtime_namespace(value.controllable_component_id.value()) + "/joint_states",
+      1'000'000'000LL, core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
+      std::string(kMeasuredJointStateProfileId)};
+  const bool pneumatic_gripper = retained_ros2_control_gripper_actuation_kind(configuration, binding) ==
+      core::GripperActuationKind::kPneumatic;
+  gripper_input.prepare_measured_sources = [handle, clock = input.shared_clock, measured_lane, pneumatic_gripper](
+      const core::RuntimeParticipantBinding& current, const core::ActiveControlConfigurationDTO& configuration)
+      -> core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>> {
+    using Result = core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>;
+    if (pneumatic_gripper)
+      return Result::Ok(std::make_shared<const RetainedPreparedRobotMeasuredSources>(
+          RetainedPreparedRobotMeasuredSources{{current.value().controllable_component_id, {}}, [] {}}));
+    auto descriptor = make_retained_ros2_control_measured_state_descriptor(current, configuration, measured_lane);
+    if (!descriptor.ok()) return Result::Err(descriptor.error());
+    auto staged = handle->StageMeasuredStateSources({descriptor.value()}, clock,
+        std::optional<core::RuntimeParticipantBinding>{}, std::optional(current));
+    if (!staged.ok()) return Result::Err(staged.error());
+    if (!staged.value()) return Result::Ok(nullptr);
+    auto publication = std::move(staged.value());
+    core::RobotMeasuredStateSourceView sources{current.value().controllable_component_id, {}};
+    for (std::size_t index = 0; index < publication->descriptors().size(); ++index)
+      sources.sources.push_back({publication->descriptors()[index], publication->readers()[index]});
+    return Result::Ok(std::make_shared<const RetainedPreparedRobotMeasuredSources>(
+        RetainedPreparedRobotMeasuredSources{std::move(sources), [publication] { publication->EnablePublication(); }}));
+  };
+  gripper_input.control_binding_representatives = physical.representatives;
+  auto owner = std::make_shared<RetainedNativeGripperRuntime>(std::move(gripper_input));
+  const auto srdf = model->srdf_bytes();
+  const auto documents = deployment::parse_model_documents_for_projection(model->urdf_bytes(),
+      srdf.empty() ? std::optional<std::string_view>{} : std::optional<std::string_view>{srdf});
+  auto descriptor = BuildManualControlGripperDescriptor(binding, limits,
+      configuration.gripper_target_configurations, input.model_map, documents);
+  const auto make_resolver = [package_root = input.package_root, bundle = input.bundle,
+      model_map = input.model_map, program_artifact_root = input.program_artifact_root,
+      program_id = physical.gripper_program->program_binding_id()](auto bindings) {
+    return std::make_shared<ProductBackedRuntimeParticipantResolver>(package_root, bundle,
+        model_map, std::move(bindings), std::vector<core::ProgramBindingId>{program_id}, program_artifact_root);
+  };
+  auto resolver = make_resolver(std::vector<core::RuntimeParticipantBinding>{binding});
+  std::vector<RetainedSceneFrameStateSourceInput> frame_sources;
+  frame_sources.push_back(SceneFrameSource(*channel,
+      std::shared_ptr<const core::IObservedStateProvider>(channel, channel->addressed_publication()),
+      SceneFrameCoordinateAuthority(*input.bundle, binding)));
+  auto frames = RetainedSceneFrameResolver::create_verified(input.collision_shared_model, *input.bundle,
+      input.model_map, *model, local, input.runtime_epoch, std::move(frame_sources),
+      input.selected_component_id);
+  auto composition = std::make_unique<Composition>(value.controllable_component_id, input.bundle,
+      input.status_program, input.status_program_binding, nullptr, physical.gripper_program,
+      std::nullopt, binding, std::nullopt, CanonicalValue(nullptr), std::move(descriptor),
+      stage, nullptr, input.projection_revision, input.publication_generation, std::nullopt,
+      physical.status_gripper_role);
+  composition->gripper_runtime = std::move(owner);
+  composition->ros2_control_runtime_handle = std::move(handle);
+  composition->measured_joint_state_lane = measured_lane;
+  composition->controller_process = launch ? launch->process : nullptr;
+  composition->controller_request_context = input.controller_request_context;
+  composition->prepared_controller_launch = launch;
+  owned_launch.receipt = nullptr;
+  composition->target_resolver = std::move(resolver);
+  composition->candidate_participant_resolver_factory = [make_resolver](auto bindings) {
+    auto owner = make_resolver(std::move(bindings));
+    return RetainedRuntimeParticipantResolver{[owner](const auto& operation, const std::size_t index) {
+      return owner->ResolveExecutionParticipant(operation, index);
+    }};
+  };
+  composition->scene_frame_resolver = std::move(frames);
+  composition->candidate_control_representatives = std::move(physical.representatives);
+  composition->required_projection_pins = std::move(input.required_projection_pins);
+  return composition;
+}
+
+[[nodiscard]] std::unique_ptr<Composition>
 BuildSingleProductComposition(CompositionBuildInput input) {
   if (input.selected_component_id.has_value() &&
       input.retained_component_snapshots.contains(*input.selected_component_id))
@@ -2763,6 +3143,8 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           *input.bundle, input.model_map, catalog_store);
   auto physical_bindings =
       ResolveNativePhysicalBindings(input, direct_control_inventory);
+  if (!physical_bindings.motion && physical_bindings.gripper)
+    return BuildGripperOnlyProductComposition(std::move(input), std::move(physical_bindings));
   Require(physical_bindings.motion.has_value() &&
               physical_bindings.status_motion_role.has_value(),
           "motion-backed native composition has no motion target");
@@ -3099,10 +3481,10 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                               }),
                   "native scene-frame state channel mixes model and "
                   "component-local resources");
-          state_sources.push_back(RetainedSceneFrameStateSourceInput{
-              channel->query_context(), channel->source_kind(),
+          state_sources.push_back(SceneFrameSource(*channel,
               std::shared_ptr<const core::IObservedStateProvider>(
-                  channel, channel->addressed_publication())});
+                  channel, channel->addressed_publication()),
+              SceneFrameCoordinateAuthority(*input.bundle, binding)));
         }
         return RetainedSceneFrameResolver::create_verified(
             reference_collision_model, *input.bundle, input.model_map,
@@ -3241,6 +3623,16 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                 : std::get<core::LinearPositionDTO>(position).value_m;
       }
     }
+    if (direct_control_gripper_binding) {
+      const auto row = std::find_if(retained_runtime_configuration.gripper_target_configurations.begin(),
+          retained_runtime_configuration.gripper_target_configurations.end(), [&](const auto& configured) {
+            return configured.controllable_component_id == direct_control_gripper_binding->value().controllable_component_id &&
+                   configured.command_target_id == direct_control_gripper_binding->value().command_target_id;
+          });
+      Require(row != retained_runtime_configuration.gripper_target_configurations.end(),
+              "ROS controller artifacts have no exact authored gripper output choice");
+      artifact_input.gripper_output_mode = row->output_mode;
+    }
     artifact_input.model_urdf = source_urdf->urdf_bytes;
     artifact_input.frame_prefix = selected_profile->frame_prefix;
     const auto written =
@@ -3361,8 +3753,10 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   ros2_control_backend_config.measured_receiver_clock = measured_receiver_clock;
   const auto measured_lane =
       ros2_control_backend_config.arm.measured_joint_state_lane;
+  const bool pneumatic_gripper = ros2_control_backend_config.gripper &&
+      ros2_control_backend_config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic;
   runtime_input.prepare_measured_sources =
-      [ros2_control_runtime_handle, measured_receiver_clock, measured_lane](
+      [ros2_control_runtime_handle, measured_receiver_clock, measured_lane, pneumatic_gripper](
           const core::RuntimeParticipantBinding &motion,
           const std::optional<core::RuntimeParticipantBinding> &gripper,
           const std::vector<core::ActiveControlConfigurationDTO> &configurations)
@@ -3407,7 +3801,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
     };
     auto added = add_binding(motion);
     if (!added.ok()) return Result::Err(added.error());
-    if (gripper) {
+    if (gripper && !pneumatic_gripper) {
       added = add_binding(*gripper);
       if (!added.ok()) return Result::Err(added.error());
     }
@@ -3571,7 +3965,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       direct_control_joint_limits.value(), runtime->gripper_position_limits,
       runtime->motion_participant_policy,
       runtime->deployment_maximum_tcp_linear_speed_mps,
-      nullptr, {}, {},
+      nullptr, {}, retained_runtime_configuration.gripper_target_configurations,
       input.model_map, retained_model_documents);
   const auto selected_component_id =
       input.selected_component_id.value_or(
@@ -3681,13 +4075,58 @@ BuildProductComposition(CompositionBuildInput input) {
       inventory.motion, "execution.trajectory.execute");
   const auto gripper_component_ids =
       sorted_component_ids(inventory.gripper, "tool.gripper.command");
-  Require(!motion_component_ids.empty(),
-          "native composition requires at least one motion binding");
-  Require(std::includes(motion_component_ids.begin(), motion_component_ids.end(),
-                        gripper_component_ids.begin(),
-                        gripper_component_ids.end()),
-          "native gripper binding has no matching motion component");
-  if (inventory.motion.size() == 1U && inventory.gripper.size() <= 1U) {
+  Require(!motion_component_ids.empty() || !gripper_component_ids.empty(),
+          "ROS composition requires at least one physical capability binding");
+  // A scalar-only cell has no motion Scene projection. Its frames still use
+  // the complete immutable retained model, with the same source/asset checks.
+  if (motion_component_ids.empty() && input.collision_shared_model == nullptr) {
+    auto selected = input;
+    selected.selected_component_id = gripper_component_ids.front();
+    const auto physical = ResolveNativePhysicalBindings(selected, inventory);
+    Require(!physical.motion && physical.gripper &&
+                physical.gripper->value().model_groups.size() == 1U &&
+                physical.gripper->value().retained_bundle_id ==
+                    input.bundle->retained_bundle_id() &&
+                physical.gripper->value().graph_revision ==
+                    input.bundle->value().cell_graph.graph_revision &&
+                input.model_map.query().retained_bundle_id ==
+                    input.bundle->retained_bundle_id(),
+            "scalar cell geometry has no exact retained target and model group");
+    const deployment::FilesystemVerifiedRetainedPlanningModelSource source(
+        input.package_root);
+    const auto model = source.get_verified(
+        {input.bundle->retained_bundle_id(),
+         input.bundle->value().compiled_products.planning_collision_model.product_id});
+    Require(model.has_value(),
+            "scalar cell geometry has no verified retained model");
+    auto stage = std::make_shared<const RetainedPlanningModelStage>(
+        RetainedPlanningModelStage::create_verified(*model, input.execution_run_root));
+    auto collision_model = collision::ManyForgeCollisionEngine::load_shared_model(
+        "manyforge_ros_scalar_cell", stage->loader_urdf_path(),
+        stage->srdf_path(), stage->package_paths(),
+        physical.gripper->value().model_groups.front().compiled_group_name,
+        input.scene_asset_root_fd);
+    // Keep the loader's private asset tree alive with this existing shared
+    // model. The pair retires the model before its stage; no projection or
+    // state authority is created, and retained component scene stages stay put.
+    const auto *model_pointer = collision_model.get();
+    auto lifetime = std::make_shared<const std::pair<
+        std::shared_ptr<const RetainedPlanningModelStage>,
+        collision::ManyForgeCollisionEngine::SharedModelPtr>>(
+            std::move(stage), std::move(collision_model));
+    input.collision_shared_model =
+        collision::ManyForgeCollisionEngine::SharedModelPtr(
+            std::move(lifetime), model_pointer);
+  }
+  if (motion_component_ids.empty() && gripper_component_ids.size() == 1U) {
+    input.selected_component_id = gripper_component_ids.front();
+    if (input.retained_component_snapshots.contains(gripper_component_ids.front()))
+      return BuildRetainedProductComposition(std::move(input));
+    return BuildSingleProductComposition(std::move(input));
+  }
+  if (inventory.motion.size() == 1U && inventory.gripper.size() <= 1U &&
+      std::includes(motion_component_ids.begin(), motion_component_ids.end(),
+                    gripper_component_ids.begin(), gripper_component_ids.end())) {
     input.selected_component_id = motion_component_ids.front();
     if (input.retained_component_snapshots.contains(
             motion_component_ids.front()))
@@ -3704,10 +4143,15 @@ BuildProductComposition(CompositionBuildInput input) {
       "multi-robot native composition requires the managed shared-owner path");
 
   auto component_ids = motion_component_ids;
-  Require(component_ids.size() == inventory.motion.size() &&
-              inventory.gripper.size() <= component_ids.size(),
-          "multi-robot native composition requires one motion binding and "
-          "optional gripper bindings per robot");
+  component_ids.insert(component_ids.end(), gripper_component_ids.begin(), gripper_component_ids.end());
+  std::sort(component_ids.begin(), component_ids.end());
+  component_ids.erase(std::unique(component_ids.begin(), component_ids.end()), component_ids.end());
+  // Preserve the existing motion root when present; independent scalar
+  // components add owners without changing any arm's local runtime.
+  if (!motion_component_ids.empty()) {
+    const auto first_motion = std::find(component_ids.begin(), component_ids.end(), motion_component_ids.front());
+    std::rotate(component_ids.begin(), first_motion, std::next(first_motion));
+  }
 
   std::vector<std::unique_ptr<Composition>> compositions;
   compositions.reserve(component_ids.size());
@@ -3726,7 +4170,8 @@ BuildProductComposition(CompositionBuildInput input) {
           projection->second->collision_shared_model();
       selected.planner_scene_projection = projection->second;
     } else {
-      Require(motion_component_ids.empty() &&
+      Require(!std::binary_search(motion_component_ids.begin(),
+                                  motion_component_ids.end(), component_id) &&
                   selected.collision_shared_model != nullptr,
               "native motion component has no Scene projection");
       selected.collision_publisher.reset();
@@ -3783,6 +4228,8 @@ BuildProductComposition(CompositionBuildInput input) {
   compositions.erase(compositions.begin());
   const bool has_retained_owner =
       !input.retained_component_snapshots.empty();
+  if (!primary->runtime)
+    primary->candidate_participant_resolver_factory = resolver_factory;
   if (!has_retained_owner) {
     std::vector<std::shared_ptr<RetainedNativeRuntime>> peers;
     peers.reserve(compositions.size());
@@ -3846,10 +4293,10 @@ BuildProductComposition(CompositionBuildInput input) {
                             return resource.source_joint_name.has_value();
                           }),
               "native cell frame source mixes local and model coordinates");
-      state_sources.push_back(RetainedSceneFrameStateSourceInput{
-          channel->query_context(), retained_channel->source_kind(),
+      state_sources.push_back(SceneFrameSource(*retained_channel,
           std::shared_ptr<const core::IObservedStateProvider>(
-              channel, channel->addressed_publication())});
+              channel, channel->addressed_publication()),
+          SceneFrameCoordinateAuthority(*input.bundle, channel_binding)));
     };
     const auto include_owner = [&](const Composition &view) {
       Require(view.component_runtime_identity() != nullptr,
@@ -3934,9 +4381,21 @@ void ResealRetainedNativeCandidateOwners(
             "retained native component lost the exact parent Apply fence");
     if (view.gripper_runtime != nullptr) {
       Require(view.runtime == nullptr &&
-                  view.candidate_component_registrations.size() == 1U &&
+                  !view.candidate_component_registrations.empty() &&
                   view.direct_control_gripper_binding.has_value(),
               "retained gripper candidate has no exact physical participant");
+      std::vector<core::RuntimeParticipantBinding> representatives;
+      std::vector<std::optional<core::RuntimeParticipantStopReadiness>> readiness;
+      for (const auto& row : view.candidate_component_registrations) {
+        representatives.push_back(row.binding);
+        readiness.push_back(row.stop_readiness);
+      }
+      auto staged = view.gripper_runtime->PrepareRegistrations(representatives, readiness);
+      Require(staged.ok(), staged.ok() ? std::string{} : staged.error().message);
+      const auto primary = std::find_if(staged.value().begin(), staged.value().end(), [&](const auto& row) {
+        return row.binding.value() == view.direct_control_gripper_binding->value();
+      });
+      Require(primary != staged.value().end(), "retained gripper candidate omits its exact primary command");
       const auto channel =
           std::dynamic_pointer_cast<RetainedObservedStateChannel>(
               view.gripper_runtime->state_channel());
@@ -3953,10 +4412,11 @@ void ResealRetainedNativeCandidateOwners(
              rebound.error().message);
       const auto installed = view.gripper_runtime->RebindRoute(
           *view.direct_control_gripper_binding, channel,
-          view.candidate_component_registrations.front().stop_readiness);
+          primary->stop_readiness);
       if (!installed.ok())
         Fail("retained gripper controller cannot be re-sealed: " +
              installed.error().message);
+      view.gripper_runtime->AdoptVerifiedRegistrations(std::move(staged.value()));
       continue;
     }
     Require(view.runtime != nullptr &&
@@ -4663,6 +5123,127 @@ void DetachRetainedCCLC(Composition &composition);
 }
 
 
+// No-motion route/readiness seams borrow the same stable cell Kernel and
+// retain component engines directly; neither callback captures Composition.
+void EnsureGripperOnlyCellPorts(Composition& composition) {
+  // Arm roots derive exact scalar delegates from their current installed
+  // inventory/factory; no per-Apply map or captured predecessor is stored.
+  if (composition.runtime || composition.cclc_cell_route_publication_owner) return;
+  Require(composition.cell_runtime && composition.bundle &&
+              composition.candidate_participant_resolver_factory,
+          "no-motion CCLC has no exact stable cell/product resolver factory");
+  auto* const cell = composition.cell_runtime;
+  const auto owners = IndexNativeComponentCompositions(composition);
+  std::vector<std::shared_ptr<RetainedNativeGripperRuntime>> grippers;
+  for (const auto& [component, view] : owners) {
+    static_cast<void>(component);
+    Require(view->gripper_runtime != nullptr && !view->runtime,
+            "no-motion CCLC contains a foreign physical owner");
+    grippers.push_back(view->gripper_runtime);
+  }
+  const auto resolver_for = [factory = composition.candidate_participant_resolver_factory,
+                             grippers](const auto& rows) {
+    std::vector<core::RuntimeParticipantBinding> physical;
+    for (const auto& gripper : grippers) {
+      const auto actual = gripper->registration();
+      const auto row = std::find_if(rows.begin(), rows.end(), [&](const auto& value) {
+        return value.binding.value() == actual.binding.value() &&
+               value.engine == actual.engine && value.stop_execution_port == actual.stop_execution_port;
+      });
+      if (row == rows.end())
+        throw std::invalid_argument("no-motion resolver lost its exact physical owner");
+      physical.push_back(row->binding);
+    }
+    auto binding_resolver = factory(std::move(physical));
+    if (!binding_resolver)
+      throw std::invalid_argument("no-motion resolver factory returned no resolver");
+    return make_retained_cell_kernel_participant_resolver(std::move(binding_resolver), rows);
+  };
+  auto candidate = [cell, resolver_for](const auto&, const auto& replacements) {
+    using Result = core::Result<RetainedNativeGripperRoutePublicationOwner::KernelCandidate>;
+    auto rows = cell->participant_registrations();
+    for (const auto& row : replacements) {
+      const auto found = std::find_if(rows.begin(), rows.end(), [&](const auto& before) {
+        return before.engine == row.engine && before.binding.value().control_path && row.binding.value().control_path &&
+               before.binding.value().controllable_component_id == row.binding.value().controllable_component_id &&
+               before.binding.value().command_target_id == row.binding.value().command_target_id &&
+               before.binding.value().capability_id == row.binding.value().capability_id &&
+               before.binding.value().control_path->control_binding_id == row.binding.value().control_path->control_binding_id;
+      });
+      if (found == rows.end()) return Result::Err(
+          {"missing_reference", "scalar candidate has no exact installed registration", {}});
+      *found = row;
+    }
+    auto resolver = resolver_for(rows);
+    return Result::Ok({std::move(rows), std::move(resolver), {}});
+  };
+  std::map<core::ControlDomainId, std::shared_ptr<RetainedNativeGripperRoutePublicationOwner>> routes;
+  for (const auto& gripper : grippers) {
+    const auto binding = gripper->binding();
+    Require(binding.value().control_path.has_value(), "scalar route owner has no physical domain");
+    auto port = std::make_shared<RetainedNativeGripperRoutePublicationOwner>(
+        gripper, *cell->clock(), cell->addressed_kernel(), candidate, cell);
+    Require(routes.emplace(binding.value().control_path->control_domain_id, port).second,
+            "scalar route inventory repeats a domain owner");
+  }
+  Require(composition.gripper_runtime != nullptr, "no-motion CCLC has no primary scalar owner");
+  const auto primary_binding = composition.gripper_runtime->binding();
+  const auto primary = routes.find(primary_binding.value().control_path->control_domain_id);
+  Require(primary != routes.end(), "no-motion route map omits its primary owner");
+  auto root_route = primary->second;
+  routes.erase(primary);
+  root_route->BindParticipantPeers(root_route, std::move(routes));
+  composition.cclc_cell_route_publication_owner = root_route;
+  composition.cclc_cell_command_readiness_port = std::make_unique<RetainedNativeCellCommandReadinessPort>(
+      *cell, [grippers = std::move(grippers), resolver_for, root_route](const auto& publication, const auto& current) {
+        using Result = core::Result<RetainedNativeCellReadinessCandidate>;
+        // This operation-local lease survives the synchronous existing port's
+        // validation, publication, exact readback and all cache adoption. It
+        // is never stored in a resolver/context/source; same thread releases it.
+        auto transition = std::make_shared<std::unique_lock<std::mutex>>(root_route->CellTransitionMutex());
+        RetainedNativeCellReadinessCandidate candidate;
+        candidate.registrations = current;
+        for (auto& row : candidate.registrations) {
+          if (row.binding.value().controllable_component_id != publication.controllable_component_id ||
+              !row.stop_readiness) continue;
+          auto sealed = core::rebind_runtime_participant_stop_readiness_generation(*row.stop_readiness,
+              publication.component_lifecycle_generation);
+          if (!sealed.ok()) return Result::Err(sealed.error());
+          row.stop_readiness = std::move(sealed.value());
+        }
+        std::vector<std::tuple<std::shared_ptr<RetainedNativeGripperRuntime>,
+            std::optional<core::RuntimeParticipantStopReadiness>,
+            std::vector<core::RuntimeParticipantExecutionRegistration>>> staged;
+        for (const auto& gripper : grippers) {
+          const auto actual = gripper->registration();
+          if (actual.binding.value().controllable_component_id != publication.controllable_component_id) continue;
+          std::vector<core::RuntimeParticipantExecutionRegistration> aliases;
+          std::optional<core::RuntimeParticipantStopReadiness> primary_readiness;
+          for (const auto& registered : gripper->registrations()) {
+            const auto row = std::find_if(candidate.registrations.begin(), candidate.registrations.end(),
+                [&](const auto& value) {
+              return value.binding.value() == registered.binding.value() &&
+                     value.engine == registered.engine && value.stop_execution_port == registered.stop_execution_port;
+            });
+            if (row == candidate.registrations.end())
+              return Result::Err({"missing_reference", "readiness candidate lost its exact scalar alias", {}});
+            aliases.push_back(*row);
+            if (row->binding.value() == actual.binding.value()) primary_readiness = row->stop_readiness;
+          }
+          staged.emplace_back(gripper, std::move(primary_readiness), std::move(aliases));
+        }
+        candidate.participant_resolver = resolver_for(candidate.registrations);
+        candidate.adopt_component_owners = [root_route, transition = std::move(transition),
+            staged = std::move(staged)]() mutable noexcept {
+          for (auto& [gripper, readiness, registrations] : staged) {
+            gripper->AdoptVerifiedReadiness(std::move(readiness));
+            gripper->AdoptVerifiedRegistrations(std::move(registrations));
+          }
+        };
+        return Result::Ok(std::move(candidate));
+      });
+}
+
 // Prepare the same actual product used by the installed facade. Original
 // delegated runtimes borrow its catalog/ports, so attachment must retain it.
 void EnsureInstalledRetainedRos2ControlLifecycleProduct(
@@ -4672,7 +5253,7 @@ void EnsureInstalledRetainedRos2ControlLifecycleProduct(
             "installed ROS lifecycle product lost its verified provider source");
     return;
   }
-  Require(composition.runtime != nullptr && composition.runtime->clock != nullptr &&
+  Require((composition.runtime || composition.gripper_runtime) && composition.cell_runtime &&
               composition.active_addressed_kernel() != nullptr,
           "installed ROS lifecycle product requires the stable runtime and Kernel");
   auto provider_manifest_source = std::make_unique<
@@ -4687,7 +5268,8 @@ void EnsureInstalledRetainedRos2ControlLifecycleProduct(
   }
   auto product = RetainedRos2ControlLifecycleProduct::Create(
       composition.bundle, *provider_manifest_source, physical_bindings, handles,
-      *composition.runtime->clock, 1'000'000'000LL);
+      *(composition.runtime ? composition.runtime->clock : composition.cell_runtime->clock()),
+      1'000'000'000LL);
   if (!product.ok())
     Fail("native lifecycle product cannot be composed: " + product.error().message);
   composition.cclc_provider_manifest_source = std::move(provider_manifest_source);
@@ -4711,7 +5293,7 @@ BuildInstalledCCLCReadinessDependencies(
     }};
   };
   const auto primary = composition.runtime;
-  if (primary == nullptr || composition.bundle == nullptr)
+  if ((!primary && !composition.gripper_runtime) || composition.bundle == nullptr)
     return unavailable({"measured_source_unavailable", "the primary product owner is absent",
                         {{"reason", "measured_primary_owner_missing"}}});
   const auto &products = composition.bundle->value().compiled_products;
@@ -4740,11 +5322,13 @@ BuildInstalledCCLCReadinessDependencies(
                         {{"reason", "measured_model_membership_mismatch"}}});
 
   std::map<core::ControllableComponentId, std::shared_ptr<RetainedNativeRuntime>> runtimes;
+  std::map<core::ControllableComponentId, std::shared_ptr<RetainedNativeGripperRuntime>> grippers;
   for (const auto &[component, view] : IndexNativeComponentCompositions(composition)) {
-    if (view == nullptr || view->runtime == nullptr)
+    if (view == nullptr || (!view->runtime && !view->gripper_runtime))
       return unavailable({"measured_source_unavailable", "the installed component owner is absent",
                           {{"reason", "measured_component_owner_missing"}}});
-    runtimes.emplace(component, view->runtime);
+    if (view->runtime) runtimes.emplace(component, view->runtime);
+    if (view->gripper_runtime) grippers.emplace(component, view->gripper_runtime);
     if (std::find(robots.begin(), robots.end(), component) == robots.end())
       continue;
     // Verified physical/model rows supply immutable coordinate names below.
@@ -4752,7 +5336,19 @@ BuildInstalledCCLCReadinessDependencies(
     // an adopted predecessor epoch cannot poison the static geometry map.
   }
   const auto physical = PhysicalControlBindings(composition);
-  auto geometry = QualifyRetainedRobotMeasuredGeometry(*model_map, robots, physical, {});
+  std::vector<core::RuntimeParticipantBinding> pneumatic;
+  for (const auto& binding : physical) {
+    if (binding.value().capability_id.value() != "tool.gripper.command") continue;
+    const auto component = binding.value().controllable_component_id;
+    const auto motion_owner = runtimes.find(component);
+    const auto scalar_owner = grippers.find(component);
+    const auto* backend = motion_owner != runtimes.end() ? motion_owner->second->gripper.get()
+        : scalar_owner != grippers.end() ? scalar_owner->second->backend() : nullptr;
+    Require(backend != nullptr, "qualified gripper geometry has no exact configured backend owner");
+    if (backend->gripper_actuation_kind(binding.value().command_target_id.value()) ==
+        core::GripperActuationKind::kPneumatic) pneumatic.push_back(binding);
+  }
+  auto geometry = QualifyRetainedRobotMeasuredGeometry(*model_map, robots, physical, {}, pneumatic);
   if (!geometry.ok()) {
     const auto &error = geometry.error();
     std::cerr << "retained measured geometry unavailable code=" << error.code;
@@ -4769,13 +5365,19 @@ BuildInstalledCCLCReadinessDependencies(
   auto inventory = std::make_shared<const core::ConfiguredRobotMeasuredStateInventory>(
       std::move(geometry.value()));
   deployment::CCLCReadinessSourceCapture capture =
-      [primary, runtimes = std::move(runtimes)](
+      [primary, runtimes = std::move(runtimes), grippers = std::move(grippers)](
           const core::ComponentLifecycleCurrentSnapshotDTO &snapshot) -> CaptureResult {
+    // The existing motion runtime owns the complete arm-and-tool inventory.
+    // The scalar owner is used only when no motion runtime exists.
     const auto found = runtimes.find(snapshot.controllable_component_id);
-    if (found == runtimes.end())
+    if (found == runtimes.end()) {
+      const auto tool = grippers.find(snapshot.controllable_component_id);
+      if (tool != grippers.end())
+        return tool->second->CaptureReadinessSources(snapshot, tool->second);
       return CaptureResult::Err({"measured_source_unavailable",
           "the component has no exact installed runtime owner",
           {{"reason", "measured_component_owner_missing"}}});
+    }
     auto captured = found->second->CaptureReadinessSources(snapshot, found->second);
     if (!captured.ok()) return captured;
     // The primary owns the cell root. A peer's raw root pointer by itself
@@ -4804,7 +5406,14 @@ void PrepareInstalledMeasuredSourcesAfterContext(const Composition &composition)
   try {
     for (const auto &[component, view] : IndexNativeComponentCompositions(composition)) {
       static_cast<void>(component);
-      if (!view || !view->runtime) continue;
+      if (!view) continue;
+      if (!view->runtime && view->gripper_runtime) {
+        auto prepared = view->gripper_runtime->PrepareCurrentMeasuredSources();
+        if (!prepared.ok()) std::cerr << "manyforge measured gripper source unavailable: component="
+            << component.value() << " code=" << prepared.error().code << " message=" << prepared.error().message << '\n';
+        continue;
+      }
+      if (!view->runtime) continue;
       const auto bindings = RetainedNativeComponentOwner(view->runtime).physical_bindings();
       const bool has_geometry = std::any_of(bindings.begin(), bindings.end(),
           [](const auto &binding) {
@@ -4843,12 +5452,11 @@ void AttachRetainedNativeCCLC(Composition &composition,
                                   &quiescent_predecessor = std::nullopt) {
   core::IClock *owner_clock = nullptr;
   core::IScheduler *owner_scheduler = nullptr;
-  Require(composition.runtime != nullptr &&
-              composition.runtime->clock != nullptr &&
-              composition.runtime->scheduler != nullptr,
-          "native CCLC attachment requires one stable addressed runtime");
-  owner_clock = composition.runtime->clock.get();
-  owner_scheduler = composition.runtime->scheduler.get();
+  Require(composition.cell_runtime && (composition.runtime || composition.gripper_runtime),
+          "CCLC attachment requires the stable cell and an actual component owner");
+  owner_clock = composition.cell_runtime->clock().get();
+  owner_scheduler = composition.cell_runtime->scheduler().get();
+  EnsureGripperOnlyCellPorts(composition);
   Require(composition.active_addressed_kernel() != nullptr &&
               owner_clock != nullptr && owner_scheduler != nullptr,
           "native CCLC attachment requires one stable addressed Kernel");
@@ -4956,6 +5564,39 @@ void AttachRetainedNativeCCLC(Composition &composition,
       };
   auto cclc = [&]() -> core::Result<
       std::unique_ptr<deployment::CCLCRuntimeComposition>> {
+    if (!composition.runtime) {
+      auto& route = *composition.cclc_cell_route_publication_owner;
+      auto& readiness = *composition.cclc_cell_command_readiness_port;
+      auto current = [&kernel](const core::ControlDomainId& domain) {
+        auto read = kernel.current_runtime_route_configuration(domain);
+        if (!read.ok()) return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Err(read.error());
+        return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(
+            read.value() ? std::optional(read.value()->active_configuration) : std::nullopt);
+      };
+      if (parent_apply || quiescent_predecessor) {
+        auto created = CreateRetainedNativeCCLCRuntime(
+            WithInstalledReadinessConstruction({std::move(cclc_config), 1'000'000'000LL}, composition, config.package_root),
+            composition.bundle, *active_publication_reader, std::move(active_publication.value()), *artifact_source,
+            lifecycle_product_view->catalog_source(), lifecycle_product_view->brand_ports(),
+            CellControlBindingRepresentatives(composition), kernel, fence_owner, route,
+            *owner_clock, *owner_scheduler, std::move(current), lifecycle_product_view->lifecycle_snapshot_source(), &readiness);
+        if (!created.ok()) return created;
+        const auto started = created.value()->Start();
+        if (!started.ok()) return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::Err(started.error());
+        return created;
+      }
+      auto* const exact_route = dynamic_cast<RetainedNativeGripperRoutePublicationOwner*>(&route);
+      Require(exact_route, "gripper-only restart has another route owner");
+      return CreateRecoveredRetainedNativeCellCCLCRuntime(
+          WithInstalledReadinessConstruction({std::move(cclc_config), 1'000'000'000LL}, composition, config.package_root),
+          composition.bundle, *active_publication_reader, std::move(active_publication.value()), *artifact_source,
+          lifecycle_product_view->catalog_source(), lifecycle_product_view->brand_ports(),
+          CellControlBindingRepresentatives(composition), kernel, fence_owner, route, readiness, kernel,
+          *owner_clock, *owner_scheduler,
+          [exact_route](const auto& predecessor) { return exact_route->AdoptAndReadBackRouteConfigurationPredecessor(predecessor); },
+          [cell = composition.cell_runtime] { return cell->ReconcileCommandFreeOrphans(); },
+          composition.cclc_cell_route_reconciler, lifecycle_product_view->lifecycle_snapshot_source());
+    }
     if (parent_apply || quiescent_predecessor) {
       // A live parent installation already carries its actual routes and
       // readiness. Reconstruct only the immutable facade dependencies; the
@@ -5699,6 +6340,8 @@ struct InstalledManagedCCLCProductLifetime final {
   std::optional<core::BuildOwnedLifecyclePlanCatalogSource> empty_catalog;
   std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>
       empty_route_publication_owner;
+  std::shared_ptr<deployment::IRouteConfigurationKernelPublicationOwner> component_route_owner;
+  std::shared_ptr<RetainedNativeCellCommandReadinessPort> component_readiness_owner;
   // Destroy the borrowing compiled product before its provider source.
   std::shared_ptr<RetainedRos2ControlLifecycleProduct> lifecycle_product;
 };
@@ -5744,6 +6387,7 @@ MakeEmptyInstalledManagedCCLCProductLifetime(
 
 struct ManagedCellCCLCLifetime final {
   std::vector<std::shared_ptr<RetainedNativeRuntime>> runtime_pins;
+  std::vector<std::shared_ptr<RetainedNativeGripperRuntime>> gripper_pins;
   std::shared_ptr<WallClock> clock;
   std::shared_ptr<SimpleScheduler> scheduler;
   std::unique_ptr<component_manager::SqliteActiveBundlePublicationStore>
@@ -5754,9 +6398,9 @@ struct ManagedCellCCLCLifetime final {
       provider_manifest_source;
   std::optional<core::BuildOwnedLifecyclePlanCatalogSource> empty_catalog;
   std::shared_ptr<RetainedRos2ControlLifecycleProduct> lifecycle_product;
-  std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>
+  std::shared_ptr<deployment::IRouteConfigurationKernelPublicationOwner>
       route_publication_owner;
-  std::unique_ptr<RetainedNativeCellCommandReadinessPort> readiness_port;
+  std::shared_ptr<RetainedNativeCellCommandReadinessPort> readiness_port;
   // Immutable construction head. Candidate installation never retargets the
   // original owner or retroactively changes its accepted request evidence.
   std::optional<core::ActiveBundlePublicationReceiptDTO> publication;
@@ -5775,8 +6419,8 @@ struct ManagedCellCCLCLifetime final {
   PrepareInstalledProduct(Composition &composition,
                           const ManagedRuntimeChildConfig &config,
                           const core::ActiveBundlePublicationReceiptDTO &head) {
-    Require(facade && clock && composition.runtime &&
-                composition.runtime->clock == clock && head.valid() &&
+    Require(facade && clock && (composition.runtime || composition.gripper_runtime) &&
+                composition.cell_runtime && composition.cell_runtime->clock() == clock && head.valid() &&
                 head.publication_generation == composition.publication_generation &&
                 head.request.candidate_retained_bundle_id ==
                     composition.bundle->retained_bundle_id() &&
@@ -5803,15 +6447,17 @@ struct ManagedCellCCLCLifetime final {
       static_cast<void>(id);
       Require(view && (view->runtime || view->gripper_runtime) &&
                   (!view->runtime || view->runtime->clock == clock) &&
-                  view->controller_process && view->ros2_control_runtime_handle,
+                  (view->controller_process || IsLocalNoOutputGripperOwner(*view)) &&
+                  view->ros2_control_runtime_handle,
               "CCLC installed product has an incomplete physical lifetime");
       if (view->runtime) lifetime->runtimes.push_back(view->runtime);
       if (view->gripper_runtime) lifetime->grippers.push_back(view->gripper_runtime);
-      lifetime->processes.push_back(view->controller_process);
+      if (view->controller_process)
+        lifetime->processes.push_back(view->controller_process);
       lifetime->projections.insert(lifetime->projections.end(),
           view->required_projection_pins.begin(), view->required_projection_pins.end());
     }
-    Require(!lifetime->runtimes.empty() && lifetime->provider_source &&
+    Require((!lifetime->runtimes.empty() || !lifetime->grippers.empty()) && lifetime->provider_source &&
                 lifetime->lifecycle_product,
             "CCLC installed product has no genuine occurrence closure");
     const auto runtime = composition.runtime;
@@ -5822,6 +6468,26 @@ struct ManagedCellCCLCLifetime final {
          10'000'000LL, 30'000'000'000LL}};
     // This reuses the existing native derivation's freshness/configuration
     // qualification only. It never constructs or starts another owner.
+    if (!runtime) {
+      EnsureGripperOnlyCellPorts(composition);
+      lifetime->component_route_owner = composition.cclc_cell_route_publication_owner;
+      lifetime->component_readiness_owner = composition.cclc_cell_command_readiness_port;
+      auto* const kernel = composition.active_addressed_kernel();
+      auto prepared = PrepareRetainedNativeCCLCProductContext(
+          *facade, WithInstalledReadinessConstruction({std::move(context_config), 1'000'000'000LL},
+              composition, selected->package_root), composition.bundle,
+          *lifetime->publication_reader, head, *lifetime->artifacts,
+          lifetime->lifecycle_product->catalog_source(), lifetime->lifecycle_product->brand_ports(),
+          CellControlBindingRepresentatives(composition), *clock, *lifetime->component_route_owner, lifetime,
+          [kernel](const core::ControlDomainId& domain) {
+            auto current = kernel->current_runtime_route_configuration(domain);
+            if (!current.ok()) return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Err(current.error());
+            return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(
+                current.value() ? std::optional(current.value()->active_configuration) : std::nullopt);
+          }, lifetime->lifecycle_product->lifecycle_snapshot_source(), lifetime->component_readiness_owner.get());
+      if (prepared.ok()) PrepareInstalledMeasuredSourcesAfterContext(composition);
+      return prepared;
+    }
     auto prepared = PrepareRetainedNativeCCLCProductContext(
         *facade, WithInstalledReadinessConstruction(
             {std::move(context_config), 1'000'000'000LL}, composition,
@@ -5852,7 +6518,8 @@ struct ManagedCellCCLCLifetime final {
 
   void TakeAttached(Composition &composition,
                     const core::ActiveBundlePublicationReceiptDTO &head) {
-    Require(!facade && composition.cclc_runtime && composition.runtime &&
+    Require(!facade && composition.cclc_runtime && composition.cell_runtime &&
+                (composition.runtime || composition.gripper_runtime) &&
                 composition.cclc_attached.load(std::memory_order_acquire),
             "cell CCLC transfer requires one actual attached facade");
     Require(head.valid() &&
@@ -5861,19 +6528,22 @@ struct ManagedCellCCLCLifetime final {
                 head.request.candidate_retained_bundle_id == composition.bundle->retained_bundle_id(),
             "cell CCLC transfer differs from its immutable construction head");
     std::vector<std::shared_ptr<RetainedNativeRuntime>> pins;
-    pins.push_back(composition.runtime);
-    for (const auto &participant : composition.participant_compositions) {
-      Require(participant && participant->runtime,
-              "cell CCLC transfer has an incomplete runtime dependency");
-      pins.push_back(participant->runtime);
+    std::vector<std::shared_ptr<RetainedNativeGripperRuntime>> tools;
+    const auto pin = [&](const Composition& owner) {
+      Require(owner.runtime || owner.gripper_runtime, "cell CCLC transfer has an incomplete component dependency");
+      if (owner.runtime) pins.push_back(owner.runtime);
+      if (owner.gripper_runtime) tools.push_back(owner.gripper_runtime);
+    };
+    pin(composition);
+    for (const auto& peer : composition.participant_compositions) {
+      Require(peer != nullptr, "cell CCLC transfer has a missing peer");
+      pin(*peer);
     }
-    // Copy the allocating receipt before moving any borrowed dependencies.
-    // If qualification/allocation throws, Composition still owns its facade
-    // and every source that facade borrows.
     publication = head;
     runtime_pins = std::move(pins);
-    clock = composition.runtime->clock;
-    scheduler = composition.runtime->scheduler;
+    gripper_pins = std::move(tools);
+    clock = composition.cell_runtime->clock();
+    scheduler = composition.cell_runtime->scheduler();
     active_publication_reader =
         std::move(composition.cclc_active_publication_reader);
     artifact_source = std::move(composition.cclc_artifact_source);
@@ -7181,6 +7851,11 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       -> core::Result<core::StopFaultRecoveryFactsDTO> {
     auto *const runtime = stop_recovery_runtime.load(std::memory_order_acquire);
     auto *const kernel = stop_recovery_kernel.load(std::memory_order_acquire);
+    if (runtime == nullptr && stable_cell_runtime_owner && kernel) {
+      return build_retained_cell_stop_recovery_facts(*stable_stop_surveillance_owner, *kernel,
+          *stable_cell_runtime_owner->clock(), core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
+          core::CellId(config.cell_id), &admission_gate, status, assessed_at_ns);
+    }
     if (runtime == nullptr || kernel == nullptr) {
       return core::Result<core::StopFaultRecoveryFactsDTO>::Err(core::ErrorDTO{
           std::string(core::to_string(core::ErrorCode::kMissingReference)),
@@ -7213,31 +7888,19 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           config.logical_scene_database, config.program_cycle_journal,
           config.execution_state_root / std::string(core::kCCLCJournalFilename),
           core::CellId(config.cell_id));
-  stable_observation_wake = std::make_shared<RetainedObservationWake>();
-  const auto observer_clock = detached_owner_clock;
-  stable_stop_surveillance_owner = std::shared_ptr<
-      RetainedStopSurveillanceOwner>(
-      new RetainedStopSurveillanceOwner(
-          {}, observer_clock.get(),
-          RetainedStopSurveillanceEmptySourceMode::kManagedCellBootstrapEmpty),
-      [observer_clock](RetainedStopSurveillanceOwner *observer) {
-        delete observer;
-      });
-  bootstrap_kernel_config.stop_surveillance =
-      core::StopSurveillanceExecutionConfig{
-          stable_stop_surveillance_owner.get(),
-          kMaintainedNativeStopSurveillancePolicy};
-  detached_operation_journal = std::make_unique<core::SqliteOperationJournal>(
-      config.execution_state_root /
-          std::string(core::kOperationJournalFilename),
-      core::CellId(config.cell_id));
-  detached_addressed_kernel =
-      std::make_unique<core::ResourceAddressedExecutionKernel>(
-          std::vector<core::RuntimeParticipantExecutionRegistration>{},
-          *detached_owner_clock, *detached_owner_scheduler,
-          *detached_operation_journal, std::move(bootstrap_kernel_config));
-  stable_kernel_owner = detached_addressed_kernel.get();
-  stable_operation_journal = detached_operation_journal.get();
+  RetainedNativeCellRuntimeInput cell_input{
+      .clock = detached_owner_clock,
+      .scheduler = detached_owner_scheduler,
+      .operation_journal_path =
+          config.execution_state_root / std::string(core::kOperationJournalFilename),
+      .participant_registrations = {},
+      .kernel_config = std::move(bootstrap_kernel_config),
+      .stop_sources = {}};
+  stable_cell_runtime_owner = std::make_unique<RetainedNativeCellRuntime>(std::move(cell_input));
+  stable_stop_surveillance_owner = stable_cell_runtime_owner->stop_surveillance_owner();
+  stable_observation_wake = stable_cell_runtime_owner->observation_wake();
+  stable_kernel_owner = &stable_cell_runtime_owner->addressed_kernel();
+  stable_operation_journal = &stable_cell_runtime_owner->operation_journal();
   Require(stable_kernel_owner != nullptr && stable_operation_journal != nullptr,
           "managed native cell owner could not be created");
 
@@ -7246,34 +7909,23 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             "selected physical runtime could not close admission before "
             "composition initialization");
   }
-  const auto bind_stable_kernel_to_runtime =
-      [&](RetainedNativeRuntime &runtime) {
-        runtime.cell_addressed_kernel = stable_kernel_owner;
-        runtime.cell_operation_journal = stable_operation_journal;
-        runtime.addressed_request_owner_epoch =
-            core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch);
-        runtime.addressed_cell_id = core::CellId(config.cell_id);
-        for (const auto &peer : runtime.participant_peers) {
-          peer->cell_addressed_kernel = stable_kernel_owner;
-          peer->cell_operation_journal = stable_operation_journal;
-          peer->addressed_request_owner_epoch =
-              runtime.addressed_request_owner_epoch;
-          peer->addressed_cell_id = runtime.addressed_cell_id;
-        }
-      };
   const auto bind_cell_runtime_to_composition =
       [&](Composition &composition) {
         composition.cell_runtime = stable_cell_runtime_owner.get();
         std::vector<std::shared_ptr<RetainedNativeGripperRuntime>>
             independent_grippers;
-        if (composition.gripper_runtime != nullptr)
+        if (composition.gripper_runtime != nullptr) {
+          composition.gripper_runtime->BindCellKernel(*stable_kernel_owner);
           independent_grippers.push_back(composition.gripper_runtime);
+        }
         for (const auto &participant : composition.participant_compositions) {
           Require(participant != nullptr,
                   "native cell has a missing component composition");
           participant->cell_runtime = stable_cell_runtime_owner.get();
-          if (participant->gripper_runtime != nullptr)
+          if (participant->gripper_runtime != nullptr) {
+            participant->gripper_runtime->BindCellKernel(*stable_kernel_owner);
             independent_grippers.push_back(participant->gripper_runtime);
+          }
           if (participant->runtime != nullptr)
             participant->runtime->cell_runtime_owner =
                 stable_cell_runtime_owner.get();
@@ -7281,8 +7933,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         if (composition.runtime != nullptr) {
           composition.runtime->cell_runtime_owner =
               stable_cell_runtime_owner.get();
-          composition.runtime->independent_gripper_peers =
-              std::move(independent_grippers);
+          composition.runtime->BindIndependentGripperPeers(
+              composition.runtime, std::move(independent_grippers));
         }
       };
   stop_recovery_kernel.store(stable_kernel_owner, std::memory_order_release);
@@ -7399,17 +8051,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   bool managed_composition_building = false;
   std::exception_ptr selected_composition_failure;
 
-  const auto stable_addressed_kernel =
-      [&]() -> core::ResourceAddressedExecutionKernel * {
-    if (detached_addressed_kernel != nullptr) {
-      return detached_addressed_kernel.get();
-    }
-    if (active_managed_composition != nullptr &&
-        active_managed_composition->active_addressed_kernel() !=
-            nullptr) {
-      return active_managed_composition->active_addressed_kernel();
-    }
-    return nullptr;
+  const auto stable_addressed_kernel = [&]() -> core::ResourceAddressedExecutionKernel* {
+    return stable_kernel_owner;
   };
 
   const auto await_manager_loss_containment = [&] {
@@ -7550,7 +8193,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       if (active_managed_composition != nullptr ||
           current_composition_builder_started ||
           preparing_composition_request.has_value() ||
-          installed_under_fence_composition_request.has_value()) {
+          installed_under_fence_composition_request.has_value() ||
+          installed_composition_request.has_value()) {
         return;
       }
     }
@@ -7569,7 +8213,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       if (active_managed_composition != nullptr ||
           current_composition_builder_started ||
           preparing_composition_request.has_value() ||
-          installed_under_fence_composition_request.has_value()) {
+          installed_under_fence_composition_request.has_value() ||
+          installed_composition_request.has_value()) {
         return;
       }
       input->attach_addressed_owner = false;
@@ -7599,47 +8244,28 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                           detached_owner_clock != nullptr &&
                           detached_owner_scheduler != nullptr,
                       "current managed composition has no stable cell owner");
-              Require(built->runtime != nullptr &&
-                          built->runtime->addressed_kernel == nullptr &&
-                          built->runtime->operation_journal == nullptr &&
-                          built->runtime->clock == detached_owner_clock &&
-                          built->runtime->scheduler == detached_owner_scheduler,
-                      "current managed composition duplicated the stable "
-                      "addressed owner");
-              auto current_registrations =
-                  NativeCellComponentRegistrations(*built);
-              auto current_resolver = NativeCellParticipantResolver(
-                  *built, current_registrations);
+              Require((built->runtime || built->gripper_runtime) &&
+                          (!built->runtime || (!built->runtime->addressed_kernel &&
+                           !built->runtime->operation_journal &&
+                           built->runtime->clock == detached_owner_clock &&
+                           built->runtime->scheduler == detached_owner_scheduler)),
+                      "current managed composition duplicated the stable addressed owner");
+              auto current_registrations = NativeCellComponentRegistrations(*built);
+              auto current_resolver = NativeCellParticipantResolver(*built, current_registrations);
               auto current_stop_sources = NativeCellStopSources(*built);
-              static_cast<void>(LoadManagedBootstrapStopProduct(
-                  config, built->bundle->retained_bundle_id(),
+              static_cast<void>(LoadManagedBootstrapStopProduct(config, built->bundle->retained_bundle_id(),
                   built->bundle->value().cell_graph.graph_revision));
-              auto reconfigured =
-                  detached_addressed_kernel->reconfigure_runtime_product(
-                      std::move(current_registrations),
-                      std::move(current_resolver), [&]() {
-                        return stable_stop_surveillance_owner->ReplaceSources(
-                            std::move(current_stop_sources));
-                      });
-              if (!reconfigured.ok()) {
-                Fail("stable Kernel rejected current runtime participants: " +
-                     reconfigured.error().message);
-              }
-              built->runtime->operation_journal =
-                  std::move(detached_operation_journal);
-              built->runtime->addressed_kernel =
-                  std::move(detached_addressed_kernel);
-              detached_owner_clock.reset();
-              detached_owner_scheduler.reset();
-              if (built->runtime != nullptr)
-                built->runtime->stop_surveillance_owner =
-                    stable_stop_surveillance_owner;
+              auto reconfigured = stable_cell_runtime_owner->reconfigure_runtime_product(
+                  std::move(current_registrations), std::move(current_resolver), std::move(current_stop_sources));
+              if (!reconfigured.ok()) Fail("stable Kernel rejected current runtime participants: " + reconfigured.error().message);
+              if (built->runtime) built->runtime->stop_surveillance_owner = stable_stop_surveillance_owner;
               built->controller_launch_adopted = true;
               for (auto &peer : built->participant_compositions)
                 peer->controller_launch_adopted = true;
               active_managed_composition = std::move(built);
               if (active_managed_composition->runtime != nullptr)
-                bind_stable_kernel_to_runtime(*active_managed_composition->runtime);
+                active_managed_composition->runtime->BindCellRuntimeOwner(
+                    *stable_cell_runtime_owner, config.runtime_epoch, config.cell_id);
               bind_cell_runtime_to_composition(*active_managed_composition);
               execution_composition.replace_current(
                   active_managed_composition.get());
@@ -8636,14 +9262,21 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                      plan.error().message);
               }
               auto &installed = *active_managed_composition;
+              EnsureGripperOnlyCellPorts(installed);
+              Require(installed.runtime != nullptr ||
+                          (installed.cclc_cell_route_publication_owner != nullptr &&
+                           installed.cclc_cell_command_readiness_port != nullptr),
+                      "installed scalar candidate has no complete CCLC route/readiness owners");
               auto &route_owner =
                   installed.cclc_cell_route_publication_owner != nullptr
                       ? *installed.cclc_cell_route_publication_owner
                       : static_cast<deployment::IRouteConfigurationKernelPublicationOwner &>(
                             *installed.runtime);
-              auto &readiness_owner =
-                  static_cast<core::ICCLCComponentCommandReadinessPort &>(
-                      *installed.runtime);
+              auto &readiness_owner = installed.runtime != nullptr
+                  ? static_cast<core::ICCLCComponentCommandReadinessPort &>(
+                        *installed.runtime)
+                  : static_cast<core::ICCLCComponentCommandReadinessPort &>(
+                        *installed.cclc_cell_command_readiness_port);
               const auto initialized = InitializeRetainedNativeCandidateControlRoutes(
                   candidate, *installed.active_addressed_kernel(), route_owner,
                   readiness_owner, installed.publication_generation,
@@ -8725,7 +9358,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             continue;
           for (const auto &[id, owner] :
                IndexNativeComponentCompositions(*root)) {
-            Require(owner->bundle && owner->controller_process &&
+            Require(owner->bundle &&
+                        (owner->controller_process || IsLocalNoOutputGripperOwner(*owner)) &&
                         owner->ros2_control_runtime_handle &&
                         owner->component_runtime_identity(),
                     "actual_installed_state_unknown: component has no exact "
@@ -8740,9 +9374,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     "identity is absent");
             if (!wanted)
               actual_removed_components.push_back(id);
-            if (wanted == installed && !owner->controller_process->exited() &&
-                owner->controller_process->cleanup_observation().state ==
-                    ControllerLaunchCleanupState::kNotRequested) {
+            const bool owned_launch_live = owner->controller_process
+                ? !owner->controller_process->exited() &&
+                      owner->controller_process->cleanup_observation().state ==
+                          ControllerLaunchCleanupState::kNotRequested
+                : IsLocalNoOutputGripperOwner(*owner);
+            if (wanted == installed && owned_launch_live) {
               const auto [existing, inserted] =
                   actual_keepers.emplace(id, owner);
               Require(inserted ||
@@ -8777,7 +9414,11 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                IndexNativeComponentCompositions(*root)) {
             const auto kept = actual_keepers.find(id);
             if (kept != actual_keepers.end() &&
-                kept->second->controller_process == owner->controller_process)
+                (owner->controller_process
+                     ? kept->second->controller_process == owner->controller_process
+                     : IsLocalNoOutputGripperOwner(*owner) &&
+                           IsLocalNoOutputGripperOwner(*kept->second) &&
+                           kept->second->gripper_runtime == owner->gripper_runtime))
               continue;
             Require(std::binary_search(request.configuration_fence_scope
                                            .controllable_component_ids.begin(),
@@ -8786,17 +9427,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                                        id),
                     "actual_installed_state_unknown: actual process retirement "
                     "is outside the accepted fence scope");
-            if (included_processes.insert(owner->controller_process.get())
-                    .second)
+            if (owner->controller_process &&
+                included_processes.insert(owner->controller_process.get()).second)
               processes_to_retire.push_back(owner->controller_process);
           }
         preparing_composition_request = request;
         managed_composition_building = true;
         start_builder = true;
-        if (active_managed_composition != nullptr) {
-          shared_clock = active_managed_composition->runtime->clock;
-          shared_scheduler = active_managed_composition->runtime->scheduler;
-        } else if (stable_addressed_kernel() != nullptr) {
+        if (stable_addressed_kernel() != nullptr) {
           shared_clock = detached_owner_clock;
           shared_scheduler = detached_owner_scheduler;
         }
@@ -9116,63 +9754,18 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           } else if (prepared_is_empty) {
             Require(prepared == nullptr,
                     "empty selected product has a physical composition");
-            const auto commit_empty_stop_sources = [&]() {
-              return stable_stop_surveillance_owner->ReplaceSources({});
-            };
-            if (active_managed_composition != nullptr) {
-              DetachRetainedCCLC(*active_managed_composition);
-              Require(detached_addressed_kernel == nullptr &&
-                          detached_operation_journal == nullptr &&
-                      detached_owner_clock == nullptr &&
-                      detached_owner_scheduler == nullptr,
-                      "stable addressed owner is duplicated");
-              auto retired_engines =
-                  snapshot_registration_engines(*active_managed_composition);
-              auto &stable_runtime = *active_managed_composition->runtime;
-              auto reconfigured = stable_runtime.active_addressed_kernel()
-                                      ->reconfigure_runtime_component_set(
-                                          {}, {},
-                                          request.candidate_projection_revision
-                                              .retained_bundle_id,
-                                          request.candidate_projection_revision
-                                              .graph_revision,
-                                          request.configuration_fence_id,
-                                          request.configuration_fence_scope,
-                                          {}, commit_empty_stop_sources);
-              if (!reconfigured.ok()) {
-                Fail("stable Kernel rejected the empty selected runtime: " +
-                     reconfigured.error().message);
-              }
-              detached_owner_clock = stable_runtime.clock;
-              detached_owner_scheduler = stable_runtime.scheduler;
-              detached_operation_journal =
-                  std::move(stable_runtime.operation_journal);
-              detached_addressed_kernel =
-                  std::move(stable_runtime.addressed_kernel);
-              retired_registration_engines = std::move(retired_engines);
-              retired_managed_composition =
-                  std::move(active_managed_composition);
-            } else if (detached_addressed_kernel != nullptr) {
-              auto reconfigured = detached_addressed_kernel
-                                      ->reconfigure_runtime_component_set(
-                                          {}, {},
-                                          request.candidate_projection_revision
-                                              .retained_bundle_id,
-                                          request.candidate_projection_revision
-                                              .graph_revision,
-                                          request.configuration_fence_id,
-                                          request.configuration_fence_scope,
-                                          {}, commit_empty_stop_sources);
-              if (!reconfigured.ok()) {
-                Fail("stable Kernel rejected the empty selected runtime: " +
-                     reconfigured.error().message);
-              }
+            if (active_managed_composition) DetachRetainedCCLC(*active_managed_composition);
+            auto reconfigured = stable_cell_runtime_owner->reconfigure_runtime_component_set(
+                {}, {}, {}, request.candidate_projection_revision.retained_bundle_id,
+                request.candidate_projection_revision.graph_revision,
+                request.configuration_fence_id, request.configuration_fence_scope, {});
+            if (!reconfigured.ok()) Fail("stable Kernel rejected the empty selected runtime: " + reconfigured.error().message);
+            if (active_managed_composition) {
+              retired_registration_engines = snapshot_registration_engines(*active_managed_composition);
+              retired_managed_composition = std::move(active_managed_composition);
             }
-            Require(
-                detached_addressed_kernel != nullptr &&
-                    detached_addressed_kernel->SetRouteRecoveryPending(false)
-                        .ok(),
-                "empty selected runtime could not release route recovery");
+            Require(stable_kernel_owner->SetRouteRecoveryPending(false).ok(),
+                    "empty selected runtime could not release route recovery");
           } else {
             Require(prepared != nullptr,
                     "physical selected product has no prepared composition");
@@ -9212,18 +9805,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   prepared->runtime->addressed_kernel
                       ->resource_admission_table());
             } else {
-              if (active_managed_composition != nullptr) {
-                Require(prepared->runtime->clock == active_managed_composition->runtime->clock &&
-                            prepared->runtime->scheduler == active_managed_composition->runtime->scheduler,
-                        "prepared runtime crossed the stable Kernel time capabilities");
-              } else {
-                Require(detached_operation_journal != nullptr &&
-                            detached_owner_clock != nullptr &&
-                            detached_owner_scheduler != nullptr &&
-                            prepared->runtime->clock == detached_owner_clock &&
-                            prepared->runtime->scheduler == detached_owner_scheduler,
-                        "detached addressed owner is incomplete");
-              }
+              Require(stable_cell_runtime_owner && detached_owner_clock && detached_owner_scheduler &&
+                          (!prepared->runtime || (prepared->runtime->clock == detached_owner_clock &&
+                           prepared->runtime->scheduler == detached_owner_scheduler)),
+                      "prepared runtime crossed the stable Kernel time capabilities");
               std::optional<std::set<
                   core::IResolvedParticipantExecutionEngine *>>
                   predecessor_engine_snapshot;
@@ -9317,17 +9902,13 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   config, prepared->bundle->retained_bundle_id(),
                   prepared->bundle->value().cell_graph.graph_revision));
               auto reconfigured =
-                  stable_owner->reconfigure_runtime_component_set(
-                      std::move(candidate_registrations),
-                      std::move(candidate_resolver),
+                  stable_cell_runtime_owner->reconfigure_runtime_component_set(
+                      std::move(candidate_registrations), std::move(candidate_resolver),
+                      std::move(candidate_stop_sources),
                       request.candidate_projection_revision.retained_bundle_id,
                       request.candidate_projection_revision.graph_revision,
                       request.configuration_fence_id,
-                      request.configuration_fence_scope, retained_component_ids,
-                      [&]() -> core::Result<void> {
-                        return stable_stop_observer->ReplaceSources(
-                            std::move(candidate_stop_sources));
-                      });
+                      request.configuration_fence_scope, retained_component_ids);
               if (!reconfigured.ok()) {
                 Fail("stable Kernel rejected the selected runtime "
                      "participants: " +
@@ -9342,46 +9923,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               if (prepared->runtime != nullptr)
                 prepared->runtime->stop_surveillance_owner =
                     stable_stop_surveillance_owner;
-              if (active_managed_composition != nullptr) {
-                auto &stable_runtime = *active_managed_composition->runtime;
-                if (prepared->runtime.get() != &stable_runtime) {
-                  prepared->runtime->operation_journal =
-                      std::move(stable_runtime.operation_journal);
-                  prepared->runtime->addressed_kernel =
-                      std::move(stable_runtime.addressed_kernel);
-                  const bool old_root_retained = std::any_of(
-                      request.component_delta.components.begin(),
-                      request.component_delta.components.end(),
-                      [&](const auto &row) {
-                        return row.controllable_component_id ==
-                                   active_managed_composition
-                                       ->controllable_component_id &&
-                               row.disposition == deployment::
-                                                      ApplyComponentDisposition::
-                                                          kRetain;
-                      });
-                  if (!old_root_retained) {
-                    stable_runtime.cell_addressed_kernel = nullptr;
-                    stable_runtime.cell_runtime_root = nullptr;
-                  }
-                } else {
-                  Require(stable_runtime.active_operation_journal() != nullptr &&
-                              stable_runtime.active_addressed_kernel() == stable_owner,
-                          "retained native root lost the stable Kernel");
-                }
-                Require(predecessor_engine_snapshot.has_value(),
-                        "predecessor engine snapshot is missing");
-                retired_registration_engines =
-                    std::move(*predecessor_engine_snapshot);
-                retired_managed_composition =
-                    std::move(active_managed_composition);
-              } else {
-                prepared->runtime->operation_journal =
-                    std::move(detached_operation_journal);
-                prepared->runtime->addressed_kernel =
-                    std::move(detached_addressed_kernel);
-                detached_owner_clock.reset();
-                detached_owner_scheduler.reset();
+              if (active_managed_composition) {
+                Require(predecessor_engine_snapshot.has_value(), "predecessor engine snapshot is missing");
+                retired_registration_engines = std::move(*predecessor_engine_snapshot);
+                retired_managed_composition = std::move(active_managed_composition);
               }
             }
             // The stable Kernel and its registered engines must outlive every
@@ -9390,7 +9935,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             // admission owner still referenced by the command surface.
             active_managed_composition = std::move(prepared);
             if (active_managed_composition->runtime != nullptr)
-              bind_stable_kernel_to_runtime(*active_managed_composition->runtime);
+              active_managed_composition->runtime->BindCellRuntimeOwner(
+                    *stable_cell_runtime_owner, config.runtime_epoch, config.cell_id);
             bind_cell_runtime_to_composition(*active_managed_composition);
             execution_composition.replace_current(active_managed_composition.get());
             execution_composition.addressed_kernel = stable_addressed_kernel();
@@ -9440,9 +9986,16 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               EnsureInstalledRetainedRos2ControlLifecycleProduct(candidate, package->package_root);
               const deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(package->package_root);
               const auto representatives = CellControlBindingRepresentatives(candidate);
+              EnsureGripperOnlyCellPorts(candidate);
+              auto& route_owner = candidate.runtime
+                  ? static_cast<deployment::IRouteConfigurationKernelPublicationOwner&>(*candidate.runtime)
+                  : *candidate.cclc_cell_route_publication_owner;
+              auto& readiness_owner = candidate.runtime
+                  ? static_cast<core::ICCLCComponentCommandReadinessPort&>(*candidate.runtime)
+                  : static_cast<core::ICCLCComponentCommandReadinessPort&>(*candidate.cclc_cell_command_readiness_port);
               const auto routes = InitializeRetainedNativeCandidateControlRoutes(
-                  *candidate.bundle, *candidate.active_addressed_kernel(), *candidate.runtime,
-                  *candidate.runtime, candidate.publication_generation, *original_apply_native_plan,
+                  *candidate.bundle, *candidate.active_addressed_kernel(), route_owner,
+                  readiness_owner, candidate.publication_generation, *original_apply_native_plan,
                   artifacts, representatives, config.execution_run_root, request.configuration_fence_id);
               if (!routes.ok())
                 Fail("installed original Apply routes are unavailable: " + routes.error().message);
@@ -10228,6 +10781,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   std::shared_ptr<const deployment::RetainedBundle> bundle;
                 };
                 std::vector<CapturedOccurrence> captures;
+                std::vector<VerifiedLocalNoneProcessOwner> local_owners;
+                std::set<const RetainedNativeGripperRuntime*> included_local_owners;
                 // Same acquisition order as the existing candidate inspection:
                 // managed composition mutex, then execution-composition read
                 // lock.
@@ -10262,8 +10817,20 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       continue;
                     for (const auto &[component, view] :
                          IndexNativeComponentCompositions(*root)) {
-                      if (!view->controller_process)
+                      if (!view->controller_process) {
+                        // A local owner has no child process to retain from an
+                        // uninstalled/retired view. Only the current installed
+                        // composition can supply its exact logical occurrence.
+                        const bool installed_root = root == active_managed_composition.get() ||
+                            (!active_managed_composition && root == execution_composition.current);
+                        if (installed_root && IsLocalNoOutputGripperOwner(*view) &&
+                            included_local_owners.insert(view->gripper_runtime.get()).second) {
+                          if (local_owners.size() == component_manager::kMaximumComponentProcessInventoryEntries)
+                            return failure("installed_process_inventory_exceeds_bound", "installed logical owner union exceeds its bound");
+                          local_owners.push_back(ReadVerifiedLocalNoneProcessOwner(*view, value));
+                        }
                         continue;
+                      }
                       // At most five owner views can refer to the same process.
                       // Bound captures, then enforce the distinct union below.
                       if (captures.size() ==
@@ -10330,6 +10897,20 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   std::lock_guard composition_lock(managed_composition_mutex);
                   std::shared_lock execution_lock(execution_composition.mutex);
                   changing = changing || owners_changing() || roots() != before;
+                  for (const auto& local : local_owners) {
+                    auto* const installed_kernel = stable_addressed_kernel();
+                    if (!installed_kernel)
+                      return failure("installed_process_inspection_scope_stale", "installed logical owner lost its stable Kernel");
+                    const auto route = installed_kernel->current_runtime_route_configuration(
+                        local.binding.value().control_path->control_domain_id);
+                    if (local.runtime->binding().value() != local.binding.value() ||
+                        !local.handle->OwnsGripper(local.runtime->backend(), local.binding) ||
+                        !route.ok() || !route.value() || *route.value() != local.route)
+                      changing = true;
+                    if (result.process_occurrences.size() == component_manager::kMaximumComponentProcessInventoryEntries)
+                      return failure("installed_process_inventory_exceeds_bound", "complete physical/logical owner union exceeds its bound");
+                    result.process_occurrences.push_back(local.occurrence);
+                  }
                 }
                 std::sort(result.process_occurrences.begin(),
                           result.process_occurrences.end(),
@@ -10573,6 +11154,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 deployment::CCLCRuntimeComposition *observer_read_owner = nullptr;
                 bool planning_predecessor_present = false;
                 component_manager::ManagerComponentBringUpInspectionResultDTO result{value, {}};
+                std::vector<VerifiedLocalNoneProcessOwner> candidate_local_owners;
+                const Composition* candidate_local_root = nullptr;
                 {
                   // Borrow the existing owners only for synchronous process reads.
                   // No construction, dispatch, shutdown, or epoch mintage occurs.
@@ -10617,7 +11200,24 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                             : component_manager::ProcessPresenceState::kPresent;
                       }
                     }
-                    result.configured_components.push_back({row.controllable_component_id, presence});
+                    component_manager::ManagerComponentProcessObservationDTO observed{
+                        row.controllable_component_id, presence};
+                    if (!changing && current != installed.end() &&
+                        IsLocalNoOutputGripperOwner(*current->second)) {
+                      const component_manager::ManagerComponentProcessInventoryRequestDTO scope{
+                          value.predecessor_projection_revision,
+                          value.expected_predecessor_publication_generation,
+                          value.expected_predecessor_public_pointer_digest,
+                          value.runtime_unit_id, value.runtime_epoch, value.manager_runtime_epoch};
+                      auto local = ReadVerifiedLocalNoneProcessOwner(*current->second, scope);
+                      candidate_local_root = active_managed_composition.get();
+                      observed.process_presence = component_manager::ProcessPresenceState::kAbsent;
+                      observed.process_owner_kind = local.occurrence.process_owner_kind;
+                      observed.pneumatic_none_owner = local.occurrence.pneumatic_none_owner;
+                      observed.installed_runtime_identity = local.occurrence.installed_runtime_identity;
+                      candidate_local_owners.push_back(std::move(local));
+                    }
+                    result.configured_components.push_back(std::move(observed));
                   }
                   // The initial builder can transfer ownership concurrently.
                   // Read the pointer under its publication mutex; an established
@@ -10716,6 +11316,30 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       target, *next};
                 }
                 result.cell_observer = managed_isaac_cell.observe_current(observer_read_owner);
+                if (!candidate_local_owners.empty()) {
+                  std::lock_guard composition_lock(managed_composition_mutex);
+                  std::shared_lock execution_lock(execution_composition.mutex);
+                  Require(active_managed_composition.get() == candidate_local_root &&
+                              !current_composition_building && !managed_composition_building &&
+                              !preparing_composition_request && !installed_under_fence_composition_request,
+                          "local None candidate owner changed during observation");
+                  const auto installed = IndexNativeComponentCompositions(*active_managed_composition);
+                  const component_manager::ManagerComponentProcessInventoryRequestDTO scope{
+                      value.predecessor_projection_revision,
+                      value.expected_predecessor_publication_generation,
+                      value.expected_predecessor_public_pointer_digest,
+                      value.runtime_unit_id, value.runtime_epoch, value.manager_runtime_epoch};
+                  for (const auto& local : candidate_local_owners) {
+                    const auto current = installed.find(local.occurrence.controllable_component_id);
+                    Require(current != installed.end() && current->second->gripper_runtime == local.runtime &&
+                                current->second->ros2_control_runtime_handle == local.handle,
+                            "local None candidate lost its exact installed owner");
+                    const auto readback = ReadVerifiedLocalNoneProcessOwner(*current->second, scope);
+                    Require(readback.binding.value() == local.binding.value() && readback.route == local.route &&
+                                readback.occurrence == local.occurrence,
+                            "local None candidate binding/route changed during observation");
+                  }
+                }
                 require_predecessor(read_current_publication());
                 const auto after = manager_liveness_receiver.get()->status();
                 Require(after.state == core::ManagerLivenessStateDTO::kCurrent && !after.command_fenced &&

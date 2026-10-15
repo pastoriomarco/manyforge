@@ -24,7 +24,13 @@
 #include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_roboplan/retained_native_cell_command_readiness_port.hpp>
 #include <manyforge_roboplan/retained_native_cell_runtime.hpp>
+#include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
+#ifdef MANYFORGE_A1_ROS_GRIPPER_CELL_TEST
+#include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
+#include <manyforge_roboplan/retained_ros2_control_backend_factory.hpp>
+#include <roboplan/core/scene.hpp>
+#endif
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -1533,6 +1539,275 @@ TEST(RetainedNativeCellRuntimeTest,
     EXPECT_EQ(arm_engine.subscription_count(), 1U);
     EXPECT_EQ(old_gripper_engine.subscription_count(), 0U);
     EXPECT_EQ(new_gripper_engine.subscription_count(), 1U);
+  }
+  RemoveJournalFiles(journal_path);
+}
+
+#ifdef MANYFORGE_A1_ROS_GRIPPER_CELL_TEST
+TEST(RetainedNativeCellRuntimeTest,
+     EmptyGripperOnlyEmptyPreservesStableServicesAndDrainsActualOwner) {
+  auto value = GripperOnlyBinding().value();
+  // One scalar ROS gripper target projected onto its actual retained joint.
+  value.control_path->state_authority_class = core::StateAuthorityClass::kCommanded;
+  value.resources.erase(value.resources.begin() + 1, value.resources.end());
+  value.model_groups.front().expanded_compiled_joint_names = {
+      value.resources.front().compiled_resource_name};
+  auto verified = core::verify_runtime_participant_binding(std::move(value));
+  ASSERT_TRUE(verified.ok()) << verified.error().message;
+  const auto binding = std::move(verified.value());
+  auto clock = std::make_shared<WallClock>();
+  auto scheduler = std::make_shared<SimpleScheduler>();
+  auto input = EmptyCellInput();
+  input.clock = clock;
+  input.scheduler = scheduler;
+  input.operation_journal_path = TemporaryJournalPath();
+  CellTestAdmissionGate gate;
+  input.kernel_config.operation_admission_gate = &gate;
+  const auto journal_path = input.operation_journal_path;
+  const auto &resource = binding.value().resources.front();
+  const std::string joint = resource.compiled_resource_name;
+  const auto scene = std::make_shared<roboplan::Scene>(
+      "gripper_cell_fixture", roboplan::loadUrdfSceneDescriptionFromXml(
+          "<robot name='gripper_cell_fixture'><link name='base'/><link name='tip'/>"
+          "<joint name='" + joint + "' type='prismatic'><parent link='base'/>"
+          "<child link='tip'/><axis xyz='0 0 1'/>"
+          "<limit lower='0' upper='0.1' effort='5' velocity='1'/></joint></robot>", {}));
+  const auto channel_config = retained_ros2_control_gripper_state_config(binding);
+  RetainedKinematicModelMapInput map{
+      binding.value().retained_bundle_id, binding.value().graph_revision,
+      {{binding.value().control_path->control_binding_id,
+        binding.value().controllable_component_id, binding.value().command_target_id,
+        {{resource.resource_id, {{binding.value().model_groups.front().model_instance_id,
+                                 joint, resource.coordinate_kind}}}}}}};
+  auto projector = std::make_shared<RetainedKinematicStateProjector>(
+      RetainedKinematicStateProjector::create(scene, std::make_shared<std::mutex>(),
+                                            std::move(map), {binding},
+                                            channel_config.freshness_budget_ns));
+  auto channel = std::make_shared<RetainedObservedStateChannel>(
+      binding, projector, channel_config, clock.get());
+  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  RetainedRos2ControlBackendConfig config;
+  config.node_name = "manyforge_gripper_cell_fixture";
+  config.node_namespace = "/manyforge/gripper_cell_fixture";
+  config.executor_thread_count = 1U;
+  config.defer_ros_start = true;
+  config.measured_receiver_clock = clock;
+  config.arm.gripper_controller = RetainedRos2ControlArmController{
+      config.node_namespace + "/controller_manager", "gripper_controller", "TestSystem"};
+  ros2_control_execution::Ros2GripperActionConfig transport;
+  transport.action_name = config.node_namespace + "/gripper_controller/gripper_cmd";
+  transport.group_id = binding.value().model_groups.front().compiled_group_name;
+  transport.joint_name = joint;
+  config.gripper = transport;
+  auto backend = make_retained_ros2_control_gripper_backend(
+      config, binding, channel, *clock, *scheduler, handle);
+  auto gripper = std::make_unique<RetainedNativeGripperRuntime>(
+      RetainedNativeGripperRuntimeInput{
+          .binding = binding, .backend = backend, .clock = clock,
+          .state_channel = channel, .stop_readiness = {}, .rebind_route = {},
+          .scheduler = scheduler, .position_limits = {}});
+  const auto registration = gripper->registration();
+  EXPECT_EQ(registration.engine, gripper->participant_engine());
+  EXPECT_EQ(registration.stop_execution_port,
+            static_cast<core::IControlDomainExecutionPort *>(gripper->participant_engine()));
+  EXPECT_FALSE(handle->participant());
+  EXPECT_FALSE(handle->current_port());
+  // This transition case does not qualify recovery evidence. The actual
+  // source refuses that request rather than manufacturing a no-goal digest.
+  const RetainedStopSurveillanceSourceInput source{
+      binding, channel, {}, [](std::int64_t) {
+        return core::Result<core::ContentDigest>::Err(
+            {"recovery_not_qualified", "ownership fixture supplies no recovery evidence", {}});
+      }};
+  const auto &path = *binding.value().control_path;
+  const core::ConfigurationFenceId fence("fence.gripper-cell");
+  const core::ConfigurationFenceScopeDTO add_scope{
+      {binding.value().controllable_component_id},
+      {{path.control_domain_id, std::nullopt, path.control_domain_revision}},
+      {{path.control_binding_id, std::nullopt, path.control_binding_revision}},
+      {resource.resource_id}};
+  const core::ConfigurationFenceScopeDTO remove_scope{
+      {binding.value().controllable_component_id},
+      {{path.control_domain_id, path.control_domain_revision, std::nullopt}},
+      {{path.control_binding_id, path.control_binding_revision, std::nullopt}},
+      {resource.resource_id}};
+  ASSERT_TRUE(add_scope.valid());
+  ASSERT_TRUE(remove_scope.valid());
+  const std::weak_ptr<RetainedRos2ControlRuntimeHandle> transport_owner = handle;
+  {
+    RetainedNativeCellRuntime cell(std::move(input));
+    auto *kernel = &cell.addressed_kernel();
+    auto *journal = &cell.operation_journal();
+    const auto observer = cell.stop_surveillance_owner();
+    const auto wake = cell.observation_wake();
+    gate.HoldFence(fence, add_scope);
+    int commit_calls = 0;
+    const auto missing_source = cell.reconfigure_runtime_component_set(
+        {registration}, UnusedResolver(), {}, binding.value().retained_bundle_id,
+        binding.value().graph_revision, fence, add_scope, {}, [&] {
+          ++commit_calls;
+          return core::Result<void>::Ok();
+        });
+    ASSERT_FALSE(missing_source.ok());
+    EXPECT_EQ(commit_calls, 0);
+    EXPECT_TRUE(cell.participant_registrations().empty());
+    EXPECT_TRUE(observer->SnapshotSources().empty());
+    EXPECT_FALSE(kernel->participant_engine_in_use(gripper->participant_engine()));
+    auto added = cell.reconfigure_runtime_component_set(
+        {registration}, UnusedResolver(), {source}, binding.value().retained_bundle_id,
+        binding.value().graph_revision, fence, add_scope, {}, [] { return core::Result<void>::Ok(); });
+    ASSERT_TRUE(added.ok()) << added.error().message;
+    ASSERT_EQ(cell.participant_registrations().size(), 1U);
+    EXPECT_EQ(cell.participant_registrations().front().engine, gripper->participant_engine());
+    ASSERT_EQ(observer->SnapshotSources().size(), 1U);
+    EXPECT_EQ(observer->SnapshotSources().front().state_channel, channel);
+    EXPECT_TRUE(kernel->participant_engine_in_use(gripper->participant_engine()));
+    gate.HoldFence(fence, remove_scope);
+    auto removed = cell.reconfigure_runtime_component_set(
+        {}, UnusedResolver(), {}, core::RetainedBundleId("bundle.empty-cell"),
+        core::GraphRevision("graph.empty-cell"), fence, remove_scope, {},
+        [] { return core::Result<void>::Ok(); });
+    ASSERT_TRUE(removed.ok()) << removed.error().message;
+    EXPECT_TRUE(cell.participant_registrations().empty());
+    EXPECT_TRUE(observer->SnapshotSources().empty());
+    EXPECT_FALSE(kernel->participant_engine_in_use(gripper->participant_engine()));
+    ASSERT_TRUE(kernel->release_retired_engine(gripper->participant_engine()).ok());
+    EXPECT_EQ(&cell.addressed_kernel(), kernel);
+    EXPECT_EQ(&cell.operation_journal(), journal);
+    EXPECT_EQ(cell.clock(), clock);
+    EXPECT_EQ(cell.scheduler(), scheduler);
+    EXPECT_EQ(cell.stop_surveillance_owner(), observer);
+    EXPECT_EQ(cell.observation_wake(), wake);
+    backend.reset();
+    handle.reset();
+    EXPECT_FALSE(transport_owner.expired());
+    gripper.reset();
+    EXPECT_TRUE(transport_owner.expired());
+  }
+  RemoveJournalFiles(journal_path);
+}
+#endif
+
+TEST(RetainedNativeCellRuntimeTest,
+     HostBindingPreservesStableBorrowAcrossRetainedAndReplacedRuntimeRoots) {
+  const auto journal_path = TemporaryJournalPath();
+  auto input = EmptyCellInput();
+  input.clock = std::make_shared<WallClock>();
+  input.scheduler = std::make_shared<SimpleScheduler>();
+  input.operation_journal_path = journal_path;
+  input.kernel_config.request_owner_epoch = core::RequestOwnerEpoch("kernel-owner-epoch.h1");
+  input.kernel_config.cell_id = core::CellId("cell.h1");
+  input.stop_source_mode = RetainedStopSurveillanceEmptySourceMode::kManagedCellBootstrapEmpty;
+  {
+    RetainedNativeCellRuntime cell(std::move(input));
+    auto *const kernel = &cell.addressed_kernel();
+    auto *const journal = &cell.operation_journal();
+    const auto binding = qualification_fixture::make_binding();
+    auto root = std::make_shared<RetainedNativeRuntime>(binding, std::nullopt);
+    auto peer = std::make_shared<RetainedNativeRuntime>(
+        DistinctCellBinding(binding, "peer"), std::nullopt);
+    auto selected_peer = std::make_shared<RetainedNativeRuntime>(
+        DistinctCellBinding(binding, "selected-peer"), std::nullopt);
+    root->participant_peers = {peer, selected_peer};
+    // Existing predecessor association only: BindCellRuntimeOwner does not
+    // adopt a route root or emulate the host's separate membership join.
+    peer->cell_runtime_root = root.get();
+    root->BindCellRuntimeOwner(cell, "epoch.h1", "cell.h1");
+    const auto check_borrow = [&](const RetainedNativeRuntime &runtime) {
+      EXPECT_EQ(runtime.active_addressed_kernel(), kernel);
+      EXPECT_EQ(runtime.active_operation_journal(), journal);
+      EXPECT_FALSE(runtime.addressed_kernel);
+      EXPECT_FALSE(runtime.operation_journal);
+      EXPECT_EQ(runtime.addressed_request_owner_epoch,
+                core::RequestOwnerEpoch("kernel-owner-epoch.h1"));
+      EXPECT_EQ(runtime.addressed_cell_id, core::CellId("cell.h1"));
+    };
+    check_borrow(*root);
+    check_borrow(*peer);
+    check_borrow(*selected_peer);
+    auto *const retained_root = root.get();
+    root->BindCellRuntimeOwner(cell, "epoch.h1", "cell.h1");
+    EXPECT_EQ(root.get(), retained_root);
+    check_borrow(*root);
+    check_borrow(*peer);
+
+    auto replacement = std::make_shared<RetainedNativeRuntime>(
+        DistinctCellBinding(binding, "replacement"), std::nullopt);
+    replacement->participant_peers = {peer, selected_peer};
+    replacement->BindCellRuntimeOwner(cell, "epoch.h1", "cell.h1");
+    // A peer may already name another live root through the separate join.
+    // This fixture state is not a handover performed by the binding method.
+    selected_peer->cell_runtime_root = replacement.get();
+    check_borrow(*replacement);
+    EXPECT_EQ(peer->cell_runtime_root, root.get());
+    const std::weak_ptr<RetainedNativeRuntime> retired_root = root;
+    root.reset();
+    EXPECT_TRUE(retired_root.expired());
+    EXPECT_EQ(peer->cell_runtime_root, nullptr);
+    EXPECT_EQ(selected_peer->cell_runtime_root, replacement.get());
+    check_borrow(*peer);
+    check_borrow(*selected_peer);
+    check_borrow(*replacement);
+
+    const std::weak_ptr<RetainedNativeRuntime> peer_lifetime = peer;
+    auto strong_borrow = peer;
+    peer.reset();
+    replacement.reset();
+    EXPECT_FALSE(peer_lifetime.expired());
+    EXPECT_EQ(selected_peer->cell_runtime_root, nullptr);
+    check_borrow(*selected_peer);
+    check_borrow(*strong_borrow);
+    EXPECT_EQ(strong_borrow->cell_runtime_root, nullptr);
+    ASSERT_EQ(strong_borrow->active_addressed_kernel(), kernel);
+    ASSERT_EQ(strong_borrow->active_operation_journal(), journal);
+    ASSERT_TRUE(strong_borrow->addressed_request_owner_epoch.has_value());
+    EXPECT_TRUE(strong_borrow->active_addressed_kernel()->resource_table_snapshot().slots.empty());
+    const auto events = strong_borrow->active_operation_journal()->ReadEvents(
+        *strong_borrow->addressed_request_owner_epoch, 0U);
+    EXPECT_TRUE(events.ok());
+    EXPECT_EQ(&cell.addressed_kernel(), kernel);
+    EXPECT_EQ(&cell.operation_journal(), journal);
+    strong_borrow.reset();
+    EXPECT_TRUE(peer_lifetime.expired());
+  }
+  RemoveJournalFiles(journal_path);
+}
+
+TEST(RetainedNativeCellRuntimeTest,
+     RuntimeRetirementClearsOnlyItsLocallyOwnedKernelFromStrongPeerBorrow) {
+  const auto journal_path = TemporaryJournalPath();
+  {
+    const auto binding = qualification_fixture::make_binding();
+    auto root = std::make_shared<RetainedNativeRuntime>(binding, std::nullopt);
+    root->clock = std::make_shared<WallClock>();
+    root->scheduler = std::make_shared<SimpleScheduler>();
+    auto config = EmptyKernelConfig();
+    root->operation_journal = std::make_unique<core::SqliteOperationJournal>(
+        journal_path, config.cell_id);
+    root->addressed_kernel = std::make_unique<core::ResourceAddressedExecutionKernel>(
+        std::vector<core::RuntimeParticipantExecutionRegistration>{},
+        *root->clock, *root->scheduler, *root->operation_journal, std::move(config));
+    root->cell_addressed_kernel = root->addressed_kernel.get();
+    root->cell_runtime_root = root.get();
+    auto peer = std::make_shared<RetainedNativeRuntime>(
+        DistinctCellBinding(binding, "local-peer"), std::nullopt);
+    root->participant_peers = {peer};
+    peer->cell_addressed_kernel = root->addressed_kernel.get();
+    peer->cell_runtime_root = root.get();
+    EXPECT_EQ(peer->active_addressed_kernel(), root->addressed_kernel.get());
+    const std::weak_ptr<RetainedNativeRuntime> root_lifetime = root;
+    const std::weak_ptr<RetainedNativeRuntime> peer_lifetime = peer;
+    auto strong_borrow = peer;
+    peer.reset();
+    root.reset();
+    EXPECT_TRUE(root_lifetime.expired());
+    EXPECT_FALSE(peer_lifetime.expired());
+    EXPECT_EQ(strong_borrow->cell_addressed_kernel, nullptr);
+    EXPECT_EQ(strong_borrow->active_addressed_kernel(), nullptr);
+    EXPECT_EQ(strong_borrow->cell_runtime_root, nullptr);
+    // No retired local journal is borrowed or dereferenced by this case.
+    strong_borrow.reset();
+    EXPECT_TRUE(peer_lifetime.expired());
   }
   RemoveJournalFiles(journal_path);
 }

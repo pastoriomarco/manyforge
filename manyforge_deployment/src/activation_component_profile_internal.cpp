@@ -113,7 +113,6 @@ struct Family final {
 
 struct Profile final {
   std::string model_family_id;
-  ActivationRuntimeKind runtime_kind;
   CanonicalValue value;
 };
 
@@ -122,16 +121,14 @@ parse_runtime_kind(const CanonicalValue &configuration,
                    std::string_view label) {
   const auto &value = text(member(configuration, "runtime_kind", label),
                            std::string(label) + ".runtime_kind");
-  if (value == "native")
-    return ActivationRuntimeKind::kNative;
   if (value == "ros2_control")
     return ActivationRuntimeKind::kRos2Control;
   fail(std::string(label) + ".runtime_kind is unsupported: " + value);
 }
 
 [[nodiscard]] std::string_view
-runtime_kind_text(ActivationRuntimeKind kind) noexcept {
-  return kind == ActivationRuntimeKind::kNative ? "native" : "ros2_control";
+runtime_kind_text(ActivationRuntimeKind) noexcept {
+  return "ros2_control";
 }
 
 } // namespace
@@ -245,10 +242,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
     }
     if (!profiles
              .emplace(profile_id,
-                      Profile{family_id,
-                              has_native ? ActivationRuntimeKind::kNative
-                                         : ActivationRuntimeKind::kRos2Control,
-                              row})
+                      Profile{family_id, row})
              .second) {
       fail("description has duplicate runtime-profile identities");
     }
@@ -258,18 +252,21 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
   result.reserve(intent.components.size());
   for (const auto &component : intent.components) {
     const auto found = profiles.find(component.component_profile_id);
-    if (found == profiles.end()) {
+    // Retired native rows remain strictly checked opaque metadata until N4.
+    // They never supply a runtime kind or qualify a selected component.
+    if (found == profiles.end() ||
+        found->second.value.find_object_member("native_runtime") != nullptr) {
       fail("component " + component.component_id + " selects unknown profile " +
            component.component_profile_id);
     }
     const auto authored_kind = parse_runtime_kind(
         component.configuration,
         "component " + component.component_id + ".configuration");
-    if (authored_kind != found->second.runtime_kind) {
+    if (authored_kind != ActivationRuntimeKind::kRos2Control) {
       fail("component " + component.component_id + " selects " +
            std::string(runtime_kind_text(authored_kind)) +
            " runtime configuration for " +
-           std::string(runtime_kind_text(found->second.runtime_kind)) +
+           std::string(runtime_kind_text(ActivationRuntimeKind::kRos2Control)) +
            " profile " + component.component_profile_id);
     }
     const auto family = families.find(found->second.model_family_id);
@@ -282,7 +279,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
         found->second.model_family_id,
         family->second.model_asset_id,
         family->second.accepted_package_uri_prefix,
-        found->second.runtime_kind,
+        authored_kind,
         family->second.value,
         found->second.value,
     });

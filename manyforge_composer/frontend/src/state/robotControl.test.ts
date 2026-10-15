@@ -1058,6 +1058,69 @@ describe('addressed Robot Control state', () => {
     });
   });
 
+  it.each(['commanded', 'none'] as const)(
+    'authors current pneumatic %s commands without finger authority', (outputMode) => {
+      const status = statusFixture();
+      const descriptor = status.directControlGripper!.targetDescriptor;
+      Object.assign(descriptor, { actuationKind: 'pneumatic', outputMode,
+        completionPolicy: outputMode === 'none' ? 'no_output' : 'output_delivery',
+        graspConfirmationPolicy: 'not_required', commandDurationS: 0 });
+      status.observedGripper = null;
+      status.observedGrippers = [];
+      const intent = buildGripperCommandIntent(status, 0.03, 'pneumatic-manual');
+      expect(intent).toMatchObject({
+        program_binding_id: status.directControlGripper!.programBindingId,
+        program_run_id: status.directControlGripper!.programRunId,
+        expected_retained_bundle_id: status.retainedBundleId,
+        expected_graph_revision: status.graphRevision,
+        expected_scene_revision: status.sceneRevision,
+        request_context: { request_id: 'pneumatic-manual', request_owner_epoch: status.ownerEpoch },
+        participants: [{ payload: { command_schema_id: 'gripper.command_position',
+          command_schema_revision: status.directControlGripper!.commandSchemaRevision,
+          command_value: { kind: 'gripper_position', position: { kind: 'linear_m', value_m: 0.03 } },
+          caller_options: [{ option_id: 'command_duration_s', value_s: 0 }] } }],
+      });
+      for (const position of [NaN, Infinity, -0.01, 0.05]) {
+        expect(() => buildGripperCommandIntent(status, position, 'invalid')).toThrow(/limits/);
+      }
+      descriptor.commandDurationS = null;
+      expect(() => buildGripperCommandIntent(status, 0.03, 'missing-duration'))
+        .toThrow(/duration is not configured/);
+      descriptor.commandDurationS = 0.25;
+      descriptor.contracts.commandSchema = null;
+      expect(() => buildGripperCommandIntent(status, 0.03, 'missing-schema'))
+        .toThrow(/schema is unavailable/);
+    },
+  );
+
+  it('keeps position observation requirements and refuses incoherent pneumatic exemptions', () => {
+    const position = statusFixture();
+    position.observedGripper = null;
+    expect(() => buildGripperCommandIntent(position, 0.03, 'position-null'))
+      .toThrow(/Authoritative gripper state is unavailable/);
+    position.observedGripper = { ...statusFixture().observedGripper!, complete: false };
+    expect(() => buildGripperCommandIntent(position, 0.03, 'position-incomplete'))
+      .toThrow(/Authoritative gripper state is incomplete/);
+    for (const invalid of [
+      { completionPolicy: 'delivered_then_dwell' },
+      { completionPolicy: 'no_output' },
+      { graspConfirmationPolicy: 'binding_feedback_required' },
+      { schemaVersion: 'manyforge.manual_control_gripper_descriptor.v2' },
+      { controllableComponentId: 'foreign-component' },
+      { commandTargetId: 'foreign-target' },
+      { sourceCoordinateName: 'foreign-finger' },
+    ]) {
+      const status = statusFixture();
+      Object.assign(status.directControlGripper!.targetDescriptor, {
+        actuationKind: 'pneumatic', outputMode: 'commanded',
+        completionPolicy: 'output_delivery', graspConfirmationPolicy: 'not_required', ...invalid,
+      });
+      status.observedGripper = null;
+      expect(() => buildGripperCommandIntent(status, 0.03, 'incoherent'))
+        .toThrow(/Authoritative gripper state is unavailable/);
+    }
+  });
+
   it('authors gripper commands with the exact schema and source-local unit', () => {
     const status = statusFixture();
     const intent = buildGripperCommandIntent(status, 0.03, 'gripper-request');

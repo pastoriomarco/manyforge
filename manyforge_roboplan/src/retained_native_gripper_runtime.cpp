@@ -3,6 +3,7 @@
 #include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <map>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -253,7 +254,8 @@ RetainedNativeGripperRuntime::RetainedNativeGripperRuntime(RetainedNativeGripper
       stop_readiness_(std::move(input.stop_readiness)),
       position_limits_(std::move(input.position_limits)),
       intrinsic_direct_control_(input.intrinsic_direct_control),
-      rebind_route_(std::move(input.rebind_route)) {
+      rebind_route_(std::move(input.rebind_route)),
+      prepare_measured_sources_(std::move(input.prepare_measured_sources)) {
   if (backend_ == nullptr || clock_ == nullptr) {
     throw std::invalid_argument("native gripper runtime requires a backend and retained clock");
   }
@@ -264,15 +266,109 @@ RetainedNativeGripperRuntime::RetainedNativeGripperRuntime(RetainedNativeGripper
   if (!state_channel_result.ok()) {
     throw std::invalid_argument(state_channel_result.error().message);
   }
-  if (stop_readiness_.has_value() && stop_execution_port_ == nullptr) {
-    throw std::invalid_argument("Stop-qualified native gripper runtime has no Stop-stage port");
-  }
   const auto readiness_result = validate_readiness(binding_, stop_readiness_);
   if (!readiness_result.ok()) {
     throw std::invalid_argument(readiness_result.error().message);
   }
   retained_default_stop_limits_ = retained_default_stop_limits(binding_, stop_readiness_);
   participant_engine_ = std::make_shared<core::GripperParticipantEngine>(*backend_, *clock_);
+  if (stop_execution_port_ == nullptr) stop_execution_port_ = participant_engine_.get();
+  if (input.control_binding_representatives.empty())
+    input.control_binding_representatives.push_back(binding_);
+  std::vector<std::optional<core::RuntimeParticipantStopReadiness>> readiness;
+  readiness.reserve(input.control_binding_representatives.size());
+  for (const auto& representative : input.control_binding_representatives)
+    readiness.push_back(representative.value() == binding_.value() ? stop_readiness_ : std::nullopt);
+  auto staged = PrepareRegistrations(input.control_binding_representatives, readiness);
+  if (!staged.ok()) throw std::invalid_argument(staged.error().message);
+  participant_registrations_ = std::move(staged.value());
+}
+
+void RetainedNativeGripperRuntime::BindCellKernel(core::ResourceAddressedExecutionKernel& kernel) {
+  std::lock_guard lock(mutex_);
+  if (cell_kernel_ && cell_kernel_ != &kernel)
+    throw std::invalid_argument("retained gripper cannot rotate its stable cell Kernel");
+  cell_kernel_ = &kernel;
+}
+
+core::Result<core::RobotMeasuredStateSourceView> RetainedNativeGripperRuntime::PrepareCurrentMeasuredSources() {
+  using Result = core::Result<core::RobotMeasuredStateSourceView>;
+  std::unique_lock lock(mutex_);
+  if (!cell_kernel_ || !prepare_measured_sources_)
+    return Result::Err({"measured_source_unavailable", "Gripper has no actual measured producer", {}});
+  const auto binding = binding_;
+  auto* const kernel = cell_kernel_;
+  const auto previous = prepared_measured_sources_;
+  const auto route = kernel->current_runtime_route_configuration(binding.value().control_path->control_domain_id);
+  if (!route.ok()) return Result::Err(route.error());
+  if (!route.value()) return Result::Err({"measured_source_unavailable", "Gripper route is not current", {}});
+  const auto prepare = prepare_measured_sources_;
+  lock.unlock();
+  auto staged = prepare(binding, route.value()->active_configuration);
+  if (!staged.ok()) return Result::Err(staged.error());
+  if (!staged.value()) return Result::Err({"measured_source_unavailable", "Gripper measured producer unavailable", {}});
+  if (staged.value()->source_view.sources.empty() &&
+      backend_->gripper_actuation_kind(binding.value().command_target_id.value()) !=
+          core::GripperActuationKind::kPneumatic)
+    return Result::Err({"measured_source_unavailable", "Gripper measured producer has no source", {}});
+  const auto valid = ValidateRetainedPreparedMeasuredSources(*staged.value(),
+      binding.value().controllable_component_id,
+      std::vector<core::RuntimeParticipantBinding>{binding},
+      {route.value()->active_configuration});
+  if (!valid.ok()) return Result::Err(valid.error());
+  lock.lock();
+  auto current = kernel->current_runtime_route_configuration(binding.value().control_path->control_domain_id);
+  if (!current.ok()) return Result::Err(current.error());
+  if (cell_kernel_ != kernel || binding_.value() != binding.value() || prepared_measured_sources_ != previous ||
+      current.value() != route.value())
+    return Result::Err({"measured_source_unavailable", "Gripper source association changed while preparing", {}});
+  auto prepared = std::move(staged.value());
+  prepared_measured_sources_.swap(prepared);
+  prepared_measured_sources_->enable_publication();
+  return Result::Ok(prepared_measured_sources_->source_view);
+}
+
+core::Result<core::ComponentLifecycleReadinessSourceView> RetainedNativeGripperRuntime::CaptureReadinessSources(
+    const core::ComponentLifecycleCurrentSnapshotDTO& snapshot,
+    const std::shared_ptr<RetainedNativeGripperRuntime>& owner) const {
+  using Result = core::Result<core::ComponentLifecycleReadinessSourceView>;
+  std::lock_guard lock(mutex_);
+  if (owner.get() != this || !cell_kernel_ || !prepared_measured_sources_)
+    return Result::Err({"measured_source_unavailable", "Gripper measured association is unavailable", {}});
+  const auto binding = binding_;
+  auto* const kernel = cell_kernel_;
+  const auto prepared = prepared_measured_sources_;
+  const auto route = kernel->current_runtime_route_configuration(binding.value().control_path->control_domain_id);
+  if (!route.ok()) return Result::Err(route.error());
+  std::vector<core::RuntimeParticipantBinding> physical;
+  for (const auto& row : participant_registrations_)
+    physical.push_back(row.binding.value().capability_id == binding.value().capability_id ? binding : row.binding);
+  const std::vector<std::pair<core::ControlDomainId, std::optional<core::RuntimeRouteConfigurationReadbackDTO>>>
+      readbacks{{binding.value().control_path->control_domain_id, route.value()}};
+  const auto valid = ValidateRetainedMeasuredReadinessSnapshot(binding.value().controllable_component_id,
+      physical, snapshot, readbacks);
+  if (!valid.ok()) return Result::Err(valid.error());
+  const auto source_valid = ValidateRetainedPreparedMeasuredSources(*prepared,
+      binding.value().controllable_component_id, physical,
+      {route.value()->active_configuration});
+  if (!source_valid.ok()) return Result::Err(source_valid.error());
+  const bool pneumatic = backend_->gripper_actuation_kind(binding.value().command_target_id.value()) ==
+      core::GripperActuationKind::kPneumatic;
+  std::optional<core::RobotMeasuredStateSourceView> measured;
+  if (!pneumatic) measured = prepared->source_view;
+  return Result::Ok({std::move(measured), [owner, prepared, binding, physical, kernel, expected = route.value(), snapshot] {
+    std::lock_guard current_lock(owner->mutex_);
+    if (owner->cell_kernel_ != kernel || owner->binding_.value() != binding.value() ||
+        owner->prepared_measured_sources_ != prepared)
+      return core::Result<void>::Err({"measured_source_unavailable", "Gripper measured owner association changed", {}});
+    auto current = kernel->current_runtime_route_configuration(binding.value().control_path->control_domain_id);
+    if (!current.ok()) return core::Result<void>::Err(current.error());
+    if (current.value() != expected)
+      return core::Result<void>::Err({"measured_source_unavailable", "Gripper Kernel route association changed", {}});
+    return ValidateRetainedMeasuredReadinessSnapshot(binding.value().controllable_component_id,
+        physical, snapshot,
+        {{binding.value().control_path->control_domain_id, current.value()}});
+  }});
 }
 
 core::RuntimeParticipantExecutionRegistration RetainedNativeGripperRuntime::registration() const {
@@ -293,6 +389,94 @@ core::RuntimeParticipantExecutionRegistration RetainedNativeGripperRuntime::regi
       .deployment_maximum_tcp_linear_speed_mps = {},
       .intrinsic_direct_control = intrinsic_direct_control_,
       .direct_control_joint_limits = {}};
+}
+
+std::vector<core::RuntimeParticipantExecutionRegistration>
+RetainedNativeGripperRuntime::registrations() const {
+  std::lock_guard lock(mutex_);
+  auto rows = participant_registrations_;
+  for (auto& row : rows) {
+    if (row.binding.value().capability_id == binding_.value().capability_id) {
+      row.binding = binding_;
+      row.stop_readiness = stop_readiness_;
+      row.retained_default_stop_limits = retained_default_stop_limits_;
+    }
+  }
+  return rows;
+}
+
+core::Result<std::vector<core::RuntimeParticipantExecutionRegistration>>
+RetainedNativeGripperRuntime::PrepareRegistrations(
+    const std::vector<core::RuntimeParticipantBinding>& representatives,
+    const std::vector<std::optional<core::RuntimeParticipantStopReadiness>>& readiness) const {
+  using Result = core::Result<std::vector<core::RuntimeParticipantExecutionRegistration>>;
+  std::lock_guard lock(mutex_);
+  if (representatives.empty() || representatives.size() != readiness.size())
+    return Result::Err(gripper_runtime_error("native_gripper_alias_set_invalid",
+        "Gripper representatives and readiness must cover the same nonempty set"));
+  if (!participant_registrations_.empty() && representatives.size() != participant_registrations_.size())
+    return Result::Err(gripper_runtime_error("native_gripper_alias_set_invalid",
+        "Route publication must preserve the complete installed binding set"));
+  const auto primary = std::find_if(representatives.begin(), representatives.end(), [&](const auto& row) {
+    return row.value().capability_id == binding_.value().capability_id;
+  });
+  if (primary == representatives.end() || !same_gripper_runtime_identity(binding_, *primary))
+    return Result::Err(gripper_runtime_error("native_gripper_alias_owner_mismatch",
+        "Gripper representatives lost their exact primary command owner"));
+  const auto primary_index = static_cast<std::size_t>(std::distance(representatives.begin(), primary));
+  std::set<core::ControlBindingId> ids;
+  std::set<core::CapabilityId> capabilities;
+  std::vector<core::RuntimeParticipantExecutionRegistration> result;
+  result.reserve(representatives.size());
+  for (std::size_t index = 0; index < representatives.size(); ++index) {
+    const auto& binding = representatives[index];
+    const auto& value = binding.value();
+    const bool command = value.capability_id == primary->value().capability_id;
+    const auto known = std::find_if(participant_registrations_.begin(), participant_registrations_.end(),
+        [&](const auto& row) { return row.binding.value().capability_id == value.capability_id; });
+    if (!value.control_path || (!command && !retained_bindings_share_backend_owner(*primary, binding)) ||
+        !ids.insert(value.control_path->control_binding_id).second ||
+        !capabilities.insert(value.capability_id).second ||
+        (!command && (primary->value().capability_id.value() != "tool.gripper.command" ||
+                      value.capability_id.value() != "tool.gripper.feedback" || value.command_schema.has_value())) ||
+        (!participant_registrations_.empty() &&
+         (known == participant_registrations_.end() ||
+          !same_gripper_runtime_identity(known->binding, binding) ||
+          known->binding.value().capability_provider_path != value.capability_provider_path)))
+      return Result::Err(gripper_runtime_error("native_gripper_alias_owner_mismatch",
+          "Gripper alias crosses its exact command owner or repeats a capability/binding"));
+    auto qualified = validate_readiness(binding, readiness[index]);
+    if (!qualified.ok()) return Result::Err(qualified.error());
+    if (!command && readiness[index] &&
+        (!readiness[primary_index] ||
+         readiness[index]->value().component_lifecycle_generation != readiness[primary_index]->value().component_lifecycle_generation ||
+         readiness[index]->value().expected_controller_domain != readiness[primary_index]->value().expected_controller_domain))
+      return Result::Err(gripper_runtime_error("native_gripper_alias_readiness_mismatch",
+          "Feedback readiness must share the primary component generation and exact domain seal"));
+    result.push_back(core::RuntimeParticipantExecutionRegistration{
+        .binding = binding,
+        .stop_readiness = readiness[index],
+        .retained_default_stop_limits = retained_default_stop_limits(binding, readiness[index]),
+        .stop_node_category = core::MotionInterruptNodeCategory::kGeneric,
+        .engine = participant_engine_.get(),
+        .stop_execution_port = stop_execution_port_,
+        .participant_policy = {},
+        .prepared_motion_engine = command ? dynamic_cast<core::IResolvedPreparedParticipantExecutionEngine*>(participant_engine_.get()) : nullptr,
+        .default_operator_stop_profile = {}, .default_fault_stop_profile = {},
+        .deployment_maximum_tcp_linear_speed_mps = {},
+        .intrinsic_direct_control = command && intrinsic_direct_control_,
+        .direct_control_joint_limits = {}});
+  }
+  std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+    return left.binding.value().control_path->control_binding_id < right.binding.value().control_path->control_binding_id;
+  });
+  return Result::Ok(std::move(result));
+}
+
+void RetainedNativeGripperRuntime::AdoptVerifiedRegistrations(
+    std::vector<core::RuntimeParticipantExecutionRegistration>&& registrations) noexcept {
+  std::lock_guard lock(mutex_);
+  participant_registrations_.swap(registrations);
 }
 
 core::RuntimeParticipantBinding RetainedNativeGripperRuntime::binding() const {
@@ -429,6 +613,9 @@ core::Result<void> RetainedNativeGripperRuntime::RebindRouteImpl(
     return rebound_channel_result;
   }
   binding_ = std::move(candidate);
+  // A re-seal changes the exact route query. The old measured association may
+  // not be returned while the actual producer for the new route is prepared.
+  prepared_measured_sources_.reset();
   state_channel_ = std::move(candidate_channel);
   stop_readiness_ = std::move(readiness);
   retained_default_stop_limits_ = std::move(candidate_defaults);

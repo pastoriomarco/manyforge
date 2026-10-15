@@ -1,10 +1,14 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
+#include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
+#include <manyforge_deployment/cell_composition.hpp>
+#include <span>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <string>
 #include <string_view>
@@ -40,7 +44,7 @@ inline constexpr std::string_view
 inline constexpr std::string_view
     kRos2ControlExecutionRuntimeConfigurationSchemaRevision =
         "sha256:"
-        "c4e6e1a1418852f773520a2c3c02ffde66883e2dca3963a218bf28e2356ca16c";
+        "20f76c1fa9f103c6f008029505639a45ec6f9166305156b31d43056235544483";
 inline constexpr std::string_view kRos2ControlExecutionRuntimeRoleId =
     ros2_control_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view
@@ -89,6 +93,30 @@ void require_no_exclusive_ros_controller_topic_collision(
 
 [[nodiscard]] std::string ros2_control_execution_runtime_profile_document();
 [[nodiscard]] std::string ros2_control_execution_runtime_profile_revision();
+[[nodiscard]] bool ros_gripper_output_mode_is_valid(
+    std::string_view actuation_kind, std::string_view output_mode) noexcept;
+
+/// Present ROS-only timeout validation shared by early authored activation
+/// selection and strict Draft/retained decoding. Absence keeps its default.
+[[nodiscard]] bool ros_gripper_delivery_result_timeout_is_valid(
+    std::string_view actuation_kind, double timeout_s) noexcept;
+
+/// Strict active ROS thirteen-field row, with an optional pneumatic-only
+/// delivery_result_timeout_s field (fourteen fields when present). The archival
+/// neutral twelve-field decoder receives only its exact private data projection.
+[[nodiscard]] std::vector<
+    ros2_control_execution_runtime_contract::Configuration::GripperTargetConfiguration>
+decode_ros2_control_execution_gripper_target_configurations(
+    const core::JsonValueDTO::Array &rows);
+
+/// DX817: one source classifier for the already-qualified selected graph.
+/// Absence preserves the historical physical/default Stop contract. A returned
+/// enum comes only from the exact strict ROS target row, never a policy token.
+[[nodiscard]] std::optional<core::GripperActuationKind>
+classify_ros_gripper_actuation_kind(
+    const core::CellGraphDTO &graph, const core::ControlBindingDTO &binding,
+    std::span<const CompositionControlBindingCoordinateMap> coordinate_maps);
+
 /// Preserve required nonempty rows for actual hosted membership at graph and
 /// retained-product qualification. Returns true for a host with no components.
 [[nodiscard]] bool require_ros2_control_execution_runtime_required_rows(

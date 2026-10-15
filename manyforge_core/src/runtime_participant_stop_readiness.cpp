@@ -115,7 +115,8 @@ template <typename Value>
       expected_binding->control_binding_revision != control_path.control_binding_revision ||
       expected_binding->control_interface_contract_id !=
           control_path.control_interface_contract_id ||
-      expected_binding->control_interface_revision != control_path.control_interface_revision) {
+      expected_binding->control_interface_revision != control_path.control_interface_revision ||
+      expected_binding->gripper_actuation_kind != plan.gripper_actuation_kind) {
     return false;
   }
   return std::any_of(expected.expected_endpoints.begin(), expected.expected_endpoints.end(),

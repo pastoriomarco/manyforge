@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:10e42acc3e46a6f842fc6fd5e2bb3eef41f005fb4ea03423f340ac4c2b34eee6",
     "deployment.yaml": "sha256:e1cc0deb6cb5bc73fb21bcc99fed4b86592059d1e5b69a0bc43c83e871e27a3e",
-    "program.yaml": "sha256:6ff4d0b5fa13b2115281f3791153301b05259a7d7654120b1a5cd10bc32b4efe"
+    "program.yaml": "sha256:1698630e7bd76d4140a9830214a4e9098e5441b94c0d303459ffa7822f8dbb9c"
   },
   "name": "ur5_roboplan_local_vision_guided_pose_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:94e2d68a0a1eeac60ce62f09fcb94610c71ea3497fa1acdcdd12b73f44748a02",
+    "checked_content_digest": "sha256:2ba128af5fb025aa34e651fdb34a7a7ad92a23fc2dc9e7e151c78034df52c44d",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

@@ -100,6 +100,17 @@ struct RetainedBoundObservedState final {
   core::ObservedStateSnapshotDTO state;
 };
 
+/// Render coordinates and their exact current binding, captured under one
+/// route fence. The render identity belongs to the existing presentation wake;
+/// these values carry no state authority, freshness or motion-rest evidence.
+struct RetainedBoundRenderState final {
+  core::RuntimeParticipantBinding binding;
+  std::vector<std::string> compiled_joint_names;
+  std::vector<double> positions_si;
+  std::uint64_t render_incarnation;
+  std::uint64_t render_generation;
+};
+
 /// One exact native state-authority channel for a sealed runtime participant.
 ///
 /// Publication is committed before best-effort scene projection, so execution
@@ -301,6 +312,16 @@ public:
   /// two separate reads.
   [[nodiscard]] core::Result<RetainedBoundObservedState>
   current_bound_state(std::int64_t now_ns) const;
+  /// Pneumatic viewer input only. The caller selects named actual finger
+  /// feedback, or the instantaneous expected position after admission. Every
+  /// coordinate must match this exact binding's compiled resource names.
+  /// This never publishes authoritative state or projects the planning scene.
+  [[nodiscard]] core::Result<void> update_render_positions(
+      const core::RuntimeParticipantBinding &expected_binding,
+      std::span<const std::string> compiled_joint_names,
+      std::span<const double> positions_si);
+  [[nodiscard]] core::Result<RetainedBoundRenderState>
+  current_bound_render_state() const;
   [[nodiscard]] core::Result<core::ObservedStateSnapshotDTO>
   current_state_bounded(std::int64_t now_ns, std::int64_t deadline_ns,
                         std::stop_token cancellation) const override;

@@ -16,6 +16,8 @@
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 
 #include "control_domain_control_internal.hpp"
+#include "verified_retained_bundle_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -732,10 +734,16 @@ retained_controlled_stop_max_deceleration_rad_s2(
       loaded->artifact_ref() != artifact) {
     fail("exact retained control-domain artifact is absent or mismatched");
   }
+  const auto model_map = detail::RetainedModelMapVerificationAuthority::verify(
+      retained_bundle, artifact_source);
+  if (!model_map.has_value())
+    fail("exact retained binding model map is absent");
+  const auto &coordinate_maps = model_map->control_bindings();
   detail::require_control_domain_control_matches_retained_bundle(
-      loaded->bytes(), retained_bundle.value(), control_path.control_domain_id);
-  const auto root =
-      detail::parse_and_verify_control_domain_control(loaded->bytes());
+      loaded->bytes(), retained_bundle.value(), control_path.control_domain_id,
+      {}, {}, {}, coordinate_maps);
+  const auto root = detail::parse_and_verify_control_domain_control(
+      loaded->bytes(), &retained_bundle.value().cell_graph, coordinate_maps);
   const CanonicalValue *selected_stop = nullptr;
   for (const auto &candidate :
        array(member(root, "stop_applicability", "control"), "control")) {
@@ -851,10 +859,16 @@ core::ResolvedStopBasePlanDTO resolve_verified_stop_base_plan(
       loaded->artifact_ref() != artifact) {
     fail("exact retained control-domain artifact is absent or mismatched");
   }
+  const auto model_map = detail::RetainedModelMapVerificationAuthority::verify(
+      retained_bundle, artifact_source);
+  if (!model_map.has_value())
+    fail("exact retained binding model map is absent");
+  const auto &coordinate_maps = model_map->control_bindings();
   detail::require_control_domain_control_matches_retained_bundle(
-      loaded->bytes(), retained_bundle.value(), control_path.control_domain_id);
-  const auto root =
-      detail::parse_and_verify_control_domain_control(loaded->bytes());
+      loaded->bytes(), retained_bundle.value(), control_path.control_domain_id,
+      {}, {}, {}, coordinate_maps);
+  const auto root = detail::parse_and_verify_control_domain_control(
+      loaded->bytes(), &retained_bundle.value().cell_graph, coordinate_maps);
   const auto runtime_product =
       require_runtime_product(retained_bundle, binding, control_path);
 
@@ -917,6 +931,42 @@ core::ResolvedStopBasePlanDTO resolve_verified_stop_base_plan(
           member(*selected_stop, "containment_granularity", "stop"), "stop")),
       {},
   };
+  const auto selected_expected_binding = std::find_if(
+      expected.expected_bindings.begin(), expected.expected_bindings.end(),
+      [&](const auto &candidate) {
+        return candidate.control_binding_id ==
+                   control_path.control_binding_id &&
+               candidate.control_binding_revision ==
+                   control_path.control_binding_revision;
+      });
+  const auto &source_graph = retained_bundle.value().cell_graph;
+  const auto source_binding = std::find_if(
+      source_graph.control_bindings.begin(),
+      source_graph.control_bindings.end(), [&](const auto &candidate) {
+        return candidate.control_binding_id ==
+                   control_path.control_binding_id &&
+               candidate.control_binding_revision ==
+                   control_path.control_binding_revision;
+      });
+  if (selected_expected_binding == expected.expected_bindings.end() ||
+      source_binding == source_graph.control_bindings.end() ||
+      source_binding->controllable_component_id !=
+          binding.controllable_component_id ||
+      source_binding->command_target_id != binding.command_target_id ||
+      source_binding->provider_runtime_unit_id !=
+          control_path.provider_runtime_unit_id)
+    fail("resolved Stop actuation source differs from its exact participant "
+         "binding");
+  const auto source_kind = detail::classify_ros_gripper_actuation_kind(
+      source_graph, *source_binding, coordinate_maps);
+  const std::optional<core::GripperActuationKind> retained_kind =
+      source_kind == core::GripperActuationKind::kPneumatic ? source_kind
+                                                            : std::nullopt;
+  if (selected_expected_binding->gripper_actuation_kind != retained_kind)
+    fail("resolved Stop actuation source differs from its sealed expected "
+         "binding");
+  plan.gripper_actuation_kind =
+      selected_expected_binding->gripper_actuation_kind;
   if (plan.stop_evidence_policy_id != control_path.stop_evidence_policy_id ||
       plan.stop_evidence_policy_revision !=
           control_path.stop_evidence_policy_revision ||

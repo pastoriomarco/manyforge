@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate and verify the maintained native and Isaac deployment occurrences.
+"""Generate and verify the maintained ROS deployment occurrences.
 
 This is an authoring projection, not a deployment validator.  It derives the
 repetitive graph/catalog records from the maintained source description and
@@ -52,7 +52,7 @@ ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:c4e6e1a1418852f773520a2c3c02ffde66883e2dca3963a218bf28e2356ca16c"
+    "sha256:20f76c1fa9f103c6f008029505639a45ec6f9166305156b31d43056235544483"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -613,23 +613,14 @@ def component_type_document(
         )
     gripper_resource = {
         "resource_role_id": "fingers",
-        "source_kind": "model_role" if physical_gripper else "component_local",
+        "source_kind": "model_role",
+        "model_role_id": "arm_model",
+        "asset_resource_role_id": "fingers",
     }
-    if physical_gripper:
-        gripper_resource.update(
-            {
-                "model_role_id": "arm_model",
-                "asset_resource_role_id": "fingers",
-            }
-        )
-    else:
-        # The historical simulated UR5 tool_position values are linear metres.
-        # Retain that semantic kind without inventing a URDF joint.
-        gripper_resource["coordinate_kind"] = "linear"
     value = {
         "api_version": "manyforge.component_type.v1",
         "component_type_id": f"{family_id}{'' if runtime_scaling else '.fixed_scale'}.component",
-        "tags": ["articulated-arm", "gripper"],
+        "tags": ["articulated-arm", *(["gripper"] if physical_gripper else [])],
         "model_roles": [{"model_role_id": "arm_model", "cardinality": "exactly_one"}],
         "component_root": {
             "model_role_id": "arm_model",
@@ -700,6 +691,8 @@ def component_type_document(
         ],
         "attachment_interfaces": [],
     }
+    if not physical_gripper:
+        value["command_targets"] = value["command_targets"][:1]
     return revisioned_document(
         value,
         domain="catalog-record-revision/component_type",
@@ -851,6 +844,28 @@ def software_hard_provider_contract() -> dict[str, Any]:
         "stop_evidence_support": {
             "evidence_kind": "motion_rest",
             "evidence_endpoint_role_ids": ["state"],
+        },
+    }
+
+
+def gripper_logical_cancel_provider_contract_ref() -> dict[str, str]:
+    return {
+        "provider_contract_role_id": "gripper_logical_cancel",
+        "contract_schema_id": EMPTY_PROVIDER_CONTRACT_SCHEMA_ID,
+        "contract_schema_revision": EMPTY_PROVIDER_CONTRACT_SCHEMA_REVISION,
+    }
+
+
+def gripper_logical_cancel_provider_contract() -> dict[str, Any]:
+    return {
+        "provider_contract_ref": gripper_logical_cancel_provider_contract_ref(),
+        "stop_command_support": {
+            "command_kind": "logical_cancel",
+            "command_endpoint_role_ids": [],
+        },
+        "stop_evidence_support": {
+            "evidence_kind": "logical_cancellation_no_continuing_effect",
+            "evidence_endpoint_role_ids": [],
         },
     }
 
@@ -1294,66 +1309,6 @@ def lite6_gripper_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
     )
 
 
-def native_control_lifecycle_plans() -> list[dict[str, Any]]:
-    """In-process native readiness; no physical drive or ROS enable is implied."""
-
-    def observed(state: str, enabled: bool) -> dict[str, Any]:
-        return lifecycle_predicate(
-            [state],
-            {
-                "native.runtime.present": lifecycle_boolean(True),
-                "native.control.enabled": lifecycle_boolean(enabled),
-            },
-        )
-
-    declared = lifecycle_predicate(
-        ["declared", "disabled"],
-        {
-            "native.runtime.present": lifecycle_boolean(True),
-            "native.control.enabled": lifecycle_boolean(False),
-        },
-    )
-    prepared = observed("prepared", False)
-    active = observed("active", True)
-    disabled = observed("disabled", False)
-    return [
-        {
-            "intent": "prepare",
-            "requested_state": "prepared",
-            "requested_postcondition": prepared,
-            "timeout_duration_ns": 30_000_000_000,
-            "transitions": [
-                lifecycle_transition("native.control.prepare", declared, prepared)
-            ],
-        },
-        {
-            "intent": "enable",
-            "requested_state": "active",
-            "requested_postcondition": active,
-            "timeout_duration_ns": 30_000_000_000,
-            "transitions": [
-                lifecycle_transition("native.control.enable", prepared, active)
-            ],
-        },
-        {
-            "intent": "disable",
-            "requested_state": "disabled",
-            "requested_postcondition": disabled,
-            "timeout_duration_ns": 30_000_000_000,
-            "transitions": [
-                lifecycle_transition(
-                    "native.control.disable",
-                    lifecycle_predicate(
-                        ["prepared", "active", "degraded", "faulted"],
-                        {"native.runtime.present": lifecycle_boolean(True)},
-                    ),
-                    disabled,
-                )
-            ],
-        },
-    ]
-
-
 def native_lifecycle_provider_manifest(
     lifecycle_manifest: dict[str, Any],
     capability_ids: tuple[str, ...],
@@ -1547,6 +1502,7 @@ def ros2_control_provider_manifest(
                 [
                     motion_controlled_stop_provider_contract(),
                     software_hard_provider_contract(),
+                    gripper_logical_cancel_provider_contract(),
                 ],
                 key=lambda row: row["provider_contract_ref"][
                     "provider_contract_role_id"
@@ -1577,6 +1533,76 @@ def lite6_lifecycle_identity_header(
         f'inline constexpr std::string_view kLite6LifecycleCatalogDigest = "{catalog["catalog_digest"]}";\n'
         "} // namespace manyforge::xarm_control::generated\n"
     ).encode("utf-8")
+
+
+def gripper_logical_cancel_stop_policy() -> dict[str, Any]:
+    # DX-755/Q58: command invalidation is logical evidence, not ROS ACK or rest.
+    contract_ref = gripper_logical_cancel_provider_contract_ref()
+    value = {
+        "api_version": "manyforge.stop_evidence_policy.v2",
+        "stop_evidence_policy_id": "manyforge.gripper_logical_cancellation",
+        "disposition": "stoppable",
+        "containment_granularity": "resource",
+        "escalation_stages": [
+            {
+                "stop_escalation_stage_id": "gripper_logical_cancel",
+                "stage_kind": "nominal",
+                "containment_granularity": "resource",
+                "containment_command": {
+                    "command": {
+                        "command_kind": "logical_cancel",
+                        "provider_contract_ref": contract_ref,
+                    },
+                },
+                "evidence_conjunction": "all_of",
+                "evidence_requirements": [
+                    {
+                        "evidence_item_id": "logical_cancel_fenced",
+                        "evidence": {
+                            "evidence_kind": "logical_cancellation_no_continuing_effect",
+                            "provider_contract_ref": contract_ref,
+                        },
+                        "source_requirement": {
+                            "source_kind": "command_target_status",
+                            "freshness_budget_ns": 100_000_000,
+                        },
+                        "observation_semantics": {
+                            "observation_kind": "command_result"
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    return revisioned_document(
+        value,
+        domain="catalog-record-revision/stop_evidence_policy",
+        api_version="manyforge.stop_evidence_policy.v2",
+        revision_field="stop_evidence_policy_revision",
+    )
+
+
+def gripper_position_cancel_stop_policy() -> dict[str, Any]:
+    # DX-775: stock action cancellation holds; logical evidence claims no rest.
+    value = gripper_logical_cancel_stop_policy()
+    value.pop("stop_evidence_policy_revision")
+    value["stop_evidence_policy_id"] = "manyforge.gripper_position_cancellation"
+    hard_stage = copy.deepcopy(value["escalation_stages"][0])
+    hard_stage["stop_escalation_stage_id"] = "software_hard"
+    hard_stage["stage_kind"] = "software_hard"
+    hard_stage["containment_command"]["command"] = {
+        "command_kind": "registered",
+        "provider_contract_ref": software_hard_provider_contract_ref(),
+        "registered_command_kind_id": "manyforge.stop.software_hard",
+    }
+    hard_stage["evidence_requirements"][0]["evidence_item_id"] = "hard_cancel_fenced"
+    value["escalation_stages"].append(hard_stage)
+    return revisioned_document(
+        value,
+        domain="catalog-record-revision/stop_evidence_policy",
+        api_version="manyforge.stop_evidence_policy.v2",
+        revision_field="stop_evidence_policy_revision",
+    )
 
 
 def controller_goal_cancel_stop_policy() -> dict[str, Any]:
@@ -1754,6 +1780,7 @@ def motion_controlled_stop_policy() -> dict[str, Any]:
 
 
 def native_runtime_profile() -> dict[str, Any]:
+    # DX-753: retain archival profile metadata for shared Draft/import validation.
     value = {
         "api_version": "manyforge.runtime_profile.v1",
         "runtime_profile_id": "manyforge.native_execution_runtime",
@@ -1835,7 +1862,7 @@ def catalog_sources(
 
     contracts = {
         (runtime_kind, target): control_contract(target, runtime_kind)
-        for runtime_kind in ("native", "ros2_control")
+        for runtime_kind in ("ros2_control",)
         for target in ("arm", "gripper")
     }
     for (runtime_kind, target), document in contracts.items():
@@ -1926,34 +1953,7 @@ def catalog_sources(
         native_gripper_capabilities,
         include_motion_controlled_stop=False,
     )
-    native_control_lifecycle_manifest, _ = lifecycle_product(
-        "manyforge.provider.native_control", native_control_lifecycle_plans()
-    )
-    native_control_manifest = native_lifecycle_provider_manifest(
-        native_control_lifecycle_manifest,
-        control_capabilities,
-        include_motion_controlled_stop=True,
-    )
-    native_control_catalog_content = {
-        "api_version": LIFECYCLE_CATALOG_API_VERSION,
-        "provider_manifest_id": native_control_manifest["provider_manifest_id"],
-        "provider_manifest_revision": native_control_manifest[
-            "provider_manifest_revision"
-        ],
-        "plans": native_control_lifecycle_plans(),
-    }
-    native_control_lifecycle_catalog = {
-        **native_control_catalog_content,
-        "catalog_digest": sha256_digest(
-            CONTENT_IDENTITY_PREFIX
-            + b"brand-lifecycle-plan-catalog\0"
-            + LIFECYCLE_CATALOG_API_VERSION.encode("ascii")
-            + b"\0"
-            + canonical_bytes(native_control_catalog_content)
-        ),
-    }
     manifests = {
-        "control": native_control_manifest,
         "planning": provider_manifest(
             "manyforge.provider.native_planning",
             planner_capabilities,
@@ -2004,6 +2004,8 @@ def catalog_sources(
     for key, policy in (
         ("stop:arm", motion_controlled_stop_policy()),
         ("stop:goal_cancel", controller_goal_cancel_stop_policy()),
+        ("stop:gripper_logical_cancel", gripper_logical_cancel_stop_policy()),
+        ("stop:gripper_position_cancel", gripper_position_cancel_stop_policy()),
     ):
         sources[key] = generated_catalog_document(
             root=root,
@@ -2135,12 +2137,6 @@ def catalog_sources(
     lifecycle_outputs = [
         (
             root
-            / "manyforge_roboplan/resources/lifecycle/native_control.lifecycle_plan_catalog.json",
-            canonical_bytes(native_control_lifecycle_catalog),
-            "build-owned generic native lifecycle plan catalog",
-        ),
-        (
-            root
             / "manyforge_xarm_control/resources/lifecycle/lite6_arm_provider.lifecycle_plan_catalog.json",
             canonical_bytes(lifecycle_catalog),
             "build-owned Lite6 lifecycle plan catalog",
@@ -2213,6 +2209,31 @@ def fault_stop_profile_row(occurrence: str, profile: dict[str, Any]) -> dict[str
     return row
 
 
+def gripper_stop_policy_key(
+    family: dict[str, Any], runtime_restoration_profile: dict[str, Any]
+) -> str:
+    if not source_joint_names(family, "fingers"):
+        raise GenerationError("arm-only model has no gripper Stop policy")
+    configuration = runtime_restoration_profile[
+        "ros2_control_runtime"
+        if "ros2_control_runtime" in runtime_restoration_profile
+        else "native_runtime"
+    ]
+    rows = [
+        row
+        for row in configuration.get("gripper_target_configurations", [])
+        if row["command_target_id"] == "gripper"
+    ]
+    if len(rows) != 1:
+        raise GenerationError("maintained model-backed gripper needs one authored row")
+    actuation_kind = rows[0]["actuation_kind"]
+    if actuation_kind == "pneumatic":
+        return "stop:gripper_logical_cancel"
+    if actuation_kind == "position_commanded":
+        return "stop:gripper_position_cancel"
+    raise GenerationError("maintained gripper has an unsupported actuation kind")
+
+
 def graph_and_applicability(
     deployment: dict[str, Any],
     family: dict[str, Any],
@@ -2267,7 +2288,6 @@ def graph_and_applicability(
     model_ref = refs[f"model:{family_id}"]
     runtime_ref = refs[f"runtime{':ros2_control' if ros2_control else ''}"]
     arm_stop_ref = refs["stop:arm"]
-    goal_cancel_stop_ref = refs["stop:goal_cancel"]
     control_ref = refs["provider:ros2_control" if ros2_control else "provider:control"]
     planning_ref = refs[
         "provider:ros2_control" if ros2_control else "provider:planning"
@@ -2291,17 +2311,18 @@ def graph_and_applicability(
         for index, _ in enumerate(source_joint_names(family, "arm_joints"))
     ]
     finger_joints = source_joint_names(family, "fingers")
+    targets = ("arm", "gripper") if finger_joints else ("arm",)
+    gripper_stop_ref = (
+        refs[gripper_stop_policy_key(family, runtime_restoration_profile)]
+        if finger_joints
+        else None
+    )
     gripper_resources = [
         {
             "resource_role_id": "fingers",
             "resource_id": f"{occurrence}.gripper.coordinate.{index:06d}",
         }
         for index, _ in enumerate(finger_joints)
-    ] or [
-        {
-            "resource_role_id": "fingers",
-            "resource_id": f"{occurrence}.gripper.logical_position",
-        }
     ]
 
     bindings: list[dict[str, Any]] = []
@@ -2313,7 +2334,9 @@ def graph_and_applicability(
         ),
         ("gripper", GRIPPER_CAPABILITIES, gripper_resources),
     ):
-        stop_ref = arm_stop_ref if target == "arm" else goal_cancel_stop_ref
+        if target not in targets:
+            continue
+        stop_ref = arm_stop_ref if target == "arm" else gripper_stop_ref
         target_control_ref = control_ref
         target_provider_instance_id = physical_provider_instance_id
         contract = refs[f"contract:{key_prefix}{target}"]
@@ -2437,14 +2460,14 @@ def graph_and_applicability(
                 ],
                 "containment_granularity": "resource",
             }
-            for target in ("arm", "gripper")
+            for target in targets
         ],
         "control_bindings": bindings,
         "component_attachments": [],
     }
 
     desired: list[dict[str, Any]] = []
-    for target in ("arm", "gripper"):
+    for target in targets:
         topology = refs[f"topology:{key_prefix}{target}"]
         selected_bindings = [
             binding for binding in bindings if binding["command_target_id"] == target
@@ -2476,6 +2499,8 @@ def graph_and_applicability(
         ("arm", ARM_CAPABILITIES),
         ("gripper", GRIPPER_CAPABILITIES),
     ):
+        if target not in targets:
+            continue
         for capability_id in capabilities:
             if CAPABILITIES[capability_id][2] != "capability_provider_binding":
                 continue
@@ -2674,11 +2699,30 @@ def stop_policy_projection(
                     "stop_evidence_policy_revision": binding[
                         "stop_evidence_policy_revision"
                     ],
-                    "stop_escalation_stage_id": "software_hard",
-                    "provider_contract_ref": software_hard_provider_contract_ref(),
+                    "stop_escalation_stage_id": (
+                        "software_hard"
+                        if binding["command_target_id"] == "arm"
+                        else "gripper_logical_cancel"
+                    ),
+                    "provider_contract_ref": (
+                        software_hard_provider_contract_ref()
+                        if binding["command_target_id"] == "arm"
+                        else gripper_logical_cancel_provider_contract_ref()
+                    ),
                     "default_contract_parameters": {},
                 }
             )
+            if (
+                binding["command_target_id"] == "gripper"
+                and binding["stop_evidence_policy_id"]
+                == "manyforge.gripper_position_cancellation"
+            ):
+                hard_parameters = copy.deepcopy(stop_stage_parameters[-1])
+                hard_parameters["stop_escalation_stage_id"] = "software_hard"
+                hard_parameters["provider_contract_ref"] = (
+                    software_hard_provider_contract_ref()
+                )
+                stop_stage_parameters.append(hard_parameters)
     stop_stage_parameters.sort(
         key=lambda row: (
             row["control_domain_id"],
@@ -2836,6 +2880,7 @@ def deployment_candidate(
     profiles: dict[str, Any],
     refs: dict[str, dict[str, str]],
     overlay_ref: dict[str, str],
+    catalog_source_rows: dict[str, tuple[Path, bytes, dict[str, str]]],
 ) -> dict[str, Any]:
     runtime_restoration_profile = runtime_profiles_by_id[
         deployment["runtime_restoration_profile_id"]
@@ -2849,6 +2894,7 @@ def deployment_candidate(
         refs,
     )
     family_id = family["model_family_id"]
+    has_gripper = bool(source_joint_names(family, "fingers"))
     catalog_keys = {
         *(
             f"capability:{capability_id}"
@@ -2856,7 +2902,10 @@ def deployment_candidate(
                 ARM_CAPABILITIES if ros2_control else NATIVE_ARM_CAPABILITIES
             )
         ),
-        *(f"capability:{capability_id}" for capability_id in GRIPPER_CAPABILITIES),
+        *(
+            f"capability:{capability_id}"
+            for capability_id in (GRIPPER_CAPABILITIES if has_gripper else ())
+        ),
         *(f"capability:{capability_id}" for capability_id in CELL_CAPABILITIES),
         *(
             f"capability:component.lifecycle.{intent}"
@@ -2866,19 +2915,25 @@ def deployment_candidate(
                 else ("disable", "enable", "observe", "prepare")
             )
         ),
-        "command_schema",
+        *(("command_schema",) if has_gripper else ()),
         f"component:{'fixed_scale:' if ros2_control else ''}{family_id}",
         f"contract:{key_prefix}arm",
-        f"contract:{key_prefix}gripper",
         f"model:{family_id}",
         "provider:logical_scene",
         ("provider:ros2_control" if ros2_control else "provider:control"),
         *([] if ros2_control else ["provider:planning"]),
         ("runtime:ros2_control" if ros2_control else "runtime"),
         "stop:arm",
-        "stop:goal_cancel",
         f"topology:{key_prefix}arm",
-        f"topology:{key_prefix}gripper",
+        *(
+            (
+                f"contract:{key_prefix}gripper",
+                gripper_stop_policy_key(family, runtime_restoration_profile),
+                f"topology:{key_prefix}gripper",
+            )
+            if has_gripper
+            else ()
+        ),
     }
     profile_id = deployment["assistant_profile_id"]
     if profile_id is not None:
@@ -2897,6 +2952,31 @@ def deployment_candidate(
                     "provider:assistant_bridge",
                 }
             )
+    # Selected reusable declarations retain their complete capability
+    # dependencies even when this occurrence has only an arm target. These
+    # are catalog definitions, not additional component targets or bindings.
+    for key in tuple(catalog_keys):
+        if key.startswith("provider:"):
+            dependency_field = "offered_capabilities"
+        elif key == "command_schema":
+            dependency_field = "compatible_capabilities"
+        else:
+            continue
+        path, payload, _reference = catalog_source_rows[key]
+        try:
+            declaration = load_strict_json_yaml_bytes(payload, source=str(path))
+        except StrictArtifactError as error:
+            raise GenerationError(f"invalid selected catalog declaration: {path}") from error
+        for dependency in declaration[dependency_field]:
+            capability_key = f"capability:{dependency['capability_id']}"
+            reference = refs.get(capability_key)
+            if (
+                reference is None
+                or reference["record_revision"]
+                != dependency["capability_definition_revision"]
+            ):
+                raise GenerationError("selected catalog capability dependency is not exact")
+            catalog_keys.add(capability_key)
     records = [refs[key] for key in catalog_keys]
     records.sort(
         key=lambda row: (
@@ -3085,6 +3165,8 @@ def _deployment_intent(
     )
     runtime_key = f"{runtime_kind}_runtime"
     runtime_configuration = copy.deepcopy(runtime_profile[runtime_key])
+    for row in runtime_configuration.get("gripper_target_configurations", []):
+        row["controllable_component_id"] = deployment["component_occurrence_id"]
     motion_limits = runtime_configuration.pop("motion_target_limits", [])
     target_settings: dict[str, dict[str, Any]] = {}
     for limit in motion_limits:
@@ -3197,6 +3279,13 @@ def _scenario_project_outputs(
     assignment: dict[str, Any],
     manyforge_version: str,
 ) -> list[tuple[Path, bytes, str]]:
+    for component in deployment_intent["components"]:
+        configuration = component["configuration"]["runtime_configuration"]
+        for row in configuration.get("gripper_target_configurations", []):
+            if row["controllable_component_id"] != component["component_id"]:
+                raise GenerationError(
+                    "maintained Scenario gripper configuration has a foreign component"
+                )
     program_draft = _program_draft(program)
     role_assignment = _role_assignment(assignment)
     content = {
@@ -3440,6 +3529,7 @@ def generate(args: argparse.Namespace) -> None:
                 profiles,
                 refs,
                 overlay_ref,
+                source_rows,
             )
             expected = sealed_deployment_bytes(
                 args.revision_tool.resolve(), candidate, temporary_root
@@ -3462,6 +3552,16 @@ def generate(args: argparse.Namespace) -> None:
     )
     for path, payload, label in outputs:
         require_or_update(path, payload, args.update, label)
+    # M1/N4 retires these exact simulator products; keep archival profile, planning and ROS outputs.
+    for relative in (
+        "manyforge_deployment/resources/maintained/catalog/provider_manifest/manyforge.provider.native_control.json",
+        "manyforge_deployment/resources/maintained/catalog/controller_topology/manyforge.native_arm_direct.json",
+        "manyforge_deployment/resources/maintained/catalog/controller_topology/manyforge.native_gripper_direct.json",
+        "manyforge_deployment/resources/maintained/catalog/control_interface_contract/manyforge.native_arm_position.json",
+        "manyforge_deployment/resources/maintained/catalog/control_interface_contract/manyforge.native_gripper_position.json",
+        "manyforge_roboplan/resources/lifecycle/native_control.lifecycle_plan_catalog.json",
+    ):
+        require_obsolete_output_absent(root / relative, update=args.update)
     for deployment in description["deployments"]:
         for assignment in deployment["program_role_assignments"]:
             require_obsolete_output_absent(

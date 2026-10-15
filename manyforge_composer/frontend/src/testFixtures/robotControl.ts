@@ -117,11 +117,12 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
       minPosition: 0,
       maxPosition: 0.04,
       targetDescriptor: {
-        schemaVersion: 'manyforge.manual_control_gripper_descriptor.v2',
+        schemaVersion: 'manyforge.manual_control_gripper_descriptor.v3',
         controllableComponentId: 'robot-a', commandTargetId: 'gripper',
         componentRoleId: 'controlled_component', targetRoleId: 'command_target',
         description: 'Test gripper', commandKind: 'gripper_position',
         actuationKind: 'position_commanded', transportKind: 'resolved_binding',
+        outputMode: 'commanded',
         controlInterfaceContractId: null, stateAuthorityId: null,
         stateAuthorityClass: null, completionPolicy: 'goal_fenced_target_reached',
         graspConfirmationPolicy: 'binding_feedback_required',

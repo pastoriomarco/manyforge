@@ -172,15 +172,29 @@ bool ControllerLifecycleExpectedEndpointDTO::locally_valid() const noexcept {
 }
 
 bool ControllerLifecycleExpectedBindingDTO::locally_valid() const noexcept {
+  if (gripper_actuation_kind && *gripper_actuation_kind != GripperActuationKind::kPositionCommanded &&
+      *gripper_actuation_kind != GripperActuationKind::kPneumatic) return false;
   return bounded_identity(control_binding_id) && bounded_identity(control_binding_revision) &&
          bounded_identity(control_interface_contract_id) &&
          bounded_identity(control_interface_revision) &&
+         logical_owner_resources.empty() &&
          (!claimed_command_interfaces.empty() || !claimed_state_interfaces.empty()) &&
          interface_set_valid(claimed_command_interfaces) &&
          interface_set_valid(claimed_state_interfaces);
 }
 
 bool ControllerLifecycleExpectedDomainDTO::locally_valid() const noexcept {
+  const bool no_physical = physical_expectation ==
+      ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone;
+  if (physical_expectation != ControllerLifecyclePhysicalExpectation::kRequired && !no_physical)
+    return false;
+  if (no_physical && (!controller_topology.controllers.empty() ||
+      !expected_controllers.empty() || !controller_topology.chain_edges.empty() ||
+      std::any_of(controller_topology.activation_sets.begin(), controller_topology.activation_sets.end(),
+          [](const auto& row) { return !row.active_controller_role_ids.empty() || !row.active_chain_edges.empty(); }) ||
+      std::any_of(controller_topology.legal_routes.begin(), controller_topology.legal_routes.end(),
+          [](const auto& row) { return !row.ordered_controller_role_ids.empty(); })))
+    return false;
   if (!bounded_identity(control_domain_id) || !bounded_identity(control_domain_revision) ||
       !bounded_identity(controller_topology_id) || !bounded_identity(topology_revision) ||
       !bounded_identity(product_id) || !bounded_identity(product_contract_id) ||
@@ -193,13 +207,13 @@ bool ControllerLifecycleExpectedDomainDTO::locally_valid() const noexcept {
       desired_configuration.control_domain_revision != control_domain_revision ||
       desired_configuration.controller_topology_id != controller_topology_id ||
       desired_configuration.topology_revision != topology_revision ||
-      desired_configuration.activation_set_id.empty() || controller_topology.controllers.empty() ||
+      desired_configuration.activation_set_id.empty() || (!no_physical && controller_topology.controllers.empty()) ||
       controller_topology.controllers.size() > kMaxControllerTopologyControllers ||
       expected_bindings.size() != desired_configuration.binding_routes.size() ||
       expected_bindings.empty() ||
       expected_bindings.size() > kMaxControllerLifecycleBindingRoutes ||
       expected_controllers.size() != controller_topology.controllers.size() ||
-      expected_controllers.empty() || expected_endpoints.empty() ||
+      (!no_physical && expected_controllers.empty()) || expected_endpoints.empty() ||
       expected_endpoints.size() > kMaxControllerLifecycleEndpoints ||
       desired_configuration.binding_routes.empty() ||
       desired_configuration.binding_routes.size() > kMaxControllerLifecycleBindingRoutes ||
@@ -211,7 +225,21 @@ bool ControllerLifecycleExpectedDomainDTO::locally_valid() const noexcept {
                    [](const auto& endpoint) { return endpoint.locally_valid(); }) ||
       !sorted_unique(expected_bindings, CanonicalControllerLifecycleExpectedBindingLess) ||
       !std::all_of(expected_bindings.begin(), expected_bindings.end(),
-                   [](const auto& binding) { return binding.locally_valid(); }) ||
+                   [no_physical](const auto& binding) {
+                     if (binding.gripper_actuation_kind &&
+                         *binding.gripper_actuation_kind != GripperActuationKind::kPositionCommanded &&
+                         *binding.gripper_actuation_kind != GripperActuationKind::kPneumatic) return false;
+                     return no_physical
+                         ? bounded_identity(binding.control_binding_id) && bounded_identity(binding.control_binding_revision) &&
+                           bounded_identity(binding.control_interface_contract_id) && bounded_identity(binding.control_interface_revision) &&
+                           binding.claimed_command_interfaces.empty() && binding.claimed_state_interfaces.empty() &&
+                           !binding.logical_owner_resources.empty() &&
+                           binding.logical_owner_resources.size() <= kMaxControllerLifecycleInterfaces &&
+                           sorted_unique(binding.logical_owner_resources, std::less<>{}) &&
+                           std::all_of(binding.logical_owner_resources.begin(), binding.logical_owner_resources.end(),
+                               [](const auto& resource) { return bounded_identity(resource); })
+                         : binding.locally_valid();
+                   }) ||
       !sorted_unique(desired_configuration.binding_routes, desired_route_less) ||
       !std::all_of(desired_configuration.binding_routes.begin(),
                    desired_configuration.binding_routes.end(), desired_route_valid)) {
@@ -248,7 +276,7 @@ bool ControllerLifecycleExpectedDomainDTO::locally_valid() const noexcept {
       selected_activation = &activation;
     }
   }
-  if (selected_activation == nullptr || selected_activation->active_controller_role_ids.empty()) {
+  if (selected_activation == nullptr || (!no_physical && selected_activation->active_controller_role_ids.empty())) {
     return false;
   }
 
@@ -338,7 +366,9 @@ Result<ControllerLifecycleExpectedDomain> verify_controller_lifecycle_expected_d
 }
 
 bool ControllerLifecycleObservationQueryDTO::locally_valid() const noexcept {
-  return bounded_identity(control_domain_id) && bounded_identity(control_domain_revision) &&
+  return (physical_expectation == ControllerLifecyclePhysicalExpectation::kRequired ||
+          physical_expectation == ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone) &&
+         bounded_identity(control_domain_id) && bounded_identity(control_domain_revision) &&
          bounded_identity(controller_topology_id) && bounded_identity(topology_revision) &&
          bounded_identity(product_id) && bounded_identity(product_contract_id) &&
          bounded_identity(product_contract_revision) && bounded_identity(control_artifact_digest) &&
@@ -360,6 +390,7 @@ ControllerLifecycleObservationQueryDTO MakeControllerLifecycleObservationQuery(
       expected.source_conformance_digest,
       expected.source_runtime_unit_id,
       expected.source_runtime_epoch,
+      expected.physical_expectation,
   };
 }
 
@@ -367,7 +398,9 @@ bool ControllerLifecycleObservationDTO::locally_valid() const noexcept {
   return query.locally_valid() && source_sequence != 0U && observed_at_ns >= 0 &&
          received_at_ns >= observed_at_ns && valid_until_ns > received_at_ns &&
          (!active_configuration.has_value() || active_configuration->locally_valid()) &&
-         !controllers.empty() && controllers.size() <= kMaxControllerTopologyControllers &&
+         (query.physical_expectation == ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone
+              ? controllers.empty() && active_chain_edges.empty() : !controllers.empty()) &&
+         controllers.size() <= kMaxControllerTopologyControllers &&
          sorted_unique(controllers, observed_controller_less) &&
          std::all_of(controllers.begin(), controllers.end(),
                      [](const auto& controller) { return controller.locally_valid(); }) &&
@@ -408,13 +441,18 @@ bool ControllerLifecycleTransitionPlanDTO::locally_valid() const noexcept {
       !controller_roles_valid(observed_active_controller_role_ids, true) ||
       !edge_refs_valid(observed_active_chain_edges) ||
       !bounded_identity(desired_activation_set_id) ||
-      !controller_roles_valid(desired_active_controller_role_ids, false) ||
+      !controller_roles_valid(desired_active_controller_role_ids,
+          query.physical_expectation == ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone) ||
       !edge_refs_valid(desired_active_chain_edges) ||
       steps.size() > kMaxControllerLifecycleTransitionSteps ||
       !std::all_of(steps.begin(), steps.end(),
                    [](const auto& step) { return step.locally_valid(); })) {
     return false;
   }
+  if (query.physical_expectation == ControllerLifecyclePhysicalExpectation::kNotApplicablePneumaticNone &&
+      (!observed_active_controller_role_ids.empty() || !observed_active_chain_edges.empty() ||
+       !desired_active_controller_role_ids.empty() || !desired_active_chain_edges.empty() || !steps.empty()))
+    return false;
   bool saw_activation = false;
   for (const auto& step : steps) {
     if (step.kind == ControllerLifecycleTransitionKindDTO::kActivate) {
@@ -427,7 +465,8 @@ bool ControllerLifecycleTransitionPlanDTO::locally_valid() const noexcept {
 }
 
 bool ControllerLifecycleTransitionIntentDTO::locally_valid() const noexcept {
-  return query.locally_valid() && expected_source_sequence != 0U &&
+  return query.physical_expectation == ControllerLifecyclePhysicalExpectation::kRequired &&
+         query.locally_valid() && expected_source_sequence != 0U &&
          step_index < kMaxControllerLifecycleTransitionSteps && step.locally_valid() &&
          remaining_duration_ns > 0;
 }

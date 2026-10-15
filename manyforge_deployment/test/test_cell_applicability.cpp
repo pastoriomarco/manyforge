@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "proof_root_transfer_test.hpp"
+#include "lite6_controllable_retention_fixture.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -4518,3 +4519,135 @@ TEST(CellApplicability,
 
 }  // namespace
 }  // namespace manyforge::deployment
+
+namespace manyforge::deployment {
+namespace {
+
+void rewrite_authored_gripper_row(CanonicalValue::Object &graph,
+                                 std::string_view field,
+                                 const CanonicalValue &replacement) {
+  for (auto &[name, value] : graph) {
+    if (name != "runtime_units") continue;
+    auto units = value.as_array();
+    for (auto &unit : units) {
+      auto members = unit.as_object();
+      for (auto &[unit_name, unit_value] : members) {
+        if (unit_name != "configuration") continue;
+        auto configuration = unit_value.as_object();
+        for (auto &[config_name, config_value] : configuration) {
+          if (config_name != "gripper_target_configurations") continue;
+          auto rows = config_value.as_array();
+          for (auto &row : rows) {
+            auto fields = row.as_object();
+            for (auto &[row_name, row_value] : fields)
+              if (row_name == field) row_value = replacement;
+            row = CanonicalValue(std::move(fields));
+          }
+          config_value = CanonicalValue(std::move(rows));
+        }
+        unit_value = CanonicalValue(std::move(configuration));
+      }
+      unit = CanonicalValue(std::move(members));
+    }
+    value = CanonicalValue(std::move(units));
+  }
+}
+
+TEST(CellApplicability, TypedRosGripperActuationSelectsOnlyTheApprovedFloorAndEvidence) {
+  for (const std::string_view kind : {"pneumatic", "position_commanded"}) {
+    const auto fixture = test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+        {}, kind, kind == "pneumatic" ? 0.0 : 0.8);
+    const auto &plans = fixture.qualified.compiler_ir().applicability().stop_applicability();
+    ASSERT_EQ(plans.size(), 1U);
+    const auto &plan = std::get<LogicalStoppableApplicabilityTemplate>(plans.front());
+    const bool position = kind == "position_commanded";
+    EXPECT_EQ(plan.stop_evidence_policy_id.value(), position
+                  ? "manyforge.gripper_position_cancellation"
+                  : "manyforge.gripper_logical_cancellation");
+    ASSERT_EQ(plan.escalation_stages.size(), position ? 2U : 1U);
+    EXPECT_EQ(std::count_if(plan.escalation_stages.begin(), plan.escalation_stages.end(),
+                           [](const auto &stage) {
+                             return stage.stage_kind == core::StopEscalationStageKind::kSoftwareHard;
+                           }), position ? 1 : 0);
+    for (const auto &stage : plan.escalation_stages) {
+      ASSERT_EQ(stage.all_of_evidence_requirements.size(), 1U);
+      const auto &evidence = stage.all_of_evidence_requirements.front();
+      EXPECT_EQ(evidence.evidence_kind,
+                core::StopEvidenceRequirementKind::kLogicalCancellationNoContinuingEffect);
+      EXPECT_EQ(evidence.source_requirement.source_kind,
+                core::StopEvidenceSourceKind::kCommandTargetStatus);
+      EXPECT_EQ(evidence.observation_semantics.observation_kind, core::StopEvidenceObservationKind::kCommandResult);
+      EXPECT_TRUE(stage.provider_evidence_endpoints.empty());
+      EXPECT_FALSE(stage.provider_command_endpoint.has_value());
+    }
+    if (position) {
+      EXPECT_EQ(plan.escalation_stages.back().containment_command.command_kind,
+                core::StopContainmentCommandKind::kRegistered);
+      EXPECT_EQ(plan.escalation_stages.back().containment_command.registered_command_kind_id,
+                std::optional<core::RegisteredStopCommandKindId>(
+                    core::RegisteredStopCommandKindId("manyforge.stop.software_hard")));
+    }
+  }
+}
+
+TEST(CellApplicability, TypedRosGripperRejectsAFalsePositionFloorAndForeignConfiguration) {
+  const auto position_without_floor = +[](CanonicalValue::Object &graph) {
+    rewrite_authored_gripper_row(graph, "actuation_kind", CanonicalValue("position_commanded"));
+  };
+  try {
+    (void)test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+        {}, "pneumatic", 0.8, position_without_floor);
+    FAIL() << "position-commanded gripper accepted a nominal-only policy";
+  } catch (const CellApplicabilityError &error) {
+    EXPECT_NE(std::string(error.what()).find("exactly one distinct software-hard floor"),
+              std::string::npos);
+  }
+  const auto pneumatic_with_floor = +[](CanonicalValue::Object &graph) {
+    rewrite_authored_gripper_row(graph, "actuation_kind",
+                                 CanonicalValue("pneumatic"));
+  };
+  try {
+    (void)test::
+        make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+            {}, "position_commanded", 0.8, pneumatic_with_floor);
+    FAIL() << "pneumatic gripper accepted a software-hard floor";
+  } catch (const CellApplicabilityError &error) {
+    EXPECT_NE(std::string(error.what())
+                  .find("must not contain a software-hard floor"),
+              std::string::npos);
+  }
+  const auto foreign_target = +[](CanonicalValue::Object &graph) {
+    rewrite_authored_gripper_row(graph, "command_target_id", CanonicalValue("foreign_gripper"));
+  };
+  EXPECT_THROW((void)test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+                   {}, "pneumatic", 0.8, foreign_target), CellApplicabilityError);
+  const auto missing_row = +[](CanonicalValue::Object &graph) {
+    for (auto &[name, value] : graph) {
+      if (name != "runtime_units") continue;
+      auto units = value.as_array();
+      for (auto &unit : units) {
+        auto members = unit.as_object();
+        for (auto &[unit_name, unit_value] : members) {
+          if (unit_name != "configuration") continue;
+          auto configuration = unit_value.as_object();
+          for (auto &[field, item] : configuration)
+            if (field == "gripper_target_configurations")
+              item = CanonicalValue(CanonicalValue::Array{});
+          unit_value = CanonicalValue(std::move(configuration));
+        }
+        unit = CanonicalValue(std::move(members));
+      }
+      value = CanonicalValue(std::move(units));
+    }
+  };
+  EXPECT_THROW((void)test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+                   {}, "pneumatic", 0.8, missing_row), CellApplicabilityError);
+  const auto unknown_kind = +[](CanonicalValue::Object &graph) {
+    rewrite_authored_gripper_row(graph, "actuation_kind", CanonicalValue("unknown"));
+  };
+  EXPECT_THROW((void)test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+                   {}, "pneumatic", 0.8, unknown_kind), CellGraphCodecError);
+}
+
+} // namespace
+} // namespace manyforge::deployment

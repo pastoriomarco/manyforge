@@ -956,7 +956,9 @@ struct StopStaticFacts final {
 }
 
 [[nodiscard]] inline Result<GripperCommandRequestDTO> build_command_request(
-    const CapabilityCommandIntentDTO& command, const RuntimeParticipantBindingDTO& binding) {
+    const CapabilityCommandIntentDTO& command, const RuntimeParticipantBindingDTO& binding,
+    GripperActuationKind actuation = GripperActuationKind::kPositionCommanded,
+    GripperOutputMode output = GripperOutputMode::kCommanded) {
   if (binding.model_groups.size() > 1U || binding.resources.size() != 1U) {
     return reject<GripperCommandRequestDTO>(
         "the retained I6 gripper mechanism requires one exact command resource",
@@ -1020,8 +1022,11 @@ struct StopStaticFacts final {
   request.commanded_state = "position";
   request.actuation_kind = kind == CoordinateKind::kAngular ? "angular" : "linear";
   request.state_authority = binding.control_path->state_authority_id.value();
-  request.completion_policy = "goal_fenced_target_reached";
-  request.grasp_confirmation_policy = "binding_feedback_required";
+  request.completion_policy = actuation == GripperActuationKind::kPneumatic
+                                  ? (output == GripperOutputMode::kNone ? "no_output" : "output_delivery")
+                                  : "goal_fenced_target_reached";
+  request.grasp_confirmation_policy = actuation == GripperActuationKind::kPneumatic
+                                         ? "not_required" : "binding_feedback_required";
   request.transport_kind = "resolved_binding";
   request.evidence = {"command_terminal"};
   request.evidence_state = "required_pending";
@@ -1519,6 +1524,39 @@ struct ActiveOperationParticipant final {
     bool settlement_in_flight{};
   };
   std::optional<DeferredPreDispatchCancelSettlement> deferred_cancel_settlement{};
+  GripperActuationKind gripper_actuation{GripperActuationKind::kPositionCommanded};
+
+  // Set only by actual selected moving containment, including partial Stops.
+  bool stop_containment_owned{};
+  // Authority is the exact returned engine session's irreversible precommit
+  // cancellation, independently of the earlier historical Kernel release.
+  bool prepared_engine_no_effect_confirmed{};
+
+  [[nodiscard]] bool non_motion_transaction() const noexcept {
+    return payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
+           gripper_actuation == GripperActuationKind::kPneumatic &&
+           stop_readiness.value().resolved_stop_base_plan.gripper_actuation_kind ==
+               GripperActuationKind::kPneumatic;
+  }
+  [[nodiscard]] bool stop_owns_reconciliation() const noexcept {
+    return stop_containment_owned;
+  }
+
+  [[nodiscard]] bool finishes_current_gripper_transaction() const noexcept {
+    return payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
+           gripper_actuation == GripperActuationKind::kPneumatic &&
+           !stop_cancelled_pre_dispatch;
+  }
+
+  [[nodiscard]] bool permanent_preparation_no_effect() const noexcept {
+    const bool never_prepared = preparation_id == 0U && subordinate_id == 0U &&
+                                !prepared_dispatch_released;
+    return non_motion_transaction() && stop_cancelled_pre_dispatch && subordinate_generation == 0U &&
+           slot_state == ResourceSlotState::kTerminal && !dispatch_effect_in_flight &&
+           !prepare_in_flight && !prepared_advance_in_flight && !reconciliation_in_flight &&
+           !deferred_cancel_settlement && !deferred_stop_settlement &&
+           (never_prepared || prepared_engine_no_effect_confirmed);
+  }
 
   /// A Prepare call, prepared read or deferred pre-dispatch cancellation
   /// (Q60) still borrows this participant's engine.
@@ -1537,6 +1575,18 @@ struct ActiveOperationParticipant final {
     resources.insert(participant.resources.begin(), participant.resources.end());
   }
   return {resources.begin(), resources.end()};
+}
+
+// Strict M1 authority shared by already resolved admission/manual checks.
+// An authored payload/capability alone never grants the Stop-only exception.
+[[nodiscard]] inline bool non_motion_registration(
+    const RuntimeParticipantExecutionRegistration& registration) {
+  return registration.binding.value().capability_id.value() == "tool.gripper.command" &&
+      registration.engine && registration.stop_readiness &&
+      registration.stop_readiness->value().resolved_stop_base_plan.gripper_actuation_kind ==
+          GripperActuationKind::kPneumatic &&
+      registration.engine->gripper_actuation_kind(
+          registration.binding.value().command_target_id.value()) == GripperActuationKind::kPneumatic;
 }
 
 /// The motion-producing recovery actions gated by operator-alarm attention
@@ -1599,6 +1649,50 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
         state.active_stop_generation == settled_stop->generation)
       return settled_stop->result;
     return std::nullopt;
+  }
+
+  [[nodiscard]] bool cancelled_pneumatic_preparation_shape() const noexcept {
+    if (state.state != OperationStateKind::kCancelledPreDispatch || state.participants.empty() ||
+        state.participants.size() != participants.size()) return false;
+    for (std::size_t index = 0U; index < participants.size(); ++index)
+      if (!participants[index].non_motion_transaction() ||
+          state.participants[index].state != OperationStateKind::kCancelledPreDispatch ||
+          state.participants[index].payload_kind != OperationParticipantPayloadKind::kCapabilityCommand ||
+          state.participants[index].terminal_error) return false;
+    return true;
+  }
+  [[nodiscard]] bool permanent_preparation_no_effect() const noexcept {
+    if (!cancelled_pneumatic_preparation_shape() || pending_control || recovery_effect_in_flight ||
+        coordinated_cancellation_in_flight || stop_effect_in_flight || runtime_scale_effect_in_flight)
+      return false;
+    return std::all_of(participants.begin(), participants.end(), [](const auto& row) {
+      return row.permanent_preparation_no_effect();
+    });
+  }
+
+  [[nodiscard]] bool ordinary_pneumatic_acknowledgement() const noexcept {
+    return !participants.empty() &&
+        std::all_of(participants.begin(), participants.end(), [](const auto& row) {
+          return row.non_motion_transaction() && !row.stop_owns_reconciliation();
+        });
+  }
+
+  /// DX778: only exact typed pneumatic Failures may be consumed without Reset.
+  [[nodiscard]] bool pneumatic_final_failure() const noexcept {
+    if (state.state != OperationStateKind::kFailed || state.participants.empty() ||
+        state.participants.size() != participants.size()) return false;
+    bool failed = false;
+    for (std::size_t index = 0; index < participants.size(); ++index) {
+      const auto& row = state.participants[index];
+      if (row.state == OperationStateKind::kCompleted) continue;
+      if (row.state != OperationStateKind::kFailed ||
+          !participants[index].finishes_current_gripper_transaction() ||
+          !row.terminal_error ||
+          !row.terminal_error->details.contains("pneumatic_transaction_final") ||
+          row.terminal_error->details.at("pneumatic_transaction_final") != "true") return false;
+      failed = true;
+    }
+    return failed;
   }
 
   [[nodiscard]] bool stop_allows_retirement() const noexcept {
@@ -1732,13 +1826,27 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
     return !participants.empty() &&
            std::all_of(participants.begin(), participants.end(), [&](const auto& participant) {
              return participant.state == OperationStateKind::kCompleted ||
-                    participant.state == state;
+                    participant.state == state ||
+                    (participant.state == OperationStateKind::kFailed &&
+                     participant.terminal_error &&
+                     participant.terminal_error->details.contains("pneumatic_transaction_final") &&
+                     participant.terminal_error->details.at("pneumatic_transaction_final") == "true");
            });
   };
+  const auto final_pneumatic_failure = [](const auto& row) {
+    return row.state == OperationStateKind::kFailed && row.terminal_error &&
+           row.terminal_error->details.contains("pneumatic_transaction_final") &&
+           row.terminal_error->details.at("pneumatic_transaction_final") == "true";
+  };
   if (any_state(OperationStateKind::kInterventionRequired) ||
-      any_state(OperationStateKind::kFailed) || any_state(OperationStateKind::kInterrupted)) {
-    return OperationStateKind::kInterventionRequired;
-  }
+      any_state(OperationStateKind::kInterrupted) ||
+      std::any_of(participants.begin(), participants.end(), [&](const auto& row) {
+        return row.state == OperationStateKind::kFailed && !final_pneumatic_failure(row);
+      })) return OperationStateKind::kInterventionRequired;
+  if (any_state(OperationStateKind::kFailed) &&
+      std::all_of(participants.begin(), participants.end(), [&](const auto& row) {
+        return row.state == OperationStateKind::kCompleted || final_pneumatic_failure(row);
+      })) return OperationStateKind::kFailed;
   if (all_state(OperationStateKind::kCompleted)) {
     return OperationStateKind::kCompleted;
   }
@@ -1902,6 +2010,12 @@ enum class InternalStopKind : std::uint8_t { kNone, kReset, kZeroSpeedHold };
   std::vector<OperationControlEffectRequest> requests;
   requests.reserve(participants.size());
   for (const auto& participant : participants) {
+    if (participant.non_motion_transaction() && participant.stop_cancelled_pre_dispatch) {
+      if (participant.permanent_preparation_no_effect()) continue;
+      return reject<std::vector<OperationControlEffectRequest>>(
+          "cancelled command still lacks permanent returned-owner no-effect proof",
+          "operation_effect_in_flight", ErrorCode::kInvalidStateTransition);
+    }
     // A prepared motion already owns process-local ExecutionKernel state even
     // when Stop cancels it before controller dispatch. The Stop transaction
     // has certified that no effect crossed the barrier, so Reset must retire
@@ -2016,6 +2130,7 @@ struct StopParticipantWork final {
   /// cancellation was accepted but before that cancellation's terminal
   /// returned. Its exact settlement is deferred to that terminal.
   bool cancel_terminal_deferred{};
+  GripperActuationKind gripper_actuation{GripperActuationKind::kPositionCommanded};
 
   /// No subordinate terminal handoff exists for a never-dispatched participant
   /// that either never received an execution identity or whose preparation
