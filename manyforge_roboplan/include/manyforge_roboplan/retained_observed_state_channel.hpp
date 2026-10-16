@@ -242,8 +242,9 @@ public:
   RetainedObservedStateChannel &
   operator=(const RetainedObservedStateChannel &) = delete;
 
-  /// Seed this channel from the exact retained scene state. This is the only
-  /// supported native bootstrap path; callers cannot supply unnamed vectors.
+  /// Seed this channel from the exact retained backend model state. Commanded
+  /// simulation uses the same initialization publication and callback cutoff
+  /// as an explicit backend-owned initial pose.
   [[nodiscard]] RetainedStateProjectionResult
   initialize_from_projection(std::int64_t timestamp_ns);
 
@@ -280,6 +281,14 @@ public:
                       std::int64_t received_timestamp_ns,
                       RetainedStateProjectionMode mode =
                           RetainedStateProjectionMode::kBlocking) override;
+
+  /// Explicit simulator backend initialization. Publishes the chosen commanded
+  /// pose and projects it through the existing model; delayed predecessor JTC
+  /// samples cannot replace it. This does not alter measured observation.
+  [[nodiscard]] RetainedStateProjectionResult
+  publish_commanded_initialization_and_project(std::span<const double> positions_si,
+                                               std::span<const double> velocities_si,
+                                               std::int64_t initialized_at_ns);
 
   [[nodiscard]] RetainedStateProjectionResult
   publish_state(std::span<const double> positions_si,
@@ -391,6 +400,12 @@ private:
   core::AddressedObservedStatePublication publication_;
   core::ObservedStateQueryContextDTO projection_context_;
   mutable std::mutex route_rebind_mutex_;
+  // Original adapter sample receipt stamps, not callback delivery/restamp time.
+  // Retained across route changes and model replacement under the same owner.
+  std::optional<std::int64_t> minimum_adapter_source_stamp_;
+  [[nodiscard]] RetainedStateProjectionResult publish_state_locked(
+      std::span<const double> positions_si, std::span<const double> velocities_si,
+      std::int64_t source_timestamp_ns, std::int64_t received_timestamp_ns);
   mutable std::mutex fresh_state_mutex_;
   mutable std::condition_variable fresh_state_cv_;
   std::atomic<bool> fresh_state_required_{};

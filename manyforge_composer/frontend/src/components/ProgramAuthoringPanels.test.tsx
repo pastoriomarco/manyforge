@@ -284,6 +284,8 @@ describe('Program authoring panels', () => {
       .toEqual(new Set(['control_flow', 'logic']));
     expect(markup).toContain('aria-label="Expand Control Flow nodes"');
     expect(markup).not.toContain('node-palette-row');
+    // Every category is collapsed here, so the header offers Expand all.
+    expect(markup).toContain('aria-label="Expand all node categories"');
 
     const unavailableItem = renderToStaticMarkup(
       <NodePaletteItem
@@ -907,6 +909,12 @@ describe('Program authoring panels', () => {
       acceptedApply: null,
       mutationUnavailableReason: null,
       documentUnavailableReason: null,
+      scenarioReplacementIdentity: null,
+      scenarioCloseSceneHandoff: vi.fn(() => ({ status: 'ready' as const, message: null, objectId: null, progress: { ownerId: 'scene', ownerEpoch: 'scene.1', expected: { retained_bundle_id: 'empty', graph_revision: 'empty', scene_revision: { scene_id: 'scene', revision_id: 1, content_hash: 'scene' } }, predecessor: null, remaining: [], removed: 0, admissionGeneration: null } })),
+      removeClosedSceneObject: vi.fn(),
+      reportCloseCancellation: vi.fn(),
+      clearClosedScenario: vi.fn(async () => null),
+      scenarioCloseHandoff: vi.fn(() => ({ status: 'waiting' as const, message: null })),
       admissionObserved: true,
       fenceDraft: null,
       refreshApplied: vi.fn(),
@@ -971,6 +979,7 @@ describe('Program authoring panels', () => {
       scenarioDocument: { id: null, name: null, description: null },
       scenarioSourceDiagnostics: [],
       updateNodePolicies: vi.fn(),
+      updateNodePresentation: vi.fn(),
       clearFeedback: vi.fn(),
     } satisfies ProgramWorkspaceController;
     const runtime = {
@@ -990,12 +999,18 @@ describe('Program authoring panels', () => {
       },
       cycleState: null,
       cycleFailure: null,
+      resetRobotPositionAvailability: { available: true, reason: null },
       active: false,
       commandAllowed: vi.fn(() => false),
       commandDisabledReason: vi.fn(() => null),
       draftUnappliedReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
+      activationOffer: null,
+      activationPending: false,
+      activationWaiting: false,
+      confirmActivationExecute: vi.fn(async () => {}),
+      cancelActivationExecute: vi.fn(),
       run: vi.fn(),
       stopMotion: vi.fn(),
       startMotion: vi.fn(),
@@ -1125,6 +1140,12 @@ describe('Program authoring panels', () => {
       acceptedApply: null,
       mutationUnavailableReason: null,
       documentUnavailableReason: null,
+      scenarioReplacementIdentity: null,
+      scenarioCloseSceneHandoff: vi.fn(() => ({ status: 'ready' as const, message: null, objectId: null, progress: { ownerId: 'scene', ownerEpoch: 'scene.1', expected: { retained_bundle_id: 'empty', graph_revision: 'empty', scene_revision: { scene_id: 'scene', revision_id: 1, content_hash: 'scene' } }, predecessor: null, remaining: [], removed: 0, admissionGeneration: null } })),
+      removeClosedSceneObject: vi.fn(),
+      reportCloseCancellation: vi.fn(),
+      clearClosedScenario: vi.fn(async () => null),
+      scenarioCloseHandoff: vi.fn(() => ({ status: 'waiting' as const, message: null })),
       admissionObserved: true,
       fenceDraft: null,
       refreshApplied: vi.fn(),
@@ -1153,6 +1174,7 @@ describe('Program authoring panels', () => {
       scenarioDocument: { id: null, name: null, description: null },
       scenarioSourceDiagnostics: [],
       updateNodePolicies: vi.fn(),
+      updateNodePresentation: vi.fn(),
       clearFeedback: vi.fn(),
     } satisfies ProgramWorkspaceController;
     const runtime = {
@@ -1172,12 +1194,18 @@ describe('Program authoring panels', () => {
       },
       cycleState: 'idle_after_reset',
       cycleFailure: null,
+      resetRobotPositionAvailability: { available: true, reason: null },
       active: false,
       commandAllowed: vi.fn(() => false),
       commandDisabledReason: vi.fn(() => null),
       draftUnappliedReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
+      activationOffer: null,
+      activationPending: false,
+      activationWaiting: false,
+      confirmActivationExecute: vi.fn(async () => {}),
+      cancelActivationExecute: vi.fn(),
       run: vi.fn(),
       stopMotion: vi.fn(),
       startMotion: vi.fn(),

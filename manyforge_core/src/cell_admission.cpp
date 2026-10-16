@@ -24,6 +24,10 @@ template <typename Value>
   return content_identity::is_sha256_digest(value.value());
 }
 
+[[nodiscard]] bool ResetCallerIdentity(std::string_view value) noexcept {
+  return !value.empty() && value.size() <= kMaximumProgramResetCallerIdentityBytes;
+}
+
 [[nodiscard]] std::size_t BinaryString(std::string_view value) {
   return sizeof(std::uint64_t) + value.size();
 }
@@ -115,6 +119,7 @@ constexpr std::size_t kJsonStructuralAllowanceBytes = 16U * 1024U;
                                     CellAdmissionOwnerRoleDTO role) noexcept {
   switch (kind) {
     case CellAdmissionClaimKindDTO::kProgramCycle:
+    case CellAdmissionClaimKindDTO::kProgramReset:
       return role == CellAdmissionOwnerRoleDTO::kProgramRunner;
     case CellAdmissionClaimKindDTO::kAuthoringMutation:
       return role == CellAdmissionOwnerRoleDTO::kAuthoringOwner;
@@ -162,6 +167,8 @@ std::string_view to_string(CellAdmissionClaimKindDTO value) noexcept {
   switch (value) {
     case CellAdmissionClaimKindDTO::kProgramCycle:
       return "program_cycle";
+    case CellAdmissionClaimKindDTO::kProgramReset:
+      return "program_reset";
     case CellAdmissionClaimKindDTO::kAuthoringMutation:
       return "authoring_mutation";
     case CellAdmissionClaimKindDTO::kManagerApply:
@@ -308,6 +315,12 @@ Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO&
   auto scope = ValidateCellAdmissionScope(intent.scope);
   if (!scope.ok()) {
     return scope;
+  }
+  if (intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset &&
+      (!intent.scope.resources.empty() || !intent.scope.configurations.empty() ||
+       intent.program_cycle_evidence || intent.intervention_evidence ||
+       intent.program_node_evidence)) {
+    return Invalid<void>("program_reset_claim_shape_invalid");
   }
   const bool intervention = intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery;
   const bool held_manual = intent.claim_kind == CellAdmissionClaimKindDTO::kManualOperation &&
@@ -635,6 +648,23 @@ Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
   const bool recovery =
       status.state == ProgramCycleStateDTO::kInterventionOrRecovery ||
       status.state == ProgramCycleStateDTO::kRecoveryRequired;
+  if (status.accepted_reset) {
+    const auto& reset = *status.accepted_reset;
+    if ((status.state != ProgramCycleStateDTO::kResetting && !recovery) ||
+        !ResetCallerIdentity(reset.request_owner_epoch.value()) ||
+        !ResetCallerIdentity(reset.request_id.value()) || !Digest(reset.request_payload_digest) ||
+        (reset.reset_claim_generation &&
+         (!reset.reset_claim_generation->nonzero() ||
+          reset.reset_claim_generation->value() > kMaximumSafeCounter ||
+          status.cycle_claim_generation.has_value())) ||
+        (!status.program_run_id &&
+         ((!reset.reload_initial_scene && !reset.reset_robot_position) ||
+          status.cycle_claim_generation || status.terminal_or_settlement_reference))) {
+      return Invalid<void>("program_cycle_accepted_reset_invalid");
+    }
+  }
+  const bool reset_claim = status.state == ProgramCycleStateDTO::kResetting &&
+                          !status.program_run_id && status.accepted_reset;
   const bool pending_acquire =
       (status.state == ProgramCycleStateDTO::kStarting ||
        status.state == ProgramCycleStateDTO::kStopping ||
@@ -646,7 +676,7 @@ Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
                 status.cycle_claim_generation.has_value() ||
                 status.terminal_or_settlement_reference.has_value())) ||
       (!idle &&
-       ((!recovery && (!status.program_run_id.has_value() ||
+       ((!recovery && !reset_claim && (!status.program_run_id.has_value() ||
                        status.program_run_id->empty())) ||
         (status.cycle_claim_generation.has_value() &&
          (!status.program_run_id.has_value() ||
@@ -664,14 +694,71 @@ Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
   return Result<void>::Ok();
 }
 
+Result<RequestId> ProgramResetClaimRequestId(const ProgramCycleStatusDTO& status) {
+  if (!ValidateProgramCycleStatus(status).ok() || !status.accepted_reset ||
+      status.cycle_claim_generation) {
+    return Invalid<RequestId>("program_reset_claim_context_invalid");
+  }
+  const auto& reset = *status.accepted_reset;
+  const auto encoded = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"cycle_generation", CanonicalValue(static_cast<double>(status.cycle_generation))},
+      {"request_owner_epoch", CanonicalValue(reset.request_owner_epoch.value())},
+      {"request_id", CanonicalValue(reset.request_id.value())},
+      {"request_payload_digest", CanonicalValue(reset.request_payload_digest.value())},
+  }));
+  return Result<RequestId>::Ok(RequestId(
+      "program-reset." + content_identity::sha256_digest(encoded).substr(7U)));
+}
+
 Result<void> ValidateProgramResetSceneAuthorization(
     const ProgramResetSceneAuthorizationDTO& authorization) {
+  if (authorization.reset_claim) {
+    const auto& reset = *authorization.reset_claim;
+    if (!BoundedIdentity(authorization.program_runner_owner_epoch.value()) ||
+        !authorization.program_run_id.empty() || authorization.cycle_claim_generation.nonzero() ||
+        !authorization.terminal_or_settlement_reference.empty() ||
+        reset.cycle_generation == 0U || reset.cycle_generation > kMaximumSafeCounter ||
+        !ResetCallerIdentity(reset.request_owner_epoch.value()) ||
+        !ResetCallerIdentity(reset.request_id.value()) || !Digest(reset.request_payload_digest) ||
+        !reset.reset_claim_generation.nonzero() ||
+        reset.reset_claim_generation.value() > kMaximumSafeCounter) {
+      return Invalid<void>("program_reset_scene_authorization_invalid");
+    }
+    return Result<void>::Ok();
+  }
   if (!BoundedIdentity(authorization.program_runner_owner_epoch.value()) ||
       !BoundedIdentity(authorization.program_run_id.value()) ||
       !authorization.cycle_claim_generation.nonzero() ||
       authorization.cycle_claim_generation.value() > kMaximumSafeCounter ||
       !Digest(authorization.terminal_or_settlement_reference)) {
     return Invalid<void>("program_reset_scene_authorization_invalid");
+  }
+  return Result<void>::Ok();
+}
+
+Result<void> ValidateProgramResetPositionAuthorization(
+    const ProgramResetPositionAuthorizationDTO& authorization) {
+  const auto counter = [](const auto& value) {
+    return value && value->nonzero() && value->value() <= kMaximumSafeCounter;
+  };
+  if (!BoundedIdentity(authorization.program_runner_owner_epoch.value()) ||
+      authorization.cycle_generation == 0U || authorization.cycle_generation > kMaximumSafeCounter ||
+      !ResetCallerIdentity(authorization.request_owner_epoch.value()) ||
+      !ResetCallerIdentity(authorization.request_id.value()) ||
+      !Digest(authorization.request_payload_digest) ||
+      (authorization.reset_claim_generation
+          ? (!counter(authorization.reset_claim_generation) || authorization.cycle_claim_generation ||
+             (authorization.program_run_id
+                 ? (!BoundedIdentity(authorization.program_run_id->value()) ||
+                    !authorization.terminal_or_settlement_reference ||
+                    !Digest(*authorization.terminal_or_settlement_reference))
+                 : authorization.terminal_or_settlement_reference.has_value()))
+          : (!authorization.program_run_id ||
+             !BoundedIdentity(authorization.program_run_id->value()) ||
+             !counter(authorization.cycle_claim_generation) ||
+             !authorization.terminal_or_settlement_reference ||
+             !Digest(*authorization.terminal_or_settlement_reference)))) {
+    return Invalid<void>("program_reset_position_authorization_invalid");
   }
   return Result<void>::Ok();
 }

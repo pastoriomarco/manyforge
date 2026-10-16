@@ -453,9 +453,25 @@
   width: min(34rem, calc(100vw - 2rem));
 }
 
+/* The card panel fills the dialog body edge to edge, so its cards keep the same
+   0.75rem inset as the dialog title on every side. */
+.overlay-panel-body:has(> .new-scenario-dialog) {
+  padding: 0;
+}
+
 .new-scenario-dialog {
-  margin: -0.25rem;
-  border-radius: var(--mf-radius-md);
+  margin: 0;
+  padding: 0.75rem;
+  border-radius: 0;
+}
+
+/* Replacement progress under the cards keeps their inset. */
+.scenario-replacement-status {
+  margin: 0;
+  padding: 0 0.75rem 0.75rem;
+  color: var(--mf-text-neutral-73);
+  font-size: var(--mf-font-size-076);
+  line-height: 1.5;
 }
 
 .new-scenario-intro,
@@ -583,4 +599,16 @@
 .folder-picker-list > p {
   margin: 0;
   font-size: var(--mf-font-size-072);
+}
+
+/* Load and Save As reuse the New Scenario card layout; the directory row keeps
+   its Refresh button at field height. */
+.scenario-document-dialog .scenario-directory-row > button {
+  min-height: 1.8rem;
+  padding: 0.15rem 0.7rem;
+  font-size: var(--mf-font-size-072);
+}
+
+.scenario-document-dialog .scenario-save-mode {
+  justify-self: start;
 }

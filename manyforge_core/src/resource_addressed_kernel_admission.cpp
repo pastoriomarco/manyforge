@@ -49,15 +49,24 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmis
         "manual claims are minted only by exact Kernel operation admission",
         "manual_operation_claim_requires_execute", ErrorCode::kInvalidRequest);
   }
-  // A lifecycle claim is a whole-cell configuration mutation. Serialize the
+  std::optional<KernelCellAdmissionOwner::PreparedProgramResetStatus> reset_proof;
+  if (intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset) {
+    auto prepared = cell_admission_owner_->PrepareProgramResetStatus(
+        ProgramResetJournalReadPurpose::kAcquire, intent);
+    if (!prepared.ok()) return Result<CellAdmissionClaimDTO>::Err(prepared.error());
+    reset_proof.emplace(std::move(prepared).value());
+  }
+  // Lifecycle and selected idle Reset mutate the whole cell. Serialize the
   // physical work check with every command submission, then retain the
   // admission lock through the durable claim so Start cannot win in between.
   std::unique_lock<std::mutex> submit_lock(submission_mutex_, std::defer_lock);
-  if (intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle) {
+  const bool physical_mutation = intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle ||
+                                 intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset;
+  if (physical_mutation) {
     submit_lock.lock();
   }
   std::lock_guard admission_lock(*admission_mutex_);
-  if (intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle) {
+  if (physical_mutation) {
     std::lock_guard state_lock(state_mutex_);
     // Every blocking condition and the identities it concerns, so a caller
     // can tell exactly what must settle; nothing is retried or stopped.
@@ -89,8 +98,12 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmis
         operations.push_back(operation_id.value());
       }
       auto rejected = reject<CellAdmissionClaimDTO>(
-          "lifecycle mutation requires settled physical and Program work",
-          blocking.size() == 1U && !busy_resources.empty()
+          intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset
+              ? "Program Reset requires settled physical and Program work"
+              : "lifecycle mutation requires settled physical and Program work",
+          intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset
+              ? "program_reset_effects_not_settled"
+              : blocking.size() == 1U && !busy_resources.empty()
               ? "component_lifecycle_resources_not_settled"
               : "component_lifecycle_effects_not_settled");
       auto error = rejected.error();
@@ -100,7 +113,9 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmis
       return Result<CellAdmissionClaimDTO>::Err(std::move(error));
     }
   }
-  auto acquired = cell_admission_owner_->AcquireCellAdmissionClaim(intent);
+  auto acquired = reset_proof
+      ? cell_admission_owner_->AcquirePreparedProgramResetClaim(intent, *reset_proof)
+      : cell_admission_owner_->AcquireCellAdmissionClaim(intent);
   if (acquired.ok() && intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle) {
     refresh_execution_claims();
   }
@@ -886,8 +901,34 @@ ResourceAddressedExecutionKernel::GetCellAdmissionRecoveryReceipt(
 
 Result<void> ResourceAddressedExecutionKernel::ValidateProgramResetSceneAuthorization(
     const ProgramResetSceneAuthorizationDTO& authorization) const {
+  auto proof = cell_admission_owner_->PrepareProgramResetSceneAuthorization(authorization);
+  if (!proof.ok()) return Result<void>::Err(proof.error());
   std::lock_guard admission_lock(*admission_mutex_);
-  return cell_admission_owner_->ValidateProgramResetSceneAuthorization(authorization);
+  return cell_admission_owner_->ValidatePreparedProgramResetSceneAuthorization(authorization,
+                                                                            proof.value());
+}
+
+Result<void> ResourceAddressedExecutionKernel::ValidateProgramResetPositionAuthorization(
+    const ProgramResetPositionAuthorizationDTO& authorization) const {
+  auto proof = cell_admission_owner_->PrepareProgramResetPositionAuthorization(authorization);
+  if (!proof.ok()) return Result<void>::Err(proof.error());
+  std::lock_guard submission_lock(submission_mutex_);
+  std::lock_guard admission_lock(*admission_mutex_);
+  {
+    std::lock_guard state_lock(state_mutex_);
+    if (pending_program_run_admission_ || !active_operations_.empty() ||
+        operation_control_reconfiguration_busy_locked() || motion_admission_unreconciled_ ||
+        manager_liveness_motion_inhibited_)
+      return reject<void>("Program Reset position effect requires settled work",
+                          "program_reset_effects_not_settled");
+    for (const auto& slot : resource_slots_->snapshot()) {
+      if (slot.state != ResourceSlotState::kFree || slot.owner)
+        return reject<void>("Program Reset position effect requires free resources",
+                            "program_reset_resources_not_settled");
+    }
+  }
+  return cell_admission_owner_->ValidatePreparedProgramResetPositionAuthorization(authorization,
+                                                                                proof.value());
 }
 
 Result<void> ResourceAddressedExecutionKernel::Publish(

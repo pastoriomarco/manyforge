@@ -663,6 +663,10 @@ void Ros2ControlExecutionBackend::ReceiveResult(
 void Ros2ControlExecutionBackend::ReceiveState(
     const std::shared_ptr<State> &state,
     const control_msgs::msg::JointTrajectoryControllerState &message) {
+  // Preserve callback acquisition time across state-lock contention and later
+  // observer delivery. Backend initialization fences this original receipt,
+  // never ROS wall time or a delayed callback's publication time.
+  const auto acquired_at_ns = state->clock.now();
   std::lock_guard lock(state->mutex);
   if (!state->ready())
     return;
@@ -702,7 +706,7 @@ void Ros2ControlExecutionBackend::ReceiveState(
   if (std::isfinite(message.speed_scaling_factor))
     sample.applied_factor = message.speed_scaling_factor;
   sample.source_stamp_ns = nanoseconds(message.header.stamp);
-  sample.local_receipt_stamp_ns = state->clock.now();
+  sample.local_receipt_stamp_ns = acquired_at_ns;
   sample.local_receipt_count = ExecutionReceiptCount(++state->receipt_count);
   sample.binding_epoch = state->config.binding_epoch;
   sample.cursor_s =

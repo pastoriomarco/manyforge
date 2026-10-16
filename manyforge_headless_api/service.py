@@ -1236,10 +1236,12 @@ class HeadlessService:
             ) from error
 
     def notify_committed_apply(self) -> None:
-        """Reconcile values and place the Program Scene after committed Apply.
+        """Reconcile values and initialize Scene only for an explicit Apply purpose.
 
         Repeated status reads do not repeat placement or retry a failed
-        placement. The existing idle Reset is the explicit retry path.
+        placement. The existing idle Reset with reload is the explicit retry path.
+        The attempt latch is memory-only: a replacement Headless instance may
+        attempt the current initializing Apply again on its next notification.
         """
 
         if self.program_runner is None:
@@ -1257,7 +1259,8 @@ class HeadlessService:
             committed = self.committed_scenario_activation()
             applied = self.program_applied_status()
             if (
-                applied["origin"]["kind"] != "scenario"
+                committed["scene_initialization"] != "initialize"
+                or applied["origin"]["kind"] != "scenario"
                 or applied["program_id"] is None
                 or applied["record_digest"] != committed["record_digest"]
             ):
@@ -2617,6 +2620,10 @@ class HeadlessService:
         )
         return {
             "schema_version": "manyforge.headless_health.v1",
+            **({"workbench_previous_session_registration": registration}
+               if (registration := getattr(
+                   self.core, "workbench_previous_session_registration", None
+               )) is not None else {}),
             "status_scope": "headless_projection",
             "status": "ready" if projection_ready else "degraded",
             "headless_projection_ready": projection_ready,

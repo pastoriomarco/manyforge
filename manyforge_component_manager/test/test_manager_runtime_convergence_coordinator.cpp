@@ -3462,6 +3462,14 @@ TEST(ManagerNamedApplyCoordinator,
             throw std::runtime_error("replayed source must not run");
           };
       EXPECT_TRUE(coordinator.AcceptOrReplay(request, never_reconstruct).request_replayed);
+      auto conflicting_purpose = request;
+      conflicting_purpose.scene_initialization =
+          ManagerSceneInitialization::kInitialize;
+      EXPECT_THROW(static_cast<void>(coordinator.AcceptOrReplay(
+                       conflicting_purpose, never_reconstruct)),
+                   ManagerNamedApplyCoordinatorError);
+      EXPECT_EQ(stored->intent.scene_initialization,
+                ManagerSceneInitialization::kPreserve);
       auto conflicting_facts = request;
       conflicting_facts.isaac_pose_observer_launch_facts->source_epoch_base =
           "manager.original.observer.foreign";

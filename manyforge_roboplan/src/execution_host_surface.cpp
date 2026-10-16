@@ -2209,6 +2209,45 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
   }
 
 [[nodiscard]] CanonicalValue
+ExecutionCommandSurface::ResetRobotPositionCapabilityResponse(
+    Composition &composition, const core::ProjectionRevisionDTO &projection) const {
+  auto capability = composition_access_.reset_robot_position_capability
+      ? composition_access_.reset_robot_position_capability(composition)
+      : core::Result<ProgramResetPositionCapability>::Ok(ProgramResetPositionCapability{
+            false, "The active Deployment has no qualified simulator position-reset capability"});
+  if (!capability.ok())
+    return ErrorResponse(capability.error().code, capability.error().message,
+                         capability.error().details);
+  const auto &value = capability.value();
+  Require(value.available == !value.reason.has_value(),
+          "Reset position capability has an inconsistent reason");
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+      {"command", CanonicalValue("reset_robot_position_capability")},
+      {"ok", CanonicalValue(true)},
+      {"identity", IdentityValue(composition, projection)},
+      {"reset_robot_position", CanonicalValue(CanonicalValue::Object{
+          {"available", CanonicalValue(value.available)},
+          {"reason", value.reason ? CanonicalValue(*value.reason) : CanonicalValue(nullptr)}})}});
+}
+
+[[nodiscard]] CanonicalValue
+ExecutionCommandSurface::ResetRobotPositionResponse(
+    Composition &composition, const ProgramResetPositionRequest &request,
+    const std::stop_token stop_token) const {
+  if (!composition_access_.reset_robot_position)
+    return ErrorResponse("program_cycle_reset_position_unavailable",
+                         "The active Deployment has no qualified simulator position-reset capability",
+                         {{"effect_disposition", "known_no_effect"}});
+  const auto result = composition_access_.reset_robot_position(composition, request, stop_token);
+  if (!result.ok())
+    return ErrorResponse(result.error().code, result.error().message, result.error().details);
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+      {"command", CanonicalValue("reset_robot_position")}, {"ok", CanonicalValue(true)}});
+}
+
+[[nodiscard]] CanonicalValue
   ExecutionCommandSurface::Execute(const Command &command, Composition &composition,
           const core::ProjectionRevisionDTO &projection,
           const std::stop_token planning_stop_token) {
@@ -2231,6 +2270,12 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     }
     if (command.kind == CommandKind::kIdentity) {
       return IdentityResponse(composition, projection);
+    }
+    if (command.kind == CommandKind::kResetRobotPositionCapability) {
+      return ResetRobotPositionCapabilityResponse(composition, projection);
+    }
+    if (command.kind == CommandKind::kResetRobotPosition) {
+      return ResetRobotPositionResponse(composition, *command.reset_robot_position, planning_stop_token);
     }
     if (command.kind == CommandKind::kTargets) {
       return TargetsResponse(composition, projection);
@@ -2857,6 +2902,8 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
             *command.control);
       case CommandKind::kStatus:
       case CommandKind::kIdentity:
+      case CommandKind::kResetRobotPositionCapability:
+      case CommandKind::kResetRobotPosition:
       case CommandKind::kTargets:
       case CommandKind::kQueryTarget:
       case CommandKind::kQueryOperation:
@@ -3396,6 +3443,12 @@ void ExecutionCommandSurface::SendResponse(
     if (command.kind == CommandKind::kIdentity) {
       return ExecutionOwnerNotReadyIdentityResponse(StableKernel(),
                                                     owner_epoch_);
+    }
+    if (command.kind == CommandKind::kResetRobotPosition) {
+      return ErrorResponse("execution_owner_not_ready",
+                           "the managed execution owner has no active physical product",
+                           {{"owner_epoch", owner_epoch_.value()},
+                            {"effect_disposition", "known_no_effect"}});
     }
     return ErrorResponse("execution_owner_not_ready",
                          "the managed execution owner has no active physical "

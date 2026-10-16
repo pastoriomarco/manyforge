@@ -198,6 +198,39 @@ class CoordinatorLifecycleTargetDriverPorts final : public ICCLCLifecycleTargetD
                                                  ComponentLifecycleIntentKindDTO intent,
                                                  std::uint32_t attempt);
 
+/// Private coordination of an already-authorized Program Reset effect. These
+/// values are neither lifecycle intents nor persisted/public operations.
+enum class CCLCProgramResetPositionPhase {
+  kSwitchingToWriter,
+  kSettingState,
+  kSwitchingToJtc,
+};
+
+struct CCLCProgramResetPositionScopeRequest final {
+  RequestOwnerEpoch runner_owner_epoch;
+  std::uint64_t cycle_generation{};
+  RequestOwnerEpoch request_owner_epoch;
+  RequestId request_id;
+  ContentDigest request_payload_digest;
+  ActiveBundlePublicationReceiptDTO expected_publication;
+  ControllableComponentId component;
+  ResolvedLifecycleProviderOccurrenceDTO provider;
+  ResolvedLifecycleControlDomainScopeDTO domain;
+  /// Adapter-owned raw-fact qualification, called only for a fresh exact
+  /// occurrence reporting availability. It must prove the precise expected
+  /// phase, healthy process/hardware/endpoints and authorized binding epoch.
+  std::function<bool(const BrandLifecycleObservationDTO&, CCLCProgramResetPositionPhase)>
+      expected_transition;
+};
+
+/// The local commit only updates already-prepared phase/epoch state. No ROS,
+/// allocation, transport lock acquisition or blocking work is permitted there.
+/// Lock order is driver RunOnce exclusion, then brief adapter state exclusion.
+using CCLCProgramResetPositionAdvance = std::function<Result<void>(
+    CCLCProgramResetPositionPhase, const std::function<Result<void>()>&)>;
+using CCLCProgramResetPositionAction =
+    std::function<Result<void>(const CCLCProgramResetPositionAdvance&)>;
+
 /// CCLC-owned requested-target follower (ADR-0026 §7, 2026-10-08).
 ///
 /// Incidents (addendum 2): once a component reached its target on fresh
@@ -288,9 +321,30 @@ class CCLCLifecycleTargetDriver final {
   [[nodiscard]] Result<std::vector<ComponentIncidentEventDTO>> LoadIncidentEvents(
       std::uint64_t after_sequence, std::size_t limit);
 
+  /// Synchronous private delegation. Begin/end serialize with RunOnce, but no
+  /// driver lock spans the effect action or its ROS waits. The caller retains
+  /// its original Kernel Reset authorization and exact installed product pin.
+  /// Before returning Ok, the action joins acknowledged return activation to
+  /// ordinary current CM/action health. This scope requires no pose dwell.
+  [[nodiscard]] Result<void> WithProgramResetPositionScope(
+      const CCLCProgramResetPositionScopeRequest& request,
+      const CCLCProgramResetPositionAction& action);
+
   [[nodiscard]] const CCLCLifecycleTargetDriverConfig& config() const noexcept { return config_; }
 
  private:
+  struct ProgramResetPositionScope final {
+    CCLCProgramResetPositionScopeRequest request;
+    std::uint64_t target_generation;
+    CCLCProgramResetPositionPhase phase{CCLCProgramResetPositionPhase::kSwitchingToWriter};
+    bool valid{true};
+  };
+  [[nodiscard]] bool MatchesProgramResetPositionScope(
+      const ProgramResetPositionScope& scope, const ComponentLifecycleTargetDTO& target,
+      const ComponentLifecycleCurrentSnapshotDTO& current) const;
+  [[nodiscard]] Result<void> ValidateProgramResetPositionScope(
+      ICCLCLifecycleTargetDriverPorts& ports, const ProgramResetPositionScope& scope);
+
   struct InFlight final {
     LifecycleTransactionId lifecycle_transaction_id;
     ComponentLifecycleIntentKindDTO intent;
@@ -461,6 +515,8 @@ class CCLCLifecycleTargetDriver final {
   mutable std::mutex state_mutex_;
   std::map<ControllableComponentId, ComponentState> components_;
   bool any_in_flight_{};
+  // Protected by run_mutex_ for use/mutation, state_mutex_ for readiness reads.
+  std::shared_ptr<ProgramResetPositionScope> program_reset_position_scope_;
   /// Containment outcomes of incidents this driver already contained (run
   /// lane), so neither a retried record nor a later pass requests it again.
   std::map<std::string, ContainmentOutcome> containments_;

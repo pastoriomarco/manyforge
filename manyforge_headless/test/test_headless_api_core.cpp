@@ -1024,22 +1024,25 @@ CanonicalValue CommittedApplyRecord(const std::string &apply_id,
       {"terminal_state", CanonicalValue(committed ? "succeeded" : "failed")},
       {"incomplete", CanonicalValue(false)},
       {"intent_digest", CanonicalValue(Digest(digest))},
-      {"prepared_activation", CanonicalValue(CanonicalValue::Object{
-          {"schema_version",
-           CanonicalValue("manyforge.prepared_activation_input.v6")},
-          {"retained_bundle_id", Member(active, "retained_bundle_id")},
-          {"graph_revision", Member(active, "graph_revision")},
-          {"origin", CanonicalValue(CanonicalValue::Object{
-              {"kind", CanonicalValue("scenario")},
-              {"scenario_id", CanonicalValue(scenario_id)},
-              {"source_document_digest", CanonicalValue(Digest('b'))},
-          })},
-          {"program_id", CanonicalValue(nullptr)},
-          {"program_revision", CanonicalValue(nullptr)},
-          {"program_outcome", CanonicalValue(CanonicalValue::Object{
-              {"kind", CanonicalValue("no_program")},
-          })},
-      })},
+      {"scene_initialization", CanonicalValue("initialize")},
+      {"prepared_activation",
+       CanonicalValue(CanonicalValue::Object{
+           {"schema_version",
+            CanonicalValue("manyforge.prepared_activation_input.v6")},
+           {"retained_bundle_id", Member(active, "retained_bundle_id")},
+           {"graph_revision", Member(active, "graph_revision")},
+           {"origin",
+            CanonicalValue(CanonicalValue::Object{
+                {"kind", CanonicalValue("scenario")},
+                {"scenario_id", CanonicalValue(scenario_id)},
+                {"source_document_digest", CanonicalValue(Digest('b'))},
+            })},
+           {"program_id", CanonicalValue(nullptr)},
+           {"program_revision", CanonicalValue(nullptr)},
+           {"program_outcome", CanonicalValue(CanonicalValue::Object{
+                                   {"kind", CanonicalValue("no_program")},
+                               })},
+       })},
   });
 }
 
@@ -1084,6 +1087,8 @@ CanonicalValue CommittedActivationCore(TemporaryDirectory &directory,
         {"admission_digest", CanonicalValue(Digest('f'))},
     }));
     records.front() = WithField(records.front(), "prepared_activation", prepared);
+    records.front() = WithField(records.front(), "scene_initialization",
+                                CanonicalValue("preserve"));
   }
   payload = WithField(payload, "active", active);
   payload = WithField(payload, "apply", CanonicalValue(CanonicalValue::Object{
@@ -1104,7 +1109,8 @@ TEST(HeadlessApiCore, CommittedActivationNamesEveryCommittedApplyOfItsHistory) {
   TemporaryDirectory directory;
   const auto activation = CommittedActivationCore(directory, 3.0, true);
   EXPECT_EQ(Text(activation, "schema_version"),
-            "manyforge.committed_scenario_activation.v2");
+            "manyforge.committed_scenario_activation.v3");
+  EXPECT_EQ(Text(activation, "scene_initialization"), "initialize");
   EXPECT_EQ(Text(activation, "record_digest"), Digest('d'));
   EXPECT_EQ(Text(activation, "apply_id"), "apply.new");
   EXPECT_EQ(std::get<double>(Member(activation, "apply_generation").storage()),
@@ -1129,8 +1135,8 @@ TEST(HeadlessApiCore, CommittedActivationNamesEveryCommittedApplyOfItsHistory) {
   EXPECT_EQ(Text(committed[1], "apply_id"), "apply.new");
   EXPECT_EQ(std::get<double>(Member(committed[1], "apply_generation").storage()),
             1.0);
-  EXPECT_EQ(committed[0].as_object().size(), 4U);
-  EXPECT_EQ(committed[1].as_object().size(), 4U);
+  EXPECT_EQ(committed[0].as_object().size(), 5U);
+  EXPECT_EQ(committed[1].as_object().size(), 5U);
 }
 
 TEST(HeadlessApiCore, SealedEmptyApplyRemainsInTheCompleteCommittedHistory) {
@@ -4260,5 +4266,249 @@ TEST(HeadlessApiCore, CCLCIncidentEventsAreRecordedOncePerIncidentAndKind) {
   EXPECT_EQ(Array(replacement.HistoryPage(query), "events").size(), 2U);
 }
 
+CanonicalValue PreviousSessionReport(const std::string &message =
+    "Previous session journals retained; old events are not imported into History.") {
+  return CanonicalValue(CanonicalValue::Object{
+      {"schema_version", CanonicalValue("manyforge.workbench_previous_session.v1")},
+      {"session_id", CanonicalValue(std::string(32U, 'a'))},
+      {"archive_relative_path", CanonicalValue("previous-sessions/" + std::string(32U, 'a'))},
+      {"shutdown", CanonicalValue("clean")},
+      {"effects", CanonicalValue("closed")},
+      {"history_coverage", CanonicalValue("not_imported")},
+      {"journal_families", CanonicalValue(CanonicalValue::Array{
+          CanonicalValue("program_cycle"), CanonicalValue("scene"),
+          CanonicalValue("manager"), CanonicalValue("cclc"),
+          CanonicalValue("kernel_operation")})},
+      {"message", CanonicalValue(message)},
+  });
+}
+
+TEST(HeadlessApiCore, PreviousSessionReportCommitsBeforeReceiptAndDeduplicatesAcrossOwners) {
+  TemporaryDirectory directory;
+  auto config = Config(directory, "api.epoch.1");
+  HistorianQuery query;
+  query.components.insert("manyforge.workbench");
+  query.event_types.insert("previous_session_report");
+  std::string identity;
+  {
+    HeadlessApiCore core(config, Clocks());
+    const auto receipt = core.AppendWorkbenchPreviousSessionReport(PreviousSessionReport());
+    EXPECT_EQ(Text(receipt, "status"), "stored");
+    EXPECT_EQ(Text(receipt, "session_id"), std::string(32U, 'a'));
+    const auto page = core.HistoryPage(query);
+    const auto &rows = Array(page, "events");
+    ASSERT_EQ(rows.size(), 1U);
+    const auto &event = Member(rows.front(), "event");
+    identity = Text(event, "event_id");
+    EXPECT_EQ(Text(event, "severity"), "INFO");
+    EXPECT_EQ(Text(event, "occurred_at_wall"), "unknown");
+    EXPECT_EQ(Text(event, "occurred_at_ns"), "0");
+    EXPECT_EQ(content_identity::canonical_json(Member(event, "payload")),
+              content_identity::canonical_json(PreviousSessionReport()));
+  }
+  config.owner_epoch = "api.epoch.2";
+  {
+    HeadlessApiCore replacement(config, Clocks());
+    const auto receipt = replacement.AppendWorkbenchPreviousSessionReport(PreviousSessionReport());
+    EXPECT_EQ(Text(receipt, "status"), "duplicate");
+    const auto page = replacement.HistoryPage(query);
+    ASSERT_EQ(Array(page, "events").size(), 1U);
+    EXPECT_EQ(Text(Member(Array(page, "events").front(), "event"), "event_id"), identity);
+  }
+  try {
+    HeadlessApiCore conflicting(config, Clocks());
+    static_cast<void>(conflicting.AppendWorkbenchPreviousSessionReport(
+        PreviousSessionReport("Conflicting report content")));
+    FAIL() << "same archived session accepted conflicting report content";
+  } catch (const EventHistorianError &error) {
+    EXPECT_EQ(error.code(), "historian_event_identity_conflict");
+  }
+}
+
+TEST(HeadlessApiCore, PreviousSessionReportRefusesChangedFamiliesAndImportedClaims) {
+  TemporaryDirectory directory;
+  for (const auto &[field, replacement] : CanonicalValue::Object{
+           {"journal_families", CanonicalValue(CanonicalValue::Array{})},
+           {"history_coverage", CanonicalValue("imported")},
+           {"shutdown", CanonicalValue("verified")},
+           {"effects", CanonicalValue("safe")},
+           {"archive_relative_path", CanonicalValue("../foreign")}}) {
+    auto report = PreviousSessionReport().as_object();
+    for (auto &[name, value] : report) if (name == field) value = replacement;
+    auto config = Config(directory, "api.epoch.invalid");
+    HeadlessApiCore core(config, Clocks());
+    EXPECT_THROW(static_cast<void>(core.AppendWorkbenchPreviousSessionReport(
+                     CanonicalValue(std::move(report)))), OperatorAlarmError) << field;
+  }
+}
+
 } // namespace
+CanonicalValue ClassifiedPreviousSessionReport(const std::string &shutdown,
+                                               const std::string &effects,
+                                               const std::string &identity = std::string(32U, 'a')) {
+  auto fields = PreviousSessionReport().as_object();
+  for (auto &[name, value] : fields) {
+    if (name == "shutdown") value = CanonicalValue(shutdown);
+    if (name == "effects") value = CanonicalValue(effects);
+    if (name == "session_id") value = CanonicalValue(identity);
+    if (name == "archive_relative_path") value = CanonicalValue("previous-sessions/" + identity);
+  }
+  return CanonicalValue(std::move(fields));
+}
+
+CanonicalValue::Array PreviousSessionAlarms(HeadlessApiCore &core) {
+  const auto snapshot = core.AlarmSnapshot();
+  CanonicalValue::Array result;
+  for (const auto &alarm : Array(snapshot, "alarms")) {
+    if (Text(alarm, "definition_id") == "manyforge.runtime.previous_session_unclean") {
+      result.push_back(alarm);
+    }
+  }
+  return result;
+}
+
+TEST(HeadlessApiCore, PreviousSessionNoticeUsesExistingNonMotionAcknowledgementAndHistory) {
+  TemporaryDirectory directory;
+  auto config = Config(directory, "api.epoch.1");
+  const auto report = ClassifiedPreviousSessionReport("unknown", "unknown");
+  HistorianQuery acknowledged;
+  acknowledged.components = {"manyforge.alarm"};
+  acknowledged.event_types = {"operator_alarm_acknowledged"};
+  acknowledged.correlations = {{"incident_id", "workbench.previous-session." + std::string(32U, 'a')}};
+  acknowledged.limit = 1U;
+  {
+    HeadlessApiCore core(config, Clocks());
+    EXPECT_EQ(Text(core.ObserveWorkbenchPreviousSessionReport(report), "status"), "registered");
+    const auto alarms = PreviousSessionAlarms(core);
+    ASSERT_EQ(alarms.size(), 1U);
+    const auto &alarm = alarms.front();
+    EXPECT_EQ(Text(alarm, "lifecycle_state"), "returned_unacknowledged");
+    EXPECT_EQ(Text(alarm, "priority"), "medium");
+    EXPECT_FALSE(std::get<bool>(Member(alarm, "requires_motion_attention").storage()));
+    EXPECT_TRUE(std::get<bool>(Member(alarm, "acknowledgement_required").storage()));
+    EXPECT_EQ(Text(alarm, "message"), "ManyForge did not close correctly last time. The cell started empty; nothing from the previous session was resumed. Its records are kept; details in History.");
+    EXPECT_EQ(Text(Member(alarm, "details"), "failure_time_status"), "unavailable");
+    EXPECT_EQ(content_identity::canonical_json(Member(Member(alarm, "details"), "previous_session")),
+              content_identity::canonical_json(report));
+    static_cast<void>(core.ObserveWorkbenchPreviousSessionReport(report));
+    EXPECT_EQ(Text(PreviousSessionAlarms(core).front(), "activation_id"), Text(alarm, "activation_id"));
+    static_cast<void>(core.AcknowledgeAlarm(Text(alarm, "condition_id"), Text(alarm, "activation_id"),
+        Unsigned(alarm, "record_revision"), Caller(), std::nullopt, true));
+    EXPECT_TRUE(PreviousSessionAlarms(core).empty());
+    static_cast<void>(core.ObserveWorkbenchPreviousSessionReport(report));
+    EXPECT_TRUE(PreviousSessionAlarms(core).empty());
+    // Ordinary ACK delivery is asynchronous. Prove its commit before replacing
+    // the owner; this is not a claim about a crash before that commit.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (Array(core.HistoryPage(acknowledged), "events").empty() &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(Array(core.HistoryPage(acknowledged), "events").size(), 1U);
+  }
+  config.owner_epoch = "api.epoch.2";
+  {
+    HeadlessApiCore replacement(config, Clocks());
+    EXPECT_EQ(Text(replacement.ObserveWorkbenchPreviousSessionReport(report), "status"), "acknowledged");
+    EXPECT_TRUE(PreviousSessionAlarms(replacement).empty());
+  }
+  config.owner_epoch = "api.epoch.3";
+  HeadlessApiCore next(config, Clocks());
+  EXPECT_EQ(Text(next.ObserveWorkbenchPreviousSessionReport(
+      ClassifiedPreviousSessionReport("unknown", "unknown", std::string(32U, 'b'))), "status"), "registered");
+  EXPECT_EQ(PreviousSessionAlarms(next).size(), 1U);
+}
+
+TEST(HeadlessApiCore, PreviousSessionNoticeKeepsUnacknowledgedObligationAcrossOwnerReplacement) {
+  TemporaryDirectory directory;
+  auto config = Config(directory, "api.epoch.1");
+  const auto report = ClassifiedPreviousSessionReport("unknown", "closed");
+  {
+    HeadlessApiCore core(config, Clocks());
+    static_cast<void>(core.ObserveWorkbenchPreviousSessionReport(report));
+    ASSERT_EQ(PreviousSessionAlarms(core).size(), 1U);
+  }
+  config.owner_epoch = "api.epoch.2";
+  HeadlessApiCore replacement(config, Clocks());
+  EXPECT_EQ(Text(replacement.ObserveWorkbenchPreviousSessionReport(report), "status"), "registered");
+  ASSERT_EQ(PreviousSessionAlarms(replacement).size(), 1U);
+}
+
+TEST(HeadlessApiCore, PreviousSessionNoticePreservesClosedOpaqueQuietAndReadableUnresolvedPolicy) {
+  for (const auto &effects : {"closed", "unknown", "unresolved"}) {
+    TemporaryDirectory directory;
+    HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+    EXPECT_EQ(Text(core.ObserveWorkbenchPreviousSessionReport(
+        ClassifiedPreviousSessionReport("clean", effects)), "status"),
+        std::string(effects) == "unresolved" ? "registered" : "quiet");
+    EXPECT_EQ(PreviousSessionAlarms(core).size(), std::string(effects) == "unresolved" ? 1U : 0U);
+  }
+}
+
+TEST(HeadlessApiCore, PreviousSessionNoticeRefusesAnotherPredecessorWithoutWritingIt) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  static_cast<void>(core.ObserveWorkbenchPreviousSessionReport(ClassifiedPreviousSessionReport("unknown", "unknown")));
+  EXPECT_THROW(static_cast<void>(core.ObserveWorkbenchPreviousSessionReport(
+      ClassifiedPreviousSessionReport("unknown", "unknown", std::string(32U, 'b')))), OperatorAlarmError);
+  HistorianQuery reports;
+  reports.event_types = {"previous_session_report"};
+  ASSERT_EQ(Array(core.HistoryPage(reports), "events").size(), 1U);
+}
+
+TEST(HeadlessApiCore, PreviousSessionNoticeRejectsAcknowledgementForAnotherDefinitionOrSubject) {
+  for (const int mismatch : {0, 1, 2}) {
+    const bool wrong_definition = mismatch == 0;
+    TemporaryDirectory directory;
+    const auto config = Config(directory, "api.epoch.1");
+    const auto identity = std::string(32U, 'a');
+    {
+      SqliteEventHistoryStore store(config.historian_database_path,
+                                   config.historian_record_retention);
+      const auto false_ack = MakeHistorianEvent("manyforge.alarm", "operator_alarm_acknowledged", "INFO", 0, "unknown",
+          CanonicalValue(CanonicalValue::Object{
+              {"definition_id", CanonicalValue(wrong_definition ? "manyforge.test.other" : "manyforge.runtime.previous_session_unclean")},
+              {"subject", CanonicalValue(CanonicalValue::Object{
+                  {"subject_kind", CanonicalValue("workbench_session")},
+                  {"subject_id", CanonicalValue(mismatch == 1 ? std::string(32U, 'b') : identity)},
+                  {"resource_ids", CanonicalValue(mismatch == 2 ? CanonicalValue::Array{CanonicalValue("other_resource")} : CanonicalValue::Array{})}})},
+              {"correlations", CanonicalValue(CanonicalValue::Object{
+                  {"incident_id", CanonicalValue("workbench.previous-session." + identity)}})},
+          }));
+      static_cast<void>(store.Append(false_ack));
+    }
+    HeadlessApiCore core(config, Clocks());
+    EXPECT_EQ(Text(core.ObserveWorkbenchPreviousSessionReport(
+        ClassifiedPreviousSessionReport("unknown", "unknown")), "status"), "registered");
+    EXPECT_EQ(PreviousSessionAlarms(core).size(), 1U);
+  }
+}
+
+TEST(HeadlessApiCore, PreviousSessionNoticeBulkAcknowledgementUsesTheSameRetainedHistoryProof) {
+  TemporaryDirectory directory;
+  auto config = Config(directory, "api.epoch.1");
+  const auto report = ClassifiedPreviousSessionReport("unknown", "unknown");
+  {
+    HeadlessApiCore core(config, Clocks());
+    static_cast<void>(core.ObserveWorkbenchPreviousSessionReport(report));
+    const auto snapshot = core.AlarmSnapshot();
+    std::vector<AlarmAcknowledgementMember> members;
+    for (const auto &alarm : Array(snapshot, "alarms")) {
+      const auto state = Text(alarm, "lifecycle_state");
+      if (state == "active_unacknowledged" || state == "returned_unacknowledged") {
+        members.push_back({Text(alarm, "condition_id"), Text(alarm, "activation_id"), Unsigned(alarm, "record_revision")});
+      }
+    }
+    ASSERT_FALSE(members.empty());
+    static_cast<void>(core.AcknowledgeAllAlarms(std::move(members),
+        Unsigned(snapshot, "generation"), Caller(), std::nullopt, true));
+    EXPECT_TRUE(PreviousSessionAlarms(core).empty());
+    // Ordinary graceful shutdown drains the existing historian writer.
+  }
+  config.owner_epoch = "api.epoch.2";
+  HeadlessApiCore replacement(config, Clocks());
+  EXPECT_EQ(Text(replacement.ObserveWorkbenchPreviousSessionReport(report), "status"), "acknowledged");
+  EXPECT_TRUE(PreviousSessionAlarms(replacement).empty());
+}
+
 } // namespace manyforge::headless

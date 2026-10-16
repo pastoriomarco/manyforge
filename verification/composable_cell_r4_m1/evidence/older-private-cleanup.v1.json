@@ -1,0 +1,65 @@
+{
+  "schema_version": "manyforge.older_private_cleanup.v1",
+  "status": "APPROVED_EXACT_TWO_DIRECTORIES_REMOVED",
+  "approval": "DX1068 explicit maintainer approval",
+  "started_utc": "2026-10-16T09:37:54.595927+00:00",
+  "finished_utc": "2026-10-16T09:37:55.459509+00:00",
+  "prior_inventory_receipt": "older-private-retention-inventory.v1.json",
+  "deleted": [
+    {
+      "resource": "dx952-browser-qualification01/runner",
+      "allocated_bytes": 1593692160
+    },
+    {
+      "resource": "dx952-browser-qualification01/source",
+      "allocated_bytes": 221335552
+    }
+  ],
+  "deleted_allocated_bytes": 1815027712,
+  "preflight": {
+    "container_references": 0,
+    "mount_references": 0,
+    "current_external_symlink_references": 0,
+    "process_or_open_file_references": 0,
+    "all_process_file_descriptors_readable_with_privileged_read_only_probe": true,
+    "current_graph_sentinel_files_independent_inodes": true
+  },
+  "preserved": {
+    "parent_directory": true,
+    "runtime_allocated_bytes": {
+      "runtime": 30363648,
+      "runtime-preserved-dx995-20261015T220459Z": 60186624
+    },
+    "regular_file_hashes_verified_unchanged": 422,
+    "logs_manifests_and_qualification_evidence": true,
+    "old_source_reconstructable": {
+      "base_commit": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+      "delta_paths": 611,
+      "delta_allocated_bytes": 49983488,
+      "manifest_sha256": "1b7f436833e646b7caab54dac5e667ce6d0692f0c52aee76a4d8674678e9a386",
+      "delta_sha256": "6884f9a77849b56d71ed51dccfad885f87b0c5cb6ee113e318623e97fb202374",
+      "resource": "dx952-browser-qualification01/evidence/dx1068-cleanup01"
+    },
+    "remaining_old_root_allocated_bytes": 145383424,
+    "current_private_graph_allocated_bytes": 1122631680,
+    "current_private_source_allocated_bytes": 221691904,
+    "current_private_sentinel_hashes_unchanged": true,
+    "current_user_container_unchanged_and_running": true,
+    "shared_cache_retained": true
+  },
+  "remaining_usage": {
+    "manyforge_remote_allocated_bytes": 37447016448,
+    "filesystem_total_bytes": 1004976848896,
+    "filesystem_used_bytes": 134222602240,
+    "filesystem_available_bytes": 819670568960
+  },
+  "effects": {
+    "removed_parent_whole_folder": false,
+    "other_deletions": [],
+    "source_or_build_mutations_to_current_graph": false,
+    "user_runtime_commands": [],
+    "user_api_probes": false
+  },
+  "raw_evidence_identifier": "dx1068-approved-older-private-cleanup-20261016",
+  "raw_receipt_sha256": "89c8700b644e4fff3111df9f5d8b93a292cb18717bc439778ba409a5a44f3e35"
+}

@@ -386,3 +386,59 @@ def test_program_origin_is_required_privately_and_forbidden_publicly(
         with pytest.raises(HeadlessApiError, match="invalid"):
             transport.submit(malformed)
     assert len(commands) == 1
+
+
+def _position_capability_response():
+    digest = "sha256:" + "a" * 64
+    return {"api_version": "manyforge.execution_command_response.v1", "command": "reset_robot_position_capability",
+            "ok": True, "reset_robot_position": {"available": True, "reason": None},
+            "identity": {"schema_version": "manyforge.execution_identity.v2", "owner_epoch": "kernel.1",
+                         "active_publication_generation": 3, "retained_bundle_id": digest, "graph_revision": digest,
+                         "cell_id": "cell.1", "control_management_mode": "component_lifecycle",
+                         "scene_revision": {"scene_id": digest, "revision_id": 1, "content_hash": digest}}}
+
+
+def _position_request():
+    digest = "sha256:" + "a" * 64
+    return {"authorization": {"program_runner_owner_epoch": "runner.1", "cycle_generation": 1,
+            "request_owner_epoch": "caller.1", "request_id": "reset.1", "request_payload_digest": digest,
+            "program_run_id": None, "cycle_claim_generation": None, "terminal_or_settlement_reference": None,
+            "reset_claim_generation": 7}, "expected_deployment_identity": {"owner_epoch": "kernel.1",
+            "active_publication_generation": 3, "retained_bundle_id": digest, "graph_revision": digest}}
+
+
+@pytest.mark.parametrize("mutation", ["extra", "wrong_kind", "boolean_int", "bad_reason", "missing_identity"])
+def test_position_capability_response_is_strict_and_pins_deployment(monkeypatch, tmp_path, mutation):
+    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
+    response = _position_capability_response()
+    packets = []
+    monkeypatch.setattr(transport, "_exchange", lambda packet: packets.append(packet) or response)
+    assert transport.reset_robot_position_capability() == response
+    assert packets == [{"api_version": "manyforge.execution_command.v1", "command": "reset_robot_position_capability"}]
+    if mutation == "extra": response["arbitrary"] = True
+    elif mutation == "wrong_kind": response["command"] = "identity"
+    elif mutation == "boolean_int": response["ok"] = 1
+    elif mutation == "bad_reason": response["reset_robot_position"]["reason"] = "unsupported"
+    else: del response["identity"]["owner_epoch"]
+    with pytest.raises(HeadlessApiError, match="response is invalid"):
+        transport.reset_robot_position_capability()
+
+
+@pytest.mark.parametrize("mutation", ["joints", "extra_authority", "claim_union", "reply_kind", "reply_extra", "reply_bool"])
+def test_position_effect_rejects_arbitrary_targets_and_mismatched_success(monkeypatch, tmp_path, mutation):
+    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
+    packets = []
+    response = {"api_version": "manyforge.execution_command_response.v1", "command": "reset_robot_position", "ok": True}
+    monkeypatch.setattr(transport, "_exchange", lambda packet: packets.append(packet) or response)
+    request = _position_request()
+    transport.reset_robot_position(request)
+    assert packets[-1] == {"api_version": "manyforge.execution_command.v1", "command": "reset_robot_position", **request}
+    if mutation == "joints": request["initial_joint_positions_rad"] = [1.0]
+    elif mutation == "extra_authority": request["authorization"]["reload_initial_scene"] = True
+    elif mutation == "claim_union": request["authorization"]["cycle_claim_generation"] = 9
+    elif mutation == "reply_kind": response["command"] = "reset"
+    elif mutation == "reply_bool": response["ok"] = 1
+    else: response["position"] = "assumed"
+    with pytest.raises(HeadlessApiError):
+        transport.reset_robot_position(request)
+    assert len(packets) == (1 if mutation in {"joints", "extra_authority", "claim_union"} else 2)

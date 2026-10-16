@@ -977,6 +977,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         )
         intent = {
             "schema_version": "manyforge.composer_authoring_effect.v1",
+            "scene_initialization": "initialize",
             "operation_kind": "revert_deployment",
             "effect_class": "external",
             "external_kind": "revert_deployment",
@@ -1220,6 +1221,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 "graph_revision": current_graph,
             },
             "expected_admission_generation": body.expected_admission_generation,
+            "scene_initialization": "initialize",
             "manager_request_id": "deployment-candidate-manager-"
             + hashlib.sha256(
                 f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")

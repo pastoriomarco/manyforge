@@ -1,4 +1,5 @@
 #include "ros_managed_runtime_host.hpp"
+#include "program_reset_position_observation.hpp"
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 
 #include <fcntl.h>
@@ -2086,6 +2087,9 @@ BuildOwnerSettlementValidator(
         case core::CellAdmissionClaimKindDTO::kProgramCycle:
           return detail::ValidateProgramCycleSettlementReadOnly(
               program_cycle_journal, claim, release);
+        case core::CellAdmissionClaimKindDTO::kProgramReset:
+          return detail::ValidateProgramResetSettlementReadOnly(
+              program_cycle_journal, claim, release);
         case core::CellAdmissionClaimKindDTO::kAuthoringMutation:
           // Composer local edits own no durable or runtime effect. Kernel's
           // exact claim/release identity validation is therefore the complete
@@ -3542,6 +3546,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       prepared_launch(nullptr, discard_launch);
   std::map<std::string, double, std::less<>> mock_cancel_by_source_joint;
   bool mock_lane = false;
+  std::optional<MockResetPositionTarget> mock_reset_position_target;
   {
     const auto &motion_value = direct_control_motion_binding.value().value();
     const auto *selected_profile =
@@ -3584,6 +3589,8 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       return text;
     };
     ComponentControllerLaunchInput artifact_input;
+    artifact_input.component_runtime_identity =
+        deployment::derive_component_runtime_identity(*input.bundle, motion_value.controllable_component_id).value().value();
     artifact_input.artifacts_root =
         input.execution_run_root / "controller-launch-artifacts" /
         path_token(input.bundle->retained_bundle_id().value()) /
@@ -3651,6 +3658,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
               << std::endl;
     if (written.lane == ControllerLaunchLane::kMock) {
       mock_lane = true;
+      mock_reset_position_target = written.mock_reset_position;
       // Q48: the same per-joint cancel bounds the generated controllers file
       // carries, keyed by the binding's own resource-to-source-joint map.
       for (const auto &[resource_id, limit] :
@@ -3744,6 +3752,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                 retained_runtime_configuration,
                 direct_control_motion_binding.value(),
                 direct_control_gripper_binding);
+  ros2_control_backend_config.arm.mock_reset_position = std::move(mock_reset_position_target);
   // The addressed wrapper historically creates its own time capabilities.
   // A subordinate runtime retains the exact supplied pair, or creates both.
   const auto measured_receiver_clock = !input.attach_addressed_owner &&
@@ -3899,6 +3908,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       {},
       {},
       {},
+      {},
       {}};
 #if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
   const std::vector<core::RequiredManagerLivenessReceiverDTO> fixture_receivers;
@@ -3926,6 +3936,10 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           manager_apply_journal, input.program_cycle_journal,
           input.execution_state_root / std::string(core::kCCLCJournalFilename),
           input.cell_id);
+  runtime_config.cell_admission_program_reset_status_source =
+      [path = input.program_cycle_journal](const auto purpose, const auto& intent, const auto& claim) {
+        return detail::ReadProgramResetStatusReadOnly(path, purpose, intent, claim);
+      };
   auto receiver_scheduler = !input.attach_addressed_owner &&
                                     input.shared_scheduler != nullptr
                                 ? input.shared_scheduler
@@ -5392,6 +5406,322 @@ BuildInstalledCCLCReadinessDependencies(
   };
   return {std::move(inventory), std::move(capture)};
 }
+struct MockResetPositionComponent final {
+  std::shared_ptr<RetainedNativeRuntime> runtime;
+  std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle;
+  MockResetPositionTarget target;
+  core::ComponentLifecycleCurrentSnapshotDTO snapshot;
+  core::ResolvedLifecycleControlDomainScopeDTO domain;
+  core::ResolvedLifecycleProviderOccurrenceDTO provider;
+};
+
+core::ErrorDTO ResetPositionError(std::string reason, std::string message,
+                                 bool effect_possible = false) {
+  if (effect_possible)
+    message += " Restart the Workbench before trying again; the Reset claim remains held.";
+  return {"program_reset_position_unavailable", std::move(message),
+          {{"reason", std::move(reason)},
+           {"effect_disposition", effect_possible ? "unknown" : "known_no_effect"}}};
+}
+
+core::Result<std::vector<MockResetPositionComponent>>
+CaptureMockResetPositionComponents(Composition& composition,
+                                   deployment::CCLCRuntimeComposition& facade) {
+  using Result = core::Result<std::vector<MockResetPositionComponent>>;
+  const auto unavailable = [](const char* reason, const char* message) {
+    return Result::Err(ResetPositionError(reason, message));
+  };
+  if (!composition.bundle ||
+      !composition.cclc_attached.load(std::memory_order_acquire) ||
+      composition.route_recovery_pending.load(std::memory_order_acquire))
+    return unavailable("reset_position_deployment_unavailable", "The current Deployment is not available for position reset.");
+  std::set<core::ControllableComponentId> required;
+  for (const auto& binding : composition.bundle->value().cell_graph.control_bindings) {
+    if (binding.capability_id == core::CapabilityId("execution.trajectory.execute"))
+      required.insert(binding.controllable_component_id);
+  }
+  if (required.empty())
+    return unavailable("reset_position_no_arm", "The current Deployment has no supported Mock arm.");
+  const auto owners = IndexNativeComponentCompositions(composition);
+  std::vector<MockResetPositionComponent> captured;
+  for (const auto& component : required) {
+    const auto owner = owners.find(component);
+    if (owner == owners.end() || !owner->second->runtime || !owner->second->ros2_control_runtime_handle)
+      return unavailable("reset_position_arm_owner_missing", "A Deployment arm has no current supported runtime.");
+    const auto& runtime = owner->second->runtime;
+    const auto& handle = owner->second->ros2_control_runtime_handle;
+    const auto target = handle->mock_reset_position_target();
+    const auto identity = deployment::derive_component_runtime_identity(*composition.bundle, component);
+    if (!target || !identity || target->component_runtime_identity != identity->value() ||
+        target->joint_names != handle->controller_joint_names() || target->positions.empty() ||
+        target->joint_names.size() != target->positions.size() ||
+        !std::all_of(target->positions.begin(), target->positions.end(), [](double value) { return std::isfinite(value); }))
+      return unavailable("reset_position_simulator_unsupported", "Position reset requires a supported Mock arm; real hardware and Isaac are unavailable.");
+    const auto& binding = runtime->motion_binding.value();
+    if (!binding.control_path || binding.resources.size() != target->positions.size() ||
+        !owner->second->measured_joint_state_lane || !runtime->motion_state_channel ||
+        runtime->motion_state_channel->source_kind() != core::ObservedStateSourceKind::kCommandedState)
+      return unavailable("reset_position_binding_unsupported", "A Mock arm has no exact measured initial-position binding.");
+    for (std::size_t index = 0; index < binding.resources.size(); ++index) {
+      if (binding.resources[index].source_joint_name != std::optional(target->joint_names[index]))
+        return unavailable("reset_position_joint_order_mismatch", "The Mock initial-position order differs from its current binding.");
+    }
+    const auto snapshot = facade.ReadCurrentComponentSnapshot(component);
+    if (!snapshot.ok()) return Result::Err(ResetPositionError("reset_position_lifecycle_unavailable", "A Mock arm has no current lifecycle observation."));
+    if (snapshot.value().component_lifecycle_state != core::ComponentLifecycleStateDTO::kActive)
+      return unavailable("reset_position_arm_inactive", "Every Deployment arm must already be Active to reset its position.");
+    const auto& publication = snapshot.value().active_publication_receipt;
+    if (publication.publication_generation != composition.publication_generation ||
+        publication.request.candidate_retained_bundle_id != composition.bundle->retained_bundle_id() ||
+        publication.request.candidate_graph_revision != composition.bundle->value().cell_graph.graph_revision ||
+        publication.request.candidate_projection_revision != composition.projection_revision)
+      return unavailable("reset_position_publication_changed", "The current lifecycle product differs from the selected Deployment.");
+    const auto& path = *binding.control_path;
+    const auto domain = std::find_if(snapshot.value().domains.begin(), snapshot.value().domains.end(),
+        [&](const auto& row) { return row.control_domain_id == path.control_domain_id; });
+    const auto provider = std::find_if(snapshot.value().provider_occurrences.begin(), snapshot.value().provider_occurrences.end(),
+        [&](const auto& row) { return row.control_domain_id == path.control_domain_id; });
+    if (domain == snapshot.value().domains.end() || provider == snapshot.value().provider_occurrences.end() ||
+        !domain->active_control_configuration ||
+        domain->active_control_configuration->state != core::ActiveControlConfigurationStateDTO::kReconciled ||
+        domain->control_domain_revision != path.control_domain_revision ||
+        domain->controller_topology_id != path.controller_topology_id ||
+        domain->topology_revision != path.topology_revision ||
+        domain->active_control_configuration->active_control_configuration_id != path.active_control_configuration_id ||
+        domain->active_control_configuration->active_control_configuration_generation != path.active_control_configuration_generation ||
+        provider->control_domain_revision != path.control_domain_revision ||
+        provider->provider_runtime_unit_id != path.provider_runtime_unit_id ||
+        provider->provider_runtime_epoch != path.provider_runtime_epoch ||
+        provider->provider_instance_id != path.provider_instance_id ||
+        provider->provider_manifest_id != path.provider_manifest_id ||
+        provider->provider_manifest_revision != path.provider_manifest_revision)
+      return unavailable("reset_position_configuration_unavailable", "A Mock arm has no exact active provider and configuration.");
+    const auto port = handle->current_port();
+    if (!port)
+      return unavailable("reset_position_controller_unavailable", "A Mock arm controller is unavailable.");
+    const auto readiness = port->ReadReadiness();
+    if (!readiness.controller_active || !readiness.controller_bound || !readiness.hardware_active ||
+        !handle->mock_reset_writer_inactive())
+      return unavailable("reset_position_controller_not_active", "A Mock arm must have an active normal controller before position reset.");
+    captured.push_back({runtime, handle, *target, snapshot.value(), *domain, *provider});
+  }
+  return Result::Ok(std::move(captured));
+}
+
+// The existing route publisher pins one raw source for the stock writer ACK.
+// It is not commanded-state authority and never feeds the frame/model channel.
+struct MockResetMeasuredSource final {
+  core::ComponentLifecycleReadinessSourceView association;
+  core::RequiredRobotMeasuredStateSource source;
+};
+
+core::Result<MockResetMeasuredSource> CaptureMockResetMeasuredSource(
+    const MockResetPositionComponent& component) {
+  using Result = core::Result<MockResetMeasuredSource>;
+  auto association = component.runtime->CaptureReadinessSources(component.snapshot, component.runtime);
+  if (!association.ok()) return Result::Err(association.error());
+  if (!association.value().measured_sources || !association.value().validate_current)
+    return Result::Err(ResetPositionError("reset_position_raw_source_missing", "The Mock arm has no current raw state source."));
+  const auto& binding = component.runtime->motion_binding.value();
+  const auto& path = *binding.control_path;
+  const auto& sources = association.value().measured_sources->sources;
+  const auto found = std::find_if(sources.begin(), sources.end(), [&](const auto& source) {
+    const auto& query = source.descriptor.publication.query_context;
+    return query.control_binding_id == path.control_binding_id &&
+        query.control_binding_revision == path.control_binding_revision &&
+        query.control_route_id == path.control_route_id &&
+        query.active_control_configuration_id == path.active_control_configuration_id &&
+        query.active_control_configuration_generation == path.active_control_configuration_generation;
+  });
+  if (found == sources.end() || !found->reader ||
+      found->descriptor.publication.query_context.resources.size() != component.target.positions.size())
+    return Result::Err(ResetPositionError("reset_position_raw_source_missing", "The Mock arm has no exact raw state source."));
+  for (std::size_t i = 0; i < binding.resources.size(); ++i)
+    if (found->descriptor.publication.query_context.resources[i] != binding.resources[i].resource_id)
+      return Result::Err(ResetPositionError("reset_position_raw_source_order", "The Mock arm raw state order is not its target order."));
+  auto source = *found;
+  return Result::Ok({std::move(association.value()), std::move(source)});
+}
+
+core::Result<core::ObservedStateSnapshotDTO> ReadMockResetMeasuredSource(
+    const MockResetPositionComponent& component, const MockResetMeasuredSource& source) {
+  auto current = source.association.validate_current();
+  if (!current.ok()) return core::Result<core::ObservedStateSnapshotDTO>::Err(current.error());
+  auto sample = source.source.reader->current_state(
+      source.source.descriptor.publication.query_context, component.runtime->clock->now());
+  current = source.association.validate_current();
+  if (!current.ok()) return core::Result<core::ObservedStateSnapshotDTO>::Err(current.error());
+  return sample;
+}
+
+core::Result<void> RunMockResetPosition(
+    Composition& composition, deployment::CCLCRuntimeComposition& facade,
+    const ProgramResetPositionRequest& request,
+    const core::RequestOwnerEpoch& owner_epoch, const std::stop_token stop_token) {
+  using Result = core::Result<void>;
+  if (!composition.bundle || request.owner_epoch != owner_epoch ||
+      request.active_publication_generation != composition.publication_generation ||
+      request.retained_bundle_id != composition.bundle->retained_bundle_id() ||
+      request.graph_revision != composition.bundle->value().cell_graph.graph_revision ||
+      !composition.active_addressed_kernel())
+    return Result::Err(ResetPositionError("reset_position_deployment_changed", "The selected Deployment identity is no longer current."));
+  auto authorized = composition.active_addressed_kernel()->ValidateProgramResetPositionAuthorization(request.authorization);
+  if (!authorized.ok()) {
+    auto error = authorized.error();
+    error.details["effect_disposition"] = "known_no_effect";
+    return Result::Err(std::move(error));
+  }
+  auto captured = CaptureMockResetPositionComponents(composition, facade);
+  if (!captured.ok()) return Result::Err(captured.error());
+  std::vector<MockResetMeasuredSource> sources;
+  sources.reserve(captured.value().size());
+  // Refuse every unsupported/changed arm before the first component effect.
+  for (const auto& component : captured.value()) {
+    auto source = CaptureMockResetMeasuredSource(component);
+    if (!source.ok()) return Result::Err(ResetPositionError("reset_position_raw_source_unavailable", source.error().message));
+    const auto sample = ReadMockResetMeasuredSource(component, source.value());
+    if (!sample.ok()) return Result::Err(ResetPositionError("reset_position_raw_source_unavailable", sample.error().message));
+    sources.push_back(std::move(source.value()));
+  }
+  bool effect_possible = false;
+  for (std::size_t index = 0; index < captured.value().size(); ++index) {
+    const auto& component = captured.value()[index];
+    const auto& source = sources[index];
+    const auto wake = component.handle->mock_reset_observation_wake();
+    if (!wake) return Result::Err(ResetPositionError("reset_position_observation_missing", "The Mock arm observation wake is absent.", effect_possible));
+    std::mutex phase_mutex;
+    MockResetPositionTransition transition{MockResetPositionPhase::kSwitchingToWriter,
+        component.handle->ReadOwnedControllerOccurrence().arm_binding_epoch.value_or(core::ExecutionBindingEpoch(0U)), std::nullopt};
+    auto core_phase = core::CCLCProgramResetPositionPhase::kSwitchingToWriter;
+    core::CCLCProgramResetPositionScopeRequest scope{
+        request.authorization.program_runner_owner_epoch, request.authorization.cycle_generation,
+        request.authorization.request_owner_epoch, request.authorization.request_id,
+        request.authorization.request_payload_digest, component.snapshot.active_publication_receipt,
+        component.snapshot.controllable_component_id, component.provider, component.domain,
+        [&](const core::BrandLifecycleObservationDTO& observation, const auto observed_phase) {
+          std::lock_guard lock(phase_mutex);
+          return observed_phase == core_phase &&
+              component.handle->IsExpectedMockPositionResetTransition(observation, transition);
+        }};
+    auto result = facade.WithProgramResetPositionScope(scope,
+        [&](const core::CCLCProgramResetPositionAdvance& advance) -> Result {
+      std::optional<core::ObservedStateSnapshotDTO> baseline;
+      const auto switched = component.handle->ResetMockPosition(stop_token,
+          [&](const MockResetPositionTransition& next, const MockResetPositionPhaseCommit& commit) -> Result {
+        auto next_core_phase = core_phase;
+        switch (next.phase) {
+          case MockResetPositionPhase::kSwitchingToWriter:
+            next_core_phase = core::CCLCProgramResetPositionPhase::kSwitchingToWriter; break;
+          case MockResetPositionPhase::kSettingState:
+            next_core_phase = core::CCLCProgramResetPositionPhase::kSettingState; break;
+          case MockResetPositionPhase::kSwitchingToJtc:
+            next_core_phase = core::CCLCProgramResetPositionPhase::kSwitchingToJtc; break;
+          case MockResetPositionPhase::kContaining: break;
+        }
+        // Only local phase/epoch state is committed under the existing driver
+        // exclusion. Every source read and ROS wait follows after it unlocks.
+        auto advanced = advance(next_core_phase, [&]() -> Result {
+          std::lock_guard lock(phase_mutex);
+          transition = next;
+          core_phase = next_core_phase;
+          return commit ? commit() : Result::Ok();
+        });
+        if (!advanced.ok()) return advanced;
+        if (next.phase == MockResetPositionPhase::kContaining) return Result::Ok();
+        if (next.phase == MockResetPositionPhase::kSwitchingToWriter && !next.switch_acknowledged)
+          effect_possible = true;  // The following switch may be sent.
+        const auto validate_scope = [&] { return advance(next_core_phase, {}); };
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::nanoseconds(kMockResetPositionWriteAcknowledgmentTimeoutNs);
+        if (next.phase == MockResetPositionPhase::kSettingState) {
+          if (!next.target_published) {
+            auto sample = ReadMockResetMeasuredSource(component, source);
+            if (!sample.ok()) return Result::Err(sample.error());
+            baseline = std::move(sample.value());
+            return Result::Ok();
+          }
+          if (!baseline) return Result::Err(ResetPositionError("reset_position_write_baseline_missing", "The Mock writer has no pre-publication source receipt.", true));
+          const auto published_at = component.runtime->clock->now();
+          auto acknowledged = WaitForMockResetObservation(*wake, stop_token, deadline, [&]() -> core::Result<bool> {
+            auto valid = source.association.validate_current();
+            if (!valid.ok()) return core::Result<bool>::Err(valid.error());
+            auto sample = ReadMockResetMeasuredSource(component, source);
+            if (!sample.ok()) return core::Result<bool>::Ok(false);
+            return core::Result<bool>::Ok(sample.value().source_epoch == baseline->source_epoch &&
+                ExactMockResetMeasuredTarget(sample.value(), component.target.positions,
+                    baseline->sequence, baseline->source_timestamp_ns, published_at));
+          }, validate_scope);
+          if (!acknowledged.ok()) return acknowledged;
+          const std::vector<double> zero(component.target.positions.size(), 0.0);
+          const auto initialized = component.runtime->motion_state_channel->publish_commanded_initialization_and_project(
+              component.target.positions, zero, component.runtime->clock->now());
+          if (!initialized.applied())
+            return Result::Err(ResetPositionError("reset_position_command_publication_failed", "The backend commanded initial pose could not be published and projected.", true));
+          return Result::Ok();
+        }
+        if (next.switch_acknowledged) {
+          // A positive response permits association with ordinary CM/action
+          // observation. Unknown responses never reach this readback barrier.
+          return WaitForMockResetObservation(*wake, stop_token, deadline, [&]() -> core::Result<bool> {
+            return core::Result<bool>::Ok(next.phase == MockResetPositionPhase::kSwitchingToWriter
+                ? component.handle->mock_reset_writer_active()
+                : component.handle->mock_reset_successor_ready());
+          }, validate_scope);
+        }
+        return Result::Ok();
+      });
+      if (switched.outcome != RetainedRos2ControlSwitchOutcome::kSucceeded)
+        return Result::Err(switched.error.value_or(ResetPositionError("reset_position_switch_failed", "The Mock position reset did not complete.", effect_possible)));
+      return Result::Ok();
+    });
+    if (!result.ok()) {
+      auto error = result.error();
+      error.details["effect_disposition"] = effect_possible ? "unknown" : "known_no_effect";
+      if (effect_possible) error.message += " Restart the Workbench before trying again; the Reset claim remains held.";
+      return Result::Err(std::move(error));
+    }
+  }
+  return Result::Ok();
+}
+
+void ConfigureProgramResetPositionAccess(ExecutionCompositionAccess& access,
+                                        const core::RequestOwnerEpoch& owner_epoch,
+                                        deployment::CCLCRuntimeComposition& facade) {
+  // The managed cell keeps this same owner through installed-product exchange.
+  // Capture its existing service lifetime, never the moving unique_ptr slot in
+  // a component composition. Callers install callbacks before ingress or under
+  // the existing execution-composition write exclusion.
+  access.reset_robot_position_capability = [&facade](Composition& composition) {
+    using Result = core::Result<ProgramResetPositionCapability>;
+    try {
+      const auto components = CaptureMockResetPositionComponents(composition, facade);
+      if (!components.ok()) return Result::Ok({false, components.error().message});
+      // Mirror the existing effect's exact source-association prerequisite
+      // before selected Scene effects. This is no sample freshness, idle or
+      // resource-admission test; those remain with their existing owners.
+      for (const auto& component : components.value()) {
+        const auto source = CaptureMockResetMeasuredSource(component);
+        if (!source.ok()) return Result::Ok({false, source.error().message});
+      }
+      return Result::Ok({true, std::nullopt});
+    } catch (const std::exception& error) {
+      return Result::Ok({false, std::string("Position reset capability is unavailable: ") + error.what()});
+    } catch (...) {
+      return Result::Ok({false, "Position reset capability is unavailable."});
+    }
+  };
+  access.reset_robot_position = [owner_epoch, &facade](Composition& composition,
+      const ProgramResetPositionRequest& request, std::stop_token stop_token) {
+    try {
+      return RunMockResetPosition(composition, facade, request, owner_epoch, stop_token);
+    } catch (const std::exception& error) {
+      return core::Result<void>::Err(ResetPositionError("reset_position_effect_exception", error.what(), true));
+    } catch (...) {
+      return core::Result<void>::Err(ResetPositionError("reset_position_effect_exception", "Position reset failed unexpectedly.", true));
+    }
+  };
+}
+
 [[nodiscard]] RetainedNativeCCLCRuntimeConfig
 WithInstalledReadinessConstruction(
     RetainedNativeCCLCRuntimeConfig config, const Composition &composition,
@@ -7888,6 +8218,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           config.logical_scene_database, config.program_cycle_journal,
           config.execution_state_root / std::string(core::kCCLCJournalFilename),
           core::CellId(config.cell_id));
+  bootstrap_kernel_config.cell_admission_program_reset_status_source =
+      [path = config.program_cycle_journal](const auto purpose, const auto& intent, const auto& claim) {
+        return detail::ReadProgramResetStatusReadOnly(path, purpose, intent, claim);
+      };
   RetainedNativeCellRuntimeInput cell_input{
       .clock = detached_owner_clock,
       .scheduler = detached_owner_scheduler,
@@ -7976,6 +8310,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         config, bootstrap_cell->bundle, bootstrap_publication,
         *stable_kernel_owner, fence_owner, detached_owner_clock,
         detached_owner_scheduler);
+    ConfigureProgramResetPositionAccess(execution_composition,
+        core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
+        *managed_cell_cclc.facade);
   }
   // The main managed channel serializes its direct reads. Recreation must
   // separately stop all asynchronous ingress before destroying this owner.
@@ -8296,6 +8633,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 Require(!managed_cell_cclc.facade && attached_head,
                         "initial runtime cannot construct a second cell CCLC owner");
                 managed_cell_cclc.TakeAttached(*installed, *attached_head);
+                // Preserve managed-composition -> execution-composition lock
+                // order. No owner mutex is acquired by the effect callbacks.
+                std::unique_lock execution_lock(execution_composition.mutex);
+                ConfigureProgramResetPositionAccess(execution_composition,
+                    core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
+                    *managed_cell_cclc.facade);
               }
               current_composition_building = false;
             }
@@ -9050,6 +9393,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
     if (published_installed_composition != nullptr || published_installed_empty) {
       bool attached = false;
+      std::optional<core::ActiveBundlePublicationReceiptDTO> attached_head;
       try {
         if (original_configuration_finalize) {
           const auto head = read_current_publication();
@@ -9158,12 +9502,24 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         {
           attached = AttachCurrentPublishedCCLCIfReady(
               *published_installed_composition, config, fence_owner, fence_query);
+          if (attached) attached_head = read_current_publication();
         }
         std::lock_guard lock(managed_composition_mutex);
         Require(active_managed_composition.get() ==
                     published_installed_composition,
                 "published installed runtime changed during route recovery");
         if (attached) {
+          if (!managed_cell_cclc.facade) {
+            // A publication race can defer the initial attachment. Transfer
+            // that same eventual owner before publishing its Reset callbacks;
+            // no component-owned reference may outlive a later replacement.
+            Require(attached_head.has_value(), "late cell CCLC attachment lost its exact publication");
+            managed_cell_cclc.TakeAttached(*published_installed_composition, *attached_head);
+            std::unique_lock execution_lock(execution_composition.mutex);
+            ConfigureProgramResetPositionAccess(execution_composition,
+                core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch),
+                *managed_cell_cclc.facade);
+          }
           if (installed_composition_request == request) {
             // This exact Apply already proved controller retention before
             // retiring its predecessor. Replay that receipt; the released
@@ -9800,7 +10156,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                           config.execution_state_root /
                               std::string(core::kCCLCJournalFilename),
                           core::CellId(config.cell_id)),
-                      {}});
+                      {},
+                      [path = config.program_cycle_journal](const auto purpose, const auto& intent, const auto& claim) {
+                        return detail::ReadProgramResetStatusReadOnly(path, purpose, intent, claim);
+                      }});
               admission_gate.BindResourceTable(
                   prepared->runtime->addressed_kernel
                       ->resource_admission_table());
@@ -12234,6 +12593,8 @@ public:
             "standalone admission fixture could not publish readiness");
 #endif
     AttachRetainedNativeCCLC(*composition_, config_, *fence_owner_);
+    ConfigureProgramResetPositionAccess(composition_access_, owner_epoch_,
+        *composition_->cclc_runtime);
     composition_access_.current = composition_.get();
     composition_access_.addressed_kernel =
         composition_->active_addressed_kernel();

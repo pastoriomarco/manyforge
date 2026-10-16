@@ -14,6 +14,7 @@ namespace manyforge::core {
 inline constexpr std::size_t kMaximumCellAdmissionClaims = 4096U;
 inline constexpr std::size_t kMaximumCellAdmissionScopeEntries = 4096U;
 inline constexpr std::size_t kMaximumCellAdmissionIdentityBytes = 128U;
+inline constexpr std::size_t kMaximumProgramResetCallerIdentityBytes = 256U;
 inline constexpr std::size_t kMaximumCellAdmissionPrivateBinaryBytes =
     256U * 1024U;
 inline constexpr std::size_t kMaximumCellAdmissionJsonRequestBytes =
@@ -29,6 +30,7 @@ enum class CellAdmissionClaimKindDTO {
   kAuthoredScene,
   kManualOperation,
   kInterventionOrRecovery,
+  kProgramReset,
 };
 
 enum class CellAdmissionOwnerRoleDTO {
@@ -280,6 +282,20 @@ struct AuthoringAdmissionDTO final {
   friend bool operator==(const AuthoringAdmissionDTO&, const AuthoringAdmissionDTO&) = default;
 };
 
+/// Original accepted Reset identity and selectors. A joining caller never
+/// replaces these facts with its own attribution or selection.
+struct AcceptedProgramResetDTO final {
+  RequestOwnerEpoch request_owner_epoch;
+  RequestId request_id;
+  ContentDigest request_payload_digest;
+  bool reload_initial_scene{};
+  bool reset_robot_position{};
+  std::optional<CellAdmissionClaimGeneration> reset_claim_generation;
+
+  friend bool operator==(const AcceptedProgramResetDTO&,
+                         const AcceptedProgramResetDTO&) = default;
+};
+
 struct ProgramCycleStatusDTO final {
   RequestOwnerEpoch program_runner_owner_epoch;
   std::uint64_t cycle_generation{};
@@ -287,6 +303,7 @@ struct ProgramCycleStatusDTO final {
   std::optional<ProgramRunId> program_run_id;
   std::optional<CellAdmissionClaimGeneration> cycle_claim_generation;
   std::optional<ContentDigest> terminal_or_settlement_reference;
+  std::optional<AcceptedProgramResetDTO> accepted_reset{};
 
   friend bool operator==(const ProgramCycleStatusDTO&, const ProgramCycleStatusDTO&) = default;
 };
@@ -296,15 +313,45 @@ struct ProgramCycleStatusDTO final {
 /// validates it against the current Resetting projection and the exact
 /// retained or reconciled Program-cycle claim before the scene owner commits
 /// one compare-and-swap transaction.
+struct ProgramResetClaimSceneAuthorizationDTO final {
+  std::uint64_t cycle_generation{};
+  RequestOwnerEpoch request_owner_epoch;
+  RequestId request_id;
+  ContentDigest request_payload_digest;
+  CellAdmissionClaimGeneration reset_claim_generation{0U};
+
+  friend bool operator==(const ProgramResetClaimSceneAuthorizationDTO&,
+                         const ProgramResetClaimSceneAuthorizationDTO&) = default;
+};
+
 struct ProgramResetSceneAuthorizationDTO final {
   RequestOwnerEpoch program_runner_owner_epoch;
   ProgramRunId program_run_id;
   CellAdmissionClaimGeneration cycle_claim_generation{0U};
   ContentDigest terminal_or_settlement_reference;
+  /// Selected Reset-claim variant (idle or proven-no-effect failed Start).
+  /// The run fields above must be empty/zero; the journal retains the real run.
+  std::optional<ProgramResetClaimSceneAuthorizationDTO> reset_claim{};
 
   friend bool operator==(const ProgramResetSceneAuthorizationDTO&,
                          const ProgramResetSceneAuthorizationDTO&) = default;
 };
+
+/// Position-specific authority, joined to the original selected Reset and its
+/// exact held Program-cycle or selected-idle Reset claim. Contains no target.
+struct ProgramResetPositionAuthorizationDTO final {
+  RequestOwnerEpoch program_runner_owner_epoch;
+  std::uint64_t cycle_generation{};
+  RequestOwnerEpoch request_owner_epoch;
+  RequestId request_id;
+  ContentDigest request_payload_digest;
+  std::optional<ProgramRunId> program_run_id;
+  std::optional<CellAdmissionClaimGeneration> cycle_claim_generation;
+  std::optional<ContentDigest> terminal_or_settlement_reference;
+  std::optional<CellAdmissionClaimGeneration> reset_claim_generation;
+};
+[[nodiscard]] Result<void> ValidateProgramResetPositionAuthorization(
+    const ProgramResetPositionAuthorizationDTO& authorization);
 
 /// Owner-produced O(1) reduction. Counts are complete bounded aggregates, not
 /// collections to be rescanned by admission or Stop.
@@ -340,6 +387,7 @@ ComputeCellAdmissionRecoveryFootprint(
     const std::vector<CellAdmissionRecoveryLedgerEntryDTO>& entries,
     const std::vector<CellAdmissionCurrentOwnerEpochDTO>& current_owner_epochs);
 [[nodiscard]] Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status);
+[[nodiscard]] Result<RequestId> ProgramResetClaimRequestId(const ProgramCycleStatusDTO& status);
 [[nodiscard]] Result<void> ValidateProgramResetSceneAuthorization(
     const ProgramResetSceneAuthorizationDTO& authorization);
 [[nodiscard]] Result<ContentDigest> CellAdmissionClaimIntentDigest(

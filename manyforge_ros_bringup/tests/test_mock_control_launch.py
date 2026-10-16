@@ -25,7 +25,8 @@ def _module():
 
 
 def _context(
-    tmp_path, *, plugin="mock_components/GenericSystem", gripper_name="", frame_prefix=""
+    tmp_path, *, plugin="mock_components/GenericSystem", gripper_name="", frame_prefix="",
+    reset_position_name="",
 ):
     description = tmp_path / "retained.urdf"
     description.write_text(
@@ -44,6 +45,7 @@ def _context(
         robot_description_file=str(description), controllers_file=str(controllers),
         runtime_namespace="/fixture/arm", controller_manager_name="control",
         arm_controller_name="arm_controller",
+        reset_position_controller_name=reset_position_name,
         gripper_controller_name=gripper_name,
         frame_prefix=frame_prefix,
     )
@@ -59,6 +61,7 @@ def test_mock_launch_requires_retained_artifacts_and_no_second_pose_input():
     assert declarations == {
         "robot_description_file", "controllers_file", "runtime_namespace",
         "controller_manager_name", "arm_controller_name",
+        "reset_position_controller_name",
         "gripper_controller_name",
         "frame_prefix",
     }
@@ -88,6 +91,16 @@ def test_observation_and_inactive_arm_use_exact_manager_route(tmp_path):
     manager_parameters = evaluate_parameters(context, nodes[1]._Node__parameters)
     assert manager_parameters[0] == tmp_path / "controllers.yaml"
     assert manager_parameters[1] == {"use_sim_time": False}
+
+
+def test_configuration_scoped_position_writer_is_loaded_inactive(tmp_path):
+    writer = "manyforge_reset_position_" + "a" * 64
+    nodes = _module().launch_setup(_context(tmp_path, reset_position_name=writer))
+    assert nodes[4]._Node__arguments == [
+        writer, "--inactive", "--controller-manager", "/fixture/arm/control",
+        "--param-file", str(tmp_path / "controllers.yaml"),
+    ]
+    assert len(nodes) == 5
 
 
 @pytest.mark.parametrize("prefix", ["", "authored_component/"])
@@ -282,6 +295,9 @@ def test_stock_gripper_plugin_dependency_is_declared():
 
     manifest = ET.fromstring((ROOT / "package.xml").read_text())
     assert "gripper_controllers" in {
+        dependency.text for dependency in manifest.findall("exec_depend")
+    }
+    assert "forward_command_controller" in {
         dependency.text for dependency in manifest.findall("exec_depend")
     }
 

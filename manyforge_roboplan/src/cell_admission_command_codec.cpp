@@ -85,7 +85,8 @@ core::CellAdmissionClaimKindDTO ClaimKind(std::string_view v) {
                  core::CellAdmissionClaimKindDTO::kComponentLifecycle,
                  core::CellAdmissionClaimKindDTO::kAuthoredScene,
                  core::CellAdmissionClaimKindDTO::kManualOperation,
-                 core::CellAdmissionClaimKindDTO::kInterventionOrRecovery})
+                 core::CellAdmissionClaimKindDTO::kInterventionOrRecovery,
+                 core::CellAdmissionClaimKindDTO::kProgramReset})
     if (core::to_string(x) == v)
       return x;
   Fail("unknown cell-admission claim_kind");
@@ -245,7 +246,7 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(const Value &v) {
       Bool(v, "program_cycle_status_current");
   result.program_cycle_status = Optional<core::ProgramCycleStatusDTO>(
       v, "program_cycle_status", [](const Value &x) {
-        Exact(x, 6U);
+        Exact(x, 7U);
         return core::ProgramCycleStatusDTO{
             core::RequestOwnerEpoch(Text(x, "program_runner_owner_epoch")),
             Counter(x, "cycle_generation"),
@@ -269,7 +270,22 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(const Value &v) {
                   Require(n.is_string(),
                           "terminal_or_settlement_reference has wrong type");
                   return core::ContentDigest(n.as_string());
-                })};
+                }),
+            Optional<core::AcceptedProgramResetDTO>(x, "accepted_reset", [](const Value& reset) {
+              Exact(reset, 6U);
+              return core::AcceptedProgramResetDTO{
+                  core::RequestOwnerEpoch(Text(reset, "request_owner_epoch", core::kMaximumProgramResetCallerIdentityBytes)),
+                  core::RequestId(Text(reset, "request_id", core::kMaximumProgramResetCallerIdentityBytes)),
+                  core::ContentDigest(Text(reset, "request_payload_digest")),
+                  Bool(reset, "reload_initial_scene"), Bool(reset, "reset_robot_position"),
+                  Optional<core::CellAdmissionClaimGeneration>(reset, "reset_claim_generation", [](const Value& value) {
+                    Require(value.is_number() && value.as_number() >= 1.0 &&
+                                std::floor(value.as_number()) == value.as_number() &&
+                                value.as_number() <= kMaximumSafeInteger,
+                            "reset_claim_generation is out of range");
+                    return core::CellAdmissionClaimGeneration(static_cast<std::uint64_t>(value.as_number()));
+                  })};
+            })};
       });
   result.required_component_status_current =
       Bool(v, "required_component_status_current");
@@ -557,6 +573,13 @@ core::CellAdmissionClaimDTO DecodeCellAdmissionClaim(
   Require(bytes.size() <= kMaximumPacketBytes,
           "cell-admission claim JSON is oversized");
   return Claim(ci::parse_canonical_json(bytes));
+}
+
+core::CellAdmissionClaimIntentDTO DecodeCellAdmissionClaimIntent(
+    const std::string_view bytes) {
+  Require(bytes.size() <= kMaximumPacketBytes,
+          "cell-admission intent JSON is oversized");
+  return Intent(ci::parse_canonical_json(bytes));
 }
 
 core::CellAdmissionClaimReleaseDTO DecodeCellAdmissionClaimRelease(

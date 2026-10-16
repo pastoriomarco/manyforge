@@ -1,0 +1,120 @@
+{
+  "schema": "manyforge.composable_cell.r4_m1.stop_record_size_audit.v1",
+  "status": "READ_ONLY_AUDIT_FUTURE_WORK_NOT_IMPLEMENTED_IN_M1",
+  "date": "2026-10-15",
+  "implementation_landing_commit": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+  "provenance": [
+    {
+      "historical_receipt_id": "m1-dx934-stop-terminal-projection-audit01.json",
+      "sha256": "57deae688285c603c8f79786bead1bf7def926aa3fa5c27951c085e069a6eb5f"
+    },
+    {
+      "historical_receipt_id": "m1-dx938-lean-stop-record-format-sizing01.json",
+      "sha256": "7dd2773898936ae4dc750870bfafc7ea11ac8d195765d6e3ce1f3145fef7e0d4"
+    }
+  ],
+  "retention_note": "This self-contained summary preserves reviewed results and limitations. Historical receipt identifiers and digests are provenance, not a promise that disposable raw files or remote paths remain available. No new execution is reported.",
+  "sample": {
+    "native_payload_utf8_bytes": 20075,
+    "participant": "one stopped Position Robotiq participant",
+    "attempt_results": 1,
+    "evidence_items": 1,
+    "prepared_stage_commands": 2,
+    "subtree_bytes": {
+      "StopStatus": 9891,
+      "Certificate": 10119,
+      "status.attempted_stage_results": 6716,
+      "certificate.attempted_stage_results": 6716,
+      "status.evidence_items": 1550,
+      "certificate.evidence_items": 1550,
+      "one_prepared_participant_stop_plan_inside_attempt": 4110,
+      "prepared_stage_commands_inside_that_plan": [
+        1750,
+        1760
+      ],
+      "participant_scope_entries_per_copy": 1044
+    },
+    "sample_is_not_global_bound": true
+  },
+  "duplication_findings": [
+    "StopStatus and Certificate each contain equal scope/results/evidence arrays under strict join validation",
+    "Each attempted result embeds the full prepared participant Stop plan and its stage command vector",
+    "The same canonical terminal payload is stored in sequenced journal_records and recovery stop_projections in one transaction",
+    "Recovery verifies payload/digest then reconstructs status from certificate truth",
+    "Headless history is a separately transformed asynchronous durable sink; queue admission is not durable commit"
+  ],
+  "participant_size_estimates_bytes": {
+    "four_comparable_moving_participants_terminal": 75935,
+    "same_payload_two_native_SQLite_text_copies": 151870,
+    "two_moving_arms_with_nonmotion_pneumatic_outputs_terminal": 38695,
+    "same_two_arm_payload_two_native_SQLite_text_copies": 77390,
+    "basis": "Linear estimate from one sample; not measured four-participant workload, excludes SQLite/WAL/index overhead; multiple stages may grow superlinearly."
+  },
+  "existing_limits": {
+    "scope_rows": 4096,
+    "attempt_results": 32768,
+    "evidence_rows": 262144,
+    "prepared_plan_bytes": 16777216,
+    "native_terminal_JSON_bytes": 67108864,
+    "native_SQLite_image_bytes": 8589934592,
+    "recovered_Stop_rows": 64,
+    "native_event_page_rows": 16,
+    "detailed_Stop_history_projection_bytes": 196608,
+    "historian_payload_bytes": 262144
+  },
+  "current_history_behavior": "Above192KiB current detailed Stop history projection emits count-only/details_truncated form. Future approved no-truncation marker policy is not implemented in M1.",
+  "future_direction": {
+    "status": "DEFERRED_NOT_M1_IMPLEMENTATION",
+    "store_once": "One verified result/evidence set and each distinct prepared plan once, with atomic reference lifetime across pruning/epochs/recovery",
+    "history": "Dense history ordinal/checkpoint and oversize identity/kind/original-byte marker with bounded diagnostic review path",
+    "compatibility": "DX941 explicit decision rejects old-format journals; NO converter approved. This supersedes DX938 migration alternatives and converter-related effort estimate.",
+    "numeric_bounds": "Existing limits above are source facts; future aggregate/shared-artifact limits still require concrete implementation review."
+  },
+  "source_pins": [
+    {
+      "path": "manyforge_core/include/manyforge_core/stop_journal_projection_codec.hpp",
+      "sha256": "2b554d17be2cd918325738a7e5a49aad54b98260d9b352b6b1c7e7603e723e7a"
+    },
+    {
+      "path": "manyforge_core/src/stop_journal_projection_codec.cpp",
+      "sha256": "f91a2bbd9f67250654e20309f15b2a9951f774b682b9b9aacb2c47a1b9040097"
+    },
+    {
+      "path": "manyforge_core/include/manyforge_core/sqlite_operation_journal.hpp",
+      "sha256": "efcb2a3e3f8e5326aba510486153467937354fcc3374e21a76700b3cc57d7b3d"
+    },
+    {
+      "path": "manyforge_core/src/sqlite_operation_journal.cpp",
+      "sha256": "a26a92e71719773db998852d3ff8b69b9f9ac49e096b5cb53eb46f0bb7e89956"
+    },
+    {
+      "path": "manyforge_core/test/test_sqlite_operation_journal.cpp",
+      "sha256": "0b0c92f61d8f4b7c1966cb21586c50a6c12cd6356a9a606f48a29aa286d03f58"
+    },
+    {
+      "path": "manyforge_core/src/prepared_participant_stop_plan_codec.cpp",
+      "sha256": "f62383537ee4c5b1938236c1ace39cd2eae655000e50f15e9cbf243a6f33cc55"
+    },
+    {
+      "path": "manyforge_core/include/manyforge_core/stop_terminal_reducer.hpp",
+      "sha256": "34f930dbc031e5ff7ae4ca4305d87be8064c8a7883e867ccce2915a32cbfcc16"
+    },
+    {
+      "path": "manyforge_roboplan/src/execution_host_config.hpp",
+      "sha256": "025bd0559137774e6ae1fe983d4e833a29019c9486cda8a87f7b376886d7c6d7"
+    },
+    {
+      "path": "manyforge_roboplan/src/execution_host_responses.cpp",
+      "sha256": "2905bbcc69e59aa9db4b63804d55c87db7c23b3f603d6c05dbba7ee5b04081a6"
+    },
+    {
+      "path": "manyforge_headless/src/headless_api_core.cpp",
+      "sha256": "8b5c4d7750cb16e09272044581abd3cdad076a35144e58c5d087b7f3670ba7aa"
+    }
+  ],
+  "limits": [
+    "Read-only source and saved-sample audit, no new build/test/runtime experiment",
+    "No storage normalization, migration, new schema, historian policy or Stop semantic change made by this audit",
+    "Position/motion remains Stop-owned; pneumatic non-motion results reconcile ordinarily and are not counted as Stop participants"
+  ]
+}

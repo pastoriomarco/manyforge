@@ -31,14 +31,15 @@ import { useDeploymentWorkspace } from './hooks/useDeploymentWorkspace';
 import { useManagerApplyStatus } from './hooks/useManagerApplyStatus';
 import { activationFailureNotice } from './state/activationNotices';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
-import { useProgramWorkspace } from './hooks/useProgramWorkspace';
+import { useProgramWorkspace, type ScenarioReplacementIdentity } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
+import { robotControlHasActiveOperation } from './state/robotControl';
 import { useHeldNodePreview } from './hooks/useHeldNodePreview';
 import { useResetApply } from './hooks/useResetApply';
 import { useAppliedSettlementRefresh } from './hooks/useAppliedSettlementRefresh';
 import { appliedCartesianDefaults } from './state/robotControl';
-import { closeScenario as closeCurrentScenario } from './state/scenarioClose';
-import { waitForObservation } from './hooks/useCCLC';
+import { closeScenario as closeCurrentScenario, resetCloseSnapshot, type ClosePreparationInputs } from './state/scenarioClose';
+import { useCCLC, waitForObservation } from './hooks/useCCLC';
 import type { ManagerActiveProjection } from './types/api';
 import {
   managerActivationSettlementKey,
@@ -71,6 +72,7 @@ import {
 import { DocumentStateLetters } from './components/DocumentStateLetters';
 import { useComposerSettingsNotices } from './components/ComposerSettingsPanel';
 import {
+  previousSessionAlarmHandoff,
   activeViewerIncidentKinds,
   classifyWorkbenchNotices,
   useTransitionScope,
@@ -340,12 +342,32 @@ export default function App() {
   // Draft / Saved / Applied of both documents, shown in every workspace.
   const programStates = programDocumentStates(programController.state.workspace);
   const deploymentStates = deploymentDocumentStates(deploymentController.workspace);
+  const configuredComponentIds = useMemo(() => (
+    deploymentController.workspace?.managerApplied.activationOrder?.componentIds ?? []
+  ), [deploymentController.workspace?.managerApplied.activationOrder]);
+  const cclc = useCCLC(headlessEnabled,
+    headlessSnapshot?.authoringAdmission.admissionGeneration ?? null, configuredComponentIds);
+  const { componentId: cclcComponentId, setComponentId: selectCCLCComponent, refresh: refreshCCLC } = cclc;
+  useOperationalErrorMirror({
+    source: 'composer.cclc',
+    title: 'Component lifecycle or route command failed',
+    message: cclc.error,
+    onDismiss: cclc.dismissError,
+  });
+  useEffect(() => {
+    const next = configuredComponentIds.includes(cclcComponentId) ? cclcComponentId : configuredComponentIds[0] ?? '';
+    if (next !== cclcComponentId) selectCCLCComponent(next);
+  }, [cclcComponentId, configuredComponentIds, selectCCLCComponent]);
+  useEffect(() => {
+    if (headlessEnabled && configuredComponentIds.includes(cclcComponentId)) void refreshCCLC();
+  }, [cclcComponentId, configuredComponentIds, headlessEnabled, refreshCCLC]);
   const programRuntime = useProgramRuntime(
     headlessEnabled,
     headlessSnapshot,
     programController.state.workspace,
     headlessStateSource,
     deploymentUnapplied(deploymentController.workspace),
+    cclc,
   );
   // Manual motion uses Applied defaults; Draft changes wait for Apply.
   const appliedProgram = programRuntime.state.applied;
@@ -376,6 +398,13 @@ export default function App() {
     programController.state.workspace?.hasUnappliedChanges === true
       || deploymentUnapplied(deploymentController.workspace),
   );
+  // Robots are moving: a Program run that is not positively held, a starting or
+  // stopping cycle, or an active manual operation. Document actions wait.
+  const documentCycle = headlessSnapshot?.programCycle;
+  const documentMotionActive = robotControlHasActiveOperation(robotControl.state)
+    || documentCycle?.state === 'starting' || documentCycle?.state === 'stopping'
+    || (documentCycle?.state === 'running'
+      && documentCycle.runtimeControls?.executionSelections.motionHeld !== true);
   const operationalErrors = useOperationalErrors();
   useOperationalErrorMirror({
     source: 'composer.deployment_workspace',
@@ -489,12 +518,28 @@ export default function App() {
   const closeAbort = useRef<AbortController | null>(null);
   const [scenarioCloseProgress, setScenarioCloseProgress] = useState<string | null>(null);
   useEffect(() => () => closeAbort.current?.abort(), []);
-  const closeCurrent = useCallback(async (expected: ManagerActiveProjection) => {
+  const latestProgramRuntime = useRef(programRuntime);
+  latestProgramRuntime.current = programRuntime;
+  const closeCurrent = useCallback(async (expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity, callerSignal?: AbortSignal) => {
     if (closeAbort.current !== null) throw new Error('Scenario Close is already in progress.');
     const abort = new AbortController();
     closeAbort.current = abort;
+    const abortFromCaller = () => abort.abort(callerSignal?.reason);
+    callerSignal?.addEventListener('abort', abortFromCaller, { once: true });
+    if (callerSignal?.aborted) abortFromCaller();
     try {
+      const preparation: ClosePreparationInputs | undefined = confirmed === undefined ? undefined : { confirmed,
+        reset: (options) => latestProgramRuntime.current.reset(options),
+        readResetSnapshot: () => resetCloseSnapshot(headlessStateSource.getShellSnapshot()),
+        readSnapshot: () => {
+          const current = headlessStateSource.getShellSnapshot();
+          if (current.snapshot === null || current.transportStatus !== 'connected' || current.semanticStatus !== 'current')
+            throw new Error('Control source is unavailable; Close is unresolved.');
+          return current.snapshot;
+        },
+      };
       return await closeCurrentScenario({ expected, signal: abort.signal,
+        preparation,
         admissionGeneration: () => {
           const state = headlessStateSource.getShellSnapshot();
           if (state.snapshot === null || state.transportStatus !== 'connected'
@@ -504,7 +549,10 @@ export default function App() {
         waitForObservation: () => waitForObservation(abort.signal),
         trackApply: setTrackedApply, progress: setScenarioCloseProgress,
       });
-    } finally { closeAbort.current = null; setScenarioCloseProgress(null); }
+    } finally {
+      callerSignal?.removeEventListener('abort', abortFromCaller);
+      closeAbort.current = null; setScenarioCloseProgress(null);
+    }
   }, [headlessStateSource]);
   useEffect(() => {
     if (programController.acceptedApply !== null) setTrackedApply(programController.acceptedApply);
@@ -714,11 +762,39 @@ export default function App() {
     maintenance,
   ]);
   const publishedNotices = usePublishedWorkbenchNotices();
+  const sessionNotice = health.status === 'ready'
+    ? health.data.workbenchSessionNotice ?? null
+    : null;
+  const [registeredSessionNotice, setRegisteredSessionNotice] = useState<string | null>(null);
+  const sessionRegistration = health.status === 'ready'
+    ? health.data.headless?.workbench_previous_session_registration
+    : null;
+  const sessionNoticeHandoff = previousSessionAlarmHandoff(
+    sessionNotice?.sessionId ?? null, registeredSessionNotice, sessionRegistration,
+  );
+  useEffect(() => {
+    setRegisteredSessionNotice(sessionNoticeHandoff);
+  }, [sessionNoticeHandoff]);
+  // A completed native startup registers this exact predecessor with the
+  // existing alarm owner (or proves its persisted acknowledgement). Keep the
+  // handoff through transport loss and removal of the acknowledged alarm.
+  const sessionNoticeOwnedByAlarms = sessionNotice !== null
+    && sessionNoticeHandoff === sessionNotice.sessionId;
+  const sessionNotices = useMemo<WorkbenchNotice[]>(() => sessionNotice === null
+    || sessionNoticeOwnedByAlarms ? [] : [{
+    id: `cold-session.${sessionNotice.sessionId}`,
+    severity: 'warning',
+    domain: 'recovery',
+    title: 'ManyForge did not close correctly last time.',
+    message: 'The cell started empty; nothing from the previous session was resumed. Its records are kept; details in History.',
+    details: `Failure time unavailable. Session: ${sessionNotice.sessionId}. Archive: ${sessionNotice.archiveRelativePath}. Journal families: ${sessionNotice.journalFamilies.join(', ')}. History coverage: ${sessionNotice.historyCoverage}. ${sessionNotice.message}`,
+  }], [sessionNotice, sessionNoticeOwnedByAlarms]);
   const workbenchNotices = useMemo(() => [
     ...controlNotices,
     ...activationNotices,
     ...publishedNotices,
     ...operationNotices,
+    ...sessionNotices,
     ...(activationCompleted === null ? [] : [activationCompleted]),
     ...(programMessage === null ? [] : [programMessage]),
     ...(deploymentMessage === null ? [] : [deploymentMessage]),
@@ -730,6 +806,7 @@ export default function App() {
     operationNotices,
     programMessage,
     publishedNotices,
+    sessionNotices,
   ]);
   const transitionScope = useTransitionScope(transitionKey, workbenchNotices);
   const transitionClassified = useMemo(
@@ -943,6 +1020,7 @@ export default function App() {
       localInvalidEdit={programInvalidEdit}
       closeScenario={closeCurrent}
       closeProgress={scenarioCloseProgress}
+      motionActive={documentMotionActive}
     />
   );
 
@@ -1117,6 +1195,7 @@ export default function App() {
           ) : (
             <div className="deployment-workspace">
               <DeploymentCompositionPanel
+                cclc={cclc}
                 controller={deploymentController}
                 enabled={headlessEnabled}
                 snapshot={headlessSnapshot}

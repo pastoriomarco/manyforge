@@ -2109,6 +2109,7 @@ def test_program_apply_preserves_a_shared_reset_apply_correlation(
     response = client.post("/api/program/apply", json=body)
 
     assert response.status_code == 202, response.text
+    assert submitted[0]["scene_initialization"] == "preserve"
     assert "typed_parameter_overrides" not in submitted[0]
     # The Manager record carries the shared reference with its own request ID.
     assert submitted[0]["correlation_id"] == (correlation or body["requestId"])

@@ -1596,6 +1596,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
         if prepare_only:
             assert _claim is None, "preparation must precede admission acquisition"
             return prepared
+        assert intent["scene_initialization"] == "initialize"
         effects.append((deepcopy(intent), apply))
         result = deepcopy(prepared["result"])
         if result["status"] == "confirmation_required":
@@ -2610,3 +2611,14 @@ def test_captured_authoring_context_requires_checked_scenario_origin(origin) -> 
         state._captured_deployment_context({"deployment": {"name": "current"},
             "scenario_id": "cell_a", "source_document_digest": _DIGEST}, {"origin": origin})
     assert error.value.code == "activation_authoring_capture_mismatch"
+
+
+@pytest.mark.parametrize("purpose", ["preserve", "initialize"])
+def test_captured_scene_initialization_is_part_of_manager_request(tmp_path, purpose):
+    state, intent, _preview = _configuration_preparation(tmp_path)
+    intent["scene_initialization"] = purpose
+    prepared = state._prepare_authored_deployment_candidate(intent, None, apply=True)
+    assert prepared["manager_apply"]["scene_initialization"] == purpose
+    # Changing the local intent after capture cannot alter its prepared request.
+    intent["scene_initialization"] = "initialize" if purpose == "preserve" else "preserve"
+    assert prepared["manager_apply"]["scene_initialization"] == purpose

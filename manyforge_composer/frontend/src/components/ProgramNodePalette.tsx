@@ -119,6 +119,19 @@ export function defaultCollapsedCatalogCategories(
     .map(([category]) => category));
 }
 
+// Drawn chevrons: text glyphs sit on font metrics and are not centered. The
+// Collapse all / Expand all button doubles the category toggle's arrow.
+function PaletteChevron({ up, double = false }: { up: boolean; double?: boolean }) {
+  const d = double
+    ? (up ? 'M4 7.75 8 4.25 12 7.75M4 11.75 8 8.25 12 11.75' : 'M4 4.25 8 7.75 12 4.25M4 8.25 8 11.75 12 8.25')
+    : (up ? 'M4 10 8 6 12 10' : 'M4 6 8 10 12 6');
+  return (
+    <svg className="program-palette-chevron" viewBox="0 0 16 16" aria-hidden="true">
+      <path d={d} />
+    </svg>
+  );
+}
+
 export const ProgramNodePalette = memo(function ProgramNodePalette({
   roots,
   program,
@@ -138,14 +151,18 @@ export const ProgramNodePalette = memo(function ProgramNodePalette({
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(
     () => defaultCollapsedCatalogCategories(catalogEntries, environment),
   );
+  const [templatesCollapsed, setTemplatesCollapsed] = useState(true);
   const categoryOverrides = useRef(new Set<string>());
   const defaultAvailabilityKey = useRef<string | null>(null);
   const infoButton = useRef<HTMLButtonElement>(null);
   const closeInfo = useCallback(() => setInfoOpen(false), []);
   useEffect(() => {
     if (environment === null) return;
+    // Availability changes without a new environment digest (an empty start, then
+    // a Load), so the key includes each entry's current execution availability.
     const key = `${environment.environmentDigest}\u0000${catalogEntries
-      .map((entry) => entry.id).sort().join('\u0000')}`;
+      .map((entry) => `${entry.id}:${executionAvailability(entry, environment).available}`)
+      .sort().join('\u0000')}`;
     if (defaultAvailabilityKey.current === key) return;
     defaultAvailabilityKey.current = key;
     const defaults = defaultCollapsedCatalogCategories(catalogEntries, environment);
@@ -179,6 +196,21 @@ export const ProgramNodePalette = memo(function ProgramNodePalette({
   }
   const grouped = [...byCategory.entries()]
     .sort(([left], [right]) => left.localeCompare(right));
+  const allCollapsed = (program === undefined || templatesCollapsed)
+    && grouped.every(([category]) => collapsedCategories.has(category));
+  const toggleAll = () => {
+    const categories = grouped.map(([category]) => category);
+    for (const category of categories) categoryOverrides.current.add(category);
+    setTemplatesCollapsed(!allCollapsed);
+    setCollapsedCategories((current) => {
+      const next = new Set(current);
+      for (const category of categories) {
+        if (allCollapsed) next.delete(category);
+        else next.add(category);
+      }
+      return next;
+    });
+  };
 
   const addDetached = useCallback(async (activation: ProgramPaletteActivation) => {
     if (busy) return;
@@ -223,6 +255,15 @@ export const ProgramNodePalette = memo(function ProgramNodePalette({
             onClick={() => setInfoOpen(true)}
           >
             i
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={allCollapsed ? 'Expand all node categories' : 'Collapse all node categories'}
+            title={allCollapsed ? 'Expand all' : 'Collapse all'}
+            onClick={toggleAll}
+          >
+            <PaletteChevron up={allCollapsed} double />
           </button>
           {onCollapse && (
             <button
@@ -270,7 +311,13 @@ export const ProgramNodePalette = memo(function ProgramNodePalette({
         />
       </label>
       {program && (
-        <ProgramAuthoringTemplate program={program} busy={busy} onMutate={onMutate} />
+        <ProgramAuthoringTemplate
+          program={program}
+          busy={busy}
+          onMutate={onMutate}
+          collapsed={templatesCollapsed}
+          onCollapsedChange={setTemplatesCollapsed}
+        />
       )}
       <div className="program-palette-list">
         {grouped.map(([category, entries]) => {
@@ -295,7 +342,7 @@ export const ProgramNodePalette = memo(function ProgramNodePalette({
                     return next;
                   })}
                 >
-                  {collapsed ? '⌃' : '⌄'}
+                  <PaletteChevron up={collapsed} />
                 </button>
               </div>
             </header>

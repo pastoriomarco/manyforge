@@ -42,6 +42,7 @@ function status(
     },
     ok: true,
     phase,
+    sceneInitialization: 'preserve',
     preparedActivation: {
       capturedInputDigest: `sha256:${'6'.repeat(64)}`,
       deploymentArtifactId: 'deployment-1',

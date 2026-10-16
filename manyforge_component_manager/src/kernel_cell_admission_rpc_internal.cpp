@@ -185,7 +185,7 @@ void Intent(Writer &w, const core::CellAdmissionClaimIntentDTO &x) {
 }
 core::CellAdmissionClaimIntentDTO Intent(Reader &r) {
   core::CellAdmissionClaimIntentDTO x{
-      Enum<core::CellAdmissionClaimKindDTO>(r, 7U),
+      Enum<core::CellAdmissionClaimKindDTO>(r, 8U),
       Enum<core::CellAdmissionOwnerRoleDTO>(r, 7U),
       S<core::RequestOwnerEpoch>(r),
       r.String(),
@@ -259,6 +259,14 @@ void Readiness(Writer &w, const core::CellAdmissionReadinessSnapshotDTO &x) {
     Opt(w, v.cycle_claim_generation, [](Writer &w, const auto &v) { G(w, v); });
     Opt(w, v.terminal_or_settlement_reference,
         [](Writer &w, const auto &v) { S(w, v); });
+    Opt(w, v.accepted_reset, [](Writer& w, const auto& reset) {
+      S(w, reset.request_owner_epoch);
+      S(w, reset.request_id);
+      S(w, reset.request_payload_digest);
+      w.Bool(reset.reload_initial_scene);
+      w.Bool(reset.reset_robot_position);
+      Opt(w, reset.reset_claim_generation, [](Writer& w, const auto& generation) { G(w, generation); });
+    });
   });
   w.Bool(x.required_component_status_current);
   w.U64(x.required_component_total);
@@ -284,7 +292,15 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(Reader &r) {
             r,
             [](Reader &r) { return G<core::CellAdmissionClaimGeneration>(r); }),
         Opt<core::ContentDigest>(
-            r, [](Reader &r) { return S<core::ContentDigest>(r); })};
+            r, [](Reader &r) { return S<core::ContentDigest>(r); }),
+        Opt<core::AcceptedProgramResetDTO>(r, [](Reader& r) {
+          return core::AcceptedProgramResetDTO{
+              S<core::RequestOwnerEpoch>(r), S<core::RequestId>(r),
+              S<core::ContentDigest>(r), r.Bool(), r.Bool(),
+              Opt<core::CellAdmissionClaimGeneration>(r, [](Reader& r) {
+                return G<core::CellAdmissionClaimGeneration>(r);
+              })};
+        })};
   });
   x.required_component_status_current = r.Bool();
   x.required_component_total = r.U32();
@@ -384,13 +400,25 @@ void ProgramResetSceneAuthorization(
   S(w, x.program_run_id);
   G(w, x.cycle_claim_generation);
   S(w, x.terminal_or_settlement_reference);
+  Opt(w, x.reset_claim, [](Writer& w, const auto& reset) {
+    w.U64(reset.cycle_generation);
+    S(w, reset.request_owner_epoch);
+    S(w, reset.request_id);
+    S(w, reset.request_payload_digest);
+    G(w, reset.reset_claim_generation);
+  });
 }
 core::ProgramResetSceneAuthorizationDTO
 ProgramResetSceneAuthorization(Reader &r) {
   auto result = core::ProgramResetSceneAuthorizationDTO{
       S<core::RequestOwnerEpoch>(r), S<core::ProgramRunId>(r),
       G<core::CellAdmissionClaimGeneration>(r),
-      S<core::ContentDigest>(r)};
+      S<core::ContentDigest>(r),
+      Opt<core::ProgramResetClaimSceneAuthorizationDTO>(r, [](Reader& r) {
+        return core::ProgramResetClaimSceneAuthorizationDTO{
+            r.U64(), S<core::RequestOwnerEpoch>(r), S<core::RequestId>(r),
+            S<core::ContentDigest>(r), G<core::CellAdmissionClaimGeneration>(r)};
+      })};
   if (!core::ValidateProgramResetSceneAuthorization(result).ok())
     Fail("invalid Program Reset scene authorization");
   return result;

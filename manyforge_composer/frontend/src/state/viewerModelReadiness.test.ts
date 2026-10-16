@@ -6,7 +6,7 @@ import type {
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { StructuralResourceState } from './structuralResource';
-import { viewerModelPresentation } from './viewerModelReadiness';
+import { verifiedNoPhysicalComponents, viewerModelPresentation } from './viewerModelReadiness';
 
 const CELL_ID = 'cell-a';
 const BUNDLE_ID = 'sha256:bundle-a';
@@ -136,6 +136,70 @@ function select(
     urdf,
   );
 }
+
+function emptySnapshot(canonicalEmpty = true): ComposerHeadlessState {
+  const value = snapshot();
+  value.runtime.activeConfiguration = { retainedBundleId: BUNDLE_ID, graphRevision: GRAPH_REVISION };
+  const active = value.runtime.sections.manager.payload!.active as Record<string, unknown>;
+  active.canonical_empty = canonicalEmpty;
+  active.publication = { publication_generation: 1,
+    projection_revision: { retained_bundle_id: BUNDLE_ID, graph_revision: GRAPH_REVISION } };
+  active.cell_graph = {
+    cell_id: CELL_ID, graph_revision: GRAPH_REVISION,
+    model_instances: [], controllable_components: [], control_bindings: [], control_domains: [],
+    // Canonical empty retains its execution-host infrastructure unit.
+    runtime_units: [{ runtime_unit_id: 'robot_cell.ros2_control_execution' }],
+  };
+  return value;
+}
+
+describe('verifiedNoPhysicalComponents', () => {
+  it.each([true, false])('uses positive empty facts without command admission, canonical=%s', (canonicalEmpty) => {
+    const value = emptySnapshot(canonicalEmpty);
+    value.executionControlStatus = null;
+    expect(verifiedNoPhysicalComponents(value, 'connected')).toBe(true);
+    expect(verifiedNoPhysicalComponents(value, 'stale')).toBe(false);
+    expect(verifiedNoPhysicalComponents(value, 'disconnected')).toBe(false);
+    expect(verifiedNoPhysicalComponents(null, 'connected')).toBe(false);
+  });
+
+  it.each([true, false])('never infers absence from invalid or nonempty facts, canonical=%s', (canonicalEmpty) => {
+    const changes: Array<(value: ComposerHeadlessState) => void> = [
+      (value) => { value.runtime.complete = false; },
+      (value) => { value.runtime.activeConfiguration = null; },
+      (value) => { value.runtime.activeConfiguration!.graphRevision = 'other'; },
+      (value) => { value.runtime.sections.manager.available = false; },
+      (value) => { value.runtime.sections.manager.freshness = 'stale'; },
+      (value) => { value.runtime.sections.manager.knownGaps = ['lost_update']; },
+      (value) => { value.runtime.sections.manager.sourceGeneration = null; },
+      (value) => { value.runtime.sections.manager.sourceOwnerEpoch = null; },
+      (value) => { value.runtime.sections.manager.payload = null; },
+      (value) => { value.runtime.sections.manager.payload!.manager_ready = false; },
+      (value) => { value.runtime.sections.manager.payload!.runtime = { converged: false }; },
+      (value) => { value.runtime.sections.manager.payload!.apply = { records: [{ incomplete: true }] }; },
+      (value) => { value.runtime.sections.manager.payload!.apply = {}; },
+      (value) => { (value.runtime.sections.manager.payload!.active as Record<string, unknown>).canonical_empty = 'false'; },
+      (value) => { delete (value.runtime.sections.manager.payload!.active as Record<string, unknown>).canonical_empty; },
+      (value) => { (value.runtime.sections.manager.payload!.active as Record<string, unknown>).publication = {}; },
+      (value) => { value.runtime.sections.manager.payload!.cell_id = 'other'; },
+    ];
+    for (const key of ['model_instances', 'controllable_components', 'control_bindings', 'control_domains']) {
+      changes.push((value) => {
+        const active = value.runtime.sections.manager.payload!.active as Record<string, unknown>;
+        (active.cell_graph as Record<string, unknown>)[key] = [{}];
+      });
+      changes.push((value) => {
+        const active = value.runtime.sections.manager.payload!.active as Record<string, unknown>;
+        delete (active.cell_graph as Record<string, unknown>)[key];
+      });
+    }
+    for (const change of changes) {
+      const value = emptySnapshot(canonicalEmpty);
+      change(value);
+      expect(verifiedNoPhysicalComponents(value, 'connected')).toBe(false);
+    }
+  });
+});
 
 describe('viewerModelPresentation', () => {
   it('admits only an exact ready Manager, source-model, and URDF identity', () => {

@@ -14,6 +14,7 @@
 #include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_core/types/lifecycle_cause.hpp>
+#include <manyforge_roboplan/controller_launch_artifacts.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <manyforge_roboplan/retained_ros2_control_statistics_monitor.hpp>
@@ -70,6 +71,35 @@ struct RetainedRos2ControlSwitchResult final {
       RetainedRos2ControlSwitchOutcome::kNotSent};
   std::optional<core::ErrorDTO> error{};
 };
+
+enum class MockResetPositionPhase {
+  kSwitchingToWriter,
+  kSettingState,
+  kSwitchingToJtc,
+  kContaining,
+};
+
+/// Mock has no stock writer service ACK. One fresh exact GenericSystem
+/// loopback sample acknowledges consumption, without a convergence/dwell wait.
+/// DX1093: the fault bound is the stock ros2_control 6.9.0 CM switch default
+/// (controller_manager.cpp:2366-2369), not a state freshness budget.
+inline constexpr core::Duration kMockResetPositionWriteAcknowledgmentTimeoutNs =
+    1'000'000'000LL;
+
+struct MockResetPositionTransition final {
+  MockResetPositionPhase phase;
+  core::ExecutionBindingEpoch predecessor_epoch;
+  std::optional<core::ExecutionBindingEpoch> successor_epoch;
+  /// True only after a positive exact controller-manager switch response.
+  bool switch_acknowledged{false};
+  /// SettingState: false captures the receipt baseline before the one publish;
+  /// true waits for consumption ACK and publishes/projects backend command.
+  bool target_published{false};
+};
+
+using MockResetPositionPhaseCommit = std::function<core::Result<void>()>;
+using MockResetPositionPhaseCallback = std::function<core::Result<void>(
+    const MockResetPositionTransition &, const MockResetPositionPhaseCommit &)>;
 
 /// Host sequencing of the arm controller around a lane-specific guard (the
 /// Isaac command-age guard, design §4.3, Q41, Q43). Every member is required.
@@ -144,6 +174,8 @@ struct RetainedRos2ControlArmTransport final {
   std::optional<RetainedRos2ControlArmController> gripper_controller{};
   /// Absent is unavailable, never a zero-robot or commanded-state fallback.
   std::optional<RetainedMeasuredJointStateLane> measured_joint_state_lane;
+  /// Supplied only from the installed Mock graph's generated artifacts.
+  std::optional<MockResetPositionTarget> mock_reset_position{};
 };
 
 /// Retained ROS resource lifetime of one runtime composition: the shared
@@ -347,6 +379,32 @@ public:
   [[nodiscard]] RetainedRos2ControlSwitchResult
   DeactivateArmControllerForFault(std::stop_token cancellation);
 
+  [[nodiscard]] std::optional<MockResetPositionTarget>
+  mock_reset_position_target() const;
+  [[nodiscard]] bool mock_reset_writer_inactive() const;
+  [[nodiscard]] bool mock_reset_writer_active() const;
+  [[nodiscard]] bool mock_reset_successor_ready() const;
+  [[nodiscard]] std::shared_ptr<RetainedObservationWake>
+  mock_reset_observation_wake() const noexcept;
+  /// Compares evidence minted from the supplied observation's own raw inputs;
+  /// never substitutes a later healthy read for a faulted observation.
+  [[nodiscard]] bool IsExpectedMockPositionResetTransition(
+      const core::BrandLifecycleObservationDTO &observation,
+      const MockResetPositionTransition &transition) const;
+  /// Owner-private transport primitive. The CCLC owner pins the exact Reset
+  /// claim/product before calling; callbacks run without a handle state lock.
+  /// The callback invokes its nonblocking local commit under the existing
+  /// driver run mutex, atomically advancing Core/handle phase before waits.
+  /// A switching callback runs before send, then again only after positive
+  /// ACK; that second callback waits for exact CM destination observation.
+  /// SettingState(target_published=true) proves one fresh exact loopback ACK
+  /// and publishes/projects backend command before returning Ok. It performs
+  /// no measured velocity, reference, convergence or dwell verification.
+  /// No caller-supplied coordinates or blind rollback.
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  ResetMockPosition(std::stop_token cancellation,
+                    const MockResetPositionPhaseCallback &phase);
+
   [[nodiscard]] RetainedExternallyManagedDomainSnapshotSource
   lifecycle_snapshot_source();
 
@@ -413,6 +471,11 @@ private:
   [[nodiscard]] RetainedRos2ControlSwitchResult
   SendSwitch(bool activate, std::stop_token cancellation,
              std::optional<std::string> selected_controller = {});
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  SendControllerSwitch(std::vector<std::string> activate,
+                       std::vector<std::string> deactivate,
+                       std::stop_token cancellation,
+                       std::optional<core::Duration> response_timeout_ns = {});
 
   struct DomainGenerationState final {
     std::uint64_t publication_generation{};
@@ -426,6 +489,8 @@ private:
   mutable std::mutex mutex_;
   /// Serializes CCLC switch primitives (one controller switch at a time).
   std::mutex switch_mutex_;
+  const std::shared_ptr<RetainedObservationWake> reset_observation_wake_{
+      std::make_shared<RetainedObservationWake>()};
   // Declared before dependent resources: destroyed after their teardown.
   std::shared_ptr<core::IClock> clock_owner_;
   std::unique_ptr<ros2_control_execution::Ros2TransportResources> resources_;

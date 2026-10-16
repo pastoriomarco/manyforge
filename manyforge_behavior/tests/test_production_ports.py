@@ -4686,3 +4686,26 @@ def test_held_preparation_stale_or_mixed_projection_never_enters_cleanup(fault):
     assert transport.controls == []
     assert node.status is py_trees.common.Status.RUNNING
     assert len(transport.submissions) == 1 and "operation-1" in port._tasks
+
+
+def test_idle_reset_scene_preparation_forwards_exact_claim_without_authoring_admission():
+    authorization = {"program_runner_owner_epoch": "runner.1", "cycle_generation": 3,
+                     "reset_claim": {"request_owner_epoch": "caller.1", "request_id": "reset.1",
+                                    "request_payload_digest": _DIGEST_A, "reset_claim_generation": 7}}
+    class Transport(_SceneTransport):
+        def __init__(self):
+            super().__init__()
+            self.forwarded = []
+        def authoring_admission(self):
+            raise AssertionError("Idle Reset used ordinary authoring admission")
+        def commit_scene_transaction(self, request):
+            self.forwarded.append(deepcopy(request))
+            # Existing fixture models ordinary authoring for its local object
+            # mutations; the actual forwarded Reset request has no such grant.
+            return super().commit_scene_transaction({**request, "expected_admission_generation": self.admission_generation})
+    transport = Transport()
+    port = _scene_port(transport)
+    port.prepare_initial_scene(_scene_context(), _authored_scene(), program_reset_scene_authorization=authorization)
+    assert transport.forwarded
+    assert all(row["program_reset_scene_authorization"] == authorization for row in transport.forwarded)
+    assert all("expected_admission_generation" not in row for row in transport.forwarded)

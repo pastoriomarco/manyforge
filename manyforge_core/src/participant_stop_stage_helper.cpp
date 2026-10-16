@@ -484,11 +484,22 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::Succeed(Run& run,
       });
   std::optional<ExecutionControllerSampleDTO> sample;
   std::optional<ExecutionGoalObservationDTO> finish_goal;
+  std::optional<TimePoint> finish_goal_observed_at;
+  const auto finish_key = run.finish_goal.value_or(run.goal.key);
   // One post-finish sample of the controller records the provenance of the
   // finish (items 1/26: the controller reports the finish; no rest check).
   const bool observed = Await(run, run.terminal_deadline, [&] {
     sample = port_.ReadSample();
-    if (needs_goal_terminal) finish_goal = port_.ReadGoal(run.finish_goal.value_or(run.goal.key));
+    if (needs_goal_terminal) {
+      finish_goal = port_.ReadGoal(finish_key);
+      // Freshness belongs to this current read, not the permanent terminal
+      // transition. Keep its original receipt unchanged for ordering/reporting.
+      if (finish_goal.has_value()) {
+        finish_goal_observed_at = clock_.now();
+      } else {
+        finish_goal_observed_at.reset();
+      }
+    }
     return sample.has_value() && sample->local_receipt_stamp_ns >= finish_receipt &&
            sample->local_receipt_count.nonzero() &&
            (!needs_goal_terminal ||
@@ -502,6 +513,13 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::Succeed(Run& run,
     return Fail(run, stage_error(needs_goal_terminal ? "stop_goal_terminal_state_mismatch"
                                                      : "stop_evidence_source_unavailable",
                                  "No post-finish observation arrived in the Stop budget"));
+  }
+  if (needs_goal_terminal &&
+      (finish_goal->key != finish_key || !finish_goal->binding_epoch.nonzero() ||
+       finish_goal->binding_epoch != sample->binding_epoch ||
+       finish_goal->binding_epoch != port_.ReadReadiness().binding_epoch)) {
+    return Fail(run, stage_error("stop_evidence_source_mismatch",
+                                 "Goal-terminal evidence differs from its current binding"));
   }
   const auto now = clock_.now();
   if (run.outcome.has_value()) {
@@ -564,13 +582,22 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::Succeed(Run& run,
           return Fail(run, stage_error("stop_evidence_source_mismatch",
                                        "Goal-terminal evidence names another source kind"));
         }
-        age = std::max<std::int64_t>(
-            0, now - finish_goal->terminal_local_receipt_stamp.value_or(now));
-        evidence.insert_or_assign(
-            "goal_observation",
-            JsonValueDTO{JsonObjectDTO{
-                {"finish_basis", JsonValueDTO{finish_basis}},
-                {"mechanism_goal_id", JsonValueDTO{finish_goal->mechanism_goal_id.value()}}}});
+        age = std::max<std::int64_t>(0, now - *finish_goal_observed_at);
+        {
+          JsonObjectDTO goal_observation{
+              {"finish_basis", JsonValueDTO{finish_basis}},
+              {"mechanism_goal_id", JsonValueDTO{finish_goal->mechanism_goal_id.value()}}};
+          if (finish_goal->terminal_local_receipt_stamp.has_value()) {
+            goal_observation.emplace(
+                "terminal_local_receipt_stamp_ns",
+                JsonValueDTO{static_cast<double>(*finish_goal->terminal_local_receipt_stamp)});
+            goal_observation.emplace(
+                "terminal_transition_age_ns",
+                JsonValueDTO{static_cast<double>(std::max<std::int64_t>(
+                    0, now - *finish_goal->terminal_local_receipt_stamp))});
+          }
+          evidence.insert_or_assign("goal_observation", JsonValueDTO{std::move(goal_observation)});
+        }
         result.controller_acknowledgement_sequence = sequence;
         break;
       default:

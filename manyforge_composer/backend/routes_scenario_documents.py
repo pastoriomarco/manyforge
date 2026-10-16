@@ -634,6 +634,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 raise ScenarioArtifactError("scenario_activation_preview_changed",
                     "Applied Deployment changed since New was opened; review the choice again", status_code=409)
             activation_intent: dict[str, Any] = {
+                "scene_initialization": "initialize",
                 "scenario_id": scenario_document["scenario_id"],
                 "source_document_digest": source_digest,
                 "captured_input_digest": captured_digest,

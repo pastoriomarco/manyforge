@@ -468,6 +468,30 @@ public:
         });
   }
 
+  std::string AppendWorkbenchPreviousSessionReport(const std::string &report_json) {
+    py::gil_scoped_release release;
+    return Invoke([this, &report_json]() {
+      if (report_json.size() > kMaximumHistorianPayloadBytes) {
+        throw OperatorAlarmError("headless_previous_session_report_invalid",
+                                 "previous-session report exceeds the historian payload bound");
+      }
+      return core_->AppendWorkbenchPreviousSessionReport(
+          deployment::parse_strict_json_model_yaml(report_json).root());
+    });
+  }
+
+  std::string ObserveWorkbenchPreviousSessionReport(const std::string &report_json) {
+    py::gil_scoped_release release;
+    return Invoke([this, &report_json]() {
+      if (report_json.size() > kMaximumHistorianPayloadBytes) {
+        throw OperatorAlarmError("headless_previous_session_report_invalid",
+                                 "previous-session report exceeds the historian payload bound");
+      }
+      return core_->ObserveWorkbenchPreviousSessionReport(
+          deployment::parse_strict_json_model_yaml(report_json).root());
+    });
+  }
+
   std::string CommitProgramModelAttempt(std::string record_json) {
     py::gil_scoped_release release;
     return Invoke([this, record_json = std::move(record_json)]() mutable {
@@ -1145,6 +1169,12 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("first_observed_ns"), py::arg("last_observed_ns"),
            py::arg("causal_context") = std::map<std::string, std::string>{})
       .def("historian_health", &HeadlessApiBridge::HistorianHealth)
+      .def("append_workbench_previous_session_report",
+           &HeadlessApiBridge::AppendWorkbenchPreviousSessionReport,
+           py::arg("report_json"))
+      .def("observe_workbench_previous_session_report",
+           &HeadlessApiBridge::ObserveWorkbenchPreviousSessionReport,
+           py::arg("report_json"))
       .def("record_program_diagnostic",
            &HeadlessApiBridge::RecordProgramDiagnostic, py::arg("record_json"))
       .def("commit_program_model_attempt",

@@ -43,7 +43,8 @@ function controller(): CCLCController {
     reconcileTransaction: vi.fn(),
     dismissError: vi.fn(),
     activate: vi.fn(async () => {}),
-    activateSequence: vi.fn(async () => {}),
+    activateSequence: vi.fn(async () => true),
+    readActivationSequence: vi.fn(),
     cancelActivation: vi.fn(),
     activationProgress: null,
     activationRefusal: null, activationUnresolved: false, componentHealth: {},
@@ -201,7 +202,7 @@ describe('CCLC presentation', () => {
     expect(html).toContain('Disable');
     expect(html).not.toContain('Recover / restart');
     expect(html).not.toContain('Stop / disable');
-    expect(html).toContain('Owner-issued state');
+    expect(html).toContain('Activate all');
   });
 
   it('shows target, achieved state, readiness and consequence while manual controls stay available', () => {
@@ -228,8 +229,8 @@ describe('CCLC presentation', () => {
       controller: waiting,
     }));
     expect(html).toContain('Startup delayed — still waiting');
-    expect(html).toContain('Requested target: active (requested by startup configuration, target 2)');
-    expect(html).toContain('Achieved: prepared · generation 4');
+    expect(html).toContain('<dt>Requested target</dt><dd>active (requested by startup configuration, target 2)</dd>');
+    expect(html).toContain('<dt>State</dt><dd>prepared · generation 4</dd>');
     expect(html).toContain('controller_manager not ready');
     expect(html).toContain('Motion is unavailable until the component reaches its requested target.');
     expect(html).toContain('aria-label="Component lifecycle status"');

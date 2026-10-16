@@ -178,6 +178,7 @@ def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> 
         "admission_context",
         "expected_current",
         "prepared_activation",
+        "scene_initialization",
         "reject_if_affected_busy",
         "request_id",
         "request_owner_epoch",
@@ -290,6 +291,7 @@ def _status_response() -> dict[str, object]:
         },
         "ok": True,
         "phase": "accepted",
+        "scene_initialization": "preserve",
         "prepared_activation": {
             **{
                 field: _prepared_activation()[field]
@@ -917,3 +919,17 @@ def test_process_stop_omits_no_correlation_at_manager_boundary(tmp_path, monkeyp
     monkeypatch.setattr(client, "_exchange", exchange)
     assert getattr(client, method)(request)["request"] == canonical
     assert observed == [{"api_version": "manyforge.manager_command.v1", "command": method, "request": canonical}]
+
+
+@pytest.mark.parametrize("purpose", ["preserve", "initialize"])
+def test_manager_transport_sends_explicit_scene_initialization(tmp_path, monkeypatch, purpose):
+    request = _request().model_copy(update={"scene_initialization": purpose})
+    commands = []
+    client = ManagerCommandClient(tmp_path)
+    def exchange(command):
+        commands.append(command)
+        return {"ok": True, "request_id": request.request_id,
+                "request_owner_epoch": request.request_owner_epoch}
+    monkeypatch.setattr(client, "_exchange", exchange)
+    client.apply(request)
+    assert commands[0]["scene_initialization"] == purpose

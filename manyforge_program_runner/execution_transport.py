@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any, TypeVar
+from typing import Annotated, Any, Literal, TypeVar
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from manyforge_behavior.orchestration_ports import ProgramSelectionReleaseRejectedError
 from manyforge_headless_api.execution import (
     EXECUTION_COMMAND_VERSION,
+    EXECUTION_RESPONSE_VERSION,
     ExecutionCommandClient,
 )
 from manyforge_headless_api.models import (
@@ -29,11 +30,82 @@ from manyforge_headless_api.models import (
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
     TargetObservationQuery,
+    SHA256_PATTERN,
+    SceneRevisionRequest,
 )
+from manyforge_headless_api.program_cycle import ProgramResetPositionAvailabilityDTO
 from manyforge_headless_api.native import HeadlessApiError
 
 
 _Request = TypeVar("_Request", bound=BaseModel)
+_Revision = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+_Digest = Annotated[str, Field(pattern=SHA256_PATTERN)]
+_Identity = Annotated[str, Field(min_length=1, max_length=256)]
+
+
+class _ResetPositionAuthorization(StrictRequest):
+    program_runner_owner_epoch: _Identity
+    cycle_generation: _Revision
+    request_owner_epoch: _Identity
+    request_id: _Identity
+    request_payload_digest: _Digest
+    program_run_id: _Identity | None
+    cycle_claim_generation: _Revision | None
+    terminal_or_settlement_reference: _Digest | None
+    reset_claim_generation: _Revision | None
+
+    @model_validator(mode="after")
+    def exact_claim_shape(self):
+        if self.cycle_claim_generation is not None:
+            valid = self.program_run_id is not None and self.terminal_or_settlement_reference is not None and self.reset_claim_generation is None
+        else:
+            valid = self.reset_claim_generation is not None and (
+                (self.program_run_id is None) == (self.terminal_or_settlement_reference is None)
+            )
+        if not valid:
+            raise ValueError("position Reset requires its exact run or Reset claim shape")
+        return self
+
+
+class _ResetPositionDeploymentIdentity(StrictRequest):
+    owner_epoch: _Identity
+    active_publication_generation: _Revision
+    retained_bundle_id: _Digest
+    graph_revision: _Digest
+
+
+class _ResetPositionRequest(StrictRequest):
+    authorization: _ResetPositionAuthorization
+    expected_deployment_identity: _ResetPositionDeploymentIdentity
+
+
+class _ResetPositionExecutionIdentity(_ResetPositionDeploymentIdentity):
+    schema_version: Literal["manyforge.execution_identity.v2"]
+    cell_id: _Identity
+    control_management_mode: Literal["component_lifecycle", "pending"]
+    scene_revision: SceneRevisionRequest
+
+
+class _ResetPositionSuccessResponse(StrictRequest):
+    api_version: Literal[EXECUTION_RESPONSE_VERSION]
+    ok: Literal[True]
+
+    @field_validator("ok", mode="before")
+    @classmethod
+    def exact_success(cls, value):
+        if value is not True:
+            raise ValueError("position Reset success must be a strict true boolean")
+        return value
+
+
+class _ResetPositionCapabilityResponse(_ResetPositionSuccessResponse):
+    command: Literal["reset_robot_position_capability"]
+    reset_robot_position: ProgramResetPositionAvailabilityDTO
+    identity: _ResetPositionExecutionIdentity
+
+
+class _ResetPositionResponse(_ResetPositionSuccessResponse):
+    command: Literal["reset_robot_position"]
 
 
 class _ProgramNodeExecutionScope(StrictRequest):
@@ -99,6 +171,26 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
                 "execution_command_invalid",
                 "Program Runner execution request is invalid",
             ) from error
+
+    @staticmethod
+    def _reset_response(model: type[_Request], body: Mapping[str, Any]) -> _Request:
+        try:
+            return model.model_validate(body)
+        except ValidationError as error:
+            raise HeadlessApiError(
+                "execution_command_response_invalid", "Native position Reset response is invalid"
+            ) from error
+
+    def reset_robot_position_capability(self) -> dict[str, Any]:
+        response = self._exchange({"api_version": EXECUTION_COMMAND_VERSION,
+                                   "command": "reset_robot_position_capability"})
+        return self._reset_response(_ResetPositionCapabilityResponse, response).model_dump(mode="json")
+
+    def reset_robot_position(self, body: Mapping[str, Any]) -> None:
+        request = self._request(_ResetPositionRequest, body)
+        response = self._exchange({"api_version": EXECUTION_COMMAND_VERSION,
+                                  "command": "reset_robot_position", **request.model_dump(mode="json")})
+        self._reset_response(_ResetPositionResponse, response)
 
     def _exchange_on(
         self, command: dict[str, Any], socket_path: Path

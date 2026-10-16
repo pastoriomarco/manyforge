@@ -1311,7 +1311,8 @@ function directControlGripperAt(value: unknown): {
     gripperResource.source_coordinate_name,
     'executionStatus.status.direct_control_gripper.resource.source_coordinate_name',
   );
-  if (directGripper.observed_state === null && sourceKind !== 'component_local') {
+  if (directGripper.observed_state === null && sourceKind !== 'component_local'
+    && gripperDescriptor.actuationKind !== 'pneumatic') {
     return fail(
       'executionStatus.status.direct_control_gripper.observed_state',
       'a model-backed observation',

@@ -46,6 +46,7 @@ template <typename Value>
                                             CellAdmissionSettlementKindDTO settlement) noexcept {
   switch (claim) {
     case CellAdmissionClaimKindDTO::kProgramCycle:
+    case CellAdmissionClaimKindDTO::kProgramReset:
       return settlement == CellAdmissionSettlementKindDTO::kExplicitReset;
     case CellAdmissionClaimKindDTO::kAuthoringMutation:
     case CellAdmissionClaimKindDTO::kAuthoredScene:
@@ -79,13 +80,15 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
     std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set,
     CellAdmissionClaimGeneration recovered_claim_generation_high_water,
     CellAdmissionProgramNodeValidator program_node_validator,
-    std::function<bool()> stop_fault_active)
+    std::function<bool()> stop_fault_active,
+    CellAdmissionProgramResetStatusSource program_reset_status_source)
     : kernel_owner_epoch_(std::move(kernel_owner_epoch)),
       capacity_(capacity),
       clock_(clock),
       journal_(journal),
       intervention_validator_(std::move(intervention_validator)),
       settlement_validator_(std::move(settlement_validator)),
+      program_reset_status_source_(std::move(program_reset_status_source)),
       reconcile_validator_(std::move(reconcile_validator)),
       program_node_validator_(std::move(program_node_validator)),
       stop_fault_active_(std::move(stop_fault_active)),
@@ -308,6 +311,202 @@ bool KernelCellAdmissionOwner::MatchingStartingProgramCycleLocked(
          cycle.program_run_id->value() == intent.owner_transaction_id &&
          !cycle.cycle_claim_generation.has_value() &&
          !cycle.terminal_or_settlement_reference.has_value();
+}
+
+Result<KernelCellAdmissionOwner::PreparedProgramResetStatus>
+KernelCellAdmissionOwner::PrepareProgramResetStatus(
+    const ProgramResetJournalReadPurpose purpose, const CellAdmissionClaimIntentDTO& intent,
+    const std::optional<CellAdmissionClaimDTO>& claim) const {
+  const auto valid = ValidateCellAdmissionClaimIntent(intent);
+  if (!valid.ok()) return Result<PreparedProgramResetStatus>::Err(valid.error());
+  PreparedProgramResetStatus proof(intent);
+  proof.owner = this;
+  {
+    std::lock_guard lock(mutex_);
+    proof.generation = generation_;
+    proof.readiness = readiness_;
+    proof.manager = manager_liveness_required_set_;
+    proof.manager_current_count = manager_liveness_current_unfenced_count_;
+    proof.purpose = purpose;
+    proof.claim = claim;
+    // Existing exact replay is independent of current journal/readiness.
+    if (purpose == ProgramResetJournalReadPurpose::kAcquire && FindReplayLocked(intent))
+      return Result<PreparedProgramResetStatus>::Ok(std::move(proof));
+    if (!readiness_.program_cycle_status_current || !readiness_.program_cycle_status)
+      return AuthoringNotReady<PreparedProgramResetStatus>(generation_, "program_reset_status_not_current");
+  }
+  // No admission, liveness-transition or owner lock spans SQLite. In particular
+  // Manager-loss containment must be able to close admission while this reads.
+  if (!program_reset_status_source_)
+    return Result<PreparedProgramResetStatus>::Err(
+        {"authoring_not_ready", "Program Reset phase proof is unavailable",
+         {{"reason", "program_reset_phase_proof_unavailable"}}});
+  auto current = program_reset_status_source_(purpose, intent, claim);
+  if (!current.ok()) return Result<PreparedProgramResetStatus>::Err(current.error());
+  proof.status = std::move(current).value();
+  return Result<PreparedProgramResetStatus>::Ok(std::move(proof));
+}
+
+Result<KernelCellAdmissionOwner::PreparedProgramResetStatus>
+KernelCellAdmissionOwner::PrepareProgramResetSceneAuthorization(
+    const ProgramResetSceneAuthorizationDTO& authorization) const {
+  const auto valid = manyforge::core::ValidateProgramResetSceneAuthorization(authorization);
+  if (!valid.ok()) return Result<PreparedProgramResetStatus>::Err(valid.error());
+  std::optional<CellAdmissionClaimDTO> claim;
+  {
+    std::lock_guard lock(mutex_);
+    const auto generation = authorization.reset_claim
+        ? authorization.reset_claim->reset_claim_generation : authorization.cycle_claim_generation;
+    const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const auto& row) {
+      return row.claim.claim_generation == generation && !row.release;
+    });
+    if (entry == entries_.end())
+      return AuthoringNotReady<PreparedProgramResetStatus>(generation_, "program_reset_claim_not_exact");
+    claim = entry->claim;
+  }
+  return PrepareProgramResetStatus(ProgramResetJournalReadPurpose::kReloadInitialScene,
+                                   claim->intent, claim);
+}
+
+Result<KernelCellAdmissionOwner::PreparedProgramResetStatus>
+KernelCellAdmissionOwner::PrepareProgramResetPositionAuthorization(
+    const ProgramResetPositionAuthorizationDTO& authorization) const {
+  const auto valid = manyforge::core::ValidateProgramResetPositionAuthorization(authorization);
+  if (!valid.ok()) return Result<PreparedProgramResetStatus>::Err(valid.error());
+  std::optional<CellAdmissionClaimDTO> claim;
+  {
+    std::lock_guard lock(mutex_);
+    const auto generation = authorization.reset_claim_generation
+        ? *authorization.reset_claim_generation : *authorization.cycle_claim_generation;
+    const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const auto& row) {
+      return row.claim.claim_generation == generation && !row.release;
+    });
+    if (entry == entries_.end())
+      return AuthoringNotReady<PreparedProgramResetStatus>(generation_, "program_reset_claim_not_exact");
+    claim = entry->claim;
+  }
+  return PrepareProgramResetStatus(ProgramResetJournalReadPurpose::kResetRobotPosition,
+                                   claim->intent, claim);
+}
+
+Result<void> KernelCellAdmissionOwner::ValidatePreparedProgramResetPositionAuthorization(
+    const ProgramResetPositionAuthorizationDTO& authorization,
+    const PreparedProgramResetStatus& proof) const {
+  const auto valid = manyforge::core::ValidateProgramResetPositionAuthorization(authorization);
+  if (!valid.ok()) return valid;
+  std::lock_guard lock(mutex_);
+  const auto generation = authorization.reset_claim_generation
+      ? *authorization.reset_claim_generation : *authorization.cycle_claim_generation;
+  const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const auto& row) {
+    return row.claim.claim_generation == generation && !row.release;
+  });
+  const auto kind = authorization.reset_claim_generation ? CellAdmissionClaimKindDTO::kProgramReset
+                                                       : CellAdmissionClaimKindDTO::kProgramCycle;
+  if (entry == entries_.end() || entry->claim.intent.claim_kind != kind ||
+      entry->claim.intent.owner_role != CellAdmissionOwnerRoleDTO::kProgramRunner ||
+      (authorization.reset_claim_generation && (entry->reconcile_settlement || held_claim_count_ != 1U)) ||
+      HasUnsettledChildrenLocked(generation))
+    return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
+  const auto current = CurrentResetLocked(ProgramResetJournalReadPurpose::kResetRobotPosition,
+                                         entry->claim.intent, entry->claim, proof);
+  if (!current.ok()) return Result<void>::Err(current.error());
+  const auto& status = current.value();
+  const auto& accepted = *status.accepted_reset;
+  if (!accepted.reset_robot_position ||
+      status.program_runner_owner_epoch != authorization.program_runner_owner_epoch ||
+      status.cycle_generation != authorization.cycle_generation ||
+      status.program_run_id != authorization.program_run_id ||
+      status.cycle_claim_generation != authorization.cycle_claim_generation ||
+      status.terminal_or_settlement_reference != authorization.terminal_or_settlement_reference ||
+      accepted.request_owner_epoch != authorization.request_owner_epoch ||
+      accepted.request_id != authorization.request_id ||
+      accepted.request_payload_digest != authorization.request_payload_digest ||
+      accepted.reset_claim_generation != authorization.reset_claim_generation)
+    return AuthoringNotReady<void>(generation_, "program_reset_status_mismatch");
+  const bool held_by_current_owner = !entry->reconcile_settlement &&
+      entry->claim.intent.owner_epoch == authorization.program_runner_owner_epoch;
+  const bool reconciled_to_current_owner = entry->reconcile_settlement &&
+      entry->reconcile_settlement->predecessor_claim == entry->claim &&
+      entry->reconcile_settlement->successor_owner_role == CellAdmissionOwnerRoleDTO::kProgramRunner &&
+      entry->reconcile_settlement->successor_owner_epoch == authorization.program_runner_owner_epoch &&
+      entry->reconcile_settlement->settlement_predicate == CellAdmissionSettlementKindDTO::kReconciled;
+  if (!held_by_current_owner && !reconciled_to_current_owner)
+    return AuthoringNotReady<void>(generation_, "program_reset_claim_not_current");
+  if (!authorization.reset_claim_generation) {
+    if (entry->claim.intent.owner_transaction_id != authorization.program_run_id->value())
+      return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
+  } else {
+    const auto identity = ProgramResetClaimRequestId(status);
+    if (!identity.ok() || entry->claim.intent.request_id != identity.value() ||
+        entry->claim.intent.owner_transaction_id != identity.value().value() ||
+        entry->claim.intent.request_payload_digest != accepted.request_payload_digest)
+      return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
+  }
+  return Result<void>::Ok();
+}
+
+Result<ProgramCycleStatusDTO> KernelCellAdmissionOwner::CurrentResetLocked(
+    const ProgramResetJournalReadPurpose purpose, const CellAdmissionClaimIntentDTO& intent,
+    const std::optional<CellAdmissionClaimDTO>& claim,
+    const PreparedProgramResetStatus& proof) const {
+  const bool reset_claim = intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset;
+  if ((reset_claim && !NonCycleReadinessLocked()) || !readiness_.program_cycle_status_current ||
+      !readiness_.program_cycle_status) {
+    return AuthoringNotReady<ProgramCycleStatusDTO>(generation_, "program_reset_status_not_current");
+  }
+  if (proof.owner != this || proof.generation != generation_ || proof.readiness != readiness_ ||
+      proof.manager != manager_liveness_required_set_ ||
+      proof.manager_current_count != manager_liveness_current_unfenced_count_ ||
+      !manager_liveness_required_set_ ||
+      manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size() ||
+      proof.purpose != purpose ||
+      proof.intent != intent || proof.claim != claim || !proof.status ||
+      persistence_outcome_unknown_ || published_stop_fault_active_ ||
+      (stop_fault_active_ && stop_fault_active_()) || route_recovery_pending_) {
+    return AuthoringNotReady<ProgramCycleStatusDTO>(generation_, "program_reset_dependencies_changed");
+  }
+  const auto current = Result<ProgramCycleStatusDTO>::Ok(*proof.status);
+  const auto& cycle = current.value();
+  const auto& observed = *readiness_.program_cycle_status;
+  if (!ValidateProgramCycleStatus(cycle).ok() || cycle.state != ProgramCycleStateDTO::kResetting ||
+      !cycle.accepted_reset || cycle.program_run_id != observed.program_run_id ||
+      cycle.program_runner_owner_epoch != observed.program_runner_owner_epoch ||
+      cycle.cycle_generation != observed.cycle_generation ||
+      (reset_claim && observed.state != ProgramCycleStateDTO::kIdleAfterReset &&
+       observed.state != ProgramCycleStateDTO::kResetting &&
+       observed.state != ProgramCycleStateDTO::kRecoveryRequired &&
+       !(observed.state == ProgramCycleStateDTO::kTerminalAwaitingReset &&
+         cycle.program_run_id && !cycle.cycle_claim_generation))) {
+    return AuthoringNotReady<ProgramCycleStatusDTO>(generation_, "program_reset_status_mismatch");
+  }
+  if (observed.accepted_reset) {
+    auto previous = *observed.accepted_reset;
+    auto accepted = *cycle.accepted_reset;
+    previous.reset_claim_generation.reset();
+    accepted.reset_claim_generation.reset();
+    if (previous != accepted) {
+      return AuthoringNotReady<ProgramCycleStatusDTO>(generation_, "program_reset_accepted_identity_mismatch");
+    }
+  }
+  return current;
+}
+
+bool KernelCellAdmissionOwner::MatchingProgramResetLocked(
+    const CellAdmissionClaimIntentDTO& intent, const PreparedProgramResetStatus& proof) const {
+  if (intent.claim_kind != CellAdmissionClaimKindDTO::kProgramReset || held_claim_count_ != 0U) {
+    return false;
+  }
+  const auto current = CurrentResetLocked(ProgramResetJournalReadPurpose::kAcquire, intent, std::nullopt, proof);
+  if (!current.ok()) return false;
+  const auto& cycle = current.value();
+  if (cycle.cycle_claim_generation || cycle.accepted_reset->reset_claim_generation ||
+      cycle.program_runner_owner_epoch != intent.owner_epoch) {
+    return false;
+  }
+  const auto identity = ProgramResetClaimRequestId(cycle);
+  return identity.ok() && intent.request_id == identity.value() &&
+         intent.owner_transaction_id == identity.value().value() &&
+         intent.request_payload_digest == cycle.accepted_reset->request_payload_digest;
 }
 
 Result<void> KernelCellAdmissionOwner::AdvanceGenerationLocked() {
@@ -648,7 +847,17 @@ bool KernelCellAdmissionOwner::HasUnsettledChildrenLocked(
 
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireCellAdmissionClaim(
     const CellAdmissionClaimIntentDTO& intent) {
+  if (intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset) {
+    auto proof = PrepareProgramResetStatus(ProgramResetJournalReadPurpose::kAcquire, intent);
+    if (!proof.ok()) return Result<CellAdmissionClaimDTO>::Err(proof.error());
+    return AcquirePreparedProgramResetClaim(intent, proof.value());
+  }
   return AcquireClaim(intent, intervention_validator_);
+}
+
+Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquirePreparedProgramResetClaim(
+    const CellAdmissionClaimIntentDTO& intent, const PreparedProgramResetStatus& proof) {
+  return AcquireClaim(intent, intervention_validator_, false, {}, &proof);
 }
 
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireManualCellAdmissionClaim(
@@ -718,7 +927,8 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireConfigurationAppl
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     const CellAdmissionClaimIntentDTO& intent,
     const CellAdmissionInterventionValidator& validate_offer, const bool selected_apply_bring_up,
-    const CellAdmissionConfigurationApplyValidator& configuration_apply_validator) {
+    const CellAdmissionConfigurationApplyValidator& configuration_apply_validator,
+    const PreparedProgramResetStatus* reset_proof) {
   const bool configuration_apply = static_cast<bool>(configuration_apply_validator);
   std::lock_guard transition_lock(liveness_transition_mutex_);
   auto valid = ValidateCellAdmissionClaimIntent(intent);
@@ -949,6 +1159,10 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
           generation_, blocking.has_value()                ? std::string(*blocking)
                        : route_recovery_pending_          ? "component_lifecycle_route_recovery_pending"
                                                           : "component_lifecycle_requires_idle_cell");
+    }
+  } else if (intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset) {
+    if (!reset_proof || !MatchingProgramResetLocked(intent, *reset_proof)) {
+      return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "program_reset_not_current");
     }
   } else if (!AdmissionLocked().authoring_allowed && !MatchingStartingProgramCycleLocked(intent)) {
     return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "positive_admission_required");
@@ -1558,23 +1772,50 @@ Result<CellAdmissionRecoveryReceiptDTO> KernelCellAdmissionOwner::GetCellAdmissi
 
 Result<void> KernelCellAdmissionOwner::ValidateProgramResetSceneAuthorization(
     const ProgramResetSceneAuthorizationDTO& authorization) const {
+  auto proof = PrepareProgramResetSceneAuthorization(authorization);
+  if (!proof.ok()) return Result<void>::Err(proof.error());
+  return ValidatePreparedProgramResetSceneAuthorization(authorization, proof.value());
+}
+
+Result<void> KernelCellAdmissionOwner::ValidatePreparedProgramResetSceneAuthorization(
+    const ProgramResetSceneAuthorizationDTO& authorization,
+    const PreparedProgramResetStatus& proof) const {
   const auto valid = manyforge::core::ValidateProgramResetSceneAuthorization(authorization);
-  if (!valid.ok()) {
-    return Result<void>::Err(valid.error());
-  }
+  if (!valid.ok()) return Result<void>::Err(valid.error());
   std::lock_guard lock(mutex_);
   if (!readiness_.program_cycle_status_current || !readiness_.program_cycle_status.has_value()) {
     return AuthoringNotReady<void>(generation_, "program_reset_status_not_current");
   }
-  const auto& status = *readiness_.program_cycle_status;
-  if (status.state != ProgramCycleStateDTO::kResetting ||
-      status.program_runner_owner_epoch != authorization.program_runner_owner_epoch ||
-      status.program_run_id != std::optional<ProgramRunId>{authorization.program_run_id} ||
-      status.cycle_claim_generation !=
-          std::optional<CellAdmissionClaimGeneration>{authorization.cycle_claim_generation} ||
-      status.terminal_or_settlement_reference !=
-          std::optional<ContentDigest>{authorization.terminal_or_settlement_reference}) {
-    return AuthoringNotReady<void>(generation_, "program_reset_status_mismatch");
+  if (authorization.reset_claim) {
+    const auto& expected = *authorization.reset_claim;
+    const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const auto& row) {
+      return row.claim.claim_generation == expected.reset_claim_generation;
+    });
+    if (entry == entries_.end() || entry->release || entry->reconcile_settlement || held_claim_count_ != 1U ||
+        entry->claim.intent.claim_kind != CellAdmissionClaimKindDTO::kProgramReset ||
+        entry->claim.intent.owner_role != CellAdmissionOwnerRoleDTO::kProgramRunner) {
+      return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
+    }
+    const auto current = CurrentResetLocked(ProgramResetJournalReadPurpose::kReloadInitialScene,
+                                                entry->claim.intent, entry->claim, proof);
+    if (!current.ok()) return Result<void>::Err(current.error());
+    const auto& status = current.value();
+    const auto& accepted = *status.accepted_reset;
+    const auto identity = ProgramResetClaimRequestId(status);
+    if (!accepted.reload_initial_scene ||
+        status.program_runner_owner_epoch != authorization.program_runner_owner_epoch ||
+        status.cycle_generation != expected.cycle_generation ||
+        accepted.request_owner_epoch != expected.request_owner_epoch ||
+        accepted.request_id != expected.request_id ||
+        accepted.request_payload_digest != expected.request_payload_digest ||
+        accepted.reset_claim_generation != expected.reset_claim_generation ||
+        !identity.ok() || entry->claim.intent.owner_epoch != status.program_runner_owner_epoch ||
+        entry->claim.intent.request_id != identity.value() ||
+        entry->claim.intent.owner_transaction_id != identity.value().value() ||
+        entry->claim.intent.request_payload_digest != accepted.request_payload_digest) {
+      return AuthoringNotReady<void>(generation_, "program_reset_status_mismatch");
+    }
+    return Result<void>::Ok();
   }
   const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const auto& candidate) {
     return candidate.claim.claim_generation == authorization.cycle_claim_generation;
@@ -1584,6 +1825,21 @@ Result<void> KernelCellAdmissionOwner::ValidateProgramResetSceneAuthorization(
       entry->claim.intent.owner_role != CellAdmissionOwnerRoleDTO::kProgramRunner ||
       entry->claim.intent.owner_transaction_id != authorization.program_run_id.value()) {
     return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
+  }
+  const auto current = CurrentResetLocked(ProgramResetJournalReadPurpose::kReloadInitialScene,
+                                         entry->claim.intent, entry->claim, proof);
+  if (!current.ok()) return Result<void>::Err(current.error());
+  const auto& status = current.value();
+  if (!status.accepted_reset->reload_initial_scene) {
+    return AuthoringNotReady<void>(generation_, "program_reset_scene_not_selected");
+  }
+  if (status.program_runner_owner_epoch != authorization.program_runner_owner_epoch ||
+      status.program_run_id != std::optional<ProgramRunId>{authorization.program_run_id} ||
+      status.cycle_claim_generation !=
+          std::optional<CellAdmissionClaimGeneration>{authorization.cycle_claim_generation} ||
+      status.terminal_or_settlement_reference !=
+          std::optional<ContentDigest>{authorization.terminal_or_settlement_reference}) {
+    return AuthoringNotReady<void>(generation_, "program_reset_status_mismatch");
   }
   const bool held_by_current_owner =
       !entry->reconcile_settlement.has_value() &&

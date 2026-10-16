@@ -2544,6 +2544,7 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
 
 [[nodiscard]] CellAdmissionClaimKindDTO CellClaimKind(std::string_view value) {
   if (value == "program_cycle") return CellAdmissionClaimKindDTO::kProgramCycle;
+  if (value == "program_reset") return CellAdmissionClaimKindDTO::kProgramReset;
   if (value == "authoring_mutation") return CellAdmissionClaimKindDTO::kAuthoringMutation;
   if (value == "manager_apply") return CellAdmissionClaimKindDTO::kManagerApply;
   if (value == "component_lifecycle") return CellAdmissionClaimKindDTO::kComponentLifecycle;

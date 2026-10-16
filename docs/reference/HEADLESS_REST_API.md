@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-10-12 18:10:14 UTC
+  Last regenerated: 2026-10-16 11:06:17 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -24,6 +24,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/assistant/modes/{mode_id}` |  | Assistant Mode |
 | `GET` | `/api/assistant/modes/{mode_id}/context` |  | Assistant Mode Context |
 | `GET` | `/api/cclc/components/{component_id}` |  | Cclc Component Snapshot |
+| `GET` | `/api/cclc/components/{component_id}/lifecycle-snapshot` |  | Cclc Component Lifecycle Snapshot |
+| `POST` | `/api/cclc/components/{component_id}/process/stop` |  | Stop Component Process |
+| `GET` | `/api/cclc/components/{component_id}/process/stop-offer` |  | Component Process Stop Offer |
+| `POST` | `/api/cclc/components/{component_id}/process/stop/result` |  | Component Process Stop Result |
 | `GET` | `/api/cclc/components/{component_id}/route-templates` |  | Cclc Route Templates |
 | `POST` | `/api/cclc/lifecycle/requests` |  | Cclc Lifecycle Submit |
 | `POST` | `/api/cclc/lifecycle/requests/result` |  | Cclc Lifecycle Request Result |
@@ -32,6 +36,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/cclc/routes/requests` |  | Cclc Route Submit |
 | `POST` | `/api/cclc/routes/requests/result` |  | Cclc Route Request Result |
 | `GET` | `/api/cclc/routes/transactions/{transaction_id}` |  | Cclc Route Status |
+| `POST` | `/api/cclc/targets/retire` |  | Retire Lifecycle Targets |
+| `POST` | `/api/cclc/targets/retire/result` |  | Lifecycle Target Retirement Result |
+| `GET` | `/api/cclc/targets/retirement-offer` |  | Lifecycle Target Retirement Offer |
+| `POST` | `/api/cclc/targets/settlement` |  | Lifecycle Owner Settlement |
 | `GET` | `/api/cell/authoring-admission` |  | Authoring Admission |
 | `GET` | `/api/component-overview` |  | Component Overview |
 | `POST` | `/api/control/commands` |  | Execution Control Command |
@@ -75,6 +83,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/health` |  | Health |
 | `POST` | `/api/manager/apply` |  | Manager Apply |
 | `GET` | `/api/manager/apply/status` |  | Manager Apply Status |
+| `GET` | `/api/manager/canonical-empty-selection` |  | Canonical Empty Selection |
 | `POST` | `/api/manager/deployment-candidates/preview` |  | Manager Deployment Candidate Preview |
 | `GET` | `/api/manager/diff` |  | Manager Diff |
 | `GET` | `/api/manager/graph` |  | Manager Graph |

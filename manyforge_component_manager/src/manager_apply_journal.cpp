@@ -100,7 +100,7 @@ using core::SceneId;
 using core::SceneRevision;
 
 constexpr std::string_view kDigestDomain =
-    "manyforge.component-manager-apply-intent.v1";
+    "manyforge.component-manager-apply-intent.v2";
 constexpr std::string_view kAffectedScopeDigestDomain =
     "manyforge.component-manager-apply-affected-scope.v2";
 constexpr std::string_view kFenceAttemptDigestDomain =
@@ -614,6 +614,8 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
               intent.request_context.correlation_id.has_value() ? "1" : "0");
   AppendField(record, "correlation_id",
               intent.request_context.correlation_id.value_or(""));
+  AppendField(record, "scene_initialization",
+              ToString(intent.scene_initialization));
   AppendField(record, "apply_id", intent.apply_id.value());
   AppendField(record, "apply_generation", std::to_string(generation));
   AppendField(record, "cell_id", intent.cell_id.value());
@@ -2599,10 +2601,10 @@ void ValidateApplyJournalIdentityAndSchema(
              ? std::string(sqlite3_db_filename(database, "main"))
              : source_path.string()) +
         " has format version " + std::to_string(user_version) +
-        "; expected v17. Preserve this file, including interrupted operations; "
+        "; expected v18. Preserve this file, including interrupted operations; "
         "reconcile the original operations with their owner and retained "
         "evidence "
-        "before explicitly selecting a fresh v17 journal. No migration, "
+        "before explicitly selecting a fresh v18 journal. No migration, "
         "conversion "
         "or deletion is performed");
   }
@@ -2615,10 +2617,10 @@ void ValidateApplyJournalIdentityAndSchema(
         (source_path.empty()
              ? std::string(sqlite3_db_filename(database, "main"))
              : source_path.string()) +
-        " has an unsupported earlier v17 format missing "
+        " has an unsupported earlier v18 format missing "
         "isaac_pose_observer_launch_facts. Preserve this file, including "
         "interrupted operations; reconcile the original operations with their "
-        "owner and retained evidence before explicitly selecting a fresh v17 "
+        "owner and retained evidence before explicitly selecting a fresh v18 "
         "journal. No migration, conversion or deletion is performed");
   }
   if (existing != ExpectedSchemaObjects()) {
@@ -2809,6 +2811,16 @@ ManagerApplyProgressDTO DeriveManagerApplyProgress(
   return {ManagerApplyPhase::kAccepted, status.intent.intent_digest};
 }
 
+const char *ToString(const ManagerSceneInitialization value) noexcept {
+  switch (value) {
+  case ManagerSceneInitialization::kPreserve:
+    return "preserve";
+  case ManagerSceneInitialization::kInitialize:
+    return "initialize";
+  }
+  return "invalid";
+}
+
 bool ManagerApplyIntentDTO::valid() const noexcept {
   const bool direct = expected_admission_generation.has_value() &&
                       expected_admission_generation->nonzero() &&
@@ -2822,7 +2834,9 @@ bool ManagerApplyIntentDTO::valid() const noexcept {
                           core::CellAdmissionClaimKindDTO::kAuthoringMutation &&
                       parent_authoring_claim->intent.owner_role ==
                           core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
-  return (direct || parent) && !request_context.request_id.empty() &&
+  return (scene_initialization == ManagerSceneInitialization::kPreserve ||
+          scene_initialization == ManagerSceneInitialization::kInitialize) &&
+         (direct || parent) && !request_context.request_id.empty() &&
          !request_context.request_owner_epoch.empty() &&
          !request_context.source_label.empty() &&
          (!request_context.correlation_id.has_value() ||
@@ -3162,8 +3176,8 @@ public:
         "program_binding_id,prepared_activation_id,"
         "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,"
-        "isaac_pose_observer_launch_facts,intent_digest"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        "isaac_pose_observer_launch_facts,intent_digest,scene_initialization"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     insert.Bind(1, intent.apply_id.value());
     insert.Bind(2, encoded.apply_generation);
     insert.Bind(3, intent.request_context.request_id.value());
@@ -3212,6 +3226,7 @@ public:
       insert.BindNull(22);
     }
     insert.Bind(23, encoded.intent_digest);
+    insert.Bind(24, ToString(intent.scene_initialization));
     static_cast<void>(insert.Step());
 
     const auto stored = IntentLocked(intent.apply_id, encoded.apply_generation);
@@ -3576,7 +3591,7 @@ public:
         "program_binding_id,prepared_activation_id,"
         "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,"
-        "isaac_pose_observer_launch_facts,intent_digest "
+        "isaac_pose_observer_launch_facts,intent_digest,scene_initialization "
         "FROM manager_apply_intents "
         "WHERE apply_id=? AND apply_generation=?");
     row.Bind(1, apply_id.value());
@@ -3616,6 +3631,12 @@ public:
     const auto parent_authoring_claim = row.OptionalBlob(20);
     const auto observer_launch_facts_encoding = row.OptionalBlob(21);
     const auto stored_digest = row.Text(22);
+    const auto scene_initialization = row.Text(23);
+    if (scene_initialization != "preserve" &&
+        scene_initialization != "initialize") {
+      throw ManagerApplyJournalIntegrityError(
+          "stored Scene initialization purpose is invalid");
+    }
     if (row.Step()) {
       throw ManagerApplyJournalIntegrityError(
           "Apply intent identity is not unique");
@@ -3673,6 +3694,9 @@ public:
                   DecodeParentAuthoringClaim(*parent_authoring_claim))
             : std::nullopt,
         std::move(observer_launch_facts),
+        scene_initialization == "initialize"
+            ? ManagerSceneInitialization::kInitialize
+            : ManagerSceneInitialization::kPreserve,
     };
     EncodedIntent encoded;
     try {

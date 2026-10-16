@@ -1,0 +1,48 @@
+{
+  "schema_version": "manyforge.shared_close_preparation_source_results.v1",
+  "scope": "DX1061/DX1063/DX1065",
+  "status": "source_landed_no_runtime_sync",
+  "behavior": "Every confirmed Close/New/Load uses eligible ordinary Reset then remaining sequential detach_at_current_pose while carriers are live. Post-Close Scene/editor clearing stays standalone only.",
+  "source_post_sha256": {
+    "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.handoff.test.tsx": "9e4453cb23862c9d20da95349f7d300b030d2231b57ad052bd0d8264c1fec28a",
+    "manyforge_composer/frontend/src/state/scenarioClose.test.ts": "8c0315348314db6510d5efbb485af59c618187e8fef82793c939494cf8037e20",
+    "manyforge_composer/frontend/src/App.tsx": "8402ba10f3a6711b208e858b835350a552953246587b951154ad0670ff145753",
+    "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.mounted.test.tsx": "495e54076af5fdc0faf447bc5832c8921b618e6a1672a533f51576d9923f7d79",
+    "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.tsx": "3953c6a3097dc6d3cec299d2e026f04543e1b3a98311a2c2bdd16887e0bcb21c",
+    "manyforge_composer/frontend/src/state/scenarioClose.ts": "a5d0b92ab83d3e391d37ae3719de426bb2b4861175583f1d39589ca2eaf1aac9"
+  },
+  "confirmation_scene_identity": "All actions capture closeScene and closeCycle in useProgramWorkspace; New/Load exact capture exercised by shared-helper handoff tests.",
+  "checks": {
+    "frontend01": {
+      "state": 94,
+      "handoff": 67,
+      "mounted": 20,
+      "App": 4,
+      "unique_tests": 185,
+      "vitest_exit": 0,
+      "typescript_exit": 0,
+      "eslint_exit": 1,
+      "reason": "3 prefer-const in handoff test; corrected declarations only"
+    },
+    "frontend02-lint": {
+      "exit": 0,
+      "errors": 0,
+      "warnings": 1,
+      "warning": "existing completeReplacement React hook dependency"
+    },
+    "final_test_delta": "3 explicitly typed const declaration corrections only; no repeated Vitest/tsc",
+    "original_git_apply_check": 0
+  },
+  "review": "Independent exact3product source PASS; no findings",
+  "source_receipts": {
+    "freeze_manifest_sha256": "928bc053da0b66cf5b58e3f005908088b75ea522991ffdbd7cc415d91e9e02d4",
+    "freeze_patch_sha256": "4241e30924ff735a883a495ab168fefdbfe35b0eac3e0d373ff548bac15210ef",
+    "original_import_sha256": "f7deadc40ba22bd175ad7abc51f3dc59e30225c07490f98cc554cd31d766ab57",
+    "independent_review_sha256": "01d92a7eccb2f971f0f20fa9cb7a7d5d3a416ddabad977cb4dfffe56eac5e614"
+  },
+  "limitations": [
+    "Backend plain Reset/default-false options are a separate coordinated batch; source change was not hot-synced.",
+    "No runtime actions or native/backend tests; no functional GUI qualification claimed.",
+    "Peer confirmation wording follows this source landing; presentation was preserved by this patch."
+  ]
+}

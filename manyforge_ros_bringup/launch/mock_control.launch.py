@@ -40,6 +40,7 @@ def launch_setup(context, *args, **kwargs):
     namespace = LaunchConfiguration("runtime_namespace").perform(context)
     manager_name = LaunchConfiguration("controller_manager_name").perform(context)
     arm_name = LaunchConfiguration("arm_controller_name").perform(context)
+    reset_position_name = LaunchConfiguration("reset_position_controller_name").perform(context)
     gripper_name = LaunchConfiguration("gripper_controller_name").perform(context)
     frame_prefix = LaunchConfiguration("frame_prefix").perform(context)
     manager_path = f"{namespace.rstrip('/')}/{manager_name}"
@@ -85,6 +86,16 @@ def launch_setup(context, *args, **kwargs):
                 ros_arguments=["--disable-external-lib-logs"],
             )
         )
+    if reset_position_name:
+        nodes.append(
+            Node(
+                package="controller_manager",
+                executable="spawner",
+                arguments=[reset_position_name, "--inactive", "--controller-manager", manager_path, "--param-file", str(controllers_path)],
+                output="screen",
+                ros_arguments=["--disable-external-lib-logs"],
+            )
+        )
     if gripper_name:
         nodes.append(
             Node(
@@ -106,6 +117,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("runtime_namespace"),
             DeclareLaunchArgument("controller_manager_name", default_value="controller_manager"),
             DeclareLaunchArgument("arm_controller_name", default_value=""),
+            DeclareLaunchArgument("reset_position_controller_name", default_value=""),
             DeclareLaunchArgument("gripper_controller_name", default_value=""),
             DeclareLaunchArgument("frame_prefix", default_value=""),
             OpaqueFunction(function=launch_setup),

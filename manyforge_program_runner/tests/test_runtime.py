@@ -1347,7 +1347,7 @@ def test_manager_recovery_resumes_contained_reset_after_runner_restart(
     result = runtime.reset_cycle(
         ProgramCycleResetRequest.model_validate(
             {
-                "request_id": "reset.after-restart",
+                "request_id": "reset.after-restart", "reload_initial_scene": True,
                 "request_owner_epoch": "composer.epoch.1",
                 "source_label": "operator_ui",
                 "correlation_id": None,
@@ -2087,15 +2087,15 @@ def test_scene_preparation_failure_blocks_run_until_idle_reset_converges(
     assert rejected.value.code == "program_scene_preparation_failed"
     assert admission.claims == []
     objects = {"changed": True}
-    def restore(_context, _scene):
-        assert runtime.cycle_status()["state"] == "idle_after_reset"
+    def restore(_context, _scene, **_kwargs):
+        assert runtime.cycle_status()["state"] == "resetting"
         objects.clear()
         objects["program_object"] = True
         return {"schema_version": "manyforge.prepared_program_scene.v1"}
     monkeypatch.setattr(runtime._scene, "prepare_initial_scene", restore)
     monkeypatch.setattr(runtime._scene, "verify_initial_scene", lambda *_args: None)
     reset = ProgramCycleResetRequest.model_validate({
-        "request_id": "idle.reset", "request_owner_epoch": "composer.1",
+        "request_id": "idle.reset", "reload_initial_scene": True, "request_owner_epoch": "composer.1",
         "source_label": "operator_ui", "correlation_id": None,
         "program_run_id": None, "expected_owner_epoch": runtime.owner_epoch,
         "expected_cycle_generation": 1, "expected_claim_generation": None,
@@ -2108,7 +2108,8 @@ def test_scene_preparation_failure_blocks_run_until_idle_reset_converges(
     assert runtime.cycle_status()["failure"] is None
     runtime.start_run(_start_request(request_id="after.idle.reset"))
     assert runtime.cycle_status()["state"] == "running"
-    assert len(admission.claims) == 1
+    assert [claim["claim_kind"] for claim in admission.claims] == ["program_reset", "program_cycle"]
+    assert len(admission.releases) == 1
     runtime.shutdown()
 
 
@@ -3224,7 +3225,6 @@ def test_default_resume_routes_only_selected_nodes_and_preserves_partial_outcome
         (True, False, None),
         (False, True, None),
         (True, True, None),
-        (False, True, "restore"),
         (False, True, "release"),
     ],
 )
@@ -3354,14 +3354,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     )
 
     if failure is not None:
-        if failure == "restore":
-
-            def failed_restore(*_args: Any) -> None:
-                raise ProgramRunnerError("program_scene_unavailable", "restore failed")
-
-            runtime._prepare_scene_after_reset = failed_restore
-        else:
-            admission.release_error = RuntimeError("release reply lost")
+        admission.release_error = RuntimeError("release reply lost")
 
         try:
             with pytest.raises(ProgramRunnerError) as rejected:
@@ -3732,6 +3725,9 @@ def test_replacement_owner_remains_fail_closed_for_later_reconciliation_owner(
         "current_command_kind",
         "failure",
         "reset_phase",
+        "reset_options",
+        "reset_robot_position",
+        "accepted_reset",
         "allowed_commands",
     }
     assert projected["program_runner_owner_epoch"] == "runner.old"
@@ -4233,7 +4229,7 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
     monkeypatch.setattr(runtime, "_prepare_current_applied_scene", prepare_scene)
     request = ProgramCycleResetRequest.model_validate(
         {
-            "request_id": "reset.scene.1",
+            "request_id": "reset.scene.1", "reload_initial_scene": True,
             "request_owner_epoch": "composer.1",
             "source_label": "operator_ui",
             "correlation_id": None,
@@ -4731,7 +4727,8 @@ def test_reset_recovers_unknown_resume_without_replay_or_capacity_growth(
     host.contain_reset_run = contain_or_lose
     runtime._prepare_scene_after_reset = restore
     for index in range(lost_confirmations + 1):
-        request = _current_reset_request(runtime, journal, f"reset.{index}")
+        request = _current_reset_request(runtime, journal, f"reset.{index}").model_copy(
+            update={"reload_initial_scene": True})
         allowed = {
             row["command_kind"]: row["allowed"]
             for row in runtime.cycle_status()["allowed_commands"]
@@ -5786,7 +5783,7 @@ def test_scene_preparation_distinguishes_not_ready_from_real_generation_change(m
         with pytest.raises(ProgramRunnerError) as caught:
             if not_ready:
                 runtime.reset_cycle(ProgramCycleResetRequest.model_validate({
-                    "request_id": "idle.reset.not-ready", "request_owner_epoch": "composer.1",
+                    "request_id": "idle.reset.not-ready", "reload_initial_scene": True, "request_owner_epoch": "composer.1",
                     "source_label": "operator", "correlation_id": None,
                     "program_run_id": None, "expected_owner_epoch": "runner.1",
                     "expected_cycle_generation": 1, "expected_claim_generation": None,
@@ -6388,5 +6385,401 @@ def test_non_simulated_ros_configuration_is_explicitly_unsupported_for_m1(progra
         with pytest.raises(ProgramRunOwnerError, match="does not support non-simulated ROS modes"):
             _simulation_lane_requirement(runtime, binding, program)
         assert headless.graph_reads == 1
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("idle", [False, True])
+@pytest.mark.parametrize("reload_scene,reset_position", [(False, False), (True, False), (False, True), (True, True)])
+def test_reset_selectors_order_and_plain_preservation(monkeypatch, tmp_path, idle, reload_scene, reset_position):
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options")
+    reference = None if idle else _retain_terminal_cycle(journal, _program_cycle_claim("runner.options"))
+    class Admission(_Admission):
+        def get(self):
+            return {"admission_generation": 1, "authoring_allowed": True}
+    admission = Admission()
+    headless = _Headless()
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+                             headless_client=headless, execution_transport=_Headless(),
+                             admission_client=admission, cycle_journal=journal)
+    events = []
+    def effect(name):
+        def apply(_request, _authorization):
+            status = runtime.cycle_status()
+            assert status["state"] == "resetting"
+            assert status["program_run_id"] == (None if idle else "program-cycle.1")
+            assert status["reset_phase"] == ("restoring_scene" if name == "scene" else "restoring_position")
+            events.append(name)
+        return apply
+    monkeypatch.setattr(runtime, "_prepare_scene_after_reset", effect("scene"))
+    monkeypatch.setattr(runtime, "_reset_robot_position_after_reset", effect("position"))
+    monkeypatch.setattr(runtime, "_require_reset_robot_position_available", lambda _request: events.append("preflight"))
+    monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda _request: None)
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({
+        "request_id": "reset.options", "request_owner_epoch": "composer.1", "source_label": "operator_ui",
+        "correlation_id": "reset.options.correlation", "program_run_id": None if idle else "program-cycle.1",
+        "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": 1,
+        "expected_claim_generation": None if idle else 1, "terminal_reference": reference,
+        "settlement_evidence_digest": reference, "reload_initial_scene": reload_scene,
+        "reset_robot_position": reset_position,
+    })
+    try:
+        result = runtime.reset_cycle(request)
+        assert events == (["preflight", "preflight"] if reset_position else []) + (["scene"] if reload_scene else []) + (["position"] if reset_position else [])
+        assert result["idle_cycle_generation"] == 2
+        assert journal.read().state == "idle_after_reset"
+        assert len(admission.releases) == (0 if idle and not (reload_scene or reset_position) else 1)
+        assert not journal.pending_commands()
+        if not reload_scene and not reset_position:
+            assert headless.applied_reads == 0
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("idle", [False, True])
+def test_position_reset_refuses_before_scene_effects(monkeypatch, tmp_path, idle):
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options")
+    reference = None if idle else _retain_terminal_cycle(journal, _program_cycle_claim("runner.options"))
+    admission = _Admission()
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+                             headless_client=_Headless(), execution_transport=_Headless(),
+                             admission_client=admission, cycle_journal=journal)
+    monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda *_args: pytest.fail("refused position Reset touched Scene"))
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({
+        "request_id": "reset.unsupported", "request_owner_epoch": "composer.1", "source_label": "operator_ui",
+        "correlation_id": None, "program_run_id": None if idle else "program-cycle.1",
+        "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": 1,
+        "expected_claim_generation": None if idle else 1, "terminal_reference": reference,
+        "settlement_evidence_digest": reference, "reload_initial_scene": True, "reset_robot_position": True,
+    })
+    before = journal.read()
+    try:
+        with pytest.raises(ProgramRunnerError) as refused:
+            runtime.reset_cycle(request)
+        assert refused.value.code == "program_cycle_reset_position_unavailable"
+        assert journal.read() == before
+        assert not journal.pending_commands()
+        assert not admission.releases
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("idle", [False, True])
+@pytest.mark.parametrize("failed_effect", ["scene", "position"])
+def test_selected_reset_failure_retains_phase_and_original_options(monkeypatch, tmp_path, idle, failed_effect):
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options")
+    reference = None if idle else _retain_terminal_cycle(journal, _program_cycle_claim("runner.options"))
+    class Admission(_Admission):
+        def get(self):
+            return {"admission_generation": 1, "authoring_allowed": True}
+    admission = Admission()
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+                             headless_client=_Headless(), execution_transport=_Headless(),
+                             admission_client=admission, cycle_journal=journal)
+    events = []
+    should_fail = True
+    def effect(name):
+        def apply(_request, _authorization):
+            events.append((name, _request.request_id))
+            if name == failed_effect and should_fail:
+                raise ProgramRunnerError("test_effect_refused", name)
+        return apply
+    monkeypatch.setattr(runtime, "_prepare_scene_after_reset", effect("scene"))
+    monkeypatch.setattr(runtime, "_reset_robot_position_after_reset", effect("position"))
+    monkeypatch.setattr(runtime, "_require_reset_robot_position_available", lambda _request: None)
+    monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda _request: None)
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({
+        "request_id": "reset.original", "request_owner_epoch": "composer.1", "source_label": "operator_ui",
+        "correlation_id": "reset.original.correlation", "program_run_id": None if idle else "program-cycle.1",
+        "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": 1,
+        "expected_claim_generation": None if idle else 1, "terminal_reference": reference,
+        "settlement_evidence_digest": reference, "reload_initial_scene": True, "reset_robot_position": True,
+    })
+    try:
+        with pytest.raises(ProgramRunnerError) as failed:
+            runtime.reset_cycle(request)
+        assert failed.value.code == "program_cycle_recovery_required"
+        state = runtime.cycle_status()
+        assert state["state"] == "recovery_required"
+        assert state["reset_phase"] == ("restoring_scene" if failed_effect == "scene" else "restoring_position")
+        assert state["failure"]["failed_phase"] == state["reset_phase"]
+        assert not admission.releases
+        pending = journal.pending_commands()
+        with pytest.raises(ProgramRunnerError) as conflict:
+            runtime.reset_cycle(request.model_copy(update={"request_id": "reset.conflict", "reload_initial_scene": False}))
+        assert conflict.value.code == "program_run_request_conflict"
+        assert journal.pending_commands() == pending
+        should_fail = False
+        runtime.reset_cycle(request.model_copy(update={"request_id": "reset.confirmed", "correlation_id": "fresh.confirmation"}))
+        expected = (["scene", "scene", "position"] if failed_effect == "scene" else ["scene", "position", "position"])
+        assert events == [(name, "reset.original") for name in expected]
+        assert journal.read().causal_correlation_id == "fresh.confirmation"
+        assert journal.read().state == "idle_after_reset"
+    finally:
+        runtime.shutdown()
+
+
+def test_plain_idle_reset_preserves_scene_failure_without_observation(monkeypatch, tmp_path):
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options")
+    failure = {"code": "program_scene_preparation_failed", "message": "Scene owner unavailable"}
+    journal.record_scene_preparation_failure(expected_generation=1, owner_epoch="runner.options", failure=failure)
+    headless = _Headless()
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+                             headless_client=headless, execution_transport=_Headless(),
+                             admission_client=_Admission(), cycle_journal=journal)
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({
+        "request_id": "reset.plain", "request_owner_epoch": "composer.1", "source_label": "operator_ui",
+        "correlation_id": None, "program_run_id": None, "expected_owner_epoch": runtime.owner_epoch,
+        "expected_cycle_generation": 1,
+    })
+    try:
+        result = runtime.reset_cycle(request)
+        assert result["idle_cycle_generation"] == 2
+        assert journal.read().failure == failure
+        status = runtime.cycle_status()
+        assert status["reset_options"] is None
+        assert next(row for row in status["allowed_commands"] if row["command_kind"] == "program_run")["allowed"] is False
+        assert headless.applied_reads == 0
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("unknown_at", ["acquire", "release"])
+def test_idle_reset_unknown_claim_outcome_retains_exact_intent_without_resend(monkeypatch, tmp_path, unknown_at):
+    class Admission(_Admission):
+        def get(self):
+            return {"admission_generation": 41, "authoring_allowed": True}
+        def acquire(self, intent):
+            assert journal.read().reset_effect_claim["intent"] == intent
+            assert intent["expected_admission_generation"] == 41
+            self.claims.append(deepcopy(intent))
+            if unknown_at == "acquire":
+                raise CellAdmissionError("transport_unavailable", "Acquire reply lost", outcome_unknown=True)
+            return {"intent": deepcopy(intent), "claim_generation": 7,
+                    "acquired_admission_generation": 41, "accepted_at_ns": 1}
+        def release(self, release):
+            assert journal.read().reset_effect_claim["release_intent"] == release
+            self.releases.append(deepcopy(release))
+            raise CellAdmissionError("transport_unavailable", "Release reply lost", outcome_unknown=True)
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options")
+    admission = Admission()
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+        headless_client=_Headless(), execution_transport=_Headless(), admission_client=admission, cycle_journal=journal)
+    effects = []
+    monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda *_args: effects.append("scene"))
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({"request_id": "reset.unknown", "request_owner_epoch": "caller.1",
+        "source_label": "operator_ui", "correlation_id": None, "program_run_id": None,
+        "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": 1, "reload_initial_scene": True})
+    try:
+        with pytest.raises(ProgramRunnerError) as failed:
+            runtime.reset_cycle(request)
+        assert failed.value.details == {"cause_code": "program_cycle_reconciliation_required"}
+        cycle = journal.read()
+        assert cycle.state == "recovery_required" and cycle.reconciliation_required
+        retained = deepcopy(cycle.reset_effect_claim)
+        assert retained["intent"]["expected_admission_generation"] == 41
+        context = runtime._current_cycle_status_projection()["accepted_reset"]
+        assert context["request_payload_digest"] == runtime._digest(request.model_dump(mode="json"))
+        assert context["reset_claim_generation"] == (None if unknown_at == "acquire" else 7)
+        with pytest.raises(ProgramRunnerError):
+            runtime.reset_cycle(request.model_copy(update={"request_id": "reset.fresh.confirmation"}))
+        assert len(admission.claims) == 1
+        assert effects == ([] if unknown_at == "acquire" else ["scene"])
+        assert len(admission.releases) == (0 if unknown_at == "acquire" else 1)
+        assert journal.read().reset_effect_claim == retained
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("fail_position", [False, True])
+def test_position_only_idle_reset_preserves_prior_scene_failure_until_selected_reload(monkeypatch, tmp_path, fail_position):
+    class Admission(_Admission):
+        def get(self):
+            return {"admission_generation": 1, "authoring_allowed": True}
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options")
+    original = {"code": "program_scene_preparation_failed", "message": "original Scene failure"}
+    journal.record_scene_preparation_failure(expected_generation=1, owner_epoch="runner.options", failure=original)
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+        headless_client=_Headless(), execution_transport=_Headless(), admission_client=Admission(), cycle_journal=journal)
+    scene_calls = []
+    monkeypatch.setattr(runtime, "_require_reset_robot_position_available", lambda _request: None)
+    def position(*_args):
+        assert journal.read().failure == original
+        if fail_position:
+            raise ProgramRunnerError("position_refused", "known position refusal")
+    monkeypatch.setattr(runtime, "_reset_robot_position_after_reset", position)
+    monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda *_args: scene_calls.append("scene"))
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({"request_id": "reset.position", "request_owner_epoch": "caller.1",
+        "source_label": "operator_ui", "correlation_id": None, "program_run_id": None,
+        "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": 1, "reset_robot_position": True})
+    try:
+        if fail_position:
+            with pytest.raises(ProgramRunnerError):
+                runtime.reset_cycle(request)
+            assert journal.read().failure["prior_scene_preparation_failure"] == original
+            fail_position = False
+            runtime.reset_cycle(request.model_copy(update={"request_id": "reset.position.confirmed"}))
+        else:
+            runtime.reset_cycle(request)
+        assert journal.read().failure == original and not scene_calls
+        assert next(row for row in runtime.cycle_status()["allowed_commands"] if row["command_kind"] == "program_run")["allowed"] is False
+        runtime.reset_cycle(request.model_copy(update={"request_id": "reset.reload", "expected_cycle_generation": 2,
+            "reset_robot_position": False, "reload_initial_scene": True}))
+        assert journal.read().failure is None and scene_calls == ["scene"]
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_completed_reload_clears_prior_scene_fault_before_later_position_failure(monkeypatch, tmp_path, restart):
+    class Admission(_Admission):
+        def get(self):
+            return {"admission_generation": 1, "authoring_allowed": True}
+    path = tmp_path / "cycle.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.options")
+    original = {"code": "program_scene_preparation_failed", "message": "Scene needs reload"}
+    journal.record_scene_preparation_failure(expected_generation=1, owner_epoch="runner.options", failure=original)
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+        headless_client=_Headless(), execution_transport=_Headless(), admission_client=Admission(), cycle_journal=journal)
+    monkeypatch.setattr(runtime, "_require_reset_robot_position_available", lambda _request: None)
+    monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda *_args: None)
+    def position(*_args):
+        assert journal.read().reset_phase == "restoring_position"
+        assert journal.read().failure is None
+        raise ProgramRunnerError("position_refused", "known position refusal")
+    monkeypatch.setattr(runtime, "_reset_robot_position_after_reset", position)
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({"request_id": "reset.both", "request_owner_epoch": "caller.1",
+        "source_label": "operator_ui", "correlation_id": None, "program_run_id": None,
+        "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": 1,
+        "reset_robot_position": True, "reload_initial_scene": True})
+    try:
+        with pytest.raises(ProgramRunnerError):
+            runtime.reset_cycle(request)
+        assert journal.read().failure["code"] == "position_refused"
+        assert "prior_scene_preparation_failure" not in journal.read().failure
+    finally:
+        runtime.shutdown()
+    if restart:
+        reopened = ProgramCycleJournal(path, owner_epoch="runner.options")
+        try:
+            assert "prior_scene_preparation_failure" not in reopened.read().failure
+            assert reopened.read().reset_phase == "restoring_position"
+        finally:
+            reopened.close()
+
+
+def test_private_heartbeat_never_reads_position_capability_but_public_status_does(tmp_path):
+    transport = _Headless()
+    def blocked_capability():
+        raise AssertionError("Private heartbeat called the capability port")
+    transport.reset_robot_position_capability = blocked_capability
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+        headless_client=_Headless(), execution_transport=transport, admission_client=_Admission(),
+        cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options"))
+    runtime.start()
+    reads = []
+    try:
+        assert runtime._current_cycle_status_projection()["accepted_reset"] is None
+        transport.reset_robot_position_capability = lambda: reads.append("current") or {
+            "reset_robot_position": {"available": True, "reason": None}}
+        assert runtime.cycle_status()["reset_robot_position"] == {"available": True, "reason": None}
+        assert reads == ["current"]
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("invalid", [None, "missing", "digest", "kind", "claim"])
+def test_selected_reload_after_proven_never_started_run_uses_reset_claim(monkeypatch, tmp_path, invalid):
+    class Admission(_Admission):
+        def get(self):
+            return {"admission_generation": 1, "authoring_allowed": True}
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options")
+    settlement = {"schema_version": "manyforge.program_cycle_start_settlement.v1", "kind": "proven_no_effect",
+                  "claim": None, "program_run_id": "never-started.1", "prepared_scene": {}}
+    if invalid == "kind": settlement["kind"] = "assumed"
+    if invalid == "claim": settlement["claim"] = {"claim_generation": 1}
+    reference = ProgramRuntime._digest(settlement) if invalid != "digest" else _DIGEST_B
+    journal.transition(expected_generation=1, expected_states=("idle_after_reset",), state="terminal_awaiting_reset",
+        program_run_id="never-started.1", terminal_reference=reference,
+        start_settlement=None if invalid == "missing" else settlement)
+    admission = Admission()
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+        headless_client=_Headless(), execution_transport=_Headless(), admission_client=admission, cycle_journal=journal)
+    effects = []
+    def scene(_request, authorization):
+        assert journal.read().program_run_id == "never-started.1"
+        assert journal.read().claim is None
+        assert authorization["reset_claim"]["reset_claim_generation"] == 1
+        assert journal.read().reset_effect_claim["claim"]["intent"]["claim_kind"] == "program_reset"
+        effects.append("scene")
+    monkeypatch.setattr(runtime, "_prepare_scene_after_reset", scene)
+    monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda *_: None)
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({"request_id": "reset.never-started", "request_owner_epoch": "caller.1",
+        "source_label": "operator_ui", "correlation_id": None, "program_run_id": "never-started.1",
+        "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": 1,
+        "expected_claim_generation": None, "terminal_reference": reference, "settlement_evidence_digest": reference,
+        "reload_initial_scene": True})
+    try:
+        if invalid is not None:
+            with pytest.raises(ProgramRunnerError):
+                runtime.reset_cycle(request)
+            assert not effects and not admission.claims and not admission.releases
+        else:
+            runtime.reset_cycle(request)
+            assert effects == ["scene"]
+            assert len(admission.claims) == len(admission.releases) == 1
+            assert journal.read().state == "idle_after_reset"
+            assert journal.read().reset_effect_claim is None
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("effect_disposition", ["known_no_effect", "unknown", None])
+def test_native_position_errors_preserve_known_vs_unknown_effect_policy(monkeypatch, tmp_path, effect_disposition):
+    from manyforge_headless_api.native import HeadlessApiError
+    class Admission(_Admission):
+        def get(self):
+            return {"admission_generation": 1, "authoring_allowed": True}
+    transport = _Headless()
+    identity = {"owner_epoch": "kernel.1", "active_publication_generation": 3,
+                "retained_bundle_id": _DIGEST_A, "graph_revision": _DIGEST_B}
+    transport.reset_robot_position_capability = lambda: {
+        "reset_robot_position": {"available": True, "reason": None}, "identity": {**identity, "scene_revision": "ignored"}}
+    effects = []
+    def position(body):
+        effects.append(body)
+        raise HeadlessApiError("position_failed", "Native position failure",
+            details={} if effect_disposition is None else {"effect_disposition": effect_disposition})
+    transport.reset_robot_position = position
+    admission = Admission()
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options")
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+        headless_client=_Headless(), execution_transport=transport, admission_client=admission, cycle_journal=journal)
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({"request_id": "reset.position", "request_owner_epoch": "caller.1",
+        "source_label": "operator_ui", "correlation_id": None, "program_run_id": None,
+        "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": 1, "reset_robot_position": True})
+    try:
+        with pytest.raises(ProgramRunnerError):
+            runtime.reset_cycle(request)
+        assert len(effects) == 1 and not admission.releases
+        assert effects[0]["expected_deployment_identity"] == identity
+        assert effects[0]["authorization"]["request_id"] == request.request_id
+        assert effects[0]["authorization"]["reset_claim_generation"] == 1
+        assert journal.read().reset_phase == "restoring_position"
+        assert journal.read().reconciliation_required == (effect_disposition != "known_no_effect")
+        if effect_disposition != "known_no_effect":
+            assert "Restart the workbench" in journal.read().failure["message"]
+            with pytest.raises(ProgramRunnerError):
+                runtime.reset_cycle(request.model_copy(update={"request_id": "fresh.confirmation"}))
+            assert len(effects) == 1
     finally:
         runtime.shutdown()

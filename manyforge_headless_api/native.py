@@ -5,8 +5,10 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Mapping, Protocol, Sequence
 import unicodedata
 from urllib.parse import urlsplit
@@ -88,8 +90,20 @@ class HeadlessApiConfig:
     activation_preparer_activation_root: Path | None = None
     activation_preparer_timeout_seconds: float = 120.0
     canonical_empty_admission_filename: Path | None = None
+    workbench_previous_session_reports_root: Path | None = None
+    workbench_previous_session_id: str | None = None
 
     def __post_init__(self) -> None:
+        if self.workbench_previous_session_id is not None and (
+            self.workbench_previous_session_reports_root is None
+            or re.fullmatch(r"[0-9a-f]{32}", self.workbench_previous_session_id) is None
+        ):
+            raise ValueError("current previous-session identity requires its report root and 32 lowercase hex digits")
+        if (
+            self.workbench_previous_session_reports_root is not None
+            and not self.workbench_previous_session_reports_root.is_absolute()
+        ):
+            raise ValueError("previous-session reports root must be absolute")
         path_values = (
             self.projection_root,
             self.install_root,
@@ -370,6 +384,7 @@ class NativeHeadlessCore:
                 "headless_native_binding_unavailable",
                 "manyforge_headless_py is not importable",
             ) from exc
+        self.workbench_previous_session_registration: dict[str, str] | None = None
         try:
             self._native = manyforge_headless_py.HeadlessApiCore(
                 str(config.projection_root),
@@ -386,11 +401,102 @@ class NativeHeadlessCore:
                 config.historian_queue_capacity,
                 config.historian_record_retention,
             )
+            if config.workbench_previous_session_reports_root is not None:
+                self._replay_previous_session_reports(
+                    config.workbench_previous_session_reports_root,
+                    config.workbench_previous_session_id,
+                )
         except Exception as exc:
             raise HeadlessApiError(
                 "headless_native_initialization_failed",
                 f"headless native core initialization failed: {exc}",
             ) from exc
+
+    def _replay_previous_session_reports(self, reports_root: Path, current_identity: str | None = None) -> None:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        reports = os.open(reports_root, directory_flags)
+        try:
+            pending = os.open("pending", directory_flags, dir_fd=reports)
+            try:
+                # The launcher holds the instance lock and the native owner
+                # holds the historian lock. No producer adds reports during
+                # this startup-only traversal; memory stays bounded per file.
+                with os.scandir(pending) as entries:
+                    for entry in entries:
+                        name = entry.name
+                        if re.fullmatch(r"\.[0-9a-f]{32}\.json\.next", name):
+                            continue  # Unpublished helper temporary; preserve it.
+                        if re.fullmatch(r"[0-9a-f]{32}\.json", name) is None:
+                            raise ValueError("unexpected pending session report filename")
+                        value, payload, source_stat = self._read_previous_session_report(pending, name)
+                        if value.get("session_id") != name[:-5]:
+                            raise ValueError("pending session report identity differs from its filename")
+                        try:
+                            final_value, _, _ = self._read_previous_session_report(reports, name)
+                        except FileNotFoundError:
+                            final_value = None
+                        if final_value is not None and final_value != value:
+                            raise ValueError("finalized session report has conflicting content")
+                        receipt = self._invoke("append_workbench_previous_session_report", payload)
+                        if (
+                            not isinstance(receipt, dict)
+                            or set(receipt) != {"session_id", "event_id", "status"}
+                            or receipt["session_id"] != value["session_id"]
+                            or receipt["status"] not in {"stored", "duplicate"}
+                            or not isinstance(receipt["event_id"], str)
+                            or re.fullmatch(r"event-[0-9a-f]{32}", receipt["event_id"]) is None
+                        ):
+                            raise ValueError("previous-session report durable receipt is invalid")
+                        current = os.stat(name, dir_fd=pending, follow_symlinks=False)
+                        if (current[:7], current.st_mtime_ns, current.st_ctime_ns) != (
+                            source_stat[:7], source_stat.st_mtime_ns, source_stat.st_ctime_ns
+                        ):
+                            raise ValueError("pending session report changed before finalization")
+                        if final_value is None:
+                            os.rename(name, name, src_dir_fd=pending, dst_dir_fd=reports)
+                        else:
+                            os.unlink(name, dir_fd=pending)
+                        os.fsync(reports)
+                        os.fsync(pending)
+            finally:
+                os.close(pending)
+            if current_identity is not None:
+                value, payload, _ = self._read_previous_session_report(reports, current_identity + ".json")
+                if value.get("session_id") != current_identity:
+                    raise ValueError("current previous-session report identity differs from its filename")
+                receipt = self._invoke("observe_workbench_previous_session_report", payload)
+                if (not isinstance(receipt, dict)
+                    or set(receipt) != {"session_id", "status"}
+                    or receipt["session_id"] != current_identity
+                    or receipt["status"] not in {"registered", "acknowledged", "quiet"}):
+                    raise ValueError("current previous-session registration receipt is invalid")
+                self.workbench_previous_session_registration = receipt
+        finally:
+            os.close(reports)
+
+    @staticmethod
+    def _read_previous_session_report(directory: int, name: str) -> tuple[dict[str, Any], str, os.stat_result]:
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=directory,
+        )
+        try:
+            source_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise ValueError("previous-session report must be a regular file")
+            # Reuse the existing 256 KiB historian payload bound.
+            if not 0 < source_stat.st_size <= MAX_PROGRAM_MODEL_ATTEMPT_BYTES:
+                raise ValueError("previous-session report exceeds the historian payload bound")
+            payload = os.read(descriptor, MAX_PROGRAM_MODEL_ATTEMPT_BYTES + 1)
+            after = os.fstat(descriptor)
+            if len(payload) != source_stat.st_size or (
+                after[:7], after.st_mtime_ns, after.st_ctime_ns
+            ) != (source_stat[:7], source_stat.st_mtime_ns, source_stat.st_ctime_ns):
+                raise ValueError("previous-session report changed while reading")
+        finally:
+            os.close(descriptor)
+        text = payload.decode("utf-8", errors="strict")
+        return strict_json_object(text, label="previous-session report"), text, source_stat
 
     def _invoke(self, method: str, *args: Any, **kwargs: Any) -> Any:
         payload = getattr(self._native, method)(*args, **kwargs)

@@ -922,6 +922,166 @@ struct InstalledEmptyContextFixture final {
   UnusedKernelPublicationOwner publication_owner;
 };
 
+TEST(CCLCRuntimeComposition,
+     PositionResetExceptionReleasesActualProductPinAndScope) {
+  ScopedTrustedRoot root;
+  const auto retained =
+      test::materialize_lite6_retained_consumer_fixture(root.path());
+  auto previous = publication(*retained.bundle);
+  previous.request.transaction_ref = core::NamedApplyPublicationTransactionDTO{
+      core::ApplyId("reset.initial.apply"), core::ApplyGeneration(1U)};
+  previous.request.expected_previous_publication_generation =
+      previous.publication_generation;
+  previous.publication_generation = core::ActiveBundlePublicationGeneration(2U);
+  const auto &graph = retained.bundle->value().cell_graph;
+  ASSERT_EQ(graph.controllable_components.size(), 1U);
+  ASSERT_EQ(graph.control_domains.size(), 1U);
+  const auto component =
+      graph.controllable_components.front().controllable_component_id;
+  const auto &binding = graph.control_bindings.front();
+  const auto &domain = graph.control_domains.front();
+  const auto &desired =
+      retained.bundle->value().desired_control_configurations.front();
+  const auto catalog = catalog_for(binding);
+  const std::vector<core::ResolvedLifecycleProviderOccurrenceDTO> providers{
+      {domain.control_domain_id, domain.control_domain_revision,
+       binding.provider_instance_id, binding.provider_manifest_id,
+       binding.provider_manifest_revision, binding.provider_runtime_unit_id,
+       core::RuntimeEpoch("reset.product.epoch"), catalog.catalog_digest}};
+  auto original = std::make_shared<InstalledContextFixture>(
+      retained.bundle, previous, root.path(), catalog);
+  UnusedKernelPorts kernel;
+  UnusedKernelPublicationOwner publication_owner;
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  const auto config =
+      configuration(root.path(), graph.cell_id, "position-reset-exception");
+  auto composition = CCLCRuntimeComposition::Create(
+      config, retained.bundle, original->reader, previous, original->artifacts,
+      original->catalogs, providers, controller_sources(*retained.bundle), {},
+      {}, {}, kernel, kernel, publication_owner, clock, scheduler);
+  ASSERT_TRUE(composition.ok()) << composition.error().message;
+  ASSERT_TRUE(composition.value()->Start().ok());
+  composition.value()->lifecycle_target_driver().Stop();
+  const auto owner = composition.value()->coordinator().request_owner_epoch();
+  const auto plan = composition.value()->PlanNativeApply(
+      {std::get<core::NamedApplyPublicationTransactionDTO>(
+           previous.request.transaction_ref),
+       retained.bundle->retained_bundle_id(),
+       graph.graph_revision,
+       {component},
+       {{domain.control_domain_id,
+         core::ActiveControlConfigurationGeneration(1U)}},
+       {},
+       {},
+       {},
+       {}});
+  ASSERT_TRUE(plan.ok()) << plan.error().message;
+  core::ActiveControlConfigurationDTO route{
+      core::ActiveControlConfigurationId("reset.active.configuration"),
+      domain.control_domain_id,
+      domain.control_domain_revision,
+      {},
+      desired.activation_set_id,
+      domain.controller_topology_id,
+      domain.topology_revision,
+      binding.provider_runtime_unit_id,
+      providers.front().provider_runtime_epoch,
+      1U,
+      {},
+      plan.value().routes.front().generation,
+      core::ActiveControlConfigurationStateDTO::kReconciled};
+  for (const auto &row : desired.binding_routes)
+    route.binding_routes.push_back({row.control_binding_id,
+                                    row.control_binding_revision,
+                                    row.control_route_id});
+  ASSERT_TRUE(route.locally_valid());
+  ASSERT_TRUE(
+      composition.value()
+          ->AdoptNativeApplyFacts({previous, plan.value().components, {route}})
+          .ok());
+  core::SqliteCCLCJournal journal(
+      config.state_root / std::string(core::kCCLCJournalFilename),
+      graph.cell_id, config.exact_result_history_capacity,
+      config.terminal_result_bytes_capacity);
+  const auto target = journal.SetLifecycleTarget(
+      component, core::LifecycleTargetStateDTO::kActive,
+      core::LifecycleTargetOriginDTO::kStartup);
+  ASSERT_TRUE(target.ok()) << target.error().message;
+  ASSERT_TRUE(journal
+                  .RecordLifecycleTargetReached(
+                      {component, target.value().target_generation}, true, 0U)
+                  .ok());
+  const auto current =
+      composition.value()->ReadCurrentComponentSnapshot(component);
+  ASSERT_TRUE(current.ok()) << current.error().message;
+  core::CCLCProgramResetPositionScopeRequest request{
+      core::RequestOwnerEpoch("runner.reset"),
+      1U,
+      core::RequestOwnerEpoch("browser.reset"),
+      core::RequestId("reset.position.1"),
+      core::ContentDigest("reset.payload"),
+      previous,
+      component,
+      current.value().provider_occurrences.front(),
+      current.value().domains.front(),
+      [](const auto &, auto) { return true; }};
+  bool invoked{};
+  const auto reset = composition.value()->WithProgramResetPositionScope(
+      request, [&](const auto &) -> core::Result<void> {
+        invoked = true;
+        EXPECT_TRUE(composition.value()
+                        ->lifecycle_target_driver()
+                        .ReadReadinessFacts(component)
+                        .value()
+                        .blocker.has_value());
+        throw std::runtime_error("position reset action failed");
+      });
+  EXPECT_TRUE(invoked);
+  EXPECT_FALSE(reset.ok());
+  EXPECT_FALSE(composition.value()
+                   ->lifecycle_target_driver()
+                   .ReadReadinessFacts(component)
+                   .value()
+                   .blocker.has_value());
+
+  // A real exchange must complete: acquiring another pin alone would not
+  // detect a leaked operation pin from the failed synchronous action.
+  auto successor = previous;
+  successor.request.transaction_ref = core::NamedApplyPublicationTransactionDTO{
+      core::ApplyId("reset.successor"), core::ApplyGeneration(1U)};
+  successor.request.expected_previous_publication_generation =
+      previous.publication_generation;
+  successor.publication_generation = core::ActiveBundlePublicationGeneration(
+      previous.publication_generation.value() + 1U);
+  successor.durable_public_pointer_content_digest =
+      core::ContentDigest("reset.successor.pointer");
+  auto installed = std::make_shared<InstalledContextFixture>(
+      retained.bundle, successor, root.path(), catalog);
+  const auto prepared = composition.value()->PrepareProductContext(
+      {installed->bundle,
+       installed->reader,
+       successor,
+       installed->artifacts,
+       installed->catalogs,
+       providers,
+       controller_sources(*installed->bundle),
+       {},
+       {},
+       {},
+       {},
+       nullptr,
+       installed->publication_owner,
+       installed});
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  const auto exchanged = composition.value()->TryExchangeProductContext(
+      *prepared.value(), owner, previous);
+  ASSERT_TRUE(exchanged.ok()) << exchanged.error().message;
+  EXPECT_EQ(exchanged.value().phase,
+            core::ComponentLifecycleProductExchangePhase::kCompleted)
+      << exchanged.value().reason;
+}
+
 TEST(CCLCRuntimeComposition, ExchangesVerifiedNonemptyToEmptyOnSameFacadeAndRetainsDependencies) {
   ScopedTrustedRoot root;
   const auto empty_package = root.path() / "canonical-empty";

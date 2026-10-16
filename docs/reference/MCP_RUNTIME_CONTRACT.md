@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-10-12 18:10:17 UTC
+  Last regenerated: 2026-10-16 11:05:37 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -435,6 +435,16 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             ],
             "title": "Expected Admission Generation"
           },
+          "expected_authoring_workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/_SceneWorkspaceIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "expected_draft_id": {
             "anyOf": [
               {
@@ -522,9 +532,13 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "$ref": "#/$defs/ProgramResetSceneAuthorizationRequest"
               },
               {
+                "$ref": "#/$defs/ProgramResetClaimSceneAuthorizationRequest"
+              },
+              {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Program Reset Scene Authorization"
           },
           "request_context": {
             "$ref": "#/$defs/CallerAttributionRequest"
@@ -814,6 +828,69 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "owner_api"
         ],
         "title": "ProgramNodeAdmissionEvidenceRequest",
+        "type": "object"
+      },
+      "ProgramResetClaimSceneAuthorizationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "cycle_generation": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Cycle Generation",
+            "type": "integer"
+          },
+          "program_runner_owner_epoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Program Runner Owner Epoch",
+            "type": "string"
+          },
+          "reset_claim": {
+            "$ref": "#/$defs/ProgramResetClaimSceneContextRequest"
+          }
+        },
+        "required": [
+          "program_runner_owner_epoch",
+          "cycle_generation",
+          "reset_claim"
+        ],
+        "title": "ProgramResetClaimSceneAuthorizationRequest",
+        "type": "object"
+      },
+      "ProgramResetClaimSceneContextRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "request_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          },
+          "request_owner_epoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Request Owner Epoch",
+            "type": "string"
+          },
+          "request_payload_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Request Payload Digest",
+            "type": "string"
+          },
+          "reset_claim_generation": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Reset Claim Generation",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "request_owner_epoch",
+          "request_id",
+          "request_payload_digest",
+          "reset_claim_generation"
+        ],
+        "title": "ProgramResetClaimSceneContextRequest",
         "type": "object"
       },
       "ProgramResetSceneAuthorizationRequest": {
@@ -1344,6 +1421,58 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         ],
         "title": "Vector3Request",
         "type": "object"
+      },
+      "_SceneWorkspaceIdentity": {
+        "additionalProperties": false,
+        "description": "The existing composite identity, carried only by Close's Scene cleanup.",
+        "properties": {
+          "deploymentDraftId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Deploymentdraftid",
+            "type": "string"
+          },
+          "deploymentDraftRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Deploymentdraftrevision",
+            "type": "integer"
+          },
+          "programDraftId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Programdraftid",
+            "type": "string"
+          },
+          "programDraftRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Programdraftrevision",
+            "type": "integer"
+          },
+          "workspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Workspaceepoch",
+            "type": "string"
+          },
+          "workspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Workspacerevision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "workspaceEpoch",
+          "workspaceRevision",
+          "programDraftId",
+          "programDraftRevision",
+          "deploymentDraftId",
+          "deploymentDraftRevision"
+        ],
+        "title": "_SceneWorkspaceIdentity",
+        "type": "object"
       }
     },
     "oneOf": [
@@ -1461,6 +1590,16 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "NewDraftRequest": {
         "additionalProperties": false,
         "properties": {
+          "completedClose": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/_CompletedCloseContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "confirmDiscard": {
             "default": false,
             "title": "Confirmdiscard",
@@ -1589,6 +1728,83 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "path"
         ],
         "title": "OpenDraftRequest",
+        "type": "object"
+      },
+      "_CompletedCloseContext": {
+        "additionalProperties": false,
+        "properties": {
+          "deploymentDraftId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Deploymentdraftid",
+            "type": "string"
+          },
+          "expectedDeploymentDraftRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Expecteddeploymentdraftrevision",
+            "type": "integer"
+          },
+          "graphRevision": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Graphrevision",
+            "type": "string"
+          },
+          "managerOwnerEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Managerownerepoch",
+            "type": "string"
+          },
+          "managerOwnerId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Managerownerid",
+            "type": "string"
+          },
+          "publication": {
+            "additionalProperties": true,
+            "title": "Publication",
+            "type": "object"
+          },
+          "retainedBundleId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Retainedbundleid",
+            "type": "string"
+          },
+          "sceneOwnerEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Sceneownerepoch",
+            "type": "string"
+          },
+          "sceneOwnerId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Sceneownerid",
+            "type": "string"
+          },
+          "sceneProjectionRevision": {
+            "additionalProperties": true,
+            "title": "Sceneprojectionrevision",
+            "type": "object"
+          }
+        },
+        "required": [
+          "sceneOwnerId",
+          "sceneOwnerEpoch",
+          "sceneProjectionRevision",
+          "managerOwnerId",
+          "managerOwnerEpoch",
+          "retainedBundleId",
+          "graphRevision",
+          "publication",
+          "deploymentDraftId",
+          "expectedDeploymentDraftRevision"
+        ],
+        "title": "_CompletedCloseContext",
         "type": "object"
       }
     },
@@ -5153,9 +5369,33 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "CallerAttributionRequest",
         "type": "object"
       },
+      "CloseIncidentRecoveryRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_incident_id": {
+            "title": "Expected Incident Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_incident_id"
+        ],
+        "title": "CloseIncidentRecoveryRequest",
+        "type": "object"
+      },
       "ComponentLifecycleRequest": {
         "additionalProperties": false,
         "properties": {
+          "close_incident_recovery": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CloseIncidentRecoveryRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "confirmed": {
             "title": "Confirmed",
             "type": "boolean"

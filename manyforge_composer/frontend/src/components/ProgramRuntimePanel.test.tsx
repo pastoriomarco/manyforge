@@ -20,6 +20,7 @@ import {
   MotionControlSettings,
   ProgramRuntimePanel,
   ProgramTransportControls,
+  resetKeptMessage,
 } from './ProgramRuntimePanel';
 import { readStyleSource } from '../styles/readStyleSource';
 
@@ -94,6 +95,7 @@ function ordinaryMotionStopControls(): NonNullable<
     recoveryOffer: ordinaryMotionStopOffer(),
     executionSelections: {
       selectionRevision: 1,
+      motionHeld: true,
       groups: [{ groupId: 'all', nodeCount: 1, heldNodeCount: 1,
         state: 'held', stopAllowed: false,
         startAllowed: false, startUnavailableReason: 'selection_not_ready',
@@ -283,6 +285,7 @@ function controller(
     },
     cycleState,
     cycleFailure: null,
+    resetRobotPositionAvailability: { available: true, reason: null },
     active: [
       'running', 'intervention_required', 'full_stopping', 'full_stopped',
       'stopping', 'finalizing',
@@ -290,6 +293,11 @@ function controller(
       .includes(state),
     refresh: vi.fn(),
     dismissError: vi.fn(),
+    activationOffer: null,
+    activationPending: false,
+    activationWaiting: false,
+    confirmActivationExecute: vi.fn(async () => {}),
+    cancelActivationExecute: vi.fn(),
     run: vi.fn(),
     stopMotion: vi.fn(),
     startMotion: vi.fn(),
@@ -795,7 +803,7 @@ describe('Program runtime projection', () => {
       source.indexOf('const requestProgramHalt'),
     );
     // Not executing: reset at once. Executing: stop motion, then ask.
-    expect(flow).toMatch(/if \(!executionActive\) \{\s*void program\.reset\(\);/);
+    expect(flow).toMatch(/if \(!executionActive\) \{\s*if \(endedReset && preferences\.confirmReset\) setResetIntent\('confirm'\);\s*else void program\.reset\(\);/);
     expect(flow).toContain("setResetIntent(preferences.confirmReset ? 'stopping' : 'automatic');");
     expect(flow).toContain("await program.stopMotion(['all'])");
     // Halted: motion is already contained, so no refused motion Stop is sent.
@@ -806,6 +814,32 @@ describe('Program runtime projection', () => {
       "if (resetIntent === 'stopping' && motionSettled) setResetIntent('confirm');",
     );
     expect(source).toContain('open={resetIntent === \'confirm\'}');
+  });
+
+  it('offers the two Reset options, off by default, and states what stays', () => {
+    expect(resetKeptMessage({ reloadInitialScene: false, resetRobotPosition: false }))
+      .toBe('The Scene, carried objects, gripper state and robot positions stay as they are.');
+    expect(resetKeptMessage({ reloadInitialScene: true, resetRobotPosition: false }))
+      .toBe('Robot positions stay as they are.');
+    expect(resetKeptMessage({ reloadInitialScene: false, resetRobotPosition: true }))
+      .toBe('The Scene, carried objects and gripper state stay as they are.');
+    expect(resetKeptMessage({ reloadInitialScene: true, resetRobotPosition: true })).toBeNull();
+    const source = readFileSync(new URL('./ProgramRuntimePanel.tsx', import.meta.url), 'utf8');
+    const flow = source.slice(
+      source.indexOf('const requestProgramReset'),
+      source.indexOf('const requestProgramHalt'),
+    );
+    // Every Reset request starts with both options off; idle Reset always asks.
+    expect(flow).toMatch(/setResetSelection\(NO_RESET_OPTIONS\);\s*if \(idleReset\) \{\s*setResetIntent\('confirm'\);/);
+    expect(source).toContain("const idleReset = cycleState === 'idle_after_reset' && !executionActive;");
+    // Position reset is sent only when the backend reports it available.
+    expect(source).toContain('resetRobotPosition: positionAvailable && resetSelection.resetRobotPosition,');
+    expect(source).toContain('disabled={!positionAvailable}');
+    expect(source).toContain('void program.reset(resetSelectionApplied);');
+    // An idle Reset with nothing selected would restore nothing.
+    expect(source).toContain('disabled={!canReset || !motionSettled || (idleReset && resetNothingSelected)}');
+    // The automatic (unconfirmed) running Reset keeps both options off.
+    expect(source).toMatch(/if \(resetIntent === 'automatic' && motionSettled\) \{\s*setResetIntent\(null\);\s*void program\.reset\(\);/);
   });
 
   it('projects Execute as active while initial motion is Ready for deliberate Run', () => {
@@ -1182,6 +1216,11 @@ describe('Program runtime projection', () => {
     // The existing guarded action travels with its message; there is no
     // acknowledgement and no second copy beside the transport controls.
     expect(manual.actions?.map((action) => action.label)).toEqual(['Open gripper recovery']);
+    expect(deriveTransportGuidance({
+      enabled: true, program: idle, robot, motionActive: false,
+      observationTransport: { phase: 'no_robot_loaded', message: 'No robot loaded' },
+      onReviewProgramRecovery: vi.fn(),
+    }).map((notice) => notice.id)).toContain('recovery.manual.faulted-gripper');
     manual.actions?.[0].run();
     expect(openRecovery).toHaveBeenCalledWith(operation);
     const markup = renderToStaticMarkup(<ProgramTransportControls
@@ -1369,6 +1408,50 @@ describe('Program runtime projection', () => {
       incidentKind: 'viewer_observation_stale',
     });
     expect(guidance('live')).toEqual([]);
+  });
+
+  it('presents verified empty as no robot loaded without an error or incident', () => {
+    const program = controller('succeeded', 'idle_after_reset');
+    const robot = robotController();
+    robot.currentStatus = null;
+    const observationTransport = { phase: 'no_robot_loaded' as const, message: 'No robot loaded' };
+    expect(deriveTransportGuidance({
+      enabled: true, program, robot, motionActive: false, observationTransport,
+      onReviewProgramRecovery: vi.fn(),
+    })).toEqual([]);
+    const markup = renderToStaticMarkup(<ProgramTransportControls
+      enabled program={program} robot={robot} observationTransport={observationTransport} />);
+    expect(markup).toContain('No robot loaded');
+    expect(markup).not.toContain('Robot status unavailable');
+    for (const phase of ['waiting', 'reconnecting'] as const) {
+      const notices = deriveTransportGuidance({
+        enabled: true, program, robot, motionActive: false,
+        observationTransport: { phase, message: null }, onReviewProgramRecovery: vi.fn(),
+      });
+      expect(notices.some((notice) => notice.id === 'recovery.robot-status')).toBe(true);
+      if (phase === 'reconnecting') {
+        expect(notices.some((notice) => notice.incidentKind === 'viewer_observation_stale')).toBe(true);
+      }
+    }
+  });
+
+  it('keeps real cell and Program recovery visible alongside verified empty', () => {
+    const program = controller('intervention_required', 'recovery_required');
+    const robot = robotController();
+    robot.state.status = statusFixture();
+    robot.state.status.cellStopAction.fault = {
+      latchId: 'latch', latchGeneration: 1, state: 'latched',
+      trigger: 'physical_rest_unproven', recoveryStatus: 'waiting_for_observation',
+      reasonCode: 'physical_rest_unproven', certificate: null,
+    };
+    robot.currentStatus = null;
+    const notices = deriveTransportGuidance({
+      enabled: true, program, robot, motionActive: false,
+      observationTransport: { phase: 'no_robot_loaded', message: 'No robot loaded' },
+      onReviewProgramRecovery: vi.fn(),
+    });
+    expect(notices.map((notice) => notice.id)).toEqual(['recovery.cell', 'recovery.program']);
+    expect(notices.every((notice) => notice.severity === 'error')).toBe(true);
   });
 
   it('starts fresh pose fields when the runtime blackboard switches key', async () => {

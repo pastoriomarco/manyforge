@@ -4154,34 +4154,59 @@ class HeadlessSceneProgramPort:
         if operation.get("kind") in _AUTHORED_SCENE_OPERATIONS or program_node_evidence is not None:
             if program_reset_scene_authorization is not None:
                 authorization = dict(program_reset_scene_authorization)
-                if set(authorization) != {
-                    "program_runner_owner_epoch",
-                    "program_run_id",
-                    "cycle_claim_generation",
-                    "terminal_or_settlement_reference",
-                }:
-                    raise ProductionPortError("Program Reset scene authorization is malformed")
-                _text(
-                    authorization["program_runner_owner_epoch"],
-                    field="program_runner_owner_epoch",
-                )
-                _text(
-                    authorization["program_run_id"],
-                    field="program_run_id",
-                )
-                generation = authorization["cycle_claim_generation"]
+                if "reset_claim" in authorization:
+                    if set(authorization) != {"program_runner_owner_epoch", "cycle_generation", "reset_claim"}:
+                        raise ProductionPortError("Idle Program Reset scene authorization is malformed")
+                    _text(authorization["program_runner_owner_epoch"], field="program_runner_owner_epoch")
+                    cycle_generation = authorization["cycle_generation"]
+                    idle = authorization["reset_claim"]
+                    if (
+                        type(cycle_generation) is not int
+                        or not 1 <= cycle_generation <= 9_007_199_254_740_991
+                        or not isinstance(idle, Mapping)
+                        or set(idle) != {"request_owner_epoch", "request_id", "request_payload_digest", "reset_claim_generation"}
+                    ):
+                        raise ProductionPortError("Idle Program Reset scene context is malformed")
+                    for key in ("request_owner_epoch", "request_id"):
+                        _text(idle[key], field=key)
+                    generation = idle["reset_claim_generation"]
+                    reference = _text(idle["request_payload_digest"], field="request_payload_digest")
+                else:
+                    if set(authorization) != {
+                        "program_runner_owner_epoch",
+                        "program_run_id",
+                        "cycle_claim_generation",
+                        "terminal_or_settlement_reference",
+                    }:
+                        raise ProductionPortError("Program Reset scene authorization is malformed")
+                    _text(
+                        authorization["program_runner_owner_epoch"],
+                        field="program_runner_owner_epoch",
+                    )
+                    _text(
+                        authorization["program_run_id"],
+                        field="program_run_id",
+                    )
+                    generation = authorization["cycle_claim_generation"]
+                    if type(generation) is not int or not 1 <= generation <= 9_007_199_254_740_991:
+                        raise ProductionPortError("Program Reset scene claim generation is invalid")
+                    reference = _text(
+                        authorization["terminal_or_settlement_reference"],
+                        field="terminal_or_settlement_reference",
+                    )
+                    if (
+                        len(reference) != 71
+                        or not reference.startswith("sha256:")
+                        or any(character not in "0123456789abcdef" for character in reference[7:])
+                    ):
+                        raise ProductionPortError("Program Reset scene settlement reference is invalid")
                 if type(generation) is not int or not 1 <= generation <= 9_007_199_254_740_991:
                     raise ProductionPortError("Program Reset scene claim generation is invalid")
-                reference = _text(
-                    authorization["terminal_or_settlement_reference"],
-                    field="terminal_or_settlement_reference",
-                )
                 if (
-                    len(reference) != 71
-                    or not reference.startswith("sha256:")
+                    len(reference) != 71 or not reference.startswith("sha256:")
                     or any(character not in "0123456789abcdef" for character in reference[7:])
                 ):
-                    raise ProductionPortError("Program Reset scene settlement reference is invalid")
+                    raise ProductionPortError("Program Reset scene evidence digest is invalid")
                 body["program_reset_scene_authorization"] = authorization
                 body["request_context"]["request_id"] = _request_identity(
                     "scene-reset", request_id, str(generation)

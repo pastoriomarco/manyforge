@@ -609,6 +609,54 @@ write_controller_launch_artifacts(const ControllerLaunchArtifactsRequest &reques
             result.controller_profile = profile.profile_id;
             if (!request.arm_joint_names.empty()) {
               result.arm_controller_name = profile.arm_controller_name;
+              if (!content_identity::is_sha256_digest(
+                      request.component_runtime_identity)) {
+                fail("Mock position writer requires the exact component "
+                     "runtime identity");
+              }
+              using Value = content_identity::CanonicalValue;
+              Value::Array joints;
+              Value::Array positions;
+              for (const auto &joint : request.arm_joint_names)
+                joints.emplace_back(joint);
+              for (const auto position : lane.initial_joint_positions_rad)
+                positions.emplace_back(position == 0.0 ? 0.0 : position);
+              const auto digest = content_identity::framed_sha256(
+                  "manyforge.mock-reset-position-target", "v1",
+                  Value(Value::Object{
+                      {"component_runtime_identity",
+                       Value(request.component_runtime_identity)},
+                      {"component", Value(request.controllable_component_id)},
+                      {"provider", Value("mock_components/GenericSystem")},
+                      {"profile", Value(profile.profile_id)},
+                      {"joints", Value(std::move(joints))},
+                      {"positions", Value(std::move(positions))}}));
+              const auto writer =
+                  "manyforge_reset_position_" + digest.substr(7U);
+              result.mock_reset_position = MockResetPositionTarget{
+                  request.component_runtime_identity,
+                  writer,
+                  runtime_namespace + "/" + writer + "/commands",
+                  request.arm_joint_names,
+                  lane.initial_joint_positions_rad,
+                  digest};
+              // One installed stock controller, configured and loaded inactive.
+              // Its identity includes the exact target, so late DDS delivery
+              // can only ever repeat this same immutable configuration target.
+              const auto manager_end = controllers.find("\n\n");
+              if (manager_end == std::string::npos)
+                fail("Mock controllers have no manager block boundary");
+              controllers.insert(
+                  manager_end,
+                  "\n    " + writer +
+                      ":\n"
+                      "      type: "
+                      "forward_command_controller/ForwardCommandController");
+              controllers +=
+                  "\n/**/" + writer + ":\n  ros__parameters:\n    joints:\n";
+              for (const auto &joint : request.arm_joint_names)
+                controllers += "      - " + joint + "\n";
+              controllers += "    interface_name: position\n";
             }
             if (physical_gripper) {
               result.gripper_controller_name = profile.gripper_controller_name;
@@ -657,6 +705,9 @@ write_controller_launch_artifacts(const ControllerLaunchArtifactsRequest &reques
     if (!result.arm_controller_name.empty()) {
       result.launch_arguments.push_back("arm_controller_name:=" +
                                         result.arm_controller_name);
+      result.launch_arguments.push_back(
+          "reset_position_controller_name:=" +
+          result.mock_reset_position->controller_name);
     }
     // `ros2 launch` rejects an empty `name:=` value; an absent controller or
     // frame prefix omits its argument (the launch defaults are empty).
@@ -715,6 +766,7 @@ ControllerLaunchArtifacts write_component_controller_launch_artifacts(
   request.controllable_component_id = component;
   request.model_urdf = input.model_urdf;
   request.frame_prefix = input.frame_prefix;
+  request.component_runtime_identity = input.component_runtime_identity;
   try {
     request.arm_joint_names =
         controller_joint_names_from_binding(motion.resources);

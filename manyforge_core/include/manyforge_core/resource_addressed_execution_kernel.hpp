@@ -280,6 +280,7 @@ struct ResourceAddressedExecutionKernelConfig final {
   /// pre-dispatch recheck then evaluate the published motion-attention
   /// projection and fail closed while it is missing, unreconciled or stale.
   std::optional<OperatorAlarmAttentionPolicyDTO> operator_alarm_attention;
+  CellAdmissionProgramResetStatusSource cell_admission_program_reset_status_source;
 };
 
 /// Private no-effect result used to project a capability-command preview at a
@@ -465,6 +466,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       CellAdmissionClaimKindDTO kind) const;
   [[nodiscard]] Result<void> ValidateProgramResetSceneAuthorization(
       const ProgramResetSceneAuthorizationDTO& authorization) const override;
+  /// Exact selected Reset grant; no motion or target is accepted here.
+  [[nodiscard]] Result<void> ValidateProgramResetPositionAuthorization(
+      const ProgramResetPositionAuthorizationDTO& authorization) const;
   [[nodiscard]] Result<void> Publish(const ManagerLivenessObservationDTO& observation) override;
   /// Retain the newest generation of one Alarm Lifecycle Owner epoch. A new
   /// owner epoch replaces the retained one only with a strictly greater

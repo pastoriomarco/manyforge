@@ -30,6 +30,12 @@ using CellAdmissionProgramNodeValidator =
     std::function<Result<void>(const ProgramNodeAdmissionEvidenceDTO&)>;
 using CellAdmissionSettlementValidator =
     std::function<Result<void>(const CellAdmissionClaimDTO&, const CellAdmissionClaimReleaseDTO&)>;
+enum class ProgramResetJournalReadPurpose { kAcquire, kReloadInitialScene, kResetRobotPosition };
+/// Current original Runner journal, read outside admission/owner locks.
+/// The adapter never calls Manager/Kernel or mutates the journal.
+using CellAdmissionProgramResetStatusSource = std::function<Result<ProgramCycleStatusDTO>(
+    ProgramResetJournalReadPurpose, const CellAdmissionClaimIntentDTO&,
+    const std::optional<CellAdmissionClaimDTO>&)>;
 using CellAdmissionReconcileValidator = std::function<Result<CellAdmissionReconcileValidationDTO>(
     const std::vector<CellAdmissionClaimDTO>&,
     const std::vector<CellAdmissionCurrentOwnerEpochDTO>&, const CellAdmissionReconcileDTO&)>;
@@ -55,7 +61,47 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
       CellAdmissionClaimGeneration recovered_claim_generation_high_water =
           CellAdmissionClaimGeneration(0U),
       CellAdmissionProgramNodeValidator program_node_validator = {},
-      std::function<bool()> stop_fault_active = {});
+      std::function<bool()> stop_fault_active = {},
+      CellAdmissionProgramResetStatusSource program_reset_status_source = {});
+
+  /// Process-local proof; only this owner can construct it. Journal I/O is
+  /// completed before the composing Kernel takes submission/admission locks.
+  class PreparedProgramResetStatus final {
+   public:
+    PreparedProgramResetStatus(const PreparedProgramResetStatus&) = default;
+    PreparedProgramResetStatus(PreparedProgramResetStatus&&) = default;
+    PreparedProgramResetStatus& operator=(const PreparedProgramResetStatus&) = default;
+    PreparedProgramResetStatus& operator=(PreparedProgramResetStatus&&) = default;
+   private:
+    friend class KernelCellAdmissionOwner;
+    explicit PreparedProgramResetStatus(const CellAdmissionClaimIntentDTO& accepted_intent)
+        : intent(accepted_intent) {}
+    const KernelCellAdmissionOwner* owner{};
+    std::size_t manager_current_count{};
+    AdmissionGeneration generation{0U};
+    CellAdmissionReadinessSnapshotDTO readiness;
+    std::optional<ManagerLivenessRequiredSetDTO> manager;
+    ProgramResetJournalReadPurpose purpose{ProgramResetJournalReadPurpose::kAcquire};
+    CellAdmissionClaimIntentDTO intent;
+    std::optional<CellAdmissionClaimDTO> claim;
+    std::optional<ProgramCycleStatusDTO> status;
+  };
+  [[nodiscard]] Result<PreparedProgramResetStatus> PrepareProgramResetStatus(
+      ProgramResetJournalReadPurpose purpose, const CellAdmissionClaimIntentDTO& intent,
+      const std::optional<CellAdmissionClaimDTO>& claim = std::nullopt) const;
+  [[nodiscard]] Result<PreparedProgramResetStatus> PrepareProgramResetSceneAuthorization(
+      const ProgramResetSceneAuthorizationDTO& authorization) const;
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquirePreparedProgramResetClaim(
+      const CellAdmissionClaimIntentDTO& intent, const PreparedProgramResetStatus& proof);
+  [[nodiscard]] Result<void> ValidatePreparedProgramResetSceneAuthorization(
+      const ProgramResetSceneAuthorizationDTO& authorization,
+      const PreparedProgramResetStatus& proof) const;
+
+  [[nodiscard]] Result<PreparedProgramResetStatus> PrepareProgramResetPositionAuthorization(
+      const ProgramResetPositionAuthorizationDTO& authorization) const;
+  [[nodiscard]] Result<void> ValidatePreparedProgramResetPositionAuthorization(
+      const ProgramResetPositionAuthorizationDTO& authorization,
+      const PreparedProgramResetStatus& proof) const;
 
   /// Noncritical publication of the live Kernel fault restriction. Closing is
   /// immediate; reopening waits for a durable admission generation advance.
@@ -140,7 +186,8 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
       const CellAdmissionClaimIntentDTO& intent,
       const CellAdmissionInterventionValidator& validate_offer,
       bool selected_apply_bring_up = false,
-      const CellAdmissionConfigurationApplyValidator& configuration_apply_validator = {});
+      const CellAdmissionConfigurationApplyValidator& configuration_apply_validator = {},
+      const PreparedProgramResetStatus* reset_proof = nullptr);
   struct Entry final {
     CellAdmissionClaimDTO claim;
     std::optional<CellAdmissionClaimReleaseDTO> release;
@@ -154,6 +201,12 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] bool BaseReadinessLocked() const noexcept;
   [[nodiscard]] bool MatchingStartingProgramCycleLocked(
       const CellAdmissionClaimIntentDTO& intent) const noexcept;
+  [[nodiscard]] Result<ProgramCycleStatusDTO> CurrentResetLocked(
+      ProgramResetJournalReadPurpose purpose, const CellAdmissionClaimIntentDTO& intent,
+      const std::optional<CellAdmissionClaimDTO>& claim,
+      const PreparedProgramResetStatus& proof) const;
+  [[nodiscard]] bool MatchingProgramResetLocked(const CellAdmissionClaimIntentDTO& intent,
+      const PreparedProgramResetStatus& proof) const;
   [[nodiscard]] const Entry* FindReplayLocked(const CellAdmissionClaimIntentDTO& intent) const;
   [[nodiscard]] Entry* FindHeldLocked(CellAdmissionClaimGeneration generation);
   [[nodiscard]] const Entry* ParentCycleLocked(const CellAdmissionClaimIntentDTO& intent) const;
@@ -180,6 +233,7 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   IOperationJournal& journal_;
   CellAdmissionInterventionValidator intervention_validator_;
   CellAdmissionSettlementValidator settlement_validator_;
+  CellAdmissionProgramResetStatusSource program_reset_status_source_;
   CellAdmissionReconcileValidator reconcile_validator_;
   CellAdmissionProgramNodeValidator program_node_validator_;
   std::function<bool()> stop_fault_active_;

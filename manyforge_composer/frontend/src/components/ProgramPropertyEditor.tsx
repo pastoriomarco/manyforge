@@ -88,6 +88,7 @@ interface ProgramPropertyEditorProps {
     operatorStopPolicy: ProgramOperatorStopPolicy,
     executionGroups: NonNullable<ProgramTreeNode['execution_groups']>,
   ) => void;
+  onUpdateNodePresentation?: (instanceId: string, collapsedByDefault: boolean) => void;
   onInvalidEditChange?: (invalid: boolean) => void;
   diagnostics?: ProgramAuthoringDiagnostic[];
 }
@@ -232,6 +233,7 @@ export function ProgramPropertyEditor({
   onCreateGroup,
   onRenamed,
   onUpdateNodePolicies,
+  onUpdateNodePresentation,
   onInvalidEditChange,
   diagnostics = [],
 }: ProgramPropertyEditorProps) {
@@ -837,6 +839,17 @@ export function ProgramPropertyEditor({
         onUpdate={onUpdateNodePolicies}
         onInvalidChange={(message) => setFieldError('_policy', message)}
       />
+      {onUpdateNodePresentation && selected.children.length > 0 && (
+        <label className="program-node-presentation">
+          <input
+            type="checkbox"
+            checked={selected.metadata?.collapsed_by_default === true}
+            disabled={busy}
+            onChange={(event) => onUpdateNodePresentation(selected.instance_id, event.target.checked)}
+          />
+          Show collapsed by default
+        </label>
+      )}
     </section>
   );
 }

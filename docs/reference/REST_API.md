@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-10-08 14:53:37 UTC
+  Last regenerated: 2026-10-16 11:06:16 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -19,6 +19,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 
 | Method | Path | Tag | Summary |
 |---|---|---|---|
+| `POST` | `/api/activation-preparations` | headless-runtime-client | Prepare Canonical Empty |
 | `POST` | `/api/assistant/bridge/tools/{tool_id}` | assistant-draft-callback | Invoke Draft Tool |
 | `GET` | `/api/assistant/modes` | headless-runtime-client | Assistant Modes |
 | `GET` | `/api/assistant/modes/{mode_id}` | headless-runtime-client | Assistant Mode |
@@ -28,12 +29,20 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/catalog` | catalog | Get Catalog |
 | `GET` | `/api/catalog/{entry_id}` | catalog | Get Catalog Entry |
 | `GET` | `/api/cclc/components/{component_id}` | headless-runtime-client | Cclc Component |
+| `POST` | `/api/cclc/components/{component_id}/process/stop` | headless-runtime-client | Stop Component Process |
+| `GET` | `/api/cclc/components/{component_id}/process/stop-offer` | headless-runtime-client | Component Process Stop Offer |
+| `POST` | `/api/cclc/components/{component_id}/process/stop/result` | headless-runtime-client | Component Process Stop Result |
 | `GET` | `/api/cclc/components/{component_id}/route-templates` | headless-runtime-client | Cclc Route Templates |
 | `POST` | `/api/cclc/lifecycle/requests` | headless-runtime-client | Cclc Lifecycle Submit |
+| `POST` | `/api/cclc/lifecycle/requests/result` | headless-runtime-client | Cclc Lifecycle Request Result |
 | `GET` | `/api/cclc/lifecycle/transactions/{transaction_id}` | headless-runtime-client | Cclc Lifecycle Status |
 | `GET` | `/api/cclc/owner` | headless-runtime-client | Cclc Owner Identity |
 | `POST` | `/api/cclc/routes/requests` | headless-runtime-client | Cclc Route Submit |
 | `GET` | `/api/cclc/routes/transactions/{transaction_id}` | headless-runtime-client | Cclc Route Status |
+| `POST` | `/api/cclc/targets/retire` | headless-runtime-client | Retire Lifecycle Targets |
+| `POST` | `/api/cclc/targets/retire/result` | headless-runtime-client | Lifecycle Target Retirement Result |
+| `GET` | `/api/cclc/targets/retirement-offer` | headless-runtime-client | Lifecycle Target Retirement Offer |
+| `POST` | `/api/cclc/targets/settlement` | headless-runtime-client | Lifecycle Owner Settlement |
 | `GET` | `/api/component-overview` | headless-runtime-client | Component Overview |
 | `GET` | `/api/composer/settings` | composer-settings | Read Settings |
 | `PUT` | `/api/composer/settings` | composer-settings | Replace Settings |
@@ -92,7 +101,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/execution/targets` | headless-runtime-client | Execution Targets |
 | `GET` | `/api/files/browse` | files | Browse Filesystem |
 | `GET` | `/api/health` |  | Health |
+| `POST` | `/api/manager/apply` | headless-runtime-client | Apply Manager Candidate |
 | `GET` | `/api/manager/apply/status` | headless-runtime-client | Manager Apply Status |
+| `GET` | `/api/manager/canonical-empty-selection` | headless-runtime-client | Canonical Empty Selection |
+| `POST` | `/api/manager/deployment-candidates/preview` | headless-runtime-client | Preview Manager Candidate |
 | `GET` | `/api/manager/diff` | headless-runtime-client | Manager Diff |
 | `GET` | `/api/manager/graph` | headless-runtime-client | Manager Graph |
 | `GET` | `/api/manager/status` | headless-runtime-client | Manager Status |

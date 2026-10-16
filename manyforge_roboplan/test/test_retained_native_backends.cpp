@@ -1,3 +1,4 @@
+#include "../src/program_reset_position_observation.hpp"
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -913,6 +914,163 @@ TEST(RetainedObservedStateChannelTest,
   EXPECT_EQ(channel.render_change_generation(), invalid_generation);
   ASSERT_TRUE(channel.publish_adapter_state(source, names, moved, {}, 104, 104).complete);
   EXPECT_GT(channel.render_change_generation(), invalid_generation);
+}
+
+TEST(ProgramResetPositionObservation, EventWaitRequiresConsumptionAcknowledgmentAndHonorsFailure) {
+  RetainedObservationWake wake;
+  int reads = 0;
+  int validations = 0;
+  const auto result = host_detail::WaitForMockResetObservation(wake, {},
+      std::chrono::steady_clock::now() + std::chrono::seconds(1), [&] {
+        ++reads;
+        if (reads == 1) wake.notify(); // An existing source publication races the wait.
+        return core::Result<bool>::Ok(reads == 2);
+      }, [&] {
+        ++validations;
+        return core::Result<void>::Ok();
+      });
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(reads, 2);
+  EXPECT_EQ(validations, 2);
+  const auto expired = host_detail::WaitForMockResetObservation(wake, {},
+      std::chrono::steady_clock::now(), [] { return core::Result<bool>::Ok(false); },
+      [] { return core::Result<void>::Ok(); });
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().details.at("reason"), "reset_position_acknowledgment_timeout");
+  const auto invalid = host_detail::WaitForMockResetObservation(wake, {},
+      std::chrono::steady_clock::now() + std::chrono::seconds(1),
+      [] { ADD_FAILURE() << "A revoked scope cannot read the source"; return core::Result<bool>::Ok(true); },
+      [] { return core::Result<void>::Err({"scope_revoked", "fault", {}}); });
+  ASSERT_FALSE(invalid.ok());
+  EXPECT_EQ(invalid.error().code, "scope_revoked");
+  auto controlled_now = std::chrono::steady_clock::time_point{};
+  const auto controlled_deadline = controlled_now + std::chrono::seconds(1);
+  const auto late = host_detail::WaitForMockResetObservation(wake, {}, controlled_deadline,
+      [&] {
+        controlled_now = controlled_deadline + std::chrono::nanoseconds(1);
+        return core::Result<bool>::Ok(true);
+      }, [] { return core::Result<void>::Ok(); }, [&] { return controlled_now; });
+  ASSERT_FALSE(late.ok());
+  EXPECT_EQ(late.error().details.at("reason"), "reset_position_acknowledgment_timeout");
+  std::stop_source stop;
+  stop.request_stop();
+  const auto cancelled = host_detail::WaitForMockResetObservation(wake, stop.get_token(),
+      std::chrono::steady_clock::now() + std::chrono::seconds(1),
+      [] { ADD_FAILURE() << "Cancellation cannot read the source"; return core::Result<bool>::Ok(true); },
+      [] { return core::Result<void>::Ok(); });
+  ASSERT_FALSE(cancelled.ok());
+  EXPECT_EQ(cancelled.error().details.at("reason"), "reset_position_cancelled");
+}
+
+TEST(ProgramResetPositionObservation, SameInitialTargetStillNeedsPostPublishMeasuredEvidence) {
+  // This unit fixture exercises the publication fence without a planning
+  // model. Keep its two ordered angular resources explicitly component-local.
+  auto value = make_binding(CoordinateKind::kAngular, "arm.target").value();
+  value.model_groups.clear();
+  for (auto& resource : value.resources) resource.source_joint_name.reset();
+  value.control_path->state_authority_class = StateAuthorityClass::kMeasured;
+  const auto binding = verify_runtime_participant_binding(std::move(value));
+  ASSERT_TRUE(binding.ok());
+  RetainedObservedStateChannel channel(binding.value(), nullptr,
+      RetainedObservedStateChannelConfig{ObservedStateSourceKind::kJointState,
+                                         "joint_state", 100, 1U});
+  ASSERT_TRUE(channel.publish_adapter_state(ObservedRobotStateSourceKind::kJointState,
+      channel.query_context().joint_names, std::vector<double>{0.0, 0.0},
+      std::vector<double>{0.0, 0.0}, 12, 22).complete);
+  auto captured = channel.current_state(22);
+  ASSERT_TRUE(captured.ok());
+  auto measured = std::move(captured.value());
+  measured.sequence = 4U;
+  measured.source_timestamp_ns = 12;
+  measured.received_timestamp_ns = 22;
+  measured.positions = {core::AngularPositionDTO{0.0}, core::AngularPositionDTO{0.0}};
+  const std::vector<double> target{0.0, 0.0};
+  // Velocity is deliberately irrelevant: this acknowledges the write, not
+  // physical settling, a reference match or a zero-velocity dwell.
+  measured.velocities = std::vector<core::CoordinateVelocityDTO>{core::AngularVelocityDTO{12.0}, core::AngularVelocityDTO{12.0}};
+  EXPECT_TRUE(host_detail::ExactMockResetMeasuredTarget(measured, target, 3U, 11, 21));
+  measured.positions = {core::AngularPositionDTO{0.01}, core::AngularPositionDTO{0.0}};
+  EXPECT_FALSE(host_detail::ExactMockResetMeasuredTarget(measured, target, 3U, 11, 21));
+  measured.positions = {core::AngularPositionDTO{0.0}, core::AngularPositionDTO{0.0}};
+  EXPECT_FALSE(host_detail::ExactMockResetMeasuredTarget(measured, target, 4U, 11, 21));
+  EXPECT_FALSE(host_detail::ExactMockResetMeasuredTarget(measured, target, 3U, 12, 21));
+  EXPECT_FALSE(host_detail::ExactMockResetMeasuredTarget(measured, target, 3U, 11, 22));
+  measured.positions = {core::LinearPositionDTO{0.0}, core::AngularPositionDTO{0.0}};
+  EXPECT_FALSE(host_detail::ExactMockResetMeasuredTarget(measured, target, 3U, 11, 21));
+}
+
+TEST(RetainedObservedStateChannelTest,
+     CommandedInitializationRejectsDelayedPredecessorsAndRetainsCutoffAcrossRebind) {
+  // This unit fixture exercises the publication fence without a planning
+  // model. Keep its two ordered angular resources explicitly component-local.
+  auto value = make_binding(CoordinateKind::kAngular, "arm.target").value();
+  value.model_groups.clear();
+  for (auto& resource : value.resources) resource.source_joint_name.reset();
+  value.control_path->state_authority_class = StateAuthorityClass::kCommanded;
+  const auto sealed = verify_runtime_participant_binding(value);
+  ASSERT_TRUE(sealed.ok());
+  RetainedObservedStateChannel channel(sealed.value(), nullptr,
+      RetainedObservedStateChannelConfig{ObservedStateSourceKind::kCommandedState,
+                                         "commanded_state", 0, 1U});
+  const auto names = channel.query_context().joint_names;
+  const std::vector<double> before{0.1, 0.2}, target{1.0, -2.0}, zero{0.0, 0.0};
+  ASSERT_TRUE(channel.publish_adapter_state(ObservedRobotStateSourceKind::kCommandedState,
+      names, before, zero, 100, 100).complete);
+  ASSERT_TRUE(channel.publish_commanded_initialization_and_project(target, zero, 200).applied());
+  for (const auto stamp : {100, 200}) {
+    const auto delayed = channel.publish_adapter_state(ObservedRobotStateSourceKind::kCommandedState,
+        names, before, zero, stamp, 250);
+    EXPECT_FALSE(delayed.published);
+    EXPECT_STREQ(delayed.reason, "commanded_sample_precedes_backend_initialization");
+  }
+  // The addressed publication retains the command despite delayed delivery.
+  auto current = channel.publication().current_state(channel.query_context(), 250);
+  ASSERT_TRUE(current.ok());
+  EXPECT_DOUBLE_EQ(std::get<AngularPositionDTO>(current.value().positions[0]).value_rad, target[0]);
+  auto rebound_value = value;
+  rebound_value.control_path->control_route_id = ControlRouteId("route.successor");
+  rebound_value.control_path->runtime_scale_qualification->control_route_id = ControlRouteId("route.successor");
+  const auto rebound = verify_runtime_participant_binding(std::move(rebound_value));
+  ASSERT_TRUE(rebound.ok());
+  ASSERT_TRUE(channel.RebindRoute(rebound.value(), 300).ok());
+  EXPECT_FALSE(channel.publish_adapter_state(ObservedRobotStateSourceKind::kCommandedState,
+      names, before, zero, 150, 400).published);
+  // A genuine later command flows, including motion derivatives/different pose.
+  const std::vector<double> moving{0.2, 0.3};
+  EXPECT_TRUE(channel.publish_adapter_state(ObservedRobotStateSourceKind::kCommandedState,
+      names, before, moving, 301, 401).complete);
+  current = channel.current_state(401);
+  ASSERT_TRUE(current.ok());
+  EXPECT_DOUBLE_EQ(std::get<AngularPositionDTO>(current.value().positions[0]).value_rad, before[0]);
+}
+
+TEST(RetainedObservedStateChannelTest,
+     CommandedInitializationDoesNotChangeOrdinaryOrMeasuredPublicationPolicy) {
+  // This unit fixture exercises the publication fence without a planning
+  // model. Keep its two ordered angular resources explicitly component-local.
+  auto value = make_binding(CoordinateKind::kAngular, "arm.target").value();
+  value.model_groups.clear();
+  for (auto& resource : value.resources) resource.source_joint_name.reset();
+  value.control_path->state_authority_class = StateAuthorityClass::kCommanded;
+  auto sealed = verify_runtime_participant_binding(value);
+  ASSERT_TRUE(sealed.ok());
+  RetainedObservedStateChannel ordinary(sealed.value(), nullptr,
+      RetainedObservedStateChannelConfig{ObservedStateSourceKind::kCommandedState, "commanded_state", 0, 1U});
+  const auto names = ordinary.query_context().joint_names;
+  const std::vector<double> pose{0.1, 0.2}, zero{0.0, 0.0};
+  ASSERT_TRUE(ordinary.publish_adapter_state(ObservedRobotStateSourceKind::kCommandedState,
+      names, pose, zero, 200, 200).complete);
+  EXPECT_TRUE(ordinary.publish_adapter_state(ObservedRobotStateSourceKind::kCommandedState,
+      names, pose, zero, 100, 250).complete);  // No initialization cutoff was installed.
+  EXPECT_FALSE(ordinary.publish_commanded_initialization_and_project(pose, pose, 300).applied());
+  value.control_path->state_authority_class = StateAuthorityClass::kMeasured;
+  sealed = verify_runtime_participant_binding(std::move(value));
+  ASSERT_TRUE(sealed.ok());
+  RetainedObservedStateChannel measured(sealed.value(), nullptr,
+      RetainedObservedStateChannelConfig{ObservedStateSourceKind::kJointState, "joint_state", 100, 1U});
+  EXPECT_FALSE(measured.publish_commanded_initialization_and_project(pose, zero, 300).applied());
+  EXPECT_TRUE(measured.publish_adapter_state(ObservedRobotStateSourceKind::kJointState,
+      names, pose, zero, 100, 300).complete);
 }
 
 TEST(RetainedExecutionStateSinkTest,

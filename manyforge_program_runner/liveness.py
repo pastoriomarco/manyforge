@@ -18,6 +18,8 @@ from threading import Event, RLock, Thread
 import time
 from typing import Any, Final
 
+from manyforge_headless_api.program_cycle import AcceptedProgramResetDTO
+
 
 API_VERSION: Final = "manyforge.program_runner_liveness.v1"
 POLICY_ID: Final = "manyforge.program-runner.manager-presence.v1"
@@ -465,6 +467,7 @@ class ProgramRunnerLivenessReceiver:
             status,
             {
                 "allowed_commands",
+                "accepted_reset",
                 "causal_client_sequence",
                 "causal_correlation_id",
                 "causal_session_id",
@@ -477,6 +480,8 @@ class ProgramRunnerLivenessReceiver:
                 "program_run_id",
                 "cycle_claim_generation",
                 "reset_phase",
+                "reset_options",
+                "reset_robot_position",
                 "terminal_or_settlement_reference",
             },
         )
@@ -489,6 +494,7 @@ class ProgramRunnerLivenessReceiver:
                 "program_run_id",
                 "cycle_claim_generation",
                 "terminal_or_settlement_reference",
+                "accepted_reset",
             )
         }
         owner = projected["program_runner_owner_epoch"]
@@ -497,6 +503,20 @@ class ProgramRunnerLivenessReceiver:
         run_id = projected["program_run_id"]
         claim_generation = projected["cycle_claim_generation"]
         terminal = projected["terminal_or_settlement_reference"]
+        accepted_reset = projected["accepted_reset"]
+        if accepted_reset is not None:
+            try:
+                AcceptedProgramResetDTO.model_validate(accepted_reset)
+            except ValueError as error:
+                raise ProgramRunnerLivenessError("malformed accepted Reset context") from error
+            if state not in {"resetting", "recovery_required"}:
+                raise ProgramRunnerLivenessError("accepted Reset context has no current Reset")
+        idle_reset = (
+            state in {"resetting", "recovery_required"}
+            and run_id is None and claim_generation is None and terminal is None
+            and accepted_reset is not None
+            and (accepted_reset["reload_initial_scene"] or accepted_reset["reset_robot_position"])
+        )
         if (
             not isinstance(owner, str)
             or not owner
@@ -524,6 +544,7 @@ class ProgramRunnerLivenessReceiver:
         if (
             not idle
             and not recovery
+            and not idle_reset
             and (
                 not isinstance(run_id, str)
                 or not run_id

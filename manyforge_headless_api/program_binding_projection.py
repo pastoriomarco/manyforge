@@ -213,6 +213,7 @@ _COMMITTED_ACTIVATION_FIELDS = frozenset(
         "apply_generation",
         "apply_id",
         "committed_applies",
+        "scene_initialization",
         "program",
         "publication_generation",
         "record_digest",
@@ -221,7 +222,7 @@ _COMMITTED_ACTIVATION_FIELDS = frozenset(
     }
 )
 _COMMITTED_APPLY_FIELDS = frozenset(
-    {"apply_generation", "apply_id", "record_digest", "origin"}
+    {"apply_generation", "apply_id", "record_digest", "origin", "scene_initialization"}
 )
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 
@@ -240,9 +241,9 @@ def validate_committed_scenario_activation(
 
     if not isinstance(value, dict) or set(value) != _COMMITTED_ACTIVATION_FIELDS:
         _fail(label, "the closed committed Scenario activation record")
-    if value.get("schema_version") != "manyforge.committed_scenario_activation.v2":
+    if value.get("schema_version") != "manyforge.committed_scenario_activation.v3":
         _fail(
-            f"{label}.schema_version", "manyforge.committed_scenario_activation.v2"
+            f"{label}.schema_version", "manyforge.committed_scenario_activation.v3"
         )
     generation = value.get("publication_generation")
     if type(generation) is not int or not 2 <= generation <= _MAXIMUM_SAFE_INTEGER:
@@ -255,7 +256,7 @@ def validate_committed_scenario_activation(
     committed = value.get("committed_applies")
     if not isinstance(committed, list) or len(committed) != generation - 1:
         _fail(f"{label}.committed_applies", "one record per Apply publication")
-    applies: list[tuple[str, dict[str, Any], str, int]] = []
+    applies: list[tuple[str, dict[str, Any], str, int, str]] = []
     for index, row in enumerate(committed):
         row_label = f"{label}.committed_applies[{index}]"
         if not isinstance(row, dict) or set(row) != _COMMITTED_APPLY_FIELDS:
@@ -269,7 +270,7 @@ def validate_committed_scenario_activation(
     return value
 
 
-def _committed_apply(value: dict[str, Any], label: str) -> tuple[str, dict[str, Any], str, int]:
+def _committed_apply(value: dict[str, Any], label: str) -> tuple[str, dict[str, Any], str, int, str]:
     """One committed Apply: record digest, exact origin, and Apply identity."""
 
     apply_generation = value.get("apply_generation")
@@ -278,9 +279,16 @@ def _committed_apply(value: dict[str, Any], label: str) -> tuple[str, dict[str, 
         or not 1 <= apply_generation <= _MAXIMUM_SAFE_INTEGER
     ):
         _fail(f"{label}.apply_generation", "a positive integer")
+    initialization = value.get("scene_initialization")
+    if initialization not in ("preserve", "initialize"):
+        _fail(f"{label}.scene_initialization", "preserve or initialize")
+    origin = validate_prepared_activation_origin(value.get("origin"), label=f"{label}.origin")
+    if origin["kind"] == "sealed_canonical_empty" and initialization != "preserve":
+        _fail(f"{label}.scene_initialization", "preserve for sealed canonical-empty origin")
     return (
         _sha256(value.get("record_digest"), f"{label}.record_digest"),
-        validate_prepared_activation_origin(value.get("origin"), label=f"{label}.origin"),
+        origin,
         _text(value.get("apply_id"), f"{label}.apply_id", 256),
         apply_generation,
+        initialization,
     )

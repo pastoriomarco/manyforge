@@ -1,0 +1,113 @@
+{
+  "schema": "manyforge.composable_cell.r4_m1.fresh_empty_session.v1",
+  "status": "PASS_FRESH_EMPTY_SESSION_UNDERLYING_RESTART_RECOVERY_FAILURE_RETAINED",
+  "date": "2026-10-15",
+  "authorization": "Explicit maintainer approved stopping the stuck session, moving its entire runtime aside intact, and starting fresh empty without automatically loading or running a Scenario.",
+  "prior_failure": {
+    "file": "workbench-restart.v1.json",
+    "sha256": "d2c993270d29e63dd06c6221c873dfcdd360b20c38ca636da0ad3b79def4a457",
+    "unchanged": true,
+    "not_repaired": "Scene epoch mismatch and recovery_required in the old session remain preserved for diagnosis. Fresh startup is an explicitly approved testing workaround, not proof of recovery correctness."
+  },
+  "preservation": {
+    "old_entire_runtime_moved_intact": true,
+    "preserved_allocated_bytes": 78692352,
+    "old_journals_history_and_evidence_retained": true,
+    "journal_or_sql_edits": false,
+    "history_purge": false,
+    "saved_lite6_scenario_files_preserved": 4,
+    "saved_files_outside_runtime": true,
+    "source_build_npm_cache_settings_and_program_persistent_values_preserved": true,
+    "old_archive_location": "Recorded only in machine-local preservation receipt; no machine path published here."
+  },
+  "fresh_start": {
+    "entrypoint": "Existing documented compose-dev helper; same root/runtime path recreated empty after old runtime moved; no new helper or alternate concurrent stack.",
+    "runtime_mode": "0755, owner held, umask0022",
+    "image": "sha256:712e576565aad0f9982d3305efd7cad1f04c0a18d644442f2419101839ee6773",
+    "current_scenario": null,
+    "ready": true,
+    "unavailable_reasons": [],
+    "manager_canonical_empty": true,
+    "manager_ready": true,
+    "manager_converged": true,
+    "program_cycle_state": "idle_after_reset",
+    "program_run_id": null,
+    "overview_readiness": "ready",
+    "overview_summary": "No components",
+    "scenario_load_enabled": true,
+    "source_entries_checked": 2885,
+    "source_mismatches": [],
+    "source_sha256": {
+      "manyforge_composer/frontend/src/api/parsers/execution.ts": "03f75f8bee25e89d98cb4ffb275c31de9796132e4c72b8c31d825db78cedabfd",
+      "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.tsx": "a462851ca67620cf8f1324aecccdf34758cdb3b4d6b319a07fd1de36db5e70f1",
+      "manyforge_composer/frontend/src/hooks/useHeadlessState.ts": "5c6e06dd392f42c9da557d1f596f278ab3fbeb098602a0eae937e24f54113a34",
+      "manyforge_composer/frontend/src/hooks/useProgramWorkspace.ts": "75c7699ae5f508ed04c0cda40bb87864b0ee564e349164b529e0f995c4f29c71",
+      "manyforge_composer/frontend/src/state/scenarioClose.ts": "dec4ca6feee59b0bff062f1e5ddaa18fae199649ca984ce3955c9a8c3c38b11a",
+      "manyforge_composer/frontend/src/state/viewerModelReadiness.ts": "bb78dbddd08f5d00c2429b7549385eb146cd9627c758c4dbc6046c9e4a31814c",
+      "manyforge_headless_api/component_overview.py": "58d40aed16244e5e2dd495a6029f54b52aeaa087779941f51a3e5c570d9e43d2",
+      "scripts/dev-workbench.py": "06d245e510d8a285a2310b18ea754aa9aec5d849292655b49f013f671d503727",
+      "tests/test_dev_workbench.py": "bd44efc243fe0e21276d51408b56887b6e5fdf54e10e9ddb3814f3d3e8ca53fd"
+    }
+  },
+  "actual_browser": {
+    "browser": "Firefox156/Linux, software rendering",
+    "label": "No robot loaded",
+    "no_program_draft": true,
+    "errors_badge_present": false,
+    "disconnected_banner_present": false,
+    "qualification_errors": [],
+    "viewer_active_sockets_before": 0,
+    "viewer_active_sockets_after": 0,
+    "viewer_socket_creations_before": 1,
+    "viewer_socket_creations_after": 1,
+    "screenshot_sha256": "33a1348cf6383ff6206b499ff6d53044429c4158b780bf059a7f0614a0ce6de4"
+  },
+  "bounded_idle": {
+    "duration_s": 44.280765,
+    "historian_accepted_before": 0,
+    "historian_accepted_after": 0,
+    "canonical_empty_through_window": true,
+    "source_connections_before_browser_open": 0,
+    "source_connections_after_browser_settled": 1,
+    "initial_transition_limit": "One transient observation connection before the browser accepted the empty fact; no durable history rows. After positive fact, physical sockets stayed0 and browser creations stayed1."
+  },
+  "operation_limits": {
+    "new_session_reset_load_activate_run_commands": 0,
+    "saved_scenarios_left_for_user_to_load": true,
+    "dedicated_diagnostic_browser_closed": true,
+    "user_workbench_left_running": true,
+    "no_real_hardware_or_isaac": true,
+    "scope": "Fresh empty readiness and preservation only; no new loaded lifecycle, motion, performance, restart restoration or recovery qualification."
+  },
+  "provenance": [
+    {
+      "receipt": "dx989-pre-fresh-state-and-saved-files.json",
+      "sha256": "2e215b4ffbc6f3a61537d3f802685b4446f9ced247542449ceecebcea9a61e9c"
+    },
+    {
+      "receipt": "dx989-preserved-runtime-receipt.json",
+      "sha256": "00b2047fec277112e30da1173e79535596bd656bb0469a7474e26f5c1c419a74"
+    },
+    {
+      "receipt": "dx989-fresh-api-before.json",
+      "sha256": "9ab628d689fbd80ba120c1f2d5b4582900ddf455e4b9f34bb1c274393b5dc097"
+    },
+    {
+      "receipt": "dx989-fresh-api-after.json",
+      "sha256": "d8bbaea815b28169eb1e69bb3f8b96c8ac50ca2909732530814af9ff9e879f4a"
+    },
+    {
+      "receipt": "dx989-fresh-browser.json",
+      "sha256": "3f203ac3f73c8e7b9dd49bb68af3339acda6d539718016f0ed546f019cb940e1"
+    },
+    {
+      "receipt": "dx989-fresh-browser-after.json",
+      "sha256": "dc3679881ff757fc51fbe8ec4b6d976ea835e8b73400554d345a33770f7882b7"
+    },
+    {
+      "receipt": "dx989-fresh-source-and-preservation-readback.json",
+      "sha256": "81ff6650d21df6a16fee53bc4235923642a83bda1f43fc0ee4c24819bb892aff"
+    }
+  ],
+  "retention_note": "Self-contained portable result. Receipt basenames/digests identify local provenance without promising raw files remain available. No LAN addresses, user names or home-directory paths."
+}

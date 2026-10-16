@@ -2979,7 +2979,8 @@ def test_failed_apply_scene_placement_is_not_retried_by_status_notification(capl
 
 def _committed_activation(apply_id: str = "apply.2") -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.committed_scenario_activation.v2",
+        "schema_version": "manyforge.committed_scenario_activation.v3",
+        "scene_initialization": "initialize",
         "apply_id": apply_id,
         "apply_generation": 1,
         "publication_generation": 3,
@@ -2988,12 +2989,14 @@ def _committed_activation(apply_id: str = "apply.2") -> dict[str, Any]:
         "program": None,
         "committed_applies": [
             {
+                "scene_initialization": "initialize",
                 "apply_id": "apply.1",
                 "apply_generation": 1,
                 "record_digest": "sha256:" + "c" * 64,
                 "origin": {"kind": "scenario", "scenario_id": "scenario.2", "source_document_digest": "sha256:" + "e" * 64},
             },
             {
+                "scene_initialization": "initialize",
                 "apply_id": apply_id,
                 "apply_generation": 1,
                 "record_digest": "sha256:" + "d" * 64,
@@ -4679,3 +4682,24 @@ def test_sealed_applied_status_keeps_true_no_scenario_and_exact_candidate(change
     if not change:
         assert "scenario_id" not in response.json() and "source_document_digest" not in response.json()
         assert response.json()["origin"] == status["origin"]
+
+
+def test_program_only_apply_preserves_scene_and_still_reconciles_values():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    core.committed_activation["scene_initialization"] = "preserve"
+    core.committed_activation["committed_applies"][-1]["scene_initialization"] = "preserve"
+    service.notify_committed_apply()
+    service.notify_committed_apply()
+    assert runner.reconciliations == 2
+    assert not [row for row in runner.calls if row[0] == "prepare_scene"]
+    assert service._apply_scene_attempted is None
+
+
+def test_replacing_headless_loses_scene_attempt_memory_for_initializing_apply():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    service.notify_committed_apply()
+    replacement = _status_reading_service(core, _CommittingManager("succeeded"), runner)
+    replacement.notify_committed_apply()
+    assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 2

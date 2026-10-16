@@ -32,6 +32,22 @@ export function collapsibleProgramNodeIds(roots: readonly ProgramTreeNode[]): Se
   return ids;
 }
 
+/**
+ * Nodes the Program asks to show collapsed when it is opened: the editor-only
+ * `metadata.collapsed_by_default` flag, on nodes that can collapse.
+ */
+export function defaultCollapsedProgramNodeIds(roots: readonly ProgramTreeNode[]): Set<string> {
+  const ids = new Set<string>();
+  const walk = (node: ProgramTreeNode) => {
+    if (node.children.length > 0 && node.metadata?.collapsed_by_default === true) {
+      ids.add(node.instance_id);
+    }
+    node.children.forEach(walk);
+  };
+  roots.forEach(walk);
+  return ids;
+}
+
 /** Number of nodes below `node`, at any depth. */
 export function programDescendantCount(node: ProgramTreeNode): number {
   return node.children.reduce(

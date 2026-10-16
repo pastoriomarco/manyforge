@@ -1,12 +1,68 @@
 import { readFileSync } from 'node:fs';
 
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import App from './App';
+import type { HealthResponse } from './types/api';
 import { readStyleSource } from './styles/readStyleSource';
 
+const healthProjection = vi.hoisted(() => ({ value: null as HealthResponse | null }));
+
+vi.mock('./state/structuralResource', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./state/structuralResource')>();
+  const { api } = await import('./api/client');
+  return {
+    ...actual,
+    useStructuralResource: (...args: Parameters<typeof actual.useStructuralResource>) => {
+      const resource = actual.useStructuralResource(...args);
+      return args[0] === api.health.get && healthProjection.value !== null
+        ? [{ status: 'ready', data: healthProjection.value }, () => {}]
+        : resource;
+    },
+  };
+});
+
+afterEach(() => { healthProjection.value = null; });
+
 describe('Composer shell continuity', () => {
+  it('shows only the backend-projected session notice in the existing warning rail', async () => {
+    const health: HealthResponse = {
+      status: 'ok', mode: 'headless_client', components: {},
+      runtimeAvailability: null, headless: null, timestamp: 1,
+    };
+    healthProjection.value = health;
+    expect(renderToStaticMarkup(<App />)).not.toContain('ManyForge did not close correctly last time.');
+    // Resolve the existing lazy viewport so its real runtime overlay is rendered.
+    await import('./components/StructuralViewer');
+    await Promise.resolve();
+    healthProjection.value = { ...health, workbenchSessionNotice: {
+      schemaVersion: 'manyforge.workbench_previous_session.v1',
+      sessionId: 'a'.repeat(32),
+      archiveRelativePath: `previous-sessions/${'a'.repeat(32)}`,
+      shutdown: 'clean', effects: 'unknown', historyCoverage: 'not_imported',
+      journalFamilies: ['program_cycle', 'scene', 'manager', 'cclc', 'kernel_operation'],
+      message: 'Session a: journals retained; motion effects unknown. Nothing was resumed.',
+    } };
+    const markup = renderToStaticMarkup(<App />);
+    expect(markup).toContain('ManyForge did not close correctly last time.');
+    expect(markup).toContain('The cell started empty; nothing from the previous session was resumed. Its records are kept; details in History.');
+    expect(markup).toContain('workbench-notice-row severity-warning');
+    const noticeHealth = healthProjection.value;
+    for (const status of ['registered', 'acknowledged', 'quiet']) {
+      healthProjection.value = { ...noticeHealth, headless: {
+        workbench_previous_session_registration: { session_id: 'a'.repeat(32), status },
+      } };
+      expect(renderToStaticMarkup(<App />)).not.toContain('ManyForge did not close correctly last time.');
+    }
+    healthProjection.value = { ...noticeHealth, headless: {
+      workbench_previous_session_registration: { session_id: 'b'.repeat(32), status: 'registered' },
+    } };
+    expect(renderToStaticMarkup(<App />)).toContain('ManyForge did not close correctly last time.');
+    healthProjection.value = { ...health, workbenchSessionNotice: null };
+    expect(renderToStaticMarkup(<App />)).not.toContain('ManyForge did not close correctly last time.');
+  });
+
   it('renders one compact application spine without duplicate authority surfaces', () => {
     const started = performance.now();
     const markup = renderToStaticMarkup(<App />);

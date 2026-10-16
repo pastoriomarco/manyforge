@@ -430,6 +430,9 @@ ApplyStatus(const component_manager::PersistedManagerApplyStatus &value) {
       {"intent_digest", CanonicalValue(value.intent.intent_digest.value())},
       {"phase", CanonicalValue(std::string(ApplyPhase(value)))},
       {"prepared_activation", std::move(prepared_activation)},
+      {"scene_initialization",
+       CanonicalValue(std::string(
+           component_manager::ToString(intent.scene_initialization)))},
       {"request",
        CanonicalValue(CanonicalValue::Object{
            {"correlation_id",

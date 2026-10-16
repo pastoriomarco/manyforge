@@ -156,7 +156,8 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
     causalClientSequence: null,
     currentCommandKind: null,
     failure: null,
-    resetPhase: null,
+    resetPhase: null, resetOptions: null,
+    resetRobotPosition: { available: false, reason: 'unsupported' },
     allowedCommands: ['program_reset', 'program_motion_resume', 'program_resume_full_stop']
       .map((commandKind) => ({ commandKind, semanticTarget: {}, allowed: true, disabledReason: null })),
     recoveryOffer: offer,
@@ -169,6 +170,7 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
       recoveryOffer: offer,
       executionSelections: {
         selectionRevision: 1,
+        motionHeld: groupState === 'held',
         groups: [{
           groupId: 'all', nodeCount: 3, heldNodeCount: groupState === 'held' ? 3 : 0,
           state: groupState, stopAllowed: false,

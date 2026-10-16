@@ -19,6 +19,9 @@ def _copy_retention_helper(launcher: Path) -> None:
     target = launcher.parent / "lib/export_retention.py"
     target.parent.mkdir(exist_ok=True)
     target.write_text((REPOSITORY_ROOT / "scripts/lib/export_retention.py").read_text())
+    (target.parent / "workbench_session.py").write_text(
+        (REPOSITORY_ROOT / "scripts/lib/workbench_session.py").read_text()
+    )
 
 
 def _copy_writable_launcher(tmp_path: Path) -> Path:
@@ -341,7 +344,7 @@ printf '%s\\n' "$*" >> "$FAKE_DOCKER_CALLS"
 case "$1" in
   image) printf 'sha256:test\\n' ;;
   container) ;;
-  run) : > "$FAKE_DOCKER_STARTED" ;;
+  run) : > "$FAKE_DOCKER_STARTED"; printf 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\n' ;;
   inspect)
     [[ -e "$FAKE_DOCKER_STARTED" ]] || exit 1
     printf 'true\\n'
@@ -361,6 +364,7 @@ esac
         ROS_STATIC_PEERS="orin;laptop",
         ROS_DOMAIN_ID="17",
         RMW_IMPLEMENTATION="rmw_fastrtps_cpp",
+        MANYFORGE_ROS2_CONTROL_BUILD_TESTING="ON",
         MANYFORGE_DEV_IMAGE="current-ros-image",
         MANYFORGE_DEV_CONTAINER_NAME=container_name,
     )
@@ -382,13 +386,17 @@ esac
     runtime_root = tmp_path / "cache/runtime" / container_name
     assert f"-v {runtime_root}:/tmp/manyforge-state" in command
     assert runtime_root.is_dir()
+    selected = json.loads((runtime_root / "current/session.json").read_text())
+    assert re.fullmatch(r"[0-9a-f]{32}", selected["session_id"])
+    assert f"-e MANYFORGE_DEV_COLD_SESSION_ID={selected['session_id']}" in command
     assert "--network host" in command
     assert "--label manyforge.dev.ros2-control=true" in command
     assert command.endswith(
         "sha256:test python3 scripts/dev-workbench.py serve" +
         (" " + " ".join(selection) if selection else "")
     )
-    for name in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "ROS_STATIC_PEERS"):
+    for name in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "ROS_STATIC_PEERS",
+                 "MANYFORGE_ROS2_CONTROL_BUILD_TESTING"):
         assert f"--env {name}" in command
     assert f"--user {os.getuid()}:{os.getgid()}" in command
     assert "--env HOME=/runner/home" in command
@@ -414,7 +422,7 @@ def test_start_refuses_shared_live_state_but_allows_another_root(tmp_path: Path,
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
     if same_root:
         assert completed.returncode == 69
-        assert "Refusing shared live ManyForge state root" in completed.stderr
+        assert "Refusing overlapping live ManyForge state root" in completed.stderr
         assert not any(call.startswith("run ") for call in calls)
         assert not state_root.exists()
     else:
@@ -428,6 +436,38 @@ def test_start_does_not_infer_unique_state_root_from_failed_inspection(tmp_path:
         FAKE_RUNNING_INSPECT_FAIL="true")
     assert completed.returncode == 69
     assert not any(call.startswith("run ") for call in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines())
+
+
+@pytest.mark.parametrize("binding", ["same", "ancestor", "descendant", "prefix_sibling"])
+def test_cold_start_requires_no_overlapping_live_bind_before_session_rotation(tmp_path, binding):
+    launcher = _copy_writable_launcher(tmp_path)
+    root = tmp_path / "runtime" / "selected"
+    root.mkdir(parents=True)
+    protected = root / "program-cycle.sqlite3"
+    if binding != "prefix_sibling":
+        protected.write_bytes(b"old cycle including unresolved effects")
+    bound = {"same": root, "ancestor": root.parent,
+             "descendant": root / "execution-state", "prefix_sibling": root.with_name("selected-other")}[binding]
+    environment = _fake_docker_environment(tmp_path,
+        FAKE_WORKSPACE=str(launcher.parents[1]), MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_CONTAINER_PRESENT="false", MANYFORGE_DEV_RUNTIME_STATE_ROOT=str(root),
+        FAKE_BOUND_STATE_ROOT=str(bound))
+    result = subprocess.run(["bash", str(launcher), "start"], env=environment,
+        cwd=REPOSITORY_ROOT, capture_output=True, text=True, check=False)
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    if binding == "prefix_sibling":
+        assert result.returncode == 0, result.stderr
+        assert any(call.startswith("run ") for call in calls)
+        # No overlapping mount is present. A genuinely fresh root needs no
+        # predecessor proof; nonempty unknown legacy roots remain protected.
+        assert (root / "current/session.json").is_file()
+        assert not (root / "previous-sessions").exists()
+    else:
+        assert result.returncode == 69
+        assert "overlapping live ManyForge state root" in result.stderr
+        assert protected.read_bytes() == b"old cycle including unresolved effects"
+        assert not (root / "current").exists()
+        assert not any(call.startswith("run ") for call in calls)
 
 
 def test_plain_container_removal_keeps_live_durable_state_files(tmp_path: Path) -> None:
@@ -750,7 +790,7 @@ def test_nonrunning_active_root_users_refuse_start_and_rotation(tmp_path,status)
     (root/"protected-artifact").write_bytes(b"active root")
     completed,environment=_run_launcher(tmp_path,"start",FAKE_CONTAINER_PRESENT="false",
         MANYFORGE_DEV_IMAGE="sha256:"+"e"*64,FAKE_BOUND_STATE_ROOT=str(root),FAKE_BOUND_STATUS=status)
-    assert completed.returncode==69 and "shared live ManyForge state root" in completed.stderr
+    assert completed.returncode==69 and "overlapping live ManyForge state root" in completed.stderr
     assert "run " not in Path(environment["FAKE_DOCKER_CALLS"]).read_text()
     assert (root/"protected-artifact").read_bytes()==b"active root"
     calls=Path(environment["FAKE_DOCKER_CALLS"]).read_text()
@@ -892,7 +932,12 @@ def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durab
     calls = Path(environment['FAKE_DOCKER_CALLS']).read_text().splitlines()
     position = lambda command: next(index for index, call in enumerate(calls) if call.startswith(command+' '))
     assert position('stop') < position('logs') < position('rm') < position('run')
-    assert durable.read_bytes() == before and not partial.exists()
+    archived = list((root / "previous-sessions").iterdir())
+    assert len(archived) == 1
+    archived_durable = archived[0] / "execution-state/cclc-journal.sqlite3"
+    assert archived_durable.read_bytes() == before and not partial.exists()
+    assert not durable.exists()
+    assert {p.name for p in (root / "current").iterdir()} == {"session.json"}
     captured = next(p for p in (root/'evidence').iterdir() if not p.name.endswith('.partial'))
     assert (captured/'docker.log').read_bytes() == b'preserved log\n'
     assert {p.name for p in captured.iterdir()} == {'docker-inspect.json', 'docker.log'}

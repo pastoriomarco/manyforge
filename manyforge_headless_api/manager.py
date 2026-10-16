@@ -302,6 +302,7 @@ class ManagerCommandClient:
                 "expected_current": request.expected_current.model_dump(),
                 "reject_if_affected_busy": request.reject_if_affected_busy,
                 "prepared_activation": request.prepared_activation.model_dump(),
+                "scene_initialization": request.scene_initialization,
                 "request_id": request.request_id,
                 "request_owner_epoch": request.request_owner_epoch,
                 "source_label": request.source_label,

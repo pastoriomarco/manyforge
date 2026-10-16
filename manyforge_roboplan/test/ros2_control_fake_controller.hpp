@@ -17,6 +17,7 @@
 #include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -328,10 +329,12 @@ private:
 /// `--inactive`); `switch_controller` activates or deactivates it.
 class FakeControllerManager final : public PeerNode {
 public:
-  FakeControllerManager(std::string manager, std::string controller, std::string hardware,
-                        FakeJtc *jtc)
-      : PeerNode("manyforge_fake_controller_manager"), controller_(std::move(controller)),
-        hardware_(std::move(hardware)), jtc_(jtc) {
+  FakeControllerManager(std::string manager, std::string controller,
+                        std::string hardware, FakeJtc *jtc,
+                        std::string reset_writer = {})
+      : PeerNode("manyforge_fake_controller_manager"),
+        controller_(std::move(controller)), hardware_(std::move(hardware)),
+        jtc_(jtc), reset_writer_(std::move(reset_writer)) {
     activity_ = node()->create_publisher<controller_manager_msgs::msg::ControllerManagerActivity>(
         manager + "/activity", rclcpp::QoS(1).reliable().transient_local());
     switch_ = node()->create_service<controller_manager_msgs::srv::SwitchController>(
@@ -339,6 +342,21 @@ public:
         [this](const std::shared_ptr<controller_manager_msgs::srv::SwitchController::Request> request,
                std::shared_ptr<controller_manager_msgs::srv::SwitchController::Response> response) {
           ++switch_requests_;
+          {
+            std::lock_guard lock(reset_mutex_);
+            switch_history_.emplace_back(request->activate_controllers,
+                                         request->deactivate_controllers);
+          }
+          if (!reset_writer_.empty()) {
+            const auto contains_writer = [&](const auto &names) {
+              return std::find(names.begin(), names.end(), reset_writer_) !=
+                     names.end();
+            };
+            if (contains_writer(request->activate_controllers))
+              writer_active_ = true;
+            if (contains_writer(request->deactivate_controllers))
+              writer_active_ = false;
+          }
           bool next = active_;
           if (std::find(request->activate_controllers.begin(), request->activate_controllers.end(),
                         controller_) != request->activate_controllers.end()) {
@@ -358,11 +376,43 @@ public:
             next = false;
           }
           SetControllerActive(next);
+          {
+            std::unique_lock lock(reply_mutex_);
+            reply_waiting_ = replies_paused_;
+            reply_changed_.wait(lock, [&] { return !replies_paused_; });
+            reply_waiting_ = false;
+          }
           response->ok = true;
         });
+    if (!reset_writer_.empty()) {
+      const auto manager_suffix = manager.rfind('/');
+      reset_subscription_ =
+          node()->create_subscription<std_msgs::msg::Float64MultiArray>(
+              manager.substr(0U, manager_suffix) + "/" + reset_writer_ +
+                  "/commands",
+              rclcpp::QoS(1).reliable(),
+              [this](std_msgs::msg::Float64MultiArray::ConstSharedPtr command) {
+                std::lock_guard lock(reset_mutex_);
+                reset_commands_.push_back(command->data);
+              });
+    }
     Start();
     Publish();
   }
+
+  ~FakeControllerManager() override {
+    SetSwitchRepliesPaused(false);
+    Stop();
+  }
+
+  void SetSwitchRepliesPaused(bool paused) {
+    {
+      std::lock_guard lock(reply_mutex_);
+      replies_paused_ = paused;
+    }
+    reply_changed_.notify_all();
+  }
+  [[nodiscard]] bool reply_waiting() const { return reply_waiting_.load(); }
 
   /// End the peer executor before destroying its actual ROS endpoints.
   /// Context shutdown alone leaves these shared endpoint owners alive.
@@ -384,10 +434,29 @@ public:
     Publish();
   }
 
+  /// Deterministically hold the old transient-local activity while a switch
+  /// can still return its positive service ACK; releasing publishes truth.
+  void SetActivityPublicationEnabled(bool enabled) {
+    activity_publication_enabled_ = enabled;
+    if (enabled)
+      Publish();
+  }
+
   [[nodiscard]] std::size_t switch_requests() const { return switch_requests_.load(); }
+  [[nodiscard]] bool writer_active() const { return writer_active_.load(); }
+  [[nodiscard]] std::vector<std::vector<double>> reset_commands() const {
+    std::lock_guard lock(reset_mutex_);
+    return reset_commands_;
+  }
+  [[nodiscard]] auto switch_history() const {
+    std::lock_guard lock(reset_mutex_);
+    return switch_history_;
+  }
 
 private:
   void Publish() {
+    if (!activity_publication_enabled_)
+      return;
     controller_manager_msgs::msg::ControllerManagerActivity message;
     message.header.stamp = node()->now();
     controller_manager_msgs::msg::NamedLifecycleState controller;
@@ -395,6 +464,13 @@ private:
     controller.state.id = active_ ? lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE
                                   : lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
     message.controllers.push_back(controller);
+    if (!reset_writer_.empty()) {
+      controller.name = reset_writer_;
+      controller.state.id =
+          writer_active_ ? lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE
+                         : lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
+      message.controllers.push_back(controller);
+    }
     controller_manager_msgs::msg::NamedLifecycleState hardware;
     hardware.name = hardware_;
     hardware.state.id = hardware_active_ ? lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE
@@ -406,7 +482,20 @@ private:
   std::string controller_;
   std::string hardware_;
   FakeJtc *jtc_;
+  std::mutex reply_mutex_;
+  std::condition_variable reply_changed_;
+  bool replies_paused_{false};
+  std::atomic<bool> reply_waiting_{false};
+  std::string reset_writer_;
+  std::atomic<bool> writer_active_{false};
+  mutable std::mutex reset_mutex_;
+  std::vector<std::vector<double>> reset_commands_;
+  std::vector<std::pair<std::vector<std::string>, std::vector<std::string>>>
+      switch_history_;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr
+      reset_subscription_;
   std::atomic<bool> active_{false};
+  std::atomic<bool> activity_publication_enabled_{true};
   std::atomic<bool> hardware_active_{true};
   std::atomic<std::size_t> switch_requests_{0U};
   rclcpp::Publisher<controller_manager_msgs::msg::ControllerManagerActivity>::SharedPtr activity_;

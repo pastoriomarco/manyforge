@@ -62,6 +62,42 @@ Revision = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 Identity = Annotated[str, Field(min_length=1, max_length=256)]
 
 
+class ProgramResetOptionsDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    reload_initial_scene: bool
+    reset_robot_position: bool
+
+
+class AcceptedProgramResetDTO(ProgramResetOptionsDTO):
+    """Private heartbeat proof of the original accepted Reset occurrence."""
+
+    request_owner_epoch: Identity
+    request_id: Identity
+    request_payload_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+    reset_claim_generation: Revision | None
+
+
+class ScenePreparationFailureDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    code: Literal["program_scene_preparation_failed"]
+    message: str
+
+
+class ProgramResetPositionAvailabilityDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    available: bool
+    reason: Identity | None
+
+    @model_validator(mode="after")
+    def exact_reason(self) -> "ProgramResetPositionAvailabilityDTO":
+        if self.available != (self.reason is None):
+            raise ValueError("position-reset availability requires its exact reason")
+        return self
+
+
 class ProgramCycleStatusDTO(BaseModel):
     """Core facts published by the Program cycle's sole lifecycle owner."""
 
@@ -90,10 +126,14 @@ class ProgramCycleStatusDTO(BaseModel):
     current_command_kind: Identity | None
     failure: dict[str, Any] | None
     reset_phase: Identity | None
+    reset_options: ProgramResetOptionsDTO | None
+    reset_robot_position: ProgramResetPositionAvailabilityDTO
     allowed_commands: list[AllowedExecutionCommandDTO]
 
     @model_validator(mode="after")
     def exact_state_shape(self) -> "ProgramCycleStatusDTO":
+        if self.failure is not None and "prior_scene_preparation_failure" in self.failure:
+            ScenePreparationFailureDTO.model_validate(self.failure["prior_scene_preparation_failure"])
         if self.state == "idle_after_reset":
             if not (
                 self.program_run_id is None
@@ -101,8 +141,24 @@ class ProgramCycleStatusDTO(BaseModel):
                 and self.terminal_or_settlement_reference is None
             ):
                 raise ValueError("Program cycle has the wrong Idle shape")
-        elif self.program_run_id is None and self.state != "recovery_required":
-            raise ValueError("active Program cycle requires its run identity")
+        elif self.program_run_id is None:
+            if self.state not in {"resetting", "recovery_required"}:
+                raise ValueError("active Program cycle requires its run identity")
+            if (self.state == "resetting" or self.reset_options is not None) and not (
+                self.cycle_claim_generation is None
+                and self.terminal_or_settlement_reference is None
+                and self.reset_phase in {
+                    "restoring_scene", "restoring_position", "releasing"
+                }
+                and self.current_command_kind == "program_reset"
+                and self.reset_options is not None
+                and (self.reset_options.reload_initial_scene or self.reset_options.reset_robot_position)
+            ):
+                raise ValueError("no-run Reset has the wrong state shape")
+            if self.reset_options is not None and self.state == "recovery_required" and (
+                self.failure is None or self.failure.get("failed_phase") != self.reset_phase
+            ):
+                raise ValueError("no-run Reset recovery requires its exact failed phase")
         elif self.cycle_claim_generation is None and self.state == "running":
             raise ValueError("acquired Program cycle requires its claim generation")
         if (
@@ -121,6 +177,15 @@ class ProgramCycleStatusDTO(BaseModel):
             raise ValueError("Resetting Program cycle requires its phase")
         if self.state == "recovery_required" and self.failure is None:
             raise ValueError("recovery-required Program cycle requires failure")
+        if self.state == "resetting" and self.reset_options is None:
+            raise ValueError("Resetting Program cycle requires accepted options")
+        if self.reset_options is not None and self.state not in {"resetting", "recovery_required"}:
+            raise ValueError("accepted Reset options have no active Reset occurrence")
+        if self.reset_options is not None and (
+            (self.reset_phase == "restoring_scene" and not self.reset_options.reload_initial_scene)
+            or (self.reset_phase == "restoring_position" and not self.reset_options.reset_robot_position)
+        ):
+            raise ValueError("Reset phase requires its selected effect")
         return self
 
 

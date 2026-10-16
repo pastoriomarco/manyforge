@@ -166,4 +166,32 @@ TEST(KernelCellAdmissionRpcInternal,
       std::holds_alternative<std::monostate>(response_packet.response));
 }
 
+TEST(KernelCellAdmissionRpcInternal, SelectedIdleResetStatusAndAuthorizationRoundTrip) {
+  const auto digest = core::ContentDigest("sha256:" + std::string(64U, 'b'));
+  const core::AcceptedProgramResetDTO accepted{
+      core::RequestOwnerEpoch("operator.1"), core::RequestId("reset.1"), digest,
+      true, true, core::CellAdmissionClaimGeneration(9U)};
+  core::CellAdmissionReadinessSnapshotDTO readiness;
+  readiness.program_cycle_status_current = true;
+  readiness.program_cycle_status = core::ProgramCycleStatusDTO{
+      core::RequestOwnerEpoch("runner.1"), 3U, core::ProgramCycleStateDTO::kResetting,
+      std::nullopt, std::nullopt, std::nullopt, accepted};
+  const component_manager::detail::KernelCellAdmissionRpcPacket request{
+      "cell_admission_update_readiness", readiness};
+  const auto decoded = component_manager::detail::DecodeKernelCellAdmissionRpcRequest(
+      component_manager::detail::EncodeKernelCellAdmissionRpcRequest(request));
+  EXPECT_EQ(std::get<core::CellAdmissionReadinessSnapshotDTO>(decoded.request), readiness);
+
+  const core::ProgramResetSceneAuthorizationDTO authorization{
+      core::RequestOwnerEpoch("runner.1"), core::ProgramRunId(""),
+      core::CellAdmissionClaimGeneration(0U), core::ContentDigest(""),
+      core::ProgramResetClaimSceneAuthorizationDTO{
+          3U, accepted.request_owner_epoch, accepted.request_id,
+          accepted.request_payload_digest, *accepted.reset_claim_generation}};
+  const auto auth_decoded = component_manager::detail::DecodeKernelCellAdmissionRpcRequest(
+      component_manager::detail::EncodeKernelCellAdmissionRpcRequest(
+          {"cell_admission_validate_program_reset_scene", authorization}));
+  EXPECT_EQ(std::get<core::ProgramResetSceneAuthorizationDTO>(auth_decoded.request), authorization);
+}
+
 }  // namespace

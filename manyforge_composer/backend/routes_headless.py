@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.close_wire import LifecycleOwnerSettlementRequest, LifecycleTargetRetirementIntent
@@ -70,6 +70,7 @@ from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
 )
 from .draft_session import DraftSessionError
+from .authoring_workspace import AuthoringWorkspaceIdentity, AuthoringWorkspaceError
 from .source_model_client import (
     ActiveSourceModelProjectionError,
     read_active_source_model_context,
@@ -97,11 +98,26 @@ _SCENE_RESULT_FIELDS = {
 }
 
 
+class _SceneWorkspaceIdentity(BaseModel):
+    """The existing composite identity, carried only by Close's Scene cleanup."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    workspace_epoch: str = Field(alias="workspaceEpoch", min_length=1, max_length=256)
+    workspace_revision: int = Field(alias="workspaceRevision", ge=1, le=_MAXIMUM_SAFE_INTEGER)
+    program_draft_id: str = Field(alias="programDraftId", min_length=1, max_length=256)
+    program_draft_revision: int = Field(alias="programDraftRevision", ge=0, le=_MAXIMUM_SAFE_INTEGER)
+    deployment_draft_id: str = Field(alias="deploymentDraftId", min_length=1, max_length=256)
+    deployment_draft_revision: int = Field(alias="deploymentDraftRevision", ge=0, le=_MAXIMUM_SAFE_INTEGER)
+
+    def identity(self) -> AuthoringWorkspaceIdentity:
+        return AuthoringWorkspaceIdentity(**self.model_dump())
+
+
 class ComposerSceneTransactionRequest(SceneTransactionRequest):
     """Scene-owner request with a Draft fence only for authored mutations."""
 
     model_config = ConfigDict(extra="forbid")
 
+    expected_authoring_workspace: _SceneWorkspaceIdentity | None = None
     expected_draft_id: str | None = Field(default=None, min_length=1, max_length=256)
     expected_draft_revision: int | None = Field(
         default=None,
@@ -111,6 +127,8 @@ class ComposerSceneTransactionRequest(SceneTransactionRequest):
 
     @model_validator(mode="after")
     def validate_authority_scope(self) -> "ComposerSceneTransactionRequest":
+        if self.expected_authoring_workspace is not None and self.operation.kind not in {"remove_object", "set_collision_policy", "detach_carried_object_at_current_pose"}:
+            raise ValueError("the composite Close fence is only valid for Close Scene cleanup")
         authored = self.operation.kind in {
             "add_object",
             "upsert_object",
@@ -494,7 +512,7 @@ def create_headless_router(
 
         assert state.authoring_admission is not None
         return await control_call(
-            lambda: state.authoring_admission.submit_execution_start(submit)
+            lambda: state.authoring_admission.submit_workspace_fenced(submit)
         )
 
     @router.get("/api/cycle/status")
@@ -621,7 +639,7 @@ def create_headless_router(
 
         assert state.authoring_admission is not None
         return await control_call(
-            lambda: state.authoring_admission.submit_execution_start(submit)
+            lambda: state.authoring_admission.submit_workspace_fenced(submit)
         )
 
     @router.get("/api/program/runs/{program_run_id}")
@@ -693,7 +711,7 @@ def create_headless_router(
 
         assert state.authoring_admission is not None
         return await control_call(
-            lambda: state.authoring_admission.submit_execution_start(submit)
+            lambda: state.authoring_admission.submit_workspace_fenced(submit)
         )
 
     @router.post("/api/program/runs/{program_run_id}/resume-motion")
@@ -717,7 +735,7 @@ def create_headless_router(
 
         assert state.authoring_admission is not None
         return await control_call(
-            lambda: state.authoring_admission.submit_execution_start(submit)
+            lambda: state.authoring_admission.submit_workspace_fenced(submit)
         )
 
     @router.post("/api/program/runs/{program_run_id}/full-stop")
@@ -762,7 +780,7 @@ def create_headless_router(
 
         assert state.authoring_admission is not None
         return await control_call(
-            lambda: state.authoring_admission.submit_execution_start(submit)
+            lambda: state.authoring_admission.submit_workspace_fenced(submit)
         )
 
     @router.post("/api/program/runs/{program_run_id}/reset")
@@ -844,7 +862,7 @@ def create_headless_router(
         assert state.authoring_admission is not None
         return await control_call(
             lambda: (
-                state.authoring_admission.submit_execution_start(submit)
+                state.authoring_admission.submit_workspace_fenced(submit)
                 if start else submit()
             ),
             stop=is_stop_command(kind),
@@ -859,7 +877,7 @@ def create_headless_router(
 
         assert state.authoring_admission is not None
         return await control_call(
-            lambda: state.authoring_admission.submit_execution_start(submit)
+            lambda: state.authoring_admission.submit_workspace_fenced(submit)
         )
 
     @router.post("/api/execution/motion-previews")
@@ -1036,7 +1054,7 @@ def create_headless_router(
         owner_request = SceneTransactionRequest.model_validate(
             body.model_dump(
                 mode="json",
-                exclude={"expected_draft_id", "expected_draft_revision"},
+                exclude={"expected_draft_id", "expected_draft_revision", "expected_authoring_workspace"},
             )
         )
 
@@ -1051,6 +1069,24 @@ def create_headless_router(
                 owner_request,
             )
 
+        if body.expected_authoring_workspace is not None:
+            if state.authoring_admission is None:
+                raise HTTPException(503, detail={"code": "authoring_not_ready", "message": "Authoring admission is unavailable"})
+
+            def submit_closed_scene():
+                state.authoring_workspace.require_identity(body.expected_authoring_workspace.identity())
+                if body.expected_draft_id is None:
+                    return commit_owner_scene()
+                return state.draft_session.execute_if_current(
+                    draft_id=body.expected_draft_id,
+                    expected_revision=body.expected_draft_revision,
+                    effect=commit_owner_scene,
+                )
+
+            try:
+                return state.authoring_admission.submit_workspace_fenced(submit_closed_scene)
+            except (AuthoringWorkspaceError, DraftSessionError) as error:
+                raise HTTPException(error.status_code, detail={"code": error.code, "message": str(error)}) from error
         if body.expected_draft_id is None:
             return commit_owner_scene()
         try:

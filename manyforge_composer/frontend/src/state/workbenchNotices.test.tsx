@@ -2,8 +2,9 @@ import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
-import { NoticeRow, WorkbenchNotificationStack } from '../components/WorkbenchNotifications';
+import { NoticeItem, NoticeRow, WorkbenchNotificationStack } from '../components/WorkbenchNotifications';
 import {
+  previousSessionAlarmHandoff,
   activeViewerIncidentKinds,
   classifyWorkbenchNotices,
   noticeRowSummary,
@@ -131,5 +132,40 @@ describe('workbench notification model', () => {
       .map((token) => markup.indexOf(token));
     expect(order.every((index) => index >= 0)).toBe(true);
     expect([...order].sort((left, right) => left - right)).toEqual(order);
+  });
+});
+
+
+describe('previous-session alarm presentation handoff', () => {
+  const session = 'a'.repeat(32);
+  it.each(['registered', 'acknowledged', 'quiet'])(
+    'hands off only the exact current archive after a %s receipt', (status) => {
+      expect(previousSessionAlarmHandoff(session, null, { session_id: session, status })).toBe(session);
+    },
+  );
+  it.each([undefined, null, {}, { session_id: 'b'.repeat(32), status: 'registered' },
+    { session_id: 'a'.repeat(32), status: 'failed' },
+    { session_id: 'a'.repeat(32), status: 'registered', invented: true }])(
+    'keeps the fallback without an exact successful receipt: %j', (receipt) => {
+      expect(previousSessionAlarmHandoff(session, null, receipt)).toBeNull();
+    },
+  );
+  it('keeps the proven handoff when the acknowledged alarm disappears or transport is lost', () => {
+    const registered = previousSessionAlarmHandoff(session, null, { session_id: session, status: 'registered' });
+    expect(previousSessionAlarmHandoff(session, registered, undefined)).toBe(session);
+    expect(previousSessionAlarmHandoff(session, registered, null)).toBe(session);
+    expect(previousSessionAlarmHandoff('b'.repeat(32), registered, null)).not.toBe('b'.repeat(32));
+  });
+  it('keeps technical details collapsed without hiding the plain message', () => {
+    const markup = renderToStaticMarkup(<NoticeItem notice={{
+      id: 'cold-session.a', severity: 'warning', domain: 'recovery',
+      title: 'ManyForge did not close correctly last time.',
+      message: 'The cell started empty; nothing from the previous session was resumed.',
+      details: 'Session a; program_cycle; not_imported; failure time unavailable.',
+    }} />);
+    expect(markup).toContain('The cell started empty');
+    expect(markup).toContain('<details><summary>Details</summary>');
+    expect(markup).not.toContain('<details open');
+    expect(markup).toContain('not_imported');
   });
 });

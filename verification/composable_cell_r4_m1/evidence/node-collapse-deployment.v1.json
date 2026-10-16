@@ -1,0 +1,73 @@
+{
+  "schema_version": "manyforge.workbench_deployment_evidence.v1",
+  "scope": "DX1021 node collapsed-by-default presentation; authorized live deployment DX1022",
+  "outcome": "deployed_and_usable",
+  "verified_at_utc": "2026-10-16T07:07:46.204479+00:00",
+  "source_base_commit": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+  "source_postimages": {
+    "manyforge_composer/backend/draft_session.py": "c919f2254d4e9fccc86fbb2b911ca78d9a849c9fc8a9823f4255ce849f297a30",
+    "manyforge_composer/frontend/src/components/ProgramAuthoringPanels.test.tsx": "cdd121b5a882f9991957985f8e98a624d01b1819b631587df6497c2aef586253",
+    "manyforge_composer/frontend/src/components/ProgramPropertyEditor.tsx": "d8215b3be2b188df105d54eeb35245d6be0d9741452fd97f70da2eeea7f74e97",
+    "manyforge_composer/frontend/src/components/ProgramTreeCanvas.tsx": "e8831a10678f4a891d6287d83bd7ffd6e27852faed6c0e24e0cbfb3a9c92d4a4",
+    "manyforge_composer/frontend/src/components/ProgramWorkspace.tsx": "7a3796086566c0af9a6fd4b0e76f232202dea2737de806ccc836fbe88f6c1e4f",
+    "manyforge_composer/frontend/src/hooks/useProgramWorkspace.ts": "125a53b44a44710c554856a1540bfde74b22b7c8e96e0b0d7c789f6d3fb75d3a",
+    "manyforge_composer/frontend/src/styles/surfaces/program-authoring.css": "90ea620009177fa8e7c8aff65f3887c2e2e9cdce4891f3ccf594fd856c1284e0",
+    "manyforge_composer/frontend/src/utils/programCollapse.test.ts": "b02336cf4831bd771188df9e659dae1db5e80072ba6d48ddf3a47920cb6f2d9c",
+    "manyforge_composer/frontend/src/utils/programCollapse.ts": "a618044b613bcac469191ff3c93efb6352d033dbd59691721de29591b83bba9f",
+    "manyforge_composer/tests/test_draft_session.py": "2c81aea11e6bbe6c876cbb8bf529023a0dc6c61843b589363e8e48fdd380e35d"
+  },
+  "runtime": {
+    "image_id": "sha256:712e576565aad0f9982d3305efd7cad1f04c0a18d644442f2419101839ee6773",
+    "container_id": "35cd835e464ba41b90d6cbeb82e524a9b03e9142ffba176c70b8ed0d00d4ac08",
+    "session_id": "8e610b6be9a94a4dbf5f7d059a407f63",
+    "standard_entrypoint": "scripts/compose-dev.sh",
+    "start_exit_code": 0,
+    "startup_seconds": 19.017627,
+    "native_source_changes": false,
+    "explicit_native_build_or_tests_run_for_deployment": false
+  },
+  "readback": {
+    "health": "ready",
+    "canonical_empty": true,
+    "physical_entry_counts": {
+      "model_instances": 0,
+      "controllable_components": 0,
+      "control_bindings": 0,
+      "control_domains": 0
+    },
+    "cycle_state": "idle_after_reset",
+    "program_run_id": null,
+    "component_overview": "No components",
+    "browser_errors": [],
+    "browser_geometry_count": 0,
+    "browser_live_feed_sockets": 0,
+    "served_editor_contains_show_collapsed_by_default": true
+  },
+  "preservation": {
+    "saved_files_byte_exact": 64,
+    "closed_session_archive_files_byte_exact": 142,
+    "archive_read_only": true,
+    "history_prior_event_ids_preserved": 106,
+    "history_event_count_after": 108,
+    "history_purged": false,
+    "prior_palette_close_and_cold_start_changes_retained": true
+  },
+  "previous_session_notice": {
+    "session_id": "8afebd80f6bf4aacb6f4fa2ad14dfa2a",
+    "shutdown": "clean",
+    "effects": "unresolved",
+    "unresolved_journal_families": [
+      "cclc"
+    ],
+    "history_coverage": "not_imported",
+    "note": "Truthful pre-existing session evidence; notice acknowledgement follow-up was not part of this deployment."
+  },
+  "validation_limits": {
+    "agent_issued_load_activate_run_reset": false,
+    "user_runtime_draft_mutation_test": false,
+    "author_reported_gates": "Frontend51 and TypeScript passed; targeted backend19 and backend121 passed. These gates were reported by the owning peer, not rerun for deployment."
+  },
+  "raw_receipt_identifier": "t1-node-collapse-20261016/user-deployment01",
+  "index_changed": false,
+  "service_left_running": true
+}

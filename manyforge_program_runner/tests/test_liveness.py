@@ -40,6 +40,9 @@ def _cycle_status(**changes):
         "current_command_kind": None,
         "failure": None,
         "reset_phase": None,
+        "reset_options": None,
+        "reset_robot_position": {"available": False, "reason": "unsupported"},
+        "accepted_reset": None,
         "allowed_commands": [],
         **changes,
     }
@@ -366,6 +369,7 @@ def test_probe_reports_pending_cycle_without_a_claim(
         "program_run_id",
         "cycle_claim_generation",
         "terminal_or_settlement_reference",
+        "accepted_reset",
     }
 
 
@@ -408,3 +412,21 @@ def test_journal_retains_only_manager_loss_identity_and_evidence(tmp_path: Path)
     assert retained == RetainedLiveness("manager-runtime", "manager-owner", True, fault)
     assert reopened.read().reconciliation_required is True
     reopened.close()
+
+
+@pytest.mark.parametrize("claim_generation", [None, 11])
+def test_private_heartbeat_reports_selected_idle_reset_without_fictitious_run(tmp_path, claim_generation):
+    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    context = {"request_owner_epoch": "caller.1", "request_id": "reset.1",
+               "request_payload_digest": "sha256:" + "a" * 64,
+               "reload_initial_scene": True, "reset_robot_position": False,
+               "reset_claim_generation": claim_generation}
+    receiver._cycle_status = lambda: _cycle_status(state="resetting", accepted_reset=context,
+        reset_options={"reload_initial_scene": True, "reset_robot_position": False},
+        reset_phase="restoring_scene", current_command_kind="program_reset")
+    projected = receiver._project_cycle_status()
+    assert projected["program_run_id"] is None and projected["cycle_claim_generation"] is None
+    assert projected["accepted_reset"] == context
+    receiver._cycle_status = lambda: _cycle_status(accepted_reset=context)
+    with pytest.raises(ProgramRunnerLivenessError, match="no current Reset"):
+        receiver._project_cycle_status()

@@ -105,6 +105,9 @@ export function NoticeItem({ notice }: { notice: WorkbenchNotice }) {
         <strong>{notice.title}</strong>
         {notice.message && <span>{notice.message}</span>}
       </p>
+      {notice.details && (
+        <details><summary>Details</summary><p>{notice.details}</p></details>
+      )}
       {notice.actions !== undefined && notice.actions.length > 0 && (
         <div className="workbench-notice-actions">
           <NoticeActions notice={notice} />

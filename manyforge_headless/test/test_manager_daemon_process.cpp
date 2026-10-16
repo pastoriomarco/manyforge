@@ -1317,9 +1317,9 @@ std::string ApplyRequest(
        accepted_impact == "receipt"
            ? RequiredMember(RequiredMember(preview, "candidate_receipt"),
                             "impact_digest")
-           : accepted_impact.empty()
-                 ? CanonicalValue(nullptr)
-                 : CanonicalValue(std::string(accepted_impact))},
+       : accepted_impact.empty()
+           ? CanonicalValue(nullptr)
+           : CanonicalValue(std::string(accepted_impact))},
       {"api_version", CanonicalValue("manyforge.manager_command.v1")},
       {"candidate_receipt", RequiredMember(preview, "candidate_receipt")},
       {"command", CanonicalValue("apply")},
@@ -1330,6 +1330,7 @@ std::string ApplyRequest(
       {"expected_current", expected},
       {"prepared_activation", prepared_summary},
       {"reject_if_affected_busy", CanonicalValue(true)},
+      {"scene_initialization", CanonicalValue("preserve")},
       {"request_id", CanonicalValue(std::string(request_id))},
       {"request_owner_epoch", CanonicalValue(std::string(manager_owner_epoch))},
       {"source_label", CanonicalValue("manager-process-test")},
@@ -4004,6 +4005,76 @@ TEST(ManagerDaemonProcess,
   } while (std::chrono::steady_clock::now() < ready_deadline);
   EXPECT_EQ(RequiredMember(command_gate, "command_eligible"),
             CanonicalValue(true));
+  // These private commands require the genuine managed cell above. The
+  // standalone CLI cannot construct this stable-cell/CCLC owner relationship.
+  const auto execution_command = [&](CanonicalValue::Object request) {
+    const auto bytes = SendCommand(directory.execution_socket_path(),
+        content_identity::canonical_json(CanonicalValue(std::move(request))));
+    return deployment::parse_strict_json_model_yaml(bytes).root();
+  };
+  const CanonicalValue::Object capability_request{
+      {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+      {"command", CanonicalValue("reset_robot_position_capability")}};
+  const auto capability = execution_command(capability_request);
+  ASSERT_EQ(capability.as_object().size(), 5U);
+  ASSERT_EQ(RequiredMember(capability, "ok"), CanonicalValue(true));
+  EXPECT_EQ(RequiredText(capability, "api_version"), "manyforge.execution_command_response.v1");
+  EXPECT_EQ(RequiredText(capability, "command"), "reset_robot_position_capability");
+  const auto &position_capability = RequiredMember(capability, "reset_robot_position");
+  ASSERT_EQ(position_capability.as_object().size(), 2U);
+  EXPECT_EQ(RequiredMember(position_capability, "available"), CanonicalValue(true));
+  EXPECT_EQ(RequiredMember(position_capability, "reason"), CanonicalValue(nullptr));
+  const auto &position_identity = RequiredMember(capability, "identity");
+  EXPECT_EQ(RequiredText(position_identity, "schema_version"), "manyforge.execution_identity.v2");
+  const CanonicalValue::Object reset_authorization{
+      {"program_runner_owner_epoch", CanonicalValue("absent.runner")},
+      {"cycle_generation", CanonicalValue(1.0)},
+      {"request_owner_epoch", CanonicalValue("absent.request-owner")},
+      {"request_id", CanonicalValue("absent.reset")},
+      {"request_payload_digest", CanonicalValue("sha256:" + std::string(64U, '1'))},
+      {"program_run_id", CanonicalValue(nullptr)},
+      {"cycle_claim_generation", CanonicalValue(nullptr)},
+      {"terminal_or_settlement_reference", CanonicalValue(nullptr)},
+      {"reset_claim_generation", CanonicalValue(1.0)}};
+  CanonicalValue::Object expected_deployment;
+  for (const auto *key : {"owner_epoch", "active_publication_generation", "retained_bundle_id", "graph_revision"})
+    expected_deployment.emplace_back(key, RequiredMember(position_identity, key));
+  const auto reset_command = [](CanonicalValue::Object authorization, CanonicalValue::Object expected) {
+    return CanonicalValue::Object{
+        {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+        {"command", CanonicalValue("reset_robot_position")},
+        {"authorization", CanonicalValue(std::move(authorization))},
+        {"expected_deployment_identity", CanonicalValue(std::move(expected))}};
+  };
+  const auto refused_reset = execution_command(reset_command(reset_authorization, expected_deployment));
+  ASSERT_EQ(RequiredMember(refused_reset, "ok"), CanonicalValue(false));
+  const auto &reset_error = RequiredMember(refused_reset, "error");
+  EXPECT_EQ(RequiredText(reset_error, "code"), "authoring_not_ready");
+  const auto &reset_details = RequiredMember(reset_error, "details");
+  EXPECT_EQ(RequiredText(reset_details, "reason"), "program_reset_claim_not_exact");
+  EXPECT_EQ(RequiredText(reset_details, "effect_disposition"), "known_no_effect");
+  std::vector<CanonicalValue::Object> malformed_reset_commands;
+  auto extra_authorization = reset_authorization;
+  extra_authorization.emplace_back("trusted", CanonicalValue(true));
+  malformed_reset_commands.push_back(reset_command(std::move(extra_authorization), expected_deployment));
+  auto caller_targets = expected_deployment;
+  caller_targets.emplace_back("joint_positions_rad", CanonicalValue(CanonicalValue::Array{CanonicalValue(0.0)}));
+  malformed_reset_commands.push_back(reset_command(reset_authorization, std::move(caller_targets)));
+  for (const auto *field : {"cycle_claim_generation", "reset_claim_generation"}) {
+    auto wrong_claim = reset_authorization;
+    for (auto &[key, value] : wrong_claim)
+      if (key == field)
+        value = key == "cycle_claim_generation" ? CanonicalValue(1.0) : CanonicalValue(nullptr);
+    malformed_reset_commands.push_back(reset_command(std::move(wrong_claim), expected_deployment));
+  }
+  auto extra_capability = capability_request;
+  extra_capability.emplace_back("unexpected", CanonicalValue(true));
+  malformed_reset_commands.push_back(std::move(extra_capability));
+  for (auto &request : malformed_reset_commands) {
+    const auto invalid = execution_command(std::move(request));
+    ASSERT_EQ(RequiredMember(invalid, "ok"), CanonicalValue(false));
+    EXPECT_EQ(RequiredText(RequiredMember(invalid, "error"), "code"), "execution_command_invalid");
+  }
   EXPECT_EQ(RequiredText(cclc_command("owner_identity",
                                       CanonicalValue(CanonicalValue::Object{})),
                          "request_owner_epoch"),

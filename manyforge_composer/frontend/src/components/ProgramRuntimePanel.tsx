@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import {
   PROGRAM_RESET_READINESS_MESSAGE,
   programMotionStopSettled,
+  type ProgramResetOptions,
   type ProgramRuntimeController,
 } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
@@ -666,7 +667,7 @@ export function deriveTransportGuidance({
   }
   if (!enabled) return notices;
   const facts = transportRecoveryFacts(program, robot);
-  if (robot.currentStatus == null) {
+  if (robot.currentStatus == null && phase !== 'no_robot_loaded') {
     notices.push({
       id: 'recovery.robot-status',
       severity: 'error',
@@ -921,11 +922,25 @@ export function MotionControlSettings({ groups }: { groups: DraftGroupVisibility
             checked={preferences.confirmReset}
             onChange={(event) => setPreferences({ confirmReset: event.target.checked })}
           />
-          <span>Confirm before resetting a running Program</span>
+          <span>Confirm before resetting a running or ended Program</span>
         </label>
       </fieldset>
     </div>
   );
+}
+
+// Both Reset options start off each time the confirmation opens (spec 450).
+const NO_RESET_OPTIONS: Required<ProgramResetOptions> = {
+  reloadInitialScene: false,
+  resetRobotPosition: false,
+};
+
+/** What a Reset with these options leaves as it is, for the confirmation. */
+export function resetKeptMessage(options: Required<ProgramResetOptions>): string | null {
+  if (options.reloadInitialScene && options.resetRobotPosition) return null;
+  if (options.reloadInitialScene) return 'Robot positions stay as they are.';
+  if (options.resetRobotPosition) return 'The Scene, carried objects and gripper state stay as they are.';
+  return 'The Scene, carried objects, gripper state and robot positions stay as they are.';
 }
 
 export function ProgramTransportControls({
@@ -954,6 +969,7 @@ export function ProgramTransportControls({
   // Reset during execution ends the run and restarts the tree, so it is
   // confirmed like Halt: motion stops first, the question comes after.
   const [resetIntent, setResetIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
+  const [resetSelection, setResetSelection] = useState(NO_RESET_OPTIONS);
   // Installation settings (UA7W.11); they never add a confirmation to Stop.
   const preferences = useComposerSettings().settings.motionPanel;
   const detailsButton = useRef<HTMLButtonElement>(null);
@@ -1097,10 +1113,33 @@ export function ProgramTransportControls({
   const continueLabel = continueStates.has('held') && continueStates.has('ready')
     ? 'Run or Resume'
     : continueStates.has('held') ? 'Resume' : 'Run';
+  // Idle, Reset only restores what its options select, so it always asks.
+  const idleReset = cycleState === 'idle_after_reset' && !executionActive;
+  // A finished, stopped or failed run asks too when Reset confirmation is on,
+  // so its options can be chosen in the same step.
+  const endedReset = cycleState === 'terminal_awaiting_reset' && !executionActive;
+  const positionAvailability = program.resetRobotPositionAvailability;
+  const positionAvailable = positionAvailability?.available === true;
+  const positionUnavailableReason = positionAvailability === null
+    ? 'The backend does not report whether robot positions can be reset.'
+    : positionAvailability.reason;
+  const resetSelectionApplied = {
+    reloadInitialScene: resetSelection.reloadInitialScene,
+    resetRobotPosition: positionAvailable && resetSelection.resetRobotPosition,
+  };
+  const resetNothingSelected = !resetSelectionApplied.reloadInitialScene
+    && !resetSelectionApplied.resetRobotPosition;
+  const resetKept = resetKeptMessage(resetSelectionApplied);
   const requestProgramReset = async () => {
     if (!canReset) return;
+    setResetSelection(NO_RESET_OPTIONS);
+    if (idleReset) {
+      setResetIntent('confirm');
+      return;
+    }
     if (!executionActive) {
-      void program.reset();
+      if (endedReset && preferences.confirmReset) setResetIntent('confirm');
+      else void program.reset();
       return;
     }
     if (!motionSettled) {
@@ -1156,7 +1195,9 @@ export function ProgramTransportControls({
           ? 'The Program requires recovery. Review the current owner-offered actions.'
           : resetRequired ? 'Reset the Program before starting another run.'
             : nativeStatus == null
-              ? 'Robot status unavailable. Last-known manual and cell recovery status is not current.' : null;
+              ? observationTransport?.phase === 'no_robot_loaded'
+                ? 'No robot loaded'
+                : 'Robot status unavailable. Last-known manual and cell recovery status is not current.' : null;
   const openManualRecovery = (operation: ManualRecoveryOperation) => {
     const target = manualRecoveryTarget(robot, operation);
     // Select the exact addressed robot before opening the panel. A gripper
@@ -1216,7 +1257,9 @@ export function ProgramTransportControls({
             <div className="transport-group-grid" aria-label="Motion group controls">
           {visibleGroups.length === 0 && (
             <p className="transport-groups-empty">
-              {selections.length === 0
+              {observationTransport?.phase === 'no_robot_loaded'
+                ? 'No robot loaded'
+                : selections.length === 0
                 ? 'Group controls require an Applied Program.'
                 : 'No command groups are displayed. Open Settings to choose one.'}
             </p>
@@ -1372,7 +1415,7 @@ export function ProgramTransportControls({
           <button
             type="button"
             className="transport-run transport-unique-control"
-            disabled={!canRunOrResume}
+            disabled={!canRunOrResume || program.activationPending || program.activationOffer !== null && program.activationOffer !== undefined}
             title={canResumeFullStop
                 ? 'Resume the halted Program tree. Motion stays stopped until Run or Resume in the Motion panel.'
                 : canRun
@@ -1410,7 +1453,8 @@ export function ProgramTransportControls({
               ? resetRequired ? 'Reset the completed Program cycle.'
                 : executionActive
                   ? 'Stop all Program motion, then confirm ending this run and resetting the Program.'
-                  : 'Reset the current Program cycle using its exact owner evidence.'
+                  : idleReset ? 'Reload the initial Scene or reset robot positions.'
+                    : 'Reset the current Program cycle using its exact owner evidence.'
               : 'Reset is unavailable in the current backend control state.'}
             onClick={() => { void requestProgramReset(); }}
           >{resetIntent === 'stopping' || resetIntent === 'automatic' ? 'Stopping'
@@ -1453,6 +1497,32 @@ export function ProgramTransportControls({
           </section>
         </div>
       </div>
+      <OverlayPanel
+        open={program.activationOffer != null}
+        title="Activate components and execute?"
+        titleId="activate-execute-title"
+        kind="dialog"
+        compact
+        onClose={() => program.cancelActivationExecute()}
+      >
+        <div className="dialog-copy transport-confirmation">
+          <p>These components are not active yet:</p>
+          <ul>{program.activationOffer?.components.filter((component) => component.lifecycleState !== 'active').map((component) => (
+            <li key={component.componentId}>{component.componentId} ({component.lifecycleState})</li>
+          ))}</ul>
+          <p>
+            Activate prepares and enables every configured component in Deployment order,
+            then executes the Program once. Components this Program does not use are activated too;
+            Execute can still be refused for another reason.
+          </p>
+          {program.activationPending && <p role="status">{program.activationWaiting ? 'Waiting for current Execute readiness…' : 'Activating components…'}</p>}
+          <div className="dialog-actions">
+            <button type="button" onClick={() => program.cancelActivationExecute()}>Cancel</button>
+            <button type="button" className="transport-run" disabled={program.activationPending}
+              onClick={() => { void program.confirmActivationExecute(); }}>Activate and execute</button>
+          </div>
+        </div>
+      </OverlayPanel>
       <OverlayPanel
         open={detailsOpen}
         title="Program run details"
@@ -1537,7 +1607,7 @@ export function ProgramTransportControls({
             </div>
             <div>
               <dt>Reset</dt>
-              <dd>Ends the run and returns Scene objects to the Program&apos;s initial Scene; the next Execute starts from the beginning.</dd>
+              <dd>Ends the run; the next Execute starts from the beginning. The Scene and robot positions stay as they are unless you select Reload initial scene or (simulators only) Reset robot position.</dd>
             </div>
             <div>
               <dt>Magenta node</dt>
@@ -1676,7 +1746,8 @@ export function ProgramTransportControls({
       </OverlayPanel>
       <OverlayPanel
         open={resetIntent === 'confirm'}
-        title="Reset the running Program?"
+        title={idleReset ? 'Reset the Program?'
+          : endedReset ? 'Reset the ended Program run?' : 'Reset the running Program?'}
         titleId="program-reset-confirmation-title"
         kind="dialog"
         compact
@@ -1684,26 +1755,64 @@ export function ProgramTransportControls({
         returnFocusRef={resetButton}
       >
         <div className="dialog-copy transport-confirmation">
-          <p>Motion is stopped. Reset also ends this run:</p>
-          <ul>
-            <li>its progress is discarded;</li>
-            <li>Scene objects return to the Program's initial Scene;</li>
-            <li>the next Execute starts the tree from the beginning.</li>
-          </ul>
-          <p>
+          {idleReset
+            ? <p>No run is active. Choose what Reset restores:</p>
+            : <>
+              <p>{endedReset ? 'The run has ended. Reset clears it:' : 'Motion is stopped. Reset also ends this run:'}</p>
+              <ul>
+                <li>its progress is discarded;</li>
+                <li>the next Execute starts the tree from the beginning.</li>
+              </ul>
+            </>}
+          <fieldset className="transport-reset-options">
+            <label className="toggle-control">
+              <input
+                type="checkbox"
+                checked={resetSelection.reloadInitialScene}
+                onChange={(event) => {
+                  const reloadInitialScene = event.target.checked;
+                  setResetSelection((current) => ({ ...current, reloadInitialScene }));
+                }}
+              />
+              <span>Reload initial scene</span>
+            </label>
+            <small className="transport-reset-option-note">
+              Scene objects, including carried ones, are replaced by the Program&apos;s initial Scene.
+            </small>
+            <label className="toggle-control" title={positionUnavailableReason ?? undefined}>
+              <input
+                type="checkbox"
+                checked={resetSelectionApplied.resetRobotPosition}
+                disabled={!positionAvailable}
+                onChange={(event) => {
+                  const resetRobotPosition = event.target.checked;
+                  setResetSelection((current) => ({ ...current, resetRobotPosition }));
+                }}
+              />
+              <span>Reset robot position</span>
+            </label>
+            <small className="transport-reset-option-note">
+              {positionAvailable
+                ? 'Simulator only: robots are set to the Deployment\'s initial joint positions.'
+                : positionUnavailableReason}
+            </small>
+          </fieldset>
+          {resetKept !== null && <p>{resetKept}</p>}
+          {!idleReset && !endedReset && <p>
             {programFullStopped
               ? 'Cancel keeps the run halted; Execute resumes it.'
               : `Cancel keeps the run stopped; ${continueLabel} in the Motion panel continues it.`}
-          </p>
+          </p>}
           <div className="dialog-actions">
             <button type="button" onClick={() => setResetIntent(null)}>Cancel</button>
             <button
               type="button"
               className="danger-button"
-              disabled={!canReset || !motionSettled}
+              disabled={!canReset || !motionSettled || (idleReset && resetNothingSelected)}
+              title={idleReset && resetNothingSelected ? 'Select what to restore.' : undefined}
               onClick={() => {
                 setResetIntent(null);
-                void program.reset();
+                void program.reset(resetSelectionApplied);
               }}
             >Reset Program</button>
           </div>

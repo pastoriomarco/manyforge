@@ -357,7 +357,7 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
       [this] {
         std::lock_guard state_lock(state_mutex_);
         return is_active_stop_fault_latch(active_stop_fault_latch_);
-      });
+      }, config_.cell_admission_program_reset_status_source);
   refresh_execution_claims();  // construction is single-threaded
   if (recovery.value().recovered_stops.size() > kMaximumResidentStopTerminalRecords) {
     throw std::runtime_error("recovered Stop terminal history exceeds its fixed bound");

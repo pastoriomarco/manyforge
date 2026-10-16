@@ -4,6 +4,7 @@ import type { ProgramTreeNode } from '../types/api';
 import {
   collapsedProgramItems,
   collapsibleProgramNodeIds,
+  defaultCollapsedProgramNodeIds,
   hiddenProgramNodeIds,
   programDescendantCount,
 } from './programCollapse';
@@ -30,6 +31,18 @@ describe('collapsed Program subtrees', () => {
     expect(hidden.has('g2')).toBe(true);
     expect(hidden.has('loose')).toBe(false);
     expect(hidden.has('l1')).toBe(false);
+  });
+
+  it('opens with only the collapsible nodes flagged collapsed_by_default', () => {
+    const flagged = (target: ProgramTreeNode): ProgramTreeNode => ({
+      ...target, metadata: { collapsed_by_default: true },
+    });
+    const program = node('root', [
+      flagged(node('leaf')),
+      flagged(node('pick', [node('p1')])),
+      node('place', [node('q1')]),
+    ]);
+    expect([...defaultCollapsedProgramNodeIds([program])]).toEqual(['pick']);
   });
 
   it('lists only nodes with children as collapsible, roots included', () => {

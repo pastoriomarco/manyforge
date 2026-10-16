@@ -1026,6 +1026,7 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   case CommandKind::kReadManualHandover:
   case CommandKind::kSubmit:
   case CommandKind::kSetRuntimeScaleControl:
+  case CommandKind::kResetRobotPosition:
     return true;
   default:
     return false;
@@ -1037,6 +1038,7 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
 /// on the Scene-read lane and never occupies the ordinary lane.
 [[nodiscard]] bool ReadsManagerScene(const CommandKind kind) noexcept {
   return kind == CommandKind::kIdentity || kind == CommandKind::kStatus ||
+         kind == CommandKind::kResetRobotPositionCapability ||
          kind == CommandKind::kTargets || kind == CommandKind::kControlState;
 }
 
@@ -1057,6 +1059,7 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   case CommandKind::kStopProgramSelection:
   case CommandKind::kFullStop:
   case CommandKind::kMalformedStop:
+  case CommandKind::kResetRobotPosition:
     return true;
   default:
     return false;
@@ -1074,7 +1077,8 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   const auto *intent =
       std::get_if<core::CellAdmissionClaimIntentDTO>(&packet.request);
   return intent != nullptr &&
-         intent->claim_kind == core::CellAdmissionClaimKindDTO::kComponentLifecycle;
+         (intent->claim_kind == core::CellAdmissionClaimKindDTO::kComponentLifecycle ||
+          intent->claim_kind == core::CellAdmissionClaimKindDTO::kProgramReset);
 }
 
 [[nodiscard]] Command DecodeCommand(std::string_view bytes) {
@@ -1187,6 +1191,40 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   if (command == "identity") {
     RequireExactObjectSize(root, 2U, "identity command");
     return Command{CommandKind::kIdentity};
+  }
+  if (command == "reset_robot_position_capability") {
+    RequireExactObjectSize(root, 2U, "Reset position capability command");
+    return Command{CommandKind::kResetRobotPositionCapability};
+  }
+  if (command == "reset_robot_position") {
+    RequireExactObjectSize(root, 4U, "Reset position command");
+    const auto &authorization = Member(root, "authorization");
+    RequireExactObjectSize(authorization, 9U, "Reset position authorization");
+    const auto run = OptionalText(authorization, "program_run_id");
+    const auto cycle_claim = OptionalCounter(authorization, "cycle_claim_generation", 1U);
+    const auto reference = OptionalText(authorization, "terminal_or_settlement_reference");
+    const auto reset_claim = OptionalCounter(authorization, "reset_claim_generation", 1U);
+    core::ProgramResetPositionAuthorizationDTO grant{
+        core::RequestOwnerEpoch(Text(authorization, "program_runner_owner_epoch")),
+        Counter(authorization, "cycle_generation", 1U),
+        core::RequestOwnerEpoch(Text(authorization, "request_owner_epoch")),
+        core::RequestId(Text(authorization, "request_id")),
+        core::ContentDigest(Text(authorization, "request_payload_digest")),
+        run ? std::optional{core::ProgramRunId(*run)} : std::nullopt,
+        cycle_claim ? std::optional{core::CellAdmissionClaimGeneration(*cycle_claim)} : std::nullopt,
+        reference ? std::optional{core::ContentDigest(*reference)} : std::nullopt,
+        reset_claim ? std::optional{core::CellAdmissionClaimGeneration(*reset_claim)} : std::nullopt};
+    Require(core::ValidateProgramResetPositionAuthorization(grant).ok(),
+            "Reset position authorization has an invalid shape");
+    const auto &expected = Member(root, "expected_deployment_identity");
+    RequireExactObjectSize(expected, 4U, "Reset position expected Deployment");
+    Command decoded{CommandKind::kResetRobotPosition};
+    decoded.reset_robot_position = ProgramResetPositionRequest{
+        std::move(grant), core::RequestOwnerEpoch(Text(expected, "owner_epoch")),
+        core::ActiveBundlePublicationGeneration(Counter(expected, "active_publication_generation", 1U)),
+        core::RetainedBundleId(Text(expected, "retained_bundle_id")),
+        core::GraphRevision(Text(expected, "graph_revision"))};
+    return decoded;
   }
   if (command == "targets") {
     RequireExactObjectSize(root, 2U, "targets command");

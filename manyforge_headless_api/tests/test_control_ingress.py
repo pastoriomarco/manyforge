@@ -717,3 +717,24 @@ def test_standalone_native_control_does_not_require_a_program_runner() -> None:
     assert service.request.request_context.request_owner_epoch == (
         "kernel.epoch.standalone"
     )
+
+
+@pytest.mark.parametrize("accepted", [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("requested", [(False, False), (True, False), (False, True), (True, True)])
+def test_reset_join_requires_exact_accepted_options(accepted, requested):
+    clock = _Clock()
+    ingress, _stamps = _ingress(clock)
+    try:
+        request = _request(ingress, kind="program_reset").model_copy(update={"payload": {
+            "program_run_id": None, "expected_owner_epoch": "runner.1", "expected_cycle_generation": 3,
+            "reload_initial_scene": requested[0], "reset_robot_position": requested[1],
+        }})
+        cycle = {"program_runner_owner_epoch": "runner.1", "execution_control_revision": 7,
+                 "cycle_generation": 3, "program_run_id": None, "state": "resetting",
+                 "reset_options": {"reload_initial_scene": accepted[0], "reset_robot_position": accepted[1]}}
+        disposition, projection = HeadlessExecutionControlDispatch(object())._reduce_unavailable(request, cycle, None)
+        assert disposition.disposition == ("joined" if accepted == requested else "rejected")
+        assert disposition.code == ("program_reset_already_current" if accepted == requested else "program_run_request_conflict")
+        assert projection == {"program_cycle": cycle}
+    finally:
+        ingress.close()

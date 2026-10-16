@@ -498,7 +498,7 @@ describe('mounted explicit activation API boundaries', () => {
   it('rereads an activation-sequence conflict without losing its captured applied order', async () => {
     await mountCCLC();
     apiMock.cclc.component.mockRejectedValueOnce(componentReadChanged());
-    let activation!: Promise<void>;
+    let activation!: Promise<boolean>;
     await act(async () => { activation = hook!.activateSequence(); });
     const appliedReads = apiMock.deploymentWorkspace.get.mock.calls.length;
     expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
@@ -516,7 +516,7 @@ describe('mounted explicit activation API boundaries', () => {
   it('refuses a changed applied order before rereading a sequence conflict', async () => {
     await mountCCLC();
     apiMock.cclc.component.mockRejectedValueOnce(componentReadChanged());
-    let activation!: Promise<void>;
+    let activation!: Promise<boolean>;
     await act(async () => { activation = hook!.activateSequence(); });
     apiMock.deploymentWorkspace.get.mockResolvedValue({ managerApplied: {
       scenarioId: 'fixture', deploymentRevision: 'deployment.replacement',
@@ -679,7 +679,7 @@ describe('mounted explicit activation API boundaries', () => {
       sent = request;
       return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
     });
-    let activation!: Promise<void>;
+    let activation!: Promise<boolean>;
     await act(async () => { activation = hook!.activateSequence(); });
     expect(hook!.pendingActivationRequest).toBe(sent);
     if (stop === 'cancel') await act(async () => { hook!.cancelActivation(); });

@@ -17300,6 +17300,111 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     FullStopAcceptsWhileResetPositionGrantIsPendingAndItsHeldClaimRejectsMotion) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  HeldSettlementCall pending_position_read;
+  std::atomic<bool> block_position_reads{};
+  ProgramCycleStatusDTO resetting{
+      RequestOwnerEpoch("program.owner"),
+      1U,
+      ProgramCycleStateDTO::kResetting,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      AcceptedProgramResetDTO{RequestOwnerEpoch("operator.reset"), RequestId("reset.position.1"),
+                              ContentDigest(test_digest('a')), false, true, std::nullopt}};
+  auto direct = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  direct.intrinsic_direct_control = true;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  config.cell_admission_program_reset_status_source = [&](const auto purpose, const auto&,
+                                                          const auto&) {
+    if (purpose == ProgramResetJournalReadPurpose::kResetRobotPosition && block_position_reads)
+      pending_position_read.Hold();
+    return Result<ProgramCycleStatusDTO>::Ok(resetting);
+  };
+  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const auto request_id = ProgramResetClaimRequestId(resetting);
+  ASSERT_TRUE(request_id.ok());
+  const CellAdmissionClaimIntentDTO intent{CellAdmissionClaimKindDTO::kProgramReset,
+                                           CellAdmissionOwnerRoleDTO::kProgramRunner,
+                                           resetting.program_runner_owner_epoch,
+                                           request_id.value().value(),
+                                           request_id.value(),
+                                           resetting.accepted_reset->request_payload_digest,
+                                           kernel.GetAuthoringAdmission().admission_generation,
+                                           {},
+                                           std::nullopt,
+                                           std::nullopt};
+  const auto acquired = kernel.AcquireCellAdmissionClaim(intent);
+  ASSERT_TRUE(acquired.ok()) << acquired.error().message;
+  resetting.accepted_reset->reset_claim_generation = acquired.value().claim_generation;
+  ASSERT_TRUE(
+      kernel.UpdateCellAdmissionReadiness({true, resetting, true, 1U, 1U, true, true, 0U, 0U, 0U})
+          .ok());
+  const ProgramResetPositionAuthorizationDTO authorization{
+      resetting.program_runner_owner_epoch,
+      resetting.cycle_generation,
+      resetting.accepted_reset->request_owner_epoch,
+      resetting.accepted_reset->request_id,
+      resetting.accepted_reset->request_payload_digest,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      acquired.value().claim_generation};
+  ASSERT_TRUE(kernel.ValidateProgramResetPositionAuthorization(authorization).ok());
+
+  block_position_reads = true;
+  auto authorizing = std::async(std::launch::async, [&] {
+    return kernel.ValidateProgramResetPositionAuthorization(authorization);
+  });
+  // Declared after the future: failure unwinding releases the actual blocked
+  // reader before the future's destructor waits for its worker.
+  const auto release_reader = std::shared_ptr<void>(
+      &pending_position_read, [&](void*) { pending_position_read.Release(); });
+  ASSERT_TRUE(pending_position_read.Entered());
+  auto motion = motion_operation("request.during-position-reset");
+  motion.program_run_id = ProgramRunId("manual.run");
+  const auto refused = kernel.execute(motion);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "positive_admission_required");
+  EXPECT_EQ(engine.prepare_motion_calls, 0);
+  EXPECT_EQ(engine.execute_calls, 0);
+
+  auto stopping = std::async(std::launch::async, [&] {
+    return kernel.full_stop({{RequestId("request.stop-during-position-reset"),
+                              RequestOwnerEpoch("kernel.epoch.1"), "test", std::nullopt},
+                             StopGeneration(0U),
+                             {}});
+  });
+  // Also protect a regression where Stop itself waits for the reader. This
+  // guard must die before either asynchronous call's future destructor.
+  const auto release_before_stop_join = std::shared_ptr<void>(
+      &pending_position_read, [&](void*) { pending_position_read.Release(); });
+  const auto stop_ready = stopping.wait_for(std::chrono::seconds(1));
+  const auto position_still_pending = authorizing.wait_for(std::chrono::seconds(0));
+  pending_position_read.Release();
+  const auto stopped = stopping.get();
+  static_cast<void>(authorizing.get());
+  ASSERT_EQ(stop_ready, std::future_status::ready);
+  EXPECT_EQ(position_still_pending, std::future_status::timeout);
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  EXPECT_EQ(stopped.value().resolution_reason, StopScopeResolutionReasonDTO::kExplicitFullStop);
+  EXPECT_TRUE(stopped.value().affected_operation_revisions.empty());
+  EXPECT_EQ(kernel.ReadHeldCellAdmissionClaim(CellAdmissionClaimKindDTO::kProgramReset),
+            std::optional<CellAdmissionClaimDTO>(acquired.value()));
+  EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
+  // This is Kernel ingress/claim evidence with no live execution. It makes no
+  // claim that an empty-scope Stop cancels a ROS writer or proves physical rest.
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      ReceiverExpiryPreemptsBlockedUnfenceAndContainsActiveOperation) {
   FakeClock clock;
   ManualScheduler scheduler;

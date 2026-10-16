@@ -8,7 +8,9 @@ import {
 } from 'react';
 
 import { api } from '../api/client';
-import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
+import { sameAuthoringWorkspaceIdentity } from '../hooks/useHeadlessState';
+import { managerPublicationMatches } from '../state/scenarioClose';
+import type { ProgramWorkspaceController, ScenarioReplacementIdentity, ScenarioCloseSceneProgress } from '../hooks/useProgramWorkspace';
 import type {
   ScenarioDocumentEntry,
   ScenarioDocumentIndexResponse,
@@ -26,6 +28,20 @@ import {
 
 type ScenarioAction = 'new' | 'save_as' | 'load' | 'close';
 type SaveAsMode = 'project' | 'portable';
+interface ReplacementConfirmation {
+  kind: 'new' | 'load' | 'close';
+  path: string | null;
+  name: string;
+  confirmDiscard: boolean;
+  predecessor: ManagerActiveProjection;
+  confirmed: ScenarioReplacementIdentity;
+}
+interface AfterCloseReplacement extends Omit<ReplacementConfirmation, 'kind' | 'path'> {
+  kind: 'new' | 'load' | 'close';
+  path: string | null;
+  closed: ManagerActiveProjection;
+  sceneProgress?: ScenarioCloseSceneProgress;
+}
 
 interface ScenarioDocumentCommandsProps {
   controller: ProgramWorkspaceController;
@@ -33,9 +49,11 @@ interface ScenarioDocumentCommandsProps {
   deploymentDirty?: boolean;
   localInvalidEdit?: boolean;
   /** GUI composition of the existing owner commands; resolves only on exact empty proof. */
-  closeScenario?: (expected: ManagerActiveProjection) => Promise<ManagerActiveProjection | null>;
+  closeScenario?: (expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity, callerSignal?: AbortSignal) => Promise<ManagerActiveProjection | null>;
   closeUnavailableReason?: string | null;
   closeProgress?: string | null;
+  /** Robots are moving (Program motion not held, or a manual operation). */
+  motionActive?: boolean;
 }
 
 const SCENARIO_ID_PATTERN = /^[a-z][a-z0-9._-]{0,127}$/;
@@ -84,7 +102,10 @@ export function ScenarioDocumentCommands({
   closeScenario,
   closeUnavailableReason = null,
   closeProgress = null,
+  motionActive = false,
 }: ScenarioDocumentCommandsProps) {
+  // Document actions wait while robots move (maintainer, 2026-10-16).
+  const motionReason = motionActive ? 'Not available while robots are moving. Stop motion first.' : null;
   const {
     state,
     documentUnavailableReason,
@@ -110,7 +131,18 @@ export function ScenarioDocumentCommands({
   const [newError, setNewError] = useState<string | null>(null);
   const [publishedScenarioId, setPublishedScenarioId] = useState<string | null>(null);
   const [replacementPending, setReplacementPending] = useState(false);
-  const replacementInFlight = useRef(false);
+  const replacementInFlight = useRef<false | 'closing' | 'waiting' | 'submitting'>(false);
+  const [confirmation, setConfirmation] = useState<ReplacementConfirmation | null>(null);
+  const [afterClose, setAfterClose] = useState<AfterCloseReplacement | null>(null);
+  const replacementMounted = useRef(true);
+  const closeCallerAbort = useRef<AbortController | null>(null);
+  useEffect(() => {
+    replacementMounted.current = true;
+    return () => {
+      replacementMounted.current = false; replacementInFlight.current = false;
+      closeCallerAbort.current?.abort(new Error('Scenario Close caller was unmounted.'));
+    };
+  }, []);
   const latestController = useRef(controller);
   useEffect(() => { latestController.current = controller; }, [controller]);
   const [newWorkspaceKey, setNewWorkspaceKey] = useState<string | null>(null);
@@ -139,8 +171,8 @@ export function ScenarioDocumentCommands({
     : busy
       ? 'Another operation is in progress.'
       : documentUnavailableReason;
-  // Ordinary document actions require Idle. Close has its own owner refusals
-  // and can retire a quiescent stopped target without Resetting its operation.
+  // Ordinary document actions require Idle. Internal replacement retains its
+  // existing Close path; standalone Close first prepares the exact stopped/idle cycle.
   const blocked = busy || documentUnavailableReason !== null || localInvalidEdit || workspace === null;
   const closeEntryReason = localInvalidEdit
     ? 'Review or discard the invalid local field edit first.'
@@ -263,16 +295,23 @@ export function ScenarioDocumentCommands({
   }, [action, newParent]);
 
   const closeAction = useCallback(() => {
-    if (replacementInFlight.current) return;
+    if (replacementInFlight.current && replacementInFlight.current !== 'waiting') return;
+    if (afterClose?.kind === 'close' && (afterClose.sceneProgress?.removed ?? 0) > 0)
+      latestController.current.reportCloseCancellation(afterClose.sceneProgress!.removed);
+    replacementInFlight.current = false;
+    setAfterClose(null);
+    setConfirmation(null);
+    setReplacementPending(false);
     setAction(null);
     setConfirmDiscard(false);
     setConfirmOverwrite(false);
-  }, []);
+  }, [afterClose]);
   const beginAction = (
     next: ScenarioAction,
     event: MouseEvent<HTMLButtonElement>,
   ) => {
     returnFocus.current = event.currentTarget;
+    if (next === 'close') setCurrentApplied(null);
     setConfirmDiscard(false);
     setConfirmOverwrite(false);
     if (next === 'new') {
@@ -309,26 +348,64 @@ export function ScenarioDocumentCommands({
     && (currentApplied.canonicalEmpty || selectedScenarioDocument?.scenarioId !== publishedScenarioId);
   const closeUnavailable = (action === 'new' || action === 'close' || loadClosesCurrent)
     && (closeScenario === undefined || closeUnavailableReason !== null);
-  const replacementReason = newError ?? (action === 'new' || action === 'close' || loadClosesCurrent
-    ? closeEntryReason : blockReason) ?? (closeUnavailable ? 'Scenario Close is unavailable.' : null);
+  const replacementReason = newError ?? (replacementPending ? null
+    : (action === 'new' || action === 'close' || loadClosesCurrent
+      ? closeEntryReason : blockReason) ?? (closeUnavailable ? 'Scenario Close is unavailable.' : null));
   const selectedIdentityUnknown = action === 'load' && selectedScenarioDocument !== null
     && selectedScenarioDocument.scenarioId === null;
-  const completeReplacement = async (kind: 'new' | 'load' | 'close') => {
-    if (replacementInFlight.current || currentApplied === null || replacementReason !== null
-      || (kind === 'load' && selectedIdentityUnknown)) return;
-    if ((kind !== 'load' || loadClosesCurrent || replaceNeedsConfirmation) && !confirmDiscard) return;
-    const expected = currentApplied;
-    const confirmedPath = kind === 'new' ? newPath : selectedScenarioPath;
-    const confirmedName = scenarioName;
-    const mustClose = kind !== 'load' || loadClosesCurrent;
-    replacementInFlight.current = true;
+  const completeReplacement = async (kind: 'new' | 'load' | 'close', acknowledged?: ReplacementConfirmation) => {
+    if (replacementInFlight.current || currentApplied === null) return;
+    if (replacementReason !== null || (kind === 'load' && selectedIdentityUnknown)) {
+      if (acknowledged !== undefined) {
+        setConfirmation(null);
+        setNewError(replacementReason ?? 'Selected Scenario identity cannot be verified.');
+      }
+      return;
+    }
+    const mustClose = acknowledged !== undefined || kind !== 'load' || loadClosesCurrent;
+    if (!mustClose && replaceNeedsConfirmation && !confirmDiscard) return;
+    const expected = acknowledged?.predecessor ?? currentApplied;
+    const confirmedPath = kind === 'close' ? null
+      : acknowledged?.path ?? (kind === 'new' ? newPath : selectedScenarioPath);
+    const confirmedName = acknowledged?.name ?? scenarioName;
+    const confirmed = acknowledged?.confirmed ?? latestController.current.scenarioReplacementIdentity;
+    if (mustClose && confirmed === null) {
+      setNewError('The shared workspace is not current. No replacement was requested.');
+      return;
+    }
+    if (acknowledged !== undefined) {
+      const current = latestController.current.scenarioReplacementIdentity;
+      if (current === null || localInvalidEdit
+        || !sameAuthoringWorkspaceIdentity(current.authoring, acknowledged.confirmed.authoring)
+        || current.receiverEpoch !== acknowledged.confirmed.receiverEpoch
+        || current.managerOwnerId !== acknowledged.confirmed.managerOwnerId
+        || current.managerOwnerEpoch !== acknowledged.confirmed.managerOwnerEpoch
+        || !managerPublicationMatches(current.managerActive, acknowledged.predecessor)) {
+        setConfirmation(null);
+        setNewError('The confirmed workspace, Draft or Applied publication changed. No replacement was requested.');
+        return;
+      }
+    }
+    if (kind !== 'close' && confirmedPath === null) return;
+    const discard = mustClose || confirmDiscard;
+    if (mustClose && (!expected.canonicalEmpty || replaceNeedsConfirmation)
+      && acknowledged === undefined && confirmed !== null) {
+      setConfirmation({ kind, path: confirmedPath, name: confirmedName, confirmDiscard: true,
+        predecessor: expected, confirmed });
+      return;
+    }
+    setConfirmation(null);
+    replacementInFlight.current = 'closing';
     setReplacementPending(true);
     setNewError(null);
+    let deferredAfterClose = false;
     try {
       let empty = expected;
       if (mustClose) {
         if (closeScenario === undefined) throw new Error('Scenario Close is unavailable.');
-        const result = await closeScenario(expected);
+        const result = await closeScenario(expected, confirmed ?? undefined,
+          (closeCallerAbort.current = new AbortController()).signal);
+        if (!replacementMounted.current) return;
         if (result === null) {
           setNewError('Scenario Close is refused or unresolved; no replacement was requested.');
           return;
@@ -336,51 +413,129 @@ export function ScenarioDocumentCommands({
         if (!result.canonicalEmpty) throw new Error('Scenario Close has no current canonical-empty proof.');
         empty = result;
       }
-      if (kind === 'close') {
-        setAction(null);
+      if (kind !== 'close' && confirmedPath === null) return;
+      if (mustClose && confirmed !== null) {
+        replacementInFlight.current = 'waiting';
+        deferredAfterClose = true;
+        setAfterClose({ kind, path: confirmedPath, name: confirmedName, confirmDiscard: discard,
+          predecessor: expected, closed: empty, confirmed });
         return;
       }
       if (confirmedPath === null) return;
-      const result = kind === 'new'
-        ? await latestController.current.newScenarioDocument({
-          path: confirmedPath, name: confirmedName, deploymentChoice: 'empty',
-          expectedRetainedBundleId: empty.retainedBundleId,
-          expectedGraphRevision: empty.graphRevision, confirmDiscard: true,
-        })
-        : await latestController.current.loadScenarioDocument(confirmedPath, confirmDiscard);
+      const result = await latestController.current.loadScenarioDocument(confirmedPath, discard);
       if (result !== null) setAction(null);
     } catch (error: unknown) {
-      setNewError(error instanceof Error ? error.message : 'Scenario replacement is unresolved.');
+      const message = error instanceof Error ? error.message : 'Scenario replacement is unresolved.';
+      if (!replacementMounted.current) latestController.current.reportCloseCancellation(0, message);
+      else setNewError(message);
     } finally {
-      replacementInFlight.current = false;
-      setReplacementPending(false);
+      closeCallerAbort.current = null;
+      if (!deferredAfterClose) {
+        replacementInFlight.current = false;
+        setReplacementPending(false);
+      }
     }
   };
-  const closeWarning = <>
-    <p className="inline-message severity-warning" role="note">
-      Close the current Scenario before continuing. Active targets are retired, open component incidents acknowledged, components disabled,
-      and their processes stopped before applying the empty configuration.
-      {managedComponentNames.length > 0 && ` Components: ${managedComponentNames.join(', ')}.`}
-    </p>
-    {replaceNeedsConfirmation && <p className="inline-message severity-warning">
-      Current unsaved and unapplied Draft changes will be discarded.
-    </p>}
-    <p>Robot positions may be unknown after Close. Robots and physically held parts may remain;
-      account for them before using the next cell.</p>
-    <label className="confirmation-check">
-      <input type="checkbox" checked={confirmDiscard} disabled={replacementPending}
-        onChange={(event) => setConfirmDiscard(event.target.checked)} />
-      I confirm closing the current Scenario{replaceNeedsConfirmation ? ' and discarding its Draft changes' : ''}
-    </label>
-  </>;
+  useEffect(() => {
+    if (action === 'close' && currentApplied !== null && confirmation === null
+      && !replacementPending && replacementReason === null) void completeReplacement('close');
+  }, [action, currentApplied, confirmation, replacementPending, replacementReason]);
+  useEffect(() => {
+    if (afterClose === null || replacementInFlight.current !== 'waiting') return;
+    const admission = afterClose.kind === 'close'
+      ? controller.scenarioCloseSceneHandoff(afterClose.predecessor, afterClose.closed, afterClose.confirmed, afterClose.sceneProgress ?? null)
+      : controller.scenarioCloseHandoff(afterClose.predecessor, afterClose.closed, afterClose.confirmed);
+    if (admission.status === 'waiting' && !localInvalidEdit) return;
+    // Claim before invoking the ordinary mutation: StrictMode and later owner
+    // publications must never send this already-confirmed replacement twice.
+    replacementInFlight.current = 'submitting';
+    setAfterClose(null);
+    if (admission.status === 'refused' || localInvalidEdit) {
+      setNewError(localInvalidEdit ? 'The local edit changed. No replacement was sent.'
+        : `${admission.message ?? 'Scenario replacement is not admitted.'}${afterClose.kind === 'close'
+          ? ` ${afterClose.sceneProgress?.removed ?? 0} Scene object removal(s) confirmed; editors were kept. Nothing was retried.` : ''}`);
+      replacementInFlight.current = false;
+      setReplacementPending(false);
+      return;
+    }
+    void (async () => {
+      let continuingScene = false;
+      try {
+        if (!replacementMounted.current) return;
+        let result;
+        if (afterClose.kind === 'close') {
+          const step = controller.scenarioCloseSceneHandoff(afterClose.predecessor, afterClose.closed, afterClose.confirmed, afterClose.sceneProgress ?? null);
+          if (step.status !== 'ready' || step.progress === undefined) throw new Error(step.message ?? 'Scene clearing is not admitted.');
+          if (step.objectId !== null || step.policyResetRequired) {
+            const progress = await controller.removeClosedSceneObject(afterClose.predecessor, afterClose.closed, afterClose.confirmed, step.progress);
+            if (!replacementMounted.current) return;
+            // The successful receipt names one new revision. Wait for that
+            // exact publication and current admission before the next step.
+            continuingScene = true;
+            replacementInFlight.current = 'waiting';
+            setAfterClose({ ...afterClose, sceneProgress: progress });
+            return;
+          }
+          result = await controller.clearClosedScenario(afterClose.predecessor, afterClose.closed, afterClose.confirmed, step.progress);
+        } else result = afterClose.kind === 'new' && afterClose.path !== null
+          ? await controller.newScenarioDocument({ path: afterClose.path, name: afterClose.name,
+            deploymentChoice: 'empty', expectedRetainedBundleId: afterClose.closed.retainedBundleId,
+            expectedGraphRevision: afterClose.closed.graphRevision, confirmDiscard: true })
+          : afterClose.path !== null
+            ? await controller.loadScenarioDocument(afterClose.path, afterClose.confirmDiscard) : null;
+        if (result !== null) setAction(null);
+        else setNewError('Scenario closed, but the replacement was refused or is unresolved. Review the current backend status; nothing was retried.');
+      } catch (error: unknown) {
+        const removed = afterClose.sceneProgress?.removed ?? 0;
+        setNewError(`${error instanceof Error ? error.message : 'Scenario replacement is unresolved.'}${afterClose.kind === 'close'
+          ? ` ${removed} Scene object removal(s) confirmed; editors were kept. Nothing was retried.` : ''}`);
+      } finally {
+        if (!continuingScene) {
+          replacementInFlight.current = false;
+          setReplacementPending(false);
+        }
+      }
+    })();
+  }, [afterClose, controller, localInvalidEdit]);
+  const afterCloseMessage = afterClose === null ? null
+    : (afterClose.kind === 'close'
+      ? controller.scenarioCloseSceneHandoff(afterClose.predecessor, afterClose.closed, afterClose.confirmed, afterClose.sceneProgress ?? null)
+      : controller.scenarioCloseHandoff(afterClose.predecessor, afterClose.closed, afterClose.confirmed)).message;
+  const emptyConfirmation = (confirmation?.predecessor ?? currentApplied)?.canonicalEmpty === true;
+  const closeOnlyConfirmation = confirmation?.kind === 'close';
+  const clearDraftMessage = 'The cell will be emptied and the Program and Scene editors cleared. Unsaved and unapplied Draft changes will be discarded. Saved files are unchanged.';
+  // Same look as the Reset/Execute confirmations: a short lead, the consequences
+  // as a list, then what stays physically true.
+  const closeWarning = emptyConfirmation
+    ? <>
+      <p>{closeOnlyConfirmation ? clearDraftMessage : 'Discard the current Draft and continue?'}</p>
+      {!closeOnlyConfirmation && replaceNeedsConfirmation
+        && <p>Current unsaved and unapplied Draft changes will be discarded.</p>}
+    </>
+    : <>
+      <p>
+        {closeOnlyConfirmation ? 'Close the current Scenario:' : 'The current Scenario is closed first:'}
+        {managedComponentNames.length > 0 && ` ${managedComponentNames.join(', ')}.`}
+      </p>
+      <ul>
+        <li>a finished, stopped or held Program is Reset first, ending the run;</li>
+        <li>carried objects are detached in the Scene at their current pose;</li>
+        <li>active targets are retired, open component incidents acknowledged, components disabled and their processes stopped;</li>
+        {closeOnlyConfirmation && <li>{clearDraftMessage}</li>}
+        {!closeOnlyConfirmation && replaceNeedsConfirmation
+          && <li>Current unsaved and unapplied Draft changes will be discarded.</li>}
+      </ul>
+      <p>Robot positions may be unknown after Close. Robots and physically held parts may remain;
+        account for them before using the next cell.</p>
+    </>;
 
   return (
     <>
       <div className="scenario-commands" role="group" aria-label="Scenario">
         <ScenarioIconButton
           label="New"
-          reason={closeEntryReason}
-          disabled={closeEntryReason !== null}
+          reason={motionReason ?? closeEntryReason}
+          disabled={motionReason !== null || closeEntryReason !== null}
           onClick={(event) => beginAction('new', event)}
         >
           <path d="M3.5 2.5h5.75L12.5 5.75v7.75a.5.5 0 0 1-.5.5H3.5a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5z" />
@@ -388,8 +543,8 @@ export function ScenarioDocumentCommands({
         </ScenarioIconButton>
         <ScenarioIconButton
           label={saveTarget ? 'Save Scenario' : 'Save Scenario (choose a project folder)'}
-          reason={blockReason ?? 'Scenario already matches Saved.'}
-          disabled={blocked || (saveTarget !== null && !hasUnsavedChanges)}
+          reason={motionReason ?? blockReason ?? 'Scenario already matches Saved.'}
+          disabled={motionReason !== null || blocked || (saveTarget !== null && !hasUnsavedChanges)}
           onClick={(event) => {
             if (saveTarget === null) {
               beginAction('save_as', event);
@@ -403,8 +558,8 @@ export function ScenarioDocumentCommands({
         </ScenarioIconButton>
         <ScenarioIconButton
           label="Save Scenario as"
-          reason={blockReason}
-          disabled={blocked}
+          reason={motionReason ?? blockReason}
+          disabled={motionReason !== null || blocked}
           onClick={(event) => beginAction('save_as', event)}
         >
           <path d="M3 2.5h6.5L12 5v3" />
@@ -414,21 +569,22 @@ export function ScenarioDocumentCommands({
         </ScenarioIconButton>
         <ScenarioIconButton
           label="Load Scenario"
-          reason={replacementEntryReason}
-          disabled={replacementEntryReason !== null}
+          reason={motionReason ?? replacementEntryReason}
+          disabled={motionReason !== null || replacementEntryReason !== null}
           onClick={(event) => beginAction('load', event)}
         >
           <path d="M2 4.5a.5.5 0 0 1 .5-.5H6l1.5 1.5h6a.5.5 0 0 1 .5.5V7H2z" />
           <path d="M2 7h12.5l-1.6 5.6a.5.5 0 0 1-.5.4H3.3a.5.5 0 0 1-.5-.4L2 7z" />
         </ScenarioIconButton>
-        <ScenarioIconButton label="Close Scenario" reason={closeEntryReason} disabled={closeEntryReason !== null}
+        {/* Temporary for testing: remove before release once New opens an untitled Scenario (plan hardening item “Untitled New”) */}
+        <ScenarioIconButton label="Close Scenario" reason={motionReason ?? closeEntryReason} disabled={motionReason !== null || closeEntryReason !== null}
           onClick={(event) => beginAction('close', event)}>
           <path d="M3 3l10 10M13 3L3 13" />
         </ScenarioIconButton>
       </div>
 
       <OverlayPanel
-        open={action !== null}
+        open={action !== null && confirmation === null}
         title={action === 'new' ? 'New Scenario' : action === 'save_as' ? 'Save Scenario as' : action === 'close' ? 'Close Scenario' : 'Load Scenario'}
         titleId="scenario-action-dialog-title"
         compact={false}
@@ -441,7 +597,6 @@ export function ScenarioDocumentCommands({
               Close the current Scenario and start a new saved one with an empty
               Program and Scene. The current Scenario&apos;s saved files are not changed.
             </p>
-            {closeWarning}
             <section className="dcard" aria-label="Scenario">
               <h4>Scenario</h4>
               <label className="stacked">
@@ -518,60 +673,69 @@ export function ScenarioDocumentCommands({
             </p>
             {newConfirmationStale && <p className="inline-message severity-warning" role="status">The workspace changed. Close and reopen New to review the current state.</p>}
             {replacementReason && <p className="inline-message severity-error" role="status">{replacementReason}</p>}
+            {afterCloseMessage && <p role="status">{afterCloseMessage}</p>}
             <div className="dactions new-scenario-actions">
-              <button type="button" onClick={closeAction} disabled={replacementPending}>Cancel</button>
+              <button type="button" onClick={closeAction} disabled={replacementPending && afterClose === null}>Cancel</button>
               <button type="button" className="primary-action"
-                disabled={busy || newConfirmationStale || currentApplied === null || !confirmDiscard
+                disabled={busy || newConfirmationStale || currentApplied === null
                   || replacementReason !== null || newNameError !== null || newFolderError !== null || newPath === null}
                 title={replacementReason ?? newNameError ?? newFolderError ?? undefined}
                 onClick={() => { void completeReplacement('new'); }}>
-                Close and create Scenario
+                Create Scenario
               </button>
             </div>
           </div>
         )}
 
         {action === 'save_as' && (
-          <div className="document-dialog">
+          <div className="dpanel new-scenario-dialog scenario-document-dialog">
             <div className="segmented-control scenario-save-mode" role="radiogroup" aria-label="Save format">
               <button type="button" role="radio" aria-checked={saveAsMode === 'project'} className={saveAsMode === 'project' ? 'active' : ''} onClick={() => setSaveAsMode('project')}>Project</button>
               <button type="button" role="radio" aria-checked={saveAsMode === 'portable'} className={saveAsMode === 'portable' ? 'active' : ''} onClick={() => setSaveAsMode('portable')}>Portable copy</button>
             </div>
             {saveAsMode === 'project' ? (
-              <div className="dialog-copy">
-                <p>
-                  Save the Program, Scene, Deployment, assignment and overrides as one project folder, and continue working on it. Robot meshes and other referenced sources stay where they are.
+              <>
+                <p className="new-scenario-intro">
+                  Save the Program, Scene, Deployment, assignment and overrides as one project folder, and continue working on it.
                 </p>
-                <label className="document-save-as-path">
-                  Project folder
-                  <input value={savePath} onChange={(event) => setSavePath(event.target.value)} />
-                </label>
-                <div className="scenario-metadata-grid">
-                  <label className="document-save-as-path">
-                    Scenario ID
-                    <input
-                      value={scenarioId}
-                      aria-invalid={!scenarioIdValid}
-                      onChange={(event) => setScenarioId(event.target.value)}
-                    />
-                    {!scenarioIdValid && (
-                      <small>Use lowercase letters, digits, dots, underscores, or hyphens; start with a letter.</small>
-                    )}
+                <section className="dcard" aria-label="Project">
+                  <h4>Project</h4>
+                  <label className="stacked">
+                    <span>Project folder <span className="required-mark" aria-hidden="true">*</span></span>
+                    <input value={savePath} onChange={(event) => setSavePath(event.target.value)} />
+                    <small className="field-hint">Robot meshes and other referenced sources stay where they are.</small>
                   </label>
-                  <label className="document-save-as-path">
-                    Name
-                    <input value={scenarioName} onChange={(event) => setScenarioName(event.target.value)} />
-                  </label>
-                </div>
-                <label className="document-save-as-path">
-                  Description
-                  <input value={scenarioDescription} onChange={(event) => setScenarioDescription(event.target.value)} />
-                </label>
-                <div className="dialog-actions">
                   <label className="confirmation-check">
                     <input type="checkbox" checked={confirmOverwrite} onChange={(event) => setConfirmOverwrite(event.target.checked)} />
                     Allow replacing an existing project
                   </label>
+                </section>
+                <section className="dcard" aria-label="Scenario">
+                  <h4>Scenario</h4>
+                  <div className="scenario-metadata-grid">
+                    <label className="stacked">
+                      <span>Scenario ID <span className="required-mark" aria-hidden="true">*</span></span>
+                      <input
+                        value={scenarioId}
+                        aria-invalid={!scenarioIdValid}
+                        onChange={(event) => setScenarioId(event.target.value)}
+                      />
+                      {!scenarioIdValid && (
+                        <small className="field-error">Use lowercase letters, digits, dots, underscores, or hyphens; start with a letter.</small>
+                      )}
+                    </label>
+                    <label className="stacked">
+                      <span>Name <span className="required-mark" aria-hidden="true">*</span></span>
+                      <input value={scenarioName} onChange={(event) => setScenarioName(event.target.value)} />
+                    </label>
+                  </div>
+                  <label className="stacked">
+                    <span>Description</span>
+                    <input value={scenarioDescription} onChange={(event) => setScenarioDescription(event.target.value)} />
+                  </label>
+                </section>
+                <div className="dactions new-scenario-actions">
+                  <button type="button" onClick={closeAction}>Cancel</button>
                   <button
                     type="button"
                     className="primary-action"
@@ -588,20 +752,24 @@ export function ScenarioDocumentCommands({
                     Save Scenario
                   </button>
                 </div>
-              </div>
+              </>
             ) : (
-              <div className="dialog-copy">
-                <p>
+              <>
+                <p className="new-scenario-intro">
                   Write a self-contained copy of the saved project, including the robot sources and Scene assets it references. The open project is not changed.
                 </p>
                 {scenarioDocumentPath === null && (
                   <p className="inline-message severity-warning">Save the Scenario as a project first.</p>
                 )}
-                <label className="document-save-as-path">
-                  New destination folder
-                  <input value={exportDestinationPath} onChange={(event) => setExportDestinationPath(event.target.value)} />
-                </label>
-                <div className="dialog-actions">
+                <section className="dcard" aria-label="Destination">
+                  <h4>Destination</h4>
+                  <label className="stacked">
+                    <span>New destination folder <span className="required-mark" aria-hidden="true">*</span></span>
+                    <input value={exportDestinationPath} onChange={(event) => setExportDestinationPath(event.target.value)} />
+                  </label>
+                </section>
+                <div className="dactions new-scenario-actions">
+                  <button type="button" onClick={closeAction}>Cancel</button>
                   <button
                     type="button"
                     className="primary-action"
@@ -611,75 +779,79 @@ export function ScenarioDocumentCommands({
                     Export copy
                   </button>
                 </div>
-              </div>
+              </>
             )}
           </div>
         )}
 
         {action === 'load' && (
-          <div className="dialog-copy">
-            <div className="scenario-directory-row">
-              <label className="document-save-as-path">
-                Scenario directory
-                <input value={scenarioDirectory} disabled={replacementPending} onChange={(event) => {
-                  setScenarioDirectory(event.target.value);
-                  scenarioDirectoryRef.current = event.target.value;
-                }} />
-              </label>
-              <button type="button" disabled={replacementPending || scenarioIndexLoading} onClick={() => void refreshScenarioIndex(scenarioDirectory)}>
-                {scenarioIndexLoading ? 'Reading…' : 'Refresh'}
-              </button>
-            </div>
-            {scenarioIndexError && <div className="document-apply-blocked" role="alert">{scenarioIndexError}</div>}
-            <label className="document-save-as-path">
-              Available Scenario
-              <select
-                value={selectedScenarioKey}
-                disabled={replacementPending || scenarioIndexLoading || scenarioIndex === null}
-                onChange={(event) => { setSelectedScenarioKey(event.target.value); setConfirmDiscard(false); }}
-              >
-                <option value="">Select a Scenario</option>
-                {scenarioIndex?.entries.map((entry) => (
-                  <option
-                    key={scenarioEntryKey(entry)}
-                    value={scenarioEntryKey(entry)}
-                    disabled={entry.displayStatus === 'unsupported'}
-                    title={entry.statusDetail}
-                  >
-                    {entry.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {selectedScenarioDocument && (
-              <div className={`scenario-status scenario-status-${selectedScenarioDocument.displayStatus}`}>
-                <strong>{selectedScenarioDocument.name}</strong>
-                <span>{selectedScenarioDocument.statusDetail}</span>
-                {selectedScenarioDocument.description && (
-                  <span>{selectedScenarioDocument.description}</span>
-                )}
-              </div>
-            )}
-            <p>
-              The list shows saved metadata, not current readiness. The selected Scenario is validated when you load it.
-            </p>
-            <p>
+          <div className="dpanel new-scenario-dialog scenario-document-dialog">
+            <p className="new-scenario-intro">
               Load replaces the current Scenario and applies its Deployment, Scene and Program. It does not start motion.
             </p>
-            {(loadClosesCurrent || currentApplied === null) && closeWarning}
+            <section className="dcard" aria-label="Location">
+              <h4>Location</h4>
+              <div className="scenario-directory-row">
+                <label className="stacked">
+                  <span>Scenario directory</span>
+                  <input value={scenarioDirectory} disabled={replacementPending} onChange={(event) => {
+                    setScenarioDirectory(event.target.value);
+                    scenarioDirectoryRef.current = event.target.value;
+                  }} />
+                </label>
+                <button type="button" disabled={replacementPending || scenarioIndexLoading} onClick={() => void refreshScenarioIndex(scenarioDirectory)}>
+                  {scenarioIndexLoading ? 'Reading…' : 'Refresh'}
+                </button>
+              </div>
+              {scenarioIndexError && <div className="document-apply-blocked" role="alert">{scenarioIndexError}</div>}
+            </section>
+            <section className="dcard" aria-label="Scenario">
+              <h4>Scenario</h4>
+              <label className="stacked">
+                <span>Available Scenario</span>
+                <select
+                  value={selectedScenarioKey}
+                  disabled={replacementPending || scenarioIndexLoading || scenarioIndex === null}
+                  onChange={(event) => { setSelectedScenarioKey(event.target.value); setConfirmDiscard(false); }}
+                >
+                  <option value="">Select a Scenario</option>
+                  {scenarioIndex?.entries.map((entry) => (
+                    <option
+                      key={scenarioEntryKey(entry)}
+                      value={scenarioEntryKey(entry)}
+                      disabled={entry.displayStatus === 'unsupported'}
+                      title={entry.statusDetail}
+                    >
+                      {entry.name}
+                    </option>
+                  ))}
+                </select>
+                <small className="field-hint">The list shows saved metadata, not current readiness. The selected Scenario is validated when you load it.</small>
+              </label>
+              {selectedScenarioDocument && (
+                <div className={`scenario-status scenario-status-${selectedScenarioDocument.displayStatus}`}>
+                  <strong>{selectedScenarioDocument.name}</strong>
+                  <span>{selectedScenarioDocument.statusDetail}</span>
+                  {selectedScenarioDocument.description && (
+                    <span>{selectedScenarioDocument.description}</span>
+                  )}
+                </div>
+              )}
+            </section>
             {!loadClosesCurrent && replaceNeedsConfirmation && <label className="confirmation-check">
               <input type="checkbox" checked={confirmDiscard} onChange={(event) => setConfirmDiscard(event.target.checked)} />
               Replace current unsaved or unapplied Draft changes
             </label>}
             {replacementReason && <p className="inline-message severity-error" role="status">{replacementReason}</p>}
+            {afterCloseMessage && <p role="status">{afterCloseMessage}</p>}
             {selectedIdentityUnknown && <p role="status">Selected Scenario identity cannot be verified.</p>}
-            <div className="dialog-actions">
-              <button type="button" onClick={closeAction} disabled={replacementPending}>Cancel</button>
+            <div className="dactions new-scenario-actions">
+              <button type="button" onClick={closeAction} disabled={replacementPending && afterClose === null}>Cancel</button>
               <button
                 type="button"
                 className="primary-action"
                 disabled={busy || currentApplied === null || replacementReason !== null || selectedIdentityUnknown || selectedScenarioPath === null
-                  || ((loadClosesCurrent || replaceNeedsConfirmation) && !confirmDiscard)}
+                  || (!loadClosesCurrent && replaceNeedsConfirmation && !confirmDiscard)}
                 title={replacementReason ?? undefined}
                 onClick={() => {
                   if (selectedScenarioPath === null) return;
@@ -692,17 +864,30 @@ export function ScenarioDocumentCommands({
           </div>
         )}
         {action === 'close' && <div className="document-dialog">
-          {closeWarning}
+          {currentApplied === null && <p role="status">Checking the current Scenario…</p>}
           {replacementReason && <p className="inline-message severity-error" role="status">{replacementReason}</p>}
+          {afterCloseMessage && <p role="status">{afterCloseMessage}</p>}
           <div className="dialog-actions">
-            <button type="button" onClick={closeAction} disabled={replacementPending}>Cancel</button>
-            <button type="button" className="primary-action" disabled={busy || !confirmDiscard
-              || currentApplied === null || replacementReason !== null}
-              onClick={() => { void completeReplacement('close'); }}>Close Scenario</button>
+            <button type="button" onClick={closeAction} disabled={replacementPending && afterClose === null}>Cancel</button>
           </div>
         </div>}
-        {replacementPending && <p role="status">{closeProgress ?? 'Closing the current Scenario; replacement waits for confirmed completion.'}</p>}
+        {replacementPending && afterClose === null && <p className="scenario-replacement-status" role="status">{action === 'close' && replacementInFlight.current === 'submitting'
+          ? 'Clearing the logical Scene before emptying the editors…' : closeProgress ?? 'Scenario replacement is in progress.'}</p>}
 
+      </OverlayPanel>
+      <OverlayPanel open={confirmation !== null}
+        title="Close Scenario?"
+        titleId="scenario-replacement-confirmation-title" kind="dialog" compact
+        onClose={() => { if (confirmation?.kind === 'close') closeAction(); else setConfirmation(null); }}>
+        <div className="dialog-copy transport-confirmation">
+          {closeWarning}
+          <div className="dialog-actions">
+            <button type="button" onClick={() => { if (confirmation?.kind === 'close') closeAction(); else setConfirmation(null); }}>Cancel</button>
+            <button type="button" className="danger-button" onClick={() => {
+              if (confirmation !== null) void completeReplacement(confirmation.kind, confirmation);
+            }}>{confirmation?.kind === 'close' ? 'Close Scenario' : 'Close and continue'}</button>
+          </div>
+        </div>
       </OverlayPanel>
     </>
   );

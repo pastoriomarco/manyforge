@@ -448,11 +448,19 @@ def test_no_project_ros_start_selects_repository_empty_with_original_identity(
     for name in ("Program runner", "Headless API"):
         command = commands[name]
         assert command[command.index("--cell-id") + 1] == "c1_build_authority_cell"
-    installed = tmp_path / "state/installed-targets"
+    installed = tmp_path / "state/current/installed-targets"
     assert {path.name for path in installed.iterdir()} == {
         "manyforge_manager_daemon", "manyforge_roboplan_candidate_worker",
         "manyforge_ros2_control_execution_host",
     }
+    runner = commands["Program runner"]
+    assert runner[runner.index("--cycle-journal-path") + 1] == str(tmp_path / "state/current/program-cycle.sqlite3")
+    headless = commands["Headless API"]
+    assert headless[headless.index("--historian-database-path") + 1] == str(tmp_path / "state/history.sqlite3")
+    assert headless[headless.index("--projection-root") + 1] == str(tmp_path / "state/current/publications")
+    manager_command = commands["Manager"]
+    assert manager_command[manager_command.index("--logical-scene-database") + 1] == str(tmp_path / "state/current/logical-scene.sqlite3")
+    assert manager_command[manager_command.index("--execution-state-root") + 1] == str(tmp_path / "state/current/execution-state")
     assert workbench.project_path is None and workbench.scenario_id is None
     assert "--startup-scenario-document" not in workbench._composer_command("http://headless")
     assert workbench.processes == []  # Every service spawn is mocked.
@@ -623,11 +631,12 @@ def test_runtime_capability_selection_keeps_one_build_closure(
     )
 
 
+@pytest.mark.parametrize("build_testing", [None, "ON"])
 def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
-    monkeypatch: Any, tmp_path: Path
+    monkeypatch: Any, tmp_path: Path, build_testing: str | None
 ) -> None:
     build_root = tmp_path / "build"
-    ros_build = build_root / "isaac/roboplan"
+    ros_build = build_root / "ros-integration"
     overlay = build_root / "isaac/ros-overlay/install/setup.bash"
     commands: list[tuple[str, ...]] = []
     parent_environment = {**os.environ, "ROS_STATIC_PEERS": "orin;laptop",
@@ -636,12 +645,15 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
     monkeypatch.setattr(dev_workbench, "BUILD_ROOT", build_root)
     monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
     monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "2")
+    monkeypatch.delenv("MANYFORGE_ROS2_CONTROL_BUILD_TESTING", raising=False)
+    if build_testing is not None:
+        monkeypatch.setenv("MANYFORGE_ROS2_CONTROL_BUILD_TESTING", build_testing)
 
     def build(command: tuple[str, ...], *, env: dict[str, str]) -> None:
         commands.append(command)
         assert env["ROS_STATIC_PEERS"] == "orin;laptop"
         assert env["MANYFORGE_ROBOPLAN_BUILD_DIR"] == str(ros_build)
-        assert env["MANYFORGE_ROS2_CONTROL_BUILD_TESTING"] == "OFF"
+        assert env["MANYFORGE_ROS2_CONTROL_BUILD_TESTING"] == (build_testing or "OFF")
         assert env["CMAKE_BUILD_PARALLEL_LEVEL"] == "2"
         assert env["CMAKE_GENERATOR"] == "Ninja"
         ros_build.mkdir(parents=True, exist_ok=True)
@@ -663,7 +675,10 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
     monkeypatch.setattr(dev_workbench, "_run", build)
     monkeypatch.setattr(dev_workbench.subprocess, "run", source_overlay)
     targets = dev_workbench._ensure_current_ros_backend()
-    assert commands == [(str(REPOSITORY_ROOT / "scripts/ros/build-ros2-control-runtime.sh"),)]
+    assert commands == [(
+        str(REPOSITORY_ROOT / "scripts/ros/build-ros2-control-runtime.sh"),
+        "--source-dir", str(REPOSITORY_ROOT / "scripts/ros/ros-integration"),
+    )]
     assert [target.name for target in targets] == [
         "manyforge_roboplan_candidate_worker",
         "manyforge_ros2_control_execution_host",
@@ -820,7 +835,8 @@ def test_g_status_uses_fresh_manager_health_without_cccl_apply_permission(tmp_pa
             return {"started": True, "closed": False}
     monkeypatch.setattr(dev_workbench, "HeadlessHttpClient", Client)
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path)
-    (tmp_path / "workbench-startup-timing.json").write_text('{"build_elapsed_seconds":999,"readiness_elapsed_seconds":null}')
+    (tmp_path / "current").mkdir()
+    (tmp_path / "current/workbench-startup-timing.json").write_text('{"build_elapsed_seconds":999,"readiness_elapsed_seconds":null}')
     status = dev_workbench.query_operator_status(headless_port=9010, runner_port=9011, composer_port=9000)
     assert status["ready"] is expected
     assert status["manager"] == manager
@@ -844,7 +860,7 @@ def test_g_package_mismatch_refuses_before_build_or_process_start(tmp_path, monk
     assert workbench.processes == []
 
 
-def test_g_start_reuses_owner_processes_without_vite_or_convergence_wait(tmp_path, monkeypatch):
+def test_g_owner_start(tmp_path, monkeypatch):
     from manyforge_operator.package_aggregate import package_aggregate_sha256
     monkeypatch.setenv("MANYFORGE_STATE_DIR", str(tmp_path / "installation-state"))
     install = tmp_path / "package"
@@ -882,10 +898,10 @@ def test_g_start_reuses_owner_processes_without_vite_or_convergence_wait(tmp_pat
     commands = []
     socket_owner = socket.socket(socket.AF_UNIX)
     def spawn(name, command):
-        logs = tmp_path / "state/execution-run/ros" / f"1-{session_started_ns}"
+        logs = tmp_path / "state/current/execution-run/ros" / f"1-{session_started_ns}"
         assert os.environ["ROS_LOG_DIR"] == str(logs)
         assert logs.is_dir()
-        assert os.environ["ROS_HOME"] == str(tmp_path / "state/execution-run/ros-home")
+        assert os.environ["ROS_HOME"] == str(tmp_path / "state/current/execution-run/ros-home")
         commands.append((name, tuple(command)))
         workbench.processes.append((name, SimpleNamespace(poll=lambda: None)))
         if name == "Manager":
@@ -925,9 +941,9 @@ def test_g_start_reuses_owner_processes_without_vite_or_convergence_wait(tmp_pat
         socket_owner.close()
     assert [name for name, _ in commands] == ["Program runner", "Headless API", "Manager", "Composer backend"]
     assert workbench._readiness_deadline == 125.0  # Build duration is outside readiness budget.
-    timing = json.loads((tmp_path / "state/workbench-startup-timing.json").read_text())
+    timing = json.loads((tmp_path / "state/current/workbench-startup-timing.json").read_text())
     assert timing == {"build_elapsed_seconds": 120.0, "readiness_elapsed_seconds": 0.0}
-    assert os.environ["ROS_LOG_DIR"] == str(tmp_path / "state/execution-run/ros" / f"1-{session_started_ns}")
+    assert os.environ["ROS_LOG_DIR"] == str(tmp_path / "state/current/execution-run/ros" / f"1-{session_started_ns}")
     assert not (tmp_path / "foreign-home").exists()
     assert not (tmp_path / "foreign-logs").exists()
     for name, command in commands[:2]:
@@ -936,3 +952,126 @@ def test_g_start_reuses_owner_processes_without_vite_or_convergence_wait(tmp_pat
     manager_command = dict(commands)["Manager"]
     assert manager_command[manager_command.index("--install-root") + 1] == str(install)
     assert manager_command[manager_command.index("--canonical-empty-admission-filename") + 1] == "empty.json"
+
+
+def test_restored_terminal_cycle_starts_vite_without_reset_or_authoring_admission(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("MANYFORGE_STATE_DIR", str(tmp_path / "installation-state"))
+    manager_binary = tmp_path / "manager"
+    manager_binary.write_bytes(b"fixture executable")
+    manager_binary.chmod(0o755)
+    extension = tmp_path / "extension.so"
+    extension.write_bytes(b"fixture extension")
+    monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", manager_binary)
+    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", lambda: extension)
+    monkeypatch.setattr(dev_workbench, "_ensure_current_ros_backend", lambda: ())
+    monkeypatch.setattr(dev_workbench, "_ensure_activation_preparer", lambda: tmp_path / "preparer")
+    monkeypatch.setattr(dev_workbench, "_ensure_repository_bootstrap_package", lambda: tmp_path / "package")
+    monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies", lambda: None)
+    monkeypatch.setattr(dev_workbench, "_port_available", lambda _port: True)
+    monkeypatch.setenv("ROS_HOME", str(tmp_path / "inherited-home"))
+    monkeypatch.setenv("ROS_LOG_DIR", str(tmp_path / "inherited-logs"))
+    workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
+        headless_port=9010, runner_port=9011, composer_port=9020, frontend_port=3000)
+    monkeypatch.setattr(workbench, "_simulation_control_arguments", lambda: ())
+    spawned: list[str] = []
+    def spawn(name, _command):
+        spawned.append(name)
+        workbench.processes.append((name, SimpleNamespace(poll=lambda: None)))
+    monkeypatch.setattr(workbench, "_spawn", spawn)
+    def popen(command, **_kwargs):
+        spawned.append("Vite HMR" if command[0] == "node" else "Composer backend")
+        return SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(dev_workbench.subprocess, "Popen", popen)
+    cycle = {"state": "terminal_awaiting_reset"}
+    requests: list[tuple[str, str]] = []
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            pass
+        def request(self, method, path):
+            requests.append((method, path))
+            assert (method, path) == ("GET", "/api/program/health")
+            return {"started": True}
+        def runtime(self):
+            return {"schema_version": "fixture"}
+        def manager_status(self):
+            return {"source": {"available": True, "freshness": "fresh", "known_gaps": []},
+                    "status": {"manager_ready": True, "runtime": {"converged": True}}}
+        def manager_diff(self):
+            return {"source": {"available": True, "freshness": "fresh", "known_gaps": []},
+                    "converged": True}
+        def program_cycle_status(self):
+            return dict(cycle)
+        def authoring_admission(self):
+            pytest.fail("UI startup must not wait for idle command admission")
+        def health(self):
+            return {"status": "ready"}
+    monkeypatch.setattr(dev_workbench, "HeadlessHttpClient", Client)
+    waits: list[str] = []
+    def wait(description, predicate, _processes, **_kwargs):
+        waits.append(description)
+        # Process/socket mechanics are substituted; owner readiness and
+        # contained-cycle predicates still run through the real start path.
+        if description in {"Manager command socket", "Vite HMR"}:
+            return True
+        result = predicate()
+        assert result
+        return result
+    monkeypatch.setattr(workbench, "_wait_until", wait)
+
+    workbench.start()
+
+    assert spawned == ["Program runner", "Headless API", "Manager", "Composer backend", "Vite HMR"]
+    assert waits == ["Program Runner and Headless reconciliation services", "Manager command socket",
+                     "contained Program-cycle startup reconciliation", "Composer backend", "Vite HMR"]
+    assert requests == [("GET", "/api/program/health")]
+    assert cycle == {"state": "terminal_awaiting_reset"}
+
+
+def test_direct_serve_selects_one_session_before_starting_any_owner(tmp_path, monkeypatch):
+    root = tmp_path / "state"
+    monkeypatch.setattr(dev_workbench, "STATE_ROOT", root)
+    monkeypatch.delenv("MANYFORGE_DEV_COLD_SESSION_ID", raising=False)
+    monkeypatch.setattr(dev_workbench.signal, "signal", lambda *_args: None)
+    workbench = dev_workbench.Workbench(project_path=None, ros2_control=False,
+        headless_port=1, runner_port=2, composer_port=3, frontend_port=4)
+    started = []
+
+    def start():
+        assert workbench.session is not None
+        marker = json.loads((root / "current/session.json").read_text())
+        assert marker["session_id"] == workbench.session.marker["session_id"]
+        assert marker["launcher_claimed"] is True
+        assert workbench.runtime_root == root / "current"
+        assert not (root / "previous-sessions").exists()
+        started.append(marker["session_id"])
+        workbench.stop_requested = True
+
+    monkeypatch.setattr(workbench, "start", start)
+    monkeypatch.setattr(workbench, "_stop_manager", lambda: True)
+    monkeypatch.setattr(workbench, "_wait_for_program_runner_manager_expiry", lambda: True)
+    workbench.serve()
+    assert len(started) == 1
+    assert workbench.session is None
+    marker = json.loads((root / "current/session.json").read_text())
+    assert marker["session_id"] == started[0] and marker["disposition"] == "stopped"
+
+
+def test_preselected_session_report_is_shared_by_existing_consumers(tmp_path, monkeypatch):
+    root = tmp_path / "state"
+    monkeypatch.setattr(dev_workbench, "STATE_ROOT", root)
+    workbench = dev_workbench.Workbench(project_path=None, ros2_control=False,
+        headless_port=1, runner_port=2, composer_port=3, frontend_port=4)
+    assert workbench._previous_session_report() is None
+    assert workbench._previous_session_arguments() == ()
+    previous = "a" * 32
+    workbench.session = SimpleNamespace(marker={"previous_session": {"session_id": previous}})
+    report = root / "session-reports" / (previous + ".json")
+    assert workbench._previous_session_report() == report
+    assert workbench._previous_session_arguments() == ("--workbench-previous-session-reports-root", str(root / "session-reports"), "--workbench-previous-session-id", previous)

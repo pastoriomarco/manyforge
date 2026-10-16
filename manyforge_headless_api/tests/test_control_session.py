@@ -67,6 +67,8 @@ def _cycle() -> dict[str, Any]:
         "cycle_claim_generation": None,
         "terminal_or_settlement_reference": None,
         "reset_phase": None,
+        "reset_options": None,
+        "reset_robot_position": {"available": False, "reason": "unsupported"},
         "current_command_kind": None,
         "allowed_commands": [
             {

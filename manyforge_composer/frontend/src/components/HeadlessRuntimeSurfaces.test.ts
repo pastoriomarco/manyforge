@@ -283,7 +283,8 @@ describe('headless Composer presentation adapters', () => {
         causalClientSequence: null,
         currentCommandKind: null,
         failure: null,
-        resetPhase: null,
+        resetPhase: null, resetOptions: null,
+        resetRobotPosition: { available: false, reason: 'unsupported' },
         allowedCommands: [],
         recoveryOffer: null,
         run: null,
@@ -476,5 +477,37 @@ describe('headless Composer presentation adapters', () => {
     expect(singleClientFailure).toContain('Viewer source-model response failed');
     expect(singleClientFailure).toContain('>Dismiss</button>');
     expect(singleClientFailure).not.toContain('Acknowledge all');
+
+    const previousAlarm: OperatorAlarmRecord = {
+      ...attentionAlarm,
+      definitionId: 'manyforge.runtime.previous_session_unclean',
+      lifecycleState: 'returned_unacknowledged', active: false,
+      priority: 'medium', requiresMotionAttention: false,
+      title: 'ManyForge did not close correctly last time',
+      message: 'ManyForge did not close correctly last time. The cell started empty; nothing from the previous session was resumed. Its records are kept; details in History.',
+      details: { previous_session: { session_id: 'a'.repeat(32), journal_families: ['program_cycle'], history_coverage: 'not_imported' }, failure_time_status: 'unavailable' },
+    };
+    const previousState = {
+      snapshot: { ...snapshot, alarms: { ...snapshot.alarms, alarms: [previousAlarm],
+        unacknowledgedCount: 1, liveCount: 1, motionAttentionCount: 0,
+        motionAttentionMembership: [], unacknowledgedMembership: [],
+      } },
+      error: null, transportStatus: 'connected' as const, transportError: null,
+      semanticStatus: 'current' as const, semanticReason: null, reconnect,
+    };
+    const previous = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
+      enabled: true, headlessState: previousState, expanded: false,
+    }));
+    expect(previous).toContain('Warnings');
+    expect(previous).toContain('>Acknowledge</button>');
+    expect(previous).toContain(previousAlarm.message);
+    expect(previous).not.toContain('not_imported');
+    const detailed = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
+      enabled: true, headlessState: previousState, expanded: true,
+    }));
+    expect(detailed).toContain('not_imported');
+    expect(detailed).toContain('<details><summary>');
+    expect(detailed).not.toContain('<details open');
+
   });
 });

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import localDeltaFixture from '../../../../manyforge_headless_api/tests/fixtures/control-v2-local-delta.json';
 
 import type { ComposerHeadlessState } from '../types/headless';
+import { deriveTransportGuidance } from '../components/ProgramRuntimePanel';
 import {
   HEADLESS_SHELL_PUBLICATION_MS,
   HeadlessStateSource,
@@ -81,7 +82,8 @@ function state(
       causalClientSequence: null,
       currentCommandKind: null,
       failure: null,
-      resetPhase: null,
+      resetPhase: null, resetOptions: null,
+      resetRobotPosition: { available: false, reason: 'unsupported' },
       allowedCommands: [],
       recoveryOffer: null,
       run: null,
@@ -460,7 +462,8 @@ function wireState(generation: number): Record<string, unknown> {
       causal_client_sequence: null,
       current_command_kind: null,
       failure: null,
-      reset_phase: null,
+      reset_phase: null, reset_options: null,
+      reset_robot_position: { available: false, reason: 'unsupported' },
       allowed_commands: [],
       recovery_offer: null,
       run: null,
@@ -650,6 +653,189 @@ function wireObservation(sequence: number): Record<string, unknown> {
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+describe('zero-physical-component viewer demand', () => {
+  class Socket {
+    static readonly OPEN = 1;
+    static instances: Socket[] = [];
+    readonly url: string;
+    readonly sent: string[] = [];
+    readyState = Socket.OPEN;
+    onopen: (() => void) | null = null;
+    onmessage: ((message: MessageEvent) => void) | null = null;
+    onerror: (() => void) | null = null;
+    onclose: (() => void) | null = null;
+    constructor(url: string) { this.url = url; Socket.instances.push(this); }
+    send(value: string): void { this.sent.push(value); }
+    close(): void { this.readyState = 3; this.onclose?.(); }
+    receive(value: unknown): void {
+      this.onmessage?.({ data: JSON.stringify(value) } as MessageEvent);
+    }
+  }
+
+  function publication(generation: number, empty: boolean, canonicalEmpty = empty): Record<string, unknown> {
+    const shell = wireState(generation);
+    (shell.program_cycle as Record<string, unknown>).execution_control_revision = 1;
+    const runtime = shell.runtime as Record<string, unknown>;
+    const bundle = empty ? 'bundle.empty' : 'bundle-1';
+    const graph = empty ? 'graph.empty' : 'graph-1';
+    runtime.active_retained_bundle_id = bundle;
+    runtime.active_graph_revision = graph;
+    const sections = runtime.sections as Record<string, Record<string, unknown>>;
+    // wireState deliberately shares its three generic source sections.
+    sections.manager = { ...sections.manager, payload: {
+      cell_id: 'cell-1', manager_ready: true, runtime: { converged: true },
+      apply: { records: [] },
+      active: {
+        canonical_empty: canonicalEmpty, retained_bundle_id: bundle, graph_revision: graph,
+        publication: { publication_generation: generation,
+          projection_revision: { retained_bundle_id: bundle, graph_revision: graph } },
+        cell_graph: { cell_id: 'cell-1', graph_revision: graph,
+          model_instances: [], controllable_components: empty ? [] : [{ controllable_component_id: 'robot-1' }],
+          control_bindings: [], control_domains: [],
+          runtime_units: [{ runtime_unit_id: 'robot_cell.ros2_control_execution' }],
+        },
+      },
+    } };
+    return shell;
+  }
+
+  function setup(demand = true) {
+    vi.useFakeTimers();
+    Socket.instances = [];
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(() => 1), cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', Socket);
+    const source = new HeadlessStateSource();
+    if (demand) source.setViewerDemand(true);
+    source.setEnabled(true);
+    const control = Socket.instances.find((socket) => new URL(socket.url).pathname === '/ws/control')!;
+    synchronizeControl(control);
+    const viewers = () => Socket.instances.filter((socket) => new URL(socket.url).pathname === '/ws/scene/viewer');
+    let challenge = 2;
+    const advanceConnected = (milliseconds: number) => {
+      for (let elapsed = 0; elapsed < milliseconds; elapsed += 250) {
+        vi.advanceTimersByTime(Math.min(250, milliseconds - elapsed));
+        const echoes = control.sent.map((value) => JSON.parse(value) as Record<string, unknown>)
+          .filter((value) => value.message_kind === 'heartbeat_echo');
+        receiveHeartbeat(control, ++challenge, echoes.at(-1)!.client_sequence as string);
+      }
+    };
+    return { source, control, viewers, advanceConnected };
+  }
+
+  it.each([true, false])('starts no physical feed or history churn with positive empty facts, canonical=%s', (canonicalEmpty) => {
+    const { source, control, viewers, advanceConnected } = setup(false);
+    receiveControlSnapshot(control, publication(1, true, canonicalEmpty));
+    source.setViewerDemand(true);
+    expect(viewers()).toHaveLength(0);
+    expect(source.getExecutionObservationTransportStatus().phase).toBe('no_robot_loaded');
+    const shellFrames = control.sent.length;
+    advanceConnected(45_000);
+    expect(viewers()).toHaveLength(0);
+    expect(source.getLatestExecutionObservation()).toBeNull();
+    // Empty observation produces no browser incident transitions for history.
+    expect(control.sent.slice(shellFrames).some((frame) => JSON.parse(frame).message_kind === 'client_incident')).toBe(false);
+    expect(source.getShellSnapshot().snapshot!.alarms.unacknowledgedCount).toBe(0);
+    source.dispose();
+  });
+
+  it.each([false, true])('quiets Close after its fresh fact with viewer-close-first=%s', (closeFirst) => {
+    const { source, control, viewers, advanceConnected } = setup();
+    receiveControlSnapshot(control, publication(1, false));
+    const viewer = viewers()[0]!;
+    viewer.onopen?.();
+    viewer.receive(wireObservation(1));
+    source.markExecutionObservationApplied(source.getLatestExecutionObservation()!);
+    expect(source.getLatestExecutionObservation()).not.toBeNull();
+    if (closeFirst) {
+      viewer.onclose?.();
+      expect(source.getExecutionObservationTransportStatus().phase).toBe('reconnecting');
+      vi.advanceTimersByTime(100);
+    }
+    receiveControlSnapshot(control, publication(2, true));
+    expect(source.getExecutionObservationTransportStatus().phase).toBe('no_robot_loaded');
+    expect(source.getLatestExecutionObservation()).toBeNull();
+    const creditCount = viewer.sent.length;
+    // Queued callbacks from the retired socket cannot undo the empty barrier.
+    viewer.onopen?.(); viewer.onerror?.(); viewer.onclose?.(); viewer.receive(wireObservation(2));
+    advanceConnected(31_000);
+    expect(viewers()).toHaveLength(1);
+    expect(viewer.sent).toHaveLength(creditCount);
+    expect(source.getLatestExecutionObservation()).toBeNull();
+    expect(source.getExecutionObservationTransportStatus().phase).toBe('no_robot_loaded');
+    source.dispose();
+  });
+
+  it.each([true, false])('resumes loaded demand and preserves real failure from empty canonical=%s', (canonicalEmpty) => {
+    const { source, control, viewers } = setup(false);
+    receiveControlSnapshot(control, publication(1, true, canonicalEmpty));
+    source.setViewerDemand(true);
+    receiveControlSnapshot(control, publication(2, false));
+    expect(viewers()).toHaveLength(1);
+    const viewer = viewers()[0]!;
+    viewer.onopen?.();
+    expect(JSON.parse(viewer.sent[0]!)).toMatchObject({ last_applied: null });
+    viewer.receive(wireObservation(1));
+    expect(source.getExecutionObservationTransportStatus().phase).toBe('live');
+    expect(source.getLatestExecutionObservation()!.targets[0]!.positionsSi).toEqual([0.01]);
+    viewer.onerror?.(); viewer.onclose?.();
+    expect(source.getExecutionObservationTransportStatus().phase).toBe('reconnecting');
+    vi.advanceTimersByTime(1000);
+    expect(viewers()).toHaveLength(2);
+    source.dispose();
+  });
+
+  it.each([true, false])('removes quiet absence when the Manager proof becomes stale, canonical=%s', (canonicalEmpty) => {
+    const { source, control, viewers } = setup(false);
+    receiveControlSnapshot(control, publication(1, true, canonicalEmpty));
+    source.setViewerDemand(true);
+    const stale = publication(2, true, canonicalEmpty);
+    const runtime = stale.runtime as Record<string, unknown>;
+    const sections = runtime.sections as Record<string, Record<string, unknown>>;
+    sections.manager.freshness = 'stale';
+    receiveControlSnapshot(control, stale);
+    expect(source.getExecutionObservationTransportStatus().phase).toBe('connecting');
+    expect(viewers()).toHaveLength(1);
+    viewers()[0]!.onerror?.();
+    expect(source.getExecutionObservationTransportStatus().phase).toBe('reconnecting');
+    source.dispose();
+  });
+
+  it('keeps hidden viewer notices quiet and resumes visibility or reconnect with fresh facts', async () => {
+    const { source, control, viewers, advanceConnected } = setup(false);
+    receiveControlSnapshot(control, publication(1, true));
+    source.setViewerDemand(true);
+    source.setViewerDemand(false);
+    await Promise.resolve();
+    expect(source.getExecutionObservationTransportStatus().phase).toBe('no_robot_loaded');
+    advanceConnected(31_000);
+    // The controls remain mounted while document visibility releases demand.
+    // Their absent robot status must not become a new error/incident then.
+    const guidance = deriveTransportGuidance({
+      enabled: true,
+      program: { state: { controls: null, run: null }, cycleState: 'idle_after_reset',
+        cycleFailure: null, resetRobotPositionAvailability: null, commandDisabledReason: () => null },
+      robot: { currentStatus: null, state: { status: null } },
+      motionActive: false, onReviewProgramRecovery: vi.fn(),
+      observationTransport: source.getExecutionObservationTransportStatus(),
+    } as unknown as Parameters<typeof deriveTransportGuidance>[0]);
+    expect(guidance).toEqual([]);
+    expect(viewers()).toHaveLength(0);
+    source.setViewerDemand(true);
+    expect(source.getExecutionObservationTransportStatus().phase).toBe('no_robot_loaded');
+    expect(viewers()).toHaveLength(0);
+    source.reconnect();
+    const replacement = Socket.instances.filter((socket) => new URL(socket.url).pathname === '/ws/control')[1]!;
+    synchronizeControl(replacement);
+    receiveControlSnapshot(replacement, publication(2, true));
+    expect(source.getExecutionObservationTransportStatus().phase).toBe('no_robot_loaded');
+    expect(viewers().every((socket) => socket.readyState === 3)).toBe(true);
+    source.dispose();
+  });
 });
 
 describe('HeadlessStateSource delivery scheduling', () => {
@@ -2443,7 +2629,10 @@ describe('HeadlessStateSource delivery scheduling', () => {
 
     const resetting = wireState(2);
     (resetting.program_cycle as Record<string, unknown>).state = 'resetting';
-    (resetting.program_cycle as Record<string, unknown>).reset_phase = 'stopping';
+    Object.assign(resetting.program_cycle as Record<string, unknown>, {
+      current_command_kind: 'program_reset', reset_phase: 'restoring_scene',
+      reset_options: { reload_initial_scene: true, reset_robot_position: false },
+    });
     receiveControlSnapshot(socket, resetting, CONTROL_SESSION_ID, command.client_sequence);
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
     expect(source.getShellSnapshot().snapshot?.programCycle.state).toBe('resetting');

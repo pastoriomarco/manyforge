@@ -1,6 +1,6 @@
 schema_version: manyforge.operator_alarm_catalog.v1
-catalog_version: 2.3.0
-descriptor_digest: sha256:2b8fe7064ba33f340ed83a39eb498a79f17d1bd79967fe0caadd4fdb8b1429bd
+catalog_version: 2.4.0
+descriptor_digest: sha256:e435a7ba1057ce8aa77eb324ae26d217a2dcde03641298e8484bbe8d21385727
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 2
@@ -220,3 +220,29 @@ definitions:
     acknowledgement_reason_required: false
     requires_motion_attention: true
     max_evidence_refs: 16
+
+  - definition_id: manyforge.runtime.previous_session_unclean
+    version: 1
+    title: ManyForge did not close correctly last time
+    message_template: "ManyForge did not close correctly last time. The cell started empty; nothing from the previous session was resumed. Its records are kept; details in History."
+    alarm_class: runtime_health
+    priority: medium
+    priority_rationale: >-
+      An unclosed previous session or readable unresolved durable work needs
+      operator awareness but does not constrain the new empty cell.
+    consequence: >-
+      The previous session remains retained evidence; its runtime state is
+      never adopted or resumed.
+    operator_response: >-
+      Acknowledge after reading; consult History for the retained session
+      record. Acknowledgement does not change its records or protection.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.workbench.session_condition
+    clear_authority: manyforge.workbench.session_condition
+    adapter_id: manyforge.alarm_adapter.workbench_session_condition
+    runtime_modes:
+      - all
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 1

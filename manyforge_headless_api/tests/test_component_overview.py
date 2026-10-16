@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+import pytest
+
 from manyforge_headless_api.component_overview import build_component_overview
 
 
@@ -369,3 +371,151 @@ def test_overview_revision_changes_only_with_semantic_content() -> None:
     second = build_component_overview(**heartbeat)
 
     assert second["overview_revision"] == first["overview_revision"]
+
+
+def _empty_facts(canonical_empty: bool = True) -> dict[str, Any]:
+    facts = _facts()
+    runtime = facts["runtime"]
+    manager = runtime["sections"]["manager"]["payload"]
+    active = manager["active"]
+    active["canonical_empty"] = canonical_empty
+    active["cell_graph"].update({
+        "graph_revision": active["graph_revision"],
+        "model_instances": [], "controllable_components": [],
+        "control_bindings": [], "control_domains": [],
+    })
+    active["publication"]["projection_revision"] = {
+        "graph_revision": active["graph_revision"],
+        "retained_bundle_id": active["retained_bundle_id"],
+    }
+    runtime.update(active_graph_revision=active["graph_revision"],
+                   active_retained_bundle_id=active["retained_bundle_id"])
+    manager["apply"] = {"records": []}
+    facts["applied_program"] = None
+    facts["program_cycle"]["state"] = "idle_after_reset"
+    facts["errors"]["applied_program"] = {
+        "code": "program_applied_selection_not_found" if canonical_empty else "program_not_selected"
+    }
+    for fact in ("execution_identity", "execution_targets", "execution_control"):
+        facts[f"{fact}_response"] = None
+        facts["errors"][fact] = {"code": "execution_owner_not_ready"}
+    return facts
+
+
+def _without_empty_rule(facts: dict[str, Any]) -> dict[str, Any]:
+    comparison = copy.deepcopy(facts)
+    del comparison["runtime"]["sections"]["manager"]["payload"]["active"]["canonical_empty"]
+    return build_component_overview(**comparison)
+
+
+@pytest.mark.parametrize("canonical_empty", [True, False])
+def test_verified_empty_publication_has_no_required_equipment_faults(canonical_empty) -> None:
+    facts = _empty_facts(canonical_empty)
+    captured = copy.deepcopy(facts)
+    overview = build_component_overview(**facts)
+    rows = _by_id(overview)
+    expected_absent = {
+        "plan_preview", "execute_control", "applied_program", "execution_owner",
+        "execution_target", "planner_collision", "stop_capability",
+    }
+    assert overview["readiness"] == "ready"
+    assert overview["summary_label"] == "No components"
+    assert "ready for authoring" in overview["user_message"]
+    assert {key for key, row in rows.items() if row["reason_code"] == ("canonical_empty" if canonical_empty else "no_physical_components")} == expected_absent
+    for key in expected_absent:
+        assert rows[key]["required"] is False
+        assert rows[key]["status"] == "offline"
+        assert rows[key]["detail"] == "No components"
+    assert rows["runtime_unit:robot.native"]["required"] is True
+    assert rows["runtime_unit:robot.native"]["status"] == "healthy"
+    assert rows["observe_render"]["status"] == "healthy"
+    assert facts == captured
+    assert build_component_overview(**facts) == overview
+
+
+@pytest.mark.parametrize(("path", "value"), [
+    (("runtime", "complete"), False),
+    (("available",), False),
+    (("freshness",), "stale"),
+    (("known_gaps",), ["source_gap"]),
+    (("source_owner_epoch",), None),
+    (("source_generation",), True),
+    (("payload", "manager_ready"), False),
+    (("payload", "runtime", "converged"), False),
+    (("payload", "apply", "records"), None),
+    (("payload", "apply", "records"), [{"incomplete": True}]),
+    (("payload", "active", "canonical_empty"), "true"),
+    (("payload", "active", "canonical_empty"), 0),
+    (("payload", "active", "canonical_empty"), 1),
+    (("payload", "active", "canonical_empty"), None),
+    (("payload", "active", "cell_graph", "model_instances"), [{}]),
+    (("payload", "active", "cell_graph", "control_domains"), [{}]),
+    (("payload", "active", "cell_graph", "model_instances"), None),
+    (("payload", "active", "cell_graph", "control_domains"), None),
+    (("payload", "active", "cell_graph", "control_bindings"), [{}]),
+    (("payload", "active", "cell_graph", "controllable_components"), [{}]),
+    (("payload", "active", "cell_graph", "cell_id"), "another-cell"),
+    (("payload", "active", "cell_graph", "graph_revision"), "another-graph"),
+    (("payload", "active", "publication", "publication_generation"), True),
+    (("payload", "active", "publication", "projection_revision", "retained_bundle_id"), "another-bundle"),
+    (("runtime", "active_graph_revision"), "another-graph"),
+])
+@pytest.mark.parametrize("canonical_empty", [True, False])
+def test_unverified_empty_keeps_the_existing_reduction(path, value, canonical_empty) -> None:
+    facts = _empty_facts(canonical_empty)
+    target = facts if path[0] == "runtime" else facts["runtime"]["sections"]["manager"]
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = value
+    assert build_component_overview(**facts) == _without_empty_rule(facts)
+    assert build_component_overview(**facts)["summary_label"] != "No components"
+
+
+@pytest.mark.parametrize("fault", [
+    "logical_scene", "scene_runtime", "source_model", "runtime_unit",
+    "program_cycle", "authoring_admission", "alarms", "applied_program",
+    "execution_identity", "execution_targets", "execution_control",
+])
+@pytest.mark.parametrize("canonical_empty", [True, False])
+def test_empty_publication_does_not_hide_actual_source_or_owner_errors(fault, canonical_empty) -> None:
+    facts = _empty_facts(canonical_empty)
+    if fault in {"logical_scene", "scene_runtime"}:
+        facts["runtime"]["sections"][fault]["available"] = False
+    elif fault == "source_model":
+        facts[fault]["source"]["freshness"] = "stale"
+    elif fault == "runtime_unit":
+        facts["runtime"]["sections"]["manager"]["payload"]["runtime"]["observed_units"][0]["source_health"] = "unavailable"
+    elif fault == "alarms":
+        facts["alarms"].update(active_count=1, motion_attention_count=1)
+    else:
+        if fault in {"program_cycle", "authoring_admission"}:
+            facts[fault] = None
+        facts["errors"][fault] = {"code": f"{fault}_invalid"}
+    assert build_component_overview(**facts) == _without_empty_rule(facts)
+    assert build_component_overview(**facts)["summary_label"] != "No components"
+
+
+def test_loaded_owner_not_ready_remains_a_required_fault() -> None:
+    facts = _facts()
+    for fact in ("execution_identity", "execution_targets", "execution_control"):
+        facts[f"{fact}_response"] = None
+        facts["errors"][fact] = {"code": "execution_owner_not_ready"}
+    overview = build_component_overview(**facts)
+    assert overview["readiness"] == "fault"
+    for key in ("execution_owner", "execution_target", "stop_capability"):
+        assert _by_id(overview)[key]["status"] == "fault"
+        assert _by_id(overview)[key]["required"] is True
+
+
+@pytest.mark.parametrize("physical_array", [
+    "model_instances", "controllable_components", "control_bindings", "control_domains",
+])
+def test_named_scenario_with_any_physical_row_keeps_required_faults(physical_array) -> None:
+    facts = _empty_facts(False)
+    graph = facts["runtime"]["sections"]["manager"]["payload"]["active"]["cell_graph"]
+    graph[physical_array] = [{}]
+    overview = build_component_overview(**facts)
+    assert overview == _without_empty_rule(facts)
+    assert overview["readiness"] == "fault"
+    assert _by_id(overview)["execution_owner"]["required"] is True
+    assert _by_id(overview)["execution_owner"]["status"] == "fault"

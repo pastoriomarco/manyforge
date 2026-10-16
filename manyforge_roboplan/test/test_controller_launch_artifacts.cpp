@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -118,11 +119,17 @@ mock_request(const std::filesystem::path &root, const std::string &component,
     gripper = MockGripperBinding{std::nullopt, std::nullopt};
   }
   return ControllerLaunchArtifactsRequest{
-      root, component, model_text, profile.arm,
+      root,
+      component,
+      model_text,
+      profile.arm,
       MockControllerArtifactsInput{profile.mock_profile,
                                    {0.0, -1.57, 1.57, -1.57, -1.57, 0.0},
                                    cancel_limits(profile.arm, cancel_limit),
-                                   gripper}};
+                                   gripper},
+      {},
+      {},
+      manyforge::content_identity::sha256_digest("test-component-runtime")};
 }
 
 [[nodiscard]] std::size_t count(const std::string &text,
@@ -280,6 +287,14 @@ TEST(ControllerLaunchArtifacts, EveryOfflineMockProfileWritesBothFilesAndTheLaun
         mock_request(root.path(), component, profile, model));
     EXPECT_EQ(written.lane, ControllerLaunchLane::kMock);
     EXPECT_EQ(written.controller_profile, profile.mock_profile);
+    ASSERT_TRUE(written.mock_reset_position);
+    EXPECT_EQ(written.mock_reset_position->joint_names, profile.arm);
+    if (profile.gripper_joint) {
+      EXPECT_EQ(std::find(written.mock_reset_position->joint_names.begin(),
+                          written.mock_reset_position->joint_names.end(),
+                          *profile.gripper_joint),
+                written.mock_reset_position->joint_names.end());
+    }
     EXPECT_EQ(written.directory, root.path() / component);
     EXPECT_EQ(written.robot_description_file,
               root.path() / component / "robot_description.urdf");
@@ -344,7 +359,9 @@ TEST(ControllerLaunchArtifacts, EveryOfflineMockProfileWritesBothFilesAndTheLaun
         "controllers_file:=" + written.controllers_file.string(),
         "runtime_namespace:=/manyforge/" + component,
         "controller_manager_name:=controller_manager",
-        "arm_controller_name:=" + profile.arm_controller};
+        "arm_controller_name:=" + profile.arm_controller,
+        "reset_position_controller_name:=" +
+            written.mock_reset_position->controller_name};
     if (profile.gripper_controller.has_value()) {
       expected_arguments.push_back("gripper_controller_name:=" +
                                    *profile.gripper_controller);
@@ -615,6 +632,8 @@ struct HostComponent final {
   auto motion = arm_binding(component, profile.arm);
   ComponentControllerLaunchInput input;
   input.artifacts_root = root;
+  input.component_runtime_identity =
+      manyforge::content_identity::sha256_digest("test-component-runtime");
   input.gripper_binding = gripper_binding(component, profile.gripper_joint);
   if (profile.gripper_joint.has_value()) input.gripper_projected_position = 0.0042;
   input.mock_profile = profile.mock_profile;
@@ -645,14 +664,17 @@ TEST(ControllerLaunchArtifactsHost, ActivationWritesBothFilesAndPassesTheLaunchC
   EXPECT_NE(read_file(mock.robot_description_file)
                 .find("<joint name=\"right_finger_joint\">"),
             std::string::npos);
-  EXPECT_EQ(mock.launch_arguments,
-            (std::vector<std::string>{
-                "robot_description_file:=" + mock.robot_description_file.string(),
-                "controllers_file:=" + mock.controllers_file.string(),
-                "runtime_namespace:=/manyforge/lite6_robot",
-                "controller_manager_name:=controller_manager",
-                "arm_controller_name:=lite6_traj_controller",
-                "gripper_controller_name:=lite_gripper_controller"}));
+  EXPECT_EQ(
+      mock.launch_arguments,
+      (std::vector<std::string>{
+          "robot_description_file:=" + mock.robot_description_file.string(),
+          "controllers_file:=" + mock.controllers_file.string(),
+          "runtime_namespace:=/manyforge/lite6_robot",
+          "controller_manager_name:=controller_manager",
+          "arm_controller_name:=lite6_traj_controller",
+          "reset_position_controller_name:=" +
+              mock.mock_reset_position->controller_name,
+          "gripper_controller_name:=lite_gripper_controller"}));
   EXPECT_TRUE(mock.frame_prefix.empty());
 
   // Isaac component of a one-robot cell: generated description, retained
@@ -691,7 +713,9 @@ TEST(ControllerLaunchArtifactsHost, ActivationWritesBothFilesAndPassesTheLaunchC
   // UR5 (logical gripper, not model-backed): no gripper joint or controller.
   const auto ur5 = write_host(
       mock_component(root.path(), "ur5_robot", profiles.at(2), "", 10.0));
-  EXPECT_EQ(ur5.launch_arguments.back(), "arm_controller_name:=joint_trajectory_controller");
+  EXPECT_EQ(ur5.launch_arguments.back(),
+            "reset_position_controller_name:=" +
+                ur5.mock_reset_position->controller_name);
   for (const auto &argument : ur5.launch_arguments) {
     EXPECT_NE(argument.rfind("gripper_controller_name:=", 0), 0U) << argument;
     EXPECT_NE(argument.rfind("frame_prefix:=", 0), 0U) << argument;
@@ -815,6 +839,57 @@ TEST(ControllerLaunchArtifactsHost, GenuineGripperOnlyMockUsesExistingProfiles) 
                   "gripper_controller_name:=" + *profile.gripper_controller,
                   "frame_prefix:=tool/"}));
   }
+}
+
+TEST(ControllerLaunchArtifacts,
+     MockWriterIdentityIsImmutableAndConfigurationScoped) {
+  const TemporaryRoot root;
+  const auto profile = offline_profiles().at(2);
+  const auto model = read_repository_file(profile.model_path);
+  auto request = mock_request(root.path(), "robot", profile, model);
+  const auto initial = write_controller_launch_artifacts(request);
+  ASSERT_TRUE(initial.mock_reset_position);
+  const auto &target = *initial.mock_reset_position;
+  EXPECT_EQ(target.joint_names, request.arm_joint_names);
+  EXPECT_EQ(target.positions,
+            std::get<MockControllerArtifactsInput>(request.lane)
+                .initial_joint_positions_rad);
+  EXPECT_EQ(target.component_runtime_identity,
+            request.component_runtime_identity);
+  EXPECT_TRUE(
+      manyforge::content_identity::is_sha256_digest(target.target_digest));
+  EXPECT_EQ(target.commands_topic,
+            "/manyforge/robot/" + target.controller_name + "/commands");
+  EXPECT_EQ(count(initial.controllers_yaml,
+                  "type: forward_command_controller/ForwardCommandController"),
+            1U);
+  EXPECT_NE(
+      initial.controllers_yaml.find("/**/" + target.controller_name + ":"),
+      std::string::npos);
+  EXPECT_NE(initial.controllers_yaml.find("    interface_name: position"),
+            std::string::npos);
+  EXPECT_EQ(write_controller_launch_artifacts(request).mock_reset_position,
+            initial.mock_reset_position);
+  auto changed = request;
+  std::get<MockControllerArtifactsInput>(changed.lane)
+      .initial_joint_positions_rad[0] = 0.125;
+  EXPECT_NE(write_controller_launch_artifacts(changed)
+                .mock_reset_position->controller_name,
+            target.controller_name);
+  changed = request;
+  std::swap(changed.arm_joint_names[0], changed.arm_joint_names[1]);
+  EXPECT_NE(write_controller_launch_artifacts(changed)
+                .mock_reset_position->controller_name,
+            target.controller_name);
+  changed = request;
+  changed.component_runtime_identity =
+      manyforge::content_identity::sha256_digest("different-provider-config");
+  EXPECT_NE(write_controller_launch_artifacts(changed)
+                .mock_reset_position->controller_name,
+            target.controller_name);
+  changed.component_runtime_identity.clear();
+  EXPECT_THROW(static_cast<void>(write_controller_launch_artifacts(changed)),
+               ControllerLaunchArtifactError);
 }
 
 TEST(ControllerLaunchArtifactsHost, OptionalMotionPreservesExistingArmArtifacts) {

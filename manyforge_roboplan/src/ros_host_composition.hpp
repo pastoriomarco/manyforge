@@ -1,6 +1,8 @@
 #pragma once
 
 #include "execution_host_config.hpp"
+#include <manyforge_roboplan/program_reset_position.hpp>
+#include <stop_token>
 #include "execution_host_scene_bridge.hpp"
 #include "product_backed_runtime_participant_resolver.hpp"
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
@@ -178,6 +180,11 @@ struct ExecutionCompositionAccess final {
   // composition; the Stop lane and cell admission read it without the
   // composition lock.
   std::atomic<core::ResourceAddressedExecutionKernel *> addressed_kernel{};
+
+  std::function<core::Result<ProgramResetPositionCapability>(Composition&)>
+      reset_robot_position_capability;
+  std::function<core::Result<void>(Composition&, const ProgramResetPositionRequest&, std::stop_token)>
+      reset_robot_position;
 
   void replace_current(Composition *replacement);
 };

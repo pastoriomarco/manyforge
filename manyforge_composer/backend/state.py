@@ -1394,6 +1394,7 @@ class ComposerState:
                 "deployment_revision": prepared_activation["deployment_revision"],
                 "expected_current": receipt["expected_current"],
                 "reject_if_affected_busy": True,
+                "scene_initialization": intent.get("scene_initialization", "preserve"),
                 "prepared_activation": {
                     field: deepcopy(prepared_activation[field])
                     for field in _PREPARED_ACTIVATION_FIELDS

@@ -87,9 +87,11 @@ OPERATOR_DRAFT_MUTATIONS = (
     "program_draft_upsert_contact_policies",
     "program_draft_update_settings",
     "program_draft_update_node_policies",
+    "program_draft_update_node_presentation",
     "viewer_draft_replace",
 )
 _NODE_POLICY_MUTATION = "program_draft_update_node_policies"
+_NODE_PRESENTATION_MUTATION = "program_draft_update_node_presentation"
 _PROGRAM_MOTION_DEFAULTS = (
     "velocity_scale",
     "acceleration_scale",
@@ -1787,6 +1789,7 @@ class ComposerDraftSession:
             "program_draft_update_motion_defaults": self._program_motion_defaults_update,
             "program_draft_update_settings": self._program_settings_update,
             _NODE_POLICY_MUTATION: self._node_policies_update,
+            _NODE_PRESENTATION_MUTATION: self._node_presentation_update,
             "blackboard_draft_upsert_namespaces": self._namespaces_upsert,
             "blackboard_draft_remove_namespaces": self._namespaces_remove,
             "blackboard_draft_upsert_keys": self._keys_upsert,
@@ -2867,6 +2870,53 @@ class ComposerDraftSession:
             node.pop("execution_groups", None)
         elif groups is not None:
             node["execution_groups"] = groups if isinstance(groups, str) else list(groups)
+        return {"updated_instance_id": instance_id}
+
+    @staticmethod
+    def _node_presentation_update(
+        document: dict[str, Any],
+        arguments: dict[str, Any],
+        _catalog: NodeCatalog,
+    ) -> dict[str, Any]:
+        """Set the editor-only "show collapsed by default" flag in node metadata.
+
+        Node metadata is non-authoritative presentation data (spec 420), but it is
+        part of the Program, so the change is an ordinary Draft edit.
+        """
+        if set(arguments) != {"instance_id", "collapsed_by_default"}:
+            _error(
+                "draft_arguments_invalid",
+                f"{_NODE_PRESENTATION_MUTATION} requires exactly "
+                "instance_id and collapsed_by_default",
+            )
+        instance_id = arguments["instance_id"]
+        if (
+            type(instance_id) is not str
+            or instance_id == _ROOT_ALIAS
+            or _PORTABLE_ID_PATTERN.fullmatch(instance_id) is None
+            or len(instance_id.encode("utf-8")) > _PORTABLE_ID_MAX_BYTES
+        ):
+            _error(
+                "draft_arguments_invalid",
+                "instance_id must be a portable lower-case ID of at most 128 bytes",
+                status_code=409,
+            )
+        collapsed = arguments["collapsed_by_default"]
+        if type(collapsed) is not bool:
+            _error("draft_arguments_invalid", "collapsed_by_default must be boolean")
+        node = _lookup_exact_instance(document["forest"], instance_id)
+        metadata = node.get("metadata", {})
+        if type(metadata) is not dict:
+            _error("composer_draft_invalid", "Program node metadata is not an object")
+        metadata = deepcopy(metadata)
+        if collapsed:
+            metadata["collapsed_by_default"] = True
+        else:
+            metadata.pop("collapsed_by_default", None)
+        if metadata:
+            node["metadata"] = metadata
+        else:
+            node.pop("metadata", None)
         return {"updated_instance_id": instance_id}
 
     @staticmethod

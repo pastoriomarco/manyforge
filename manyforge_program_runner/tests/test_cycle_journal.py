@@ -1161,3 +1161,46 @@ def test_running_cas_classifies_only_exact_accepted_stop(tmp_path, mismatch):
     assert isinstance(caught.value, ProgramCycleStopWon) == (mismatch in {"none", "terminal"})
     assert journal.read() == before
     journal.close()
+
+
+def test_reset_option_defaults_preserve_exact_request_identity(tmp_path):
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1")
+    original = {"request_id": "reset.1", "unrelated": "must stay exact"}
+    try:
+        assert journal.record_request(owner_epoch="caller.1", request_id="reset.1", kind="reset",
+                                      intent=original, cycle_generation=1).disposition == "new"
+        defaults = {**original, "reload_initial_scene": False, "reset_robot_position": False}
+        assert journal.record_request(owner_epoch="caller.1", request_id="reset.1", kind="reset",
+                                      intent=defaults, cycle_generation=1).disposition == "in_progress"
+        for changed in ({**defaults, "reload_initial_scene": True},
+                        {**defaults, "reset_robot_position": True},
+                        {**defaults, "unrelated": "changed"}):
+            with pytest.raises(ValueError, match="different intent"):
+                journal.record_request(owner_epoch="caller.1", request_id="reset.1", kind="reset",
+                                       intent=changed, cycle_generation=1)
+        assert journal.pending_commands()[0]["intent"] == original
+    finally:
+        journal.close()
+
+
+def test_idle_reset_claim_register_and_prior_scene_fault_survive_interruption(tmp_path):
+    path = tmp_path / "cycle.sqlite3"
+    journal = ProgramCycleJournal(path, owner_epoch="runner.1")
+    original = {"code": "program_scene_preparation_failed", "message": "unrepaired Scene"}
+    journal.record_scene_preparation_failure(expected_generation=1, owner_epoch="runner.1", failure=original)
+    journal.record_request(owner_epoch="caller.1", request_id="reset.1", kind="reset",
+                           intent={"reset_robot_position": True}, cycle_generation=1)
+    journal.begin_idle_resetting(expected_generation=1, owner_epoch="runner.1", correlation_id="reset.1",
+                                 session_id=None, client_sequence=None, phase="restoring_position")
+    retained = {"intent": {"expected_admission_generation": 41}, "claim": None, "release_intent": None}
+    journal.remember_reset_effect_claim(expected_generation=1, expected=None, retained=retained)
+    journal.close()
+    reopened = ProgramCycleJournal(path, owner_epoch="runner.1")
+    try:
+        cycle = reopened.read()
+        assert cycle.state == "recovery_required" and cycle.reconciliation_required
+        assert cycle.reset_effect_claim == retained
+        assert cycle.failure["prior_scene_preparation_failure"] == original
+        assert cycle.failure["failed_phase"] == "restoring_position"
+    finally:
+        reopened.close()

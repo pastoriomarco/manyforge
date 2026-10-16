@@ -71,6 +71,7 @@ import {
 import {
   collapsedProgramItems,
   collapsibleProgramNodeIds,
+  defaultCollapsedProgramNodeIds,
   hiddenProgramNodeIds,
 } from '../utils/programCollapse';
 import { BtNode, type BtNodePresentation } from './BtNode';
@@ -300,8 +301,31 @@ export function ProgramTreeCanvas({
       .map((row) => ({ source: row.parentId as string, target: row.node.instance_id })),
     [flat],
   );
-  // Collapsed subtrees are view state only: they never edit the Program.
-  const [collapsedIds, setCollapsedIds] = useState<ReadonlySet<string>>(() => new Set());
+  // Collapsed subtrees are view state only: they never edit the Program. The
+  // canvas opens with the nodes the Program flags "collapsed by default"; toggling
+  // that flag collapses or expands the node; other clicks stay session-only.
+  const [collapsedIds, setCollapsedIds] = useState<ReadonlySet<string>>(
+    () => defaultCollapsedProgramNodeIds(roots),
+  );
+  const defaultCollapsedKey = useMemo(
+    () => [...defaultCollapsedProgramNodeIds(roots)].sort().join('\u0000'),
+    [roots],
+  );
+  const previousDefaultCollapsed = useRef(defaultCollapsedKey);
+  useEffect(() => {
+    const previous = new Set(previousDefaultCollapsed.current.split('\u0000').filter(Boolean));
+    const current = new Set(defaultCollapsedKey.split('\u0000').filter(Boolean));
+    previousDefaultCollapsed.current = defaultCollapsedKey;
+    const added = [...current].filter((id) => !previous.has(id));
+    const removed = [...previous].filter((id) => !current.has(id));
+    if (added.length === 0 && removed.length === 0) return;
+    setCollapsedIds((ids) => {
+      const next = new Set(ids);
+      added.forEach((id) => next.add(id));
+      removed.forEach((id) => next.delete(id));
+      return next;
+    });
+  }, [defaultCollapsedKey]);
   const collapsible = useMemo(() => collapsibleProgramNodeIds(roots), [roots]);
   const collapsed = useMemo(
     () => new Set([...collapsedIds].filter((id) => collapsible.has(id))),

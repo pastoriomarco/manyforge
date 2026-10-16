@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
@@ -13,9 +15,10 @@
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <lifecycle_msgs/msg/state.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_ros2_control_execution/selected_ros_endpoint_facts.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -122,6 +125,19 @@ cause_fact(const core::LifecycleBlockingCauseClassDTO cause) {
            std::string(core::to_string(cause))}};
 }
 
+constexpr std::string_view kMockResetTransitionFact =
+    "external.mock_reset_position_transition";
+
+std::string
+reset_transition_token(const MockResetPositionTransition &transition) {
+  return "phase." + std::to_string(static_cast<int>(transition.phase)) +
+         ".pre." + std::to_string(transition.predecessor_epoch.value()) +
+         ".post." +
+         (transition.successor_epoch
+              ? std::to_string(transition.successor_epoch->value())
+              : std::string("none"));
+}
+
 // Fact ids are sorted: every `external.*` id precedes the standard
 // `manyforge.blocking_cause_class` id.
 [[nodiscard]] std::vector<core::LifecycleFactDTO>
@@ -129,8 +145,9 @@ lifecycle_facts(const bool controller_ready,
                 const bool controller_inactive_unrequested,
                 const bool controller_loaded, const bool fault_present,
                 const bool transport_ready,
-                const core::LifecycleBlockingCauseClassDTO cause) {
-  return {
+                const core::LifecycleBlockingCauseClassDTO cause,
+                const std::optional<std::string> &reset_transition = {}) {
+  std::vector<core::LifecycleFactDTO> result{
       boolean_fact("external.controller_configuration_ready", controller_ready),
       // Diagnostic only: the trajectory controller is inactive although this
       // host's CCLC did not deactivate it after it was once active.
@@ -141,6 +158,17 @@ lifecycle_facts(const bool controller_ready,
       boolean_fact("external.transport_ready", transport_ready),
       cause_fact(cause),
   };
+  if (reset_transition) {
+    result.push_back(
+        {core::LifecycleFactId(std::string(kMockResetTransitionFact)),
+         {core::LifecycleFactValueKindDTO::kToken, std::nullopt, std::nullopt,
+          *reset_transition}});
+    std::sort(result.begin(), result.end(),
+              [](const auto &left, const auto &right) {
+                return left.lifecycle_fact_id < right.lifecycle_fact_id;
+              });
+  }
+  return result;
 }
 
 [[nodiscard]] bool
@@ -238,10 +266,12 @@ public:
 
   ArmPort(std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend>
               adapter,
-          std::vector<std::string> compiled, std::vector<std::string> controller,
-          std::shared_ptr<const Gate> gate)
+          std::vector<std::string> compiled,
+          std::vector<std::string> controller, std::shared_ptr<const Gate> gate,
+          std::shared_ptr<const std::atomic<bool>> reset_motion_admitted)
       : adapter_(std::move(adapter)), compiled_(std::move(compiled)),
-        controller_(std::move(controller)), gate_(std::move(gate)) {}
+        controller_(std::move(controller)), gate_(std::move(gate)),
+        reset_motion_admitted_(std::move(reset_motion_admitted)) {}
 
   [[nodiscard]] ros2_control_execution::Ros2ControlExecutionBackend &
   adapter() const noexcept {
@@ -303,6 +333,13 @@ public:
 private:
   [[nodiscard]] std::optional<core::ExecutionPortCommandResultDTO>
   Refusal() const {
+    if (!reset_motion_admitted_->load())
+      return core::ExecutionPortCommandResultDTO{
+          core::ExecutionPortDispatch::kNotDispatched,
+          core::ExecutionPortRefusal::kNotReady,
+          core::ErrorDTO{"execution_rejected",
+                         "The accepted position Reset has not completed",
+                         {{"reason", "mock_reset_position_pending"}}}};
     if (!*gate_ || (*gate_)()) return std::nullopt;
     return core::ExecutionPortCommandResultDTO{
         core::ExecutionPortDispatch::kNotDispatched,
@@ -335,6 +372,7 @@ private:
   std::vector<std::string> compiled_;
   std::vector<std::string> controller_;
   std::shared_ptr<const Gate> gate_;
+  std::shared_ptr<const std::atomic<bool>> reset_motion_admitted_;
 };
 
 struct RetainedRos2ControlRuntimeHandle::ArmState final {
@@ -365,6 +403,15 @@ struct RetainedRos2ControlRuntimeHandle::ArmState final {
   std::shared_ptr<ros2_control_execution::SelectedRosEndpointFacts>
       activity_endpoints;
   rclcpp::Client<SwitchService>::SharedPtr switch_client;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr
+      reset_publisher;
+  bool reset_writer_loaded{false};
+  bool reset_writer_active{false};
+  bool reset_writer_possibly_active{false};
+  bool reset_position_pending{false};
+  std::shared_ptr<std::atomic<bool>> reset_motion_admitted{
+      std::make_shared<std::atomic<bool>>(true)};
+  std::optional<MockResetPositionTransition> reset_transition;
   /// Q54: the controller manager's statistics for this controller.
   std::shared_ptr<RetainedControllerStatisticsMonitor> statistics_monitor;
   rclcpp::Subscription<pal_statistics_msgs::msg::Statistics>::SharedPtr
@@ -390,9 +437,10 @@ struct PreparedMeasuredStateSources::Storage final {
     std::vector<double> velocities;
   };
   Storage(std::vector<core::MeasuredStateSourceDescriptor> descriptors,
-          std::shared_ptr<core::IClock> clock, rclcpp::Node::SharedPtr node)
+          std::shared_ptr<core::IClock> clock, rclcpp::Node::SharedPtr node,
+          std::shared_ptr<RetainedObservationWake> observation_wake)
       : descriptors(std::move(descriptors)), clock(std::move(clock)),
-        node(std::move(node)) {}
+        node(std::move(node)), observation_wake(std::move(observation_wake)) {}
   ~Storage() {
     std::lock_guard lock(mutex);
     active = false;
@@ -403,6 +451,7 @@ struct PreparedMeasuredStateSources::Storage final {
   const std::vector<core::MeasuredStateSourceDescriptor> descriptors;
   const std::shared_ptr<core::IClock> clock;
   const rclcpp::Node::SharedPtr node;
+  const std::shared_ptr<RetainedObservationWake> observation_wake;
   std::vector<Channel> channels;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr subscription;
 };
@@ -523,7 +572,9 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
           "Measured source differs from the actual bound physical lane.");
   }
   auto replacement = std::make_shared<PreparedMeasuredStateSources::Storage>(
-      std::move(descriptors), std::move(receiver_clock), resources_->node());
+      std::move(descriptors), std::move(receiver_clock), resources_->node(),
+      arm_ && arm_->transport.mock_reset_position ? reset_observation_wake_
+                                                  : nullptr);
   Readers readers;
   replacement->channels.reserve(replacement->descriptors.size());
   readers.reserve(replacement->descriptors.size());
@@ -595,6 +646,8 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
                   source_time, received);
             }
             publication_lock.unlock();
+            if (channels->observation_wake)
+              channels->observation_wake->notify();
             // This existing NRT sample checkpoint also sees graph edges after
             // the latched activity's matched callback. Refresh's unchanged
             // clean/event fast path performs no SDK graph query when steady.
@@ -755,6 +808,20 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::Bind(
         "the gripper controller requires its exact domain in the "
         "same controller manager and hardware");
   }
+  if (arm.mock_reset_position) {
+    const auto &target = *arm.mock_reset_position;
+    if (target.component_runtime_identity.empty() ||
+        target.target_digest.empty() || target.controller_name.empty() ||
+        target.commands_topic.empty() ||
+        target.controller_name == arm.controller.controller_name ||
+        target.joint_names != arm.adapter.lane_facts.joint_names ||
+        target.positions.size() != target.joint_names.size() ||
+        !std::all_of(target.positions.begin(), target.positions.end(),
+                     [](double value) { return std::isfinite(value); }))
+      return reject_owned(
+          "mock_reset_target_binding_invalid",
+          "Mock reset writer must retain its exact ordered immutable target");
+  }
   const auto &motion_domain =
       motion_binding.value().control_path->control_domain_id;
   const auto gripper_domain =
@@ -812,7 +879,8 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::Bind(
             *resources, clock, state->transport.adapter);
     state->port = std::make_shared<ArmPort>(
         state->adapter, state->transport.compiled_joint_names,
-        state->transport.adapter.lane_facts.joint_names, state->gate);
+        state->transport.adapter.lane_facts.joint_names, state->gate,
+        state->reset_motion_admitted);
     participant = make_participant(state->port);
   } catch (const std::exception &error) {
     if (state->adapter)
@@ -1119,6 +1187,12 @@ void RetainedRos2ControlRuntimeHandle::StartBackend() {
             node, controller.controller_manager + "/activity",
             "controller_manager_msgs/msg/ControllerManagerActivity");
     const auto endpoint_facts = arm_->activity_endpoints;
+    const auto reset_target = arm_->transport.mock_reset_position;
+    if (reset_target)
+      arm_->reset_publisher =
+          node->create_publisher<std_msgs::msg::Float64MultiArray>(
+              reset_target->commands_topic,
+              rclcpp::QoS(1).reliable().durability_volatile());
     rclcpp::SubscriptionOptions options;
     // The controller manager appearing or disappearing changes what its
     // (transient-local) activity sample can still claim.
@@ -1140,7 +1214,7 @@ void RetainedRos2ControlRuntimeHandle::StartBackend() {
     arm_->activity_subscription = node->create_subscription<ActivityMessage>(
         controller.controller_manager + "/activity",
         rclcpp::QoS(1).reliable().transient_local(),
-        [weak, controller,
+        [weak, controller, reset_target,
          gripper_controller](const ActivityMessage::ConstSharedPtr message) {
           const auto self = weak.lock();
           if (!self)
@@ -1184,6 +1258,24 @@ void RetainedRos2ControlRuntimeHandle::StartBackend() {
             }
           }
           self->ObserveActivity(activity, gripper_activity);
+          if (reset_target) {
+            std::lock_guard lock(self->mutex_);
+            self->arm_->reset_writer_loaded = false;
+            self->arm_->reset_writer_active = false;
+            for (const auto &row : message->controllers) {
+              if (row.name != reset_target->controller_name)
+                continue;
+              self->arm_->reset_writer_loaded =
+                  row.state.id ==
+                      lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE ||
+                  row.state.id ==
+                      lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+              self->arm_->reset_writer_active =
+                  row.state.id ==
+                  lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+            }
+            self->reset_observation_wake_->notify();
+          }
         },
         options);
     arm_->switch_client = node->create_client<SwitchService>(
@@ -1205,7 +1297,8 @@ void RetainedRos2ControlRuntimeHandle::StartBackend() {
         throw std::invalid_argument("ROS arm lane has no controller state rate");
       sample_timer_ = node->create_wall_timer(
           std::chrono::nanoseconds(static_cast<std::int64_t>(1e9 / rate)),
-          [weak]() {
+          [weak,
+           reset_wake = reset_target ? reset_observation_wake_ : nullptr]() {
             const auto self = weak.lock();
             if (!self)
               return;
@@ -1236,6 +1329,8 @@ void RetainedRos2ControlRuntimeHandle::StartBackend() {
               self->last_observed_sample_ = identity;
             }
             observer(*sample);
+            if (reset_wake)
+              reset_wake->notify();
           });
     }
     resources_->start();
@@ -1314,6 +1409,8 @@ void RetainedRos2ControlRuntimeHandle::ObserveActivity(
     arm_->active_seen_while_bound = false;
   }
   PublishReadinessLocked();
+  if (arm_->transport.mock_reset_position)
+    reset_observation_wake_->notify();
 }
 
 void RetainedRos2ControlRuntimeHandle::PublishReadinessLocked() {
@@ -1322,6 +1419,9 @@ void RetainedRos2ControlRuntimeHandle::PublishReadinessLocked() {
   readiness.binding_epoch = core::ExecutionBindingEpoch(arm_->epoch);
   readiness.controller_active =
       activity.controller_manager_present && activity.controller_active;
+  // Physical binding readiness also enables JTC feedback reception. The
+  // accepted Reset claim/CCLC scope and ArmPort's pending gate separately
+  // prevent motion until exact post-effect readback has completed.
   readiness.controller_bound = arm_->bound;
   readiness.hardware_active =
       activity.controller_manager_present && activity.hardware_active;
@@ -1351,7 +1451,8 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::RotateEpochLocked() {
     arm_->activation_client_discovered = false;
     arm_->port = std::make_shared<ArmPort>(
         arm_->adapter, arm_->transport.compiled_joint_names,
-        arm_->transport.adapter.lane_facts.joint_names, arm_->gate);
+        arm_->transport.adapter.lane_facts.joint_names, arm_->gate,
+        arm_->reset_motion_admitted);
     arm_->epoch_used = false;
     arm_->bound = false;
     arm_->rebind_pending = true;
@@ -1371,9 +1472,34 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::RotateEpochLocked() {
 RetainedRos2ControlSwitchResult RetainedRos2ControlRuntimeHandle::SendSwitch(
     const bool activate, const std::stop_token cancellation,
     const std::optional<std::string> selected_controller) {
+  std::string controller;
+  {
+    std::lock_guard lock(mutex_);
+    if (!arm_ && !gripper_only_)
+      return not_sent("ros2_control_switch_unavailable",
+                      "the controller-manager switch client is not started");
+    controller = selected_controller.value_or(
+        arm_ ? arm_->transport.controller.controller_name
+             : gripper_only_->controller.controller_name);
+  }
+  return SendControllerSwitch(activate ? std::vector<std::string>{controller}
+                                       : std::vector<std::string>{},
+                              activate ? std::vector<std::string>{}
+                                       : std::vector<std::string>{controller},
+                              cancellation);
+}
+
+RetainedRos2ControlSwitchResult
+RetainedRos2ControlRuntimeHandle::SendControllerSwitch(
+    std::vector<std::string> activate_controllers,
+    std::vector<std::string> deactivate_controllers,
+    const std::stop_token cancellation,
+    const std::optional<core::Duration> response_timeout_ns) {
   rclcpp::Client<SwitchService>::SharedPtr client;
   rclcpp::Node::SharedPtr node;
-  std::string controller;
+  const bool activate = !activate_controllers.empty();
+  const auto controller =
+      activate ? activate_controllers.front() : deactivate_controllers.front();
   {
     std::lock_guard lock(mutex_);
     if ((!arm_ || !arm_->switch_client) && (!gripper_only_ || !gripper_only_->switch_client))
@@ -1381,19 +1507,22 @@ RetainedRos2ControlSwitchResult RetainedRos2ControlRuntimeHandle::SendSwitch(
                       "the controller-manager switch client is not started");
     client = arm_ ? arm_->switch_client : gripper_only_->switch_client;
     node = resources_->node();
-    controller = selected_controller.value_or(
-        arm_ ? arm_->transport.controller.controller_name : gripper_only_->controller.controller_name);
   }
   if (!client->service_is_ready())
     return not_sent("ros2_control_switch_service_unavailable",
                     "the controller manager's switch_controller service is not "
                     "available");
   auto request = std::make_shared<SwitchService::Request>();
-  (activate ? request->activate_controllers : request->deactivate_controllers)
-      .push_back(controller);
+  request->activate_controllers = std::move(activate_controllers);
+  request->deactivate_controllers = std::move(deactivate_controllers);
   request->strictness = SwitchService::Request::STRICT;
   request->activate_asap = false;
   auto future = client->async_send_request(request);
+  const auto response_deadline =
+      response_timeout_ns
+          ? std::optional(std::chrono::steady_clock::now() +
+                          std::chrono::nanoseconds(*response_timeout_ns))
+          : std::nullopt;
   while (future.wait_for(std::chrono::milliseconds(10)) !=
          std::future_status::ready) {
     if (cancellation.stop_requested()) {
@@ -1403,8 +1532,32 @@ RetainedRos2ControlSwitchResult RetainedRos2ControlRuntimeHandle::SendSwitch(
                            "the controller switch was cancelled before its "
                            "answer; its effect is unknown")};
     }
+    if (response_deadline &&
+        std::chrono::steady_clock::now() >= *response_deadline) {
+      client->remove_pending_request(future);
+      return {RetainedRos2ControlSwitchOutcome::kUncertain,
+              switch_error("ros2_control_switch_timeout",
+                           "The controller switch response exceeded the stock "
+                           "CM 1 s fault bound; its effect is unknown")};
+    }
   }
   const auto response = future.get();
+  // A response can become ready during the final wait after its deadline.
+  // The optional Reset bound still applies before accepting that response;
+  // ordinary lifecycle callers retain their existing cancellation semantics.
+  if (response_deadline && cancellation.stop_requested()) {
+    return {RetainedRos2ControlSwitchOutcome::kUncertain,
+            switch_error("ros2_control_switch_cancelled",
+                         "the controller switch was cancelled before its "
+                         "answer; its effect is unknown")};
+  }
+  if (response_deadline &&
+      std::chrono::steady_clock::now() >= *response_deadline) {
+    return {RetainedRos2ControlSwitchOutcome::kUncertain,
+            switch_error("ros2_control_switch_timeout",
+                         "The controller switch response exceeded the stock "
+                         "CM 1 s fault bound; its effect is unknown")};
+  }
   if (!response || !response->ok) {
     auto error = switch_error(activate ? "ros2_control_activation_refused"
                                       : "ros2_control_deactivation_refused",
@@ -1529,7 +1682,371 @@ RetainedRos2ControlRuntimeHandle::DeactivateArmControllerForFault(
     arm_->bound = false;
     PublishReadinessLocked();
   }
+  std::optional<std::string> writer;
+  {
+    std::lock_guard lock(mutex_);
+    if (arm_->transport.mock_reset_position &&
+        (arm_->reset_writer_possibly_active || arm_->reset_writer_active))
+      writer = arm_->transport.mock_reset_position->controller_name;
+  }
+  if (writer) {
+    const auto contained = SendSwitch(false, cancellation, *writer);
+    if (contained.outcome != RetainedRos2ControlSwitchOutcome::kSucceeded)
+      return contained;
+    std::lock_guard lock(mutex_);
+    arm_->reset_writer_possibly_active = false;
+  }
   return SendSwitch(false, cancellation);
+}
+
+std::optional<MockResetPositionTarget>
+RetainedRos2ControlRuntimeHandle::mock_reset_position_target() const {
+  std::lock_guard lock(mutex_);
+  return arm_ ? arm_->transport.mock_reset_position : std::nullopt;
+}
+
+bool RetainedRos2ControlRuntimeHandle::mock_reset_writer_inactive() const {
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr publisher;
+  {
+    std::lock_guard lock(mutex_);
+    if (!arm_ || !arm_->transport.mock_reset_position ||
+        !arm_->activity.controller_manager_present ||
+        !arm_->activity.observed || !arm_->reset_writer_loaded ||
+        arm_->reset_writer_active || arm_->reset_writer_possibly_active)
+      return false;
+    publisher = arm_->reset_publisher;
+  }
+  return publisher && publisher->get_subscription_count() == 1U;
+}
+
+bool RetainedRos2ControlRuntimeHandle::mock_reset_writer_active() const {
+  std::lock_guard lock(mutex_);
+  return arm_ && arm_->transport.mock_reset_position &&
+         arm_->activity.controller_manager_present && arm_->activity.observed &&
+         arm_->activity.hardware_active && arm_->activity.controller_loaded &&
+         !arm_->activity.controller_active && arm_->reset_writer_loaded &&
+         arm_->reset_writer_active;
+}
+
+std::shared_ptr<RetainedObservationWake>
+RetainedRos2ControlRuntimeHandle::mock_reset_observation_wake() const noexcept {
+  return reset_observation_wake_;
+}
+
+bool RetainedRos2ControlRuntimeHandle::mock_reset_successor_ready() const {
+  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> adapter;
+  {
+    std::lock_guard lock(mutex_);
+    if (!arm_ || !arm_->reset_position_pending || !arm_->bound ||
+        !arm_->activity.controller_manager_present ||
+        !arm_->activity.observed || !arm_->activity.hardware_active ||
+        !arm_->activity.controller_active || !arm_->reset_writer_loaded ||
+        arm_->reset_writer_active || arm_->reset_writer_possibly_active)
+      return false;
+    adapter = arm_->adapter;
+  }
+  const bool discovered = adapter->ActionServerIsReady();
+  std::lock_guard lock(mutex_);
+  return discovered && arm_ && arm_->adapter == adapter && arm_->bound &&
+         arm_->activity.controller_manager_present &&
+         arm_->activity.hardware_active && arm_->activity.controller_active &&
+         !arm_->reset_writer_active && !arm_->reset_writer_possibly_active;
+}
+
+bool RetainedRos2ControlRuntimeHandle::IsExpectedMockPositionResetTransition(
+    const core::BrandLifecycleObservationDTO &observation,
+    const MockResetPositionTransition &transition) const {
+  std::lock_guard lock(mutex_);
+  if (!observation.locally_valid() || !arm_ || !motion_binding_ ||
+      !arm_->reset_position_pending || !arm_->transport.mock_reset_position)
+    return false;
+  const auto &binding = motion_binding_->value();
+  const auto &path = *binding.control_path;
+  if (observation.controllable_component_id !=
+          binding.controllable_component_id ||
+      observation.control_domain_id != path.control_domain_id ||
+      observation.control_domain_revision != path.control_domain_revision ||
+      observation.provider_instance_id != path.provider_instance_id ||
+      observation.provider_manifest_id != path.provider_manifest_id ||
+      observation.provider_manifest_revision !=
+          path.provider_manifest_revision ||
+      observation.provider_runtime_unit_id != path.provider_runtime_unit_id ||
+      observation.provider_runtime_epoch != path.provider_runtime_epoch)
+    return false;
+  const auto expected = reset_transition_token(transition);
+  const auto boolean = [&](std::string_view id, bool value) {
+    return std::any_of(observation.facts.begin(), observation.facts.end(),
+                       [&](const auto &fact) {
+                         return fact.lifecycle_fact_id.value() == id &&
+                                fact.value.boolean_value == value;
+                       });
+  };
+  const bool availability = std::any_of(
+      observation.facts.begin(), observation.facts.end(), [](const auto &fact) {
+        return fact.lifecycle_fact_id.value() ==
+                   core::kLifecycleBlockingCauseFactId &&
+               fact.value.token_value ==
+                   core::to_string(
+                       core::LifecycleBlockingCauseClassDTO::kAvailability);
+      });
+  if (observation.observed_state !=
+          core::ComponentLifecycleStateDTO::kDegraded ||
+      !availability || !boolean("external.fault_present", false) ||
+      !boolean("external.controller_loaded", true) ||
+      !boolean("external.transport_ready", true))
+    return false;
+  return std::any_of(observation.facts.begin(), observation.facts.end(),
+                     [&](const auto &fact) {
+                       return fact.lifecycle_fact_id.value() ==
+                                  kMockResetTransitionFact &&
+                              fact.value.token_value == expected;
+                     });
+}
+
+RetainedRos2ControlSwitchResult
+RetainedRos2ControlRuntimeHandle::ResetMockPosition(
+    const std::stop_token cancellation,
+    const MockResetPositionPhaseCallback &phase) {
+  std::lock_guard switch_lock(switch_mutex_);
+  RefreshEndpointFacts();
+  if (auto error = ReadEndpointDiagnostic())
+    return {RetainedRos2ControlSwitchOutcome::kNotSent, std::move(error)};
+  MockResetPositionTarget target;
+  std::string controller;
+  std::uint64_t predecessor{};
+  std::uint64_t expected_successor{};
+  std::optional<core::ExecutionBindingEpoch> successor;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr publisher;
+  {
+    std::lock_guard lock(mutex_);
+    if (!phase || !arm_ || !arm_->transport.mock_reset_position ||
+        !arm_->reset_publisher || !arm_->bound ||
+        arm_->reset_position_pending ||
+        !arm_->activity.controller_manager_present ||
+        !arm_->activity.observed || !arm_->activity.hardware_active ||
+        !arm_->activity.controller_active || !arm_->reset_writer_loaded ||
+        arm_->reset_writer_active || arm_->reset_writer_possibly_active)
+      return not_sent("mock_reset_position_unavailable",
+                      "Mock position reset requires the active exact arm and "
+                      "inactive writer");
+    target = *arm_->transport.mock_reset_position;
+    controller = arm_->transport.controller.controller_name;
+    predecessor = arm_->epoch;
+    if (arm_->epoch_used &&
+        arm_->epoch == std::numeric_limits<std::uint64_t>::max())
+      return not_sent("ros2_control_binding_epoch_exhausted",
+                      "ROS controller binding epoch is exhausted");
+    expected_successor = arm_->epoch_used ? arm_->epoch + 1U : arm_->epoch;
+    publisher = arm_->reset_publisher;
+  }
+  if (cancellation.stop_requested())
+    return not_sent("mock_reset_position_cancelled",
+                    "Mock position reset was cancelled before effects");
+  if (publisher->get_subscription_count() != 1U)
+    return not_sent("mock_reset_writer_endpoint_unavailable",
+                    "Mock position reset requires exactly one discovered stock "
+                    "writer subscription");
+  const auto notify = [&](MockResetPositionPhase next,
+                          bool acknowledged = false, bool published = false) {
+    const MockResetPositionTransition transition{
+        next, core::ExecutionBindingEpoch(predecessor), successor, acknowledged,
+        published};
+    bool committed = false;
+    const MockResetPositionPhaseCommit commit = [&] {
+      // Core calls this under its existing driver run mutex; it contains no
+      // SDK/ROS calls, allocation or waits. Driver -> handle state is the
+      // same lock order used by its observation pass.
+      std::lock_guard lock(mutex_);
+      arm_->reset_transition = transition;
+      committed = true;
+      return core::Result<void>::Ok();
+    };
+    try {
+      auto result = phase(transition, commit);
+      if (result.ok() && !committed)
+        return core::Result<void>::Err(
+            switch_error("mock_reset_phase_uncommitted",
+                         "The Reset owner did not commit its exact phase"));
+      return result;
+    } catch (const std::exception &error) {
+      return core::Result<void>::Err(
+          switch_error("mock_reset_phase_failed", error.what()));
+    } catch (...) {
+      return core::Result<void>::Err(switch_error(
+          "mock_reset_phase_failed", "Reset phase callback failed"));
+    }
+  };
+  auto accepted = notify(MockResetPositionPhase::kSwitchingToWriter);
+  if (!accepted.ok())
+    return {RetainedRos2ControlSwitchOutcome::kNotSent, accepted.error()};
+  if (cancellation.stop_requested())
+    return not_sent("mock_reset_position_cancelled",
+                    "Mock position reset was cancelled before effects");
+  const auto send = [&](std::vector<std::string> activate,
+                        std::vector<std::string> deactivate) {
+    try {
+      return SendControllerSwitch(
+          std::move(activate), std::move(deactivate), cancellation,
+          kMockResetPositionWriteAcknowledgmentTimeoutNs);
+    } catch (const std::exception &error) {
+      return RetainedRos2ControlSwitchResult{
+          RetainedRos2ControlSwitchOutcome::kUncertain,
+          switch_error("mock_reset_switch_unknown", error.what())};
+    } catch (...) {
+      return RetainedRos2ControlSwitchResult{
+          RetainedRos2ControlSwitchOutcome::kUncertain,
+          switch_error("mock_reset_switch_unknown",
+                       "Controller switch outcome is unknown")};
+    }
+  };
+  {
+    std::lock_guard lock(mutex_);
+    arm_->reset_position_pending = true;
+    arm_->reset_motion_admitted->store(false);
+    arm_->reset_writer_possibly_active = true;
+    PublishReadinessLocked();
+  }
+  // This is containment only: never resend a target, reactivate JTC or roll
+  // back after a failed/unknown effect. The owner retains the Reset claim.
+  const auto abort = [&](RetainedRos2ControlSwitchResult failed) {
+    static_cast<void>(notify(MockResetPositionPhase::kContaining));
+    bool possibly_active;
+    {
+      std::lock_guard lock(mutex_);
+      possibly_active =
+          arm_->reset_writer_possibly_active || arm_->reset_writer_active;
+      arm_->bound = false;
+      PublishReadinessLocked();
+    }
+    if (possibly_active) {
+      const auto contained = send({}, {target.controller_name});
+      if (contained.outcome == RetainedRos2ControlSwitchOutcome::kSucceeded) {
+        std::lock_guard lock(mutex_);
+        arm_->reset_writer_possibly_active = false;
+      } else {
+        failed.outcome = RetainedRos2ControlSwitchOutcome::kUncertain;
+        if (failed.error)
+          failed.error->details.emplace("writer_containment", "unresolved");
+      }
+    }
+    if (failed.outcome == RetainedRos2ControlSwitchOutcome::kNotSent)
+      failed.outcome = RetainedRos2ControlSwitchOutcome::kFailed;
+    if (failed.error)
+      failed.error->message +=
+          " Robot position unknown after a failed position reset. Restart the "
+          "workbench to recover.";
+    return failed;
+  };
+  auto switched = send({target.controller_name}, {controller});
+  if (switched.outcome == RetainedRos2ControlSwitchOutcome::kNotSent) {
+    // The service was unavailable before dispatch: no physical transition
+    // occurred, so preserve the original active binding and existing retry.
+    std::lock_guard lock(mutex_);
+    arm_->reset_position_pending = false;
+    arm_->reset_motion_admitted->store(true);
+    arm_->reset_transition.reset();
+    arm_->reset_writer_possibly_active = false;
+    PublishReadinessLocked();
+    return switched;
+  }
+  if (switched.outcome != RetainedRos2ControlSwitchOutcome::kSucceeded)
+    return abort(std::move(switched));
+  // Only a positive exact ACK enters this observation barrier. Unknown or
+  // timed-out switches went directly to containment above; later activity
+  // never changes their classification or authorizes a compensating switch.
+  accepted = notify(MockResetPositionPhase::kSwitchingToWriter, true);
+  if (!accepted.ok())
+    return abort({RetainedRos2ControlSwitchOutcome::kFailed, accepted.error()});
+  if (!mock_reset_writer_active())
+    return abort(
+        {RetainedRos2ControlSwitchOutcome::kFailed,
+         switch_error(
+             "mock_reset_writer_activation_unobserved",
+             "The acknowledged writer destination has not been observed")});
+  accepted = notify(MockResetPositionPhase::kSettingState);
+  if (!accepted.ok())
+    return abort({RetainedRos2ControlSwitchOutcome::kFailed, accepted.error()});
+  if (cancellation.stop_requested())
+    return abort(
+        not_sent("mock_reset_position_cancelled",
+                 "Mock position reset was cancelled before publication"));
+  std_msgs::msg::Float64MultiArray command;
+  command.data = target.positions;
+  try {
+    publisher->publish(command); // Exactly one immutable target publication.
+  } catch (const std::exception &error) {
+    return abort({RetainedRos2ControlSwitchOutcome::kUncertain,
+                  switch_error("mock_reset_publish_unknown", error.what())});
+  } catch (...) {
+    return abort({RetainedRos2ControlSwitchOutcome::kUncertain,
+                  switch_error("mock_reset_publish_unknown",
+                               "Target publication outcome is unknown")});
+  }
+  // GenericSystem 6.9.0 generic_system.cpp:449-476 (read's position branch)
+  // loops the position command back exactly. One fresh target-valued sample
+  // acknowledges writer consumption; no measured convergence/dwell follows.
+  // A DDS delivery ACK alone does not prove the writer's update ran.
+  accepted = notify(MockResetPositionPhase::kSettingState, false, true);
+  if (!accepted.ok())
+    return abort(
+        {RetainedRos2ControlSwitchOutcome::kUncertain, accepted.error()});
+  successor = core::ExecutionBindingEpoch(expected_successor);
+  accepted = notify(MockResetPositionPhase::kSwitchingToJtc);
+  if (!accepted.ok())
+    return abort({RetainedRos2ControlSwitchOutcome::kFailed, accepted.error()});
+  try {
+    std::lock_guard lock(mutex_);
+    accepted = RotateEpochLocked();
+    if (accepted.ok() && arm_->epoch != expected_successor)
+      accepted = core::Result<void>::Err(switch_error(
+          "mock_reset_successor_mismatch",
+          "The rotated binding differs from the authorized successor"));
+  } catch (const std::exception &error) {
+    accepted = core::Result<void>::Err(
+        switch_error("mock_reset_rotation_unknown", error.what()));
+  } catch (...) {
+    accepted = core::Result<void>::Err(switch_error(
+        "mock_reset_rotation_unknown", "Binding rotation did not complete"));
+  }
+  if (!accepted.ok())
+    return abort(
+        {RetainedRos2ControlSwitchOutcome::kUncertain, accepted.error()});
+  if (cancellation.stop_requested())
+    return abort(not_sent(
+        "mock_reset_position_cancelled",
+        "Mock position reset was cancelled before successor activation"));
+  switched = send({controller}, {target.controller_name});
+  {
+    std::lock_guard lock(mutex_);
+    if (switched.outcome != RetainedRos2ControlSwitchOutcome::kNotSent)
+      arm_->epoch_used = true;
+    if (switched.outcome == RetainedRos2ControlSwitchOutcome::kSucceeded) {
+      arm_->reset_writer_possibly_active = false;
+      arm_->bound = true;
+      arm_->active_seen_while_bound = arm_->activity.controller_active;
+      arm_->requested = core::ComponentLifecycleStateDTO::kActive;
+      PublishReadinessLocked();
+    }
+  }
+  if (switched.outcome != RetainedRos2ControlSwitchOutcome::kSucceeded)
+    return abort(std::move(switched));
+  accepted = notify(MockResetPositionPhase::kSwitchingToJtc, true);
+  if (!accepted.ok())
+    return abort({RetainedRos2ControlSwitchOutcome::kFailed, accepted.error()});
+  if (!mock_reset_successor_ready())
+    return abort(
+        {RetainedRos2ControlSwitchOutcome::kFailed,
+         switch_error(
+             "mock_reset_jtc_activation_unobserved",
+             "The acknowledged successor destination has not been observed")});
+  {
+    std::lock_guard lock(mutex_);
+    arm_->reset_position_pending = false;
+    arm_->reset_transition.reset();
+    arm_->reset_motion_admitted->store(true);
+    PublishReadinessLocked();
+  }
+  return switched;
 }
 
 RetainedRos2ControlSwitchResult
@@ -1753,6 +2270,17 @@ struct RetainedRos2ControlRuntimeHandle::LifecycleHealthInputs final {
       gripper_snapshot;
   std::shared_ptr<const content_identity::CanonicalValue> diagnostic_snapshot;
   std::string diagnostic_incident_id;
+  bool reset_pending{};
+  bool reset_raw_bound{};
+  bool reset_writer_loaded{};
+  bool reset_writer_active{};
+  bool reset_endpoints_healthy{};
+  bool reset_writer_endpoint_ready{};
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr
+      reset_publisher;
+  std::uint64_t reset_epoch{};
+  std::optional<MockResetPositionTarget> reset_target;
+  std::optional<MockResetPositionTransition> reset_transition;
 };
 
 struct RetainedRos2ControlRuntimeHandle::LifecycleClassification final {
@@ -1787,7 +2315,17 @@ RetainedRos2ControlRuntimeHandle::CaptureLifecycleHealthInputs(
       (arm_ && arm_->transport.gripper_controller.has_value());
   if (arm_) {
     inputs.requested = arm_->requested;
-    inputs.bound = arm_->bound;
+    // Operation availability is closed while the physical binding continues
+    // to receive feedback; only ArmPort Submit/Replace are gated.
+    inputs.bound = arm_->bound && !arm_->reset_position_pending;
+    inputs.reset_pending = arm_->reset_position_pending;
+    inputs.reset_raw_bound = arm_->bound;
+    inputs.reset_writer_loaded = arm_->reset_writer_loaded;
+    inputs.reset_writer_active = arm_->reset_writer_active;
+    inputs.reset_epoch = arm_->epoch;
+    inputs.reset_target = arm_->transport.mock_reset_position;
+    inputs.reset_transition = arm_->reset_transition;
+    inputs.reset_publisher = arm_->reset_publisher;
     inputs.activation_client_discovered = arm_->activation_client_discovered;
     inputs.adapter = arm_->adapter;
   }
@@ -1811,6 +2349,9 @@ void RetainedRos2ControlRuntimeHandle::ReadLifecycleMonitorFacts(
   if (inputs.process_fault && (inputs.is_motion || inputs.is_gripper))
     return;
   if (inputs.is_motion) {
+    inputs.reset_writer_endpoint_ready =
+        inputs.reset_publisher &&
+        inputs.reset_publisher->get_subscription_count() == 1U;
     inputs.guard_fault = inputs.fault_hook ? inputs.fault_hook() : std::nullopt;
     const auto &activity = inputs.activity;
     if (!inputs.activation_client_discovered && inputs.bound &&
@@ -2054,6 +2595,7 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
         "ros2_control_lifecycle_domain_unknown",
         "requested lifecycle domain is not bound to this ROS runtime");
   ReadLifecycleMonitorFacts(inputs);
+  inputs.reset_endpoints_healthy = !ReadEndpointDiagnostic().has_value();
   auto classification = ComputeLifecycleHealth(inputs);
   return CommitLifecycleObservation(domain, std::move(inputs),
                                     std::move(classification));
@@ -2098,6 +2640,47 @@ RetainedRos2ControlRuntimeHandle::CommitLifecycleObservation(
   auto &diagnostic = classification.diagnostic;
   const auto &process_fault = inputs.process_fault;
   auto diagnostic_snapshot = std::move(inputs.diagnostic_snapshot);
+  std::optional<std::string> reset_evidence;
+  if (inputs.is_motion && inputs.reset_pending && inputs.reset_target &&
+      inputs.reset_transition && inputs.reset_endpoints_healthy &&
+      inputs.reset_writer_endpoint_ready && inputs.process_fault_source &&
+      !process_fault && !inputs.guard_fault &&
+      inputs.retained_cause == Cause::kNone &&
+      inputs.activity.controller_manager_present && inputs.activity.observed &&
+      inputs.activity.hardware_active && inputs.activity.controller_loaded &&
+      inputs.reset_writer_loaded && !fault_present &&
+      (cause == Cause::kNone || cause == Cause::kAvailability)) {
+    const auto &transition = *inputs.reset_transition;
+    const bool predecessor =
+        inputs.reset_epoch == transition.predecessor_epoch.value();
+    const bool successor =
+        transition.successor_epoch &&
+        inputs.reset_epoch == transition.successor_epoch->value();
+    const bool exclusive =
+        inputs.activity.controller_active != inputs.reset_writer_active;
+    bool expected = false;
+    switch (transition.phase) {
+    case MockResetPositionPhase::kSwitchingToWriter:
+      expected = predecessor && exclusive;
+      break;
+    case MockResetPositionPhase::kSettingState:
+      expected = predecessor && !inputs.activity.controller_active &&
+                 inputs.reset_writer_active;
+      break;
+    case MockResetPositionPhase::kSwitchingToJtc:
+      expected = (predecessor && !inputs.activity.controller_active &&
+                  inputs.reset_writer_active) ||
+                 (successor && exclusive);
+      break;
+    case MockResetPositionPhase::kContaining:
+      break;
+    }
+    if (expected)
+      reset_evidence = reset_transition_token(transition);
+  }
+  // The tag belongs to these exact captured inputs, not a later healthy read.
+  // Include it in the source signature so phase/epoch changes advance the
+  // observation generation consumed by the private CCLC scope.
   std::lock_guard lock(mutex_);
   auto &generation = domain_generations_[control_domain_id];
   // An availability observation cannot clear an intervention-requiring cause;
@@ -2107,6 +2690,10 @@ RetainedRos2ControlRuntimeHandle::CommitLifecycleObservation(
               generation.last_intervention_cause != Cause::kNone
           ? generation.last_intervention_cause
           : cause;
+  if (reported != Cause::kAvailability)
+    reset_evidence.reset();
+  if (inputs.reset_pending)
+    signature += ":mock-reset:" + reset_evidence.value_or("none");
   if (cause != Cause::kAvailability) {
     generation.last_intervention_cause =
         core::lifecycle_cause_requires_intervention(cause) ? cause
@@ -2136,7 +2723,7 @@ RetainedRos2ControlRuntimeHandle::CommitLifecycleObservation(
       state,
       ready,
       lifecycle_facts(ready, inactive_unrequested, loaded, fault_present,
-                      transport_ready, reported),
+                      transport_ready, reported, reset_evidence),
       std::move(diagnostic),
       process_fault ? std::move(diagnostic_snapshot) : nullptr};
   if (!result.locally_valid()) {

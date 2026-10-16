@@ -1,0 +1,73 @@
+{
+  "schema_version": "manyforge.replacement_popup_style_deployment.v1",
+  "status": "LIVE_PRESENTATION_MODULE_VERIFIED",
+  "approval": "DX1045/DX1046 explicit popup-style hot-sync",
+  "started_utc": "2026-10-16T08:29:13.764351+00:00",
+  "finished_utc": "2026-10-16T08:29:13.860002+00:00",
+  "source": {
+    "files": [
+      {
+        "path": "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.tsx",
+        "pre_sha256": "b4b387601af3763ca7bc6944a6ceb5ffc6051188b4e37d644f8b4a2f08749259",
+        "post_sha256": "a9679cfee34d27eb14779107f90a4214505162adbae3df5ef4c0f1ff148c5e68"
+      }
+    ],
+    "peer_artifact_sha256": {
+      "pre.sha256": "5d65fbfa3e53be6447b54082c9c6ca010e2a97487819859374c00b7be7568f7e",
+      "post.sha256": "9950041e26efe5c3cd03b52a150af7f20df26187cb6713da5ef1e84b09213692",
+      "replacement-popup01.patch": "2e1df019031c1b28225742994a12433d7f9dfa60f612ef39bd2c3e038870a865"
+    }
+  },
+  "served_modules": {
+    "components/ScenarioDocumentCommands.tsx": {
+      "http_status": 200,
+      "sha256": "a0098cbad4ef76a2f70cd8a55e1cc09561cacb3a3d3ea44d4d4983eba442138c",
+      "expected_marker": "transport-confirmation",
+      "marker_present": true
+    }
+  },
+  "deployment": {
+    "existing_container_identity_preserved": true,
+    "restart": false,
+    "backend_or_native_update": false,
+    "App_and_Close_behavior_source_unchanged": true,
+    "agent_runtime_commands": []
+  },
+  "limits": [
+    "Presentation-only change; motion-held Program switching is not fixed by this sync.",
+    "No browser dialog was opened or confirmed by the agent.",
+    "No user lifecycle or execution command was issued."
+  ],
+  "raw_evidence_identifier": "t1-replacement-popup-20261016/live-hotsync01",
+  "raw_receipt_sha256": "e03144f9128bbd5e56ccfb3029e676517e5ad003f44676a357248dfea610b0a9",
+  "follow_up_syncs": [
+    {
+      "approval": "DX1048/DX1049 explicit title follow-up sync",
+      "started_utc": "2026-10-16T08:31:47.504457+00:00",
+      "finished_utc": "2026-10-16T08:31:47.584240+00:00",
+      "files": [
+        {
+          "path": "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.tsx",
+          "pre_sha256": "a9679cfee34d27eb14779107f90a4214505162adbae3df5ef4c0f1ff148c5e68",
+          "post_sha256": "acf95b66b24d52a5da59d79925e8e81f6d8d74a9deec850bc843f2bce3622a55"
+        }
+      ],
+      "post02_manifest_sha256": "be1e2390086f1fb512c69a49077e894b3a50d2ef8e6c1a2de4047ec55085960c",
+      "served_modules": {
+        "components/ScenarioDocumentCommands.tsx": {
+          "http_status": 200,
+          "sha256": "171a133725c78f26dea062e77fdb16d5a10737df7757d45dd66a5b592936652a",
+          "expected_marker": "transport-confirmation",
+          "marker_present": true
+        }
+      },
+      "title": "Close Scenario?",
+      "existing_container_identity_preserved": true,
+      "restart": false,
+      "runtime_commands": [],
+      "raw_evidence_identifier": "t1-replacement-popup-20261016/live-hotsync02",
+      "raw_receipt_sha256": "09f2cb9236e4ed675ca1ad51069fc0e28d16d26c4d76b4245fa6f8c3c9189fca"
+    }
+  ],
+  "current_product_sha256": "acf95b66b24d52a5da59d79925e8e81f6d8d74a9deec850bc843f2bce3622a55"
+}

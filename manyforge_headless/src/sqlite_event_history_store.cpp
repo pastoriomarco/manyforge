@@ -359,7 +359,7 @@ private:
   sqlite3_stmt *statement_{};
 };
 
-/// A batch holding an ERROR or CRITICAL condition is synced to disk at
+/// A batch holding an ERROR/CRITICAL condition or a previous-session report is synced to disk at
 /// commit; routine batches keep synchronous=NORMAL. Restored after the
 /// transaction ends (a failed restore only leaves later commits synced).
 class SynchronousScope final {
@@ -762,7 +762,11 @@ public:
   IEventHistoryStore::AppendBatchResult AppendBatch(const std::span<const HistorianEvent> events) {
     IEventHistoryStore::AppendBatchResult result;
     if (events.empty()) return result;
-    const bool durable = std::any_of(events.begin(), events.end(), IsFailureTrigger);
+    const bool durable = std::any_of(events.begin(), events.end(), [](const auto &event) {
+      return IsFailureTrigger(event) ||
+             (event.component == "manyforge.workbench" &&
+              event.event_type == "previous_session_report");
+    });
     std::lock_guard lock(mutex_);
     RequireOpen();
     RequireReclaimableWal();

@@ -539,6 +539,25 @@ void CCLCRuntimeComposition::StopRequestFollowingAndTransports() noexcept {
   http_open_request_server_.reset();
 }
 
+core::Result<void> CCLCRuntimeComposition::WithProgramResetPositionScope(
+    const core::CCLCProgramResetPositionScopeRequest &request,
+    const core::CCLCProgramResetPositionAction &action) {
+  auto pin = coordinator_.AcquireProductPin();
+  if (!pin.ok())
+    return core::Result<void>::Err(pin.error());
+  const auto &context = pin.value().context();
+  if (!context.identity ||
+      context.identity->publication != request.expected_publication ||
+      std::count(context.identity->configured_components.begin(),
+                 context.identity->configured_components.end(),
+                 request.component) != 1)
+    return core::Result<void>::Err(
+        {"program_reset_position_product_stale",
+         "the position Reset does not name this exact installed product",
+         {}});
+  return target_driver_.WithProgramResetPositionScope(request, action);
+}
+
 core::Result<core::NativeApplyPlanDTO> CCLCRuntimeComposition::PlanNativeApply(
     const core::NativeApplyPlanRequestDTO &request) {
   auto pin = coordinator_.AcquireProductPin();

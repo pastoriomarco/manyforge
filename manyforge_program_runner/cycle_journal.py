@@ -19,13 +19,15 @@ from typing import Any, Callable, Final, Iterator
 
 import rfc8785
 
+from manyforge_headless_api.program_cycle import ScenePreparationFailureDTO
+
 from .liveness import RetainedLiveness
 
 
 # Development-only cutover: this runner creates and opens exactly this
 # journal version. Older and newer journals are refused unchanged, before any
 # write; their run history is not migrated or reinterpreted.
-SCHEMA_VERSION: Final = 7
+SCHEMA_VERSION: Final = 8
 # How many of the most recent completed persistent-value requests are kept.
 MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS: Final = 16_384
 _REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
@@ -56,6 +58,7 @@ _REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] 
         ("failure_json", "TEXT", 0, 0),
         ("reset_phase", "TEXT", 0, 0),
         ("runtime_controls_json", "TEXT", 0, 0),
+        ("reset_effect_claim_json", "TEXT", 0, 0),
     ),
     "program_cycle_inflight_commands": (
         ("request_owner_epoch", "TEXT", 1, 1),
@@ -117,7 +120,8 @@ _REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
           current_command_kind TEXT,
           failure_json TEXT,
           reset_phase TEXT,
-          runtime_controls_json TEXT
+          runtime_controls_json TEXT,
+          reset_effect_claim_json TEXT
         )
     """,
     "program_cycle_inflight_commands": """
@@ -259,6 +263,15 @@ def _strict_object(
     return decoded
 
 
+def _prior_scene_preparation_failure(failure: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if failure is None:
+        return None
+    prior = failure if failure.get("code") == "program_scene_preparation_failed" else failure.get("prior_scene_preparation_failure")
+    if prior is None:
+        return None
+    return ScenePreparationFailureDTO.model_validate(prior).model_dump(mode="json")
+
+
 class ProgramCycleJournalVersionError(RuntimeError):
     """An existing journal of another (older or newer) schema version.
 
@@ -301,6 +314,7 @@ class CycleRecord:
     failure: dict[str, Any] | None
     reset_phase: str | None
     runtime_controls: dict[str, Any] | None
+    reset_effect_claim: dict[str, Any] | None = None
 
 
 class ProgramCycleStopWon(RuntimeError):
@@ -791,11 +805,23 @@ class ProgramCycleJournal:
             ):
                 raise RuntimeError("Program-cycle control identity is corrupt")
             _strict_object(cycle_rows[0][19])
+            failure = _strict_object(cycle_rows[0][19])
+            if failure is not None and "prior_scene_preparation_failure" in failure:
+                _prior_scene_preparation_failure(failure)
             if cycle_rows[0][20] is not None and not _bounded_identity(
                 cycle_rows[0][20]
             ):
                 raise RuntimeError("Program-cycle reset phase is corrupt")
             _strict_object(cycle_rows[0][21])
+            reset_effect = _strict_object(cycle_rows[0][22])
+            if reset_effect is not None and (
+                set(reset_effect) != {"intent", "claim", "release_intent"}
+                or not isinstance(reset_effect["intent"], dict)
+                or any(reset_effect[key] is not None and not isinstance(reset_effect[key], dict)
+                       for key in ("claim", "release_intent"))
+                or (reset_effect["release_intent"] is not None and reset_effect["claim"] is None)
+            ):
+                raise RuntimeError("Program Reset effect claim register is corrupt")
 
             request_count = 0
             reset_request_count = 0
@@ -1120,8 +1146,8 @@ class ProgramCycleJournal:
                          release_intent_json,execution_control_revision,
                          causal_correlation_id,causal_session_id,
                          causal_client_sequence,current_command_kind,
-                         failure_json,reset_phase,runtime_controls_json)
-                        VALUES(1,1,'idle_after_reset',?,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,NULL,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL)
+                         failure_json,reset_phase,runtime_controls_json,reset_effect_claim_json)
+                        VALUES(1,1,'idle_after_reset',?,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,NULL,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)
                         """,
                         (owner_epoch,),
                     )
@@ -1139,6 +1165,9 @@ class ProgramCycleJournal:
                     }
                     if _bounded_identity(phase):
                         failure["failed_phase"] = phase
+                    prior = _prior_scene_preparation_failure(row.failure)
+                    if prior is not None:
+                        failure["prior_scene_preparation_failure"] = prior
                     self._database.execute(
                         """
                         UPDATE program_cycle
@@ -1440,7 +1469,7 @@ class ProgramCycleJournal:
                        execution_control_revision,causal_correlation_id,
                        causal_session_id,causal_client_sequence,
                        current_command_kind,failure_json,reset_phase,
-                       runtime_controls_json
+                       runtime_controls_json,reset_effect_claim_json
                 FROM program_cycle WHERE singleton=1
                 """
             ).fetchone()
@@ -1468,6 +1497,7 @@ class ProgramCycleJournal:
             self._load(row[18]),
             row[19],
             self._load(row[20]),
+            self._load(row[21]),
         )
 
     def remember_release_intent(
@@ -1548,7 +1578,18 @@ class ProgramCycleJournal:
                 (owner_epoch, request_id),
             ).fetchone()
             if current is not None:
-                if current[0] != kind or current[1] != encoded:
+                same_intent = current[1] == encoded
+                if kind == "reset" and current[0] == kind:
+                    # Missing selectors in this version's request mean off.
+                    # Earlier journal versions are refused unchanged; their
+                    # implicit Scene restoration is never reinterpreted.
+                    retained_intent = self._load(current[1])
+                    compared_intent = dict(intent)
+                    for key in ("reload_initial_scene", "reset_robot_position"):
+                        retained_intent.setdefault(key, False)
+                        compared_intent.setdefault(key, False)
+                    same_intent = self._dump(retained_intent) == self._dump(compared_intent)
+                if current[0] != kind or not same_intent:
                     raise ValueError(
                         "request identity was reused with different intent"
                     )
@@ -1920,6 +1961,58 @@ class ProgramCycleJournal:
             if changed != 1:
                 raise RuntimeError("Program-cycle stopping transition is stale")
 
+    def remember_reset_effect_claim(
+        self, *, expected_generation: int, expected: Mapping[str, Any] | None,
+        retained: Mapping[str, Any],
+    ) -> None:
+        """Persist exact acquisition/receipt/release before crossing the owner boundary."""
+        encoded = self._dump(retained)
+        previous = None if expected is None else self._dump(expected)
+        with self._transaction():
+            changed = self._database.execute(
+                """
+                UPDATE program_cycle SET reset_effect_claim_json=?,
+                    execution_control_revision=execution_control_revision+1
+                WHERE singleton=1 AND cycle_generation=? AND state='resetting'
+                  AND claim_json IS NULL AND reset_effect_claim_json IS ?
+                """, (encoded, expected_generation, previous),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("Program Reset effect claim register is stale")
+
+    def begin_idle_resetting(
+        self,
+        *,
+        expected_generation: int,
+        owner_epoch: str,
+        correlation_id: str,
+        session_id: str | None,
+        client_sequence: str | None,
+        phase: str,
+    ) -> None:
+        """Fence explicit no-run Reset effects with the existing lifecycle."""
+        if phase not in {"restoring_scene", "restoring_position"}:
+            raise ValueError("Idle Reset must begin with a selected effect")
+        with self._transaction():
+            changed = self._database.execute(
+                """
+                UPDATE program_cycle
+                SET state='resetting',reset_phase=?,
+                    execution_control_revision=execution_control_revision+1,
+                    causal_correlation_id=?,causal_session_id=?,
+                    causal_client_sequence=?,current_command_kind='program_reset'
+                WHERE singleton=1 AND cycle_generation=? AND owner_epoch=?
+                  AND state='idle_after_reset' AND program_run_id IS NULL
+                  AND claim_json IS NULL AND acquisition_pending_json IS NULL
+                  AND reset_effect_claim_json IS NULL
+                  AND reconciliation_required=0
+                """,
+                (phase, correlation_id, session_id, client_sequence,
+                 expected_generation, owner_epoch),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("Idle Program-cycle Reset transition is stale")
+
     def begin_resetting(
         self,
         *,
@@ -1988,6 +2081,7 @@ class ProgramCycleJournal:
         expected: CycleRecord,
         manager_runtime_epoch: str | None,
         manager_owner_epoch: str | None,
+        phase: str = "restoring_scene",
     ) -> None:
         """Persist an externally proved containment join, not guessed outcomes."""
         if (
@@ -1997,6 +2091,7 @@ class ProgramCycleJournal:
             or expected.claim is None
             or expected.acquisition_pending is not None
             or expected.release_intent is not None
+            or phase not in {"restoring_scene", "restoring_position", "releasing"}
         ):
             raise RuntimeError("Program-cycle containment discharge is invalid")
         with self._transaction():
@@ -2009,30 +2104,49 @@ class ProgramCycleJournal:
             ):
                 raise RuntimeError("Program-cycle containment discharge is stale")
             self._database.execute(
-                "UPDATE program_cycle SET reset_phase='restoring_scene', "
+                "UPDATE program_cycle SET reset_phase=?, "
                 "reconciliation_required=0,failure_json=NULL, "
-                "execution_control_revision=execution_control_revision+1 WHERE singleton=1"
+                "execution_control_revision=execution_control_revision+1 WHERE singleton=1",
+                (phase,),
             )
 
     def update_reset_phase(
         self,
         *,
         expected_generation: int,
-        program_run_id: str,
+        program_run_id: str | None,
         expected_phase: str,
         phase: str,
         terminal_reference: str | None = None,
+        scene_preparation_completed: bool = False,
     ) -> None:
         for value in (expected_phase, phase):
             if not _bounded_identity(value):
                 raise ValueError("Reset phase must be bounded non-empty NFC text")
+        if scene_preparation_completed and (
+            expected_phase != "restoring_scene" or phase not in {"restoring_position", "releasing"}
+        ):
+            raise ValueError("Scene completion requires its exact next Reset phase")
         with self._transaction():
+            if scene_preparation_completed:
+                current = self.read()
+                failure = current.failure
+                if failure is not None and failure.get("code") == "program_scene_preparation_failed":
+                    failure = None
+                elif failure is not None and "prior_scene_preparation_failure" in failure:
+                    failure = {key: value for key, value in failure.items() if key != "prior_scene_preparation_failure"}
+                self._database.execute(
+                    "UPDATE program_cycle SET failure_json=? WHERE singleton=1 AND cycle_generation=? "
+                    "AND program_run_id IS ? AND state='resetting' AND reset_phase=?",
+                    (None if failure is None else self._dump(failure), expected_generation,
+                     program_run_id, expected_phase),
+                )
             changed = self._database.execute(
                 """
                 UPDATE program_cycle
                 SET reset_phase=?,terminal_reference=COALESCE(?,terminal_reference),
                     execution_control_revision=execution_control_revision+1
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id=?
+                WHERE singleton=1 AND cycle_generation=? AND program_run_id IS ?
                   AND state='resetting' AND reset_phase=?
                 """,
                 (
@@ -2050,7 +2164,7 @@ class ProgramCycleJournal:
         self,
         *,
         expected_generation: int,
-        program_run_id: str,
+        program_run_id: str | None,
         code: str,
         message: str,
         reconciliation_required: bool = False,
@@ -2058,27 +2172,29 @@ class ProgramCycleJournal:
         with self._transaction():
             row = self._database.execute(
                 """
-                SELECT reset_phase FROM program_cycle
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id=?
+                SELECT reset_phase,failure_json FROM program_cycle
+                WHERE singleton=1 AND cycle_generation=? AND program_run_id IS ?
                   AND state='resetting'
                 """,
                 (expected_generation, program_run_id),
             ).fetchone()
             if row is None or not _bounded_identity(row[0]):
                 raise RuntimeError("Program-cycle failed Reset transition is stale")
-            failure = self._dump(
-                {
+            failure = {
                     "code": code,
                     "message": message,
                     "failed_phase": row[0],
                 }
-            )
+            prior = _prior_scene_preparation_failure(self._load(row[1]))
+            if prior is not None:
+                failure["prior_scene_preparation_failure"] = prior
+            failure = self._dump(failure)
             changed = self._database.execute(
                 """
                 UPDATE program_cycle SET state='recovery_required',failure_json=?,
                     reconciliation_required=MAX(reconciliation_required,?),
                     execution_control_revision=execution_control_revision+1
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id=?
+                WHERE singleton=1 AND cycle_generation=? AND program_run_id IS ?
                   AND state='resetting'
                 """,
                 (
@@ -2095,7 +2211,7 @@ class ProgramCycleJournal:
         self,
         *,
         expected_generation: int,
-        program_run_id: str,
+        program_run_id: str | None,
         expected_failure_code: str,
         phase: str,
         correlation_id: str,
@@ -2114,7 +2230,7 @@ class ProgramCycleJournal:
                 SELECT failure_json,reset_phase,reconciliation_required,
                        release_intent_json
                 FROM program_cycle
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id=?
+                WHERE singleton=1 AND cycle_generation=? AND program_run_id IS ?
                   AND state='recovery_required'
                 """,
                 (expected_generation, program_run_id),
@@ -2148,15 +2264,17 @@ class ProgramCycleJournal:
                 """
                 UPDATE program_cycle
                 SET state='resetting',reset_phase=?,reconciliation_required=0,
-                    failure_json=NULL,
+                    failure_json=?,
                     execution_control_revision=execution_control_revision+1,
                     causal_correlation_id=?,causal_session_id=?,
                     causal_client_sequence=?,current_command_kind='program_reset'
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id=?
+                WHERE singleton=1 AND cycle_generation=? AND program_run_id IS ?
                   AND state='recovery_required'
                 """,
                 (
                     phase,
+                    None if _prior_scene_preparation_failure(failure) is None
+                    else self._dump(_prior_scene_preparation_failure(failure)),
                     correlation_id,
                     session_id,
                     client_sequence,
@@ -2226,7 +2344,7 @@ class ProgramCycleJournal:
                 WHERE singleton=1 AND cycle_generation=? AND owner_epoch=?
                   AND state='idle_after_reset' AND claim_json IS NULL
                   AND program_run_id IS NULL AND acquisition_pending_json IS NULL
-                  AND reconciliation_required=0 AND failure_json IS NULL
+                  AND reconciliation_required=0
                 """, (encoded, expected_generation, owner_epoch),
             ).rowcount
             if changed != 1:
@@ -2544,13 +2662,17 @@ class ProgramCycleJournal:
         with self._transaction():
             request = self._database.execute(
                 """
-                SELECT cycle_generation FROM program_cycle_inflight_commands
+                SELECT cycle_generation,intent_json FROM program_cycle_inflight_commands
                 WHERE request_owner_epoch=? AND request_id=?
                 """,
                 (request_owner_epoch, request_id),
             ).fetchone()
-            if request != (expected_generation,):
+            if request is None or request[0] != expected_generation:
                 raise RuntimeError("Program-cycle Reset in-flight command is absent")
+            prior = (
+                None if self._load(request[1]).get("reload_initial_scene", False)
+                else _prior_scene_preparation_failure(self.read().failure)
+            )
             changed = self._database.execute(
                 """
                 UPDATE program_cycle
@@ -2564,12 +2686,13 @@ class ProgramCycleJournal:
                     acquisition_pending_json=NULL,
                     reconciliation_evidence_digest=NULL,
                     execution_control_revision=execution_control_revision+1,
-                    current_command_kind=NULL,failure_json=NULL,reset_phase=NULL
+                    current_command_kind=NULL,failure_json=?,reset_phase=NULL
                     ,runtime_controls_json=NULL
+                    ,reset_effect_claim_json=NULL
                 WHERE singleton=1 AND cycle_generation=?
                   AND state IN ('terminal_awaiting_reset','resetting')
                 """,
-                (owner_epoch, encoded, expected_generation),
+                (owner_epoch, encoded, None if prior is None else self._dump(prior), expected_generation),
             ).rowcount
             if changed != 1:
                 raise RuntimeError("Program-cycle Reset is stale")

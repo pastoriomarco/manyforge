@@ -33,7 +33,7 @@
           "execution_tick_hz": 100,
           "gripper_target_configurations": [
             {
-              "actuation_kind": "position_commanded",
+              "actuation_kind": "pneumatic",
               "attach_frame": "link_tcp",
               "auxiliary_frames": [
                 "lite_gripper_base_link"
@@ -42,9 +42,11 @@
               "command_duration_s": 0.8,
               "command_target_id": "gripper",
               "controllable_component_id": "lite6_robot",
+              "delivery_result_timeout_s": 1.0,
               "description": "Native simulated UFACTORY lite pneumatic gripper.",
               "mount_frame": "link_eef",
               "open_state_ref": "open",
+              "output_mode": "commanded",
               "tcp_frame": "link_tcp",
               "touch_links": [
                 "lite_gripper_base_link",
@@ -173,6 +175,7 @@
               "description": "Native simulated Robotiq 2F-85 gripper.",
               "mount_frame": "tool0",
               "open_state_ref": "open",
+              "output_mode": "commanded",
               "tcp_frame": "robotiq_85_base_link",
               "touch_links": [
                 "robotiq_85_base_link",

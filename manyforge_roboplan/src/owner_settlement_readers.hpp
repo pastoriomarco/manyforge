@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <manyforge_core/ports/ioperation_journal.hpp>
+#include <manyforge_core/kernel_cell_admission_owner.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <optional>
@@ -30,6 +31,17 @@ ReadActiveProgramRunProductForReconciliation(
     const std::filesystem::path &database_path,
     const core::CellAdmissionClaimDTO &claim,
     const core::CellAdmissionClaimReleaseDTO &release);
+
+[[nodiscard]] core::Result<void> ValidateProgramResetSettlementReadOnly(
+    const std::filesystem::path &database_path,
+    const core::CellAdmissionClaimDTO &claim,
+    const core::CellAdmissionClaimReleaseDTO &release);
+
+[[nodiscard]] core::Result<core::ProgramCycleStatusDTO>
+ReadProgramResetStatusReadOnly(
+    const std::filesystem::path& database_path, core::ProgramResetJournalReadPurpose purpose,
+    const core::CellAdmissionClaimIntentDTO& intent,
+    const std::optional<core::CellAdmissionClaimDTO>& claim);
 
 [[nodiscard]] core::Result<core::CellAdmissionReconcileValidationDTO>
 ValidateProgramRunnerOwnerReconciliationReadOnly(

@@ -64,6 +64,8 @@ struct ManagerNamedApplyRequestDTO final {
   /// retains the stored snapshot and base rather than recapturing either.
   std::optional<ManagerIsaacPoseObserverLaunchFactsDTO>
       isaac_pose_observer_launch_facts{};
+  ManagerSceneInitialization scene_initialization{
+      ManagerSceneInitialization::kPreserve};
 
   [[nodiscard]] bool valid() const noexcept;
 

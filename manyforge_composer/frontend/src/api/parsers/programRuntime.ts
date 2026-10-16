@@ -58,7 +58,7 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
     'runtime_control_revision', 'recovery_offer', 'run', 'runtime_controls',
     'execution_control_revision', 'causal_correlation_id',
     'causal_session_id', 'causal_client_sequence', 'current_command_kind',
-    'failure', 'reset_phase', 'allowed_commands',
+    'failure', 'reset_phase', 'reset_options', 'reset_robot_position', 'allowed_commands',
   ], 'programCycleStatus');
   const state = stringAt(record.state, 'programCycleStatus.state');
   if (!['idle_after_reset', 'starting', 'running', 'stopping',
@@ -134,6 +134,29 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
       record.reset_phase,
       'programCycleStatus.reset_phase',
     ),
+    resetOptions: record.reset_options === null
+      ? null
+      : (() => {
+        const path = 'programCycleStatus.reset_options';
+        const options = objectAt(record.reset_options, path);
+        exactKeysAt(options, ['reload_initial_scene', 'reset_robot_position'], path);
+        return {
+          reloadInitialScene: booleanAt(options.reload_initial_scene, `${path}.reload_initial_scene`),
+          resetRobotPosition: booleanAt(options.reset_robot_position, `${path}.reset_robot_position`),
+        };
+      })(),
+    resetRobotPosition: (() => {
+      const path = 'programCycleStatus.reset_robot_position';
+      const capability = objectAt(record.reset_robot_position, path);
+      exactKeysAt(capability, ['available', 'reason'], path);
+      const available = booleanAt(capability.available, `${path}.available`);
+      const reason = capability.reason === null
+        ? null : nonEmptyStringAt(capability.reason, `${path}.reason`);
+      if (available !== (reason === null)) {
+        return fail(path, 'available with no reason, or unavailable with a reason');
+      }
+      return { available, reason };
+    })(),
     allowedCommands: arrayAt(
       record.allowed_commands,
       'programCycleStatus.allowed_commands',
@@ -164,6 +187,35 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
       ? null
       : parseProgramRuntimeControlProjection(record.runtime_controls),
   };
+  if (parsed.resetOptions !== null && (
+    !['resetting', 'recovery_required'].includes(parsed.state)
+    || parsed.currentCommandKind !== 'program_reset'
+  )) {
+    return fail('programCycleStatus.reset_options', 'an accepted Reset intent');
+  }
+  if (parsed.state === 'resetting' && parsed.resetOptions === null) {
+    return fail('programCycleStatus.reset_options', 'the accepted Reset selectors');
+  }
+  if (parsed.resetOptions !== null) {
+    if (
+      (parsed.resetPhase === 'restoring_scene' && !parsed.resetOptions.reloadInitialScene)
+      || (parsed.resetPhase === 'restoring_position' && !parsed.resetOptions.resetRobotPosition)
+    ) {
+      return fail('programCycleStatus.reset_phase', 'a phase selected by the accepted Reset');
+    }
+    if (parsed.programRunId === null && (
+      parsed.cycleClaimGeneration !== null
+      || parsed.terminalOrSettlementReference !== null
+      || !['restoring_scene', 'restoring_position', 'releasing'].includes(parsed.resetPhase ?? '')
+      || !(parsed.resetOptions.reloadInitialScene || parsed.resetOptions.resetRobotPosition)
+    )) {
+      return fail('programCycleStatus.reset_options', 'a selected no-run Reset with no claim or terminal reference');
+    }
+    if (parsed.programRunId === null && parsed.state === 'recovery_required'
+      && parsed.failure?.failed_phase !== parsed.resetPhase) {
+      return fail('programCycleStatus.failure', 'the exact failed phase of the selected no-run Reset');
+    }
+  }
   if (parsed.run === null) {
     if (parsed.runRevision !== null || parsed.nodeStatusRevision !== null) {
       return fail('programCycleStatus.run', 'the advertised run revisions');
@@ -949,9 +1001,7 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
   exactKeysAt(record, ['selection_revision', 'motion_held', 'groups'], path);
   const selectionRevision = integerAt(record.selection_revision, `${path}.selection_revision`);
   if (selectionRevision < 0) return fail(path, 'a nonnegative selection revision');
-  // The backend derives the held-run Draft rule from it; Composer reads only
-  // that published rule (`held_run_draft_edit_allowed`).
-  booleanAt(record.motion_held, `${path}.motion_held`);
+  const motionHeld = booleanAt(record.motion_held, `${path}.motion_held`);
   let previous = '';
   const groups = boundedArrayAt(record.groups, `${path}.groups`, 4097).map((raw, index) => {
     const key = `${path}.groups[${index}]`;
@@ -1024,7 +1074,7 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
       runtimeScaleSelector, runtimeScaleUnavailableReason, resourceIds };
   });
   if (!groups.some((group) => group.groupId === 'all')) return fail(path, 'the built-in all selection');
-  return { selectionRevision, groups };
+  return { selectionRevision, motionHeld, groups };
 }
 
 export function parseProgramRuntimeControlProjection(

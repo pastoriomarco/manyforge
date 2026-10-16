@@ -219,7 +219,7 @@ public:
   void ObserveDeliveryLoss(std::uint64_t cumulative_losses) override;
   [[nodiscard]] AppendStatus Append(const HistorianEvent &event) override;
   /// One transaction for the whole batch, one savepoint per event. A batch
-  /// holding an ERROR or CRITICAL condition is also synced to disk.
+  /// holding an ERROR/CRITICAL condition or a previous-session report is also synced to disk.
   [[nodiscard]] AppendBatchResult
   AppendBatch(std::span<const HistorianEvent> events) override;
   [[nodiscard]] HistorianPage Query(const HistorianQuery &query) override;

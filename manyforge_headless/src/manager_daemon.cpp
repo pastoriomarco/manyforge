@@ -541,6 +541,8 @@ struct ManagerCommand final {
   std::optional<DeploymentCandidateReceipt> deployment_candidate_receipt{};
   std::optional<component_manager::ManagerApplyPreparedActivationDTO>
       prepared_activation{};
+  component_manager::ManagerSceneInitialization scene_initialization{
+      component_manager::ManagerSceneInitialization::kPreserve};
   std::optional<core::ProjectionRevisionDTO> expected_scene_projection{};
   std::vector<core::SceneResourceId> scene_resource_ids{};
   std::optional<core::ResolvedSceneCandidatePreviewRequestDTO>
@@ -860,7 +862,7 @@ struct ProgramRunnerLivenessRenewal final {
 
 core::ProgramCycleStatusDTO
 RequiredProgramCycleStatus(const CanonicalValue &value) {
-  RequireExactObjectSize(value, 6U, "Program Runner cycle status");
+  RequireExactObjectSize(value, 7U, "Program Runner cycle status");
   const auto state_name = RequiredString(value, "state");
   core::ProgramCycleStateDTO state;
   if (state_name == "idle_after_reset") {
@@ -905,6 +907,21 @@ RequiredProgramCycleStatus(const CanonicalValue &value) {
       terminal.has_value()
           ? std::optional<core::ContentDigest>(core::ContentDigest(*terminal))
           : std::nullopt};
+  const auto& accepted_reset = RequiredMember(value, "accepted_reset");
+  if (!std::holds_alternative<std::nullptr_t>(accepted_reset.storage())) {
+    RequireExactObjectSize(accepted_reset, 6U, "accepted Program Reset");
+    const auto& reset_claim = RequiredMember(accepted_reset, "reset_claim_generation");
+    result.accepted_reset = core::AcceptedProgramResetDTO{
+        core::RequestOwnerEpoch(RequiredString(accepted_reset, "request_owner_epoch")),
+        core::RequestId(RequiredString(accepted_reset, "request_id")),
+        core::ContentDigest(RequiredString(accepted_reset, "request_payload_digest")),
+        RequiredBool(accepted_reset, "reload_initial_scene"),
+        RequiredBool(accepted_reset, "reset_robot_position"),
+        std::holds_alternative<std::nullptr_t>(reset_claim.storage())
+            ? std::nullopt
+            : std::optional<core::CellAdmissionClaimGeneration>(
+                  core::CellAdmissionClaimGeneration(RequiredUnsigned(reset_claim, "Reset claim generation")))};
+  }
   Require(core::ValidateProgramCycleStatus(result).ok(),
           "Program Runner cycle status is malformed");
   return result;
@@ -1546,7 +1563,7 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     return result;
   }
   Require(command == "apply", "command kind is unsupported");
-  RequireExactObjectSize(root, 14U, "Apply command");
+  RequireExactObjectSize(root, 15U, "Apply command");
   const auto request_id = RequiredString(root, "request_id");
   const auto request_owner_epoch = RequiredString(root, "request_owner_epoch");
   const auto source_label = RequiredString(root, "source_label");
@@ -1584,6 +1601,19 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
       RequiredMember(root, "candidate_receipt"));
   result.prepared_activation =
       RequiredPreparedActivation(RequiredMember(root, "prepared_activation"));
+  const auto initialization = RequiredString(root, "scene_initialization");
+  Require(initialization == "preserve" || initialization == "initialize",
+          "Apply Scene initialization purpose is unsupported");
+  result.scene_initialization =
+      initialization == "initialize"
+          ? component_manager::ManagerSceneInitialization::kInitialize
+          : component_manager::ManagerSceneInitialization::kPreserve;
+  const auto prepared = content_identity::parse_canonical_json(
+      result.prepared_activation->canonical_receipt_json);
+  Require(initialization == "preserve" ||
+              RequiredString(RequiredMember(prepared, "origin"), "kind") ==
+                  "scenario",
+          "sealed canonical-empty Apply must preserve Scene initialization");
   result.expected_current_retained_bundle_id =
       core::RetainedBundleId(expected_retained_bundle_id);
   result.expected_current_graph_revision =
@@ -2331,30 +2361,29 @@ CanonicalValue ApplyStatusResponse(
        Unsigned(intent.apply_generation.value(), "Apply generation")},
       {"apply_id", CanonicalValue(intent.apply_id.value())},
       {"candidate_projection_revision",
-       succeeded ? ProjectionRevision(
-                       *terminal->candidate_projection_revision)
+       succeeded ? ProjectionRevision(*terminal->candidate_projection_revision)
                  : CanonicalValue(nullptr)},
       {"error", CanonicalValue(nullptr)},
       {"failure", std::move(failure)},
       {"last_progress",
        CanonicalValue(CanonicalValue::Object{
            {"phase", phase},
-           {"record_digest",
-            CanonicalValue(progress.record_digest.value())},
+           {"record_digest", CanonicalValue(progress.record_digest.value())},
        })},
       {"ok", CanonicalValue(true)},
       {"phase", phase},
       {"prepared_activation",
        ApplyPreparedActivationValue(intent.prepared_activation)},
-      {"request_id",
-       CanonicalValue(intent.request_context.request_id.value())},
+      {"scene_initialization",
+       CanonicalValue(std::string(
+           component_manager::ToString(intent.scene_initialization)))},
+      {"request_id", CanonicalValue(intent.request_context.request_id.value())},
       {"request_owner_epoch",
        CanonicalValue(intent.request_context.request_owner_epoch.value())},
-      {"state",
-       CanonicalValue(terminal == nullptr
-                          ? std::string("pending")
-                          : std::string(component_manager::ToString(
-                                terminal->state)))},
+      {"state", CanonicalValue(terminal == nullptr
+                                   ? std::string("pending")
+                                   : std::string(component_manager::ToString(
+                                         terminal->state)))},
   });
 }
 
@@ -5831,9 +5860,9 @@ private:
                   : original_checked_observer
                       ? std::optional(original_checked_observer->launch_facts)
                       : std::nullopt,
+                  command.scene_initialization,
               },
-              {},
-              std::move(original_prepare_acknowledgement));
+              {}, std::move(original_prepare_acknowledgement));
           TrySendResponse(client.get(), ApplyResponse(command, result));
           if (result.state ==
               component_manager::ManagerNamedApplyResultState::kPending) {

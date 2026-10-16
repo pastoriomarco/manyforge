@@ -1389,11 +1389,15 @@ create_retained_native_runtime_participants(
       config.initial_motion_positions_rad.empty()
           ? runtime->motion_state_channel->initialize_from_projection(
                 initial_timestamp_ns)
-          : runtime->motion_state_channel->publish_and_project(
-                config.initial_motion_positions_rad,
-                std::vector<double>(config.initial_motion_positions_rad.size(),
-                                    0.0),
-                initial_timestamp_ns, initial_timestamp_ns);
+          : runtime->motion_state_channel->source_kind() == core::ObservedStateSourceKind::kCommandedState
+                ? runtime->motion_state_channel->publish_commanded_initialization_and_project(
+                      config.initial_motion_positions_rad,
+                      std::vector<double>(config.initial_motion_positions_rad.size(), 0.0),
+                      initial_timestamp_ns)
+                : runtime->motion_state_channel->publish_and_project(
+                      config.initial_motion_positions_rad,
+                      std::vector<double>(config.initial_motion_positions_rad.size(), 0.0),
+                      initial_timestamp_ns, initial_timestamp_ns);
   if (!motion_initialized.applied()) {
     throw std::invalid_argument(
         "native motion state could not be seeded from the retained model");
@@ -4968,6 +4972,8 @@ void attach_retained_native_addressed_owner(
         std::move(config.cell_admission_reconcile_validator);
     addressed_config.manager_liveness_required_set =
         std::move(config.manager_liveness_required_set);
+    addressed_config.cell_admission_program_reset_status_source =
+        std::move(config.cell_admission_program_reset_status_source);
     runtime->addressed_kernel =
         std::make_unique<core::ResourceAddressedExecutionKernel>(
             runtime->participant_registrations, *runtime->clock,
@@ -5002,7 +5008,8 @@ create_retained_native_runtime(RetainedNativeRuntimeInput input,
       std::move(config.cell_admission_intervention_validator),
       std::move(config.cell_admission_settlement_validator),
       std::move(config.cell_admission_reconcile_validator),
-      std::move(config.manager_liveness_required_set)};
+      std::move(config.manager_liveness_required_set),
+      std::move(config.cell_admission_program_reset_status_source)};
   auto runtime = create_retained_native_runtime_participants(
       std::move(input), std::move(config), std::move(shared_clock),
       std::move(shared_scheduler));

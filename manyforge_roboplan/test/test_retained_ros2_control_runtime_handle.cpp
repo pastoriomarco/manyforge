@@ -25,6 +25,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
@@ -157,14 +158,15 @@ struct ArmWorld final {
           &successor_occurrence = std::nullopt,
       std::size_t *participant_constructions = nullptr,
       core::RuntimeParticipantBinding initial_binding = ArmBinding(),
-      std::shared_ptr<core::IClock> receiver_clock = {})
+      std::shared_ptr<core::IClock> receiver_clock = {},
+      bool mock_reset_position = false)
       : owning_clock(receiver_clock ? std::move(receiver_clock)
                                     : std::make_shared<WallClock>()),
         clock(*owning_clock), binding(std::move(initial_binding)),
         prefix("/manyforge_handle_test_" + fake::unique_suffix()),
         jtc(prefix + "/arm_controller", {"source_joint_1"}),
         manager(prefix + "/controller_manager", "arm_controller", "TestSystem",
-                &jtc) {
+                &jtc, mock_reset_position ? "reset_writer" : "") {
     RetainedRos2ControlArmTransport arm;
     arm.adapter.action_name = prefix + "/" + action_controller +
                               "/follow_joint_trajectory";
@@ -177,6 +179,14 @@ struct ArmWorld final {
     arm.adapter.lane_facts.controller_update_rate_hz = 100.0;
     arm.controller = {prefix + "/controller_manager", "arm_controller", "TestSystem"};
     arm.compiled_joint_names = {"joint_1"};
+    if (mock_reset_position)
+      arm.mock_reset_position =
+          MockResetPositionTarget{"test-runtime-identity",
+                                  "reset_writer",
+                                  prefix + "/reset_writer/commands",
+                                  {"source_joint_1"},
+                                  {0.125},
+                                  "test-target-digest"};
     arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
         prefix + "/joint_states", 100,
         core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
@@ -208,6 +218,12 @@ struct ArmWorld final {
         },
         nullptr, binding, std::nullopt, successor_occurrence);
     if (!bound.ok()) throw std::logic_error(bound.error().message);
+    if (mock_reset_position)
+      handle->InstallControllerProcessFaultSource(
+          [] { return std::optional<std::string>{}; },
+          [] {
+            return core::Result<std::optional<std::string>>::Ok(std::nullopt);
+          });
   }
 
   [[nodiscard]] RetainedExternallyManagedDomainSnapshot Snapshot() {
@@ -976,6 +992,366 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   EXPECT_EQ(port->ReadReadiness(), readiness);
   EXPECT_EQ(world.handle->ReadOwnedControllerOccurrence(), owned);
   EXPECT_EQ(world.manager.switch_requests(), switches);
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     MockResetPublishesOnceAndRotatesBeforeSuccessorActivation) {
+  ArmWorld world("arm_controller", {}, nullptr, ArmBinding(), {}, true);
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->mock_reset_writer_inactive(); }));
+  ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
+            Outcome::kSucceeded);
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->arm_activity().controller_active; }));
+  const auto predecessor = world.handle->current_port();
+  std::vector<MockResetPositionPhase> phases;
+  const auto reset = world.handle->ResetMockPosition(
+      {}, [&](const auto &transition, const auto &commit) {
+        const auto advanced = commit();
+        if (!advanced.ok())
+          return advanced;
+        phases.push_back(transition.phase);
+        EXPECT_EQ(transition.predecessor_epoch,
+                  core::ExecutionBindingEpoch(1U));
+        if (transition.phase == MockResetPositionPhase::kSwitchingToWriter &&
+            transition.switch_acknowledged) {
+          EXPECT_TRUE(fake::WaitUntil(
+              [&] { return world.handle->mock_reset_writer_active(); }));
+        }
+        if (transition.phase == MockResetPositionPhase::kSettingState &&
+            transition.target_published) {
+          EXPECT_TRUE(world.manager.writer_active());
+          EXPECT_FALSE(predecessor->ReadReadiness().controller_bound);
+          EXPECT_FALSE(transition.successor_epoch);
+          EXPECT_TRUE(fake::WaitUntil(
+              [&] { return world.manager.reset_commands().size() == 1U; }));
+          EXPECT_EQ(world.manager.switch_requests(), 2U);
+          // Publishing is only buffering; the owner must acknowledge actual
+          // consumption before this callback permits writer deactivation.
+          core::TrajectoryDTO hold;
+          hold.joint_names = {"joint_1"};
+          const core::ExecutionGoalKey key{
+              core::ControllerGoalId("goal.reset-gated"),
+              core::ControllerGoalGeneration(1U)};
+          EXPECT_EQ(predecessor->Submit(key, hold).refusal,
+                    core::ExecutionPortRefusal::kNotReady);
+          EXPECT_EQ(predecessor
+                        ->Replace(key,
+                                  {core::ControllerGoalId("goal.reset-gated"),
+                                   core::ControllerGoalGeneration(2U)},
+                                  hold)
+                        .refusal,
+                    core::ExecutionPortRefusal::kNotReady);
+          // Containment cancellation bypasses the pending-motion gate.
+          const auto cancelled = predecessor->Cancel(key);
+          if (cancelled.error) {
+            const auto reason = cancelled.error->details.find("reason");
+            EXPECT_TRUE(reason == cancelled.error->details.end() ||
+                        reason->second != "mock_reset_position_pending");
+          }
+        }
+        if (transition.phase == MockResetPositionPhase::kSwitchingToJtc) {
+          EXPECT_EQ(transition.successor_epoch,
+                    core::ExecutionBindingEpoch(2U));
+          if (!transition.switch_acknowledged) {
+            EXPECT_EQ(world.handle->current_port(),
+                      predecessor); // Authorization precedes rotation.
+          } else {
+            EXPECT_NE(world.handle->current_port(), predecessor);
+            EXPECT_TRUE(fake::WaitUntil(
+                [&] { return world.handle->mock_reset_successor_ready(); }));
+          }
+        }
+        return core::Result<void>::Ok();
+      });
+  ASSERT_EQ(reset.outcome, Outcome::kSucceeded) << SwitchFailureText(reset);
+  EXPECT_EQ(phases, (std::vector<MockResetPositionPhase>{
+                        MockResetPositionPhase::kSwitchingToWriter,
+                        MockResetPositionPhase::kSwitchingToWriter,
+                        MockResetPositionPhase::kSettingState,
+                        MockResetPositionPhase::kSettingState,
+                        MockResetPositionPhase::kSwitchingToJtc,
+                        MockResetPositionPhase::kSwitchingToJtc}));
+  EXPECT_EQ(world.manager.reset_commands(),
+            (std::vector<std::vector<double>>{{0.125}}));
+  EXPECT_EQ(world.manager.switch_requests(), 3U);
+  const auto switches = world.manager.switch_history();
+  ASSERT_EQ(switches.size(), 3U);
+  EXPECT_EQ(switches[1].first, (std::vector<std::string>{"reset_writer"}));
+  EXPECT_EQ(switches[1].second, (std::vector<std::string>{"arm_controller"}));
+  EXPECT_EQ(switches[2].first, (std::vector<std::string>{"arm_controller"}));
+  EXPECT_EQ(switches[2].second, (std::vector<std::string>{"reset_writer"}));
+  EXPECT_TRUE(world.handle->current_port()->ReadReadiness().controller_bound);
+}
+
+TEST(
+    RetainedRos2ControlRuntimeHandleTest,
+    MockResetPositiveAckWaitsForActivityAndQualifiesOnlyTheSameHealthyObservation) {
+  ArmWorld world("arm_controller", {}, nullptr, ArmBinding(), {}, true);
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->mock_reset_writer_inactive(); }));
+  ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
+            Outcome::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kActive));
+  const auto as_brand =
+      [&](const RetainedExternallyManagedDomainSnapshot &snapshot) {
+        const auto &binding = world.binding.value();
+        const auto &path = *binding.control_path;
+        const auto now = world.clock.now();
+        return core::BrandLifecycleObservationDTO{
+            core::LifecycleTransactionId("reset.test"),
+            core::LifecycleTransactionGeneration(1U),
+            binding.controllable_component_id,
+            path.control_domain_id,
+            path.control_domain_revision,
+            path.provider_instance_id,
+            path.provider_manifest_id,
+            path.provider_manifest_revision,
+            path.provider_runtime_unit_id,
+            path.provider_runtime_epoch,
+            snapshot.source_generation,
+            snapshot.source_generation,
+            now,
+            now,
+            now + 1'000'000'000,
+            snapshot.component_state,
+            snapshot.facts,
+            snapshot.diagnostic,
+            snapshot.diagnostic_snapshot};
+      };
+  bool saw_delayed_activity = false;
+  bool checked_fault = false;
+  const auto reset = world.handle->ResetMockPosition(
+      {}, [&](const auto &transition, const auto &commit) {
+        const auto advanced = commit();
+        if (!advanced.ok())
+          return advanced;
+        if (transition.phase == MockResetPositionPhase::kSwitchingToWriter) {
+          if (!transition.switch_acknowledged) {
+            world.manager.SetActivityPublicationEnabled(false);
+          } else {
+            EXPECT_FALSE(world.handle->mock_reset_writer_active());
+            const auto prior = as_brand(world.Snapshot());
+            EXPECT_TRUE(world.handle->IsExpectedMockPositionResetTransition(
+                prior, transition));
+            saw_delayed_activity = true;
+            world.manager.SetActivityPublicationEnabled(true);
+            EXPECT_TRUE(fake::WaitUntil(
+                [&] { return world.handle->mock_reset_writer_active(); }));
+          }
+        }
+        if (transition.phase == MockResetPositionPhase::kSettingState &&
+            transition.target_published) {
+          EXPECT_TRUE(fake::WaitUntil(
+              [&] { return world.manager.reset_commands().size() == 1U; }));
+          const auto healthy = as_brand(world.Snapshot());
+          EXPECT_TRUE(world.handle->IsExpectedMockPositionResetTransition(
+              healthy, transition));
+          auto retained_fault = healthy;
+          for (auto &fact : retained_fault.facts)
+            if (fact.lifecycle_fact_id.value() ==
+                core::kLifecycleBlockingCauseFactId)
+              fact.value.token_value = std::string(core::to_string(
+                  core::LifecycleBlockingCauseClassDTO::kFault));
+          EXPECT_FALSE(world.handle->IsExpectedMockPositionResetTransition(
+              retained_fault, transition));
+          auto wrong_phase = transition;
+          wrong_phase.phase = MockResetPositionPhase::kSwitchingToJtc;
+          EXPECT_FALSE(world.handle->IsExpectedMockPositionResetTransition(
+              healthy, wrong_phase));
+          auto foreign = healthy;
+          foreign.provider_runtime_epoch = core::RuntimeEpoch("foreign.epoch");
+          EXPECT_FALSE(world.handle->IsExpectedMockPositionResetTransition(
+              foreign, transition));
+          world.manager.SetHardwareActive(false);
+          EXPECT_TRUE(fake::WaitUntil(
+              [&] { return !world.handle->arm_activity().hardware_active; }));
+          const auto fault = as_brand(world.Snapshot());
+          EXPECT_FALSE(world.handle->IsExpectedMockPositionResetTransition(
+              fault, transition));
+          world.manager.SetHardwareActive(true);
+          EXPECT_TRUE(fake::WaitUntil(
+              [&] { return world.handle->arm_activity().hardware_active; }));
+          // A later healthy physical read cannot rewrite the earlier fault row.
+          EXPECT_FALSE(world.handle->IsExpectedMockPositionResetTransition(
+              fault, transition));
+          checked_fault = true;
+          return core::Result<void>::Err(
+              {"execution_rejected", "hardware loss observed", {}});
+        }
+        return core::Result<void>::Ok();
+      });
+  EXPECT_TRUE(saw_delayed_activity);
+  EXPECT_TRUE(checked_fault);
+  EXPECT_EQ(reset.outcome, Outcome::kUncertain);
+  EXPECT_FALSE(world.manager.writer_active());
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     MockResetFailureContainsWriterAndNeverReactivatesOrResends) {
+  ArmWorld world("arm_controller", {}, nullptr, ArmBinding(), {}, true);
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->mock_reset_writer_inactive(); }));
+  ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
+            Outcome::kSucceeded);
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->arm_activity().controller_active; }));
+  std::vector<MockResetPositionPhase> phases;
+  const auto reset = world.handle->ResetMockPosition(
+      {}, [&](const auto &transition, const auto &commit) {
+        const auto advanced = commit();
+        if (!advanced.ok())
+          return advanced;
+        phases.push_back(transition.phase);
+        if (transition.phase == MockResetPositionPhase::kSwitchingToWriter &&
+            transition.switch_acknowledged) {
+          EXPECT_TRUE(fake::WaitUntil(
+              [&] { return world.handle->mock_reset_writer_active(); }));
+        }
+        if (transition.phase == MockResetPositionPhase::kSettingState &&
+            transition.target_published) {
+          EXPECT_TRUE(fake::WaitUntil(
+              [&] { return world.manager.reset_commands().size() == 1U; }));
+          return core::Result<void>::Err(
+              {"execution_rejected", "fresh measured target unavailable", {}});
+        }
+        return core::Result<void>::Ok();
+      });
+  EXPECT_EQ(reset.outcome, Outcome::kUncertain);
+  ASSERT_TRUE(reset.error);
+  EXPECT_NE(reset.error->message.find("Restart the workbench"),
+            std::string::npos);
+  EXPECT_EQ(phases.back(), MockResetPositionPhase::kContaining);
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->mock_reset_writer_inactive(); }));
+  EXPECT_FALSE(world.manager.writer_active());
+  EXPECT_FALSE(world.handle->arm_activity().controller_active);
+  EXPECT_FALSE(world.handle->current_port()->ReadReadiness().controller_bound);
+  EXPECT_EQ(world.handle->ReadOwnedControllerOccurrence().arm_binding_epoch,
+            core::ExecutionBindingEpoch(1U));
+  EXPECT_EQ(world.manager.reset_commands(),
+            (std::vector<std::vector<double>>{{0.125}}));
+  EXPECT_EQ(world.manager.switch_requests(), 3U);
+  EXPECT_EQ(world.handle
+                ->ResetMockPosition({},
+                                    [](const auto &, const auto &) {
+                                      return core::Result<void>::Ok();
+                                    })
+                .outcome,
+            Outcome::kNotSent);
+  EXPECT_EQ(world.manager.switch_requests(), 3U);
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     MockResetLostSwitchReplyNeverUsesActivityAsSuccess) {
+  ArmWorld world("arm_controller", {}, nullptr, ArmBinding(), {}, true);
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->mock_reset_writer_inactive(); }));
+  ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
+            Outcome::kSucceeded);
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->arm_activity().controller_active; }));
+  world.manager.SetSwitchRepliesPaused(true);
+  std::stop_source cancellation;
+  std::atomic<bool> saw_positive_ack{false};
+  auto operation = std::async(std::launch::async, [&] {
+    return world.handle->ResetMockPosition(
+        cancellation.get_token(),
+        [&](const auto &transition, const auto &commit) {
+          if (transition.switch_acknowledged)
+            saw_positive_ack = true;
+          return commit();
+        });
+  });
+  const bool dispatched =
+      fake::WaitUntil([&] { return world.manager.reply_waiting(); });
+  EXPECT_TRUE(dispatched);
+  EXPECT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->mock_reset_writer_active(); }));
+  cancellation.request_stop();
+  const bool answered = operation.wait_for(2s) == std::future_status::ready;
+  EXPECT_TRUE(answered);
+  // Release the fake before any fatal assertion, including failure teardown.
+  world.manager.SetSwitchRepliesPaused(false);
+  const auto reset = operation.get();
+  EXPECT_EQ(reset.outcome, Outcome::kUncertain);
+  EXPECT_FALSE(saw_positive_ack.load());
+  EXPECT_TRUE(world.manager.reset_commands().empty());
+  EXPECT_FALSE(world.handle->current_port()->ReadReadiness().controller_bound);
+  ASSERT_TRUE(reset.error);
+  EXPECT_NE(reset.error->message.find("Restart the workbench"),
+            std::string::npos);
+}
+
+TEST(
+    RetainedRos2ControlRuntimeHandleTest,
+    MockResetLostReplyHasTheStockOneSecondFaultBoundWithoutCallerCancellation) {
+  ArmWorld world("arm_controller", {}, nullptr, ArmBinding(), {}, true);
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->mock_reset_writer_inactive(); }));
+  ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
+            Outcome::kSucceeded);
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->arm_activity().controller_active; }));
+  world.manager.SetSwitchRepliesPaused(true);
+  std::atomic<bool> saw_positive_ack{false};
+  auto operation = std::async(std::launch::async, [&] {
+    return world.handle->ResetMockPosition(
+        {}, [&](const auto &transition, const auto &commit) {
+          if (transition.switch_acknowledged)
+            saw_positive_ack = true;
+          return commit();
+        });
+  });
+  const bool dispatched =
+      fake::WaitUntil([&] { return world.manager.reply_waiting(); });
+  EXPECT_TRUE(dispatched);
+  const bool bounded = operation.wait_for(3s) == std::future_status::ready;
+  world.manager.SetSwitchRepliesPaused(
+      false); // Unblock fake teardown even if the assertion fails.
+  EXPECT_TRUE(bounded);
+  const auto reset = operation.get();
+  EXPECT_EQ(reset.outcome, Outcome::kUncertain);
+  ASSERT_TRUE(reset.error);
+  EXPECT_EQ(reset.error->details.at("reason"), "ros2_control_switch_timeout");
+  EXPECT_FALSE(saw_positive_ack.load());
+  EXPECT_TRUE(world.manager.reset_commands().empty());
+  EXPECT_FALSE(world.handle->current_port()->ReadReadiness().controller_bound);
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     MockResetRefusesUnsupportedOrUnauthorizedBeforeEffects) {
+  ArmWorld unsupported;
+  EXPECT_EQ(unsupported.handle
+                ->ResetMockPosition({},
+                                    [](const auto &, const auto &) {
+                                      return core::Result<void>::Ok();
+                                    })
+                .outcome,
+            Outcome::kNotSent);
+  EXPECT_EQ(unsupported.manager.switch_requests(), 0U);
+  ArmWorld world("arm_controller", {}, nullptr, ArmBinding(), {}, true);
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->mock_reset_writer_inactive(); }));
+  ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
+            Outcome::kSucceeded);
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->arm_activity().controller_active; }));
+  const auto reset =
+      world.handle->ResetMockPosition({}, [](const auto &, const auto &) {
+        return core::Result<void>::Err(
+            {"execution_rejected", "foreign Reset claim", {}});
+      });
+  EXPECT_EQ(reset.outcome, Outcome::kNotSent);
+  EXPECT_TRUE(world.handle->current_port()->ReadReadiness().controller_bound);
+  EXPECT_EQ(world.manager.switch_requests(), 1U);
+  EXPECT_TRUE(world.manager.reset_commands().empty());
 }
 
 TEST(RetainedRos2ControlRuntimeHandleTest,

@@ -958,11 +958,19 @@ ReadSceneTransactionStoreState(sqlite3 *database,
       history.compacted_maintenance_completion_count;
   const auto apply_maintenance_until =
       [&](const std::optional<ProjectionRevisionDTO> &expected) {
-        while (next_maintenance_completion < completed_maintenance.size() &&
-               (!expected.has_value() ||
-                state.active_projection != *expected)) {
+        while (next_maintenance_completion < completed_maintenance.size()) {
           const auto &initialization =
               *completed_maintenance[next_maintenance_completion];
+          // A configuration-only Apply may leave the composite unchanged.
+          // Consume those completions before the next Scene transaction, but
+          // not across a no-op transaction that kept the same revision.
+          if (expected.has_value() && state.active_projection == *expected &&
+              !(initialization.predecessor == state.active_projection &&
+                initialization.target == state.active_projection &&
+                initialization.authoritative_snapshot.transaction_sequence ==
+                    state.active_snapshot.transaction_sequence)) {
+            break;
+          }
           if (initialization.predecessor != state.active_projection ||
               initialization.predecessor.scene_revision !=
                   state.active_snapshot.revision ||
@@ -1183,8 +1191,7 @@ ReadSceneTransactionStoreState(sqlite3 *database,
       }
       auto &record = records[index];
       if (transaction_event_seen[index] ||
-          (record.intent.prior != state.active_projection &&
-           !apply_maintenance_until(record.intent.prior))) {
+          !apply_maintenance_until(record.intent.prior)) {
         throw LogicalSceneOwnerIntegrityError(
             "scene transaction event does not follow the active composite");
       }

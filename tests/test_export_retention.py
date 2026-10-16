@@ -139,6 +139,60 @@ def test_default_aggregate_counts_but_never_deletes_sibling_root(tmp_path):
     assert 'configured-root' in result.warning and 'active-other' not in result.warning
 
 
+@pytest.mark.parametrize('effects', ['closed', 'unresolved', 'unknown'])
+def test_previous_session_journals_are_accounted_but_never_pruned_without_history_import(tmp_path, effects):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    archive = root / 'previous-sessions' / ('a' * 32)
+    archive.mkdir(parents=True)
+    (archive / 'session.json').write_text(json.dumps({
+        'schema_version': 'manyforge.workbench_session.v1', 'session_id': 'a' * 32,
+        'disposition': 'stopped', 'shutdown': 'clean', 'effects': effects,
+    }))
+    # Real allocated bytes, not sparse logical length, must count toward Q99.
+    protected = archive / 'execution-state/operation-journal.sqlite3-wal'
+    protected.parent.mkdir()
+    protected.write_bytes(b'original safety evidence' * 4096)
+    original = {str(p.relative_to(archive)): p.read_bytes() for p in archive.rglob('*') if p.is_file()}
+    old, latest = capture(root, 1), capture(root, 2)
+    result = pressure(root)
+    assert result.deleted == (str(old.relative_to(root)),)
+    assert latest.exists() and archive.exists()
+    assert original == {str(p.relative_to(archive)): p.read_bytes() for p in archive.rglob('*') if p.is_file()}
+    assert 'previous-session journals kept' in result.warning and 'not_imported or unknown' in result.warning
+    measured = int(result.warning.split('measured owned=')[1].split(' bytes')[0])
+    assert measured >= protected.stat().st_blocks * 512
+
+
+def test_current_session_incident_guard_does_not_read_legacy_or_archived_owner(tmp_path):
+    root = tmp_path / 'runtime'
+    legacy = journal(root, 0)
+    current = journal(root / 'current', 1)
+    archived = journal(root / 'previous-sessions' / ('b' * 32), 0)
+    originals = {p: p.read_bytes() for p in (legacy, current, archived)}
+    old, latest = capture(root, 1), capture(root, 2)
+    result = pressure(root)
+    assert result.deleted == (str(old.relative_to(root)),)
+    assert latest.exists() and archived.exists()
+    assert all(p.read_bytes() == content for p, content in originals.items())
+
+
+def test_multiple_previous_sessions_are_kept_without_a_new_count_limit(tmp_path):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    protected = []
+    for index in range(12):
+        folder = root / 'previous-sessions' / f'{index:032x}'
+        folder.mkdir(parents=True)
+        source = folder / 'program-cycle.sqlite3'
+        source.write_bytes(f'not imported safety event {index}'.encode())
+        protected.append((source, source.read_bytes()))
+    result = pressure(root)
+    assert not result.deleted
+    assert 'previous-session journals kept' in result.warning
+    assert all(path.read_bytes() == original for path, original in protected)
+
+
 def test_mounted_child_aborts_deletion_with_visible_warning(tmp_path,monkeypatch):
     root=tmp_path/'runtime'
     old,latest=capture(root,1),capture(root,2)

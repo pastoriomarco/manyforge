@@ -27,8 +27,8 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.h1a.v17";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 17;
+    "manyforge.internal.component-manager.apply-journal.h1a.v18";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 18;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -118,6 +118,12 @@ struct ManagerApplyPreparedActivationDTO final {
                          const ManagerApplyPreparedActivationDTO &) = default;
 };
 
+/// Scene preparation policy for this Apply operation, independent of prepared
+/// content.
+enum class ManagerSceneInitialization { kPreserve, kInitialize };
+
+[[nodiscard]] const char *ToString(ManagerSceneInitialization value) noexcept;
+
 /// Immutable named-Apply input for the first durable Apply boundary.
 ///
 /// The predecessor projection is the complete active composite expected by
@@ -144,6 +150,8 @@ struct ManagerApplyIntentDTO final {
       parent_authoring_claim;
   std::optional<ManagerIsaacPoseObserverLaunchFactsDTO>
       isaac_pose_observer_launch_facts{};
+  ManagerSceneInitialization scene_initialization{
+      ManagerSceneInitialization::kPreserve};
 
   [[nodiscard]] bool valid() const noexcept;
 

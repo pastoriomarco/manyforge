@@ -60,10 +60,14 @@ export function ProgramAuthoringTemplate({
   program,
   busy,
   onMutate,
+  collapsed,
+  onCollapsedChange,
 }: {
   program: ProgramAuthoringDocument;
   busy: boolean;
   onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
+  collapsed?: boolean;
+  onCollapsedChange?: (collapsed: boolean) => void;
 }) {
   const pickButton = useRef<HTMLButtonElement>(null);
   const placeButton = useRef<HTMLButtonElement>(null);
@@ -132,8 +136,15 @@ export function ProgramAuthoringTemplate({
     && placePosition.every(Number.isFinite)
     && placeOrientation.every(Number.isFinite);
 
-  // Collapsed by default, like a catalog category the user has not opened.
-  const [templatesCollapsed, setTemplatesCollapsed] = useState(true);
+  // Collapsed by default, like a catalog category the user has not opened. The
+  // palette may control it so its collapse-all/expand-all also covers Templates.
+  const [ownCollapsed, setOwnCollapsed] = useState(true);
+  const templatesCollapsed = collapsed ?? ownCollapsed;
+  const setTemplatesCollapsed = (next: (current: boolean) => boolean) => {
+    const value = next(templatesCollapsed);
+    if (onCollapsedChange) onCollapsedChange(value);
+    else setOwnCollapsed(value);
+  };
   const openTemplate = (kind: 'pick' | 'place') => {
     setOperation(kind);
     setNamespaceId('planning');

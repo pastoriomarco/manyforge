@@ -169,6 +169,13 @@ public:
              measured_state_inventory = {},
          CCLCReadinessSourceCapture capture_readiness_sources = {});
 
+  /// Internal delegation from the native endpoint after its exact Reset grant
+  /// validation. Retains this product through all phases; never acquires a
+  /// claim.
+  [[nodiscard]] core::Result<void> WithProgramResetPositionScope(
+      const core::CCLCProgramResetPositionScopeRequest &request,
+      const core::CCLCProgramResetPositionAction &action);
+
   /// Starts effectful retained-transaction recovery and request transports.
   /// Construction alone permits owner-local observation, without admitting
   /// requests or resuming journaled effects. Call only with startup authority;

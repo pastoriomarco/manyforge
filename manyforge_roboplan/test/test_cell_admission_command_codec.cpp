@@ -56,6 +56,20 @@ Value Intent() {
       {"scope", Value(Value::Object{{"configurations", Value(Value::Array{})},
                                      {"resources", Value(Value::Array{})}})}});
 }
+
+Value ResetReadiness(Value accepted) {
+  auto fields = Readiness().as_object();
+  for (auto& [name, value] : fields) {
+    if (name != "program_cycle_status") continue;
+    value = Value(Value::Object{
+        {"program_runner_owner_epoch", Value("runner.1")},
+        {"cycle_generation", Value(3.0)}, {"state", Value("resetting")},
+        {"program_run_id", Value(nullptr)}, {"cycle_claim_generation", Value(nullptr)},
+        {"terminal_or_settlement_reference", Value(nullptr)},
+        {"accepted_reset", std::move(accepted)}});
+  }
+  return Value(std::move(fields));
+}
 Value Release() {
   return Value(Value::Object{
       {"acquired_admission_generation", Value(1.0)},
@@ -643,6 +657,33 @@ TEST(CellAdmissionCommandCodec,
   EXPECT_EQ(inbound, outbound);
   ::close(descriptors[0]);
   ::close(descriptors[1]);
+}
+
+TEST(CellAdmissionCommandCodec, SelectedIdleResetHasClosedAcceptedContext) {
+  const Value accepted(Value::Object{
+      {"request_owner_epoch", Value("operator.1")}, {"request_id", Value("reset.1")},
+      {"request_payload_digest", Value(std::string(kDigest))},
+      {"reload_initial_scene", Value(true)}, {"reset_robot_position", Value(false)},
+      {"reset_claim_generation", Value(5.0)}});
+  const auto decoded = TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_update_readiness", ResetReadiness(accepted))));
+  ASSERT_TRUE(decoded.has_value());
+  const auto& readiness = std::get<core::CellAdmissionReadinessSnapshotDTO>(decoded->request);
+  ASSERT_TRUE(readiness.program_cycle_status->accepted_reset);
+  EXPECT_FALSE(readiness.program_cycle_status->program_run_id);
+  EXPECT_EQ(readiness.program_cycle_status->accepted_reset->request_id, core::RequestId("reset.1"));
+  for (const auto name : {"reload_initial_scene", "reset_claim_generation"}) {
+    auto fields = accepted.as_object();
+    for (auto& [key, value] : fields) {
+      if (key == name) value = Value(0.0);
+    }
+    EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(
+        Envelope("cell_admission_update_readiness", ResetReadiness(Value(std::move(fields)))))),
+        std::invalid_argument);
+  }
+  EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_update_readiness", ResetReadiness(Value(nullptr))))),
+      std::invalid_argument);
 }
 
 } // namespace

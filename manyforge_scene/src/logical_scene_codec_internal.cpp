@@ -1467,6 +1467,18 @@ CanonicalValue ProgramResetSceneAuthorization(
   if (!core::ValidateProgramResetSceneAuthorization(authorization).ok()) {
     Fail("cannot encode an invalid Program Reset scene authorization");
   }
+  if (authorization.reset_claim) {
+    const auto& reset = *authorization.reset_claim;
+    return CanonicalValue(CanonicalValue::Object{
+        {"program_runner_owner_epoch", CanonicalValue(authorization.program_runner_owner_epoch.value())},
+        {"cycle_generation", Unsigned(reset.cycle_generation, "cycle_generation")},
+        {"reset_claim", CanonicalValue(CanonicalValue::Object{
+            {"request_owner_epoch", CanonicalValue(reset.request_owner_epoch.value())},
+            {"request_id", CanonicalValue(reset.request_id.value())},
+            {"request_payload_digest", CanonicalValue(reset.request_payload_digest.value())},
+            {"reset_claim_generation", Unsigned(reset.reset_claim_generation.value(), "reset_claim_generation")}})},
+    });
+  }
   return CanonicalValue(CanonicalValue::Object{
       {"cycle_claim_generation",
        Unsigned(authorization.cycle_claim_generation.value(),
@@ -1482,6 +1494,24 @@ CanonicalValue ProgramResetSceneAuthorization(
 
 core::ProgramResetSceneAuthorizationDTO DecodeProgramResetSceneAuthorization(
     const CanonicalValue &value) {
+  if (value.is_object() && value.find_object_member("reset_claim") != nullptr) {
+    ExactObject(value, 3U, "idle Program Reset scene authorization");
+    const auto& reset = Member(value, "reset_claim");
+    ExactObject(reset, 4U, "idle Program Reset identity");
+    core::ProgramResetSceneAuthorizationDTO result{
+        core::RequestOwnerEpoch(String(Member(value, "program_runner_owner_epoch"), "program_runner_owner_epoch")),
+        core::ProgramRunId(""), core::CellAdmissionClaimGeneration(0U), core::ContentDigest(""),
+        core::ProgramResetClaimSceneAuthorizationDTO{
+            DecodeUnsigned(Member(value, "cycle_generation"), "cycle_generation"),
+            core::RequestOwnerEpoch(String(Member(reset, "request_owner_epoch"), "request_owner_epoch")),
+            core::RequestId(String(Member(reset, "request_id"), "request_id")),
+            core::ContentDigest(String(Member(reset, "request_payload_digest"), "request_payload_digest")),
+            core::CellAdmissionClaimGeneration(DecodeUnsigned(Member(reset, "reset_claim_generation"), "reset_claim_generation"))}};
+    if (!core::ValidateProgramResetSceneAuthorization(result).ok()) {
+      Fail("idle Program Reset scene authorization is invalid");
+    }
+    return result;
+  }
   ExactObject(value, 4U, "Program Reset scene authorization");
   core::ProgramResetSceneAuthorizationDTO result{
       core::RequestOwnerEpoch(String(Member(value, "program_runner_owner_epoch"),

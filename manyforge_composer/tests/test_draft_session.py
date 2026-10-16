@@ -1145,6 +1145,40 @@ def test_node_policy_mutation_round_trips_nondefaults_and_reidentifies() -> None
     ).to_dict() == result.snapshot["program"]
 
 
+def test_node_presentation_flag_is_node_metadata_and_a_program_change() -> None:
+    original = _program()
+    session = ComposerDraftSession(original)
+    arguments = {"instance_id": "move_to_pick", "collapsed_by_default": True}
+
+    result = _mutate(session, "program_draft_update_node_presentation", arguments)
+    node = result.snapshot["program"]["tree"]["children"][0]
+    assert node["metadata"] == {"collapsed_by_default": True}
+    # Presentation metadata is part of the Program, so it is an ordinary edit.
+    assert result.snapshot["program_revision"] != original.program_revision
+    assert Program.from_dict(
+        result.snapshot["program"],
+        build_node_environment().catalog,
+    ).to_dict() == result.snapshot["program"]
+
+    result = _mutate(
+        session,
+        "program_draft_update_node_presentation",
+        {**arguments, "collapsed_by_default": False},
+    )
+    assert "metadata" not in result.snapshot["program"]["tree"]["children"][0]
+
+    before = session.snapshot()
+    for invalid in (
+        {"instance_id": "move_to_pick"},
+        {**arguments, "collapsed_by_default": "yes"},
+        {**arguments, "extra": 1},
+        {**arguments, "instance_id": "Not Portable"},
+    ):
+        with pytest.raises(DraftSessionError):
+            _mutate(session, "program_draft_update_node_presentation", invalid)
+        assert session.snapshot() == before
+
+
 def test_node_execution_groups_use_existing_draft_policy_validation() -> None:
     session = ComposerDraftSession(_program())
     arguments = {**_node_policy_arguments(session), "execution_groups": ["robot_a", "all_grippers"]}

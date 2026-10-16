@@ -3,6 +3,7 @@ import { resolveStructuralAssetUrl } from '../api/client';
 import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
 import { operatorAlarmRefusalMessage } from '../state/operatorAlarmRefusal';
 import { structuredErrorText } from '../state/structuredError';
+import { verifiedNoPhysicalComponents } from '../state/viewerModelReadiness';
 import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
 import {
   parseApiErrorDto,
@@ -1105,7 +1106,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       if (generation !== this.viewerDemandGeneration || !this.viewerDemand) return;
       this.viewerDemand = false;
       this.stopObservationConnection('Composer viewer is not visible');
-      this.publishObservationTransportStatus('disabled', null);
+      if (!this.suspendEmptyObservation()) this.publishObservationTransportStatus('disabled', null);
     });
   }
 
@@ -1869,6 +1870,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
 
   private connectObservation(): void {
     if (!this.enabled || !this.viewerDemand || this.disposed) return;
+    if (this.suspendEmptyObservation()) return;
+    if (this.observationSocket !== null) return;
     const serial = ++this.observationSerial;
     const socket = new WebSocket(websocketUrl('/ws/scene/viewer'));
     this.observationSocket = socket;
@@ -1992,6 +1995,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private sendObservationCredit(
     frame: ExecutionObservationFrame | null,
   ): void {
+    if (this.suspendEmptyObservation()) return;
     const socket = this.observationSocket;
     if (
       socket === null
@@ -2090,6 +2094,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   }
 
   private refreshControlCondition(): void {
+    this.refreshObservationDemand();
     let error = this.enabled ? this.controlTransportError : null;
     const semantic = this.semanticCondition();
     if (this.enabled && error === null && semantic.status === 'synchronizing') {
@@ -2190,6 +2195,36 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.appliedExecutionObservation = null;
     this.cancelObservationFrame();
     for (const listener of this.executionObservationListeners) listener();
+  }
+
+  /** Stop physical observation only on a current, positively empty publication. */
+  private suspendEmptyObservation(): boolean {
+    if (!this.enabled || this.disposed
+        || !verifiedNoPhysicalComponents(this.latest, this.controlTransportStatus)) return false;
+    if (this.observationTransportStatus.phase !== 'no_robot_loaded') {
+      this.stopObservationConnection('No robot loaded');
+      this.clearExecutionObservation();
+      this.publishObservationTransportStatus('no_robot_loaded', 'No robot loaded');
+    }
+    return true;
+  }
+
+  private refreshObservationDemand(): void {
+    if (this.suspendEmptyObservation()) return;
+    // The visible viewer retains its demand while empty. Once that exact
+    // publication changes (also from another client), ordinary demand resumes.
+    if (this.observationTransportStatus.phase === 'no_robot_loaded') {
+      this.publishObservationTransportStatus(
+        this.viewerDemand ? 'connecting' : 'disabled',
+        this.viewerDemand ? 'Connecting the live measured-state viewer.' : null,
+      );
+    }
+    if (this.enabled && this.viewerDemand && !this.disposed
+        && this.controlTransportStatus === 'connected'
+        && this.observationTransportStatus.phase === 'connecting'
+        && this.observationSocket === null && this.observationReconnectTimer === null) {
+      this.connectObservation();
+    }
   }
 
   private discardUnappliedExecutionObservation(): void {

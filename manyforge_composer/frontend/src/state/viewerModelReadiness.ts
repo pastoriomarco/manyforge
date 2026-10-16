@@ -65,6 +65,43 @@ export function pendingManagerApply(payload: Record<string, unknown>): boolean |
   return false;
 }
 
+/** Current zero-physical graph evidence, independent of its Scenario/Close origin. */
+export function verifiedNoPhysicalComponents(
+  snapshot: ComposerHeadlessState | null,
+  transportStatus: ControlTransportStatus,
+): boolean {
+  if (snapshot === null || transportStatus !== 'connected' || !snapshot.runtime.complete) return false;
+  const manager = snapshot.runtime.sections.manager;
+  const payload = manager.payload;
+  if (!manager.available || manager.freshness !== 'fresh' || manager.knownGaps.length !== 0
+      || !Number.isSafeInteger(manager.sourceGeneration) || (manager.sourceGeneration ?? 0) <= 0
+      || !manager.sourceOwnerId || !manager.sourceOwnerEpoch || payload === null
+      || payload.manager_ready !== true || pendingManagerApply(payload) !== false) return false;
+  const active = recordValue(payload.active);
+  const graph = recordValue(active?.cell_graph);
+  const publication = recordValue(active?.publication);
+  const revision = recordValue(publication?.projection_revision);
+  const runtime = recordValue(payload.runtime);
+  const configuration = snapshot.runtime.activeConfiguration;
+  return typeof active?.canonical_empty === 'boolean' && runtime?.converged === true
+    && typeof payload.cell_id === 'string' && payload.cell_id.length > 0
+    && graph?.cell_id === payload.cell_id
+    && typeof active.retained_bundle_id === 'string' && active.retained_bundle_id.length > 0
+    && typeof active.graph_revision === 'string' && active.graph_revision.length > 0
+    && graph?.graph_revision === active.graph_revision
+    && configuration?.retainedBundleId === active.retained_bundle_id
+    && configuration?.graphRevision === active.graph_revision
+    && revision?.retained_bundle_id === active.retained_bundle_id
+    && revision?.graph_revision === active.graph_revision
+    && Number.isSafeInteger(publication?.publication_generation)
+    && (publication?.publication_generation as number) > 0
+    && ['model_instances', 'controllable_components', 'control_bindings', 'control_domains']
+      .every((key) => {
+        const rows = graph?.[key];
+        return Array.isArray(rows) && rows.length === 0;
+      });
+}
+
 function resourceStateMessage<T>(
   resource: StructuralResourceState<T>,
 ): string | null {

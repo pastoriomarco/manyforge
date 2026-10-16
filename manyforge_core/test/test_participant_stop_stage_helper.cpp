@@ -287,6 +287,42 @@ std::string Text(const JsonObjectDTO& object, const char* key) {
   return std::get<std::string>(object.at(key).value);
 }
 
+/// Changes only the returned copy of a goal read, never the stored DTO.
+class GoalReadObservingPort final : public IExecutionPort {
+ public:
+  explicit GoalReadObservingPort(FakeExecutionPort& port) : port_(port) {}
+
+  ExecutionPortCommandResultDTO Submit(const ExecutionGoalKey& key,
+                                       const TrajectoryDTO& trajectory) override {
+    return port_.Submit(key, trajectory);
+  }
+  ExecutionPortCommandResultDTO Replace(const ExecutionGoalKey& active,
+                                        const ExecutionGoalKey& next,
+                                        const TrajectoryDTO& trajectory) override {
+    return port_.Replace(active, next, trajectory);
+  }
+  ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key) override {
+    return port_.Cancel(key);
+  }
+  ExecutionPortCommandResultDTO SetScale(double value) override { return port_.SetScale(value); }
+  std::optional<ExecutionGoalObservationDTO> ReadGoal(const ExecutionGoalKey& key) const override {
+    auto goal = port_.ReadGoal(key);
+    if (on_read_goal) on_read_goal(goal);
+    return goal;
+  }
+  std::optional<ExecutionControllerSampleDTO> ReadSample() const override {
+    return port_.ReadSample();
+  }
+  ExecutionReadinessDTO ReadReadiness() const override { return port_.ReadReadiness(); }
+  ExecutionTimingDTO ReadTiming() override { return port_.ReadTiming(); }
+  ExecutionLaneFactsDTO ReadLaneFacts() const override { return port_.ReadLaneFacts(); }
+
+  std::function<void(std::optional<ExecutionGoalObservationDTO>&)> on_read_goal;
+
+ private:
+  FakeExecutionPort& port_;
+};
+
 /// Scripted world: a fake clock, the fake port, and per-tick scripts.
 class World {
  public:
@@ -311,9 +347,9 @@ class World {
     if (build) Build();
   }
 
-  void Build() {
+  void Build(IExecutionPort* execution_port = nullptr) {
     helper = std::make_unique<ParticipantStopStageHelper>(
-        port, clock,
+        execution_port == nullptr ? port : *execution_port, clock,
         [this](TimePoint deadline, const std::stop_token&) {
           clock.advance(std::max<Duration>(1, std::min(kTick, deadline - clock.now())));
           ++ticks;
@@ -1644,6 +1680,168 @@ TEST(ParticipantStopStageHelperTest, HardStageObservesAnAlreadyEndedGoalWithoutA
     ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
     EXPECT_TRUE(world.port.commands().empty());
     EXPECT_EQ(Text(EvidenceObject(result), "hard_stop_level"), "goal_already_terminal");
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, FreshTerminalReadKeepsOldTransitionDataWithoutRewritingDtos) {
+  for (const auto ended : {ExecutionGoalResult::kSucceeded, ExecutionGoalResult::kCanceled,
+                           ExecutionGoalResult::kAbortedPathTolerance}) {
+    for (const bool has_receipt : {false, true}) {
+      SCOPED_TRACE(static_cast<int>(ended));
+      SCOPED_TRACE(has_receipt);
+      World world(false);
+      GoalReadObservingPort observing(world.port);
+      world.config.controller_state_max_age_ns = 250'000'000;
+      world.Build(&observing);
+      const auto stage = Stage(0U, Nominal::kGoalCancel);  // requires goal-terminal evidence
+      world.Dispatch(stage);
+      world.Finish(kOriginal, ended);
+      if (!has_receipt) {
+        auto goal = *world.port.ReadGoal(kOriginal);
+        goal.terminal_local_receipt_stamp.reset();
+        world.port.SetGoal(goal);
+      }
+      const auto original_goal = world.port.ReadGoal(kOriginal);
+      world.clock.advance(500'000'000);  // transition is older than the 100 ms evidence budget
+      world.Sample(2.0, 2.0, 1.0);
+      // Readiness flags do not gate an already-ended Stop's evidence.
+      world.port.SetReadiness({false, false, false, ExecutionBindingEpoch(1U)});
+      std::optional<ExecutionControllerSampleDTO> hold_sample;
+      world.on_tick = [&] {
+        world.Sample(2.0, 2.0, 0.0);
+        hold_sample = world.port.ReadSample();
+      };
+      observing.on_read_goal = [&](auto&) {
+        if (world.ticks > 0U) {
+          // The current observation must be stamped AFTER the actual read;
+          // a timestamp taken before this call would itself exceed its budget.
+          world.clock.advance(150'000'000);
+        }
+      };
+      const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+      ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+      EXPECT_TRUE(world.port.commands().empty());
+      ASSERT_EQ(result.evidence_items.size(), 1U);
+      EXPECT_EQ(result.evidence_items.front().source_age_at_evaluation_ns, 0);
+      const auto& goal_evidence =
+          std::get<JsonObjectDTO>(EvidenceObject(result).at("goal_observation").value);
+      EXPECT_EQ(Text(goal_evidence, "finish_basis"), "goal_already_terminal");
+      if (has_receipt) {
+        EXPECT_EQ(std::get<double>(goal_evidence.at("terminal_local_receipt_stamp_ns").value),
+                  static_cast<double>(*original_goal->terminal_local_receipt_stamp));
+        EXPECT_EQ(std::get<double>(goal_evidence.at("terminal_transition_age_ns").value),
+                  static_cast<double>(world.clock.now() -
+                                      *original_goal->terminal_local_receipt_stamp));
+        EXPECT_GT(std::get<double>(goal_evidence.at("terminal_transition_age_ns").value),
+                  100'000'000.0);
+      } else {
+        EXPECT_FALSE(goal_evidence.contains("terminal_local_receipt_stamp_ns"));
+        EXPECT_FALSE(goal_evidence.contains("terminal_transition_age_ns"));
+      }
+      EXPECT_EQ(world.port.ReadGoal(kOriginal), original_goal);
+      EXPECT_EQ(world.port.ReadSample(), hold_sample);
+    }
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, OldTerminalFactDoesNotMakeAStaleControllerFeedFresh) {
+  World world(false);
+  world.config.controller_state_max_age_ns = 250'000'000;
+  world.Build();
+  const auto stage = Stage(0U, Nominal::kGoalCancel);
+  world.Dispatch(stage);
+  world.Finish(kOriginal, ExecutionGoalResult::kSucceeded);
+  const auto original_goal = world.port.ReadGoal(kOriginal);
+  world.Sample(2.0, 2.0, 0.0);
+  const auto original_sample = world.port.ReadSample();
+  world.clock.advance(500'000'000);
+  const auto started = world.clock.now();
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"), "stale_controller_state");
+  EXPECT_EQ(world.clock.now(), started);
+  EXPECT_TRUE(world.port.commands().empty());
+  EXPECT_EQ(world.port.ReadGoal(kOriginal), original_goal);
+  EXPECT_EQ(world.port.ReadSample(), original_sample);
+}
+
+TEST(ParticipantStopStageHelperTest, CurrentTerminalEvidenceRequiresTheExactGoalAndBinding) {
+  enum class Mismatch { kGoalKey, kZeroGoalEpoch, kGoalEpoch, kCurrentEpoch, kSampleEpoch };
+  for (const auto mismatch : {Mismatch::kGoalKey, Mismatch::kZeroGoalEpoch,
+                              Mismatch::kGoalEpoch, Mismatch::kCurrentEpoch,
+                              Mismatch::kSampleEpoch}) {
+    SCOPED_TRACE(static_cast<int>(mismatch));
+    World world(false);
+    GoalReadObservingPort observing(world.port);
+    world.Build(&observing);
+    const auto stage = Stage(0U, Nominal::kGoalCancel);
+    world.Dispatch(stage);
+    world.Finish(kOriginal, ExecutionGoalResult::kSucceeded);
+    const auto original_goal = world.port.ReadGoal(kOriginal);
+    world.clock.advance(500'000'000);
+    world.on_tick = [&] { world.Sample(2.0, 2.0, 0.0); };
+    observing.on_read_goal = [&](auto& goal) {
+      if (world.ticks == 0U || !goal.has_value()) return;
+      switch (mismatch) {
+        case Mismatch::kGoalKey:
+          goal->key = kSecond;
+          break;
+        case Mismatch::kZeroGoalEpoch:
+          goal->binding_epoch = ExecutionBindingEpoch(0U);
+          break;
+        case Mismatch::kGoalEpoch:
+          goal->binding_epoch = ExecutionBindingEpoch(2U);
+          break;
+        case Mismatch::kCurrentEpoch:
+          world.port.SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
+          break;
+        case Mismatch::kSampleEpoch:
+          goal->binding_epoch = ExecutionBindingEpoch(2U);
+          world.port.SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
+          break;
+      }
+    };
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(result.error.has_value());
+    EXPECT_EQ(result.error->details.at("reason"), "stop_evidence_source_mismatch");
+    EXPECT_EQ(world.ticks, 1U);
+    EXPECT_TRUE(world.port.commands().empty());
+    EXPECT_EQ(world.port.ReadGoal(kOriginal), original_goal);
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, CurrentTerminalEvidenceCannotUseAnAbsentOrExecutingRecord) {
+  for (const bool absent : {false, true}) {
+    SCOPED_TRACE(absent);
+    World world(false);
+    GoalReadObservingPort observing(world.port);
+    world.Build(&observing);
+    const auto stage = Stage(0U, Nominal::kGoalCancel);
+    world.Dispatch(stage);
+    world.Finish(kOriginal, ExecutionGoalResult::kSucceeded);
+    const auto original_goal = world.port.ReadGoal(kOriginal);
+    world.clock.advance(500'000'000);
+    const auto started = world.clock.now();
+    world.on_tick = [&] { world.Sample(2.0, 2.0, 0.0); };
+    observing.on_read_goal = [&](auto& goal) {
+      if (world.ticks == 0U) return;
+      if (absent) {
+        goal.reset();
+      } else {
+        goal->phase = ExecutionGoalPhase::kExecuting;
+        goal->result.reset();
+        goal->terminal_local_receipt_stamp.reset();
+      }
+    };
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(result.error.has_value());
+    EXPECT_EQ(result.error->details.at("reason"), "stop_goal_terminal_state_mismatch");
+    EXPECT_EQ(world.clock.now() - started, world.config.hard_stop_completion_timeout_ns);
+    EXPECT_TRUE(world.port.commands().empty());
+    EXPECT_EQ(world.port.ReadGoal(kOriginal), original_goal);
   }
 }
 

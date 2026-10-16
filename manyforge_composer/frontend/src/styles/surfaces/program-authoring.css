@@ -1502,6 +1502,27 @@
   margin-top: 0.2rem;
 }
 
+/* Reset options: each checkbox with its effect underneath. */
+.transport-reset-options {
+  display: grid;
+  gap: 0.15rem;
+  margin: 0;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--mf-border-neutral-30);
+  border-radius: var(--mf-radius-md-sm);
+}
+
+.transport-reset-option-note {
+  margin: 0 0 0.3rem 1.6rem;
+  color: var(--mf-text-neutral-59);
+  font-size: var(--mf-font-size-068);
+  line-height: 1.4;
+}
+
+.transport-reset-option-note:last-child {
+  margin-bottom: 0;
+}
+
 .transport-confirmation .dialog-actions > button {
   min-width: 0;
   min-height: 1.9rem;
@@ -1510,8 +1531,29 @@
   font-size: var(--mf-font-size-072);
 }
 
+/* The confirm button of the activate-and-execute popup reuses Execute's look. */
+.transport-confirmation .dialog-actions > .transport-run:not(:disabled) {
+  border-color: var(--mf-border-success-35);
+  color: var(--mf-text-success-82);
+  background: var(--mf-bg-success-15);
+}
+
+.transport-confirmation .dialog-actions > .transport-run:hover:not(:disabled) {
+  border-color: var(--mf-border-success-51);
+  background: var(--mf-bg-success-20);
+}
+
 .overlay-actions {
   display: flex;
   justify-content: flex-end;
   gap: 0.5rem;
+}
+
+/* Editor-only "Show collapsed by default" toggle below the node policies. */
+.program-node-presentation {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.6rem;
+  font-size: var(--mf-font-size-076);
 }

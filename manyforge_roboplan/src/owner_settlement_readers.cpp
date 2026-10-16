@@ -24,7 +24,7 @@ constexpr int kBusyTimeoutMilliseconds = 5000;
 // The only Program-cycle journal schema these readers accept. It equals
 // `SCHEMA_VERSION` in manyforge_program_runner/cycle_journal.py (a runner test
 // checks this); older and newer development journals are refused unchanged.
-constexpr int kProgramCycleJournalSchema = 7;
+constexpr int kProgramCycleJournalSchema = 8;
 
 class Statement final {
 public:
@@ -287,6 +287,125 @@ struct RoleReplacement final {
   return *replacement;
 }
 
+// One read transaction joins cycle phase, original accepted Reset and its
+// exact claim register. Called only from existing bounded read-only adapters;
+// no Runner transaction remains open across the calling native RPC.
+struct ProgramResetJournalSnapshot final {
+  core::ProgramCycleStatusDTO status;
+  std::string phase;
+  std::optional<core::CellAdmissionClaimIntentDTO> effect_intent;
+  std::optional<core::CellAdmissionClaimDTO> claim;
+  std::optional<core::CellAdmissionClaimReleaseDTO> release;
+  ci::CanonicalValue claim_value;
+};
+
+ProgramResetJournalSnapshot ReadResetSnapshot(sqlite3* database) {
+  Statement metadata(database, "SELECT schema_version FROM program_cycle_metadata WHERE singleton=1");
+  if (!metadata.Step() || metadata.Integer(0) != kProgramCycleJournalSchema || metadata.Step())
+    throw std::runtime_error("Program-cycle journal schema differs");
+  Statement row(database,
+      "SELECT state,owner_epoch,cycle_generation,program_run_id,claim_json,terminal_reference,"
+      "reconciliation_required,acquisition_pending_json,reset_phase,reset_effect_claim_json,"
+      "start_settlement_json,release_intent_json "
+      "FROM program_cycle WHERE singleton=1");
+  if (!row.Step() || row.Text(0) != "resetting" || row.Integer(2) <= 0 ||
+      row.Integer(6) != 0 || !row.IsNull(7) || row.IsNull(8))
+    throw std::runtime_error("Program Reset is not current");
+  const auto generation = static_cast<std::uint64_t>(row.Integer(2));
+  ProgramResetJournalSnapshot result{
+      {core::RequestOwnerEpoch(row.Text(1)), generation, core::ProgramCycleStateDTO::kResetting,
+       std::nullopt, std::nullopt, std::nullopt}, row.Text(8), std::nullopt, std::nullopt,
+       std::nullopt, ci::CanonicalValue(nullptr)};
+  if (row.IsNull(4)) {
+    if (row.IsNull(3)) {
+      if (!row.IsNull(5) || !row.IsNull(10) || !row.IsNull(11))
+        throw std::runtime_error("no-run Reset retains Program settlement");
+    } else {
+      // Existing failed-Start proof is explicit and digest pinned. A missing
+      // Program-cycle claim alone grants no selected effect authority.
+      if (row.IsNull(5) || row.IsNull(10) || !row.IsNull(11))
+        throw std::runtime_error("claimless failed Start has no exact settlement");
+      const auto settlement = ci::parse_canonical_json(row.Text(10));
+      const auto& prepared = Member(settlement, "prepared_scene");
+      if (StringMember(settlement, "schema_version") != "manyforge.program_cycle_start_settlement.v1" ||
+          StringMember(settlement, "kind") != "proven_no_effect" ||
+          !Member(settlement, "claim").is_null() ||
+          StringMember(settlement, "program_run_id") != row.Text(3) ||
+          !prepared.is_object() || (!prepared.as_object().empty() &&
+            StringMember(prepared, "schema_version") != "manyforge.prepared_program_scene.v1") ||
+          ci::sha256_digest(ci::canonical_json(settlement)) != row.Text(5))
+        throw std::runtime_error("claimless failed Start settlement differs");
+      result.status.program_run_id = core::ProgramRunId(row.Text(3));
+      result.status.terminal_or_settlement_reference = core::ContentDigest(row.Text(5));
+    }
+    if (row.IsNull(9))
+      throw std::runtime_error("idle Reset claim register is absent or mixed");
+    const auto registered = ci::parse_canonical_json(row.Text(9));
+    if (!registered.is_object() || registered.as_object().size() != 3U)
+      throw std::runtime_error("Program Reset claim register shape differs");
+    result.effect_intent = DecodeCellAdmissionClaimIntent(ci::canonical_json(Member(registered, "intent")));
+    if (!Member(registered, "claim").is_null()) {
+      result.claim_value = Member(registered, "claim");
+      result.claim = DecodeCellAdmissionClaim(ci::canonical_json(result.claim_value));
+      if (result.claim->intent != *result.effect_intent)
+        throw std::runtime_error("Program Reset receipt intent differs");
+    }
+    if (!Member(registered, "release_intent").is_null())
+      result.release = DecodeCellAdmissionClaimRelease(ci::canonical_json(Member(registered, "release_intent")));
+    if (result.effect_intent->claim_kind != core::CellAdmissionClaimKindDTO::kProgramReset ||
+        result.effect_intent->owner_epoch != result.status.program_runner_owner_epoch)
+      throw std::runtime_error("Program Reset claim owner differs");
+  } else {
+    if (row.IsNull(3) || row.IsNull(5) || !row.IsNull(9))
+      throw std::runtime_error("run Reset claim is absent or mixed");
+    result.status.program_run_id = core::ProgramRunId(row.Text(3));
+    result.status.terminal_or_settlement_reference = core::ContentDigest(row.Text(5));
+    result.claim_value = ci::parse_canonical_json(row.Text(4));
+    result.claim = DecodeCellAdmissionClaim(ci::canonical_json(result.claim_value));
+    if (result.claim->intent.claim_kind != core::CellAdmissionClaimKindDTO::kProgramCycle)
+      throw std::runtime_error("run Reset parent kind differs");
+    result.status.cycle_claim_generation = result.claim->claim_generation;
+  }
+  if (row.Step()) throw std::runtime_error("duplicate Program-cycle row");
+  Statement pending(database,
+      "SELECT request_owner_epoch,request_id,intent_json,cycle_generation "
+      "FROM program_cycle_inflight_commands WHERE request_kind='reset'");
+  if (!pending.Step() || pending.Integer(3) != static_cast<std::int64_t>(generation))
+    throw std::runtime_error("accepted Program Reset occurrence absent");
+  const auto original = ci::parse_canonical_json(pending.Text(2));
+  const auto& reload = Member(original, "reload_initial_scene");
+  const auto& position = Member(original, "reset_robot_position");
+  if (!reload.is_bool() || !position.is_bool() ||
+      StringMember(original, "request_owner_epoch") != pending.Text(0) ||
+      StringMember(original, "request_id") != pending.Text(1) ||
+      !Member(original, "expected_cycle_generation").is_number() ||
+      Member(original, "expected_cycle_generation").as_number() != static_cast<double>(generation))
+    throw std::runtime_error("accepted Reset identity or selectors differ");
+  if (result.status.program_run_id) {
+    if (StringMember(original, "program_run_id") != result.status.program_run_id->value())
+      throw std::runtime_error("accepted Reset run differs");
+  } else if (!Member(original, "program_run_id").is_null() ||
+             StringMember(original, "expected_owner_epoch") != result.status.program_runner_owner_epoch.value()) {
+    throw std::runtime_error("accepted idle Reset owner differs");
+  }
+  const auto digest = ci::sha256_digest(ci::canonical_json(original));
+  result.status.accepted_reset = core::AcceptedProgramResetDTO{
+      core::RequestOwnerEpoch(pending.Text(0)), core::RequestId(pending.Text(1)),
+      core::ContentDigest(digest), reload.as_bool(), position.as_bool(),
+      result.effect_intent && result.claim
+          ? std::optional(result.claim->claim_generation) : std::nullopt};
+  if (!core::ValidateProgramCycleStatus(result.status).ok() || pending.Step())
+    throw std::runtime_error("accepted Reset projection is invalid");
+  if (result.effect_intent) {
+    const auto identity = core::ProgramResetClaimRequestId(result.status);
+    if (!identity.ok() || result.effect_intent->request_id != identity.value() ||
+        result.effect_intent->owner_transaction_id != identity.value().value() ||
+        result.effect_intent->request_payload_digest.value() != digest)
+      throw std::runtime_error("accepted Reset claim identity differs");
+  }
+  return result;
+}
+
 } // namespace
 
 core::Result<std::optional<ActiveProgramRunProductIdentity>>
@@ -440,6 +559,67 @@ core::Result<void> ValidateProgramCycleSettlementReadOnly(
     return core::Result<void>::Ok();
   } catch (const std::exception &) {
     return Rejected("Program-cycle", "program_cycle_journal_read_failed");
+  }
+}
+
+core::Result<core::ProgramCycleStatusDTO> ReadProgramResetStatusReadOnly(
+    const std::filesystem::path& database_path, const core::ProgramResetJournalReadPurpose purpose,
+    const core::CellAdmissionClaimIntentDTO& intent,
+    const std::optional<core::CellAdmissionClaimDTO>& claim) {
+  try {
+    auto database = OpenReadOnly(database_path);
+    const auto snapshot = ReadResetSnapshot(database.get());
+    const bool acquiring = purpose == core::ProgramResetJournalReadPurpose::kAcquire;
+    const auto& accepted = *snapshot.status.accepted_reset;
+    if ((acquiring &&
+         (snapshot.status.cycle_claim_generation || !snapshot.effect_intent ||
+          *snapshot.effect_intent != intent || snapshot.claim || snapshot.release ||
+          snapshot.phase != (accepted.reload_initial_scene ? "restoring_scene" : "restoring_position"))) ||
+        (!acquiring &&
+         ((purpose == core::ProgramResetJournalReadPurpose::kReloadInitialScene
+               ? (!accepted.reload_initial_scene || snapshot.phase != "restoring_scene")
+               : (!accepted.reset_robot_position || snapshot.phase != "restoring_position")) ||
+          !snapshot.claim || !claim || *snapshot.claim != *claim ||
+          snapshot.claim->intent != intent || snapshot.release)))
+      throw std::runtime_error("Program Reset effect phase or authority differs");
+    Exec(database.get(), "COMMIT");
+    return core::Result<core::ProgramCycleStatusDTO>::Ok(snapshot.status);
+  } catch (const std::exception&) {
+    return core::Result<core::ProgramCycleStatusDTO>::Err(
+        {"authoring_not_ready", "Program Reset journal is not current",
+         {{"reason", "program_reset_journal_evidence_mismatch"}}});
+  }
+}
+
+core::Result<void> ValidateProgramResetSettlementReadOnly(
+    const std::filesystem::path& database_path,
+    const core::CellAdmissionClaimDTO& claim,
+    const core::CellAdmissionClaimReleaseDTO& release) {
+  if (!ExactReleaseIdentity(claim, release) ||
+      claim.intent.claim_kind != core::CellAdmissionClaimKindDTO::kProgramReset ||
+      claim.acquired_admission_generation != claim.intent.expected_admission_generation ||
+      release.settlement.settlement_kind != core::CellAdmissionSettlementKindDTO::kExplicitReset)
+    return Rejected("Program Reset", "program_reset_release_identity_mismatch");
+  try {
+    auto database = OpenReadOnly(database_path);
+    const auto snapshot = ReadResetSnapshot(database.get());
+    if (snapshot.status.cycle_claim_generation || snapshot.phase != "releasing" ||
+        snapshot.claim != claim || snapshot.release != release)
+      throw std::runtime_error("Program Reset settlement authority differs");
+    const auto& accepted = *snapshot.status.accepted_reset;
+    const auto evidence = ci::canonical_json(ci::CanonicalValue(ci::CanonicalValue::Object{
+        {"schema_version", ci::CanonicalValue("manyforge.program_reset_effect_settlement.v1")},
+        {"cycle_generation", ci::CanonicalValue(static_cast<double>(snapshot.status.cycle_generation))},
+        {"request_owner_epoch", ci::CanonicalValue(accepted.request_owner_epoch.value())},
+        {"request_id", ci::CanonicalValue(accepted.request_id.value())},
+        {"request_payload_digest", ci::CanonicalValue(accepted.request_payload_digest.value())},
+        {"claim", snapshot.claim_value}}));
+    if (ci::sha256_digest(evidence) != release.settlement.evidence_digest.value())
+      throw std::runtime_error("Program Reset settlement digest differs");
+    Exec(database.get(), "COMMIT");
+    return core::Result<void>::Ok();
+  } catch (const std::exception&) {
+    return Rejected("Program Reset", "program_reset_journal_evidence_mismatch");
   }
 }
 

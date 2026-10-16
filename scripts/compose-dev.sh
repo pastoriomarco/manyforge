@@ -11,10 +11,12 @@ image=${MANYFORGE_DEV_IMAGE:-manyforge-dev:latest}
 cache_base=${MANYFORGE_DEV_CACHE_BASE:-"$repo_root/.manyforge-dev"}
 runtime_root=${MANYFORGE_DEV_RUNTIME_STATE_ROOT:-"$cache_base/runtime/$container_name"}
 retention_helper="$repo_root/scripts/lib/export_retention.py"
+session_helper="$repo_root/scripts/lib/workbench_session.py"
 project=
 bootstrap_project=
 ros2_control=true
 started_container=false
+stopped_container_receipt=
 operator_instance=${MANYFORGE_DEV_LAUNCH_INSTANCE_ID:-}
 operator_digest=${MANYFORGE_DEV_LAUNCH_INPUT_DIGEST:-}
 operator_mode=false
@@ -40,7 +42,7 @@ if (expected_id and row["Id"] != expected_id) or row["Image"] != image or labels
 assert_runtime_root_available() {
   local running
   running=$(docker container ls --filter status=running --filter status=paused --filter status=restarting \
-    --filter label=manyforge.dev.ros2-control --quiet --no-trunc) || return $?
+    --quiet --no-trunc) || return $?
   [[ -n "$running" ]] || return 0
   local -a running_ids
   mapfile -t running_ids <<<"$running"
@@ -57,8 +59,10 @@ for row in rows:
     if not any(row["State"].get(key, False) for key in ("Running", "Paused", "Restarting")):
         continue
     for mount in row["Mounts"]:
-        if mount.get("Type") == "bind" and mount.get("Destination") == "/tmp/manyforge-state" and os.path.realpath(mount["Source"]) == root:
-            raise SystemExit("Refusing shared live ManyForge state root: "+root+" already bound by "+row["Id"])
+        if mount.get("Type") == "bind":
+            source=os.path.realpath(mount["Source"])
+            if os.path.commonpath((source,root)) in (source,root):
+                raise SystemExit("Refusing overlapping live ManyForge state root: "+root+" already bound by "+row["Id"])
 ' "$runtime_root"
 }
 
@@ -244,6 +248,7 @@ print(json.dumps(row,separators=(",",":")))
     return 69
   fi
   echo "Evidence preserved at $evidence_path"
+  [[ -z "$mounted_root" ]] || stopped_container_receipt="$evidence_path/docker-inspect.json"
   [[ -z "$mounted_root" ]] || rotate_quiescent_root "$mounted_root"
 }
 
@@ -419,11 +424,12 @@ case "$command" in
       done
       ros_identity=(--user "$(id -u):$(id -g)" --env HOME=/runner/home \
         --env MANYFORGE_BUILD_DIR=/runner/build)
-      # Preserve explicitly configured DDS inputs. The image entrypoint owns
+      # Preserve explicitly configured DDS and build inputs. The image entrypoint owns
       # ROS/venv setup; this launcher neither sources a topology nor picks peers.
       for variable in ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_AUTOMATIC_DISCOVERY_RANGE \
           ROS_STATIC_PEERS FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE \
-          ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI; do
+          ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI \
+          MANYFORGE_ROS2_CONTROL_BUILD_TESTING; do
         if [[ -v "$variable" ]]; then
           ros_environment+=(--env "$variable")
         fi
@@ -436,9 +442,20 @@ case "$command" in
       serve_args+=(--bootstrap-project "$bootstrap_project")
     fi
     rotate_quiescent_root "$runtime_root"
+    # Same inode lock as the child launcher: hold it across the final old-
+    # process proof, durable session switch and creation of the new container.
+    exec {session_lock_fd}<"$runtime_root"
+    flock --exclusive --nonblock "$session_lock_fd" || { echo "Another workbench owns the state-root lock" >&2; exit 69; }
+    assert_runtime_root_available || exit 69
+    session_id=$(python3 -c 'import uuid;print(uuid.uuid4().hex)')
+    session_proof=()
+    [[ -z "$stopped_container_receipt" ]] || session_proof=(--stopped-container-receipt "$stopped_container_receipt")
+    python3 "$session_helper" "$runtime_root" --session-id "$session_id" --lock-fd "$session_lock_fd" "${session_proof[@]}" >/dev/null
+    session_environment=(-e "MANYFORGE_DEV_COLD_SESSION_ID=$session_id")
     container_ref=$(docker run -d \
       --name "$container_name" \
       --label "manyforge.dev.ros2-control=$ros2_control" \
+      --label "manyforge.workbench-session=$session_id" \
       "${operator_labels[@]}" \
       --network host \
       --init \
@@ -446,6 +463,7 @@ case "$command" in
       --log-opt max-file=3 \
       -e MANYFORGE_DEV_BUILD_JOBS="${MANYFORGE_DEV_BUILD_JOBS:-}" \
       -e MANYFORGE_STATE_DIR=/var/lib/manyforge \
+      "${session_environment[@]}" \
       "${ros_identity[@]}" \
       "${ros_environment[@]}" \
       "${operator_mounts[@]}" \
@@ -459,6 +477,11 @@ case "$command" in
       "$image_id" \
       python3 scripts/dev-workbench.py "${serve_args[@]}")
     started_container=true
+    python3 "$session_helper" "$runtime_root" --session-id "$session_id" --lock-fd "$session_lock_fd" --bind-container-id "$container_ref"
+    # The running container is now the process-set boundary. Its launcher
+    # takes the root flock before opening any store; contenders recheck all
+    # live overlapping mounts while holding the lock before any rotation.
+    exec {session_lock_fd}<&-
     deadline=$((SECONDS + ${MANYFORGE_DEV_START_TIMEOUT_SECONDS:-900}))
     while ((SECONDS < deadline)); do
       if [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") != true ]]; then

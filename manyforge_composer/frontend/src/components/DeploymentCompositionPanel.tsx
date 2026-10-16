@@ -1,3 +1,4 @@
+import type { CCLCController } from '../hooks/useCCLC';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { api } from '../api/client';
@@ -43,6 +44,7 @@ export interface ComponentOverviewInput {
 }
 
 interface DeploymentCompositionPanelProps {
+  cclc: CCLCController;
   controller: DeploymentWorkspaceController;
   enabled: boolean;
   snapshot: ComposerHeadlessState | null;
@@ -87,6 +89,7 @@ export function controllableComponentIds(graph: ManagerGraphProjection): string[
 }
 
 export function DeploymentCompositionPanel({
+  cclc,
   controller: deploymentController,
   enabled,
   snapshot,
@@ -345,19 +348,15 @@ export function DeploymentCompositionPanel({
               </div>
               <span>{componentIds.length} controllable</span>
             </header>
-            {componentIds.length === 0 ? (
+            {componentIds.length === 0 && (
               <p className="panel-intro">
                 The current graph publishes no controllable component identities.
               </p>
-            ) : (
-              <div className="deployment-component-chips" aria-label="Current graph components">
-                {componentIds.map((identity) => <code key={identity}>{identity}</code>)}
-              </div>
             )}
             <CCLCPanel
               enabled={enabled}
               componentIds={componentIds}
-              admissionGeneration={snapshot?.authoringAdmission.admissionGeneration ?? null}
+              controller={cclc}
               mutationAvailable={snapshot?.authoringAdmission.authoringAllowed === true}
               mutationUnavailableReason={snapshot === null
                 ? 'Current backend admission is unavailable.'

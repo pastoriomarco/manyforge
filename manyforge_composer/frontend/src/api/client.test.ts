@@ -1040,6 +1040,7 @@ describe('headless intent client', () => {
       },
       ok: true,
       phase: 'fence_accepted',
+      scene_initialization: 'preserve',
       prepared_activation: {
         captured_input_digest: `sha256:${'2'.repeat(64)}`,
         deployment_artifact_id: 'deployment-1',
@@ -1077,6 +1078,7 @@ describe('headless intent client', () => {
       },
       ok: true,
       phase: 'accepted',
+      scene_initialization: 'preserve',
       prepared_activation: {
         captured_input_digest: `sha256:${'2'.repeat(64)}`,
         deployment_artifact_id: 'deployment-1',

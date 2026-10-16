@@ -708,6 +708,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
             # Load is the operator's confirmation: one preparation, no token.
             assert confirmed is True
             assert intent["confirmation_token"] is None
+            assert intent["scene_initialization"] == "initialize"
             return {
                 "prepared_activation": candidate,
                 "candidate_preview": dict(preview),

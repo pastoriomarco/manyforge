@@ -121,9 +121,26 @@ struct ControllerLaunchArtifactsRequest final {
   std::string frame_prefix{};
   /// Explicit no-output Isaac gripper's model facts, validation only.
   std::optional<MockGripperBinding> gripper_without_control_interfaces{};
+  /// Exact deployment::derive_component_runtime_identity of this component;
+  /// includes its physical provider and retained configuration families.
+  std::string component_runtime_identity{};
 };
 
 enum class ControllerLaunchLane { kMock, kIsaac };
+
+/// One configuration-scoped stock writer. Its topic is never reused for a
+/// different provider, ordered joint set or Deployment initial target.
+struct MockResetPositionTarget final {
+  std::string component_runtime_identity{};
+  std::string controller_name;
+  std::string commands_topic;
+  std::vector<std::string> joint_names;
+  std::vector<double> positions;
+  std::string target_digest;
+
+  friend bool operator==(const MockResetPositionTarget &,
+                         const MockResetPositionTarget &) = default;
+};
 
 struct ControllerLaunchArtifacts final {
   ControllerLaunchLane lane{};
@@ -142,6 +159,7 @@ struct ControllerLaunchArtifacts final {
   std::string arm_controller_name;
   std::optional<std::string> gripper_controller_name;
   std::string frame_prefix;
+  std::optional<MockResetPositionTarget> mock_reset_position;
   /// Mock lane: `mock_control.launch.py` arguments (`name:=value`).
   std::vector<std::string> launch_arguments;
   /// Isaac lane: `launch-isaac-topic-based-control.sh` environment.
@@ -193,6 +211,7 @@ struct ComponentControllerLaunchInput final {
   /// Caller supplies the strict selected pneumatic output choice. None never
   /// follows from a missing binding and does not create physical gripper output.
   core::GripperOutputMode gripper_output_mode{core::GripperOutputMode::kCommanded};
+  std::string component_runtime_identity{};
 };
 
 /// Write one ROS component's controller launch artifacts at activation.

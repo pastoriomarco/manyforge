@@ -5,6 +5,7 @@ import type {
   CatalogParameter,
   CatalogResponse,
   HealthResponse,
+  WorkbenchSessionNotice,
   JsonValue,
   ProgramDocument,
   ProgramAuthoringDocument,
@@ -202,6 +203,57 @@ function parseCatalogEntry(value: unknown, path: string): CatalogEntry {
   };
 }
 
+function parseWorkbenchSessionNotice(value: unknown): WorkbenchSessionNotice {
+  const path = 'health.workbench_session_notice';
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'session_id', 'archive_relative_path', 'shutdown',
+    'effects', 'history_coverage', 'journal_families', 'message',
+  ], path);
+  if (record.schema_version !== 'manyforge.workbench_previous_session.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.workbench_previous_session.v1');
+  }
+  const sessionId = stringAt(record.session_id, `${path}.session_id`);
+  if (!/^[0-9a-f]{32}$/.test(sessionId)) {
+    return fail(`${path}.session_id`, '32 lowercase hexadecimal characters');
+  }
+  const archiveRelativePath = stringAt(record.archive_relative_path, `${path}.archive_relative_path`);
+  if (archiveRelativePath !== `previous-sessions/${sessionId}`) {
+    return fail(`${path}.archive_relative_path`, 'the matching previous-session archive path');
+  }
+  if (record.shutdown !== 'clean' && record.shutdown !== 'unknown') {
+    return fail(`${path}.shutdown`, 'clean or unknown');
+  }
+  if (record.effects !== 'closed' && record.effects !== 'unresolved' && record.effects !== 'unknown') {
+    return fail(`${path}.effects`, 'closed, unresolved or unknown');
+  }
+  if (record.history_coverage !== 'not_imported') {
+    return fail(`${path}.history_coverage`, 'not_imported');
+  }
+  const journalFamilies = stringArrayAt(record.journal_families, `${path}.journal_families`);
+  const expectedFamilies = ['program_cycle', 'scene', 'manager', 'cclc', 'kernel_operation'];
+  if (journalFamilies.length !== expectedFamilies.length
+    || journalFamilies.some((family, index) => family !== expectedFamilies[index])) {
+    return fail(`${path}.journal_families`, 'the five ordered journal families');
+  }
+  const message = stringAt(record.message, `${path}.message`);
+  const messageBytes = new TextEncoder().encode(message);
+  if (messageBytes.length > 1024 || new TextDecoder().decode(messageBytes) !== message
+    || message.normalize('NFC') !== message) {
+    return fail(`${path}.message`, 'NFC UTF-8 text of at most 1024 bytes');
+  }
+  return {
+    schemaVersion: record.schema_version,
+    sessionId,
+    archiveRelativePath,
+    shutdown: record.shutdown,
+    effects: record.effects,
+    historyCoverage: record.history_coverage,
+    journalFamilies,
+    message,
+  };
+}
+
 export function parseHealthResponse(value: unknown): HealthResponse {
   const record = objectAt(value, 'health');
   const mode = stringAt(record.mode, 'health.mode');
@@ -235,6 +287,9 @@ export function parseHealthResponse(value: unknown): HealthResponse {
       ? null
       : objectAt(record.headless, 'health.headless'),
     timestamp: numberAt(record.timestamp, 'health.timestamp'),
+    workbenchSessionNotice: record.workbench_session_notice == null
+      ? null
+      : parseWorkbenchSessionNotice(record.workbench_session_notice),
   };
 }
 

@@ -23,6 +23,18 @@ export interface HealthResponse {
   runtimeAvailability: RuntimeAvailability | null;
   headless: Record<string, unknown> | null;
   timestamp: number;
+  workbenchSessionNotice?: WorkbenchSessionNotice | null;
+}
+
+export interface WorkbenchSessionNotice {
+  schemaVersion: 'manyforge.workbench_previous_session.v1';
+  sessionId: string;
+  archiveRelativePath: string;
+  shutdown: 'clean' | 'unknown';
+  effects: 'closed' | 'unresolved' | 'unknown';
+  historyCoverage: 'not_imported';
+  journalFamilies: string[];
+  message: string;
 }
 
 export interface CatalogJsonSchema {
@@ -766,6 +778,17 @@ export interface ProgramRunStatus {
   message: string;
 }
 
+/** The immutable selectors accepted with one Program Reset intent. */
+export interface ProgramResetSelection {
+  reloadInitialScene: boolean;
+  resetRobotPosition: boolean;
+}
+
+export interface ProgramResetRobotPositionAvailability {
+  available: boolean;
+  reason: string | null;
+}
+
 export interface ProgramCycleStatus {
   programRunnerOwnerEpoch: string;
   cycleGeneration: number;
@@ -784,6 +807,8 @@ export interface ProgramCycleStatus {
   currentCommandKind: string | null;
   failure: Record<string, JsonValue> | null;
   resetPhase: string | null;
+  resetOptions: ProgramResetSelection | null;
+  resetRobotPosition: ProgramResetRobotPositionAvailability;
   allowedCommands: Array<{
     commandKind: string;
     semanticTarget: Record<string, JsonValue>;
@@ -971,6 +996,8 @@ export interface CycleRecoveryOffer {
 
 export interface ProgramExecutionSelectionControls {
   selectionRevision: number;
+  /** Owner proof that every effectful node is held, with no Stop pending or faulted. */
+  motionHeld: boolean;
   groups: Array<{
     groupId: string;
     nodeCount: number;
@@ -1405,6 +1432,11 @@ export type SceneTransactionOperation =
     }
   | { kind: 'remove_object'; scene_resource_id: string }
   | {
+      kind: 'set_collision_policy';
+      configured_policy: Record<string, JsonValue>;
+      expected_configured_policy_revision: { revision_id: number; content_hash: string };
+    }
+  | {
       kind: 'update_object_pose';
       scene_resource_id: string;
       pose: ScenePoseRequest;
@@ -1432,6 +1464,8 @@ export type SceneTransactionOperation =
     };
 
 interface SceneTransactionRequestBase {
+  /** Opt-in composite fence for the temporary standalone Close cleanup. */
+  expected_authoring_workspace?: AuthoringWorkspaceIdentity;
   request_context: {
     request_id: string;
     request_owner_epoch: string;
@@ -1632,6 +1666,7 @@ export type ManagerApplyPhase =
   | 'terminal';
 
 export interface ManagerApplyRecord {
+  sceneInitialization: 'preserve' | 'initialize';
   applyGeneration: number;
   applyId: string;
   candidateGraphRevision: string;
@@ -1736,6 +1771,7 @@ export interface ManagerApplyFailure {
 }
 
 export interface ManagerApplyStatus {
+  sceneInitialization: 'preserve' | 'initialize';
   apiVersion: 'manyforge.manager_command_response.v1';
   applyGeneration: number;
   applyId: string;

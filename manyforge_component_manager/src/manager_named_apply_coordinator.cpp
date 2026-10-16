@@ -301,7 +301,8 @@ LoadBundle(const deployment::IVerifiedRetainedBundleSource &source,
 
 [[nodiscard]] bool MatchesRequest(const ManagerApplyIntentDTO &intent,
                                   const ManagerNamedApplyRequestDTO &request) {
-  return intent.request_context == request.request_context &&
+  return intent.scene_initialization == request.scene_initialization &&
+         intent.request_context == request.request_context &&
          intent.expected_active_projection_revision.retained_bundle_id ==
              request.expected_current_retained_bundle_id &&
          intent.expected_active_projection_revision.graph_revision ==
@@ -566,7 +567,9 @@ bool ManagerNamedApplyRequestDTO::valid() const noexcept {
                           core::CellAdmissionClaimKindDTO::kAuthoringMutation &&
                       parent_authoring_claim->intent.owner_role ==
                           core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
-  return (direct || parent) && !request_context.request_id.empty() &&
+  return (scene_initialization == ManagerSceneInitialization::kPreserve ||
+          scene_initialization == ManagerSceneInitialization::kInitialize) &&
+         (direct || parent) && !request_context.request_id.empty() &&
          !request_context.request_owner_epoch.empty() &&
          !request_context.source_label.empty() &&
          (!request_context.correlation_id.has_value() ||
@@ -575,8 +578,7 @@ bool ManagerNamedApplyRequestDTO::valid() const noexcept {
          core::IsExactLowercaseSha256Digest(deployment_revision.value()) &&
          !expected_current_retained_bundle_id.empty() &&
          !expected_current_graph_revision.empty() &&
-         !candidate_retained_bundle_id.empty() &&
-         prepared_activation.valid() &&
+         !candidate_retained_bundle_id.empty() && prepared_activation.valid() &&
          (!isaac_pose_observer_launch_facts ||
           isaac_pose_observer_launch_facts->valid());
 }
@@ -1284,6 +1286,7 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
       request.expected_admission_generation,
       request.parent_authoring_claim,
       request.isaac_pose_observer_launch_facts,
+      request.scene_initialization,
   };
   Require(intent.valid(), "Manager could not construct a valid Apply intent");
   std::optional<ManagerApplyBringUpPlanDTO> original_plan;

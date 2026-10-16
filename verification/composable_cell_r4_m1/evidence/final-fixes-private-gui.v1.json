@@ -1,0 +1,54 @@
+{
+  "schema_version": "manyforge.final_live_fixes_private_gui.v1",
+  "outcome": "pass_with_named_coverage_limits",
+  "verified_at_utc": "2026-10-16T07:48:47.667847+00:00",
+  "source_pins": {
+    "scene_owner": "048edb7f1119367a4301ea8d0730e2081278e2f73ecaccaa0985ff0dd16e4018",
+    "previous_session_native": "21b275a753d5c0801a21e80d7baefbd2e81dfb2ba0204fe5587c18c86cb9b3e7",
+    "scenario_close": "6c5b73f19db6addcc00db2fe6e2f214605f3633095c9ab6ceba6be99a290ada9",
+    "merged_app": "1ba96b2d23100321e84108c73c070c6aa7ac3e5210c4ede8b8db5fd81829367f"
+  },
+  "gui_journey": {
+    "selected_saved_scenario": "ur5e_lite6_wall_workbench",
+    "ordinary_load_completed": true,
+    "load_apply_id": "apply-ea3fb78ba5f58bce0201ca3e355e21c8",
+    "components_left_declared": true,
+    "ordinary_close_confirmations_after_namespace_fix": 1,
+    "close_apply_id": "apply-f63876fa56561bd65ee77f68f677d5b1",
+    "canonical_empty": true,
+    "manager_fresh_ready_converged": true,
+    "logical_scene_objects": 0,
+    "carried_attachments": 0,
+    "collision_policy": {
+      "allowed_static_static_pairs": [],
+      "allowed_touch_link_pairs": [],
+      "contact_grasps": [],
+      "policy_id": "free_space",
+      "require_full_diagnostics": true,
+      "revision": {
+        "content_hash": "sha256:59e1687796336598d7256d010902f760beb3c238adba73fe3e5ccd6674d797ac",
+        "revision_id": 1
+      },
+      "support_contacts": []
+    },
+    "program_forest_nodes": 0,
+    "deployment_components": 0,
+    "viewer_geometry_count": 0,
+    "browser_errors": [],
+    "saved_files_byte_exact": 72
+  },
+  "acknowledgement": "Separate previous-session-ack-browser.v1.json records actual GUI ACK, durable History identity and quiet reload.",
+  "native": "Separate scene-maintenance-replay.v1.json and previous-session-ack.v1.json record focused green native gates; original failed fixture receipts retained.",
+  "historical_private_failure": {
+    "close_attempts_before_namespace_fix": 1,
+    "outcome": "refused before retirement effects because CCLC and Manager owner namespaces were compared",
+    "record_preserved": true
+  },
+  "coverage_limits": [
+    "Actual successful Close used idle_after_reset and free objects; terminal Reset-first and carried-object detach branches were not exercised in this GUI run.",
+    "No Activate, Run, Program Reset, physical binding or simulator start was issued by the agent.",
+    "Software Firefox render delay was observed; no performance qualification is claimed."
+  ],
+  "raw_receipt_identifier": "dx1026-dualrobot-load-20261016/private-gui-gate01",
+  "user_runtime_touched_by_this_private_gate": false
+}

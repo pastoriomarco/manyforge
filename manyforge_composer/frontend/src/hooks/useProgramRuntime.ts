@@ -1,3 +1,4 @@
+import type { ActivationSequenceObservation, CCLCController } from './useCCLC';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { ApiError, api, apiErrorCode, type PersistentKeyValuesFence } from '../api/client';
@@ -382,6 +383,17 @@ export type ProgramResetExpectation = Pick<
   ProgramResetIdentity, 'programRunId' | 'programRunnerOwnerEpoch' | 'cycleGeneration'
 >;
 
+/** Optional explicit restoration effects; omitted selectors preserve known state. */
+export interface ProgramResetOptions {
+  reloadInitialScene?: boolean;
+  resetRobotPosition?: boolean;
+}
+
+export interface ProgramResetCallOptions extends ProgramResetOptions {
+  correlationId?: string;
+  expected?: ProgramResetExpectation;
+}
+
 /** What one Reset call established; never settlement on its own. */
 export type ProgramResetOutcome =
   /** Received by the owner (its receipt was not a refusal). */
@@ -396,6 +408,7 @@ export function buildProgramResetRequest(
   requestOwnerEpoch: string,
   requestId: string,
   correlationId: string = requestId,
+  options: ProgramResetOptions = {},
 ): Record<string, JsonValue> | null {
   const cycle = snapshot?.programCycle;
   const allowed = cycle?.allowedCommands.some(
@@ -418,6 +431,8 @@ export function buildProgramResetRequest(
     expected_claim_generation: cycle.cycleClaimGeneration,
     terminal_reference: cycle.terminalOrSettlementReference,
     settlement_evidence_digest: cycle.terminalOrSettlementReference,
+    reload_initial_scene: options.reloadInitialScene ?? false,
+    reset_robot_position: options.resetRobotPosition ?? false,
   };
 }
 
@@ -553,6 +568,7 @@ export function useProgramRuntime(
   workspace: ProgramWorkspaceResponse | null = null,
   controlSource: HeadlessStateSource | null = null,
   deploymentPending = false,
+  cclc?: CCLCController,
 ) {
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
   const mounted = useRef(true);
@@ -944,7 +960,7 @@ export function useProgramRuntime(
     ? null
     : `Apply or Discard first: unapplied changes in ${pendingDocuments.join(' and ')}. Execute, Run, Resume and Retry use only what is applied.`;
 
-  const run = useCallback(async () => {
+  const ordinaryRun = useCallback(async () => {
     const requestId = identity('program-run-start');
     const request = buildProgramStartRequest(
       state.applied, state.runnerAvailable, state.pending, snapshot, workspace,
@@ -980,7 +996,7 @@ export function useProgramRuntime(
    * observe its correlated cycle Idle.
    */
   const reset = useCallback(async (
-    options: { correlationId?: string; expected?: ProgramResetExpectation } = {},
+    options: ProgramResetCallOptions = {},
   ): Promise<ProgramResetOutcome> => {
     const requestId = identity('program-cycle-reset');
     const correlationId = options.correlationId ?? requestId;
@@ -998,7 +1014,7 @@ export function useProgramRuntime(
       };
     }
     const request = buildProgramResetRequest(
-      snapshot, callerEpoch.current, requestId, correlationId,
+      snapshot, callerEpoch.current, requestId, correlationId, options,
     );
     if (request === null || controlSource === null || cycle === null) {
       const message = request === null
@@ -1675,6 +1691,7 @@ export function useProgramRuntime(
   );
   const cycleState = snapshot?.programCycle?.state ?? null;
   const cycleFailure = snapshot?.programCycle?.failure ?? null;
+  const resetRobotPositionAvailability = snapshot?.programCycle?.resetRobotPosition ?? null;
   const commandAllowed = useCallback((commandKind: string): boolean => (
     !(DRAFT_GATED_COMMANDS.has(commandKind) && draftUnappliedReason !== null)
     && (commandKind !== 'program_run' || buildProgramStartRequest(
@@ -1695,6 +1712,112 @@ export function useProgramRuntime(
     ?? (commandKind === 'program_run' ? programResetReadinessMessage(snapshot) : null)
   ), [draftUnappliedReason, snapshot]);
 
+  const [activationOffer, setActivationOffer] = useState<ActivationSequenceObservation | null>(null);
+  const [activationPending, setActivationPending] = useState(false);
+  const [activationWaiting, setActivationWaiting] = useState(false);
+  const executeFlow = useRef<{
+    key: string; observation: ActivationSequenceObservation | null;
+    phase: 'reading' | 'offered' | 'activating' | 'waiting'; abort: AbortController;
+  } | null>(null);
+  // Admission generations may advance while lifecycle work settles. Both Drafts,
+  // the Applied selection, receiver and exact idle Runner cycle must stay bound.
+  const executeKey = JSON.stringify([
+    enabled, appliedKey(state.applied), state.currentScenario?.currentScenario,
+    snapshot?.runtime?.activeConfiguration, snapshot?.runtime?.sections.manager.sourceOwnerEpoch,
+    snapshot?.executionControlStatus?.ownerEpoch,
+    snapshot?.receiverEpoch, snapshot?.authoringWorkspace, snapshot?.authoringWorkspaceContainment,
+    workspace?.draft.draftId, workspace?.draft.draftRevision, workspace?.draft.programRevision,
+    workspace?.draft.programLoaded,
+    snapshot?.programCycle.programRunnerOwnerEpoch, snapshot?.programCycle.cycleGeneration,
+    snapshot?.programCycle.programRunId, snapshot?.programCycle.cycleClaimGeneration,
+    snapshot?.programCycle.state, deploymentPending,
+  ]);
+  const executeAllowed = commandAllowed('program_run');
+  const latestExecute = useRef({ key: executeKey, cclc, ordinaryRun, allowed: executeAllowed, applied: state.applied });
+  latestExecute.current = { key: executeKey, cclc, ordinaryRun, allowed: executeAllowed, applied: state.applied };
+  const finishExecuteFlow = useCallback((message?: string) => {
+    const flow = executeFlow.current;
+    executeFlow.current = null;
+    flow?.abort.abort();
+    if (flow?.phase === 'activating') latestExecute.current.cclc?.cancelActivation();
+    setActivationOffer(null);
+    setActivationPending(false);
+    setActivationWaiting(false);
+    if (message !== undefined) setState((current) => ({ ...current, error: message }));
+  }, []);
+  const cancelActivationExecute = useCallback(() => finishExecuteFlow(), [finishExecuteFlow]);
+  useEffect(() => () => {
+    const flow = executeFlow.current;
+    executeFlow.current = null;
+    flow?.abort.abort();
+    if (flow?.phase === 'activating') latestExecute.current.cclc?.cancelActivation();
+  }, []);
+  useEffect(() => {
+    const flow = executeFlow.current;
+    if (flow === null) return;
+    if (flow.key !== executeKey) {
+      finishExecuteFlow('Execute stopped: the Scenario, Draft, owner or Runner cycle changed.');
+      return;
+    }
+    if (flow.phase === 'waiting' && latestExecute.current.allowed) {
+      // Consume before dispatch. This uses the latest ordinary builder and a new
+      // request identity; a refusal is displayed once with no recursive offer.
+      finishExecuteFlow();
+      void latestExecute.current.ordinaryRun();
+    }
+  }, [executeKey, executeAllowed, activationWaiting, finishExecuteFlow]);
+  const run = useCallback(async () => {
+    if (executeFlow.current !== null) return;
+    if (cclc === undefined) { await ordinaryRun(); return; }
+    if (!latestExecute.current.allowed) return;
+    const flow = { key: latestExecute.current.key, observation: null as ActivationSequenceObservation | null,
+      phase: 'reading' as 'reading' | 'offered' | 'activating' | 'waiting', abort: new AbortController() };
+    executeFlow.current = flow;
+    setActivationPending(true);
+    try {
+      const observation = await cclc.readActivationSequence(flow.abort.signal);
+      if (executeFlow.current !== flow || latestExecute.current.key !== flow.key) return;
+      const applied = latestExecute.current.applied;
+      if (applied === null || observation.components.some((component) => (
+        component.retainedBundleId !== applied.retainedBundleId || component.graphRevision !== applied.graphRevision
+      ))) throw new Error('Execute stopped: components do not match the Applied Program configuration.');
+      flow.observation = observation;
+      if (observation.components.some((component) => component.lifecycleState !== 'active')) {
+        flow.phase = 'offered';
+        setActivationOffer(observation);
+        setActivationPending(false);
+      } else {
+        finishExecuteFlow();
+        if (latestExecute.current.allowed) await latestExecute.current.ordinaryRun();
+      }
+    } catch (reason) {
+      if (executeFlow.current === flow) finishExecuteFlow(errorMessage(reason, 'Component activation state is unavailable.'));
+    }
+  }, [cclc, finishExecuteFlow, ordinaryRun]);
+  const confirmActivationExecute = useCallback(async () => {
+    const flow = executeFlow.current;
+    if (flow === null || flow.phase !== 'offered' || flow.observation === null) return;
+    if (flow.key !== latestExecute.current.key || latestExecute.current.cclc === undefined) {
+      finishExecuteFlow('Execute stopped: the Scenario, Draft, owner or Runner cycle changed.');
+      return;
+    }
+    const controller = latestExecute.current.cclc;
+    flow.phase = 'activating';
+    setActivationPending(true);
+    try {
+      const succeeded = await controller.activateSequence(flow.observation.identity);
+      if (executeFlow.current !== flow || latestExecute.current.key !== flow.key) return;
+      if (!succeeded) {
+        finishExecuteFlow('Activation stopped; Execute was not sent. See component lifecycle details.');
+        return;
+      }
+      flow.phase = 'waiting';
+      setActivationWaiting(true);
+    } catch (reason) {
+      if (executeFlow.current === flow) finishExecuteFlow(errorMessage(reason, 'Activation outcome is unknown.'));
+    }
+  }, [finishExecuteFlow]);
+
   const alarms = snapshot?.alarms ?? null;
   const activeConfiguration = snapshot?.runtime?.activeConfiguration ?? null;
   /** Operator-alarm attention that refuses Program motion on the exact
@@ -1712,6 +1835,7 @@ export function useProgramRuntime(
     state,
     cycleState,
     cycleFailure,
+    resetRobotPositionAvailability,
     commandAllowed,
     commandDisabledReason,
     motionAttentionBlock,
@@ -1719,6 +1843,11 @@ export function useProgramRuntime(
     active,
     refresh,
     dismissError,
+    activationOffer,
+    activationPending,
+    activationWaiting,
+    confirmActivationExecute,
+    cancelActivationExecute,
     run,
     startMotion,
     stopMotion,
@@ -1735,10 +1864,16 @@ export function useProgramRuntime(
     stageManualResult,
   }), [
     active,
+    activationOffer,
+    activationPending,
+    activationWaiting,
+    confirmActivationExecute,
+    cancelActivationExecute,
     applyRecoveryAction,
     dismissError,
     cycleFailure,
     cycleState,
+    resetRobotPositionAvailability,
     commandAllowed,
     commandDisabledReason,
     motionAttentionBlock,

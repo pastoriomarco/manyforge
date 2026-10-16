@@ -211,6 +211,64 @@ def _scope_status(
     return _HEALTHY
 
 
+def _current_empty_physical_graph(
+    runtime: Mapping[str, Any],
+    manager_source: Mapping[str, Any],
+    manager: Mapping[str, Any],
+) -> bool:
+    """Recognize a current zero-physical graph, not its Scenario/Close origin."""
+
+    active = _mapping(manager.get("active"))
+    graph = _mapping(active.get("cell_graph"))
+    publication = _mapping(active.get("publication"))
+    projection = _mapping(publication.get("projection_revision"))
+    generation = manager_source.get("source_generation")
+    publication_generation = publication.get("publication_generation")
+    apply_records = _mapping(manager.get("apply")).get("records")
+    return (
+        runtime.get("complete") is True
+        and manager_source.get("available") is True
+        and manager_source.get("freshness") == "fresh"
+        and manager_source.get("known_gaps") == []
+        and all(
+            isinstance(manager_source.get(field), str) and manager_source[field]
+            for field in ("source_owner_id", "source_owner_epoch")
+        )
+        and type(generation) is int
+        and generation > 0
+        and manager.get("manager_ready") is True
+        and _mapping(manager.get("runtime")).get("converged") is True
+        and isinstance(apply_records, list)
+        and all(
+            isinstance(row, Mapping) and row.get("incomplete") is False
+            for row in apply_records
+        )
+        and type(active.get("canonical_empty")) is bool
+        and all(
+            graph.get(field) == []
+            for field in (
+                "model_instances", "controllable_components", "control_bindings",
+                "control_domains",
+            )
+        )
+        and isinstance(manager.get("cell_id"), str)
+        and bool(manager["cell_id"])
+        and graph.get("cell_id") == manager["cell_id"]
+        and type(publication_generation) is int
+        and publication_generation > 0
+        and all(
+            isinstance(active.get(field), str)
+            and bool(active[field])
+            and active[field] == runtime.get(runtime_field) == projection.get(field)
+            for field, runtime_field in (
+                ("graph_revision", "active_graph_revision"),
+                ("retained_bundle_id", "active_retained_bundle_id"),
+            )
+        )
+        and graph.get("graph_revision") == active.get("graph_revision")
+    )
+
+
 def build_component_overview(
     *,
     runtime: Mapping[str, Any] | None,
@@ -799,6 +857,44 @@ def build_component_overview(
         )
     )
 
+    # A verified zero-physical graph has no equipment prerequisites.
+    # Keep the ordinary reduction intact if any actual source/owner fault is
+    # present; in particular, no missing or unexpected error proves absence.
+    empty_prerequisites = {
+        "applied_program", "execution_owner", "execution_target",
+        "planner_collision", "stop_capability",
+    }
+    quiet_empty = (
+        _current_empty_physical_graph(runtime, manager_section, manager_payload)
+        and not applied_program
+        and applied_error.get("code") in {
+            "program_applied_selection_not_found", "program_not_selected"
+        }
+        and all(
+            error.get("code") == "execution_owner_not_ready"
+            for error in (identity_error, targets_error, control_error)
+        )
+        and not identity
+        and not commandable_rows
+        and not capability_ids
+        and all(
+            component["status"] == _HEALTHY
+            for component in components
+            if component["id"] not in empty_prerequisites
+        )
+    )
+    empty_reason = (
+        "canonical_empty" if _mapping(manager_payload.get("active")).get("canonical_empty") is True
+        else "no_physical_components"
+    )
+    if quiet_empty:
+        for component in components:
+            if component["id"] in empty_prerequisites:
+                component.update(
+                    required=False, status=_OFFLINE,
+                    detail="No components", reason_code=empty_reason,
+                )
+
     components_by_id = {component["id"]: component for component in components}
     scopes = (
         (
@@ -833,26 +929,34 @@ def build_component_overview(
     )
     scope_components: list[dict[str, Any]] = []
     for component_id, label, contributors in scopes:
-        status = _scope_status(components_by_id, contributors)
+        empty_scope = quiet_empty and component_id in {"plan_preview", "execute_control"}
+        status = _OFFLINE if empty_scope else _scope_status(components_by_id, contributors)
         scope_components.append(
             _component(
                 component_id,
                 label,
                 status,
                 (
-                    f"{label} prerequisites are current"
+                    "No components"
+                    if empty_scope
+                    else f"{label} prerequisites are current"
                     if status == _HEALTHY
                     else f"one or more {label} prerequisites are not current"
                 ),
-                required=True,
+                required=not empty_scope,
                 required_for=(label,),
-                reason_code=(None if status == _HEALTHY else f"{component_id}_unavailable"),
+                reason_code=(
+                    empty_reason if empty_scope else
+                    None if status == _HEALTHY else f"{component_id}_unavailable"
+                ),
                 scope="functional_scope",
                 contributor_ids=contributors,
             )
         )
 
-    functional_statuses = [component["status"] for component in scope_components]
+    functional_statuses = [
+        component["status"] for component in scope_components if component["required"]
+    ]
     if alarm_status == _FAULT or _FAULT in functional_statuses:
         readiness = "fault"
     elif all(status == _OFFLINE for status in functional_statuses):
@@ -878,6 +982,9 @@ def build_component_overview(
         "fault": "An owner-issued fault or exact-coordinate mismatch affects a required scope.",
         "offline": "No complete current projection exists for the required runtime scopes.",
     }
+    if quiet_empty:
+        labels["ready"] = "No components"
+        messages["ready"] = "No components are loaded. The empty workspace is ready for authoring."
     if maintenance_operation is not None and readiness == "waiting":
         labels["waiting"] = "Deployment maintenance in progress"
         messages["waiting"] = (

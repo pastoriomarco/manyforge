@@ -209,3 +209,19 @@ describe('Program workspace request fencing', () => {
   });
 
 });
+
+
+it('retains a partial Close cancellation message without settling another pending request', () => {
+  const ready = programWorkspaceReducer(INITIAL_PROGRAM_WORKSPACE_STATE, {
+    type: 'request_succeeded', generation: 0, workspace: workspace('draft-1', 7),
+    message: null, transitionStatus: null,
+  });
+  const pending = programWorkspaceReducer(ready, { type: 'request_started', generation: 1, action: 'mutate' });
+  const reported = programWorkspaceReducer(pending, { type: 'close_canceled',
+    message: 'Close cleanup canceled. 1 Scene object removal(s) confirmed; editors were kept.',
+  });
+  expect(reported.pendingAction).toBe('mutate');
+  expect(reported.requestGeneration).toBe(1);
+  expect(reported.workspace).toBe(pending.workspace);
+  expect(reported.message).toContain('1 Scene object removal(s) confirmed');
+});

@@ -19,6 +19,9 @@ inline constexpr std::string_view kCellAdmissionResponseApiVersion =
 [[nodiscard]] manyforge::core::CellAdmissionClaimDTO
 DecodeCellAdmissionClaim(std::string_view bytes);
 
+[[nodiscard]] manyforge::core::CellAdmissionClaimIntentDTO
+DecodeCellAdmissionClaimIntent(std::string_view bytes);
+
 [[nodiscard]] manyforge::core::CellAdmissionClaimReleaseDTO
 DecodeCellAdmissionClaimRelease(std::string_view bytes);
 

@@ -339,17 +339,27 @@ HistorianEvent MakeHistorianEvent(std::string component, std::string event_type,
   ValidateText(occurred_at_wall, "occurred_at_wall", kMaximumWallTimeBytes);
   const auto dedicated_identity =
       DedicatedEventIdentity(component, event_type, payload);
+  const bool session_report = component == "manyforge.workbench" &&
+                              event_type == "previous_session_report";
+  const auto *session_id = session_report
+      ? payload.find_object_member("session_id") : nullptr;
+  Require(!session_report || (session_id != nullptr &&
+              std::holds_alternative<std::string>(session_id->storage())),
+          "historian_event_invalid", "previous-session report identity is absent");
   const auto identity =
-      dedicated_identity.has_value()
+      session_report ? CanonicalValue(CanonicalValue::Object{
+                           {"session_id", *session_id},
+                       }) : dedicated_identity.has_value()
           ? CanonicalValue(CanonicalValue::Object{
                 {"model_attempt_id", CanonicalValue(*dedicated_identity)},
             })
           : EventIdentityValue(component, event_type, severity, occurred_at_ns,
                                occurred_at_wall, payload);
   const auto digest = content_identity::framed_sha256(
+      session_report ? "manyforge-workbench-previous-session-report-event" :
       dedicated_identity.has_value() ? "manyforge-program-model-attempt-event"
                                      : "manyforge-historian-event",
-      dedicated_identity.has_value() ||
+      session_report || dedicated_identity.has_value() ||
               static_cast<std::uint64_t>(occurred_at_ns) <= kMaximumSafeInteger
           ? "v1"
           : "v2",

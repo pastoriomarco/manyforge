@@ -212,7 +212,9 @@ export function runtimeAttentionSummary(
   }
   const clientError = clientErrors[0];
   if (clientError !== undefined) return `${clientError.title} — ${clientError.message}`;
-  return alarms[0]?.title ?? 'Attention required';
+  return alarms[0]?.definitionId === 'manyforge.runtime.previous_session_unclean'
+    ? alarms[0].message
+    : alarms[0]?.title ?? 'Attention required';
 }
 
 export function HeadlessRuntimeSurfacesView({
@@ -480,7 +482,11 @@ export function HeadlessRuntimeSurfacesView({
     >
       <NotificationRail
         className="runtime-observability-rail"
-        label={itemCount > 0 ? 'Errors' : 'Runtime / history'}
+        label={itemCount > 0
+          ? (attention.length > 0 && attention.every((alarm) =>
+            alarm.definitionId === 'manyforge.runtime.previous_session_unclean')
+            && clientErrors.length === 0 && conditions.length === 0 ? 'Warnings' : 'Errors')
+          : 'Runtime / history'}
         summary={attentionSummary}
         expanded={expanded}
         onToggle={() => onExpandedChange?.(!expanded)}

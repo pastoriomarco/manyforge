@@ -290,7 +290,24 @@ class HeadlessExecutionControlDispatch:
         kind = request.command_envelope.command_kind
         state = cycle.get("state")
         if kind == "program_reset" and state == "resetting":
-            disposition, code = "joined", "program_reset_already_current"
+            try:
+                model = ProgramCycleResetRequest.model_validate({
+                    **request.payload, **self._caller_context(request, include_session=True)
+                })
+            except ValidationError as error:
+                raise HeadlessApiError(
+                    "execution_control_payload_invalid",
+                    "command payload does not match its declared command kind",
+                    details={"validation": str(error)},
+                ) from error
+            selected = {
+                "reload_initial_scene": model.reload_initial_scene,
+                "reset_robot_position": model.reset_robot_position,
+            }
+            if cycle.get("reset_options") != selected:
+                disposition, code = "rejected", "program_run_request_conflict"
+            else:
+                disposition, code = "joined", "program_reset_already_current"
         elif is_stop_command(kind) and state == "stopping":
             disposition, code = "joined", "program_stop_already_current"
         elif is_stop_command(kind) and state in {

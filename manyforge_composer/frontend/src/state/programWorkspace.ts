@@ -67,6 +67,7 @@ export type ProgramWorkspaceStateAction =
     }
   | { type: 'request_refused'; generation: number; message: string }
   | { type: 'clear_feedback' }
+  | { type: 'close_canceled'; message: string }
   | {
       type: 'authoring_synced';
       workspace: ProgramWorkspaceResponse;
@@ -117,6 +118,9 @@ export function programWorkspaceReducer(
       };
     }
     return state;
+  }
+  if (action.type === 'close_canceled') {
+    return state.status === 'ready' ? { ...state, message: action.message } : state;
   }
   if (action.type === 'authoring_synced') {
     // Publishing the shared authoring half is not a user request, so it must

@@ -132,6 +132,7 @@ struct DomainObservation final {
   /// The fresh intervention class must be retained durably (the caller
   /// records it, see RetainCause), observed at `observed_at_ns`.
   bool retain{};
+  bool planned_reset_transition{};
   std::int64_t observed_at_ns{};
 };
 
@@ -558,6 +559,177 @@ void CCLCLifecycleTargetDriver::WorkerLoop() {
   }
 }
 
+bool CCLCLifecycleTargetDriver::MatchesProgramResetPositionScope(
+    const ProgramResetPositionScope& scope, const ComponentLifecycleTargetDTO& target,
+    const ComponentLifecycleCurrentSnapshotDTO& current) const {
+  const auto& request = scope.request;
+  return scope.valid && target.controllable_component_id == request.component &&
+         target.target_generation == scope.target_generation && target.reached &&
+         target.requested_state == LifecycleTargetStateDTO::kActive &&
+         current.controllable_component_id == request.component &&
+         current.active_publication_receipt == request.expected_publication &&
+         std::count(current.provider_occurrences.begin(), current.provider_occurrences.end(),
+                    request.provider) == 1 &&
+         std::count(current.domains.begin(), current.domains.end(), request.domain) == 1;
+}
+
+Result<void> CCLCLifecycleTargetDriver::ValidateProgramResetPositionScope(
+    ICCLCLifecycleTargetDriverPorts& ports, const ProgramResetPositionScope& scope) {
+  const auto facts = store_.LoadLifecycleTargetFacts(scope.request.component);
+  if (!facts.ok()) return Result<void>::Err(facts.error());
+  const auto current = ports.ReadCurrentComponent(scope.request.component);
+  if (!current.ok()) return Result<void>::Err(current.error());
+  if (!facts.value().target || facts.value().open_incident ||
+      !facts.value().intervention_causes.empty() ||
+      !MatchesProgramResetPositionScope(scope, *facts.value().target, current.value()) ||
+      ports.ComponentLifecycleSettling(scope.request.component))
+    return Result<void>::Err(driver_error("program_reset_position_scope_stale",
+                                          "the exact active component Reset scope is unavailable",
+                                          "scope_identity_or_work_changed"));
+  return Result<void>::Ok();
+}
+
+Result<void> CCLCLifecycleTargetDriver::WithProgramResetPositionScope(
+    const CCLCProgramResetPositionScopeRequest& request,
+    const CCLCProgramResetPositionAction& action) {
+  const auto refused = [](std::string reason) {
+    return Result<void>::Err(driver_error("program_reset_position_scope_unavailable",
+                                          "the component cannot enter the requested position Reset",
+                                          std::move(reason)));
+  };
+  if (request.runner_owner_epoch.empty() || request.cycle_generation == 0U ||
+      request.request_owner_epoch.empty() || request.request_id.empty() ||
+      request.request_payload_digest.empty() || request.component.empty() ||
+      !request.provider.locally_valid() || !request.domain.locally_valid() ||
+      !request.domain.active_control_configuration ||
+      request.domain.active_control_configuration->state !=
+          ActiveControlConfigurationStateDTO::kReconciled ||
+      request.provider.control_domain_id != request.domain.control_domain_id ||
+      !request.expected_transition || !action)
+    return refused("scope_request_invalid");
+  std::shared_ptr<ProgramResetPositionScope> scope;
+  {
+    // An already-decided follower submission completes under this exclusion.
+    // No driver/admission lock is retained over the effect action below.
+    std::lock_guard run_lock(run_mutex_);
+    {
+      std::lock_guard lock(state_mutex_);
+      if (program_reset_position_scope_) return refused("position_reset_already_scoped");
+      const auto found = components_.find(request.component);
+      if (found != components_.end() &&
+          (found->second.in_flight || found->second.pending_intent ||
+           found->second.unrecorded_incident || !found->second.unrecorded_causes.empty()))
+        return refused("component_work_unsettled");
+    }
+    Result<void> validated = refused("product_pin_unavailable");
+    const auto pinned = ports_.WithPinnedProduct([&](ICCLCLifecycleTargetDriverPorts& ports) {
+      const auto facts = store_.LoadLifecycleTargetFacts(request.component);
+      if (!facts.ok()) {
+        validated = Result<void>::Err(facts.error());
+        return;
+      }
+      if (!facts.value().target) {
+        validated = refused("active_target_unavailable");
+        return;
+      }
+      scope = std::make_shared<ProgramResetPositionScope>(
+          ProgramResetPositionScope{request, facts.value().target->target_generation});
+      validated = ValidateProgramResetPositionScope(ports, *scope);
+      if (!validated.ok()) return;
+      const auto current = ports.ReadCurrentComponent(request.component);
+      if (!current.ok()) {
+        validated = Result<void>::Err(current.error());
+        return;
+      }
+      if (current.value().component_lifecycle_state != ComponentLifecycleStateDTO::kActive)
+        validated = refused("component_not_active");
+    });
+    if (!pinned.ok()) return Result<void>::Err(pinned.error());
+    if (!validated.ok()) return validated;
+    std::lock_guard lock(state_mutex_);
+    program_reset_position_scope_ = scope;
+  }
+  struct CloseScope final {
+    CCLCLifecycleTargetDriver& driver;
+    const std::shared_ptr<ProgramResetPositionScope>& scope;
+    ~CloseScope() {
+      {
+        std::lock_guard run_lock(driver.run_mutex_);
+        std::lock_guard lock(driver.state_mutex_);
+        scope->valid = false;
+        if (driver.program_reset_position_scope_ == scope)
+          driver.program_reset_position_scope_.reset();
+      }
+      driver.Wake();
+    }
+  } close_scope{*this, scope};
+  const auto advance = [this, scope, refused](const CCLCProgramResetPositionPhase phase,
+                                              const std::function<Result<void>()>& phase_commit) {
+    std::lock_guard run_lock(run_mutex_);
+    if (program_reset_position_scope_ != scope || !scope->valid)
+      return refused("scope_closed_or_expired");
+    const auto previous = scope->phase;
+    const bool ordered = phase == previous ||
+                         (phase == CCLCProgramResetPositionPhase::kSettingState &&
+                          previous == CCLCProgramResetPositionPhase::kSwitchingToWriter) ||
+                         (phase == CCLCProgramResetPositionPhase::kSwitchingToJtc &&
+                          previous == CCLCProgramResetPositionPhase::kSettingState);
+    Result<void> validated = refused("phase_out_of_order");
+    if (ordered) {
+      const auto pinned = ports_.WithPinnedProduct([&](ICCLCLifecycleTargetDriverPorts& ports) {
+        validated = ValidateProgramResetPositionScope(ports, *scope);
+      });
+      if (!pinned.ok()) validated = Result<void>::Err(pinned.error());
+    }
+    if (!validated.ok()) {
+      scope->valid = false;
+      return validated;
+    }
+    if (phase_commit) {
+      try {
+        validated = phase_commit();
+      } catch (...) {
+        validated = refused("phase_commit_exception");
+      }
+      if (!validated.ok()) {
+        scope->valid = false;
+        return validated;
+      }
+    }
+    scope->phase = phase;
+    Wake();
+    return Result<void>::Ok();
+  };
+  Result<void> result = refused("effect_action_exception");
+  try {
+    result = action(advance);
+  } catch (const std::exception& error) {
+    result = Result<void>::Err(driver_error("program_reset_position_action_failed", error.what(),
+                                            "effect_action_exception"));
+  } catch (...) {
+  }
+  {
+    std::lock_guard run_lock(run_mutex_);
+    if (result.ok()) {
+      if (scope->phase != CCLCProgramResetPositionPhase::kSwitchingToJtc) {
+        result = refused("position_reset_activation_not_completed");
+      } else {
+        const auto pinned = ports_.WithPinnedProduct([&](ICCLCLifecycleTargetDriverPorts& ports) {
+          result = ValidateProgramResetPositionScope(ports, *scope);
+          if (!result.ok()) return;
+          const auto current = ports.ReadCurrentComponent(request.component);
+          if (!current.ok())
+            result = Result<void>::Err(current.error());
+          else if (current.value().component_lifecycle_state != ComponentLifecycleStateDTO::kActive)
+            result = refused("position_reset_component_not_active");
+        });
+        if (!pinned.ok()) result = Result<void>::Err(pinned.error());
+      }
+    }
+  }
+  return result;
+}
+
 void CCLCLifecycleTargetDriver::RunOnce() {
   std::lock_guard run_lock(run_mutex_);
   const auto pinned = ports_.WithPinnedProduct(
@@ -699,6 +871,19 @@ CCLCLifecycleTargetDriver::ObserveAllDomains(
         ports, target.controllable_component_id, occurrence, target.target_generation,
         stored == retained.end() ? LifecycleBlockingCauseClassDTO::kNone : stored->second,
         target.recovered_cause, record_causes, clock_);
+    const auto& scope = program_reset_position_scope_;
+    if (scope && MatchesProgramResetPositionScope(*scope, target, current) &&
+        occurrence == scope->request.provider && observed.observation &&
+        observed.reported == LifecycleBlockingCauseClassDTO::kAvailability &&
+        observed.cause == LifecycleBlockingCauseClassDTO::kAvailability) {
+      // The adapter qualifies the SAME raw sample; no Core controller names,
+      // cause rewriting, stale observations or broad availability allowance.
+      try {
+        observed.planned_reset_transition =
+            scope->request.expected_transition(*observed.observation, scope->phase);
+      } catch (...) {
+      }
+    }
     if (observed.retain) {
       RetainCause(state, target.controllable_component_id, occurrence.control_domain_id,
                   observed.cause, observed.observed_at_ns);
@@ -929,7 +1114,8 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
                            : std::vector<std::string>{};
       continue;
     }
-    if (!fresh || observed.reported == LifecycleBlockingCauseClassDTO::kAvailability) {
+    if (!fresh || (observed.reported == LifecycleBlockingCauseClassDTO::kAvailability &&
+                   !observed.planned_reset_transition)) {
       if (!lost && !trigger) trigger = condition.control_domain_id;
       lost = true;
       continue;
@@ -1391,6 +1577,29 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
                          open, detection, next, now_ns));
     return true;
   }
+  if (program_reset_position_scope_ &&
+      program_reset_position_scope_->request.component == component) {
+    auto& scope = *program_reset_position_scope_;
+    if (!MatchesProgramResetPositionScope(scope, target, current)) scope.valid = false;
+    const auto conditions = ObserveAllDomains(ports, target, state, current, retained, !settling);
+    const bool planned = std::any_of(
+        conditions.begin(), conditions.end(),
+        [](const auto& condition) { return condition.observed.planned_reset_transition; });
+    const auto unexplained = achieved == ComponentLifecycleStateDTO::kFaulted ||
+                                     (achieved == ComponentLifecycleStateDTO::kDegraded && !planned)
+                                 ? LifecycleBlockingCauseClassDTO::kUnknown
+                                 : LifecycleBlockingCauseClassDTO::kNone;
+    if (EvaluateIncident(ports, target, state, current, conditions, std::nullopt, detection, next,
+                         now_ns, unexplained)) {
+      scope.valid = false;
+      return true;
+    }
+    Publish(
+        state, LifecycleProgressPhaseDTO::kTransitionInProgress, next, retained_worst,
+        scope.valid ? "program_reset_position_in_progress" : "program_reset_position_scope_expired",
+        now_ns);
+    return true;
+  }
   if (!next) {
     state.failed_basis.reset();
     state.failure_reason.reset();
@@ -1636,6 +1845,11 @@ CCLCLifecycleTargetDriver::ReadReadinessFacts(const ControllableComponentId& com
   }
   {
     std::lock_guard lock(state_mutex_);
+    if (!result.blocker && program_reset_position_scope_ &&
+        program_reset_position_scope_->request.component == component)
+      result.blocker = driver_error("program_reset_position_in_progress",
+                                    "the component position Reset has not completed",
+                                    "position_reset_scope_open");
     const auto found = components_.find(component);
     if (found != components_.end() && !result.blocker) {
       const auto& state = found->second;

@@ -56,7 +56,8 @@ function admissionFixtures() {
       executionControlRevision: 1,
       causalCorrelationId: null, causalSessionId: null,
       causalClientSequence: null, currentCommandKind: null,
-      failure: null, resetPhase: null, allowedCommands: [],
+      failure: null, resetPhase: null, resetOptions: null,
+      resetRobotPosition: { available: false, reason: 'unsupported' }, allowedCommands: [],
       run: null, runtimeControls: null,
     },
     authoringWorkspace: {
@@ -426,7 +427,7 @@ describe('Program command settlement', () => {
     const settled = {
       ownerEpoch: 'runner.epoch.1',
       programRunId: 'run-1',
-      executionSelections: { selectionRevision: 1, groups: [
+      executionSelections: { selectionRevision: 1, motionHeld: true, groups: [
         { groupId: 'all', nodeCount: 1, heldNodeCount: 1, state: 'held',
           stopAllowed: true, resumeAllowed: true, resumeUnavailableReason: null },
       ] },
@@ -588,6 +589,24 @@ describe('Program runtime authority requests', () => {
     )).toBeNull();
   });
 
+  it.each([
+    [false, false], [true, false], [false, true], [true, true],
+  ])('sends explicit idle Reset selectors %s/%s with exact request identity', (scene, position) => {
+    const { snapshot } = admissionFixtures();
+    snapshot.programCycle.allowedCommands = [{ commandKind: 'program_reset',
+      semanticTarget: {}, allowed: true, disabledReason: null }];
+    expect(buildProgramResetRequest(snapshot, 'caller.1', 'request.1', 'correlation.1', {
+      reloadInitialScene: scene, resetRobotPosition: position,
+    })).toMatchObject({
+      request_id: 'request.1', request_owner_epoch: 'caller.1', correlation_id: 'correlation.1',
+      program_run_id: null, expected_claim_generation: null,
+      terminal_reference: null, settlement_evidence_digest: null,
+      reload_initial_scene: scene, reset_robot_position: position,
+    });
+    expect(buildProgramResetRequest(snapshot, 'caller.1', 'plain.1'))
+      .toMatchObject({ reload_initial_scene: false, reset_robot_position: false });
+  });
+
   it('builds Reset only from exact backend-authorized cycle evidence', () => {
     const { snapshot } = admissionFixtures();
     const terminalReference = digest('d');
@@ -603,7 +622,8 @@ describe('Program runtime authority requests', () => {
         executionControlRevision: 1,
         causalCorrelationId: null, causalSessionId: null,
         causalClientSequence: null, currentCommandKind: null,
-        failure: null, resetPhase: null, allowedCommands: [{
+        failure: null, resetPhase: null, resetOptions: null,
+        resetRobotPosition: { available: false, reason: 'unsupported' }, allowedCommands: [{
           commandKind: 'program_reset', semanticTarget: {},
           allowed: true, disabledReason: null,
         }],
@@ -623,6 +643,7 @@ describe('Program runtime authority requests', () => {
       expected_claim_generation: 12,
       terminal_reference: terminalReference,
       settlement_evidence_digest: terminalReference,
+      reload_initial_scene: false, reset_robot_position: false,
     });
     expect(buildProgramResetRequest(
       {
@@ -645,6 +666,7 @@ describe('Program runtime authority requests', () => {
       expected_claim_generation: 12,
       terminal_reference: null,
       settlement_evidence_digest: null,
+      reload_initial_scene: false, reset_robot_position: false,
     });
     expect(buildProgramResetRequest(
       {

@@ -121,6 +121,7 @@ export function ProgramWorkspace({
     refresh,
     mutate,
     updateNodePolicies,
+    updateNodePresentation,
   } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   // Program settings show in the Program inspector, opened from the tree
@@ -749,6 +750,7 @@ export function ProgramWorkspace({
                     if (selectedNodeId === previousId) setSelectedNodeId(renamedId);
                   }}
                   onUpdateNodePolicies={updateNodePolicies}
+                  onUpdateNodePresentation={updateNodePresentation}
                   onInvalidEditChange={setInvalidLocalEdit}
                   diagnostics={diagnostics}
                 />

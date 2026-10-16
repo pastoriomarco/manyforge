@@ -122,6 +122,48 @@ std::string RequiredString(const CanonicalValue &root,
   return *value;
 }
 
+HistorianEvent PreviousSessionReportEvent(const CanonicalValue &report) {
+  constexpr auto code = "headless_previous_session_report_invalid";
+  Require(report.is_object() && report.as_object().size() == 8U, code,
+          "previous-session report must contain its eight fixed fields");
+  const auto text = [&](const std::string_view field) {
+    const auto value = RequiredString(report, field);
+    Require(value.size() <= 1024U && content_identity::is_utf8_nfc(value),
+            code, "previous-session report text must be bounded NFC UTF-8");
+    return value;
+  };
+  Require(text("schema_version") == "manyforge.workbench_previous_session.v1",
+          code, "previous-session report version is unsupported");
+  const auto session_id = text("session_id");
+  Require(session_id.size() == 32U &&
+              std::all_of(session_id.begin(), session_id.end(), [](char c) {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+              }) &&
+              text("archive_relative_path") == "previous-sessions/" + session_id,
+          code, "previous-session archive identity is invalid");
+  const auto shutdown = text("shutdown");
+  const auto effects = text("effects");
+  Require((shutdown == "clean" || shutdown == "unknown") &&
+              (effects == "closed" || effects == "unresolved" || effects == "unknown") &&
+              text("history_coverage") == "not_imported", code,
+          "previous-session report classification is invalid");
+  static_cast<void>(text("message"));
+  const auto &families = RequiredMember(report, "journal_families");
+  const std::array<std::string_view, 5U> expected{
+      "program_cycle", "scene", "manager", "cclc", "kernel_operation"};
+  Require(families.is_array() && families.as_array().size() == expected.size(),
+          code, "previous-session report must name all five journal families");
+  for (std::size_t i = 0U; i < expected.size(); ++i) {
+    const auto *family = std::get_if<std::string>(&families.as_array()[i].storage());
+    Require(family != nullptr && *family == expected[i], code,
+            "previous-session report journal families differ from the fixed inventory");
+  }
+  // This report has no source occurrence clock. Keep it explicitly unknown
+  // and stable across Headless restarts; do not assign an old event a new time.
+  return MakeHistorianEvent("manyforge.workbench", "previous_session_report",
+                            "INFO", 0, "unknown", report);
+}
+
 std::optional<std::string> OptionalStringMember(const CanonicalValue &root,
                                                 const std::string_view name) {
   const auto &member = RequiredMember(root, name);
@@ -704,7 +746,11 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
           0U,
           {},
           std::nullopt,
-      } {
+      },
+      workbench_session_adapter_{config_.owner_id + ".workbench-session-adapter",
+                                 "runtime_health",
+                                 "manyforge.alarm_adapter.workbench_session_condition",
+                                 {}, 0U, 0U, {}, std::nullopt} {
   RegisterAdapterEpochLocked(runtime_health_adapter_,
                              config_.owner_epoch + ".runtime-health");
   // The retained refusals are this owner's own state and start empty, so the
@@ -721,6 +767,97 @@ HeadlessApiCore::~HeadlessApiCore() {
     Shutdown();
   } catch (...) {
   }
+}
+
+CanonicalValue HeadlessApiCore::AppendWorkbenchPreviousSessionReport(CanonicalValue report) {
+  auto event = PreviousSessionReportEvent(report);
+  std::shared_ptr<SqliteEventHistoryStore> store;
+  {
+    std::lock_guard lock(mutex_);
+    Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+    store = history_store_;
+  }
+  // FULL synchronous commit precedes this receipt. Duplicate status also
+  // verifies the persisted digest, so changed content cannot be finalized.
+  const auto status = store->Append(event);
+  return CanonicalValue(CanonicalValue::Object{
+      {"event_id", CanonicalValue(event.event_id)},
+      {"session_id", RequiredMember(report, "session_id")},
+      {"status", CanonicalValue(status == IEventHistoryStore::AppendStatus::kStored
+                                   ? "stored" : "duplicate")},
+  });
+}
+
+CanonicalValue HeadlessApiCore::ObserveWorkbenchPreviousSessionReport(CanonicalValue report) {
+  // Reuse the immutable report validator and durable duplicate proof. This
+  // registration never opens the archived runtime stores.
+  const auto event = PreviousSessionReportEvent(report);
+  const auto identity = RequiredString(report, "session_id");
+  const auto incident_id = "workbench.previous-session." + identity;
+  std::shared_ptr<SqliteEventHistoryStore> store;
+  {
+    std::lock_guard lock(mutex_);
+    Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+    Require(!workbench_previous_session_id_ || *workbench_previous_session_id_ == identity,
+            "headless_previous_session_report_invalid",
+            "only the current predecessor may be registered");
+    store = history_store_;
+  }
+  static_cast<void>(store->Append(event));
+  HistorianQuery query;
+  query.components = {"manyforge.alarm"};
+  query.event_types = {"operator_alarm_acknowledged"};
+  query.correlations = {{"incident_id", incident_id}};
+  query.limit = 1U;
+  // A read failure propagates; absence or an unreadable result is never an ACK.
+  const auto page = store->Query(query);
+  const bool acknowledged = !page.events.empty() &&
+      RequiredString(page.events.front().event.payload, "definition_id") ==
+          "manyforge.runtime.previous_session_unclean" &&
+      RequiredString(RequiredMember(page.events.front().event.payload, "subject"),
+                     "subject_kind") == "workbench_session" &&
+      RequiredString(RequiredMember(page.events.front().event.payload, "subject"),
+                     "subject_id") == identity &&
+      RequiredMember(RequiredMember(page.events.front().event.payload, "subject"),
+                     "resource_ids").is_array() &&
+      RequiredMember(RequiredMember(page.events.front().event.payload, "subject"),
+                     "resource_ids").as_array().empty();
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  Require(!workbench_previous_session_id_ || *workbench_previous_session_id_ == identity,
+          "headless_previous_session_report_invalid",
+          "only the current predecessor may be registered");
+  const bool visible = RequiredString(report, "shutdown") != "clean" ||
+                       RequiredString(report, "effects") == "unresolved";
+  if (!workbench_previous_session_id_ && visible && !acknowledged) {
+    RegisterAdapterEpochLocked(workbench_session_adapter_,
+                               config_.owner_epoch + ".workbench-session");
+    const AlarmSubject subject{"workbench_session", identity, {}};
+    const CanonicalValue details(CanonicalValue::Object{
+        {"previous_session", report},
+        {"failure_time", CanonicalValue(nullptr)},
+        {"failure_time_status", CanonicalValue("unavailable")},
+    });
+    const CanonicalValue correlations(CanonicalValue::Object{
+        {"incident_id", CanonicalValue(incident_id)},
+    });
+    // This is a historical occurrence, not a current execution condition.
+    // Return leaves the ordinary acknowledgement obligation until seen.
+    for (const bool active : {true, false}) {
+      const auto mutation = SubmitAdapterUpdateLocked(
+          workbench_session_adapter_, "manyforge.runtime.previous_session_unclean",
+          subject, active, details, correlations);
+      static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
+    }
+    alarm_owner_.CompleteSourceSnapshot(workbench_session_adapter_.source_id,
+                                        workbench_session_adapter_.source_epoch,
+                                        AlarmConditionQuality::kGood);
+  }
+  workbench_previous_session_id_ = identity;
+  return CanonicalValue(CanonicalValue::Object{
+      {"session_id", CanonicalValue(identity)},
+      {"status", CanonicalValue(acknowledged ? "acknowledged" : visible ? "registered" : "quiet")},
+  });
 }
 
 CanonicalValue HeadlessApiCore::RuntimeSnapshot() {
@@ -1127,15 +1264,23 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
       "publication_generation", 2U);
   // Every committed Apply, including sealed empty origins, remains in the
   // complete publication inventory. Canonical origin bytes keep ordering exact.
-  using CommittedApply =
-      std::tuple<std::string, std::string, std::string, std::uint64_t>;
+  using CommittedApply = std::tuple<std::string, std::string, std::string,
+                                    std::uint64_t, std::string>;
   const auto committed_apply = [](const CanonicalValue &apply_record) {
-    return CommittedApply(
-        RequiredString(apply_record, "intent_digest"),
-        content_identity::canonical_json(ReadPreparedOrigin(
-            RequiredMember(apply_record, "prepared_activation"))),
-        RequiredString(apply_record, "apply_id"),
-        RequiredCounter(apply_record, "apply_generation", 1U));
+    const auto initialization =
+        RequiredString(apply_record, "scene_initialization");
+    const auto origin =
+        ReadPreparedOrigin(RequiredMember(apply_record, "prepared_activation"));
+    Require((initialization == "preserve" || initialization == "initialize") &&
+                (initialization == "preserve" ||
+                 RequiredString(origin, "kind") == "scenario"),
+            "program_activation_invalid",
+            "Manager Scene initialization purpose is invalid");
+    return CommittedApply(RequiredString(apply_record, "intent_digest"),
+                          content_identity::canonical_json(origin),
+                          RequiredString(apply_record, "apply_id"),
+                          RequiredCounter(apply_record, "apply_generation", 1U),
+                          initialization);
   };
   std::vector<CommittedApply> committed;
   for (const auto &candidate :
@@ -1158,13 +1303,14 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
           "Manager's committed Applies do not account for every publication");
   CanonicalValue::Array committed_applies;
   committed_applies.reserve(committed.size());
-  for (const auto &[record_digest, origin_json, apply_id, apply_generation] :
-       committed) {
+  for (const auto &[record_digest, origin_json, apply_id, apply_generation,
+                    initialization] : committed) {
     committed_applies.emplace_back(CanonicalValue(CanonicalValue::Object{
         {"apply_generation", Number(apply_generation, "apply_generation")},
         {"apply_id", CanonicalValue(apply_id)},
         {"record_digest", CanonicalValue(record_digest)},
         {"origin", content_identity::parse_canonical_json(origin_json)},
+        {"scene_initialization", CanonicalValue(initialization)},
     }));
   }
   const auto &prepared = RequiredMember(record, "prepared_activation");
@@ -1189,7 +1335,8 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
   Require(std::binary_search(committed.begin(), committed.end(), active),
           "program_activation_history_incomplete",
           "the active Apply is not among Manager's committed Applies");
-  const auto &[record_digest, origin_json, apply_id, apply_generation] = active;
+  const auto &[record_digest, origin_json, apply_id, apply_generation,
+               initialization] = active;
   return CanonicalValue(CanonicalValue::Object{
       {"apply_generation", Number(apply_generation, "apply_generation")},
       {"apply_id", CanonicalValue(apply_id)},
@@ -1199,6 +1346,7 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
        Number(publication_generation, "publication_generation")},
       {"record_digest", CanonicalValue(record_digest)},
       {"origin", content_identity::parse_canonical_json(origin_json)},
+      {"scene_initialization", CanonicalValue(initialization)},
       {"schema_version",
        CanonicalValue(std::string(kCommittedScenarioActivationSchemaVersion))},
   });

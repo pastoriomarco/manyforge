@@ -648,6 +648,19 @@
   margin-top: 0.35rem;
 }
 
+/* Drawn palette chevrons (category toggle; doubled for Collapse/Expand all). */
+.program-palette-chevron {
+  display: block;
+  width: 0.9rem;
+  height: 0.9rem;
+  margin: auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.6;
+}
+
 .program-palette-category {
   position: sticky;
   z-index: var(--mf-z-raised-2);

@@ -2083,13 +2083,15 @@ TEST(ManagerApplyJournalValues,
   }
 }
 
-TEST(ManagerApplyJournal, AbsentObserverFactsPreserveOriginalIntentDigestBytes) {
+TEST(ManagerApplyJournal,
+     SceneInitializationPurposeIsDurableAndChangesIntentDigest) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "ordinary-digest.sqlite3";
   const auto intent = Intent();
-  // Frozen before DX362 from the existing ordered v1 intent byte grammar.
-  const ContentDigest original_digest(
-      "sha256:3ffaf11f9a9da295019da2f650969dd7aba8755cc62c8cb3fbac310e8ed7d417");
+  auto initializing = intent;
+  initializing.scene_initialization = ManagerSceneInitialization::kInitialize;
+  const auto original_digest = ComputeManagerApplyIntentDigest(intent);
+  EXPECT_NE(ComputeManagerApplyIntentDigest(initializing), original_digest);
   EXPECT_EQ(ComputeManagerApplyIntentDigest(intent), original_digest);
   {
     SqliteManagerApplyJournal journal(path, intent.cell_id);
@@ -2097,6 +2099,8 @@ TEST(ManagerApplyJournal, AbsentObserverFactsPreserveOriginalIntentDigestBytes) 
     EXPECT_TRUE(accepted.inserted);
     EXPECT_EQ(accepted.record.intent_digest, original_digest);
     EXPECT_FALSE(journal.EnsureIntent(intent).inserted);
+    EXPECT_THROW(journal.EnsureIntent(initializing),
+                 ManagerApplyJournalConflictError);
   }
   SqliteManagerApplyJournal reopened(path, intent.cell_id);
   const auto stored = reopened.ReadIntent(intent.apply_id, intent.apply_generation);
@@ -2552,7 +2556,8 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "captured_input_digest,deployment_artifact_id,deployment_revision,"
         "program_binding_id,prepared_activation_id,"
         "prepared_activation_receipt_json,"
-        "expected_admission_generation,parent_authoring_claim,intent_digest"
+        "expected_admission_generation,parent_authoring_claim,scene_"
+        "initialization,intent_digest"
         ") VALUES ("
         "'apply-uncommitted',1,'request-uncommitted','owner-epoch-1',"
         "'child',NULL,'predecessor-bundle','predecessor-graph','" +
@@ -2564,11 +2569,13 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "'sha256:14141414141414141414141414141414141414141414141414141414"
         "14141414','deployment-artifact-1',"
         "'sha256:15151515151515151515151515151515151515151515151515151515"
-        "15151515','sha256:17171717171717171717171717171717171717171717171717171717"
+        "15151515','sha256:"
+        "17171717171717171717171717171717171717171717171717171717"
         "17171717',"
         "'sha256:16161616161616161616161616161616161616161616161616161616"
-        "16161616','{\"schema_version\":\"test.prepared_activation_receipt.v1\"}',"
-        "7,NULL,'sha256:"
+        "16161616','{\"schema_version\":\"test.prepared_activation_receipt."
+        "v1\"}',"
+        "7,NULL,'preserve','sha256:"
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
         ");";
     if (sqlite3_exec(database, sql.c_str(), nullptr, nullptr, nullptr) !=
@@ -4536,10 +4543,10 @@ TEST(ManagerApplyBringUpJournal,
 }
 
 TEST(ManagerApplyJournalIntegrity,
-     RefusesEarlierV17MissingObserverColumnWithoutMutatingInterruptedFile) {
+     RefusesEarlierV18MissingObserverColumnWithoutMutatingInterruptedFile) {
   for (const bool interrupted : {false, true}) {
     TemporaryDirectory directory;
-    const auto path = directory.path() / "earlier-v17.sqlite3";
+    const auto path = directory.path() / "earlier-v18.sqlite3";
     {
       SqliteManagerApplyJournal owner(path, CellId("cell-1"));
       if (interrupted) static_cast<void>(owner.EnsureIntent(Intent()));
@@ -4548,11 +4555,11 @@ TEST(ManagerApplyJournalIntegrity,
     const auto before = ReadFileBytes(path);
     try {
       SqliteManagerApplyJournal refused(path, CellId("cell-1"));
-      FAIL() << "earlier v17 journal must be refused";
+      FAIL() << "earlier v18 journal must be refused";
     } catch (const ManagerApplyJournalIntegrityError &error) {
       const std::string message(error.what());
       EXPECT_NE(message.find(path.string()), std::string::npos);
-      EXPECT_NE(message.find("unsupported earlier v17"), std::string::npos);
+      EXPECT_NE(message.find("unsupported earlier v18"), std::string::npos);
       EXPECT_NE(message.find("isaac_pose_observer_launch_facts"), std::string::npos);
       EXPECT_NE(message.find("Preserve"), std::string::npos);
       EXPECT_NE(message.find("interrupted"), std::string::npos);
@@ -4581,13 +4588,32 @@ TEST(ManagerApplyJournalIntegrity,
     const std::string message(error.what());
     EXPECT_NE(message.find(path.string()), std::string::npos);
     EXPECT_NE(message.find("version 16"), std::string::npos);
-    EXPECT_NE(message.find("v17"), std::string::npos);
+    EXPECT_NE(message.find("v18"), std::string::npos);
     EXPECT_NE(message.find("Preserve"), std::string::npos);
     EXPECT_NE(message.find("interrupted"), std::string::npos);
     EXPECT_NE(message.find("reconcile"), std::string::npos);
   }
   EXPECT_EQ(ReadFileBytes(path), before);
   ExpectNoSqliteSidecars(path);
+}
+
+TEST(ManagerApplyJournal, InitializingPurposeSurvivesJournalReopen) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "initializing.sqlite3";
+  auto intent = Intent();
+  intent.scene_initialization = ManagerSceneInitialization::kInitialize;
+  {
+    SqliteManagerApplyJournal journal(path, intent.cell_id);
+    EXPECT_TRUE(journal.EnsureIntent(intent).inserted);
+  }
+  SqliteManagerApplyJournal reopened(path, intent.cell_id);
+  const auto stored =
+      reopened.ReadIntent(intent.apply_id, intent.apply_generation);
+  ASSERT_TRUE(stored);
+  EXPECT_EQ(stored->intent, intent);
+  EXPECT_EQ(stored->intent.scene_initialization,
+            ManagerSceneInitialization::kInitialize);
+  EXPECT_FALSE(reopened.EnsureIntent(intent).inserted);
 }
 
 } // namespace manyforge::component_manager

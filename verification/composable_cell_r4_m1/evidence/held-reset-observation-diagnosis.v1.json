@@ -1,0 +1,92 @@
+{
+  "schema_version": "manyforge.held_reset_observation_diagnosis.v1",
+  "status": "RESET_COMPLETED_CLOSE_CONTINUATION_ABORTED_FIRST_CLIENT_CONDITION_NOT_CAPTURED",
+  "captured_utc": "2026-10-16T08:45:07.512821+00:00",
+  "reported_failure": "Control source is unavailable; Close is unresolved. Close not completed; Reset was submitted and may have changed the Scene.",
+  "cycle": {
+    "program_runner_owner_epoch": "program-runner-65f00c7600ae4c28b493a5794f2123f0",
+    "state": "idle_after_reset",
+    "cycle_generation": 6,
+    "cycle_claim_generation": null,
+    "program_run_id": null,
+    "failure": null,
+    "reset_phase": null,
+    "execution_control_revision": 38,
+    "causal_correlation_id": "composer-close-9cf733c8099daa344db4495b05bce0b1"
+  },
+  "control": {
+    "receiver_incarnation": "control-receiver.4aed8078fc2942d4ba921a419364fed0",
+    "semantic_owner_epoch": "program-runner-65f00c7600ae4c28b493a5794f2123f0",
+    "execution_control_revision": 38,
+    "cycle_state": "idle_after_reset",
+    "cycle_generation": 6,
+    "program_run_id": null,
+    "causal_correlation_id": "composer-close-9cf733c8099daa344db4495b05bce0b1",
+    "causal_session_id": "control-session.7071c10ff73541d1ade47b119260fe1d",
+    "causal_client_sequence": "43",
+    "current_rejection": null,
+    "current_failure": null,
+    "recovery_required": false
+  },
+  "manager": {
+    "available": true,
+    "freshness": "fresh",
+    "known_gaps": [],
+    "ready": true,
+    "converged": true,
+    "canonical_empty": false,
+    "graph_revision": "sha256:d20e9d93840135d07a184bbcda000d431af9549366755bddcfdfa52985be814e",
+    "retained_bundle_id": "sha256:f21abaa947ac30a6d79c23d80c50570ec3705f779aa8f2376e7221f6e429c0ab"
+  },
+  "health": {
+    "composer": "ready",
+    "headless": "ready",
+    "authoring_admission": {
+      "admission_generation": 168,
+      "authoring_allowed": true
+    },
+    "stop_fault": null,
+    "alarm_active_count": 0
+  },
+  "control_diagnostics": {
+    "active_clients": 1,
+    "source_failures": 0,
+    "stale_transitions": 0,
+    "delayed_transitions": 0,
+    "heartbeat_challenges": 13672,
+    "heartbeat_echoes": 13672,
+    "messages_sent": {
+      "server_hello": 10,
+      "heartbeat_challenge": 13672,
+      "snapshot": 9,
+      "delta": 221,
+      "command_receipt": 7,
+      "resync_required": 0
+    }
+  },
+  "captured_http_post_requests": [],
+  "interpretation": {
+    "reset_completion": "Same composer-close correlation is current in Program and control with idle_after_reset, no run/claim/failure, authoring allowed.",
+    "close_load_completion": "Original dual configuration remains active; no Close/Load HTTP POST in captured log window.",
+    "client_failure_boundary": "App.tsx528 rejects snapshot absent, transport not connected or semantic status not current. It does not distinguish ordinary synchronizing from unavailable in its error text.",
+    "candidate_cause": "A normal heartbeat/execution-control revision synchronizing barrier is a source-supported possible cause; the browser exact semanticReason was not captured.",
+    "current_readiness": "Later snapshot is healthy and idle; it does not prove the exact earlier browser condition."
+  },
+  "limits": [
+    "No historical WebSocket frame ring is exposed by existing capture/server diagnostics.",
+    "No server fail-closed/source/parser error was found in captured logs; source_failures is zero.",
+    "No automatic retry or further runtime action is authorized by this receipt.",
+    "Snapshot only; user may continue operating afterward."
+  ],
+  "effects": {
+    "agent_runtime_commands": [],
+    "agent_source_changes": false,
+    "restart": false,
+    "probes_stopped": true
+  },
+  "raw_evidence_identifier": "dx1054-held-reset-live-failure-20261016",
+  "raw_sha256": {
+    "api.json": "afe45cdeceb5677f0a669e3c1b1faf0afdeaee971728bd918eac3cd0c10b4dce",
+    "docker.log": "70b03b93f6b4572af8812217eaf9f64e06424445c66c46ef7d037416ddba611d"
+  }
+}

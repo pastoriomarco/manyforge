@@ -1,0 +1,118 @@
+{
+  "schema_version": "manyforge.stop_terminal_freshness_source.v1",
+  "status": "LANDED_FOCUSED_TESTS_PASSED_NOT_DEPLOYED",
+  "date": "2026-10-16",
+  "source_base_commit": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+  "problem": "Goal-terminal Stop evidence was aged from its original terminal-result receipt. An old permanent terminal fact could fail the freshness budget despite a current exact status read.",
+  "correction": {
+    "owner": "ParticipantStopStageHelper::Succeed",
+    "current_observation_timestamp": "Core local clock sampled after the successful synchronous ReadGoal returns; no new action result or controller timestamp",
+    "identity": "Returned exact finish goal key and nonzero binding epoch must match the final controller sample and current port readiness epoch. Readiness booleans are not admission gates.",
+    "original_data": "Original goal DTO and controller sample DTO remain unchanged. Original terminal receipt and transition age are reported separately when present; missing receipt remains missing.",
+    "preserved": [
+      "controller-feed freshness",
+      "Q50 same-epoch source ordering and ended-goal hold",
+      "result classification and provider-source identity",
+      "Cancel ACK/terminal conjunction and applied-factor-zero rule",
+      "all stage deadlines and escalation",
+      "command selection and dispatch behavior"
+    ],
+    "transport_dto_schema_or_persistent_format_change": false
+  },
+  "source_paths": [
+    {
+      "path": "manyforge_core/src/participant_stop_stage_helper.cpp",
+      "pre_sha256": "cfb265f908f5b80aed13cdcb8593dbc3cf62e9b3ae4898671e9e57f60d1f2bec",
+      "post_sha256": "864d859ca9d43ca209055c110730242aa05522844ead8d92a3ad464b20a50555"
+    },
+    {
+      "path": "manyforge_core/test/test_participant_stop_stage_helper.cpp",
+      "pre_sha256": "246e7d8ac944480eff5cb6c9498fbba1d07254db0e2de0a8490c27ffc58a6429",
+      "post_sha256": "0f8539c56f554291313d6174dbb966890c4b1908dff6abcb288f73a5ec598a50"
+    }
+  ],
+  "regressions": {
+    "new_cases": 4,
+    "scripted_variants": 14,
+    "cases": [
+      {
+        "name": "FreshTerminalReadKeepsOldTransitionDataWithoutRewritingDtos",
+        "coverage": "Succeeded/canceled/aborted goal, original receipt present/absent, 500ms old transition, 150ms synchronous read exceeding 100ms goal-evidence budget, correct epoch with false readiness flags, genuine hold within 250ms feed age, unchanged full goal and sample DTOs, no controller commands"
+      },
+      {
+        "name": "OldTerminalFactDoesNotMakeAStaleControllerFeedFresh",
+        "coverage": "Stale sample still fails immediately; old terminal fact does not freshen it or extend deadline"
+      },
+      {
+        "name": "CurrentTerminalEvidenceRequiresTheExactGoalAndBinding",
+        "coverage": "Wrong key, zero or foreign goal epoch, current-port mismatch, final-sample mismatch all refuse through existing source-mismatch reason"
+      },
+      {
+        "name": "CurrentTerminalEvidenceCannotUseAnAbsentOrExecutingRecord",
+        "coverage": "Absent/executing final current read cannot satisfy terminal evidence; original timeout and no command/DTO write"
+      }
+    ],
+    "full_target_cases_passed": 59,
+    "fixtures": {
+      "ParticipantStopStageHelperTest": 52,
+      "ExecutionSampleAssociationTest": 3,
+      "ProposedNarrowFallbackRuleEvidence": 4
+    },
+    "existing_policy_tests_preserved": true
+  },
+  "provider_contract_source_proof": {
+    "shared_adapter_path": "manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp",
+    "shared_adapter_sha256": "3b3cfaaf14eafdbcfff05d0a8e913de4eeb796fd6897ba4050fa30c2199274a5",
+    "nonzero_constructor_guard_line": 222,
+    "goal_config_epoch_assignment_line": 387,
+    "sample_config_epoch_assignment_line": 707,
+    "readiness_config_epoch_initialization_line": 157,
+    "foreign_readiness_rejected_line": 279,
+    "retained_handle_path": "manyforge_roboplan/src/retained_ros2_control_runtime_handle.cpp",
+    "retained_handle_sha256": "b4eda1a7004a4a687dfac02424bf3d6f89b23caec2d26bea83a6f2f4f82200d1",
+    "initial_or_validated_successor_epoch_line": 803,
+    "readiness_same_arm_epoch_line": 1322,
+    "reactivation_new_adapter_epoch_line": 1345,
+    "port_read_dtos_forwarded_unchanged": true,
+    "participant_rebind_refuses_motion_or_stop_in_flight": true,
+    "prebind_zero_default": "Profile config may start at zero; retained Bind overwrites it with 1 or validated successor before construction. Constructor independently rejects zero. Zero cannot be a valid port observation.",
+    "lane_scope": "Mock and Isaac retained factories use this shared JTC port. The same invariant applies to real hardware using this port; real Lite6 retained availability and physical qualification remain unclaimed.",
+    "existing_adapter_and_lifecycle_tests_inspected": true,
+    "additional_adapter_tests_run": false,
+    "independent_source_review": "Accepted DX1040 after independent matching source audit"
+  },
+  "qualification_reference": {
+    "receipt": "stop-terminal-freshness-native.v1.json",
+    "sha256": "a365b797b8d431847600b8615c97bb965960c5d8a45a1526b1fb01cb8052fb75",
+    "scope": "Exact 521-file Core/content-identity input proof; four build actions; full focused target59/59 passed. No ROS/host build or runtime effects."
+  },
+  "landing": {
+    "landed_utc": "2026-10-16T08:13:51.483747+00:00",
+    "exact_frozen_two_paths": true,
+    "original_index_unchanged": true,
+    "other_tracked_diff_unchanged": true,
+    "diff_check": "PASS",
+    "commit_created": false
+  },
+  "provenance": {
+    "freeze_manifest_sha256": "fb02c0799df55436afcb7fe6057025fa29ede011b47be3148b38890770bc27a3",
+    "focused_patch_sha256": "289f065f11c66f6ead6f80c27bea6f01804bad202a9e2fdee43f9b044d7378f4",
+    "binding_source_proof_sha256": "b31645fb0ae8a8711857f3e3083eeda39ff7d0680be4e25f459f15a853f89392",
+    "original_landing_receipt_sha256": "01ad92a65db884c53eb666b4d8a9790a75fa80b4e0280e6451d66a4e1678707e"
+  },
+  "limits": [
+    "Focused fake-clock Core tests only; no new ROS provider, simulator, real-robot or physical-rest qualification.",
+    "The current real-Lite6 read-only entrypoint remains unavailable at its I10/R gate; the source invariant does not qualify that lane.",
+    "No live deployment of this Stop source slice; the user workbench was not modified or restarted for it."
+  ],
+  "runtime_effects_issued_by_source_author": [],
+  "cleanup": {
+    "author_worktree_removed_after_runtime_reference_handoff": true,
+    "branch_preserved": true,
+    "exact_reconstruction_paths_verified": 2925,
+    "uncommitted_delta_and_original_current_context_preserved": true,
+    "warm_graphs_and_caches_retained": true,
+    "runtime_or_evidence_deletion": false,
+    "receipt_sha256": "75786a47b8be51314f4681eb91534cda2f259516ad0544ce1455b12ba695b95c"
+  }
+}

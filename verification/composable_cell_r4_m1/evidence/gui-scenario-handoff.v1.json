@@ -1,0 +1,155 @@
+{
+  "schema": "manyforge.composable_cell.r4_m1.gui_scenario_handoff.v1",
+  "status": "PASS_THREE_DOCUMENT_HANDOFFS_WITH_DISTINCT_NEW_EMPTY_PRESENTATION_FAILURE",
+  "date": "2026-10-15",
+  "source": {
+    "base_commit": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+    "baseline": "Previously reviewed quiet-empty nine-file overlay; see quiet-empty-viewer.v1.json.",
+    "document_patch_sha256": "a11445e2f7297797f48e662569638ecb48d96d6bfcd4403094f4188c9eabf76a",
+    "pneumatic_parser_patch_sha256": "a3c6cc96bada9f7b26206f5cec6263d5fcd100012a111827c880f9745340a8c8",
+    "files": {
+      "manyforge_composer/frontend/src/state/scenarioClose.ts": "dec4ca6feee59b0bff062f1e5ddaa18fae199649ca984ce3955c9a8c3c38b11a",
+      "manyforge_composer/frontend/src/hooks/useProgramWorkspace.ts": "75c7699ae5f508ed04c0cda40bb87864b0ee564e349164b529e0f995c4f29c71",
+      "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.tsx": "0d26e90940ac7ba223cb61159ec9860a0c891f225a7e734d4ea2978799ee8f97",
+      "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.mounted.test.tsx": "9126a24f610854f43bb04d4bb17e1778104a3581f9a582c00085322ca8cee44f",
+      "manyforge_composer/frontend/src/components/ScenarioDocumentCommands.handoff.test.tsx": "01e54b58e5bf6b287255482c709bd85fd15ef04b6269683a9a205404bb33d5b6",
+      "manyforge_composer/frontend/src/components/ProgramAuthoringPanels.test.tsx": "db54fa9a77da84d4a6dfc29c83c646fd77b0c42e689de9cc6afa0152988a47c3",
+      "manyforge_composer/frontend/src/api/parsers/execution.ts": "03f75f8bee25e89d98cb4ffb275c31de9796132e4c72b8c31d825db78cedabfd",
+      "manyforge_composer/frontend/src/api/parsers.test.ts": "844d4e3b1a968566fa015eac907fe2f82d40c43dd6785d21182e99adde48b982"
+    },
+    "user_and_private_source_entries_read_back": 2885,
+    "unexpected_mismatches": 0,
+    "native_binaries_unchanged": true
+  },
+  "validation": {
+    "document_affected_mounted_passes": 39,
+    "retained_scenario_close_passes": 30,
+    "retained_program_workspace_passes": 11,
+    "pneumatic_parser_passes": 126,
+    "typescript": "PASS",
+    "test_scope": "Scoped owner runs; no combined test-total or full release claim."
+  },
+  "rendered": {
+    "environment": "Private isolated Workbench using warm ARM64 native artifacts; Firefox 156 with software rendering.",
+    "empty_to_load": {
+      "interaction": "Actual GUI Load Scenario, saved UR10e Mock, one primary click. No inline Close checkbox or popup in clean canonical empty.",
+      "internal_empty_close_verified_publication_ms_after_click": 1841,
+      "load_started_ms_after_click": 1960,
+      "load_request_duration_ms": 4372,
+      "document_posts": 1,
+      "http_status": 200,
+      "rendered": "UR10e Program tree and normal Motion controls; nodes Execution available."
+    },
+    "loaded_to_different_load": {
+      "interaction": "Actual GUI different Lite6 Mock choice. First popup Cancel sent no mutation; a subsequent explicit Close and continue initiated one replacement.",
+      "popup_title": "Confirm Scenario replacement",
+      "popup_cancel_mutation_count": 0,
+      "ack_to_load_started_ms": 2443,
+      "load_request_duration_ms": 1806,
+      "document_posts": 1,
+      "http_status": 200,
+      "rendered": "Lite6 Program tree. Existing pneumatic-null parser rejected control; approved narrow correction hot-reloaded, then nodes Execution available and control error cleared."
+    },
+    "loaded_new": {
+      "interaction": "Actual GUI New, unique private saved project, Create Scenario then explicit Close and continue once.",
+      "ack_to_new_started_ms": 2656,
+      "new_request_duration_ms": 746,
+      "document_posts": 1,
+      "http_status": 200,
+      "saved_scenario_id": "scenario-ec2e27ad43ef47cebd1ca1b224e1354f",
+      "rendered": "Named saved Scenario with empty Program tree. Final quiet presentation FAILED as described separately."
+    },
+    "no_standalone_close_header": true,
+    "api_load_substitution": false,
+    "run_or_manual_motion": false,
+    "waiting_cancel": "Covered by controlled mounted race; no artificial runtime failure/delay injected."
+  },
+  "pneumatic_control_failure": {
+    "cause": "Strict frontend parser required a measured observation for every model-backed gripper. Fresh Lite6 pneumatic descriptor had actuation_kind=pneumatic and observed=null, so the whole control shell was rejected. Generic onclose text hid the parser cause.",
+    "before_replay_error": "executionStatus.status.direct_control_gripper.observed_state must be a model-backed observation",
+    "captured_snapshot_bytes": 95836,
+    "same_snapshot_after_narrow_fix": "parseComposerHeadlessState succeeded, complete=true",
+    "position_gripper_absence_refusal": "Retained; only strict parsed pneumatic descriptor permits null."
+  },
+  "new_empty_presentation_failure": {
+    "manager_ready": true,
+    "runtime_converged": true,
+    "canonical_empty": false,
+    "model_instances": 0,
+    "controllable_components": 0,
+    "runtime_units": 1,
+    "graph_revision": "sha256:30f6a38c13a38271e80e2166bc2b28d07c6512afb51da561a984b0774c46a74b",
+    "retained_bundle_id": "sha256:3aa6a7d7f9001ac1c79082a69f566210d9482b3dc3428f40e0acfa682f76be40",
+    "publication_generation": 10,
+    "execution_identity_http_status": 503,
+    "execution_identity_error": "execution_owner_not_ready",
+    "presentation": "Six prerequisite errors and a reconnecting live viewer persist. Positive canonical-empty rule correctly does not classify canonical_empty=false as quiet; New created a saved empty Program bundle.",
+    "idle_history_accepted_before": 43,
+    "idle_history_accepted_after": 125,
+    "idle_window_s": 42.522576,
+    "outcome": "Distinct issue reported for explicit scope decision. No further New/Apply/retry or suppression was attempted. Private browser session closed to stop test noise; private runtime remains available."
+  },
+  "user_handoff": {
+    "document_six_files_synced_utc": "2026-10-15T20:56:52.177501+00:00",
+    "parser_two_files_synced_utc": "2026-10-15T21:03:56.822010+00:00",
+    "preimage_and_posthash_checks": true,
+    "actual_vite_modules_served": true,
+    "backend_or_container_restart": false,
+    "user_scenario_mutation_by_qualification": false,
+    "history_purged": false,
+    "runtime_state_retained": true
+  },
+  "limits": [
+    "This receipt separates successful document handoffs from the failed final New empty presentation; it is not an unconditional end-to-end pass.",
+    "Initial private startup used an incorrect selected bootstrap argument against retained generic-bootstrap state and refused marker identity. Failed log retained; correcting only the owned launch argument reused the same runtime/cache and succeeded. No cold compile.",
+    "Initial browser timing observer used unbound Firefox fetch, causing read-only initialization/listing failures before any mutation. Binding original fetch to Window corrected test instrumentation; no product workaround.",
+    "No real robot, Isaac, Run, manual motion or graphics performance qualification. No optional additional empty New was executed."
+  ],
+  "provenance": [
+    {
+      "receipt": "empty-load-ur10e.json",
+      "sha256": "fd8d79ca678098a169017a709c595266f5534d650d412e9b04516a2e56b87a55"
+    },
+    {
+      "receipt": "different-load-cancel.json",
+      "sha256": "9c1e4df66737a16be3acc5a8808bd5a2e1aa7b71c99cb5ddb75bfb566c2421e5"
+    },
+    {
+      "receipt": "different-load-progress.json",
+      "sha256": "0c235e711a5a5a0141ac0b01d97e61d1b7031918d51a35549b870bac8f0c758f"
+    },
+    {
+      "receipt": "loaded-new-final.json",
+      "sha256": "9e13b57beddcbedfddbaf02e3a9a9e90deaaa50df39e3cc869e722879176ed8b"
+    },
+    {
+      "receipt": "new-empty-full-projection.json",
+      "sha256": "1b93361572d71b0bae0313f4a75f953cdf279257a156cdd76997addb1f8520c5"
+    },
+    {
+      "receipt": "user-control-wire.json",
+      "sha256": "995212125540818b7f29666b701de4e60b43fd1b1e092517a28cee6cc9bb515c"
+    },
+    {
+      "receipt": "user-control-parser-replay.json",
+      "sha256": "f8bb721c366d19bcd3290feb0339348619181cb652ceb353c066c3e75da43c60"
+    },
+    {
+      "receipt": "user-control-parser-replay-after.json",
+      "sha256": "e6b52b7dffd8e5961bf26922edae88cfdfb402b443763197b46ac5d8058e1b51"
+    },
+    {
+      "receipt": "final-source-readback.json",
+      "sha256": "ffd7622c43c9439e21988cf8b7fb4e97c74db553c1a02a5a498e8cd2152e1d18"
+    },
+    {
+      "receipt": "user-source-sync-receipt.json",
+      "sha256": "c19577a54274d01ba3292e18687aa1c73aacfbdef24f079d6629c9b5753f5322"
+    },
+    {
+      "receipt": "pneumatic-parser-sync.json",
+      "sha256": "dbbdc373aa10284775c51888fc648b0b4a38f19335cf86a18c6c47094dfab75e"
+    }
+  ],
+  "retention_note": "Self-contained portable scoped results. Receipt basenames and hashes identify local provenance without promising raw artifacts remain available. Machine addresses, user names and home paths are excluded."
+}

@@ -36,7 +36,7 @@ inline constexpr std::string_view kAppliedProgramSelectionSchemaVersion =
 inline constexpr std::string_view kAppliedProgramStatusSchemaVersion =
     "manyforge.applied_program_status.v2";
 inline constexpr std::string_view kCommittedScenarioActivationSchemaVersion =
-    "manyforge.committed_scenario_activation.v2";
+    "manyforge.committed_scenario_activation.v3";
 inline constexpr std::string_view kSourceModelContextSchemaVersion =
     "manyforge.source_model_context.v1";
 inline constexpr std::string_view kAssistantModeContextSchemaVersion =
@@ -276,6 +276,13 @@ public:
                        std::uint64_t last_observed_ns,
                        std::map<std::string, std::string> causal_context = {});
   [[nodiscard]] manyforge::content_identity::CanonicalValue HistorianHealth();
+  /// Startup-only launcher evidence, committed before a pending file is finalized.
+  /// Never opens or imports an archived owner journal.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  AppendWorkbenchPreviousSessionReport(manyforge::content_identity::CanonicalValue report);
+  /// Register only the current predecessor with the existing alarm owner.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ObserveWorkbenchPreviousSessionReport(manyforge::content_identity::CanonicalValue report);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ReconcileHistorianHealth(std::uint64_t expected_health_generation,
                            AlarmCallerAttribution caller);
@@ -533,6 +540,8 @@ private:
   /// CCLC owner epoch and is registered only after the first complete
   /// observation.
   AdapterCursor component_lifecycle_adapter_;
+  AdapterCursor workbench_session_adapter_;
+  std::optional<std::string> workbench_previous_session_id_;
   /// Controllable components of the active configuration, sorted.
   std::vector<std::string> alarm_component_ids_;
   /// (definition id, component id) -> last submitted state.

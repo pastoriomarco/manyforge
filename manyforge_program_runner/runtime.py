@@ -73,6 +73,7 @@ from manyforge_behavior.program_scheduling import (
     ProgramSchedulingError,
 )
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.models import (
     ManualProgramHandover,
     ProgramRunStartRequest,
@@ -435,6 +436,8 @@ class ProgramRuntime:
                 timeout_seconds=min(config.headless_timeout_seconds, 30.0),
             )
         self._kernel = KernelClient(execution_transport)
+        self._execution_transport = execution_transport
+        self._reset_position_identity: dict[str, Any] | None = None
         # Starting has no bound tree yet. Retain its already-read Kernel
         # attribution so priority Stop never needs an ordinary owner read.
         self._starting_kernel_owner_epoch: str | None = None
@@ -600,7 +603,10 @@ class ProgramRuntime:
         preflight only and publishes readiness after the heartbeat returns a
         stable current status.
         """
-        return self._cycle_status_core()
+        status = self._cycle_status_core()
+        _admission, journal = self._require_cycle_owner()
+        status["accepted_reset"] = self._accepted_reset_context(journal, journal.read())
+        return status
 
     def _reconcile_manager_liveness(
         self,
@@ -1427,7 +1433,7 @@ class ProgramRuntime:
         if (
             (allow_reconciliation or not cycle.reconciliation_required)
             and cycle.reset_phase
-            in {"stopping", "settling", "restoring_scene", "releasing"}
+            in {"stopping", "settling", "restoring_scene", "restoring_position", "releasing"}
             and failed_phase == cycle.reset_phase
             and isinstance(failure_code, str)
             and failure_code
@@ -1613,6 +1619,7 @@ class ProgramRuntime:
             and cycle.start_settlement.get("program_run_id") == cycle.program_run_id
             and self._digest(cycle.start_settlement) == cycle.terminal_reference
         )
+        idle_reset = self._idle_reset_occurrence(journal, cycle) is not None
         if (
             acquisition_pending
             and (
@@ -1625,6 +1632,7 @@ class ProgramRuntime:
             and cycle.claim is None
             and cycle.state != "idle_after_reset"
             and not claimless_no_effect
+            and not idle_reset
         ):
             raise ProgramRunnerError(
                 "program_cycle_owner_unknown",
@@ -1753,6 +1761,13 @@ class ProgramRuntime:
                 "current_command_kind": cycle.current_command_kind,
                 "failure": failure,
                 "reset_phase": cycle.reset_phase,
+                "reset_options": self._accepted_reset_options(journal, cycle),
+                # Liveness must not depend on an execution/Manager round trip.
+                # The public wrapper replaces this unsampled private field.
+                "reset_robot_position": {
+                    "available": False,
+                    "reason": "Position-reset capability is not sampled by the private cycle projection",
+                },
                 "allowed_commands": allowed_commands,
             }
         )
@@ -1760,6 +1775,7 @@ class ProgramRuntime:
 
     def cycle_status(self) -> dict[str, Any]:
         result = self._cycle_status_core()
+        result["reset_robot_position"] = self._reset_robot_position_availability()
         program_run_id = result["program_run_id"]
         controls = (
             None if program_run_id is None else self._optional_controls(program_run_id)
@@ -3838,7 +3854,7 @@ class ProgramRuntime:
             if (
                 not isinstance(projection, Mapping)
                 or projection.get("schema_version")
-                != "manyforge.committed_scenario_activation.v2"
+                != "manyforge.committed_scenario_activation.v3"
                 or not isinstance(projection.get("origin"), Mapping)
             ):
                 raise ProgramRunnerError(
@@ -5548,6 +5564,430 @@ class ProgramRuntime:
                     )
                 )
 
+    def _advance_reset_options(
+        self, request: ProgramCycleResetRequest, authorization: Mapping[str, Any] | None,
+        journal: Any,
+    ) -> Any:
+        """Run the selected stages once in order, retaining each completed phase."""
+        cycle = journal.read()
+        if cycle.reset_phase == "restoring_scene":
+            try:
+                if request.reload_initial_scene:
+                    self._prepare_scene_after_reset(request, authorization)
+                journal.update_reset_phase(
+                    expected_generation=cycle.cycle_generation, program_run_id=request.program_run_id,
+                    expected_phase="restoring_scene",
+                    phase="restoring_position" if request.reset_robot_position else "releasing",
+                    terminal_reference=request.terminal_reference,
+                    scene_preparation_completed=request.reload_initial_scene,
+                )
+                cycle = journal.read()
+            except ProgramRunnerError:
+                raise
+            except Exception as error:
+                raise ProgramRunnerError(
+                    "program_cycle_reset_scene_preparation_failed", str(error) or type(error).__name__
+                ) from error
+        if cycle.reset_phase == "restoring_position":
+            try:
+                self._reset_robot_position_after_reset(request, authorization)
+                journal.update_reset_phase(
+                    expected_generation=cycle.cycle_generation, program_run_id=request.program_run_id,
+                    expected_phase="restoring_position", phase="releasing",
+                    terminal_reference=request.terminal_reference,
+                )
+                cycle = journal.read()
+            except ProgramRunnerError:
+                raise
+            except Exception as error:
+                raise ProgramRunnerError(
+                    "program_cycle_reset_position_failed", str(error) or type(error).__name__
+                ) from error
+        return cycle
+
+    @staticmethod
+    def _accepted_reset_context(journal: Any, cycle: Any) -> dict[str, Any] | None:
+        options = ProgramRuntime._accepted_reset_options(journal, cycle)
+        if options is None:
+            return None
+        row = next(row for row in journal.pending_commands() if row["kind"] == "reset")
+        retained = cycle.reset_effect_claim
+        claim = None if retained is None else retained["claim"]
+        return {
+            "request_owner_epoch": row["request_owner_epoch"],
+            "request_id": row["request_id"],
+            "request_payload_digest": ProgramRuntime._digest(row["intent"]),
+            **options,
+            "reset_claim_generation": None if claim is None else claim["claim_generation"],
+        }
+
+    @staticmethod
+    def _accepted_reset_options(journal: Any, cycle: Any) -> dict[str, bool] | None:
+        if cycle.state not in {"resetting", "recovery_required"}:
+            return None
+        pending = [row for row in journal.pending_commands() if row["kind"] == "reset"]
+        if len(pending) != 1:
+            return None
+        row = pending[0]
+        if (
+            row["cycle_generation"] != cycle.cycle_generation
+            or row["intent"].get("program_run_id") != cycle.program_run_id
+        ):
+            return None
+        # Version eight journals own the explicit-option Reset contract. Older
+        # implicit-scene journals are rejected intact, never reinterpreted.
+        return {
+            key: row["intent"].get(key, False)
+            for key in ("reload_initial_scene", "reset_robot_position")
+        }
+
+    def _reset_robot_position_availability(self) -> dict[str, Any]:
+        capability = getattr(self._execution_transport, "reset_robot_position_capability", None)
+        if not callable(capability):
+            return {"available": False, "reason": "The active Deployment has no qualified simulator position-reset capability"}
+        try:
+            return capability()["reset_robot_position"]
+        except HeadlessApiError as error:
+            return {"available": False, "reason": f"Position-reset capability is unavailable ({error.code})"}
+
+    def _require_reset_robot_position_available(self, request: ProgramCycleResetRequest) -> None:
+        capability = getattr(self._execution_transport, "reset_robot_position_capability", None)
+        try:
+            response = None if not callable(capability) else capability()
+        except HeadlessApiError as error:
+            raise ProgramRunnerError("program_cycle_reset_position_unavailable", str(error)) from error
+        if response is None or not response["reset_robot_position"]["available"]:
+            raise ProgramRunnerError("program_cycle_reset_position_unavailable",
+                self._reset_robot_position_availability()["reason"] if response is None
+                else response["reset_robot_position"]["reason"])
+        self._reset_position_identity = {
+            key: response["identity"][key]
+            for key in ("owner_epoch", "active_publication_generation", "retained_bundle_id", "graph_revision")
+        }
+
+    def _reset_robot_position_after_reset(
+        self, request: ProgramCycleResetRequest, authorization: Mapping[str, Any] | None
+    ) -> None:
+        _admission, journal = self._require_cycle_owner()
+        cycle = journal.read()
+        context = self._accepted_reset_context(journal, cycle)
+        if context is None or self._reset_position_identity is None:
+            raise ProgramRunnerError("program_cycle_journal_invalid", "Position Reset lost its accepted deployment context")
+        body = {
+            "authorization": {
+                "program_runner_owner_epoch": cycle.owner_epoch,
+                "cycle_generation": cycle.cycle_generation,
+                **{key: context[key] for key in ("request_owner_epoch", "request_id", "request_payload_digest")},
+                "program_run_id": cycle.program_run_id,
+                "cycle_claim_generation": None if cycle.claim is None else cycle.claim["claim_generation"],
+                "terminal_or_settlement_reference": cycle.terminal_reference,
+                "reset_claim_generation": context["reset_claim_generation"],
+            },
+            "expected_deployment_identity": self._reset_position_identity,
+        }
+        try:
+            self._execution_transport.reset_robot_position(body)
+        except Exception as error:
+            if isinstance(error, HeadlessApiError) and error.details.get("effect_disposition") == "known_no_effect":
+                raise ProgramRunnerError(error.code, str(error)) from error
+            raise ProgramRunnerError("program_cycle_reconciliation_required",
+                "Robot position unknown after a failed position reset. Restart the workbench to recover.",
+                details={"cause_code": getattr(error, "code", type(error).__name__)}) from error
+
+    @staticmethod
+    def _idle_reset_occurrence(journal: Any, cycle: Any) -> ProgramCycleResetRequest | None:
+        """Recognize selected no-run Reset from its retained accepted intent."""
+        if (
+            cycle.state not in {"resetting", "recovery_required"}
+            or cycle.program_run_id is not None
+            or cycle.claim is not None
+            or cycle.acquisition_pending is not None
+            or cycle.terminal_reference is not None
+            or cycle.start_settlement is not None
+            or cycle.release_intent is not None
+            or cycle.current_command_kind != "program_reset"
+            or not cycle.causal_correlation_id
+            or cycle.reset_phase not in {
+                "restoring_scene", "restoring_position", "releasing"
+            }
+            or (cycle.state == "recovery_required" and (
+                not isinstance(cycle.failure, Mapping)
+                or cycle.failure.get("failed_phase") != cycle.reset_phase
+            ))
+        ):
+            return None
+        pending = journal.pending_commands()
+        if len(pending) != 1 or pending[0]["kind"] != "reset":
+            return None
+        row = pending[0]
+        try:
+            accepted = ProgramCycleResetRequest.model_validate(row["intent"])
+        except ValueError:
+            return None
+        if (
+            row["cycle_generation"] != cycle.cycle_generation
+            or row["request_owner_epoch"] != accepted.request_owner_epoch
+            or row["request_id"] != accepted.request_id
+            or accepted.expected_owner_epoch != cycle.owner_epoch
+            or accepted.expected_cycle_generation != cycle.cycle_generation
+            or accepted.program_run_id is not None
+            or accepted.expected_claim_generation is not None
+            or accepted.terminal_reference is not None
+            or accepted.settlement_evidence_digest is not None
+            or not (accepted.reload_initial_scene or accepted.reset_robot_position)
+        ):
+            return None
+        retained = cycle.reset_effect_claim
+        if retained is not None:
+            payload_digest = ProgramRuntime._digest(row["intent"])
+            transaction_id = "program-reset." + ProgramRuntime._digest({
+                "cycle_generation": cycle.cycle_generation,
+                "request_owner_epoch": accepted.request_owner_epoch,
+                "request_id": accepted.request_id,
+                "request_payload_digest": payload_digest,
+            })[7:]
+            intent = retained["intent"]
+            if (
+                intent.get("claim_kind") != "program_reset"
+                or intent.get("owner_role") != "program_runner"
+                or intent.get("owner_epoch") != cycle.owner_epoch
+                or intent.get("request_id") != transaction_id
+                or intent.get("owner_transaction_id") != transaction_id
+                or intent.get("request_payload_digest") != payload_digest
+                or (retained["claim"] is not None and retained["claim"].get("intent") != intent)
+                or (retained["release_intent"] is not None and cycle.reset_phase != "releasing")
+            ):
+                return None
+        return accepted
+
+    @staticmethod
+    def _require_same_reset_options(
+        request: ProgramCycleResetRequest, accepted: ProgramCycleResetRequest
+    ) -> None:
+        if (request.reload_initial_scene, request.reset_robot_position) != (
+            accepted.reload_initial_scene, accepted.reset_robot_position
+        ):
+            raise ProgramRunnerError(
+                "program_run_request_conflict",
+                "Reset options differ from the accepted Reset occurrence",
+            )
+
+    def _acquire_reset_effect_claim(self, admission: Any, journal: Any) -> dict[str, Any]:
+        cycle = journal.read()
+        context = self._accepted_reset_context(journal, cycle)
+        if context is None:
+            raise ProgramRunnerError("program_cycle_journal_invalid", "Idle Reset lost its accepted occurrence")
+        retained = cycle.reset_effect_claim
+        if retained is None:
+            identity = {
+                "cycle_generation": cycle.cycle_generation,
+                "request_owner_epoch": context["request_owner_epoch"],
+                "request_id": context["request_id"],
+                "request_payload_digest": context["request_payload_digest"],
+            }
+            transaction_id = "program-reset." + self._digest(identity)[7:]
+            intent = {
+                "claim_kind": "program_reset", "owner_role": "program_runner",
+                "owner_epoch": self.owner_epoch, "owner_transaction_id": transaction_id,
+                "request_id": transaction_id, "request_payload_digest": context["request_payload_digest"],
+                "expected_admission_generation": self._admission_generation(admission.get()),
+                "scope": {"resources": [], "configurations": []},
+                "program_cycle_evidence": None, "intervention_evidence": None,
+            }
+            retained = {"intent": intent, "claim": None, "release_intent": None}
+            journal.remember_reset_effect_claim(
+                expected_generation=cycle.cycle_generation, expected=None, retained=retained,
+            )
+        intent = retained["intent"]
+        if intent["owner_epoch"] != self.owner_epoch:
+            raise ProgramRunnerError("program_cycle_reconciliation_required", "Idle Reset claim belongs to a previous owner")
+        if retained["claim"] is None:
+            try:
+                claim = admission.acquire(intent)
+                if claim.get("intent") != intent:
+                    raise RuntimeError("Idle Reset claim receipt does not match its retained intent")
+                acquired = {**retained, "claim": claim}
+                journal.remember_reset_effect_claim(
+                    expected_generation=cycle.cycle_generation, expected=retained, retained=acquired,
+                )
+                retained = acquired
+            except CellAdmissionError as error:
+                raise ProgramRunnerError(
+                    "program_cycle_reconciliation_required" if error.outcome_unknown else error.code,
+                    str(error),
+                ) from error
+            except Exception as error:
+                raise ProgramRunnerError(
+                    "program_cycle_reconciliation_required", str(error) or type(error).__name__
+                ) from error
+        return {
+            "program_runner_owner_epoch": self.owner_epoch,
+            "cycle_generation": cycle.cycle_generation,
+            "reset_claim": {
+                key: (retained["claim"]["claim_generation"] if key == "reset_claim_generation" else context[key])
+                for key in ("request_owner_epoch", "request_id", "request_payload_digest", "reset_claim_generation")
+            },
+        }
+
+    def _release_reset_effect_claim(self, admission: Any, journal: Any) -> dict[str, Any]:
+        cycle = journal.read()
+        retained = cycle.reset_effect_claim
+        context = self._accepted_reset_context(journal, cycle)
+        if cycle.reset_phase != "releasing" or retained is None or retained["claim"] is None or context is None:
+            raise ProgramRunnerError("program_cycle_journal_invalid", "Idle Reset has no exact settled claim")
+        claim = retained["claim"]
+        release = retained["release_intent"]
+        if release is None:
+            settlement = {
+                "schema_version": "manyforge.program_reset_effect_settlement.v1",
+                "cycle_generation": cycle.cycle_generation,
+                "request_owner_epoch": context["request_owner_epoch"],
+                "request_id": context["request_id"],
+                "request_payload_digest": context["request_payload_digest"],
+                "claim": claim,
+            }
+            release = {
+                **{key: retained["intent"][key] for key in (
+                    "owner_role", "owner_epoch", "owner_transaction_id", "request_id", "request_payload_digest"
+                )},
+                "acquired_admission_generation": claim["acquired_admission_generation"],
+                "claim_generation": claim["claim_generation"],
+                "settlement": {"settlement_kind": "explicit_reset", "evidence_digest": self._digest(settlement)},
+            }
+            journal.remember_reset_effect_claim(
+                expected_generation=cycle.cycle_generation, expected=retained,
+                retained={**retained, "release_intent": release},
+            )
+        try:
+            return admission.release(release)
+        except CellAdmissionError as error:
+            raise ProgramRunnerError(
+                "program_cycle_reconciliation_required" if error.outcome_unknown else error.code,
+                str(error),
+            ) from error
+        except Exception as error:
+            raise ProgramRunnerError(
+                "program_cycle_reconciliation_required", str(error) or type(error).__name__
+            ) from error
+
+    def _reset_idle_cycle(
+        self, request: ProgramCycleResetRequest, admission: Any, journal: Any, cycle: Any
+    ) -> dict[str, Any]:
+        accepted = self._idle_reset_occurrence(journal, cycle)
+        if (
+            cycle.owner_epoch != request.expected_owner_epoch
+            or cycle.owner_epoch != self.owner_epoch
+            or cycle.cycle_generation != request.expected_cycle_generation
+            or cycle.reconciliation_required
+            or cycle.acquisition_pending is not None
+            or request.program_run_id is not None
+            or request.expected_claim_generation is not None
+            or request.terminal_reference is not None
+            or request.settlement_evidence_digest is not None
+            or (cycle.state != "idle_after_reset" and accepted is None)
+        ):
+            raise ProgramRunnerError(
+                "program_cycle_reset_stale", "Reset does not identify the current idle cycle"
+            )
+        if accepted is not None:
+            self._require_same_reset_options(request, accepted)
+        if accepted is None or (
+            request.request_owner_epoch, request.request_id
+        ) == (accepted.request_owner_epoch, accepted.request_id):
+            try:
+                self._require_new_command(journal.record_request(
+                    owner_epoch=request.request_owner_epoch, request_id=request.request_id,
+                    kind="reset", intent=request.model_dump(mode="json"),
+                    cycle_generation=cycle.cycle_generation,
+                ))
+            except (ValueError, OverflowError) as error:
+                raise ProgramRunnerError(
+                    "program_run_request_conflict" if isinstance(error, ValueError)
+                    else "execution_control_ingress_busy", str(error)
+                ) from error
+        selected = request.reload_initial_scene or request.reset_robot_position
+        started = False
+        try:
+            if selected:
+                if request.reset_robot_position:
+                    self._require_reset_robot_position_available(request)
+                if accepted is None:
+                    current_admission = admission.get()
+                    if current_admission.get("authoring_allowed") is not True:
+                        raise ProgramRunnerError(
+                            "authoring_not_ready",
+                            "authoring admission is not ready for selected Reset effects",
+                            details={
+                                "admission_generation": self._admission_generation(current_admission),
+                                "authoring_allowed": current_admission.get("authoring_allowed"),
+                                "expected_admission_generation": self._admission_generation(current_admission),
+                            },
+                        )
+                    journal.begin_idle_resetting(
+                        expected_generation=cycle.cycle_generation, owner_epoch=self.owner_epoch,
+                        correlation_id=request.correlation_id or request.request_id,
+                        session_id=request.session_id, client_sequence=request.client_sequence,
+                        phase="restoring_scene" if request.reload_initial_scene else "restoring_position",
+                    )
+                else:
+                    phase = self._reset_retry_phase(cycle)
+                    if phase is None:
+                        raise ProgramRunnerError(
+                            "program_cycle_reset_stale", "Idle Reset has no resumable phase"
+                        )
+                    journal.resume_resetting(
+                        expected_generation=cycle.cycle_generation, program_run_id=None,
+                        expected_failure_code=cycle.failure["code"], phase=phase,
+                        correlation_id=request.correlation_id or request.request_id,
+                        session_id=request.session_id, client_sequence=request.client_sequence,
+                    )
+                    request = accepted
+                started = True
+                authorization = self._acquire_reset_effect_claim(admission, journal)
+                if request.reset_robot_position:
+                    self._require_reset_robot_position_available(request)
+                cycle = self._advance_reset_options(request, authorization, journal)
+                released = self._release_reset_effect_claim(admission, journal)
+            result = {
+                "schema_version": "manyforge.program_cycle_reset_result.v1",
+                "program_run_id": None,
+                "reset_cycle_generation": cycle.cycle_generation,
+                "idle_cycle_generation": cycle.cycle_generation + 1,
+                "settlement_reference": None,
+                "admission": released if selected else admission.get(),
+                "runtime_controls": None,
+            }
+            publish = journal.publish_reset if selected else journal.publish_idle_reset
+            publish(
+                expected_generation=cycle.cycle_generation, owner_epoch=self.owner_epoch,
+                request_owner_epoch=request.request_owner_epoch, request_id=request.request_id,
+                result=result,
+            )
+            return result
+        except Exception as error:
+            cause = error if isinstance(error, ProgramRunnerError) else ProgramRunnerError(
+                "program_cycle_reset_failed", str(error) or type(error).__name__
+            )
+            if started:
+                try:
+                    journal.fail_reset(
+                        expected_generation=cycle.cycle_generation, program_run_id=None,
+                        code=cause.code, message=str(cause),
+                        reconciliation_required=cause.code == "program_cycle_reconciliation_required",
+                    )
+                except Exception:
+                    pass
+                raise ProgramRunnerError(
+                    "program_cycle_recovery_required", str(cause),
+                    details={"cause_code": cause.code},
+                ) from error
+            if accepted is None:
+                self._retain_rejection(
+                    journal, owner_epoch=request.request_owner_epoch,
+                    request_id=request.request_id, error=cause,
+                )
+            raise cause
+
     def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]:
         if not isinstance(request, ProgramCycleResetRequest):
             raise TypeError("reset_cycle requires one ProgramCycleResetRequest")
@@ -5560,60 +6000,8 @@ class ProgramRuntime:
             self._require_manager_current()
             admission, journal = self._require_cycle_owner()
             cycle = journal.read()
-            if cycle.state == "idle_after_reset" and cycle.claim is None:
-                if (
-                    cycle.owner_epoch != request.expected_owner_epoch
-                    or cycle.owner_epoch != self.owner_epoch
-                    or cycle.cycle_generation != request.expected_cycle_generation
-                    or cycle.reconciliation_required
-                    or cycle.acquisition_pending is not None
-                    or request.program_run_id is not None
-                    or request.expected_claim_generation is not None
-                    or request.terminal_reference is not None
-                    or request.settlement_evidence_digest is not None
-                ):
-                    raise ProgramRunnerError("program_cycle_reset_stale", "Reset does not identify the current idle cycle")
-                record = journal.record_request(
-                    owner_epoch=request.request_owner_epoch,
-                    request_id=request.request_id,
-                    kind="reset",
-                    intent=request.model_dump(mode="json"),
-                    cycle_generation=cycle.cycle_generation,
-                )
-                self._require_new_command(record)
-                try:
-                    applied = self._headless.program_applied()
-                    self.prepare_applied_scene(
-                        ProgramScenePreparationRequest.model_validate({
-                            "request_id": request.request_id,
-                            "request_owner_epoch": request.request_owner_epoch,
-                            "source_label": request.source_label,
-                            "correlation_id": request.correlation_id,
-                            "expected_applied_record_digest": applied["source"]["record_digest"],
-                            "expected_admission_generation": self._admission_generation(admission.get()),
-                        })
-                    )
-                    result = {
-                        "schema_version": "manyforge.program_cycle_reset_result.v1",
-                        "program_run_id": None,
-                        "reset_cycle_generation": cycle.cycle_generation,
-                        "idle_cycle_generation": cycle.cycle_generation + 1,
-                        "settlement_reference": None,
-                        "admission": admission.get(),
-                        "runtime_controls": None,
-                    }
-                    journal.publish_idle_reset(
-                        expected_generation=cycle.cycle_generation,
-                        owner_epoch=self.owner_epoch,
-                        request_owner_epoch=request.request_owner_epoch,
-                        request_id=request.request_id,
-                        result=result,
-                    )
-                    return result
-                except ProgramRunnerError as error:
-                    self._retain_rejection(journal, owner_epoch=request.request_owner_epoch,
-                                           request_id=request.request_id, error=error)
-                    raise
+            if cycle.claim is None and cycle.program_run_id is None:
+                return self._reset_idle_cycle(request, admission, journal, cycle)
             pending = journal.pending_commands()
             requested_intent = request.model_dump(mode="json")
             try:
@@ -5762,6 +6150,12 @@ class ProgramRuntime:
                         "Retained Reset occurrence is ambiguous",
                     )
                 )
+            if retained_resets:
+                self._require_same_reset_options(
+                    request, ProgramCycleResetRequest.model_validate(retained_resets[0]["intent"])
+                )
+            if request.reset_robot_position:
+                self._require_reset_robot_position_available(request)
             if recovery_reset:
                 try:
                     resident = self._owner.read(request.program_run_id)
@@ -6077,6 +6471,18 @@ class ProgramRuntime:
                         self._host.reset_retained_run(request.program_run_id)
                     elif retained_run is not None:
                         self._host.reset_run(request.program_run_id)
+                    controls = self._optional_controls(request.program_run_id)
+                    if controls is not None:
+                        controls.mark_reset(
+                            request_id=request.request_id,
+                            correlation_id=request.correlation_id,
+                            source_label=request.source_label,
+                        )
+                    next_phase = (
+                        "restoring_scene" if request.reload_initial_scene
+                        else "restoring_position" if request.reset_robot_position
+                        else "releasing"
+                    )
                     if recovery_reset:
                         try:
                             self._prove_reset_recovery(
@@ -6087,6 +6493,7 @@ class ProgramRuntime:
                                 expected=cycle,
                                 manager_runtime_epoch=recovery_liveness.manager_runtime_epoch,
                                 manager_owner_epoch=recovery_liveness.manager_owner_epoch,
+                                phase=next_phase,
                             )
                         except Exception as error:
                             raise ProgramRunnerError(
@@ -6097,7 +6504,7 @@ class ProgramRuntime:
                             expected_generation=cycle.cycle_generation,
                             program_run_id=request.program_run_id,
                             expected_phase="settling",
-                            phase="restoring_scene",
+                            phase=next_phase,
                             terminal_reference=request.terminal_reference,
                         )
                     cycle = journal.read()
@@ -6117,7 +6524,7 @@ class ProgramRuntime:
                             str(error) or type(error).__name__,
                         )
                     )
-            elif cycle.reset_phase not in {"restoring_scene", "releasing"}:
+            elif cycle.reset_phase not in {"restoring_scene", "restoring_position", "releasing"}:
                 reject(
                     ProgramRunnerError(
                         "program_cycle_reset_phase_invalid",
@@ -6134,39 +6541,27 @@ class ProgramRuntime:
                     "terminal_or_settlement_reference": (request.terminal_reference),
                 }
             )
-            controls = self._optional_controls(request.program_run_id)
-            if cycle.reset_phase == "restoring_scene":
+            if claim is None and (request.reload_initial_scene or request.reset_robot_position):
                 try:
-                    self._prepare_scene_after_reset(
-                        request,
-                        reset_scene_authorization,
-                    )
-                    if controls is not None:
-                        controls.mark_reset(
-                            request_id=request.request_id,
-                            correlation_id=request.correlation_id,
-                            source_label=request.source_label,
-                        )
-                    journal.update_reset_phase(
-                        expected_generation=cycle.cycle_generation,
-                        program_run_id=request.program_run_id,
-                        expected_phase="restoring_scene",
-                        phase="releasing",
-                        terminal_reference=request.terminal_reference,
-                    )
-                    cycle = journal.read()
+                    reset_scene_authorization = self._acquire_reset_effect_claim(admission, journal)
                 except ProgramRunnerError as error:
                     reject(error)
-                except Exception as error:
-                    reject(
-                        ProgramRunnerError(
-                            "program_cycle_reset_scene_preparation_failed",
-                            str(error) or type(error).__name__,
-                        )
-                    )
+            controls = self._optional_controls(request.program_run_id)
+            try:
+                if request.reset_robot_position:
+                    self._require_reset_robot_position_available(request)
+                cycle = self._advance_reset_options(request, reset_scene_authorization, journal)
+            except ProgramRunnerError as error:
+                reject(error)
             if not claim_was_settled_by_recovery:
                 if claim is None:
-                    released = admission.get()
+                    try:
+                        released = (
+                            self._release_reset_effect_claim(admission, journal)
+                            if journal.read().reset_effect_claim is not None else admission.get()
+                        )
+                    except ProgramRunnerError as error:
+                        reject(error)
                 else:
                     assert release is not None
                 try:

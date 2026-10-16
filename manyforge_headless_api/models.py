@@ -683,6 +683,7 @@ class ManagerApplyPreparedActivation(StrictRequest):
 
 
 class ManagerApplyRequest(CallerAttributionRequest):
+    scene_initialization: Literal["preserve", "initialize"] = "preserve"
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     expected_current: ExpectedCurrentRequest
@@ -711,6 +712,11 @@ class ManagerApplyRequest(CallerAttributionRequest):
 
     @model_validator(mode="after")
     def require_busy_rejection(self) -> "ManagerApplyRequest":
+        if (
+            self.prepared_activation.origin.kind == "sealed_canonical_empty"
+            and self.scene_initialization != "preserve"
+        ):
+            raise ValueError("sealed canonical empty Apply requires Scene preservation")
         if not self.reject_if_affected_busy:
             raise ValueError("reject_if_affected_busy must be true")
         if (self.expected_admission_generation is None) == (
@@ -823,6 +829,8 @@ class ProgramSelectionStartRequest(ProgramSelectionResumeRequest):
 
 
 class ProgramCycleResetRequest(ExecutionControlAttributionRequest):
+    reload_initial_scene: bool = False
+    reset_robot_position: bool = False
     program_run_id: str | None
     expected_owner_epoch: str
     expected_cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
@@ -1324,6 +1332,7 @@ class ManagerApplyStatus(StrictRequest):
     """
 
     apply_id: str
+    scene_initialization: Literal["preserve", "initialize"]
     apply_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     request_id: str
     request_owner_epoch: str
@@ -1973,6 +1982,29 @@ class ProgramResetSceneAuthorizationRequest(StrictRequest):
         )
 
 
+class ProgramResetClaimSceneContextRequest(StrictRequest):
+    request_owner_epoch: Annotated[str, Field(min_length=1, max_length=256)]
+    request_id: Annotated[str, Field(min_length=1, max_length=256)]
+    request_payload_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    reset_claim_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+
+    @field_validator("request_owner_epoch", "request_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+class ProgramResetClaimSceneAuthorizationRequest(StrictRequest):
+    program_runner_owner_epoch: Annotated[str, Field(min_length=1, max_length=256)]
+    cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    reset_claim: ProgramResetClaimSceneContextRequest
+
+    @field_validator("program_runner_owner_epoch")
+    @classmethod
+    def validate_identity(cls, value: str) -> str:
+        return _bounded_nfc(value, label="program_runner_owner_epoch", maximum_bytes=MAX_IDENTITY_BYTES)
+
+
 class ProgramNodeAdmissionEvidenceRequest(StrictRequest):
     """Exact runtime-node attribution; the Kernel checks the sealed owner API."""
 
@@ -2012,7 +2044,9 @@ class SceneTransactionRequest(StrictRequest):
     expected_admission_generation: Annotated[
         int | None, Field(ge=1, le=9_007_199_254_740_991)
     ] = None
-    program_reset_scene_authorization: ProgramResetSceneAuthorizationRequest | None = (
+    program_reset_scene_authorization: (
+        ProgramResetSceneAuthorizationRequest | ProgramResetClaimSceneAuthorizationRequest | None
+    ) = (
         None
     )
     program_node_evidence: ProgramNodeAdmissionEvidenceRequest | None = None

@@ -475,6 +475,8 @@ RetainedObservedStateChannel::initialize_from_projection(
     positions.push_back(position_value(position));
   }
   std::vector<double> velocities(positions.size(), 0.0);
+  if (config_.source_kind == core::ObservedStateSourceKind::kCommandedState)
+    return publish_commanded_initialization_and_project(positions, velocities, timestamp_ns);
   return publish_and_project(positions, velocities, timestamp_ns, timestamp_ns,
                              RetainedStateProjectionMode::kBlocking);
 }
@@ -499,6 +501,38 @@ RetainedStateProjectionResult RetainedObservedStateChannel::publish_state(
     const std::int64_t source_timestamp_ns,
     const std::int64_t received_timestamp_ns) {
   std::lock_guard route_lock(route_rebind_mutex_);
+  return publish_state_locked(positions_si, velocities_si, source_timestamp_ns,
+                              received_timestamp_ns);
+}
+
+RetainedStateProjectionResult RetainedObservedStateChannel::publish_commanded_initialization_and_project(
+    const std::span<const double> positions_si, const std::span<const double> velocities_si,
+    const std::int64_t initialized_at_ns) {
+  {
+    std::lock_guard route_lock(route_rebind_mutex_);
+    if (config_.source_kind != core::ObservedStateSourceKind::kCommandedState ||
+        initialized_at_ns < 0 || velocities_si.size() != positions_si.size() ||
+        !std::all_of(positions_si.begin(), positions_si.end(), [](double position) {
+          return std::isfinite(position);
+        }) ||
+        !std::all_of(velocities_si.begin(), velocities_si.end(), [](double velocity) {
+          return std::isfinite(velocity) && velocity == 0.0;
+        }))
+      return {RetainedStateProjectionStatus::kRejected,
+              channel_error("commanded_initialization_invalid",
+                            "Simulator initialization requires a commanded pose with zero derivatives")};
+    const auto published = publish_state_locked(positions_si, velocities_si,
+                                                initialized_at_ns, initialized_at_ns);
+    if (!published.applied()) return published;
+    minimum_adapter_source_stamp_ = std::max(minimum_adapter_source_stamp_.value_or(0),
+                                            initialized_at_ns);
+  }
+  return project_latest(initialized_at_ns, RetainedStateProjectionMode::kBlocking);
+}
+
+RetainedStateProjectionResult RetainedObservedStateChannel::publish_state_locked(
+    const std::span<const double> positions_si, const std::span<const double> velocities_si,
+    const std::int64_t source_timestamp_ns, const std::int64_t received_timestamp_ns) {
   // Route changes cannot alter physical shape/names; reuse the construction
   // context on this per-sample path instead of copying routing metadata.
   const auto &context = projection_context_;
@@ -540,6 +574,9 @@ RetainedObservedStateChannel::publish_adapter_state(
     const std::int64_t source_timestamp_ns,
     const std::int64_t received_timestamp_ns) {
   std::lock_guard route_lock(route_rebind_mutex_);
+  if (source == core::ObservedRobotStateSourceKind::kCommandedState &&
+      minimum_adapter_source_stamp_ && source_timestamp_ns <= *minimum_adapter_source_stamp_)
+    return {false, false, false, 0U, "commanded_sample_precedes_backend_initialization"};
   const auto published = publication_.publish(
       addressed_source_kind(source), source_joint_names, positions_si,
       velocities_si, source_timestamp_ns, received_timestamp_ns);

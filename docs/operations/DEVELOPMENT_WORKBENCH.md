@@ -148,8 +148,40 @@ Run every command from the repository root.
 **After a host reboot** the workbench does not start by itself. Its container
 is left `Exited`; run the start command again, which removes the stale
 container on its own. Durable journals, incidents and runtime files remain on
-the host; keeping those records does not resume motion or a Program. The
-selected saved Scenario is loaded through the ordinary startup path.
+the host as evidence. Every full development workbench restart creates a fresh
+empty cell; previous runtime state is never adopted or replayed. An explicitly
+supplied `--project` still uses the ordinary startup Load path. Without it, Load
+the Saved Scenario in Composer when ready; no Activate, Execute or Reset is
+submitted automatically.
+
+Runtime owners use `current/` below the mounted state root. Before they start,
+the launcher atomically moves the previous `current/` into
+`previous-sessions/<session-id>/`, preserving all five journal families and
+their WAL/SHM companions together. Archived files lose write permissions and
+are never passed to runtime owners. `history.sqlite3` and its companions stay
+at the stable state root; installation settings and persistent Program keys
+also retain their existing separate storage.
+
+An unclosed previous session, or readable unresolved work, produces a named
+warning in the existing Workbench notification rail. An ordinary verified
+shutdown stays quiet when remaining journal evidence is opaque; History records
+the unknown families. These facts describe durable work and process shutdown,
+not physical rest. History also records that old journal events may not have
+been imported. Reports are written durably to `session-reports/pending/`, then
+the existing historian appends each idempotently before moving it to
+`session-reports/`. A crash retries only those report appends, never old effects.
+
+The host holds the state-root flock across session selection and container
+creation; the child holds it until owned services finish. Selection follows
+confirmed old-container termination and refuses any live overlapping bind,
+including foreign containers and ancestor/child paths. The exact Docker container
+ID is recorded under that lock before the child can claim its session; an
+unbound occurrence or unavailable Docker authority remains unknown and is
+preserved. A direct launcher uses the same lock and selection. If legacy or unclosed direct state has no proof
+that its old process set stopped, it preserves that state and explains the
+missing proof instead of treating PID absence as authority. Legacy flat roots
+move only their exact recognized session entries through a durable transition;
+unknown entries or conflicting partial transitions are preserved and reported.
 
 During every start the log shows two error-looking lines before the ROS
 execution host is up. They are expected and stop once the start reports ready:
@@ -211,9 +243,9 @@ receipt instead of accumulating full-state partial copies. Unknown historical
 partials remain protected. The legacy export path can be removed once an inventory confirms that no unmounted containers remain.
 
 Q99 runs one bounded retention pass before a new container starts and after a
-confirmed stop, after checking that no running, paused or restarting ManyForge
-container uses that root. Serialize operations sharing an explicit root; the
-mount inspection is a point-in-time check. Selected roots may have symlinked
+confirmed stop, after checking that no running, paused or restarting container
+has an overlapping bind. A root flock serializes session selection and service
+ownership; the mount inspection is a point-in-time check. Selected roots may have symlinked
 ancestors; links leading to a unit folder remain protected, with an
 accounting-incomplete warning. Other independently eligible units can
 still rotate. Links inside a positively owned unit may be unlinked; their targets
@@ -229,8 +261,8 @@ discovery of custom roots.
 
 Only older completed console captures, superseded generated controller-launch
 artifact epochs, and older owned host ROS log sessions are eligible. ROS host
-logs use `execution-run/ros/<sequence>-<session-start-ns>`, stamped once before
-the first workbench service starts under the existing state-root lock. The
+logs use `current/execution-run/ros/<sequence>-<session-start-ns>`, stamped once before
+the first workbench service starts under the session-directory lock. The
 highest sequence identifies the latest session independently of wall-clock
 changes and is always protected; an older
 session containing a file at or after that start time is also protected.
@@ -240,7 +272,7 @@ examines at most 1,000 candidate units per pass, with sequenced sessions ahead
 of protected legacy names. A failed name listing protects
 all observed ROS sessions, while a limited deep inventory does not stop
 reclamation of independently qualified older sessions. The stable runtime-wide
-`execution-run/ros-home` preserves spawner lock coordination across controllers
+`current/execution-run/ros-home` preserves spawner lock coordination across controllers
 and epochs and is never rotated. Controller child logs retain their existing
 per-artifact `ros` directory. Running a ROS host outside the supported workbench
 requires explicit owned `ROS_HOME` and `ROS_LOG_DIR` environment paths; the host
@@ -264,6 +296,15 @@ observed units only when measured usage or the actual filesystem free-space
 floor proves pressure, oldest observed first. Protected-only or unresolved
 pressure reports a warning and stops cleanup; it never gates motion or
 startup.
+
+Whole previous-session archives are included in pressure accounting and remain
+protected. Their coverage is `not_imported`; the current interim policy grants
+no automatic journal retirement, even after an ordinary closed shutdown. Q99
+reports remaining protected pressure. There is no new fixed session-count cap;
+offline import and any future retirement/count policy remain publication
+decisions. The separate installed operator launcher is deferred to R9; the
+development launcher, including its `--operator-runtime` mode, uses these
+session paths.
 
 Each resolved immutable workbench image gets a separate cache under
 `.manyforge-dev/images/`; rebuilding the mutable image tag therefore cannot

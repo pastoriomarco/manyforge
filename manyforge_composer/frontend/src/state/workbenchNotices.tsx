@@ -53,6 +53,7 @@ export interface WorkbenchNotice {
   domain: NoticeDomain;
   title: string;
   message: string;
+  details?: string;
   actions?: NoticeAction[];
   busy?: boolean;
   /**
@@ -346,4 +347,19 @@ export function usePublishWorkbenchNotices(
     })));
   }, [publish, signature, source]);
   useEffect(() => () => withdraw(source), [source, withdraw]);
+}
+
+/** Presentation handoff only: the existing alarm owner retains ACK authority. */
+export function previousSessionAlarmHandoff(
+  currentSessionId: string | null,
+  previousHandoff: string | null,
+  receipt: unknown,
+): string | null {
+  if (currentSessionId !== null && receipt !== null && typeof receipt === 'object'
+    && Object.keys(receipt).length === 2
+    && 'session_id' in receipt && receipt.session_id === currentSessionId
+    && 'status' in receipt
+    && (receipt.status === 'registered' || receipt.status === 'acknowledged'
+      || receipt.status === 'quiet')) return currentSessionId;
+  return previousHandoff;
 }

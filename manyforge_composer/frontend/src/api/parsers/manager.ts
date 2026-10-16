@@ -188,6 +188,13 @@ const MANAGER_FENCE_STATES = new Set<ManagerApplyRecord['fence']['state']>([
   'released',
 ]);
 
+function parseSceneInitialization(value: unknown, path: string): 'preserve' | 'initialize' {
+  if (value !== 'preserve' && value !== 'initialize') {
+    return fail(path, 'preserve or initialize');
+  }
+  return value;
+}
+
 function parseManagerApplyRecord(
   value: unknown,
   path: string,
@@ -207,6 +214,7 @@ function parseManagerApplyRecord(
       'intent_digest',
       'phase',
       'prepared_activation',
+      'scene_initialization',
       'request',
       'terminal_state',
     ],
@@ -281,6 +289,7 @@ function parseManagerApplyRecord(
       path + '.apply_generation',
     ),
     applyId: stringAt(record.apply_id, path + '.apply_id'),
+    sceneInitialization: parseSceneInitialization(record.scene_initialization, path + '.scene_initialization'),
     candidateGraphRevision: stringAt(
       record.candidate_graph_revision,
       path + '.candidate_graph_revision',
@@ -936,7 +945,7 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
     'api_version', 'apply_generation', 'apply_id',
     'candidate_projection_revision', 'error', 'failure', 'last_progress',
     'ok', 'phase', 'prepared_activation', 'request_id',
-    'request_owner_epoch', 'state',
+    'request_owner_epoch', 'state', 'scene_initialization',
   ], 'managerApplyStatus');
   const apiVersion = stringAt(
     record.api_version,
@@ -1072,6 +1081,7 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
       'managerApplyStatus.apply_generation',
     ),
     applyId: stringAt(record.apply_id, 'managerApplyStatus.apply_id'),
+    sceneInitialization: parseSceneInitialization(record.scene_initialization, 'managerApplyStatus.scene_initialization'),
     candidateProjectionRevision: candidate,
     error: null,
     failure,

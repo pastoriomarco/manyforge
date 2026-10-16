@@ -573,6 +573,7 @@ function managerApplyRecordFixture(): Record<string, unknown> {
     incomplete: true,
     intent_digest: `sha256:${'f'.repeat(64)}`,
     phase: 'fence_held',
+    scene_initialization: 'preserve',
     prepared_activation: {
       schema_version: 'manyforge.prepared_activation_input.v6',
       prepared_activation_id: `sha256:${'a'.repeat(64)}`,
@@ -1236,11 +1237,14 @@ describe('Program product projections', () => {
     expect(projection.programRunId).toBe('program-run.1');
   });
 
-  it('requires the owner\'s boolean motion-held fact', () => {
+  it.each([true, false])('retains the owner\'s motion-held fact unchanged when %s', (motionHeld) => {
     const input = runtimeControlsProjection();
-    (input.execution_selections as Record<string, unknown>).motion_held = true;
-    expect(() => parseProgramRuntimeControlProjection(input)).not.toThrow();
-    for (const value of [undefined, null, 'true']) {
+    (input.execution_selections as Record<string, unknown>).motion_held = motionHeld;
+    expect(parseProgramRuntimeControlProjection(input).executionSelections.motionHeld).toBe(motionHeld);
+  });
+
+  it('requires the owner\'s boolean motion-held fact', () => {
+    for (const value of [undefined, null, 'true', 0, 1]) {
       const invalid = runtimeControlsProjection();
       const selections = invalid.execution_selections as Record<string, unknown>;
       if (value === undefined) delete selections.motion_held;
@@ -1366,7 +1370,8 @@ describe('Program product projections', () => {
       causal_client_sequence: null,
       current_command_kind: null,
       failure: null,
-      reset_phase: null,
+      reset_phase: null, reset_options: null,
+      reset_robot_position: { available: false, reason: 'unsupported' },
       allowed_commands: [],
       run_revision: 3,
       node_status_revision: 2,
@@ -1377,6 +1382,15 @@ describe('Program product projections', () => {
     };
     const cycle = parseProgramCycleStatus(input);
 
+    expect(cycle.resetRobotPosition).toEqual({ available: false, reason: 'unsupported' });
+    expect(parseProgramCycleStatus({ ...input,
+      reset_robot_position: { available: true, reason: null },
+    }).resetRobotPosition).toEqual({ available: true, reason: null });
+    for (const capability of [undefined, null, {}, { available: true, reason: 'unsupported' },
+      { available: false, reason: null }, { available: false, reason: '' },
+      { available: 1, reason: null }, { available: true, reason: null, extra: false }]) {
+      expect(() => parseProgramCycleStatus({ ...input, reset_robot_position: capability })).toThrow();
+    }
     expect(cycle.run?.runRevision).toBe(3);
     expect(cycle.runtimeControls?.runtimeControls.runtimeControlRevision).toBe(1);
     expect(() => parseProgramCycleStatus({
@@ -1412,7 +1426,8 @@ describe('Program product projections', () => {
       causal_client_sequence: null,
       current_command_kind: 'program_run',
       failure: null,
-      reset_phase: null,
+      reset_phase: null, reset_options: null,
+      reset_robot_position: { available: false, reason: 'unsupported' },
       allowed_commands: [],
       run_revision: 3,
       node_status_revision: 2,
@@ -1428,13 +1443,72 @@ describe('Program product projections', () => {
     expect(parseProgramCycleStatus({
       ...input,
       state: 'resetting',
-      reset_phase: 'stopping_motion',
+      reset_phase: 'stopping',
+      reset_options: { reload_initial_scene: false, reset_robot_position: false },
       current_command_kind: 'program_reset',
     }).run?.ownerEpoch).toBe('program-runner.epoch.1');
     expect(() => parseProgramCycleStatus({
       ...input,
       state: 'running',
     })).toThrow(/exact advertised run projection/);
+  });
+
+  it('strictly retains selected no-run Reset progress and recovery', () => {
+    const input = {
+      program_runner_owner_epoch: 'runner.1', cycle_generation: 3,
+      state: 'resetting', program_run_id: null, cycle_claim_generation: null,
+      terminal_or_settlement_reference: null, run_revision: null,
+      node_status_revision: null, runtime_control_revision: null,
+      execution_control_revision: 4, causal_correlation_id: 'reset.1',
+      causal_session_id: null, causal_client_sequence: null,
+      current_command_kind: 'program_reset', failure: null,
+      reset_phase: 'restoring_scene',
+      reset_robot_position: { available: false, reason: 'unsupported' },
+      reset_options: { reload_initial_scene: true, reset_robot_position: true },
+      allowed_commands: [], recovery_offer: null, run: null, runtime_controls: null,
+    };
+    for (const phase of ['restoring_scene', 'restoring_position', 'releasing']) {
+      expect(parseProgramCycleStatus({ ...input, reset_phase: phase }).resetOptions)
+        .toEqual({ reloadInitialScene: true, resetRobotPosition: true });
+    }
+    expect(parseProgramCycleStatus({
+      ...input, state: 'recovery_required', reset_phase: 'restoring_position',
+      failure: { failed_phase: 'restoring_position', code: 'position_failed' },
+    })).toMatchObject({ state: 'recovery_required', resetPhase: 'restoring_position',
+      resetOptions: { reloadInitialScene: true, resetRobotPosition: true } });
+    for (const change of [
+      { reset_options: undefined }, { reset_options: null },
+      { reset_options: { reload_initial_scene: true } },
+      { reset_options: { reload_initial_scene: true, reset_robot_position: 1 } },
+      { reset_options: { reload_initial_scene: true, reset_robot_position: false, extra: true } },
+      { reset_options: { reload_initial_scene: false, reset_robot_position: false } },
+      { state: 'idle_after_reset' }, { current_command_kind: 'program_run' },
+      { cycle_claim_generation: 2 }, { terminal_or_settlement_reference: digestA },
+      { reset_phase: 'stopping' }, { reset_phase: null },
+    ]) {
+      expect(() => parseProgramCycleStatus({ ...input, ...change })).toThrow();
+    }
+    for (const phase of ['restoring_scene', 'restoring_position']) {
+      const selected = phase === 'restoring_scene'
+        ? { reload_initial_scene: true, reset_robot_position: false }
+        : { reload_initial_scene: false, reset_robot_position: true };
+      expect(parseProgramCycleStatus({ ...input, reset_phase: phase, reset_options: selected })
+        .resetPhase).toBe(phase);
+      const unselected = { reload_initial_scene: !selected.reload_initial_scene,
+        reset_robot_position: !selected.reset_robot_position };
+      for (const state of ['resetting', 'recovery_required']) {
+        expect(() => parseProgramCycleStatus({ ...input, state, reset_phase: phase,
+          reset_options: unselected, failure: { failed_phase: phase } })).toThrow(/phase selected/);
+      }
+    }
+    for (const failure of [null, {}, { failed_phase: 'releasing' }]) {
+      expect(() => parseProgramCycleStatus({ ...input, state: 'recovery_required',
+        reset_phase: 'restoring_position', failure })).toThrow(/exact failed phase/);
+    }
+    expect(parseProgramCycleStatus({
+      ...input, state: 'recovery_required', current_command_kind: 'program_run',
+      reset_options: null, reset_phase: null,
+    }).resetOptions).toBeNull();
   });
 
   it('parses accepted Program Apply and rejects a mismatched Manager identity', () => {
@@ -2613,6 +2687,7 @@ describe('headless projection parsers', () => {
       },
       ok: true,
       phase: 'runtime_converged',
+      scene_initialization: 'preserve',
       prepared_activation: {
         captured_input_digest: `sha256:${'2'.repeat(64)}`,
         deployment_artifact_id: 'deployment-1',
@@ -2625,6 +2700,10 @@ describe('headless projection parsers', () => {
       state: 'pending',
     };
     expect(parseManagerApplyStatus(base).phase).toBe('runtime_converged');
+    expect(parseManagerApplyStatus({ ...base, scene_initialization: 'initialize' }).sceneInitialization).toBe('initialize');
+    for (const purpose of [undefined, true, 'initialize_once']) {
+      expect(() => parseManagerApplyStatus({ ...base, scene_initialization: purpose })).toThrow();
+    }
     // A non-executable Program is reported by a null binding, not a failure.
     expect(parseManagerApplyStatus({
       ...base,
@@ -2700,6 +2779,53 @@ describe('headless projection parsers', () => {
     expect(structural.headless).toBeNull();
     expect(headless.mode).toBe('headless_client');
     expect(headless.runtimeAvailability).toBeNull();
+    expect(structural.workbenchSessionNotice).toBeNull();
+  });
+
+  it('parses the optional projected previous-session notice without classifying it', () => {
+    const notice = {
+      schema_version: 'manyforge.workbench_previous_session.v1',
+      session_id: 'a'.repeat(32),
+      archive_relative_path: `previous-sessions/${'a'.repeat(32)}`,
+      shutdown: 'clean',
+      effects: 'unknown',
+      history_coverage: 'not_imported',
+      journal_families: ['program_cycle', 'scene', 'manager', 'cclc', 'kernel_operation'],
+      message: 'Previous session journals retained; effects are unknown.',
+    };
+    const health = {
+      status: 'ok', mode: 'headless_client', components: {},
+      runtimeAvailability: null, timestamp: 1,
+      workbench_session_notice: notice,
+    };
+    const parsed = parseHealthResponse(health).workbenchSessionNotice;
+    expect(parsed).toEqual({
+      schemaVersion: notice.schema_version,
+      sessionId: notice.session_id,
+      archiveRelativePath: notice.archive_relative_path,
+      shutdown: 'clean', effects: 'unknown', historyCoverage: 'not_imported',
+      journalFamilies: notice.journal_families, message: notice.message,
+    });
+    expect(parseHealthResponse({ ...health, workbench_session_notice: null })
+      .workbenchSessionNotice).toBeNull();
+
+    for (const invalid of [
+      { ...notice, schema_version: 'other' },
+      { ...notice, session_id: 'A'.repeat(32) },
+      { ...notice, archive_relative_path: `previous-sessions/${'b'.repeat(32)}` },
+      { ...notice, shutdown: 'verified' },
+      { ...notice, effects: 'safe' },
+      { ...notice, history_coverage: 'imported' },
+      { ...notice, journal_families: notice.journal_families.slice(1) },
+      { ...notice, journal_families: [...notice.journal_families].reverse() },
+      { ...notice, message: '\u00e9'.repeat(513) },
+      { ...notice, message: 'e\u0301' },
+      { ...notice, message: '\ud800' },
+      { ...notice, extra: true },
+    ]) {
+      expect(() => parseHealthResponse({ ...health, workbench_session_notice: invalid }))
+        .toThrow('health.workbench_session_notice');
+    }
   });
 
   it('parses exact Manager status, graph, and diff identities', () => {
@@ -3902,6 +4028,39 @@ describe('addressed Robot Control parsers', () => {
     expect(stoppedStatus.cellStopAction.latestTerminal?.executedStages[0])
       .toMatchObject({ executedMode: 'hard_deceleration', stageIndex: 1 });
     expect(stoppedStatus.cellStopAction.fault?.latchId).toBe('stop-fault.1');
+
+    // Strict pneumatic targets expose a model coordinate for display, without
+    // claiming an authoritative finger observation. The control shell must
+    // accept that typed absence while preserving position-gripper validation.
+    const pneumaticAbsent = structuredClone(response);
+    Object.assign(pneumaticAbsent.status.direct_control_gripper.target_descriptor, {
+      actuation_kind: 'pneumatic', completion_policy: 'output_delivery',
+      grasp_confirmation_policy: 'not_required', state_authority_class: 'commanded',
+    });
+    Object.assign(pneumaticAbsent.status.direct_control_gripper, { observed_state: null });
+    const pneumaticWire = composed(pneumaticAbsent);
+    for (const parsed of [
+      parseExecutionOwnerStatus(pneumaticWire),
+      parseExecutionControlStatus(
+        { ...targetsResponse, targets: pneumaticWire.status.targets },
+        { ...controlResponse, control_state: pneumaticWire.status.control_state },
+      ),
+    ]) {
+      expect(parsed.directControlGripper?.targetDescriptor.actuationKind).toBe('pneumatic');
+      expect(parsed.directControlGripper?.sourceKind).toBe('model_role');
+      expect(parsed.observedGripper).toBeNull();
+      expect(parsed.observedMotion?.positionsRad).toEqual(observedMotion.positions_rad);
+    }
+    const positionAbsent = structuredClone(response);
+    Object.assign(positionAbsent.status.direct_control_gripper, { observed_state: null });
+    expect(() => parseExecutionOwnerStatus(composed(positionAbsent)))
+      .toThrow(/a model-backed observation/);
+    const invalidPneumaticObservation = structuredClone(pneumaticAbsent);
+    Object.assign(invalidPneumaticObservation.status.direct_control_gripper, {
+      observed_state: { ...observedGripper, source_coordinate_name: 'another_finger' },
+    });
+    expect(() => parseExecutionOwnerStatus(composed(invalidPneumaticObservation)))
+      .toThrow(StructuralContractError);
 
     const componentLocal = structuredClone(response);
     Object.assign(componentLocal.status.direct_control_gripper.resource, {

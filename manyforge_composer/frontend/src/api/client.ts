@@ -151,6 +151,20 @@ import type {
   CCLCTransactionStatus,
 } from '../types/cclc';
 
+/** Exact verified Close and both-Draft fence for its temporary editor clear. */
+export interface CompletedScenarioCloseContext {
+  sceneOwnerId: string;
+  sceneOwnerEpoch: string;
+  sceneProjectionRevision: import('../types/api').ProjectionRevision;
+  managerOwnerId: string;
+  managerOwnerEpoch: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  publication: Record<string, import('../types/api').JsonValue>;
+  deploymentDraftId: string;
+  expectedDeploymentDraftRevision: number;
+}
+
 export interface HistorianListQuery {
   startNs?: string;
   endNs?: string;
@@ -937,6 +951,14 @@ export const api = {
       parseProgramWorkspaceResponse,
       signal,
       { method: 'POST', body: JSON.stringify(fence) },
+    ),
+    clearClosedScenario: (
+      fence: LocalWorkspaceFenceRequest,
+      completedClose: CompletedScenarioCloseContext,
+      signal?: AbortSignal,
+    ): Promise<ProgramWorkspaceResponse> => requestJson(
+      '/api/program/new-draft', parseProgramWorkspaceResponse, signal,
+      { method: 'POST', body: JSON.stringify({ ...fence, confirmDiscard: true, completedClose }) },
     ),
     newDraft: (
       fence: LocalWorkspaceFenceRequest,

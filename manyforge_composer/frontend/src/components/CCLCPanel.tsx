@@ -1,15 +1,15 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 
 import type { CCLCController } from '../hooks/useCCLC';
-import { useCCLC } from '../hooks/useCCLC';
 import type {
   CCLCComponentSnapshot,
+  CCLCLifecycleFactValue,
   CCLCLifecycleIntent,
   CCLCRouteTemplate,
 } from '../types/cclc';
 import { OverlayPanel } from './OverlayPanel';
-import { useOperationalErrorMirror } from '../state/operationalErrors';
 import {
+  type ComponentLifecycleTone,
   componentLifecyclePresentation,
   componentLifecycleToneClass,
   componentReadinessDomainPresentation,
@@ -58,39 +58,64 @@ export function lifecycleActionUnavailableReason(
   return null;
 }
 
+const TONE_DOT: Record<ComponentLifecycleTone, string> = {
+  ready: 'status-ready',
+  waiting: 'status-waiting',
+  held: 'status-warning',
+  intervention: 'status-fault',
+};
+
+function factValue(value: CCLCLifecycleFactValue): string {
+  return value.kind === 'unknown' ? 'unknown'
+    : value.kind === 'boolean' ? String(value.booleanValue)
+      : value.kind === 'integer' ? String(value.integerValue) : value.tokenValue;
+}
+
+/** Current state of one component: verdict, owner errors, then raw owner facts on demand. */
 function ComponentLifecycleSummary({ snapshot }: { snapshot: CCLCComponentSnapshot }) {
   const presentation = componentLifecyclePresentation(snapshot);
+  const problems = snapshot.readiness.domains.flatMap((domain) => {
+    const planError = readinessErrorPresentation(domain.error);
+    const diagnostic = domain.health?.diagnostic ? readinessErrorPresentation(domain.health.diagnostic) : null;
+    return [planError, diagnostic !== planError ? diagnostic : null]
+      .filter((text): text is string => text !== null);
+  });
+  const measured = readinessErrorPresentation(snapshot.readiness.measuredState.error);
   return (
     <div className="cclc-lifecycle-summary" role="status" aria-label="Component lifecycle status">
-      <span className={componentLifecycleToneClass(presentation.tone)}>
-        {presentation.message}
-      </span>
-      <p className="muted">Requested target: {presentation.target}</p>
-      <p className="muted">Achieved: {presentation.achieved}</p>
-      <p className="muted">Readiness: {presentation.readiness}</p>
-      {snapshot.readiness.domains.map((domain) => {
-        const presented = componentReadinessDomainPresentation(domain);
-        const planError = readinessErrorPresentation(domain.error);
-        const diagnostic = domain.health?.diagnostic
-          ? readinessErrorPresentation(domain.health.diagnostic) : null;
-        return (
-          <div key={`${domain.providerOccurrence.controlDomainId}:${domain.providerOccurrence.providerInstanceId}`}>
-            <p>{domain.providerOccurrence.controlDomainId}: {presented.state}</p>
-            {planError !== null && <p>{planError}</p>}
-            {diagnostic !== null && diagnostic !== planError && <p>{diagnostic}</p>}
-            {presented.facts.map((fact) => (
-              <p className="muted" key={fact.lifecycleFactId}>{fact.lifecycleFactId}: {
-                fact.value.kind === 'unknown' ? 'unknown'
-                  : fact.value.kind === 'boolean' ? String(fact.value.booleanValue)
-                    : fact.value.kind === 'integer' ? String(fact.value.integerValue) : fact.value.tokenValue
-              }</p>
-            ))}
-          </div>
-        );
-      })}
-      {snapshot.readiness.measuredState.error !== null && <p>{readinessErrorPresentation(snapshot.readiness.measuredState.error)}</p>}
-      {presentation.incident !== null && <p>Incident: {presentation.incident}</p>}
-      <p>{presentation.consequence}</p>
+      <div className="cclc-verdict">
+        <span className={componentLifecycleToneClass(presentation.tone)}>{presentation.message}</span>
+        <span className="muted">{presentation.consequence}</span>
+      </div>
+      {presentation.incident !== null && (
+        <p className="inline-message severity-error">Incident: {presentation.incident}</p>
+      )}
+      {[...problems, ...(measured === null ? [] : [measured])].map((problem) => (
+        <p className="inline-message severity-warning" key={problem}>{problem}</p>
+      ))}
+      <dl className="cclc-facts">
+        <dt>State</dt><dd>{presentation.achieved}</dd>
+        <dt>Requested target</dt><dd>{presentation.target}</dd>
+        <dt>Readiness</dt><dd>{presentation.readiness}</dd>
+      </dl>
+      <details className="cclc-details">
+        <summary>Control domains and owner facts</summary>
+        {snapshot.readiness.domains.map((domain) => {
+          const presented = componentReadinessDomainPresentation(domain);
+          return (
+            <div className="cclc-domain" key={`${domain.providerOccurrence.controlDomainId}:${domain.providerOccurrence.providerInstanceId}`}>
+              <p><strong>{domain.providerOccurrence.controlDomainId}</strong> · {presented.state}</p>
+              {presented.facts.length > 0 && (
+                <ul className="cclc-fact-list">
+                  {presented.facts.map((fact) => (
+                    <li key={fact.lifecycleFactId}>{fact.lifecycleFactId}: {factValue(fact.value)}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          );
+        })}
+      </details>
     </div>
   );
 }
@@ -116,15 +141,9 @@ export function CCLCPanelView({
   const {
     componentId, snapshot, routeTemplates, transaction, pendingTransaction,
     busy, readUnavailableReason, error, setComponentId, refresh,
-    reconcileTransaction, dismissError,
+    reconcileTransaction,
     submitLifecycle, submitRoute,
   } = controller;
-  useOperationalErrorMirror({
-    source: 'composer.cclc',
-    title: 'Component lifecycle or route command failed',
-    message: error,
-    onDismiss: dismissError,
-  });
   const [confirmation, setConfirmation] = useState<PendingConfirmation | null>(null);
   const primitiveMessage = transaction?.error?.details.primitive_message;
   const routeUnavailableReason = snapshot === null
@@ -136,6 +155,11 @@ export function CCLCPanelView({
         : snapshot.lifecycleState !== 'prepared' && snapshot.lifecycleState !== 'active'
           ? `Routes cannot change while the component is ${snapshot.lifecycleState}.`
           : null;
+  const activationBlocked = !enabled || !mutationAvailable || busy || controller.activationUnresolved;
+  const activationBlockedReason = !enabled ? 'CCLC owner is unavailable.'
+    : busy ? 'Another lifecycle request is being read or submitted.'
+      : controller.activationUnresolved ? 'A previous activation outcome is still being resolved.'
+        : !mutationAvailable ? mutationUnavailableReason ?? 'Lifecycle changes require current Idle admission.' : null;
 
   const confirm = async () => {
     const current = confirmation;
@@ -150,36 +174,89 @@ export function CCLCPanelView({
 
   return (
     <section className="panel cclc-panel" aria-labelledby="cclc-panel-title">
-      <header className="panel-header">
+      <header className="cclc-header">
         <div>
-          <p className="eyebrow">CCLC-owned lifecycle</p>
-          <h2 id="cclc-panel-title">Lifecycle and control route</h2>
+          <h4 id="cclc-panel-title">Lifecycle</h4>
+          <p className="muted">
+            Activate components before executing a Program. Activation prepares and enables each
+            component in Deployment order; it does not move anything.
+          </p>
         </div>
-        <span className="muted">Owner-issued state</span>
+        <div className="button-row">
+          <button type="button" className="primary-action"
+            disabled={activationBlocked || componentIds.length === 0}
+            title={activationBlockedReason ?? 'Prepare and enable every configured component in Deployment order.'}
+            onClick={() => setConfirmation({ kind: 'activation', sequence: true,
+              label: 'Activate sequence?', detail: 'Activate in the applied Deployment list order. Stop at the first failure or unknown outcome.' })}>
+            Activate all
+          </button>
+          <button type="button" className="quiet-button"
+            disabled={!enabled || busy || !componentId.trim()}
+            onClick={() => void refresh()}>
+            Refresh
+          </button>
+        </div>
       </header>
 
-      <div className="inline-fields">
-        <label>
-          Component
-          <select
-            value={componentId}
-            disabled={!enabled || busy || componentIds.length === 0}
-            onChange={(event) => setComponentId(event.target.value)}
-          >
-            {componentIds.length === 0 && <option value="">No controllable components</option>}
-            {componentIds.map((identity) => (
-              <option key={identity} value={identity}>{identity}</option>
+      {(controller.activationProgress !== null || controller.activationRefusal !== null
+        || controller.pendingActivationRequest !== null) && (
+        <div className="cclc-activation-status">
+          {controller.activationProgress !== null && <p role="status">{controller.activationProgress}</p>}
+          {controller.activationRefusal !== null && <div role="status" className="notice severity-warning">
+            <p>{controller.activationRefusal.componentId}: {
+              controller.activationRefusal.error.details.observed_fault_present === 'true' ? 'Fault — intervention required' : 'Not ready'
+            }</p>
+            {['reason', 'observed_state', 'observed_controller_loaded', 'observed_fault_present', 'observed_transport_ready'].map((field) => (
+              <p className="muted" key={field}>{field}: {controller.activationRefusal!.error.details[field] ?? 'missing'}</p>
             ))}
-          </select>
-        </label>
-        <button
-          type="button"
-          disabled={!enabled || busy || !componentId.trim()}
-          onClick={() => void refresh()}
-        >
-          Refresh
-        </button>
-      </div>
+          </div>}
+          {controller.pendingActivationRequest !== null && (
+            <div role="status" className="notice severity-warning">
+              Activation outcome unknown for {controller.pendingActivationRequest.controllable_component_id}
+              {' · request '}{controller.pendingActivationRequest.request_context.request_id}
+              <button type="button" disabled={busy} onClick={() => void reconcileTransaction()}>Reconcile</button>
+            </div>
+          )}
+          <div className="button-row">
+            {busy && controller.activationProgress !== null && (
+              <button type="button" onClick={controller.cancelActivation}>Cancel remaining activation</button>
+            )}
+            {!busy && controller.activationProgress !== null && controller.activationProgress.startsWith('Activation stopped')
+              && !controller.activationUnresolved && <button type="button" disabled={!enabled || !mutationAvailable || componentIds.length === 0}
+                onClick={() => setConfirmation({ kind: 'activation', sequence: true, label: 'Retry activation sequence?',
+                  detail: 'Run the whole current Deployment list again with fresh checks. Already Active components are skipped.' })}>Retry activation sequence</button>}
+          </div>
+        </div>
+      )}
+
+      {componentIds.length === 0 ? (
+        <p className="muted" role="status">No controllable components</p>
+      ) : (
+        <ul className="cclc-component-list" aria-label="Configured component health">
+          {componentIds.map((id) => {
+            const current = controller.componentHealth?.[id];
+            const rowSnapshot = id === componentId && snapshot !== null ? snapshot : current?.snapshot ?? null;
+            const presentation = rowSnapshot === null ? null : componentLifecyclePresentation(rowSnapshot);
+            const selected = id === componentId;
+            return (
+              <li key={id}>
+                <button type="button"
+                  className={selected ? 'cclc-component-row selected' : 'cclc-component-row'}
+                  aria-pressed={selected}
+                  disabled={!enabled || busy}
+                  onClick={() => { if (!selected) setComponentId(id); }}>
+                  <span className={`component-dot ${presentation === null ? 'status-offline' : TONE_DOT[presentation.tone]}`} aria-hidden="true" />
+                  <strong>{id}</strong>
+                  <span className="cclc-row-state">{rowSnapshot?.lifecycleState ?? 'unknown'}</span>
+                  <span className="muted cclc-row-message">
+                    {presentation?.message ?? current?.error ?? 'Current component health has not been read.'}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
 
       {snapshot === null ? (
         <p className="muted" role="status">
@@ -187,123 +264,87 @@ export function CCLCPanelView({
         </p>
       ) : (
         <div className="cclc-current-state">
-          <p>
-            <strong>{snapshot.componentId}</strong>
-            {' · '}{snapshot.lifecycleState}
-            {' · generation '}{snapshot.lifecycleGeneration}
-          </p>
+          <div className="cclc-selected-head">
+            <h5>{snapshot.componentId}</h5>
+            <span className="muted">{snapshot.lifecycleState} · generation {snapshot.lifecycleGeneration}</span>
+          </div>
           <ComponentLifecycleSummary snapshot={snapshot} />
-          <p className="muted">
-            {snapshot.domains.length} control domain(s)
-            {' · '}{snapshot.providers.length} provider occurrence(s)
-          </p>
-          {snapshot.providers.map((provider) => (
-            <div className="cclc-provider-card" key={`${provider.controlDomainId}:${provider.providerInstanceId}`}>
-              <strong>{provider.providerRuntimeUnitId}</strong>
-              <span>{provider.providerManifestId} · {provider.controlDomainId}</span>
-            </div>
-          ))}
-        </div>
-      )}
-
-      <div className="button-row cclc-lifecycle-actions" aria-label="Lifecycle requests">
-        {ACTIONS.map((action) => {
-          const reason = !enabled
-            ? 'CCLC owner is unavailable.'
-            : lifecycleActionUnavailableReason(
-              action.intent, snapshot, mutationAvailable,
-              mutationUnavailableReason, busy,
-            );
-          return (
-            <button
-              type="button"
-              key={action.intent}
-              disabled={reason !== null}
-              title={reason ?? action.detail}
-              onClick={() => setConfirmation({
-                kind: 'lifecycle',
-                intent: action.intent,
-                label: action.label,
-                detail: action.detail,
-              })}
-            >
-              {action.label}
+          <div className="button-row cclc-lifecycle-actions" aria-label="Lifecycle requests">
+            <button type="button" className="primary-action"
+              disabled={activationBlocked || snapshot.lifecycleState === 'active'}
+              title={snapshot.lifecycleState === 'active' ? 'Already active.'
+                : activationBlockedReason ?? 'Prepare if required, then Enable this component to Active.'}
+              onClick={() => setConfirmation({ kind: 'activation', sequence: false,
+                label: 'Activate component?', detail: 'Prepare if required, then Enable this component to Active.' })}>
+              Activate
             </button>
-          );
-        })}
-      </div>
-
-      <div className="button-row" aria-label="Explicit activation">
-        <button type="button" disabled={!enabled || !mutationAvailable || busy || snapshot === null || controller.activationUnresolved}
-          onClick={() => setConfirmation({ kind: 'activation', sequence: false,
-            label: 'Activate component?', detail: 'Prepare if required, then Enable this component to Active.' })}>
-          Activate
-        </button>
-        <button type="button" disabled={!enabled || !mutationAvailable || busy || componentIds.length === 0 || controller.activationUnresolved}
-          onClick={() => setConfirmation({ kind: 'activation', sequence: true,
-            label: 'Activate sequence?', detail: 'Activate in the applied Deployment list order. Stop at the first failure or unknown outcome.' })}>
-          Activate sequence
-        </button>
-        {busy && controller.activationProgress !== null && (
-          <button type="button" onClick={controller.cancelActivation}>Cancel remaining activation</button>
-        )}
-        {!busy && controller.activationProgress !== null && controller.activationProgress.startsWith('Activation stopped')
-          && !controller.activationUnresolved && <button type="button" disabled={!enabled || !mutationAvailable || componentIds.length === 0}
-            onClick={() => setConfirmation({ kind: 'activation', sequence: true, label: 'Retry activation sequence?',
-              detail: 'Run the whole current Deployment list again with fresh checks. Already Active components are skipped.' })}>Retry activation sequence</button>}
-      </div>
-      <div aria-label="Configured component health">
-        {componentIds.map((id) => {
-          const current = controller.componentHealth[id];
-          return <div key={id}><strong>{id}</strong>{current?.snapshot
-            ? <ComponentLifecycleSummary snapshot={current.snapshot} />
-            : <p>{current?.error ?? 'Current component health has not been read.'}</p>}</div>;
-        })}
-      </div>
-      {controller.activationRefusal !== null && <div role="status">
-        <p>{controller.activationRefusal.componentId}: {
-          controller.activationRefusal.error.details.observed_fault_present === 'true' ? 'Fault — intervention required' : 'Not ready'
-        }</p>
-        {['reason', 'observed_state', 'observed_controller_loaded', 'observed_fault_present', 'observed_transport_ready'].map((field) => (
-          <p key={field}>{field}: {controller.activationRefusal!.error.details[field] ?? 'missing'}</p>
-        ))}
-      </div>}
-      {controller.activationProgress !== null && <p role="status">{controller.activationProgress}</p>}
-      {controller.pendingActivationRequest !== null && (
-        <div role="status">
-          Activation outcome unknown for {controller.pendingActivationRequest.controllable_component_id}
-          {' · request '}{controller.pendingActivationRequest.request_context.request_id}
-          <button type="button" disabled={busy} onClick={() => void reconcileTransaction()}>Reconcile</button>
+            {ACTIONS.map((action) => {
+              const reason = !enabled
+                ? 'CCLC owner is unavailable.'
+                : lifecycleActionUnavailableReason(
+                  action.intent, snapshot, mutationAvailable,
+                  mutationUnavailableReason, busy,
+                );
+              return (
+                <button
+                  type="button"
+                  className="quiet-button"
+                  key={action.intent}
+                  disabled={reason !== null}
+                  title={reason ?? action.detail}
+                  onClick={() => setConfirmation({
+                    kind: 'lifecycle',
+                    intent: action.intent,
+                    label: action.label,
+                    detail: action.detail,
+                  })}
+                >
+                  {action.label}
+                </button>
+              );
+            })}
+          </div>
+          <details className="cclc-details">
+            <summary>Providers and control routes</summary>
+            <p className="muted">
+              {snapshot.domains.length} control domain(s)
+              {' · '}{snapshot.providers.length} provider occurrence(s)
+            </p>
+            {snapshot.providers.map((provider) => (
+              <div className="cclc-provider-card" key={`${provider.controlDomainId}:${provider.providerInstanceId}`}>
+                <strong>{provider.controlDomainId}</strong>
+                <span>{provider.providerManifestId} · {provider.providerRuntimeUnitId}</span>
+              </div>
+            ))}
+            <div className="cclc-routes">
+              {(routeTemplates?.templates ?? []).length === 0 ? (
+                <p className="muted">No retained route is selectable in the current state.</p>
+              ) : routeTemplates?.templates.map((template) => {
+                const desired = template.desired_configuration;
+                const routes = desired.binding_routes
+                  .map((route) => `${route.control_binding_id} → ${route.control_route_id}`)
+                  .join(', ');
+                return (
+                  <div key={desired.control_domain_id} className="cclc-route-row">
+                    <span><strong>{desired.control_domain_id}</strong>{' · '}{routes}</span>
+                    <button
+                      type="button"
+                      disabled={routeUnavailableReason !== null}
+                      title={routeUnavailableReason ?? 'Select this retained route'}
+                      onClick={() => setConfirmation({
+                        kind: 'route', template, label: 'Select control route',
+                        detail: `${desired.control_domain_id}: ${routes}`,
+                      })}
+                    >
+                      Select route
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </details>
         </div>
       )}
-
-      <div className="cclc-routes">
-        <h3>Control routes</h3>
-        {(routeTemplates?.templates ?? []).length === 0 ? (
-          <p className="muted">No retained route is selectable in the current state.</p>
-        ) : routeTemplates?.templates.map((template) => {
-          const desired = template.desired_configuration;
-          const routes = desired.binding_routes
-            .map((route) => `${route.control_binding_id} → ${route.control_route_id}`)
-            .join(', ');
-          return (
-            <div key={desired.control_domain_id} className="cclc-route-row">
-              <span><strong>{desired.control_domain_id}</strong>{' · '}{routes}</span>
-              <button
-                type="button"
-                disabled={routeUnavailableReason !== null}
-                title={routeUnavailableReason ?? 'Select this retained route'}
-                onClick={() => setConfirmation({
-                  kind: 'route', template, label: 'Select control route',
-                  detail: `${desired.control_domain_id}: ${routes}`,
-                })}
-              >
-                Select route
-              </button>
-            </div>
-          );
-        })}
-      </div>
 
       {pendingTransaction !== null && (
         <div className="cclc-transaction" role="status">
@@ -346,25 +387,15 @@ export function CCLCPanelView({
 }
 
 export function CCLCPanel({
-  enabled, componentIds, admissionGeneration, mutationAvailable,
+  enabled, componentIds, controller, mutationAvailable,
   mutationUnavailableReason,
 }: {
   enabled: boolean;
   componentIds: string[];
-  admissionGeneration: number | null;
+  controller: CCLCController;
   mutationAvailable: boolean;
   mutationUnavailableReason: string | null;
 }) {
-  const controller = useCCLC(enabled, admissionGeneration, componentIds);
-  const { componentId, setComponentId, refresh } = controller;
-  useEffect(() => {
-    const next = componentIds.includes(componentId) ? componentId : componentIds[0] ?? '';
-    if (next !== componentId) setComponentId(next);
-  }, [componentId, componentIds, setComponentId]);
-  useEffect(() => {
-    if (!enabled || !componentIds.includes(componentId)) return;
-    void refresh();
-  }, [componentId, componentIds, enabled, refresh]);
   return (
     <CCLCPanelView
       enabled={enabled}

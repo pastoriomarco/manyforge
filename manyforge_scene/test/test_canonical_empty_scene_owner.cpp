@@ -1330,6 +1330,19 @@ TEST(LogicalSceneTransactionCodec,
                 reset_request),
             logical_scene_codec_internal::EncodeRequestDigestInput(request));
 
+  reset_request.program_reset_scene_authorization = core::ProgramResetSceneAuthorizationDTO{
+      RequestOwnerEpoch("program-runner.epoch.2"), core::ProgramRunId(""),
+      core::CellAdmissionClaimGeneration(0U), core::ContentDigest(""),
+      core::ProgramResetClaimSceneAuthorizationDTO{
+          3U, RequestOwnerEpoch("operator.1"), core::RequestId("reset.1"), Digest('e'),
+          core::CellAdmissionClaimGeneration(9U)}};
+  const auto reset_claim_encoded = logical_scene_codec_internal::EncodeRequest(reset_request);
+  const auto reset_claim_decoded = DecodeCanonicalSceneTransactionRequest(reset_claim_encoded);
+  EXPECT_EQ(reset_claim_decoded.program_reset_scene_authorization,
+            reset_request.program_reset_scene_authorization);
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(reset_claim_decoded), reset_claim_encoded);
+  EXPECT_NE(reset_claim_encoded, reset_encoded);
+
   auto node_request = request;
   node_request.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
       RequestOwnerEpoch("runner.2"),
@@ -2924,7 +2937,12 @@ deployment::test::DurableLite6RetainedConsumerFixture AdoptionProduct(
   return deployment::test::materialize_lite6_retained_consumer_fixture_from(
       package_root, deployment::test::make_lite6_controllable_retention_fixture(
                         false, false, 1U, false, true, cell_id.value(),
-                        false, true, "resource", true, Digest(lifecycle_digest_digit).value()));
+                        false, true, "resource", true,
+                        Digest(lifecycle_digest_digit).value(), {}, true, false,
+                        false, std::nullopt, false,
+                        deployment::test::kLite6ArmTargetId, std::nullopt,
+                        std::nullopt, {}, {}, true, {},
+                        "manyforge.provider.ros2_control", false, true));
 }
 
 struct SceneProductAdoptionFixture final {
@@ -3684,6 +3702,111 @@ TEST(CanonicalEmptySceneOwner,
   }
 }
 
+TEST(CanonicalEmptySceneOwner,
+     RepeatedEmptyConfigurationAdoptionReplaysBeforeOrdinarySceneEdits) {
+  for (const bool no_op_between_applies : {false, true}) {
+    SCOPED_TRACE(no_op_between_applies);
+    SceneProductAdoptionFixture fixture(true);
+    const auto added = fixture.owner->Commit(AddBoxRequest(
+        fixture.owner->CurrentProjectionRevision(), fixture.admission.cell_id(),
+        "replay-add"));
+    ASSERT_TRUE(added.success);
+    std::uint64_t publication_generation = 2U;
+    const auto adopt_empty = [&](const std::string &id) {
+      const core::ApplyFenceOwnerDTO manager{ApplyId(id), ApplyGeneration(1U)};
+      const auto claim = fixture.cell_admission.AcquireCellAdmissionClaim(
+          {core::CellAdmissionClaimKindDTO::kManagerApply,
+           core::CellAdmissionOwnerRoleDTO::kManager,
+           RequestOwnerEpoch("manager.1"), id, core::RequestId(id + ".request"),
+           Digest('b'), core::AdmissionGeneration(1U), {}, std::nullopt,
+           std::nullopt});
+      ASSERT_TRUE(claim.ok());
+      const auto previous = fixture.publication_reader.ReadActiveBundlePublication(
+          ActiveBundlePublicationGeneration(publication_generation));
+      ASSERT_TRUE(previous.ok());
+      const core::ConfigurationFenceStatusQueryDTO query{
+          manager, core::ConfigurationFenceId(id + ".fence"),
+          core::ConfigurationFenceGeneration(1U), {},
+          core::RuntimeEpoch("manager-runtime.1")};
+      fixture.fence.Configure(query, previous.value());
+      const QualifiedSceneConfigurationAdoptionRequest request{
+          {manager, Digest('b'), claim.value(), query}, previous.value(),
+          fixture.owner->CurrentProjectionRevision(),
+          fixture.owner->LogicalSnapshot()->identity(),
+          fixture.admission.retained_bundle().value(), {}};
+      static_cast<void>(fixture.owner->StageOriginalManagerConfigurationAdoption(
+          request, fixture.fence, fixture.fence.OriginalAttemptQuery()));
+      const auto ready = fixture.owner->BeginOriginalManagerConfigurationAdoption(
+          request, fixture.fence);
+      ASSERT_TRUE(ready.ready_for_publication());
+      const ActiveBundlePublicationReceiptDTO publication{
+          {NamedApplyPublicationTransactionDTO{manager.apply_id,
+                                              manager.apply_generation},
+           ready.target_projection_revision,
+           ready.target_projection_revision.retained_bundle_id,
+           ready.target_projection_revision.graph_revision,
+           previous.value().publication_generation, Digest('7')},
+          ActiveBundlePublicationGeneration(++publication_generation),
+          Digest('8')};
+      fixture.publication_reader.SetCurrent(publication);
+      const auto completed =
+          fixture.owner->CompleteOriginalManagerConfigurationAdoption(
+              request, publication, fixture.fence);
+      ASSERT_EQ(completed.state,
+                core::ProjectionMaintenanceInitializationState::kCompleted);
+      const auto &held = claim.value();
+      ASSERT_TRUE(fixture.cell_admission.ReleaseCellAdmissionClaim(
+          {held.intent.owner_role, held.intent.owner_epoch,
+           held.intent.owner_transaction_id, held.intent.request_id,
+           held.intent.request_payload_digest, held.acquired_admission_generation,
+           held.claim_generation,
+           {core::CellAdmissionSettlementKindDTO::kOwnerCommit, Digest('b')}}).ok());
+    };
+    ASSERT_NO_FATAL_FAILURE(adopt_empty("replay-empty-first"));
+    const auto empty_projection = fixture.owner->CurrentProjectionRevision();
+    if (no_op_between_applies) {
+      const auto pose = fixture.owner->GetObjectPose(core::SceneResourceId("scene-box"));
+      ASSERT_TRUE(pose.ok());
+      const core::SceneTransactionRequestDTO no_op{
+          SceneRequestContext("replay-no-op", empty_projection), {},
+          empty_projection,
+          core::UpdateObjectPoseRequestDTO{
+              core::SceneResourceId("scene-box"), pose.value(),
+              core::CellSceneFrameRefDTO{fixture.admission.cell_id()},
+              std::nullopt, false},
+          core::AdmissionGeneration(1U)};
+      const auto unchanged = fixture.owner->Commit(no_op);
+      ASSERT_TRUE(unchanged.success);
+      EXPECT_EQ(unchanged.update_status, core::SceneUpdateStatusDTO::kNoOp);
+      EXPECT_EQ(unchanged.committed_projection_revision, empty_projection);
+    }
+    ASSERT_NO_FATAL_FAILURE(adopt_empty("replay-empty-second"));
+    EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), empty_projection);
+    const core::SceneTransactionRequestDTO remove{
+        SceneRequestContext("replay-remove", empty_projection), {},
+        empty_projection,
+        core::RemoveObjectRequestDTO{core::SceneResourceId("scene-box")},
+        core::AdmissionGeneration(1U)};
+    const auto removed = fixture.owner->Commit(remove);
+    ASSERT_TRUE(removed.success);
+    ASSERT_TRUE(removed.committed_projection_revision.has_value());
+    const auto final_projection = *removed.committed_projection_revision;
+    EXPECT_TRUE(fixture.owner->LogicalSnapshot()->objects.empty());
+    EXPECT_EQ(fixture.owner->VerifyIntegrity().transaction_intent_count,
+              no_op_between_applies ? 3 : 2);
+    fixture.owner.reset();
+    fixture.owner = std::make_unique<LogicalSceneOwner>(
+        fixture.database_path, fixture.admission, fixture.publication_reader,
+        fixture.bundle_source, fixture.resolver, fixture.cell_admission);
+    EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), final_projection);
+    EXPECT_TRUE(fixture.owner->LogicalSnapshot()->objects.empty());
+    EXPECT_EQ(fixture.owner->LogicalSnapshot()->transaction_sequence,
+              no_op_between_applies ? 3U : 2U);
+    EXPECT_TRUE(fixture.owner->ReadAccessStatus().scene_writes_open);
+    fixture.ExpectNoCandidateEffects();
+  }
+}
+
 TEST(CanonicalEmptySceneOwner, ConfigurationAdoptionRefusesForeignClaimIntentFenceAndScene) {
   for (const bool same_product : {false, true}) {
     SCOPED_TRACE(same_product);
@@ -4304,7 +4427,7 @@ TEST(CanonicalEmptySceneOwner,
   CopyCanonicalEmptyPackage(package_root);
   const auto admission = LoadAdmission(package_root);
   const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto bindings = NativeRuntimeBindings(candidate.bundle->value(),
                                                "runtime-initial-baseline");
@@ -4474,7 +4597,7 @@ TEST(CanonicalEmptySceneOwner,
   CopyCanonicalEmptyPackage(package_root);
   const auto admission = LoadAdmission(package_root);
   const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto bindings = NativeRuntimeBindings(candidate.bundle->value(),
                                                "runtime-initial-frame");
@@ -4531,7 +4654,7 @@ TEST(CanonicalEmptySceneOwner,
   CopyCanonicalEmptyPackage(package_root);
   const auto admission = LoadAdmission(package_root);
   const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto bindings = NativeRuntimeBindings(candidate.bundle->value(),
                                                "runtime-initial-interrupted");
@@ -4592,7 +4715,7 @@ TEST(CanonicalEmptySceneOwner,
   CopyCanonicalEmptyPackage(package_root);
   const auto admission = LoadAdmission(package_root);
   const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-maintenance-duplicate");
@@ -4639,7 +4762,7 @@ TEST(CanonicalEmptySceneOwner,
   CopyCanonicalEmptyPackage(package_root);
   const auto admission = LoadAdmission(package_root);
   const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-partial-replay");
@@ -4684,7 +4807,7 @@ TEST(CanonicalEmptySceneOwner,
   CopyCanonicalEmptyPackage(package_root);
   const auto admission = LoadAdmission(package_root);
   const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-maintenance-responsive");
@@ -4736,7 +4859,7 @@ TEST(CanonicalEmptySceneOwner,
   CopyCanonicalEmptyPackage(package_root);
   const auto admission = LoadAdmission(package_root);
   const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-maintenance-interrupted");
@@ -4807,7 +4930,7 @@ TEST(CanonicalEmptySceneOwner,
   CopyCanonicalEmptyPackage(package_root);
   const auto admission = LoadAdmission(package_root);
   const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto native_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-frame-resolution");
@@ -5155,7 +5278,7 @@ TEST(CanonicalEmptySceneOwner,
   CopyCanonicalEmptyPackage(package_root);
   const auto admission = LoadAdmission(package_root);
   const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto native_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-policy-resolution");
@@ -5432,12 +5555,12 @@ TEST(CanonicalEmptySceneOwner,
   CopyCanonicalEmptyPackage(package_root);
   const auto admission = LoadAdmission(package_root);
   const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto native_bindings = NativeRuntimeBindings(
       candidate.bundle->value(), "runtime-epoch-scene-projection");
   const auto two_robot_candidate = deployment::test::
-      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+      materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto two_robot_native_bindings = NativeRuntimeBindings(
       two_robot_candidate.bundle->value(),
@@ -5681,7 +5804,7 @@ TEST(CanonicalEmptySceneOwner,
     CopyCanonicalEmptyPackage(package_root);
     const auto native_admission = LoadAdmission(package_root);
     const auto candidate = deployment::test::
-        materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+        materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
             package_root, native_admission.cell_id().value());
     const auto native_bindings = NativeRuntimeBindings(
         candidate.bundle->value(), "runtime-epoch-scene-recovery");
@@ -5752,7 +5875,7 @@ public:
         package_root_(PreparePackages(directory_.path())),
         admission_(LoadAdmission(package_root_)),
         candidate_(deployment::test::
-                       materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+                       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
                            package_root_, admission_.cell_id().value())),
         bindings_(NativeRuntimeBindings(candidate_.bundle->value(),
                                         "runtime-epoch-provider-freshness")),

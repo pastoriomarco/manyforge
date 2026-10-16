@@ -64,6 +64,7 @@ struct RetainedNativeRuntimeConfig final {
   core::CellAdmissionReconcileValidator cell_admission_reconcile_validator;
   std::optional<core::ManagerLivenessRequiredSetDTO>
       manager_liveness_required_set;
+  core::CellAdmissionProgramResetStatusSource cell_admission_program_reset_status_source;
 };
 
 struct RetainedNativeAddressedOwnerConfig final {
@@ -79,6 +80,7 @@ struct RetainedNativeAddressedOwnerConfig final {
   core::CellAdmissionReconcileValidator cell_admission_reconcile_validator;
   std::optional<core::ManagerLivenessRequiredSetDTO>
       manager_liveness_required_set;
+  core::CellAdmissionProgramResetStatusSource cell_admission_program_reset_status_source;
 };
 
 using RetainedMotionBackendRouteRebinder = std::function<core::Result<void>(

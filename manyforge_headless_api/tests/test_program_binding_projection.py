@@ -17,10 +17,12 @@ def _origin(kind="scenario"):
 
 def _publication(kind="sealed_canonical_empty"):
     rows = [{"apply_id": "apply-1", "apply_generation": 1,
+             "scene_initialization": "initialize",
              "record_digest": "sha256:" + "a" * 64, "origin": _origin()},
             {"apply_id": "apply-2", "apply_generation": 2,
+             "scene_initialization": "preserve",
              "record_digest": "sha256:" + "b" * 64, "origin": _origin(kind)}]
-    return {"schema_version": "manyforge.committed_scenario_activation.v2", **deepcopy(rows[-1]),
+    return {"schema_version": "manyforge.committed_scenario_activation.v3", **deepcopy(rows[-1]),
             "publication_generation": 3, "program": None, "committed_applies": rows}
 
 
@@ -64,5 +66,28 @@ def test_typed_history_rejects_incomplete_or_mismatched_publication(mutation):
 def test_typed_history_validates_all_rows_before_consumer_scenario_subset(change):
     value = _publication("scenario")
     value["committed_applies"][0]["origin"] = {**_origin("sealed_canonical_empty"), **change}
+    with pytest.raises(ProgramBindingTransportError):
+        validate_committed_scenario_activation(value)
+
+
+@pytest.mark.parametrize("purpose", [None, "initialize_once", True, "", "reset"])
+def test_committed_scene_initialization_rejects_untyped_purpose(purpose):
+    value = _publication("scenario")
+    value["scene_initialization"] = purpose
+    with pytest.raises(ProgramBindingTransportError):
+        validate_committed_scenario_activation(value)
+
+
+def test_committed_scene_initialization_is_joined_to_exact_current_history():
+    value = _publication("scenario")
+    value["scene_initialization"] = "initialize"
+    with pytest.raises(ProgramBindingTransportError):
+        validate_committed_scenario_activation(value)
+
+
+def test_sealed_empty_cannot_request_scene_initialization():
+    value = _publication()
+    value["scene_initialization"] = "initialize"
+    value["committed_applies"][-1]["scene_initialization"] = "initialize"
     with pytest.raises(ProgramBindingTransportError):
         validate_committed_scenario_activation(value)

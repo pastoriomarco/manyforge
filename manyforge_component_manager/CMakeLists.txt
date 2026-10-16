@@ -461,6 +461,7 @@ if(BUILD_TESTING)
     manyforge::deployment
     manyforge_deployment_canonical_package_generator
     manyforge::scene
+    manyforge::scene_value_codec
     GTest::gtest_main)
   # The real failure/restart test owns the concrete journals. Standalone
   # Manager embeds pure Core; composed graphs can reuse its existing adapters.

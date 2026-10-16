@@ -87,11 +87,11 @@ std::string Redigest(std::string source) {
 TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   const auto catalog = OperatorAlarmCatalog::Load(PackagedCatalog());
   EXPECT_EQ(catalog.schema_version(), "manyforge.operator_alarm_catalog.v1");
-  EXPECT_EQ(catalog.catalog_version(), "2.3.0");
+  EXPECT_EQ(catalog.catalog_version(), "2.4.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "2b8fe7064ba33f340ed83a39eb498a79f17d1bd79967fe0caadd4fdb8b1429bd");
-  ASSERT_EQ(catalog.definitions().size(), 8U);
+            "e435a7ba1057ce8aa77eb324ae26d217a2dcde03641298e8484bbe8d21385727");
+  ASSERT_EQ(catalog.definitions().size(), 9U);
   const auto *collision = catalog.Find("manyforge.motion.runtime_collision");
   ASSERT_NE(collision, nullptr);
   EXPECT_EQ(collision->priority, "critical");
@@ -107,6 +107,13 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   EXPECT_FALSE(scope->acknowledgement_required);
   EXPECT_FALSE(scope->acknowledgement_reason_required);
   EXPECT_EQ(scope->version, 2U);
+  const auto *previous = catalog.Find("manyforge.runtime.previous_session_unclean");
+  ASSERT_NE(previous, nullptr);
+  EXPECT_EQ(previous->alarm_class, "runtime_health");
+  EXPECT_EQ(previous->priority, "medium");
+  EXPECT_TRUE(previous->acknowledgement_required);
+  EXPECT_FALSE(previous->acknowledgement_reason_required);
+  EXPECT_FALSE(previous->requires_motion_attention);
   EXPECT_EQ(catalog.Find("manyforge.unknown"), nullptr);
 }
 
@@ -116,7 +123,7 @@ TEST(OperatorAlarmCatalog,
   const auto parsed = deployment::parse_strict_json_model_yaml(source);
   const auto canonical_json = content_identity::canonical_json(parsed.root());
   EXPECT_EQ(OperatorAlarmCatalog::Decode(canonical_json).definitions().size(),
-            8U);
+            9U);
 
   auto tampered = source;
   const auto title = tampered.find("Runtime collision stop");

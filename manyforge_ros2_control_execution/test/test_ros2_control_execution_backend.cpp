@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <gtest/gtest.h>
 #include <memory>
 #include <mutex>
@@ -19,6 +20,10 @@ namespace manyforge::ros2_control_execution {
 // action server. Normal sends, acceptance and positive ACK use the real client.
 class JtcExecutionPortTestPeer {
 public:
+  static void receive_state(Ros2ControlExecutionBackend& port,
+      const control_msgs::msg::JointTrajectoryControllerState& message) {
+    Ros2ControlExecutionBackend::ReceiveState(port.state_, message);
+  }
   static bool executor_is_spinning(const Ros2TransportResources &resources) {
     return resources.executor_->is_spinning();
   }
@@ -276,6 +281,50 @@ private:
       scale_sub_;
 };
 std::atomic<std::uint64_t> Rig::sequence_{0};
+
+TEST(JtcExecutionPort, StateReceiptIsAcquiredBeforeStateLockAndNeverRestamped) {
+  Rig rig;
+  class AcquisitionClock final : public IClock {
+   public:
+    std::atomic<TimePoint> value{100};
+    std::function<void()> on_read;
+    TimePoint now() const override {
+      const auto acquired = value.load();
+      if (on_read) on_read();
+      return acquired;
+    }
+  } clock;
+  Ros2ControlExecutionBackend adapter(rig.resources, clock, rig.config(2));
+  adapter.ObserveReadiness({true, true, true, ExecutionBindingEpoch(2)});
+  std::promise<void> entered;
+  auto acquisition = entered.get_future();
+  auto lock_probe = std::async(std::launch::async, [&] {
+    acquisition.wait();
+    return adapter.ReadReadiness();
+  });
+  bool read_outside_state_lock = false;
+  clock.on_read = [&] {
+    entered.set_value();
+    read_outside_state_lock = lock_probe.wait_for(1s) == std::future_status::ready;
+    clock.value.store(200); // Initialization/delivery time advances independently.
+  };
+  control_msgs::msg::JointTrajectoryControllerState message;
+  message.header.stamp.sec = 7;
+  message.joint_names = {"a", "b"};
+  message.reference.positions = {0.1, 0.2};
+  message.reference.velocities = {0.0, 0.0};
+  message.output.positions = {0.1, 0.2};
+  message.feedback.positions = {0.1, 0.2};
+  message.error.positions = {0.0, 0.0};
+  JtcExecutionPortTestPeer::receive_state(adapter, message);
+  static_cast<void>(lock_probe.get());
+  EXPECT_TRUE(read_outside_state_lock);
+  const auto sample = adapter.ReadSample();
+  ASSERT_TRUE(sample);
+  EXPECT_EQ(sample->local_receipt_stamp_ns, 100);
+  EXPECT_EQ(sample->source_stamp_ns, 7'000'000'000LL);
+  EXPECT_EQ(clock.value.load(), 200);
+}
 
 TEST(JtcExecutionPort, EndpointFactsKeepRetainedBindingsAndScalingPublishersSeparate) {
   Rig rig(true);

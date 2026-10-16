@@ -56,6 +56,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     serve.add_argument("--alarm-catalog-path", type=Path, required=True)
     serve.add_argument("--historian-database-path", type=Path, required=True)
+    serve.add_argument("--workbench-previous-session-reports-root", type=Path)
+    serve.add_argument("--workbench-previous-session-id")
     serve.add_argument("--manager-run-root", type=Path, required=True)
     serve.add_argument("--execution-run-root", type=Path, required=True)
     serve.add_argument("--cell-id", required=True)
@@ -187,6 +189,8 @@ def _serve(args: argparse.Namespace) -> int:
         node_environment_manifest_path=args.node_environment_manifest_path,
         alarm_catalog_path=args.alarm_catalog_path,
         historian_database_path=args.historian_database_path,
+        workbench_previous_session_reports_root=args.workbench_previous_session_reports_root,
+        workbench_previous_session_id=args.workbench_previous_session_id,
         manager_run_root=args.manager_run_root,
         execution_run_root=args.execution_run_root,
         cell_id=args.cell_id,

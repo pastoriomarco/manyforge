@@ -100,7 +100,12 @@ class _IncidentGuard:
         self.ready = False
         self.reason: str | None = None
         try:
-            self.state_fd = _open_relative_directory(root_fd, Path("execution-state"))
+            try:
+                os.stat("current", dir_fd=root_fd, follow_symlinks=False)
+                self.state_relative = Path("current/execution-state")
+            except FileNotFoundError:
+                self.state_relative = Path("execution-state")
+            self.state_fd = _open_relative_directory(root_fd, self.state_relative)
             resources.callback(os.close, self.state_fd)
             self.journal_fd = os.open("cclc-journal.sqlite3", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.state_fd)
             resources.callback(os.close, self.journal_fd)
@@ -136,7 +141,7 @@ class _IncidentGuard:
     def check(self) -> None:
         if not self.ready:
             return
-        state = os.stat("execution-state", dir_fd=self.root_fd, follow_symlinks=False)
+        state = os.stat(self.state_relative, dir_fd=self.root_fd, follow_symlinks=False)
         held_state = os.fstat(self.state_fd)
         journal = os.stat("cclc-journal.sqlite3", dir_fd=self.state_fd, follow_symlinks=False)
         if ((state.st_dev, state.st_ino) != (held_state.st_dev, held_state.st_ino) or
@@ -529,7 +534,16 @@ def _units(root: Path, *, sibling: bool = False, ownership_root: Path | None = N
         if completed:
             latest = max(completed, key=lambda folder: folder.name)
             units = [(folder, reason or ("most recent console capture" if folder == latest else None), order) for folder, reason, order in units]
-    artifacts = root / "execution-run/controller-launch-artifacts"
+    # Cold-session archives contain the original owner journals, including
+    # facts not imported into History. DX996/DX1003 preserve every archive;
+    # account for disk pressure, but grant no new journal retirement authority.
+    previous = root / "previous-sessions"
+    if _safe_inventory_path(previous, root, ownership_root, warnings) and previous.exists():
+        for folder in _children(previous, warnings, str(ownership_root / "previous-sessions")):
+            if _safe_inventory_path(folder, root, ownership_root, warnings) and folder.is_dir():
+                units.append((folder, "previous-session journals kept; history coverage not_imported or unknown", None))
+    runtime = root / "current" if (root / "current").exists() else root
+    artifacts = runtime / "execution-run/controller-launch-artifacts"
     if _safe_inventory_path(artifacts, root, ownership_root, warnings) and artifacts.exists():
         for bundle in _children(artifacts, warnings, str(ownership_root / "execution-run/controller-launch-artifacts")):
             if not _safe_inventory_path(bundle, root, ownership_root, warnings) or not bundle.is_dir():
@@ -549,7 +563,7 @@ def _units(root: Path, *, sibling: bool = False, ownership_root: Path | None = N
                 elif order == newest:
                     reason = reason or "latest controller-launch artifact epoch (equal marker times protected)"
                 units.append((epoch, reason, order))
-    ros_logs = root / "execution-run/ros"
+    ros_logs = runtime / "execution-run/ros"
     if _safe_inventory_path(ros_logs, root, ownership_root, warnings) and ros_logs.exists():
         folders, latest = _ros_session_candidates(ros_logs, warnings, str(ownership_root / "execution-run/ros"))
         sessions = [folder for folder in folders

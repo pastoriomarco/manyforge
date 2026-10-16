@@ -1,6 +1,7 @@
 #pragma once
 
 #include "execution_host_config.hpp"
+#include <manyforge_roboplan/program_reset_position.hpp>
 #include <array>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/pick_place_planning_owner.hpp>
@@ -155,6 +156,8 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value);
 enum class CommandKind {
   kStatus,
   kIdentity,
+  kResetRobotPositionCapability,
+  kResetRobotPosition,
   kTargets,
   kQueryTarget,
   kQueryOperation,
@@ -274,6 +277,7 @@ struct Command final {
   std::optional<core::ProgramRunExecutionCaptureDTO> program_capture;
   std::optional<core::ProgramExecutionSelectionRequestDTO> program_selection;
   std::optional<core::ProgramNodeMotionAttentionCheckDTO> program_node_attention;
+  std::optional<ProgramResetPositionRequest> reset_robot_position;
   std::uint64_t expected_selection_revision{};
   std::optional<core::ContentDigest> operation_digest;
   std::optional<core::OperationId> operation_id;

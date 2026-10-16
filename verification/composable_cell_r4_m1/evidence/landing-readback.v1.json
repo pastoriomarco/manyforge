@@ -1,0 +1,59 @@
+{
+  "schema": "manyforge.composable_cell.r4_m1.landing_readback.v1",
+  "status": "EXACT_IMPORT_READBACK_PASS_THEN_COMMITTED",
+  "date": "2026-10-15",
+  "implementation_landing_commit": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+  "provenance": [
+    {
+      "historical_receipt_id": "m1-final-original-import-independent-readback01.json",
+      "sha256": "47a18a7c486e28b2cad608585e8e79b06f75b12c52729226d22c20f606f0cd88"
+    },
+    {
+      "historical_receipt_id": "m1-final-1face-manager-and-integration-independent-review01.json",
+      "sha256": "b87fc2b28fefca1c111ab76c5834f55d61a1e6fa816b60a8a0e06be1ff2070bd"
+    }
+  ],
+  "retention_note": "This self-contained summary preserves reviewed results and limitations. Historical receipt identifiers and digests are provenance, not a promise that disposable raw files or remote paths remain available. No new execution is reported.",
+  "implementation_commit": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+  "pre_import_HEAD": "cdf1a917e9a3aee0dba724d639d9aaf83bc77538",
+  "landed_source_manifest_sha256": "1face8ad9994e97ced753142ccd45e58fe99d3b1ce524e459dcd6523d2e3ae82",
+  "import_counts": {
+    "modified": 283,
+    "deleted": 9,
+    "new": 8,
+    "total_paths": 300,
+    "copied_current_files": 291
+  },
+  "independent_readback": {
+    "Git_summary_only9_expected_deletions_no_mode_changes": true,
+    "HEAD_unchanged": "cdf1a917e9a3aee0dba724d639d9aaf83bc77538",
+    "all291_imported_file_bytes_and_reviewed_new_files": true,
+    "all9_deletions_absent": true,
+    "all_existing_original_modes_preserved": true,
+    "diff_check_clean": true,
+    "external_dependencies_verified": 523,
+    "full3408_compiled_manifest_content_verified": true,
+    "modified283_deleted9_new8_exact_status_set": true,
+    "no_staged_changes": true,
+    "no_unexpected_nonignored_artifacts": true,
+    "raw_index_before_after_unchanged": "584c3276cdafff7ee742e8d5229a3741c33054d1d9e93e7e48096a81f2a11f32",
+    "untouched_tracked_files_verified": 2594,
+    "vision_guided_bin_pick_program_mode": "0600"
+  },
+  "post_commit_pre_summary_state": {
+    "HEAD": "d3920e13f0f9560a6b83fd8329570a6bb64d17c2",
+    "tracked_and_untracked_clean": true,
+    "note": "Verified immediately before creating these nine result records; records themselves are new uncommitted additions."
+  },
+  "safeguards": [
+    "All300 intended paths/bytes/deletions and preserved original modes verified",
+    "2594 untouched tracked files and523 external dependencies verified unchanged",
+    "No optional format wrapper applied",
+    "Pre-import raw index was preserved by import; later authorized commit necessarily updates index and HEAD",
+    "No source mutation, staging, commit or deletion by this result-preservation task"
+  ],
+  "limits": [
+    "Readback proves exact landing, not a new test run",
+    "No claim that old source snapshots/worktrees/raw evidence remain available indefinitely"
+  ]
+}

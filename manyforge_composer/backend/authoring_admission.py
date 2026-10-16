@@ -632,12 +632,12 @@ class AuthoringAdmissionCoordinator:
                 admission_generation=envelope.expected_admission_generation,
             )
 
-    def submit_execution_start(self, callback: Callable[[], Any]) -> Any:
-        """Serialize an execution start with Composer's local Draft commits.
+    def submit_workspace_fenced(self, callback: Callable[[], Any]) -> Any:
+        """Serialize a workspace-fenced owner submission with local authoring commits.
 
         The callback checks the current workspace and submits to Headless while
         the same short lock used by local mutations is held. Headless/Kernel
-        still own the execution admission and return its authoritative receipt.
+        still own effect admission and return its authoritative receipt.
         Stop uses its independent priority lane and never takes this lock.
         """
 

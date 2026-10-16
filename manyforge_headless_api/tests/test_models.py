@@ -852,6 +852,13 @@ def test_apply_requires_one_exact_ua2a_prepared_activation() -> None:
             "receipt_digest": "sha256:" + "c" * 64,
         },
     }
+    assert ManagerApplyRequest.model_validate(body).scene_initialization == "preserve"
+    assert ManagerApplyRequest.model_validate({**body, "scene_initialization": "initialize"}).scene_initialization == "initialize"
+    with pytest.raises(ValidationError, match="sealed canonical empty"):
+        ManagerApplyRequest.model_validate({**body, "prepared_activation": _sealed_prepared_activation(),
+                                           "scene_initialization": "initialize"})
+    with pytest.raises(ValidationError):
+        ManagerApplyRequest.model_validate({**body, "scene_initialization": "inferred"})
     request = ManagerApplyRequest.model_validate(body)
     assert request.prepared_activation.program_outcome == {
         "kind": "bound",
@@ -937,6 +944,7 @@ def _status_body() -> dict[str, object]:
     prepared = _prepared_activation()
     return {
         "apply_id": "apply.3",
+        "scene_initialization": "preserve",
         "apply_generation": 3,
         "request_id": "request.3",
         "request_owner_epoch": "client.epoch.3",
@@ -1613,3 +1621,54 @@ def test_sealed_origin_refuses_mixed_or_unbounded_identity(field, wrong) -> None
     value = _sealed_prepared_activation()
     with pytest.raises(ValidationError):
         ManagerApplyPreparedActivation.model_validate({**value, "origin": {**value["origin"], field: wrong}})
+
+
+@pytest.mark.parametrize("option", ["reload_initial_scene", "reset_robot_position"])
+@pytest.mark.parametrize("value", [None, 0, 1, "true", "false", [], {}])
+def test_program_reset_options_are_strict_default_off(option, value):
+    from manyforge_headless_api.models import ProgramCycleResetRequest
+    body = {"request_id": "reset.1", "request_owner_epoch": "caller.1", "source_label": "operator_ui",
+            "correlation_id": None, "program_run_id": None, "expected_owner_epoch": "runner.1",
+            "expected_cycle_generation": 1}
+    parsed = ProgramCycleResetRequest.model_validate(body)
+    assert parsed.reload_initial_scene is False and parsed.reset_robot_position is False
+    with pytest.raises(ValidationError):
+        ProgramCycleResetRequest.model_validate({**body, option: value})
+
+
+def test_no_run_selected_reset_requires_retained_options_and_truthful_phase():
+    from manyforge_headless_api.program_cycle import ProgramCycleStatusDTO
+    cycle = {"program_runner_owner_epoch": "runner.1", "cycle_generation": 1,
+             "state": "resetting", "program_run_id": None, "cycle_claim_generation": None,
+             "terminal_or_settlement_reference": None, "execution_control_revision": 2,
+             "causal_correlation_id": "reset.1", "causal_session_id": None, "causal_client_sequence": None,
+             "current_command_kind": "program_reset", "failure": None, "reset_phase": "restoring_scene",
+             "reset_options": {"reload_initial_scene": True, "reset_robot_position": False},
+             "reset_robot_position": {"available": False, "reason": "unsupported"}, "allowed_commands": []}
+    ProgramCycleStatusDTO.model_validate(cycle)
+    failure = {"code": "scene_failed", "failed_phase": "restoring_scene"}
+    recovery = {**cycle, "state": "recovery_required", "failure": failure}
+    ProgramCycleStatusDTO.model_validate(recovery)
+    for change in ({"reset_options": None}, {"reset_phase": "stopping"},
+                   {"cycle_claim_generation": 1}, {"current_command_kind": None},
+                   {"reset_options": {"reload_initial_scene": False, "reset_robot_position": False}},
+                   {"reset_robot_position": {"available": True, "reason": "unsupported"}},
+                   {"reset_robot_position": {"available": False, "reason": None}}):
+        with pytest.raises(ValidationError):
+            ProgramCycleStatusDTO.model_validate({**cycle, **change})
+    with pytest.raises(ValidationError):
+        ProgramCycleStatusDTO.model_validate({**recovery, "failure": {"code": "scene_failed", "failed_phase": "releasing"}})
+
+
+def test_idle_reset_scene_authorization_is_a_closed_union_with_the_existing_run_shape():
+    authorization = {"program_runner_owner_epoch": "runner.1", "cycle_generation": 3,
+                     "reset_claim": {"request_owner_epoch": "caller.1", "request_id": "reset.1",
+                                    "request_payload_digest": "sha256:" + "a" * 64, "reset_claim_generation": 7}}
+    body = {**_scene_transaction(), "program_reset_scene_authorization": authorization}
+    parsed = SceneTransactionRequest.model_validate(body)
+    assert parsed.program_reset_scene_authorization.model_dump(mode="json") == authorization
+    for malformed in ({**authorization, "program_run_id": "invented"},
+                      {**authorization, "reset_claim": {**authorization["reset_claim"], "reset_claim_generation": None}},
+                      {**authorization, "reset_claim": {**authorization["reset_claim"], "reload_initial_scene": True}}):
+        with pytest.raises(ValidationError):
+            SceneTransactionRequest.model_validate({**body, "program_reset_scene_authorization": malformed})

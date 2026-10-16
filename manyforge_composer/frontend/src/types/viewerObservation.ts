@@ -31,6 +31,8 @@ export interface ExecutionObservationReader {
 
 export type ExecutionObservationTransportPhase =
   | 'disabled'
+  /** Fresh Manager publication proves that no physical product is loaded. */
+  | 'no_robot_loaded'
   | 'connecting'
   | 'waiting'
   | 'live'

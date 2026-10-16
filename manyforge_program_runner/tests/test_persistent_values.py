@@ -104,6 +104,7 @@ class _Headless(_Transport):
         committed = {
             "apply_id": f"apply.{len(self.applies) + 1}",
             "apply_generation": 1,
+            "scene_initialization": "preserve",
             "record_digest": "sha256:"
             + hashlib.sha256(
                 f"{self.history}:{len(self.applies) + 1}".encode()
@@ -133,6 +134,7 @@ class _Headless(_Transport):
         committed = {
             "apply_id": f"apply.{len(self.applies) + 1}",
             "apply_generation": 1,
+            "scene_initialization": "preserve",
             "record_digest": "sha256:"
             + hashlib.sha256(
                 f"{self.history}:{len(self.applies) + 1}".encode()
@@ -149,7 +151,7 @@ class _Headless(_Transport):
         # As the Headless client hands it to the runner: validated.
         return validate_committed_scenario_activation(
             {
-                "schema_version": "manyforge.committed_scenario_activation.v2",
+                "schema_version": "manyforge.committed_scenario_activation.v3",
                 "publication_generation": len(self.applies) + 1,
                 **deepcopy(self.current),
                 "committed_applies": sorted(
@@ -964,7 +966,7 @@ def test_unreadable_scenario_program_keeps_precedence_over_stale_record(tmp_path
 
 @pytest.mark.parametrize("schema", [
     "manyforge.committed_scenario_activation.v1",
-    "manyforge.committed_scenario_activation.v2",
+    "manyforge.committed_scenario_activation.v3",
 ])
 def test_originless_projection_is_a_named_refusal_with_a_stale_parser(
     tmp_path, monkeypatch, schema

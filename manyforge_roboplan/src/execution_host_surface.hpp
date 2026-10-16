@@ -155,6 +155,13 @@ private:
   IdentityResponse(Composition &composition,
                    const core::ProjectionRevisionDTO &projection) const;
 
+  [[nodiscard]] CanonicalValue ResetRobotPositionCapabilityResponse(
+      Composition &composition, const core::ProjectionRevisionDTO &projection) const;
+
+  [[nodiscard]] CanonicalValue ResetRobotPositionResponse(
+      Composition &composition, const ProgramResetPositionRequest &request,
+      std::stop_token stop_token) const;
+
   [[nodiscard]] CanonicalValue
   TargetsResponse(Composition &composition,
                   const core::ProjectionRevisionDTO &projection) const;

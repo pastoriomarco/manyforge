@@ -25,6 +25,7 @@ function status(state: ManagerApplyStatus['state'] = 'pending'): ManagerApplySta
     ...identity, apiVersion: 'manyforge.manager_command_response.v1', ok: true,
     state, phase, candidateProjectionRevision: null, error: null, failure: null,
     lastProgress: { phase, recordDigest: digest },
+    sceneInitialization: 'preserve',
     preparedActivation: {
       capturedInputDigest: digest, deploymentArtifactId: 'deployment.fixture',
       deploymentRevision: digest, programBindingId: digest, preparedActivationId: digest,
