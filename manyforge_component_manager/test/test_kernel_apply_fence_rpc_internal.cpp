@@ -500,4 +500,105 @@ TEST(
                std::invalid_argument);
 }
 
+TEST(KernelApplyFenceRpcInternal,
+     ProviderScopesUseExplicitEnvelopeAndRetainExactProof) {
+  const core::ProviderConfigurationFenceOccurrenceDTO occurrence{
+      core::ControllableComponentId("io"),
+      core::ProviderInstanceId("provider.io"),
+      core::ContentDigest(std::string(kDigestOne)),
+      {core::ResourceId("io.output")}};
+  const core::ConfigurationFenceScopeDTO scope{
+      {occurrence.controllable_component_id},
+      {{core::ControlDomainId("io.domain"), core::ControlDomainRevision("old"),
+        core::ControlDomainRevision("new"),
+        core::ProviderConfigurationFenceDomainDTO{occurrence, occurrence}}},
+      {},
+      occurrence.output_resources};
+  ASSERT_TRUE(scope.valid());
+  const core::ConfigurationFenceAdmissionQueryDTO query{
+      scope, core::RuntimeEpoch("manager")};
+  const auto request = EncodeKernelApplyFenceRpcRequest(query);
+  EXPECT_EQ(request.substr(0U, 8U), "MFNKAFR4");
+  EXPECT_TRUE(IsKernelApplyFenceRpcPacket(request));
+  EXPECT_EQ(std::get<core::ConfigurationFenceAdmissionQueryDTO>(
+                DecodeKernelApplyFenceRpcRequest(request)),
+            query);
+  auto alias = request;
+  alias[7] = '2';
+  EXPECT_THROW((void)DecodeKernelApplyFenceRpcRequest(alias),
+               std::invalid_argument);
+  const core::ConfigurationFenceAcceptedDTO accepted{
+      core::ConfigurationFenceId("fence.io"),
+      core::ConfigurationFenceGeneration(1U), scope, 1,
+      core::RequestReplayStatusDTO::kAcceptedNew};
+  const auto reply = EncodeKernelApplyFenceRpcResponse(accepted);
+  EXPECT_EQ(reply.substr(0U, 8U), "MFNKAFR4");
+  EXPECT_EQ(std::get<core::ConfigurationFenceAcceptedDTO>(
+                DecodeKernelApplyFenceRpcResponse(reply)),
+            accepted);
+  EXPECT_EQ(EncodeKernelApplyFenceRpcResponse(
+                DecodeKernelApplyFenceRpcResponse(reply)),
+            reply);
+  auto physical = MaximumIntent(MaximumTransitionScope());
+  const auto legacy = EncodeKernelApplyFenceRpcRequest(physical);
+  EXPECT_EQ(legacy.substr(0U, 8U), "MFNKAFR2");
+  alias = legacy;
+  alias[7] = '3';
+  EXPECT_THROW((void)DecodeKernelApplyFenceRpcRequest(alias),
+               std::invalid_argument);
+}
+
+TEST(KernelApplyFenceRpcInternal,
+     ProviderAdmissionLineageSurvivesExplicitV4RoundTrip) {
+  const core::ProviderConfigurationFenceOccurrenceDTO occurrence{
+      core::ControllableComponentId("io"),
+      core::ProviderInstanceId("provider.io"),
+      core::ContentDigest(std::string(kDigestOne)),
+      {}};
+  const core::ConfigurationFenceScopeDTO scope{
+      {occurrence.controllable_component_id},
+      {{core::ControlDomainId("io.domain"), core::ControlDomainRevision("old"),
+        core::ControlDomainRevision("new"),
+        core::ProviderConfigurationFenceDomainDTO{occurrence, occurrence}}},
+      {},
+      {}};
+  core::ConfigurationFenceAdmissionSnapshotDTO snapshot{
+      {scope, core::RuntimeEpoch("manager.io")},
+      ExecutionHostEpoch(),
+      ActiveProjection(),
+      core::ContentDigest(std::string(kDigestOne)),
+      1U,
+      core::ConfigurationFenceGeneration(2U),
+      {},
+      0U,
+      0U,
+      core::ContentDigest(std::string(kDigestTwo)),
+      {{core::ControlDomainId("io.domain"),
+        core::RuntimeEpoch("actual.provider.epoch"),
+        core::ComponentLifecycleGeneration(7U)}}};
+  ASSERT_TRUE(snapshot.presence_valid());
+  const auto bytes = EncodeKernelApplyFenceRpcResponse(snapshot);
+  EXPECT_EQ(bytes.substr(0U, 8U), "MFNKAFR4");
+  EXPECT_EQ(std::get<core::ConfigurationFenceAdmissionSnapshotDTO>(
+                DecodeKernelApplyFenceRpcResponse(bytes)),
+            snapshot);
+  auto intent = MaximumIntent(scope);
+  intent.expected_active_control_configurations.clear();
+  intent.expected_provider_lineages = snapshot.provider_lineages;
+  ASSERT_TRUE(intent.valid());
+  const auto intent_bytes = EncodeKernelApplyFenceRpcRequest(intent);
+  EXPECT_EQ(intent_bytes.substr(0U, 8U), "MFNKAFR4");
+  EXPECT_EQ(std::get<core::ApplyConfigurationFenceIntentDTO>(
+                DecodeKernelApplyFenceRpcRequest(intent_bytes)),
+            intent);
+  auto old = bytes;
+  old[7] = '3';
+  EXPECT_THROW((void)DecodeKernelApplyFenceRpcResponse(old),
+               std::invalid_argument);
+  snapshot.provider_lineages.front().component_lifecycle_generation =
+      core::ComponentLifecycleGeneration(0U);
+  EXPECT_THROW((void)EncodeKernelApplyFenceRpcResponse(snapshot),
+               std::invalid_argument);
+}
+
 } // namespace manyforge::component_manager::detail

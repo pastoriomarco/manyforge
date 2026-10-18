@@ -5,7 +5,7 @@ import type {
   JsonValue,
   ProgramTreeNode,
 } from '../types/api';
-import { schemaAcceptsProgramType } from './programAuthoring';
+import { automaticRetryLockReason, schemaAcceptsProgramType } from './programAuthoring';
 
 /**
  * Nodes whose `value` takes the type of the key they name (Set value, Check
@@ -76,11 +76,14 @@ export interface KeyValueParameterRule {
   choices?: readonly string[];
   /** Why the parameter does not apply to the current key and operator. */
   inapplicable?: string;
+  /** Why the field is locked: shown as a hint and disabled, its value still stands. */
+  locked?: string;
 }
 
 /**
- * How a comparison node's `operator` and `tolerance` follow its key's type,
- * and how a wait's `timeout_while_held` follows its `timeout_s`.
+ * The per-parameter rule the editor reads: how a comparison node's `operator`
+ * and `tolerance` follow its key's type, how a wait's `timeout_while_held`
+ * follows its `timeout_s`, and which motion nodes lock their automatic retry.
  */
 export function keyValueParameterRule(
   entry: CatalogEntry,
@@ -88,6 +91,8 @@ export function keyValueParameterRule(
   keys: readonly BlackboardKeyDeclaration[],
   parameterId: string,
 ): KeyValueParameterRule {
+  const locked = automaticRetryLockReason(node.node_id, node, parameterId);
+  if (locked !== null) return { locked };
   if (keyValueParameter(entry) === null) return {};
   if (parameterId === 'timeout_while_held') {
     return node.parameters.timeout_s === undefined && node.value_sources?.timeout_s === undefined

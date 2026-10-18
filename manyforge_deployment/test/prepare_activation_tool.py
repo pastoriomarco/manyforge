@@ -7,6 +7,7 @@ import argparse
 import base64
 import copy
 import json
+import shutil
 import sys
 from pathlib import Path
 import subprocess
@@ -23,6 +24,7 @@ from manyforge_behavior.canonical_artifact import (
     load_strict_json_yaml,
     raw_sha256_digest,
 )
+from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.model_source_capture import (
     MAX_XML_BYTES,
     capture_deployment_model_sources,
@@ -30,6 +32,11 @@ from manyforge_behavior.model_source_capture import (
     encode_model_source_artifact,
 )
 from manyforge_behavior.model_source_preparation import prepare_captured_model_source
+from manyforge_composer.backend.authoring_forest import derive_candidate
+from manyforge_headless_api.activation_preparer import (
+    _model_preparation_profiles,
+    _prepare_model_closure,
+)
 
 
 def _arguments() -> argparse.Namespace:
@@ -42,23 +49,21 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--stop-limit-names", action="store_true")
     parser.add_argument("--source-closure-rejections", action="store_true")
     parser.add_argument("--runtime-identity", action="store_true")
+    parser.add_argument("--takeover-budget", action="store_true")
     parser.add_argument("--no-program", action="store_true")
     parser.add_argument("--ros2-control", action="store_true")
     parser.add_argument("--manager-ros-apply-fixture-root", type=Path)
     return parser.parse_args()
 
 
-def _program(workspace: Path, program_id: str) -> dict[str, object]:
-    matches = []
-    for path in sorted((workspace / "examples").glob("*.program.yaml")):
-        value = load_strict_json_yaml(path)
-        if value.get("program_id") == program_id:
-            matches.append(value)
-    if len(matches) != 1:
+def _program(workspace: Path, authoring: dict[str, object]) -> dict[str, object]:
+    catalog = NodeCatalog(workspace / "manyforge_behavior/resources/node_catalog.yaml")
+    program, diagnostics = derive_candidate(authoring, catalog)
+    if diagnostics or program is None:
         raise AssertionError(
-            f"expected one maintained Program for {program_id}; found {len(matches)}"
+            f"expected one executable maintained Program draft; diagnostics={diagnostics!r}"
         )
-    return matches[0]
+    return program.to_dict()
 
 
 def _request(
@@ -102,41 +107,11 @@ def _request(
         **captured,
         "captured_input_digest": raw_sha256_digest(canonical_json_bytes(captured)),
     }
-    profiles = load_strict_json_yaml(
-        scenario_path.parents[1]
-        / "manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json"
+    request["prepared_model_closure"] = _prepare_model_closure(
+        deployment=captured["deployment"],
+        model_source_closure=captured["model_source_closure"],
+        profiles=_model_preparation_profiles(scenario_path.parents[1]),
     )
-    families = {
-        row["model_family_id"]: (
-            row["model_asset_id"],
-            row["source"]["accepted_package_uri_prefix"],
-        )
-        for row in profiles["model_families"]
-    }
-    profile_models = {
-        row["runtime_restoration_profile_id"]: families[row["model_family_id"]]
-        for row in profiles["runtime_restoration_profiles"]
-    }
-    sources = {
-        row["component_id"]: row
-        for row in captured["model_source_closure"]["components"]
-    }
-    request["prepared_model_closure"] = {
-        "schema_version": "manyforge.activation_prepared_model_closure.v1",
-        "components": sorted(
-            (
-                prepare_captured_model_source(
-                    sources[component["component_id"]],
-                    model_asset_id=profile_models[component["component_profile_id"]][0],
-                    accepted_package_uri_prefix=profile_models[
-                        component["component_profile_id"]
-                    ][1],
-                )
-                for component in captured["deployment"]["components"]
-            ),
-            key=lambda row: row["component_id"],
-        ),
-    }
     return request
 
 
@@ -157,9 +132,8 @@ def _scenario_request(
     }
     if manifest.get("api_version") != "manyforge.scenario.project.v2":
         raise AssertionError("test input is not a Scenario project")
-    program_id = document["program_draft"]["program_id"]
     return scenario_path, document, _request(
-        scenario_path, document, _program(workspace, program_id)
+        scenario_path, document, _program(workspace, document["program_draft"])
     )
 
 
@@ -515,10 +489,11 @@ def _arm_source_joints(workspace: Path, component: dict[str, object]) -> list[st
         workspace
         / "manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json"
     )
-    family_id = {
-        row["runtime_restoration_profile_id"]: row["model_family_id"]
+    profile = {
+        row["runtime_restoration_profile_id"]: row
         for row in sources["runtime_restoration_profiles"]
     }[component["component_profile_id"]]
+    family_id = profile["model_family_id"]
     for family in sources["model_families"]:
         if family["model_family_id"] != family_id:
             continue
@@ -1241,8 +1216,32 @@ def _write_manager_ros_apply_fixture(
     # This is the real runtime cell requested by the test, not a retained ID,
     # catalog seal, generation, owner epoch, or readiness observation.
     request["runtime_cell_id"] = "manager_ros_apply_fixture"
-    root = args.manager_ros_apply_fixture_root.resolve()
-    root.parent.mkdir(parents=True, exist_ok=True)
+    requested_root = args.manager_ros_apply_fixture_root
+    if (
+        requested_root.name != "manager-ros-apply-fixture"
+        or requested_root.is_symlink()
+    ):
+        raise AssertionError(
+            "Manager ROS fixture cleanup requires its dedicated output root"
+        )
+    root = requested_root.resolve()
+    workspace = args.workspace.resolve()
+    build_root = root.parent
+    if (
+        root == workspace
+        or root in workspace.parents
+        or workspace in root.parents
+        or build_root.name != "headless"
+        or not (build_root / "CMakeCache.txt").is_file()
+    ):
+        raise AssertionError(
+            "Manager ROS fixture output must be a child of the Headless CMake build"
+        )
+    if root.exists():
+        if not root.is_dir():
+            raise AssertionError("Manager ROS fixture output root is not a directory")
+        shutil.rmtree(root)
+    root.mkdir()
     prepared = _run(args, request, root, publish_canonical_empty=True, reuse_root=True)
     bundle = prepared["activation_payload"]["retained_bundle"]
     graph = bundle["cell_graph"]
@@ -1428,6 +1427,27 @@ def main() -> int:
         return 0
     with tempfile.TemporaryDirectory(prefix="manyforge-prepare-test-") as raw:
         temporary = Path(raw)
+        if args.takeover_budget:
+            baseline = copy.deepcopy(request)
+            baseline["deployment"]["policies"].pop(
+                "motion_takeover_preparation_budget_s", None
+            )
+            _rehash_request(baseline)
+            ordinary = _run(args, baseline, temporary / "budget-absent")
+            assert ordinary is not None
+            ordinary_bundle = ordinary["activation_payload"]["retained_bundle"]
+            assert "motion_takeover_preparation_budget_s" not in ordinary_bundle
+            selected = copy.deepcopy(baseline)
+            selected["deployment"]["policies"][
+                "motion_takeover_preparation_budget_s"
+            ] = 3.5
+            _rehash_request(selected)
+            moving = _run(args, selected, temporary / "budget-present")
+            assert moving is not None
+            moving_bundle = moving["activation_payload"]["retained_bundle"]
+            assert moving_bundle["motion_takeover_preparation_budget_s"] == 3.5
+            assert moving_bundle["retained_bundle_id"] != ordinary_bundle["retained_bundle_id"]
+            return 0
         if args.ros2_control:
             _check_ros_preparation(args, request, scenario_path, document, temporary)
             return 0
@@ -1677,7 +1697,7 @@ def main() -> int:
             changed = _request(
                 scenario_path,
                 document,
-                _program(workspace, document["program_draft"]["program_id"]),
+                _program(workspace, document["program_draft"]),
                 source_digest="sha256:" + "f" * 64,
             )
             changed_result = _run(args, changed, temporary / "changed")

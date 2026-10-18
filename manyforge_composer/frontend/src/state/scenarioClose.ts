@@ -2,6 +2,7 @@ import { parseLogicalSceneProjection } from '../api/parsers';
 import { sameAuthoringWorkspaceIdentity, type HeadlessStateResult } from '../hooks/useHeadlessState';
 import type { ScenarioReplacementIdentity } from '../hooks/useProgramWorkspace';
 import type { ProgramResetExpectation, ProgramResetOutcome } from '../hooks/useProgramRuntime';
+import { scenarioCloseUncertainOutputRefusal, uncertainOutputs } from '../utils/uncertainOutputs';
 import type { ComposerHeadlessState } from '../types/headless';
 import { api } from '../api/client';
 import { awaitActivationCompletion, browserRequestIdentity, cclcRequestOwnerEpoch, lifecycleRequestFromSnapshot, requestContext } from '../hooks/useCCLC';
@@ -124,6 +125,11 @@ export async function prepareProgramCycleForClose(
   const read = () => currentCloseSnapshot(expected, preparation, signal);
   try {
     const initial = read();
+    // Close never acknowledges outputs with unknown acceptance (contract 66).
+    const uncertain = scenarioCloseUncertainOutputRefusal(
+      uncertainOutputs(initial.executionControlStatus?.manualOperations),
+    );
+    if (uncertain !== null) throw new Error(uncertain);
     const cycle = initial.programCycle;
     const confirmedCycle = preparation.confirmed.closeCycle;
     const confirmedScene = preparation.confirmed.closeScene;

@@ -387,6 +387,118 @@ it('composes an identity-fenced stop-fault recovery from the live offer', async 
   });
 });
 
+it('reads global-rule recovery offers and clears one with its exact selector (SX-2206)', async () => {
+  const selector = {
+    context: {
+      owner_epoch: 'kernel.1', catalog_generation: '18446744073709551615',
+      active_publication_generation: 2, bundle: 'bundle.1', graph: 'graph.1',
+    },
+    rule_id: 'door_open',
+    expected_rule_registration_id: '1',
+  };
+  const offer = {
+    selector, current_condition: false,
+    post_latch_disposition: 'await_operator_ack', latch_cause: 'source_loss',
+  };
+  const stopFault = (offers?: unknown) => ({
+    api_version: 'manyforge.execution_command_response.v1',
+    command: 'get_stop_fault',
+    ok: true,
+    stop_fault: null,
+    ...(offers === undefined ? {} : { global_rule_recovery_offers: offers }),
+  });
+  const { parseGlobalRuleRecoveryOffers } = await import('./parsers');
+  expect(parseGlobalRuleRecoveryOffers(stopFault())).toEqual([]);
+  for (const invalid of [
+    { ...offer, current_condition: 0 },
+    { ...offer, latch_cause: 'lost' },
+    { ...offer, post_latch_disposition: 'auto' },
+    { ...offer, selector: { ...selector, expected_rule_registration_id: 9 } },
+    // SX-2216: Core emits only a positive registration nonce.
+    { ...offer, selector: { ...selector, expected_rule_registration_id: '0' } },
+    { ...offer, selector: { ...selector, context: { ...selector.context, catalog_generation: '0' } } },
+    { ...offer, extra: true },
+  ]) {
+    expect(() => parseGlobalRuleRecoveryOffers(stopFault([invalid]))).toThrow();
+  }
+  const result = {
+    request_id: 'request.rule.1', replay_status: 'accepted_new', accepted: true,
+    context: selector.context,
+    rule: { rule_id: 'door_open', state: 'clear', triggering_acquisition: null },
+    error: null,
+  };
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(response(stopFault([offer])))
+    .mockResolvedValueOnce(response({
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'recover_stop_fault', ok: true, result,
+    }))
+    .mockResolvedValueOnce(response({
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'recover_stop_fault', ok: true,
+      result: { ...result, accepted: false, rule: null, error: 'global_rule_condition_true' },
+    }));
+  vi.stubGlobal('fetch', fetchMock);
+
+  const [parsed] = await api.execution.globalRuleRecoveryOffers();
+  expect(parsed).toEqual({
+    selector, currentCondition: false,
+    postLatchDisposition: 'await_operator_ack', latchCause: 'source_loss',
+  });
+  await expect(api.execution.clearGlobalRuleLatch('owner.1', 'request.rule.1', parsed))
+    .resolves.toEqual({ accepted: true, replayStatus: 'accepted_new', ruleState: 'clear', error: null });
+  const [path, options] = fetchMock.mock.calls[1] as [string, RequestInit];
+  expect(path).toContain('/api/execution/stop-fault/recover');
+  expect(JSON.parse(String(options.body))).toEqual({
+    kind: 'global_io_rule',
+    request_context: {
+      request_id: 'request.rule.1', request_owner_epoch: 'owner.1',
+      source_label: 'composer_ui', correlation_id: null,
+    },
+    selector,
+    reason: 'operator cleared global rule latch',
+  });
+  await expect(api.execution.clearGlobalRuleLatch('owner.1', 'request.rule.1', parsed))
+    .resolves.toMatchObject({ accepted: false, ruleState: null, error: 'global_rule_condition_true' });
+});
+
+it('accepts a global-rule recovery result only for the requested selector context (SX-2216)', async () => {
+  const { parseGlobalRuleRecoveryResult } = await import('./parsers');
+  const selector = {
+    context: {
+      owner_epoch: 'kernel.1', catalog_generation: '4',
+      active_publication_generation: 2, bundle: 'bundle.1', graph: 'graph.1',
+    },
+    rule_id: 'door_open',
+    expected_rule_registration_id: '9',
+  };
+  const reply = (context: unknown, replayStatus = 'accepted_new') => ({
+    api_version: 'manyforge.execution_command_response.v1',
+    command: 'recover_stop_fault',
+    ok: true,
+    result: {
+      request_id: 'request.rule.1', replay_status: replayStatus, accepted: true, context,
+      rule: { rule_id: 'door_open', state: 'clear', triggering_acquisition: null },
+      error: null,
+    },
+  });
+  expect(parseGlobalRuleRecoveryResult(reply(selector.context), 'request.rule.1', selector))
+    .toMatchObject({ accepted: true, ruleState: 'clear' });
+  for (const patch of [
+    { owner_epoch: 'kernel.2' }, { catalog_generation: '5' },
+    { active_publication_generation: 3 }, { bundle: 'bundle.2' }, { graph: 'graph.2' },
+  ]) {
+    expect(() => parseGlobalRuleRecoveryResult(
+      reply({ ...selector.context, ...patch }), 'request.rule.1', selector,
+    )).toThrow();
+  }
+  // A historical request's replay echoes its own (no longer Applied) context.
+  const historical = { ...selector, context: { ...selector.context, active_publication_generation: 1 } };
+  expect(parseGlobalRuleRecoveryResult(
+    reply(historical.context, 'replayed_exact'), 'request.rule.1', historical,
+  )).toMatchObject({ accepted: true, replayStatus: 'replayed_exact' });
+});
+
 function response(
   payload: unknown,
   options: { ok?: boolean; status?: number; statusText?: string } = {},
@@ -1249,20 +1361,20 @@ it('accepts an authorization-only incident Recover only for the requested compon
     .mockResolvedValueOnce(response(recovered))
     .mockResolvedValueOnce(response(recovered));
   vi.stubGlobal('fetch', fetchMock);
-  const request = (componentId: string) => ({
+  const request = (controllableComponentId: string) => ({
     request_context: {
       request_id: 'request.recover.1',
       request_owner_epoch: 'cclc.epoch.1',
       source_label: 'manyforge_composer',
       correlation_id: null,
     },
-    controllable_component_id: componentId,
+    controllable_component_id: controllableComponentId,
     intent: 'recover',
   }) as unknown as Parameters<typeof api.cclc.submitLifecycle>[0];
 
   await expect(api.cclc.submitLifecycle(request('component.arm'))).resolves.toMatchObject({
     transactionId: null,
-    incidentRecovery: { incidentId: 'incident.component.arm.1', componentId: 'component.arm' },
+    incidentRecovery: { incidentId: 'incident.component.arm.1', controllableComponentId: 'component.arm' },
   });
   await expect(api.cclc.submitLifecycle(request('component.gripper')))
     .rejects.toThrow('incident recovery does not match its request');

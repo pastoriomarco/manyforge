@@ -192,9 +192,12 @@ bool ManagerComponentBringUpPlanningFactsDTO::valid() const noexcept {
   for (std::size_t index = 0U; index < candidate_expected_domains.size(); ++index) {
     const auto &domain = candidate_expected_domains[index];
     if (!domain.locally_valid() ||
-        (index && !(candidate_expected_domains[index - 1U].control_domain_id < domain.control_domain_id)) ||
-        bindings > kMaxLifecycleExpectedBindings - domain.expected_control_bindings.size()) return false;
-    bindings += domain.expected_control_bindings.size();
+        (index && !(candidate_expected_domains[index - 1U].control_domain_id <
+                    domain.control_domain_id)) ||
+        bindings >
+            kMaxLifecycleExpectedBindings - domain.control_bindings().size())
+      return false;
+    bindings += domain.control_bindings().size();
   }
   return true;
 }

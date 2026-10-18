@@ -433,6 +433,22 @@ def capture_deployment_model_sources(
             raise ModelSourceCaptureError("Deployment component is not an object")
         component_id = raw_component.get("component_id")
         source = raw_component.get("model_source")
+        configuration = raw_component.get("configuration")
+        if (
+            source is None
+            and "model_source" not in raw_component
+            and isinstance(configuration, Mapping)
+            and configuration.get("runtime_kind") == "io_provider"
+        ):
+            # A model-free I/O device has no model source closure.
+            if (
+                not isinstance(component_id, str)
+                or not component_id
+                or component_id in seen_components
+            ):
+                raise ModelSourceCaptureError("Deployment component source is invalid")
+            seen_components.add(component_id)
+            continue
         if (
             not isinstance(component_id, str)
             or not component_id

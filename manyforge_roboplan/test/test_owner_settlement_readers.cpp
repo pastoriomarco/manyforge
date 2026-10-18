@@ -1,5 +1,8 @@
 #include "cell_admission_command_codec.hpp"
 #include "owner_settlement_readers.hpp"
+#include "applied_program_owner_reader.hpp"
+#include <manyforge_component_manager/active_bundle_publication_store.hpp>
+#include <manyforge_component_manager/durable_store_set.hpp>
 
 #include <gtest/gtest.h>
 #include <manyforge_content_identity/content_identity.hpp>
@@ -107,6 +110,53 @@ ProgramStartSettlementJson(std::string_view claim_json,
          std::string(program_run_id) +
          "\",\"schema_version\":"
          "\"manyforge.program_cycle_start_settlement.v1\"}";
+}
+
+TEST(OwnerSettlementReaders,
+     AppliedProgramOwnerReadRequiresActualNamedApplyWithoutCreatingState) {
+  TemporaryDatabase name;
+  name.Close();
+  const auto root = std::filesystem::path(name.path().string() + ".state");
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{root};
+  const core::CellId cell("cell.applied-reader");
+  const auto absent = ReadAppliedProgramOwnerReadOnly(
+      root, cell, core::ActiveBundlePublicationGeneration(1U));
+  ASSERT_FALSE(absent.ok());
+  EXPECT_FALSE(std::filesystem::exists(root));
+  ASSERT_TRUE(std::filesystem::create_directory(root));
+  component_manager::SqliteActiveBundlePublicationStore store(
+      root /
+          std::string(component_manager::kActiveBundlePublicationStoreFilename),
+      cell);
+  const core::ProjectionRevisionDTO projection{
+      core::RetainedBundleId(std::string(kDigestA)),
+      core::GraphRevision(std::string(kDigestB)),
+      core::SceneRevision{core::SceneId(std::string(kDigestA)), 1U,
+                          core::ContentDigest(std::string(kDigestB))}};
+  const auto published = store.PublishActiveBundle(
+      {core::BootstrapPublicationTransactionDTO{
+           core::BootstrapId("bootstrap.reader"),
+           core::BootstrapGeneration(1U)},
+       projection, projection.retained_bundle_id, projection.graph_revision,
+       std::nullopt, core::ContentDigest(std::string(kDigestA))});
+  const auto unbound = ReadAppliedProgramOwnerReadOnly(
+      root, cell, published.publication_generation);
+  ASSERT_FALSE(unbound.ok());
+  EXPECT_EQ(unbound.error().details.at("reason"),
+            "program_bb_applied_program_unbound");
+  EXPECT_FALSE(std::filesystem::exists(
+      root / std::string(component_manager::kManagerApplyJournalFilename)));
+  const auto stale = ReadAppliedProgramOwnerReadOnly(
+      root, cell, core::ActiveBundlePublicationGeneration(2U));
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"),
+            "program_bb_applied_publication_stale");
 }
 
 TEST(OwnerSettlementReaders,

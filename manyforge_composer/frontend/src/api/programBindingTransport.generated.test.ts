@@ -207,6 +207,48 @@ describe('generated Program Binding transport parser', () => {
     expect(rows(document.node_policies)[0].instance_id).toBe('root');
   });
 
+  it('preserves omitted intervention scope without inserting a default', () => {
+    const document = fixture();
+    const before = JSON.stringify(document);
+    expect(parseProgramBindingTransport(document, 'binding')).toBe(document);
+    expect(JSON.stringify(document)).toBe(before);
+    expect(Object.hasOwn(row(rows(document.node_policies)[0].recovery_policy), 'intervention_stop_scope')).toBe(false);
+  });
+
+  it.each(['all', 'own_groups'])('preserves intervention scope %s', (scope) => {
+    const document = fixture();
+    row(rows(document.node_policies)[0].recovery_policy).intervention_stop_scope = scope;
+    const before = JSON.stringify(document);
+    expect(parseProgramBindingTransport(document, 'binding')).toBe(document);
+    expect(JSON.stringify(document)).toBe(before);
+  });
+
+  it('accepts own-groups scope as a nondefault policy on its own', () => {
+    const document = fixture();
+    document.node_policies = [{
+      instance_id: 'root',
+      recovery_policy: { allow_intervention: false, max_retries: 0, intervention_stop_scope: 'own_groups' },
+      operator_stop_policy: 'inherit',
+    }];
+    expect(parseProgramBindingTransport(document, 'binding')).toBe(document);
+  });
+
+  it('rejects an otherwise-default policy with explicit all scope', () => {
+    const document = fixture();
+    document.node_policies = [{
+      instance_id: 'root',
+      recovery_policy: { allow_intervention: false, max_retries: 0, intervention_stop_scope: 'all' },
+      operator_stop_policy: 'inherit',
+    }];
+    expect(() => parseProgramBindingTransport(document, 'binding')).toThrow(/default node-policy rows must be omitted/);
+  });
+
+  it.each([null, true, 0, [], {}, 'own_group', 'selected', undefined])('rejects intervention scope %j', (scope) => {
+    const document = fixture();
+    row(rows(document.node_policies)[0].recovery_policy).intervention_stop_scope = scope;
+    expect(() => parseProgramBindingTransport(document, 'binding')).toThrow(/intervention_stop_scope/);
+  });
+
   it.each(cases)('rejects the %s mutation family', (name) => {
     const document = fixture();
     mutate(name, document);

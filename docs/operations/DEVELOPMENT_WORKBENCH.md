@@ -65,7 +65,16 @@ MANYFORGE_DEV_IMAGE=<source-matched-full-ros-image> \
 
 The image entrypoint must supply its ROS and Python environment. Startup builds
 the mechanical ROS overlay and imports its setup into the service environment;
-Manager children inherit that environment. Explicitly exported standard DDS
+Manager children inherit that environment. If this installation uses separately
+installed ROS message dependencies, persist
+`MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS` in its existing machine launch
+configuration as a colon-separated, ordered list of absolute setup-script paths
+inside the container. Startup sources them before the backend build and imports
+the application overlay last for services. Missing configured scripts fail
+startup with their exact path. With this variable unset, image setup remains the
+default; no dependency paths are discovered or selected automatically.
+
+Explicitly exported standard DDS
 inputs, including `ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`,
 `ROS_AUTOMATIC_DISCOVERY_RANGE` and `ROS_STATIC_PEERS`, pass into this container
 unchanged. Configure the selected topology before starting it. Exported DDS

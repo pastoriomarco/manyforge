@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:84e103dc895e6da75d430d5d08f69583126910c832efc100b1f652524690cb46",
     "deployment.yaml": "sha256:6a41384e9ae228bde05dfb38bac0c137ad0bc8a1824dfb953be217f59ccfb9a6",
-    "program.yaml": "sha256:413d898bd0d506d00f06c409ad815f99144dcc79bf3699524b3e58360e7838e1"
+    "program.yaml": "sha256:8038727e2b2df2a0ca6b96a81e7dd5b27c309491f4e72fc309517bc35abc4b1c"
   },
   "name": "lite6_lite_gripper_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:a2d5c25c0427b985ac9acfad91f79631a36eda2abf3d5ed34708b96ecbc511dc",
+    "checked_content_digest": "sha256:e0894c0239b59091cc4090211502b9c347d470193797b57bbf5c0bc1b323f6d8",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

@@ -195,7 +195,7 @@ TEST(ComponentLifecyclePlanEvaluator, RejectsCatalogContentBehindAStaleDeclaredD
   auto catalog =
       Catalog({FixedPlan({Transition("prepare", Predicate(ComponentLifecycleStateDTO::kDeclared),
                                      ComponentLifecycleStateDTO::kPrepared)})});
-  catalog.plans.front().timeout_duration_ns += 1;
+  std::get<std::int64_t>(catalog.plans.front().timeout_policy) += 1;
 
   const auto decision =
       EvaluateLifecycleDomainPlan(ComponentLifecycleIntentKindDTO::kPrepare,

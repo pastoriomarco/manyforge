@@ -1187,6 +1187,8 @@ def export_scenario_artifact(
             }
             for component in deployment["components"]:
                 component_id = component["component_id"]
+                if "model_source" not in component:
+                    continue  # A model-free I/O device has no source to export.
                 captured = components[component_id]
                 source_root = _export_relative_path("sources", component_id)
                 urdf_relative = _export_relative_path(source_root, "model.urdf")

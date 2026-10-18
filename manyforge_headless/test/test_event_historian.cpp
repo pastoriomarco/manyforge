@@ -76,6 +76,42 @@ HistorianEvent Event(const std::uint64_t index,
       }));
 }
 
+HistorianEvent OperationFailureEvent(const std::string &message) {
+  auto event = MakeHistorianEvent(
+      "manyforge.runtime", "motion_retry_selected", "ERROR", 101,
+      "2026-08-05T00:00:00Z",
+      CanonicalValue(CanonicalValue::Object{
+          {"schema_version",
+           CanonicalValue("manyforge.operation_history_event.v1")},
+          {"journal_payload",
+           CanonicalValue(CanonicalValue::Object{
+               {"operation_state",
+                CanonicalValue(CanonicalValue::Object{
+                    {"operation_id", CanonicalValue("operation.1")},
+                    {"program_run_id", CanonicalValue("run.1")},
+                    {"participants",
+                     CanonicalValue(CanonicalValue::Array{
+                         CanonicalValue(CanonicalValue::Object{
+                             {"execution_scope",
+                              CanonicalValue(CanonicalValue::Object{
+                                  {"node_instance_id", CanonicalValue("move")},
+                                  {"node_attempt_id",
+                                   CanonicalValue("move.attempt.1")}})},
+                             {"terminal_error",
+                              CanonicalValue(CanonicalValue::Object{
+                                  {"code", CanonicalValue("planning_failed")},
+                                  {"message",
+                                   CanonicalValue(message)}})}})})}})}})}}));
+  const auto &state = *event.payload.find_object_member("journal_payload")
+                           ->find_object_member("operation_state");
+  auto payload = event.payload.as_object();
+  payload.emplace_back("message",
+                       CanonicalValue(OperationFailureHistoryMessage(state)));
+  return MakeHistorianEvent(event.component, event.event_type, event.severity,
+                            event.occurred_at_ns, event.occurred_at_wall,
+                            CanonicalValue(std::move(payload)));
+}
+
 // Partition-retention tests isolate ordinary pruning: each error capture
 // protects only its trigger, closes at once and retires the previous one.
 HistorianCaptureLimits TriggerOnlyCaptureLimits() {
@@ -861,6 +897,99 @@ TEST(EventHistorian, SummaryPageSelectsListFieldsWithoutPublishingPayload) {
   EXPECT_EQ(encoded.find(std::string(1024U, 'x')), std::string::npos);
 }
 
+TEST(EventHistorian,
+     OperationFailureSummaryUsesOriginalErrorAndAttemptWithoutExtraRows) {
+  TemporaryDirectory directory;
+  SqliteEventHistoryStore store(directory.path() / "operation-history.sqlite3");
+  const auto event = OperationFailureEvent("No path from authored target");
+  EXPECT_EQ(store.Append(event), IEventHistoryStore::AppendStatus::kStored);
+  const auto summary =
+      HistorianSummaryEventValue(event, std::nullopt, std::nullopt, false);
+  EXPECT_EQ(
+      summary.find_object_member("message")->as_string(),
+      "[move / move.attempt.1] planning_failed: No path from authored target");
+  EXPECT_EQ(summary.find_object_member("severity")->as_string(), "ERROR");
+  EXPECT_EQ(summary.find_object_member("operation_id")->as_string(),
+            "operation.1");
+  EXPECT_EQ(summary.find_object_member("program_run_id")->as_string(), "run.1");
+  const auto page = store.Query({});
+  ASSERT_EQ(page.events.size(), 1U);
+  EXPECT_EQ(page.events.front().event.payload, event.payload);
+  const auto detail = content_identity::canonical_json(
+      HistorianDetailValue(page.events.front()));
+  EXPECT_NE(detail.find("planning_failed"), std::string::npos);
+  EXPECT_NE(detail.find("node_attempt_id"), std::string::npos);
+  EXPECT_NE(detail.find("move.attempt.1"), std::string::npos);
+}
+
+TEST(EventHistorian,
+     OperationFailureSummaryIsBoundedAndPreservesLegacyProjection) {
+  const auto long_event = OperationFailureEvent(std::string(9000U, 'x'));
+  const auto summary =
+      HistorianSummaryEventValue(long_event, std::nullopt, std::nullopt, false);
+  const auto &message = summary.find_object_member("message")->as_string();
+  EXPECT_EQ(message.size(), 1024U);
+  EXPECT_EQ(message.find("[move / move.attempt.1] planning_failed: "), 0U);
+  // The bounded list projection never clips the source evidence in
+  // detail/export.
+  EXPECT_EQ(long_event.payload.find_object_member("journal_payload")
+                ->find_object_member("operation_state")
+                ->find_object_member("participants")
+                ->as_array()
+                .front()
+                .find_object_member("terminal_error")
+                ->find_object_member("message")
+                ->as_string()
+                .size(),
+            9000U);
+  auto legacy_payload = long_event.payload.as_object();
+  std::erase_if(legacy_payload,
+                [](const auto &field) { return field.first == "message"; });
+  const auto legacy = MakeHistorianEvent(
+      long_event.component, long_event.event_type, long_event.severity,
+      long_event.occurred_at_ns, long_event.occurred_at_wall,
+      CanonicalValue(std::move(legacy_payload)));
+  const auto legacy_summary =
+      HistorianSummaryEventValue(legacy, std::nullopt, std::nullopt, false);
+  EXPECT_EQ(legacy_summary.find_object_member("message")->as_string(),
+            "motion retry selected");
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "legacy-operation-history.sqlite3";
+  {
+    SqliteEventHistoryStore store(path);
+    EXPECT_EQ(store.Append(legacy), IEventHistoryStore::AppendStatus::kStored);
+  }
+  SqliteEventHistoryStore reopened(path);
+  EXPECT_EQ(reopened.Query({}).events.size(), 1U);
+  EXPECT_EQ(reopened.Read(1)->event.payload, legacy.payload);
+}
+
+TEST(EventHistorian,
+     OperationFailureMessageKeepsCoordinatedErrorsWithTheirOwnScopes) {
+  const auto participant = [](const char *node, const char *code,
+                              const char *message) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"execution_scope",
+         CanonicalValue(CanonicalValue::Object{
+             {"node_instance_id", CanonicalValue(node)},
+             {"node_attempt_id",
+              CanonicalValue(std::string(node) + ".attempt.1")}})},
+        {"terminal_error", CanonicalValue(CanonicalValue::Object{
+                               {"code", CanonicalValue(code)},
+                               {"message", CanonicalValue(message)}})}});
+  };
+  const CanonicalValue state(CanonicalValue::Object{
+      {"participants", CanonicalValue(CanonicalValue::Array{
+                           participant("peer", "cancelled", "Peer stopped"),
+                           participant("origin", "runtime_collision_fault",
+                                       "Collision detected")})}});
+  EXPECT_EQ(OperationFailureHistoryMessage(state),
+            "[peer / peer.attempt.1] cancelled: Peer stopped; "
+            "[origin / origin.attempt.1] runtime_collision_fault: Collision "
+            "detected");
+  EXPECT_TRUE(OperationFailureHistoryMessage(CanonicalValue(nullptr)).empty());
+}
+
 TEST(EventHistorian, StoredSummariesMatchFullProjectionAcrossFiltersAndPages) {
   TemporaryDirectory directory;
   SqliteEventHistoryStore store(directory.path() / "summaries.sqlite3", 2U);
@@ -1282,6 +1411,22 @@ TEST(EventHistorian, AlarmLifecycleEnvelopeRetainsOwnerCallerAndSubject) {
   EXPECT_NE(encoded.find("resource.arm.a"), std::string::npos);
   EXPECT_NE(encoded.find("principal.operator"), std::string::npos);
   EXPECT_NE(encoded.find("alarm.owner.epoch.1"), std::string::npos);
+  for (const auto *definition :
+       {"manyforge.runtime.program_runner_loss",
+        "manyforge.runtime.operation_journal_write_fault",
+        "manyforge.motion.stop_fault"}) {
+    fact.definition_id = definition;
+    for (const auto *type :
+         {"alarm_raised", "alarm_acknowledged", "alarm_returned"}) {
+      fact.event_type = type;
+      const auto lifecycle = MakeAlarmLifecycleHistorianEvent(fact);
+      const bool new_fault_raised =
+          std::string_view(type) == "alarm_raised" &&
+          std::string_view(definition) != "manyforge.motion.stop_fault";
+      EXPECT_EQ(lifecycle.severity, new_fault_raised ? "ERROR" : "INFO")
+          << definition << " " << type;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@
 #include <manyforge_core/testing/fake_execution_port.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <variant>
 #include <vector>
@@ -302,6 +303,7 @@ class GoalReadObservingPort final : public IExecutionPort {
     return port_.Replace(active, next, trajectory);
   }
   ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key) override {
+    if (on_cancel) return on_cancel(key);
     return port_.Cancel(key);
   }
   ExecutionPortCommandResultDTO SetScale(double value) override { return port_.SetScale(value); }
@@ -318,6 +320,7 @@ class GoalReadObservingPort final : public IExecutionPort {
   ExecutionLaneFactsDTO ReadLaneFacts() const override { return port_.ReadLaneFacts(); }
 
   std::function<void(std::optional<ExecutionGoalObservationDTO>&)> on_read_goal;
+  std::function<ExecutionPortCommandResultDTO(const ExecutionGoalKey&)> on_cancel;
 
  private:
   FakeExecutionPort& port_;
@@ -461,6 +464,180 @@ void ScriptReplacement(World& world, const ExecutionGoalKey& key, std::size_t ti
 }
 
 // --- Stage identity, membership and budget -------------------------------------
+
+// A second possibly-sent goal is retained in the same helper record list.
+void RecordPendingReplacement(World& world) {
+  ASSERT_TRUE(world.helper->ReserveReplacement(kOriginal));
+  ExecutionGoalObservationDTO candidate;
+  candidate.key = kSecond;
+  candidate.binding_epoch = ExecutionBindingEpoch(1U);
+  candidate.phase = ExecutionGoalPhase::kPending;
+  world.port.SetGoal(std::move(candidate));
+  world.helper->RecordReplacement(
+      kSecond, Original(),
+      std::make_shared<ExecutionSampleAssociation>(ExecutionBindingEpoch(1U),
+                                                   world.port.ReadSample(), world.clock.now()));
+}
+
+TEST(ParticipantStopStageHelperTest, PendingSuccessorBlocksNaturalCompletionUntilExactlyRejected) {
+  World world;
+  world.Dispatch(Stage(0U));
+  RecordPendingReplacement(world);
+  world.Finish(kOriginal, ExecutionGoalResult::kSucceeded);
+  EXPECT_FALSE(world.helper->CanCompleteNaturally(kOriginal));
+  EXPECT_FALSE(world.helper->ReserveReplacement(kOriginal));
+  world.Finish(kSecond, ExecutionGoalResult::kEndedUnknown);
+  EXPECT_FALSE(world.helper->CanCompleteNaturally(kOriginal));
+  EXPECT_TRUE(world.helper->HasLiveGoal());
+  world.Finish(kSecond, ExecutionGoalResult::kCanceled);
+  EXPECT_FALSE(world.helper->CanCompleteNaturally(kOriginal));
+  world.Finish(kSecond, ExecutionGoalResult::kRejected);
+  EXPECT_TRUE(world.helper->CanCompleteNaturally(kOriginal));
+  world.helper->RetireSettledReplacement(kSecond);
+  EXPECT_FALSE(world.helper->HasPendingReplacement());
+  EXPECT_TRUE(world.helper->ReserveReplacement(kOriginal));
+}
+
+TEST(ParticipantStopStageHelperTest, MissingPendingSuccessorRemainsLiveAndIsCancelled) {
+  World world(false);
+  GoalReadObservingPort observed(world.port);
+  world.Build(&observed);
+  world.Dispatch(Stage(0U));
+  RecordPendingReplacement(world);
+  world.Finish(kOriginal, ExecutionGoalResult::kSucceeded);
+  observed.on_read_goal = [](auto& goal) {
+    if (goal && goal->key == kSecond) goal.reset();
+  };
+  EXPECT_FALSE(world.helper->CanCompleteNaturally(kOriginal));
+  EXPECT_TRUE(world.helper->HasLiveGoal());
+  EXPECT_TRUE(world.helper->CancelLiveGoals());
+  EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kSecond});
+}
+
+TEST(ParticipantStopStageHelperTest, PendingFaultCancellationRequestsBothKeysNewestFirst) {
+  World world;
+  world.Dispatch(Stage(0U));
+  RecordPendingReplacement(world);
+  world.port.QueueCommandResult(
+      {ExecutionPortDispatch::kEffectUncertain, std::nullopt, std::nullopt});
+  world.port.QueueCommandResult(
+      {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey, std::nullopt});
+  EXPECT_TRUE(world.helper->CancelLiveGoals());
+  EXPECT_EQ(Cancels(world.port), (std::vector<ExecutionGoalKey>{kSecond, kOriginal}));
+}
+
+TEST(ParticipantStopStageHelperTest, KnownSupersededTerminalSurvivesNativeRecordEviction) {
+  World world;
+  world.Dispatch(Stage(0U));
+  RecordPendingReplacement(world);
+  world.Executing(kSecond);
+  world.port.FinishGoal(kOriginal, ExecutionGoalResult::kPreemptedBy, kSecond, world.clock.now());
+  EXPECT_TRUE(world.helper->HasLiveGoal());  // retains exact old terminal before eviction
+  ExecutionGoalObservationDTO rejected;
+  rejected.key = kThird;
+  rejected.binding_epoch = ExecutionBindingEpoch(1U);
+  rejected.phase = ExecutionGoalPhase::kTerminal;
+  rejected.result = ExecutionGoalResult::kRejected;
+  world.port.SetGoal(std::move(rejected));
+  ASSERT_FALSE(world.port.ReadGoal(kOriginal));
+  EXPECT_TRUE(world.helper->CancelLiveGoals());
+  EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kSecond});
+}
+
+TEST(ParticipantStopStageHelperTest, PendingCancelThrowStillRequestsOtherRetainedKey) {
+  World world(false);
+  GoalReadObservingPort observed(world.port);
+  world.Build(&observed);
+  world.Dispatch(Stage(0U));
+  RecordPendingReplacement(world);
+  observed.on_cancel = [&](const ExecutionGoalKey& key) {
+    const auto result = world.port.Cancel(key);
+    if (key == kSecond) throw std::runtime_error("send outcome unknown");
+    return result;
+  };
+  EXPECT_TRUE(world.helper->CancelLiveGoals());
+  EXPECT_EQ(Cancels(world.port), (std::vector<ExecutionGoalKey>{kSecond, kOriginal}));
+}
+
+TEST(ParticipantStopStageHelperTest, PendingCancelProofCannotHideAnotherUnresolvedKey) {
+  for (const bool superseded : {false, true}) {
+    SCOPED_TRACE(superseded);
+    World world;
+    world.config.max_deceleration_on_cancel_rad_s2.clear();
+    world.Build();
+    const auto stage = Stage(1U);
+    world.Dispatch(stage);
+    RecordPendingReplacement(world);
+    world.Executing(kSecond);
+    world.Sample(0.5, 0.5, 1.0);
+    world.on_tick = [&] {
+      if (world.ticks != 1U) return;
+      if (superseded)
+        world.port.FinishGoal(kOriginal, ExecutionGoalResult::kPreemptedBy, kSecond,
+                              world.clock.now());
+      world.port.MarkCancelSent(kSecond, world.clock.now() - 1);
+      world.Cancelled(kSecond);
+      world.Sample(0.0, 0.5, 0.0, 0.0);
+    };
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    EXPECT_EQ(result.outcome, superseded ? ParticipantStopStageOutcomeDTO::kSucceeded
+                                         : ParticipantStopStageOutcomeDTO::kFailed);
+    EXPECT_EQ(Cancels(world.port), (std::vector<ExecutionGoalKey>{kSecond, kOriginal}));
+    EXPECT_LE(world.clock.now() - 1'000'000'000, world.config.hard_stop_completion_timeout_ns);
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, RejectedPendingSuccessorRecancelsRestoredPredecessorOnce) {
+  for (const bool finish : {false, true}) {
+    SCOPED_TRACE(finish);
+    World world(false);
+    world.config.max_deceleration_on_cancel_rad_s2.clear();
+    GoalReadObservingPort observed(world.port);
+    world.Build(&observed);
+    const auto stage = Stage(1U);
+    world.Dispatch(stage);
+    world.Sample(1.0, 1.0, 1.0, 1.0);
+    RecordPendingReplacement(world);
+    unsigned old_cancel_count = 0U;
+    observed.on_cancel = [&](const ExecutionGoalKey& key) {
+      if (key == kSecond) {
+        world.port.QueueCommandResult(
+            {ExecutionPortDispatch::kEffectUncertain, std::nullopt, std::nullopt});
+      } else if (++old_cancel_count == 1U) {
+        world.port.QueueCommandResult(
+            {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey, std::nullopt});
+      }
+      const auto result = world.port.Cancel(key);
+      if (key == kOriginal && old_cancel_count == 2U && finish) {
+        world.port.MarkCancelSent(key, world.clock.now());
+        world.port.AcknowledgeCancel(key, world.clock.now());
+      }
+      return result;
+    };
+    world.on_tick = [&] {
+      if (world.ticks == 1U) {
+        world.Finish(kSecond, ExecutionGoalResult::kRejected);
+        world.Sample(1.1, 1.1, 1.0, 1.0);
+      } else if (finish && old_cancel_count == 2U) {
+        world.Finish(kOriginal, ExecutionGoalResult::kCanceled);
+        world.Sample(0.0, 1.1, 0.0, 1.0);
+      }
+    };
+    const auto started = world.clock.now();
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    EXPECT_EQ(Cancels(world.port), (std::vector<ExecutionGoalKey>{kSecond, kOriginal, kOriginal}));
+    EXPECT_EQ(old_cancel_count, 2U);
+    EXPECT_LE(world.clock.now() - started, world.config.hard_stop_completion_timeout_ns);
+    EXPECT_EQ(result.outcome, finish ? ParticipantStopStageOutcomeDTO::kSucceeded
+                                     : ParticipantStopStageOutcomeDTO::kFailed);
+    if (finish) {
+      EXPECT_EQ(
+          Text(std::get<JsonObjectDTO>(EvidenceObject(result).at("post_command_sample").value),
+               "finish_basis"),
+          "cancel_reference_at_rest");
+    }
+  }
+}
 
 TEST(ParticipantStopStageHelperTest, RefusesBeforeEffectWithoutExactMembershipOrBudget) {
   World world;
@@ -887,6 +1064,112 @@ TEST(ParticipantStopStageHelperTest, SpringBackSubstitutionUsesTheSameReplaceTim
   const auto& diagnostics =
       std::get<JsonObjectDTO>(EvidenceObject(result).at("provider_diagnostics").value);
   EXPECT_EQ(Text(diagnostics, "recoverable_substitution_pair"), "soft_on_path->spring_back_hold");
+}
+
+class SpringPointObserver final : public IStopStageSpringReturnObserver {
+ public:
+  explicit SpringPointObserver(World& world, bool accept = true) : world_(world), accept_(accept) {}
+  bool SpringReturnPointReady(const SpringBackReturnPointDTO& value) noexcept override {
+    ++calls;
+    try {
+      before_replace = Replaces(world_.port).empty();
+      if (!accept_) return false;
+      point = value;
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+  std::optional<SpringBackReturnPointDTO> point;
+  unsigned calls{};
+  bool before_replace{};
+
+ private:
+  World& world_;
+  bool accept_;
+};
+
+TEST(ParticipantStopStageHelperTest, TakeoverUsesOnlySealedSpringPermissionAndPublishesBeforeSend) {
+  for (const bool substituted : {false, true}) {
+    World world;
+    const auto stage =
+        Stage(0U, Nominal::kControlled,
+              substituted ? Parameters("soft_on_path", false, std::string("spring_back_hold"))
+                          : Parameters("spring_back_hold", false));
+    world.Dispatch(stage);
+    world.Sample(0.5, 0.5, 1.0);
+    ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+    SpringPointObserver observer(world);
+    const auto result =
+        world.helper->TranslateStopStageForTakeover(stage, Budget(stage), {}, observer);
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+        << result.error->details.at("reason");
+    EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSpringBackHold);
+    EXPECT_EQ(observer.calls, 1U);
+    EXPECT_TRUE(observer.before_replace);
+    ASSERT_TRUE(observer.point);
+    EXPECT_EQ(observer.point->source_goal, kOriginal);
+    EXPECT_EQ(observer.point->binding_epoch, ExecutionBindingEpoch(1U));
+    EXPECT_NEAR(observer.point->initial.command_path_time_s, 0.5, 1e-12);
+    EXPECT_EQ(observer.point->initial.spring_back_return_point.positions_rad,
+              std::vector<double>{0.5});
+    EXPECT_EQ(observer.point->initial.spring_back_return_point.velocities_rad_s,
+              std::vector<double>{0.0});
+    EXPECT_EQ(observer.point->initial.spring_back_return_point.accelerations_rad_s2,
+              std::vector<double>{0.0});
+    ASSERT_EQ(Replaces(world.port).size(), 1U);
+    EXPECT_NEAR(Replaces(world.port).front().trajectory.waypoints.back().positions_rad.front(), 0.5,
+                1e-6);
+    EXPECT_EQ(result.recoverable_substitution_reason.has_value(), substituted);
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, TakeoverWithoutSpringPermissionKeepsOrdinaryStopAndNoAnchor) {
+  World world;
+  const auto stage = Stage(0U, Nominal::kControlled, Parameters("soft_on_path", false));
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0);
+  ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+  SpringPointObserver observer(world);
+  const auto result =
+      world.helper->TranslateStopStageForTakeover(stage, Budget(stage), {}, observer);
+  EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+  EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSoftOnPath);
+  EXPECT_EQ(observer.calls, 0U);
+  EXPECT_FALSE(observer.point);
+}
+
+TEST(ParticipantStopStageHelperTest, SpringNotificationFailureNeverChangesContainment) {
+  World world;
+  const auto stage = Stage(0U, Nominal::kControlled, Parameters("spring_back_hold", false));
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0);
+  ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+  SpringPointObserver observer(world, false);
+  const auto result =
+      world.helper->TranslateStopStageForTakeover(stage, Budget(stage), {}, observer);
+  EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+  EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSpringBackHold);
+  EXPECT_EQ(observer.calls, 1U);
+  EXPECT_FALSE(observer.point);
+  ASSERT_EQ(Replaces(world.port).size(), 1U);
+  EXPECT_NEAR(Replaces(world.port).front().trajectory.waypoints.back().positions_rad.front(), 0.5,
+              1e-6);
+}
+
+TEST(ParticipantStopStageHelperTest, SpringPointDoesNotCertifyReturnFeasibility) {
+  World world;
+  const auto stage =
+      Stage(0U, Nominal::kControlled, Parameters("spring_back_hold", false, std::nullopt, 0.01));
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0);
+  SpringPointObserver observer(world);
+  const auto result =
+      world.helper->TranslateStopStageForTakeover(stage, Budget(stage), {}, observer);
+  EXPECT_EQ(observer.calls, 1U);
+  ASSERT_TRUE(observer.point);
+  EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+  EXPECT_TRUE(Replaces(world.port).empty());
 }
 
 TEST(ParticipantStopStageHelperTest, DirectSpringBackProfileUsesTheSameReplaceTimeline) {

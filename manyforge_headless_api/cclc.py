@@ -27,6 +27,7 @@ from .private_transport import (
 
 
 CCLC_SOCKET_FILE = "cclc-command.sock"
+# Stays v1 for the coordinated unreleased 128/130 cut (agreed with Track 2).
 CCLC_OPEN_REQUEST_VERSION = "manyforge.cclc_open_request.v1"
 CCLC_OPEN_RESPONSE_VERSION = "manyforge.cclc_open_response.v1"
 MAX_CCLC_REQUEST_BYTES = 4 * 1024 * 1024
@@ -201,6 +202,67 @@ _LIFECYCLE_STATES = frozenset({
 })
 
 
+_PROVIDER_DOMAIN_FIELDS = {
+    "active_control_configuration", "control_domain_id", "control_domain_revision", "kind",
+    "provider", "provider_runtime_epoch", "resources",
+}
+_PROVIDER_FIELDS = {
+    "controllable_component_id", "lifecycle_command_timeout_ns", "lifecycle_plan_catalog_digest",
+    "provider_instance_id", "provider_manifest_id", "provider_manifest_revision",
+    "provider_runtime_unit_id", "signal_configuration_digest", "signal_names",
+}
+_PROVIDER_ACTIVE_FIELDS = {
+    "active_control_configuration_generation", "active_control_configuration_id",
+    "signal_configuration_digest", "source_runtime_epoch", "source_runtime_unit_id",
+    "source_sequence",
+}
+_MAX_LIFECYCLE_TIMEOUT_NS = 3_600_000_000_000
+# Every response domain names its meaning; `resources` is Core resource_ids():
+# controller = current control-binding resources, io_provider = sealed logical outputs.
+_DOMAIN_KINDS = frozenset({"controller", "io_provider"})
+
+
+def _sha256_digest(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) == 71 and value.startswith("sha256:")
+            and all(digit in "0123456789abcdef" for digit in value[7:]))
+
+
+def _provider_domain(domain: Any) -> bool:
+    """Mirror the Core's model-free I/O provider domain (no bindings, topology or kinematics)."""
+    def identity(value: Any) -> bool:
+        return _diagnostic_text(value, 128, nonempty=True)
+
+    if not _closed(domain, _PROVIDER_DOMAIN_FIELDS) or domain["kind"] != "io_provider":
+        return False
+    provider = domain["provider"]
+    if not (_closed(provider, _PROVIDER_FIELDS)
+            and all(identity(domain[key]) for key in
+                    ("control_domain_id", "control_domain_revision", "provider_runtime_epoch"))
+            and all(identity(provider[key]) for key in
+                    ("controllable_component_id", "provider_runtime_unit_id", "provider_instance_id",
+                     "provider_manifest_id"))
+            and all(_sha256_digest(provider[key]) for key in
+                    ("provider_manifest_revision", "lifecycle_plan_catalog_digest",
+                     "signal_configuration_digest"))
+            and _is_int(provider["lifecycle_command_timeout_ns"])
+            and 0 < provider["lifecycle_command_timeout_ns"] <= _MAX_LIFECYCLE_TIMEOUT_NS
+            and _canonical_rows(provider["signal_names"], 4096, lambda name: name)
+            and bool(provider["signal_names"])
+            and all(_bounded_text(name, 128) for name in provider["signal_names"])
+            and _canonical_rows(domain["resources"], 4096, lambda resource: resource)
+            and all(identity(resource) for resource in domain["resources"])):
+        return False
+    active = domain["active_control_configuration"]
+    return active is None or (
+        _closed(active, _PROVIDER_ACTIVE_FIELDS)
+        and identity(active["active_control_configuration_id"])
+        and all(_is_int(active[key]) and 1 <= active[key] <= MAXIMUM_SAFE_INTEGER
+                for key in ("active_control_configuration_generation", "source_sequence"))
+        and active["source_runtime_unit_id"] == provider["provider_runtime_unit_id"]
+        and active["source_runtime_epoch"] == domain["provider_runtime_epoch"]
+        and active["signal_configuration_digest"] == provider["signal_configuration_digest"])
+
+
 def _readiness_error(value: Any, maximum_details: int = 64) -> bool:
     return value is None or (
         _closed(value, {"code", "message", "details"})
@@ -244,10 +306,18 @@ def _validate_component_readiness(
         require(_canonical_rows(domains, 256, lambda row: row["control_domain_id"]))
         require(bool(domains))
         revisions = {}
+        provider_domains = []
         for domain in domains:
+            require(isinstance(domain, dict) and _member(domain.get("kind"), _DOMAIN_KINDS))
+            if domain["kind"] == "io_provider":
+                require(_provider_domain(domain)
+                    and domain["provider"]["controllable_component_id"] == snapshot["controllable_component_id"])
+                provider_domains.append(domain)
+                revisions[domain["control_domain_id"]] = domain["control_domain_revision"]
+                continue
             require(_closed(domain, {"active_control_configuration", "control_domain_id",
                 "control_domain_revision", "controller_topology_id", "current_control_bindings",
-                "current_resources", "topology_revision"}))
+                "kind", "resources", "topology_revision"}))
             for name in ("control_domain_id", "control_domain_revision", "controller_topology_id", "topology_revision"):
                 require(_diagnostic_text(domain[name], 256, nonempty=True))
             bindings = domain["current_control_bindings"]
@@ -255,7 +325,7 @@ def _validate_component_readiness(
             for binding in bindings:
                 require(_closed(binding, {"control_binding_id", "control_binding_revision", "control_route_id"})
                     and all(_diagnostic_text(value, 256, nonempty=True) for value in binding.values()))
-            resources = domain["current_resources"]
+            resources = domain["resources"]
             require(_canonical_rows(resources, 4096, lambda resource: resource) and bool(resources)
                 and all(_diagnostic_text(resource, 256, nonempty=True) for resource in resources))
             active = domain["active_control_configuration"]
@@ -280,6 +350,16 @@ def _validate_component_readiness(
         for provider in providers:
             require(_closed(provider, _OCCURRENCE_FIELDS))
             require(all(_diagnostic_text(value, 256, nonempty=True) for value in provider.values()))
+        for domain in provider_domains:
+            identity = domain["provider"]
+            require([{key: row[key] for key in _OCCURRENCE_FIELDS - {"control_domain_id"}}
+                     for row in providers if row["control_domain_id"] == domain["control_domain_id"]] == [{
+                "provider_instance_id": identity["provider_instance_id"],
+                "provider_manifest_id": identity["provider_manifest_id"],
+                "provider_manifest_revision": identity["provider_manifest_revision"],
+                "provider_runtime_unit_id": identity["provider_runtime_unit_id"],
+                "provider_runtime_epoch": domain["provider_runtime_epoch"],
+                "lifecycle_plan_catalog_digest": identity["lifecycle_plan_catalog_digest"]}])
         if lifecycle_only:
             return
         readiness = snapshot["readiness"]
@@ -383,10 +463,13 @@ def _valid_diagnostic(value: Any) -> bool:
         groups = {
             "exit": {"status", "signal", "core_dumped", "observed_utc"},
             "context": {
-                "component_id", "request_context", "runtime_unit_id", "runtime_epoch",
-                "bundle_id", "graph_revision", "generator_identity", "launch_identity",
+                "controllable_component_id", "request_context", "runtime_unit_id",
+                "runtime_epoch", "retained_bundle_id", "graph_revision", "generator_identity",
+                "launch_identity",
             },
-            "readiness": {
+            # ros2_control launch facts (always null for an I/O provider), not the
+            # CCLC owner readiness verdict.
+            "launch_readiness": {
                 "known", "controller_manager_present", "controller_observed",
                 "controller_loaded", "controller_bound", "arm_controller_active",
                 "hardware_ready", "joint_sample_available", "binding_epoch",
@@ -424,8 +507,7 @@ def _valid_diagnostic(value: Any) -> bool:
             )
             if fact is not None and not _diagnostic_text(fact, maximum):
                 return False
-        readiness = snapshot["readiness"]
-        for key, fact in readiness.items():
+        for key, fact in snapshot["launch_readiness"].items():
             if fact is None:
                 continue
             if key == "binding_epoch":

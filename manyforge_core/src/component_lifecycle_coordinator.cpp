@@ -12,11 +12,13 @@
 #include <manyforge_core/component_lifecycle_plan_evaluator.hpp>
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/controller_lifecycle_evaluator.hpp>
+#include <manyforge_core/runtime_participant_binding.hpp>
 #include <mutex>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -484,6 +486,123 @@ class ComponentLifecycleCoordinator::Impl final {
     lease->armed = true;
     return Result<ComponentLifecycleProductPin>::Ok(
         ComponentLifecycleProductPin(product_control_->current, std::move(lease)));
+  }
+
+  [[nodiscard]] Result<IoOutputLocalResynchronizationProofDTO> ReadIoOutputLocalResynchronization(
+      const RuntimeParticipantBindingDTO& captured) const {
+    using Reply = Result<IoOutputLocalResynchronizationProofDTO>;
+    const auto refuse = [] {
+      return Reply::Err(coordinator_error(
+          "io_output_local_resynchronization_unproved",
+          "Actual completed local Disable then Enable is not retained for this exact output",
+          "io_output_local_resynchronization_unproved"));
+    };
+    const auto valid = verify_runtime_participant_binding(captured);
+    if (!valid.ok() || !captured.io_output_binding) return refuse();
+    const auto& output = *captured.io_output_binding;
+    auto pin = AcquireProductPin();
+    if (!pin.ok()) return Reply::Err(pin.error());
+    const auto& context = pin.value().context();
+    const auto current = context.current_snapshot_source.ReadCurrentComponentSnapshot(
+        captured.controllable_component_id);
+    if (!current.ok()) return Reply::Err(current.error());
+    const auto& snapshot = current.value();
+    if (!VerifyComponentLifecycleCurrentSnapshot(snapshot).ok() || !context.identity ||
+        snapshot.controllable_component_id != captured.controllable_component_id ||
+        snapshot.component_lifecycle_state != ComponentLifecycleStateDTO::kActive ||
+        snapshot.active_publication_receipt != context.identity->publication ||
+        std::count(context.identity->configured_components.begin(),
+                   context.identity->configured_components.end(),
+                   captured.controllable_component_id) != 1 ||
+        snapshot.active_publication_receipt.request.candidate_retained_bundle_id !=
+            captured.retained_bundle_id ||
+        snapshot.active_publication_receipt.request.candidate_graph_revision !=
+            captured.graph_revision ||
+        snapshot.component_lifecycle_generation.value() <=
+            output.component_lifecycle_generation.value() ||
+        std::count(snapshot.provider_occurrences.begin(), snapshot.provider_occurrences.end(),
+                   output.provider) != 1 ||
+        std::any_of(snapshot.domains.begin(), snapshot.domains.end(),
+                    [](const auto& domain) { return domain.provider() == nullptr; }))
+      return refuse();
+    const auto history =
+        journal_.LoadRetainedComponentLifecycleHistory(captured.controllable_component_id);
+    if (!history.ok()) return Reply::Err(history.error());
+    const auto qualified = [&](const ComponentLifecycleStatusDTO& status,
+                               ComponentLifecycleIntentKindDTO intent,
+                               ComponentLifecycleStateDTO state, std::string_view primitive) {
+      if (!status.locally_valid() || status.selected_bring_up || status.apply_bring_up ||
+          status.accepted_intent.intent != intent ||
+          status.accepted_intent.controllable_component_id != captured.controllable_component_id ||
+          status.accepted_intent.expected_graph_revision != captured.graph_revision ||
+          status.phase != ComponentLifecycleTransactionPhaseDTO::kSucceeded ||
+          status.terminal_result != ComponentLifecycleTerminalResultDTO::kSucceeded ||
+          status.current_state != state || status.reconciliation_required || status.error ||
+          status.acceptance.component_lifecycle_generation.value() <=
+              output.component_lifecycle_generation.value())
+        return false;
+      const auto domain =
+          std::find_if(status.domains.begin(), status.domains.end(), [&](const auto& row) {
+            return row.control_domain_id == output.provider.control_domain_id;
+          });
+      if (domain == status.domains.end() || !domain->current_scope ||
+          !domain->current_scope->provider() ||
+          domain->resolved_provider_occurrence != output.provider ||
+          domain->current_state != state ||
+          domain->action_state != ComponentLifecycleDomainActionStateDTO::kSucceeded ||
+          domain->current_scope->provider()->provider.signal_configuration_digest !=
+              output.signal_configuration_digest ||
+          std::find(domain->current_scope->resource_ids().begin(),
+                    domain->current_scope->resource_ids().end(),
+                    *output.signal.output_resource) == domain->current_scope->resource_ids().end())
+        return false;
+      // An already-satisfied label is not proof that a local restart happened.
+      return std::any_of(
+          domain->primitive_attempts.begin(), domain->primitive_attempts.end(),
+          [&](const auto& attempt) {
+            return attempt.lifecycle_primitive_id.value() == primitive &&
+                   attempt.provider_instance_id == output.provider.provider_instance_id &&
+                   attempt.provider_manifest_id == output.provider.provider_manifest_id &&
+                   attempt.provider_manifest_revision ==
+                       output.provider.provider_manifest_revision &&
+                   attempt.provider_runtime_unit_id == output.provider.provider_runtime_unit_id &&
+                   attempt.provider_runtime_epoch == output.provider.provider_runtime_epoch &&
+                   attempt.dispatch_state == LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown &&
+                   attempt.effect == LifecyclePrimitiveEffectDTO::kObserved &&
+                   attempt.known_result == LifecyclePrimitiveKnownResultDTO::kSucceeded;
+          });
+    };
+    const ComponentLifecycleStatusDTO* enabled = nullptr;
+    const ComponentLifecycleStatusDTO* disabled = nullptr;
+    for (const auto& status : history.value()) {
+      if (status.acceptance.component_lifecycle_generation ==
+              snapshot.component_lifecycle_generation &&
+          qualified(status, ComponentLifecycleIntentKindDTO::kEnable,
+                    ComponentLifecycleStateDTO::kActive, "io.provider.enable"))
+        enabled = &status;
+    }
+    if (!enabled) return refuse();
+    for (const auto& status : history.value()) {
+      if (status.acceptance.component_lifecycle_generation.value() <
+              enabled->acceptance.component_lifecycle_generation.value() &&
+          status.latest_updated_at_ns <= enabled->accepted_at_ns &&
+          qualified(status, ComponentLifecycleIntentKindDTO::kDisable,
+                    ComponentLifecycleStateDTO::kDisabled, "io.provider.disable") &&
+          (!disabled || status.acceptance.component_lifecycle_generation.value() >
+                            disabled->acceptance.component_lifecycle_generation.value()))
+        disabled = &status;
+    }
+    if (!disabled) return refuse();
+    const auto after = context.current_snapshot_source.ReadCurrentComponentSnapshot(
+        captured.controllable_component_id);
+    if (!after.ok()) return Reply::Err(after.error());
+    if (after.value() != snapshot) return refuse();
+    return Reply::Ok({captured.retained_bundle_id, captured.graph_revision,
+                      captured.controllable_component_id, output.provider,
+                      disabled->acceptance.lifecycle_transaction_id,
+                      enabled->acceptance.lifecycle_transaction_id,
+                      disabled->acceptance.component_lifecycle_generation,
+                      enabled->acceptance.component_lifecycle_generation});
   }
 
   [[nodiscard]] Result<CCLCComponentReadDTO> ReadCurrentComponentView(
@@ -1870,6 +1989,112 @@ class ComponentLifecycleCoordinator::Impl final {
     });
   }
 
+  [[nodiscard]] Result<void> ValidateInstalledApplyCandidate(
+      const std::shared_ptr<RuntimeState>& runtime, const ComponentLifecycleIntentDTO& intent,
+      const ContentDigest& digest, const ComponentLifecycleStatusDTO& retained_status,
+      const std::vector<ResolvedLifecycleControlDomainScopeDTO>& domains,
+      const std::vector<ResolvedLifecycleProviderOccurrenceDTO>& providers,
+      const std::vector<BrandLifecyclePortRegistrationDTO>& registrations) const {
+    if (!retained_status.locally_valid() || !retained_status.apply_bring_up ||
+        retained_status.acceptance != runtime->original_acceptance ||
+        !runtime->original_apply_parent ||
+        retained_status.apply_bring_up->parent_authority != *runtime->original_apply_parent)
+      return Result<void>::Err(ApplyError("original_runtime_required"));
+    if (retained_status.accepted_intent != intent ||
+        retained_status.apply_bring_up->original_request_payload_digest != digest ||
+        domains.size() != runtime->apply_candidate_domains.size() ||
+        providers != runtime->apply_candidate_providers || registrations.size() != providers.size())
+      return Result<void>::Err(ApplyError("installed_candidate_mismatch"));
+    for (std::size_t index = 0U; index < domains.size(); ++index) {
+      auto qualified = runtime->apply_candidate_domains[index];
+      const bool same_configuration = std::visit(
+          [&](auto& before, const auto& installed) {
+            if constexpr (!std::is_same_v<std::decay_t<decltype(before)>,
+                                          std::decay_t<decltype(installed)>>) {
+              return false;
+            } else {
+              if (before.active_control_configuration &&
+                  before.active_control_configuration != installed.active_control_configuration)
+                return false;
+              before.active_control_configuration = installed.active_control_configuration;
+              return true;
+            }
+          },
+          qualified.payload, domains[index].payload);
+      if (!same_configuration)
+        return Result<void>::Err(ApplyError("installed_configuration_mismatch"));
+      // Configuration can now exist because this is actual installation;
+      // every other qualified scope fact must remain exact.
+      if (!domains[index].locally_valid() || qualified != domains[index] ||
+          registrations[index].provider_occurrence != providers[index] ||
+          !registrations[index].port || !providers[index].locally_valid() ||
+          providers[index].control_domain_id != domains[index].control_domain_id ||
+          providers[index].control_domain_revision != domains[index].control_domain_revision)
+        return Result<void>::Err(ApplyError("installed_registration_mismatch"));
+    }
+    return Result<void>::Ok();
+  }
+
+  [[nodiscard]] Result<InstalledProviderCandidateFactsDTO> ReadInstalledApplyCandidateFacts(
+      const ComponentLifecycleIntentDTO& intent, const ContentDigest& digest,
+      const std::vector<ResolvedLifecycleControlDomainScopeDTO>& domains,
+      const std::vector<ResolvedLifecycleProviderOccurrenceDTO>& providers,
+      const std::vector<BrandLifecyclePortRegistrationDTO>& registrations) {
+    using Reply = Result<InstalledProviderCandidateFactsDTO>;
+    try {
+      const auto owner = CurrentOwnerEpoch();
+      const auto retained = ReadApplyComponentBringUpRequestResult(intent, digest);
+      if (!retained.ok()) return Reply::Err(retained.error());
+      if (!retained.value() || !retained.value()->status)
+        return Reply::Err(ApplyError("accepted_runtime_absent"));
+      const auto& status = *retained.value()->status;
+      std::shared_ptr<RuntimeState> runtime;
+      {
+        std::lock_guard lock(state_mutex_);
+        const auto found = std::find_if(
+            active_transactions_.begin(), active_transactions_.end(),
+            [&](const auto& row) { return row->original_acceptance == status.acceptance; });
+        if (found != active_transactions_.end()) runtime = *found;
+      }
+      // Accepted candidate vectors/services are immutable after insertion.
+      // Do not read mutable RuntimeState::status or enter ResolveAdmission:
+      // the caller already holds the original host installation guard.
+      if (!runtime || !runtime->apply_services || !runtime->original_apply_parent ||
+          !AdmissionIsOpen() || shutting_down_.load(std::memory_order_acquire) ||
+          runtime->apply_continued.load(std::memory_order_acquire) ||
+          runtime->apply_stopped.load(std::memory_order_acquire) ||
+          intent.request_context.request_owner_epoch != owner ||
+          status.status_owner_epoch != owner ||
+          status.phase != ComponentLifecycleTransactionPhaseDTO::kAccepted ||
+          status.reconciliation_required || status.error)
+        return Reply::Err(ApplyError("original_runtime_required"));
+      const auto valid = ValidateInstalledApplyCandidate(runtime, intent, digest, status, domains,
+                                                         providers, registrations);
+      if (!valid.ok()) return Reply::Err(valid.error());
+      const auto& publication = runtime->apply_services->expected_publication;
+      InstalledProviderCandidateFactsDTO facts{
+          publication.candidate_retained_bundle_id,
+          publication.candidate_graph_revision,
+          intent.controllable_component_id,
+          runtime->original_acceptance.component_lifecycle_generation,
+          domains,
+          providers,
+          InstalledApplyChildCandidateSourceDTO{owner, runtime->original_apply_parent->parent,
+                                                runtime->original_acceptance, digest}};
+      const auto after = ReadApplyComponentBringUpRequestResult(intent, digest);
+      if (!after.ok()) return Reply::Err(after.error());
+      if (!after.value() || after.value()->status != retained.value()->status ||
+          CurrentOwnerEpoch() != owner || !AdmissionIsOpen() ||
+          shutting_down_.load(std::memory_order_acquire) ||
+          runtime->apply_continued.load(std::memory_order_acquire) ||
+          runtime->apply_stopped.load(std::memory_order_acquire))
+        return Reply::Err(ApplyError("original_runtime_changed"));
+      return Reply::Ok(std::move(facts));
+    } catch (...) {
+      return Reply::Err(ApplyError("candidate_fact_source_failed"));
+    }
+  }
+
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> ContinueApplyComponentBringUp(
       const ComponentLifecycleIntentDTO& intent, const ContentDigest& digest,
       const std::vector<ResolvedLifecycleControlDomainScopeDTO>& domains,
@@ -1930,28 +2155,10 @@ class ComponentLifecycleCoordinator::Impl final {
                  sibling->apply_stopped.load(std::memory_order_acquire)))
               return Result<void>::Err(ApplyError("previous_apply_child_not_holding"));
           }
-          if (runtime->status.accepted_intent != intent ||
-              runtime->status.apply_bring_up->original_request_payload_digest != digest ||
-              domains.size() != runtime->apply_candidate_domains.size() ||
-              providers != runtime->apply_candidate_providers ||
-              registrations.size() != providers.size())
-            return Result<void>::Err(ApplyError("installed_candidate_mismatch"));
-          for (std::size_t index = 0U; index < domains.size(); ++index) {
-            auto qualified = runtime->apply_candidate_domains[index];
-            if (qualified.active_control_configuration &&
-                qualified.active_control_configuration !=
-                    domains[index].active_control_configuration)
-              return Result<void>::Err(ApplyError("installed_configuration_mismatch"));
-            // Configuration can now exist because this is actual installation;
-            // every other qualified scope fact must remain exact.
-            qualified.active_control_configuration = domains[index].active_control_configuration;
-            if (!domains[index].locally_valid() || qualified != domains[index] ||
-                registrations[index].provider_occurrence != providers[index] ||
-                !registrations[index].port || !providers[index].locally_valid() ||
-                providers[index].control_domain_id != domains[index].control_domain_id ||
-                providers[index].control_domain_revision != domains[index].control_domain_revision)
-              return Result<void>::Err(ApplyError("installed_registration_mismatch"));
-          }
+          const auto installation =
+              ValidateInstalledApplyCandidate(runtime, intent, digest, *retained.value()->status,
+                                              domains, providers, registrations);
+          if (!installation.ok()) return installation;
           std::vector<ControlDomainId> expected_retired;
           for (const auto& domain : runtime->status.domains)
             if (!domain.expected_domain) expected_retired.push_back(domain.control_domain_id);
@@ -2147,7 +2354,8 @@ class ComponentLifecycleCoordinator::Impl final {
           runtime->status.apply_bring_up->parent_authority.held_fence_query.configuration_fence_id,
           runtime->status.accepted_intent.controllable_component_id,
           runtime->status.acceptance.component_lifecycle_generation,
-          false};
+          false,
+          runtime->status.apply_bring_up->parent_authority.held_fence_query.expected_scope};
       const auto readback =
           runtime->apply_readiness_port->PublishComponentCommandReadiness(publication);
       if (!readback.ok() || readback.value().command_eligible ||
@@ -3041,7 +3249,8 @@ class ComponentLifecycleCoordinator::Impl final {
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireDurableCellClaim(
       const CellAdmissionClaimIntentDTO& intent, RecordRejection&& record_rejection,
       const ActiveControlConfigurationDTO* recovery_predecessor = nullptr,
-      const SelectedComponentBringUpOfferDTO* selected_offer = nullptr) {
+      const SelectedComponentBringUpOfferDTO* selected_offer = nullptr,
+      const ComponentLifecycleIntentDTO* local_output_recovery = nullptr) {
     // This submit owns the persistence flag. Closing must not wait for itself.
     const auto close = [&] {
       std::lock_guard lock(admission_mutex_);
@@ -3062,6 +3271,9 @@ class ComponentLifecycleCoordinator::Impl final {
                       : recovery_predecessor
                           ? kernel_cell_admission_port_.AcquireRouteRecoveryCellAdmissionClaim(
                                 intent, *recovery_predecessor)
+                      : local_output_recovery
+                          ? kernel_cell_admission_port_.AcquireIoOutputRecoveryLifecycleClaim(
+                                intent, *local_output_recovery)
                           : kernel_cell_admission_port_.AcquireCellAdmissionClaim(intent);
       if (!acquired.ok() || acquired.value().intent != intent) {
         const bool unstarted =
@@ -5138,9 +5350,20 @@ class ComponentLifecycleCoordinator::Impl final {
     persistence_owned = true;
     known_unstarted = false;
     admission_lock.unlock();
-    const auto acquired = AcquireDurableCellClaim(claim_intent, [&](const ErrorDTO& error) {
-      return journal_.RecordLifecycleRejection(CurrentOwnerEpoch(), intent, error, claim_intent);
-    });
+    const bool local_output_recovery =
+        facts.current_snapshot && !facts.current_snapshot->domains.empty() &&
+        std::all_of(facts.current_snapshot->domains.begin(), facts.current_snapshot->domains.end(),
+                    [](const auto& domain) { return domain.provider() != nullptr; }) &&
+        (intent.intent == ComponentLifecycleIntentKindDTO::kDisable ||
+         intent.intent == ComponentLifecycleIntentKindDTO::kPrepare ||
+         intent.intent == ComponentLifecycleIntentKindDTO::kEnable);
+    const auto acquired = AcquireDurableCellClaim(
+        claim_intent,
+        [&](const ErrorDTO& error) {
+          return journal_.RecordLifecycleRejection(CurrentOwnerEpoch(), intent, error,
+                                                   claim_intent);
+        },
+        nullptr, nullptr, local_output_recovery ? &intent : nullptr);
     if (!acquired.ok()) {
       admission_lock.lock();
       admission_persistence_active_ = false;
@@ -6356,26 +6579,67 @@ class ComponentLifecycleCoordinator::Impl final {
         (!runtime->command_eligibility_closed && !runtime->recovering)) {
       return Result<void>::Ok();
     }
+    const bool provider_component =
+        std::any_of(status.domains.begin(), status.domains.end(), [](const auto& domain) {
+          return domain.current_scope && domain.current_scope->provider();
+        });
+    std::optional<ComponentLifecycleCurrentSnapshotDTO> provider_snapshot;
+    std::vector<BrandLifecycleObservationDTO> provider_observations;
+    if (provider_component) {
+      try {
+        // Read the actual durable membership/generation; do not project the
+        // not-yet-committed terminal aggregate state into this snapshot.
+        const auto current =
+            runtime->product_context->current_snapshot_source.ReadCurrentComponentSnapshot(
+                status.accepted_intent.controllable_component_id);
+        if (!current.ok()) return Result<void>::Err(current.error());
+        const auto verified = VerifyComponentLifecycleCurrentSnapshot(current.value());
+        if (!verified.ok()) return Result<void>::Err(verified.error());
+        if (current.value().controllable_component_id !=
+                status.accepted_intent.controllable_component_id ||
+            current.value().component_lifecycle_generation !=
+                status.acceptance.component_lifecycle_generation)
+          return Result<void>::Err(coordinator_error(
+              "component_lifecycle_readiness_publication_failed",
+              "actual provider snapshot does not match the held lifecycle generation",
+              "provider_snapshot_identity_mismatch"));
+        provider_snapshot = current.value();
+        for (const auto& observation : runtime->observations) {
+          if (observation && std::any_of(provider_snapshot->domains.begin(),
+                                         provider_snapshot->domains.end(), [&](const auto& domain) {
+                                           return domain.provider() &&
+                                                  domain.control_domain_id ==
+                                                      observation->control_domain_id;
+                                         }))
+            provider_observations.push_back(*observation);
+        }
+      } catch (...) {
+        return Result<void>::Err(
+            coordinator_error("component_lifecycle_readiness_publication_failed",
+                              "actual provider publication proof could not be captured",
+                              "provider_snapshot_read_exception"));
+      }
+    }
     // Retirement and terminal publication share the existing CCLC exclusion.
     // SQL completes outside Kernel state; this local exclusion ends before the
     // caller's failure path may call CloseAdmission on the same mutex.
     std::unique_lock retirement_lock(admission_mutex_);
-    const auto retained = journal_.ReadLifecycleTargetRetention(
-        status.accepted_intent.controllable_component_id);
+    const auto retained =
+        journal_.ReadLifecycleTargetRetention(status.accepted_intent.controllable_component_id);
     if (!retained.ok()) return Result<void>::Err(retained.error());
-    if (retained.value() &&
-        (!retained.value()->locally_valid() ||
-         retained.value()->target.controllable_component_id !=
-             status.accepted_intent.controllable_component_id)) {
-      return Result<void>::Err(coordinator_error(
-          "component_lifecycle_target_retirement_proof_invalid",
-          "terminal readiness has no valid exact retained target proof",
-          "retirement_proof_invalid"));
+    if (retained.value() && (!retained.value()->locally_valid() ||
+                             retained.value()->target.controllable_component_id !=
+                                 status.accepted_intent.controllable_component_id)) {
+      return Result<void>::Err(
+          coordinator_error("component_lifecycle_target_retirement_proof_invalid",
+                            "terminal readiness has no valid exact retained target proof",
+                            "retirement_proof_invalid"));
     }
-    const bool closed_by_retirement = retained.value() &&
+    const bool closed_by_retirement =
+        retained.value() &&
         retained.value()->retirement_reason == LifecycleTargetRetirementReasonDTO::kClose;
-    const bool eligible = !closed_by_retirement &&
-        status.terminal_result.has_value() &&
+    const bool eligible =
+        !closed_by_retirement && status.terminal_result.has_value() &&
         *status.terminal_result != ComponentLifecycleTerminalResultDTO::kFailedPartialEffect &&
         status.current_state == ComponentLifecycleStateDTO::kActive;
     const ComponentCommandReadinessPublicationDTO publication{
@@ -6390,8 +6654,12 @@ class ComponentLifecycleCoordinator::Impl final {
             "the Kernel component readiness publication raised an exception",
             "publication_exception"));
     try {
-      published = runtime->product_context->component_command_readiness_port
-                      ->PublishComponentCommandReadiness(publication);
+      published = provider_snapshot
+                      ? runtime->product_context->component_command_readiness_port
+                            ->PublishComponentCommandReadiness(
+                                publication, *provider_snapshot, provider_observations)
+                      : runtime->product_context->component_command_readiness_port
+                            ->PublishComponentCommandReadiness(publication);
     } catch (...) {
     }
     if (!published.ok() && !runtime->command_eligibility_closed) {
@@ -6889,6 +7157,12 @@ Result<void> ComponentLifecycleCoordinator::Start() {
   return impl_->Start();
 }
 
+Result<IoOutputLocalResynchronizationProofDTO>
+ComponentLifecycleCoordinator::ReadIoOutputLocalResynchronization(
+    const RuntimeParticipantBindingDTO& captured_binding) const {
+  return impl_->ReadIoOutputLocalResynchronization(captured_binding);
+}
+
 Result<CCLCComponentReadDTO> ComponentLifecycleCoordinator::ReadCurrentComponentView(
     const ControllableComponentId& component,
     const std::function<Result<ComponentLifecycleTargetViewDTO>()>& read_target,
@@ -7001,6 +7275,15 @@ Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinator::AcceptApply
   return impl_->AcceptApplyComponentBringUp(intent, evidence, genuine_predecessor,
                                             candidate_catalogs, qualified_candidate_domains,
                                             candidate_provider_occurrences, std::move(services));
+}
+
+Result<InstalledProviderCandidateFactsDTO>
+ComponentLifecycleCoordinator::ReadInstalledApplyCandidateFacts(
+    const ComponentLifecycleIntentDTO& intent, const ContentDigest& digest,
+    const std::vector<ResolvedLifecycleControlDomainScopeDTO>& domains,
+    const std::vector<ResolvedLifecycleProviderOccurrenceDTO>& providers,
+    const std::vector<BrandLifecyclePortRegistrationDTO>& registrations) {
+  return impl_->ReadInstalledApplyCandidateFacts(intent, digest, domains, providers, registrations);
 }
 
 Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinator::ContinueApplyComponentBringUp(

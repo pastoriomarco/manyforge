@@ -8,6 +8,8 @@
 #include <string>
 #include <utility>
 
+#include "provider_domain_value_internal.hpp"
+
 namespace manyforge::core {
 namespace {
 
@@ -231,11 +233,66 @@ template <typename StrongCounter>
   return result;
 }
 
-[[nodiscard]] ExpectedControlDomainRevisionDTO expected_control_domain(
-    const CanonicalValue& value) {
+[[nodiscard]] ProviderControlDomainDTO provider_control_domain(const CanonicalValue& value) {
   exact_object(
       value,
-      {"control_domain_id", "control_domain_revision", "controller_topology_id",
+      {"controllable_component_id", "provider_runtime_unit_id", "provider_instance_id",
+       "provider_manifest_id", "provider_manifest_revision", "lifecycle_plan_catalog_digest",
+       "signal_configuration_digest", "signal_names", "lifecycle_command_timeout_ns"},
+      {}, "provider control domain");
+  std::vector<std::string> names;
+  for (const auto& name : bounded_array(member(value, "signal_names", "provider control domain"),
+                                        kMaxLifecycleCurrentResources, "provider signal names"))
+    names.push_back(text(name, "provider signal name"));
+  ProviderControlDomainDTO result{
+      ControllableComponentId(
+          text(member(value, "controllable_component_id", "provider control domain"), "component")),
+      RuntimeUnitId(text(member(value, "provider_runtime_unit_id", "provider control domain"),
+                         "runtime unit")),
+      ProviderInstanceId(text(member(value, "provider_instance_id", "provider control domain"),
+                              "provider instance")),
+      ProviderManifestId(text(member(value, "provider_manifest_id", "provider control domain"),
+                              "provider manifest")),
+      ProviderManifestRevision(
+          text(member(value, "provider_manifest_revision", "provider control domain"),
+               "manifest revision")),
+      ContentDigest(text(member(value, "lifecycle_plan_catalog_digest", "provider control domain"),
+                         "catalog digest")),
+      ContentDigest(text(member(value, "signal_configuration_digest", "provider control domain"),
+                         "signal digest")),
+      std::move(names),
+      static_cast<Duration>(
+          unsigned_integer(member(value, "lifecycle_command_timeout_ns", "provider control domain"),
+                           "lifecycle command timeout"))};
+  if (!result.locally_valid()) fail("invalid provider-domain proof");
+  return result;
+}
+
+[[nodiscard]] ExpectedControlDomainRevisionDTO expected_control_domain(
+    const CanonicalValue& value) {
+  const auto kind = text(member(value, "kind", "expected lifecycle domain"), "domain kind");
+  if (kind == "io_provider") {
+    exact_object(value,
+                 {"kind", "control_domain_id", "control_domain_revision", "provider",
+                  "expected_active_control_configuration"},
+                 {}, "expected provider domain");
+    ExpectedControlDomainRevisionDTO result{
+        ControlDomainId(
+            text(member(value, "control_domain_id", "expected provider domain"), "domain id")),
+        ControlDomainRevision(
+            text(member(value, "control_domain_revision", "expected provider domain"),
+                 "domain revision")),
+        ExpectedProviderDomainScopeDTO{
+            provider_control_domain(member(value, "provider", "expected provider domain")),
+            expected_active_configuration(member(value, "expected_active_control_configuration",
+                                                 "expected provider domain"))}};
+    if (!result.locally_valid()) fail("invalid expected provider-domain scope");
+    return result;
+  }
+  if (kind != "controller") fail("unknown lifecycle domain kind");
+  exact_object(
+      value,
+      {"kind", "control_domain_id", "control_domain_revision", "controller_topology_id",
        "topology_revision", "expected_active_control_configuration", "expected_control_bindings"},
       {}, "expected control domain");
   std::vector<ExpectedControlBindingRevisionDTO> bindings;
@@ -1059,30 +1116,32 @@ template <typename StrongCounter>
   CanonicalValue::Array domains;
   domains.reserve(value.domains.size());
   for (const auto& domain : value.domains) {
+    if (domain.provider()) {
+      domains.emplace_back(detail::ResolvedProviderDomainValue(
+          domain, true, detail::LifecycleDomainResourceShape::kWire));
+      continue;
+    }
     CanonicalValue::Array bindings;
-    bindings.reserve(domain.current_control_bindings.size());
-    for (const auto& binding : domain.current_control_bindings) {
+    bindings.reserve(domain.control_bindings().size());
+    for (const auto& binding : domain.control_bindings()) {
       bindings.emplace_back(CanonicalValue::Object{
           {"control_binding_id", CanonicalValue(binding.control_binding_id.value())},
           {"control_binding_revision", CanonicalValue(binding.control_binding_revision.value())},
           {"control_route_id", CanonicalValue(binding.control_route_id.value())}});
     }
-    CanonicalValue::Array resources;
-    resources.reserve(domain.current_resources.size());
-    for (const auto& resource : domain.current_resources) {
-      resources.emplace_back(resource.value());
-    }
     domains.emplace_back(CanonicalValue::Object{
         {"active_control_configuration",
-         domain.active_control_configuration.has_value()
-             ? active_configuration_value(*domain.active_control_configuration)
+         domain.controller().active_control_configuration.has_value()
+             ? active_configuration_value(*domain.controller().active_control_configuration)
              : CanonicalValue(nullptr)},
         {"control_domain_id", CanonicalValue(domain.control_domain_id.value())},
         {"control_domain_revision", CanonicalValue(domain.control_domain_revision.value())},
-        {"controller_topology_id", CanonicalValue(domain.controller_topology_id.value())},
+        {"controller_topology_id",
+         CanonicalValue(domain.controller().controller_topology_id.value())},
         {"current_control_bindings", CanonicalValue(std::move(bindings))},
-        {"current_resources", CanonicalValue(std::move(resources))},
-        {"topology_revision", CanonicalValue(domain.topology_revision.value())}});
+        {"kind", CanonicalValue("controller")},
+        {"resources", detail::LifecycleDomainResourcesValue(domain)},
+        {"topology_revision", CanonicalValue(domain.controller().topology_revision.value())}});
   }
   CanonicalValue::Array providers;
   providers.reserve(value.provider_occurrences.size());

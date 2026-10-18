@@ -1,5 +1,6 @@
 #include "kernel_apply_fence_rpc_internal.hpp"
 #include <manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp>
+#include <manyforge_core/component_lifecycle_value_codec.hpp>
 
 #include <array>
 #include <bit>
@@ -19,6 +20,11 @@ namespace core = manyforge::core;
 
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'K',
                                               'A', 'F', 'R', '2'};
+constexpr auto kProviderMagic = [] {
+  auto value = kMagic;
+  value.back() = '4';
+  return value;
+}();
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
 
 [[noreturn]] void Fail(const std::string &detail) {
@@ -27,11 +33,16 @@ constexpr std::size_t kMaximumCollectionEntries = 4096U;
 
 class Writer final {
 public:
-  Writer() {
+  explicit Writer(bool provider_format = false)
+      : provider_format_(provider_format) {
     bytes_.reserve(1024U);
-    for (const auto byte : kMagic) {
+    for (const auto byte : provider_format_ ? kProviderMagic : kMagic) {
       Byte(byte);
     }
+  }
+
+  [[nodiscard]] bool ProviderFormat() const noexcept {
+    return provider_format_;
   }
 
   void Byte(const std::uint8_t value) {
@@ -80,6 +91,7 @@ private:
     }
   }
 
+  bool provider_format_;
   std::string bytes_;
 };
 
@@ -90,11 +102,20 @@ public:
         bytes_.size() > kMaximumKernelApplyFenceRpcPacketBytes) {
       Fail("packet is empty or oversized");
     }
-    for (const auto expected : kMagic) {
-      if (Byte() != expected) {
-        Fail("packet magic or version differs");
-      }
-    }
+    const auto magic = bytes_.substr(0U, kMagic.size());
+    provider_format_ =
+        magic ==
+        std::string_view(reinterpret_cast<const char *>(kProviderMagic.data()),
+                         kProviderMagic.size());
+    if (!provider_format_ &&
+        magic != std::string_view(reinterpret_cast<const char *>(kMagic.data()),
+                                  kMagic.size()))
+      Fail("packet magic or version differs");
+    offset_ = kMagic.size();
+  }
+
+  [[nodiscard]] bool ProviderFormat() const noexcept {
+    return provider_format_;
   }
 
   [[nodiscard]] std::uint8_t Byte() {
@@ -138,7 +159,9 @@ public:
     return result;
   }
 
-  void Finish() const {
+  void Finish(bool provider_scope = false) const {
+    if (provider_scope != provider_format_)
+      Fail("packet version differs from scope kind");
     if (offset_ != bytes_.size()) {
       Fail("packet has trailing fields");
     }
@@ -151,6 +174,7 @@ private:
     }
   }
 
+  bool provider_format_{};
   std::string_view bytes_;
   std::size_t offset_{};
 };
@@ -293,10 +317,25 @@ ReadPublicRequestContext(Reader &reader) {
               reader, [](Reader &input) { return input.String(); })};
 }
 
+[[nodiscard]] bool
+UsesProviderDomains(const core::ConfigurationFenceScopeDTO &scope) {
+  return std::any_of(
+      scope.domains.begin(), scope.domains.end(), [](const auto &domain) {
+        return std::holds_alternative<
+            core::ProviderConfigurationFenceDomainDTO>(domain.payload);
+      });
+}
+
 void WriteScope(Writer &writer, const core::ConfigurationFenceScopeDTO &scope) {
   if (!scope.valid()) {
     Fail("cannot encode an invalid configuration-fence scope");
   }
+  if (writer.ProviderFormat()) {
+    writer.String(core::detail::EncodeConfigurationFenceScopeRecord(scope));
+    return;
+  }
+  if (UsesProviderDomains(scope))
+    Fail("provider scope requires the provider packet version");
   WriteVector(
       writer, scope.controllable_component_ids,
       [](Writer &output, const auto &value) { WriteStrong(output, value); });
@@ -332,6 +371,8 @@ void WriteScope(Writer &writer, const core::ConfigurationFenceScopeDTO &scope) {
 }
 
 [[nodiscard]] core::ConfigurationFenceScopeDTO ReadScope(Reader &reader) {
+  if (reader.ProviderFormat())
+    return core::detail::DecodeConfigurationFenceScopeRecord(reader.String());
   core::ConfigurationFenceScopeDTO result{
       ReadVector<core::ControllableComponentId>(
           reader,
@@ -433,6 +474,24 @@ void WriteReplayStatus(Writer &writer,
   return result;
 }
 
+void WriteProviderLineage(
+    Writer &writer, const core::ProviderConfigurationFenceLineageDTO &value) {
+  if (!value.valid())
+    Fail("invalid provider lineage receipt");
+  WriteStrong(writer, value.control_domain_id);
+  WriteStrong(writer, value.provider_runtime_epoch);
+  WriteGeneration(writer, value.component_lifecycle_generation);
+}
+core::ProviderConfigurationFenceLineageDTO ReadProviderLineage(Reader &reader) {
+  core::ProviderConfigurationFenceLineageDTO value{
+      ReadStrong<core::ControlDomainId>(reader),
+      ReadStrong<core::RuntimeEpoch>(reader),
+      ReadGeneration<core::ComponentLifecycleGeneration>(reader)};
+  if (!value.valid())
+    Fail("invalid provider lineage receipt");
+  return value;
+}
+
 void WriteIntent(Writer &writer,
                  const core::ApplyConfigurationFenceIntentDTO &intent) {
   if (!intent.valid()) {
@@ -449,6 +508,9 @@ void WriteIntent(Writer &writer,
   WriteVector(writer, intent.expected_active_control_configurations,
               WriteActiveConfiguration);
   writer.String(intent.reason);
+  if (writer.ProviderFormat())
+    WriteVector(writer, intent.expected_provider_lineages,
+                WriteProviderLineage);
 }
 
 [[nodiscard]] core::ApplyConfigurationFenceIntentDTO
@@ -465,6 +527,10 @@ ReadIntent(Reader &reader) {
       ReadVector<core::DomainActiveControlConfigurationDTO>(
           reader, ReadActiveConfiguration),
       reader.String()};
+  if (reader.ProviderFormat())
+    result.expected_provider_lineages =
+        ReadVector<core::ProviderConfigurationFenceLineageDTO>(
+            reader, ReadProviderLineage);
   if (!result.valid()) {
     Fail("decoded Apply-fence intent is invalid");
   }
@@ -565,6 +631,8 @@ void WriteAdmissionSnapshot(
   writer.U64(snapshot.affected_queued_operation_count);
   writer.U64(snapshot.affected_active_operation_count);
   WriteStrong(writer, snapshot.result_digest);
+  if (writer.ProviderFormat())
+    WriteVector(writer, snapshot.provider_lineages, WriteProviderLineage);
 }
 
 [[nodiscard]] core::ConfigurationFenceAdmissionSnapshotDTO
@@ -581,6 +649,10 @@ ReadAdmissionSnapshot(Reader &reader) {
       reader.U64(),
       reader.U64(),
       ReadStrong<core::ContentDigest>(reader)};
+  if (reader.ProviderFormat())
+    result.provider_lineages =
+        ReadVector<core::ProviderConfigurationFenceLineageDTO>(
+            reader, ReadProviderLineage);
   if (!result.presence_valid()) {
     Fail("decoded fence-admission snapshot is invalid");
   }
@@ -1361,23 +1433,115 @@ enum class ResponseKind : std::uint8_t {
 
 };
 
+[[nodiscard]] bool UsesProviderScope(const KernelApplyFenceRpcRequest &packet) {
+  return std::visit(
+      [](const auto &value) {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T,
+                                     core::ConfigurationFenceAdmissionQueryDTO>)
+          return UsesProviderDomains(value.affected_scope);
+        else if constexpr (std::is_same_v<
+                               T, core::ApplyConfigurationFenceIntentDTO>)
+          return UsesProviderDomains(value.scope);
+        else if constexpr (std::is_same_v<
+                               T, core::ApplyFenceAcquireAttemptQueryDTO>)
+          return UsesProviderDomains(value.persisted_intent.scope);
+        else if constexpr (std::is_same_v<T, core::ApplyFenceRehydrateDTO>)
+          return UsesProviderDomains(value.persisted_scope);
+        else if constexpr (std::is_same_v<
+                               T, core::ConfigurationFenceStatusQueryDTO>)
+          return UsesProviderDomains(value.expected_scope);
+        else if constexpr (std::is_same_v<T,
+                                          core::ConfigurationFenceReleaseDTO>)
+          return UsesProviderDomains(
+              value.reconciliation_evidence.reconciled_scope);
+        else if constexpr (
+            std::is_same_v<T, core::SelectedBringUpConfigurationFenceIntentDTO>)
+          return UsesProviderDomains(value.selected_scope);
+        else if constexpr (
+            std::is_same_v<T, core::SelectedBringUpFenceAcquireAttemptQueryDTO>)
+          return UsesProviderDomains(value.persisted_intent.selected_scope);
+        else if constexpr (
+            std::is_same_v<
+                T, core::SelectedBringUpConfigurationFenceStatusQueryDTO>)
+          return UsesProviderDomains(value.expected_scope);
+        else if constexpr (
+            std::is_same_v<T,
+                           core::SelectedBringUpConfigurationFenceReleaseDTO>)
+          return UsesProviderDomains(
+              value.reconciliation_evidence.reconciled_scope);
+        else if constexpr (
+            std::is_same_v<T, core::SelectedBringUpFenceReleaseAttemptQueryDTO>)
+          return UsesProviderDomains(
+              value.persisted_request.reconciliation_evidence.reconciled_scope);
+        else
+          return false;
+      },
+      packet);
+}
+
+[[nodiscard]] bool
+UsesProviderScope(const KernelApplyFenceRpcResponse &packet) {
+  return std::visit(
+      [](const auto &value) {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<
+                          T, core::ConfigurationFenceAdmissionSnapshotDTO>)
+          return UsesProviderDomains(value.echoed_query.affected_scope);
+        else if constexpr (std::is_same_v<T,
+                                          core::ConfigurationFenceAcceptedDTO>)
+          return UsesProviderDomains(value.captured_scope);
+        else if constexpr (
+            std::is_same_v<T, core::ApplyFenceAcquireAttemptReconcileResultDTO>)
+          return UsesProviderDomains(value.echoed_query.persisted_intent.scope);
+        else if constexpr (std::is_same_v<T, core::ConfigurationFenceStatusDTO>)
+          return UsesProviderDomains(value.echoed_query.expected_scope);
+        else if constexpr (std::is_same_v<T,
+                                          core::ConfigurationFenceReleasedDTO>)
+          return UsesProviderDomains(
+              value.request.reconciliation_evidence.reconciled_scope);
+        else if constexpr (
+            std::is_same_v<
+                T, core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO>)
+          return UsesProviderDomains(
+              value.echoed_query.persisted_intent.selected_scope);
+        else if constexpr (
+            std::is_same_v<T, core::SelectedBringUpConfigurationFenceStatusDTO>)
+          return UsesProviderDomains(value.echoed_query.expected_scope);
+        else if constexpr (
+            std::is_same_v<T,
+                           core::SelectedBringUpConfigurationFenceReleasedDTO>)
+          return UsesProviderDomains(
+              value.request.reconciliation_evidence.reconciled_scope);
+        else if constexpr (
+            std::is_same_v<
+                T, core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO>)
+          return UsesProviderDomains(
+              value.echoed_query.persisted_request.reconciliation_evidence
+                  .reconciled_scope);
+        else
+          return false;
+      },
+      packet);
+}
+
 } // namespace
 
 bool IsKernelApplyFenceRpcPacket(const std::string_view bytes) noexcept {
-  if (bytes.size() < kMagic.size()) {
+  if (bytes.size() < kMagic.size())
     return false;
-  }
-  for (std::size_t index = 0U; index < kMagic.size(); ++index) {
-    if (static_cast<std::uint8_t>(bytes[index]) != kMagic[index]) {
-      return false;
-    }
-  }
-  return true;
+  const auto magic = bytes.substr(0U, kMagic.size());
+  return magic ==
+             std::string_view(reinterpret_cast<const char *>(kMagic.data()),
+                              kMagic.size()) ||
+         magic == std::string_view(
+                      reinterpret_cast<const char *>(kProviderMagic.data()),
+                      kProviderMagic.size());
 }
 
 std::string
 EncodeKernelApplyFenceRpcRequest(const KernelApplyFenceRpcRequest &request) {
-  Writer writer;
+  Writer writer(UsesProviderScope(request));
   std::visit(
       [&](const auto &value) {
         using T = std::decay_t<decltype(value)>;
@@ -1469,13 +1633,13 @@ DecodeKernelApplyFenceRpcRequest(const std::string_view bytes) {
     }
     Fail("request kind is unknown");
   }();
-  reader.Finish();
+  reader.Finish(UsesProviderScope(result));
   return result;
 }
 
 std::string
 EncodeKernelApplyFenceRpcResponse(const KernelApplyFenceRpcResponse &response) {
-  Writer writer;
+  Writer writer(UsesProviderScope(response));
   std::visit(
       [&](const auto &value) {
         using T = std::decay_t<decltype(value)>;
@@ -1569,7 +1733,7 @@ DecodeKernelApplyFenceRpcResponse(const std::string_view bytes) {
     }
     Fail("response kind is unknown");
   }();
-  reader.Finish();
+  reader.Finish(UsesProviderScope(result));
   return result;
 }
 

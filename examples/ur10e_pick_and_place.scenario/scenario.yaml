@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:fe4fe32b76167ec3c2593aa9afd6643f68b85b3676df142a20e31464eeb4e42e",
     "deployment.yaml": "sha256:a808b8c4c8062636f83d286bbcecb53acba22303964b7e8c433bcf593b93d06e",
-    "program.yaml": "sha256:c58d2f0331772b636647825e17cadbfd567456941cb4eacf2b96f83efd8b7517"
+    "program.yaml": "sha256:e6cefe8d3166bd8f8684d576b6758dbd09e54c4cf9d1b5bc01b9e16de5eb82c9"
   },
   "name": "ur10e_robotiq_pick_place_preview",
   "saved_status": {
-    "checked_content_digest": "sha256:391c14e367ee0423462569e559d024af0bdea84fefb3de15f579ce2caf7bb5cd",
+    "checked_content_digest": "sha256:92eea42c8afb4cf61dc235485d178a66864d8aca34291bbcc6393da43ac55900",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

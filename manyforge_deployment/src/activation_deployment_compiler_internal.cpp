@@ -1,7 +1,9 @@
 #include "activation_deployment_compiler_internal.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "stop_deceleration_coherence_internal.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
+#include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_deployment/io_provider_domain.hpp>
 
 #include <algorithm>
 #include <array>
@@ -19,6 +21,7 @@
 #include <variant>
 
 #include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
@@ -64,6 +67,9 @@ arm_capabilities() {
 
 [[nodiscard]] std::string
 component_type_id(const ActivationComponentProfile &profile) {
+  if (profile.runtime_kind == ActivationRuntimeKind::kIoProvider)
+    throw std::logic_error(
+        "I/O type must come from its actual qualified structural artifact");
   return profile.model_asset_id + ".fixed_scale.component";
 }
 constexpr std::array<std::string_view, 14U> kCellCapabilities{{
@@ -241,6 +247,8 @@ class CatalogSelection final {
 [[nodiscard]] std::vector<std::string>
 source_joints(const ActivationComponentProfile &profile,
               std::string_view role) {
+  if (profile.runtime_kind == ActivationRuntimeKind::kIoProvider)
+    throw std::logic_error("I/O profile has no physical model source");
   const auto &semantics = member(profile.model_family, "semantics", "model family");
   for (const auto &binding : array(member(semantics, "resource_role_bindings",
                                           "model semantics"),
@@ -436,6 +444,9 @@ struct ComponentProjection final {
     const ActivationComponentProfile &profile,
     const ActivationPreparedModel &model, CatalogSelection &catalog,
     std::string_view runtime_unit_id) {
+  if (!component.root_pose_in_cell || !component.model_source)
+    fail("physical component projection requires its actual captured model and "
+         "pose");
   const bool ros2_control =
       profile.runtime_kind == ActivationRuntimeKind::kRos2Control;
   const std::string prefix = "ros2_control";
@@ -686,7 +697,7 @@ struct ComponentProjection final {
            })})},
           {"runtime_unit_ids",
            CanonicalValue(Array{CanonicalValue(std::string(runtime_unit_id))})},
-          {"root_pose_in_cell", component.root_pose_in_cell},
+          {"root_pose_in_cell", *component.root_pose_in_cell},
       }),
       std::move(domains), std::move(bindings)};
 }
@@ -731,23 +742,50 @@ CanonicalValue compile_activation_deployment(
     const std::vector<ActivationComponentProfile> &component_profiles,
     const std::vector<ActivationPreparedModel> &prepared_models,
     const std::vector<core::CatalogRecordRefDTO> &catalog_records,
-    const std::vector<QualifiedRuntimeProfile> &runtime_profiles) {
+    const std::vector<QualifiedRuntimeProfile> &runtime_profiles,
+    const std::vector<ActivationPreparedIoType> &io_types,
+    std::span<const QualifiedProviderManifest> provider_manifests) {
+  const auto physical_count = static_cast<std::size_t>(std::count_if(
+      component_profiles.begin(), component_profiles.end(),
+      [](const auto &profile) {
+        return profile.runtime_kind != ActivationRuntimeKind::kIoProvider;
+      }));
   if (intent.components.size() != component_profiles.size() ||
-      intent.components.size() != prepared_models.size()) {
+      physical_count != prepared_models.size() ||
+      io_types.size() + physical_count != intent.components.size()) {
     fail("component/profile/model joins differ in size");
+  }
+  // D8: authored declarations must reach an installed runtime policy owner.
+  // This producer still emits empty interrupt tables below; refuse required
+  // declarations here instead of silently dropping them from the activation.
+  for (const std::string_view field : {"interrupt_sources", "interrupt_policies"}) {
+    if (const auto *declarations = intent.policies.find_object_member(field);
+        declarations != nullptr && !array(*declarations, field).empty()) {
+      fail(std::string(field) +
+           ": authored interrupt declarations are not installed by this compiler");
+    }
   }
   if (!array(intent.attachments, "attachments").empty()) {
     fail("component attachments are not yet supported by the authored compiler");
   }
   CatalogSelection catalog(catalog_records);
-  const bool ros2_control =
-      component_profiles.empty() || component_profiles.front().runtime_kind ==
-                                         ActivationRuntimeKind::kRos2Control;
+  const bool ros2_control = true;
+  const auto prepared_model =
+      [&](std::size_t component_index) -> const ActivationPreparedModel & {
+    const auto index = static_cast<std::size_t>(std::count_if(
+        component_profiles.begin(),
+        component_profiles.begin() + component_index, [](const auto &profile) {
+          return profile.runtime_kind != ActivationRuntimeKind::kIoProvider;
+        }));
+    return prepared_models.at(index);
+  };
   // Q89: empty membership keeps the same ROS cell host and optional world.
   // Q68: a ROS composition admits any number of robots and components, each
   // of which must select a ROS controller profile from the catalog. Mixing
   // with native components stays refused until the native executor goes.
   const auto has_ros_controller_profile = [](const auto &profile) {
+    if (profile.runtime_kind == ActivationRuntimeKind::kIoProvider)
+      return true;
     if (profile.runtime_kind != ActivationRuntimeKind::kRos2Control) {
       return false;
     }
@@ -764,9 +802,10 @@ CanonicalValue compile_activation_deployment(
   };
   if (std::any_of(component_profiles.begin(), component_profiles.end(),
                   [&](const auto &profile) {
-                    return (profile.runtime_kind ==
-                            ActivationRuntimeKind::kRos2Control) !=
-                           ros2_control;
+                    return profile.runtime_kind !=
+                               ActivationRuntimeKind::kRos2Control &&
+                           profile.runtime_kind !=
+                               ActivationRuntimeKind::kIoProvider;
                   })) {
     const auto lacking = lacking_ros_controller_profile();
     fail("mixed native and ROS runtime compositions are not yet supported: "
@@ -822,7 +861,11 @@ CanonicalValue compile_activation_deployment(
     bool shared_world_seen = false;
     for (std::size_t index = 0; index < intent.components.size(); ++index) {
       const auto &component = intent.components[index];
-      const auto &urdf = prepared_models[index].verified_asset.source_ir().urdf();
+      if (component_profiles[index].runtime_kind ==
+          ActivationRuntimeKind::kIoProvider)
+        continue;
+      const auto &urdf =
+          prepared_model(index).verified_asset.source_ir().urdf();
       for (const auto &link : urdf.links) {
         // Only the unprefixed root world is the shared global parent. A
         // prefixed link named world is still a component-owned published frame.
@@ -844,9 +887,55 @@ CanonicalValue compile_activation_deployment(
   std::vector<ComponentProjection> projections;
   projections.reserve(intent.components.size());
   for (std::size_t index = 0; index < intent.components.size(); ++index) {
-    projections.push_back(project_component(
-        intent.components[index], component_profiles[index],
-        prepared_models[index], catalog, runtime_id));
+    const auto &component = intent.components[index];
+    if (component_profiles[index].runtime_kind ==
+        ActivationRuntimeKind::kIoProvider) {
+      const auto found = std::find_if(
+          io_types.begin(), io_types.end(), [&](const auto &value) {
+            return value.component_id == component.component_id;
+          });
+      if (found == io_types.end() ||
+          std::count_if(io_types.begin(), io_types.end(),
+                        [&](const auto &value) {
+                          return value.component_id == component.component_id;
+                        }) != 1)
+        fail("I/O component has no exact qualified derived type");
+      const auto &type_ref =
+          catalog.require(core::CatalogRecordKind::kComponentType,
+                          found->type.value().component_type_id.value());
+      if (revision(type_ref) !=
+          found->type.value().component_type_revision.value())
+        fail("I/O derived component type differs from actual catalog referent");
+      auto configuration =
+          ros2_control_execution_runtime_contract::empty_host_configuration();
+      configuration =
+          object_with(object_with(configuration, "io_signals",
+                                  member(found->normalized_configuration,
+                                         "io_signals", "I/O configuration")),
+                      "io_provider_devices",
+                      member(found->normalized_configuration,
+                             "io_provider_devices", "I/O configuration"));
+      projections.push_back(
+          {std::move(configuration),
+           CanonicalValue(nullptr),
+           CanonicalValue(Object{
+               {"controllable_component_id",
+                CanonicalValue(component.component_id)},
+               {"component_type_id",
+                CanonicalValue(found->type.value().component_type_id.value())},
+               {"component_type_revision",
+                CanonicalValue(
+                    found->type.value().component_type_revision.value())},
+               {"model_role_bindings", CanonicalValue(Array{})},
+               {"runtime_unit_ids",
+                CanonicalValue(Array{CanonicalValue(runtime_id)})}}),
+           {},
+           {}});
+    } else {
+      projections.push_back(
+          project_component(component, component_profiles[index],
+                            prepared_model(index), catalog, runtime_id));
+    }
   }
 
   Array controller_profiles;
@@ -871,30 +960,43 @@ CanonicalValue compile_activation_deployment(
   }
   require_no_exclusive_ros_controller_topic_collision(controller_profiles);
 
-  CanonicalValue runtime_configuration = projections.front().runtime_configuration;
+  const auto physical = std::find_if(
+      component_profiles.begin(), component_profiles.end(),
+      [](const auto &profile) {
+        return profile.runtime_kind != ActivationRuntimeKind::kIoProvider;
+      });
+  const auto base_index =
+      physical == component_profiles.end()
+          ? 0U
+          : static_cast<std::size_t>(physical - component_profiles.begin());
+  CanonicalValue runtime_configuration =
+      projections[base_index].runtime_configuration;
   if (projections.size() > 1U) {
     for (const std::string_view name : {"planner_rng_seed",
                                         "execution_tick_hz",
                                         "collision_monitor_period_ms", "mode"}) {
       const auto &expected = member(runtime_configuration, name, "runtime configuration");
-      for (const auto &projection : projections) {
-        if (member(projection.runtime_configuration, name, "runtime configuration") !=
-            expected) {
+      for (std::size_t index = 0; index != projections.size(); ++index) {
+        if (component_profiles[index].runtime_kind ==
+            ActivationRuntimeKind::kIoProvider)
+          continue;
+        const auto &projection = projections[index];
+        if (member(projection.runtime_configuration, name,
+                   "runtime configuration") != expected) {
           fail("grouped native components disagree on " + std::string(name));
         }
       }
     }
-    using MergedFields = std::array<std::string_view, 5U>;
+    using MergedFields = std::array<std::string_view, 7U>;
     // Q68: one ROS runtime unit hosts every component and each component
     // keeps its own controller profile, fault Stop profile and authored
     // gripper target rows; the ROS runtime schema has no native
     // direct-control field.
-    const MergedFields merged_fields =
-        MergedFields{"initial_joint_positions_rad",
-                                    "motion_target_limits",
-                                    "default_fault_stop_profiles",
-                                    "gripper_target_configurations",
-                                    "controller_profiles"};
+    const MergedFields merged_fields = MergedFields{
+        "initial_joint_positions_rad", "motion_target_limits",
+        "default_fault_stop_profiles", "gripper_target_configurations",
+        "controller_profiles",         "io_signals",
+        "io_provider_devices"};
     for (const std::string_view name : merged_fields) {
       if (name.empty()) continue;
       Array combined;
@@ -913,9 +1015,12 @@ CanonicalValue compile_activation_deployment(
             const auto *component = row.find_object_member("controllable_component_id");
             const auto *target = row.find_object_member("command_target_id");
             const auto *joint = row.find_object_member("source_joint_name");
-            return std::tuple(component == nullptr ? "" : component->as_string(),
+            const auto *resource = row.find_object_member("resource_role_id");
+            return std::tuple(component == nullptr ? ""
+                                                   : component->as_string(),
                               target == nullptr ? "" : target->as_string(),
-                              joint == nullptr ? "" : joint->as_string());
+                              joint == nullptr ? "" : joint->as_string(),
+                              resource == nullptr ? "" : resource->as_string());
           };
           return key(left) < key(right);
         });
@@ -935,7 +1040,8 @@ CanonicalValue compile_activation_deployment(
   Array domains;
   Array bindings;
   for (auto &projection : projections) {
-    models.push_back(std::move(projection.model_instance));
+    if (!projection.model_instance.is_null())
+      models.push_back(std::move(projection.model_instance));
     components.push_back(std::move(projection.component));
     domains.insert(domains.end(), projection.domains.begin(), projection.domains.end());
     bindings.insert(bindings.end(), projection.bindings.begin(), projection.bindings.end());
@@ -982,8 +1088,10 @@ CanonicalValue compile_activation_deployment(
   for (std::size_t index = 0; index < intent.components.size(); ++index) {
     const auto &component = intent.components[index];
     const auto &profile = component_profiles[index];
+    if (profile.runtime_kind == ActivationRuntimeKind::kIoProvider)
+      continue;
     const auto &model_urdf =
-        prepared_models[index].verified_asset.source_ir().urdf();
+        prepared_model(index).verified_asset.source_ir().urdf();
     for (const std::string_view target : {std::string_view("arm"),
                                           std::string_view("gripper")}) {
       if (target == "gripper" && source_joints(profile, "fingers").empty())
@@ -1248,6 +1356,122 @@ CanonicalValue compile_activation_deployment(
       static_cast<void>(selector(catalog, "component.lifecycle.recover"));
     }
   }
+  std::optional<core::CatalogRecordRefDTO> io_manifest;
+  std::span<const core::ProviderCapabilityOfferDTO> io_offers;
+  if (!io_types.empty()) {
+    io_manifest = catalog.require(core::CatalogRecordKind::kProviderManifest,
+                                  "manyforge.provider.io_signals");
+    const auto actual = std::find_if(
+        provider_manifests.begin(), provider_manifests.end(),
+        [&](const auto &manifest) {
+          return manifest.value().provider_manifest_id.value() ==
+                     "manyforge.provider.io_signals" &&
+                 manifest.value().provider_manifest_revision.value() ==
+                     revision(*io_manifest);
+        });
+    if (actual == provider_manifests.end())
+      fail("I/O manifest has no exact qualified source");
+    io_offers = actual->value().offered_capabilities;
+    // The manifest's complete offer closure remains selected even when this
+    // device only instantiates inputs. A capability offer does not install an
+    // output.
+    for (const auto &offer : actual->value().offered_capabilities) {
+      const auto selected = selector(catalog, offer.capability_id.value());
+      if (member(selected, "capability_definition_revision", "capability")
+              .as_string() != offer.capability_definition_revision.value())
+        fail("I/O manifest capability differs from its exact qualified "
+             "definition");
+    }
+    const bool output =
+        std::any_of(io_types.begin(), io_types.end(), [](const auto &prepared) {
+          return std::any_of(prepared.type.value().command_targets.begin(),
+                             prepared.type.value().command_targets.end(),
+                             [](const auto &target) {
+                               return std::any_of(
+                                   target.capabilities.begin(),
+                                   target.capabilities.end(),
+                                   [](const auto &capability) {
+                                     return capability.capability_id.value() ==
+                                            "io.gpio.set_output";
+                                   });
+                             });
+        });
+    if (output)
+      static_cast<void>(catalog.require(core::CatalogRecordKind::kCommandSchema,
+                                        core::kIoSignalWriteCommandSchemaId));
+  }
+  const auto io_provider_row = [&](std::string_view capability,
+                                   std::string_view instance,
+                                   std::string_view scope,
+                                   CanonicalValue target) {
+    const auto selected = selector(catalog, capability);
+    const auto offer = std::find_if(
+        io_offers.begin(), io_offers.end(), [&](const auto &candidate) {
+          return candidate.capability_id.value() == capability &&
+                 candidate.capability_definition_revision.value() ==
+                     member(selected, "capability_definition_revision",
+                            "capability").as_string();
+        });
+    if (offer == io_offers.end())
+      fail("I/O binding has no exact qualified capability offer");
+    Array endpoint_bindings;
+    for (const auto &role : offer->required_endpoint_role_ids) {
+      if (role.value() != "io_signal_service")
+        fail("I/O offer endpoint role has no qualified runtime projection");
+      endpoint_bindings.emplace_back(Object{
+          {"endpoint_role_id", CanonicalValue(role.value())},
+          {"source_kind", CanonicalValue("runtime_unit")},
+          {"source_id", CanonicalValue(runtime_id)},
+          {"source_endpoint_role_id",
+           CanonicalValue("ros2_control_execution_status")}});
+    }
+    const auto identity = content_identity::framed_sha256(
+        "io-capability-provider-binding", "manyforge.io_provider_binding.v1",
+        CanonicalValue(Object{
+            {"provider_instance_id", CanonicalValue(std::string(instance))},
+            {"capability_id", CanonicalValue(std::string(capability))},
+            {"target", target}}));
+    Object row{
+        {"capability_provider_binding_id",
+         CanonicalValue("io.binding." + identity.substr(7U))},
+        {"capability_provider_binding_revision",
+         CanonicalValue(std::string(kZeroDigest))},
+        {"scope", CanonicalValue(std::string(scope))},
+        {"target", std::move(target)},
+        {"provider_instance_id", CanonicalValue(std::string(instance))},
+        {"provider_manifest_id",
+         CanonicalValue("manyforge.provider.io_signals")},
+        {"provider_manifest_revision", CanonicalValue(revision(*io_manifest))},
+        {"endpoint_bindings", CanonicalValue(std::move(endpoint_bindings))}};
+    for (const auto &field : selected.as_object())
+      row.push_back(field);
+    return CanonicalValue(std::move(row));
+  };
+  for (const auto &prepared : io_types) {
+    const auto identity = content_identity::framed_sha256(
+        "io-provider-instance", "manyforge.io_provider_instance.v1",
+        CanonicalValue(Object{{"runtime_unit_id", CanonicalValue(runtime_id)},
+                              {"controllable_component_id",
+                               CanonicalValue(prepared.component_id)}}));
+    const auto instance = "provider.io." + identity.substr(7U);
+    for (const auto &target : prepared.type.value().command_targets)
+      for (const auto &capability : target.capabilities)
+        providers.push_back(io_provider_row(
+            capability.capability_id.value(), instance, "target_binding",
+            CanonicalValue(Object{
+                {"controllable_component_id",
+                 CanonicalValue(prepared.component_id)},
+                {"component_type_revision",
+                 CanonicalValue(
+                     prepared.type.value().component_type_revision.value())},
+                {"command_target_id",
+                 CanonicalValue(target.command_target_id.value())}})));
+    for (const auto capability :
+         {"component.lifecycle.observe", "component.lifecycle.prepare",
+          "component.lifecycle.enable", "component.lifecycle.disable",
+          "component.lifecycle.recover"})
+      static_cast<void>(selector(catalog, capability));
+  }
   const auto &logical = catalog.require(core::CatalogRecordKind::kProviderManifest,
                                         "manyforge.provider.logical_scene");
   for (const auto capability : kCellCapabilities) {
@@ -1278,7 +1502,11 @@ CanonicalValue compile_activation_deployment(
     providers.emplace_back(std::move(row));
   }
   if (std::any_of(component_profiles.begin(), component_profiles.end(),
-                  [](const auto &profile) { return !source_joints(profile, "fingers").empty(); })) {
+                  [](const auto &profile) {
+                    return profile.runtime_kind !=
+                               ActivationRuntimeKind::kIoProvider &&
+                           !source_joints(profile, "fingers").empty();
+                  })) {
     static_cast<void>(catalog.require(core::CatalogRecordKind::kCommandSchema,
                                       "gripper.command_position"));
   }
@@ -1291,14 +1519,29 @@ CanonicalValue compile_activation_deployment(
                       text(member(right, "stop_escalation_stage_id", "stage"), "stage"));
   });
 
-  Object policies{
-      {"retained_policy_records", CanonicalValue(Array{})},
-      {"stop_stage_parameters", CanonicalValue(std::move(stop_stages))},
-      {"commissioned_stop_interfaces", CanonicalValue(Array{})},
-      {"interrupt_sources", CanonicalValue(Array{})},
-      {"interrupt_policies", CanonicalValue(Array{})},
-      {"interrupt_config", member(intent.policies, "interrupt_config", "policies")},
-  };
+  const bool has_policies =
+      physical_count != 0U || !intent.policies.as_object().empty();
+  Object policies;
+  if (has_policies) {
+    policies = {
+        {"retained_policy_records", CanonicalValue(Array{})},
+        {"stop_stage_parameters", CanonicalValue(std::move(stop_stages))},
+        {"commissioned_stop_interfaces", CanonicalValue(Array{})},
+        {"interrupt_sources", CanonicalValue(Array{})},
+        {"interrupt_policies", CanonicalValue(Array{})},
+        {"interrupt_config",
+         member(intent.policies, "interrupt_config", "policies")},
+    };
+    if (const auto *rules =
+            intent.policies.find_object_member("interrupt_rules");
+        rules && !array(*rules, "interrupt_rules").empty())
+      policies.emplace_back("interrupt_rules", *rules);
+    if (const auto *budget = intent.policies.find_object_member(
+            "motion_takeover_preparation_budget_s")) {
+      // The shared Deployment decoder below owns positive-finite validation.
+      policies.emplace_back("motion_takeover_preparation_budget_s", *budget);
+    }
+  }
   Object authored_graph;
   for (const std::string_view name : {"runtime_units", "model_instances",
                                       "controllable_components", "control_domains",
@@ -1315,17 +1558,56 @@ CanonicalValue compile_activation_deployment(
       {"graph", CanonicalValue(std::move(authored_graph))},
       {"desired_control_configurations", CanonicalValue(std::move(desired))},
       {"capability_provider_bindings", CanonicalValue(std::move(providers))},
-      {"policies", CanonicalValue(std::move(policies))},
   };
+  if (has_policies)
+    root.emplace_back("policies", CanonicalValue(std::move(policies)));
   if (intent.description.has_value())
     root.emplace_back("description", CanonicalValue(*intent.description));
   if (intent.compatibility.has_value())
     root.emplace_back("compatibility", *intent.compatibility);
   if (intent.assistant_profile_id.has_value())
     fail("assistant profiles are not yet supported by the authored compiler");
-  const auto candidate = parse_strict_json_model_yaml(
-      canonical_json(CanonicalValue(std::move(root))));
-  return compute_deployment_artifact_revision(candidate, selected_profiles)
+  CanonicalValue authored(std::move(root));
+  const auto preliminary = compute_deployment_artifact_revision(
+      parse_strict_json_model_yaml(canonical_json(authored)),
+      selected_profiles);
+  const auto derived = DeriveIoProviderDomains(
+      preliminary.graph().graph(),
+      preliminary.applicability_inputs().value().capability_provider_bindings,
+      selected_profiles, provider_manifests);
+  if (!derived.ok())
+    fail("I/O provider derivation: " + derived.error().details.at("reason"));
+  if (!derived.value().provider_domains.empty()) {
+    auto graph_value = member(authored, "graph", "Deployment");
+    auto domains = member(graph_value, "control_domains", "graph").as_array();
+    auto provider_rows =
+        member(authored, "capability_provider_bindings", "Deployment")
+            .as_array();
+    for (const auto &domain : derived.value().provider_domains) {
+      domains.push_back(IoProviderDomainRecord(domain));
+      for (const auto capability :
+           {"component.lifecycle.observe", "component.lifecycle.prepare",
+            "component.lifecycle.enable", "component.lifecycle.disable",
+            "component.lifecycle.recover"})
+        provider_rows.push_back(io_provider_row(
+            capability, domain.provider()->provider_instance_id.value(),
+            "control_domain",
+            CanonicalValue(
+                Object{{"control_domain_id",
+                        CanonicalValue(domain.control_domain_id.value())},
+                       {"control_domain_revision",
+                        CanonicalValue(domain.control_domain_revision.value())},
+                       {"domain_kind", CanonicalValue("provider")}})));
+    }
+    graph_value = object_with(graph_value, "control_domains",
+                              CanonicalValue(std::move(domains)));
+    authored = object_with(object_with(authored, "graph", graph_value),
+                           "capability_provider_bindings",
+                           CanonicalValue(std::move(provider_rows)));
+  }
+  return compute_deployment_artifact_revision(
+             parse_strict_json_model_yaml(canonical_json(authored)),
+             selected_profiles)
       .normalized_authored_root();
 }
 

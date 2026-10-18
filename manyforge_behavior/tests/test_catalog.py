@@ -23,7 +23,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = "sha256:946dcdf51bfdae12e2ff6effed9e1ab3e9c437360ac7c600bf91cd25e6675eb3"
+EXPECTED_CATALOG_DIGEST = "sha256:76cf8c7efdf959a132e9c33802c4c683cb3afddaf229cf06bb09605d609fdf36"
 
 
 def _catalog_data() -> dict[str, object]:
@@ -91,7 +91,7 @@ def test_gripper_position_schema_keeps_numeric_and_strict_semantic_aliases(
 
 def test_gripper_program_dwell_policy_is_optional_pause_default() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
-    assert catalog.content_version == "2.5.0"
+    assert catalog.content_version == "2.7.0"
     gripper = catalog.get("gripper.command_position")
     policy = next(parameter for parameter in gripper.parameters if parameter.id == "dwell_while_held")
     assert policy.required is False
@@ -115,9 +115,47 @@ def test_gripper_dwell_policy_uses_the_closed_enum(value, valid) -> None:
     assert (not validate_value(policy.schema, value, registry=catalog.schema_registry)) is valid
 
 
+@pytest.mark.parametrize("node_id", [
+    "motion.move_to_joint_target",
+    "motion.move_to_pose",
+    "motion.follow_cartesian_path",
+])
+def test_motion_automatic_retry_parameters_are_optional_with_bounded_defaults(node_id) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    parameters = {parameter.id: parameter for parameter in catalog.get(node_id).parameters}
+    retries = parameters["automatic_retries"]
+    delay = parameters["automatic_retry_delay_s"]
+    assert (retries.required, retries.has_default, retries.default) == (False, True, 3)
+    assert (delay.required, delay.has_default, delay.default) == (False, True, 1.0)
+    for value, valid in ((0, True), (10, True), (11, False), (-1, False)):
+        assert (not validate_value(retries.schema, value, registry=catalog.schema_registry)) is valid
+    for value, valid in ((0.0, True), (60.0, True), (60.5, False), (-0.1, False)):
+        assert (not validate_value(delay.schema, value, registry=catalog.schema_registry)) is valid
+
+
+@pytest.mark.parametrize("node_id", [
+    "motion.move_to_joint_target",
+    "motion.move_to_pose",
+    "motion.follow_cartesian_path",
+])
+def test_motion_preemption_parameters_are_optional_with_closed_values(node_id) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    parameters = {parameter.id: parameter for parameter in catalog.get(node_id).parameters}
+    priority = parameters["preemption_priority"]
+    result = parameters["preempted_result"]
+    # The outcome lives in the system-owned node_outcome.<instance_id> key.
+    assert "outcome_key" not in parameters
+    assert (priority.required, priority.has_default, priority.default) == (False, True, 0)
+    assert (result.required, result.has_default, result.default) == (False, True, "failure")
+    for value, valid in ((0, True), (100, True), (101, False), (-1, False)):
+        assert (not validate_value(priority.schema, value, registry=catalog.schema_registry)) is valid
+    for value, valid in (("success", True), ("failure", True), ("aborted", False)):
+        assert (not validate_value(result.schema, value, registry=catalog.schema_registry)) is valid
+
+
 def test_recomputed_previous_catalog_version_is_not_an_alias(tmp_path: Path) -> None:
-    path = _write_recomputed(tmp_path, lambda data: data.__setitem__("content_version", "2.4.0"))
-    with pytest.raises(CatalogValidationError, match="content_version must be '2.5.0'"):
+    path = _write_recomputed(tmp_path, lambda data: data.__setitem__("content_version", "2.6.0"))
+    with pytest.raises(CatalogValidationError, match="content_version must be '2.7.0'"):
         NodeCatalog(path)
 
 
@@ -132,6 +170,8 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
     assert move.runner_implementation_ids == {"py_trees": "motion_move_to_pose_v1"}
     assert {parameter.id for parameter in move.parameters} == {
         "acceleration_scale",
+        "automatic_retries",
+        "automatic_retry_delay_s",
         "base_frame_role",
         "cache_mode",
         "contact_scene_resource_id",
@@ -144,6 +184,8 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
         "per_joint_dynamics_limits",
         "planning_profile",
         "planning_timeout_s",
+        "preempted_result",
+        "preemption_priority",
         "rotation_tol_rad",
         "target_reference",
         "target_mode",
@@ -152,6 +194,17 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
         "translation_tol_m",
         "velocity_scale",
     }
+    parameters = {parameter.id: parameter for parameter in move.parameters}
+    for parameter_id, default in {
+        "automatic_retries": 3,
+        "automatic_retry_delay_s": 1.0,
+        "preemption_priority": 0,
+        "preempted_result": "failure",
+    }.items():
+        assert parameters[parameter_id].required is False
+        assert parameters[parameter_id].has_default is True
+        assert parameters[parameter_id].default == default
+    assert "outcome_key" not in parameters
     assert {
         (requirement.capability_id, requirement.scope) for requirement in move.required_capabilities
     } >= {
@@ -431,6 +484,7 @@ def test_check_input_reads_one_input_like_get_input() -> None:
         "target_role",
         "resource_role",
         "expected_value",
+        "mock_simulation",
     ]
     assert check.parameters[2].schema.schema_type == "bool"
     assert check.required_capabilities == get.required_capabilities

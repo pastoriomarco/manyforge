@@ -16,6 +16,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
+#include <manyforge_core/types/plan_request.hpp>
 #include <manyforge_core/types/resolved_frame.hpp>
 #include <manyforge_core/types/speed_profile.hpp>
 #include <manyforge_core/types/tolerances.hpp>
@@ -64,6 +65,7 @@ struct RoboPlanCandidateRequestDTO final {
   double planning_timeout_s{5.0};
   std::uint32_t planning_attempt_index{};
   std::optional<core::ActionSpanDTO> action_span;
+  std::optional<core::MovingReplacementInputDTO> moving_replacement{};
 };
 
 /// Caller-owned bounded-control hooks. The production wrapper supplies these

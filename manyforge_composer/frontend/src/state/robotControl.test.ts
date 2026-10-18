@@ -57,17 +57,17 @@ describe('addressed Robot Control state', () => {
       type: 'status_resolved', status,
     });
     expect(state).toMatchObject({
-      selectedComponentId: 'robot-a',
+      selectedControllableComponentId: 'robot-a',
       selectedMotionTargetId: 'arm',
       selectedGripperTargetId: 'gripper',
     });
     state = robotControlReducer(state, { type: 'edit_joint', jointIndex: 0, positionRad: 0.2 });
     const oldGeneration = state.generation;
     const switched = robotControlReducer(state, {
-      type: 'select_robot', componentId: 'robot-b', motionTargetId: 'arm',
+      type: 'select_robot', controllableComponentId: 'robot-b', motionTargetId: 'arm',
     });
     expect(switched).toMatchObject({
-      selectedComponentId: 'robot-b',
+      selectedControllableComponentId: 'robot-b',
       selectedMotionTargetId: 'arm',
       selectedGripperTargetId: 'gripper',
       phase: 'idle',
@@ -79,7 +79,7 @@ describe('addressed Robot Control state', () => {
     const refreshed = robotControlReducer(switched, {
       type: 'status_refreshed', status: structuredClone(status),
     });
-    expect(refreshed.selectedComponentId).toBe('robot-b');
+    expect(refreshed.selectedControllableComponentId).toBe('robot-b');
     expect(refreshed.generation).toBe(switched.generation);
     expect(robotControlReducer(refreshed, {
       type: 'preview_resolved', generation: oldGeneration,

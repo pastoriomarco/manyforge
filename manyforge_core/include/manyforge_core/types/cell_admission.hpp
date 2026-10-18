@@ -355,6 +355,22 @@ struct ProgramResetPositionAuthorizationDTO final {
 
 /// Owner-produced O(1) reduction. Counts are complete bounded aggregates, not
 /// collections to be rescanned by admission or Stop.
+/// Manager's first failed contact with an established active Program owner.
+/// This is availability evidence, never proof of physical containment.
+struct ProgramRunnerContactLossDTO final {
+  RequestOwnerEpoch manager_owner_epoch;
+  RuntimeEpoch manager_runtime_epoch;
+  ProgramCycleStatusDTO established_cycle;
+  std::string failure_predicate;
+  std::string message;
+
+  friend bool operator==(const ProgramRunnerContactLossDTO&,
+                         const ProgramRunnerContactLossDTO&) = default;
+};
+
+[[nodiscard]] Result<void> ValidateProgramRunnerContactLoss(
+    const ProgramRunnerContactLossDTO& loss);
+
 struct CellAdmissionReadinessSnapshotDTO final {
   bool program_cycle_status_current{};
   std::optional<ProgramCycleStatusDTO> program_cycle_status;
@@ -366,6 +382,7 @@ struct CellAdmissionReadinessSnapshotDTO final {
   std::uint32_t blocking_fault_count{};
   std::uint32_t unresolved_owner_count{};
   std::uint32_t unsettled_effect_count{};
+  std::optional<ProgramRunnerContactLossDTO> program_runner_loss{};
 
   friend bool operator==(const CellAdmissionReadinessSnapshotDTO&,
                          const CellAdmissionReadinessSnapshotDTO&) = default;

@@ -7,7 +7,10 @@
 #include <manyforge_core/ports/icclc_kernel_route_configuration_fence_port.hpp>
 #include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
+#include <manyforge_core/sqlite_cclc_journal.hpp>
+#include <manyforge_core/types/provider_candidate_facts.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
+#include <manyforge_core/types/runtime_domain_configuration.hpp>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -59,6 +62,7 @@ public:
   [[nodiscard]] bool exact_fence_covers(
       const manyforge::core::ConfigurationFenceId &fence_id,
       const std::vector<manyforge::core::ResourceId> &resources) const override;
+  [[nodiscard]] bool has_held_configuration_fences() const override;
   [[nodiscard]] bool exact_fence_is_held(
       const manyforge::core::ConfigurationFenceId &fence_id,
       const manyforge::core::ConfigurationFenceScopeDTO &scope) const override;
@@ -146,6 +150,12 @@ struct ManagedKernelApplyFenceOwnerConfig final {
       manyforge::core::Result<manyforge::core::CellAdmissionRecoveryReceiptDTO>(
           const manyforge::core::CellAdmissionRecoveryReceiptQueryDTO &)>
       selected_claim_recovery_receipt{};
+  // Stable Kernel inventory; callback takes only its state mutex. Closed
+  // installed metadata proves identity, never operation eligibility.
+  std::function<manyforge::core::Result<std::optional<
+      manyforge::core::RuntimeProviderDomainConfigurationReadbackDTO>>(
+      const manyforge::core::ControlDomainId &)>
+      provider_configuration_source{};
 };
 
 /// Durable Kernel-owned Apply, route and selected bring-up fence lifecycle.
@@ -177,6 +187,20 @@ public:
   QueryStatus(const manyforge::core::ConfigurationFenceStatusQueryDTO &query)
       const override;
 
+  /// Private observation of the SAME installed ordinary NativeApply while
+  /// its verified predecessor is still public. Facts come from the original
+  /// facade's fresh full-plan reader, never a caller-created candidate receipt.
+  /// The bounded callback rechecks only actual installed request/facade/group
+  /// identity under the existing ledger->composition order, before admission.
+  [[nodiscard]] manyforge::core::ConfigurationFenceStatusDTO
+  QueryInstalledNativeApplyCandidateStatus(
+      const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
+      const manyforge::core::ActiveBundlePublicationReceiptDTO &predecessor,
+      const manyforge::core::CellAdmissionClaimDTO &parent,
+      const manyforge::core::NativeApplyPlanDTO &expected_plan,
+      const std::vector<manyforge::core::InstalledProviderCandidateFactsDTO> &facts,
+      const std::function<void()> &revalidate_installed_attempt) const;
+
   /// Run one selected-runtime installation effect only while the exact
   /// durable Apply fence is held and the active publication is still the
   /// predecessor named by Component Manager. Candidate active-control
@@ -194,6 +218,20 @@ public:
   /// The post-publication half of the same parent Apply interlock. The
   /// successor receipt must name that Apply and still be the active pointer;
   /// the parent fence remains held throughout the delegated operation.
+  /// Original live Apply child only: the host independently reads the actual
+  /// original child receipts and retains the complete installed driver group
+  /// through the action. Observations alone cannot reconstruct that authority.
+  void RunWithExactHeldOriginalApplyCandidate(
+      const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
+      manyforge::core::ActiveBundlePublicationGeneration predecessor_generation,
+      const manyforge::core::ContentDigest &predecessor_pointer_digest,
+      const manyforge::core::ApplyComponentBringUpAuthorityDTO &parent,
+      const manyforge::core::ProjectionRevisionDTO &candidate,
+      const std::vector<
+          manyforge::core::RuntimeProviderDomainConfigurationReadbackDTO>
+          &actual_candidate_configurations,
+      const std::function<void()> &effect) const;
+
   void RunWithExactHeldSuccessor(
       const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
       const manyforge::core::ActiveBundlePublicationReceiptDTO &successor,

@@ -240,6 +240,169 @@ TEST(CartesianTrajectoryContractTest,
 }
 
 TEST(CartesianTrajectoryContractTest,
+     ConstValidationPreservesMovingBoundariesAndRequiresZeroOrigin) {
+  roboplan::JointTrajectory trajectory;
+  trajectory.joint_names = {"joint_1"};
+  trajectory.times = {0.0, 1.0};
+  trajectory.positions = {Eigen::VectorXd::Zero(1),
+                          Eigen::VectorXd::Ones(1)};
+  trajectory.velocities = {Eigen::VectorXd::Constant(1, 0.4),
+                           Eigen::VectorXd::Constant(1, 0.2)};
+  trajectory.accelerations = {Eigen::VectorXd::Constant(1, -0.3),
+                              Eigen::VectorXd::Constant(1, 0.1)};
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+
+  EXPECT_FALSE(trajectory_detail::validate_cartesian_trajectory_output(
+                   trajectory, trajectory.joint_names, control)
+                   .has_value());
+  EXPECT_DOUBLE_EQ(trajectory.positions.front()[0], 0.0);
+  EXPECT_DOUBLE_EQ(trajectory.positions.back()[0], 1.0);
+  EXPECT_DOUBLE_EQ(trajectory.velocities.front()[0], 0.4);
+  EXPECT_DOUBLE_EQ(trajectory.velocities.back()[0], 0.2);
+  EXPECT_DOUBLE_EQ(trajectory.accelerations.front()[0], -0.3);
+  EXPECT_DOUBLE_EQ(trajectory.accelerations.back()[0], 0.1);
+  EXPECT_EQ(trajectory.times, (std::vector<double>{0.0, 1.0}));
+
+  trajectory.times.front() = -0.1;
+  const auto error = trajectory_detail::validate_cartesian_trajectory_output(
+      trajectory, trajectory.joint_names, control);
+  ASSERT_TRUE(error.has_value());
+  EXPECT_EQ(error->details.at("reason"),
+            "cartesian_trajectory_sample_invalid");
+  EXPECT_DOUBLE_EQ(trajectory.times.front(), -0.1);
+  EXPECT_DOUBLE_EQ(trajectory.velocities.front()[0], 0.4);
+  EXPECT_DOUBLE_EQ(trajectory.accelerations.back()[0], 0.1);
+}
+
+TEST(CartesianTrajectoryContractTest,
+     BernsteinPositionBoundsDetectInteriorViolationWithLegalEndpoints) {
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+  const auto result = trajectory_detail::check_quintic_position_bounds(
+      {0.0, 10.0, 0.0}, {0.0, -10.0, 0.0}, 1.0, -1.0, 1.0,
+      0.0, 32, control);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(result.value(),
+            trajectory_detail::QuinticPositionBoundResult::kProvenViolation);
+}
+
+TEST(CartesianTrajectoryContractTest,
+     BernsteinPositionBoundsSubdivideInsteadOfRejectingControlHull) {
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+  // Control polygon spans [-0.6, 1.6], while the actual quintic stays in
+  // [0, 1]. An out-of-bounds control point is not a proven violation.
+  const auto check = [&](std::size_t budget) {
+    return trajectory_detail::check_quintic_position_bounds(
+        {0.0, 4.0, 0.0}, {1.0, 4.0, 0.0}, 1.0, -0.01, 1.01,
+        0.0, budget, control);
+  };
+  const auto exhausted = check(1);
+  ASSERT_TRUE(exhausted.ok());
+  EXPECT_EQ(exhausted.value(),
+            trajectory_detail::QuinticPositionBoundResult::kInconclusive);
+  const auto qualified = check(255);
+  ASSERT_TRUE(qualified.ok());
+  EXPECT_EQ(qualified.value(),
+            trajectory_detail::QuinticPositionBoundResult::kProvenWithin);
+  const auto repeat = check(1);
+  ASSERT_TRUE(repeat.ok());
+  EXPECT_EQ(repeat.value(), exhausted.value());
+}
+
+TEST(CartesianTrajectoryContractTest,
+     BernsteinPositionBoundsUseAsymmetricPhysicalPVAAndCallerTolerance) {
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+  // q(u)=.2+.3u-.1u^2+.2u^3-.1u^4+.05u^5, u=t/2.
+  const auto asymmetric = trajectory_detail::check_quintic_position_bounds(
+      {0.2, 0.15, -0.05}, {0.55, 0.275, 0.2}, 2.0, 0.19, 0.56,
+      0.0, 1, control);
+  ASSERT_TRUE(asymmetric.ok());
+  EXPECT_EQ(asymmetric.value(),
+            trajectory_detail::QuinticPositionBoundResult::kProvenWithin);
+
+  const auto constant = trajectory_detail::check_quintic_position_bounds(
+      {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, 1.0, 0.0, 0.0,
+      0.0, 1, control);
+  ASSERT_TRUE(constant.ok());
+  EXPECT_EQ(constant.value(),
+            trajectory_detail::QuinticPositionBoundResult::kProvenWithin);
+  const auto tolerated = trajectory_detail::check_quintic_position_bounds(
+      {1.005, 0.0, 0.0}, {1.005, 0.0, 0.0}, 1.0, 0.0, 1.0,
+      0.01, 1, control);
+  ASSERT_TRUE(tolerated.ok());
+  EXPECT_EQ(tolerated.value(),
+            trajectory_detail::QuinticPositionBoundResult::kProvenWithin);
+  const auto outside = trajectory_detail::check_quintic_position_bounds(
+      {1.015, 0.0, 0.0}, {1.015, 0.0, 0.0}, 1.0, 0.0, 1.0,
+      0.01, 1, control);
+  ASSERT_TRUE(outside.ok());
+  EXPECT_EQ(outside.value(),
+            trajectory_detail::QuinticPositionBoundResult::kProvenViolation);
+}
+
+TEST(CartesianTrajectoryContractTest,
+     BernsteinPositionBoundsFailClosedOnInvalidInputAndOverflow) {
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+  const trajectory_detail::QuinticPositionEndpoint rest{0.0, 0.0, 0.0};
+  for (const auto duration : {0.0, -1.0,
+                              std::numeric_limits<double>::infinity()}) {
+    const auto invalid = trajectory_detail::check_quintic_position_bounds(
+        rest, rest, duration, -1.0, 1.0, 0.0, 1, control);
+    ASSERT_FALSE(invalid.ok());
+    EXPECT_EQ(invalid.error().details.at("reason"),
+              "quintic_position_bounds_input_invalid");
+  }
+  EXPECT_FALSE(trajectory_detail::check_quintic_position_bounds(
+                   rest, rest, 1.0, 1.0, -1.0, 0.0, 1, control)
+                   .ok());
+  EXPECT_FALSE(trajectory_detail::check_quintic_position_bounds(
+                   rest, rest, 1.0, -1.0, 1.0, -0.1, 1, control)
+                   .ok());
+  EXPECT_FALSE(trajectory_detail::check_quintic_position_bounds(
+                   {0.0, std::numeric_limits<double>::quiet_NaN(), 0.0},
+                   rest, 1.0, -1.0, 1.0, 0.0, 1, control)
+                   .ok());
+  const auto overflow = trajectory_detail::check_quintic_position_bounds(
+      rest, rest, std::numeric_limits<double>::max(), -1.0, 1.0,
+      0.0, 1, control);
+  ASSERT_FALSE(overflow.ok());
+  EXPECT_EQ(overflow.error().details.at("reason"),
+            "quintic_position_bounds_arithmetic_overflow");
+  const auto expanded_overflow =
+      trajectory_detail::check_quintic_position_bounds(
+          rest, rest, 1.0, -1.0, std::numeric_limits<double>::max(),
+          std::numeric_limits<double>::max(), 1, control);
+  ASSERT_FALSE(expanded_overflow.ok());
+  EXPECT_EQ(expanded_overflow.error().details.at("reason"),
+            "quintic_position_bounds_arithmetic_overflow");
+}
+
+TEST(CartesianTrajectoryContractTest,
+     BernsteinPositionBoundsHaveExplicitBudgetAndPlanningControl) {
+  const trajectory_detail::QuinticPositionEndpoint rest{0.0, 0.0, 0.0};
+  const auto empty_budget = trajectory_detail::check_quintic_position_bounds(
+      rest, rest, 1.0, -1.0, 1.0, 0.0, 0, {});
+  ASSERT_TRUE(empty_budget.ok());
+  EXPECT_EQ(empty_budget.value(),
+            trajectory_detail::QuinticPositionBoundResult::kInconclusive);
+  const auto cancelled = trajectory_detail::check_quintic_position_bounds(
+      rest, rest, 1.0, -1.0, 1.0, 0.0, 1,
+      {[] { return true; }, [] { return false; }});
+  ASSERT_FALSE(cancelled.ok());
+  EXPECT_EQ(cancelled.error().details.at("reason"),
+            "planning_cancelled_by_interrupt");
+  const auto expired = trajectory_detail::check_quintic_position_bounds(
+      rest, rest, 1.0, -1.0, 1.0, 0.0, 1,
+      {[] { return false; }, [] { return true; }});
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().details.at("reason"), "planning_timeout");
+}
+
+TEST(CartesianTrajectoryContractTest,
      DynamicsEnvelopeMeasuresInteriorQuinticExtremaInsteadOfTrustingProducer) {
   roboplan::JointTrajectory trajectory;
   trajectory.joint_names = {"joint_1"};

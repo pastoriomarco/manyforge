@@ -192,7 +192,7 @@ def test_client_exchanges_exact_canonical_owner_open_and_observe_packets(
         "object_id",
         "payload",
         "policy_id",
-        "quality",
+        "payload_quality",
         "source_epoch",
         "source_id",
         "source_sequence",

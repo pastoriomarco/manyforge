@@ -13,10 +13,10 @@ namespace manyforge::deployment::detail {
 struct ActivationDeploymentComponent final {
   std::string component_id;
   std::string component_profile_id;
-  CanonicalValue root_pose_in_cell;
+  std::optional<CanonicalValue> root_pose_in_cell;
   CanonicalValue target_settings;
   CanonicalValue configuration;
-  CapturedComponentModelSource model_source;
+  std::optional<CapturedComponentModelSource> model_source;
   std::string frame_prefix{};
 };
 
@@ -36,8 +36,9 @@ struct ActivationDeploymentIntent final {
 /// Parse one normalized authored Deployment intent and join it exactly to the
 /// source bytes captured for the same components.
 ///
-/// The caller has no path-based fallback: every authored component must have
+/// The caller has no path-based fallback: every physical component must have
 /// exactly one captured source row and every captured row must be consumed.
+/// Model-free provider components carry neither a model source nor a pose.
 [[nodiscard]] ActivationDeploymentIntent parse_activation_deployment_intent(
     const CanonicalValue &value,
     std::vector<CapturedComponentModelSource> captured_sources);

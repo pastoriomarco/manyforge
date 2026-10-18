@@ -213,7 +213,10 @@ file(
   "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/include/*"
   "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/src/*.cpp"
   "${MANYFORGE_CORE_INCLUDE_DIR}/*"
-  "${MANYFORGE_RUNTIME_CONTRACT_CODEC_SOURCE}")
+  "${MANYFORGE_RUNTIME_CONTRACT_CODEC_SOURCE}"
+  "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/io_rule_stop_response.cpp"
+  "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/io_signal_descriptor.cpp"
+  "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/io_condition_evaluator.cpp")
 list(
   REMOVE_ITEM
   MANYFORGE_COMPILER_SOURCE_INPUTS
@@ -583,6 +586,11 @@ manyforge_embed_closed_schema(
   resources/closed_schema/value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml
   mf_ros2_cfg)
 manyforge_embed_closed_schema(
+  kEmbeddedIoProviderComponentConfigurationSchema
+  io_provider_component_configuration
+  resources/closed_schema/value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml
+  mf_io_cfg)
+manyforge_embed_closed_schema(
   kEmbeddedEmptyProviderContractSchema
   empty_provider_contract
   resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml
@@ -617,7 +625,13 @@ else()
   # parallel algorithms or requiring the full Kernel link closure.
   add_library(manyforge_deployment_runtime_contract_codec STATIC
     "${MANYFORGE_RUNTIME_CONTRACT_CODEC_SOURCE}"
-    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/stop_timing.cpp")
+    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/stop_timing.cpp"
+    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/io_signal_descriptor.cpp"
+    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/io_condition_evaluator.cpp"
+    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/io_rule_stop_response.cpp"
+    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/io_provider_lifecycle_catalog.cpp"
+    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/component_lifecycle_plan_catalog_codec.cpp"
+    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/component_lifecycle_plan_validity.cpp")
   set_target_properties(manyforge_deployment_runtime_contract_codec
     PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(manyforge_deployment_runtime_contract_codec
@@ -673,6 +687,8 @@ add_library(manyforge_deployment_verification_core
   src/ordinary_motion_jerk.cpp
   src/deployment_jerk_import.cpp
   src/initial_scene_projection.cpp
+  src/io_signal_catalog.cpp
+  src/io_provider_domain.cpp
   src/ros2_control_execution_runtime_unit_internal.cpp
   src/planning_resource_map_internal.cpp
   src/posix_read_only_internal.cpp
@@ -681,6 +697,8 @@ add_library(manyforge_deployment_verification_core
   src/program_contract.cpp
   src/program_value_path.cpp
   src/program_binding.cpp
+  src/program_io_condition_compiler.cpp
+  src/retained_io_policy_compiler.cpp
   src/provider_manifest_codec.cpp
   src/runtime_program_binding.cpp
   src/reference_runtime_unit_verifier.cpp
@@ -773,6 +791,13 @@ if(MANYFORGE_BUILD_RESOLVED_STOP_BASE_PLAN_RESOLVER)
     PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
+# The pure retained policy compiler shares the existing verification owner.
+# Preserve both historical target names without a second translation unit.
+add_library(manyforge_deployment_program_io_condition_compiler ALIAS
+  manyforge_deployment_verification_core)
+add_library(manyforge::deployment_program_io_condition_compiler ALIAS
+  manyforge_deployment_verification_core)
+
 # Verified lifecycle/route-current snapshot composition is independently
 # read-only and has no dependency on the Stop-plan repository adapter. Keep
 # the target separate so minimal Manager compositions do not inherit
@@ -858,6 +883,7 @@ endif()
 # defined separately below; producer manifests remain content-addressed
 # provenance and are not interpreted as current-reader compatibility profiles.
 add_library(manyforge_deployment
+  src/activation_io_provider_internal.cpp
   src/activation_component_profile_internal.cpp
   src/activation_deployment_compiler_internal.cpp
   src/activation_deployment_intent_internal.cpp
@@ -879,6 +905,8 @@ add_library(manyforge_deployment
   src/posix_durability_internal.cpp
   src/program_binding_compiler.cpp
   src/prepared_activation_repository.cpp
+  src/program_io_stop_response_validation.cpp
+  src/global_io_rule_qualification.cpp
   src/reference_runtime_unit_internal.cpp
   src/retained_bundle.cpp
   src/retained_bundle_materializer.cpp
@@ -1235,6 +1263,31 @@ if(BUILD_TESTING)
       "RetainedBundleMaterializer remains callable from the public header")
   endif()
 
+  add_executable(test_io_provider_domain test/test_io_provider_domain.cpp)
+  target_compile_definitions(test_io_provider_domain PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+  target_include_directories(test_io_provider_domain PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_io_provider_domain PRIVATE
+    manyforge_deployment manyforge_deployment_canonical_package_generator GTest::gtest_main)
+  gtest_discover_tests(test_io_provider_domain PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_activation_io_provider test/test_activation_io_provider.cpp)
+  target_compile_definitions(test_activation_io_provider PRIVATE
+    MANYFORGE_WORKSPACE_ROOT="${_MANYFORGE_WORKSPACE_ROOT}")
+  target_include_directories(test_activation_io_provider PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_activation_io_provider PRIVATE
+    manyforge_preparation_support manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_activation_io_provider PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_io_signal_catalog test/test_io_signal_catalog.cpp)
+  target_include_directories(test_io_signal_catalog PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_io_signal_catalog PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_io_signal_catalog
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_artifact_codec test/test_artifact_codec.cpp)
   target_link_libraries(test_artifact_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
@@ -1267,6 +1320,41 @@ if(BUILD_TESTING)
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_program_binding
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  if(TARGET manyforge_deployment_program_io_condition_compiler)
+    add_executable(test_program_io_condition_compiler
+      test/test_program_io_condition_compiler.cpp
+      test/test_retained_io_policy_compiler.cpp)
+    target_compile_definitions(test_program_io_condition_compiler PRIVATE
+      MANYFORGE_WORKSPACE_ROOT="${_MANYFORGE_WORKSPACE_ROOT}"
+      MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/program_capture_package"
+      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
+      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+    target_include_directories(test_program_io_condition_compiler PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_program_io_condition_compiler PRIVATE
+      manyforge_preparation_support
+      manyforge_deployment_program_io_condition_compiler manyforge_deployment GTest::gtest_main)
+    add_dependencies(test_program_io_condition_compiler manyforge_maintained_deployment_occurrences)
+    gtest_discover_tests(test_program_io_condition_compiler
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+        FIXTURES_REQUIRED ProgramCapturePackage)
+
+    add_executable(test_program_io_stop_response_validation
+      test/test_program_io_stop_response_validation.cpp)
+    target_compile_definitions(test_program_io_stop_response_validation PRIVATE
+      MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/program_capture_package"
+      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
+      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+    target_include_directories(test_program_io_stop_response_validation PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_program_io_stop_response_validation PRIVATE
+      manyforge_deployment_program_io_condition_compiler manyforge_deployment GTest::gtest_main)
+    add_dependencies(test_program_io_stop_response_validation manyforge_maintained_deployment_occurrences)
+    gtest_discover_tests(test_program_io_stop_response_validation
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+        FIXTURES_REQUIRED ProgramCapturePackage)
+  endif()
 
   add_executable(test_program_contract
     test/test_program_contract.cpp)
@@ -1689,6 +1777,10 @@ if(BUILD_TESTING)
     "examples/lite6_pick_and_place.scenario"
     --no-program)
   manyforge_add_prepare_activation_test(
+    PrepareActivationMovingTakeoverBudget
+    "examples/lite6_pick_and_place.scenario"
+    --takeover-budget)
+  manyforge_add_prepare_activation_test(
     PrepareActivationRuntimeIdentity
     "examples/lite6_pick_and_place.scenario"
     --runtime-identity)
@@ -1807,6 +1899,17 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_program_binding_outcome
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_scenario_activation_empty_map
+    test/test_scenario_activation_empty_map.cpp)
+  target_compile_definitions(test_scenario_activation_empty_map PRIVATE
+    MANYFORGE_WORKSPACE_ROOT="${_MANYFORGE_WORKSPACE_ROOT}")
+  target_include_directories(test_scenario_activation_empty_map PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_scenario_activation_empty_map PRIVATE
+    manyforge_preparation_support manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_scenario_activation_empty_map
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_apply_affected_scope
     test/test_apply_affected_scope.cpp)
   target_include_directories(test_apply_affected_scope PRIVATE
@@ -1836,7 +1939,8 @@ if(BUILD_TESTING)
   target_include_directories(test_retained_bundle_store PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(test_retained_bundle_store PRIVATE
-    manyforge_deployment GTest::gtest_main)
+    manyforge_deployment manyforge_deployment_canonical_package_generator
+    GTest::gtest_main)
   # The test defines fsync to inject directory-fsync faults.
   target_link_libraries(test_retained_bundle_store PRIVATE ${CMAKE_DL_LIBS})
   gtest_discover_tests(test_retained_bundle_store

@@ -4,6 +4,8 @@
 #include <functional>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/capability_command_receipt.hpp>
+#include <manyforge_core/types/addressed_command_identity.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
@@ -76,16 +78,7 @@ enum class GripperInvalidationReason {
 /// Exact addressed-operation identity stamped only when a prepared command is
 /// released. Direct/manual gripper commands leave this absent. A Stop adapter
 /// uses it to reject a stale goal before cancelling a newer command.
-struct AddressedGripperCommandIdentityDTO final {
-  OperationId operation_id;
-  OperationRevision operation_revision;
-  OperationParticipantId participant_id;
-  ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
-
-  friend bool operator==(const AddressedGripperCommandIdentityDTO&,
-                         const AddressedGripperCommandIdentityDTO&) = default;
-};
+using AddressedGripperCommandIdentityDTO = AddressedCommandIdentityDTO;
 
 struct GripperCommandRequestDTO {
   std::string gripper_id;
@@ -114,12 +107,7 @@ struct GripperCommandRequestDTO {
   std::optional<std::uint64_t> owner_lifecycle_generation;
 };
 
-struct GripperCommandResultDTO {
-  bool accepted = false;
-  std::uint64_t command_id = 0;
-  std::uint64_t generation = 0;
-  std::optional<ErrorDTO> error;
-};
+using GripperCommandResultDTO = CapabilityCommandDispatchReceiptDTO;
 
 enum class GraspConfirmationSourceKind {
   kDiscreteInput = 1,

@@ -10,6 +10,11 @@
 
 namespace manyforge::core {
 
+/// Decode the existing closed profile value without granting a participant,
+/// resource scope or Stop authority. Prepare still qualifies all live context.
+[[nodiscard]] Result<MotionInterruptStopProfileDTO> DecodeMotionInterruptStopProfile(
+    std::string_view canonical_bytes);
+
 struct PreparedParticipantStopPlanContextDTO final {
   OperationId operation_id;
   OperationRevision operation_revision;

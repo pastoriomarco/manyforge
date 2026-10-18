@@ -22,7 +22,7 @@
 namespace manyforge::roboplan_backend {
 namespace {
 
-class EmptyCellRoutePublicationOwner final
+class NoControllerRoutePublicationOwner final
     : public deployment::IRouteConfigurationKernelPublicationOwner {
 public:
   [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
@@ -181,6 +181,12 @@ adopt_durable_route_configurations(
       component_ids.insert(binding.value().controllable_component_id);
       domain_ids.insert(binding.value().control_path->control_domain_id);
     }
+    for (const auto &domain : bundle.cell_graph.control_domains) {
+      if (const auto *provider = domain.provider()) {
+        component_ids.insert(provider->controllable_component_id);
+        domain_ids.insert(domain.control_domain_id);
+      }
+    }
     if (component_ids.empty() || domain_ids.empty()) {
       return reject<std::vector<RuntimeEpochRouteReconciliation>>(
           "native_cclc_restart_scope_empty",
@@ -208,6 +214,19 @@ adopt_durable_route_configurations(
         config.maximum_resolved_stop_plan_bytes,
         config.maximum_single_resolved_stop_plan_bytes);
     for (const auto &domain : facts.value().domains) {
+      const auto graph_domain = std::find_if(
+          bundle.cell_graph.control_domains.begin(),
+          bundle.cell_graph.control_domains.end(), [&](const auto &value) {
+            return value.control_domain_id == domain.control_domain_id;
+          });
+      if (graph_domain != bundle.cell_graph.control_domains.end() &&
+          graph_domain->provider()) {
+        if (domain.current_active_control_configuration)
+          return reject<std::vector<RuntimeEpochRouteReconciliation>>(
+              "native_cclc_provider_route_invalid",
+              "provider domain has a fabricated controller route");
+        continue;
+      }
       if (!domain.current_active_control_configuration.has_value()) {
         continue;
       }
@@ -436,7 +455,8 @@ adopt_durable_route_configurations(
                                 ? published.error().details.at("reason")
                                 : std::string{});
       if (!published.ok() && eligible &&
-          reason == "component_readiness_route_not_current") {
+          (reason == "component_readiness_route_not_current" ||
+           reason == "component_readiness_provider_not_current")) {
         // A route still awaits owner reconciliation; stay closed until the
         // route-recovery path rebuilds readiness from current facts.
         publication.command_eligible = false;
@@ -538,17 +558,30 @@ adopt_durable_route_configurations(
     const core::ResolvedLifecycleProviderOccurrenceDTO &provider,
     const std::set<core::ControllableComponentId> &components,
     const core::CellGraphDTO &graph) noexcept {
-  return std::any_of(
-      graph.control_bindings.begin(), graph.control_bindings.end(),
-      [&](const auto &binding) {
-        return components.contains(binding.controllable_component_id) &&
-               binding.provider_instance_id == provider.provider_instance_id &&
-               binding.provider_manifest_id == provider.provider_manifest_id &&
-               binding.provider_manifest_revision ==
-                   provider.provider_manifest_revision &&
-               binding.provider_runtime_unit_id ==
-                   provider.provider_runtime_unit_id;
-      });
+  return std::any_of(graph.control_domains.begin(), graph.control_domains.end(),
+                     [&](const auto &domain) {
+                       const auto *driver = domain.provider();
+                       return driver &&
+                              components.contains(
+                                  driver->controllable_component_id) &&
+                              core::ProviderDomainMatchesOccurrence(
+                                  domain.control_domain_id,
+                                  domain.control_domain_revision, *driver,
+                                  provider.provider_runtime_epoch, provider);
+                     }) ||
+         std::any_of(graph.control_bindings.begin(),
+                     graph.control_bindings.end(), [&](const auto &binding) {
+                       return components.contains(
+                                  binding.controllable_component_id) &&
+                              binding.provider_instance_id ==
+                                  provider.provider_instance_id &&
+                              binding.provider_manifest_id ==
+                                  provider.provider_manifest_id &&
+                              binding.provider_manifest_revision ==
+                                  provider.provider_manifest_revision &&
+                              binding.provider_runtime_unit_id ==
+                                  provider.provider_runtime_unit_id;
+                     });
 }
 
 struct DerivedRuntimeClosure final {
@@ -575,7 +608,10 @@ struct DerivedRuntimeClosure final {
   const auto &graph = value.cell_graph;
   if (!config.locally_valid() ||
       !deployment::verify_retained_bundle_identity(bundle) ||
-      physical_bindings.empty() ||
+      (physical_bindings.empty() &&
+       std::none_of(
+           graph.control_domains.begin(), graph.control_domains.end(),
+           [](const auto &domain) { return domain.provider() != nullptr; })) ||
       physical_bindings.size() > core::kMaxRouteReadinessPublicationRows) {
     return reject<DerivedRuntimeClosure>(
         "native_cclc_input_invalid",
@@ -608,10 +644,11 @@ struct DerivedRuntimeClosure final {
     const auto *domain = unique_by(
         graph.control_domains, desired.control_domain_id,
         [](const auto &candidate) { return candidate.control_domain_id; });
-    if (domain == nullptr ||
+    if (domain == nullptr || domain->provider() ||
         domain->control_domain_revision != desired.control_domain_revision ||
-        domain->controller_topology_id != desired.controller_topology_id ||
-        domain->topology_revision != desired.topology_revision) {
+        domain->controller().controller_topology_id !=
+            desired.controller_topology_id ||
+        domain->controller().topology_revision != desired.topology_revision) {
       return reject<DerivedRuntimeClosure>(
           "native_cclc_desired_domain_invalid",
           "desired controller configuration has no exact retained domain");
@@ -707,7 +744,16 @@ struct DerivedRuntimeClosure final {
               return lhs.provider_occurrence.control_domain_id <
                      rhs.provider_occurrence.control_domain_id;
             });
-  if (brand_ports.size() != value.desired_control_configurations.size()) {
+  const auto provider_domain_count = std::count_if(
+      graph.control_domains.begin(), graph.control_domains.end(),
+      [](const auto &domain) { return domain.provider() != nullptr; });
+  if (brand_ports.size() !=
+          value.desired_control_configurations.size() + provider_domain_count ||
+      std::adjacent_find(brand_ports.begin(), brand_ports.end(),
+                         [](const auto &a, const auto &b) {
+                           return a.provider_occurrence.control_domain_id ==
+                                  b.provider_occurrence.control_domain_id;
+                         }) != brand_ports.end()) {
     return reject<DerivedRuntimeClosure>(
         "native_cclc_lifecycle_coverage_incomplete",
         "native CCLC requires one exact lifecycle registration per domain");
@@ -724,6 +770,8 @@ struct DerivedRuntimeClosure final {
         [](const auto &candidate) { return candidate.control_domain_id; });
     std::set<core::ControllableComponentId> components;
     if (domain != nullptr) {
+      if (const auto *driver = domain->provider())
+        components.insert(driver->controllable_component_id);
       for (const auto &binding : graph.control_bindings) {
         if (binding.control_domain_id == domain->control_domain_id) {
           components.insert(binding.controllable_component_id);
@@ -735,18 +783,26 @@ struct DerivedRuntimeClosure final {
         [&](const auto &source) {
           return source.control_domain_id == occurrence.control_domain_id;
         });
+    const bool provider_domain = domain && domain->provider();
+    const bool exact_driver =
+        provider_domain &&
+        core::ProviderDomainMatchesOccurrence(
+            domain->control_domain_id, domain->control_domain_revision,
+            *domain->provider(), occurrence.provider_runtime_epoch, occurrence);
+    const bool exact_controller =
+        !provider_domain && desired &&
+        controller_source != result.controller_sources.end() &&
+        controller_source->source_runtime_unit_id ==
+            occurrence.provider_runtime_unit_id &&
+        controller_source->source_runtime_epoch ==
+            occurrence.provider_runtime_epoch;
     if (registration.port == nullptr || !occurrence.locally_valid() ||
-        domain == nullptr || desired == nullptr ||
+        domain == nullptr || (!exact_driver && !exact_controller) ||
         occurrence.control_domain_revision != domain->control_domain_revision ||
         !std::binary_search(domain->runtime_unit_ids.begin(),
                             domain->runtime_unit_ids.end(),
                             occurrence.provider_runtime_unit_id) ||
-        !provider_matches_component(occurrence, components, graph) ||
-        controller_source == result.controller_sources.end() ||
-        controller_source->source_runtime_unit_id !=
-            occurrence.provider_runtime_unit_id ||
-        controller_source->source_runtime_epoch !=
-            occurrence.provider_runtime_epoch) {
+        !provider_matches_component(occurrence, components, graph)) {
       return reject<DerivedRuntimeClosure>(
           "native_cclc_lifecycle_registration_invalid",
           "lifecycle registration does not match its exact retained "
@@ -788,21 +844,33 @@ struct DerivedRuntimeClosure final {
 
 core::Result<
     std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>>
-MakeVerifiedEmptyCellRoutePublicationOwner(
+MakeVerifiedNoControllerRoutePublicationOwner(
     const deployment::RetainedBundle &retained_bundle) {
   const auto &graph = retained_bundle.value().cell_graph;
   if (!deployment::verify_retained_bundle_identity(retained_bundle) ||
-      !graph.controllable_components.empty() ||
-      !graph.control_domains.empty() || !graph.control_bindings.empty() ||
+      !graph.control_bindings.empty() ||
+      std::any_of(graph.control_domains.begin(), graph.control_domains.end(),
+                  [](const auto &domain) { return !domain.provider(); }) ||
+      std::any_of(graph.controllable_components.begin(),
+                  graph.controllable_components.end(),
+                  [&](const auto &component) {
+                    return std::none_of(
+                        graph.control_domains.begin(),
+                        graph.control_domains.end(), [&](const auto &domain) {
+                          return domain.provider() &&
+                                 domain.provider()->controllable_component_id ==
+                                     component.controllable_component_id;
+                        });
+                  }) ||
       !retained_bundle.value().desired_control_configurations.empty()) {
     return reject<
         std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>>(
         "empty_cell_route_product_invalid",
-        "empty-cell route dependency requires a verified empty physical graph");
+        "route dependency requires a verified cell without controller domains");
   }
   return core::Result<
-      std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>>::Ok(
-      std::make_unique<EmptyCellRoutePublicationOwner>());
+      std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>>::
+      Ok(std::make_unique<NoControllerRoutePublicationOwner>());
 }
 
 core::Result<std::vector<core::KinematicResourceSourceProjectionDTO>>
@@ -1070,10 +1138,13 @@ core::Result<void> InitializeRetainedNativeCandidateControlRoutes(
     const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
     const std::span<const core::RuntimeParticipantBinding> physical_bindings,
     const std::filesystem::path &execution_run_root,
-    const core::ConfigurationFenceId &parent_apply_fence_id) {
+    const core::ConfigurationFenceStatusQueryDTO &actual_parent_fence) {
   try {
     if (!deployment::verify_retained_bundle_identity(bundle) ||
         !candidate_publication_generation.nonzero() || !plan.apply.valid() ||
+        !actual_parent_fence.valid() ||
+        actual_parent_fence.owner_transaction.apply_id != plan.apply.apply_id ||
+        actual_parent_fence.owner_transaction.apply_generation != plan.apply.apply_generation ||
         plan.candidate_retained_bundle_id != bundle.retained_bundle_id() ||
         plan.candidate_graph_revision != bundle.value().cell_graph.graph_revision ||
         plan.routes.size() != bundle.value().desired_control_configurations.size()) {
@@ -1271,8 +1342,10 @@ core::Result<void> InitializeRetainedNativeCandidateControlRoutes(
       }
       const core::ComponentCommandReadinessPublicationDTO publication{
           core::ComponentReadinessAuthorityDTO::kParentApplyFence, std::nullopt,
-          parent_apply_fence_id, component.component_id, component.generation,
-          component.state == core::ComponentLifecycleStateDTO::kActive};
+          actual_parent_fence.configuration_fence_id, component.component_id,
+          component.generation,
+          component.state == core::ComponentLifecycleStateDTO::kActive,
+          actual_parent_fence.expected_scope};
       const auto published = readiness_owner.PublishComponentCommandReadiness(
           publication);
       if (!published.ok()) {
@@ -1435,14 +1508,18 @@ CreateRecoveredRetainedNativeCellCCLCRuntime(
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     deployment::IRouteConfigurationKernelPublicationOwner &route_owner,
     core::ICCLCComponentCommandReadinessPort &readiness_owner,
-    core::ResourceAddressedExecutionKernel &kernel,
-    core::IClock &clock, core::IScheduler &scheduler,
+    core::ResourceAddressedExecutionKernel &kernel, core::IClock &clock,
+    core::IScheduler &scheduler,
     std::function<core::Result<core::RuntimeRouteConfigurationReadbackDTO>(
-        const core::ActiveControlConfigurationDTO &)> adopt_predecessor,
+        const core::ActiveControlConfigurationDTO &)>
+        adopt_predecessor,
     std::function<core::Result<void>()> reconcile_command_free_orphans,
     std::function<core::Result<void>()> &reconcile_after_start,
     RetainedExternallyManagedDomainSnapshotSource
-        externally_managed_controller_snapshot_source) {
+        externally_managed_controller_snapshot_source,
+    std::function<
+        core::Result<void>(const deployment::CCLCRuntimeComposition &)>
+        before_start) {
   reconcile_after_start = {};
   if (retained_bundle == nullptr || !adopt_predecessor ||
       !reconcile_command_free_orphans) {
@@ -1453,10 +1530,13 @@ CreateRecoveredRetainedNativeCellCCLCRuntime(
   // Recovery may publish predecessor routes. Reject malformed products and
   // physical scope before the first publication rather than discovering them
   // only when CCLC is constructed below.
-  if (!config.locally_valid() ||
-      !config.composition.trusted_roots_valid() ||
+  if (!config.locally_valid() || !config.composition.trusted_roots_valid() ||
       !deployment::verify_retained_bundle_identity(*retained_bundle) ||
-      physical_bindings.empty() ||
+      (physical_bindings.empty() &&
+       std::none_of(
+           retained_bundle->value().cell_graph.control_domains.begin(),
+           retained_bundle->value().cell_graph.control_domains.end(),
+           [](const auto &domain) { return domain.provider() != nullptr; })) ||
       physical_bindings.size() > core::kMaxRouteReadinessPublicationRows) {
     return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
         "native_cell_restart_input_invalid",
@@ -1519,6 +1599,22 @@ CreateRecoveredRetainedNativeCellCCLCRuntime(
       std::move(externally_managed_controller_snapshot_source), &readiness_owner);
   if (!composition.ok())
     return composition;
+  if (before_start) {
+    try {
+      const auto prepared = before_start(*composition.value());
+      if (!prepared.ok())
+        return core::
+            Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::Err(
+                prepared.error());
+    } catch (const std::exception &error) {
+      return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
+          "native_cell_before_start_failed", error.what());
+    } catch (...) {
+      return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
+          "native_cell_before_start_failed",
+          "participant construction raised an exception");
+    }
+  }
   auto started = composition.value()->Start();
   if (!started.ok())
     return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
@@ -1565,7 +1661,10 @@ CreateRetainedNativeCCLCRuntime(
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     RetainedExternallyManagedDomainSnapshotSource
-        externally_managed_controller_snapshot_source) {
+        externally_managed_controller_snapshot_source,
+    std::function<
+        core::Result<void>(const deployment::CCLCRuntimeComposition &)>
+        before_start) {
   if (!config.composition.trusted_roots_valid()) {
     return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
         "native_cclc_storage_capabilities_invalid",
@@ -1633,6 +1732,22 @@ CreateRetainedNativeCCLCRuntime(
       std::move(externally_managed_controller_snapshot_source), &runtime);
   if (!composition.ok()) {
     return composition;
+  }
+  if (before_start) {
+    try {
+      const auto prepared = before_start(*composition.value());
+      if (!prepared.ok())
+        return core::
+            Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::Err(
+                prepared.error());
+    } catch (const std::exception &error) {
+      return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
+          "native_cell_before_start_failed", error.what());
+    } catch (...) {
+      return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
+          "native_cell_before_start_failed",
+          "participant construction raised an exception");
+    }
   }
   auto started = composition.value()->Start();
   if (!started.ok()) {

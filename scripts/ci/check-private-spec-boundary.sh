@@ -57,9 +57,6 @@ ALLOWLIST=(
   "scripts/dev-agent-session-start.sh" # dev-only: seeds an OpenClaw agent sandbox with specs context
   "scripts/regen-public-contracts.py" # mentions specs in its own docstring (explaining why mirrors exist)
   "scripts/ci/check-private-spec-boundary.sh" # this file (mentions manyforge_specs in its own docstring/messages)
-  "scripts/qualification/runtime_collision_schedule_baseline.md" # dev-only: exact offline qualification runbook binds immutable Specs identities
-  "scripts/qualification/step18_offline_proof.md" # dev-only: exact Step 18 proof campaign binds immutable Specs identities
-  "scripts/run-step18-loaded-kernel-qualification.sh" # dev-only: binds the loaded-kernel gate to the Specs contract identity
 )
 
 validate_relative_path() {

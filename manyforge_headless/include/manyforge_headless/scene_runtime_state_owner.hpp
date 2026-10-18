@@ -16,7 +16,7 @@
 namespace manyforge::headless {
 
 inline constexpr std::string_view kSceneRuntimeStateSnapshotApiVersion =
-    "manyforge.scene_runtime_state.v1";
+    "manyforge.scene_runtime_state.v2";
 inline constexpr std::size_t kDefaultMaximumPoseObservationKeys = 4096U;
 
 class SceneRuntimeStateError : public std::runtime_error {
@@ -96,7 +96,7 @@ struct PoseSourceObservation final {
   std::uint64_t source_sequence{};
   std::int64_t observed_at_ns{};
   std::int64_t expires_at_ns{};
-  PoseSourceQuality quality{PoseSourceQuality::kUnknown};
+  PoseSourceQuality payload_quality{PoseSourceQuality::kUnknown};
   bool eligible{};
   manyforge::content_identity::CanonicalValue payload;
 

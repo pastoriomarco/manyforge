@@ -54,9 +54,13 @@ def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> No
         for row in runtime["configuration"]["gripper_target_configurations"]
     }
     assert set(grippers) == {"lite6_robot", "ur5e_robot"}
+    # Gripper model A1: the Lite6 lite gripper is pneumatic, the Robotiq
+    # 2F-85 is position commanded.
+    assert {
+        component_id: row["actuation_kind"] for component_id, row in grippers.items()
+    } == {"lite6_robot": "pneumatic", "ur5e_robot": "position_commanded"}
     assert all(
         row["command_target_id"] == "gripper"
-        and row["actuation_kind"] == "position_commanded"
         and row["open_state_ref"] == "open"
         and row["closed_state_ref"] == "closed"
         and row["mount_frame"]

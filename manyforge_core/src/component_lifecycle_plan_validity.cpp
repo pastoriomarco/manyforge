@@ -127,12 +127,13 @@ bool LifecyclePrimitiveTransitionDTO::locally_valid() const noexcept {
 }
 
 bool LifecycleIntentPlanDTO::locally_valid() const noexcept {
-  if (!known(intent) || !known(requested_state) ||
-      !requested_postcondition.locally_valid() || timeout_duration_ns <= 0 ||
-      timeout_duration_ns > kMaxLifecycleTransactionTimeoutNs ||
+  if (!known(intent) || !known(requested_state) || !requested_postcondition.locally_valid() ||
+      timeout_policy.valueless_by_exception() ||
+      (std::holds_alternative<std::int64_t>(timeout_policy) &&
+       (std::get<std::int64_t>(timeout_policy) <= 0 ||
+        std::get<std::int64_t>(timeout_policy) > kMaxLifecycleTransactionTimeoutNs)) ||
       transitions.size() > kMaxLifecycleTransitionsPerPlan ||
-      (recover_target_eligibility.has_value() &&
-       !recover_target_eligibility->locally_valid())) {
+      (recover_target_eligibility.has_value() && !recover_target_eligibility->locally_valid())) {
     return false;
   }
   const bool target_valid = [&]() {
@@ -198,6 +199,31 @@ bool BrandLifecyclePlanCatalogDTO::locally_valid() const noexcept {
     }
   }
   return true;
+}
+
+bool ProviderControlDomainDTO::locally_valid() const noexcept {
+  if (!bounded_identity(controllable_component_id) || !bounded_identity(provider_runtime_unit_id) ||
+      !bounded_identity(provider_instance_id) || !bounded_identity(provider_manifest_id) ||
+      !IsExactLowercaseSha256Digest(provider_manifest_revision.value()) ||
+      !IsExactLowercaseSha256Digest(lifecycle_plan_catalog_digest.value()) ||
+      !IsExactLowercaseSha256Digest(signal_configuration_digest.value()) ||
+      lifecycle_command_timeout_ns <= 0 ||
+      lifecycle_command_timeout_ns > kMaxLifecycleTransactionTimeoutNs || signal_names.empty() ||
+      signal_names.size() > kMaxLifecycleCurrentResources ||
+      !std::is_sorted(signal_names.begin(), signal_names.end()) ||
+      std::adjacent_find(signal_names.begin(), signal_names.end()) != signal_names.end())
+    return false;
+  return std::all_of(signal_names.begin(), signal_names.end(), [](const auto& name) {
+    return !name.empty() && name.size() <= kMaxLifecycleIdentityBytes;
+  });
+}
+
+bool ResolvedLifecycleProviderOccurrenceDTO::locally_valid() const noexcept {
+  return bounded_identity(control_domain_id) && bounded_identity(control_domain_revision) &&
+         bounded_identity(provider_instance_id) && bounded_identity(provider_manifest_id) &&
+         bounded_identity(provider_manifest_revision) &&
+         bounded_identity(provider_runtime_unit_id) && bounded_identity(provider_runtime_epoch) &&
+         bounded_identity(lifecycle_plan_catalog_digest);
 }
 
 } // namespace manyforge::core

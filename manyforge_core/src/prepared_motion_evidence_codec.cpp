@@ -148,7 +148,7 @@ void require_digest(std::string_view value, std::string reason) {
       !content_identity::is_sha256_digest(result.capability_provider_binding_id.value()) ||
       !content_identity::is_sha256_digest(result.capability_provider_binding_revision.value()) ||
       !portable_identifier(result.provider_instance_id.value()) ||
-      !content_identity::is_sha256_digest(result.provider_manifest_id.value()) ||
+      !portable_identifier(result.provider_manifest_id.value()) ||
       !content_identity::is_sha256_digest(result.provider_manifest_revision.value()) ||
       !portable_identifier(result.provider_runtime_unit_id.value()) ||
       !portable_identifier(result.provider_runtime_epoch.value())) {
@@ -157,8 +157,9 @@ void require_digest(std::string_view value, std::string reason) {
   return result;
 }
 
-[[nodiscard]] CanonicalValue planning_value(const PreparedMotionPlanningEvidenceDTO& value) {
-  const auto encoded_result = EncodePreparedPlanResult(value.planning_result);
+[[nodiscard]] CanonicalValue planning_value(const PreparedMotionPlanningEvidenceDTO& value,
+                                            const MovingReplacementInputDTO* replacement) {
+  const auto encoded_result = EncodePreparedPlanResult(value.planning_result, replacement);
   if (!encoded_result.ok() || !value.planning_result.trajectory.has_value() ||
       value.planning_result.error.has_value()) {
     fail("accepted_planning_result_required");
@@ -169,10 +170,11 @@ void require_digest(std::string_view value, std::string reason) {
       {"planner_capability_binding", provider_binding_value(value.planner_capability_binding)}});
 }
 
-[[nodiscard]] PreparedMotionPlanningEvidenceDTO parse_planning(const CanonicalValue& value) {
+[[nodiscard]] PreparedMotionPlanningEvidenceDTO parse_planning(
+    const CanonicalValue& value, const MovingReplacementInputDTO* replacement) {
   exact(value, {"planning_result", "planning_attempt_index", "planner_capability_binding"});
   const auto result_bytes = content_identity::canonical_json(member(value, "planning_result"));
-  auto result = DecodePreparedPlanResult(result_bytes);
+  auto result = DecodePreparedPlanResult(result_bytes, replacement);
   if (!result.ok() || !result.value().trajectory.has_value() || result.value().error.has_value()) {
     fail("accepted_planning_result_required");
   }
@@ -301,15 +303,7 @@ void require_digest(std::string_view value, std::string reason) {
   return result;
 }
 
-[[nodiscard]] CanonicalValue validation_value(const PreparedMotionValidationEvidenceDTO& value) {
-  if (!portable_identifier(value.validation_revision.value()) || !value.noncollision_result.valid ||
-      value.noncollision_result.error || !value.noncollision_result.trajectory_metrics ||
-      !value.collision_decision.collision_world_revision ||
-      !same_revision(*value.collision_decision.collision_world_revision,
-                     value.collision_world_revision)) {
-    fail("accepted_validation_evidence_required");
-  }
-  const auto& metrics = *value.noncollision_result.trajectory_metrics;
+[[nodiscard]] CanonicalValue metrics_value(const TrajectoryValidationMetricsDTO& metrics) {
   const auto metrics_valid = [](const std::vector<double>& values) {
     return std::all_of(values.begin(), values.end(),
                        [](const double item) { return std::isfinite(item) && item >= 0.0; });
@@ -342,26 +336,10 @@ void require_digest(std::string_view value, std::string reason) {
   if (metrics.cartesian_fidelity_metrics)
     metrics_fields.emplace_back("cartesian_fidelity_metrics",
                                 cartesian_fidelity_value(metrics.cartesian_fidelity_metrics));
-  const CanonicalValue metrics_value(std::move(metrics_fields));
-  return CanonicalValue(CanonicalValue::Object{
-      {"validation_revision", CanonicalValue(value.validation_revision.value())},
-      {"noncollision_result",
-       CanonicalValue(CanonicalValue::Object{{"trajectory_metrics", metrics_value},
-                                             {"valid", CanonicalValue(true)}})},
-      {"collision_world_revision", revision_value(value.collision_world_revision)},
-      {"collision_policy_revision", revision_value(value.collision_policy_revision)},
-      {"collision_decision", decision_value(value.collision_decision)}});
+  return CanonicalValue(std::move(metrics_fields));
 }
 
-[[nodiscard]] PreparedMotionValidationEvidenceDTO parse_validation(const CanonicalValue& value) {
-  exact(value, {"validation_revision", "noncollision_result", "collision_world_revision",
-                "collision_policy_revision", "collision_decision"});
-  const auto validation_revision = text(member(value, "validation_revision"));
-  if (!portable_identifier(validation_revision)) fail("validation_revision_invalid");
-  const auto& noncollision = member(value, "noncollision_result");
-  exact(noncollision, {"trajectory_metrics", "valid"});
-  if (!boolean(member(noncollision, "valid"))) fail("accepted_noncollision_result_required");
-  const auto& metrics_value = member(noncollision, "trajectory_metrics");
+[[nodiscard]] TrajectoryValidationMetricsDTO parse_metrics(const CanonicalValue& metrics_value) {
   const auto* fidelity_value = metrics_value.find_object_member("cartesian_fidelity_metrics");
   if (fidelity_value)
     exact(metrics_value,
@@ -392,12 +370,69 @@ void require_digest(std::string_view value, std::string reason) {
        !valid_cartesian_fidelity_metrics(*metrics.cartesian_fidelity_metrics))) {
     fail("trajectory_validation_metrics_invalid");
   }
+  return metrics;
+}
+
+void validate_piece_diagnostics(const MovingReplacementValidationEvidenceDTO& pair) {
+  // Only the complete candidate carries authored-path fidelity authority.
+  if (pair.unchanged_prefix.cartesian_fidelity_metrics ||
+      pair.changed_future.cartesian_fidelity_metrics)
+    fail("moving_replacement_piece_fidelity_forbidden");
+}
+
+[[nodiscard]] CanonicalValue validation_value(const PreparedMotionValidationEvidenceDTO& value) {
+  if (!portable_identifier(value.validation_revision.value()) || !value.noncollision_result.valid ||
+      value.noncollision_result.error || !value.noncollision_result.trajectory_metrics ||
+      !value.collision_decision.collision_world_revision ||
+      !same_revision(*value.collision_decision.collision_world_revision,
+                     value.collision_world_revision)) {
+    fail("accepted_validation_evidence_required");
+  }
+  CanonicalValue::Object noncollision{
+      {"trajectory_metrics", metrics_value(*value.noncollision_result.trajectory_metrics)},
+      {"valid", CanonicalValue(true)}};
+  if (value.noncollision_result.moving_replacement) {
+    const auto& pair = *value.noncollision_result.moving_replacement;
+    validate_piece_diagnostics(pair);
+    noncollision.emplace_back("moving_replacement",
+                              CanonicalValue(CanonicalValue::Object{
+                                  {"unchanged_prefix", metrics_value(pair.unchanged_prefix)},
+                                  {"changed_future", metrics_value(pair.changed_future)}}));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"validation_revision", CanonicalValue(value.validation_revision.value())},
+      {"noncollision_result", CanonicalValue(std::move(noncollision))},
+      {"collision_world_revision", revision_value(value.collision_world_revision)},
+      {"collision_policy_revision", revision_value(value.collision_policy_revision)},
+      {"collision_decision", decision_value(value.collision_decision)}});
+}
+
+[[nodiscard]] PreparedMotionValidationEvidenceDTO parse_validation(const CanonicalValue& value) {
+  exact(value, {"validation_revision", "noncollision_result", "collision_world_revision",
+                "collision_policy_revision", "collision_decision"});
+  const auto validation_revision = text(member(value, "validation_revision"));
+  if (!portable_identifier(validation_revision)) fail("validation_revision_invalid");
+  const auto& noncollision = member(value, "noncollision_result");
+  const auto* moving = noncollision.find_object_member("moving_replacement");
+  exact(noncollision, moving
+                          ? std::initializer_list<std::string_view>{"trajectory_metrics", "valid",
+                                                                    "moving_replacement"}
+                          : std::initializer_list<std::string_view>{"trajectory_metrics", "valid"});
+  if (!boolean(member(noncollision, "valid"))) fail("accepted_noncollision_result_required");
   PreparedMotionValidationEvidenceDTO result{
       ValidationRevision(validation_revision),
-      ValidationResultDTO{true, std::nullopt, std::move(metrics)},
+      ValidationResultDTO{true, std::nullopt,
+                          parse_metrics(member(noncollision, "trajectory_metrics"))},
       parse_world_revision(member(value, "collision_world_revision")),
       parse_policy_revision(member(value, "collision_policy_revision")),
       parse_decision(member(value, "collision_decision"))};
+  if (moving) {
+    exact(*moving, {"unchanged_prefix", "changed_future"});
+    result.noncollision_result.moving_replacement =
+        MovingReplacementValidationEvidenceDTO{parse_metrics(member(*moving, "unchanged_prefix")),
+                                               parse_metrics(member(*moving, "changed_future"))};
+    validate_piece_diagnostics(*result.noncollision_result.moving_replacement);
+  }
   if (!result.collision_decision.collision_world_revision ||
       !same_revision(*result.collision_decision.collision_world_revision,
                      result.collision_world_revision)) {
@@ -435,13 +470,16 @@ template <class Value, class Decoder>
 }  // namespace
 
 Result<std::string> EncodePreparedMotionPlanningEvidence(
-    const PreparedMotionPlanningEvidenceDTO& value) {
-  return encode(value, planning_value);
+    const PreparedMotionPlanningEvidenceDTO& value, const MovingReplacementInputDTO* replacement) {
+  return encode(value,
+                [replacement](const auto& item) { return planning_value(item, replacement); });
 }
 
 Result<PreparedMotionPlanningEvidenceDTO> DecodePreparedMotionPlanningEvidence(
-    std::string_view canonical_bytes) {
-  return decode<PreparedMotionPlanningEvidenceDTO>(canonical_bytes, parse_planning);
+    std::string_view canonical_bytes, const MovingReplacementInputDTO* replacement) {
+  return decode<PreparedMotionPlanningEvidenceDTO>(
+      canonical_bytes,
+      [replacement](const auto& item) { return parse_planning(item, replacement); });
 }
 
 Result<std::string> EncodePreparedMotionValidationEvidence(

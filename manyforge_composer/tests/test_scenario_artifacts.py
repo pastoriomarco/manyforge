@@ -777,15 +777,19 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
     assert loaded["deployment"]["savedPath"] == str(target / "deployment.yaml")
 
 
-@pytest.mark.parametrize("choice", ["empty", "keep_applied"])
-@pytest.mark.parametrize("failure", [None, "prepare", "save", "submit", "stale", "unexpected_impact"])
+# New closes first (Q113): it starts only from the owner-proved canonical-empty
+# cell, always with an Empty Deployment, so its candidate has no component impact.
+@pytest.mark.parametrize("failure", [
+    None, "not_closed", "prepare", "save", "submit", "stale", "unexpected_impact",
+])
 def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None, choice: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
 ) -> None:
     state = ComposerState(allowed_fs_roots=[str(tmp_path)])
     admission = _PassThroughAdmission()
     state.authoring_admission = admission  # type: ignore[assignment]
-    state.headless_client = type("Manager", (), {"manager_status": lambda _self: {"status": {"active": {"canonical_empty": True}}}})()  # type: ignore[assignment]
+    canonical_empty = failure != "not_closed"
+    state.headless_client = type("Manager", (), {"manager_status": lambda _self: {"status": {"active": {"canonical_empty": canonical_empty}}}})()  # type: ignore[assignment]
     monkeypatch.setattr(state, "_manager_current", lambda _status: ("bundle", "graph", "epoch"))
     monkeypatch.setattr(routes_scenario_documents, "program_workspace",
                         lambda _state: {"authoringWorkspace": {"workspaceEpoch": "test"}})
@@ -794,13 +798,6 @@ def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
     (tmp_path / "model.urdf").write_text('<robot name="fixture"><link name="base"/></robot>')
     save_scenario_artifact(_document(), str(old_project), allowed_roots=[str(tmp_path)], overwrite=False)
     original_files = {path.name: path.read_bytes() for path in old_project.iterdir() if path.is_file()}
-    source_closure = routes_scenario_documents.capture_deployment_model_sources(
-        _deployment_intent(), project_root=old_project)
-    monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": {"active": True}})
-    monkeypatch.setattr(state, "applied_activation_for_publication", lambda _publication: {
-        "deployment": _deployment_intent(), "project_path": str(old_project),
-        "model_source_closure": source_closure,
-    })
     before = state.authoring_workspace.snapshot()
     calls: list[str] = []
 
@@ -810,11 +807,7 @@ def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
         assert intent["program"] is None
         assert intent["program_authoring"]["forest"] == []
         assert not intent["program_authoring"].get("scene")
-        if choice == "empty":
-            assert intent["deployment"]["components"] == []
-        else:
-            assert intent["deployment"]["name"] == "Fixture deployment"
-            assert len(intent["deployment"]["components"]) == 1
+        assert intent["deployment"]["components"] == []
         assert intent["program_role_assignment"] == {"component_roles": [], "target_roles": []}
         assert "typed_parameter_overrides" not in intent
         if prepare_only:
@@ -823,12 +816,10 @@ def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
             calls.append("prepare")
             if failure == "prepare":
                 raise HeadlessClientError("activation_preparation_failed", "invalid candidate", status_code=409)
+            changes = [{"controllable_component_id": "fixture_robot", "disposition": "remove"}]
             return {"confirmation_required": False, "prepared_activation": {},
-                    "candidate_preview": {"impact": {"components": [{
-                        "controllable_component_id": "fixture_robot",
-                        "disposition": "replace" if failure == "unexpected_impact" else
-                            "retain" if choice == "keep_applied" else "remove",
-                    }]}}}
+                    "candidate_preview": {"impact": {
+                        "components": changes if failure == "unexpected_impact" else []}}}
         calls.append("submit")
         saved, _path, digest = capture_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
         assert digest == intent["source_document_digest"]
@@ -844,13 +835,18 @@ def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
             raise ScenarioArtifactError("scenario_save_failed", "disk unavailable", status_code=503)
         monkeypatch.setattr(routes_scenario_documents, "save_scenario_artifact", refuse_save)
     response = _scenario_client(state).post("/api/scenario-documents/new", json={
-        **_fence(state), "path": str(target), "name": "new_cell", "deploymentChoice": choice,
+        **_fence(state), "path": str(target), "name": "new_cell", "deploymentChoice": "empty",
         "confirmDiscard": True, "expectedRetainedBundleId": "other" if failure == "stale" else "bundle",
         "expectedGraphRevision": "graph",
     })
     assert {path.name: path.read_bytes() for path in old_project.iterdir() if path.is_file()} == original_files
-    if failure in {"prepare", "save", "stale", "unexpected_impact"}:
+    if failure in {"not_closed", "prepare", "save", "stale", "unexpected_impact"}:
         assert response.status_code in {409, 503}, response.text
+        if failure == "not_closed":
+            assert response.json()["detail"]["code"] == "scenario_close_required"
+            assert calls == []
+        elif failure == "unexpected_impact":
+            assert response.json()["detail"]["code"] == "scenario_new_impact_changed"
         assert not target.exists()
         assert state.authoring_workspace.snapshot() == before
         assert "submit" not in calls
@@ -880,19 +876,19 @@ def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
         assert saved["path"] == str(copy_path / "program.yaml")
 
 
-def test_new_keep_refuses_missing_applied_source_instead_of_using_draft(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_new_refuses_keep_applied_choice_instead_of_retaining_or_using_draft(
+    tmp_path: Path,
 ) -> None:
+    # Q113 removed the keep-applied New; only an Empty Deployment is accepted.
     state = ComposerState(allowed_fs_roots=[str(tmp_path)])
-    monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": None})
     before = state.authoring_workspace.snapshot()
     response = _scenario_client(state).post("/api/scenario-documents/new", json={
         **_fence(state), "path": str(tmp_path / "new"), "name": "New",
         "deploymentChoice": "keep_applied", "confirmDiscard": True,
         "expectedRetainedBundleId": "bundle", "expectedGraphRevision": "graph",
     })
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["code"] == "scenario_applied_source_unavailable"
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"][0]["loc"] == ["body", "deploymentChoice"]
     assert state.authoring_workspace.snapshot() == before
     assert not (tmp_path / "new").exists()
 
@@ -1324,11 +1320,12 @@ def test_load_confirmation_accepts_a_disruptive_impact_in_one_preparation(
     """Load is the operator's confirmation: one preparation, no token round trip."""
 
     current = {"retained_bundle_id": "bundle-current", "graph_revision": "graph-current"}
+    source_document_digest = "sha256:" + "1" * 64
     prepared_activation = {
-        "schema_version": "manyforge.prepared_activation_input.v5",
+        "schema_version": "manyforge.prepared_activation_input.v6",
         "prepared_activation_id": "prepared-1",
-        "scenario_id": "cell",
-        "source_document_digest": "sha256:" + "1" * 64,
+        "origin": {"kind": "scenario", "scenario_id": "cell",
+                   "source_document_digest": source_document_digest},
         "captured_input_digest": "sha256:" + "2" * 64,
         "deployment_artifact_id": "deployment",
         "deployment_revision": "deployment-revision",
@@ -1372,7 +1369,7 @@ def test_load_confirmation_accepts_a_disruptive_impact_in_one_preparation(
     state.headless_client = Headless()  # type: ignore[assignment]
     intent = {
         "scenario_id": "cell",
-        "source_document_digest": prepared_activation["source_document_digest"],
+        "source_document_digest": source_document_digest,
         "captured_input_digest": prepared_activation["captured_input_digest"],
         "deployment": {},
         "model_source_closure": {},

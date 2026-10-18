@@ -5,14 +5,14 @@ import type {
   CCLCComponentSnapshot,
   CCLCLifecycleFactValue,
   CCLCLifecycleIntent,
-  CCLCRouteTemplate,
+  CCLCRouteTemplateWire,
 } from '../types/cclc';
 import { OverlayPanel } from './OverlayPanel';
 import {
   type ComponentLifecycleTone,
   componentLifecyclePresentation,
   componentLifecycleToneClass,
-  componentReadinessDomainPresentation,
+  componentReadinessOccurrencePresentation,
   readinessErrorPresentation,
 } from '../state/componentLifecyclePresentation';
 
@@ -74,7 +74,7 @@ function factValue(value: CCLCLifecycleFactValue): string {
 /** Current state of one component: verdict, owner errors, then raw owner facts on demand. */
 function ComponentLifecycleSummary({ snapshot }: { snapshot: CCLCComponentSnapshot }) {
   const presentation = componentLifecyclePresentation(snapshot);
-  const problems = snapshot.readiness.domains.flatMap((domain) => {
+  const problems = snapshot.readiness.providerOccurrences.flatMap((domain) => {
     const planError = readinessErrorPresentation(domain.error);
     const diagnostic = domain.health?.diagnostic ? readinessErrorPresentation(domain.health.diagnostic) : null;
     return [planError, diagnostic !== planError ? diagnostic : null]
@@ -99,9 +99,9 @@ function ComponentLifecycleSummary({ snapshot }: { snapshot: CCLCComponentSnapsh
         <dt>Readiness</dt><dd>{presentation.readiness}</dd>
       </dl>
       <details className="cclc-details">
-        <summary>Control domains and owner facts</summary>
-        {snapshot.readiness.domains.map((domain) => {
-          const presented = componentReadinessDomainPresentation(domain);
+        <summary>Provider occurrences and owner facts</summary>
+        {snapshot.readiness.providerOccurrences.map((domain) => {
+          const presented = componentReadinessOccurrencePresentation(domain);
           return (
             <div className="cclc-domain" key={`${domain.providerOccurrence.controlDomainId}:${domain.providerOccurrence.providerInstanceId}`}>
               <p><strong>{domain.providerOccurrence.controlDomainId}</strong> · {presented.state}</p>
@@ -123,14 +123,14 @@ function ComponentLifecycleSummary({ snapshot }: { snapshot: CCLCComponentSnapsh
 type PendingConfirmation =
   | { kind: 'activation'; sequence: boolean; label: string; detail: string }
   | { kind: 'lifecycle'; intent: CCLCLifecycleIntent; label: string; detail: string }
-  | { kind: 'route'; template: CCLCRouteTemplate; label: string; detail: string };
+  | { kind: 'route'; template: CCLCRouteTemplateWire; label: string; detail: string };
 
 export function CCLCPanelView({
   enabled,
   mutationAvailable,
   mutationUnavailableReason,
   controller,
-  componentIds = controller.componentId ? [controller.componentId] : [],
+  componentIds = controller.controllableComponentId ? [controller.controllableComponentId] : [],
 }: {
   enabled: boolean;
   mutationAvailable: boolean;
@@ -139,8 +139,8 @@ export function CCLCPanelView({
   componentIds?: string[];
 }) {
   const {
-    componentId, snapshot, routeTemplates, transaction, pendingTransaction,
-    busy, readUnavailableReason, error, setComponentId, refresh,
+    controllableComponentId, snapshot, routeTemplates, transaction, pendingTransaction,
+    busy, readUnavailableReason, error, setControllableComponentId, refresh,
     reconcileTransaction,
     submitLifecycle, submitRoute,
   } = controller;
@@ -191,7 +191,7 @@ export function CCLCPanelView({
             Activate all
           </button>
           <button type="button" className="quiet-button"
-            disabled={!enabled || busy || !componentId.trim()}
+            disabled={!enabled || busy || !controllableComponentId.trim()}
             onClick={() => void refresh()}>
             Refresh
           </button>
@@ -203,7 +203,7 @@ export function CCLCPanelView({
         <div className="cclc-activation-status">
           {controller.activationProgress !== null && <p role="status">{controller.activationProgress}</p>}
           {controller.activationRefusal !== null && <div role="status" className="notice severity-warning">
-            <p>{controller.activationRefusal.componentId}: {
+            <p>{controller.activationRefusal.controllableComponentId}: {
               controller.activationRefusal.error.details.observed_fault_present === 'true' ? 'Fault — intervention required' : 'Not ready'
             }</p>
             {['reason', 'observed_state', 'observed_controller_loaded', 'observed_fault_present', 'observed_transport_ready'].map((field) => (
@@ -235,16 +235,16 @@ export function CCLCPanelView({
         <ul className="cclc-component-list" aria-label="Configured component health">
           {componentIds.map((id) => {
             const current = controller.componentHealth?.[id];
-            const rowSnapshot = id === componentId && snapshot !== null ? snapshot : current?.snapshot ?? null;
+            const rowSnapshot = id === controllableComponentId && snapshot !== null ? snapshot : current?.snapshot ?? null;
             const presentation = rowSnapshot === null ? null : componentLifecyclePresentation(rowSnapshot);
-            const selected = id === componentId;
+            const selected = id === controllableComponentId;
             return (
               <li key={id}>
                 <button type="button"
                   className={selected ? 'cclc-component-row selected' : 'cclc-component-row'}
                   aria-pressed={selected}
                   disabled={!enabled || busy}
-                  onClick={() => { if (!selected) setComponentId(id); }}>
+                  onClick={() => { if (!selected) setControllableComponentId(id); }}>
                   <span className={`component-dot ${presentation === null ? 'status-offline' : TONE_DOT[presentation.tone]}`} aria-hidden="true" />
                   <strong>{id}</strong>
                   <span className="cclc-row-state">{rowSnapshot?.lifecycleState ?? 'unknown'}</span>
@@ -265,7 +265,7 @@ export function CCLCPanelView({
       ) : (
         <div className="cclc-current-state">
           <div className="cclc-selected-head">
-            <h5>{snapshot.componentId}</h5>
+            <h5>{snapshot.controllableComponentId}</h5>
             <span className="muted">{snapshot.lifecycleState} · generation {snapshot.lifecycleGeneration}</span>
           </div>
           <ComponentLifecycleSummary snapshot={snapshot} />

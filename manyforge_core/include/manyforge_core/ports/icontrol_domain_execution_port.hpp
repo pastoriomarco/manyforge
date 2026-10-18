@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/types/participant_stop_stage.hpp>
+#include <manyforge_core/types/spring_back_return_point.hpp>
 #include <stop_token>
 
 namespace manyforge::core {
@@ -23,6 +24,17 @@ class IControlDomainExecutionPort {
   [[nodiscard]] virtual ParticipantStopStageResultDTO TranslateStopStage(
       const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
       std::stop_token cancellation) = 0;
+
+  /// Private takeover selection. The selected immutable plan must already
+  /// authorize spring return. Providers without the progress seam retain
+  /// ordinary Stop containment and cannot authorize a successor from it.
+  [[nodiscard]] virtual ParticipantStopStageResultDTO TranslateStopStageForTakeover(
+      const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+      std::stop_token cancellation, IStopStageSpringReturnObserver& observer) {
+    static_cast<void>(observer);
+    return TranslateStopStage(stage, budget, cancellation);
+  }
+
 };
 
 }  // namespace manyforge::core

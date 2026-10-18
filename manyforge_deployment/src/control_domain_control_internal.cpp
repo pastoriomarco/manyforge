@@ -158,8 +158,8 @@ template <typename Strong>
     const CompilerQualifiedCellIr& compiler_ir, const core::ControlDomainDTO& domain) {
   const auto& topologies = compiler_ir.applicability().controller_topologies();
   const auto found = std::find_if(topologies.begin(), topologies.end(), [&](const auto& topology) {
-    return topology.value().controller_topology_id == domain.controller_topology_id &&
-           topology.value().topology_revision == domain.topology_revision;
+    return topology.value().controller_topology_id == domain.controller().controller_topology_id &&
+           topology.value().topology_revision == domain.controller().topology_revision;
   });
   if (found == topologies.end()) {
     fail_retained_bundle("control-domain product selected no exact qualified topology");
@@ -878,9 +878,9 @@ template <typename Stop>
   preimage.push_back('\0');
   preimage.append(domain.control_domain_revision.value());
   preimage.push_back('\0');
-  preimage.append(domain.controller_topology_id.value());
+  preimage.append(domain.controller().controller_topology_id.value());
   preimage.push_back('\0');
-  preimage.append(domain.topology_revision.value());
+  preimage.append(domain.controller().topology_revision.value());
   const std::string digest = sha256_digest(preimage);
   return "mf1_controller_manager_" + digest.substr(7U, 24U);
 }
@@ -1036,8 +1036,8 @@ template <typename Stop>
       {"api_version", CanonicalValue(std::string(kControlDomainControlApiVersion))},
       {"control_domain_id", CanonicalValue(domain.control_domain_id.value())},
       {"control_domain_revision", CanonicalValue(domain.control_domain_revision.value())},
-      {"controller_topology_id", CanonicalValue(domain.controller_topology_id.value())},
-      {"topology_revision", CanonicalValue(domain.topology_revision.value())},
+      {"controller_topology_id", CanonicalValue(domain.controller().controller_topology_id.value())},
+      {"topology_revision", CanonicalValue(domain.controller().topology_revision.value())},
       {"control_coordinator_endpoint_role",
        CanonicalValue(domain.control_coordinator_endpoint_role.value())},
       {"containment_granularity",

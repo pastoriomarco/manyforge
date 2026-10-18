@@ -9,9 +9,9 @@
 #include <manyforge_core/types/prepared_execution.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
-#include <stop_token>
 #include <memory>
 #include <stdexcept>
+#include <stop_token>
 #include <utility>
 
 namespace manyforge::core {
@@ -61,6 +61,43 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   /// not reopen retired membership, and stale retirement cannot clear a newer
   /// execution. Failure retains membership and prevents owner release.
   virtual Result<void> RetirePreparedExecution(std::uint64_t execution_id) = 0;
+
+  /// Optional source-fenced takeover on this same execution owner. Unsupported
+  /// backends retain ordinary preparation/dispatch behavior unchanged.
+  virtual Result<PreparedMotionReplacementSourceDTO> CaptureReplacementSource(
+      std::uint64_t /*execution_id*/, std::uint64_t /*execution_generation*/,
+      const ExecutionGoalKey& /*goal*/, const ContentDigest& /*digest*/) const {
+    return Result<PreparedMotionReplacementSourceDTO>::Err(ErrorCode::kUnsupportedCapability);
+  }
+
+  virtual PrepareParticipantResultDTO PrepareReplacement(
+      const PreparedOperationParticipantDTO& participant, std::uint64_t /*candidate_id*/,
+      const PreparedMotionReplacementSourceDTO& /*source*/) {
+    return MakePrepareParticipantResult(
+               participant, PrepareParticipantResultStateDTO::kRejected,
+               ErrorDTO{kErrorUnsupportedCapability, "Motion replacement is unsupported", {}})
+        .value();
+  }
+
+  virtual PreparedMotionReplacementDispatchDTO DispatchReplacement(
+      const PreparedMotionReplacementSourceDTO& /*source*/, std::uint64_t /*candidate_id*/,
+      const PreparedOperationParticipantDTO& /*participant*/,
+      const ExecutionGoalKey& /*successor_goal*/, std::int64_t /*preparation_deadline_ns*/) {
+    return {{ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kUnsupported,
+             ErrorDTO{kErrorUnsupportedCapability, "Motion replacement is unsupported", {}}},
+            std::nullopt};
+  }
+
+  virtual Result<PreparedMotionReplacementObservationDTO> ObserveReplacement(
+      const PreparedMotionReplacementSourceDTO& /*source*/, std::uint64_t /*candidate_id*/) const {
+    return Result<PreparedMotionReplacementObservationDTO>::Err(ErrorCode::kUnsupportedCapability);
+  }
+
+  virtual Result<void> AdoptReplacement(const PreparedMotionReplacementSourceDTO& /*source*/,
+                                        std::uint64_t /*candidate_id*/,
+                                        PreparedMotionReplacementCommitDTO /*commit*/) {
+    return Result<void>::Err(ErrorCode::kUnsupportedCapability);
+  }
 
   /// Dispatch one already-prepared participant under the Kernel-minted goal.
   /// Exact repetition returns the same goal-bound handle and never sends a

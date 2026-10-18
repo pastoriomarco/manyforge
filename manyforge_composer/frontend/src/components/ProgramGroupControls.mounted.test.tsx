@@ -229,3 +229,28 @@ it('authors Allow intervention and a Retry limit of Unlimited or N, never a bare
     expect(recoveryWrites.at(-1)).toEqual({ allow_intervention: true, max_retries: 0 });
   } finally { await mounted.unmount(); }
 });
+
+it('authors the intervention stop scope only while intervention is allowed, and omits the default', async () => {
+  const mounted = await mountPolicy(move, []);
+  const { recoveryWrites, find } = mounted;
+  try {
+    const intervention = () => find((p) => p.id === 'policy-move-allow_intervention');
+    const scope = () => find((p) => p.id === 'policy-move-intervention_stop_scope');
+    expect(() => scope()).toThrow();
+    await act(() => intervention().onChange?.({ target: { checked: true } }));
+    expect(scope().value).toBe('all');
+    await act(() => scope().onChange?.({ target: { value: 'own_groups' } }));
+    expect(recoveryWrites.at(-1)).toEqual({
+      allow_intervention: true, max_retries: 0, intervention_stop_scope: 'own_groups',
+    });
+    expect(scope().value).toBe('own_groups');
+    // Choosing All groups again saves the default by omission.
+    await act(() => scope().onChange?.({ target: { value: 'all' } }));
+    expect(recoveryWrites.at(-1)).toEqual({ allow_intervention: true, max_retries: 0 });
+    await act(() => scope().onChange?.({ target: { value: 'own_groups' } }));
+    // Turning intervention off drops the hidden scope from the authored policy.
+    await act(() => intervention().onChange?.({ target: { checked: false } }));
+    expect(recoveryWrites.at(-1)).toEqual({ allow_intervention: false, max_retries: 0 });
+    expect(() => scope()).toThrow();
+  } finally { await mounted.unmount(); }
+});

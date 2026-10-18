@@ -618,6 +618,47 @@ public:
     });
   }
 
+std::string ObserveProgramFailureCondition(std::string condition_json) {
+  py::gil_scoped_release release;
+  return Invoke([this, condition_json = std::move(condition_json)]() mutable {
+    CanonicalValue condition;
+    try {
+      content_identity::CanonicalJsonParseLimits limits;
+      limits.maximum_bytes = kMaximumRuntimeFaultSnapshotBytes;
+      condition =
+          content_identity::parse_canonical_json(condition_json, limits);
+      if (content_identity::canonical_json(condition) != condition_json)
+        throw std::invalid_argument(
+            "Program failure condition must be canonical JSON");
+    } catch (const std::exception &error) {
+      throw OperatorAlarmError("headless_program_failure_condition_invalid",
+                               error.what());
+    }
+    return core_->ObserveProgramFailureCondition(std::move(condition));
+  });
+}
+  std::string ObserveRuntimeFaultConditions(
+      std::string source_owner_epoch, std::string current_runtime_faults_json) {
+    py::gil_scoped_release release;
+    return Invoke([this, source_owner_epoch = std::move(source_owner_epoch),
+                   current_runtime_faults_json =
+                       std::move(current_runtime_faults_json)]() mutable {
+      CanonicalValue current_runtime_faults;
+      try {
+        content_identity::CanonicalJsonParseLimits limits;
+        limits.maximum_bytes = kMaximumRuntimeFaultSnapshotBytes;
+        current_runtime_faults = content_identity::parse_canonical_json(
+            current_runtime_faults_json, limits);
+      } catch (const std::exception &error) {
+        throw OperatorAlarmError(
+            "headless_runtime_fault_invalid",
+            "current runtime faults are not canonical JSON: " + std::string(error.what()));
+      }
+      return core_->ObserveRuntimeFaultConditions(
+          std::move(source_owner_epoch), std::move(current_runtime_faults));
+    });
+  }
+
   std::string MarkOperationEventSourceUnknown(std::string source_owner_epoch) {
     py::gil_scoped_release release;
     return Invoke(
@@ -1203,6 +1244,12 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("mark_operation_event_source_unknown",
            &HeadlessApiBridge::MarkOperationEventSourceUnknown,
            py::arg("source_owner_epoch"))
+      .def("observe_program_failure_condition",
+           &HeadlessApiBridge::ObserveProgramFailureCondition,
+           py::arg("condition_json"))
+      .def("observe_runtime_fault_conditions",
+           &HeadlessApiBridge::ObserveRuntimeFaultConditions,
+           py::arg("source_owner_epoch"), py::arg("current_runtime_faults_json"))
       .def("component_lifecycle_condition_scope",
            &HeadlessApiBridge::ComponentLifecycleConditionScope)
       .def("observe_component_lifecycle_conditions",

@@ -205,6 +205,8 @@ interface StructuralViewerProps {
    * so its Stop is at hand. */
   robotMotionActive?: boolean;
   objectControlSurface?: ReactNode;
+  /** Tool & I/O signals; mounted (and polling) only while its panel is open. */
+  ioControlSurface?: ReactNode;
   transportControls?: ReactNode | ((
     openRobotControls: () => void,
     viewerSettings: { open: () => void; previewLayerActive: boolean },
@@ -221,7 +223,7 @@ interface StructuralViewerProps {
   onInspectorPanelChange?: (panel: ViewerInspectorPanel) => void;
 }
 
-export type ViewerInspectorPanel = 'tools' | 'robot' | 'object' | null;
+export type ViewerInspectorPanel = 'tools' | 'robot' | 'object' | 'io' | null;
 
 const READ_ONLY_SCENE_REASON = 'Read-only: the Program Draft cannot be edited now, or this Applied view hides unapplied Draft changes (switch to the Draft Scene).';
 
@@ -3012,6 +3014,7 @@ function StructuralViewerContent({
   robotControlBlocked = false,
   robotMotionActive = false,
   objectControlSurface,
+  ioControlSurface,
   transportControls,
   controlPanelSettings,
   programViewerPendingApply,
@@ -3529,6 +3532,15 @@ function StructuralViewerContent({
               title={robotPanelLocked ? robotLockTitle : undefined}
               onClick={() => toggleInspectorPanel('object')}
             >Object</button>
+            {ioControlSurface !== undefined && (
+              <button
+                type="button"
+                aria-pressed={inspectorPanel === 'io'}
+                disabled={robotPanelLocked}
+                title={robotPanelLocked ? robotLockTitle : 'Tool and I/O signals'}
+                onClick={() => toggleInspectorPanel('io')}
+              >Tool &amp; I/O</button>
+            )}
           </div>
         </div>
       </header>
@@ -3726,7 +3738,9 @@ function StructuralViewerContent({
                 ? 'Robot control'
                 : inspectorPanel === 'object'
                   ? 'Selected object'
-                  : 'Viewer settings'}</strong>
+                  : inspectorPanel === 'io'
+                    ? 'Tool & I/O'
+                    : 'Viewer settings'}</strong>
             {inspectorPanel === 'robot' && robotControlBlocked && (
               <span className="central-inspector-warning" title="The current manual target has no executable preview. Check the Robot panel; this is not a Program fault.">Check preview</span>
             )}
@@ -3770,6 +3784,8 @@ function StructuralViewerContent({
                 robotControlSurface ?? (
                   <p className="panel-state">Robot control is unavailable.</p>
                 )
+              ) : inspectorPanel === 'io' ? (
+                ioControlSurface ?? <p className="panel-state">Tool and I/O signals are unavailable.</p>
               ) : inspectorPanel === 'tools' ? (
                 <div ref={viewerSettingsPanel} className="viewer-options-body dpanel">
                   {auxiliaryViewerSourcesActive && (

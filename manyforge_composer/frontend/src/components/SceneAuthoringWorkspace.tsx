@@ -32,6 +32,7 @@ import {
 } from './ProgramRuntimePanel';
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { RobotControlPanelView } from './RobotControlPanel';
+import { ToolIoPanel } from './ToolIoPanel';
 import { useGizmoSettings } from './common/GizmoControls';
 import type { GizmoController } from './common/GizmoControls';
 import type { ViewerInspectorPanel } from './StructuralViewer';
@@ -1417,14 +1418,14 @@ function SourceOccurrencePanel({
             </div>
             <div>
               <span className={`status-pill ${source.fresh ? 'ready' : 'warning'}`}>
-                {source.quality === 'unknown'
+                {source.payload_quality === 'unknown'
                   ? 'unknown'
                   : source.fresh ? 'fresh' : 'stale'}
               </span>
               <span>{source.payload.kind} · sequence {source.source_sequence}</span>
               {source.buffered && <span>buffered</span>}
             </div>
-            {source.quality === 'unknown' && (
+            {source.payload_quality === 'unknown' && (
               <span className="scene-commit-error inline-message severity-error">{source.payload.source_error.detail}</span>
             )}
           </div>
@@ -2204,6 +2205,15 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
             gizmo={gizmo}
           />
         </>
+      )}
+      ioControlSurface={(
+        <ToolIoPanel
+          enabled={runtimeEnabled}
+          ownerEpoch={robotControl.selectedStatus?.ownerEpoch ?? null}
+          retainedBundleId={robotControl.selectedStatus?.retainedBundleId ?? null}
+          ioSignalBindings={robotControl.selectedStatus?.ioSignalBindings}
+          controlSource={robotControl.controlSource}
+        />
       )}
       robotControlBlocked={robotControl.state.phase === 'blocked'}
       robotMotionActive={robotControlHasActiveOperation(robotControl.state)}

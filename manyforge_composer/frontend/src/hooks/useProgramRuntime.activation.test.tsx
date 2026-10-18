@@ -46,13 +46,13 @@ function deferred<T>() {
   return { promise, resolve };
 }
 function component(id: string, state: CCLCComponentSnapshot['lifecycleState']): CCLCComponentSnapshot {
-  return { componentId: id, lifecycleState: state, lifecycleGeneration: 1,
+  return { controllableComponentId: id, lifecycleState: state, lifecycleGeneration: 1,
     retainedBundleId: 'bundle', graphRevision: 'graph', publicationGeneration: 1,
     activePublicPointerDigest: 'pointer.1', providers: [], domains: [], lifecycleTarget: null,
     lifecycleProgress: null, readiness: { requestOwnerEpoch: 'cclc.1', evaluatedAtNs: 1,
       nextIntent: state === 'disabled' || state === 'declared' ? 'prepare' : state === 'prepared' ? 'enable' : null,
       requestedState: state === 'disabled' || state === 'declared' ? 'prepared' : state === 'prepared' ? 'active' : null,
-      ready: true, error: null, domains: [], measuredState: { required: false, available: null, error: null } } };
+      ready: true, error: null, providerOccurrences: [], measuredState: { required: false, available: null, error: null } } };
 }
 function accepted(transactionId: string) {
   return { replayStatus: 'accepted_new', requestId: transactionId, transactionId,
@@ -79,7 +79,7 @@ function facts(): { snapshot: ComposerHeadlessState; workspace: ProgramWorkspace
         runtimeControlRevision: null, executionControlRevision: 1,
         causalCorrelationId: null, causalSessionId: null, causalClientSequence: null,
         currentCommandKind: null, failure: null, resetPhase: null, resetOptions: null,
-        resetRobotPosition: { available: false, reason: 'unsupported' }, recoveryOffer: null,
+        resetRobotPosition: { available: false, reason: 'unsupported' },
         run: null, runtimeControls: null,
         allowedCommands: [{ commandKind: 'program_run', allowed: true,
           disabledReason: null, semanticTarget: {} }] } } as unknown as ComposerHeadlessState,
@@ -111,7 +111,7 @@ async function mount(states: Record<string, CCLCComponentSnapshot['lifecycleStat
   apiMock.cclc.owner.mockResolvedValue({ requestOwnerEpoch: 'cclc.1' });
   apiMock.cclc.component.mockImplementation(async (id: string) => component(id, states[id]));
   apiMock.cclc.routeTemplates.mockImplementation(async (id: string) => ({
-    componentId: id, graphRevision: 'graph', retainedBundleId: 'bundle', templates: [] }));
+    controllableComponentId: id, graphRevision: 'graph', retainedBundleId: 'bundle', templates: [] }));
   const effectOrder: string[] = [];
   const completeLifecycle = (request: CCLCLifecycleRequestBody) => {
     effectOrder.push(`${request.controllable_component_id}:${request.intent}`);
@@ -151,7 +151,7 @@ it('offers all configured inactive components and Cancel sends neither lifecycle
   const test = await mount();
   expect(test.runtime.commandAllowed('program_run')).toBe(true);
   await act(async () => { await test.runtime.run(); });
-  expect(test.runtime.activationOffer?.components.map((row) => [row.componentId, row.lifecycleState]))
+  expect(test.runtime.activationOffer?.components.map((row) => [row.controllableComponentId, row.lifecycleState]))
     .toEqual([['robot.z', 'disabled'], ['robot.a', 'active']]);
   expect(test.send).not.toHaveBeenCalled();
   expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
@@ -398,4 +398,28 @@ it('plain Reset defaults both effects off and never resends unconfirmed delivery
   } });
   await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
   expect(test.send).toHaveBeenCalledTimes(1);
+});
+
+it('forwards current activation health and the named wait without replacing the captured offer', async () => {
+  const test = await mount({ 'robot.z': 'disabled', 'robot.a': 'disabled' });
+  await act(async () => { await test.runtime.run(); });
+  const offer = test.runtime.activationOffer;
+  apiMock.cclc.component.mockImplementation(async (id: string) => {
+    const current = component(id, test.states[id]);
+    return id !== 'robot.a' ? current : { ...current, readiness: { ...current.readiness,
+      ready: false, error: { code: 'component_lifecycle_transition_missing',
+        message: 'No lifecycle transition is satisfied', details: { reason: 'no_transition_satisfied' } } } };
+  });
+  let confirmation!: Promise<void>;
+  await act(async () => { confirmation = test.runtime.confirmActivationExecute(); });
+  expect(test.runtime.activationPending).toBe(true);
+  expect(test.runtime.activationComponentHealth['robot.z'].snapshot?.lifecycleState).toBe('active');
+  expect(test.runtime.activationComponentHealth['robot.a'].snapshot?.lifecycleState).toBe('disabled');
+  expect(test.runtime.activationProgress).toBe('robot.a: Not ready — [component_lifecycle_transition_missing] No lifecycle transition is satisfied · no_transition_satisfied');
+  expect(test.runtime.activationOffer).toBe(offer);
+  expect(offer?.components.map((row) => row.lifecycleState)).toEqual(['disabled', 'disabled']);
+  expect(test.effectOrder).toEqual(['robot.z:prepare', 'robot.z:enable']);
+  expect(test.send).not.toHaveBeenCalled();
+  await act(async () => { test.runtime.cancelActivationExecute(); await confirmation; });
+  expect(test.send).not.toHaveBeenCalled();
 });

@@ -5,10 +5,12 @@
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/participant_binding_identity.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace manyforge::core {
@@ -24,23 +26,56 @@ enum class ResourceSlotState {
   kUnreconciledExternalOrOrphanGoal,
 };
 
-struct ResourceSlotOwnerDTO final {
-  OperationId operation_id;
-  OperationRevision operation_revision;
-  OperationParticipantId participant_id;
-  ControlDomainId control_domain_id;
-  ControlDomainRevision control_domain_revision;
-  ControlBindingId control_binding_id;
-  ControlBindingRevision control_binding_revision;
+struct ResourceSlotControllerAuthorityDTO final {
   ControllerTopologyId controller_topology_id;
   TopologyRevision topology_revision;
   ControlRouteId control_route_id;
   ActiveControlConfigurationId active_control_configuration_id;
   ActiveControlConfigurationGeneration active_control_configuration_generation;
   ContainmentGranularity containment_granularity{ContainmentGranularity::kResource};
+  friend bool operator==(const ResourceSlotControllerAuthorityDTO&,
+                         const ResourceSlotControllerAuthorityDTO&) = default;
+};
 
+struct ResourceSlotOwnerDTO final {
+  OperationId operation_id;
+  OperationRevision operation_revision;
+  OperationParticipantId participant_id;
+  ParticipantBindingIdentityDTO binding_identity;
+  std::optional<ResourceSlotControllerAuthorityDTO> controller_authority;
+
+  ResourceSlotOwnerDTO() = default;
+  ResourceSlotOwnerDTO(OperationId operation, OperationRevision revision,
+                       OperationParticipantId participant, ControlDomainId domain,
+                       ControlDomainRevision domain_revision, ControlBindingId binding,
+                       ControlBindingRevision binding_revision, ControllerTopologyId topology,
+                       TopologyRevision topology_revision, ControlRouteId route,
+                       ActiveControlConfigurationId configuration,
+                       ActiveControlConfigurationGeneration configuration_generation,
+                       ContainmentGranularity granularity = ContainmentGranularity::kResource)
+      : operation_id(std::move(operation)),
+        operation_revision(revision),
+        participant_id(std::move(participant)),
+        binding_identity{std::move(domain), std::move(domain_revision),
+                         ControllerParticipantBindingIdentityDTO{
+                             std::move(binding), std::move(binding_revision), {}}},
+        controller_authority(ResourceSlotControllerAuthorityDTO{
+            std::move(topology), std::move(topology_revision), std::move(route),
+            std::move(configuration), configuration_generation, granularity}) {}
+  ResourceSlotOwnerDTO(OperationId operation, OperationRevision revision,
+                       OperationParticipantId participant,
+                       ParticipantBindingIdentityDTO provider_identity)
+      : operation_id(std::move(operation)),
+        operation_revision(revision),
+        participant_id(std::move(participant)),
+        binding_identity(std::move(provider_identity)) {}
+  [[nodiscard]] ResourceSlotControllerAuthorityDTO& controller() {
+    return controller_authority.value();
+  }
+  [[nodiscard]] const ResourceSlotControllerAuthorityDTO& controller() const {
+    return controller_authority.value();
+  }
   [[nodiscard]] bool valid() const noexcept;
-
   friend bool operator==(const ResourceSlotOwnerDTO&, const ResourceSlotOwnerDTO&) = default;
 };
 
@@ -77,6 +112,24 @@ struct ResourceSlotReservationOwnerDTO final {
 
   friend bool operator==(const ResourceSlotReservationOwnerDTO&,
                          const ResourceSlotReservationOwnerDTO&) = default;
+};
+
+enum class ResourceSlotOwnerTransferMode : std::uint8_t {
+  kMoving,
+  kSettled,
+};
+
+/// One complete incumbent participant scope transferred to a fresh operation.
+/// Rows are canonical by (expected operation_id, participant_id); each resource
+/// scope is sorted/unique and disjoint. Only operation/participant identity and
+/// operation revision may change; every physical binding/configuration stays exact.
+struct ResourceSlotOwnerTransferDTO final {
+  ResourceSlotOwnerDTO expected_owner;
+  ResourceSlotOwnerDTO next_owner;
+  std::vector<ResourceId> resources;
+
+  friend bool operator==(const ResourceSlotOwnerTransferDTO&,
+                         const ResourceSlotOwnerTransferDTO&) = default;
 };
 
 /// One exact participant owner in an atomic multi-owner Stop fence. Rows are a
@@ -128,8 +181,7 @@ struct ResourceSlotAdmissionSnapshotDTO final {
   /// Only configurations with an authoritative Kernel route publication.
   /// CCLC route-fence admission consumes this inventory so an unready
   /// Apply-staged candidate cannot masquerade as a published predecessor.
-  std::vector<DomainActiveControlConfigurationDTO>
-      route_published_active_control_configurations;
+  std::vector<DomainActiveControlConfigurationDTO> route_published_active_control_configurations;
   std::uint64_t affected_queued_operation_count{};
   std::uint64_t affected_active_operation_count{};
 };
@@ -170,6 +222,29 @@ class ResourceSlotTable final {
   /// advances the shared generation once.
   [[nodiscard]] Result<void> transition_batch(
       const std::vector<ResourceSlotReservationOwnerDTO>& owners, ResourceSlotState next_state);
+
+  /// Transfer complete Dispatched scopes atomically, without releasing or
+  /// reserving them. The exact coherent snapshot fences table generation,
+  /// old owner/state and per-resource Stop generation. All targets name one
+  /// valid operation/revision absent from the table, with distinct participants; no
+  /// physical scope/configuration changes. State remains Dispatched and Stop
+  /// generations remain unchanged; success advances the table generation once.
+  ///
+  /// The caller proves physical handover, same-Run/priority permission, durable
+  /// identity freshness and admission/configuration fencing before this CAS.
+  /// This table grants no dispatch or supersession authority and keeps no history.
+  [[nodiscard]] Result<std::uint64_t> transfer_dispatched_owners(
+      const ResourceSlotTableSnapshotDTO& expected,
+      const std::vector<ResourceSlotOwnerTransferDTO>& transfers);
+
+  /// Same exact batch CAS for a qualified moving handover or a settled cold
+  /// handover. Settled transfers require Terminal and publish Reserved; the
+  /// caller proves actual settlement/no-effect and local cleanup. Stop
+  /// generations and physical binding stay exact in both modes.
+  [[nodiscard]] Result<std::uint64_t> transfer_owners(
+      const ResourceSlotTableSnapshotDTO& expected,
+      const std::vector<ResourceSlotOwnerTransferDTO>& transfers,
+      ResourceSlotOwnerTransferMode mode);
 
   /// Advance the owning operation revision after an accepted operation-scoped
   /// control without changing reservation state or resolved runtime facts.
@@ -274,8 +349,7 @@ class ResourceSlotTable final {
   mutable std::recursive_mutex data_mutex_;
   std::vector<ResourceSlotSnapshotDTO> slots_;
   std::vector<DomainActiveControlConfigurationDTO> active_control_configurations_;
-  std::vector<DomainActiveControlConfigurationDTO>
-      route_published_active_control_configurations_;
+  std::vector<DomainActiveControlConfigurationDTO> route_published_active_control_configurations_;
   std::uint64_t operation_resource_generation_{};
 };
 
@@ -301,16 +375,23 @@ class IResourceOperationAdmissionGate {
       const std::vector<ResourceId>& resources) const = 0;
   /// Whether the one exact held fence covers every listed resource. Coverage
   /// by any other fence does not count. Gates without fence identity refuse.
-  [[nodiscard]] virtual bool exact_fence_covers(const ConfigurationFenceId& /*fence_id*/,
-                                                const std::vector<ResourceId>& /*resources*/) const {
+  [[nodiscard]] virtual bool exact_fence_covers(
+      const ConfigurationFenceId& /*fence_id*/,
+      const std::vector<ResourceId>& /*resources*/) const {
     return false;
   }
+
+  /// Any held configuration fence, including an empty-scope Apply. Callers
+  /// retain shared_admission_mutex() through the protected installation step.
+  /// Gates without this proof fail closed for that installation only.
+  [[nodiscard]] virtual bool has_held_configuration_fences() const { return true; }
 
   /// Exact held scope check, including empty-scope Applies that only re-seal
   /// product bindings. Coverage by a different or wider fence is insufficient.
   [[nodiscard]] virtual bool exact_fence_is_held(
-      const ConfigurationFenceId& /*fence_id*/,
-      const ConfigurationFenceScopeDTO& /*scope*/) const { return false; }
+      const ConfigurationFenceId& /*fence_id*/, const ConfigurationFenceScopeDTO& /*scope*/) const {
+    return false;
+  }
 };
 
 }  // namespace manyforge::core

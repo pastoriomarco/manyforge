@@ -54,6 +54,9 @@ struct ComponentCommandReadinessPublicationDTO final {
   ControllableComponentId controllable_component_id;
   ComponentLifecycleGeneration component_lifecycle_generation;
   bool command_eligible{false};
+  /// Actual held parent Apply scope when a provider-only component has no
+  /// physical resource coordinates. Old physical publications need no value.
+  std::optional<ConfigurationFenceScopeDTO> parent_apply_scope{};
 
   [[nodiscard]] bool locally_valid() const noexcept {
     const bool claim = authority == ComponentReadinessAuthorityDTO::kLifecycleClaim;
@@ -62,6 +65,7 @@ struct ComponentCommandReadinessPublicationDTO final {
            (!lifecycle_transaction_id.has_value() || !lifecycle_transaction_id->empty()) &&
            fence == parent_apply_fence_id.has_value() &&
            (!parent_apply_fence_id.has_value() || !parent_apply_fence_id->empty()) &&
+           (!parent_apply_scope || (fence && parent_apply_scope->valid())) &&
            (claim || authority == ComponentReadinessAuthorityDTO::kParentApplyFence ||
             authority == ComponentReadinessAuthorityDTO::kRestartExclusion) &&
            !controllable_component_id.empty() && component_lifecycle_generation.nonzero();
@@ -98,6 +102,25 @@ class ICCLCComponentCommandReadinessPort {
   [[nodiscard]] virtual Result<ComponentCommandReadinessDTO> PublishComponentCommandReadiness(
       const ComponentCommandReadinessPublicationDTO& publication) = 0;
 
+  /// Terminal CCLC publication with its actual structural/current-generation
+  /// snapshot and retained driver observations. The journal aggregate state may
+  /// precede terminal commit; it is never rewritten into an observation.
+  /// Physical implementations retain their original path. A provider domain
+  /// requires an implementation that consumes the additional proof.
+  [[nodiscard]] virtual Result<ComponentCommandReadinessDTO> PublishComponentCommandReadiness(
+      const ComponentCommandReadinessPublicationDTO& publication,
+      const ComponentLifecycleCurrentSnapshotDTO& actual_snapshot,
+      const std::vector<BrandLifecycleObservationDTO>&) {
+    for (const auto& domain : actual_snapshot.domains) {
+      if (domain.provider())
+        return Result<ComponentCommandReadinessDTO>::Err(
+            ErrorDTO{"invalid_request",
+                     "provider readiness proof is unsupported",
+                     {{"reason", "provider_readiness_publication_unsupported"}}});
+    }
+    return PublishComponentCommandReadiness(publication);
+  }
+
   /// Original live selected owner only: publish already-installed successor
   /// facts without opening commands, resealing products, or installing engines.
   [[nodiscard]] virtual Result<ComponentCommandReadinessDTO> PublishComponentCommandReadiness(
@@ -106,7 +129,8 @@ class ICCLCComponentCommandReadinessPort {
       const std::vector<RuntimeParticipantExecutionRegistration>&,
       const std::vector<ActiveControlConfigurationDTO>&, bool = false) {
     return Result<ComponentCommandReadinessDTO>::Err(
-        ErrorDTO{"invalid_request", "selected successor readiness publication is unavailable",
+        ErrorDTO{"invalid_request",
+                 "selected successor readiness publication is unavailable",
                  {{"reason", "selected_successor_readiness_unsupported"}}});
   }
 

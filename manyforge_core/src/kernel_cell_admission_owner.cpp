@@ -81,7 +81,8 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
     CellAdmissionClaimGeneration recovered_claim_generation_high_water,
     CellAdmissionProgramNodeValidator program_node_validator,
     std::function<bool()> stop_fault_active,
-    CellAdmissionProgramResetStatusSource program_reset_status_source)
+    CellAdmissionProgramResetStatusSource program_reset_status_source,
+    std::function<Result<void>(std::shared_ptr<IIoSignalService>*)> required_health_loss_observer)
     : kernel_owner_epoch_(std::move(kernel_owner_epoch)),
       capacity_(capacity),
       clock_(clock),
@@ -92,6 +93,7 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
       reconcile_validator_(std::move(reconcile_validator)),
       program_node_validator_(std::move(program_node_validator)),
       stop_fault_active_(std::move(stop_fault_active)),
+      required_health_loss_observer_(std::move(required_health_loss_observer)),
       manager_liveness_required_set_(std::move(manager_liveness_required_set)),
       membership_(std::move(recovered_membership)),
       current_owners_(std::move(recovered_current_owners)) {
@@ -218,6 +220,34 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
   if (!footprint.ok() || !footprint.value().admitted()) {
     throw std::runtime_error("durable cell-admission recovery footprint exceeds its bound");
   }
+}
+
+Result<KernelCellAdmissionOwner::ProgramBlackboardAdmissionGuard>
+KernelCellAdmissionOwner::AcquireProgramBlackboardAdmission() const {
+  std::unique_lock lock(mutex_);
+  if (persistence_outcome_unknown_ || !manager_liveness_required_set_ ||
+      manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size() ||
+      !readiness_.program_cycle_status_current || !readiness_.program_cycle_status ||
+      readiness_.program_runner_loss)
+    return Result<ProgramBlackboardAdmissionGuard>::Err(
+        {"stale_generation",
+         "Program blackboard requires current Runner health and cycle",
+         {{"reason", "program_bb_owner_not_current"}}});
+  return Result<ProgramBlackboardAdmissionGuard>::Ok(
+      ProgramBlackboardAdmissionGuard(std::move(lock), *readiness_.program_cycle_status,
+                                      manager_liveness_required_set_->active_bundle_id));
+}
+
+Result<KernelCellAdmissionOwner::ManagedProductAdmissionGuard>
+KernelCellAdmissionOwner::AcquireManagedProductAdmission() const {
+  std::unique_lock lock(mutex_);
+  if (persistence_outcome_unknown_ || !manager_liveness_required_set_ ||
+      manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size())
+    return Result<ManagedProductAdmissionGuard>::Err(
+        {"stale_generation", "Global interrupt rules require the current managed product owner",
+         {{"reason", "global_interrupt_owner_not_current"}}});
+  return Result<ManagedProductAdmissionGuard>::Ok(
+      ManagedProductAdmissionGuard(std::move(lock), manager_liveness_required_set_->active_bundle_id));
 }
 
 bool KernelCellAdmissionOwner::NonCycleReadinessLocked() const noexcept {
@@ -586,8 +616,23 @@ AuthoringAdmissionDTO KernelCellAdmissionOwner::GetAuthoringAdmission() const {
   return AdmissionLocked();
 }
 
+Result<void> KernelCellAdmissionOwner::ValidateProgramRunnerContactLossSource(
+    const ProgramRunnerContactLossDTO& loss) const {
+  const auto valid = ValidateProgramRunnerContactLoss(loss);
+  if (!valid.ok()) return valid;
+  std::lock_guard lock(mutex_);
+  if (!manager_liveness_required_set_ ||
+      loss.manager_owner_epoch != manager_liveness_required_set_->manager_owner_epoch ||
+      loss.manager_runtime_epoch != manager_liveness_required_set_->manager_runtime_epoch) {
+    return Reject<void>("invalid_request", "program_runner_contact_loss_invalid");
+  }
+  return Result<void>::Ok();
+}
+
 Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::UpdateCellAdmissionReadiness(
-    const CellAdmissionReadinessSnapshotDTO& snapshot) {
+    const CellAdmissionReadinessSnapshotDTO& snapshot,
+    std::shared_ptr<IIoSignalService>* actual_retired_service) {
+  if (actual_retired_service) actual_retired_service->reset();
   if (snapshot.required_component_total > kMaximumCellAdmissionScopeEntries ||
       snapshot.required_component_current_compatible_ready_converged >
           snapshot.required_component_total ||
@@ -600,6 +645,15 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::UpdateCellAdmissionReadi
   }
   std::lock_guard transition_lock(liveness_transition_mutex_);
   std::lock_guard lock(mutex_);
+  if (snapshot.program_runner_loss &&
+      (!ValidateProgramRunnerContactLoss(*snapshot.program_runner_loss).ok() ||
+       snapshot.program_cycle_status_current || !manager_liveness_required_set_ ||
+       snapshot.program_runner_loss->manager_owner_epoch !=
+           manager_liveness_required_set_->manager_owner_epoch ||
+       snapshot.program_runner_loss->manager_runtime_epoch !=
+           manager_liveness_required_set_->manager_runtime_epoch)) {
+    return Reject<AuthoringAdmissionDTO>("invalid_request", "program_runner_contact_loss_invalid");
+  }
   if (readiness_ != snapshot) {
     if (generation_.value() >= 9'007'199'254'740'991ULL) {
       return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
@@ -618,6 +672,12 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::UpdateCellAdmissionReadi
 }
 
 Result<void> KernelCellAdmissionOwner::Publish(const ManagerLivenessObservationDTO& observation) {
+  return Publish(observation, nullptr);
+}
+
+Result<void> KernelCellAdmissionOwner::Publish(
+    const ManagerLivenessObservationDTO& observation,
+    std::shared_ptr<IIoSignalService>* actual_retired_service) {
   if (!ValidateManagerLivenessObservation(observation).ok()) {
     return Reject<void>("invalid_request", "manager_liveness_observation_invalid");
   }
@@ -681,10 +741,15 @@ Result<void> KernelCellAdmissionOwner::Publish(const ManagerLivenessObservationD
       }
     }
   }
-  if (!transition_required) {
-    return Result<void>::Ok();
-  }
+  // Invalidate already acquired observations at the same health boundary as
+  // new admissions, before journal I/O releases this mutex. A registered rule
+  // must not keep consuming the old BB snapshot while persistence is blocked.
+  auto invalidated = !next_current && required_health_loss_observer_
+                         ? required_health_loss_observer_(actual_retired_service)
+                         : Result<void>::Ok();
+  if (!transition_required) return invalidated;
   if (generation_.value() >= kMaximumManagerLivenessCounter) {
+    if (!invalidated.ok()) return invalidated;
     return Reject<void>("authoring_not_ready", "admission_generation_exhausted");
   }
   const auto previous_generation = generation_;
@@ -694,7 +759,10 @@ Result<void> KernelCellAdmissionOwner::Publish(const ManagerLivenessObservationD
       kernel_owner_epoch_, previous_generation, next_generation);
   lock.lock();
   if (!recorded.ok()) {
-    return Result<void>::Err(recorded.error());
+    auto error = recorded.error();
+    if (!invalidated.ok())
+      error.details.emplace("program_bb_invalidation_error", invalidated.error().code);
+    return Result<void>::Err(std::move(error));
   }
   generation_ = next_generation;
   const auto current = std::lower_bound(
@@ -712,11 +780,20 @@ Result<void> KernelCellAdmissionOwner::Publish(const ManagerLivenessObservationD
       ++manager_liveness_current_unfenced_count_;
     }
   }
-  return Result<void>::Ok();
+  return invalidated;
 }
 
 bool KernelCellAdmissionOwner::LatchManagerLivenessLoss(
-    const ManagerLivenessLossIntentDTO& intent) noexcept {
+    const ManagerLivenessLossIntentDTO& intent,
+    std::optional<ErrorDTO>* source_invalidation_error) noexcept {
+  return LatchManagerLivenessLoss(intent, source_invalidation_error, nullptr);
+}
+
+bool KernelCellAdmissionOwner::LatchManagerLivenessLoss(
+    const ManagerLivenessLossIntentDTO& intent,
+    std::optional<ErrorDTO>* source_invalidation_error,
+    std::shared_ptr<IIoSignalService>* actual_retired_service) noexcept {
+  bool committed = false;
   try {
     if (!ValidateManagerLivenessLossIntent(intent).ok()) {
       return false;
@@ -757,14 +834,28 @@ bool KernelCellAdmissionOwner::LatchManagerLivenessLoss(
       found->generation_pending_sequence = intent.receiver_status_sequence;
       found->generation_pending_current = false;
     }
+    committed = true;
+    if (required_health_loss_observer_) {
+      auto invalidated = required_health_loss_observer_(actual_retired_service);
+      if (!invalidated.ok() && source_invalidation_error)
+        *source_invalidation_error = invalidated.error();
+    }
     return true;
   } catch (...) {
-    return false;
+    // A bounded invalidation/diagnostic failure cannot turn a committed real
+    // health loss into a stale request and suppress mandatory containment.
+    return committed;
   }
 }
 
 Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReplaceManagerLivenessRequiredSet(
     const ManagerLivenessRequiredSetDTO& required_set) {
+  return ReplaceManagerLivenessRequiredSet(required_set, nullptr);
+}
+
+Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReplaceManagerLivenessRequiredSet(
+    const ManagerLivenessRequiredSetDTO& required_set,
+    std::shared_ptr<IIoSignalService>* actual_retired_service) {
   if (!ValidateManagerLivenessRequiredSet(required_set).ok()) {
     return Reject<AuthoringAdmissionDTO>("invalid_request",
                                          "manager_liveness_required_set_invalid");
@@ -788,6 +879,10 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReplaceManagerLivenessRe
   manager_liveness_required_set_ = std::move(next_set);
   manager_liveness_rows_ = std::move(next_rows);
   manager_liveness_current_unfenced_count_ = 0U;
+  if (required_health_loss_observer_) {
+    auto invalidated = required_health_loss_observer_(actual_retired_service);
+    if (!invalidated.ok()) return Result<AuthoringAdmissionDTO>::Err(invalidated.error());
+  }
   return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
 }
 
@@ -924,11 +1019,56 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireConfigurationAppl
   return AcquireClaim(intent, {}, false, validate);
 }
 
+bool KernelCellAdmissionOwner::IoOutputRecoveryDependenciesReadyLocked() const noexcept {
+  return !persistence_outcome_unknown_ && !published_stop_fault_active_ &&
+         !(stop_fault_active_ && stop_fault_active_()) && !route_recovery_pending_ &&
+         manager_liveness_required_set_ &&
+         manager_liveness_current_unfenced_count_ == manager_liveness_rows_.size() &&
+         readiness_.required_component_status_current && readiness_.deployment_status_current &&
+         readiness_.deployment_converged && readiness_.blocking_fault_count == 0U &&
+         readiness_.unresolved_owner_count == 0U && readiness_.unsettled_effect_count == 0U &&
+         readiness_.program_cycle_status_current && readiness_.program_cycle_status &&
+         !readiness_.program_runner_loss;
+}
+
+Result<void> KernelCellAdmissionOwner::ValidateHeldIoOutputRecoveryLifecycleClaim(
+    const LifecycleTransactionId& transaction,
+    const CellAdmissionIoOutputRecoveryValidator& validate) const {
+  std::lock_guard lock(mutex_);
+  if (!validate || !IoOutputRecoveryDependenciesReadyLocked())
+    return AuthoringNotReady<void>(generation_, "io_output_recovery_dependencies_not_current");
+  const auto claim = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
+    return !entry.release && !entry.reconcile_settlement &&
+           entry.claim.intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle &&
+           entry.claim.intent.owner_transaction_id == transaction.value();
+  });
+  if (claim == entries_.end())
+    return AuthoringNotReady<void>(generation_, "io_output_recovery_lifecycle_claim_not_held");
+  std::vector<CellAdmissionClaimDTO> held;
+  held.reserve(held_claim_count_);
+  for (const auto& entry : entries_)
+    if (!entry.release && !entry.reconcile_settlement && &entry != &*claim)
+      held.push_back(entry.claim);
+  return validate(claim->claim.intent, held, readiness_,
+                  manager_liveness_required_set_->manager_runtime_epoch);
+}
+
+Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireIoOutputRecoveryLifecycleClaim(
+    const CellAdmissionClaimIntentDTO& intent,
+    const CellAdmissionIoOutputRecoveryValidator& validate) {
+  if (intent.claim_kind != CellAdmissionClaimKindDTO::kComponentLifecycle ||
+      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
+      intent.program_node_evidence || intent.intervention_evidence || !validate)
+    return Reject<CellAdmissionClaimDTO>("invalid_request", "io_output_recovery_claim_invalid");
+  return AcquireClaim(intent, {}, false, {}, nullptr, validate);
+}
+
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     const CellAdmissionClaimIntentDTO& intent,
     const CellAdmissionInterventionValidator& validate_offer, const bool selected_apply_bring_up,
     const CellAdmissionConfigurationApplyValidator& configuration_apply_validator,
-    const PreparedProgramResetStatus* reset_proof) {
+    const PreparedProgramResetStatus* reset_proof,
+    const CellAdmissionIoOutputRecoveryValidator& io_output_recovery_validator) {
   const bool configuration_apply = static_cast<bool>(configuration_apply_validator);
   std::lock_guard transition_lock(liveness_transition_mutex_);
   auto valid = ValidateCellAdmissionClaimIntent(intent);
@@ -1151,6 +1291,19 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
                                                              : reason->second);
       return Result<CellAdmissionClaimDTO>::Err(std::move(error));
     }
+  } else if (io_output_recovery_validator) {
+    // Preserve every unrelated health/Apply/Scene fault. These counters come
+    // from those actual owners, not from the retained output operation.
+    if (!IoOutputRecoveryDependenciesReadyLocked())
+      return AuthoringNotReady<CellAdmissionClaimDTO>(
+          generation_, "io_output_recovery_dependencies_not_current");
+    std::vector<CellAdmissionClaimDTO> held;
+    held.reserve(held_claim_count_);
+    for (const auto& entry : entries_)
+      if (!entry.release && !entry.reconcile_settlement) held.push_back(entry.claim);
+    const auto checked = io_output_recovery_validator(
+        intent, held, readiness_, manager_liveness_required_set_->manager_runtime_epoch);
+    if (!checked.ok()) return Result<CellAdmissionClaimDTO>::Err(checked.error());
   } else if (intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle) {
     const auto blocking = LifecycleBlockingReasonLocked();
     if (intent.intervention_evidence.has_value() || blocking.has_value() ||

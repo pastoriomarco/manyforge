@@ -324,6 +324,45 @@ std::string SummaryMessage(const HistorianEvent &event) {
 
 } // namespace
 
+std::string OperationFailureHistoryMessage(const CanonicalValue &state) {
+  const auto *participants =
+      state.is_object() ? state.find_object_member("participants") : nullptr;
+  if (participants == nullptr || !participants->is_array())
+    return {};
+  std::string result;
+  for (const auto &participant : participants->as_array()) {
+    if (!participant.is_object())
+      continue;
+    const auto *error = participant.find_object_member("terminal_error");
+    if (error == nullptr)
+      continue;
+    const auto *code = StringMember(*error, "code");
+    const auto *message = StringMember(*error, "message");
+    if (code == nullptr || code->empty() || message == nullptr ||
+        message->empty())
+      continue;
+    if (!result.empty())
+      result += "; ";
+    // Keep each participant's attribution beside its own error. In particular,
+    // a coordinated peer's cancellation must not be called the collision cause.
+    const auto *scope = participant.find_object_member("execution_scope");
+    if (scope != nullptr) {
+      const auto *node = StringMember(*scope, "node_instance_id");
+      const auto *attempt = StringMember(*scope, "node_attempt_id");
+      if (node != nullptr && attempt != nullptr) {
+        result += "[" + Utf8Prefix(*node, kMaximumSummaryTextCodePoints) +
+                  " / " + Utf8Prefix(*attempt, kMaximumSummaryTextCodePoints) +
+                  "] ";
+      }
+    }
+    result += Utf8Prefix(*code, kMaximumSummaryTextCodePoints) + ": " +
+              Utf8Prefix(*message, kMaximumSummaryTextCodePoints);
+    if (result.size() >= kMaximumSummaryTextCodePoints)
+      return Utf8Prefix(result, kMaximumSummaryTextCodePoints);
+  }
+  return Utf8Prefix(result, kMaximumSummaryTextCodePoints);
+}
+
 EventHistorianError::EventHistorianError(std::string code, std::string message)
     : std::runtime_error(code + ": " + message), code_(std::move(code)) {}
 
@@ -380,8 +419,14 @@ HistorianEvent MakeHistorianEvent(std::string component, std::string event_type,
 HistorianEvent
 MakeAlarmLifecycleHistorianEvent(const AlarmLifecycleFact &fact) {
   auto payload = AlarmLifecycleFactValue(fact).as_object();
-  payload.emplace_back("clock_owner", CanonicalValue("headless:" + fact.owner_epoch));
-  return MakeHistorianEvent("manyforge.alarm", fact.event_type, "INFO",
+  payload.emplace_back("clock_owner",
+                       CanonicalValue("headless:" + fact.owner_epoch));
+  const bool runtime_fault_raised =
+      fact.event_type == "alarm_raised" &&
+      (fact.definition_id == "manyforge.runtime.program_runner_loss" ||
+       fact.definition_id == "manyforge.runtime.operation_journal_write_fault");
+  return MakeHistorianEvent("manyforge.alarm", fact.event_type,
+                            runtime_fault_raised ? "ERROR" : "INFO",
                             fact.occurred_at_ns, fact.occurred_at_wall,
                             CanonicalValue(std::move(payload)));
 }

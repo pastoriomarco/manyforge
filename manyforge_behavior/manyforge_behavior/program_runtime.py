@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -36,6 +36,8 @@ from manyforge_behavior.orchestration_values import (
     ProgramValueStore,
 )
 from manyforge_behavior.program import (
+    INTERRUPT_MOTION_NODE_IDS,
+    MOTION_NODE_IDS,
     Program,
     ProgramNodePolicy,
     ProgramTreeNode,
@@ -44,6 +46,7 @@ from manyforge_behavior.recovery import (
     RecoveryAwareNode,
     recovery_policy_is_actionable,
 )
+from manyforge_behavior.nodes.v2_owner import MotionTaskAdapter, OwnerTaskAdapter
 from manyforge_behavior.nodes.stop_policy import (
     OperatorMotionStopPolicy,
     OperatorMotionStopSnapshot,
@@ -58,15 +61,6 @@ from manyforge_behavior.value_path import (
 )
 
 PROGRAM_RUN_CAPTURE_API: Final = "manyforge.program_run_capture.v2"
-
-_MOTION_TARGET_NODE_IDS: Final = frozenset(
-    {
-        "motion.move_to_joint_target",
-        "motion.move_to_pose",
-        "motion.follow_cartesian_path",
-    }
-)
-
 
 class ProgramRuntimeError(RuntimeError):
     """A Program run cannot be built or advanced truthfully."""
@@ -338,6 +332,7 @@ class ExecutableProgramRun:
         readiness: NodeExecutionReadiness,
         ports: NodeAdapterPorts,
         program_clock: ProgramClock | None = None,
+        motion_attention: Callable[[str, str], None] | None = None,
     ) -> None:
         if not isinstance(program, Program):
             raise TypeError("program must be one validated Program")
@@ -376,7 +371,7 @@ class ExecutableProgramRun:
         pending_nodes = [program.tree]
         while pending_nodes:
             node = pending_nodes.pop()
-            if node.node_id in _MOTION_TARGET_NODE_IDS:
+            if node.node_id in MOTION_NODE_IDS or node.node_id in INTERRUPT_MOTION_NODE_IDS:
                 target_role = node.parameters.get("target_role")
                 if isinstance(target_role, str) and target_role:
                     motion_target_by_node[node.instance_id] = target_role
@@ -442,12 +437,23 @@ class ExecutableProgramRun:
         # halted; waits, the timer and held-time measurement all read it, so
         # a hold that spans a Halt is never subtracted twice.
         self._program_clock = program_clock or ProgramClock()
+        # The owner's motion-attention check, and this run's automatic-retry audit facts.
+        if motion_attention is not None and not callable(motion_attention):
+            raise TypeError("motion_attention must be callable")
+        self._motion_attention = motion_attention
+        self._node_history_events: list[dict[str, Any]] = []
         self._operator_stop_state = OperatorMotionStopState(
             node_children,
             read_scope=self._read_operator_stop_scope,
             clock=self._program_clock.now,
         )
         self._authored_nodes: dict[str, py_trees.behaviour.Behaviour] = {}
+        # Owner-task leaves by node: drained after each tick, and restarted
+        # (motion retry budget) when the operator releases a hold over them.
+        self._task_adapters: dict[str, OwnerTaskAdapter] = {}
+        # Decision 138: each node's nearest Hold scope (None: Continue up to
+        # the root), for the held-node mask of the Run's Mock snapshot.
+        self._hold_scopes: dict[str, str | None] = {}
         root = self._build_node(
             program.tree,
             inherited_stop_policy="continue",
@@ -457,6 +463,8 @@ class ExecutableProgramRun:
         self._tree.setup()
         self._lock = RLock()
         self._stopped = False
+        # Decision 135: unconfirmed Mock ENDs/pause states already reported.
+        self._mock_ends_reported: set[tuple[str, str]] = set()
 
     def _build_node(
         self,
@@ -507,8 +515,13 @@ class ExecutableProgramRun:
                 operator_stop_state=self._operator_stop_state,
                 operator_stop_hold_scope=hold_scope,
                 program_clock=self._program_clock,
+                motion_attention=self._motion_attention,
+                audit_sink=self._record_node_history_event,
             ),
         )
+        if isinstance(built, OwnerTaskAdapter):
+            self._task_adapters[node.instance_id] = built
+        self._hold_scopes[node.instance_id] = hold_scope
         policy = self._capture.node_policy_by_instance_id.get(node.instance_id)
         recovery_port = self._ports.program_interventions
         if (
@@ -516,6 +529,10 @@ class ExecutableProgramRun:
             and recovery_policy_is_actionable(policy)
             and recovery_port is not None
         ):
+            if isinstance(built, OwnerTaskAdapter):
+                # The leaf's own hold keeps its failed operation live for the
+                # operator's owner actions (Retry, Continue) instead of closing.
+                built.hold_failures_for_intervention()
             built = RecoveryAwareNode(
                 child=built,
                 node_instance_id=node.instance_id,
@@ -682,6 +699,62 @@ class ExecutableProgramRun:
     def status(self) -> py_trees.common.Status:
         return self._tree.root.status
 
+    def _record_node_history_event(self, event: dict[str, Any]) -> None:
+        """One node history event (`kind` plus its facts: an automatic retry,
+        a logical preemption), drained with the run's status."""
+
+        with self._lock:
+            self._node_history_events.append(dict(event))
+
+    def take_node_history_events(self) -> tuple[dict[str, Any], ...]:
+        """Node history events decided since the last take."""
+
+        with self._lock:
+            events, self._node_history_events = self._node_history_events, []
+        return tuple(events)
+
+    def note_operator_release(self, node_ids: frozenset[str]) -> None:
+        """An accepted operator release (Resume, Run, Retry, Continue) freed
+        these nodes: each motion node's automatic retry budget restarts."""
+
+        with self._lock:
+            for node_id in node_ids:
+                adapter = self._task_adapters.get(node_id)
+                if isinstance(adapter, MotionTaskAdapter):
+                    adapter.restart_retry_series()
+
+    def node_motion_groups(self, node_instance_id: str) -> tuple[str, ...]:
+        """The named execution groups containing this node, or ``("all",)``
+        for a node in no named group (only "all" addresses it)."""
+
+        groups = tuple(
+            group
+            for group, members in self._program.execution_selections.items()
+            if group != "all" and node_instance_id in members
+        )
+        return groups or ("all",)
+
+    def operation_failure(self, node_instance_id: str | None = None) -> dict[str, Any] | None:
+        """The operation failure at the failed tip of a held node's subtree
+        (or of the failed tree): its node attempt and the Kernel's facts."""
+
+        with self._lock:
+            behaviour = (
+                self._tree.root
+                if node_instance_id is None
+                else self._authored_nodes.get(node_instance_id)
+            )
+            tip = None if behaviour is None else behaviour.tip()
+            fact = getattr(tip, "operation_failure", None)
+            identity = getattr(tip, "attempt_identity", None)
+            if not isinstance(fact, Mapping) or not isinstance(identity, NodeAttemptIdentity):
+                return None
+            return {
+                "node_instance_id": identity.node_instance_id,
+                "node_attempt_id": identity.node_attempt_id,
+                **deepcopy(dict(fact)),
+            }
+
     @property
     def node_statuses(self) -> Mapping[str, str]:
         """Return exact authored-node phases from the current tree tick.
@@ -710,7 +783,65 @@ class ExecutableProgramRun:
             }:
                 return self._tree.root.status
             self._tree.tick()
-            return self._tree.root.status
+            for adapter in self._task_adapters.values():
+                # Abandoned (INVALID) attempts close once their Stop settled.
+                if adapter.has_pending_drain:
+                    adapter.drain_invalidated()
+            status = self._tree.root.status
+            self._settle_mock_ends(
+                final=status in {py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE}
+            )
+            return status
+
+    def _settle_mock_ends(self, *, final: bool) -> None:
+        """Decision 135: resend this Run's unanswered node ENDs unchanged on
+        every tick; when the tree ends with an END still unanswered, its
+        cancellation is unproven and the history says so (once)."""
+
+        port = getattr(self._ports, "mock_simulation", None)
+        resend = getattr(port, "resend_unknown_ends", None)
+        if resend is None:
+            return
+        run_id = self._capture.program_run_id
+        try:
+            pending = resend(run_id)
+            superseded, current = port.resend_run_pause(run_id)
+        except Exception:
+            return
+        # A Halt state never answered: the Mock may not have paused/resumed.
+        for fact in (*superseded, *((current,) if final and current else ())):
+            key = ("pause", fact["run_revision"])
+            if key in self._mock_ends_reported:
+                continue
+            self._mock_ends_reported.add(key)
+            self._record_node_history_event(
+                {"kind": "program_mock_simulation_pause_unconfirmed", **fact}
+            )
+        if not final:
+            return
+        for request in pending:
+            key = (request["node_attempt_id"], request["node_start_index"])
+            if key in self._mock_ends_reported:
+                continue
+            self._mock_ends_reported.add(key)
+            self._record_node_history_event(
+                {
+                    "kind": "program_node_mock_simulation_end_unconfirmed",
+                    "node_instance_id": request["node_instance_id"],
+                    "node_attempt_id": request["node_attempt_id"],
+                    "node_start_index": request["node_start_index"],
+                }
+            )
+
+    def mock_held_nodes(self) -> tuple[str, ...]:
+        """S2b: the sorted node instance ids whose nearest Hold wrapper is
+        wholly held: a pure function of the selection state."""
+
+        return tuple(sorted(
+            node_id
+            for node_id, hold_scope in self._hold_scopes.items()
+            if hold_scope is not None and self._operator_stop_state.holds_subtree(hold_scope)
+        ))
 
     def diagnostic_snapshot(self) -> dict[str, Any]:
         """Capture local values at the owner transition; no remote reads or I/O."""
@@ -991,14 +1122,26 @@ class ExecutableProgramRun:
             ) from error
 
     def execution_selection_request(
-        self, group_id: str | list[str], request_id: str
+        self,
+        group_id: str | list[str],
+        request_id: str,
+        *,
+        node_instance_id: str | None = None,
     ) -> dict[str, Any]:
+        """The selection DTO. ``node_instance_id`` (release only, contract 43
+        / SX-2020) names one captured held node with ``group_ids: []``."""
         if self._scope_identity is None:
             raise ProgramRuntimeError("Program execution scope is not captured")
+        if node_instance_id is not None and (
+            group_id != [] or node_instance_id not in self._authored_nodes
+        ):
+            raise ProgramRuntimeError(
+                "a node release names one captured node and no group"
+            )
         kernel_epoch, runner_epoch, claim = self._scope_identity
         # Do not resolve Stop membership here: the Kernel owns conservative
         # containment of an unknown selection as well as valid selections.
-        return {
+        request = {
             "schema_version": "manyforge.program_execution_selection.v2",
             "program_runner_owner_epoch": runner_epoch,
             "claim_generation": claim,
@@ -1011,6 +1154,9 @@ class ExecutableProgramRun:
                 "correlation_id": None,
             },
         }
+        if node_instance_id is not None:
+            request["node_instance_id"] = node_instance_id
+        return request
 
     def node_motion_attention_request(
         self, node_instance_id: str, request_id: str
@@ -1085,6 +1231,7 @@ class ExecutableProgramRun:
                 return
             self._stopped = True
             self._tree.root.stop(py_trees.common.Status.INVALID)
+            self._settle_mock_ends(final=True)
 
 
 __all__ = [

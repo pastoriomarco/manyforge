@@ -15,11 +15,12 @@ namespace manyforge::core {
 
 /// Component incidents (maintainer decisions 2026-10-08, addendum 2).
 ///
-/// After a component first reached its requested target in the session, any
-/// unexpected loss or change is an incident: CCLC opens it once, requests a
-/// system-attributed cell containment Stop that latches the cell, blocks
-/// lifecycle progress and keeps it open until the operator's acknowledgement
-/// (an accepted operator `recover` request) is recorded.
+/// A fresh intervention from the current occurrence is an incident in every
+/// lifecycle state (129); ordinary availability becomes an incident after
+/// the target was reached. An unadopted whole-component Apply replacement
+/// keeps its existing exemption. CCLC opens/extends one incident, requests a
+/// system-attributed cell containment Stop and keeps it open until the
+/// operator's acknowledgement (an accepted `recover` request) is recorded.
 
 inline constexpr std::size_t kMaxComponentIncidentRecordBytes = 512U * 1024U;
 inline constexpr std::size_t kMaxComponentIncidentIdBytes = 128U;
@@ -168,6 +169,8 @@ struct CellObserverBringUpAdmissionDTO final {
 /// invalid, never clamped.
 
 /// Durable history event kinds of the incident record (contract item 5).
+inline constexpr std::string_view kComponentIncidentEventSchemaVersion =
+    "manyforge.component_incident_event.v2";
 inline constexpr std::string_view kComponentIncidentEventKind = "component_incident";
 inline constexpr std::string_view kComponentIncidentAcknowledgedEventKind =
     "component_incident_acknowledged";

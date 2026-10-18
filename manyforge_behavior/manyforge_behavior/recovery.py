@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import Any, Final
 
 import py_trees
 
@@ -83,7 +83,10 @@ class RecoveryAwareNode(py_trees.decorators.Decorator):
                 return py_trees.common.Status.SUCCESS
             return py_trees.common.Status.FAILURE
 
-        if self.decorated.status is not py_trees.common.Status.FAILURE:
+        if self.decorated.status is not py_trees.common.Status.FAILURE or getattr(
+            self.decorated, "preempted", False
+        ):
+            # A logically preempted node's result goes straight to the tree.
             return self.decorated.status
         identity = self._exact_identity()
         reason = getattr(self.decorated, "failure_reason_code", None)
@@ -143,6 +146,25 @@ class RecoveryAwareNode(py_trees.decorators.Decorator):
             yield from super().tick()
 
 
+# The Kernel owner recovery actions a Program offer or recovery node may
+# request on a held operation.
+OWNER_RECOVERY_ACTIONS: Final = frozenset(
+    {
+        "retry_motion_from_current_state",
+        "acknowledge_and_continue",
+        "retry_after_scene_repair",
+        "replan_from_stopped_state",
+    }
+)
+
+
+def is_non_moving_recovery(action_id: str) -> bool:
+    """Acknowledge and Reset release no Program motion and count no Retry;
+    they stay available while a failure pause's containment is unconfirmed."""
+
+    return action_id in {"acknowledge_and_continue", "reset_cycle"}
+
+
 def recovery_retry_permitted(
     recovery_policy: Mapping[str, Any], *, retries_used: int
 ) -> bool:
@@ -172,7 +194,9 @@ def recovery_policy_is_actionable(policy: ProgramNodePolicy) -> bool:
 
 
 __all__ = [
+    "OWNER_RECOVERY_ACTIONS",
     "RecoveryAwareNode",
+    "is_non_moving_recovery",
     "recovery_policy_is_actionable",
     "recovery_retry_permitted",
 ]

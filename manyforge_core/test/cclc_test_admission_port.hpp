@@ -82,7 +82,9 @@ class FakeCellAdmissionPort : public IKernelCellAdmissionPort {
     return {true, AdmissionGeneration(1U)};
   }
   Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
-      const CellAdmissionReadinessSnapshotDTO&) override {
+      const CellAdmissionReadinessSnapshotDTO&,
+      std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr) override {
+    if (actual_retired_service) actual_retired_service->reset();
     return Result<AuthoringAdmissionDTO>::Ok(GetAuthoringAdmission());
   }
   Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(

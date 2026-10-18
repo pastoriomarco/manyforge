@@ -1610,5 +1610,185 @@ TEST(SoftOnPathStopPlannerTest, NonFiniteTrajectoryValuesAreRejectedByShapeValid
   EXPECT_FALSE(plan_soft_on_path_stop(accel_poisoned, profile, state, config).ok());
 }
 
+TEST(SoftOnPathInitialStateTest, CommandCursorKeepsExactOccurrenceAndCanonicalJointOrder) {
+  SoftOnPathInitialStateDTO state;
+  state.state = {{"joint_2", "joint_1"}, {0.05, 0.2}, {0.0, 0.4}};
+  state.velocity_source = SoftOnPathStateSource::kModelDerived;
+  state.trajectory_time_from_start_s = 0.3;
+  state.runtime_velocity_scale_at_trip = 0.4;
+  SoftOnPathPlannerConfig config;
+  config.allow_model_velocity_fallback = true;
+  config.max_initial_path_deviation_rad = 0.1;
+
+  const auto result = resolve_soft_on_path_stop_initial_state(linear_trajectory_2d(),
+                                                              soft_profile(), state, config);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto& resolved = result.value();
+  EXPECT_EQ(resolved.joint_names, (std::vector<std::string>{"joint_1", "joint_2"}));
+  EXPECT_DOUBLE_EQ(resolved.command_path_time_s, 0.3);
+  EXPECT_NEAR(resolved.projected_time_from_start_s, 0.2, 1e-12);
+  EXPECT_NEAR(resolved.initial_path_deviation_rad, 0.05, 1e-12);
+  EXPECT_DOUBLE_EQ(resolved.path_time_rate, 0.4);
+  EXPECT_DOUBLE_EQ(resolved.runtime_velocity_scale_at_trip, 0.4);
+  EXPECT_TRUE(resolved.used_model_velocity);
+  const auto& point = resolved.spring_back_return_point;
+  EXPECT_DOUBLE_EQ(point.time_from_start_s, 0.0);
+  ASSERT_EQ(point.positions_rad.size(), 2U);
+  EXPECT_NEAR(point.positions_rad[0], 0.3, 1e-12);
+  EXPECT_DOUBLE_EQ(point.positions_rad[1], 0.0);
+  EXPECT_EQ(point.velocities_rad_s, (std::vector<double>{0.0, 0.0}));
+  EXPECT_EQ(point.accelerations_rad_s2, (std::vector<double>{0.0, 0.0}));
+}
+
+TEST(SoftOnPathInitialStateTest, MeasuredAuthorityRetainsProjectionAndVelocityDeviation) {
+  SoftOnPathInitialStateDTO state;
+  state.state = {{"joint_2", "joint_1"}, {0.05, 0.2}, {1.0, 0.5}};
+  // Measured authority keeps its projection even when a different cursor and
+  // factor were supplied. Those facts must not become a new authority rule.
+  state.trajectory_time_from_start_s = 0.7;
+  state.runtime_velocity_scale_at_trip = 0.9;
+  const auto result =
+      resolve_soft_on_path_stop_initial_state(linear_trajectory_2d(), soft_profile(), state);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_FALSE(result.value().used_model_velocity);
+  EXPECT_NEAR(result.value().command_path_time_s, 0.2, 1e-12);
+  EXPECT_NEAR(result.value().path_time_rate, 0.5, 1e-12);
+  EXPECT_NEAR(result.value().initial_velocity_deviation_rad_s, 1.0, 1e-12);
+  EXPECT_DOUBLE_EQ(result.value().runtime_velocity_scale_at_trip, 0.9);
+  EXPECT_NEAR(result.value().spring_back_return_point.positions_rad[0], 0.2, 1e-12);
+  EXPECT_DOUBLE_EQ(result.value().spring_back_return_point.positions_rad[1], 0.0);
+}
+
+TEST(SoftOnPathInitialStateTest, ReturnPointMatchesBothSpringShapesAtTheExactOccurrence) {
+  const TrajectoryDTO retracing{{ResourceId("joint.1"), ResourceId("joint.2")},
+                                {"joint_1", "joint_2"},
+                                {{0.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}},
+                                 {1.0, {1.0, 0.5}, {0.0, 0.0}, {0.0, 0.0}},
+                                 {2.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}},
+                                 {3.0, {1.0, 0.5}, {0.0, 0.0}, {0.0, 0.0}}},
+                                TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0}};
+  for (const bool capped : {false, true}) {
+    SCOPED_TRACE(capped);
+    const auto trajectory = capped ? prepared_cruise_trajectory() : retracing;
+    auto state = capped ? cruise_trip_state() : measured_state_1d(0.5, 0.6);
+    if (!capped) {
+      state.state = {{"joint_2", "joint_1"}, {0.25, 0.5}, {}};
+      state.trajectory_time_from_start_s = 2.5;
+      state.velocity_source = SoftOnPathStateSource::kModelDerived;
+    }
+    auto config = cruise_trip_config();
+    const auto profile = spring_back_profile(capped ? 0.2 : 1.0);
+    auto forward_profile = profile;
+    forward_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+    forward_profile.deceleration_time_s = 0.5 * *profile.deceleration_time_s;
+    const auto resolved =
+        resolve_soft_on_path_stop_initial_state(trajectory, forward_profile, state, config);
+    ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+    const auto planned = plan_spring_back_on_path_stop(trajectory, profile, state, config);
+    ASSERT_TRUE(planned.ok()) << planned.error().message;
+    EXPECT_DOUBLE_EQ(resolved.value().command_path_time_s, capped ? 1.7 : 2.5);
+    EXPECT_DOUBLE_EQ(resolved.value().command_path_time_s, planned.value().command_path_time_s);
+    const auto& returned = planned.value().replacement_trajectory.waypoints.back();
+    EXPECT_EQ(resolved.value().spring_back_return_point.positions_rad, returned.positions_rad);
+    EXPECT_EQ(resolved.value().spring_back_return_point.velocities_rad_s,
+              returned.velocities_rad_s);
+    EXPECT_EQ(resolved.value().spring_back_return_point.accelerations_rad_s2,
+              returned.accelerations_rad_s2);
+    EXPECT_EQ(interrupt_structured_scalar_text(
+                  planned.value().diagnostics.at("spring_back_return_profile")),
+              capped ? "ramp_cruise_ramp_rate_capped" : "quintic_rest_to_rest");
+  }
+}
+
+TEST(SoftOnPathInitialStateTest, RejectsInvalidTripWithTheExistingErrorAndCheckOrder) {
+  const std::vector<std::string> reasons{
+      "stop_mode_not_soft_on_path",       "soft_on_path_deceleration_time_required",
+      "invalid_stop_traj_delta_s",        "invalid_sample_period_s",
+      "runtime_scale_bounds_required",    "observed_state_size_mismatch",
+      "missing_joint_deceleration_limit", "initial_path_deviation_exceeds_limit",
+      "model_velocity_not_authorized",    "non_finite_command_cursor",
+      "command_cursor_out_of_range",      "initial_velocity_deviation_exceeds_limit"};
+  for (std::size_t i = 0U; i < reasons.size(); ++i) {
+    SCOPED_TRACE(reasons[i]);
+    auto trajectory = linear_trajectory_2d();
+    auto profile = soft_profile();
+    SoftOnPathInitialStateDTO state;
+    state.state = {{"joint_1", "joint_2"}, {0.2, 0.0}, {0.5, 0.0}};
+    SoftOnPathPlannerConfig config;
+    switch (i) {
+      case 0U:
+        profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+        config.stop_traj_delta_s = -1.0;
+        break;
+      case 1U:
+        profile.deceleration_time_s.reset();
+        config.stop_traj_delta_s = -1.0;
+        break;
+      case 2U:
+        config.stop_traj_delta_s = -1.0;
+        trajectory.waypoints.clear();
+        break;
+      case 3U:
+        config.sample_period_s = 0.0;
+        trajectory.waypoints.clear();
+        break;
+      case 4U:
+        trajectory.runtime_scale_bounds.reset();
+        state.state.positions_rad.clear();
+        break;
+      case 5U:
+        state.state.positions_rad.clear();
+        profile.per_joint_max_deceleration.clear();
+        break;
+      case 6U:
+        profile.per_joint_max_deceleration.erase("joint_2");
+        state.state.positions_rad[1] = 0.5;
+        config.max_initial_path_deviation_rad = 0.1;
+        break;
+      case 7U:
+        state.state.positions_rad[1] = 0.5;
+        config.max_initial_path_deviation_rad = 0.1;
+        break;
+      case 8U:
+        state.velocity_source = SoftOnPathStateSource::kModelDerived;
+        state.trajectory_time_from_start_s = std::numeric_limits<double>::quiet_NaN();
+        break;
+      case 9U:
+      case 10U:
+        state.velocity_source = SoftOnPathStateSource::kModelDerived;
+        config.allow_model_velocity_fallback = true;
+        state.trajectory_time_from_start_s =
+            i == 9U ? std::numeric_limits<double>::quiet_NaN() : 2.0;
+        break;
+      case 11U:
+        state.state.velocities_rad_s[1] = 1.0;
+        config.max_initial_velocity_deviation_rad_s = 0.1;
+        break;
+    }
+    const auto resolved =
+        resolve_soft_on_path_stop_initial_state(trajectory, profile, state, config);
+    ASSERT_FALSE(resolved.ok());
+    EXPECT_EQ(resolved.error().details.at("reason"), reasons[i]);
+    const auto planned = plan_soft_on_path_stop(trajectory, profile, state, config);
+    ASSERT_FALSE(planned.ok());
+    EXPECT_EQ(resolved.error(), planned.error());
+  }
+}
+
+TEST(SoftOnPathInitialStateTest, ResolvingTheReturnPointDoesNotCertifyBrakingFeasibility) {
+  auto profile = soft_profile(0.1);
+  profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{4.0}}};
+  const auto state = measured_state_1d(0.2, 1.0);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.02;
+  const auto resolved =
+      resolve_soft_on_path_stop_initial_state(linear_trajectory_1d(), profile, state, config);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  EXPECT_NEAR(resolved.value().spring_back_return_point.positions_rad[0], 0.2, 1e-12);
+  const auto planned = plan_soft_on_path_stop(linear_trajectory_1d(), profile, state, config);
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"), "soft_on_path_deceleration_time_infeasible");
+}
+
 }  // namespace
 }  // namespace manyforge::core

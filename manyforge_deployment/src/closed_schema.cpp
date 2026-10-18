@@ -34,6 +34,7 @@
 #include "embedded_native_execution_runtime_configuration_schema.hpp"
 #include "embedded_provider_manifest_schema.hpp"
 #include "embedded_ros2_control_execution_runtime_configuration_schema.hpp"
+#include "embedded_io_provider_component_configuration_schema.hpp"
 #include "embedded_runtime_profile_schema.hpp"
 #include "embedded_stop_evidence_policy_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
@@ -1187,10 +1188,10 @@ void validate_expanded_depths(
   }
 }
 
-void validate_key_path(const SchemaNode &authored,
-                       const std::vector<std::string> &path,
-                       const ConstDefinitionMap &definitions,
-                       std::string_view label) {
+const SchemaNode &validate_key_path(const SchemaNode &authored,
+                                    const std::vector<std::string> &path,
+                                    const ConstDefinitionMap &definitions,
+                                    std::string_view label) {
   const SchemaNode *current = &resolve_node(authored, definitions);
   for (std::size_t index = 0U; index < path.size(); ++index) {
     if (current->kind != NodeKind::kObject) {
@@ -1208,6 +1209,7 @@ void validate_key_path(const SchemaNode &authored,
       fail(label, "key path must terminate at scalar");
     }
   }
+  return *current;
 }
 
 void validate_collection_shapes(const ConstDefinitionMap &definitions) {
@@ -1230,14 +1232,31 @@ void validate_collection_shapes(const ConstDefinitionMap &definitions) {
                "scalar_set item must resolve to scalar");
         }
         if (node->collection_kind == CollectionKind::kKeyedRecordSet &&
-            item.kind != NodeKind::kObject) {
+            item.kind != NodeKind::kObject &&
+            item.kind != NodeKind::kTaggedUnion) {
           fail("definitions." + definition_id,
                "keyed_record_set item must resolve to object");
         }
         for (std::size_t index = 0U; index < node->key_paths.size(); ++index) {
-          validate_key_path(item, node->key_paths[index], definitions,
-                            "definitions." + definition_id + ".key_paths[" +
-                                std::to_string(index) + "]");
+          const auto label = "definitions." + definition_id + ".key_paths[" +
+                             std::to_string(index) + "]";
+          if (item.kind == NodeKind::kTaggedUnion) {
+            std::optional<ScalarType> key_type;
+            for (const auto &alternative : item.alternatives) {
+              const auto &branch =
+                  resolve_node(*alternative.value_schema, definitions);
+              if (branch.kind != NodeKind::kObject)
+                fail(label, "keyed tagged-union branch must resolve to object");
+              const auto &key = validate_key_path(
+                  branch, node->key_paths[index], definitions, label);
+              if (key_type && *key_type != key.scalar_type)
+                fail(label, "key-path scalar type differs across tagged-union "
+                            "branches");
+              key_type = key.scalar_type;
+            }
+          } else {
+            validate_key_path(item, node->key_paths[index], definitions, label);
+          }
         }
         pending.push_back(node->item_schema.get());
       } else if (node->kind == NodeKind::kTaggedUnion) {
@@ -1560,15 +1579,32 @@ void validate_root_api_version(const SchemaNode &authored,
                                const ConstDefinitionMap &definitions,
                                std::string_view schema_id) {
   const auto &root = resolve_node(authored, definitions);
-  std::vector<const SchemaNode *> roots;
+  const bool api_union =
+      root.kind == NodeKind::kTaggedUnion && root.tag_field == "api_version";
+  std::vector<std::pair<const SchemaNode *, std::string_view>> roots;
   if (root.kind == NodeKind::kTaggedUnion) {
+    if (api_union &&
+        std::none_of(root.alternatives.begin(), root.alternatives.end(),
+                     [&](const auto &alternative) {
+                       return alternative.tag_value == schema_id;
+                     })) {
+      throw ClosedSchemaError(
+          "root api_version tagged union must include its schema_id family");
+    }
     for (const auto &alternative : root.alternatives) {
-      roots.push_back(&resolve_node(*alternative.value_schema, definitions));
+      if (api_union && (alternative.tag_value.size() > 128U ||
+                        !is_api_version(alternative.tag_value))) {
+        throw ClosedSchemaError("root api_version tagged-union tags must be "
+                                "versioned ManyForge APIs");
+      }
+      roots.emplace_back(&resolve_node(*alternative.value_schema, definitions),
+                         api_union ? std::string_view(alternative.tag_value)
+                                   : schema_id);
     }
   } else {
-    roots.push_back(&root);
+    roots.emplace_back(&root, schema_id);
   }
-  for (const auto *branch : roots) {
+  for (const auto &[branch, expected_api] : roots) {
     if (branch->kind != NodeKind::kObject) {
       throw ClosedSchemaError("root definition and every root tagged-union "
                               "branch must resolve to object");
@@ -1586,9 +1622,12 @@ void validate_root_api_version(const SchemaNode &authored,
         api_schema.scalar_type != ScalarType::kString ||
         enumeration == nullptr || enumeration->values.size() != 1U ||
         !scalar_equal(enumeration->values.front(),
-                      CanonicalValue(std::string(schema_id)))) {
-      throw ClosedSchemaError("root api_version must be a required "
-                              "single-value string enum equal to schema_id");
+                      CanonicalValue(std::string(expected_api)))) {
+      throw ClosedSchemaError(
+          api_union ? "root api_version must be a required single-value string "
+                      "enum matching its tag"
+                    : "root api_version must be a required single-value string "
+                      "enum equal to schema_id");
     }
   }
 }
@@ -1939,7 +1978,7 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
        "catalog/manyforge.stop_evidence_policy.v2.yaml",
        detail::kEmbeddedStopEvidencePolicySchema},
   }};
-  const std::array<QualifiedValueSchemaSource, 5U> qualified_value_sources{{
+  const std::array<QualifiedValueSchemaSource, 6U> qualified_value_sources{{
       {"value/manyforge.value_schema.provider_contract.empty.v1.yaml",
        detail::kEmbeddedEmptyProviderContractSchema},
       {"value/"
@@ -1953,6 +1992,8 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
       {"value/"
        "manyforge.value_schema.runtime.ros2_control_execution.v1.yaml",
        detail::kEmbeddedRos2ControlExecutionRuntimeConfigurationSchema},
+      {"value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml",
+       detail::kEmbeddedIoProviderComponentConfigurationSchema},
   }};
 
   auto storage = std::make_shared<Storage>();

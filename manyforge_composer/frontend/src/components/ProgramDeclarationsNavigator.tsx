@@ -8,9 +8,13 @@ import type {
   ProgramTreeNode,
 } from '../types/api';
 import {
+  groupByNamespace, INTERRUPT_STATE_NAMESPACE, keyNamespace, NODE_OUTCOME_NAMESPACE,
+} from '../utils/blackboardNamespaces';
+import {
   collectBlackboardUsages,
   collectFormulaUsages,
   collectProgramParameterUsages,
+  programBlackboardKeys,
   type ProgramMotionDefaultRole,
 } from '../utils/programAuthoring';
 
@@ -30,7 +34,11 @@ interface ProgramDeclarationsNavigatorProps {
   onSelect: (selection: ProgramDeclarationSelection) => void;
   /** Parameters acting as Program motion defaults, by parameter ID. */
   motionDefaults?: ReadonlyMap<string, ProgramMotionDefaultRole>;
+  /** The Deployment Draft's global rule ids: each adds `interrupt_state.<rule_id>`. */
+  globalRuleIds?: readonly string[];
 }
+
+const NO_RULE_IDS: readonly string[] = [];
 
 function selectedClass(
   selected: ProgramDeclarationSelection | null,
@@ -50,6 +58,7 @@ export function ProgramDeclarationsNavigator({
   selected,
   onSelect,
   motionDefaults = new Map(),
+  globalRuleIds = NO_RULE_IDS,
 }: ProgramDeclarationsNavigatorProps) {
   const parameterUsages = useMemo(() => collectProgramParameterUsages(roots), [roots]);
   const blackboardUsages = useMemo(() => collectBlackboardUsages(roots), [roots]);
@@ -57,6 +66,45 @@ export function ProgramDeclarationsNavigator({
     () => collectFormulaUsages(formulaReferences),
     [formulaReferences],
   );
+
+  // Declared keys plus the system-owned node outcome and interrupt state keys.
+  const readableKeys = useMemo(
+    () => programBlackboardKeys({ blackboard: { namespaces: [], keys }, forest: roots }, globalRuleIds),
+    [globalRuleIds, keys, roots],
+  );
+  const keyGroups = groupByNamespace(readableKeys, (key) => key.key);
+  const keyRow = (key: BlackboardKeyDeclaration) => {
+    const usages = (blackboardUsages[key.key]?.length ?? 0)
+      + (formulaUsages.keys[key.key]?.length ?? 0);
+    const namespace = keyNamespace(key.key);
+    if (namespace === NODE_OUTCOME_NAMESPACE || namespace === INTERRUPT_STATE_NAMESPACE) {
+      const owner = namespace === NODE_OUTCOME_NAMESPACE
+        ? 'written only by its motion node' : 'published only by its Deployment global rule';
+      return (
+        <button
+          key={key.key}
+          type="button"
+          className="dpick"
+          disabled
+          title={`System-owned, ${owner}. ${key.description ?? ''}`}
+        >
+          <span><strong>{key.key}</strong><small>{key.type} · system</small></span>
+          <small>{usages}</small>
+        </button>
+      );
+    }
+    return (
+      <button
+        key={key.key}
+        type="button"
+        className={`dpick${selectedClass(selected, 'key', key.key)}`}
+        onClick={() => onSelect({ kind: 'key', id: key.key })}
+      >
+        <span><strong>{key.key}</strong><small>{key.type}</small></span>
+        <small>{usages}</small>
+      </button>
+    );
+  };
 
   return (
     <nav className="program-declaration-navigator dpanel" aria-label="Program declarations">
@@ -123,21 +171,16 @@ export function ProgramDeclarationsNavigator({
             New
           </button>
         </header>
-        {keys.length === 0 && <p>No keys</p>}
-        {keys.map((key) => (
-          <button
-            key={key.key}
-            type="button"
-            className={`dpick${selectedClass(selected, 'key', key.key)}`}
-            onClick={() => onSelect({ kind: 'key', id: key.key })}
-          >
-            <span><strong>{key.key}</strong><small>{key.type}</small></span>
-            <small>
-              {(blackboardUsages[key.key]?.length ?? 0)
-                + (formulaUsages.keys[key.key]?.length ?? 0)}
-            </small>
-          </button>
-        ))}
+        {readableKeys.length === 0 && <p>No keys</p>}
+        {keyGroups.length === 1
+          ? keyGroups[0].items.map(keyRow)
+          : keyGroups.map((group) => (
+            // Each namespace collapses; closed by default.
+            <details key={group.id}>
+              <summary>{group.label} ({group.items.length})</summary>
+              {group.items.map(keyRow)}
+            </details>
+          ))}
       </section>
     </nav>
   );

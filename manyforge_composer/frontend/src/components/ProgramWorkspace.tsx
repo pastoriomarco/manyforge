@@ -9,9 +9,11 @@ import type {
   CatalogResponse,
   NodeEnvironmentResponse,
   DeploymentWorkspaceResponse,
+  JsonValue,
   SourceModelProjection,
 } from '../types/api';
 import type { ManualControlMotionDescriptor } from '../types/robotControl';
+import { globalRuleIds, interruptConditionKeyUses, type TargetStopChain } from '../utils/interruptAuthoring';
 import {
   deriveProgramMotionConfiguration,
   flattenProgramForest,
@@ -72,6 +74,8 @@ interface ProgramWorkspaceProps {
   sourceModel: StructuralResourceState<SourceModelProjection>;
   deploymentWorkspace?: DeploymentWorkspaceResponse | null;
   motionDescriptors?: ManualControlMotionDescriptor[];
+  /** Published motion targets' qualified Stop chains (SX-2167). */
+  stopChains?: TargetStopChain[];
   onRetryCatalog: () => void;
   onRetryEnvironment: () => void;
   onInvalidEditChange?: (invalid: boolean) => void;
@@ -102,6 +106,7 @@ export function ProgramWorkspace({
   sourceModel,
   deploymentWorkspace = null,
   motionDescriptors = [],
+  stopChains,
   onRetryCatalog,
   onRetryEnvironment,
   onInvalidEditChange,
@@ -124,6 +129,11 @@ export function ProgramWorkspace({
     updateNodePresentation,
   } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const deploymentDraftDocument = deploymentWorkspace?.draft?.document ?? null;
+  const draftGlobalRuleIds = useMemo(
+    () => globalRuleIds(deploymentDraftDocument as Record<string, JsonValue> | null),
+    [deploymentDraftDocument],
+  );
   // Program settings show in the Program inspector, opened from the tree
   // editor gear or the Composer settings; closing returns to the properties.
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -229,6 +239,10 @@ export function ProgramWorkspace({
   }, []);
   const workspace = state.workspace;
   const authoring = workspace?.draft.authoring ?? null;
+  // Contract 87: keys read by node or global interrupt rules must declare `initial:`.
+  const interruptKeyUses = useMemo(() => interruptConditionKeyUses(
+    authoring?.forest ?? [], deploymentDraftDocument as Record<string, JsonValue> | null,
+  ), [authoring?.forest, deploymentDraftDocument]);
   const diagnostics = useMemo(
     () => workspace?.draft.diagnostics ?? [],
     [workspace?.draft.diagnostics],
@@ -550,6 +564,7 @@ export function ProgramWorkspace({
               selected={declarationSelection}
               onSelect={selectDeclaration}
               motionDefaults={motionDefaults}
+              globalRuleIds={draftGlobalRuleIds}
             />
           </section>
         ) : (
@@ -713,6 +728,7 @@ export function ProgramWorkspace({
                       : sourceModel.message}
                   deploymentWorkspace={deploymentWorkspace}
                   motionDescriptors={motionDescriptors}
+                  stopChains={stopChains}
                   busy={authoringBusy}
                   onMutate={mutate}
                   onCreateGroup={() => {
@@ -767,6 +783,7 @@ export function ProgramWorkspace({
                   formulaReferences={workspace!.draft.formulaReferences}
                   catalogEntries={catalogEntries}
                   motionDefaults={motionDefaults}
+                  interruptKeyUses={interruptKeyUses}
                   creationExpectedType={declarationPrefill?.expectedType ?? null}
                   creationExpectedAccess={declarationPrefill?.expectedAccess ?? null}
                   busy={authoringBusy}

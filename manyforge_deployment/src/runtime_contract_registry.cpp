@@ -286,6 +286,7 @@ RuntimeContractDeclarationRegistry::make_rows() {
           declared_capabilities(
               runtime_contract_capabilities::kComponentLifecycleServices,
               runtime_contract_capabilities::kExecutionServices,
+              runtime_contract_capabilities::kIoSignalServices,
               runtime_contract_capabilities::kLogicalSceneServices)),
       {role_mapping(
           detail::kRos2ControlExecutionRuntimeRoleId,

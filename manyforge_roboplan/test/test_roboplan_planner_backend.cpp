@@ -138,6 +138,57 @@ TEST(RoboPlanPlannerBackendTest,
             request.start_state);
   EXPECT_EQ(fixture.client->last_request->motion, request.motion);
   EXPECT_EQ(fixture.client->last_request->planning_attempt_index, 7U);
+  EXPECT_FALSE(fixture.client->last_request->moving_replacement);
+}
+
+TEST(RoboPlanPlannerBackendTest,
+     MapsMovingSourceWithoutReplacingCapturedStartAndChargesSetupBudget) {
+  BackendFixture fixture;
+  auto request = testing::make_test_plan_request(
+      "move:moving", ResolvedMotionSpecDTO{joint_goal(fixture.binding)});
+  auto suffix_seed = request.start_state;
+  suffix_seed.positions[0] = AngularPositionDTO{0.5};
+  request.moving_replacement = MovingReplacementInputDTO{
+      ExecutionGoalKey{ControllerGoalId("source-goal"),
+                       ControllerGoalGeneration(13U)},
+      ExecutionBindingEpoch(7U),
+      1.0,
+      trajectory(fixture.binding),
+      2.0,
+      suffix_seed,
+      request.base_frame,
+      request.tcp_frame,
+      SpeedProfileDTO{0.9, 0.8, 0.3},
+      request.per_resource_dynamics_limits,
+      3.0};
+
+  const auto result = fixture.backend->plan(request);
+
+  ASSERT_TRUE(result.trajectory);
+  ASSERT_TRUE(fixture.client->last_request);
+  ASSERT_TRUE(fixture.client->last_request->moving_replacement);
+  const auto &actual = *fixture.client->last_request->moving_replacement;
+  const auto &expected = *request.moving_replacement;
+  EXPECT_EQ(fixture.client->last_request->start_state, request.start_state);
+  EXPECT_EQ(actual.source_goal, expected.source_goal);
+  EXPECT_EQ(actual.source_binding_epoch, expected.source_binding_epoch);
+  EXPECT_EQ(actual.source_cursor_s, expected.source_cursor_s);
+  EXPECT_EQ(actual.divergence_cursor_s, expected.divergence_cursor_s);
+  EXPECT_EQ(actual.source_prefix_trajectory.resources,
+            expected.source_prefix_trajectory.resources);
+  EXPECT_EQ(actual.source_prefix_trajectory.joint_names,
+            expected.source_prefix_trajectory.joint_names);
+  ASSERT_EQ(actual.source_prefix_trajectory.waypoints.size(), 2U);
+  EXPECT_EQ(actual.source_prefix_trajectory.waypoints[1].positions_rad,
+            expected.source_prefix_trajectory.waypoints[1].positions_rad);
+  EXPECT_EQ(actual.suffix_start_state, expected.suffix_start_state);
+  EXPECT_EQ(actual.source_base_frame, expected.source_base_frame);
+  EXPECT_EQ(actual.source_tcp_frame, expected.source_tcp_frame);
+  EXPECT_EQ(actual.source_speed_profile, expected.source_speed_profile);
+  EXPECT_EQ(actual.source_per_resource_dynamics_limits,
+            expected.source_per_resource_dynamics_limits);
+  EXPECT_GT(actual.remaining_preparation_budget_s, 0.0);
+  EXPECT_LT(actual.remaining_preparation_budget_s, 3.0);
 }
 
 TEST(RoboPlanPlannerBackendTest,

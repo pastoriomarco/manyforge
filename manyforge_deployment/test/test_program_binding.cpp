@@ -17,9 +17,14 @@
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/initial_scene_projection.hpp>
 #include <manyforge_deployment/program_binding.hpp>
+#include <manyforge_deployment/program_binding_compiler.hpp>
+#include <manyforge_deployment/runtime_program_binding.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include "lite6_retained_consumer_fixture.hpp"
+#include "io_retained_fixture.hpp"
 #include "program_binding_internal.hpp"
 #include "scoped_procfd_root.hpp"
 
@@ -61,7 +66,7 @@ using manyforge::deployment::reload_verified_program_binding;
 using manyforge::deployment::sha256_digest;
 using manyforge::deployment::test::materialize_lite6_retained_consumer_fixture;
 using manyforge::deployment::test::
-    materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture;
+    materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture;
 
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -123,8 +128,11 @@ struct BindingContext final {
 
 [[nodiscard]] BindingContext make_aggregate_context(
     const std::filesystem::path& root) {
+  // Keep the alternate context materializable through the same qualified
+  // runtime family as make_context; its extra gripper still changes identity.
   const auto materialized =
-      materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(root);
+      materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
+          root);
   const FilesystemVerifiedRetainedBundleSource bundle_source(root);
   auto bundle = bundle_source.get_verified(
       materialized.bundle->retained_bundle_id());
@@ -565,6 +573,43 @@ TEST(ProgramBindingTest, RawNodePolicyReloadRejectsEveryBoundedNegativeFamily) {
   expect_rejected(replace_policy_table(valid, row + "," + lower_row));
 }
 
+TEST(ProgramBindingTest, InterventionStopScopeIsClosedAndSurvivesReload) {
+  using Scope = manyforge::core::ProgramInterventionStopScope;
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  auto value = make_policy_binding_value(context);
+  ASSERT_EQ(value.node_policies.size(), 1U);
+  const auto default_scope = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_EQ(default_scope->canonical_bytes().find("intervention_stop_scope"),
+            std::string::npos);
+  value.node_policies.front().recovery_policy.intervention_stop_scope =
+      Scope::kOwnGroups;
+  const auto own_groups = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(own_groups->program_binding_id(),
+            default_scope->program_binding_id());
+  const auto reopened = reload_verified_program_binding(
+      own_groups->canonical_bytes(), *context.bundle, context.model_map);
+  ASSERT_NE(reopened, nullptr);
+  EXPECT_EQ(reopened->value()
+                .node_policies.front()
+                .recovery_policy.intervention_stop_scope,
+            Scope::kOwnGroups);
+  const std::string valid(own_groups->canonical_bytes());
+  for (const auto *invalid : {"\"own_group\"", "false", "null"}) {
+    EXPECT_THROW(
+        static_cast<void>(reload_verified_program_binding(
+            replace_once(valid, "\"intervention_stop_scope\":\"own_groups\"",
+                         "\"intervention_stop_scope\":" + std::string(invalid)),
+            *context.bundle, context.model_map)),
+        ProgramBindingError);
+  }
+  value.node_policies.front().recovery_policy.intervention_stop_scope =
+      static_cast<Scope>(255U);
+  EXPECT_THROW(
+      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
+      ProgramBindingError);
+}
+
 TEST(ProgramBindingTest, ContextRejectsAResealedGeneratedFrameSubstitution) {
   ScopedTrustedRoot root;
   const BindingContext context = make_context(root.path());
@@ -729,4 +774,238 @@ TEST(ProgramBindingTest,
       ProgramBindingError);
 }
 
-}  // namespace
+TEST(ProgramBindingTest,
+     SignalBindingsAreSparseClosedAndCannotAliasCoordinates) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  auto value = make_binding_value(context);
+  const auto ordinary = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_EQ(ordinary->canonical_bytes().find("signal_role_bindings"),
+            std::string::npos);
+  auto &target = value.target_role_bindings.front();
+  target.signal_role_bindings.push_back(
+      {ResourceRoleId("input_ready"), "ready",
+       manyforge::core::IoSignalValueType::kBoolean,
+       manyforge::core::IoSignalDirection::kInput,
+       manyforge::core::IoTransitionCapability::kSampledOnly,
+       ContentDigest(std::string(kZeroDigest))});
+  const auto extended = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(extended->program_binding_id(), ordinary->program_binding_id());
+  EXPECT_NE(extended->canonical_bytes().find("signal_role_bindings"),
+            std::string::npos);
+  // This retained fixture declares no I/O descriptor: a resealed invented row
+  // cannot acquire a qualified binding merely by passing the closed codec.
+  EXPECT_THROW(
+      static_cast<void>(reload_verified_program_binding(
+          extended->canonical_bytes(), *context.bundle, context.model_map)),
+      ProgramBindingError);
+  target.signal_role_bindings.front().resource_role_id =
+      target.resource_role_bindings.front().resource_role_id;
+  EXPECT_THROW(
+      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
+      ProgramBindingError);
+  target.signal_role_bindings.clear();
+  EXPECT_EQ(ProgramBindingConstructionAuthority::seal(value)->canonical_bytes(),
+            ordinary->canonical_bytes());
+}
+
+TEST(ProgramBindingTest,
+     SignalBindingRejectsUnknownEnumsDuplicateRolesAndBadDigests) {
+  ScopedTrustedRoot root;
+  auto value = make_binding_value(make_context(root.path()));
+  auto &signals = value.target_role_bindings.front().signal_role_bindings;
+  signals.push_back({ResourceRoleId("input_ready"), "ready",
+                     manyforge::core::IoSignalValueType::kBoolean,
+                     manyforge::core::IoSignalDirection::kInput,
+                     manyforge::core::IoTransitionCapability::kSampledOnly,
+                     ContentDigest(std::string(kZeroDigest))});
+  const auto valid = signals.front();
+  signals.front().direction =
+      static_cast<manyforge::core::IoSignalDirection>(255);
+  EXPECT_THROW(
+      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
+      ProgramBindingError);
+  signals.front() = valid;
+  signals.front().transition_capability =
+      static_cast<manyforge::core::IoTransitionCapability>(255);
+  EXPECT_THROW(
+      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
+      ProgramBindingError);
+  signals.front() = valid;
+  signals.front().signal_descriptor_digest = ContentDigest("not_a_digest");
+  EXPECT_THROW(
+      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
+      ProgramBindingError);
+  signals.front() = valid;
+  signals.push_back(valid);
+  EXPECT_THROW(
+      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
+      ProgramBindingError);
+}
+
+namespace output_runtime_tests {
+namespace c = manyforge::core;
+namespace d = manyforge::deployment;
+
+c::RuntimeProviderDomainConfigurationReadbackDTO
+closed_output_occurrence(const d::RetainedBundle &bundle) {
+  const auto &domains = bundle.value().cell_graph.control_domains;
+  if (domains.size() != 1U || !domains.front().provider())
+    throw std::logic_error("output fixture has no one genuine provider domain");
+  const auto &domain = domains.front();
+  const auto &provider = *domain.provider();
+  const auto catalog =
+      d::ResolveRetainedIoSignalCatalog(bundle.value().cell_graph);
+  if (!catalog.ok())
+    throw std::logic_error(catalog.error().message);
+  std::vector<c::ResourceId> resources;
+  for (const auto &row : catalog.value())
+    if (row.descriptor.output_resource)
+      resources.push_back(*row.descriptor.output_resource);
+  std::sort(resources.begin(), resources.end());
+  resources.erase(std::unique(resources.begin(), resources.end()),
+                  resources.end());
+  const c::RuntimeEpoch epoch("io.runtime.actual");
+  return {bundle.retained_bundle_id(),
+          bundle.value().cell_graph.graph_revision,
+          c::ComponentLifecycleGeneration(3U),
+          {domain.control_domain_id, domain.control_domain_revision,
+           c::ResolvedProviderDomainScopeDTO{provider, epoch, std::nullopt,
+                                             resources}},
+          {domain.control_domain_id, domain.control_domain_revision,
+           provider.provider_instance_id, provider.provider_manifest_id,
+           provider.provider_manifest_revision,
+           provider.provider_runtime_unit_id, epoch,
+           provider.lifecycle_plan_catalog_digest},
+          false,
+          0U,
+          0U};
+}
+
+TEST(ProgramBindingTest,
+     ProductionOutputBindingUsesActualProviderAndSealedMechanismPolicy) {
+  for (const bool ros_output : {false, true}) {
+    ScopedTrustedRoot root;
+    const auto fixture = d::test::materialize_boolean_io_retained_fixture(
+        root.path(), false, true, ros_output);
+    const auto &bundle = *fixture.bundle;
+    d::FilesystemVerifiedRetainedModelMapSource maps(root.path());
+    const auto map = maps.get_verified(
+        {bundle.retained_bundle_id(),
+         bundle.value().compiled_products.symbol_role_maps.front().product_id});
+    ASSERT_TRUE(map);
+    d::FilesystemCatalogArtifactStore catalog(root.path());
+    const auto inventory = d::compile_direct_control_program_binding_inventory(
+        bundle, *map, catalog);
+    ASSERT_EQ(inventory.io.size(), 1U);
+    const auto &binding = *inventory.io.front();
+    const auto &role = binding.value().target_role_bindings.front();
+    const auto target = d::resolve_runtime_program_target(
+        binding, role.target_role_id, c::CapabilityId("io.gpio.set_output"),
+        bundle, *map);
+    const auto actual = closed_output_occurrence(bundle);
+    ASSERT_TRUE(actual.locally_valid());
+    const auto value = d::build_runtime_io_output_binding_dto(
+        target, c::ResourceRoleId("lamp"), bundle, actual);
+    const auto sealed = c::verify_runtime_participant_binding(value);
+    ASSERT_TRUE(sealed.ok()) << sealed.error().message;
+    ASSERT_TRUE(value.io_output_binding);
+    EXPECT_TRUE(value.resources.empty());
+    EXPECT_TRUE(value.model_groups.empty());
+    EXPECT_FALSE(value.control_path);
+    EXPECT_EQ(value.io_output_binding->provider, actual.provider_occurrence);
+    EXPECT_EQ(value.io_output_binding->component_lifecycle_generation,
+              actual.component_lifecycle_generation);
+    const auto *budget =
+        value.io_output_binding->completion_policy.source_ack_budget();
+    if (ros_output) {
+      ASSERT_NE(budget, nullptr);
+      EXPECT_EQ(budget->timeout_ns, 500'000'000LL);
+    } else {
+      EXPECT_EQ(budget, nullptr);
+    }
+    EXPECT_FALSE(
+        actual
+            .operation_admission_open); // Construction grants no enable proof.
+  }
+}
+
+TEST(ProgramBindingTest, ProductionTypedRosOutputPolicyComesFromItsActualMechanism) {
+  for (const auto profile : {"ur_set_io", "ros2_control_gpio"}) {
+    ScopedTrustedRoot root;
+    const auto fixture = d::test::materialize_boolean_io_retained_fixture(
+        root.path(), false, true, false, false, false, nullptr, profile);
+    const auto& bundle = *fixture.bundle;
+    ASSERT_EQ(bundle.value().compiled_products.symbol_role_maps.size(), 1U);
+    d::FilesystemVerifiedRetainedModelMapSource maps(root.path());
+    const auto map = maps.get_verified(
+        {bundle.retained_bundle_id(),
+         bundle.value().compiled_products.symbol_role_maps.front().product_id});
+    ASSERT_TRUE(map);
+    d::FilesystemCatalogArtifactStore catalog(root.path());
+    const auto inventory = d::compile_direct_control_program_binding_inventory(
+        bundle, *map, catalog);
+    ASSERT_EQ(inventory.io.size(), 1U);
+    const auto &binding = *inventory.io.front();
+    const auto target = d::resolve_runtime_program_target(
+        binding, binding.value().target_role_bindings.front().target_role_id,
+        c::CapabilityId("io.gpio.set_output"), bundle, *map);
+    const auto actual = closed_output_occurrence(bundle);
+    const auto value = d::build_runtime_io_output_binding_dto(
+        target, c::ResourceRoleId("lamp"), bundle, actual);
+    ASSERT_TRUE(c::verify_runtime_participant_binding(value).ok());
+    ASSERT_TRUE(value.io_output_binding);
+    const auto &policy = value.io_output_binding->completion_policy;
+    if (std::string_view(profile) == "ur_set_io") {
+      ASSERT_NE(policy.source_ack_budget(), nullptr);
+      EXPECT_EQ(policy.source_ack_budget()->timeout_ns, 500'000'000LL);
+      EXPECT_FALSE(policy.submitted_only());
+    } else {
+      EXPECT_TRUE(policy.submitted_only());
+      EXPECT_EQ(policy.source_ack_budget(), nullptr);
+    }
+    EXPECT_FALSE(actual.operation_admission_open);
+    EXPECT_FALSE(value.control_path);
+    EXPECT_TRUE(value.resources.empty());
+  }
+}
+
+TEST(ProgramBindingTest,
+     ProductionOutputBindingRejectsForeignRolesAndProviderProof) {
+  ScopedTrustedRoot root;
+  const auto fixture = d::test::materialize_boolean_io_retained_fixture(
+      root.path(), false, true);
+  const auto &bundle = *fixture.bundle;
+  d::FilesystemVerifiedRetainedModelMapSource maps(root.path());
+  const auto map = maps.get_verified(
+      {bundle.retained_bundle_id(),
+       bundle.value().compiled_products.symbol_role_maps.front().product_id});
+  ASSERT_TRUE(map);
+  d::FilesystemCatalogArtifactStore catalog(root.path());
+  const auto inventory = d::compile_direct_control_program_binding_inventory(
+      bundle, *map, catalog);
+  ASSERT_EQ(inventory.io.size(), 1U);
+  const auto &binding = *inventory.io.front();
+  const auto target = d::resolve_runtime_program_target(
+      binding, binding.value().target_role_bindings.front().target_role_id,
+      c::CapabilityId("io.gpio.set_output"), bundle, *map);
+  const auto actual = closed_output_occurrence(bundle);
+  EXPECT_THROW(static_cast<void>(d::build_runtime_io_output_binding_dto(
+                   target, c::ResourceRoleId("missing"), bundle, actual)),
+               d::RuntimeProgramBindingResolutionError);
+  auto foreign = actual;
+  foreign.provider_occurrence.provider_runtime_epoch =
+      c::RuntimeEpoch("foreign.epoch");
+  EXPECT_THROW(static_cast<void>(d::build_runtime_io_output_binding_dto(
+                   target, c::ResourceRoleId("lamp"), bundle, foreign)),
+               d::RuntimeProgramBindingResolutionError);
+  auto extra_resource = actual;
+  std::get<c::ResolvedProviderDomainScopeDTO>(extra_resource.domain.payload)
+      .output_resources.push_back(c::ResourceId("zz.unqualified.channel"));
+  EXPECT_THROW(static_cast<void>(d::build_runtime_io_output_binding_dto(
+                   target, c::ResourceRoleId("lamp"), bundle, extra_resource)),
+               d::RuntimeProgramBindingResolutionError);
+}
+} // namespace output_runtime_tests
+
+} // namespace

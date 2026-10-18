@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/execution_progress_publication.hpp>
+#include <manyforge_core/ports/iexecution_port.hpp>
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/prepared_operation_participant.hpp>
 #include <optional>
@@ -10,6 +12,58 @@
 namespace manyforge::core {
 
 class RuntimeParticipantBinding;
+
+/// Exact resident predecessor captured by the existing execution owner. This
+/// process-local fact is not caller-authored planning or dispatch authority.
+struct PreparedMotionReplacementSourceDTO final {
+  std::uint64_t execution_id{};
+  std::uint64_t execution_generation{};
+  ExecutionGoalKey goal;
+  ExecutionBindingEpoch binding_epoch{0U};
+  ContentDigest prepared_contract_digest{std::string{}};
+  ExecutionControllerSampleDTO controller_sample;
+  /// Existing canonical prepared-trajectory cursor, joined to the exact
+  /// controller sample. Raw controller time can have a delivery-origin offset.
+  ExecutionProgressCursorSnapshotDTO progress;
+};
+
+/// Computed observation of the existing candidate membership and goal facts;
+/// not an independently advanced backend state machine.
+enum class PreparedMotionReplacementPhaseDTO : std::uint8_t {
+  kPreparing = 0,
+  kPrepared,
+  kNoEffect,
+  kPossiblySent,
+  kReadyToCommit,
+  kCommitted,
+  kEffectUncertain,
+};
+
+struct PreparedMotionReplacementDispatchDTO final {
+  ExecutionPortCommandResultDTO command;
+  std::optional<ExecutionHandle> handle{};
+  /// Existing host clock at the actual Replace call. Watchdog accounting
+  /// only; never a trajectory cursor or proof of controller acceptance.
+  std::optional<std::int64_t> submitted_at_ns{};
+};
+
+struct PreparedMotionReplacementObservationDTO final {
+  PreparedMotionReplacementPhaseDTO phase{PreparedMotionReplacementPhaseDTO::kPreparing};
+  std::optional<ExecutionGoalObservationDTO> predecessor{};
+  std::optional<ExecutionGoalObservationDTO> successor{};
+  /// Existing own-goal association evidence. Absence never proves recognition.
+  std::optional<std::int64_t> recognition_delay_ns{};
+  std::optional<ErrorDTO> error{};
+};
+
+/// Called under the participant mutex with the addressed state lock already
+/// held. The callback must not wait or acquire that lock. All preparation and
+/// validation precede it; successful owner CAS is the last fallible action.
+/// After success, backend and worker adoption perform prebuilt noexcept swaps.
+struct PreparedMotionReplacementCommitDTO final {
+  void* context{};
+  Result<void> (*owner_commit)(void*) noexcept {};
+};
 
 enum class PreparedParticipantPayloadKindDTO : std::uint8_t {
   kMotionExecution = 0,

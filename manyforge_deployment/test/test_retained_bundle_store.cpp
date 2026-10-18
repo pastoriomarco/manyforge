@@ -38,14 +38,23 @@
 #include <manyforge_deployment/cell_composition.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
+#include <manyforge_deployment/program_binding.hpp>
+#include <manyforge_deployment/program_binding_compiler.hpp>
+#include <manyforge_deployment/program_contract.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 
 #include "catalog_artifact_store_internal.hpp"
+#include "canonical_empty_admission_internal.hpp"
+#include "content_identity_internal.hpp"
+#include "program_root_fixture.hpp"
 #include "composed_model_symbol_role_map_internal.hpp"
 #include "control_domain_control_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
+#include "io_retained_fixture.hpp"
+#include "verified_retained_bundle_internal.hpp"
 #include "lite6_structural_retention_fixture.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "posix_durability_internal.hpp"
@@ -339,7 +348,8 @@ class ScopedTrustedRoot final {
 
 [[nodiscard]] std::shared_ptr<const RetainedBundle>
 materialize_durable_bundle(
-    const std::filesystem::path& root, std::string_view cell_id) {
+    const std::filesystem::path& root, std::string_view cell_id,
+    bool retain_empty_model_map = false) {
   FilesystemBuildManifestRepository manifest_repository(
       root);
   detail::RejectingCatalogArtifactStore catalog_store;
@@ -349,7 +359,8 @@ materialize_durable_bundle(
   return detail::RetainedBundleMaterializer::
       materialize_store_and_reload_production(
           qualify_empty(cell_id), manifest_repository, input_source,
-          {}, catalog_store, raw_store, bundle_repository);
+          {}, catalog_store, raw_store, bundle_repository,
+          retain_empty_model_map);
 }
 
 struct DurableLite6PlanningFixture final {
@@ -2952,6 +2963,353 @@ TEST(FilesystemRetentionStoreTest,
                      *reloaded, group.runtime_unit_id, artifact_source)),
                  RetainedBundleError);
   }
+}
+
+
+// -- Logic-only Programs: zero component roles on a model-free cell --------
+
+[[nodiscard]] CanonicalValue logic_only_program(std::string_view content_version) {
+  test::ProgramOptions options;
+  options.catalog_content_version = std::string(content_version);
+  options.logic_only = true;
+  return test::with_program_revision(test::make_program_root(options));
+}
+
+TEST(RetainedBundleStore, EmptyCellCarriesTheEmptyModelMapOnlyWhenRetained) {
+  ScopedTrustedRoot bare_root;
+  const auto bare = materialize_durable_bundle(bare_root.path(), "logic_same_cell");
+  ASSERT_NE(bare, nullptr);
+  EXPECT_TRUE(bare->value().compiled_products.symbol_role_maps.empty());
+
+  ScopedTrustedRoot mapped_root;
+  const auto bundle =
+      materialize_durable_bundle(mapped_root.path(), "logic_same_cell", true);
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+  ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
+  // Same cell and deployment in both roots: only the map product differs, so
+  // the identity change is caused by map presence alone.
+  EXPECT_NE(bundle->retained_bundle_id(), bare->retained_bundle_id());
+
+  const auto &product =
+      bundle->value().compiled_products.symbol_role_maps.front();
+  const FilesystemVerifiedRetainedModelMapSource map_source(mapped_root.path());
+  const auto map = map_source.get_verified(
+      RetainedModelMapQuery{bundle->retained_bundle_id(), product.product_id});
+  ASSERT_TRUE(map.has_value());
+  EXPECT_EQ(map->query().product_id, product.product_id);
+
+  const FilesystemVerifiedRetainedBundleSource bundles(mapped_root.path());
+  const auto reloaded = bundles.get_verified(bundle->retained_bundle_id());
+  ASSERT_NE(reloaded, nullptr);
+  EXPECT_EQ(reloaded->canonical_bytes(), bundle->canonical_bytes());
+}
+
+TEST(RetainedBundleStore, ZeroRoleProgramBindsAgainstTheEmptyModelMap) {
+  ScopedTrustedRoot root;
+  const auto bundle = materialize_durable_bundle(root.path(), "logic_bind", true);
+  ASSERT_NE(bundle, nullptr);
+  const auto &product =
+      bundle->value().compiled_products.symbol_role_maps.front();
+  const FilesystemVerifiedRetainedModelMapSource map_source(root.path());
+  const auto map = map_source.get_verified(
+      RetainedModelMapQuery{bundle->retained_bundle_id(), product.product_id});
+  ASSERT_TRUE(map.has_value());
+
+  const auto contract = verify_program_binding_contract(
+      canonical_json(logic_only_program(
+          bundle->value().catalogs.node_environment.content_version)),
+      *bundle);
+  ASSERT_NE(contract, nullptr);
+  EXPECT_TRUE(contract->value().component_roles.empty());
+  EXPECT_TRUE(contract->value().target_roles.empty());
+
+  detail::RejectingCatalogArtifactStore catalogs;
+  const auto outcome =
+      compile_program_binding_outcome(*contract, {}, *bundle, *map, catalogs);
+  ASSERT_NE(outcome.binding, nullptr);
+  EXPECT_FALSE(outcome.non_executable.has_value());
+  EXPECT_TRUE(outcome.binding->value().component_role_bindings.empty());
+  EXPECT_TRUE(outcome.binding->value().target_role_bindings.empty());
+
+  // Both the envelope validator and its decode twin accept the empty tables.
+  const auto reloaded = reload_verified_program_binding(
+      outcome.binding->canonical_bytes(), *bundle, *map);
+  ASSERT_NE(reloaded, nullptr);
+  EXPECT_EQ(reloaded->program_binding_id(), outcome.binding->program_binding_id());
+  EXPECT_TRUE(verify_program_binding_identity(*reloaded));
+
+  ScopedTrustedRoot binding_root;
+  FilesystemProgramBindingRepository repository(binding_root.path());
+  EXPECT_TRUE(repository.put_if_absent(outcome.binding, *bundle, *map));
+  const auto stored = repository.get_verified(
+      outcome.binding->program_binding_id(), *bundle, *map);
+  ASSERT_NE(stored, nullptr);
+  EXPECT_EQ(stored->canonical_bytes(), outcome.binding->canonical_bytes());
+}
+
+TEST(RetainedBundleStore, ZeroRoleProgramHasNoBindingWithoutAModelMap) {
+  // A cell whose candidate carries no map (the pre-existing shape) still has
+  // no executable binding for a zero-role Program.
+  ScopedTrustedRoot root;
+  const auto bundle = materialize_durable_bundle(root.path(), "logic_no_map");
+  ASSERT_NE(bundle, nullptr);
+  ASSERT_TRUE(bundle->value().compiled_products.symbol_role_maps.empty());
+  const auto contract = verify_program_binding_contract(
+      canonical_json(logic_only_program(
+          bundle->value().catalogs.node_environment.content_version)),
+      *bundle);
+  ASSERT_NE(contract, nullptr);
+  detail::RejectingCatalogArtifactStore catalogs;
+  EXPECT_THROW(static_cast<void>(compile_program_binding_outcome(
+                   *contract, {}, *bundle, std::nullopt, catalogs)),
+               ProgramBindingCompilerError);
+
+  // The sealed canonical-empty package has no map and keeps refusing every
+  // Program (Q125); its zero-role Program is refused the same way.
+  ScopedTrustedRoot package;
+  const auto admission = detail::generate_ros_empty_package(
+      package.path(), core::CellId("sealed_logic_cell"),
+      detail::ros2_control_execution_runtime_profile_document());
+  const auto &sealed = admission.retained_bundle();
+  EXPECT_TRUE(sealed.value().compiled_products.symbol_role_maps.empty());
+  const auto sealed_contract = verify_program_binding_contract(
+      canonical_json(logic_only_program(
+          sealed.value().catalogs.node_environment.content_version)),
+      sealed);
+  ASSERT_NE(sealed_contract, nullptr);
+  const FilesystemVerifiedCatalogArtifactSource sealed_catalogs(package.path());
+  EXPECT_THROW(static_cast<void>(compile_program_binding_outcome(
+                   *sealed_contract, {}, sealed, std::nullopt, sealed_catalogs)),
+               ProgramBindingCompilerError);
+}
+
+TEST(RetainedBundleStore, SealedCanonicalEmptyAdmissionRefusesAMapCarryingBundle) {
+  // Both cells are passive and otherwise sealed-shaped. Only the map-carrying
+  // one trips the map check in require_canonical_empty_shape, which runs before
+  // the runtime-unit check; the control fails on the missing runtime unit.
+  const core::CellId cell_id("sealed_map_cell");
+  const auto filename = cell_scoped_canonical_empty_admission_filename(cell_id);
+
+  ScopedTrustedRoot mapped_root;
+  const auto mapped =
+      materialize_durable_bundle(mapped_root.path(), "sealed_map_cell", true);
+  ASSERT_NE(mapped, nullptr);
+  ASSERT_EQ(mapped->value().compiled_products.symbol_role_maps.size(), 1U);
+  try {
+    static_cast<void>(detail::publish_cell_scoped_canonical_empty_admission(
+        mapped_root.path(), filename, *mapped));
+    FAIL() << "a sealed canonical-empty package carrying a map was admitted";
+  } catch (const CanonicalEmptyAdmissionError &error) {
+    EXPECT_NE(std::string(error.what()).find("active cell semantics"),
+              std::string::npos)
+        << error.what();
+  }
+
+  ScopedTrustedRoot control_root;
+  const auto control =
+      materialize_durable_bundle(control_root.path(), "sealed_map_cell");
+  ASSERT_NE(control, nullptr);
+  ASSERT_TRUE(control->value().compiled_products.symbol_role_maps.empty());
+  try {
+    static_cast<void>(detail::publish_cell_scoped_canonical_empty_admission(
+        control_root.path(), filename, *control));
+    FAIL() << "the map-free control unexpectedly passed the sealed shape";
+  } catch (const CanonicalEmptyAdmissionError &error) {
+    EXPECT_EQ(std::string(error.what()).find("active cell semantics"),
+              std::string::npos)
+        << error.what();
+  }
+}
+
+TEST(RetainedBundleStore, ComposedModelMapRequiresSymbolsAndOccurrencesTogether) {
+  ScopedTrustedRoot root;
+  const auto bundle = materialize_durable_bundle(root.path(), "logic_map_bytes", true);
+  ASSERT_NE(bundle, nullptr);
+  const auto &artifact =
+      bundle->value().compiled_products.symbol_role_maps.front().artifact_refs.front();
+  const auto bytes = FilesystemRawArtifactStore(root.path()).get_verified(
+      artifact.content_addressed_store_key, artifact.content_digest,
+      artifact.byte_size);
+  ASSERT_TRUE(bytes.has_value());
+  // The candidate's own empty map parses only through the scoped candidate flag.
+  const CanonicalValue parsed = detail::parse_and_verify_composed_model_symbol_role_map(
+      *bytes, /*allow_empty_model_map=*/true);
+
+  // A symbol row without any model occurrence is not a populated map.
+  CanonicalValue::Object members = parsed.as_object();
+  for (auto &[name, value] : members) {
+    if (name == "symbol_rows") {
+      value = CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+          {"model_instance_id", CanonicalValue("ghost_model")},
+          {"kind", CanonicalValue("link")},
+          {"scope_name", CanonicalValue("scope")},
+          {"source_name", CanonicalValue("link")},
+          {"compiled_name", CanonicalValue("ghost_link")},
+      })});
+    }
+  }
+  const std::string ghost_bytes = canonical_json(CanonicalValue(std::move(members)));
+  EXPECT_THROW(static_cast<void>(detail::parse_and_verify_composed_model_symbol_role_map(
+                   ghost_bytes)),
+               RetainedBundleError);
+  EXPECT_THROW(static_cast<void>(detail::parse_and_verify_composed_model_symbol_role_map(
+                   ghost_bytes, /*allow_empty_model_map=*/true)),
+               RetainedBundleError);
+
+  // Scoping: `*bytes` is the candidate's empty map. The strict default refuses
+  // it with HEAD's message; only the candidate path's flag accepts it.
+  try {
+    static_cast<void>(detail::parse_and_verify_composed_model_symbol_role_map(*bytes));
+    FAIL() << "the strict default accepted the empty candidate map";
+  } catch (const RetainedBundleError &error) {
+    EXPECT_NE(std::string(error.what()).find("must contain source symbols"),
+              std::string::npos)
+        << error.what();
+  }
+  EXPECT_NO_THROW(static_cast<void>(detail::parse_and_verify_composed_model_symbol_role_map(
+      *bytes, /*allow_empty_model_map=*/true)));
+}
+
+TEST(RetainedBundleStore,
+     GenuineNonCoordinateTargetsRoundTripWithoutPhysicalMaps) {
+  for (const auto &[input, output] :
+       std::array{std::pair{true, false}, std::pair{false, true},
+                  std::pair{true, true}}) {
+    SCOPED_TRACE(input);
+    SCOPED_TRACE(output);
+    ScopedTrustedRoot root;
+    const auto bundle = test::materialize_boolean_io_retained_fixture(
+                            root.path(), input, output)
+                            .bundle;
+    ASSERT_NE(bundle, nullptr);
+    EXPECT_TRUE(bundle->value().cell_graph.model_instances.empty());
+    EXPECT_TRUE(bundle->value().cell_graph.control_bindings.empty());
+    ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
+    const auto &product =
+        bundle->value().compiled_products.symbol_role_maps.front();
+    const auto map =
+        FilesystemVerifiedRetainedModelMapSource(root.path())
+            .get_verified({bundle->retained_bundle_id(), product.product_id});
+    ASSERT_TRUE(map.has_value());
+    EXPECT_TRUE(map->model_occurrences().empty());
+    EXPECT_TRUE(map->symbols().empty());
+    EXPECT_TRUE(map->coordinates().empty());
+    EXPECT_TRUE(map->control_bindings().empty());
+    ASSERT_EQ(map->targets().size(), 1U);
+    const auto &target = map->targets().front();
+    EXPECT_TRUE(target.model_groups.empty());
+    EXPECT_TRUE(target.frames.empty());
+    EXPECT_TRUE(target.collision_bodies.empty());
+    const auto witness =
+        std::find_if(bundle->value().capability_provider_bindings.begin(),
+                     bundle->value().capability_provider_bindings.end(),
+                     [](const auto &provider) {
+                       return std::holds_alternative<
+                           core::ComponentTargetCapabilityProviderTargetDTO>(
+                           provider.target);
+                     });
+    ASSERT_NE(witness, bundle->value().capability_provider_bindings.end());
+    const auto &bound =
+        std::get<core::ComponentTargetCapabilityProviderTargetDTO>(
+            witness->target);
+    EXPECT_EQ(target.controllable_component_id,
+              bound.controllable_component_id);
+    EXPECT_EQ(target.command_target_id, bound.command_target_id);
+  }
+}
+
+TEST(RetainedBundleStore,
+     NonCoordinateMapRequiresExactSealedTargetAndEmptyGeometry) {
+  ScopedTrustedRoot root;
+  const auto bundle =
+      test::materialize_boolean_io_retained_fixture(root.path(), true, true)
+          .bundle;
+  ASSERT_NE(bundle, nullptr);
+  ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
+  const auto &product =
+      bundle->value().compiled_products.symbol_role_maps.front();
+  ASSERT_EQ(product.artifact_refs.size(), 1U);
+  const auto &artifact = product.artifact_refs.front();
+  const auto bytes =
+      FilesystemRawArtifactStore(root.path())
+          .get_verified(artifact.content_addressed_store_key,
+                        artifact.content_digest, artifact.byte_size);
+  ASSERT_TRUE(bytes.has_value());
+  const auto parsed = detail::parse_and_verify_composed_model_symbol_role_map(
+      *bytes, /*allow_empty_model_map=*/true);
+  const auto *targets = parsed.find_object_member("target_role_maps");
+  ASSERT_NE(targets, nullptr);
+  ASSERT_EQ(targets->as_array().size(), 1U);
+  EXPECT_NO_THROW(detail::require_symbol_role_map_matches_retained_bundle(
+      parsed, bundle->value()));
+
+  const auto replace_field = [](const CanonicalValue &value,
+                                std::string_view name,
+                                CanonicalValue replacement) {
+    auto fields = value.as_object();
+    for (auto &[key, selected] : fields) {
+      if (key == name) {
+        selected = std::move(replacement);
+        return CanonicalValue(std::move(fields));
+      }
+    }
+    throw std::logic_error("map fixture field missing");
+  };
+  const auto missing = replace_field(parsed, "target_role_maps",
+                                     CanonicalValue(CanonicalValue::Array{}));
+  EXPECT_THROW(detail::require_symbol_role_map_matches_retained_bundle(
+                   missing, bundle->value()),
+               RetainedBundleError);
+  const auto foreign_target =
+      replace_field(targets->as_array().front(), "command_target_id",
+                    CanonicalValue("foreign_target"));
+  const auto foreign =
+      replace_field(parsed, "target_role_maps",
+                    CanonicalValue(CanonicalValue::Array{foreign_target}));
+  EXPECT_THROW(detail::require_symbol_role_map_matches_retained_bundle(
+                   foreign, bundle->value()),
+               RetainedBundleError);
+  for (const auto *field : {"model_groups", "frames", "collision_bodies"}) {
+    SCOPED_TRACE(field);
+    // Exercise the cross-product geometry restriction itself; this internal
+    // seam runs after the existing map syntax verifier on every public read.
+    const auto role_target =
+        replace_field(targets->as_array().front(), field,
+                      CanonicalValue(CanonicalValue::Array{
+                          CanonicalValue(CanonicalValue::Object{})}));
+    const auto role_map =
+        replace_field(parsed, "target_role_maps",
+                      CanonicalValue(CanonicalValue::Array{role_target}));
+    try {
+      detail::require_symbol_role_map_matches_retained_bundle(role_map,
+                                                              bundle->value());
+      FAIL() << "non-coordinate target gained geometry";
+    } catch (const RetainedBundleError &error) {
+      EXPECT_NE(std::string(error.what())
+                    .find("non-coordinate target contains model geometry"),
+                std::string::npos)
+          << error.what();
+    }
+  }
+  // A copied untrusted DTO is used only as negative input to the pure
+  // validator; it is never made into a verified retained product or operational
+  // authority.
+  auto invalid_witness = bundle->value();
+  auto witness = std::find_if(
+      invalid_witness.capability_provider_bindings.begin(),
+      invalid_witness.capability_provider_bindings.end(),
+      [](const auto &provider) {
+        return std::holds_alternative<
+            core::ComponentTargetCapabilityProviderTargetDTO>(provider.target);
+      });
+  ASSERT_NE(witness, invalid_witness.capability_provider_bindings.end());
+  std::get<core::ComponentTargetCapabilityProviderTargetDTO>(witness->target)
+      .component_type_revision =
+      core::ComponentTypeRevision("foreign_revision");
+  EXPECT_THROW(detail::require_symbol_role_map_matches_retained_bundle(
+                   parsed, invalid_witness),
+               RetainedBundleError);
 }
 
 } // namespace manyforge::deployment

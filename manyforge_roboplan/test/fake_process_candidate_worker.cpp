@@ -142,10 +142,11 @@ void set_integer(std::array<unsigned char, kHeaderBytes> &header,
   return {static_cast<MessageType>(u16(header, 6U)), std::move(payload)};
 }
 
-void send_frame(int descriptor, MessageType type, std::string_view payload) {
+void send_frame(int descriptor, MessageType type, std::string_view payload,
+                std::uint16_t version = worker_protocol::kProtocolVersion) {
   std::array<unsigned char, kHeaderBytes> header{};
   set_integer(header, 0U, worker_protocol::kFrameMagic);
-  set_u16(header, 4U, worker_protocol::kProtocolVersion);
+  set_u16(header, 4U, version);
   set_u16(header, 6U, static_cast<std::uint16_t>(type));
   set_integer(header, 8U, static_cast<std::uint64_t>(payload.size()));
   write_all(descriptor, header.data(), header.size());
@@ -265,7 +266,10 @@ int run() {
   } else {
     first_generation_marker = input.model.native_scene_name;
   }
-  send_frame(descriptor, MessageType::kReady, {});
+  send_frame(descriptor, MessageType::kReady, {},
+             input.model.native_scene_name == "old-protocol"
+                 ? worker_protocol::kProtocolVersion - 1U
+                 : worker_protocol::kProtocolVersion);
 
   for (;;) {
     const auto frame = receive_frame(descriptor);

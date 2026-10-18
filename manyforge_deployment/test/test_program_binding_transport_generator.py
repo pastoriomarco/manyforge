@@ -77,10 +77,14 @@ def test_checked_in_native_binding_fixture_is_exact() -> None:
         ),
         lambda value: value["records"]["node_policy"].remove("recovery_policy"),
         lambda value: value["enums"]["operator_stop_policy"].remove("hold"),
+        lambda value: value["enums"]["intervention_stop_scope"].append("selected"),
+        lambda value: value["optional_record_fields"]["recovery_policy"].clear(),
         lambda value: value["records"]["recovery_policy"].append(
             "allowed_recovery_actions"
         ),
         lambda value: value["records"]["target"].remove("command_target_id"),
+        lambda value: value["optional_record_fields"]["target"].clear(),
+        lambda value: value["records"]["signal"].remove("signal_descriptor_digest"),
         lambda value: value["records"]["component"].append("component_role_id"),
         lambda value: value["scalars"]["digest"].update(
             {"pattern": "^sha256:[0-9A-F]{64}$"}

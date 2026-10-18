@@ -6,6 +6,7 @@ from collections.abc import Collection, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
+from hashlib import sha256
 from types import MappingProxyType
 from typing import Any, Callable, Final, Protocol
 
@@ -13,6 +14,7 @@ from manyforge_behavior.failure_details import (
     require_failure_details,
     require_failure_origin,
 )
+from manyforge_behavior.kernel_client import ExecutionState
 
 
 PROGRAM_MOTION_STOP_RECOVERY_CLASSES: Final = frozenset(
@@ -404,6 +406,18 @@ class OwnerInvocationHeldError(RuntimeError):
         self.selection_revision = selection_revision
 
 
+class OwnerInvocationRefusedByPriorityError(RuntimeError):
+    """The Kernel refused this motion: a higher-priority one holds the robot.
+
+    No effect was started. ``winner`` names the winning operation, node and
+    attempt exactly as the Kernel reported them.
+    """
+
+    def __init__(self, message: str, winner: Mapping[str, str]) -> None:
+        super().__init__(message or "refused by a higher-priority motion")
+        self.winner = dict(winner)
+
+
 class OwnerInvocationPort(Protocol):
     """One focused owner family whose public request settles synchronously."""
 
@@ -413,6 +427,62 @@ class OwnerInvocationPort(Protocol):
         identity: NodeAttemptIdentity,
         inputs: OwnerNodeInputs,
     ) -> OwnerInvocationResult: ...
+
+
+class MockSimulationRefusedError(RuntimeError):
+    """The host closed-refused one node start's Mock simulation (its typed
+    ErrorResponse, code and details kept); nothing was started."""
+
+    def __init__(
+        self, code: str, message: str, details: Mapping[str, Any] | None = None
+    ) -> None:
+        super().__init__(message or "Mock simulation start was refused")
+        self.code = code
+        self.details = dict(details) if details is not None else None
+
+
+class MockSimulationPort(Protocol):
+    """Decision 133: one node attempt's literal Mock simulation start.
+
+    ``request`` builds the exact wire request once per attempt (the node then
+    resends that same request until it is answered); ``start`` sends it and
+    returns the host's exact acknowledgement; ``end`` ends that attempt's
+    simulation. ``start`` raises
+    ``MockSimulationRefusedError`` for a closed refusal; any other exception
+    leaves the outcome unknown.
+    """
+
+    def request(
+        self,
+        identity: NodeAttemptIdentity,
+        node_start_index: int,
+        signals: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]: ...
+
+    def start(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def end(self, start_request: Mapping[str, Any]) -> None:
+        """Decision 135: the attempt of this exact start ended (once per
+        attempt; never for a Halt). An unknown reply keeps that exact END
+        pending until ``resend_unknown_ends`` gets its ACK."""
+        ...
+
+    def resend_unknown_ends(self, program_run_id: str) -> tuple[Mapping[str, Any], ...]:
+        """Resend the Run's pending ENDs unchanged; those still unanswered."""
+        ...
+
+    def set_run_paused(
+        self,
+        program_run_id: str,
+        run_revision: int,
+        paused: bool,
+        held_node_instance_ids: Sequence[str] = (),
+    ) -> None:
+        """Decisions 135/138: the Run's snapshot at the Runner's run_revision
+        (Halt state and held-node mask); never raises (an unanswered
+        snapshot is resent unchanged)."""
+        ...
+
 
 
 def describe_owner_failure(message: str, details: object) -> str:
@@ -689,6 +759,10 @@ class ProgramInterventionPort(Protocol):
         self, program_run_id: str
     ) -> tuple[ProgramInterventionSnapshot, ...]: ...
 
+    def read_holds(
+        self, program_run_id: str
+    ) -> tuple[ProgramInterventionSnapshot, ...]: ...
+
     def has_operator_stop(self, program_run_id: str) -> bool: ...
 
     def refresh_owner_assessment(
@@ -783,6 +857,12 @@ class NodeAdapterPorts:
     kernel_operations: OwnerTaskPort | None = None
     scene_transactions: OwnerInvocationPort | None = None
     gripper_status: OwnerInvocationPort | None = None
+    # Boolean input reads (`io.get_input`/`io.check_input`) and level-input
+    # watches (`io.wait_for_input`) on the native execution owner.
+    io_signals: OwnerInvocationPort | None = None
+    io_watches: OwnerTaskPort | None = None
+    # Decision 133: per-node Mock simulation starts of signal-reading nodes.
+    mock_simulation: MockSimulationPort | None = None
     model_queries: ModelQueryPort | None = None
     assistant_requests: OwnerTaskPort | None = None
     simulator_control: OwnerTaskPort | None = None
@@ -791,6 +871,46 @@ class NodeAdapterPorts:
     program_run_context: ProgramRunContextPort | None = None
     program_interventions: ProgramInterventionPort | None = None
     persistent_keys: PersistentKeyRegisterPort | None = None
+
+
+# The Kernel execution states of a failure and of an interruption (spec 230).
+FAILED_EXECUTION_STATES: Final = frozenset(
+    {ExecutionState.FAILED.value, ExecutionState.INTERVENTION_REQUIRED.value}
+)
+INTERRUPTED_EXECUTION_STATES: Final = frozenset(
+    {
+        ExecutionState.STOPPED.value,
+        ExecutionState.INTERRUPTED.value,
+        ExecutionState.CANCELLED_PRE_DISPATCH.value,
+    }
+)
+
+
+def is_ordinary_operator_stop(task: OwnerTaskSnapshot) -> bool:
+    """An ordinary operator Stop holds the node; it is not a failure."""
+
+    assessment = task.metadata.get("recovery_assessment")
+    return (
+        task.state is OwnerTaskState.INTERRUPTED
+        and isinstance(assessment, Mapping)
+        and assessment.get("recovery_class") == "ordinary_operator_stop"
+    )
+
+
+def recovery_outcome(result: object) -> bool | None:
+    """One recovery reply's exact outcome: True accepted, False refused, and
+    None unknown (no exact boolean verdict was received)."""
+
+    if not isinstance(result, Mapping) or type(result.get("accepted")) is not bool:
+        return None
+    return result["accepted"]
+
+
+def request_identity(prefix: str, *coordinates: str) -> str:
+    """A request identity that is exact for these coordinates."""
+
+    digest = sha256(b"\x00".join(value.encode("utf-8") for value in coordinates))
+    return f"{prefix}:{digest.hexdigest()}"
 
 
 __all__ = [
@@ -810,12 +930,15 @@ __all__ = [
     "FrameTransformPort",
     "FrameTransformResult",
     "ModelQueryPort",
+    "MockSimulationPort",
+    "MockSimulationRefusedError",
     "PersistentKeyRegisterPort",
     "PersistentValueUncertainError",
     "OwnerInvocationPort",
     "OwnerInvocationResult",
     "OwnerInvocationPendingError",
     "OwnerInvocationHeldError",
+    "OwnerInvocationRefusedByPriorityError",
     "OwnerTaskPort",
     "OwnerTaskObservationUnavailableError",
     "OwnerTaskSettlementPendingError",

@@ -3,6 +3,7 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <algorithm>
 #include <cmath>
+#include <charconv>
 
 namespace manyforge::roboplan_backend::host_detail {
 
@@ -539,18 +540,38 @@ DecodeCoordinateEffort(const CanonicalValue &value) {
 
 [[nodiscard]] core::CapabilityCommandIntentDTO
 DecodeCapabilityCommandPayload(const CanonicalValue &value) {
-  RequireExactObjectSize(value, 6U, "capability-command payload");
   Require(Text(value, "kind") == "capability_command",
           "operation payload kind is unsupported");
   const auto &command_value = Member(value, "command_value");
-  RequireExactObjectSize(command_value, 3U, "gripper-position command value");
-  Require(Text(command_value, "kind") == "gripper_position",
-          "capability-command value kind is unsupported");
+  RequireExactObjectSize(command_value, 3U, "capability-command value");
+  const auto decoded_value = [&]() -> core::CapabilityCommandValueDTO {
+    const auto kind = Text(command_value, "kind");
+    if (kind == "io_signal_write") {
+      return core::IoSignalWriteCommandValueDTO{
+          core::ResourceRoleId(Text(command_value, "resource_role_id")),
+          Boolean(command_value, "value")};
+    }
+    Require(kind == "gripper_position",
+            "capability-command value kind is unsupported");
+    std::optional<core::CoordinateEffortDTO> max_effort;
+    const auto &effort = Member(command_value, "max_effort");
+    if (!std::holds_alternative<std::nullptr_t>(effort.storage())) {
+      max_effort = DecodeCoordinateEffort(effort);
+    }
+    return core::GripperPositionCommandValueDTO{
+        DecodeCoordinatePosition(Member(command_value, "position")),
+        std::move(max_effort)};
+  }();
 
-  std::optional<core::CoordinateEffortDTO> max_effort;
-  const auto &effort = Member(command_value, "max_effort");
-  if (!std::holds_alternative<std::nullptr_t>(effort.storage())) {
-    max_effort = DecodeCoordinateEffort(effort);
+  const bool output =
+      std::holds_alternative<core::IoSignalWriteCommandValueDTO>(decoded_value);
+  RequireExactObjectSize(value, output ? 5U : 6U, "capability-command payload");
+  std::optional<double> completion_timeout_s;
+  if (output) {
+    Require(value.find_object_member("completion_timeout_s") == nullptr,
+            "I/O output completion policy is sealed, not caller supplied");
+  } else {
+    completion_timeout_s = Number(value, "completion_timeout_s");
   }
 
   const auto &option_values = Array(value, "caller_options");
@@ -568,10 +589,7 @@ DecodeCapabilityCommandPayload(const CanonicalValue &value) {
   return core::CapabilityCommandIntentDTO{
       core::CommandSchemaId(Text(value, "command_schema_id")),
       core::CommandSchemaRevision(Text(value, "command_schema_revision")),
-      core::GripperPositionCommandValueDTO{
-          DecodeCoordinatePosition(Member(command_value, "position")),
-          std::move(max_effort)},
-      Number(value, "completion_timeout_s"), std::move(caller_options)};
+      decoded_value, completion_timeout_s, std::move(caller_options)};
 }
 
 [[nodiscard]] core::OperationParticipantPayloadDTO
@@ -642,19 +660,20 @@ DecodeOperation(const CanonicalValue &value,
   for (const auto &participant : participant_values) {
     auto execution_scope =
         DecodeProgramExecutionScope(participant, attribution);
-    RequireExactObjectSize(participant, execution_scope.has_value() ? 6U : 5U,
+    RequireExactObjectSize(participant,
+                           5U + (execution_scope.has_value() ? 1U : 0U),
                            "operation participant");
     std::optional<core::ActionSpanDTO> action_span;
     const auto &span = Member(participant, "action_span");
     if (!std::holds_alternative<std::nullptr_t>(span.storage())) {
       action_span = DecodeActionSpan(span);
     }
+    auto payload = DecodeParticipantPayload(Member(participant, "payload"));
+    core::CapabilityId capability(Text(participant, "required_capability_id"));
     participants.push_back(core::OperationParticipantIntentDTO{
         core::ComponentRoleId(Text(participant, "component_role_id")),
         core::TargetRoleId(Text(participant, "target_role_id")),
-        core::CapabilityId(Text(participant, "required_capability_id")),
-        std::move(action_span),
-        DecodeParticipantPayload(Member(participant, "payload")),
+        std::move(capability), std::move(action_span), std::move(payload),
         std::move(execution_scope)});
   }
   std::optional<core::SceneRevision> expected_scene;
@@ -772,10 +791,34 @@ DecodePlacePlanningIntent(const CanonicalValue &value,
 
 [[nodiscard]] core::OperationControlRequestDTO
 DecodeOperationControlRequest(const CanonicalValue &value,
-                              const core::RequestAttributionDTO &attribution) {
+                              const core::RequestAttributionDTO &attribution,
+                              bool permits_uncertain_output_acknowledgement) {
   auto execution_scope = DecodeProgramExecutionScope(value, attribution);
-  RequireExactObjectSize(value, execution_scope.has_value() ? 5U : 4U,
-                         "operation control request");
+  const auto *encoded_ack =
+      value.find_object_member("acknowledged_uncertain_outputs");
+  Require(!encoded_ack || permits_uncertain_output_acknowledgement,
+          "Uncertain output acknowledgement is only legal on explicit Reset");
+  RequireExactObjectSize(
+      value, 4U + (execution_scope ? 1U : 0U) + (encoded_ack ? 1U : 0U),
+      "operation control request");
+  std::optional<std::vector<core::UncertainOutputAcknowledgementDTO>>
+      acknowledged;
+  if (encoded_ack) {
+    Require(encoded_ack->is_array(),
+            "Uncertain output acknowledgement must be an array");
+    acknowledged.emplace();
+    for (const auto &row : encoded_ack->as_array()) {
+      RequireExactObjectSize(row, 2U, "uncertain output acknowledgement");
+      core::UncertainOutputAcknowledgementDTO decoded{
+          core::OperationId(Text(row, "operation_id")),
+          core::OperationRevision(Counter(row, "operation_revision", 1U))};
+      Require(acknowledged->empty() ||
+                  acknowledged->back().operation_id < decoded.operation_id,
+              "Uncertain output acknowledgements must have unique sorted "
+              "operation IDs");
+      acknowledged->push_back(std::move(decoded));
+    }
+  }
   return core::OperationControlRequestDTO{
       DecodeRequestContext(Member(value, "request_context")),
       core::OperationId(Text(value, "operation_id")),
@@ -783,7 +826,8 @@ DecodeOperationControlRequest(const CanonicalValue &value,
           Counter(value, "expected_operation_revision", 1U)),
       OptionalBoundedText(value, "reason", kMaximumReasonBytes),
       attribution,
-      std::move(execution_scope)};
+      std::move(execution_scope),
+      std::move(acknowledged)};
 }
 
 [[nodiscard]] core::StopIntentDTO
@@ -989,6 +1033,9 @@ DecodeRecoveryAction(const std::string_view value) {
   if (value == "replan_from_stopped_state") {
     return core::RecoveryAction::kReplanFromStoppedState;
   }
+  if (value == "close_operation") {
+    return core::RecoveryAction::kCloseOperation;
+  }
   if (value == "reset_cycle") {
     return core::RecoveryAction::kResetCycle;
   }
@@ -997,7 +1044,10 @@ DecodeRecoveryAction(const std::string_view value) {
 
 [[nodiscard]] core::KernelRecoveryActionRequestDTO
 DecodeOperationRecoveryRequest(const CanonicalValue &value) {
-  RequireExactObjectSize(value, 10U, "operation recovery request");
+  const bool has_fresh_motion_attempt =
+      value.find_object_member("fresh_motion_attempt") != nullptr;
+  RequireExactObjectSize(value, has_fresh_motion_attempt ? 11U : 10U,
+                         "operation recovery request");
   return core::KernelRecoveryActionRequestDTO{
       Text(value, "request_id"),
       DecodeRecoveryAction(Text(value, "action")),
@@ -1008,7 +1058,9 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
       Text(value, "expected_latch_id", true),
       Text(value, "expected_stop_certificate_id", true),
       Counter(value, "expected_stop_owner_generation", 0U),
-      Text(value, "reason", true)};
+      Text(value, "reason", true),
+      has_fresh_motion_attempt ? Boolean(value, "fresh_motion_attempt")
+                               : false};
 }
 
 /// Commands whose addressed-Kernel entry takes its submission ordering. A
@@ -1081,6 +1133,206 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
           intent->claim_kind == core::CellAdmissionClaimKindDTO::kProgramReset);
 }
 
+namespace {
+
+std::uint64_t IoCounter(const CanonicalValue& object, std::string_view name,
+                        std::uint64_t minimum) {
+  const auto& value = Member(object, name);
+  Require(value.is_string(), "I/O counter must be a canonical decimal string");
+  const auto& text = value.as_string();
+  Require(!text.empty() && text.size() <= 20U &&
+              (text.size() == 1U || text.front() != '0'),
+          "I/O counter is not canonical unsigned decimal");
+  std::uint64_t result{};
+  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
+  Require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() &&
+              result >= minimum,
+          "I/O counter exceeds its unsigned range");
+  return result;
+}
+
+core::IoGlobalRuleRecoveryIntentDTO
+DecodeGlobalIoRuleRecoveryIntent(const CanonicalValue &value) {
+  RequireExactObjectSize(value, 4U, "global rule recovery intent");
+  Require(Text(value, "kind") == "global_io_rule",
+          "cell recovery request kind is invalid");
+  const auto &selector = Member(value, "selector");
+  RequireExactObjectSize(selector, 3U, "global rule recovery selector");
+  const auto &context = Member(selector, "context");
+  RequireExactObjectSize(context, 5U, "global rule recovery context");
+  core::IoRuleStateContextDTO actual_context{
+      core::RequestOwnerEpoch(Text(context, "owner_epoch")),
+      IoCounter(context, "catalog_generation", 1U),
+      core::ActiveBundlePublicationGeneration(
+          Counter(context, "active_publication_generation", 1U)),
+      core::RetainedBundleId(Text(context, "bundle")),
+      core::GraphRevision(Text(context, "graph"))};
+  Require(!core::io_rule_state_context_field_error(actual_context),
+          "global rule recovery context is invalid");
+  auto rule = Text(selector, "rule_id");
+  Require(rule.find('\0') == std::string::npos,
+          "global rule recovery ID contains a null byte");
+  return {DecodeRequestContext(Member(value, "request_context")),
+          {std::move(actual_context), core::InterruptPolicyId(std::move(rule)),
+           IoCounter(selector, "expected_rule_registration_id", 1U)},
+          OptionalBoundedText(value, "reason", kMaximumReasonBytes)};
+}
+
+core::IoWatchRegistrationDTO DecodeIoWatchRegistration(const CanonicalValue& value) {
+  RequireExactObjectSize(value, 4U, "I/O watch registration");
+  const auto& scope = Member(value, "scope");
+  RequireExactObjectSize(scope, 3U, "I/O watch scope");
+  const auto& node = Member(scope, "node");
+  RequireExactObjectSize(node, 2U, "I/O watch node scope");
+  core::ProgramNodeExecutionScopeDTO node_scope{
+      core::ProgramNodeInstanceId(Text(node, "node_instance_id")),
+      Text(node, "node_attempt_id")};
+  Require(core::valid_program_node_execution_scope(node_scope),
+          "I/O watch node scope is invalid");
+  return {core::RequestOwnerEpoch(Text(value, "owner_epoch")),
+          IoCounter(value, "catalog_generation", 1U),
+          IoCounter(value, "registration_id", 1U),
+          {core::RequestOwnerEpoch(Text(scope, "program_runner_owner_epoch")),
+           core::ProgramRunId(Text(scope, "program_run_id")),
+           std::move(node_scope)}};
+}
+
+core::ProgramIoWatchScopeReleaseRequestDTO
+DecodeIoWatchScopeRelease(const CanonicalValue &request) {
+  RequireExactObjectSize(request, 8U, "I/O watch scope release");
+  Require(Text(request, "schema_version") ==
+              "manyforge.io_watch_scope_release.v1",
+          "I/O watch scope release schema is unsupported");
+  core::ProgramNodeExecutionScopeDTO node{
+      core::ProgramNodeInstanceId(Text(request, "node_instance_id")),
+      Text(request, "node_attempt_id")};
+  Require(core::valid_program_node_execution_scope(node),
+          "I/O watch node scope is invalid");
+  return {core::RequestOwnerEpoch(Text(request, "owner_epoch")),
+          core::ProgramBindingId(Text(request, "program_binding_id")),
+          core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
+          core::CellAdmissionClaimGeneration(
+              Counter(request, "claim_generation", 1U)),
+          core::ProgramRunId(Text(request, "program_run_id")),
+          std::move(node)};
+}
+
+core::IoProgramBlackboardPublicationDTO
+DecodeBlackboardPublication(const CanonicalValue &request) {
+  RequireExactObjectSize(request, 12U, "Program BB publication");
+  Require(Text(request, "schema_version") ==
+              "manyforge.program_bbkey_publication.v1",
+          "Program BB publication schema is unsupported");
+  const auto &claim = Member(request, "claim_generation");
+  const auto &run = Member(request, "program_run_id");
+  Require(claim.is_null() == run.is_null(),
+          "Program BB Run and claim must both be present or both null");
+  std::optional<core::CellAdmissionClaimGeneration> claim_generation;
+  std::optional<core::ProgramRunId> program_run_id;
+  if (!claim.is_null()) {
+    claim_generation = core::CellAdmissionClaimGeneration(
+        Counter(request, "claim_generation", 1U));
+    program_run_id = core::ProgramRunId(Text(request, "program_run_id"));
+  }
+  const auto kind = Text(request, "kind");
+  Require(kind == "baseline" || kind == "update",
+          "Program BB publication kind is unsupported");
+  std::vector<core::IoBlackboardValueDTO> values;
+  std::string previous;
+  for (const auto &row : Array(request, "values")) {
+    RequireExactObjectSize(row, 3U, "Program BB value");
+    auto name = Text(row, "name");
+    Require(previous < name,
+            "Program BB value names must be unique and canonical-sorted");
+    previous = name;
+    const auto type = Text(row, "value_type");
+    core::IoConditionValueKind value_kind =
+        core::IoConditionValueKind::kBoolean;
+    if (type == "bool")
+      value_kind = core::IoConditionValueKind::kBoolean;
+    else if (type == "float64")
+      value_kind = core::IoConditionValueKind::kFloat64;
+    else if (type == "string")
+      value_kind = core::IoConditionValueKind::kString;
+    else if (type == "int64")
+      value_kind = core::IoConditionValueKind::kInt64;
+    else
+      Fail("Program BB value type is unsupported");
+    std::optional<core::IoConditionValueDTO> value;
+    if (Member(row, "value").is_null()) {
+      // Truthful unset key: its declared type is retained independently.
+    } else if (type == "bool")
+      value = core::IoConditionValueDTO{Boolean(row, "value")};
+    else if (type == "float64")
+      value = core::IoConditionValueDTO{Number(row, "value")};
+    else if (type == "string") {
+      const auto &text = Member(row, "value");
+      Require(text.is_string(), "Program BB string value has the wrong type");
+      value = core::IoConditionValueDTO{
+          text.as_string()}; // Complete packet bounds the payload.
+    } else if (type == "int64") {
+      const auto &text = Member(row, "value");
+      Require(text.is_string() && !text.as_string().empty() &&
+                  text.as_string().size() <= 20U,
+              "Program BB int64 must be canonical signed decimal");
+      const auto &bytes = text.as_string();
+      std::int64_t integer{};
+      const auto parsed =
+          std::from_chars(bytes.data(), bytes.data() + bytes.size(), integer);
+      Require(parsed.ec == std::errc{} &&
+                  parsed.ptr == bytes.data() + bytes.size() &&
+                  std::to_string(integer) == bytes,
+              "Program BB int64 is noncanonical or outside its signed range");
+      value = core::IoConditionValueDTO{integer};
+    }
+    values.push_back({std::move(name), value_kind, std::move(value)});
+  }
+  return {
+      {core::RequestOwnerEpoch(Text(request, "owner_epoch")),
+       core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
+       Counter(request, "cycle_generation", 1U), std::move(claim_generation),
+       std::move(program_run_id),
+       core::ProgramBindingId(Text(request, "program_binding_id")),
+       core::ActiveBundlePublicationGeneration(
+           Counter(request, "active_publication_generation", 1U))},
+      kind == "baseline" ? core::IoBlackboardPublicationKind::kBaseline
+                         : core::IoBlackboardPublicationKind::kUpdate,
+      IoCounter(request, "message_sequence", 1U),
+      IoCounter(request, "previous_sequence", 0U),
+      std::move(values),
+      0}; // Kernel replaces this with the trusted receiver clock at admission.
+}
+
+} // namespace
+
+std::vector<core::ProgramMockSimulationSignalDTO>
+DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
+  Require(rows.is_array() && !rows.as_array().empty(), "Mock simulation signals must be a nonempty array");
+  std::vector<core::ProgramMockSimulationSignalDTO> result;
+  result.reserve(rows.as_array().size());
+  for (const auto& row : rows.as_array()) {
+    RequireExactObjectSize(row, 3U, "Mock simulation row");
+    const auto& selector = Member(row, "signal");
+    RequireExactObjectSize(selector, 2U, "Mock simulation selector");
+    std::optional<core::ProgramMockSimulationChangeDTO> change;
+    if (const auto& value = Member(row, "change"); !value.is_null()) {
+      RequireExactObjectSize(value, 2U, "Mock simulation change");
+      change = core::ProgramMockSimulationChangeDTO{Counter(value, "after_ms", 0U), Boolean(value, "value")};
+    }
+    core::ProgramMockSimulationSignalDTO next{
+        core::TargetRoleId(Text(selector, "target_role")),
+        core::ResourceRoleId(Text(selector, "resource_role")), Boolean(row, "start_value"), change};
+    if (!result.empty()) {
+      const auto& previous = result.back();
+      Require(previous.target_role_id < next.target_role_id ||
+                  (previous.target_role_id == next.target_role_id && previous.resource_role_id < next.resource_role_id),
+              "Mock simulation selectors must be sorted and unique");
+    }
+    result.push_back(std::move(next));
+  }
+  return result;
+}
+
 [[nodiscard]] Command DecodeCommand(std::string_view bytes) {
   Require(!bytes.empty() && bytes.size() <= kMaximumPacketBytes,
           "execution command packet is empty or oversized");
@@ -1096,6 +1348,140 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   Require(Text(root, "api_version") == kCommandApiVersion,
           "execution command API version is unsupported");
   const auto command = Text(root, "command");
+  if (command == "publish_program_bbkeys") {
+    RequireExactObjectSize(root, 4U, "Program BB publication command");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance ==
+                    core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(),
+            "Program BB publication requires internal owner attribution");
+    Command decoded{CommandKind::kPublishProgramBlackboard};
+    decoded.blackboard_publication =
+        DecodeBlackboardPublication(Member(root, "request"));
+    return decoded;
+  }
+  if (command == "set_mock_io_run_paused") {
+    RequireExactObjectSize(root, 4U, "Run Mock simulation clock command");
+    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance == core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(), "Run Mock simulation requires internal owner attribution");
+    const auto& request = Member(root, "request");
+    RequireExactObjectSize(request, 9U, "Run Mock simulation clock request");
+    Require(Text(request, "schema_version") == "manyforge.mock_io_run_pause.v1",
+            "Run Mock simulation clock schema is unsupported");
+    std::vector<core::ProgramNodeInstanceId> held_nodes;
+    for (const auto& value : Array(request, "held_node_instance_ids")) {
+      const auto* id = std::get_if<std::string>(&value.storage());
+      Require(id && !id->empty() && id->size() <= 128U && id->find('\0') == std::string::npos &&
+                  (held_nodes.empty() || held_nodes.back().value() < *id),
+              "Run Mock simulation held mask must contain canonical unique captured node IDs");
+      held_nodes.emplace_back(*id);
+    }
+    Command decoded{CommandKind::kSetMockIoRunPaused};
+    decoded.mock_run_simulation_pause = core::ProgramRunMockSimulationPauseRequestDTO{
+        {core::RequestOwnerEpoch(Text(request, "owner_epoch")), core::ProgramBindingId(Text(request, "program_binding_id")),
+         core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
+         core::CellAdmissionClaimGeneration(Counter(request, "claim_generation", 1U)),
+         core::ProgramRunId(Text(request, "program_run_id"))},
+        IoCounter(request, "run_revision", 1U), Boolean(request, "paused"), std::move(held_nodes)};
+    return decoded;
+  }
+  if (command == "start_mock_io_node_simulation" || command == "end_mock_io_node_simulation") {
+    RequireExactObjectSize(root, 4U, "Node Mock simulation command");
+    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance == core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(), "Node Mock simulation requires internal owner attribution");
+    const auto& request = Member(root, "request");
+    const bool ending = command == "end_mock_io_node_simulation";
+    RequireExactObjectSize(request, ending ? 9U : 10U, "Node Mock simulation request");
+    Require(Text(request, "schema_version") == (ending ? "manyforge.mock_io_node_end.v1" : "manyforge.mock_io_node_start.v1"),
+            "Node Mock simulation schema is unsupported");
+    core::ProgramNodeExecutionScopeDTO node{core::ProgramNodeInstanceId(Text(request, "node_instance_id")),
+                                           Text(request, "node_attempt_id")};
+    Require(core::valid_program_node_execution_scope(node), "Node Mock simulation scope is invalid");
+    core::ProgramNodeMockSimulationScopeDTO scope{
+        core::RequestOwnerEpoch(Text(request, "owner_epoch")), core::ProgramBindingId(Text(request, "program_binding_id")),
+        core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
+        core::CellAdmissionClaimGeneration(Counter(request, "claim_generation", 1U)),
+        core::ProgramRunId(Text(request, "program_run_id")), std::move(node),
+        IoCounter(request, "node_start_index", 1U)};
+    Command decoded{ending ? CommandKind::kEndMockIoNodeSimulation : CommandKind::kStartMockIoNodeSimulation};
+    if (ending) decoded.mock_node_simulation_end = std::move(scope);
+    else decoded.mock_node_simulation = core::ProgramNodeMockSimulationRequestDTO{
+        std::move(scope), DecodeProgramMockSimulationSignals(Member(request, "signals"))};
+    return decoded;
+  }
+  if (command == "set_mock_io_input") {
+    RequireExactObjectSize(root, 4U, "Mock input command");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance ==
+                    core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(),
+            "Mock input commands require internal owner attribution");
+    const auto &request = Member(root, "request");
+    RequireExactObjectSize(request, 7U, "Mock input request");
+    Require(Text(request, "schema_version") == "manyforge.mock_io_input_request.v1",
+            "Mock input request schema is unsupported");
+    Command decoded{CommandKind::kSetMockIoInput};
+    decoded.mock_io_input_set = MockIoInputSetRequest{
+        {core::RequestOwnerEpoch(Text(request, "owner_epoch")),
+         core::ProgramBindingId(Text(request, "program_binding_id")),
+         core::TargetRoleId(Text(request, "target_role_id")), {}, {}, {},
+         core::ResourceRoleId(Text(request, "resource_role_id"))},
+        core::IoSourceIncarnation(Text(request, "expected_source_epoch")),
+        Boolean(request, "value")};
+    return decoded;
+  }
+  if (command == "register_io_watch" || command == "read_io_watch" ||
+      command == "release_io_watch") {
+    RequireExactObjectSize(root, 4U, "I/O watch command");
+    const auto attribution = DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance == core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(),
+            "I/O watch commands require internal owner attribution");
+    if (command != "register_io_watch") {
+      Command decoded{command == "read_io_watch"
+                          ? CommandKind::kReadIoWatch
+                          : CommandKind::kReleaseIoWatch};
+      if (command == "release_io_watch" &&
+          root.find_object_member("scope_request"))
+        decoded.io_watch_scope_release =
+            DecodeIoWatchScopeRelease(Member(root, "scope_request"));
+      else
+        decoded.io_watch_registration =
+            DecodeIoWatchRegistration(Member(root, "registration"));
+      return decoded;
+    }
+    const auto &request = Member(root, "request");
+    RequireExactObjectSize(request, 11U, "I/O watch request");
+    Require(Text(request, "schema_version") == "manyforge.io_watch_request.v1",
+            "I/O watch request schema is unsupported");
+    const auto& condition = Member(request, "condition");
+    RequireExactObjectSize(condition, 2U, "I/O watch condition");
+    core::ProgramNodeExecutionScopeDTO node{
+        core::ProgramNodeInstanceId(Text(request, "node_instance_id")),
+        Text(request, "node_attempt_id")};
+    Require(core::valid_program_node_execution_scope(node), "I/O watch node scope is invalid");
+    Command decoded{CommandKind::kRegisterIoWatch};
+    decoded.io_watch_condition_unsupported = Text(condition, "kind") != "level";
+    decoded.io_watch_request = core::ProgramIoWatchRequestDTO{
+        core::RequestOwnerEpoch(Text(request, "owner_epoch")),
+        core::ProgramBindingId(Text(request, "program_binding_id")),
+        core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
+        core::CellAdmissionClaimGeneration(Counter(request, "claim_generation", 1U)),
+        core::ProgramRunId(Text(request, "program_run_id")), std::move(node),
+        core::TargetRoleId(Text(request, "target_role_id")),
+        core::ResourceRoleId(Text(request, "resource_role_id")),
+        Boolean(condition, "expected_value")};
+    return decoded;
+  }
   if (command == "stop_program_selection" ||
       command == "start_program_selection" ||
       command == "release_program_selection") {
@@ -1111,7 +1497,10 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
                 !attribution.principal_id.has_value(),
             "Program selection requires internal owner attribution");
     const auto &request = Member(root, "request");
-    RequireExactObjectSize(request, 6U, "Program selection request");
+    const bool node_release = request.find_object_member("node_instance_id") != nullptr;
+    Require(!node_release || release,
+            "exact node selection is exclusive to individual hold release");
+    RequireExactObjectSize(request, node_release ? 7U : 6U, "Program selection request");
     Require(Text(request, "schema_version") ==
                 "manyforge.program_execution_selection.v2",
             "Program selection request schema is unsupported");
@@ -1126,6 +1515,12 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
         core::ProgramRunId(Text(request, "program_run_id")),
         TextArray(request, "group_ids", core::kMaxProgramExecutionGroups),
         attribution};
+    if (node_release) {
+      Require(decoded.program_selection->group_ids.empty(),
+              "individual hold release cannot mix node and group selectors");
+      decoded.program_selection->node_instance_id =
+          core::ProgramNodeInstanceId(Text(request, "node_instance_id"));
+    }
     if (start || release)
       decoded.expected_selection_revision =
           Counter(root, "expected_selection_revision", 0U);
@@ -1252,6 +1647,18 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
           FrameTransformQuery{DecodePose(pose), DecodeReference(source, true),
                               DecodeReference(target, true), pose, source,
                               target}};
+      return decoded;
+    }
+    if (kind == "io_signal") {
+      RequireExactObjectSize(query, 6U, "I/O signal query");
+      Require(Text(query, "schema_version") == "manyforge.target_observation_query.v1",
+              "target observation query schema is unsupported");
+      Command decoded{CommandKind::kQueryTarget};
+      decoded.target_query = TargetObservationQuery{
+          core::RequestOwnerEpoch(Text(query, "owner_epoch")),
+          core::ProgramBindingId(Text(query, "program_binding_id")),
+          core::TargetRoleId(Text(query, "target_role_id")), {}, {}, {},
+          core::ResourceRoleId(Text(query, "resource_role_id"))};
       return decoded;
     }
     Require(kind == "frame_pose" || kind == "gripper_status",
@@ -1503,8 +1910,11 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   if (command == "recover_stop_fault") {
     RequireExactObjectSize(root, 3U, "Stop-fault recovery command");
     Command decoded{CommandKind::kRecoverStopFault};
-    decoded.stop_fault_recovery =
-        DecodeStopFaultRecoveryIntent(Member(root, "request"));
+    const auto &request = Member(root, "request");
+    if (request.find_object_member("kind"))
+      decoded.global_io_rule_recovery = DecodeGlobalIoRuleRecoveryIntent(request);
+    else
+      decoded.stop_fault_recovery = DecodeStopFaultRecoveryIntent(request);
     return decoded;
   }
   if (command == "set_operation_runtime_scale") {
@@ -1548,7 +1958,8 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
       DecodeRequestAttribution(Member(root, "attribution"));
   Command decoded{kind};
   decoded.control =
-      DecodeOperationControlRequest(Member(root, "request"), attribution);
+      DecodeOperationControlRequest(Member(root, "request"), attribution,
+                                    kind == CommandKind::kReset);
   return decoded;
 }
 

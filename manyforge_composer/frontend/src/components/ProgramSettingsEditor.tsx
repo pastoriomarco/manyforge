@@ -10,6 +10,8 @@ import type {
   ProgramAuthoringDocument,
 } from '../types/api';
 import {
+  collectComponentRoleUsages,
+  removeGuardTitle,
   deriveProgramMotionConfiguration,
   flattenProgramForest,
   PROGRAM_MOTION_CEILING_FIELDS,
@@ -89,6 +91,10 @@ export function ProgramSettingsEditor({
   onRoleCreated,
   diagnostics = [],
 }: ProgramSettingsEditorProps) {
+  const componentRoleUsages = useMemo(
+    () => collectComponentRoleUsages(program, catalogEntries),
+    [catalogEntries, program],
+  );
   const motionConfiguration = useMemo(
     () => deriveProgramMotionConfiguration(program, catalogEntries),
     [catalogEntries, program],
@@ -290,6 +296,14 @@ export function ProgramSettingsEditor({
       setError(caught instanceof Error ? caught.message : 'Component role is invalid.');
       setErrorTarget('program-component-role-id');
     }
+  };
+  const removeComponentRole = (roleId: string) => {
+    void replaceRoles(
+      Object.fromEntries(
+        Object.entries(program.component_roles).filter(([role]) => role !== roleId),
+      ),
+      program.target_roles,
+    );
   };
   const addTargetRole = () => {
     try {
@@ -710,9 +724,29 @@ export function ProgramSettingsEditor({
           implementations later; this Program does not name live components.
         </p>
         <dl>
-          {Object.keys(program.component_roles).map((role) => (
-            <div key={`component:${role}`}><dt>Component role</dt><dd><code>{role}</code></dd></div>
-          ))}
+          {Object.keys(program.component_roles).map((role) => {
+            const usages = componentRoleUsages.get(role) ?? [];
+            return (
+              <div key={`component:${role}`}>
+                <dt>Component role</dt>
+                <dd>
+                  <code>{role}</code>
+                  {' '}
+                  <button
+                    type="button"
+                    className="text-button"
+                    aria-label={`Remove component role ${role}`}
+                    disabled={busy || usages.length > 0}
+                    title={removeGuardTitle(usages, 'Remove component role')}
+                    onClick={() => removeComponentRole(role)}
+                  >Remove</button>
+                  {usages.length > 0 && (
+                    <small> {usages.length} binding{usages.length === 1 ? '' : 's'}</small>
+                  )}
+                </dd>
+              </div>
+            );
+          })}
           {Object.keys(program.target_roles).map((role) => (
             <div key={`target:${role}`}><dt>Target role</dt><dd><code>{role}</code></dd></div>
           ))}

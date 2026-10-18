@@ -85,6 +85,17 @@ namespace deployment = manyforge::deployment;
            candidate_host.dependency_runtime_unit_ids ==
                empty_host.dependency_runtime_unit_ids;
   }
+  if (candidate.size() == 1U &&
+      candidate.front().runtime_profile_id.value() ==
+          deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId) {
+    auto expected = candidate.front();
+    for (const auto name : {"io_signals", "io_provider_devices"}) {
+      const auto field = expected.configuration.find(name);
+      if (field != expected.configuration.end())
+        field->second = core::JsonValueDTO{core::JsonValueDTO::Array{}};
+    }
+    return expected == empty.front();
+  }
   return candidate == empty;
 }
 
@@ -683,6 +694,22 @@ void verify_gripper_resource_semantics(
     throw std::logic_error(
         "maintained gripper proof requires a controllable component");
   }
+  const auto provider_only = [&](const auto &component) {
+    return component.model_role_bindings.empty() &&
+           std::any_of(graph.control_domains.begin(),
+                       graph.control_domains.end(), [&](const auto &domain) {
+                         return domain.provider() &&
+                                domain.provider()->controllable_component_id ==
+                                    component.controllable_component_id;
+                       });
+  };
+  const auto physical_components = static_cast<std::size_t>(std::count_if(
+      graph.controllable_components.begin(),
+      graph.controllable_components.end(),
+      [&](const auto &component) { return !provider_only(component); }));
+  // Genuine qualified provider-only components have no physical gripper fact.
+  if (physical_components == 0U)
+    return;
   // DX783: the maintained arm-only family has no gripper target. Its Programs
   // requiring one must fail the normal role/capability selection, not acquire
   // a component-local placeholder that could be mistaken for a physical tool.
@@ -725,7 +752,7 @@ void verify_gripper_resource_semantics(
       }
     }
   }
-  if (found_components.size() != graph.controllable_components.size()) {
+  if (found_components.size() != physical_components) {
     throw std::logic_error(
         "maintained deployment lacks one retained gripper resource proof per "
         "component");
@@ -979,7 +1006,8 @@ materialize_scenarios(const std::filesystem::path &root,
     auto bundle = deployment::detail::RetainedBundleMaterializer::
         materialize_store_and_reload_production(
             qualified, manifest_repository, input_source, selected_preparations,
-            catalog_store, raw_store, bundle_repository);
+            catalog_store, raw_store, bundle_repository,
+            /*retain_empty_model_map=*/true);
     if (bundle == nullptr ||
         bundle->value().compiled_products.symbol_role_maps.size() > 1U) {
       throw std::logic_error("scenario retained an invalid model-map set");
@@ -1079,7 +1107,10 @@ materialize_scenarios(const std::filesystem::path &root,
         }
       }
     }
-    if (model_map.has_value()) {
+    // A cell without components has no gripper to prove; its empty map is
+    // only the Program-binding model map.
+    if (model_map.has_value() &&
+        !verified.graph().graph().controllable_components.empty()) {
       verify_gripper_resource_semantics(scenario, verified.graph().graph(),
                                         *model_map);
     }
@@ -1546,7 +1577,7 @@ qualify_catalog(const std::filesystem::path &root,
   QualifiedCatalogClosure result;
 
   for (const auto &path :
-       source_files(catalog_root / "capability_definition", 42U)) {
+       source_files(catalog_root / "capability_definition", 45U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::CapabilityDefinitionCatalogRecordRefDTO>(bytes);
@@ -1564,7 +1595,7 @@ qualify_catalog(const std::filesystem::path &root,
       target_capabilities.push_back(capability);
     }
   }
-  if (target_capabilities.size() != 21U) {
+  if (target_capabilities.size() != 24U) {
     throw std::logic_error(
         "maintained component closure has the wrong target-capability count");
   }
@@ -1658,7 +1689,7 @@ qualify_catalog(const std::filesystem::path &root,
   bool found_lite6_gripper_lifecycle_manifest = false;
   bool found_ros2_control_lifecycle_manifest = false;
   for (const auto &path :
-       source_files(catalog_root / "provider_manifest", 7U)) {
+       source_files(catalog_root / "provider_manifest", 8U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ProviderManifestCatalogRecordRefDTO>(bytes);
@@ -1755,19 +1786,21 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
-  const std::filesystem::path command_path =
-      root / "manyforge_deployment/resources/catalog/"
-             "gripper.command_position.v1.yaml";
-  const std::string command_bytes = read_file(command_path);
-  const auto command_reference =
-      make_reference<core::CommandSchemaCatalogRecordRefDTO>(command_bytes);
-  result.command_schemas.push_back(
-      deployment::resolve_and_qualify_command_schema(
-          command_reference, command_reference.content_addressed_store_key,
-          command_bytes));
-  input_source.add(command_reference.content_addressed_store_key,
-                   command_reference.content_digest, command_bytes);
-  insert_reference(result, command_reference);
+  for (const std::string_view name : {"gripper.command_position.v1.yaml",
+                                      "io.signal_write_boolean.v1.yaml"}) {
+    const std::filesystem::path command_path =
+        root / "manyforge_deployment/resources/catalog" / name;
+    const std::string command_bytes = read_file(command_path);
+    const auto command_reference =
+        make_reference<core::CommandSchemaCatalogRecordRefDTO>(command_bytes);
+    result.command_schemas.push_back(
+        deployment::resolve_and_qualify_command_schema(
+            command_reference, command_reference.content_addressed_store_key,
+            command_bytes));
+    input_source.add(command_reference.content_addressed_store_key,
+                     command_reference.content_digest, command_bytes);
+    insert_reference(result, command_reference);
+  }
 
   result.contracts = contracts;
   for (const auto &family : families) {
@@ -1905,7 +1938,8 @@ void verify_scenarios(const std::filesystem::path &root,
       root / "manyforge_deployment/resources/maintained/"
              "maintained_deployment_sources.v1.json");
   if (deployment::sha256_digest(description_bytes) !=
-      "sha256:8ca8f3cf1fe6e9fd7a7532dd6c38c867dd7010fa4643f319e69db7e8a5507c08") {
+      "sha256:"
+      "2e26d0d9dd7a194f14438af7bbe2e02d3d3f81291c6385bbc8e2fedd1f0ec6da") {
     throw std::invalid_argument(
         "maintained runtime input source differs from its qualified source pin");
   }
@@ -2620,6 +2654,17 @@ PreparedActivationMaterialization materialize_prepared_activation(
   ExactCompilerInputSource input_source;
   auto catalog = qualify_catalog(options.workspace_root, input_source, {},
                                  prepared_models);
+  const auto io_types = prepare_activation_io_types(intent, component_profiles,
+                                                    catalog.capabilities);
+  for (const auto &prepared : io_types) {
+    const auto &reference = prepared.type.reference();
+    input_source.add(reference.content_addressed_store_key,
+                     reference.content_digest, prepared.catalog_bytes);
+    if (!catalog.records.contains(catalog_key(reference))) {
+      insert_reference(catalog, reference);
+      catalog.component_types.push_back(prepared.type);
+    }
+  }
   std::vector<core::CatalogRecordRefDTO> catalog_records;
   catalog_records.reserve(catalog.records.size());
   for (const auto &[unused, reference] : catalog.records) {
@@ -2629,8 +2674,9 @@ PreparedActivationMaterialization materialize_prepared_activation(
   CanonicalValue compiled;
   try {
     compiled = compile_activation_deployment(
-        intent, runtime_cell_id, component_profiles, prepared_models, catalog_records,
-        catalog.runtime_profiles);
+        intent, runtime_cell_id, component_profiles, prepared_models,
+        catalog_records, catalog.runtime_profiles, io_types,
+        catalog.provider_manifests);
   } catch (const std::bad_alloc &) {
     throw std::runtime_error(
         "activation Deployment compiler exhausted memory");

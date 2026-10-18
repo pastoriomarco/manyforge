@@ -9,6 +9,18 @@
 
 namespace manyforge::core {
 
+/// Provider outputs are sealed without controller topology or physical Stop evidence.
+[[nodiscard]] Result<PreparedOperationParticipantDTO> MakePreparedIoOutputParticipant(
+    const OperationId& operation_id, OperationRevision operation_revision,
+    const OperationParticipantId& participant_id, const ProgramRunId& program_run_id,
+    const CapabilityCommandIntentDTO& command, const RuntimeParticipantBinding& binding);
+[[nodiscard]] Result<PreparedOperationParticipantDTO> MakePreparedIoOutputParticipant(
+    PreparedOperationParticipantDTO candidate, const RuntimeParticipantBinding& binding);
+[[nodiscard]] Result<void> VerifyPreparedIoOutputParticipant(
+    const PreparedOperationParticipantDTO& value, const RuntimeParticipantBinding& binding);
+[[nodiscard]] Result<std::string> EncodePreparedIoOutputParticipant(
+    const PreparedOperationParticipantDTO& value, const RuntimeParticipantBinding& binding);
+
 [[nodiscard]] Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
     PreparedOperationParticipantDTO candidate, const RuntimeParticipantBinding& binding,
     const RuntimeParticipantStopReadiness& readiness,

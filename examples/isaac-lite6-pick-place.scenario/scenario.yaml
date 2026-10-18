@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:dc572e492edec9edcd61a9e8404f16c75c4ad77cb9cab55aff7d8f20eeb7a253",
     "deployment.yaml": "sha256:f19bc5b9b45d368888fa0d119ea8d55f402b26b7bbfe248aa9990d41b787535c",
-    "program.yaml": "sha256:49db4d91fd923da03c6c8472137861b2a7fe95d40540b2518defc30ccab4463a"
+    "program.yaml": "sha256:0f0e4cdb722eb72cf905cf21e6a7be9144432d84afc5600a4ab11c7f8769f3be"
   },
   "name": "isaac_lite6_lite_gripper_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:61d2d470758598f558a91af1b7553f0ed298d07b68572a70c572b1b033021384",
+    "checked_content_digest": "sha256:66865ddd943d12251e9ece7b940e3291db6d9ee5d24a660b83ee415646d28fd4",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

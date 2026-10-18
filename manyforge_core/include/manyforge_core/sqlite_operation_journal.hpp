@@ -14,8 +14,8 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kOperationJournalSchemaId =
-    "manyforge.internal.execution.operation-journal.o1.5.v14";
-inline constexpr std::int64_t kOperationJournalSchemaVersion = 14;
+    "manyforge.internal.execution.operation-journal.o1.5.v16";
+inline constexpr std::int64_t kOperationJournalSchemaVersion = 16;
 inline constexpr std::int64_t kOperationJournalSqliteApplicationId = 0x4D46454A;
 inline constexpr std::string_view kOperationJournalFilename = "operation-journal.sqlite3";
 inline constexpr std::size_t kMaximumOperationJournalHistory = 4096U;
@@ -128,6 +128,10 @@ class SqliteOperationJournal final : public IOperationJournal {
   [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionGenerationAdvanced(
       const RequestOwnerEpoch& owner_epoch, AdmissionGeneration prior_generation,
       AdmissionGeneration resulting_generation) override;
+  [[nodiscard]] Result<std::uint64_t> RecordInterruptRuleStateChanged(
+      const IoRuleStateChangeDTO& change) override;
+  [[nodiscard]] Result<std::uint64_t> RecordGlobalIoRuleCleared(
+      const IoGlobalRuleRecoveryRecordDTO& record) override;
 
   /// Read-only, replay-safe projection. Reading never acknowledges, deletes,
   /// or changes operation ownership.

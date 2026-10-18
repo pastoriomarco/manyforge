@@ -1,4 +1,6 @@
 #include "manyforge_deployment/verified_retained_bundle.hpp"
+#include <manyforge_deployment/io_provider_domain.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 
 #include <algorithm>
 #include <array>
@@ -150,6 +152,14 @@ require_array(const CanonicalValue &value, std::string_view field) {
     detail::fail_retained_bundle(std::string(field) + " must be a string");
   }
   return *text;
+}
+
+[[nodiscard]] const CanonicalValue *
+find_member(const CanonicalValue::Object &object, std::string_view name) {
+  const auto found =
+      std::find_if(object.begin(), object.end(),
+                   [name](const auto &member) { return member.first == name; });
+  return found == object.end() ? nullptr : &found->second;
 }
 
 [[nodiscard]] const CanonicalValue &
@@ -470,8 +480,12 @@ parse_retained_product(const CanonicalValue &value, std::string_view field,
     }
     return verified;
   }
-  if (graph.model_instances.empty() || graph.controllable_components.empty() ||
-      graph.control_domains.empty() || graph.control_bindings.empty()) {
+  const bool has_controller_domain = std::any_of(
+      graph.control_domains.begin(), graph.control_domains.end(),
+      [](const auto &domain) { return domain.provider() == nullptr; });
+  if (graph.controllable_components.empty() || graph.control_domains.empty() ||
+      (has_controller_domain &&
+       (graph.model_instances.empty() || graph.control_bindings.empty()))) {
     detail::fail_retained_bundle(
         "retained native control graph requires non-empty model, component, "
         "domain, and binding tables");
@@ -498,9 +512,17 @@ parse_retained_product(const CanonicalValue &value, std::string_view field,
 
   std::set<core::ModelInstanceId> owned_models;
   for (const auto &component : graph.controllable_components) {
-    if (!component.root_pose_in_cell.has_value() ||
-        component.model_role_bindings.empty() || !has_execution_runtime ||
-        component.runtime_unit_ids.empty() ||
+    const bool model_free_provider =
+        component.model_role_bindings.empty() &&
+        std::any_of(graph.control_domains.begin(), graph.control_domains.end(),
+                    [&](const auto &domain) {
+                      return domain.provider() &&
+                             domain.provider()->controllable_component_id ==
+                                 component.controllable_component_id;
+                    });
+    if ((!model_free_provider && (!component.root_pose_in_cell.has_value() ||
+                                  component.model_role_bindings.empty())) ||
+        !has_execution_runtime || component.runtime_unit_ids.empty() ||
         !std::all_of(component.runtime_unit_ids.begin(),
                      component.runtime_unit_ids.end(),
                      [&](const auto &runtime_unit_id) {
@@ -560,13 +582,14 @@ parse_retained_product(const CanonicalValue &value, std::string_view field,
           return value.control_domain_id == binding.control_domain_id;
         });
     if (component == graph.controllable_components.end() ||
-        domain == graph.control_domains.end() ||
+        domain == graph.control_domains.end() || domain->provider() ||
         binding.resource_bindings.empty() ||
         binding.legal_control_route_ids.empty() ||
         binding.route_endpoint_projections.size() !=
             binding.legal_control_route_ids.size() ||
-        binding.controller_topology_id != domain->controller_topology_id ||
-        binding.topology_revision != domain->topology_revision ||
+        binding.controller_topology_id !=
+            domain->controller().controller_topology_id ||
+        binding.topology_revision != domain->controller().topology_revision ||
         !execution_runtime_units.contains(binding.provider_runtime_unit_id) ||
         std::find(component->runtime_unit_ids.begin(),
                   component->runtime_unit_ids.end(),
@@ -632,9 +655,15 @@ void require_structural_catalog_closure(
                           component.component_type_revision.value());
   }
   for (const auto &domain : graph.control_domains) {
-    graph_records.emplace(core::CatalogRecordKind::kControllerTopology,
-                          domain.controller_topology_id.value(),
-                          domain.topology_revision.value());
+    if (const auto *provider = domain.provider()) {
+      graph_records.emplace(core::CatalogRecordKind::kProviderManifest,
+                            provider->provider_manifest_id.value(),
+                            provider->provider_manifest_revision.value());
+    } else {
+      graph_records.emplace(core::CatalogRecordKind::kControllerTopology,
+                            domain.controller().controller_topology_id.value(),
+                            domain.controller().topology_revision.value());
+    }
   }
   for (const auto &binding : graph.control_bindings) {
     graph_records.emplace(core::CatalogRecordKind::kCapabilityDefinition,
@@ -660,6 +689,11 @@ void require_structural_catalog_closure(
     }
   }
   for (const auto &binding : provider_bindings) {
+    if (binding.capability_id.value() == "io.gpio.set_output")
+      graph_records.emplace(
+          core::CatalogRecordKind::kCommandSchema,
+          std::string(core::kIoSignalWriteCommandSchemaId),
+          std::string(core::kIoSignalWriteCommandSchemaRevision));
     graph_records.emplace(core::CatalogRecordKind::kCapabilityDefinition,
                           binding.capability_id.value(),
                           binding.capability_definition_revision.value());
@@ -955,14 +989,155 @@ void verify_node_environment_projection(const CanonicalValue &value) {
       "catalogs.node_environment.environment_digest");
 }
 
+// Normalized hard profiles contain explicit false flags that the authored
+// source grammar deliberately forbids spelling. Reconstruct only that source
+// omission; the caller requires exact normalization back to the retained rows.
+CanonicalValue interrupt_policy_source_rows(const CanonicalValue &rows) {
+  auto policies = rows.as_array();
+  for (auto &policy : policies) {
+    const auto *profile = policy.find_object_member("stop_profile");
+    if (profile == nullptr || !profile->is_object())
+      continue;
+    const auto *mode = profile->find_object_member("stop_mode");
+    if (mode == nullptr || !mode->is_string() ||
+        mode->as_string() != "hard_deceleration")
+      continue;
+    auto fields = profile->as_object();
+    fields.erase(std::remove_if(
+                     fields.begin(), fields.end(),
+                     [](const auto &field) {
+                       return (field.first ==
+                                   "allow_natural_completion_on_short_path" ||
+                               field.first == "jerk_limits_enabled") &&
+                              field.second.is_bool() && !field.second.as_bool();
+                     }),
+                 fields.end());
+    auto members = policy.as_object();
+    for (auto &[name, value] : members)
+      if (name == "stop_profile")
+        value = CanonicalValue(std::move(fields));
+    policy = CanonicalValue(std::move(members));
+  }
+  return CanonicalValue(std::move(policies));
+}
+
+void require_retained_interrupt_policy_references(
+    const CanonicalValue::Object &interrupts, const core::CellGraphDTO &graph,
+    const std::vector<core::CapabilityProviderBindingDTO> &providers) {
+  std::map<std::string, std::set<std::string>> known;
+  for (const auto &component : graph.controllable_components)
+    known["controllable_component_ids"].insert(
+        component.controllable_component_id.value());
+  for (const auto &domain : graph.control_domains)
+    known["control_domain_ids"].insert(domain.control_domain_id.value());
+  for (const auto &binding : graph.control_bindings) {
+    known["control_binding_ids"].insert(binding.control_binding_id.value());
+    known["command_target_ids"].insert(binding.command_target_id.value());
+    for (const auto &resource : binding.resource_bindings)
+      known["resource_ids"].insert(resource.resource_id.value());
+  }
+  for (const auto &provider : providers) {
+    if (const auto *target =
+            std::get_if<core::ComponentTargetCapabilityProviderTargetDTO>(
+                &provider.target))
+      known["command_target_ids"].insert(target->command_target_id.value());
+  }
+  const auto signals = ResolveRetainedIoSignalCatalog(graph);
+  if (!signals.ok())
+    detail::fail_retained_bundle(signals.error().message);
+  for (const auto &signal : signals.value()) {
+    known["command_target_ids"].insert(signal.command_target_id.value());
+    if (signal.descriptor.output_resource)
+      known["resource_ids"].insert(signal.descriptor.output_resource->value());
+  }
+  const auto verify_condition = [&](auto &&self,
+                                    const CanonicalValue &condition) -> void {
+    if (const auto *compare = condition.find_object_member("compare")) {
+      const auto &operand = *compare->find_object_member("operand");
+      if (const auto *signal = operand.find_object_member("signal")) {
+        const auto &component =
+            signal->find_object_member("controllable_component_id")
+                ->as_string();
+        const auto &name =
+            signal->find_object_member("signal_name")->as_string();
+        const auto found = std::find_if(
+            signals.value().begin(), signals.value().end(),
+            [&](const auto &row) {
+              return row.descriptor.signal_id.controllable_component_id.value() ==
+                         component &&
+                     row.descriptor.signal_id.name == name;
+            });
+        if (found == signals.value().end() ||
+            found->descriptor.direction != core::IoSignalDirection::kInput)
+          detail::fail_retained_bundle(
+              "interrupt condition has no exact retained input signal");
+      }
+      return;
+    }
+    if (const auto *child = condition.find_object_member("not")) {
+      self(self, *child);
+      return;
+    }
+    const auto *children = condition.find_object_member("all");
+    if (children == nullptr)
+      children = condition.find_object_member("any");
+    for (const auto &child : children->as_array())
+      self(self, child);
+  };
+  for (const auto &policy :
+       require_member(interrupts, "interrupt_policies", "interrupts")
+           .as_array()) {
+    for (const std::string_view field :
+         {"controllable_component_ids", "command_target_ids",
+          "control_domain_ids", "control_binding_ids", "resource_ids"}) {
+      for (const auto &value : policy.find_object_member(field)->as_array())
+        if (!known[std::string(field)].contains(value.as_string()))
+          detail::fail_retained_bundle(
+              "interrupt policy references unknown retained " +
+              std::string(field));
+    }
+    if (const auto *condition = policy.find_object_member("condition"))
+      verify_condition(verify_condition, *condition);
+  }
+  if (const auto *rules = find_member(interrupts, "interrupt_rules"))
+    for (const auto &rule : rules->as_array())
+      verify_condition(verify_condition, *rule.find_object_member("condition"));
+}
+
 [[nodiscard]] RevisionVerifiedDeploymentApplicabilityInputs
 verify_structural_applicability_projection(
     const CanonicalValue &desired_value, const CanonicalValue &provider_value,
     const CanonicalValue &retained_policy_records_value,
+    const CanonicalValue *interrupt_policy_configuration,
     const CanonicalValue *site_overlay_ref_value,
     const CanonicalValue *external_resources_value,
     const core::CellGraphDTO &graph,
     std::span<const QualifiedRuntimeProfile> runtime_profiles) {
+  const CanonicalValue::Object *interrupts = nullptr;
+  if (interrupt_policy_configuration != nullptr) {
+    interrupts =
+        &require_object(*interrupt_policy_configuration,
+                        "retained_bundle.interrupt_policy_configuration");
+    auto legacy_fields = *interrupts;
+    std::erase_if(legacy_fields, [](const auto &field) {
+      return field.first == "interrupt_rules";
+    });
+    require_exact_fields(
+        legacy_fields,
+        {"interrupt_sources", "interrupt_policies", "interrupt_config"},
+        "retained_bundle.interrupt_policy_configuration");
+    const auto &sources = require_array(
+        require_member(*interrupts, "interrupt_sources", "interrupts"),
+        "interrupt_sources");
+    const auto &policies = require_array(
+        require_member(*interrupts, "interrupt_policies", "interrupts"),
+        "interrupt_policies");
+    const auto *rules = find_member(*interrupts, "interrupt_rules");
+    if (sources.empty() && policies.empty() &&
+        (rules == nullptr || require_array(*rules, "interrupt_rules").empty()))
+      detail::fail_retained_bundle(
+          "empty interrupt_policy_configuration must be omitted");
+  }
   CanonicalValue::Object root_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"desired_control_configurations", desired_value},
@@ -973,17 +1148,35 @@ verify_structural_applicability_projection(
            {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
            {"commissioned_stop_interfaces",
             CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
+           {"interrupt_sources",
+            interrupts == nullptr
+                ? CanonicalValue(CanonicalValue::Array{})
+                : require_member(*interrupts, "interrupt_sources",
+                                 "interrupts")},
+           {"interrupt_policies",
+            interrupts == nullptr
+                ? CanonicalValue(CanonicalValue::Array{})
+                : interrupt_policy_source_rows(require_member(
+                      *interrupts, "interrupt_policies", "interrupts"))},
            {"interrupt_config",
-            CanonicalValue(CanonicalValue::Object{
-                {"queue_depth", CanonicalValue(8.0)},
-                {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
-                {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
-                {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
-            })},
+            interrupts == nullptr
+                ? CanonicalValue(CanonicalValue::Object{
+                      {"queue_depth", CanonicalValue(8.0)},
+                      {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
+                      {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
+                      {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
+                  })
+                : require_member(*interrupts, "interrupt_config",
+                                 "interrupts")},
        })},
   };
+  if (interrupts != nullptr) {
+    if (const auto *rules = find_member(*interrupts, "interrupt_rules")) {
+      auto policies = root_members.back().second.as_object();
+      policies.emplace_back("interrupt_rules", *rules);
+      root_members.back().second = CanonicalValue(std::move(policies));
+    }
+  }
   if (site_overlay_ref_value != nullptr) {
     root_members.emplace_back("site_overlay_ref", *site_overlay_ref_value);
   }
@@ -1029,24 +1222,61 @@ verify_structural_applicability_projection(
         "retained applicability differs from its exact revision-verified "
         "projection");
   }
+  if (interrupts != nullptr) {
+    for (const std::string_view field :
+         {"interrupt_sources", "interrupt_policies", "interrupt_config"}) {
+      if (!verified.normalized_policies().has_value() ||
+          verified.normalized_policies()->find_object_member(field) ==
+              nullptr ||
+          *verified.normalized_policies()->find_object_member(field) !=
+              require_member(*interrupts, field, "interrupts"))
+        detail::fail_retained_bundle(
+            "retained interrupt policy normalization mismatch");
+    }
+  }
+  if (interrupts != nullptr) {
+    const auto *rules = find_member(*interrupts, "interrupt_rules");
+    const auto *normalized_rules =
+        verified.normalized_policies()->find_object_member("interrupt_rules");
+    if ((rules == nullptr) != (normalized_rules == nullptr) ||
+        (rules && *rules != *normalized_rules))
+      detail::fail_retained_bundle(
+          "retained global rule normalization mismatch");
+  }
+  if (interrupts != nullptr)
+    require_retained_interrupt_policy_references(
+        *interrupts, graph, verified.value().capability_provider_bindings);
   const auto &desired = verified.value().desired_control_configurations;
   const auto &providers = verified.value().capability_provider_bindings;
   if (graph.control_domains.empty()) {
-    if (!desired.empty() || !providers.empty()) {
+    if (!desired.empty() || std::any_of(providers.begin(), providers.end(), [](const auto& provider) {
+          return !std::holds_alternative<core::ComponentTargetCapabilityProviderTargetDTO>(provider.target);
+        })) {
       detail::fail_retained_bundle(
           "passive structural retention cannot select a control "
           "configuration or capability provider");
     }
-    return verified;
-  }
-  if (desired.size() != graph.control_domains.size() ||
-      graph.control_bindings.empty()) {
+  } else if (desired.size() !=
+                 static_cast<std::size_t>(std::count_if(
+                     graph.control_domains.begin(), graph.control_domains.end(),
+                     [](const auto &domain) {
+                       return domain.provider() == nullptr;
+                     })) ||
+             (!desired.empty() && graph.control_bindings.empty())) {
     detail::fail_retained_bundle(
         "native structural retention requires one desired control "
         "configuration per control domain");
   }
 
   for (const auto &domain : graph.control_domains) {
+    if (domain.provider()) {
+      if (std::any_of(desired.begin(), desired.end(), [&](const auto &value) {
+            return value.control_domain_id == domain.control_domain_id;
+          }))
+        detail::fail_retained_bundle(
+            "provider domain cannot select controller configuration");
+      continue;
+    }
     const auto selected = std::find_if(
         desired.begin(), desired.end(), [&domain](const auto &value) {
           return value.control_domain_id == domain.control_domain_id;
@@ -1058,8 +1288,8 @@ verify_structural_applicability_projection(
         }));
     if (selected == desired.end() || binding_count == 0U ||
         selected->control_domain_revision != domain.control_domain_revision ||
-        selected->controller_topology_id != domain.controller_topology_id ||
-        selected->topology_revision != domain.topology_revision ||
+        selected->controller_topology_id != domain.controller().controller_topology_id ||
+        selected->topology_revision != domain.controller().topology_revision ||
         selected->binding_routes.size() != binding_count) {
       detail::fail_retained_bundle(
           "retained desired control configuration is not the exact selected "
@@ -1169,13 +1399,25 @@ verify_structural_applicability_projection(
                 domain == graph.control_domains.end() ||
                 domain->control_domain_revision !=
                     target.control_domain_revision ||
-                domain->controller_topology_id !=
-                    target.controller_topology_id ||
-                domain->topology_revision != target.topology_revision) {
+                target.provider() != (domain->provider() != nullptr) ||
+                (domain->provider()
+                     ? (provider.provider_instance_id !=
+                            domain->provider()->provider_instance_id ||
+                        provider.provider_manifest_id !=
+                            domain->provider()->provider_manifest_id ||
+                        provider.provider_manifest_revision !=
+                            domain->provider()->provider_manifest_revision)
+                     : (domain->controller().controller_topology_id !=
+                            target.controller().controller_topology_id ||
+                        domain->controller().topology_revision !=
+                            target.controller().topology_revision))) {
               detail::fail_retained_bundle(
                   "retained control-domain capability provider does not "
                   "target the exact retained domain");
             }
+          } else if constexpr (std::is_same_v<Target, core::ComponentTargetCapabilityProviderTargetDTO>) {
+            const auto bound = ValidateNonCoordinateProviderTarget(graph, provider);
+            if (!bound.ok()) detail::fail_retained_bundle(bound.error().details.at("reason"));
           } else {
             const auto component = std::find_if(
                 graph.controllable_components.begin(),
@@ -1219,7 +1461,9 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
        "desired_control_configurations", "capability_provider_bindings",
        "retained_policy_records", "runtime_contract_requirements",
        "compiled_products", "provenance"},
-      {"site_overlay_ref", "external_resources", "assistant"},
+      {"site_overlay_ref", "external_resources", "assistant",
+       "motion_takeover_preparation_budget_s",
+       "interrupt_policy_configuration"},
       "retained_bundle");
   if (require_string(require_member(object, "api_version", "retained_bundle"),
                      "retained_bundle.api_version") !=
@@ -1242,6 +1486,17 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
       "retained_bundle.deployment_revision");
   detail::require_retained_digest(deployment_revision,
                                   "retained_bundle.deployment_revision");
+  std::optional<double> motion_takeover_preparation_budget_s;
+  if (const auto *budget =
+          root.find_object_member("motion_takeover_preparation_budget_s")) {
+    const auto *seconds = std::get_if<double>(&budget->storage());
+    if (seconds == nullptr || !std::isfinite(*seconds) || *seconds <= 0.0) {
+      detail::fail_retained_bundle(
+          "retained_bundle.motion_takeover_preparation_budget_s must be "
+          "finite and positive");
+    }
+    motion_takeover_preparation_budget_s = *seconds;
+  }
   const auto &catalogs =
       require_object(require_member(object, "catalogs", "retained_bundle"),
                      "retained_bundle.catalogs");
@@ -1324,9 +1579,16 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
                      "retained_bundle"),
       require_member(object, "capability_provider_bindings", "retained_bundle"),
       require_member(object, "retained_policy_records", "retained_bundle"),
+      root.find_object_member("interrupt_policy_configuration"),
       root.find_object_member("site_overlay_ref"),
       root.find_object_member("external_resources"), verified_graph.graph(),
       runtime_profiles);
+  const auto provider_projection = ValidateIoProviderDomainProjection(
+      verified_graph.graph(),
+      applicability.value().capability_provider_bindings, runtime_profiles);
+  if (!provider_projection.ok())
+    detail::fail_retained_bundle(
+        provider_projection.error().details.at("reason"));
   require_structural_catalog_closure(
       verified_graph.graph(),
       applicability.value().capability_provider_bindings,
@@ -1424,8 +1686,11 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
       require_member(products, "control_domain_products",
                      "retained_bundle.compiled_products"),
       "retained_bundle.compiled_products.control_domain_products");
-  if (control_group_values.size() !=
-      verified_graph.graph().control_domains.size()) {
+  std::vector<const core::ControlDomainDTO *> controller_domains;
+  for (const auto &domain : verified_graph.graph().control_domains)
+    if (!domain.provider())
+      controller_domains.push_back(&domain);
+  if (control_group_values.size() != controller_domains.size()) {
     detail::fail_retained_bundle(
         "retained control-domain product subjects do not equal the graph "
         "control-domain set");
@@ -1443,9 +1708,8 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
                        path + ".control_domain_id");
     detail::require_retained_portable_identity(control_domain_id,
                                                path + ".control_domain_id");
-    if (control_domain_id != verified_graph.graph()
-                                 .control_domains[index]
-                                 .control_domain_id.value()) {
+    if (control_domain_id !=
+        controller_domains[index]->control_domain_id.value()) {
       detail::fail_retained_bundle(
           "retained control-domain product groups are not the exact "
           "canonical graph-domain table");
@@ -1474,18 +1738,20 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
       require_array(require_member(products, "symbol_role_maps",
                                    "retained_bundle.compiled_products"),
                     "retained_bundle.compiled_products.symbol_role_maps");
+  // A model-free bundle carries either no map or the one empty map product
+  // (Scenario origin, zero components). The sealed canonical-empty package
+  // must have none; its admission shape check enforces that.
   std::vector<core::RetainedProductDTO> symbol_role_maps;
-  if (verified_graph.graph().model_instances.empty()) {
-    if (!symbol_role_map_values.empty()) {
-      detail::fail_retained_bundle(
-          "canonical-empty bundle cannot contain a model symbol/role map");
-    }
-  } else {
-    if (symbol_role_map_values.size() != 1U) {
-      detail::fail_retained_bundle(
-          "non-empty model bundle requires exactly one composed-model "
-          "symbol/role map");
-    }
+  const bool model_free = verified_graph.graph().model_instances.empty();
+  if (model_free ? symbol_role_map_values.size() > 1U
+                 : symbol_role_map_values.size() != 1U) {
+    detail::fail_retained_bundle(
+        model_free
+            ? "model-free bundle cannot contain more than one symbol/role map"
+            : "non-empty model bundle requires exactly one composed-model "
+              "symbol/role map");
+  }
+  if (!symbol_role_map_values.empty()) {
     symbol_role_maps.push_back(parse_retained_product(
         symbol_role_map_values.front(),
         "retained_bundle.compiled_products.symbol_role_maps[0]",
@@ -1761,6 +2027,7 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
       applicability.value().external_resources,
       std::move(assistant),
       std::move(runtime_contract_requirements),
+      motion_takeover_preparation_budget_s,
   };
 }
 

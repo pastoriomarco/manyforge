@@ -166,8 +166,6 @@ const controller = vi.hoisted(() => ({
   runtimeScaleDraft: 1,
   runtimeScalePending: false,
   runtimeScaleError: null,
-  fullStopPending: false,
-  fullStopError: null,
   stopFaultRecoveryPending: false,
   stopFaultRecoveryError: null,
   componentIncidents: [],
@@ -186,7 +184,6 @@ const controller = vi.hoisted(() => ({
   stop: vi.fn(),
   fullStop: vi.fn(),
   recoverStopFault: vi.fn(),
-  dismissFullStopError: vi.fn(),
   reset: vi.fn(),
   setRuntimeScale: vi.fn(),
   retry: vi.fn(),
@@ -467,6 +464,22 @@ describe('RobotControlPanel layout', () => {
     markup = renderToStaticMarkup(<RobotControlPanel enabled />);
     expect(markup).not.toContain('Reset operation required.');
 
+    state.phase = 'ready';
+    state.operation = null;
+  });
+
+  it('requires an explicit per-output acknowledgement before a Reset of an unknown-acceptance output', () => {
+    const state = controller.state as unknown as Record<string, unknown>;
+    state.phase = 'completed';
+    state.operation = {
+      operationId: 'operation-io', operationRevision: 2, resident: true, state: 'failed', progress: 1,
+      activeStopId: null, activeStopGeneration: null, terminalError: 'acceptance unknown',
+      controllableComponentId: 'station', commandTargetId: 'io', outputEvidence: 'acceptance_unknown',
+    };
+    const markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+    expect(markup).toContain('A write already queued in the remote device may still act.');
+    expect(markup).toContain('aria-label="Acknowledge station · io (operation-io)"');
+    expect(markup).toMatch(/disabled=""[^>]*aria-label="Reset operation" title="Confirm each output with unknown acceptance first."/);
     state.phase = 'ready';
     state.operation = null;
   });

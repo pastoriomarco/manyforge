@@ -293,12 +293,49 @@ def test_program_node_policy_independent_defaults_migrate_to_omission(
 
 
 @pytest.mark.parametrize(
+    "recovery,plain",
+    [
+        (
+            {"allow_intervention": False, "max_retries": 0, "intervention_stop_scope": "all"},
+            None,
+        ),
+        (
+            {"allow_intervention": True, "max_retries": 2, "intervention_stop_scope": "all"},
+            {"allow_intervention": True, "max_retries": 2},
+        ),
+    ],
+)
+def test_program_intervention_stop_scope_default_migrates_to_omission(
+    recovery: dict[str, Any],
+    plain: dict[str, Any] | None,
+) -> None:
+    catalog = _catalog()
+    source = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    if plain is None:
+        baseline = Program.from_dict(source, catalog)
+    else:
+        plain_document = deepcopy(source)
+        plain_document["tree"]["children"][0]["recovery_policy"] = plain
+        baseline = Program.from_dict(_identified(plain_document), catalog)
+    explicit = deepcopy(source)
+    explicit["tree"]["children"][0]["recovery_policy"] = recovery
+    explicit["program_revision"] = baseline.program_revision
+
+    migrated = Program.from_dict(explicit, catalog)
+
+    assert migrated.to_dict() == baseline.to_dict()
+    assert migrated.canonical_bytes == baseline.canonical_bytes
+    assert migrated.program_revision == baseline.program_revision
+
+
+@pytest.mark.parametrize(
     "policy",
     [
         {"recovery_policy": None},
         {"recovery_policy": {}},
         {"recovery_policy": {"allow_intervention": True}},
         {"recovery_policy": {"max_retries": 0}},
+        {"recovery_policy": {"intervention_stop_scope": "own_groups"}},
         {"operator_stop_policy": None},
     ],
 )
@@ -318,6 +355,11 @@ def test_program_node_policy_rejects_null_empty_and_partial_objects(
         # Zero is Unlimited; intervention stays an explicit opt-in.
         {"allow_intervention": True, "max_retries": 0},
         {"allow_intervention": False, "max_retries": 3},
+        {
+            "allow_intervention": True,
+            "max_retries": 2,
+            "intervention_stop_scope": "own_groups",
+        },
     ],
 )
 def test_program_node_policy_nondefaults_change_identity_and_round_trip(
@@ -395,6 +437,16 @@ def test_program_node_policy_rejects_removed_policy_forms(
         ("recovery_policy", {"allow_intervention": True, "max_retries": 256}),
         ("recovery_policy", {"allow_intervention": True, "max_retries": -1}),
         ("recovery_policy", {"allow_intervention": True, "max_retries": 1.5}),
+        ("recovery_policy", {
+            "allow_intervention": True,
+            "max_retries": 0,
+            "intervention_stop_scope": "groups",
+        }),
+        ("recovery_policy", {
+            "allow_intervention": True,
+            "max_retries": 0,
+            "intervention_stop_scope": None,
+        }),
         ("operator_stop_policy", "pause"),
     ],
 )
@@ -822,3 +874,103 @@ def test_blackboard_key_construction_is_bounded() -> None:
     assert BlackboardKey(id="key-id", type="string", key="name").key == "name"
     with pytest.raises(ProgramValidationError, match="text bound"):
         BlackboardKey(id="x" * 257, type="string", key="name")
+
+
+def _logic_only_document() -> dict[str, Any]:
+    """A Program with no component or target role and only a timer."""
+
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    document["component_roles"] = {}
+    document["target_roles"] = {}
+    document.pop("scene", None)
+    document.pop("parameters", None)
+    document["tree"] = {
+        "node_id": "sequence",
+        "instance_id": "main_sequence",
+        "parameters": {},
+        "children": [
+            {
+                "node_id": "timer",
+                "instance_id": "wait",
+                "parameters": {"duration_s": 0.1},
+                "children": [],
+            }
+        ],
+    }
+    return document
+
+
+def test_logic_only_program_parses_with_an_empty_component_role_map() -> None:
+    program = Program.from_dict(_identified(_logic_only_document()), _catalog())
+
+    assert program.to_dict()["component_roles"] == {}
+    assert program.to_dict()["target_roles"] == {}
+
+
+def test_logic_only_declarations_accept_an_empty_component_role_map() -> None:
+    parameters, keys = program_module.program_value_declarations(
+        _identified(_logic_only_document()), catalog=_catalog()
+    )
+
+    assert parameters == {}
+    assert keys == {}
+
+
+def test_program_refuses_an_absent_component_role_map() -> None:
+    document = _logic_only_document()
+    del document["component_roles"]
+
+    with pytest.raises(ProgramValidationError, match="component_roles"):
+        Program.from_dict(_identified(document), _catalog())
+    with pytest.raises(ProgramValidationError, match="component_roles"):
+        program_module.program_value_declarations(
+            _identified(document), catalog=_catalog()
+        )
+
+
+def test_program_still_refuses_a_target_without_a_declared_component_role() -> None:
+    document = _logic_only_document()
+    document["target_roles"] = {
+        "arm": {
+            "component_role": "robot",
+            "required_capabilities": [],
+        }
+    }
+
+    with pytest.raises(ProgramValidationError, match="declared component role"):
+        Program.from_dict(_identified(document), _catalog())
+
+
+def test_component_role_map_keeps_its_fixed_upper_bound() -> None:
+    too_many = {
+        f"role_{index}": {}
+        for index in range(program_module._MAX_PROGRAM_ROLES + 1)
+    }
+
+    with pytest.raises(ProgramValidationError, match="bounded mapping"):
+        program_module._validate_component_roles(too_many, path="Program.component_roles")
+
+
+@pytest.mark.parametrize("literal", [2**53, -(2**53), 2**63])
+def test_integer_literals_outside_the_exact_range_are_refused_at_parse(literal: int) -> None:
+    safe = 2**53 - 1
+
+    def tree(value: int) -> dict[str, Any]:
+        return {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {"id": "flow.wait", "name": "pause", "params": {"count": value}}
+            ],
+        }
+
+    assert tree_node_from_dict(tree(safe)).children[0].params["count"] == safe
+    assert tree_node_from_dict(tree(-safe)).children[0].params["count"] == -safe
+    with pytest.raises(ProgramValidationError, match=r"outside the exact range ±\(2\^53−1\)"):
+        tree_node_from_dict(tree(literal))
+    with pytest.raises(ProgramValidationError, match=r"±\(2\^53−1\)"):
+        merge_param_patch({}, {"nested": {"count": literal}})
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    document["tree"]["children"][0].setdefault("parameters", {})["count"] = literal
+    with pytest.raises(ProgramValidationError, match="safe range"):
+        Program.from_dict(document, _catalog())

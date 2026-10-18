@@ -277,6 +277,9 @@ _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
     },
 ]
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
+    "io_device_v0": (
+        "28b47a00f2ae915e3281bc6a58c0927f164aaa8a8d4a4635a997a49e6436f6b1"
+    ),
     "lite6_isaac_commanded_v0": (
         "04b1228ba7445e40263b25c5b11f7b01c91f7e0488a0cf7676cf24bb0e43d1eb"
     ),
@@ -1839,20 +1842,35 @@ def validate(source: Path, root: Path) -> None:
         path = f"$.runtime_restoration_profiles[{index}]"
         raw_profile_object = _object(raw_profile, path=path)
         is_ros2_control = "ros2_control_runtime" in raw_profile_object
-        profile = _exact(
-            raw_profile,
-            required=frozenset(
-                {
-                    "runtime_restoration_profile_id",
-                    "model_family_id",
-                    "source_fields",
-                    ("ros2_control_runtime" if is_ros2_control else "native_runtime"),
-                    "stop_profiles",
-                    "acceptance_obligations",
-                }
-            ),
-            path=path,
-        )
+        is_io_provider = "io_provider_runtime" in raw_profile_object
+        if is_io_provider:
+            expected_io_profile = {
+                "runtime_restoration_profile_id": "io_device_v0",
+                "io_provider_runtime": {},
+                "source_fields": {},
+                "stop_profiles": {},
+                "acceptance_obligations": [],
+            }
+            if raw_profile_object != expected_io_profile:
+                raise SourceDescriptionError(
+                    f"{path} changes the exact model-free I/O component profile"
+                )
+            profile = raw_profile_object
+        else:
+            profile = _exact(
+                raw_profile,
+                required=frozenset(
+                    {
+                        "runtime_restoration_profile_id",
+                        "model_family_id",
+                        "source_fields",
+                        ("ros2_control_runtime" if is_ros2_control else "native_runtime"),
+                        "stop_profiles",
+                        "acceptance_obligations",
+                    }
+                ),
+                path=path,
+            )
         profile_id = _identifier(
             profile.get("runtime_restoration_profile_id"),
             path=f"{path}.runtime_restoration_profile_id",
@@ -1871,6 +1889,8 @@ def validate(source: Path, root: Path) -> None:
             raise SourceDescriptionError(
                 f"{path} changes the exact runtime restoration/example-policy input"
             )
+        if is_io_provider:
+            continue
         is_mock = is_ros2_control and "mock_profile" in _object(
             profile["ros2_control_runtime"], path=f"{path}.ros2_control_runtime"
         )

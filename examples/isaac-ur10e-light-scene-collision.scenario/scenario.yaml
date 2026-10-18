@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:a0331144128edc4cae7f59ef4bf68bd0bc192d8fbfa1a9bb9de97b1025dcd098",
     "deployment.yaml": "sha256:4723877379c31edcb13db947fb3f5a05661420be5e04bd68de545cb01decb3fe",
-    "program.yaml": "sha256:0727a346a8bdebc48fa67e5643681585e8b56cadeb88ca5879d1b16585ed4b9a"
+    "program.yaml": "sha256:f9a96a175c2bf0e620fcbe299128a78e6f965067aed64b32ad96c9d28e3c45c5"
   },
   "name": "isaac_manipulator_scene_light_ros2_control_collision",
   "saved_status": {
-    "checked_content_digest": "sha256:2301857c2bbe0526657e42d926928bcdf8c2d7bbe259bb98a44ac92ddfe57f42",
+    "checked_content_digest": "sha256:6babacdefa5a19475330af1bd95982f0f9576cf387842f0c9e3ce963890ca0ad",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

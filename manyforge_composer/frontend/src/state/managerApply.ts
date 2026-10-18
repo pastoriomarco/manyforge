@@ -16,6 +16,14 @@ const PHASE_ORDER: Record<ManagerApplyLifecyclePhase, number> = {
   settled: 8,
 };
 
+/**
+ * Manager Apply family: only `unknown_effect` leaves it open whether the
+ * Apply changed the cell; `failed` and `succeeded` are settled outcomes.
+ */
+export function applyMayHaveActed(state: ManagerApplyStatus['state'] | null | undefined): boolean {
+  return state === 'unknown_effect';
+}
+
 export interface ManagerApplyIdentity {
   applyId: string;
   applyGeneration: number;

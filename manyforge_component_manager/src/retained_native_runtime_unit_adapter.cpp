@@ -3056,7 +3056,10 @@ RetainedNativeRuntimeUnitAdapter::GetAuthoringAdmission() const {
 
 manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
 RetainedNativeRuntimeUnitAdapter::UpdateCellAdmissionReadiness(
-    const manyforge::core::CellAdmissionReadinessSnapshotDTO &snapshot) {
+    const manyforge::core::CellAdmissionReadinessSnapshotDTO &snapshot,
+    std::shared_ptr<manyforge::core::IIoSignalService>* actual_retired_service) {
+  // A process-local source pin is consumed by the receiving host, never RPC.
+  if (actual_retired_service) actual_retired_service->reset();
   return impl_->KernelLivenessLaneCall<manyforge::core::AuthoringAdmissionDTO>(
       {"cell_admission_update_readiness", snapshot});
 }

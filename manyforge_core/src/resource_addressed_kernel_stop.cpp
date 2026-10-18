@@ -1,4 +1,6 @@
+#include <manyforge_core/io_rule_stop_response.hpp>
 #include "resource_addressed_execution_kernel_internal.hpp"
+#include "program_stop_projection_internal.hpp"
 
 namespace manyforge::core {
 
@@ -15,10 +17,15 @@ StopScopeResolverSnapshotDTO ResourceAddressedExecutionKernel::capture_stop_scop
   snapshot.operations.reserve(active_operations_.size() + historical_operations_.size());
   for (const auto& [operation_id, operation] : active_operations_) {
     const bool effect_uncertain = operation->containment_effect_uncertain();
+    const bool fully_transferred =
+        !operation->participants.empty() &&
+        std::all_of(operation->participants.begin(), operation->participants.end(),
+                    [](const auto& participant) { return participant.ownership_transferred; });
     std::vector<ControllableComponentId> components;
     std::vector<ResourceId> resources;
     components.reserve(operation->participants.size());
     for (const auto& participant : operation->participants) {
+      if (participant.ownership_transferred) continue;
       components.push_back(participant.binding.value().controllable_component_id);
       resources.insert(resources.end(), participant.resources.begin(), participant.resources.end());
     }
@@ -29,7 +36,8 @@ StopScopeResolverSnapshotDTO ResourceAddressedExecutionKernel::capture_stop_scop
     snapshot.operations.push_back(StopScopeOperationSnapshotDTO{
         operation_id, operation->state.program_run_id, operation->state.operation_revision,
         operation->state.active_stop_generation.value_or(StopGeneration(0U)),
-        operation->state.state, true, effect_uncertain, std::move(components), std::move(resources),
+        operation->state.state, !fully_transferred, effect_uncertain, std::move(components),
+        std::move(resources),
         operation->manual_handover
             ? std::optional<ProgramRunId>{operation->manual_handover->capture.program_run_id}
             : std::nullopt});
@@ -652,18 +660,25 @@ Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_sto
     const auto replay = std::find_if(
         stop_fault_recovery_replay_ledger_.begin(), stop_fault_recovery_replay_ledger_.end(),
         [&](const auto& row) {
-          return row.intent.request_context.request_id == intent.request_context.request_id;
+          return row.request_id() == intent.request_context.request_id;
         });
     if (replay != stop_fault_recovery_replay_ledger_.end()) {
-      if (replay->intent != intent) {
+      if (!std::holds_alternative<StopFaultRecoveryIntentDTO>(replay->intent) ||
+          std::get<StopFaultRecoveryIntentDTO>(replay->intent) != intent) {
         return Result<StopFaultRecoveryResultDTO>::Err(
             error("request_id_conflict", "Stop fault-recovery request ID conflicts",
                   "request_id_conflict"));
       }
-      auto result = replay->result;
+      auto result = std::get<StopFaultRecoveryResultDTO>(replay->result);
       result.replay_status = RequestReplayStatusDTO::kReplayedExact;
       return Result<StopFaultRecoveryResultDTO>::Ok(std::move(result));
     }
+    if (std::any_of(stop_fault_recovery_replay_ledger_.begin(),
+          stop_fault_recovery_replay_ledger_.end(),
+          [](const auto& row) { return row.pending_global_record.has_value(); }))
+      return Result<StopFaultRecoveryResultDTO>::Err(
+          error("invalid_state_transition", "A durable global recovery is unresolved",
+                "io_global_rule_recovery_pending"));
     const auto request_id = intent.request_context.request_id;
     const bool request_id_used_elsewhere =
         emergency_stop_reserve_.find(request_id.value()).has_value() ||
@@ -775,8 +790,14 @@ Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_sto
   // Orphan fences are resource-scoped and enforced by the slot table. A
   // successful durable fault clear removes the cell-wide Stop latch without
   // weakening any remaining orphan resource.
+  // A containment can begin after the external recovery facts read, before
+  // its Stop is accepted (or acceptance can fail). Its existing pending row
+  // is already restrictive truth. Keep the historical clear/replay truthful
+  // without reopening admission under that newer incident.
   motion_admission_closed_ =
-      manager_liveness_motion_inhibited_ || is_active_stop_fault_latch(active_stop_fault_latch_);
+      manager_liveness_motion_inhibited_ || is_active_stop_fault_latch(active_stop_fault_latch_) ||
+      std::any_of(incident_containments_.begin(), incident_containments_.end(),
+                  [](const auto& row) { return !row.receipt.has_value(); });
   state_lock.unlock();
   // The clear result is already durable. A failed generation publication keeps
   // authoring closed and is retried by the existing reconciliation lane.
@@ -788,7 +809,10 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
     EmergencyStopProjectedIntentDTO projected_intent,
     const PartialDispatchStopScope* partial_dispatch_scope,
     const MalformedStopIngressDTO* malformed_ingress,
-    const std::optional<StopFaultTriggerDTO> required_fault_latch) {
+    const std::optional<StopFaultTriggerDTO> required_fault_latch,
+    const MotionTakeoverStopSelection* takeover_selection,
+    const InterruptStopSelection* interrupt_selection,
+    std::span<const InterruptStopSelection> disjoint_interrupt_selections) {
   const auto accepted_at_ns = clock_.now();
   StopWorkHandoff handoff;
   const ScopeExit publish([&] { publish_stop_work(handoff); });
@@ -796,7 +820,9 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
     // Neither ordinary admission nor its durable journal is on this lane.
     std::lock_guard state_lock(state_mutex_);
     return accept_stop_locked(std::move(projected_intent), handoff, accepted_at_ns,
-                              partial_dispatch_scope, malformed_ingress, required_fault_latch);
+                              partial_dispatch_scope, malformed_ingress, required_fault_latch,
+                              takeover_selection, interrupt_selection,
+                              disjoint_interrupt_selections);
   }();
   return result;
 }
@@ -812,7 +838,12 @@ void ResourceAddressedExecutionKernel::publish_stop_work(const StopWorkHandoff& 
 
 bool ResourceAddressedExecutionKernel::ordinary_request_id_retained_locked(
     const RequestId& request_id) const {
-  return std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
+  return std::any_of(stop_fault_recovery_replay_ledger_.begin(),
+                     stop_fault_recovery_replay_ledger_.end(), [&](const auto& row) {
+                       return std::holds_alternative<IoGlobalRuleRecoveryIntentDTO>(row.intent) &&
+                              row.request_id() == request_id;
+                     }) ||
+         std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
                      [&](const auto& row) {
                        return row.intent.request_context.request_id == request_id;
                      }) ||
@@ -834,7 +865,135 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
     EmergencyStopProjectedIntentDTO projected_intent, StopWorkHandoff& handoff,
     const TimePoint accepted_at_ns, const PartialDispatchStopScope* partial_dispatch_scope,
     const MalformedStopIngressDTO* malformed_ingress,
-    const std::optional<StopFaultTriggerDTO> required_fault_latch) {
+    const std::optional<StopFaultTriggerDTO> required_fault_latch,
+    const MotionTakeoverStopSelection* takeover_selection,
+    const InterruptStopSelection* primary_interrupt_selection,
+    std::span<const InterruptStopSelection> disjoint_interrupt_selections,
+    const GlobalInterruptStopSelection* global_selection) {
+  if (global_selection) {
+    const auto valid = validate_global_io_rule_stop_locked(*global_selection);
+    if (!valid.ok()) return Result<StopAcceptedDTO>::Err(valid.error());
+  }
+  std::vector<const InterruptStopSelection*> interrupt_selections;
+  if (primary_interrupt_selection) interrupt_selections.push_back(primary_interrupt_selection);
+  for (const auto& selection : disjoint_interrupt_selections)
+    interrupt_selections.push_back(&selection);
+  std::set<std::pair<OperationId, OperationParticipantId>> interrupt_memberships;
+  for (const auto* interrupt_selection : interrupt_selections) {
+    const auto* exact =
+        std::get_if<IoOperationRuleScopeDTO>(&interrupt_selection->registration.scope);
+    if (!exact || !interrupt_memberships.emplace(exact->operation_id, exact->participant_id).second)
+      return reject<StopAcceptedDTO>("interrupt response repeats an exact participant",
+                                     "io_rule_response_membership_invalid",
+                                     ErrorCode::kInvalidRequest);
+    const auto* operation = find_active_operation_locked(exact->operation_id);
+    const auto participant_row =
+        operation ? std::find_if(operation->participants.begin(), operation->participants.end(),
+                                 [&](const auto& row) {
+                                   return row.slot_owner.participant_id == exact->participant_id;
+                                 })
+                  : std::vector<ActiveOperationParticipant>::const_iterator{};
+    const auto* participant =
+        operation && participant_row != operation->participants.end() ? &*participant_row : nullptr;
+    if (!operation || !participant || terminal(operation->state.state) ||
+        !io_rule_scope_current_locked(*operation, *participant,
+                                      interrupt_selection->registration) ||
+        std::find(participant->io_rule_registrations.begin(),
+                  participant->io_rule_registrations.end(),
+                  interrupt_selection->registration) == participant->io_rule_registrations.end())
+      return reject<StopAcceptedDTO>("interrupt response lost its exact prepared owner",
+                                     "io_rule_response_scope_stale", ErrorCode::kStaleGeneration);
+    const auto* motion =
+        std::get_if<PreparedMotionExecutionDTO>(&participant->prepared_participant->payload);
+    const auto policy =
+        std::find_if(participant->io_motion_rule_policies.begin(),
+                     participant->io_motion_rule_policies.end(), [&](const auto& value) {
+                       return value.policy_id == interrupt_selection->registration.policy_id;
+                     });
+    if (policy == participant->io_motion_rule_policies.end() || !policy->semantics ||
+        !policy->maximum_scope ||
+        policy->maximum_scope->stop_scope != interrupt_selection->stop_scope ||
+        policy->effective_priority != interrupt_selection->priority ||
+        policy->semantics->preemption_action != interrupt_selection->action)
+      return reject<StopAcceptedDTO>("interrupt response lost its compiled action",
+                                     "io_rule_response_policy_stale", ErrorCode::kStaleGeneration);
+    const bool desired =
+        interrupt_selection->action == InterruptPreemptionAction::kCompleteMoveOnSignal;
+    if (operation->state.active_stop_id) {
+      const auto* resident = io_rule_response_owner_locked(*operation, *participant);
+      if (desired || !policy->semantics->affected_phases.contains(OperationStateKind::kStopping) ||
+          !resident ||
+          (resident && std::any_of(resident->interrupt_winners.begin(),
+                                   resident->interrupt_winners.end(), [&](const auto& winner) {
+                                     const auto& owner = std::get<IoOperationRuleScopeDTO>(
+                                         winner.registration.scope);
+                                     return owner.operation_id == exact->operation_id &&
+                                            owner.participant_id == exact->participant_id &&
+                                            interrupt_selection->priority <= winner.priority;
+                                   })))
+        return reject<StopAcceptedDTO>("interrupt cannot replace the current logical Stop owner",
+                                       "io_rule_response_priority_stale",
+                                       ErrorCode::kStaleGeneration);
+    }
+    const auto scope =
+        motion ? std::find_if(motion->interrupt_scopes.begin(), motion->interrupt_scopes.end(),
+                              [&](const auto& value) {
+                                return value.scope_id == exact->motion_interrupt_scope_id &&
+                                       value.interrupt_policy_id ==
+                                           interrupt_selection->registration.policy_id;
+                              })
+               : std::vector<PreparedMotionInterruptScopeDTO>::const_iterator{};
+    const auto* ordinary = std::get_if<StopIntentDTO>(&projected_intent);
+    const auto* targets =
+        ordinary ? std::get_if<std::vector<StopOperationTargetDTO>>(&ordinary->selector) : nullptr;
+    const bool full_cell = std::holds_alternative<FullStopIntentDTO>(projected_intent) &&
+                           std::any_of(interrupt_selections.begin(), interrupt_selections.end(),
+                                       [](const auto* value) {
+                                         return value->stop_scope == IoRuleStopScopeDTO::kFullCell;
+                                       });
+    if (!motion || scope == motion->interrupt_scopes.end() ||
+        scope->preemption_action != interrupt_selection->action || !scope->stop_entry ||
+        *scope->stop_entry != interrupt_selection->stop_entry || !scope->success_through ||
+        *scope->success_through != interrupt_selection->success_through ||
+        !VerifyPreparedIoRuleSuccessThrough(interrupt_selection->plan,
+                                            interrupt_selection->stop_entry,
+                                            interrupt_selection->success_through)
+             .ok() ||
+        !VerifyPreparedIoRuleStopEntry(interrupt_selection->plan, interrupt_selection->stop_entry)
+             .ok() ||
+        (desired ? scope->stop_plan
+                 : participant->prepared_participant->controller().ordinary_stop_plan) !=
+            interrupt_selection->plan ||
+        (!full_cell &&
+         (!targets || targets->size() != 1 ||
+          targets->front().operation_id != exact->operation_id ||
+          targets->front().expected_operation_revision != operation->state.operation_revision)) ||
+        (desired && (interrupt_selection->plan.participant_stop_profile_purpose !=
+                         ParticipantStopProfilePurposeDTO::kMotionInterruptScope ||
+                     interrupt_selection->plan.motion_interrupt_scope_id !=
+                         exact->motion_interrupt_scope_id.value())))
+      return reject<StopAcceptedDTO>("interrupt response differs from its sealed Stop plan",
+                                     "io_rule_stop_plan_mismatch", ErrorCode::kInvalidRequest);
+  }
+  if (takeover_selection != nullptr) {
+    const auto* source = find_active_operation_locked(takeover_selection->incumbent_id);
+    if (source == nullptr || source->pending_motion_takeover.empty() ||
+        source->pending_motion_takeover.key() != takeover_selection->candidate_id ||
+        source->state.active_stop_id.has_value() || source->stop_effect_in_flight ||
+        source->participants.size() != 1U ||
+        source->participants.front().non_motion_transaction()) {
+      return reject<StopAcceptedDTO>("Takeover Stop selection lost its exact source or candidate",
+                                     "motion_takeover_stop_selection_stale", ErrorCode::kExecutionRejected);
+    }
+    const auto* selected = std::get_if<StopIntentDTO>(&projected_intent);
+    const auto* targets = selected == nullptr ? nullptr :
+        std::get_if<std::vector<StopOperationTargetDTO>>(&selected->selector);
+    if (targets == nullptr || targets->size() != 1U ||
+        targets->front().operation_id != source->state.operation_id) {
+      return reject<StopAcceptedDTO>("Takeover Stop must select its existing physical source",
+                                     "motion_takeover_stop_selection_invalid", ErrorCode::kInvalidRequest);
+    }
+  }
   struct PostReserveInvariantGuard final {
     bool armed{};
     ~PostReserveInvariantGuard() {
@@ -957,10 +1116,75 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
     const auto proposed_generation = StopGeneration(cell_stop_generation_.value() + 1U);
     const auto slot_snapshot = resource_slots_->coherent_snapshot();
     auto resolver_snapshot = capture_stop_scope_locked(slot_snapshot);
-    auto resolution = ordinary != nullptr ? resolve_stop_scope(*ordinary, resolver_snapshot)
+    // Pending newcomers name the same physical arm still presented solely by
+    // the incumbent. Only this resolution view is canonicalized; the accepted
+    // request/digest and its original authored target remain unchanged.
+    std::optional<StopIntentDTO> physical_intent;
+    std::vector<StopScopeStaleDiagnosticDTO> alias_stale;
+    bool has_motion_alias = false;
+    if (ordinary) {
+      physical_intent = *ordinary;
+      if (auto* targets = std::get_if<std::vector<StopOperationTargetDTO>>(&physical_intent->selector)) {
+        for (auto& target : *targets) {
+          for (const auto& [id, owner] : active_operations_) {
+            const auto* pending = !owner->pending_motion_takeover.empty() &&
+                                          owner->pending_motion_takeover.key() == target.operation_id
+                                      ? owner->pending_motion_takeover.mapped().get()
+                                : !owner->next_motion_takeover.empty() &&
+                                          owner->next_motion_takeover.key() == target.operation_id
+                                      ? owner->next_motion_takeover.mapped().get() : nullptr;
+            if (!pending) continue;
+            has_motion_alias = true;
+            if (target.expected_operation_revision != pending->state.operation_revision)
+              alias_stale.push_back({StopScopeStaleFieldDTO::kOperationRevision, target.operation_id,
+                                     target.expected_operation_revision,
+                                     pending->state.operation_revision});
+            const auto current_stop = owner->state.active_stop_generation.value_or(StopGeneration(0U));
+            if (target.expected_stop_generation != current_stop)
+              alias_stale.push_back({StopScopeStaleFieldDTO::kOperationStopGeneration, target.operation_id,
+                                     target.expected_stop_generation, current_stop});
+            target = {id, owner->state.operation_revision, current_stop};
+            break;
+          }
+        }
+        if (has_motion_alias) {
+          // Preserve an original incumbent target's stale metadata before
+          // deduplicating it against a translated newcomer target.
+          for (auto& target : *targets) {
+            const auto* current = find_active_operation_locked(target.operation_id);
+            if (!current) continue;
+            if (target.expected_operation_revision != current->state.operation_revision)
+              alias_stale.push_back({StopScopeStaleFieldDTO::kOperationRevision, target.operation_id,
+                                     target.expected_operation_revision, current->state.operation_revision});
+            const auto generation = current->state.active_stop_generation.value_or(StopGeneration(0U));
+            if (target.expected_stop_generation != generation)
+              alias_stale.push_back({StopScopeStaleFieldDTO::kOperationStopGeneration, target.operation_id,
+                                     target.expected_stop_generation, generation});
+            target.expected_operation_revision = current->state.operation_revision;
+            target.expected_stop_generation = generation;
+          }
+        }
+        std::sort(targets->begin(), targets->end(), [](const auto& a, const auto& b) {
+          return a.operation_id < b.operation_id;
+        });
+        targets->erase(std::unique(targets->begin(), targets->end(), [](const auto& a, const auto& b) {
+          return a.operation_id == b.operation_id;
+        }), targets->end());
+      }
+    }
+    auto resolution = ordinary != nullptr ? resolve_stop_scope(*physical_intent, resolver_snapshot)
                                           : resolve_full_stop_scope(*full, resolver_snapshot);
     if (!resolution.ok()) {
       return Result<StopAcceptedDTO>::Err(resolution.error());
+    }
+    if (!alias_stale.empty() && !resolution.value().full_stop) {
+      resolution.value().stale_diagnostics.insert(resolution.value().stale_diagnostics.end(),
+                                                 alias_stale.begin(), alias_stale.end());
+      canonicalize_stop_scope_stale_diagnostics(resolution.value().stale_diagnostics);
+      if (resolution.value().disposition != StopResolutionDispositionDTO::kAlreadyTerminalNoEffect) {
+        resolution.value().disposition = StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved;
+        resolution.value().reason = StopScopeResolutionReasonDTO::kStaleMetadataCurrentScope;
+      }
     }
     if (malformed_ingress != nullptr) {
       resolution.value().disposition = StopResolutionDispositionDTO::kPromotedToFull;
@@ -1027,6 +1251,30 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
           exact_partial.resources.end());
       resolution = Result<StopScopeResolutionDTO>::Ok(std::move(exact_partial));
     }
+    if (global_selection && !global_selection->everything) {
+      StopScopeResolutionDTO exact{StopResolutionDispositionDTO::kExact,
+                                    StopScopeResolutionReasonDTO::kExactCurrentScope,
+                                    false, {}, {}, {}, {}};
+      for (const auto& selected : global_selection->participants) {
+        const auto* operation = find_active_operation_locked(selected.operation_id);
+        const auto participant = std::find_if(
+            operation->participants.begin(), operation->participants.end(), [&](const auto& value) {
+              return value.slot_owner.participant_id == selected.participant_id;
+            });
+        exact.operations.push_back(selected.operation_id);
+        exact.controllable_components.push_back(participant->binding.value().controllable_component_id);
+        exact.resources.insert(exact.resources.end(), participant->resources.begin(),
+                                participant->resources.end());
+      }
+      const auto canonicalize = [](auto& values) {
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()), values.end());
+      };
+      canonicalize(exact.operations);
+      canonicalize(exact.controllable_components);
+      canonicalize(exact.resources);
+      resolution = Result<StopScopeResolutionDTO>::Ok(std::move(exact));
+    }
     auto full_resolution =
         ordinary != nullptr
             ? resolve_full_stop_scope(
@@ -1061,8 +1309,8 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       return Result<StopAcceptedDTO>::Err(full_digest.error());
     }
 
-    const auto transaction_intersects = [](const StopTransaction& transaction,
-                                           const StopScopeResolutionDTO& scope) {
+    const auto transaction_intersects = [&](const StopTransaction& transaction,
+                                            const StopScopeResolutionDTO& scope) {
       const bool operation_overlap =
           transaction.accepted.has_value() &&
           std::any_of(transaction.accepted->affected_operation_revisions.begin(),
@@ -1075,7 +1323,11 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
           transaction.resources.begin(), transaction.resources.end(), [&](const auto& resource) {
             return std::binary_search(scope.resources.begin(), scope.resources.end(), resource);
           });
-      return operation_overlap || resource_overlap;
+      // A global groups/all-motion selection can name only some participants
+      // of one operation. Its independent physical resources must not acquire
+      // an unrelated resident Stop merely through the enclosing operation ID.
+      return resource_overlap ||
+             (operation_overlap && (!global_selection || global_selection->everything));
     };
     const auto transaction_covers = [](const StopTransaction& transaction,
                                        const StopScopeResolutionDTO& scope) {
@@ -1278,6 +1530,34 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       accepted->request_id = context.request_id;
       accepted->replay_status = RequestReplayStatusDTO::kAcceptedNew;
       accepted->requested_selector_digest = requested_selector_digest.value();
+      for (const auto* interrupt_selection : interrupt_selections) {
+        // Same resident Stop: its accepted time, plan/digest, attempt state and
+        // deadline remain untouched. Only the higher-priority logical owner
+        // changes, retaining the new rule's actual evidence independently.
+        const auto& scope =
+            std::get<IoOperationRuleScopeDTO>(interrupt_selection->registration.scope);
+        const auto current = std::find_if(
+            transaction.interrupt_winners.begin(), transaction.interrupt_winners.end(),
+            [&](const auto& winner) {
+              const auto& owner = std::get<IoOperationRuleScopeDTO>(winner.registration.scope);
+              return owner.operation_id == scope.operation_id &&
+                     owner.participant_id == scope.participant_id;
+            });
+        if (current != transaction.interrupt_winners.end()) {
+          const auto& prior = current->registration;
+          if (auto* operation = find_active_operation_locked(scope.operation_id)) {
+            for (auto& row : operation->state.participants)
+              for (auto& rule : row.io_rule_outcomes)
+                if (rule.registration == prior)
+                  rule.arbitration_disposition = IoRuleArbitrationDispositionDTO::kSuperseded;
+          }
+          *current = *interrupt_selection;
+        } else {
+          transaction.interrupt_winners.push_back(*interrupt_selection);
+        }
+      }
+      if (global_selection)
+        transaction.global_interrupt_winners.push_back(*global_selection);
       // A containment that joins a resident Stop still latches its outcome.
       if (required_fault_latch.has_value() && !transaction.certificate.has_value()) {
         latch_stop_fault_locked(transaction, *required_fault_latch);
@@ -1362,9 +1642,16 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       std::vector<OperationId> newly_fenced_operations;
       EmergencyStopAffectedStateSnapshotDTO affected_state;
       const bool exact_partial_capture =
-          partial_dispatch_scope != nullptr && !acceptance_resolution.full_stop;
+          (partial_dispatch_scope != nullptr || global_selection != nullptr) &&
+          !acceptance_resolution.full_stop;
       const auto participant_selected = [&](const OperationId& operation_id,
                                             const OperationParticipantId& participant_id) {
+        if (global_selection && exact_partial_capture)
+          return std::any_of(global_selection->participants.begin(),
+                              global_selection->participants.end(), [&](const auto& value) {
+                                return value.operation_id == operation_id &&
+                                       value.participant_id == participant_id;
+                              });
         return !exact_partial_capture ||
                (operation_id == partial_dispatch_scope->operation_id &&
                 std::binary_search(partial_dispatch_scope->participant_ids.begin(),
@@ -1442,7 +1729,14 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
                                            "stop_participant_plan_missing",
                                            ErrorCode::kInvariantViolation);
           }
-          plans.push_back(*selected_stop_plan);
+          const auto* effective_plan = selected_stop_plan.get();
+          for (const auto* selection : interrupt_selections) {
+            const auto& owner = std::get<IoOperationRuleScopeDTO>(selection->registration.scope);
+            if (owner.operation_id == operation_id &&
+                owner.participant_id == participant.slot_owner.participant_id)
+              effective_plan = &selection->plan;
+          }
+          plans.push_back(*effective_plan);
           owner_rows.push_back(ResourceSlotStopFenceOwnerDTO{participant.slot_owner,
                                                              participant.resources, next_revision});
         }
@@ -1624,7 +1918,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
           affected_revisions,
           fenced.value().orphan_resources,
           std::move(newly_fenced_operations),
-          exact_partial_capture ? partial_dispatch_scope->participant_ids
+          exact_partial_capture && partial_dispatch_scope ? partial_dispatch_scope->participant_ids
                                 : std::vector<OperationParticipantId>{},
           acceptance_resolution.resources,
           aggregate ? full_predecessor_tokens : std::vector<StopControlWorkToken>{},
@@ -1637,6 +1931,21 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
                                        : std::nullopt,
           std::nullopt,
           {}};
+      if (primary_interrupt_selection != nullptr) {
+        transaction.interrupt_selection = *primary_interrupt_selection;
+        transaction.disjoint_interrupt_selections.assign(disjoint_interrupt_selections.begin(),
+                                                         disjoint_interrupt_selections.end());
+        for (const auto* selection : interrupt_selections)
+          transaction.interrupt_winners.push_back(*selection);
+      }
+      if (global_selection) {
+        transaction.global_interrupt_selection = *global_selection;
+        transaction.global_interrupt_winners.push_back(*global_selection);
+      }
+      if (takeover_selection != nullptr) {
+        transaction.motion_takeover_candidate_id = takeover_selection->candidate_id;
+        transaction.force_spring_return = takeover_selection->force_spring_return;
+      }
       if (accepted->resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull) {
         latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kScopePromotion);
       }
@@ -2432,7 +2741,15 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
         std::move(predecessors),
         std::move(entries),
         std::move(attempts),
-        std::nullopt,
+        transaction.interrupt_selection
+            ? std::optional(StopInterruptCorrelationDTO{
+                  transaction.interrupt_selection->source_id,
+                  transaction.interrupt_selection->registration.policy_id,
+                  std::get<IoOperationRuleScopeDTO>(
+                      transaction.interrupt_selection->registration.scope)
+                      .motion_interrupt_scope_id,
+                  std::nullopt})
+            : std::nullopt,
         latch_id,
         latch_generation,
         completed_at_ns,
@@ -2657,8 +2974,9 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
       projection.terminal_status = status;
       projection.terminal_certificate = certificate;
       projection.terminal_fault_latch = latch;
-      projection.terminal_operation_states.reserve(transaction.operations.size());
-      for (const auto& operation_id : transaction.operations) {
+      const auto snapshot_ids = stop_operation_snapshot_ids(transaction);
+      projection.terminal_operation_states.reserve(snapshot_ids.size());
+      for (const auto& operation_id : snapshot_ids) {
         auto* operation = find_active_operation_locked(operation_id);
         if (operation == nullptr) return false;
         // Only the actual selected moving rows belong to this certificate.
@@ -2695,6 +3013,14 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
         status, certificate, latch, projection_token, std::move(surveillance_state), std::nullopt,
         0U, false, std::nullopt, first_surveillance_sample_ns, first_surveillance_checkpoint_ns});
     transaction.certificate = certificate;
+    finalize_io_rule_stop_locked(transaction, certificate);
+    if (projection_token) {
+      auto& states = stop_projection_jobs_[projection_token->slot]->terminal_operation_states;
+      for (auto& state : states) {
+        const auto* operation = find_active_operation_locked(state.operation_id);
+        if (operation) state = operation->state;
+      }
+    }
     transaction.fault_latch = latch;
     transaction.terminal_projection_token = projection_token;
     stop_terminal_history_.push_back(std::move(record));
@@ -2702,8 +3028,54 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
       auto* operation = find_active_operation_locked(operation_id);
       if (operation != nullptr && operation->state.active_stop_id == certificate.stop_id &&
           operation->state.active_stop_generation == certificate.stop_generation) {
+        if (transaction.motion_takeover_candidate_id &&
+            !operation->pending_motion_takeover.empty() &&
+            operation->pending_motion_takeover.key() == *transaction.motion_takeover_candidate_id) {
+          auto& fallback = operation->pending_motion_takeover.mapped()->motion_takeover_spring_fallback;
+          if (fallback && fallback->stop_id == certificate.stop_id &&
+              fallback->stop_generation == certificate.stop_generation)
+            fallback->certificate = std::make_shared<const StopCertificateDTO>(certificate);
+        }
+        // Retain only the exact qualification needed by recovery. Diagnostic
+        // certificate rotation and later disjoint Stops cannot change this fact.
+        const bool requested_controlled_stop_succeeded =
+            certificate.result == StopCertificateResultDTO::kSucceededNominal &&
+            !certificate.terminal_error &&
+            std::all_of(operation->participants.begin(), operation->participants.end(),
+                        [&](const auto& participant) {
+              if (participant.payload_kind != OperationParticipantPayloadKind::kMotion ||
+                  !participant.fault_stop_plan ||
+                  !participant.fault_stop_plan->participant_stop_profile ||
+                  participant.fault_stop_plan->participant_stop_profile_purpose !=
+                      ParticipantStopProfilePurposeDTO::kFault) return false;
+              bool succeeded = false;
+              for (const auto& attempt : certificate.attempted_stage_results) {
+                const auto& result = attempt.result;
+                const auto& stage = result.request;
+                if (stage.operation_id != operation_id ||
+                    stage.participant_id != participant.slot_owner.participant_id ||
+                    attempt.authority != StopStageResultAuthorityDTO::kAuthoritative) continue;
+                if (stage.stop_id != certificate.stop_id ||
+                    stage.stop_generation != certificate.stop_generation || result.error ||
+                    result.outcome != ParticipantStopStageOutcomeDTO::kSucceeded ||
+                    result.attempt_disposition != StopStageAttemptDispositionDTO::kDispatched ||
+                    stage.participant_stop_plan != *participant.fault_stop_plan ||
+                    stage.stage_index >= stage.participant_stop_plan.stage_commands.size()) return false;
+                const auto& command = stage.participant_stop_plan.stage_commands[stage.stage_index];
+                if (command.resolved_stage.containment_command.command_kind !=
+                        StopContainmentCommandKind::kMotionControlledStop ||
+                    command.resolved_stage.command_qualification.stop_action_class !=
+                        StopActionClass::kControlled) return false;
+                succeeded = true;
+              }
+              return succeeded;
+            });
         operation->settled_stop = ActiveOperation::SettledStop{
-            certificate.stop_id, certificate.stop_generation, certificate.result};
+            certificate.stop_id, certificate.stop_generation, certificate.result,
+            StopCertificateRefDTO{certificate.stop_certificate_id,
+                                  certificate.stop_certificate_revision, certificate.stop_id,
+                                  certificate.stop_generation},
+            requested_controlled_stop_succeeded};
       }
     }
     const bool program_run_fence_releasable =
@@ -2713,14 +3085,19 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
       if (fence.stop_id == certificate.stop_id &&
           fence.stop_generation == certificate.stop_generation) {
         fence.releasable = program_run_fence_releasable;
+        bool selection_changed = false;
         for (auto& state : fence.node_states) {
           if (!program_run_fence_releasable) {
+            selection_changed |= terminal_program_fault_changes_selection(state);
             if (state != ProgramNodeHoldStateDTO::kFaulted) state = ProgramNodeHoldStateDTO::kFaulted;
           } else if (state == ProgramNodeHoldStateDTO::kStopping) {
             // Contained work waits for Resume; every other state is kept.
             state = ProgramNodeHoldStateDTO::kHeld;
           }
         }
+        if (selection_changed)
+          advance_terminal_program_fault_selection(
+              fence.selection_revision, fence.legacy_selection_revision, kMaximumKernelJsonInteger);
       }
     }
     reduce_program_selection_stop_locked(certificate);
@@ -2742,6 +3119,15 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
 
 void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken token) noexcept {
   try {
+    std::optional<OperationId> takeover_source_wakeup;
+    const ScopeExit wake_takeover([&] {
+      if (!takeover_source_wakeup) return;
+      try { static_cast<void>(advance_motion_takeover(*takeover_source_wakeup)); }
+      catch (...) {
+        std::lock_guard lock(state_mutex_);
+        motion_admission_closed_ = true;
+      }
+    });
     // Q60: late cancellation replies of never-dispatched participants whose
     // Stop already closed are tidied up on this lane, before any Stop work.
     settle_deferred_pre_dispatch_cancellations();
@@ -2782,6 +3168,8 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       transaction.progress_in_flight = true;
       const auto stop_id = *transaction.stop_id;
       const auto stop_generation = transaction.stop_generation;
+      if (transaction.motion_takeover_candidate_id && transaction.operations.size() == 1U)
+        takeover_source_wakeup = transaction.operations.front();
       const auto now = clock_.now();
       const auto* ordinary_stop = std::get_if<StopIntentDTO>(&transaction.projected_intent);
       const bool runtime_collision_containment =
@@ -2822,6 +3210,14 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                     participant_state.participant_id)) {
               continue;
             }
+            if (transaction.global_interrupt_selection && !transaction.full_stop &&
+                std::none_of(transaction.global_interrupt_selection->participants.begin(),
+                             transaction.global_interrupt_selection->participants.end(),
+                             [&](const auto& selected) {
+                               return selected.operation_id == operation_id &&
+                                      selected.participant_id == participant_state.participant_id;
+                             }))
+              continue;
             const auto& selected_active_stop_plan =
                 runtime_collision_containment &&
                         active_participant.payload_kind ==
@@ -2834,16 +3230,47 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
               motion_admission_closed_ = true;
               continue;
             }
-            const auto& stop_plan = *selected_active_stop_plan;
-            const auto& stop_goal_id = participant_state.controller_goal_id;
-            const auto stop_goal_generation = participant_state.controller_goal_generation;
+            const auto* effective_plan = selected_active_stop_plan.get();
+            const InterruptStopSelection* initial_interrupt = nullptr;
+            if (transaction.interrupt_selection &&
+                std::get<IoOperationRuleScopeDTO>(
+                    transaction.interrupt_selection->registration.scope)
+                        .operation_id == operation_id &&
+                transaction.interrupt_selection->plan.participant_id ==
+                    active_participant.slot_owner.participant_id) {
+              effective_plan = &transaction.interrupt_selection->plan;
+              initial_interrupt = &*transaction.interrupt_selection;
+            }
+            for (const auto& selection : transaction.disjoint_interrupt_selections) {
+              const auto& owner = std::get<IoOperationRuleScopeDTO>(selection.registration.scope);
+              if (owner.operation_id == operation_id &&
+                  owner.participant_id == active_participant.slot_owner.participant_id) {
+                effective_plan = &selection.plan;
+                initial_interrupt = &selection;
+              }
+            }
+            const GlobalInterruptStopParticipant* initial_global = nullptr;
+            if (transaction.global_interrupt_selection) {
+              const auto& members = transaction.global_interrupt_selection->participants;
+              const auto selected = std::find_if(members.begin(), members.end(), [&](const auto& value) {
+                return value.operation_id == operation_id &&
+                       value.participant_id == participant_state.participant_id;
+              });
+              if (selected != members.end()) {
+                initial_global = &*selected;
+                effective_plan = &selected->plan;
+              }
+            }
+            const auto& stop_plan = *effective_plan;
+            const auto& stop_goal_id = participant_state.command_id;
+            const auto stop_goal_generation = participant_state.command_generation;
             StopParticipantWork work{operation_id,
                                      accepted_revision->operation_revision_after_acceptance,
                                      active_participant.payload_kind,
                                      stop_goal_id,
                                      stop_goal_generation,
                                      active_participant.binding,
-                                     active_participant.stop_readiness,
+                                     *active_participant.stop_readiness,
                                      active_participant.retained_default_stop_limits,
                                      active_participant.stop_node_category,
                                      stop_plan,
@@ -2873,6 +3300,24 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                      false,
                                      std::nullopt,
                                      std::nullopt};
+            if (initial_interrupt) {
+              if (!VerifyPreparedIoRuleStopEntry(work.plan, initial_interrupt->stop_entry).ok()) {
+                motion_admission_closed_ = true;
+                continue;
+              }
+              work.current_stage_index =
+                  static_cast<std::size_t>(initial_interrupt->stop_entry.stage_index);
+              work.selected_interrupt_suffix = true;
+            }
+            if (initial_global) {
+              if (!VerifyPreparedIoRuleStopEntry(work.plan, initial_global->stop_entry).ok()) {
+                motion_admission_closed_ = true;
+                continue;
+              }
+              work.current_stage_index =
+                  static_cast<std::size_t>(initial_global->stop_entry.stage_index);
+              work.selected_interrupt_suffix = true;
+            }
             work.gripper_actuation = active_participant.gripper_actuation;
             work.retained_results.reserve(kMaxStopEscalationStages * 2U);
             if (runtime_collision_containment &&
@@ -2917,6 +3362,14 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           // or Spring attempt. The original transaction budget is unchanged.
           const auto count = item.plan.stage_commands.size();
           item.current_stage_index = item.current_stage_index + 1U < count ? count - 1U : count;
+        };
+        const auto advance_after_failed_stage = [&] {
+          if (item.selected_interrupt_suffix) {
+            if (item.current_stage_index < item.plan.stage_commands.size())
+              ++item.current_stage_index;
+          } else {
+            advance_to_strongest();
+          }
         };
         if (item.terminal && item.terminal_projection_complete) {
           continue;
@@ -3037,15 +3490,35 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           retain_first_error(error(std::string(to_string(ErrorCode::kExecutionTimeout)),
                                    "Controlled Stop did not prove containment before its deadline",
                                    "participant_stop_stage_deadline_expired"));
-          // The deadline watchdog issues the hard floor (as `main`). A
-          // contained fallback is a degraded Stop, never a cell-wide latch
-          // (item 25); an uncontained cascade still latches below.
-          advance_to_strongest();
+          // Ordinary watchdog expiry retains main's hard-floor jump. A
+          // selected interrupt advances its same qualified suffix; the
+          // transaction deadline and attempted-stage evidence are unchanged.
+          advance_after_failed_stage();
           return true;
         };
         for (auto& attempt : item.attempts) {
           if (!attempt.started || attempt.result_consumed || !attempt.handle.has_value()) {
             continue;
+          }
+          if (transaction.motion_takeover_candidate_id) {
+            auto* source = find_active_operation_locked(item.operation_id);
+            if (source != nullptr && !source->pending_motion_takeover.empty() &&
+                source->pending_motion_takeover.key() == *transaction.motion_takeover_candidate_id) {
+              auto& candidate = *source->pending_motion_takeover.mapped();
+              auto& fallback = candidate.motion_takeover_spring_fallback;
+              if (fallback && !fallback->return_point && fallback->stop_id == stop_id &&
+                  fallback->stop_generation == stop_generation &&
+                  source->state.active_stop_id == stop_id &&
+                  source->state.active_stop_generation == stop_generation) {
+                auto point = stop_stage_attempt_executor_->ReadSpringReturnPoint(*attempt.handle);
+                if (point && point->source_goal.controller_goal_id == item.controller_goal_id &&
+                    point->source_goal.controller_goal_generation == item.controller_goal_generation &&
+                    point->binding_epoch == point->trip.binding_epoch) {
+                  fallback->stage = attempt.stage;
+                  fallback->return_point = std::move(point);
+                }
+              }
+            }
           }
           auto result = stop_stage_attempt_executor_->TryTake(*attempt.handle);
           const auto observed_at = clock_.now();
@@ -3110,20 +3583,20 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                   }
                 } else {
                   // No cell-wide latch for an escalation (items 25, Q29).
-                  advance_to_strongest();
+                  advance_after_failed_stage();
                 }
               }
             } else if (!attempt.superseded) {
               // Q29: an invalid provider result escalates; the participant's
               // outcome carries it, no cell-wide latch or admission closure.
               retain_first_error(valid.error());
-              advance_to_strongest();
+              advance_after_failed_stage();
             }
           } else if (!attempt.superseded) {
             retain_first_error(error(std::string(to_string(ErrorCode::kInternalError)),
                                      "Stop-stage execution lane failed without a result",
                                      "stop_stage_attempt_infrastructure_failure"));
-            advance_to_strongest();
+            advance_after_failed_stage();
           }
         }
 
@@ -3151,7 +3624,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             break;
           }
           if (attempt.started) {
-            advance_to_strongest();
+            advance_after_failed_stage();
             continue;
           }
           const auto dispatch_now = clock_.now();
@@ -3164,28 +3637,29 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             retain_first_error(error(std::string(to_string(ErrorCode::kExecutionTimeout)),
                                      "Controlled Stop deadline passed before its dispatch",
                                      "participant_stop_stage_deadline_expired"));
-            advance_to_strongest();
+            advance_after_failed_stage();
             continue;
           }
           if (item.port == nullptr) {
             retain_first_error(error(std::string(to_string(ErrorCode::kInvariantViolation)),
                                      "prepared Stop participant has no execution port",
                                      "participant_stop_execution_port_missing"));
-            advance_to_strongest();
+            advance_after_failed_stage();
             continue;
           }
           auto stage = resolve_participant_stop_stage(item, stop_id, stop_generation,
                                                       item.current_stage_index, budget);
           if (!stage.ok()) {
             retain_first_error(stage.error());
-            advance_to_strongest();
+            advance_after_failed_stage();
             continue;
           }
           attempt.stage =
               std::make_shared<const ResolvedParticipantStopStageDTO>(std::move(stage.value()));
           attempt.budget = std::make_shared<const RemainingStopBudgetDTO>(std::move(budget));
           const auto started = stop_stage_attempt_executor_->TryStart(
-              StopStageAttemptRequest{item.port, attempt.stage, attempt.budget});
+              StopStageAttemptRequest{item.port, attempt.stage, attempt.budget,
+                  transaction.force_spring_return && item.current_stage_index == 0U});
           if (started.status != StopStageAttemptStartStatus::kStarted ||
               !started.handle.has_value()) {
             item.terminal = true;
@@ -3327,6 +3801,14 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             continue;
           }
         }
+        const auto rules_retired = retire_participant_io_rules_locked(*active_participant);
+        if (!rules_retired.ok()) {
+          motion_admission_closed_ = true;
+          item.participant_settlement_error = rules_retired.error();
+        }
+        const bool io_source_failed = std::any_of(
+            participant_state->io_rule_outcomes.begin(), participant_state->io_rule_outcomes.end(),
+            [](const auto& outcome) { return !outcome.evidence.source_losses.empty(); });
         // A failed preparation keeps its owner's failure terminal and recovery
         // authority; containment had nothing physical to stop.
         const bool participant_settled =
@@ -3339,9 +3821,10 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         const bool runtime_collision_participant =
             runtime_collision_containment &&
             active_participant->runtime_collision_error.has_value();
-        participant_state->state = participant_settled && !runtime_collision_participant
-                                       ? OperationStateKind::kStopped
-                                       : OperationStateKind::kInterventionRequired;
+        participant_state->state =
+            participant_settled && !runtime_collision_participant
+                ? (io_source_failed ? OperationStateKind::kFailed : OperationStateKind::kStopped)
+                : OperationStateKind::kInterventionRequired;
         if (item.stop_path_collision.has_value()) {
           // The collision on the Stop path is the participant's cause.
           participant_state->terminal_error = item.stop_path_collision;
@@ -3349,6 +3832,10 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           participant_state->terminal_error = item.participant_settlement_error.has_value()
                                                   ? item.participant_settlement_error
                                                   : item.terminal_error;
+        } else if (io_source_failed && participant_settled && !runtime_collision_participant) {
+          participant_state->terminal_error =
+              error("interrupt_source_unavailable", "A required motion interrupt source failed",
+                    "io_rule_required_source_lost");
         } else if (runtime_collision_participant) {
           participant_state->terminal_error = active_participant->runtime_collision_error;
         } else if (runtime_collision_containment &&
@@ -3377,20 +3864,26 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           const bool has_pneumatic_transaction = std::any_of(
               operation->participants.begin(), operation->participants.end(),
               [](const auto& row) { return row.finishes_current_gripper_transaction(); });
-          operation->state.state = has_pneumatic_transaction
-              ? aggregate_participant_state(operation->state.participants)
+          operation->state.state =
+              (has_pneumatic_transaction || io_source_failed)
+                  ? aggregate_participant_state(operation->state.participants)
               : std::all_of(operation->state.participants.begin(),
-                            operation->state.participants.end(), [](const auto& candidate) {
+                            operation->state.participants.end(),
+                            [](const auto& candidate) {
                               return candidate.state == OperationStateKind::kStopped;
-                            }) ? OperationStateKind::kStopped : OperationStateKind::kInterventionRequired;
+                            })
+                  ? OperationStateKind::kStopped
+                  : OperationStateKind::kInterventionRequired;
         } else {
           // Once the selected moving rows have settled, ordinary siblings
           // retain their truthful aggregate state independently of Stop.
-          const bool moving_settled = std::all_of(operation->participants.begin(),
-              operation->participants.end(), [&](const auto& candidate) {
+          const bool moving_settled = std::all_of(
+              operation->participants.begin(), operation->participants.end(),
+              [&](const auto& candidate) {
                 if (!candidate.stop_owns_reconciliation()) return true;
-                const auto row = std::find_if(operation->state.participants.begin(),
-                    operation->state.participants.end(), [&](const auto& state) {
+                const auto row = std::find_if(
+                    operation->state.participants.begin(), operation->state.participants.end(),
+                    [&](const auto& state) {
                       return state.participant_id == candidate.slot_owner.participant_id;
                     });
                 return row != operation->state.participants.end() && terminal(row->state);
@@ -3416,6 +3909,27 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             operation->state.state = OperationStateKind::kInterventionRequired;
             participant_state->state = OperationStateKind::kInterventionRequired;
             participant_state->terminal_error = transitioned.error();
+          }
+        }
+        if (item.payload_kind == OperationParticipantPayloadKind::kMotion) {
+          if (item.preparation_failed) {
+            // The exact prepared snapshot proved this failure never
+            // dispatched. Preserve any already-published local failure.
+            if (!participant_state->terminal_fact)
+              participant_state->terminal_fact = ParticipantExecutionFact{
+                  ParticipantExecutionFactKind::kLocalFailure,
+                  ParticipantEffectKnowledge::kNoEffect, participant_state->terminal_error};
+          } else if (participant_settled && !runtime_collision_participant) {
+            // These are the same containment/local-settlement proofs used
+            // above, not an inference from the public Stopped state. A
+            // deferred pre-dispatch cleanup still retains its existing borrow.
+            participant_state->terminal_fact = ParticipantExecutionFact{
+                item.cancelled_pre_dispatch
+                    ? ParticipantExecutionFactKind::kCancelledBeforeDispatch
+                    : ParticipantExecutionFactKind::kPreemptedByAddressedStop,
+                item.cancelled_pre_dispatch ? ParticipantEffectKnowledge::kNoEffect
+                                            : ParticipantEffectKnowledge::kEffectSettled,
+                participant_state->terminal_error};
           }
         }
         item.terminal_projection_complete = true;
@@ -3475,12 +3989,13 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             });
             if (row != states.end()) *row = capture;
           };
-          for (const auto& operation_id : transaction.operations) {
+          for (const auto& operation_id : stop_operation_snapshot_ids(transaction)) {
             auto* operation = find_active_operation_locked(operation_id);
             if (operation == nullptr || !operation->pending_control.has_value() ||
                 !operation->pending_control->durable) {
               continue;
             }
+            if (operation->has_pending_io_rule_response()) continue;
             auto& pending = *operation->pending_control;
             if (pending.accepted.control != OperationControlKind::kReset) {
               if (pending.accepted.control == OperationControlKind::kAcknowledgeCompleted &&
@@ -3795,6 +4310,20 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                 "operation_control_effect_handoff_failed")});
     }
     if (transaction_became_terminal) {
+      StopWorkHandoff global_handoff;
+      {
+        std::lock_guard lock(state_mutex_);
+        if (global_io_rule_catalog_) {
+          const auto evaluated = global_io_rule_service_->EvaluateRules();
+          const auto processed = evaluated.ok()
+              ? process_global_io_rule_evidence_locked(global_handoff)
+              : evaluated;
+          if (!processed.ok()) global_io_rule_projection_error_ = processed.error();
+        }
+      }
+      // The existing control lane performs no recovery SQL. Reevaluate idle
+      // rules once at this actual terminal boundary, then publish work only.
+      publish_stop_work(global_handoff);
       if (terminal_projection.has_value()) {
         stop_projection_worker_->Publish(*terminal_projection);
       }

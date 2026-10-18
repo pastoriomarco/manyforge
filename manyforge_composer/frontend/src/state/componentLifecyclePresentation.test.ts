@@ -3,13 +3,13 @@ import { describe, expect, it } from 'vitest';
 import {
   componentLifecyclePresentation,
   componentLifecycleToneClass,
-  componentReadinessDomainPresentation,
+  componentReadinessOccurrencePresentation,
 } from './componentLifecyclePresentation';
 import type {
   CCLCComponentSnapshot,
   CCLCLifecycleProgress,
   CCLCLifecycleTarget,
-  CCLCReadinessDomain,
+  CCLCReadinessProviderOccurrence,
 } from '../types/cclc';
 
 function snapshot(
@@ -18,7 +18,7 @@ function snapshot(
   progress: Partial<CCLCLifecycleProgress> | null,
 ): CCLCComponentSnapshot {
   return {
-    componentId: 'component.arm',
+    controllableComponentId: 'component.arm',
     lifecycleGeneration: 4,
     lifecycleState,
     retainedBundleId: 'bundle.1',
@@ -31,7 +31,7 @@ function snapshot(
       requestedState: lifecycleState === 'declared' || lifecycleState === 'disabled' ? 'prepared' : lifecycleState === 'prepared' ? 'active' : null,
       ready: lifecycleState === 'active',
       error: lifecycleState === 'active' ? null : { code: 'not_ready', message: 'controller_manager not ready', details: {} },
-      domains: [], measuredState: { required: false, available: null, error: null } },
+      providerOccurrences: [], measuredState: { required: false, available: null, error: null } },
     lifecycleTarget: target === null ? null : {
       requestedState: 'active', origin: 'startup', targetGeneration: 1, ...target,
     },
@@ -52,7 +52,7 @@ function message(value: CCLCComponentSnapshot): string {
   return componentLifecyclePresentation(value).message;
 }
 
-function readinessDomain(): CCLCReadinessDomain {
+function readinessDomain(): CCLCReadinessProviderOccurrence {
   return {
     providerOccurrence: { controlDomainId: 'domain.gripper', controlDomainRevision: 'revision.1',
       lifecyclePlanCatalogDigest: 'catalog.1', providerInstanceId: 'provider.1',
@@ -72,12 +72,12 @@ describe('domain activation presentation', () => {
   it.each([undefined, true])('preserves existing presentation for activation fact %s', (hasActivationStep) => {
     const domain = readinessDomain();
     domain.hasActivationStep = hasActivationStep;
-    expect(componentReadinessDomainPresentation(domain)).toEqual({ state: 'active', facts: domain.health!.facts });
+    expect(componentReadinessOccurrencePresentation(domain)).toEqual({ state: 'active', facts: domain.health!.facts });
   });
   it('words no activation step without displaying normalized controller facts or changing raw health', () => {
     const domain = readinessDomain();
     domain.hasActivationStep = false;
-    const presented = componentReadinessDomainPresentation(domain);
+    const presented = componentReadinessOccurrencePresentation(domain);
     expect(presented.state).toBe('No activation step');
     expect(presented.facts.map((fact) => fact.lifecycleFactId)).toEqual([
       'external.fault_present', 'external.transport_ready',
@@ -89,9 +89,9 @@ describe('domain activation presentation', () => {
     const domain = readinessDomain();
     domain.hasActivationStep = false;
     domain.health!.observedState = 'faulted';
-    expect(componentReadinessDomainPresentation(domain).state).toBe('No activation step · faulted');
+    expect(componentReadinessOccurrencePresentation(domain).state).toBe('No activation step · faulted');
     domain.health = null;
-    expect(componentReadinessDomainPresentation(domain).state).toBe('No activation step · health unavailable');
+    expect(componentReadinessOccurrencePresentation(domain).state).toBe('No activation step · health unavailable');
   });
 });
 
@@ -262,7 +262,7 @@ it('shows actual degraded readiness even for durable Active and keeps a real hea
     error: { code: 'measured_source_unavailable', message: 'Measured feed is stale', details: {} } };
   expect(componentLifecyclePresentation(current).message).toBe('Not ready');
   expect(componentLifecyclePresentation(current).readiness).toContain('Measured feed is stale');
-  current.readiness.domains = [{ providerOccurrence: {
+  current.readiness.providerOccurrences = [{ providerOccurrence: {
     controlDomainId: 'domain.arm', controlDomainRevision: 'revision.1', providerInstanceId: 'provider.1',
     providerManifestId: 'manifest.1', providerManifestRevision: 'manifest.revision.1', providerRuntimeUnitId: 'runtime.1',
     providerRuntimeEpoch: 'epoch.1', lifecyclePlanCatalogDigest: 'catalog.1' },

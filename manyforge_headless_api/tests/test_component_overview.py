@@ -408,9 +408,37 @@ def _without_empty_rule(facts: dict[str, Any]) -> dict[str, Any]:
     return build_component_overview(**comparison)
 
 
-@pytest.mark.parametrize("canonical_empty", [True, False])
-def test_verified_empty_publication_has_no_required_equipment_faults(canonical_empty) -> None:
+def _warm_empty_facts(canonical_empty: bool = True) -> dict[str, Any]:
     facts = _empty_facts(canonical_empty)
+    active = facts["runtime"]["sections"]["manager"]["payload"]["active"]
+    identity = copy.deepcopy(_facts()["execution_identity_response"]["identity"])
+    identity["active_publication_generation"] = active["publication"]["publication_generation"]
+    identity["scene_revision"] = {"scene_id": "scene-a", "revision_id": 1,
+                                  "content_hash": "sha256:" + "4" * 64}
+    facts["execution_identity_response"] = {"ok": True, "identity": identity}
+    facts["execution_targets_response"] = {
+        "ok": True, "identity": copy.deepcopy(identity),
+        "targets": {"schema_version": "manyforge.execution_targets.v3", "components": []},
+    }
+    facts["execution_control_response"] = {
+        "ok": True, "identity": copy.deepcopy(identity),
+        "control_state": {
+            "schema_version": "manyforge.execution_control_state.v6",
+            "observed_targets": [], "manual_operations": [], "runtime_scale_control": None,
+            "cell_stop_action": {"available": True, "expected_stop_generation": 0,
+                                 "fault": None, "latest_terminal": None,
+                                 "unavailable_reason": None},
+        },
+    }
+    for name in ("execution_identity", "execution_targets", "execution_control"):
+        del facts["errors"][name]
+    return facts
+
+
+@pytest.mark.parametrize("canonical_empty", [True, False])
+@pytest.mark.parametrize("warm", [True, False])
+def test_verified_empty_publication_has_no_required_equipment_faults(canonical_empty, warm) -> None:
+    facts = _warm_empty_facts(canonical_empty) if warm else _empty_facts(canonical_empty)
     captured = copy.deepcopy(facts)
     overview = build_component_overview(**facts)
     rows = _by_id(overview)
@@ -461,8 +489,9 @@ def test_verified_empty_publication_has_no_required_equipment_faults(canonical_e
     (("runtime", "active_graph_revision"), "another-graph"),
 ])
 @pytest.mark.parametrize("canonical_empty", [True, False])
-def test_unverified_empty_keeps_the_existing_reduction(path, value, canonical_empty) -> None:
-    facts = _empty_facts(canonical_empty)
+@pytest.mark.parametrize("warm", [True, False])
+def test_unverified_empty_keeps_the_existing_reduction(path, value, canonical_empty, warm) -> None:
+    facts = _warm_empty_facts(canonical_empty) if warm else _empty_facts(canonical_empty)
     target = facts if path[0] == "runtime" else facts["runtime"]["sections"]["manager"]
     for part in path[:-1]:
         target = target[part]
@@ -477,8 +506,9 @@ def test_unverified_empty_keeps_the_existing_reduction(path, value, canonical_em
     "execution_identity", "execution_targets", "execution_control",
 ])
 @pytest.mark.parametrize("canonical_empty", [True, False])
-def test_empty_publication_does_not_hide_actual_source_or_owner_errors(fault, canonical_empty) -> None:
-    facts = _empty_facts(canonical_empty)
+@pytest.mark.parametrize("warm", [True, False])
+def test_empty_publication_does_not_hide_actual_source_or_owner_errors(fault, canonical_empty, warm) -> None:
+    facts = _warm_empty_facts(canonical_empty) if warm else _empty_facts(canonical_empty)
     if fault in {"logical_scene", "scene_runtime"}:
         facts["runtime"]["sections"][fault]["available"] = False
     elif fault == "source_model":
@@ -493,6 +523,35 @@ def test_empty_publication_does_not_hide_actual_source_or_owner_errors(fault, ca
         facts["errors"][fault] = {"code": f"{fault}_invalid"}
     assert build_component_overview(**facts) == _without_empty_rule(facts)
     assert build_component_overview(**facts)["summary_label"] != "No components"
+
+
+@pytest.mark.parametrize(("path", "value"), [
+    (("execution_identity_response", "identity", "cell_id"), "foreign-cell"),
+    (("execution_identity_response", "identity", "retained_bundle_id"), "foreign-bundle"),
+    (("execution_identity_response", "identity", "graph_revision"), "foreign-graph"),
+    (("execution_identity_response", "identity", "active_publication_generation"), 3),
+    (("execution_identity_response", "identity", "active_publication_generation"), True),
+    (("execution_identity_response", "identity", "owner_epoch"), ""),
+    (("execution_targets_response", "identity", "owner_epoch"), "replaced-owner"),
+    (("execution_control_response", "identity", "active_publication_generation"), 5),
+    (("execution_control_response", "identity", "scene_revision", "revision_id"), 2),
+    (("execution_targets_response", "targets", "components"), [{}]),
+    (("execution_control_response", "control_state", "observed_targets"), [{}]),
+    (("execution_control_response", "control_state", "manual_operations"), [{}]),
+    (("execution_control_response", "control_state", "runtime_scale_control"), {}),
+    (("execution_control_response", "control_state", "cell_stop_action", "available"), False),
+    (("execution_control_response", "control_state", "cell_stop_action", "fault"), {"code": "stop_failed"}),
+])
+def test_warm_empty_requires_current_matching_fault_free_owner_projections(path, value) -> None:
+    facts = _warm_empty_facts()
+    target = facts
+    for field in path[:-1]:
+        target = target[field]
+    target[path[-1]] = value
+    overview = build_component_overview(**facts)
+    assert overview == _without_empty_rule(facts)
+    assert overview["summary_label"] != "No components"
+    assert _by_id(overview)["plan_preview"]["required"] is True
 
 
 def test_loaded_owner_not_ready_remains_a_required_fault() -> None:

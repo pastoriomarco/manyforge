@@ -52,7 +52,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     payload = catalog.json()
     assert len(payload["entries"]) == 49
     assert payload["apiVersion"] == "manyforge.node_catalog.v2"
-    assert payload["contentVersion"] == "2.5.0"
+    assert payload["contentVersion"] == "2.6.0"
     assert payload["catalogId"] == "manyforge_builtin"
     assert payload["catalogDigest"].startswith("sha256:")
     assert payload["environmentDigest"].startswith("sha256:")

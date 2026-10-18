@@ -69,14 +69,26 @@ _PROFILE_DESCRIPTION = Path(
 )
 
 
+_MODEL_FREE_IO_PROFILE = {
+    "runtime_restoration_profile_id": "io_device_v0",
+    "io_provider_runtime": {},
+    "source_fields": {},
+    "stop_profiles": {},
+    "acceptance_obligations": [],
+}
+
+
 def _model_preparation_profiles(
     capability_root: Path,
-) -> dict[str, tuple[str, str]]:
+) -> dict[str, tuple[str, str] | None]:
     """Read the minimum repository-owned profile facts needed by Python XML prep.
 
     Native preparation independently validates the complete profile and intent
     join.  This projection only supplies the model identity and accepted package
-    prefix required to rewrite the already captured source bytes.
+    prefix required to rewrite the already captured source bytes.  The approved
+    model-free I/O profile (runtime kind ``io_provider_runtime``) maps to
+    ``None``: it has no model to prepare.  Only its exact approved row is
+    accepted; every other row must name a known model family.
     """
 
     try:
@@ -121,7 +133,7 @@ def _model_preparation_profiles(
                 "Activation model families contain an invalid row",
             )
         families[family_id] = (model_asset_id, prefix)
-    profiles: dict[str, tuple[str, str]] = {}
+    profiles: dict[str, tuple[str, str] | None] = {}
     profile_rows = root.get("runtime_restoration_profiles")
     if not isinstance(profile_rows, list):
         raise HeadlessApiError(
@@ -134,12 +146,13 @@ def _model_preparation_profiles(
             if isinstance(row, dict)
             else None
         )
+        model_free = isinstance(row, dict) and "io_provider_runtime" in row
         family_id = row.get("model_family_id") if isinstance(row, dict) else None
         family = families.get(family_id) if isinstance(family_id, str) else None
         if (
             not isinstance(profile_id, str)
             or not profile_id
-            or family is None
+            or (row != _MODEL_FREE_IO_PROFILE if model_free else family is None)
             or profile_id in profiles
         ):
             raise HeadlessApiError(
@@ -325,7 +338,7 @@ def _prepare_model_closure(
     *,
     deployment: Mapping[str, Any],
     model_source_closure: Mapping[str, Any],
-    profiles: Mapping[str, tuple[str, str]],
+    profiles: Mapping[str, tuple[str, str] | None],
 ) -> dict[str, Any]:
     if (
         set(model_source_closure) != {"components", "schema_version"}
@@ -352,6 +365,7 @@ def _prepare_model_closure(
         source_by_component[component_id] = source
     prepared: list[dict[str, object]] = []
     seen_components: set[str] = set()
+    consumed_sources: set[str] = set()
     try:
         for component in deployment["components"]:
             component_id = (
@@ -362,7 +376,8 @@ def _prepare_model_closure(
                 if isinstance(component, dict)
                 else None
             )
-            profile = profiles.get(profile_id) if isinstance(profile_id, str) else None
+            known_profile = isinstance(profile_id, str) and profile_id in profiles
+            profile = profiles.get(profile_id) if known_profile else None
             source = (
                 source_by_component.get(component_id)
                 if isinstance(component_id, str)
@@ -372,14 +387,34 @@ def _prepare_model_closure(
                 not isinstance(component_id, str)
                 or not component_id
                 or component_id in seen_components
-                or profile is None
-                or source is None
+                or not known_profile
             ):
                 raise HeadlessApiError(
                     "activation_model_profile_invalid",
                     "Deployment components do not match captured model profiles",
                 )
             seen_components.add(component_id)
+            if profile is None:
+                # The registered model-free I/O profile: only an io_provider
+                # component with no model source and no captured row has no XML.
+                configuration = component.get("configuration")
+                if (
+                    not isinstance(configuration, dict)
+                    or configuration.get("runtime_kind") != "io_provider"
+                    or "model_source" in component
+                    or source is not None
+                ):
+                    raise HeadlessApiError(
+                        "activation_model_profile_invalid",
+                        "Deployment components do not match captured model profiles",
+                    )
+                continue
+            if source is None:
+                raise HeadlessApiError(
+                    "activation_model_profile_invalid",
+                    "Deployment components do not match captured model profiles",
+                )
+            consumed_sources.add(component_id)
             model_asset_id, package_prefix = profile
             prepared.append(
                 prepare_captured_model_source(
@@ -394,7 +429,7 @@ def _prepare_model_closure(
             "Activation model source preparation failed",
             details={"preparer_detail": str(error)[:4096]},
         ) from error
-    if seen_components != set(source_by_component):
+    if consumed_sources != set(source_by_component):
         raise HeadlessApiError(
             "activation_model_source_invalid",
             "Captured activation model sources contain an unused component",

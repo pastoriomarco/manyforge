@@ -34,13 +34,13 @@ _FIELDS = {
     "node_environment": ("catalog_id", "content_version", "catalog_digest", "environment_digest"),
     "component": ("component_role_id", "controllable_component_id", "component_type_id", "component_type_revision", "model_role_bindings"),
     "model": ("model_role_id", "model_instance_id", "model_revision"),
-    "target": ("target_role_id", "component_role_id", "controllable_component_id", "command_target_id", "frame_role_bindings", "resource_role_bindings", "collision_body_role_bindings", "capability_bindings"),
+    "target": ("target_role_id", "component_role_id", "controllable_component_id", "command_target_id", "frame_role_bindings", "resource_role_bindings", "collision_body_role_bindings", "capability_bindings", "signal_role_bindings"),
     "frame": ("frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name"),
     "resource": ("resource_role_id", "resource_ids", "compiled_resource_names"),
     "collision": ("collision_body_role_id", "model_instance_id", "model_revision", "compiled_collision_body_names"),
     "capability": ("capability_id", "capability_definition_revision", "control_binding", "capability_provider_binding", "command_schema"),
     "node_policy": ("instance_id", "recovery_policy", "operator_stop_policy"),
-    "recovery_policy": ("allow_intervention", "max_retries"),
+    "recovery_policy": ("allow_intervention", "max_retries", "intervention_stop_scope"),
     "control": ("control_binding_id", "control_binding_revision"),
     "provider": ("capability_provider_binding_id", "capability_provider_binding_revision"),
     "command_schema": ("command_schema_id", "command_schema_revision"),
@@ -48,8 +48,11 @@ _FIELDS = {
     "contact_body": ("component_role_id", "target_role_id", "controllable_component_id", "command_target_id", "model_role_id", "collision_body_role_id", "model_instance_id", "model_revision", "collision_body_ids"),
     "provenance": ("binding_compiler_contract_digest", "role_assignment_digest", "source_records", "resolved_output_records"),
     "provenance_record": ("record_kind", "record_id", "revision"),
+    "signal": ("resource_role_id", "signal_name", "value_type", "direction", "transition_capability", "signal_descriptor_digest"),
 }
+_OPTIONAL_FIELDS = {'recovery_policy': ('intervention_stop_scope',), 'target': ('signal_role_bindings',)}
 _STOP_POLICIES = frozenset(('inherit', 'hold', 'continue'))
+_INTERVENTION_STOP_SCOPES = frozenset(('all', 'own_groups'))
 _PROGRAM_ID = re.compile(r"^[a-z][a-z0-9_.-]*\Z")
 _COLLISION_BODY_ID = "component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}"
 
@@ -62,8 +65,11 @@ def _fail(path: str, expected: str) -> None:
     raise ProgramBindingTransportError(f"{path}: {expected}")
 
 
-def _record(value: object, keys: tuple[str, ...], path: str) -> Mapping[str, Any]:
-    if not isinstance(value, dict) or set(value) != set(keys):
+def _record(
+    value: object, keys: tuple[str, ...], path: str, *, optional: tuple[str, ...] = (),
+) -> Mapping[str, Any]:
+    allowed = set(keys)
+    if not isinstance(value, dict) or not allowed.difference(optional) <= set(value) <= allowed:
         _fail(path, "expected closed record")
     return cast(ProgramBindingDocument, value)
 
@@ -138,12 +144,16 @@ def _node_policy(value: object, path: str) -> Mapping[str, Any]:
     recovery = _record(
         row["recovery_policy"], _FIELDS["recovery_policy"],
         f"{path}.recovery_policy",
+        optional=_OPTIONAL_FIELDS["recovery_policy"],
     )
     if type(recovery["allow_intervention"]) is not bool:
         _fail(f"{path}.recovery_policy.allow_intervention", "boolean")
     retries = recovery["max_retries"]
     if type(retries) is not int or not 0 <= retries <= _RETRY_MAX:
         _fail(f"{path}.recovery_policy.max_retries", "integer in bounded range")
+    scope = recovery.get("intervention_stop_scope", "all")
+    if type(scope) is not str or scope not in _INTERVENTION_STOP_SCOPES:
+        _fail(f"{path}.recovery_policy.intervention_stop_scope", "closed enum value")
     if (
         type(row["operator_stop_policy"]) is not str
         or row["operator_stop_policy"] not in _STOP_POLICIES
@@ -152,6 +162,7 @@ def _node_policy(value: object, path: str) -> Mapping[str, Any]:
     if (
         recovery["allow_intervention"] is False
         and retries == 0
+        and scope == "all"
         and row["operator_stop_policy"] == "inherit"
     ):
         _fail(path, "default node-policy rows must be omitted")
@@ -173,7 +184,7 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
     _digest(env["catalog_digest"], f"{label}.node_environment.catalog_digest")
     _digest(env["environment_digest"], f"{label}.node_environment.environment_digest")
 
-    components = _array(root["component_role_bindings"], f"{label}.component_role_bindings", minimum=1, maximum=_ROLE_MAX)
+    components = _array(root["component_role_bindings"], f"{label}.component_role_bindings", maximum=_ROLE_MAX)
     component_by_role: dict[str, Mapping[str, Any]] = {}
     for index, item in enumerate(components):
         path = f"{label}.component_role_bindings[{index}]"
@@ -196,7 +207,7 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
     target_by_role: dict[str, Mapping[str, Any]] = {}
     for index, item in enumerate(targets):
         path = f"{label}.target_role_bindings[{index}]"
-        target = _record(item, _FIELDS["target"], path)
+        target = _record(item, _FIELDS["target"], path, optional=_OPTIONAL_FIELDS["target"])
         for field in ("target_role_id", "component_role_id", "controllable_component_id", "command_target_id"):
             _identity(target[field], f"{path}.{field}")
         component = component_by_role.get(target["component_role_id"])
@@ -221,6 +232,20 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
             if len(ids) != len(names):
                 _fail(rp, "resource correspondence vectors must have equal length")
         _sorted_unique(resources, lambda x: x["resource_role_id"], f"{path}.resource_role_bindings")
+        if "signal_role_bindings" in target:
+            signals = _array(target["signal_role_bindings"], f"{path}.signal_role_bindings", minimum=1)
+            coordinate_roles = {row["resource_role_id"] for row in resources}
+            for si, item2 in enumerate(signals):
+                sp = f"{path}.signal_role_bindings[{si}]"
+                signal = _record(item2, _FIELDS["signal"], sp)
+                _identity(signal["resource_role_id"], f"{sp}.resource_role_id")
+                _identity(signal["signal_name"], f"{sp}.signal_name")
+                _digest(signal["signal_descriptor_digest"], f"{sp}.signal_descriptor_digest")
+                if signal["value_type"] != "bool" or signal["direction"] not in ("input", "output") or signal["transition_capability"] not in ("sampled_only", "captured"):
+                    _fail(sp, "invalid signal declaration")
+                if signal["resource_role_id"] in coordinate_roles:
+                    _fail(sp, "resource role cannot resolve to both coordinate and signal")
+            _sorted_unique(signals, lambda x: x["resource_role_id"], f"{path}.signal_role_bindings")
         collisions = _array(target["collision_body_role_bindings"], f"{path}.collision_body_role_bindings")
         for ci, item2 in enumerate(collisions):
             cp = f"{path}.collision_body_role_bindings[{ci}]"

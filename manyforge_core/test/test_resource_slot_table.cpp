@@ -48,6 +48,290 @@ using namespace manyforge::core;
   return ResourceSlotReservationOwnerDTO{std::move(value), std::move(resources)};
 }
 
+[[nodiscard]] ResourceSlotOwnerTransferDTO transfer_owner(ResourceSlotOwnerDTO expected,
+                                                          ResourceSlotOwnerDTO next,
+                                                          std::vector<ResourceId> resources) {
+  return ResourceSlotOwnerTransferDTO{std::move(expected), std::move(next), std::move(resources)};
+}
+
+TEST(ResourceSlotTableTest, TransfersCoordinatedDispatchedOwnersAtomicallyWithOneGeneration) {
+  ResourceSlotTable table({ResourceId("a"), ResourceId("b"), ResourceId("unrelated")});
+  const auto first = owner("old.op", "old.a");
+  auto second = owner("old.op", "old.b");
+  std::get<ControllerParticipantBindingIdentityDTO>(second.binding_identity.binding)
+      .control_binding_id = ControlBindingId("binding.b");
+  auto next_first = first;
+  next_first.operation_id = OperationId("new.op");
+  next_first.participant_id = OperationParticipantId("new.a");
+  auto next_second = second;
+  next_second.operation_id = OperationId("new.op");
+  next_second.participant_id = OperationParticipantId("new.b");
+  ASSERT_TRUE(table
+                  .reserve_batch({reservation_owner(first, {ResourceId("a")}),
+                                  reservation_owner(second, {ResourceId("b")})})
+                  .ok());
+  ASSERT_TRUE(table
+                  .transition_batch({reservation_owner(first, {ResourceId("a")}),
+                                     reservation_owner(second, {ResourceId("b")})},
+                                    ResourceSlotState::kDispatched)
+                  .ok());
+  const auto before = table.coherent_snapshot();
+  const auto transferred = table.transfer_dispatched_owners(
+      before, {transfer_owner(first, next_first, {ResourceId("a")}),
+               transfer_owner(second, next_second, {ResourceId("b")})});
+  ASSERT_TRUE(transferred.ok()) << transferred.error().message;
+  const auto after = table.coherent_snapshot();
+  EXPECT_EQ(transferred.value(), before.operation_resource_generation + 1U);
+  EXPECT_EQ(after.operation_resource_generation, transferred.value());
+  EXPECT_EQ(after.slots[0].owner, std::optional(next_first));
+  EXPECT_EQ(after.slots[1].owner, std::optional(next_second));
+  for (std::size_t index = 0; index < 2U; ++index) {
+    EXPECT_EQ(after.slots[index].state, ResourceSlotState::kDispatched);
+    EXPECT_EQ(after.slots[index].stop_generation, before.slots[index].stop_generation);
+  }
+  EXPECT_EQ(after.slots[2], before.slots[2]);
+  EXPECT_EQ(table.active_operation_ids(), std::vector<OperationId>{OperationId("new.op")});
+  EXPECT_FALSE(table
+                   .transfer_dispatched_owners(
+                       before, {transfer_owner(first, next_first, {ResourceId("a")}),
+                                transfer_owner(second, next_second, {ResourceId("b")})})
+                   .ok());
+  EXPECT_EQ(table.coherent_snapshot(), after);
+}
+
+TEST(ResourceSlotTableTest, TransferPreservesPreviouslyStampedStopGenerations) {
+  ResourceSlotTable table(arm_resources());
+  const auto former = owner("former.op", "former.part");
+  ASSERT_TRUE(table.reserve(former, arm_resources()).ok());
+  ASSERT_TRUE(table.transition(former, arm_resources(), ResourceSlotState::kDispatched).ok());
+  const auto fenced =
+      table.stop_fence_batch({table.coherent_snapshot().operation_resource_generation,
+                              StopGeneration(7U),
+                              {stop_fence_owner(former, arm_resources())},
+                              {}});
+  ASSERT_TRUE(fenced.ok());
+  const auto revised = fenced.value().revised_owners.front();
+  ASSERT_TRUE(table.transition(revised, arm_resources(), ResourceSlotState::kTerminal).ok());
+  ASSERT_TRUE(table.release(revised, arm_resources()).ok());
+  const auto incumbent = owner("incumbent.op", "incumbent.part");
+  const auto next = owner("new.op", "new.part");
+  ASSERT_TRUE(table.reserve(incumbent, arm_resources()).ok());
+  ASSERT_TRUE(table.transition(incumbent, arm_resources(), ResourceSlotState::kDispatched).ok());
+  ASSERT_TRUE(table
+                  .transfer_dispatched_owners(table.coherent_snapshot(),
+                                              {transfer_owner(incumbent, next, arm_resources())})
+                  .ok());
+  for (const auto& slot : table.snapshot()) {
+    EXPECT_EQ(slot.owner, std::optional(next));
+    EXPECT_EQ(slot.state, ResourceSlotState::kDispatched);
+    EXPECT_EQ(slot.stop_generation, StopGeneration(7U));
+  }
+}
+
+TEST(ResourceSlotTableTest, TransferRejectsStaleOrAlteredCaptureWithoutMutation) {
+  ResourceSlotTable table({ResourceId("a"), ResourceId("b")});
+  const auto incumbent = owner();
+  const auto next = owner("new.op", "new.part");
+  ASSERT_TRUE(table.reserve(incumbent, {ResourceId("a")}).ok());
+  ASSERT_TRUE(table.transition(incumbent, {ResourceId("a")}, ResourceSlotState::kDispatched).ok());
+  const auto captured = table.coherent_snapshot();
+  const std::vector<ResourceSlotOwnerTransferDTO> rows{
+      transfer_owner(incumbent, next, {ResourceId("a")})};
+  auto altered = captured;
+  altered.slots[0].stop_generation = StopGeneration(1U);
+  EXPECT_FALSE(table.transfer_dispatched_owners(altered, rows).ok());
+  EXPECT_EQ(table.coherent_snapshot(), captured);
+  altered = captured;
+  altered.slots[0].state = ResourceSlotState::kStopping;
+  EXPECT_FALSE(table.transfer_dispatched_owners(altered, rows).ok());
+  EXPECT_EQ(table.coherent_snapshot(), captured);
+  altered = captured;
+  altered.slots[0].owner->operation_revision = OperationRevision(2U);
+  EXPECT_FALSE(table.transfer_dispatched_owners(altered, rows).ok());
+  EXPECT_EQ(table.coherent_snapshot(), captured);
+  ASSERT_TRUE(table.reserve(owner("unrelated.op", "other.part"), {ResourceId("b")}).ok());
+  const auto now = table.coherent_snapshot();
+  const auto stale = table.transfer_dispatched_owners(captured, rows);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"), "operation_resource_generation_stale");
+  EXPECT_EQ(table.coherent_snapshot(), now);
+}
+
+TEST(ResourceSlotTableTest, TransferCannotOvertakeAnAcceptedStopFence) {
+  ResourceSlotTable table(arm_resources());
+  const auto incumbent = owner();
+  const auto next = owner("new.op", "new.part");
+  ASSERT_TRUE(table.reserve(incumbent, arm_resources()).ok());
+  ASSERT_TRUE(table.transition(incumbent, arm_resources(), ResourceSlotState::kDispatched).ok());
+  const auto captured = table.coherent_snapshot();
+  const auto stopped = table.stop_fence_batch({captured.operation_resource_generation,
+                                               StopGeneration(3U),
+                                               {stop_fence_owner(incumbent, arm_resources())},
+                                               {}});
+  ASSERT_TRUE(stopped.ok());
+  const auto before = table.coherent_snapshot();
+  EXPECT_FALSE(
+      table.transfer_dispatched_owners(captured, {transfer_owner(incumbent, next, arm_resources())})
+          .ok());
+  EXPECT_EQ(table.coherent_snapshot(), before);
+  EXPECT_FALSE(table
+                   .transfer_dispatched_owners(
+                       before, {transfer_owner(stopped.value().revised_owners.front(), next,
+                                               arm_resources())})
+                   .ok());
+  EXPECT_EQ(table.coherent_snapshot(), before);
+}
+TEST(ResourceSlotTableTest, TransferRejectsEveryNonDispatchedStateWithoutMutation) {
+  for (const auto state :
+       {ResourceSlotState::kFree, ResourceSlotState::kReserved, ResourceSlotState::kStopping,
+        ResourceSlotState::kTerminal, ResourceSlotState::kUnreconciledExternalOrOrphanGoal}) {
+    ResourceSlotTable table(arm_resources());
+    const auto incumbent = owner();
+    if (state == ResourceSlotState::kUnreconciledExternalOrOrphanGoal) {
+      ASSERT_TRUE(table.mark_unreconciled_external_or_orphan_goal(arm_resources()).ok());
+    } else if (state != ResourceSlotState::kFree) {
+      ASSERT_TRUE(table.reserve(incumbent, arm_resources()).ok());
+      if (state != ResourceSlotState::kReserved) {
+        ASSERT_TRUE(table.transition(incumbent, arm_resources(), state).ok());
+      }
+    }
+    const auto before = table.coherent_snapshot();
+    EXPECT_FALSE(
+        table
+            .transfer_dispatched_owners(
+                before, {transfer_owner(incumbent, owner("new.op", "new.part"), arm_resources())})
+            .ok());
+    EXPECT_EQ(table.coherent_snapshot(), before);
+  }
+}
+
+TEST(ResourceSlotTableTest, TransferValidatesCompleteCanonicalScopesAndEveryRowBeforeMutation) {
+  ResourceSlotTable table({ResourceId("a"), ResourceId("b"), ResourceId("c")});
+  const auto first = owner("old.op", "old.a");
+  const auto second = owner("old.op", "old.b");
+  const auto next_first = owner("new.op", "new.a");
+  const auto next_second = owner("new.op", "new.b");
+  ASSERT_TRUE(table
+                  .reserve_batch({reservation_owner(first, {ResourceId("a"), ResourceId("b")}),
+                                  reservation_owner(second, {ResourceId("c")})})
+                  .ok());
+  ASSERT_TRUE(table
+                  .transition_batch({reservation_owner(first, {ResourceId("a"), ResourceId("b")}),
+                                     reservation_owner(second, {ResourceId("c")})},
+                                    ResourceSlotState::kDispatched)
+                  .ok());
+  const auto before = table.coherent_snapshot();
+  const auto first_row = transfer_owner(first, next_first, {ResourceId("a"), ResourceId("b")});
+  const auto second_row = transfer_owner(second, next_second, {ResourceId("c")});
+  const auto reject_rows = [&](std::vector<ResourceSlotOwnerTransferDTO> rows) {
+    EXPECT_FALSE(table.transfer_dispatched_owners(before, rows).ok());
+    EXPECT_EQ(table.coherent_snapshot(), before);
+  };
+  reject_rows({});
+  reject_rows({second_row, first_row});
+  reject_rows({first_row, first_row});
+  auto changed = second_row;
+  changed.expected_owner.operation_revision = OperationRevision(2U);
+  reject_rows({first_row, changed});
+  changed = first_row;
+  changed.resources = {ResourceId("a")};
+  reject_rows({changed, second_row});
+  changed.resources = {ResourceId("b"), ResourceId("a")};
+  reject_rows({changed, second_row});
+  changed.resources = {ResourceId("a"), ResourceId("a")};
+  reject_rows({changed, second_row});
+  changed.resources = {ResourceId("unknown")};
+  reject_rows({changed, second_row});
+  changed = second_row;
+  changed.resources = {ResourceId("a")};
+  reject_rows({first_row, changed});
+}
+
+TEST(ResourceSlotTableTest, TransferRejectsInvalidOrReusedTargetIdentityWithoutMutation) {
+  ResourceSlotTable table({ResourceId("a"), ResourceId("b"), ResourceId("c")});
+  const auto first = owner("old.op", "old.a");
+  const auto second = owner("old.op", "old.b");
+  const auto unrelated = owner("resident.op", "resident.part");
+  ASSERT_TRUE(table
+                  .reserve_batch({reservation_owner(first, {ResourceId("a")}),
+                                  reservation_owner(second, {ResourceId("b")}),
+                                  reservation_owner(unrelated, {ResourceId("c")})})
+                  .ok());
+  ASSERT_TRUE(table
+                  .transition_batch({reservation_owner(first, {ResourceId("a")}),
+                                     reservation_owner(second, {ResourceId("b")})},
+                                    ResourceSlotState::kDispatched)
+                  .ok());
+  const auto before = table.coherent_snapshot();
+  const auto reject_next = [&](ResourceSlotOwnerDTO next_first, ResourceSlotOwnerDTO next_second) {
+    EXPECT_FALSE(
+        table
+            .transfer_dispatched_owners(
+                before, {transfer_owner(first, std::move(next_first), {ResourceId("a")}),
+                         transfer_owner(second, std::move(next_second), {ResourceId("b")})})
+            .ok());
+    EXPECT_EQ(table.coherent_snapshot(), before);
+  };
+  reject_next(owner("", "new.a"), owner("", "new.b"));
+  reject_next(owner("new.op", ""), owner("new.op", "new.b"));
+  reject_next(owner("old.op", "new.a"), owner("old.op", "new.b"));
+  reject_next(owner("resident.op", "new.a"), owner("resident.op", "new.b"));
+  reject_next(owner("new.op", "same.part"), owner("new.op", "same.part"));
+  reject_next(owner("new.op", "new.a"), owner("different.op", "new.b"));
+  auto revised = owner("new.op", "new.b");
+  revised.operation_revision = OperationRevision(2U);
+  reject_next(owner("new.op", "new.a"), revised);
+}
+
+TEST(ResourceSlotTableTest, TransferPreservesEveryRuntimeBindingAndContainmentField) {
+  ResourceSlotTable table(arm_resources());
+  const auto incumbent = owner();
+  const auto next = owner("new.op", "new.part");
+  ASSERT_TRUE(table.reserve(incumbent, arm_resources()).ok());
+  ASSERT_TRUE(table.transition(incumbent, arm_resources(), ResourceSlotState::kDispatched).ok());
+  const auto before = table.coherent_snapshot();
+  const auto reject_change = [&](auto mutate) {
+    auto changed = next;
+    mutate(changed);
+    EXPECT_FALSE(table
+                     .transfer_dispatched_owners(
+                         before, {transfer_owner(incumbent, changed, arm_resources())})
+                     .ok());
+    EXPECT_EQ(table.coherent_snapshot(), before);
+  };
+  reject_change([](auto& value) { value.operation_revision = OperationRevision(0U); });
+  reject_change(
+      [](auto& value) { value.binding_identity.control_domain_id = ControlDomainId("changed"); });
+  reject_change([](auto& value) {
+    value.binding_identity.control_domain_revision = ControlDomainRevision("changed");
+  });
+  reject_change([](auto& value) {
+    std::get<ControllerParticipantBindingIdentityDTO>(value.binding_identity.binding)
+        .control_binding_id = ControlBindingId("changed");
+  });
+  reject_change([](auto& value) {
+    std::get<ControllerParticipantBindingIdentityDTO>(value.binding_identity.binding)
+        .control_binding_revision = ControlBindingRevision("changed");
+  });
+  reject_change([](auto& value) {
+    value.controller().controller_topology_id = ControllerTopologyId("changed");
+  });
+  reject_change(
+      [](auto& value) { value.controller().topology_revision = TopologyRevision("changed"); });
+  reject_change(
+      [](auto& value) { value.controller().control_route_id = ControlRouteId("changed"); });
+  reject_change([](auto& value) {
+    value.controller().active_control_configuration_id = ActiveControlConfigurationId("changed");
+  });
+  reject_change([](auto& value) {
+    value.controller().active_control_configuration_generation =
+        ActiveControlConfigurationGeneration(2U);
+  });
+  reject_change([](auto& value) {
+    value.controller().containment_granularity = ContainmentGranularity::kControlDomain;
+  });
+}
+
 TEST(ResourceSlotTableTest, RunsOneExactScopeThroughTerminalAndRelease) {
   ResourceSlotTable table({ResourceId("joint.2"), ResourceId("gripper.1"), ResourceId("joint.1")});
   const auto operation = owner();
@@ -858,10 +1142,49 @@ TEST(ResourceSlotTableTest, StopFenceCompanionFailureConservesEverySlotAndGenera
         {stop_fence_owner(first, {ResourceId("a")})}, {},
         {stop_fence_owner(second, {ResourceId("b")})}};
     if (invalid == 0) request.revision_only_owners.front().resources = {ResourceId("a")};
-    if (invalid == 1) request.revision_only_owners.front().expected_owner.control_route_id = ControlRouteId("foreign");
+    if (invalid == 1) request.revision_only_owners.front().expected_owner.controller().control_route_id = ControlRouteId("foreign");
     if (invalid == 2) request.revision_only_owners.front().next_operation_revision = OperationRevision(3U);
     if (invalid == 3) request.revision_only_owners.front().resources = {ResourceId("missing")};
     EXPECT_FALSE(table.stop_fence_batch(request).ok());
+    EXPECT_EQ(table.coherent_snapshot(), before);
+  }
+}
+
+TEST(ResourceSlotTableTest, SettledOwnerTransferPublishesReservationWithoutAFreeGap) {
+  ResourceSlotTable table(arm_resources());
+  const auto incumbent = owner();
+  const auto successor = owner("successor.op", "successor.part");
+  ASSERT_TRUE(table.reserve(incumbent, arm_resources()).ok());
+  ASSERT_TRUE(table.transition(incumbent, arm_resources(), ResourceSlotState::kTerminal).ok());
+  const auto before = table.coherent_snapshot();
+  const auto result =
+      table.transfer_owners(before, {transfer_owner(incumbent, successor, arm_resources())},
+                            ResourceSlotOwnerTransferMode::kSettled);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(result.value(), before.operation_resource_generation + 1U);
+  for (const auto& slot : table.snapshot()) {
+    EXPECT_EQ(slot.state, ResourceSlotState::kReserved);
+    EXPECT_EQ(slot.owner, std::optional(successor));
+    EXPECT_EQ(slot.stop_generation, before.slots.front().stop_generation);
+  }
+}
+
+TEST(ResourceSlotTableTest, SettledOwnerTransferRefusesUnsettledAndInvalidModesWithoutMutation) {
+  for (const auto state : {ResourceSlotState::kReserved, ResourceSlotState::kDispatched,
+                           ResourceSlotState::kStopping}) {
+    ResourceSlotTable table(arm_resources());
+    const auto incumbent = owner();
+    ASSERT_TRUE(table.reserve(incumbent, arm_resources()).ok());
+    if (state != ResourceSlotState::kReserved) {
+      ASSERT_TRUE(table.transition(incumbent, arm_resources(), state).ok());
+    }
+    const auto before = table.coherent_snapshot();
+    const std::vector<ResourceSlotOwnerTransferDTO> rows{
+        transfer_owner(incumbent, owner("successor.op", "successor.part"), arm_resources())};
+    EXPECT_FALSE(table.transfer_owners(before, rows, ResourceSlotOwnerTransferMode::kSettled).ok());
+    EXPECT_EQ(table.coherent_snapshot(), before);
+    EXPECT_FALSE(
+        table.transfer_owners(before, rows, static_cast<ResourceSlotOwnerTransferMode>(255U)).ok());
     EXPECT_EQ(table.coherent_snapshot(), before);
   }
 }

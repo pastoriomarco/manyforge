@@ -155,6 +155,8 @@ const char* recovery_action_name(RecoveryAction action) {
       return "replan_from_stopped_state";
     case RecoveryAction::kResetCycle:
       return "reset_cycle";
+    case RecoveryAction::kCloseOperation:
+      return "close_operation";
   }
   return "unknown";
 }
@@ -173,6 +175,72 @@ const char* recovery_assessment_status_name(RecoveryAssessmentStatus status) {
       return "reset_required";
   }
   return "unknown";
+}
+
+const char* motion_retry_cause_name(MotionRetryCause cause) {
+  switch (cause) {
+    case MotionRetryCause::kNotEligible:
+      return "not_eligible";
+    case MotionRetryCause::kPlanningNoEffect:
+      return "planning_no_effect";
+    case MotionRetryCause::kCollisionStopNominal:
+      return "collision_stop_nominal";
+  }
+  return "not_eligible";
+}
+
+const char* motion_retry_effect_name(MotionRetryEffect effect) {
+  switch (effect) {
+    case MotionRetryEffect::kKnownNoEffect:
+      return "known_no_effect";
+    case MotionRetryEffect::kEffectObserved:
+      return "effect_observed";
+    case MotionRetryEffect::kEffectUncertain:
+      return "effect_uncertain";
+  }
+  return "effect_uncertain";
+}
+
+const char* motion_retry_ineligibility_reason_name(MotionRetryIneligibilityReason reason) {
+  switch (reason) {
+    case MotionRetryIneligibilityReason::kNone:
+      return "none";
+    case MotionRetryIneligibilityReason::kNotRetryableState:
+      return "not_retryable_state";
+    case MotionRetryIneligibilityReason::kFailureCauseNotRetryable:
+      return "failure_cause_not_retryable";
+    case MotionRetryIneligibilityReason::kDispatchAbsenceUnproven:
+      return "dispatch_absence_unproven";
+    case MotionRetryIneligibilityReason::kEffectUncertain:
+      return "effect_uncertain";
+    case MotionRetryIneligibilityReason::kEffectObserved:
+      return "effect_observed";
+    case MotionRetryIneligibilityReason::kValidationNotConclusiveCollision:
+      return "validation_not_conclusive_collision";
+    case MotionRetryIneligibilityReason::kStopOwnerActive:
+      return reason_codes::kRecoveryStopOwnerActive;
+    case MotionRetryIneligibilityReason::kStrongerAuthorityActive:
+      return reason_codes::kRecoveryStrongerAuthorityActive;
+    case MotionRetryIneligibilityReason::kQueuedLatchPresent:
+      return reason_codes::kRecoveryQueuedLatchPresent;
+    case MotionRetryIneligibilityReason::kLatchPresent:
+      return "latch_present";
+    case MotionRetryIneligibilityReason::kStopNotSettled:
+      return "stop_not_settled";
+    case MotionRetryIneligibilityReason::kStopNotNominal:
+      return "stop_not_nominal";
+    case MotionRetryIneligibilityReason::kStopNotControlled:
+      return "stop_not_controlled";
+    case MotionRetryIneligibilityReason::kObservationNotQualified:
+      return "observation_not_qualified";
+    case MotionRetryIneligibilityReason::kCollisionNotConclusive:
+      return "collision_not_conclusive";
+    case MotionRetryIneligibilityReason::kOperationInFlight:
+      return "operation_in_flight";
+    case MotionRetryIneligibilityReason::kProgramScopeRequired:
+      return "program_scope_required";
+  }
+  return "failure_cause_not_retryable";
 }
 
 std::size_t RecoveryCertificateStore::owner_index(StopOwnerKind kind) {
@@ -379,6 +447,58 @@ bool certificate_matches_latch(const KernelStopCertificateDTO& certificate,
 }
 
 }  // namespace
+
+MotionRetryEligibilityDTO planning_retry_eligibility(const RecoveryAuthorityCapture& capture) {
+  MotionRetryEligibilityDTO retry;
+  const bool any_stop_owner_active =
+      capture.fault_preempt_stop_active || capture.fault_preempt_worker_active ||
+      capture.operator_stop_active || capture.motion_trip_stop_active;
+  if (capture.execution_state == ExecutionState::kFailed) {
+    switch (capture.failed_execution_effect) {
+      case ParticipantEffectKnowledge::kNoEffect:
+        retry.effect = MotionRetryEffect::kKnownNoEffect;
+        break;
+      case ParticipantEffectKnowledge::kEffectSettled:
+        retry.effect = MotionRetryEffect::kEffectObserved;
+        break;
+      case ParticipantEffectKnowledge::kEffectUncertain:
+        retry.effect = MotionRetryEffect::kEffectUncertain;
+        break;
+    }
+    const bool retryable_code = capture.failed_validation_code == kErrorPlanningFailed ||
+                                capture.failed_validation_code == kErrorPlanningTimeout ||
+                                capture.failed_validation_code == kErrorIkFailed ||
+                                capture.failed_validation_code == kErrorCartesianIncomplete ||
+                                capture.failed_validation_code == kErrorValidationCollision;
+    if (retry.effect == MotionRetryEffect::kEffectUncertain) {
+      retry.reason = MotionRetryIneligibilityReason::kEffectUncertain;
+    } else if (retry.effect != MotionRetryEffect::kKnownNoEffect) {
+      retry.reason = MotionRetryIneligibilityReason::kEffectObserved;
+    } else if (!capture.failed_preparation_never_dispatched) {
+      retry.reason = MotionRetryIneligibilityReason::kDispatchAbsenceUnproven;
+    } else if (!retryable_code) {
+      retry.reason = MotionRetryIneligibilityReason::kFailureCauseNotRetryable;
+    } else if (capture.failed_validation_code == kErrorValidationCollision &&
+               !capture.failed_validation_conclusive_collision) {
+      retry.reason = MotionRetryIneligibilityReason::kValidationNotConclusiveCollision;
+    } else if (any_stop_owner_active) {
+      retry.reason = MotionRetryIneligibilityReason::kStopOwnerActive;
+    } else if (capture.stronger_authority_active) {
+      retry.reason = MotionRetryIneligibilityReason::kStrongerAuthorityActive;
+    } else if (capture.queued_latch_present) {
+      retry.reason = MotionRetryIneligibilityReason::kQueuedLatchPresent;
+    } else if (capture.active_latch.has_value()) {
+      retry.reason = MotionRetryIneligibilityReason::kLatchPresent;
+    } else if (capture.failed_validation_retryable) {
+      retry.eligible = true;
+      retry.cause = MotionRetryCause::kPlanningNoEffect;
+      retry.reason = MotionRetryIneligibilityReason::kNone;
+    } else {
+      retry.reason = MotionRetryIneligibilityReason::kFailureCauseNotRetryable;
+    }
+  }
+  return retry;
+}
 
 KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCapture& capture,
                                                       const RecoveryReadinessPolicy& policy,
@@ -639,6 +759,17 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
       break;
     }
   }
+  assessment.retry_eligibility = planning_retry_eligibility(capture);
+  const bool terminal = capture.execution_state == ExecutionState::kCompleted ||
+                        capture.execution_state == ExecutionState::kFailed ||
+                        (capture.execution_state == ExecutionState::kStopped &&
+                         assessment.backend_stop_confirmed &&
+                         !assessment.stop_certificate_id.empty());
+  assessment.eligible_close = terminal && capture.execution_id != 0U &&
+      capture.terminal_cleanup_complete &&
+      capture.terminal_effect != ParticipantEffectKnowledge::kEffectUncertain &&
+      !any_stop_owner_active && !capture.stronger_authority_active &&
+      !capture.queued_latch_present && !capture.active_latch;
   finish_assessment(assessment, previous_revision);
   return assessment;
 }
@@ -666,6 +797,8 @@ bool recovery_assessment_semantically_differs(const KernelRecoveryAssessmentDTO&
          previous.stronger_authority_active != next.stronger_authority_active ||
          previous.queued_latch_present != next.queued_latch_present ||
          previous.retry_admissible != next.retry_admissible ||
+         previous.retry_eligibility != next.retry_eligibility ||
+         previous.eligible_close != next.eligible_close ||
          previous.allowed_actions != next.allowed_actions ||
          previous.reason_code != next.reason_code;
 }
@@ -686,6 +819,12 @@ RecoveryAssessmentPublication prepare_recovery_assessment_publication(
       {"status", recovery_assessment_status_name(next.status)},
       {"reason_code", next.reason_code},
       {"retry_admissible", next.retry_admissible ? "true" : "false"},
+      {"eligible_close", next.eligible_close ? "true" : "false"},
+      {"automatic_retry_eligible", next.retry_eligibility.eligible ? "true" : "false"},
+      {"automatic_retry_cause", motion_retry_cause_name(next.retry_eligibility.cause)},
+      {"automatic_retry_effect", motion_retry_effect_name(next.retry_eligibility.effect)},
+      {"automatic_retry_reason",
+       motion_retry_ineligibility_reason_name(next.retry_eligibility.reason)},
       {"stop_certificate_id", next.stop_certificate_id},
       {"stop_certificate_revision", std::to_string(next.stop_certificate_revision)},
       {"latch_id", next.latch_id},
@@ -724,7 +863,12 @@ RecoveryAdmissionDecision evaluate_recovery_admission(
   }
   const auto allowed = std::find(assessment.allowed_actions.begin(),
                                  assessment.allowed_actions.end(), request.action);
-  if (assessment.status != RecoveryAssessmentStatus::kRetryReady &&
+  const bool close = request.action == RecoveryAction::kCloseOperation;
+  if (close && (!assessment.eligible_close || request.fresh_motion_attempt)) {
+    decision.rejection_reason = reason_codes::kRecoveryActionNotAllowed;
+    return decision;
+  }
+  if (!close && assessment.status != RecoveryAssessmentStatus::kRetryReady &&
       assessment.status != RecoveryAssessmentStatus::kActionRequired) {
     if (assessment.reason_code.empty()) {
       decision.rejection_reason = reason_codes::kRecoveryStopNotCertified;
@@ -733,7 +877,7 @@ RecoveryAdmissionDecision evaluate_recovery_admission(
     }
     return decision;
   }
-  if (allowed == assessment.allowed_actions.end()) {
+  if (!close && allowed == assessment.allowed_actions.end()) {
     decision.rejection_reason = reason_codes::kRecoveryActionNotAllowed;
     return decision;
   }

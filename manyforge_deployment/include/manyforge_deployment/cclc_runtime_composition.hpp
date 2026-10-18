@@ -128,6 +128,20 @@ public:
   PlanNativeApply(const core::NativeApplyPlanRequestDTO &request);
   [[nodiscard]] core::Result<std::optional<core::NativeApplyPlanDTO>>
   LoadNativeApplyPlan(const core::NamedApplyPublicationTransactionDTO &apply);
+  /// Pure exact-transaction candidate facts while the actual host retains its
+  /// Apply installation guard. No public snapshot/head or readiness is made.
+  [[nodiscard]] core::Result<core::InstalledProviderCandidateFactsDTO>
+  ReadInstalledNativeApplyCandidateFacts(
+      const core::NativeApplyPlanDTO &expected_plan,
+      const RetainedBundle &actual_candidate,
+      const core::ICCLCLifecyclePlanCatalogSource &installed_catalogs,
+      const core::ControllableComponentId &component,
+      const std::vector<core::ResolvedLifecycleControlDomainScopeDTO>
+          &installed_domains,
+      const std::vector<core::ResolvedLifecycleProviderOccurrenceDTO>
+          &installed_providers,
+      const std::vector<core::BrandLifecyclePortRegistrationDTO>
+          &installed_ports);
   [[nodiscard]] core::Result<void>
   AdoptNativeApplyFacts(const core::NativeApplyFactAdoptionDTO &adoption);
 

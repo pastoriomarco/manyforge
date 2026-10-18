@@ -164,7 +164,7 @@ CanonicalValue PoseLifetimeValue(const PoseSourceLifetimeSnapshot &value) {
        Number(observation.observed_at_ns, "pose.observed_at_ns")},
       {"payload", observation.payload},
       {"policy_id", CanonicalValue(observation.key.policy_id)},
-      {"quality", CanonicalValue(std::string(ToString(observation.quality)))},
+      {"payload_quality", CanonicalValue(std::string(ToString(observation.payload_quality)))},
       {"source_epoch", CanonicalValue(observation.source_epoch)},
       {"source_epoch_order",
        Number(observation.source_epoch_order, "pose.source_epoch_order")},
@@ -188,7 +188,7 @@ std::string ReplayBatchDigest(const SceneReplayBatch &batch) {
          Number(observation.observed_at_ns, "pose.observed_at_ns")},
         {"payload", observation.payload},
         {"policy_id", CanonicalValue(observation.key.policy_id)},
-        {"quality", CanonicalValue(std::string(ToString(observation.quality)))},
+        {"payload_quality", CanonicalValue(std::string(ToString(observation.payload_quality)))},
         {"source_epoch", CanonicalValue(observation.source_epoch)},
         {"source_epoch_order",
          Number(observation.source_epoch_order, "pose.source_epoch_order")},
@@ -198,7 +198,7 @@ std::string ReplayBatchDigest(const SceneReplayBatch &batch) {
     }));
   }
   return content_identity::framed_sha256(
-      "manyforge-scene-replay-batch", "v1",
+      "manyforge-scene-replay-batch", "v2",
       CanonicalValue(CanonicalValue::Object{
           {"initialization_generation",
            Number(batch.initialization_generation, "initialization_generation",
@@ -550,7 +550,7 @@ SceneRuntimeStateOwner::BeginReplay(const std::string_view token) {
       continue;
     }
     if (IsImmediatePosePolicy(record.observation.key.policy_id) &&
-        record.observation.quality == PoseSourceQuality::kGood &&
+        record.observation.payload_quality == PoseSourceQuality::kGood &&
         record.observation.eligible &&
         record.observation.expires_at_ns >= now) {
       observations.push_back(record.observation);
@@ -714,7 +714,7 @@ SceneRuntimeStateOwner::ObservePose(PoseSourceObservation observation) {
         if (observation == current) {
           return {PoseObservationDisposition::kDuplicate,
                   initialization_generation_,
-                  observation.quality == PoseSourceQuality::kGood &&
+                  observation.payload_quality == PoseSourceQuality::kGood &&
                       observation.expires_at_ns >= now};
         }
         throw SceneRuntimeStateConflictError(
@@ -726,7 +726,7 @@ SceneRuntimeStateOwner::ObservePose(PoseSourceObservation observation) {
         "scene runtime state owner: pose observation capacity is exhausted");
   }
 
-  const bool fresh = observation.quality == PoseSourceQuality::kGood &&
+  const bool fresh = observation.payload_quality == PoseSourceQuality::kGood &&
                      observation.expires_at_ns >= now;
   const bool can_apply = fresh && observation.eligible &&
                          IsImmediatePosePolicy(observation.key.policy_id);
@@ -761,7 +761,7 @@ SceneRuntimeStateSnapshot SceneRuntimeStateOwner::Snapshot() const {
     static_cast<void>(key);
     pose_sources.push_back(PoseSourceLifetimeSnapshot{
         record.observation,
-        record.observation.quality == PoseSourceQuality::kGood &&
+        record.observation.payload_quality == PoseSourceQuality::kGood &&
             record.observation.expires_at_ns >= now &&
             (!configured_pose_source_ || configured_pose_source_->available ||
              configured_pose_source_->source_id !=

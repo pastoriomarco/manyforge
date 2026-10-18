@@ -31,7 +31,8 @@ struct DurableLite6RetainedConsumerFixture final {
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_lite6_retained_consumer_fixture_from(const std::filesystem::path& package_root,
-                                                 Lite6ControllableRetentionFixture controllable) {
+                                                 Lite6ControllableRetentionFixture controllable,
+                                                 bool retain_empty_model_map = false) {
   auto qualified = controllable.qualified;
   const Lite6ControllableCompilerInputArtifactSource input_source(controllable);
   FilesystemBuildManifestRepository manifest_repository(package_root);
@@ -42,7 +43,7 @@ materialize_lite6_retained_consumer_fixture_from(const std::filesystem::path& pa
       materialize_store_and_reload_production(
           qualified, manifest_repository, input_source,
           controllable.structural_preparations(), catalog_store, raw_store,
-          bundle_repository);
+          bundle_repository, retain_empty_model_map);
   if (bundle == nullptr) {
     throw std::logic_error("non-empty Lite6 materializer returned no durable bundle");
   }

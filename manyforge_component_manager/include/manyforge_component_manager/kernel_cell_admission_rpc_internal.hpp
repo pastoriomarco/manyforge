@@ -53,7 +53,8 @@ struct KernelCellAdmissionRpcResponsePacket final {
 
 [[nodiscard]] KernelCellAdmissionRpcResponse DispatchKernelCellAdmissionRpc(
     manyforge::core::IKernelCellAdmissionPort &kernel,
-    const KernelCellAdmissionRpcPacket &request);
+    const KernelCellAdmissionRpcPacket &request,
+    std::shared_ptr<manyforge::core::IIoSignalService>* actual_retired_service = nullptr);
 
 [[nodiscard]] bool
 IsKernelCellAdmissionRpcPacket(std::string_view bytes) noexcept;

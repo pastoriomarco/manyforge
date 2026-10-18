@@ -43,38 +43,72 @@ namespace {
          catalog.catalog_digest == occurrence.lifecycle_plan_catalog_digest;
 }
 
-[[nodiscard]] std::optional<std::int64_t> fixed_plan_timeout(
-    const BrandLifecyclePlanCatalogDTO& catalog, ComponentLifecycleIntentKindDTO intent) noexcept {
+[[nodiscard]] ProviderConfigurationFenceOccurrenceDTO provider_fence_occurrence(
+    const ResolvedProviderDomainScopeDTO& scope) {
+  return {scope.provider.controllable_component_id, scope.provider.provider_instance_id,
+          scope.provider.signal_configuration_digest, scope.output_resources};
+}
+
+void attach_provider_fence_occurrence(ConfigurationFenceDomainScopeDTO& fence,
+                                      const ResolvedLifecycleControlDomainScopeDTO& scope,
+                                      bool candidate) {
+  const auto* provider = scope.provider();
+  if (!provider) return;
+  if (!std::holds_alternative<ProviderConfigurationFenceDomainDTO>(fence.payload))
+    fence.payload = ProviderConfigurationFenceDomainDTO{};
+  auto& payload = std::get<ProviderConfigurationFenceDomainDTO>(fence.payload);
+  (candidate ? payload.candidate_provider : payload.predecessor_provider) =
+      provider_fence_occurrence(*provider);
+}
+
+[[nodiscard]] std::optional<std::int64_t> resolved_plan_timeout(
+    const LifecycleIntentPlanDTO& plan,
+    const ResolvedLifecycleControlDomainScopeDTO& domain) noexcept {
+  if (const auto* fixed = std::get_if<std::int64_t>(&plan.timeout_policy)) return *fixed;
+  if (plan.timeout_policy.valueless_by_exception()) return std::nullopt;
+  const auto* provider = domain.provider();
+  if (!provider || !provider->provider.locally_valid()) return std::nullopt;
+  return provider->provider.lifecycle_command_timeout_ns;
+}
+
+[[nodiscard]] std::optional<std::int64_t> selected_plan_timeout(
+    const BrandLifecyclePlanCatalogDTO& catalog, ComponentLifecycleIntentKindDTO intent,
+    const ResolvedLifecycleControlDomainScopeDTO& domain) noexcept {
   const auto match =
       std::find_if(catalog.plans.begin(), catalog.plans.end(),
                    [&](const LifecycleIntentPlanDTO& plan) { return plan.intent == intent; });
   if (match == catalog.plans.end()) {
     return std::nullopt;
   }
-  return match->timeout_duration_ns;
+  return resolved_plan_timeout(*match, domain);
 }
 
 [[nodiscard]] std::optional<std::int64_t> recover_preselection_timeout(
-    const BrandLifecyclePlanCatalogDTO& catalog) noexcept {
+    const BrandLifecyclePlanCatalogDTO& catalog,
+    const ResolvedLifecycleControlDomainScopeDTO& domain) noexcept {
   std::optional<std::int64_t> result;
   for (const auto& plan : catalog.plans) {
     if (plan.intent != ComponentLifecycleIntentKindDTO::kRecover) {
       continue;
     }
-    result =
-        result.has_value() ? std::min(*result, plan.timeout_duration_ns) : plan.timeout_duration_ns;
+    const auto selected = resolved_plan_timeout(plan, domain);
+    if (!selected) return std::nullopt;
+    result = result.has_value() ? std::min(*result, *selected) : *selected;
   }
   return result;
 }
 
 [[nodiscard]] std::optional<std::int64_t> admission_timeout(
     const ComponentLifecycleIntentDTO& intent,
-    const std::vector<BrandLifecyclePlanCatalogDTO>& catalogs) noexcept {
+    const std::vector<BrandLifecyclePlanCatalogDTO>& catalogs,
+    const std::vector<ResolvedLifecycleControlDomainScopeDTO>& domains) noexcept {
+  if (catalogs.size() != domains.size()) return std::nullopt;
   std::optional<std::int64_t> result;
-  for (const auto& catalog : catalogs) {
+  for (std::size_t index = 0U; index < catalogs.size(); ++index) {
+    const auto& catalog = catalogs[index];
     const auto selected = intent.intent == ComponentLifecycleIntentKindDTO::kRecover
-                              ? recover_preselection_timeout(catalog)
-                              : fixed_plan_timeout(catalog, intent.intent);
+                              ? recover_preselection_timeout(catalog, domains[index])
+                              : selected_plan_timeout(catalog, intent.intent, domains[index]);
     if (!selected.has_value()) {
       return std::nullopt;
     }
@@ -212,7 +246,8 @@ Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
                     "one or more lifecycle catalogs do not match the accepted provider closure",
                     "catalog_identity_or_shape_mismatch");
     }
-    const auto selected_timeout = admission_timeout(intent, candidate.lifecycle_plan_catalogs);
+    const auto selected_timeout =
+        admission_timeout(intent, candidate.lifecycle_plan_catalogs, snapshot.domains);
     if (!selected_timeout.has_value()) {
       return reject("component_lifecycle_intent_unsupported",
                     "one or more accepted provider catalogs do not support the lifecycle intent",
@@ -318,13 +353,22 @@ Result<PreparedComponentLifecycleAdmission> PrepareApplyComponentBringUpAdmissio
                       "the candidate domain or provider differs from the qualified expectation",
                       "candidate_domain_or_provider_mismatch");
     }
+    if (const auto* typed = scope.provider();
+        typed && !ProviderDomainMatchesOccurrence(scope.control_domain_id,
+                                                  scope.control_domain_revision, typed->provider,
+                                                  typed->provider_runtime_epoch, provider)) {
+      return rejected("component_lifecycle_configuration_stale",
+                      "the candidate provider proof differs from its actual domain occurrence",
+                      "candidate_domain_or_provider_mismatch");
+    }
     if (!catalog_matches_occurrence(candidate.lifecycle_plan_catalogs[index], provider)) {
       return rejected("component_lifecycle_catalog_mismatch",
                       "the candidate catalog does not match its exact provider occurrence",
                       "catalog_identity_or_shape_mismatch");
     }
   }
-  const auto timeout = admission_timeout(intent, candidate.lifecycle_plan_catalogs);
+  const auto timeout =
+      admission_timeout(intent, candidate.lifecycle_plan_catalogs, qualified_candidate_domains);
   if (!timeout.has_value()) {
     return rejected("component_lifecycle_intent_unsupported",
                     "the candidate provider catalog does not support the original lifecycle intent",
@@ -400,15 +444,27 @@ Result<PreparedComponentLifecycleAdmission> PrepareApplyComponentBringUpAdmissio
                               : std::nullopt,
          domain.expected_domain ? std::optional(domain.expected_domain->control_domain_revision)
                                 : std::nullopt});
+    if (domain.current_scope)
+      attach_provider_fence_occurrence(exact_scope.domains.back(), *domain.current_scope, false);
+    if (domain.expected_domain) {
+      const auto next = std::find_if(
+          qualified_candidate_domains.begin(), qualified_candidate_domains.end(),
+          [&](const auto& scope) { return scope.control_domain_id == domain.control_domain_id; });
+      if (next == qualified_candidate_domains.end())
+        return rejected("component_lifecycle_configuration_stale",
+                        "the expected domain lacks its qualified candidate scope",
+                        "candidate_domain_set_changed");
+      attach_provider_fence_occurrence(exact_scope.domains.back(), *next, true);
+    }
     reserved_domains.push_back(domain.control_domain_id);
   }
   std::map<ControlBindingId, ConfigurationFenceBindingScopeDTO> bindings;
   const auto collect = [&](const std::vector<ResolvedLifecycleControlDomainScopeDTO>& scopes,
                            bool successor) {
     for (const auto& scope : scopes) {
-      exact_scope.resources.insert(exact_scope.resources.end(), scope.current_resources.begin(),
-                                   scope.current_resources.end());
-      for (const auto& binding : scope.current_control_bindings) {
+      exact_scope.resources.insert(exact_scope.resources.end(), scope.resource_ids().begin(),
+                                   scope.resource_ids().end());
+      for (const auto& binding : scope.control_bindings()) {
         const auto entry =
             bindings
                 .try_emplace(binding.control_binding_id,
@@ -484,18 +540,21 @@ Result<ConfigurationFenceScopeDTO> SelectedComponentBringUpFenceScope(
   };
   const auto verified = VerifyComponentLifecycleCurrentSnapshot(offer.predecessor);
   if (!verified.ok()) return Result<ConfigurationFenceScopeDTO>::Err(verified.error());
-  if (offer.candidate_participants.empty() ||
-      offer.candidate_participants.size() > kMaxLifecycleResolvedBindings) {
+  if ((offer.candidate_participants.empty() && offer.candidate_provider_domains.empty()) ||
+      offer.candidate_participants.size() > kMaxLifecycleResolvedBindings ||
+      offer.candidate_provider_domains.size() > kMaxLifecycleResolvedDomains) {
     return invalid("candidate_participant_closure_empty_or_oversized");
   }
   std::map<ControlDomainId, ConfigurationFenceDomainScopeDTO> domains;
   std::map<ControlBindingId, ConfigurationFenceBindingScopeDTO> bindings;
   std::vector<ResourceId> resources;
   for (const auto& domain : offer.predecessor.domains) {
-    domains.emplace(domain.control_domain_id,
-                    ConfigurationFenceDomainScopeDTO{domain.control_domain_id,
-                                                     domain.control_domain_revision, std::nullopt});
-    for (const auto& binding : domain.current_control_bindings) {
+    const auto entry = domains.emplace(
+        domain.control_domain_id,
+        ConfigurationFenceDomainScopeDTO{domain.control_domain_id, domain.control_domain_revision,
+                                         std::nullopt});
+    attach_provider_fence_occurrence(entry.first->second, domain, false);
+    for (const auto& binding : domain.control_bindings()) {
       const auto [entry, inserted] = bindings.emplace(
           binding.control_binding_id,
           ConfigurationFenceBindingScopeDTO{binding.control_binding_id,
@@ -505,18 +564,57 @@ Result<ConfigurationFenceScopeDTO> SelectedComponentBringUpFenceScope(
         return invalid("predecessor_binding_revision_conflict");
       }
     }
-    resources.insert(resources.end(), domain.current_resources.begin(),
-                     domain.current_resources.end());
+    resources.insert(resources.end(), domain.resource_ids().begin(), domain.resource_ids().end());
+  }
+  std::optional<ControlDomainId> previous_provider_domain;
+  for (const auto& scope : offer.candidate_provider_domains) {
+    const auto* provider = scope.provider();
+    if (!scope.locally_valid() || !provider ||
+        provider->provider.controllable_component_id !=
+            offer.predecessor.controllable_component_id ||
+        (previous_provider_domain && !(*previous_provider_domain < scope.control_domain_id)))
+      return invalid("candidate_provider_domain_closure_invalid");
+    previous_provider_domain = scope.control_domain_id;
+    auto [entry, inserted] =
+        domains.emplace(scope.control_domain_id,
+                        ConfigurationFenceDomainScopeDTO{scope.control_domain_id, std::nullopt,
+                                                         scope.control_domain_revision});
+    if (!inserted && entry->second.candidate_control_domain_revision &&
+        entry->second.candidate_control_domain_revision != scope.control_domain_revision)
+      return invalid("candidate_domain_revision_conflict");
+    entry->second.candidate_control_domain_revision = scope.control_domain_revision;
+    attach_provider_fence_occurrence(entry->second, scope, true);
+    resources.insert(resources.end(), scope.resource_ids().begin(), scope.resource_ids().end());
   }
   for (const auto& participant : offer.candidate_participants) {
     const auto checked = verify_runtime_participant_binding(participant);
     if (!checked.ok()) return Result<ConfigurationFenceScopeDTO>::Err(checked.error());
     if (participant.controllable_component_id != offer.predecessor.controllable_component_id ||
         participant.retained_bundle_id != offer.candidate_projection_revision.retained_bundle_id ||
-        participant.graph_revision != offer.candidate_projection_revision.graph_revision ||
-        !participant.control_path) {
+        participant.graph_revision != offer.candidate_projection_revision.graph_revision) {
       return invalid("candidate_component_product_or_control_path_mismatch");
     }
+    if (participant.io_output_binding) {
+      const auto& output = *participant.io_output_binding;
+      const auto scope =
+          std::find_if(offer.candidate_provider_domains.begin(),
+                       offer.candidate_provider_domains.end(), [&](const auto& candidate) {
+                         return candidate.control_domain_id == output.provider.control_domain_id;
+                       });
+      if (scope == offer.candidate_provider_domains.end() ||
+          !ProviderDomainMatchesOccurrence(
+              scope->control_domain_id, scope->control_domain_revision, scope->provider()->provider,
+              scope->provider()->provider_runtime_epoch, output.provider) ||
+          output.signal_configuration_digest !=
+              scope->provider()->provider.signal_configuration_digest ||
+          !output.signal.output_resource ||
+          !std::binary_search(scope->resource_ids().begin(), scope->resource_ids().end(),
+                              *output.signal.output_resource))
+        return invalid("candidate_output_provider_domain_mismatch");
+      continue;
+    }
+    if (!participant.control_path)
+      return invalid("candidate_component_product_or_control_path_mismatch");
     const auto& path = *participant.control_path;
     auto [domain, domain_inserted] =
         domains.emplace(path.control_domain_id,
@@ -558,8 +656,9 @@ Result<CellAdmissionScopeDTO> SelectedComponentBringUpAdmissionScope(
   if (!fence.ok()) return Result<CellAdmissionScopeDTO>::Err(fence.error());
   CellAdmissionScopeDTO result{std::move(fence.value().resources), {}};
   for (const auto& domain : offer.predecessor.domains) {
-    if (!domain.active_control_configuration) continue;
-    const auto& current = *domain.active_control_configuration;
+    const auto active = domain.configuration_identity();
+    if (!active) continue;
+    const auto& current = *active;
     result.configurations.push_back({domain.control_domain_id,
                                      current.active_control_configuration_id,
                                      current.active_control_configuration_generation});

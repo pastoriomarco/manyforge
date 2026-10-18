@@ -1,3 +1,4 @@
+#include "io_rule_outcome_fixture.hpp"
 #include <gtest/gtest.h>
 #include <sqlite3.h>
 #include <unistd.h>
@@ -12,11 +13,14 @@
 #include <functional>
 #include <future>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/stop_journal_projection_codec.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -479,9 +483,9 @@ TEST(SqliteOperationJournalTest, ExactLongServiceTimesSurviveOperationStopAndRes
 }
 
 TEST(SqliteOperationJournalTest, EarlierJournalFormatsAreRefusedAndLeftUntouched) {
-  // Q51/Q53: journals written before the per-robot Stop timing format are
-  // refused, never converted, and their bytes stay as they were.
-  for (const int version : {9, 10, 11, 12, 13}) {
+  // Earlier Stop/controller-only/common-goal formats are refused, never
+  // converted, and their retained bytes stay as they were.
+  for (const int version : {9, 10, 11, 12, 13, 14, 15}) {
     SCOPED_TRACE(version);
     ScopedTemporaryDirectory directory;
     const auto database = directory.path() / "journal.sqlite3";
@@ -525,7 +529,7 @@ TEST(SqliteOperationJournalTest, EarlierJournalFormatsAreRefusedAndLeftUntouched
       SqliteOperationJournal refused(database, cell);
       ADD_FAILURE() << "an earlier journal format was opened";
     } catch (const std::runtime_error& error) {
-      EXPECT_NE(std::string(error.what()).find("per-robot Stop timing format"), std::string::npos)
+      EXPECT_NE(std::string(error.what()).find("common command identity format"), std::string::npos)
           << error.what();
     }
     EXPECT_EQ(retained(), before);
@@ -1133,6 +1137,42 @@ TEST(SqliteOperationJournalTest, LaterSnapshotsCannotChangeCapturedProgramOrigin
   }
 }
 
+TEST(SqliteOperationJournalTest, AcceptedBooleanOutputRecordsExactRoleAndFalseWithoutCoercion) {
+  for (const bool value : {false, true}) {
+    SCOPED_TRACE(value);
+    ScopedTemporaryDirectory temporary;
+    const RequestOwnerEpoch epoch("execution-host.io-write");
+    SqliteOperationJournal journal(temporary.path() / "io-write.sqlite3", CellId("cell.1"), 8U);
+    const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 4U, inventory).ok());
+    auto intent = CommandIntent("io-write", epoch.value());
+    auto& command = std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload);
+    command.command_schema_id = CommandSchemaId("io-write-schema");
+    command.command_schema_revision = CommandSchemaRevision("io-write-schema-revision");
+    command.command_value = IoSignalWriteCommandValueDTO{ResourceRoleId("valve_enable"), value};
+    const auto state = OperationState("operation.io-write", OperationStateKind::kPrepared, 10);
+    // A caller budget cannot replace the sealed output mechanism policy.
+    ASSERT_TRUE(command.completion_timeout_s.has_value());
+    EXPECT_FALSE(
+        journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, state), state).ok());
+    command.completion_timeout_s.reset();
+    ASSERT_TRUE(
+        journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, state), state).ok());
+    const auto events = journal.ReadEvents(epoch, 0U, 1U);
+    ASSERT_TRUE(events.ok()) << events.error().message;
+    ASSERT_EQ(events.value().events.size(), 1U);
+    const auto& payload = events.value().events.front().payload_json;
+    EXPECT_NE(payload.find(std::string("\"command_value\":{\"kind\":\"io_signal_write\",") +
+                           "\"resource_role_id\":\"valve_enable\",\"value\":" +
+                           (value ? "true}" : "false}")),
+              std::string::npos)
+        << payload;
+    EXPECT_EQ(payload.find("\"max_effort\""), std::string::npos);
+    EXPECT_EQ(payload.find("\"position\""), std::string::npos);
+    EXPECT_EQ(payload.find("\"completion_timeout_s\""), std::string::npos);
+  }
+}
+
 TEST(SqliteOperationJournalTest, AcceptedMotionRecordsAbsoluteGoalFrameAndRobotQualifier) {
   ScopedTemporaryDirectory temporary;
   const RequestOwnerEpoch epoch("execution-host.goal-frame");
@@ -1278,34 +1318,35 @@ TEST(SqliteOperationJournalTest, TypedControlScaleAndStopRecordsRoundTripAsTermi
         *state.runtime_scale_generation,
         scale_request.scale,
         scale_request.scale,
-        {RuntimeScaleParticipantStatusDTO{participant.participant_id,
-                                          participant.controllable_component_id,
-                                          participant.command_target_id,
-                                          participant.capability_id,
-                                          participant.control_domain_id,
-                                          participant.control_domain_revision,
-                                          participant.control_binding_id,
-                                          participant.control_binding_revision,
-                                          participant.controller_goal_id,
-                                          participant.controller_goal_generation,
-                                          ControllerTopologyId("topology.1"),
-                                          TopologyRevision("topology-revision"),
-                                          ControlRouteId("route.1"),
-                                          ScalingDomainId("scale.1"),
-                                          std::nullopt,
-                                          participant.resources,
-                                          ActiveControlConfigurationId("configuration.1"),
-                                          ActiveControlConfigurationGeneration(1U),
-                                          *state.runtime_scale_generation,
-                                          scale_request.scale,
-                                          scale_request.scale,
-                                          0.0,
-                                          RuntimeEpoch("runtime.epoch.1"),
-                                          1U,
-                                          state.updated_at_ns,
-                                          true,
-                                          RuntimeScaleApplicationState::kApplied,
-                                          std::nullopt}},
+        {RuntimeScaleParticipantStatusDTO{
+            participant.participant_id,
+            participant.controllable_component_id,
+            participant.command_target_id,
+            participant.capability_id,
+            participant.binding_identity.control_domain_id,
+            participant.binding_identity.control_domain_revision,
+            participant.binding_identity.controller()->control_binding_id,
+            participant.binding_identity.controller()->control_binding_revision,
+            participant.command_id,
+            participant.command_generation,
+            ControllerTopologyId("topology.1"),
+            TopologyRevision("topology-revision"),
+            ControlRouteId("route.1"),
+            ScalingDomainId("scale.1"),
+            std::nullopt,
+            participant.resources,
+            ActiveControlConfigurationId("configuration.1"),
+            ActiveControlConfigurationGeneration(1U),
+            *state.runtime_scale_generation,
+            scale_request.scale,
+            scale_request.scale,
+            0.0,
+            RuntimeEpoch("runtime.epoch.1"),
+            1U,
+            state.updated_at_ns,
+            true,
+            RuntimeScaleApplicationState::kApplied,
+            std::nullopt}},
         RuntimeScaleApplicationState::kApplied,
         state.updated_at_ns};
     ASSERT_TRUE(journal
@@ -1418,7 +1459,7 @@ TEST(SqliteOperationJournalTest,
     EXPECT_FALSE(event.operation_revision.has_value());
     EXPECT_TRUE(event.effect_pending);
     EXPECT_NE(
-        event.payload_json.find("\"api_version\":\"manyforge.stop_acceptance_projection.v2\""),
+        event.payload_json.find("\"api_version\":\"manyforge.stop_acceptance_projection.v8\""),
         std::string::npos);
     EXPECT_NE(event.payload_json.find("\"intent_kind\":\"full_stop\""), std::string::npos);
     EXPECT_NE(event.payload_json.find("\"joined_predecessor_stops\":[{"), std::string::npos);
@@ -2002,7 +2043,7 @@ TEST(SqliteOperationJournalTest, ScopedStopProjectionRetainsOriginAndVersionOnRe
     ASSERT_TRUE(events.ok());
     ASSERT_EQ(events.value().events.size(), 2U);
     const auto& bytes = events.value().events.back().payload_json;
-    EXPECT_NE(bytes.find("manyforge.stop_acceptance_projection.v3"), std::string::npos);
+    EXPECT_NE(bytes.find("manyforge.stop_acceptance_projection.v8"), std::string::npos);
     EXPECT_NE(bytes.find("grasp.attempt.1"), std::string::npos);
   }
   SqliteOperationJournal replacement(database, cell, 8U);
@@ -2597,4 +2638,1132 @@ TEST(SqliteOperationJournalTest, ActiveOperationControlUpdatesConsumeOneDurableA
   ASSERT_TRUE(journal.CloseOwnerEpoch(epoch, 100).ok());
 }
 
+TEST(SqliteOperationJournalTest, CapturedScopeAndFailureAreImmutableAcrossOwnerReplacement) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / "retry.sqlite3";
+  const CellId cell("cell.1");
+  const RequestOwnerEpoch epoch("execution-host.retry");
+  const std::vector<ResourceId> inventory{ResourceId("robot.joint1")};
+  auto intent = CommandIntent("retry.context", epoch.value());
+  intent.participants.front().required_capability_id = CapabilityId("execution.trajectory.execute");
+  intent.participants.front().payload = MotionParticipantIntentDTO{MoveId("move"),
+                                                                   FrameRoleId("base"),
+                                                                   FrameRoleId("tcp"),
+                                                                   TolerancesDTO{},
+                                                                   SpeedProfileDTO{},
+                                                                   TimeoutsDTO{},
+                                                                   CacheMode::kDefault,
+                                                                   PlanningProfileDTO::kBalanced,
+                                                                   MotionTargetModeDTO::kAbsolute,
+                                                                   std::nullopt,
+                                                                   std::nullopt,
+                                                                   JointGoalDTO{{"joint1"}, {0.25}},
+                                                                   std::nullopt,
+                                                                   {},
+                                                                   {}};
+  auto state = PreparedMotionState("operation.retry", 10);
+  state.journal_capture_order = 1U;
+  state.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("move"), "attempt.1"};
+  intent.participants.front().execution_scope = state.participants.front().execution_scope;
+  {
+    SqliteOperationJournal journal(database, cell, 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 4U, inventory).ok());
+    ASSERT_TRUE(
+        journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, state), state).ok());
+    for (const bool remove : {false, true}) {
+      auto changed = state;
+      changed.journal_capture_order = 2U;
+      changed.updated_at_ns = 11;
+      if (remove)
+        changed.participants.front().execution_scope.reset();
+      else
+        changed.participants.front().execution_scope->node_attempt_id = "attempt.changed";
+      EXPECT_FALSE(journal.RecordOperationState(epoch, changed, nullptr, "changed-origin").ok());
+    }
+    state.journal_capture_order = 2U;
+    state.updated_at_ns = 12;
+    state.state = OperationStateKind::kFailed;
+    state.participants.front().state = OperationStateKind::kFailed;
+    state.participants.front().terminal_error = ErrorDTO{"planning_failed", "transient", {}};
+    ASSERT_TRUE(journal.RecordOperationState(epoch, state, nullptr, "planning-failure").ok());
+    const auto events = journal.ReadEvents(epoch, 0U);
+    ASSERT_TRUE(events.ok());
+    ASSERT_EQ(events.value().events.size(), 2U);
+    EXPECT_NE(events.value().events.front().payload_json.find(
+                  "manyforge.operation_journal_record.v8"), std::string::npos);
+    EXPECT_EQ(events.value().events.front().payload_json.find("automatic_retry_context"),
+              std::string::npos);
+    EXPECT_NE(events.value().events.back().payload_json.find("planning_failed"),
+              std::string::npos);
+    journal.Close();
+  }
+  SqliteOperationJournal replacement(database, cell, 8U);
+  const auto recovered =
+      replacement.BeginOwnerEpoch(RequestOwnerEpoch("replacement"), 20, 4U, inventory);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+  const auto& historical = recovered.value().historical_operations.front();
+  EXPECT_EQ(historical.participants.front().execution_scope,
+            state.participants.front().execution_scope);
+  EXPECT_EQ(historical.participants.front().terminal_error,
+            state.participants.front().terminal_error);
+}
+
+TEST(SqliteOperationJournalTest, ExactParticipantFactsSurviveCaptureAndReopenWithoutColumns) {
+  for (const auto effect : {std::optional<ParticipantEffectKnowledge>{},
+                            std::optional(ParticipantEffectKnowledge::kNoEffect),
+                            std::optional(ParticipantEffectKnowledge::kEffectSettled),
+                            std::optional(ParticipantEffectKnowledge::kEffectUncertain)}) {
+    ScopedTemporaryDirectory temporary;
+    const auto database = temporary.path() / "participant-fact.sqlite3";
+    const RequestOwnerEpoch epoch("owner.fact");
+    const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+    auto initial = OperationState("operation.fact", OperationStateKind::kExecuting, 10);
+    initial.journal_capture_order = 1U;
+    auto failed = initial;
+    failed.state = OperationStateKind::kFailed;
+    failed.participants.front().state = OperationStateKind::kFailed;
+    failed.journal_capture_order = 2U;
+    const ErrorDTO cause{"command_failed", "exact failure", {{"phase", "delivery"}}};
+    failed.participants.front().terminal_error = cause;
+    if (effect)
+      failed.participants.front().terminal_fact =
+          ParticipantExecutionFact{ParticipantExecutionFactKind::kLocalFailure, *effect, cause};
+    {
+      SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
+      ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+      const auto intent = CommandIntent("request.fact", epoch.value());
+      ASSERT_TRUE(
+          journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, initial), initial)
+              .ok());
+      ASSERT_TRUE(journal.RecordOperationState(epoch, failed, nullptr, "exact_failure").ok());
+      const auto events = journal.ReadEvents(epoch, 0U, 8U);
+      ASSERT_TRUE(events.ok());
+      const auto& bytes = events.value().events.back().payload_json;
+      EXPECT_EQ(bytes.find("terminal_fact") != std::string::npos, effect.has_value());
+      if (effect) {
+        EXPECT_NE(bytes.find("manyforge.operation_journal_record.v8"), std::string::npos);
+      }
+      if (effect) {
+        auto mismatch = failed;
+        mismatch.journal_capture_order = 3U;
+        mismatch.participants.front().terminal_error =
+            ErrorDTO{"resource_slot_state_invalid", "selected resource transition failed", {}};
+        ASSERT_TRUE(journal.RecordOperationState(epoch, mismatch, nullptr, "mismatched_fact").ok());
+        failed = mismatch;
+        mismatch.journal_capture_order = 4U;
+        mismatch.participants.front().state = OperationStateKind::kExecuting;
+        EXPECT_FALSE(
+            journal.RecordOperationState(epoch, mismatch, nullptr, "nonterminal_fact").ok());
+      }
+    }
+    SqliteOperationJournal reopened(database, CellId("cell.test"), 8U);
+    const auto recovered =
+        reopened.BeginOwnerEpoch(RequestOwnerEpoch("owner.fact.2"), 20, 8U, inventory);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+    EXPECT_EQ(recovered.value().historical_operations.front(), failed);
+  }
+}
+
+TEST(SqliteOperationJournalTest,
+     PreCutCommandIdentityIsRejectedAfterIntegrityCheckedRead) {
+  for (const bool legacy_members : {false, true}) {
+    SCOPED_TRACE(legacy_members);
+    ScopedTemporaryDirectory temporary;
+    const auto database = temporary.path() / "empty-fact-version.sqlite3";
+    const RequestOwnerEpoch epoch("owner.empty-fact");
+    const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+    auto state = OperationState("operation.empty-fact", OperationStateKind::kCompleted, 10);
+    state.journal_capture_order = 1U;
+    {
+      SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
+      ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+      const auto intent = CommandIntent("request.empty-fact", epoch.value());
+      ASSERT_TRUE(
+          journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, state), state).ok());
+    }
+    sqlite3* connection = nullptr;
+    ASSERT_EQ(sqlite3_open(database.c_str(), &connection), SQLITE_OK);
+    sqlite3_stmt* statement = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  connection,
+                  "SELECT sequence,payload_json FROM journal_records ORDER BY sequence DESC LIMIT 1",
+                  -1, &statement, nullptr),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(statement), SQLITE_ROW);
+    const auto sequence = sqlite3_column_int64(statement, 0);
+    std::string bytes(reinterpret_cast<const char*>(sqlite3_column_text(statement, 1)));
+    ASSERT_EQ(sqlite3_finalize(statement), SQLITE_OK);
+    if (legacy_members) {
+      for (const auto& [current, legacy] :
+           std::vector<std::pair<std::string, std::string>>{
+               {"\"command_id\"", "\"controller_goal_id\""},
+               {"\"command_generation\"", "\"controller_goal_generation\""}}) {
+        const auto at = bytes.find(current);
+        ASSERT_NE(at, std::string::npos);
+        bytes.replace(at, current.size(), legacy);
+      }
+    } else {
+      const std::string version = "manyforge.operation_journal_record.v8";
+      const auto at = bytes.find(version);
+      ASSERT_NE(at, std::string::npos);
+      bytes.replace(at, version.size(), "manyforge.operation_journal_record.v5");
+    }
+    const auto digest = manyforge::content_identity::sha256_digest(bytes);
+    ASSERT_EQ(
+        sqlite3_prepare_v2(
+            connection, "UPDATE journal_records SET payload_json=?,payload_digest=? WHERE sequence=?",
+            -1, &statement, nullptr),
+        SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(statement, 1, bytes.c_str(), -1, SQLITE_TRANSIENT), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(statement, 2, digest.c_str(), -1, SQLITE_TRANSIENT), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_int64(statement, 3, sequence), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(statement), SQLITE_DONE);
+    ASSERT_EQ(sqlite3_finalize(statement), SQLITE_OK);
+    ASSERT_EQ(sqlite3_close(connection), SQLITE_OK);
+    SqliteOperationJournal reopened(database, CellId("cell.test"), 8U);
+    const auto recovered =
+        reopened.BeginOwnerEpoch(RequestOwnerEpoch("owner.empty-fact.2"), 20, 8U, inventory);
+    ASSERT_FALSE(recovered.ok());
+    EXPECT_EQ(recovered.error().code, "operation_journal_corrupt");
+  }
+}
+
+TEST(SqliteOperationJournalTest, LogicalPreemptionPersistsWithoutClaimingPhysicalCompletion) {
+  for (const auto kind : {OperationPreemptionKind::kPreempted,
+                          OperationPreemptionKind::kSupersededUnsent}) {
+    ScopedTemporaryDirectory temporary;
+    const auto database = temporary.path() / "preemption.sqlite3";
+    const RequestOwnerEpoch epoch("owner.preemption");
+    const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+    auto initial = OperationState("operation.preemption", OperationStateKind::kExecuting, 10);
+    initial.journal_capture_order = 1U;
+    initial.participants.front().execution_scope =
+        ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("arm.node"), "attempt.1"};
+    auto preempted = initial;
+    preempted.journal_capture_order = 2U;
+    preempted.preemption = OperationPreemptionDTO{
+        kind, {OperationId("operation.winner"), ProgramNodeInstanceId("winner.node"), "attempt.2"}};
+    {
+      SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
+      ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+      auto intent = CommandIntent("request.preemption", epoch.value());
+      intent.participants.front().execution_scope = initial.participants.front().execution_scope;
+      ASSERT_TRUE(journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, initial), initial)
+                      .ok());
+      ASSERT_TRUE(journal.RecordOperationState(epoch, preempted, nullptr, "motion_preempted").ok());
+      const auto events = journal.ReadEvents(epoch, 0U, 8U);
+      ASSERT_TRUE(events.ok());
+      EXPECT_NE(events.value().events.back().payload_json.find(
+                    "manyforge.operation_journal_record.v8"), std::string::npos);
+      EXPECT_EQ(preempted.participants.front().state, OperationStateKind::kExecuting);
+      EXPECT_FALSE(preempted.participants.front().terminal_fact);
+      auto erased = preempted;
+      erased.journal_capture_order = 3U;
+      erased.preemption.reset();
+      EXPECT_FALSE(journal.RecordOperationState(epoch, erased, nullptr, "lost_preemption").ok());
+      auto changed = preempted;
+      changed.journal_capture_order = 3U;
+      changed.preemption->by.node_attempt_id = "changed";
+      EXPECT_FALSE(journal.RecordOperationState(epoch, changed, nullptr, "changed_preemption").ok());
+    }
+    SqliteOperationJournal reopened(database, CellId("cell.test"), 8U);
+    const auto recovered =
+        reopened.BeginOwnerEpoch(RequestOwnerEpoch("owner.preemption.2"), 20, 8U, inventory);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+    const auto& historical = recovered.value().historical_operations.front();
+    EXPECT_EQ(historical.preemption, preempted.preemption);
+    EXPECT_EQ(historical.state, OperationStateKind::kInterventionRequired);
+    EXPECT_NE(historical.participants.front().state, OperationStateKind::kCompleted);
+  }
+}
+
+IoRuleStateChangeDTO GlobalRuleChange(RequestOwnerEpoch owner, IoGlobalRuleState state,
+                                      TimePoint at = 1) {
+  return {{std::move(owner), UINT64_MAX, ActiveBundlePublicationGeneration(3U),
+           RetainedBundleId("retained.global"), GraphRevision("graph.global")},
+          {InterruptPolicyId("door.guard"), state, std::nullopt},
+          at};
+}
+
+TEST(SqliteOperationJournalTest, InterruptRuleStateUsesExistingOrderedOperationalStreamAndReopens) {
+  ScopedTemporaryDirectory directory;
+  const auto database = directory.path() / "rule-state.sqlite3";
+  const RequestOwnerEpoch owner("global.owner");
+  std::uint64_t first_sequence{};
+  std::uint64_t last_sequence{};
+  {
+    SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 0, 8U, {}).ok());
+    auto change = GlobalRuleChange(owner, IoGlobalRuleState::kTripped);
+    const auto first = journal.RecordInterruptRuleStateChanged(change);
+    ASSERT_TRUE(first.ok());
+    first_sequence = first.value();
+    change.rule.state = IoGlobalRuleState::kLatched;
+    change.rule.triggering_acquisition =
+        IoRuleAcquisitionKeyDTO{InterruptSourceId("door.source"),
+                                IoSourceIncarnation("door.epoch"),
+                                UINT64_MAX,
+                                {owner, UINT64_MAX, InterruptSourceId("door.source"), UINT64_MAX}};
+    change.occurred_at_ns = 2;
+    const auto last = journal.RecordInterruptRuleStateChanged(change);
+    ASSERT_TRUE(last.ok());
+    last_sequence = last.value();
+    EXPECT_GT(last_sequence, first_sequence);
+    const auto events = journal.ReadOperationalEvents(owner, 0U);
+    ASSERT_TRUE(events.ok());
+    ASSERT_EQ(events.value().events.size(), 2U);
+    const auto& event = events.value().events.back();
+    EXPECT_EQ(event.record_kind, "interrupt_rule_state_changed");
+    EXPECT_FALSE(event.operation_id);
+    EXPECT_FALSE(event.request_id);
+    EXPECT_FALSE(event.effect_pending);
+    EXPECT_EQ(event.occurred_at_ns, 2);
+    const auto payload = manyforge::content_identity::parse_canonical_json(event.payload_json);
+    ASSERT_EQ(payload.as_object().size(), 8U);
+    EXPECT_EQ(payload.find_object_member("catalog_generation")->as_string(),
+              std::to_string(UINT64_MAX));
+    EXPECT_EQ(payload.find_object_member("active_publication_generation")->as_number(), 3.0);
+    EXPECT_EQ(payload.find_object_member("state")->as_string(), "latched");
+    EXPECT_EQ(payload.find_object_member("triggering_acquisition")
+                  ->find_object_member("source_sequence")
+                  ->as_string(),
+              std::to_string(UINT64_MAX));
+    EXPECT_TRUE(manyforge::content_identity::parse_canonical_json(
+                    events.value().events.front().payload_json)
+                    .find_object_member("triggering_acquisition")
+                    ->is_null());
+  }
+  SqliteOperationJournal reopened(database, CellId("cell.test"), 8U);
+  const auto replay = reopened.ReadOperationalEvents(owner, first_sequence);
+  ASSERT_TRUE(replay.ok());
+  ASSERT_EQ(replay.value().events.size(), 1U);
+  EXPECT_EQ(replay.value().events.front().sequence, last_sequence);
+  EXPECT_EQ(replay.value().next_after_sequence, last_sequence);
+}
+
+TEST(SqliteOperationJournalTest, InterruptRuleStateRefusesInvalidEvidenceWithoutConsumingSequence) {
+  ScopedTemporaryDirectory directory;
+  SqliteOperationJournal journal(directory.path() / "rule-invalid.sqlite3", CellId("cell.test"),
+                                 8U);
+  const RequestOwnerEpoch owner("global.owner");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 0, 8U, {}).ok());
+  auto change = GlobalRuleChange(owner, IoGlobalRuleState::kClear);
+  const auto first = journal.RecordInterruptRuleStateChanged(change);
+  ASSERT_TRUE(first.ok());
+  change.rule.triggering_acquisition =
+      IoRuleAcquisitionKeyDTO{InterruptSourceId("door.source"),
+                              IoSourceIncarnation("door.epoch"),
+                              1U,
+                              {owner, UINT64_MAX, InterruptSourceId("door.source"), 2U}};
+  EXPECT_FALSE(journal.RecordInterruptRuleStateChanged(change).ok());  // No fabricated clear cause.
+  change.rule.state = static_cast<IoGlobalRuleState>(255);
+  EXPECT_FALSE(journal.RecordInterruptRuleStateChanged(change).ok());
+  change.rule.state = IoGlobalRuleState::kTripped;
+  change.rule.triggering_acquisition->source_cursor.owner_epoch = RequestOwnerEpoch("foreign");
+  EXPECT_FALSE(journal.RecordInterruptRuleStateChanged(change).ok());
+  change.rule.triggering_acquisition.reset();
+  change.context.active_publication_generation = ActiveBundlePublicationGeneration(0U);
+  EXPECT_FALSE(journal.RecordInterruptRuleStateChanged(change).ok());
+  change.context.active_publication_generation = ActiveBundlePublicationGeneration(3U);
+  change.occurred_at_ns = -1;
+  EXPECT_FALSE(journal.RecordInterruptRuleStateChanged(change).ok());
+  change.occurred_at_ns = 2;
+  const auto last = journal.RecordInterruptRuleStateChanged(change);
+  ASSERT_TRUE(last.ok());
+  EXPECT_EQ(last.value(), first.value() + 1U);
+  const auto all = journal.ReadOperationalEvents(owner, 0U);
+  ASSERT_TRUE(all.ok());
+  EXPECT_EQ(all.value().events.size(), 2U);
+}
+
+TEST(SqliteOperationJournalTest, InterruptRuleStateUsesBoundedHistoryAndRejectsRetiredOwner) {
+  ScopedTemporaryDirectory directory;
+  SqliteOperationJournal journal(directory.path() / "rule-history.sqlite3", CellId("cell.test"),
+                                 2U);
+  const RequestOwnerEpoch owner("global.owner");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 0, 2U, {}).ok());
+  std::uint64_t last{};
+  for (std::uint64_t index = 0U; index < 5U; ++index) {
+    const auto recorded = journal.RecordInterruptRuleStateChanged(GlobalRuleChange(
+        owner, index % 2U ? IoGlobalRuleState::kClear : IoGlobalRuleState::kTripped,
+        static_cast<TimePoint>(index)));
+    ASSERT_TRUE(recorded.ok());
+    last = recorded.value();
+  }
+  const auto retained = journal.ReadOperationalEvents(owner, 0U);
+  ASSERT_TRUE(retained.ok());
+  ASSERT_EQ(retained.value().events.size(), 2U);
+  EXPECT_EQ(retained.value().events.front().sequence, last - 1U);
+  EXPECT_EQ(retained.value().events.back().sequence, last);
+  ASSERT_TRUE(journal.BeginOwnerEpoch(RequestOwnerEpoch("global.replacement"), 6, 2U, {}).ok());
+  EXPECT_FALSE(
+      journal.RecordInterruptRuleStateChanged(GlobalRuleChange(owner, IoGlobalRuleState::kClear, 7))
+          .ok());
+  EXPECT_FALSE(journal.ReadOperationalEvents(owner, 0U).ok());
+}
+
+TEST(SqliteOperationJournalTest, InterruptRuleStateBaselineRequiresCanonicalActualContextRows) {
+  const auto change =
+      GlobalRuleChange(RequestOwnerEpoch("global.owner"), IoGlobalRuleState::kClear);
+  IoRuleStateBaselineDTO baseline{change.context, 0U, {change.rule}};
+  EXPECT_FALSE(io_rule_state_baseline_field_error(baseline));
+  baseline.states.push_back(change.rule);
+  EXPECT_EQ(io_rule_state_baseline_field_error(baseline), "io_rule_state_rows_not_canonical");
+  baseline.states.back().rule_id = InterruptPolicyId("aaa.first");
+  EXPECT_EQ(io_rule_state_baseline_field_error(baseline), "io_rule_state_rows_not_canonical");
+  baseline.states.clear();
+  EXPECT_FALSE(io_rule_state_baseline_field_error(baseline));  // Actual qualified empty catalog.
+  baseline.through_sequence = UINT64_MAX;
+  EXPECT_EQ(io_rule_state_baseline_field_error(baseline), "io_rule_state_sequence_invalid");
+}
+
+}  // namespace
+
+namespace {
+TEST(SqliteOperationJournalTest, PreemptedWithoutStopRetainsFactAndSelectedCauseAcrossReopen) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / "preempted-fact.sqlite3";
+  const RequestOwnerEpoch epoch("owner.preempted");
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+  auto state = OperationState("operation.preempted", OperationStateKind::kInterventionRequired, 10);
+  state.journal_capture_order = 1U;
+  const ErrorDTO selected{
+      "success", "unexpected subordinate terminal", {{"reason", "subordinate_terminal_error"}}};
+  const ParticipantExecutionFact reported{ParticipantExecutionFactKind::kPreemptedByAddressedStop,
+                                          ParticipantEffectKnowledge::kEffectSettled, std::nullopt};
+  state.participants.front().terminal_error = selected;
+  state.participants.front().terminal_fact = reported;
+  {
+    SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+    const auto intent = CommandIntent("request.preempted", epoch.value());
+    ASSERT_TRUE(
+        journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, state), state).ok());
+    const auto events = journal.ReadEvents(epoch, 0U, 8U);
+    ASSERT_TRUE(events.ok());
+    ASSERT_EQ(events.value().events.size(), 1U);
+    const auto payload = manyforge::content_identity::parse_canonical_json(
+        events.value().events.front().payload_json);
+    const auto& participant = payload.find_object_member("operation_state")
+                                  ->find_object_member("participants")
+                                  ->as_array()
+                                  .front();
+    const auto* fact = participant.find_object_member("terminal_fact");
+    ASSERT_NE(fact, nullptr);
+    EXPECT_EQ(fact->find_object_member("kind")->as_string(), "preempted_by_addressed_stop");
+    EXPECT_EQ(fact->find_object_member("effect")->as_string(), "effect_settled");
+    EXPECT_TRUE(fact->find_object_member("error")->is_null());
+    EXPECT_EQ(
+        participant.find_object_member("terminal_error")->find_object_member("code")->as_string(),
+        selected.code);
+  }
+  SqliteOperationJournal reopened(database, CellId("cell.test"), 8U);
+  const auto recovered =
+      reopened.BeginOwnerEpoch(RequestOwnerEpoch("owner.preempted.2"), 20, 8U, inventory);
+  ASSERT_TRUE(recovered.ok());
+  ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+  EXPECT_EQ(recovered.value().historical_operations.front(), state);
+}
+
+TEST(SqliteOperationJournalTest,
+     HostReplacementRetainsEndedSiblingFactWithSelectedReplacementCause) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / "sibling-fact.sqlite3";
+  const RequestOwnerEpoch epoch("owner.siblings");
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper"),
+                                          ResourceId("robot2.gripper")};
+  auto state = OperationState("operation.siblings", OperationStateKind::kExecuting, 10);
+  auto sibling = state.participants.front();
+  sibling.participant_id = OperationParticipantId("participant.2");
+  sibling.command_id = ControllerGoalId("goal.2");
+  sibling.controllable_component_id = ControllableComponentId("robot.2");
+  sibling.resources = {inventory.back()};
+  state.participants.push_back(sibling);
+  const ParticipantExecutionFact reported{ParticipantExecutionFactKind::kComputedCompletion,
+                                          ParticipantEffectKnowledge::kEffectSettled, std::nullopt};
+  {
+    SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+    auto intent = CommandIntent("request.siblings", epoch.value());
+    intent.participants.push_back(intent.participants.front());
+    intent.participants.back().component_role_id = ComponentRoleId("robot2");
+    auto accepted = Acceptance(intent, state);
+    accepted.participant_assignments.push_back({1U, sibling.participant_id});
+    ASSERT_TRUE(journal.RecordOperationAccepted(epoch, intent, accepted, state).ok());
+    state.participants.front().state = OperationStateKind::kCompleted;
+    state.participants.front().terminal_fact = reported;
+    state.updated_at_ns = 11;
+    ASSERT_TRUE(journal.RecordOperationState(epoch, state, nullptr, "sibling_completed").ok());
+  }
+  SqliteOperationJournal replacement(database, CellId("cell.test"), 8U);
+  const RequestOwnerEpoch next("owner.siblings.2");
+  const auto recovered = replacement.BeginOwnerEpoch(next, 20, 8U, inventory);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+  const auto& historical = recovered.value().historical_operations.front();
+  EXPECT_EQ(historical.state, OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(historical.participants.front().terminal_fact, std::optional(reported));
+  ASSERT_TRUE(historical.participants.front().terminal_error);
+  EXPECT_EQ(historical.participants.front().terminal_error->code, "execution_host_replaced");
+  EXPECT_EQ(recovered.value().unreconciled_resources, inventory);
+  const auto events = replacement.ReadEvents(next, 0U, 8U);
+  ASSERT_TRUE(events.ok());
+  const auto& bytes = events.value().events.back().payload_json;
+  EXPECT_NE(bytes.find("computed_completion"), std::string::npos);
+  EXPECT_NE(bytes.find("execution_host_replaced"), std::string::npos);
+}
+
+TEST(SqliteOperationJournalTest, ProviderIdentityAndCorrelatedOutputEvidenceSurviveReopen) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / "provider-output.sqlite3";
+  const RequestOwnerEpoch epoch("owner.output");
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+  auto state = OperationState("operation.output", OperationStateKind::kFailed, 10);
+  auto& participant = state.participants.front();
+  participant.binding_identity = ParticipantBindingIdentityDTO{
+      ControlDomainId("domain.output"), ControlDomainRevision("provider-domain-revision"),
+      CapabilityProviderBindingIdentityDTO{CapabilityProviderBindingId("provider.output"),
+                                           CapabilityProviderBindingRevision("provider-revision")}};
+  {
+    SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+    auto intent = CommandIntent("request.output", epoch.value());
+    auto& command = std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload);
+    command.command_schema_id = CommandSchemaId("io-write-schema");
+    command.command_schema_revision = CommandSchemaRevision("io-write-schema-revision");
+    command.command_value = IoSignalWriteCommandValueDTO{ResourceRoleId("valve_enable"), false};
+    command.completion_timeout_s.reset();
+    ASSERT_TRUE(
+        journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, state), state).ok());
+    for (const auto evidence :
+         {IoOutputEvidence::kNotSubmitted, IoOutputEvidence::kSubmitted,
+          IoOutputEvidence::kSourceAccepted, IoOutputEvidence::kSourceRejected,
+          IoOutputEvidence::kAcceptanceUnknown}) {
+      participant.output_evidence = evidence;
+      ++state.updated_at_ns;
+      ASSERT_TRUE(journal.RecordOperationState(epoch, state, nullptr, "output_observed").ok());
+      // State records intentionally coalesce. Inspect each actual retained
+      // latest event before the next observation supersedes it.
+      const auto current = journal.ReadEvents(epoch, 0U, 8U);
+      ASSERT_TRUE(current.ok()) << current.error().message;
+      ASSERT_EQ(current.value().events.size(), 2U);
+      const auto payload = manyforge::content_identity::parse_canonical_json(
+          current.value().events.back().payload_json);
+      const auto& row = payload.find_object_member("operation_state")
+                            ->find_object_member("participants")->as_array().front();
+      EXPECT_EQ(row.find_object_member("output_evidence")->as_string(),
+                std::string(to_string(evidence)));
+    }
+    const auto events = journal.ReadEvents(epoch, 0U, 8U);
+    ASSERT_TRUE(events.ok());
+    ASSERT_EQ(events.value().events.size(), 2U);
+    for (const auto& event : events.value().events) {
+      const auto payload = manyforge::content_identity::parse_canonical_json(event.payload_json);
+      EXPECT_EQ(payload.find_object_member("api_version")->as_string(),
+                "manyforge.operation_journal_record.v8");
+      const auto& row = payload.find_object_member("operation_state")
+                            ->find_object_member("participants")
+                            ->as_array()
+                            .front();
+      EXPECT_EQ(row.find_object_member("command_id")->as_string(), participant.command_id.value());
+      EXPECT_EQ(row.find_object_member("command_generation")->as_number(),
+                static_cast<double>(participant.command_generation.value()));
+      EXPECT_EQ(row.find_object_member("controller_goal_id"), nullptr);
+      EXPECT_EQ(row.find_object_member("controller_goal_generation"), nullptr);
+      EXPECT_TRUE(row.find_object_member("control_binding_id")->is_null());
+      EXPECT_TRUE(row.find_object_member("control_binding_revision")->is_null());
+      EXPECT_EQ(row.find_object_member("capability_provider_binding_id")->as_string(),
+                "provider.output");
+      EXPECT_EQ(row.find_object_member("control_domain_id")->as_string(), "domain.output");
+    }
+    EXPECT_NE(events.value().events.back().payload_json.find("acceptance_unknown"),
+              std::string::npos);
+    auto invalid = state;
+    invalid.participants.front().output_evidence = static_cast<IoOutputEvidence>(999);
+    EXPECT_FALSE(journal.RecordOperationState(epoch, invalid, nullptr, "invalid_evidence").ok());
+  }
+  SqliteOperationJournal reopened(database, CellId("cell.test"), 8U);
+  const auto recovered =
+      reopened.BeginOwnerEpoch(RequestOwnerEpoch("owner.output.2"), 30, 8U, inventory);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+  EXPECT_EQ(recovered.value().historical_operations.front(), state);
+}
+
+TEST(SqliteOperationJournalTest,
+     ExplicitUncertainOutputAcknowledgementIsDurableAndAbsentByDefault) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / "explicit-output-ack.sqlite3";
+  const CellId cell("cell.ack");
+  const RequestOwnerEpoch epoch("owner.ack");
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+  auto state = OperationState("operation.ack", OperationStateKind::kExecuting, 10);
+  {
+    SqliteOperationJournal journal(database, cell, 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+    const auto intent = CommandIntent("request.ack.initial", epoch.value());
+    ASSERT_TRUE(
+        journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, state), state).ok());
+    // Journal codec fixture: the actual Kernel owns whether this explicit set
+    // qualifies retirement. Persist exactly its accepted typed control fact.
+    for (const bool explicit_ack : {false, true}) {
+      OperationControlRequestDTO request{
+          PublicRequestContextDTO{RequestId(explicit_ack ? "reset.explicit" : "reset.default"),
+                                  epoch, "operator.fixture", std::nullopt},
+          state.operation_id, state.operation_revision, std::nullopt};
+      if (explicit_ack)
+        request.acknowledged_uncertain_outputs = std::vector<UncertainOutputAcknowledgementDTO>{
+            {state.operation_id, state.operation_revision}};
+      const auto before = state.operation_revision;
+      state.operation_revision = OperationRevision(before.value() + 1U);
+      ++state.updated_at_ns;
+      const OperationControlAcceptedDTO accepted{request.request_context.request_id,
+                                                 RequestReplayStatusDTO::kAcceptedNew,
+                                                 state.operation_id,
+                                                 before,
+                                                 OperationControlKind::kReset,
+                                                 state.operation_revision,
+                                                 state.updated_at_ns};
+      ASSERT_TRUE(journal.RecordControlAccepted(epoch, request, accepted, state).ok());
+      const auto events = journal.ReadEvents(epoch, 0U, 8U);
+      ASSERT_TRUE(events.ok());
+      const auto payload = manyforge::content_identity::parse_canonical_json(
+          events.value().events.back().payload_json);
+      const auto* encoded = payload.find_object_member("intent")->find_object_member(
+          "acknowledged_uncertain_outputs");
+      ASSERT_EQ(encoded != nullptr, explicit_ack);
+      if (explicit_ack) {
+        ASSERT_TRUE(encoded->is_array());
+        ASSERT_EQ(encoded->as_array().size(), 1U);
+        const auto& row = encoded->as_array().front();
+        EXPECT_EQ(row.as_object().size(), 2U);
+        EXPECT_EQ(row.find_object_member("operation_id")->as_string(), state.operation_id.value());
+        EXPECT_EQ(row.find_object_member("operation_revision")->as_number(),
+                  static_cast<double>(before.value()));
+      }
+    }
+  }
+  SqliteOperationJournal reopened(database, cell, 8U);
+  const auto events = reopened.ReadEvents(epoch, 0U, 8U);
+  ASSERT_TRUE(events.ok());
+  const auto payload =
+      manyforge::content_identity::parse_canonical_json(events.value().events.back().payload_json);
+  ASSERT_NE(
+      payload.find_object_member("intent")->find_object_member("acknowledged_uncertain_outputs"),
+      nullptr);
+}
+
+}  // namespace
+
+namespace {
+TEST(SqliteOperationJournalTest, ControlAckKeepsHistoricalRuleOriginThroughJournalReopen) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / "historical-rule-ack.sqlite3";
+  const CellId cell("cell.rule.ack");
+  const RequestOwnerEpoch owner("owner.rule.ack");
+  const std::vector<ResourceId> resources{ResourceId("robot.gripper")};
+  auto state = OperationState("operation.rule.ack", OperationStateKind::kCompleted, 10);
+  state.participants.front().io_rule_outcomes = {rule_codec_test::Outcome(state, owner)};
+  const auto original = state.participants.front().io_rule_outcomes;
+  {
+    SqliteOperationJournal journal(database, cell, 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U, resources).ok());
+    const auto intent = CommandIntent("request.rule.initial", owner.value());
+    ASSERT_TRUE(journal.RecordOperationAccepted(owner, intent, Acceptance(intent, state), state).ok());
+    const OperationControlRequestDTO request{
+        PublicRequestContextDTO{RequestId("request.rule.ack"), owner, "operator.fixture", std::nullopt},
+        state.operation_id, state.operation_revision, std::nullopt};
+    const auto before = state.operation_revision;
+    state.operation_revision = OperationRevision(before.value() + 1U);
+    ++state.updated_at_ns;
+    // Typed accepted-control persistence fixture: no new Kernel ACK authority.
+    const OperationControlAcceptedDTO accepted{
+        request.request_context.request_id, RequestReplayStatusDTO::kAcceptedNew,
+        state.operation_id, before, OperationControlKind::kAcknowledgeCompleted,
+        state.operation_revision, state.updated_at_ns};
+    const auto stored = journal.RecordControlAccepted(owner, request, accepted, state);
+    ASSERT_TRUE(stored.ok()) << stored.error().message;
+    const auto events = journal.ReadEvents(owner, 0U, 8U);
+    ASSERT_TRUE(events.ok());
+    ASSERT_EQ(events.value().events.size(), 2U);
+    EXPECT_EQ(events.value().events.back().operation_revision, state.operation_revision);
+    const auto payload = manyforge::content_identity::parse_canonical_json(
+        events.value().events.back().payload_json);
+    const auto* rows = payload.find_object_member("operation_state")
+                           ->find_object_member("participants");
+    ASSERT_EQ(rows->as_array().size(), 1U);
+    const auto* encoded = rows->as_array().front().find_object_member("io_rule_outcomes");
+    ASSERT_NE(encoded, nullptr);
+    const auto decoded = DecodeIoRuleOutcomes(manyforge::content_identity::canonical_json(*encoded));
+    ASSERT_TRUE(decoded.ok());
+    EXPECT_EQ(decoded.value(), original);
+  }
+  SqliteOperationJournal reopened(database, cell, 8U);
+  const auto recovered = reopened.BeginOwnerEpoch(
+      RequestOwnerEpoch("owner.rule.ack.replacement"), 20, 8U, resources);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+  const auto& historical = recovered.value().historical_operations.front();
+  EXPECT_EQ(historical.operation_revision, OperationRevision(2U));
+  EXPECT_EQ(historical.participants.front().io_rule_outcomes, original);
+  EXPECT_EQ(std::get<IoOperationRuleScopeDTO>(historical.participants.front()
+                    .io_rule_outcomes.front().registration.scope).operation_revision,
+            OperationRevision(1U));
+}
+TEST(SqliteOperationJournalTest, CommonCommandIdentityUsesOneNeutralStoredShape) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / "neutral-command.sqlite3";
+  const CellId cell("cell.command");
+  const RequestOwnerEpoch owner("owner.command");
+  const std::vector<ResourceId> inventory{ResourceId("robot.gripper")};
+  const auto state = OperationState("operation.command", OperationStateKind::kCompleted, 10);
+  {
+    SqliteOperationJournal journal(database, cell, 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U, inventory).ok());
+    const auto intent = CommandIntent("request.command", owner.value());
+    ASSERT_TRUE(journal.RecordOperationAccepted(owner, intent, Acceptance(intent, state), state).ok());
+    const auto events = journal.ReadOperationalEvents(owner, 0U);
+    ASSERT_TRUE(events.ok());
+    ASSERT_EQ(events.value().events.size(), 1U);
+    const auto& event = events.value().events.front();
+    EXPECT_EQ(event.payload_digest,
+              manyforge::content_identity::sha256_digest(event.payload_json));
+    const auto payload = manyforge::content_identity::parse_canonical_json(event.payload_json);
+    EXPECT_EQ(payload.find_object_member("api_version")->as_string(),
+              "manyforge.operation_journal_record.v8");
+    const auto& participant = payload.find_object_member("operation_state")
+                                  ->find_object_member("participants")->as_array().front();
+    ASSERT_NE(participant.find_object_member("command_id"), nullptr);
+    ASSERT_NE(participant.find_object_member("command_generation"), nullptr);
+    EXPECT_EQ(participant.find_object_member("command_id")->as_string(),
+              state.participants.front().command_id.value());
+    EXPECT_EQ(participant.find_object_member("command_generation")->as_number(),
+              static_cast<double>(state.participants.front().command_generation.value()));
+    EXPECT_EQ(participant.find_object_member("controller_goal_id"), nullptr);
+    EXPECT_EQ(participant.find_object_member("controller_goal_generation"), nullptr);
+  }
+  sqlite3* connection = nullptr;
+  ASSERT_EQ(sqlite3_open(database.c_str(), &connection), SQLITE_OK);
+  sqlite3_stmt* columns = nullptr;
+  ASSERT_EQ(sqlite3_prepare_v2(connection, "PRAGMA table_info(operation_participants)",
+                              -1, &columns, nullptr), SQLITE_OK);
+  std::set<std::string> names;
+  while (sqlite3_step(columns) == SQLITE_ROW)
+    names.emplace(reinterpret_cast<const char*>(sqlite3_column_text(columns, 1)));
+  ASSERT_EQ(sqlite3_finalize(columns), SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(connection), SQLITE_OK);
+  EXPECT_TRUE(names.contains("command_id"));
+  EXPECT_TRUE(names.contains("command_generation"));
+  EXPECT_FALSE(names.contains("controller_goal_id"));
+  EXPECT_FALSE(names.contains("controller_goal_generation"));
+  SqliteOperationJournal reopened(database, cell, 8U);
+  const auto recovered = reopened.BeginOwnerEpoch(
+      RequestOwnerEpoch("owner.command.replacement"), 20, 8U, inventory);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+  EXPECT_EQ(recovered.value().historical_operations.front().participants, state.participants);
+}
+TEST(SqliteOperationJournalTest, RuleEvidenceSurvivesRealJournalCoalescingAndReopen) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / "rule-evidence.sqlite3";
+  const RequestOwnerEpoch owner("owner.rules");
+  const std::vector<ResourceId> resources{ResourceId("robot.gripper")};
+  auto state = OperationState("operation.rules", OperationStateKind::kStopped, 10);
+  state.participants.front().io_rule_outcomes.push_back(rule_codec_test::Outcome(state, owner));
+  {
+    SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U, resources).ok());
+    const auto intent = CommandIntent("request.rules", owner.value());
+    ASSERT_TRUE(journal.RecordOperationAccepted(owner, intent, Acceptance(intent, state), state).ok());
+    for (auto disposition : {IoRuleArbitrationDispositionDTO::kQueued, IoRuleArbitrationDispositionDTO::kSuperseded}) {
+      state.participants.front().io_rule_outcomes.front().arbitration_disposition = disposition;
+      state.updated_at_ns += 1;
+      ASSERT_TRUE(journal.RecordOperationState(owner, state, nullptr, "rule_evidence_observed").ok());
+    }
+    const auto events = journal.ReadEvents(owner, 0U, 8U);
+    ASSERT_TRUE(events.ok()); ASSERT_EQ(events.value().events.size(), 2U);
+    const auto payload = manyforge::content_identity::parse_canonical_json(events.value().events.back().payload_json);
+    EXPECT_EQ(payload.find_object_member("api_version")->as_string(), "manyforge.operation_journal_record.v8");
+  }
+  SqliteOperationJournal reopened(database, CellId("cell.test"), 8U);
+  const auto recovered = reopened.BeginOwnerEpoch(RequestOwnerEpoch("owner.rules.replacement"), 20, 8U, resources);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+  EXPECT_EQ(recovered.value().historical_operations.front().participants.front().io_rule_outcomes,
+            state.participants.front().io_rule_outcomes);
+}
+}  // namespace
+
+namespace {
+IoGlobalRuleRecoveryRecordDTO GlobalRecoveryRecord(const RequestOwnerEpoch& owner,
+                                                   std::string request_id = "global.recover") {
+  auto state = rule_codec_test::State();
+  state.updated_at_ns = 10;
+  auto outcome = rule_codec_test::Outcome(state, owner);
+  const IoRuleStateContextDTO context{owner, UINT64_MAX, ActiveBundlePublicationGeneration(11U),
+                                      RetainedBundleId("retained.global"),
+                                      GraphRevision("graph.global")};
+  const IoActivationRuleScopeDTO scope{context.retained_bundle_id, context.graph_revision};
+  outcome.registration.scope = scope;
+  outcome.evidence.trip->registration = outcome.registration;
+  for (auto& loss : outcome.evidence.source_losses) loss.registration = outcome.registration;
+  auto successor = outcome.registration;
+  successor.registration_id = 1U;
+  return {{{RequestId(request_id), owner, "operator", std::string("correlation")},
+           {context, outcome.registration.policy_id, outcome.registration.registration_id},
+           std::string("Operator acknowledges the inactive condition")},
+          {RequestId(request_id),
+           RequestReplayStatusDTO::kAcceptedNew,
+           true,
+           context,
+           {outcome.registration.policy_id, IoGlobalRuleState::kClear, std::nullopt},
+           std::nullopt},
+          {outcome.registration.policy_id, IoGlobalRuleState::kLatched,
+           outcome.evidence.trip->triggering_acquisition},
+          outcome.evidence,
+          {false, 11},
+          successor};
+}
+
+TEST(SqliteOperationJournalTest, GlobalRecoveryCodecRetainsActualActivationAndFullEvidence) {
+  const auto record = GlobalRecoveryRecord(RequestOwnerEpoch("global.owner"));
+  const auto encoded = EncodeIoGlobalRuleRecoveryRecord(record);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  const std::string current_version = "manyforge.internal.io_global_rule_recovery_record.v2";
+  const auto version_at = encoded.value().find(current_version);
+  ASSERT_NE(version_at, std::string::npos);
+  auto old_version = encoded.value();
+  old_version.replace(version_at, current_version.size(),
+                      "manyforge.internal.io_global_rule_recovery_record.v1");
+  EXPECT_FALSE(DecodeIoGlobalRuleRecoveryRecord(old_version).ok());
+  const auto decoded = DecodeIoGlobalRuleRecoveryRecord(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value().intent, record.intent);
+  EXPECT_EQ(decoded.value().result, record.result);
+  EXPECT_EQ(decoded.value().prior_latched_state, record.prior_latched_state);
+  EXPECT_EQ(decoded.value().prior_latched_evidence, record.prior_latched_evidence);
+  EXPECT_EQ(decoded.value().successor_registration, record.successor_registration);
+  EXPECT_EQ(decoded.value().inactive_observation.value, std::optional<bool>(false));
+  EXPECT_EQ(decoded.value().inactive_observation.evaluated_at_ns, 11);
+  EXPECT_EQ(EncodeIoGlobalRuleRecoveryRecord(decoded.value()).value(), encoded.value());
+  EXPECT_EQ(decoded.value().intent.selector.expected_rule_registration_id, UINT64_MAX);
+  ASSERT_TRUE(decoded.value().prior_latched_evidence.trip->blackboard);
+  EXPECT_EQ(decoded.value().prior_latched_evidence.trip->blackboard->values.back()->value,
+            record.prior_latched_evidence.trip->blackboard->values.back()->value);
+  EXPECT_EQ(encoded.value().find("stop_id"), std::string::npos);
+  EXPECT_EQ(encoded.value().find("operation_id"), std::string::npos);
+  auto unknown = encoded.value();
+  unknown.insert(unknown.size() - 1U, ",\"unknown\":0");
+  EXPECT_FALSE(DecodeIoGlobalRuleRecoveryRecord(unknown).ok());
+  EXPECT_FALSE(DecodeIoGlobalRuleRecoveryRecord(" " + encoded.value()).ok());
+
+  // Generalizing shared registration evidence must not relax operation outcomes.
+  auto operation =
+      rule_codec_test::Outcome(rule_codec_test::State(), record.result.context.owner_epoch);
+  ASSERT_TRUE(EncodeIoRuleOutcomes(std::span(&operation, 1U)).ok());
+  operation.registration.scope = record.successor_registration.scope;
+  operation.evidence.trip->registration = operation.registration;
+  for (auto& loss : operation.evidence.source_losses) loss.registration = operation.registration;
+  EXPECT_FALSE(EncodeIoRuleOutcomes(std::span(&operation, 1U)).ok());
+}
+
+TEST(SqliteOperationJournalTest, GlobalRecoveryRefusesMismatchedTupleAndUnknownCurrentCondition) {
+  const auto original = GlobalRecoveryRecord(RequestOwnerEpoch("global.owner"));
+  ScopedTemporaryDirectory directory;
+  SqliteOperationJournal journal(directory.path() / "global-invalid.sqlite3", CellId("cell.test"),
+                                 8U);
+  ASSERT_TRUE(journal.BeginOwnerEpoch(original.result.context.owner_epoch, 0, 8U, {}).ok());
+  std::vector<std::function<void(IoGlobalRuleRecoveryRecordDTO&)>> invalid{
+      [](auto& r) { r.intent.request_context.request_owner_epoch = RequestOwnerEpoch("foreign"); },
+      [](auto& r) { r.intent.request_context.request_id = RequestId(""); },
+      [](auto& r) { r.result.request_id = RequestId("foreign"); },
+      [](auto& r) { r.result.accepted = false; },
+      [](auto& r) { r.result.replay_status = RequestReplayStatusDTO::kReplayedExact; },
+      [](auto& r) { r.result.error = ErrorDTO{"error", "not accepted", {}}; },
+      [](auto& r) { r.result.context.catalog_generation = 1U; },
+      [](auto& r) { r.result.rule.state = IoGlobalRuleState::kLatched; },
+      [](auto& r) {
+        r.result.rule.triggering_acquisition = r.prior_latched_state.triggering_acquisition;
+      },
+      [](auto& r) { r.prior_latched_state.state = IoGlobalRuleState::kClear; },
+      [](auto& r) {
+        r.prior_latched_state.triggering_acquisition.reset();
+        r.prior_latched_evidence =
+            {IoRuleRegistrationState::kArmed, std::nullopt, {}, std::nullopt};
+      },
+      [](auto& r) { r.prior_latched_state.triggering_acquisition.reset(); },
+      [](auto& r) { r.intent.selector.expected_rule_registration_id = 0U; },
+      [](auto& r) { r.prior_latched_evidence.trip->registration.registration_id = 7U; },
+      [](auto& r) {
+        r.prior_latched_evidence.source_losses.front().registration.policy_id =
+            InterruptPolicyId("foreign");
+      },
+      [](auto& r) {
+        r.prior_latched_evidence.trip->source_cursors.front().owner_epoch =
+            RequestOwnerEpoch("foreign");
+      },
+      [](auto& r) {
+        r.prior_latched_evidence.trip->blackboard->scope.active_publication_generation =
+            ActiveBundlePublicationGeneration(1U);
+      },
+      [](auto& r) { r.inactive_observation.value = true; },
+      [](auto& r) { r.inactive_observation.value.reset(); },
+      [](auto& r) { r.inactive_observation.evaluated_at_ns = -1; },
+      [](auto& r) { r.inactive_observation.evaluated_at_ns = 9; },
+      [](auto& r) { r.successor_registration.registration_id = UINT64_MAX; },
+      [](auto& r) { r.successor_registration.registration_id = 0U; },
+      [](auto& r) { r.successor_registration.owner_epoch = RequestOwnerEpoch("foreign"); },
+      [](auto& r) {
+        std::get<IoActivationRuleScopeDTO>(r.successor_registration.scope).graph_revision =
+            GraphRevision("foreign");
+      },
+      [](auto& r) {
+        r.successor_registration.scope =
+            rule_codec_test::Outcome(rule_codec_test::State(), RequestOwnerEpoch("global.owner"))
+                .registration.scope;
+      },
+      [](auto& r) {
+        r.intent.selector.context.active_publication_generation =
+            ActiveBundlePublicationGeneration(9007199254740992ULL);
+      }};
+  for (std::size_t index = 0U; index < invalid.size(); ++index) {
+    SCOPED_TRACE(index);
+    auto changed = original;
+    invalid[index](changed);
+    EXPECT_FALSE(EncodeIoGlobalRuleRecoveryRecord(changed).ok());
+    EXPECT_FALSE(journal.RecordGlobalIoRuleCleared(changed).ok());
+  }
+  const auto empty = journal.ReadEvents(original.result.context.owner_epoch, 0U);
+  ASSERT_TRUE(empty.ok());
+  EXPECT_TRUE(empty.value().events.empty());
+  ASSERT_TRUE(journal.RecordGlobalIoRuleCleared(original).ok());
+  const auto stored = journal.ReadEvents(original.result.context.owner_epoch, 0U);
+  ASSERT_TRUE(stored.ok());
+  EXPECT_EQ(stored.value().events.size(), 1U);
+  auto baseline = original;
+  baseline.prior_latched_evidence.trip->triggering_acquisition.reset();
+  baseline.prior_latched_state.triggering_acquisition.reset();
+  EXPECT_TRUE(EncodeIoGlobalRuleRecoveryRecord(baseline).ok());  // No invented baseline cause.
+}
+
+TEST(SqliteOperationJournalTest, GlobalRecoveryReplaysExactlyAcrossReopenWithoutMirrorClear) {
+  ScopedTemporaryDirectory directory;
+  const auto database = directory.path() / "global-recovery.sqlite3";
+  const RequestOwnerEpoch owner("global.owner");
+  const auto record = GlobalRecoveryRecord(owner);
+  std::uint64_t sequence{};
+  {
+    SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 0, 8U, {}).ok());
+    const auto first = journal.RecordGlobalIoRuleCleared(record);
+    ASSERT_TRUE(first.ok()) << first.error().message;
+    sequence = first.value();
+    const auto retry = journal.RecordGlobalIoRuleCleared(record);
+    ASSERT_TRUE(retry.ok());
+    EXPECT_EQ(retry.value(), sequence);
+    auto changed = record;
+    changed.intent.reason = "Different accepted history";
+    const auto conflict = journal.RecordGlobalIoRuleCleared(changed);
+    ASSERT_FALSE(conflict.ok());
+    EXPECT_EQ(conflict.error().code, "request_id_conflict");
+    const auto events = journal.ReadEvents(owner, 0U);
+    ASSERT_TRUE(events.ok());
+    ASSERT_EQ(events.value().events.size(), 1U);
+    const auto& event = events.value().events.front();
+    EXPECT_EQ(event.record_kind, "global_io_rule_recovery_authorized");
+    EXPECT_EQ(event.request_id, std::optional(record.intent.request_context.request_id));
+    EXPECT_FALSE(event.operation_id);
+    EXPECT_FALSE(event.operation_revision);
+    EXPECT_FALSE(event.effect_pending);
+    EXPECT_EQ(event.occurred_at_ns, 11);
+    EXPECT_EQ(event.payload_json, EncodeIoGlobalRuleRecoveryRecord(record).value());
+    const auto operational = journal.ReadOperationalEvents(owner, 0U);
+    ASSERT_TRUE(operational.ok());
+    EXPECT_TRUE(
+        operational.value().events.empty());  // Core publishes actual Clear only after commit.
+  }
+  SqliteOperationJournal reopened(database, CellId("cell.test"), 8U);
+  const auto retry = reopened.RecordGlobalIoRuleCleared(record);
+  ASSERT_TRUE(retry.ok());
+  EXPECT_EQ(retry.value(), sequence);
+  const auto all = reopened.ReadEvents(owner, 0U);
+  ASSERT_TRUE(all.ok());
+  ASSERT_EQ(all.value().events.size(), 1U);
+  EXPECT_EQ(all.value().events.front().sequence, sequence);
+}
+
+TEST(SqliteOperationJournalTest,
+     GlobalRecoveryUsesBoundedHistoryAndExistingCrossKindRequestIdentity) {
+  ScopedTemporaryDirectory directory;
+  SqliteOperationJournal journal(directory.path() / "global-history.sqlite3", CellId("cell.test"),
+                                 2U);
+  const RequestOwnerEpoch owner("global.owner");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 0, 8U, {ResourceId("robot.gripper")}).ok());
+  auto intent = CommandIntent("ordinary", owner.value());
+  const auto state = OperationState("operation.ordinary", OperationStateKind::kExecuting, 1);
+  ASSERT_TRUE(
+      journal.RecordOperationAccepted(owner, intent, Acceptance(intent, state), state).ok());
+  auto record = GlobalRecoveryRecord(owner, "ordinary");
+  const auto conflict = journal.RecordGlobalIoRuleCleared(record);
+  ASSERT_FALSE(conflict.ok());
+  EXPECT_EQ(conflict.error().code, "request_id_conflict");
+  std::uint64_t last{};
+  for (std::uint64_t index = 1U; index <= 3U; ++index) {
+    record = GlobalRecoveryRecord(owner, "recover." + std::to_string(index));
+    record.successor_registration.registration_id = index;
+    const auto result = journal.RecordGlobalIoRuleCleared(record);
+    ASSERT_TRUE(result.ok());
+    last = result.value();
+  }
+  const auto retained = journal.ReadEvents(owner, 0U);
+  ASSERT_TRUE(retained.ok());
+  EXPECT_EQ(std::count_if(retained.value().events.begin(), retained.value().events.end(),
+                          [](const auto& e) {
+                            return e.record_kind == "global_io_rule_recovery_authorized";
+                          }),
+            2);
+  const auto retry = journal.RecordGlobalIoRuleCleared(record);
+  ASSERT_TRUE(retry.ok());
+  EXPECT_EQ(retry.value(), last);
+  ASSERT_TRUE(journal.BeginOwnerEpoch(RequestOwnerEpoch("replacement"), 20, 8U, {}).ok());
+  const auto stale = journal.RecordGlobalIoRuleCleared(record);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().code, "operation_journal_owner_epoch_stale");
+}
+
+TEST(SqliteOperationJournalTest, GlobalRecoveryFailedWriteKeepsExactPayloadRetryable) {
+  ScopedTemporaryDirectory directory;
+  bool fail = false;
+  SqliteOperationJournal journal(directory.path() / "global-retry.sqlite3", CellId("cell.test"), 8U,
+                                 {}, [&](std::string_view point) {
+                                   if (fail && point == "ordinary_write")
+                                     throw std::runtime_error("injected writer failure");
+                                 });
+  const RequestOwnerEpoch owner("global.owner");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 0, 8U, {}).ok());
+  const auto record = GlobalRecoveryRecord(owner);
+  fail = true;
+  EXPECT_FALSE(journal.RecordGlobalIoRuleCleared(record).ok());
+  fail = false;
+  const auto empty = journal.ReadEvents(owner, 0U);
+  ASSERT_TRUE(empty.ok());
+  EXPECT_TRUE(empty.value().events.empty());
+  const auto stored = journal.RecordGlobalIoRuleCleared(record);
+  ASSERT_TRUE(stored.ok());
+  const auto retry = journal.RecordGlobalIoRuleCleared(record);
+  ASSERT_TRUE(retry.ok());
+  EXPECT_EQ(stored.value(), retry.value());
+  // This is a known pre-commit failure, not a simulated unknown COMMIT result.
+}
+
+TEST(SqliteOperationJournalTest,
+     GlobalRecoverySeparatelyRetainsActualLossObserverWithoutRelabelingLatch) {
+  const RequestOwnerEpoch owner("global.owner");
+  auto record = GlobalRecoveryRecord(owner);
+  const auto old_state = record.prior_latched_state;
+  const auto old_evidence = record.prior_latched_evidence;
+  const auto legacy = EncodeIoGlobalRuleRecoveryRecord(record);
+  ASSERT_TRUE(legacy.ok());
+  EXPECT_EQ(legacy.value().find("source_loss_evidence"), std::string::npos);
+  auto upgraded = old_evidence;
+  upgraded.trip.reset();
+  for (auto& loss : upgraded.source_losses) loss.registration.registration_id = 2U;
+  record.source_loss_evidence = upgraded;
+  const auto encoded = EncodeIoGlobalRuleRecoveryRecord(record);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  const auto decoded = DecodeIoGlobalRuleRecoveryRecord(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value().prior_latched_state, old_state);
+  EXPECT_EQ(decoded.value().prior_latched_evidence, old_evidence);
+  EXPECT_EQ(decoded.value().source_loss_evidence, record.source_loss_evidence);
+  EXPECT_EQ(decoded.value().successor_registration.registration_id, 1U);
+  EXPECT_EQ(
+      decoded.value().source_loss_evidence->source_losses.front().registration.registration_id, 2U);
+  EXPECT_EQ(decoded.value().intent.selector.expected_rule_registration_id, UINT64_MAX);
+  EXPECT_EQ(EncodeIoGlobalRuleRecoveryRecord(decoded.value()).value(), encoded.value());
+  const auto decoded_legacy = DecodeIoGlobalRuleRecoveryRecord(legacy.value());
+  ASSERT_TRUE(decoded_legacy.ok());
+  EXPECT_FALSE(decoded_legacy.value().source_loss_evidence);
+
+  std::vector<std::function<void(IoGlobalRuleRecoveryRecordDTO&)>> invalid{
+      [](auto& r) { r.source_loss_evidence->source_losses.clear(); },
+      [](auto& r) {
+        r.source_loss_evidence->source_losses.front().registration.owner_epoch =
+            RequestOwnerEpoch("foreign");
+      },
+      [](auto& r) {
+        r.source_loss_evidence->source_losses.front().registration.catalog_generation = 3U;
+      },
+      [](auto& r) {
+        r.source_loss_evidence->source_losses.front().registration.policy_id =
+            InterruptPolicyId("foreign");
+      },
+      [](auto& r) {
+        r.source_loss_evidence->source_losses.front().registration.registration_id = 0U;
+      },
+      [](auto& r) {
+        r.source_loss_evidence->source_losses.front().registration.registration_id =
+            r.successor_registration.registration_id;
+      },
+      [](auto& r) {
+        std::get<IoActivationRuleScopeDTO>(
+            r.source_loss_evidence->source_losses.front().registration.scope)
+            .graph_revision = GraphRevision("foreign");
+      },
+      [](auto& r) {
+        r.source_loss_evidence->source_losses.front().registration.scope =
+            rule_codec_test::Outcome(rule_codec_test::State(), RequestOwnerEpoch("global.owner"))
+                .registration.scope;
+      },
+      [](auto& r) { r.source_loss_evidence->source_losses.front().evaluated_at_ns = 12; },
+      [](auto& r) {
+        r.source_loss_evidence->source_losses.front()
+            .blackboard->scope.active_publication_generation =
+            ActiveBundlePublicationGeneration(3U);
+      },
+      [](auto& r) {
+        auto other = r.source_loss_evidence->source_losses.front();
+        other.source_id = InterruptSourceId("other.actual.source");
+        other.cursor.source_id = other.source_id;
+        other.blackboard.reset();
+        other.registration.registration_id = 3U;
+        r.source_loss_evidence->source_losses.push_back(other);
+      }};
+  for (std::size_t index = 0U; index < invalid.size(); ++index) {
+    SCOPED_TRACE(index);
+    auto changed = record;
+    invalid[index](changed);
+    EXPECT_FALSE(EncodeIoGlobalRuleRecoveryRecord(changed).ok());
+  }
+  ScopedTemporaryDirectory directory;
+  SqliteOperationJournal journal(directory.path() / "global-upgrade.sqlite3", CellId("cell.test"),
+                                 8U);
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 0, 8U, {}).ok());
+  const auto stored = journal.RecordGlobalIoRuleCleared(record);
+  ASSERT_TRUE(stored.ok());
+  const auto retry = journal.RecordGlobalIoRuleCleared(record);
+  ASSERT_TRUE(retry.ok());
+  EXPECT_EQ(stored.value(), retry.value());
+  auto missing_actual_upgrade = record;
+  missing_actual_upgrade.source_loss_evidence.reset();
+  const auto conflict = journal.RecordGlobalIoRuleCleared(missing_actual_upgrade);
+  ASSERT_FALSE(conflict.ok());
+  EXPECT_EQ(conflict.error().code, "request_id_conflict");
+  const auto events = journal.ReadEvents(owner, 0U);
+  ASSERT_TRUE(events.ok());
+  ASSERT_EQ(events.value().events.size(), 1U);
+  const auto persisted =
+      DecodeIoGlobalRuleRecoveryRecord(events.value().events.front().payload_json);
+  ASSERT_TRUE(persisted.ok());
+  EXPECT_EQ(persisted.value().source_loss_evidence, record.source_loss_evidence);
+  auto actual_loss_latch = GlobalRecoveryRecord(owner, "loss.original");
+  actual_loss_latch.prior_latched_state.triggering_acquisition.reset();
+  actual_loss_latch.prior_latched_evidence.trip.reset();
+  EXPECT_TRUE(EncodeIoGlobalRuleRecoveryRecord(actual_loss_latch)
+                  .ok());  // Retained loss, no fabricated trip.
+}
 }  // namespace

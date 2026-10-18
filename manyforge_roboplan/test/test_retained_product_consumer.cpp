@@ -1,3 +1,5 @@
+#include "sealed_program_execution_capture.hpp"
+#include <manyforge_core/types/program_io_condition.hpp>
 #include <gtest/gtest.h>
 
 #include <Eigen/Core>
@@ -14,31 +16,33 @@
 #include <future>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_core/execution_port_participant.hpp>
+#include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
-#include <manyforge_core/execution_port_participant.hpp>
-#include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
-#include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
+#include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
-#include <manyforge_core/testing/fake_execution_port.hpp>
 #include <manyforge_core/runtime_participant_registry.hpp>
+#include <manyforge_core/testing/fake_execution_port.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/model_source.hpp>
+#include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
+#include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_controller_lifecycle_expected_domain.hpp>
-#include <manyforge_deployment/program_binding_compiler.hpp>
-#include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
 #include <manyforge_roboplan/retained_collision_world_projector.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_kinematic_state_projector.hpp>
+#include <manyforge_roboplan/retained_native_cell_runtime.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
@@ -63,13 +67,24 @@
 #include <vector>
 
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+#include "host_io_output_channels.hpp"
+#include "io_provider_lifecycle_product.hpp"
+#include "maintained_activation_fixture.hpp"
+#include <manyforge_component_manager/active_bundle_publication_store.hpp>
+#include <manyforge_core/build_owned_lifecycle_plan_catalog_source.hpp>
+#include <manyforge_core/io_signal_ingress.hpp>
+#include <manyforge_core/prepared_operation_participant_codec.hpp>
+#include <manyforge_core/sqlite_cclc_journal.hpp>
+#include <manyforge_deployment/component_lifecycle_current_snapshot_source.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_roboplan/retained_ros2_control_backend_factory.hpp>
+#include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
 #include "../src/retained_ros2_control_lifecycle_plans_internal.hpp"
 #endif
 
 #include "content_identity_internal.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
+#include "io_retained_fixture.hpp"
 #include "managed_kernel_apply_fence_owner.hpp"
 #include "mf2_joint_name_internal.hpp"
 #include "product_backed_runtime_participant_resolver.hpp"
@@ -585,8 +600,8 @@ require_fixture_one(const Range &values, Predicate predicate,
           if constexpr (std::is_same_v<
                             Frame,
                             deployment::CompositionComponentModelFrame>) {
-            if (frame.controllable_component_id != component_id ||
-                frame.frame_role_id != resolution.frame_role_id) {
+            // A target role may alias a component frame role in the qualified map.
+            if (frame.controllable_component_id != component_id) {
               throw std::logic_error(
                   "retained fixture target frame ownership differs");
             }
@@ -3915,6 +3930,7 @@ TEST(RetainedProductCrossConsumer,
 
 enum class Lite6AggregateCheck {
   kCompose,
+  kMovingValidation,
   kResealInventory,
   kRefreshCellModel,
   kDeploymentFaultStopProfile,
@@ -3929,7 +3945,13 @@ enum class Lite6AggregateCheck {
   kRosOrdinaryJerkRejection,
 #endif
   kSameRoutePredecessorQualification,
-  kMeasuredPublication, kMeasuredOptionalDomainRace, kMeasuredNullOptionalDomainRace
+  kMeasuredPublication,
+  kMovingBudgetPublication,
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+  kMixedOutputPublication,
+#endif
+  kMeasuredOptionalDomainRace,
+  kMeasuredNullOptionalDomainRace
 };
 
 void check_refreshed_cell_model(
@@ -4098,8 +4120,10 @@ private:
 
 void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+  const bool mixed_output_check = check == Lite6AggregateCheck::kMixedOutputPublication;
   const bool ros_jerk_rejection = check == Lite6AggregateCheck::kRosOrdinaryJerkRejection;
 #else
+  const bool mixed_output_check = false;
   const bool ros_jerk_rejection = false;
 #endif
   const bool reseal_capability_inventory =
@@ -4122,21 +4146,26 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
   ASSERT_TRUE(std::filesystem::create_directory(empty_ambient_root));
 
-  const auto materialized = [&]() {
+  struct SelectedBundle { std::shared_ptr<const deployment::RetainedBundle> bundle; };
+  const auto materialized = [&]() -> SelectedBundle {
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+    if (mixed_output_check)
+      return {deployment::test::MaterializeMaintainedInterruptDeployment(
+          package_root, deployment::parse_strict_json_model_yaml(R"({"interrupt_rules":[]})").root(),
+          "examples/r5_trial_e_signal.scenario").bundle};
     if (ros_jerk_rejection) {
       const auto plans = detail::ros2_control_lifecycle_plans_internal::
           retained_ros2_control_lifecycle_plans();
       const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
           core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
       if (!semantic.ok()) throw std::logic_error(semantic.error().message);
-      return deployment::test::
+      return {deployment::test::
           materialize_lite6_ros2_control_cclc_product_retained_consumer_fixture(
-              package_root, semantic.value().value());
+              package_root, semantic.value().value()).bundle};
     }
 #endif
-    return deployment::test::
-        materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(package_root);
+    return {deployment::test::
+        materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(package_root).bundle};
   }();
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
@@ -4151,27 +4180,36 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
                         products.symbol_role_maps.front().product_id});
 
   const core::ControllableComponentId component_id(
-      std::string(deployment::test::kLite6ControllableComponentId));
+      mixed_output_check ? "lite6_robot" : std::string(deployment::test::kLite6ControllableComponentId));
   const core::CommandTargetId arm_target_id(
       std::string(deployment::test::kLite6ArmTargetId));
   const core::CommandTargetId gripper_target_id(
       std::string(deployment::test::kLite6GripperTargetId));
   const auto &graph = materialized.bundle->value().cell_graph;
-  ASSERT_EQ(graph.runtime_units.size(), 1U);
+  if (!mixed_output_check) {
+    ASSERT_EQ(graph.runtime_units.size(), 1U);
+  }
+  const auto& arm_control = require_fixture_one(graph.control_bindings, [&](const auto& row) {
+    return row.controllable_component_id == component_id && row.command_target_id == arm_target_id &&
+           row.capability_id == core::CapabilityId("execution.trajectory.execute");
+  }, "actual arm execution control binding");
   const core::RuntimeEpoch local_runtime_epoch(
-      "epoch." + graph.runtime_units.front().runtime_unit_id.value());
+      "epoch." + (mixed_output_check ? arm_control.provider_runtime_unit_id
+                                     : graph.runtime_units.front().runtime_unit_id).value());
   const auto state_authority = core::StateAuthorityClass::kCommanded;
   const auto arm_binding = make_fixture_runtime_participant(
       *materialized.bundle, model_map, component_id, arm_target_id,
-      state_authority, std::nullopt, local_runtime_epoch);
+      state_authority, std::nullopt, local_runtime_epoch,
+      mixed_output_check ? std::optional(arm_control.capability_id) : std::nullopt);
   const core::ProgramCommandSchemaRefDTO command_schema{
       core::CommandSchemaId(std::string(core::kGripperPositionCommandSchemaId)),
       core::CommandSchemaRevision(
           std::string(core::kGripperPositionCommandSchemaRevision))};
   const auto gripper_binding = make_fixture_runtime_participant(
       *materialized.bundle, model_map, component_id, gripper_target_id,
-      state_authority, command_schema,
-      local_runtime_epoch);
+      state_authority, command_schema, local_runtime_epoch,
+      mixed_output_check ? std::optional(core::CapabilityId("tool.gripper.command"))
+                         : std::nullopt);
 
   auto stage =
       RetainedPlanningModelStage::create_verified(retained, staging_parent);
@@ -4249,6 +4287,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       {},
       {},
       {},
+      {},
       {}};
   ManagedKernelAdmissionGate admission_gate;
   auto runtime_input = RetainedNativeRuntimeInput{
@@ -4285,6 +4324,24 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       {},
       {},
       {}};
+  if (mixed_output_check) {
+    // Include every actual control-facing route, including shared feedback,
+    // reset and Stop capabilities of the same physical backend owner.
+    for (const auto& control : graph.control_bindings) {
+      if (control.controllable_component_id != component_id) continue;
+      ASSERT_TRUE(control.command_target_id == arm_target_id ||
+                  control.command_target_id == gripper_target_id);
+      if (control.control_binding_id == arm_binding.value().control_path->control_binding_id) {
+        runtime_input.control_binding_representatives.push_back(arm_binding);
+      } else if (control.control_binding_id == gripper_binding.value().control_path->control_binding_id) {
+        runtime_input.control_binding_representatives.push_back(gripper_binding);
+      } else {
+        runtime_input.control_binding_representatives.push_back(make_fixture_runtime_participant(
+            *materialized.bundle, model_map, component_id, control.command_target_id,
+            state_authority, {}, local_runtime_epoch, control.capability_id));
+      }
+    }
+  }
   runtime_input.deployment_maximum_tcp_linear_speed_mps = 0.15;
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
   if (ros_jerk_rejection) {
@@ -4482,8 +4539,340 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   }
   runtime_input.backend_factory = selected_core_test_backend_factory(port_participant, true);
   unsigned rebinds = 0, enabled = 0, retired = 0, reentrant_reads = 0;
-  auto runtime = create_retained_native_runtime(std::move(runtime_input),
-                                                std::move(runtime_config));
+  const bool moving_budget_check =
+      check == Lite6AggregateCheck::kMovingBudgetPublication;
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+  if (mixed_output_check) {
+    runtime_input.participant_resolver_factory =
+        [package_root, bundle = materialized.bundle, model_map](auto composed) {
+          auto resolver = std::make_shared<ProductBackedRuntimeParticipantResolver>(
+              package_root, bundle, model_map, std::move(composed),
+              std::vector<core::ProgramBindingId>{});
+          return RetainedRuntimeParticipantResolver{
+              [resolver](const auto& operation, auto index) {
+                return resolver->ResolveExecutionParticipant(operation, index);
+              }};
+        };
+  }
+#endif
+  auto runtime = (moving_budget_check || mixed_output_check)
+                     ? create_retained_native_runtime_participants(
+                           std::move(runtime_input), std::move(runtime_config))
+                     : create_retained_native_runtime(
+                           std::move(runtime_input), std::move(runtime_config));
+  // Match managed composition: one stable cell Kernel, subordinate engines,
+  // and an already sealed cell policy in its current registration snapshot.
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+  std::shared_ptr<host_detail::IoProviderDriverRecord> mixed_driver;
+  std::shared_ptr<std::vector<host_detail::HostIoOutputChannelEntry>> mixed_channels;
+  std::function<void()> dispatch_mixed_output;
+  std::optional<core::ComponentLifecycleGeneration> mixed_arm_generation;
+#endif
+  std::unique_ptr<RetainedNativeCellRuntime> budget_cell;
+  if (moving_budget_check || mixed_output_check) {
+    auto rows = runtime->participant_registrations;
+    if (moving_budget_check) for (auto &row : rows) {
+      row.motion_takeover_preparation_budget_s =
+          row.binding.value().capability_id.value() ==
+                  "execution.trajectory.execute"
+              ? std::optional<double>(3.5)
+              : std::nullopt;
+    }
+    if (moving_budget_check) runtime->participant_resolver_factory = [](auto) {
+      return RetainedRuntimeParticipantResolver{
+          [](const core::OperationIntentDTO &, std::size_t) {
+            return core::Result<RetainedResolvedParticipant>::Err(
+                {"unused_route_fixture",
+                 "route fixture dispatches no operations",
+                 {}});
+          }};
+    };
+    const auto resolver = mixed_output_check ? runtime->participant_resolver
+        : make_retained_cell_kernel_participant_resolver(
+            runtime->participant_resolver_factory({runtime->motion_binding}), rows);
+    RetainedNativeCellRuntimeInput cell_input{
+        runtime->clock,
+        runtime->scheduler,
+        temporary.path() / "budget-cell.sqlite3",
+        std::move(rows),
+        core::ResourceAddressedExecutionKernelConfig{
+            owner_epoch,
+            materialized.bundle->value().cell_graph.cell_id,
+            1024U,
+            resolver,
+            &admission_gate,
+            materialized.bundle->value().cell_graph.graph_revision},
+        runtime->stop_surveillance_owner->SnapshotSources()};
+    budget_cell =
+        std::make_unique<RetainedNativeCellRuntime>(std::move(cell_input));
+    runtime->cell_runtime_owner = budget_cell.get();
+    runtime->stop_surveillance_owner = budget_cell->stop_surveillance_owner();
+    runtime->BindCellRuntimeOwner(
+        *budget_cell, "budget-cell",
+        materialized.bundle->value().cell_graph.cell_id.value());
+  }
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+  if (mixed_output_check) {
+    // Same genuine maintained arm + model-free station product as the process
+    // trial. The current snapshot supplies the construction generation; no
+    // component Active state or Kernel output admission is fabricated here.
+    const auto take = []<class T>(core::Result<T> value) {
+      if (!value.ok()) {
+        const auto& error = value.error();
+        const auto reason = error.details.find("reason");
+        throw std::logic_error(error.code + ": " + error.message +
+            (reason == error.details.end() ? std::string{} : " [" + reason->second + "]"));
+      }
+      return std::move(value.value());
+    };
+    const core::ControllableComponentId station("station_io");
+    const auto catalog = take(deployment::ResolveRetainedIoSignalCatalog(graph));
+    const auto& domain = require_fixture_one(graph.control_domains, [&](const auto& row) {
+      return row.provider() && row.provider()->controllable_component_id == station;
+    }, "actual station provider domain");
+    const auto& provider = *domain.provider();
+    deployment::FilesystemVerifiedRetainedProviderManifestSource manifests(package_root);
+    const auto manifest = manifests.get_verified({materialized.bundle->retained_bundle_id(),
+        provider.provider_manifest_id, provider.provider_manifest_revision});
+    ASSERT_TRUE(manifest);
+    std::vector<core::ResourceId> resources;
+    std::vector<core::IoSignalDescriptorDTO> descriptors;
+    std::map<core::InterruptSourceId, std::vector<deployment::RetainedIoSignalConfiguration>> input_rows;
+    for (const auto& row : catalog) {
+      if (row.descriptor.signal_id.controllable_component_id != station) continue;
+      if (row.descriptor.output_resource) resources.push_back(*row.descriptor.output_resource);
+      else {
+        descriptors.push_back(row.descriptor);
+        input_rows[row.descriptor.source_id].push_back(row);
+      }
+    }
+    std::sort(resources.begin(), resources.end());
+    resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
+    ASSERT_FALSE(resources.empty());
+    const core::RuntimeEpoch station_epoch("mixed.actual.station.driver");
+    const core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
+        domain.control_domain_id, domain.control_domain_revision, provider.provider_instance_id,
+        provider.provider_manifest_id, provider.provider_manifest_revision,
+        provider.provider_runtime_unit_id, station_epoch, provider.lifecycle_plan_catalog_digest};
+    mixed_driver = take(host_detail::IoProviderDriverRecord::Create(
+        {domain.control_domain_id, domain.control_domain_revision,
+         core::ResolvedProviderDomainScopeDTO{provider, station_epoch, {}, resources}},
+        occurrence, manifest->value(), runtime->clock, 1'000'000'000LL));
+
+    component_manager::SqliteActiveBundlePublicationStore publications(
+        temporary.path() / "mixed-active.sqlite3", graph.cell_id);
+    const core::ProjectionRevisionDTO product_projection{
+        materialized.bundle->retained_bundle_id(), graph.graph_revision, initial_scene.shared()->revision};
+    const auto publication = publications.PublishActiveBundle(
+        {core::BootstrapPublicationTransactionDTO{core::BootstrapId("mixed.bootstrap"),
+                                                core::BootstrapGeneration(1U)},
+         product_projection, materialized.bundle->retained_bundle_id(), graph.graph_revision, {},
+         core::ContentDigest(deployment::sha256_digest(materialized.bundle->canonical_bytes()))});
+    core::SqliteCCLCJournal lifecycle_journal(
+        temporary.path() / "mixed-cclc.sqlite3", graph.cell_id, 8U);
+    ASSERT_TRUE(lifecycle_journal.BeginOwnerEpoch(
+        core::RequestOwnerEpoch("mixed.cclc.owner"), runtime->clock->now(), 32U).ok());
+    std::vector<core::BuildOwnedLifecyclePlanCatalogEntryDTO> lifecycle_entries{
+        {manifest->value(), mixed_driver->catalog()}};
+    std::vector<core::ResolvedLifecycleProviderOccurrenceDTO> occurrences{mixed_driver->occurrence()};
+    for (const auto& registration : runtime->participant_registrations) {
+      const auto& path = *registration.binding.value().control_path;
+      if (std::any_of(occurrences.begin(), occurrences.end(), [&](const auto& row) {
+            return row.control_domain_id == path.control_domain_id;
+          })) continue;
+      const auto physical_manifest = manifests.get_verified({materialized.bundle->retained_bundle_id(),
+          path.provider_manifest_id, path.provider_manifest_revision});
+      ASSERT_TRUE(physical_manifest);
+      auto physical_catalog = take(make_retained_ros2_control_lifecycle_catalog(physical_manifest->value()));
+      occurrences.push_back({path.control_domain_id, path.control_domain_revision, path.provider_instance_id,
+          path.provider_manifest_id, path.provider_manifest_revision, path.provider_runtime_unit_id,
+          path.provider_runtime_epoch, physical_catalog.catalog_digest});
+      if (std::none_of(lifecycle_entries.begin(), lifecycle_entries.end(), [&](const auto& row) {
+            return row.provider_manifest.provider_manifest_id == path.provider_manifest_id &&
+                row.provider_manifest.provider_manifest_revision == path.provider_manifest_revision;
+          })) lifecycle_entries.push_back({physical_manifest->value(), std::move(physical_catalog)});
+    }
+    auto lifecycle_catalog = take(core::BuildOwnedLifecyclePlanCatalogSource::Make(std::move(lifecycle_entries)));
+    deployment::VerifiedComponentLifecycleCurrentSnapshotSource current_source(
+        *materialized.bundle, publications, publication, lifecycle_journal,
+        lifecycle_catalog, std::move(occurrences));
+    const auto actual_arm = take(current_source.ReadCurrentComponentSnapshot(component_id));
+    ASSERT_EQ(actual_arm.component_lifecycle_state, core::ComponentLifecycleStateDTO::kDeclared);
+    mixed_arm_generation = actual_arm.component_lifecycle_generation;
+    const auto actual = take(current_source.ReadCurrentComponentSnapshot(station));
+    ASSERT_EQ(actual.component_lifecycle_state, core::ComponentLifecycleStateDTO::kDeclared);
+    ASSERT_EQ(actual.domains.size(), 1U);
+    ASSERT_EQ(actual.domains.front(), mixed_driver->domain());
+    ASSERT_EQ(actual.provider_occurrences.front(), mixed_driver->occurrence());
+
+    std::vector<core::InterruptSourceId> synthetic_sources;
+    for (const auto& [source, rows] : input_rows)
+      if (rows.front().provider.profile == "mock") synthetic_sources.push_back(source);
+    std::shared_ptr<core::IoSignalSubsystem> inputs(take(core::IoSignalSubsystem::Create(
+        {owner_epoch, 1U, descriptors, std::move(synthetic_sources)},
+        {input_rows.size(), descriptors.size(), 16U, 8U, 512U, 1024U}, *runtime->clock)));
+    std::map<core::InterruptSourceId, core::IoSourceIncarnation> incarnations;
+    for (const auto& [source, rows] : input_rows) {
+      const core::IoSourceIncarnation incarnation("mixed." + source.value());
+      ASSERT_TRUE(inputs->InstallSource(source, incarnation, {}).ok());
+      incarnations.emplace(source, incarnation);
+    }
+    std::shared_ptr<core::IoSignalIngress> ingress(take(core::IoSignalIngress::Create(inputs)));
+    std::vector<host_detail::IoProviderInputSourceInstallation> installed_inputs;
+    for (const auto& [source, rows] : input_rows)
+      installed_inputs.push_back({rows, {}, ingress, incarnations.at(source)});
+    std::vector<host_detail::HostIoOutputAliasInstallation> aliases;
+    {
+      auto delivery = mixed_driver->AcquireDelivery();
+      for (const auto& row : catalog)
+        if (row.descriptor.signal_id.controllable_component_id == station && row.descriptor.output_resource)
+          aliases.push_back({row, mixed_driver->occurrence(),
+              mixed_driver->driver_observation_generation_locked(), mixed_driver,
+              publication.publication_generation});
+    }
+    mixed_channels = std::make_shared<std::vector<host_detail::HostIoOutputChannelEntry>>(
+        take(host_detail::CreateHostIoOutputChannels(std::move(aliases), {}, *runtime->clock)));
+    std::vector<host_detail::IoProviderOutputChannelInstallation> installed_outputs;
+    for (const auto& channel : *mixed_channels) {
+      std::vector<deployment::RetainedIoSignalConfiguration> rows;
+      for (const auto& row : catalog)
+        if (row.descriptor.signal_id.controllable_component_id == station &&
+            row.descriptor.output_resource == channel.resource_id) rows.push_back(row);
+      installed_outputs.push_back({channel.resource_id, std::move(rows), channel.provider});
+    }
+    {
+      auto delivery = mixed_driver->AcquireDelivery();
+      ASSERT_TRUE(mixed_driver->InstallResourcesLocked(
+          std::move(installed_inputs), std::move(installed_outputs), {}).ok());
+    }
+    for (const auto* primitive : {"prepare", "enable"}) {
+      SCOPED_TRACE(primitive);
+      const auto before = take(mixed_driver->ReadLifecycleSnapshot(
+          domain.control_domain_id, runtime->clock->now()));
+      const auto& selected = mixed_driver->occurrence();
+      const core::BrandLifecyclePrimitiveIntentDTO intent{
+          core::LifecycleTransactionId("mixed.driver." + std::string(primitive)),
+          core::LifecycleTransactionGeneration(1U), station, domain.control_domain_id,
+          selected.control_domain_revision, selected.provider_instance_id, selected.provider_manifest_id,
+          selected.provider_manifest_revision, selected.provider_runtime_unit_id,
+          selected.provider_runtime_epoch, core::LifecyclePrimitiveId("io.provider." + std::string(primitive)),
+          core::LifecyclePrimitiveAttemptId("mixed.attempt." + std::string(primitive)),
+          before.source_generation, 1'000'000'000LL};
+      ASSERT_TRUE(intent.locally_valid());
+      const auto outcome = mixed_driver->Dispatch(intent, {});
+      ASSERT_EQ(outcome.known, core::LifecyclePrimitiveKnownResultDTO::kSucceeded)
+          << (outcome.error ? outcome.error->code + ": " + outcome.error->message
+                            : "no lifecycle error returned");
+    }
+    EXPECT_EQ(take(current_source.ReadCurrentComponentSnapshot(station)).component_lifecycle_state,
+              core::ComponentLifecycleStateDTO::kDeclared);
+
+    deployment::FilesystemCatalogArtifactStore artifacts(package_root);
+    const auto direct = deployment::compile_direct_control_program_binding_inventory(
+        *materialized.bundle, model_map, artifacts);
+    const auto binding = require_fixture_one(direct.io, [&](const auto& row) {
+      return std::any_of(row->value().target_role_bindings.begin(), row->value().target_role_bindings.end(),
+          [&](const auto& target) { return target.controllable_component_id == station; });
+    }, "genuine station direct output binding");
+    const auto& target = require_fixture_one(binding->value().target_role_bindings,
+        [&](const auto& row) { return row.controllable_component_id == station; }, "station target");
+    const auto sealed_target = deployment::resolve_runtime_program_target(
+        *binding, target.target_role_id, core::CapabilityId("io.gpio.set_output"),
+        *materialized.bundle, model_map);
+    const core::RuntimeProviderDomainConfigurationReadbackDTO closed{
+        materialized.bundle->retained_bundle_id(), graph.graph_revision,
+        actual.component_lifecycle_generation, actual.domains.front(), actual.provider_occurrences.front(),
+        false, 0U, 0U};
+    auto complete = budget_cell->participant_registrations();
+    for (const auto& role : target.signal_role_bindings) {
+      if (role.direction != core::IoSignalDirection::kOutput) continue;
+      auto output = take(core::verify_runtime_participant_binding(
+          deployment::build_runtime_io_output_binding_dto(
+              sealed_target, role.resource_role_id, *materialized.bundle, closed)));
+      const auto& channel = require_fixture_one(*mixed_channels, [&](const auto& row) {
+        return row.resource_id == *output.value().io_output_binding->signal.output_resource;
+      }, "actual station output channel engine");
+      complete.push_back({.binding = std::move(output), .stop_readiness = {},
+          .retained_default_stop_limits = {}, .stop_node_category = core::MotionInterruptNodeCategory::kGeneric,
+          .engine = channel.engine.get(), .stop_execution_port = nullptr, .participant_policy = {},
+          .prepared_motion_engine = channel.engine.get(), .default_operator_stop_profile = {},
+          .default_fault_stop_profile = {}, .deployment_maximum_tcp_linear_speed_mps = {},
+          .intrinsic_direct_control = true, .direct_control_joint_limits = {}});
+    }
+    RetainedRuntimeParticipantResolverFactory current_factory =
+        [package_root, bundle = materialized.bundle, model_map, direct_id = binding->program_binding_id()]
+        (auto composed) {
+          auto resolver = std::make_shared<ProductBackedRuntimeParticipantResolver>(
+              package_root, bundle, model_map, std::move(composed),
+              std::vector<core::ProgramBindingId>{direct_id});
+          return RetainedRuntimeParticipantResolver{
+              [resolver](const auto& operation, auto index) {
+                return resolver->ResolveExecutionParticipant(operation, index);
+              }};
+        };
+    std::vector<core::RuntimeParticipantBinding> all_bindings;
+    for (const auto& row : complete) all_bindings.push_back(row.binding);
+    auto resolver = make_retained_cell_kernel_participant_resolver(
+        current_factory(std::move(all_bindings)), complete);
+    ASSERT_TRUE(budget_cell->addressed_kernel().SetRouteRecoveryPending(true).ok());
+    ASSERT_TRUE(budget_cell->reconfigure_runtime_product(
+        std::move(complete), std::move(resolver), budget_cell->stop_surveillance_owner()->SnapshotSources()).ok());
+    // The current immutable product factory is adopted only after the same
+    // successful stable-cell publication, as in the actual host caller.
+    runtime->AdoptVerifiedParticipantResolverFactory(std::move(current_factory));
+    ASSERT_TRUE(budget_cell->addressed_kernel().SetRouteRecoveryPending(false).ok());
+    auto* const stable = budget_cell.get();
+    dispatch_mixed_output = [stable, binding, driver = mixed_driver, channels = mixed_channels,
+        expected_generation = actual.component_lifecycle_generation, sequence = 0U]() mutable {
+      const auto& selected = require_fixture_one(stable->participant_registrations(), [&](const auto& row) {
+        return row.binding.value().io_output_binding &&
+            row.binding.value().controllable_component_id == core::ControllableComponentId("station_io") &&
+            row.binding.value().io_output_binding->resource_role_id == core::ResourceRoleId("lamp");
+      }, "retained genuine lamp registration");
+      EXPECT_EQ(selected.binding.value().io_output_binding->component_lifecycle_generation, expected_generation);
+      const auto& target = binding->value().target_role_bindings.front();
+      const auto schema = core::builtin_io_signal_write_command_schema();
+      const core::CapabilityCommandIntentDTO command{schema.command_schema_id, schema.command_schema_revision,
+          core::IoSignalWriteCommandValueDTO{core::ResourceRoleId("lamp"), (++sequence % 2U) != 0U}, {}, {}};
+      const core::OperationIntentDTO operation{
+          {core::RequestId("mixed.output." + std::to_string(sequence)), stable->addressed_kernel().request_owner_epoch(), "test", {}},
+          binding->value().program_id, binding->value().program_revision, binding->program_binding_id(),
+          core::ProgramRunId("mixed.output.session"), selected.binding.value().graph_revision,
+          selected.binding.value().retained_bundle_id, {},
+          {{target.component_role_id, target.target_role_id, core::CapabilityId("io.gpio.set_output"), {}, command, {}}}};
+      const auto resolved = stable->participant_resolver()(operation, 0U);
+      ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+      ASSERT_EQ(resolved.value().engine, selected.engine);
+      ASSERT_EQ(resolved.value().prepared_motion_engine, selected.prepared_motion_engine);
+      EXPECT_EQ(resolved.value().binding.value().io_output_binding, selected.binding.value().io_output_binding);
+      ASSERT_FALSE(resolved.value().binding.value().control_path);
+      const auto prepared = core::MakePreparedIoOutputParticipant(
+          core::OperationId("mixed.write." + std::to_string(sequence)), core::OperationRevision(1U),
+          core::OperationParticipantId("lamp"), operation.program_run_id, command, resolved.value().binding);
+      ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+      auto participant = std::make_shared<const core::PreparedOperationParticipantDTO>(prepared.value());
+      const auto& output = std::get<core::PreparedIoOutputCommandDTO>(participant->payload);
+      auto* const engine = resolved.value().prepared_motion_engine;
+      const auto prepared_id = engine->PrepareCapabilityCommand({participant, resolved.value().binding,
+          core::ResolvedPreparedIoOutputCommandAuthorityDTO{output.signal_id, output.output_resource,
+              output.command_value.value, participant->provider()->lifecycle_provider, output.completion_policy}});
+      ASSERT_TRUE(prepared_id.ok()) << prepared_id.error().message;
+      const auto sent = engine->DispatchPreparedCapabilityCommand(prepared_id.value(), participant->prepared_contract_digest,
+          core::ControllerGoalId("mixed.goal." + std::to_string(sequence)), core::ControllerGoalGeneration(1U));
+      ASSERT_TRUE(sent.ok()) << sent.error().message;
+      ASSERT_TRUE(sent.value().accepted);
+      const auto observed = engine->ObservePreparedCapabilityCommand(prepared_id.value());
+      ASSERT_TRUE(observed.ok());
+      ASSERT_TRUE(observed.value().output_observation);
+      EXPECT_EQ(observed.value().output_observation->evidence, core::IoOutputEvidence::kSourceAccepted);
+      EXPECT_EQ(observed.value().output_observation->identity.component_lifecycle_generation, expected_generation);
+      EXPECT_EQ(observed.value().output_observation->identity.provider, driver->occurrence());
+      EXPECT_TRUE(resolved.value().engine->acknowledge_completed(prepared_id.value()).accepted);
+      // Keep the actual leaf/engine and driver alive through the dispatch.
+      EXPECT_FALSE(channels->empty());
+    };
+  }
+#endif
   if (check == Lite6AggregateCheck::kExecutionPortParticipant) {
     ASSERT_NE(runtime, nullptr);
     ASSERT_NE(port_participant, nullptr);
@@ -4503,10 +4892,11 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   }
 
   ASSERT_NE(runtime, nullptr);
-  ASSERT_NE(runtime->addressed_kernel, nullptr);
+  ASSERT_NE(runtime->active_addressed_kernel(), nullptr);
   ASSERT_NE(runtime->participant_engine, nullptr);
   ASSERT_TRUE(runtime->gripper_binding.has_value());
   if (check == Lite6AggregateCheck::kMeasuredPublication ||
+      moving_budget_check || mixed_output_check ||
       check == Lite6AggregateCheck::kMeasuredOptionalDomainRace ||
       check == Lite6AggregateCheck::kMeasuredNullOptionalDomainRace) {
     // Use the verified ROS product and actual Kernel with the focused Core port.
@@ -4536,16 +4926,38 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         if (selected.control_domain_id != path.control_domain_id) continue;
         const auto channel = retained_bindings_share_backend_owner(runtime->motion_binding, representative)
                                  ? runtime->motion_state_channel : runtime->gripper_state_channel;
-        for (const auto &resource : representative.value().resources)
-          result.kinematic_resource_source_projections.push_back(
-              {resource.resource_id, {{selected.control_binding_id, selected.control_binding_revision}},
-               selected.provider_instance_id, selected.provider_manifest_id,
-               selected.provider_manifest_revision, selected.state_authority_id,
-               selected.state_authority_class, channel->source_kind()});
+        for (const auto &resource : representative.value().resources) {
+          core::KinematicResourceSourceProjectionDTO projection{
+              resource.resource_id, {{selected.control_binding_id, selected.control_binding_revision}},
+              selected.provider_instance_id, selected.provider_manifest_id,
+              selected.provider_manifest_revision, selected.state_authority_id,
+              selected.state_authority_class, channel->source_kind()};
+          auto prior = std::find_if(result.kinematic_resource_source_projections.begin(),
+              result.kinematic_resource_source_projections.end(), [&](const auto& row) {
+                return row.resource_id == resource.resource_id;
+              });
+          if (prior == result.kinematic_resource_source_projections.end()) {
+            result.kinematic_resource_source_projections.push_back(std::move(projection));
+          } else {
+            auto same_owner = projection;
+            same_owner.contributing_control_bindings = prior->contributing_control_bindings;
+            if (same_owner != *prior)
+              throw std::logic_error("actual fixture resource has conflicting source owners");
+            prior->contributing_control_bindings.push_back(projection.contributing_control_bindings.front());
+          }
+        }
       }
       std::sort(result.kinematic_resource_source_projections.begin(),
                 result.kinematic_resource_source_projections.end(),
                 [](const auto &a, const auto &b) { return a.resource_id < b.resource_id; });
+      for (auto& projection : result.kinematic_resource_source_projections)
+        std::sort(projection.contributing_control_bindings.begin(),
+            projection.contributing_control_bindings.end(), [](const auto& a, const auto& b) {
+              return std::tie(a.control_binding_id, a.control_binding_revision) <
+                     std::tie(b.control_binding_id, b.control_binding_revision);
+            });
+      if (!result.locally_valid())
+        throw std::logic_error("actual fixture route configuration is not canonical");
       return result;
     };
     const auto ready = [&](const core::ActiveControlConfigurationDTO &configuration) {
@@ -4563,10 +4975,73 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         if (binding.value().control_path->control_domain_id == configuration.control_domain_id)
           bindings.push_back(binding);
       const std::vector<core::RouteSelectionComponentExpectationDTO> components{
-          {component_id, core::ComponentLifecycleGeneration(1U), core::ComponentLifecycleStateDTO::kPrepared}};
+          {component_id, mixed_output_check
+              ? runtime->active_addressed_kernel()->component_command_readiness(component_id).value().component_lifecycle_generation.value()
+              : core::ComponentLifecycleGeneration(1U), mixed_output_check
+              ? core::ComponentLifecycleStateDTO::kDeclared
+              : core::ComponentLifecycleStateDTO::kPrepared}};
       return deployment::resolve_store_and_verify_route_readiness_batch(
           *materialized.bundle, artifacts, expected, configuration, components, bindings, plans);
     };
+    const auto assert_budget = [&]() {
+      if (!moving_budget_check)
+        return;
+      const auto &runtime_rows =
+          std::as_const(runtime->participant_registrations);
+      for (const auto *rows :
+           {&runtime_rows, &budget_cell->participant_registrations()}) {
+        ASSERT_FALSE(rows->empty());
+        for (const auto &row : *rows) {
+          const bool motion = row.binding.value().capability_id.value() ==
+                              "execution.trajectory.execute";
+          EXPECT_EQ(row.motion_takeover_preparation_budget_s,
+                    motion ? std::optional<double>(3.5) : std::nullopt);
+        }
+      }
+    };
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+    if (mixed_output_check) {
+      dispatch_mixed_output();
+      ASSERT_TRUE(mixed_arm_generation);
+      const core::ComponentCommandReadinessPublicationDTO publication{
+          core::ComponentReadinessAuthorityDTO::kRestartExclusion, {}, {}, component_id,
+          *mixed_arm_generation, false};
+      EXPECT_FALSE(runtime->PublishComponentCommandReadiness(publication).ok());
+      const auto initial = make_configuration(runtime->motion_binding,
+          runtime->motion_binding.value().control_path->active_control_configuration_generation);
+      // Unchanged predecessor adoption is allowed while drained. A valid
+      // foreign owner revision must still refuse without touching IO.
+      auto foreign_predecessor = initial;
+      foreign_predecessor.control_domain_revision = core::ControlDomainRevision("foreign.domain.revision");
+      ASSERT_TRUE(foreign_predecessor.locally_valid());
+      const auto refused = runtime->AdoptAndReadBackRouteConfigurationPredecessor(foreign_predecessor);
+      ASSERT_FALSE(refused.ok());
+      EXPECT_EQ(refused.error().details.at("reason"), "route_predecessor_rebind_mismatch");
+      dispatch_mixed_output();
+      ASSERT_TRUE(budget_cell->addressed_kernel().SetRouteRecoveryPending(true).ok());
+      const auto readiness = runtime->PublishComponentCommandReadiness(publication);
+      ASSERT_TRUE(readiness.ok()) << readiness.error().message;
+      EXPECT_FALSE(readiness.value().command_eligible);
+      EXPECT_EQ(readiness.value().component_lifecycle_generation, publication.component_lifecycle_generation);
+      dispatch_mixed_output();
+      const auto adopted = runtime->AdoptAndReadBackRouteConfigurationPredecessor(initial);
+      ASSERT_TRUE(adopted.ok()) << adopted.error().message;
+      EXPECT_EQ(adopted.value().active_configuration, initial);
+      EXPECT_FALSE(adopted.value().operation_admission_open);
+      dispatch_mixed_output();
+      const auto successor = make_configuration(runtime->motion_binding,
+          core::ActiveControlConfigurationGeneration(initial.active_control_configuration_generation.value() + 1U));
+      auto successor_ready = ready(successor);
+      ASSERT_TRUE(successor_ready.ok()) << successor_ready.error().message;
+      const auto published = runtime->PublishAndReadBackRouteConfiguration(successor, successor_ready.value());
+      ASSERT_TRUE(published.ok()) << published.error().message;
+      EXPECT_EQ(published.value().active_configuration, successor);
+      dispatch_mixed_output();
+      mixed_driver->Shutdown();
+      return;
+    }
+#endif
+    assert_budget();
     const auto initial = make_configuration(runtime->motion_binding,
         runtime->motion_binding.value().control_path->active_control_configuration_generation);
     ASSERT_TRUE(initial.locally_valid());
@@ -4575,8 +5050,10 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     auto installed = runtime->PublishAndReadBackRouteConfiguration(initial, std::move(initial_ready.value()));
     ASSERT_TRUE(installed.ok()) << installed.error().message;
     EXPECT_EQ(installed.value().active_configuration, initial);
-    const auto absent = runtime->addressed_kernel->current_runtime_route_configuration(
-        runtime->gripper_binding->value().control_path->control_domain_id);
+    assert_budget();
+    const auto absent =
+        runtime->active_addressed_kernel()->current_runtime_route_configuration(
+            runtime->gripper_binding->value().control_path->control_domain_id);
     ASSERT_TRUE(absent.ok());
     ASSERT_FALSE(absent.value());
     const auto actual_rebind = runtime->rebind_motion_route;
@@ -4613,11 +5090,15 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       EXPECT_EQ(rebinds, 0U);
       EXPECT_EQ(enabled, 0U);
       EXPECT_EQ(runtime->motion_binding.value(), physical_before);
-      const auto still_current = runtime->addressed_kernel->current_runtime_route_configuration(initial.control_domain_id);
+      const auto still_current =
+          runtime->active_addressed_kernel()
+              ->current_runtime_route_configuration(initial.control_domain_id);
       ASSERT_TRUE(still_current.ok());
       ASSERT_TRUE(still_current.value());
       EXPECT_EQ(still_current.value()->active_configuration, initial);
-      const auto appeared = runtime->addressed_kernel->current_runtime_route_configuration(other.control_domain_id);
+      const auto appeared =
+          runtime->active_addressed_kernel()
+              ->current_runtime_route_configuration(other.control_domain_id);
       ASSERT_TRUE(appeared.ok());
       ASSERT_TRUE(appeared.value());
       EXPECT_EQ(appeared.value()->active_configuration, other);
@@ -4635,7 +5116,9 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     EXPECT_EQ(rebinds, 0U);
     EXPECT_EQ(runtime->motion_binding.value(), physical_before);
     EXPECT_EQ(runtime->motion_state_channel->binding().value(), channel_before);
-    const auto failed_readback = runtime->addressed_kernel->current_runtime_route_configuration(initial.control_domain_id);
+    const auto failed_readback =
+        runtime->active_addressed_kernel()->current_runtime_route_configuration(
+            initial.control_domain_id);
     ASSERT_TRUE(failed_readback.ok());
     ASSERT_TRUE(failed_readback.value());
     EXPECT_EQ(failed_readback.value()->active_configuration, initial);
@@ -4667,7 +5150,9 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
           RetainedPreparedRobotMeasuredSources{{motion.value().controllable_component_id, {}},
               [&, lease, successor] {
                 ++enabled;
-                const auto current = runtime->addressed_kernel->current_runtime_route_configuration(successor.control_domain_id);
+                const auto current = runtime->active_addressed_kernel()
+                                         ->current_runtime_route_configuration(
+                                             successor.control_domain_id);
                 EXPECT_TRUE(current.ok());
                 if (current.ok() && current.value())
                   EXPECT_EQ(current.value()->active_configuration, successor);
@@ -4681,6 +5166,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     const auto published = runtime->PublishAndReadBackRouteConfiguration(successor, successor_ready.value());
     ASSERT_TRUE(published.ok()) << published.error().message;
     EXPECT_EQ(published.value().active_configuration, successor);
+    assert_budget();
     EXPECT_EQ(enabled, 1U);
     EXPECT_EQ(rebinds, 1U);
     EXPECT_FALSE(committed.expired());
@@ -4699,6 +5185,17 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     EXPECT_TRUE(committed.expired());
     EXPECT_EQ(retired, 1U);
     EXPECT_EQ(reentrant_reads, 1U);
+    assert_budget();
+    if (moving_budget_check) {
+      ASSERT_TRUE(
+          budget_cell->addressed_kernel().SetRouteRecoveryPending(true).ok());
+      const auto readiness = runtime->PublishComponentCommandReadiness(
+          {core::ComponentReadinessAuthorityDTO::kRestartExclusion,
+           std::nullopt, std::nullopt, component_id,
+           core::ComponentLifecycleGeneration(2U), false});
+      ASSERT_TRUE(readiness.ok()) << readiness.error().message;
+      assert_budget();
+    }
     return;
   }
   if (check == Lite6AggregateCheck::kSameRoutePredecessorQualification) {
@@ -5100,6 +5597,157 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   ASSERT_TRUE(measured_metrics.peak_tcp_linear_speed_mps.has_value());
   EXPECT_GT(*measured_metrics.peak_tcp_linear_speed_mps, 0.0);
   EXPECT_LE(*measured_metrics.peak_tcp_linear_speed_mps, 0.15);
+  if (check == Lite6AggregateCheck::kMovingValidation) {
+    core::ValidationOptionsDTO moving_options{
+        1.0, tcp_frame.compiled_frame_name, base_frame.compiled_frame_name,
+        false};
+    moving_options.retained_prefix =
+        core::RetainedTrajectoryPrefixValidationOptionsDTO{
+            0.5, 1.0, tcp_frame.compiled_frame_name,
+            base_frame.compiled_frame_name};
+    const auto validate = [&](const core::TrajectoryDTO &trajectory,
+                              const core::ValidationOptionsDTO &options) {
+      return runtime->kinematic_model->validate_non_collision(
+          trajectory, options, cancellation);
+    };
+    auto seam_trajectory = measured_trajectory;
+    for (auto &point : seam_trajectory.waypoints) {
+      std::fill(point.velocities_rad_s.begin(), point.velocities_rad_s.end(),
+                0.0);
+      std::fill(point.accelerations_rad_s2.begin(),
+                point.accelerations_rad_s2.end(), 0.0);
+    }
+    seam_trajectory.waypoints[1].positions_rad[0] = 0.0;
+    const auto ordinary = validate(
+        seam_trajectory,
+        core::ValidationOptionsDTO{1.0, tcp_frame.compiled_frame_name,
+                                   base_frame.compiled_frame_name, false});
+    const auto moving = validate(seam_trajectory, moving_options);
+    ASSERT_TRUE(ordinary.valid && moving.valid);
+    EXPECT_FALSE(ordinary.moving_replacement);
+    EXPECT_EQ(moving.trajectory_metrics, ordinary.trajectory_metrics);
+    ASSERT_TRUE(moving.moving_replacement);
+    const auto &prefix = moving.moving_replacement->unchanged_prefix;
+    const auto &future = moving.moving_replacement->changed_future;
+    EXPECT_DOUBLE_EQ(prefix.trajectory_duration_s, 0.5);
+    EXPECT_DOUBLE_EQ(future.trajectory_duration_s, 0.5);
+    ASSERT_TRUE(prefix.peak_tcp_linear_speed_mps &&
+                future.peak_tcp_linear_speed_mps);
+    EXPECT_DOUBLE_EQ(*moving.trajectory_metrics->peak_tcp_linear_speed_mps,
+                     std::max(*prefix.peak_tcp_linear_speed_mps,
+                              *future.peak_tcp_linear_speed_mps));
+    ASSERT_EQ(prefix.peak_abs_joint_acceleration_rad_s2.size(),
+              joint_names.value().size());
+    ASSERT_EQ(future.peak_abs_joint_acceleration_rad_s2.size(),
+              joint_names.value().size());
+    EXPECT_DOUBLE_EQ(prefix.peak_abs_joint_acceleration_rad_s2[0], 0.0);
+    EXPECT_NEAR(future.peak_abs_joint_acceleration_rad_s2[0], 0.08, 1e-12);
+    for (std::size_t joint = 0; joint < joint_names.value().size(); ++joint) {
+      EXPECT_DOUBLE_EQ(
+          moving.trajectory_metrics->peak_abs_joint_velocity_rad_s[joint],
+          std::max(prefix.peak_abs_joint_velocity_rad_s[joint],
+                   future.peak_abs_joint_velocity_rad_s[joint]));
+      EXPECT_DOUBLE_EQ(
+          moving.trajectory_metrics->peak_abs_joint_acceleration_rad_s2[joint],
+          std::max(prefix.peak_abs_joint_acceleration_rad_s2[joint],
+                   future.peak_abs_joint_acceleration_rad_s2[joint]));
+    }
+    const auto shared_knot = validate(measured_trajectory, moving_options);
+    ASSERT_TRUE(shared_knot.valid && shared_knot.moving_replacement);
+    EXPECT_NEAR(shared_knot.moving_replacement->unchanged_prefix
+                    .peak_abs_joint_acceleration_rad_s2[0],
+                0.03, 1e-12);
+    EXPECT_NEAR(shared_knot.moving_replacement->changed_future
+                    .peak_abs_joint_acceleration_rad_s2[0],
+                0.03, 1e-12);
+
+    auto fast_prefix = seam_trajectory;
+    fast_prefix.waypoints[1].positions_rad[0] = 0.01;
+    fast_prefix.waypoints[2].positions_rad[0] = 0.01;
+    auto slower_future_options = moving_options;
+    slower_future_options.max_tcp_linear_speed_mps =
+        *measured_metrics.peak_tcp_linear_speed_mps * 0.1;
+    const auto slower_future = validate(fast_prefix, slower_future_options);
+    ASSERT_TRUE(slower_future.valid && slower_future.moving_replacement);
+    EXPECT_GT(*slower_future.moving_replacement->unchanged_prefix
+                   .peak_tcp_linear_speed_mps,
+              slower_future_options.max_tcp_linear_speed_mps);
+    EXPECT_DOUBLE_EQ(*slower_future.moving_replacement->changed_future
+                          .peak_tcp_linear_speed_mps,
+                     0.0);
+    auto source_too_slow = slower_future_options;
+    source_too_slow.retained_prefix->max_tcp_linear_speed_mps = 1e-6;
+    const auto refused_source = validate(fast_prefix, source_too_slow);
+    ASSERT_FALSE(refused_source.valid);
+    ASSERT_TRUE(refused_source.error);
+    EXPECT_EQ(refused_source.error->details.at("reason"),
+              "tcp_linear_speed_limit_exceeded");
+    EXPECT_EQ(refused_source.error->details.at("tcp_frame"),
+              tcp_frame.compiled_frame_name);
+    auto future_too_slow = moving_options;
+    future_too_slow.max_tcp_linear_speed_mps = 1e-6;
+    const auto refused_future = validate(seam_trajectory, future_too_slow);
+    ASSERT_FALSE(refused_future.valid);
+    ASSERT_TRUE(refused_future.error);
+    EXPECT_EQ(refused_future.error->details.at("reason"),
+              "tcp_linear_speed_limit_exceeded");
+    EXPECT_EQ(refused_future.error->details.at("segment_index"), "1");
+
+    // The seam must be re-evaluated in the new frame pair, not subtracted
+    // from the source's TCP coordinates. A frame relative to itself is fixed.
+    auto different_tcp = moving_options;
+    different_tcp.tcp_frame = base_frame.compiled_frame_name;
+    different_tcp.max_tcp_linear_speed_mps = 1e-6;
+    const auto changed_tcp = validate(measured_trajectory, different_tcp);
+    ASSERT_TRUE(changed_tcp.valid && changed_tcp.moving_replacement);
+    EXPECT_DOUBLE_EQ(*changed_tcp.moving_replacement->changed_future
+                          .peak_tcp_linear_speed_mps,
+                     0.0);
+    auto different_base = moving_options;
+    different_base.retained_prefix->base_frame = tcp_frame.compiled_frame_name;
+    const auto changed_base = validate(measured_trajectory, different_base);
+    ASSERT_TRUE(changed_base.valid && changed_base.moving_replacement);
+    EXPECT_NEAR(*changed_base.moving_replacement->unchanged_prefix
+                     .peak_tcp_linear_speed_mps,
+                0.0, 1e-12);
+    EXPECT_GT(*changed_base.moving_replacement->changed_future
+                   .peak_tcp_linear_speed_mps,
+              0.0);
+
+    auto excessive_seam_acceleration = seam_trajectory;
+    excessive_seam_acceleration.waypoints[1].time_from_start_s = 0.1;
+    excessive_seam_acceleration.waypoints[2].time_from_start_s = 0.2;
+    excessive_seam_acceleration.waypoints[2].positions_rad[0] = 0.19;
+    auto short_options = moving_options;
+    short_options.retained_prefix->end_time_s = 0.1;
+    const auto refused_acceleration =
+        validate(excessive_seam_acceleration, short_options);
+    ASSERT_FALSE(refused_acceleration.valid);
+    ASSERT_TRUE(refused_acceleration.error);
+    EXPECT_EQ(refused_acceleration.error->details.at("reason"),
+              "trajectory_segment_acceleration_limit_exceeded");
+
+    auto missing_boundary = moving_options;
+    missing_boundary.retained_prefix->end_time_s = 0.4;
+    const auto missing = validate(seam_trajectory, missing_boundary);
+    ASSERT_FALSE(missing.valid);
+    ASSERT_TRUE(missing.error);
+    EXPECT_EQ(missing.error->details.at("reason"),
+              "trajectory_retained_prefix_boundary_missing");
+    for (const double boundary :
+         {0.0, 1.0, std::numeric_limits<double>::quiet_NaN()}) {
+      auto invalid = moving_options;
+      invalid.retained_prefix->end_time_s = boundary;
+      EXPECT_FALSE(validate(seam_trajectory, invalid).valid);
+    }
+    auto invalid_cap = moving_options;
+    invalid_cap.retained_prefix->max_tcp_linear_speed_mps = 0.0;
+    EXPECT_FALSE(validate(seam_trajectory, invalid_cap).valid);
+    auto invalid_frames = moving_options;
+    invalid_frames.retained_prefix->tcp_frame.clear();
+    EXPECT_FALSE(validate(seam_trajectory, invalid_frames).valid);
+    return;
+  }
   auto over_speed_trajectory = stationary_trajectory;
   over_speed_trajectory.waypoints.back().time_from_start_s = 0.1;
   over_speed_trajectory.waypoints.back().positions_rad.front() = 1.0;
@@ -5362,6 +6010,11 @@ TEST(RetainedProductCrossConsumer,
 }
 
 TEST(RetainedProductCrossConsumer,
+     MovingValidationPreservesJointSeamAndUsesEachTcpFrameAndLimit) {
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMovingValidation);
+}
+
+TEST(RetainedProductCrossConsumer,
      MissingSelectedBackendRefusesInsteadOfConstructingASimulator) {
   check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMissingSelectedBackend);
 }
@@ -5370,6 +6023,19 @@ TEST(RetainedProductCrossConsumer,
      SameRoutePredecessorAdoptionPreservesExactScaleQualificationWithoutOpeningReadiness) {
   check_selected_core_lite6_aggregate(Lite6AggregateCheck::kSameRoutePredecessorQualification);
 }
+
+TEST(RetainedNativeMeasuredRoutePublication,
+     MovingBudgetSurvivesRouteRebuildAndReadinessPublication) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kMovingBudgetPublication);
+}
+
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+TEST(RetainedNativeMeasuredRoutePublication,
+     ActualMixedOutputResolvesAndDispatchesAcrossArmReadinessAndRouteAdoption) {
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMixedOutputPublication);
+}
+#endif
 
 TEST(RetainedNativeMeasuredRoutePublication, ExactStagePrecedesRebindAndRealThenNullCommitPreserveKernelPublication) {
   check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMeasuredPublication);
@@ -5606,6 +6272,7 @@ TEST(RetainedProductCrossConsumer,
         {},
         {},
         {},
+        {},
         {}};
     const auto local_runtime_unit_id = control.provider_runtime_unit_id;
     const auto local_runtime_epoch = control.provider_runtime_epoch;
@@ -5790,6 +6457,7 @@ TEST(RetainedProductCrossConsumer,
           nullptr,
           bundle.value().cell_graph.graph_revision,
               {},
+          {},
           {},
           {},
           {}});
@@ -7315,9 +7983,24 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
   ASSERT_TRUE(capture.ok()) << capture.error().message;
   ASSERT_TRUE(capture.value().table);
   ASSERT_TRUE(capture.value().binding);
+  ASSERT_TRUE(capture.value().blackboard_key_declarations);
+  ASSERT_TRUE(capture.value().io_conditions);
+  EXPECT_TRUE(capture.value().io_conditions->program_node_conditions.empty());
+  EXPECT_TRUE(capture.value()
+                  .io_conditions->referenced_program_blackboard_keys.empty());
+  auto injected_conditions = capture_request;
+  injected_conditions.io_conditions =
+      std::make_shared<const core::ProgramIoConditionProjectionDTO>();
+  EXPECT_FALSE(resolver.ResolveProgramCapture(injected_conditions).ok());
   EXPECT_EQ(*capture.value().binding, selected_program);
   // Identity-only ingress cannot supply a table or a pre-resolved Binding.
   EXPECT_FALSE(resolver.ResolveProgramCapture(capture.value()).ok());
+  auto injected_declarations = capture_request;
+  injected_declarations.blackboard_key_declarations = std::make_shared<
+      const std::vector<core::ProgramBlackboardKeyDeclarationDTO>>(
+      std::vector<core::ProgramBlackboardKeyDeclarationDTO>{
+          {"caller.grant", "bool"}});
+  EXPECT_FALSE(resolver.ResolveProgramCapture(injected_declarations).ok());
   const auto query =
       [&](const auto &binding_id, const auto &target_id,
           const auto &capability_id, const auto &source,
@@ -7525,6 +8208,32 @@ TEST(RetainedProductCrossConsumer,
                                 .product_id}),
       physical_bindings,
       {program_binding_ids.begin(), program_binding_ids.end()});
+  // The control readmodel qualifies sealed selectors against the actual
+  // product and physical prototypes, without a separate alias inventory.
+  for (std::size_t index = 0U; index < inventory.motion.size(); ++index) {
+    const auto &selected = *inventory.motion[index];
+    const auto &role = selected.value().target_role_bindings.front();
+    const auto bound = resolver.ResolveBoundTarget(
+        selected, role.target_role_id,
+        core::CapabilityId("execution.trajectory.execute"));
+    ASSERT_TRUE(bound.ok()) << bound.error().message;
+    EXPECT_EQ(bound.value().program_binding_id(), selected.program_binding_id());
+    EXPECT_EQ(bound.value().target_role().component_role_id, role.component_role_id);
+    EXPECT_EQ(bound.value().target_role().target_role_id, role.target_role_id);
+    EXPECT_EQ(bound.value().component().controllable_component_id,
+              physical_bindings[index].value().controllable_component_id);
+    EXPECT_EQ(bound.value().target_role().command_target_id,
+              physical_bindings[index].value().command_target_id);
+    EXPECT_NE(bound.value().component().controllable_component_id,
+              physical_bindings[(index + 1U) % physical_bindings.size()]
+                  .value().controllable_component_id);
+    EXPECT_FALSE(resolver.ResolveBoundTarget(
+        selected, core::TargetRoleId("missing.role"),
+        core::CapabilityId("execution.trajectory.execute")).ok());
+    EXPECT_FALSE(resolver.ResolveBoundTarget(
+        selected, role.target_role_id,
+        core::CapabilityId("tool.gripper.command")).ok());
+  }
   const auto scene = make_projection_runtime_shadow_snapshot(
       core::CellId(std::string(cell_id)));
   for (std::size_t index = 0U; index < physical_bindings.size(); ++index) {
@@ -8346,6 +9055,503 @@ TEST(RetainedProductCrossConsumer,
   projection->ReleaseProjection(
       core::ProjectionLeaseId("freshness.projection.lease"));
 }
+
+namespace io_resolver_tests {
+using V = deployment::CanonicalValue;
+V member(V root, std::string_view name, V value) {
+  auto fields = root.as_object();
+  for (auto &[key, selected] : fields)
+    if (key == name) {
+      selected = std::move(value);
+      return V(std::move(fields));
+    }
+  fields.emplace_back(std::string(name), std::move(value));
+  return V(std::move(fields));
+}
+
+class Fixture final {
+public:
+  explicit Fixture(bool output = false, bool second = false, bool ros = false) {
+    const auto retained =
+        deployment::test::materialize_boolean_io_retained_fixture(
+            package.path(), !output, output, ros, second);
+    bundle = retained.bundle;
+    deployment::FilesystemVerifiedRetainedModelMapSource maps(package.path());
+    map = maps.get_verified({bundle->retained_bundle_id(),
+                             bundle->value()
+                                 .compiled_products.symbol_role_maps.front()
+                                 .product_id});
+    if (!map)
+      throw std::logic_error(
+          "IO resolver fixture has no real retained model map");
+    deployment::FilesystemCatalogArtifactStore catalog(package.path());
+    if (output) {
+      const auto direct =
+          deployment::compile_direct_control_program_binding_inventory(
+              *bundle, *map, catalog);
+      if (direct.io.size() != 1U)
+        throw std::logic_error(
+            "IO resolver fixture has no exact direct target");
+      direct_binding = direct.io.front();
+    }
+    auto root = deployment::parse_strict_json_model_yaml(R"({
+      "api_version":"manyforge.program.v2","program_id":"resolver_io_authored",
+      "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "program_profile":"composable-cell-v1","name":"Resolver IO fixture",
+      "catalog":{"api_version":"manyforge.node_catalog.v2","content_version":"0.0.0"},
+      "component_roles":{"device":{}},
+      "target_roles":{"signals":{"component_role":"device","required_capabilities":[],
+        "required_frame_roles":[],"required_resource_roles":[],"required_collision_body_roles":[],"required_model_roles":[]}},
+      "blackboard":{"namespaces":[],"keys":[]},
+      "tree":{"node_id":"io.check_input","instance_id":"check","parameters":{"target_role":"signals","resource_role":"ready","expected_value":true},"children":[]}
+    })")
+                    .root();
+    root = member(
+        root, "catalog",
+        member(*root.find_object_member("catalog"), "content_version",
+               V(bundle->value().catalogs.node_environment.content_version)));
+    auto roles = *root.find_object_member("target_roles");
+    auto target = *roles.find_object_member("signals");
+    target = member(target, "required_capabilities",
+                    V(V::Array{V(V::Object{
+                        {"capability_id", V(output ? "io.gpio.set_output"
+                                                   : "io.gpio.get_input")},
+                        {"parameters", V(V::Object{})},
+                        {"disposition", V("required")}})}));
+    V::Array resources{V(output ? "lamp" : "ready")};
+    if (second)
+      resources.emplace_back("lamp_other");
+    root = member(root, "target_roles",
+                  member(roles, "signals",
+                         member(target, "required_resource_roles",
+                                V(std::move(resources)))));
+    if (output) {
+      V::Array children;
+      for (const auto &role :
+           second ? std::vector<std::string>{"lamp", "lamp_other"}
+                  : std::vector<std::string>{"lamp"})
+        children.emplace_back(
+            V::Object{{"node_id", V("io.set_output")},
+                      {"instance_id", V("write." + role)},
+                      {"parameters", V(V::Object{{"target_role", V("signals")},
+                                                 {"resource_role", V(role)},
+                                                 {"value", V(true)}})},
+                      {"children", V(V::Array{})}});
+      root = member(root, "tree",
+                    V(V::Object{{"node_id", V("sequence")},
+                                {"instance_id", V("root")},
+                                {"parameters", V(V::Object{})},
+                                {"children", V(std::move(children))}}));
+    }
+    root = deployment::normalize_program_authoring(root);
+    const auto revision = deployment::detail::compute_content_identity(
+        root, {"program-revision", "manyforge.program.v2", "program_revision"});
+    root = member(root, "program_revision", V(revision));
+    program = deployment::verify_program_binding_contract(
+        deployment::canonical_json(root), *bundle);
+    authored_binding = deployment::compile_program_binding(
+        *program,
+        {{{core::ComponentRoleId("device"),
+           core::ControllableComponentId("device.io")}},
+         {{core::TargetRoleId("signals"), core::CommandTargetId("gpio")}}},
+        *bundle, *map, catalog);
+    deployment::FilesystemProgramRepository programs(artifacts.path());
+    deployment::FilesystemProgramBindingRepository bindings(artifacts.path());
+    if (!programs.put_if_absent(program, *bundle) ||
+        !bindings.put_if_absent(authored_binding, *bundle, *map))
+      throw std::logic_error(
+          "IO resolver fixture could not publish exact authored artifacts");
+  }
+
+  core::RuntimeParticipantBinding
+  Prototype(std::string role, std::uint64_t generation = 3U,
+            bool authored = false) const {
+    const auto &graph = bundle->value().cell_graph;
+    if (graph.control_domains.size() != 1U ||
+        !graph.control_domains.front().provider())
+      throw std::logic_error(
+          "IO resolver fixture has no qualified provider domain");
+    const auto &domain = graph.control_domains.front();
+    const auto &provider = *domain.provider();
+    const auto rows = deployment::ResolveRetainedIoSignalCatalog(graph);
+    if (!rows.ok())
+      throw std::logic_error(rows.error().message);
+    std::vector<core::ResourceId> resources;
+    for (const auto &row : rows.value())
+      if (row.descriptor.output_resource)
+        resources.push_back(*row.descriptor.output_resource);
+    std::sort(resources.begin(), resources.end());
+    resources.erase(std::unique(resources.begin(), resources.end()),
+                    resources.end());
+    const core::RuntimeEpoch epoch("actual.fixture.provider");
+    const core::RuntimeProviderDomainConfigurationReadbackDTO closed{
+        bundle->retained_bundle_id(),
+        graph.graph_revision,
+        core::ComponentLifecycleGeneration(generation),
+        {domain.control_domain_id, domain.control_domain_revision,
+         core::ResolvedProviderDomainScopeDTO{provider, epoch, std::nullopt,
+                                              resources}},
+        {domain.control_domain_id, domain.control_domain_revision,
+         provider.provider_instance_id, provider.provider_manifest_id,
+         provider.provider_manifest_revision, provider.provider_runtime_unit_id,
+         epoch, provider.lifecycle_plan_catalog_digest},
+        false,
+        0U,
+        0U};
+    const auto &identity = authored ? *authored_binding : *direct_binding;
+    const auto target = deployment::resolve_runtime_program_target(
+        identity, identity.value().target_role_bindings.front().target_role_id,
+        core::CapabilityId("io.gpio.set_output"), *bundle, *map);
+    auto made = core::verify_runtime_participant_binding(
+        deployment::build_runtime_io_output_binding_dto(
+            target, core::ResourceRoleId(std::move(role)), *bundle, closed));
+    if (!made.ok())
+      throw std::logic_error(made.error().message);
+    return std::move(made.value());
+  }
+
+  core::OperationIntentDTO
+  Operation(const core::RuntimeParticipantBinding &prototype, std::string role,
+            bool direct) const {
+    const auto &value = prototype.value();
+    const auto &identity = direct ? *direct_binding : *authored_binding;
+    const auto &target = identity.value().target_role_bindings.front();
+    const auto schema = core::builtin_io_signal_write_command_schema();
+    return {{core::RequestId("request.resolver." + role),
+             core::RequestOwnerEpoch("kernel"),
+             "test",
+             {}},
+            identity.value().program_id,
+            identity.value().program_revision,
+            identity.program_binding_id(),
+            core::ProgramRunId("run.resolver"),
+            value.graph_revision,
+            value.retained_bundle_id,
+            std::nullopt,
+            {{target.component_role_id,
+              target.target_role_id,
+              core::CapabilityId("io.gpio.set_output"),
+              {},
+              core::CapabilityCommandIntentDTO{
+                  schema.command_schema_id,
+                  schema.command_schema_revision,
+                  core::IoSignalWriteCommandValueDTO{core::ResourceRoleId(role),
+                                                     true},
+                  std::nullopt,
+                  {}},
+              direct ? std::nullopt
+                     : std::optional(core::ProgramNodeExecutionScopeDTO{
+                           core::ProgramNodeInstanceId("write." + role),
+                           "attempt.1"})}}};
+  }
+
+  ScopedTemporaryRoot package, artifacts;
+  std::shared_ptr<const deployment::RetainedBundle> bundle;
+  std::optional<deployment::VerifiedRetainedModelMap> map;
+  std::shared_ptr<const deployment::ProgramBindingContract> program;
+  std::shared_ptr<const deployment::ProgramBinding> authored_binding,
+      direct_binding;
+};
+
+TEST(RetainedProductConsumerTest,
+     IoResolverCapturesQualifiedProviderOnlyProductWithoutExecutionBindings) {
+  Fixture fixture;
+  ProductBackedRuntimeParticipantResolver resolver(
+      fixture.package.path(), fixture.bundle, *fixture.map, {}, {},
+      fixture.artifacts.path());
+  const auto &value = fixture.authored_binding->value();
+  const core::ProgramRunExecutionCaptureDTO request{
+      core::RequestOwnerEpoch("kernel"),
+      core::RequestOwnerEpoch("runner"),
+      core::CellAdmissionClaimGeneration(1U),
+      core::ProgramRunId("run"),
+      value.program_id,
+      value.program_revision,
+      value.program_binding_id,
+      value.retained_bundle_id,
+      value.graph_revision,
+      {}};
+  const auto capture = resolver.ResolveProgramCapture(request);
+  ASSERT_TRUE(capture.ok()) << capture.error().message;
+  ASSERT_TRUE(capture.value().table);
+  ASSERT_TRUE(capture.value().binding);
+  const auto target = resolver.ResolveBoundTarget(
+      *fixture.authored_binding, core::TargetRoleId("signals"),
+      core::CapabilityId("io.gpio.get_input"));
+  ASSERT_TRUE(target.ok()) << target.error().message;
+  EXPECT_FALSE(target.value().control_binding());
+  EXPECT_FALSE(target.value().control_domain());
+  const auto selected = resolver.ResolveOperationTarget(
+      value.program_binding_id, core::TargetRoleId("signals"));
+  ASSERT_TRUE(selected.ok());
+  ASSERT_EQ(selected.value().signal_role_bindings.size(), 1U);
+  EXPECT_EQ(selected.value().signal_role_bindings.front().resource_role_id,
+            core::ResourceRoleId("ready"));
+  auto injected = request;
+  injected.binding = capture.value().binding;
+  EXPECT_FALSE(resolver.ResolveProgramCapture(std::move(injected)).ok());
+}
+
+TEST(RetainedProductConsumerTest,
+     IoResolverSelectsActualChannelRoleAndRebindPreservesArtifactRoots) {
+  Fixture fixture(true, true);
+  auto first = fixture.Prototype("lamp");
+  auto other = fixture.Prototype("lamp_other");
+  ASSERT_NE(*first.value().io_output_binding->signal.output_resource,
+            *other.value().io_output_binding->signal.output_resource);
+  ProductBackedRuntimeParticipantResolver empty(
+      fixture.package.path(), fixture.bundle, *fixture.map, {}, {},
+      fixture.artifacts.path());
+  auto current = empty.WithComposedParticipants(
+      {first, other}, {fixture.direct_binding->program_binding_id()});
+  for (const bool direct : {false, true}) {
+    for (const auto &row :
+         std::vector<core::RuntimeParticipantBinding>{first, other}) {
+      const auto role = row.value().io_output_binding->resource_role_id.value();
+      auto request = fixture.Operation(row, role, direct);
+      EXPECT_TRUE(current->ValidateExecutionOrigin(request).ok());
+      const auto resolved = current->ResolveExecutionParticipant(request, 0U);
+      ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+      EXPECT_EQ(resolved.value().intrinsic_direct_control, direct);
+      EXPECT_EQ(resolved.value().binding.value().io_output_binding,
+                row.value().io_output_binding);
+      EXPECT_FALSE(resolved.value().binding.value().control_path);
+      EXPECT_TRUE(resolved.value().binding.value().resources.empty());
+      EXPECT_FALSE(empty.Resolve(request, 0U).ok());
+      std::get<core::IoSignalWriteCommandValueDTO>(
+          std::get<core::CapabilityCommandIntentDTO>(
+              request.participants.front().payload)
+              .command_value)
+          .resource_role_id = core::ResourceRoleId("missing");
+      EXPECT_FALSE(current->Resolve(request, 0U).ok());
+    }
+  }
+  auto request = fixture.Operation(first, "lamp", false);
+  auto resealed = empty.WithComposedParticipants(
+      {fixture.Prototype("lamp", 7U), fixture.Prototype("lamp_other", 7U)},
+      {fixture.direct_binding->program_binding_id()});
+  const auto old = current->Resolve(request, 0U);
+  const auto newer = resealed->Resolve(request, 0U);
+  ASSERT_TRUE(old.ok());
+  ASSERT_TRUE(newer.ok());
+  EXPECT_EQ(
+      old.value().value().io_output_binding->component_lifecycle_generation,
+      core::ComponentLifecycleGeneration(3U));
+  EXPECT_EQ(
+      newer.value().value().io_output_binding->component_lifecycle_generation,
+      core::ComponentLifecycleGeneration(7U));
+  const auto bound = resealed->ResolveBoundTarget(
+      *fixture.authored_binding, core::TargetRoleId("signals"),
+      core::CapabilityId("io.gpio.set_output"));
+  ASSERT_TRUE(bound.ok());
+  EXPECT_EQ(bound.value().program_binding_id(),
+            fixture.authored_binding->program_binding_id());
+  request.participants.front().execution_scope.reset();
+  EXPECT_FALSE(resealed->ValidateExecutionOrigin(request).ok());
+}
+
+TEST(RetainedProductConsumerTest,
+     IoResolverPrefersExactProgramOutputAliasOverDirectChannelPrototype) {
+  Fixture fixture(true, true);
+  const auto direct = fixture.Prototype("lamp");
+  const auto authored = fixture.Prototype("lamp", 3U, true);
+  const auto other_direct = fixture.Prototype("lamp_other");
+  const auto other_authored = fixture.Prototype("lamp_other", 3U, true);
+  ASSERT_NE(direct.value().program_binding_id,
+            authored.value().program_binding_id);
+  ASSERT_EQ(direct.value().io_output_binding,
+            authored.value().io_output_binding);
+  ProductBackedRuntimeParticipantResolver resolver(
+      fixture.package.path(), fixture.bundle, *fixture.map,
+      {direct, authored, other_direct, other_authored},
+      {fixture.direct_binding->program_binding_id()}, fixture.artifacts.path());
+  for (const bool intrinsic : {false, true}) {
+    for (const auto &row :
+         std::vector<core::RuntimeParticipantBinding>{direct, other_direct}) {
+      const auto role = row.value().io_output_binding->resource_role_id.value();
+      const auto request = fixture.Operation(row, role, intrinsic);
+      ASSERT_TRUE(resolver.ValidateExecutionOrigin(request).ok());
+      const auto resolved = resolver.ResolveExecutionParticipant(request, 0U);
+      ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+      EXPECT_EQ(resolved.value().binding.value().program_binding_id,
+                request.program_binding_id);
+      EXPECT_EQ(resolved.value().binding.value().io_output_binding,
+                row.value().io_output_binding);
+      EXPECT_EQ(resolved.value().intrinsic_direct_control, intrinsic);
+    }
+  }
+  const auto duplicate =
+      resolver.WithComposedParticipants({direct, authored, authored});
+  EXPECT_FALSE(
+      duplicate->Resolve(fixture.Operation(direct, "lamp", false), 0U).ok());
+  EXPECT_TRUE(
+      duplicate->Resolve(fixture.Operation(direct, "lamp", true), 0U).ok());
+}
+
+TEST(RetainedProductConsumerTest,
+     IoResolverRebindRefusesForeignProductAndAmbiguousActualChannel) {
+  Fixture fixture(true);
+  Fixture foreign(true, false, true);
+  const auto first = fixture.Prototype("lamp");
+  ProductBackedRuntimeParticipantResolver resolver(
+      fixture.package.path(), fixture.bundle, *fixture.map, {first},
+      {fixture.direct_binding->program_binding_id()}, fixture.artifacts.path());
+  EXPECT_THROW(resolver.WithComposedParticipants({foreign.Prototype("lamp")}),
+               std::invalid_argument);
+  auto duplicated = resolver.WithComposedParticipants({first, first});
+  EXPECT_FALSE(
+      duplicated->Resolve(fixture.Operation(first, "lamp", false), 0U).ok());
+  EXPECT_FALSE(
+      duplicated->Resolve(fixture.Operation(first, "lamp", true), 0U).ok());
+  auto wrong = fixture.Operation(first, "lamp", true);
+  wrong.program_id = core::ProgramId("invented.direct.identity");
+  EXPECT_FALSE(resolver.ValidateExecutionOrigin(wrong).ok());
+  EXPECT_FALSE(resolver.Resolve(wrong, 0U).ok());
+  EXPECT_FALSE(resolver
+                   .ResolveBoundTarget(*foreign.authored_binding,
+                                       core::TargetRoleId("signals"),
+                                       core::CapabilityId("io.gpio.set_output"))
+                   .ok());
+}
+
+TEST(RetainedProductConsumerTest,
+     SealedCaptureRetainsActualSourceAliasesWithoutAResolver) {
+  Fixture fixture;
+  const auto &value = fixture.authored_binding->value();
+  const core::ProgramRunExecutionCaptureDTO request{
+      core::RequestOwnerEpoch("kernel.sealed.capture"),
+      core::RequestOwnerEpoch("runner.sealed.capture"),
+      core::CellAdmissionClaimGeneration(1U),
+      core::ProgramRunId("run.sealed.capture"),
+      value.program_id,
+      value.program_revision,
+      value.program_binding_id,
+      value.retained_bundle_id,
+      value.graph_revision,
+      {}};
+  const auto *table = &fixture.program->execution_table();
+  const auto *declarations = &fixture.program->blackboard_key_declarations();
+  const auto *binding = &fixture.authored_binding->value();
+  const std::weak_ptr<const deployment::ProgramBindingContract>
+      program_lifetime = fixture.program;
+  const std::weak_ptr<const deployment::ProgramBinding> binding_lifetime =
+      fixture.authored_binding;
+  {
+    const auto capture = detail::ResolveSealedProgramCapture(
+        request, fixture.program, fixture.authored_binding, *fixture.bundle);
+    ASSERT_TRUE(capture.ok()) << capture.error().message;
+    ASSERT_TRUE(capture.value().table);
+    ASSERT_TRUE(capture.value().binding);
+    ASSERT_TRUE(capture.value().blackboard_key_declarations);
+    ASSERT_TRUE(capture.value().io_conditions);
+    EXPECT_EQ(capture.value().table.get(), table);
+    EXPECT_EQ(capture.value().binding.get(), binding);
+    EXPECT_EQ(capture.value().blackboard_key_declarations.get(), declarations);
+    EXPECT_EQ(capture.value().request_owner_epoch, request.request_owner_epoch);
+    EXPECT_EQ(capture.value().program_runner_owner_epoch,
+              request.program_runner_owner_epoch);
+    EXPECT_EQ(capture.value().claim_generation, request.claim_generation);
+    EXPECT_EQ(capture.value().program_run_id, request.program_run_id);
+    EXPECT_TRUE(capture.value().io_conditions->program_node_conditions.empty());
+    EXPECT_TRUE(capture.value()
+                    .io_conditions->referenced_program_blackboard_keys.empty());
+    // The aliases, rather than a resolver or another product registry, retain
+    // the exact sealed source objects after their original pins are released.
+    fixture.program.reset();
+    fixture.authored_binding.reset();
+    EXPECT_FALSE(program_lifetime.expired());
+    EXPECT_FALSE(binding_lifetime.expired());
+    EXPECT_EQ(capture.value().table.get(), table);
+    EXPECT_EQ(capture.value().binding.get(), binding);
+  }
+  EXPECT_TRUE(program_lifetime.expired());
+  EXPECT_TRUE(binding_lifetime.expired());
+}
+
+TEST(RetainedProductConsumerTest,
+     SealedCaptureAndResolverShareIdentityAndInjectionRefusals) {
+  Fixture fixture;
+  ProductBackedRuntimeParticipantResolver resolver(
+      fixture.package.path(), fixture.bundle, *fixture.map, {}, {},
+      fixture.artifacts.path());
+  const auto &value = fixture.authored_binding->value();
+  const core::ProgramRunExecutionCaptureDTO request{
+      core::RequestOwnerEpoch("kernel.sealed.capture"),
+      core::RequestOwnerEpoch("runner.sealed.capture"),
+      core::CellAdmissionClaimGeneration(1U),
+      core::ProgramRunId("run.sealed.capture"),
+      value.program_id,
+      value.program_revision,
+      value.program_binding_id,
+      value.retained_bundle_id,
+      value.graph_revision,
+      {}};
+  const auto direct = detail::ResolveSealedProgramCapture(
+      request, fixture.program, fixture.authored_binding, *fixture.bundle);
+  const auto delegated = resolver.ResolveProgramCapture(request);
+  ASSERT_TRUE(direct.ok()) << direct.error().message;
+  ASSERT_TRUE(delegated.ok()) << delegated.error().message;
+  EXPECT_EQ(*direct.value().table, *delegated.value().table);
+  EXPECT_EQ(*direct.value().binding, *delegated.value().binding);
+  EXPECT_EQ(*direct.value().blackboard_key_declarations,
+            *delegated.value().blackboard_key_declarations);
+  EXPECT_EQ(direct.value().io_conditions->program_node_conditions.size(),
+            delegated.value().io_conditions->program_node_conditions.size());
+  EXPECT_EQ(
+      direct.value().io_conditions->referenced_program_blackboard_keys,
+      delegated.value().io_conditions->referenced_program_blackboard_keys);
+  std::vector<core::ProgramRunExecutionCaptureDTO> injected(4U, request);
+  injected[0].table = direct.value().table;
+  injected[1].binding = direct.value().binding;
+  injected[2].blackboard_key_declarations =
+      direct.value().blackboard_key_declarations;
+  injected[3].io_conditions = direct.value().io_conditions;
+  for (const auto &candidate : injected) {
+    const auto pure = detail::ResolveSealedProgramCapture(
+        candidate, fixture.program, fixture.authored_binding, *fixture.bundle);
+    const auto loaded = resolver.ResolveProgramCapture(candidate);
+    ASSERT_FALSE(pure.ok());
+    ASSERT_FALSE(loaded.ok());
+    EXPECT_EQ(pure.error().code, loaded.error().code);
+    EXPECT_EQ(pure.error().message, loaded.error().message);
+    EXPECT_EQ(pure.error().details, loaded.error().details);
+    EXPECT_EQ(pure.error().details.at("reason"),
+              "program_capture_product_mismatch");
+  }
+  auto foreign = request;
+  foreign.graph_revision = core::GraphRevision("foreign.graph");
+  const auto bad_product = detail::ResolveSealedProgramCapture(
+      foreign, fixture.program, fixture.authored_binding, *fixture.bundle);
+  ASSERT_FALSE(bad_product.ok());
+  EXPECT_EQ(bad_product.error().details.at("reason"),
+            "program_capture_product_mismatch");
+  auto wrong_binding = request;
+  wrong_binding.program_binding_id = core::ProgramBindingId("foreign.binding");
+  const auto bad_binding = detail::ResolveSealedProgramCapture(
+      wrong_binding, fixture.program, fixture.authored_binding,
+      *fixture.bundle);
+  ASSERT_FALSE(bad_binding.ok());
+  EXPECT_EQ(bad_binding.error().details.at("reason"),
+            "program_capture_binding_unavailable");
+  const auto missing_binding = detail::ResolveSealedProgramCapture(
+      request, fixture.program, nullptr, *fixture.bundle);
+  ASSERT_FALSE(missing_binding.ok());
+  EXPECT_EQ(missing_binding.error().details.at("reason"),
+            "program_capture_binding_unavailable");
+  const auto missing_program = detail::ResolveSealedProgramCapture(
+      request, nullptr, fixture.authored_binding, *fixture.bundle);
+  ASSERT_FALSE(missing_program.ok());
+  EXPECT_EQ(missing_program.error().details.at("reason"),
+            "program_capture_source_unavailable");
+  Fixture other(true);
+  const auto wrong_program = detail::ResolveSealedProgramCapture(
+      request, other.program, fixture.authored_binding, *fixture.bundle);
+  ASSERT_FALSE(wrong_program.ok());
+  EXPECT_EQ(wrong_program.error().details.at("reason"),
+            "program_capture_source_unavailable");
+}
+
+} // namespace io_resolver_tests
 
 } // namespace
 } // namespace manyforge::roboplan_backend

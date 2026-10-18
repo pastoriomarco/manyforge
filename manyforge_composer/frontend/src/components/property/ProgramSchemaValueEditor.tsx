@@ -10,10 +10,12 @@ import type {
 import { firstCatalogSchemaValidationMessage } from '../../utils/catalogSchema';
 import { keyValueTyping, type KeyValueTyping } from '../../utils/keyValueAuthoring';
 import {
+  programBlackboardKeys,
   programSemanticChoices,
   programSemanticCreateTarget,
   programSemanticExpectedAccess,
   programSemanticExpectedType,
+  type ProgramSemanticChoice,
   type ProgramSemanticCreateTarget,
 } from '../../utils/programAuthoring';
 import type { FrameScope } from '../../utils/programFrames';
@@ -38,13 +40,22 @@ import {
   type ValueCommit,
 } from './ProgramSpecializedEditors';
 import { SourceableLeaf, SourceableValue } from './ValueSourceField';
+import { NamespaceGroupOptions, useNamespaceGroups } from '../common/NamespaceGroupOptions';
 
 export interface ProgramSchemaValueEditorContext {
   entry: CatalogEntry;
   node: ProgramTreeNode;
   parameterId: string;
   program: ProgramAuthoringDocument;
+  /** The Deployment Draft's global rule ids (`interrupt_state.<rule_id>` keys). */
+  globalRuleIds?: readonly string[];
   sourceJointInventory?: ProgramSourceJointInventory | null;
+  /** Replaces the Draft-derived choices of this semantic parameter (an io node's bound input signals). */
+  semanticChoices?: ProgramSemanticChoice[] | null;
+  /** Enum values shown but not selectable for this parameter, with why. */
+  unsupportedChoices?: { values: readonly JsonValue[]; hint: string };
+  /** An empty number omits this optional parameter instead of being refused. */
+  emptyOmits?: { placeholder: string; onOmit: () => void };
   onCreateReference?: (
     target: ProgramSemanticCreateTarget,
     expectedType: string | null,
@@ -160,14 +171,17 @@ function SemanticChoiceEditor({
   context,
   onCommit,
 }: ProgramSchemaValueEditorProps) {
-  const choices = programSemanticChoices(
+  const overridden = context.semanticChoices != null;
+  const choices = context.semanticChoices ?? programSemanticChoices(
     schema,
     context.node,
     context.entry,
     context.parameterId,
     context.program,
+    context.globalRuleIds,
   );
   const semanticType = schema['x-manyforge-semantic-type'];
+  const namespaces = useNamespaceGroups();
   const createTarget = programSemanticCreateTarget(semanticType);
   const canCreate = createTarget !== null && context.onCreateReference !== undefined;
   const expectedType = programSemanticExpectedType(
@@ -186,14 +200,22 @@ function SemanticChoiceEditor({
     const group = choice.group ?? 'Available';
     grouped.set(group, [...(grouped.get(group) ?? []), choice]);
   }
+  const renderChoice = (choice: (typeof choices)[number]) => (
+    <option key={choice.value} value={choice.value}>{choice.label}</option>
+  );
   return (
     <select
       className={currentMissing ? 'program-reference-invalid' : undefined}
       value={current}
       disabled={disabled}
       aria-invalid={currentMissing || undefined}
-      title={currentMissing ? `Current ${semanticType} is not declared in this Draft.` : undefined}
+      title={currentMissing
+        ? overridden
+          ? `Current ${semanticType} is not a bound input signal of this target.`
+          : `Current ${semanticType} is not declared in this Draft.`
+        : undefined}
       onChange={(event) => {
+        if (namespaces.handleToggle(event.target.value)) return;
         if (event.target.value === '__create__') {
           if (canCreate && createTarget) {
             context.onCreateReference?.(createTarget, expectedType, expectedAccess, {
@@ -208,13 +230,22 @@ function SemanticChoiceEditor({
       }}
     >
       <option value="" disabled>Select {semanticType?.replaceAll('_', ' ')}</option>
-      {currentMissing && <option value={current}>Current (not declared) · {current}</option>}
-      {[...grouped.entries()].map(([group, rows]) => (
-        <optgroup key={group} label={group}>
-          {rows.map((choice) => (
-            <option key={choice.value} value={choice.value}>{choice.label}</option>
-          ))}
-        </optgroup>
+      {currentMissing && (
+        <option value={current}>
+          {overridden ? 'Current (not a bound input)' : 'Current (not declared)'} · {current}
+        </option>
+      )}
+      {semanticType === 'blackboard_key' ? (
+        // Keys are grouped by namespace, each group collapsed by default.
+        <NamespaceGroupOptions
+          groups={[...grouped.entries()].map(([group, rows]) => ({ id: group, label: group, items: rows }))}
+          expanded={namespaces.expanded}
+          current={current}
+          valueOf={(choice) => choice.value}
+          option={renderChoice}
+        />
+      ) : [...grouped.entries()].map(([group, rows]) => (
+        <optgroup key={group} label={group}>{rows.map(renderChoice)}</optgroup>
       ))}
       {canCreate && <option value="__create__">Create new…</option>}
     </select>
@@ -689,7 +720,7 @@ export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
   const leaf = (editor: ReactNode) => (
     <SourceableLeaf path={path} schema={schema} label={leafLabel(path)}>{editor}</SourceableLeaf>
   );
-  const typing = keyValueTyping(schema, context.node, context.program.blackboard?.keys ?? []);
+  const typing = keyValueTyping(schema, context.node, programBlackboardKeys(context.program, context.globalRuleIds));
   if (typing !== null) return <KeyValueEditor {...stableProps} typing={typing} />;
   const semanticType = schema['x-manyforge-semantic-type'];
   if (semanticType && semanticType !== 'source_joint') {
@@ -697,6 +728,8 @@ export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
   }
   if (schema.enum) {
     const encoded = value === undefined ? '' : JSON.stringify(value);
+    const unsupported = path === context.parameterId ? context.unsupportedChoices : undefined;
+    const unsupportedValues = new Set(unsupported?.values.map((option) => JSON.stringify(option)));
     return leaf(
       <select value={encoded} disabled={disabled} onChange={(event) => {
         onCommit(JSON.parse(event.target.value) as JsonValue);
@@ -704,7 +737,17 @@ export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
         <option value="" disabled>Select a value</option>
         {schema.enum.map((option) => {
           const encodedOption = JSON.stringify(option);
-          return <option key={encodedOption} value={encodedOption}>{String(option)}</option>;
+          const refused = unsupportedValues.has(encodedOption);
+          return (
+            <option
+              key={encodedOption}
+              value={encodedOption}
+              disabled={refused}
+              title={refused ? unsupported?.hint : undefined}
+            >
+              {refused ? `${String(option)} (not supported yet)` : String(option)}
+            </option>
+          );
         })}
       </select>,
     );
@@ -721,15 +764,22 @@ export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
     );
   }
   if (schema.type === 'number' || schema.type === 'integer') {
+    const emptyOmits = path === context.parameterId ? context.emptyOmits : undefined;
     return leaf(
       <DraftTextInput
         type="number"
         step={schema.type === 'integer' ? 1 : 'any'}
         value={typeof value === 'number' ? value : ''}
         disabled={disabled}
-        validate={(text) => numericValidationMessage(schema, text, path)}
+        placeholder={emptyOmits?.placeholder}
+        validate={(text) => emptyOmits !== undefined && text.trim() === ''
+          ? null
+          : numericValidationMessage(schema, text, path)}
         onInvalidChange={onInvalidChange}
-        onCommit={(text) => onCommit(Number(text))}
+        onCommit={(text) => {
+          if (emptyOmits !== undefined && text.trim() === '') emptyOmits.onOmit();
+          else onCommit(Number(text));
+        }}
       />,
     );
   }

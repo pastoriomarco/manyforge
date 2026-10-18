@@ -39,6 +39,10 @@ from manyforge_behavior.nodes.v2_owner import (
     OwnerTaskAdapter,
     GripperCommandAdapter,
     GripperStatusWaitAdapter,
+    IoInputWaitAdapter,
+    InterruptMotionTaskAdapter,
+    IoOutputCommandAdapter,
+    MotionTaskAdapter,
 )
 from manyforge_behavior.nodes.v2_pure import (
     GeometryCheckPoseBounds,
@@ -63,11 +67,8 @@ from manyforge_behavior.orchestration_ports import (
 )
 from manyforge_behavior.orchestration_values import NodeAttemptInputResolver
 from manyforge_behavior.nodes.stop_policy import OperatorMotionStopState
+from manyforge_behavior.program import INTERRUPT_MOTION_NODE_IDS, MOTION_NODE_IDS
 from manyforge_behavior.program_clock import ProgramClock
-
-I8_ADAPTER_REASON: Final = "kernel_policy_node_adapter_unavailable_until_i8"
-I11_ADAPTER_REASON: Final = "semantic_io_node_adapter_unavailable_until_i11"
-
 
 class ExecutableNodeResolverError(ValueError):
     """The closed resolver and retained environment do not agree."""
@@ -102,6 +103,10 @@ class NodeAdapterBuildContext:
     operator_stop_hold_scope: str | None = None
     # The run's one Program clock: waits and the timer read time from it.
     program_clock: ProgramClock | None = None
+    # The owner's motion attention check of one captured node (spec 530 §11).
+    motion_attention: Callable[[str, str], None] | None = None
+    # Receives each automatic retry's audit fact (the run's own audit list).
+    audit_sink: Callable[[dict[str, Any]], None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -154,6 +159,10 @@ class NodeAdapterBuildContext:
             self.program_clock, ProgramClock
         ):
             raise TypeError("program_clock must be the run's ProgramClock")
+        if self.motion_attention is not None and not callable(self.motion_attention):
+            raise TypeError("motion_attention must be callable")
+        if self.audit_sink is not None and not callable(self.audit_sink):
+            raise TypeError("audit_sink must be callable")
 
 
 NodeAdapterBuilder = Callable[[NodeAdapterBuildContext], py_trees.behaviour.Behaviour]
@@ -294,11 +303,24 @@ def _owner_task_builder(
     def build(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
         port = _required_port(context, port_name)
         gripper_command = node_id == "gripper.command_position"
-        adapter = GripperCommandAdapter if gripper_command else OwnerTaskAdapter
+        interrupt_motion = node_id in INTERRUPT_MOTION_NODE_IDS
+        motion = node_id in MOTION_NODE_IDS or interrupt_motion
+        adapter = (
+            GripperCommandAdapter if gripper_command
+            else InterruptMotionTaskAdapter if interrupt_motion
+            else MotionTaskAdapter if motion
+            else IoOutputCommandAdapter if node_id == "io.set_output"
+            else OwnerTaskAdapter
+        )
         timing = ({
             "program_clock": _required_program_clock(context),
             "operator_stop_hold_scope": context.operator_stop_hold_scope,
-        } if gripper_command else {})
+        } if gripper_command or motion else {})
+        if motion:
+            timing["motion_attention"] = context.motion_attention
+            timing["audit_sink"] = context.audit_sink
+        if interrupt_motion:
+            timing["mock_simulation"] = getattr(context.ports, "mock_simulation", None)
         return adapter(
             **timing,
             name=context.name,
@@ -399,6 +421,11 @@ def _owner_invocation_builder(
             cancellable=cancellable,
             owner_api=owner_api,
         )
+        if node_id in {"io.get_input", "io.check_input"}:
+            common.update(
+                mock_simulation=getattr(context.ports, "mock_simulation", None),
+                audit_sink=context.audit_sink,
+            )
         if node_id != "gripper.wait_for_status":
             return OwnerInvocationAdapter(
                 operator_stop_state=context.operator_stop_state,
@@ -415,6 +442,38 @@ def _owner_invocation_builder(
             operator_stop_state=context.operator_stop_state if held else None,
             operator_stop_hold_scope=context.operator_stop_hold_scope if held else None,
             **common,  # type: ignore[arg-type]
+        )
+
+    return build
+
+
+def _io_wait_builder(
+    node_id: str, *, owner_api: str, cancellable: bool
+) -> NodeAdapterBuilder:
+    """One level watch per attempt, observed at the tree's own tick cadence."""
+
+    def build(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
+        held = (
+            context.operator_stop_state is not None
+            and context.operator_stop_hold_scope is not None
+        )
+        return IoInputWaitAdapter(
+            name=context.name,
+            node_id=node_id,
+            node_instance_id=context.node_instance_id,
+            attempt_source=_required_attempt_source(context),
+            parameters=context.parameters,
+            value_sources=context.value_sources,
+            input_resolver=_required_input_resolver(context),
+            port=_required_port(context, "io_watches"),  # type: ignore[arg-type]
+            owner_port_name="io_watches",
+            program_clock=_required_program_clock(context),
+            operator_stop_state=context.operator_stop_state if held else None,
+            operator_stop_hold_scope=context.operator_stop_hold_scope if held else None,
+            audit_sink=context.audit_sink,
+            mock_simulation=getattr(context.ports, "mock_simulation", None),
+            cancellable=cancellable,
+            owner_api=owner_api,
         )
 
     return build
@@ -497,18 +556,6 @@ _INVOCATION_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
         "scene.transaction": "scene_transactions",
     }
 )
-_DEFERRED_BY_NODE: Final[Mapping[str, tuple[str, tuple[str, ...]]]] = MappingProxyType(
-    {
-        "io.check_input": (I11_ADAPTER_REASON, ("I11", "T")),
-        "io.get_input": (I11_ADAPTER_REASON, ("I11", "T")),
-        "io.set_output": (I11_ADAPTER_REASON, ("I11", "T")),
-        "io.wait_for_input": (I11_ADAPTER_REASON, ("I11", "T")),
-        "motion.move_until_signal": (I8_ADAPTER_REASON, ("I8", "P5")),
-        "motion.probe_search": (I8_ADAPTER_REASON, ("I8", "P5")),
-    }
-)
-
-
 def _output_key_parameter(entry: CatalogEntry) -> str | None:
     if len(entry.blackboard_writes) > 1:
         raise ExecutableNodeResolverError(f"node {entry.id!r} has multiple output bindings")
@@ -553,17 +600,6 @@ def _definition_for(
             None,
             (),
         )
-    deferred = _DEFERRED_BY_NODE.get(row.node_id)
-    if deferred is not None:
-        reason_code, restoration_gates = deferred
-        return _AdapterDefinition(
-            row,
-            None,
-            None,
-            reason_code,
-            restoration_gates,
-        )
-
     pure_builder = _PURE_BUILDERS.get(row.implementation_id)
     if pure_builder is not None:
         if entry.execution.owner_api not in _OWNER_NEUTRAL_APIS:
@@ -583,10 +619,24 @@ def _definition_for(
     task_port = _TASK_OWNER_PORTS.get(entry.execution.owner_api)
     invocation_port = _INVOCATION_OWNER_PORTS.get(entry.execution.owner_api)
     if entry.execution.owner_api == "kernel.command_target":
-        if row.node_id == "gripper.command_position":
+        if row.node_id in {"gripper.command_position", "io.set_output"}:
             task_port = "kernel_operations"
         elif row.node_id in {"gripper.check_status", "gripper.wait_for_status"}:
             invocation_port = "gripper_status"
+        elif row.node_id in {"io.get_input", "io.check_input"}:
+            invocation_port = "io_signals"
+        elif row.node_id == "io.wait_for_input":
+            return _AdapterDefinition(
+                row,
+                _io_wait_builder(
+                    row.node_id,
+                    owner_api=entry.execution.owner_api,
+                    cancellable=entry.execution.cancellable,
+                ),
+                "io_watches",
+                None,
+                (),
+            )
     if task_port is not None and invocation_port is not None:
         raise ExecutableNodeResolverError(f"node {row.node_id!r} has ambiguous owner-port binding")
     if task_port is not None:

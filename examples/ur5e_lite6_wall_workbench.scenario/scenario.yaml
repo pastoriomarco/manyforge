@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:f44d0d3f0adf5a93854e73a414393a779a4a5704a910f29b2500a491cf3a3ebe",
     "deployment.yaml": "sha256:8ee865ad5288acac03e4ee3b5c5745af9a9524a8e8b26bbaaf6207d776a0391d",
-    "program.yaml": "sha256:09a63dc9cf09f06dedf4bb483009e1edd59a16a140099d95ed2d09e17fac079d"
+    "program.yaml": "sha256:91532cae36f6ea64c1c40765c81da3980b415dec7d361d2ea0b1a21f265d58ef"
   },
   "name": "ur5e_lite6_wall_workbench",
   "saved_status": {
-    "checked_content_digest": "sha256:b3ac4f8a41314efdb0ebaa1b1d64b5843d6b244fc725ab84fd411ee39c0943c6",
+    "checked_content_digest": "sha256:1dbdf9a5917b8252d857ce18d9530ecd9c2de4b1ad8d4b44673a0e47bc9455e5",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

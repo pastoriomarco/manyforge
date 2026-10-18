@@ -283,6 +283,7 @@ template <typename Rows, typename Identity, typename Key>
 struct ResourceOwnerIndexRow final {
   const ResourceId* resource_id{};
   const StopScopeComponentSnapshotDTO* owner{};
+  bool logical_output{};
 };
 
 using ResourceOwnerIndex = std::vector<ResourceOwnerIndexRow>;
@@ -294,24 +295,27 @@ using ResourceOwnerIndex = std::vector<ResourceOwnerIndexRow>;
                          snapshot.resources.size() + snapshot.components.size()));
   for (const auto& component : snapshot.components) {
     for (const auto& resource_id : component.resources) {
-      index.push_back(ResourceOwnerIndexRow{&resource_id, &component});
+      index.push_back(ResourceOwnerIndexRow{
+          &resource_id, &component,
+          std::binary_search(component.logical_output_resources.begin(),
+                             component.logical_output_resources.end(), resource_id)});
     }
   }
   std::sort(index.begin(), index.end(), [](const auto& left, const auto& right) {
-    return *left.resource_id < *right.resource_id;
+    return std::tie(*left.resource_id, left.owner->controllable_component_id) <
+           std::tie(*right.resource_id, right.owner->controllable_component_id);
   });
   return index;
 }
 
-[[nodiscard]] const StopScopeComponentSnapshotDTO* resource_owner(const ResourceOwnerIndex& index,
-                                                                  const ResourceId& resource_id) {
-  const auto found =
+[[nodiscard]] auto resource_owners(const ResourceOwnerIndex& index, const ResourceId& resource_id) {
+  const auto first =
       std::lower_bound(index.begin(), index.end(), resource_id,
                        [](const auto& row, const auto& value) { return *row.resource_id < value; });
-  if (found == index.end() || *found->resource_id != resource_id) {
-    return nullptr;
-  }
-  return found->owner;
+  const auto last =
+      std::upper_bound(first, index.end(), resource_id,
+                       [](const auto& value, const auto& row) { return value < *row.resource_id; });
+  return std::pair{first, last};
 }
 
 template <typename Expected, typename Current>
@@ -540,9 +544,9 @@ void capture_effect_uncertain_resource(const ResourceOwnerIndex& owner_index,
     return;
   }
   capture.resources.insert(resource.resource_id);
-  if (const auto* owner = resource_owner(owner_index, resource.resource_id); owner != nullptr) {
-    capture.components.insert(owner->controllable_component_id);
-  }
+  const auto [first, last] = resource_owners(owner_index, resource.resource_id);
+  for (auto owner = first; owner != last; ++owner)
+    capture.components.insert(owner->owner->controllable_component_id);
 }
 
 [[nodiscard]] Capture capture_full(const StopScopeResolverSnapshotDTO& snapshot,
@@ -640,7 +644,11 @@ std::optional<std::string_view> stop_scope_snapshot_field_error(
         !safe_counter(component.component_lifecycle_generation)) {
       return "stop_scope_component_invalid";
     }
-    if (!canonical_id_set(component.resources)) {
+    if (!canonical_id_set(component.resources) ||
+        !canonical_id_set(component.logical_output_resources) ||
+        !std::includes(component.resources.begin(), component.resources.end(),
+                       component.logical_output_resources.begin(),
+                       component.logical_output_resources.end())) {
       return "stop_scope_component_resources_not_canonical";
     }
     if (component.resources.size() > kMaximumStopScopeMembershipRows - membership_rows) {
@@ -659,7 +667,8 @@ std::optional<std::string_view> stop_scope_snapshot_field_error(
     const auto next = std::upper_bound(
         current, owner_index.end(), *current->resource_id,
         [](const auto& value, const auto& row) { return value < *row.resource_id; });
-    if (static_cast<std::size_t>(std::distance(current, next)) > 1U) {
+    if (static_cast<std::size_t>(std::distance(current, next)) > 1U &&
+        std::any_of(current, next, [](const auto& member) { return !member.logical_output; })) {
       return "stop_scope_resource_owner_ambiguous";
     }
     current = next;
@@ -705,10 +714,12 @@ std::optional<std::string_view> stop_scope_snapshot_field_error(
       if (find_resource(snapshot, resource_id) == nullptr) {
         return "stop_scope_operation_resource_unknown";
       }
-      const auto* owner = resource_owner(owner_index, resource_id);
-      if (owner == nullptr || !std::binary_search(operation.controllable_components.begin(),
-                                                  operation.controllable_components.end(),
-                                                  owner->controllable_component_id)) {
+      const auto [first, last] = resource_owners(owner_index, resource_id);
+      if (std::none_of(first, last, [&](const auto& member) {
+            return std::binary_search(operation.controllable_components.begin(),
+                                      operation.controllable_components.end(),
+                                      member.owner->controllable_component_id);
+          })) {
         return "stop_scope_operation_resource_owner_outside_scope";
       }
     }
@@ -1056,6 +1067,11 @@ template <typename Intent>
 }
 
 }  // namespace
+
+void canonicalize_stop_scope_stale_diagnostics(
+    std::vector<StopScopeStaleDiagnosticDTO>& diagnostics) {
+  canonicalize_diagnostics(diagnostics);
+}
 
 Result<StopAcceptedDTO> MakeStopAccepted(
     const StopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,

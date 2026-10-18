@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:1d248020eb6772cc45e60b008e25548ed6aa146b8735be2c4035ec3a818257af",
     "deployment.yaml": "sha256:5b7cac6f80ffc94f1239d68708da88a40fb26bd69ba80b01b91f9e3202b46a1d",
-    "program.yaml": "sha256:df15754fa0c29ff0ed178bf3ac2655d06534dd156be33177ea5d78b04ba3ff5c"
+    "program.yaml": "sha256:51db879465f2372ce1eed550b0a3675b8399098dc813e5f6f670db08b37efcd6"
   },
   "name": "isaac_manipulator_scene_light_ros2_control",
   "saved_status": {
-    "checked_content_digest": "sha256:9a32d9584f01c6ad704ae17b8f288d48e1250407267f084fe292875bd9355cda",
+    "checked_content_digest": "sha256:1b87661fc185c36a24d659c13732f848827df6ac619030bf4aaa162f5e17e4dd",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

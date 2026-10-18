@@ -116,6 +116,26 @@ TEST(ExecutionProgressPublicationTest,
             ExecutionProgressHazardClaimResult::kGenerationMismatch);
 }
 
+TEST(ExecutionProgressPublicationTest, HazardObservationDoesNotClaimClearOrCrossGenerations) {
+  ExecutionProgressPublication publication(ExecutionProgressSourceKind::kBackendCommanded,
+                                           ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                           "handover", 0);
+  EXPECT_FALSE(publication.hazard_authority_claimed(7).has_value());
+  ASSERT_TRUE(publication.publish(7, 100, 1, 1).published);
+  EXPECT_EQ(publication.hazard_authority_claimed(7), false);
+  EXPECT_EQ(publication.claim_hazard_authority(7), ExecutionProgressHazardClaimResult::kClaimed);
+  // acquire() remains valid; the separate existing authority must nevertheless
+  // block a handover before any newer generation can clear it.
+  EXPECT_TRUE(publication.acquire().valid);
+  EXPECT_EQ(publication.hazard_authority_claimed(7), true);
+  EXPECT_EQ(publication.hazard_authority_claimed(7), true);
+  EXPECT_FALSE(publication.hazard_authority_claimed(8).has_value());
+  EXPECT_FALSE(publication.publish_terminal(7, 200, 2, 2).published);
+  ASSERT_TRUE(publication.publish(8, 0, 3, 3).published);
+  EXPECT_FALSE(publication.hazard_authority_claimed(7).has_value());
+  EXPECT_EQ(publication.hazard_authority_claimed(8), false);
+}
+
 TEST(ExecutionProgressPublicationTest,
      MeasuredAuthorityRequiresFreshnessAndRejectsSourceConfusion) {
   EXPECT_THROW(ExecutionProgressPublication(ExecutionProgressSourceKind::kMeasuredProjection,

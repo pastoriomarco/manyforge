@@ -393,3 +393,99 @@ def test_isaac_world_refuses_machine_paths_and_invalid_ids(world: object) -> Non
     intent["isaac_world"] = world
     with pytest.raises(DeploymentIntentError, match="isaac_world must be a portable identifier"):
         validate_deployment_intent(intent, source="test")
+
+
+def _io_device() -> dict:
+    return {
+        "component_id": "station_io",
+        "component_profile_id": "io_device_v0",
+        "target_settings": {},
+        "configuration": {
+            "runtime_kind": "io_provider",
+            "runtime_configuration": {
+                "io_provider_devices": [
+                    {
+                        "controllable_component_id": "station_io",
+                        "lifecycle_command_timeout_s": 30,
+                    }
+                ],
+                "io_signals": [],
+            },
+        },
+    }
+
+
+def test_io_device_component_is_model_free_and_appendable() -> None:
+    intent = _intent()
+    session = DeploymentDraftSession()
+    initial = session.retained_state()
+    session.commit_open(
+        session.preview_source(json.dumps(intent)),
+        "/tmp/cell/deployment.yaml",
+        draft_id=initial["draft_id"],
+        expected_revision=initial["draft_revision"],
+        confirm_discard=False,
+    )
+    state = session.retained_state()
+    appended = session.preview_update(
+        ["components"],
+        _io_device(),
+        "append",
+        draft_id=state["draft_id"],
+        expected_revision=state["draft_revision"],
+    )
+    rows = {row["component_id"]: row for row in appended.document["components"]}
+    assert rows["station_io"] == _io_device()
+    for forbidden in ("model_source", "root_pose_in_cell", "frame_prefix"):
+        assert forbidden not in rows["station_io"]
+    # The device contributes no source reference.
+    with_device = json.loads(json.dumps(intent))
+    with_device["components"].append(_io_device())
+    assert list(iter_source_references(with_device)) == list(
+        iter_source_references(intent)
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda row: row.update(model_source={}), "model_source"),
+        (lambda row: row.update(root_pose_in_cell={}), "root_pose_in_cell"),
+        (lambda row: row.update(frame_prefix="io/"), "frame_prefix"),
+        (lambda row: row.update(default_fault_stop_profile={}), "default_fault_stop_profile"),
+        (lambda row: row.update(target_settings={"io": {}}), "target_settings"),
+        (lambda row: row.update(component_id="Station"), "component_id"),
+    ],
+)
+def test_io_device_component_refuses_physical_fields(mutate, message: str) -> None:
+    intent = _intent()
+    device = _io_device()
+    mutate(device)
+    intent["components"].append(device)
+    with pytest.raises(DeploymentIntentError, match=message):
+        validate_deployment_intent(intent, source="test")
+
+
+def test_io_device_component_id_stays_unique() -> None:
+    intent = _intent()
+    device = _io_device()
+    device["component_id"] = intent["components"][0]["component_id"]
+    intent["components"].append(device)
+    with pytest.raises(DeploymentIntentError, match="duplicate component_id"):
+        validate_deployment_intent(intent, source="test")
+
+
+def test_io_device_component_has_no_model_source_closure(tmp_path: Path) -> None:
+    from manyforge_behavior.model_source_capture import (
+        ModelSourceCaptureError,
+        capture_deployment_model_sources,
+    )
+
+    closure = capture_deployment_model_sources(
+        {"components": [_io_device()]}, project_root=tmp_path
+    )
+    assert closure["components"] == []
+    with pytest.raises(ModelSourceCaptureError):
+        capture_deployment_model_sources(
+            {"components": [_io_device(), _io_device()]}, project_root=tmp_path
+        )

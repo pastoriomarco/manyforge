@@ -738,3 +738,94 @@ def test_reset_join_requires_exact_accepted_options(accepted, requested):
         assert projection == {"program_cycle": cycle}
     finally:
         ingress.close()
+
+
+def _held_output_reset(payload_patch: dict[str, Any] | None = None) -> ExecutionCommandRequestDTO:
+    ingress, _ = _ingress(_Clock())
+    try:
+        request = _request(ingress, kind="operation_reset")
+    finally:
+        ingress.close()
+    payload = {
+        "operation_id": "op.output",
+        "expected_operation_revision": 4,
+        "reason": "operator Reset acknowledging outputs with unknown acceptance",
+        "expected_execution_owner_epoch": "kernel.1",
+        "acknowledged_uncertain_outputs": [{"operation_id": "op.output", "operation_revision": 4}],
+        **(payload_patch or {}),
+    }
+    return request.model_copy(update={"payload": {k: v for k, v in payload.items() if v is not None}})
+
+
+class _HeldOutputService:
+    def __init__(self, **operation_patch: Any) -> None:
+        self.reads: list[str] = []
+        self.resident = operation_patch.pop("resident", True)
+        self.operation = {
+            "operation_id": "op.output",
+            "operation_revision": 4,
+            "program_run_id": "program-cycle.3",
+            "participants": [{"participant_id": "p", "output_evidence": "acceptance_unknown"}],
+            **operation_patch,
+        }
+
+    @staticmethod
+    def execution_control_state() -> dict[str, Any]:
+        return {
+            "identity": {"owner_epoch": "kernel.1"},
+            "control_state": {
+                "schema_version": "manyforge.execution_control_state.v6",
+                "manual_operations": [],
+            },
+        }
+
+    def execution_read(self, operation_id: str) -> dict[str, Any]:
+        self.reads.append(operation_id)
+        return {"ok": True, "command": "read", "resident": self.resident, "operation": self.operation}
+
+
+_HELD_CYCLE = {"state": "intervention_required", "program_run_id": "program-cycle.3"}
+
+
+def test_operator_reset_of_a_held_program_uncertain_output_is_qualified() -> None:
+    service = _HeldOutputService()
+    dispatch = HeadlessExecutionControlDispatch(service)  # type: ignore[arg-type]
+    assert dispatch._manual_scope_conflict(_held_output_reset(), _HELD_CYCLE) is None  # noqa: SLF001
+    assert service.reads == ["op.output"]
+
+
+@pytest.mark.parametrize(
+    ("service", "payload", "cycle"),
+    [
+        # Not acknowledged, or acknowledging another revision.
+        ({}, {"acknowledged_uncertain_outputs": None}, _HELD_CYCLE),
+        ({}, {"acknowledged_uncertain_outputs": [{"operation_id": "op.output", "operation_revision": 3}]},
+         _HELD_CYCLE),
+        # Another revision, not resident, another Run, a known output, two participants.
+        ({"operation_revision": 5}, {}, _HELD_CYCLE),
+        ({"resident": False}, {}, _HELD_CYCLE),
+        ({"program_run_id": "program-cycle.2"}, {}, _HELD_CYCLE),
+        ({"participants": [{"output_evidence": "source_accepted"}]}, {}, _HELD_CYCLE),
+        ({"participants": [{"output_evidence": "acceptance_unknown"}, {}]}, {}, _HELD_CYCLE),
+        # A motion operation (no output evidence) of the held Run: no general bypass.
+        ({"participants": [{"participant_id": "arm"}]}, {}, _HELD_CYCLE),
+        # No current Run, or an execution scope.
+        ({}, {}, {"state": "intervention_required", "program_run_id": None}),
+        ({}, {"execution_scope": {"kind": "program"}}, _HELD_CYCLE),
+    ],
+)
+def test_other_held_program_operations_stay_refused(service, payload, cycle) -> None:
+    dispatch = HeadlessExecutionControlDispatch(_HeldOutputService(**service))  # type: ignore[arg-type]
+    assert dispatch._manual_scope_conflict(  # noqa: SLF001
+        _held_output_reset(payload), cycle
+    ) == "manual_operation_scope_stale"
+
+
+def test_acknowledge_completed_never_uses_the_uncertain_output_gate() -> None:
+    service = _HeldOutputService()
+    request = _held_output_reset()
+    request = request.model_copy(update={"command_envelope": request.command_envelope.model_copy(
+        update={"command_kind": "operation_acknowledge_completed"})})
+    dispatch = HeadlessExecutionControlDispatch(service)  # type: ignore[arg-type]
+    assert dispatch._manual_scope_conflict(request, _HELD_CYCLE) == "manual_operation_scope_stale"  # noqa: SLF001
+    assert service.reads == []

@@ -12,6 +12,9 @@
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 
 namespace manyforge::roboplan_backend {
+namespace host_detail {
+class IoProviderDriverRecord;
+}
 
 inline constexpr std::string_view kRos2ControlLifecycleProviderManifestId =
     "manyforge.provider.ros2_control";
@@ -30,19 +33,22 @@ retained_ros2_control_lifecycle_plans();
 make_retained_ros2_control_lifecycle_catalog(
     const core::ProviderManifestDTO &manifest);
 
-/// Lifetime owner for the ROS provider catalog and brand ports selected from
-/// one exact retained runtime.
-class RetainedRos2ControlLifecycleProduct final {
+/// Existing immutable host catalog/brand-port collection. The historical
+/// source/CMake path stays fixed while actual generic driver records join the
+/// same collection as the physical ROS controller providers.
+class RetainedHostLifecycleProduct final {
 public:
   [[nodiscard]] static core::Result<
-      std::unique_ptr<RetainedRos2ControlLifecycleProduct>>
+      std::unique_ptr<RetainedHostLifecycleProduct>>
   Create(std::shared_ptr<const deployment::RetainedBundle> retained_bundle,
          const deployment::IVerifiedRetainedProviderManifestSource
              &provider_manifest_source,
          const std::vector<core::RuntimeParticipantBinding> &physical_bindings,
          const std::vector<std::shared_ptr<RetainedRos2ControlRuntimeHandle>>
              &runtime_handles,
-         core::IClock &clock, core::Duration observation_freshness_ns);
+         core::IClock &clock, core::Duration observation_freshness_ns,
+         const std::vector<std::shared_ptr<host_detail::IoProviderDriverRecord>>
+             &provider_drivers = {});
 
   [[nodiscard]] RetainedExternallyManagedDomainSnapshotSource
   lifecycle_snapshot_source() const;
@@ -54,7 +60,7 @@ public:
   brand_ports() const noexcept;
 
 private:
-  RetainedRos2ControlLifecycleProduct(
+  RetainedHostLifecycleProduct(
       core::BuildOwnedLifecyclePlanCatalogSource catalog_source,
       std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
       RetainedExternallyManagedDomainSnapshotSource snapshot_source);

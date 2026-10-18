@@ -39,6 +39,11 @@ bool ExecutionWorkerSignals::wait_for_completion(std::int64_t timeout_ns) {
   return execution_complete_;
 }
 
+bool ExecutionWorkerSignals::complete() const {
+  std::lock_guard lock(mutex_);
+  return execution_complete_;
+}
+
 void ExecutionWorkerSignals::notify() {
   {
     std::lock_guard<std::mutex> lock(mutex_);

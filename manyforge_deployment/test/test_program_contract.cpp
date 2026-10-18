@@ -20,8 +20,14 @@
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include "content_identity_internal.hpp"
+#include "program_root_fixture.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
 #include "scoped_procfd_root.hpp"
+
+using manyforge::deployment::test::ProgramOptions;
+using manyforge::deployment::test::text_array;
+using manyforge::deployment::test::make_program_root;
+using manyforge::deployment::test::with_program_revision;
 
 namespace {
 
@@ -76,266 +82,6 @@ private:
   inline static std::atomic<std::uint64_t> sequence_{0U};
   std::filesystem::path path_;
 };
-
-struct ProgramOptions final {
-  std::string catalog_content_version;
-  std::vector<std::string> frame_roles{"base", "tcp"};
-  std::vector<std::string> resource_roles{"joints"};
-  std::vector<std::string> capability_ids{"state.observed.current"};
-  bool include_legacy_robot{false};
-  bool duplicate_tree_instance{false};
-  bool include_contact_grasp{false};
-  std::string value_source_kind;
-  bool duplicate_value_source_parameter{false};
-  bool include_node_policy{false};
-  bool explicit_default_node_policy{false};
-};
-
-[[nodiscard]] CanonicalValue
-text_array(const std::vector<std::string> &values) {
-  CanonicalValue::Array result;
-  result.reserve(values.size());
-  for (const auto &value : values) {
-    result.emplace_back(value);
-  }
-  return CanonicalValue(std::move(result));
-}
-
-[[nodiscard]] CanonicalValue make_contact_grasp_policy() {
-  CanonicalValue policy(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.contact_policy.v1")},
-      {"policy_id", CanonicalValue("selected_object_grasp")},
-      {"version", CanonicalValue(std::string(kZeroDigest))},
-      {"mode", CanonicalValue("contact_grasp")},
-      {"sensing_mode", CanonicalValue("geometry_only")},
-      {"default_unmatched_response", CanonicalValue("hard_stop")},
-      {"zones",
-       CanonicalValue(
-           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-               {"zone_id", CanonicalValue("tool_contact")},
-               {"body_pairs",
-                CanonicalValue(
-                    CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-                        {"body_a",
-                         CanonicalValue(CanonicalValue::Object{
-                             {"kind", CanonicalValue("component_model_body")},
-                             {"component_role_id", CanonicalValue("robot")},
-                             {"model_role_id", CanonicalValue("arm_model")},
-                             {"collision_body_role_id",
-                              CanonicalValue("arm_collision")},
-                         })},
-                        {"body_b",
-                         CanonicalValue(CanonicalValue::Object{
-                             {"kind", CanonicalValue("runtime_object")},
-                             {"runtime_object_id",
-                              CanonicalValue("selected_object")},
-                         })},
-                    })})},
-               {"violation_response", CanonicalValue("hard_stop")},
-               {"max_penetration_m", CanonicalValue(0.002)},
-               {"terminal_window_start_fraction", CanonicalValue(0.8)},
-           })})},
-  });
-  const std::string revision = compute_content_identity(
-      policy, ContentIdentitySpec{
-                  .identity_domain = "catalog-record-revision/contact_policy",
-                  .api_version = "manyforge.contact_policy.v1",
-                  .own_field = "version",
-              });
-  auto members = policy.as_object();
-  for (auto &[name, value] : members) {
-    if (name == "version") {
-      value = CanonicalValue(revision);
-      return CanonicalValue(std::move(members));
-    }
-  }
-  throw std::logic_error("test contact policy omitted version");
-}
-
-[[nodiscard]] CanonicalValue make_program_root(const ProgramOptions &options) {
-  CanonicalValue::Array capabilities;
-  capabilities.reserve(options.capability_ids.size());
-  for (const auto &capability_id : options.capability_ids) {
-    capabilities.emplace_back(CanonicalValue::Object{
-        {"capability_id", CanonicalValue(capability_id)},
-        {"parameters", CanonicalValue(CanonicalValue::Object{})},
-        {"disposition", CanonicalValue("required")},
-    });
-  }
-
-  CanonicalValue::Array children;
-  if (options.duplicate_tree_instance) {
-    children.emplace_back(CanonicalValue::Object{
-        {"node_id", CanonicalValue("sequence")},
-        {"instance_id", CanonicalValue("root")},
-        {"parameters", CanonicalValue(CanonicalValue::Object{})},
-        {"children", CanonicalValue(CanonicalValue::Array{})},
-    });
-  }
-
-  CanonicalValue::Object tree_parameters;
-  CanonicalValue::Object tree{
-      {"node_id", CanonicalValue("sequence")},
-      {"instance_id", CanonicalValue("root")},
-      {"parameters", CanonicalValue(tree_parameters)},
-      {"children", CanonicalValue(std::move(children))},
-  };
-  if (!options.value_source_kind.empty()) {
-    // A timer whose duration comes from a declared Program value.
-    CanonicalValue::Object source{
-        {"kind", CanonicalValue(options.value_source_kind)}};
-    if (options.value_source_kind == "program_parameter" ||
-        options.value_source_kind == "blackboard_key") {
-      source.emplace_back("reference", CanonicalValue("wait_s"));
-    } else if (options.value_source_kind == "blackboard_field") {
-      source.emplace_back("reference", CanonicalValue("plan"));
-      source.emplace_back("field", CanonicalValue("wait_s"));
-    }
-    CanonicalValue::Object timer_parameters;
-    if (options.duplicate_value_source_parameter) {
-      timer_parameters.emplace_back("duration_s", CanonicalValue(0.5));
-    }
-    for (auto &[name, value] : tree) {
-      if (name == "children") {
-        value = CanonicalValue(CanonicalValue::Array{
-            CanonicalValue(CanonicalValue::Object{
-                {"node_id", CanonicalValue("timer")},
-                {"instance_id", CanonicalValue("wait")},
-                {"parameters", CanonicalValue(std::move(timer_parameters))},
-                {"value_sources",
-                 CanonicalValue(CanonicalValue::Object{
-                     {"duration_s", CanonicalValue(std::move(source))}})},
-                {"children", CanonicalValue(CanonicalValue::Array{})},
-            })});
-        break;
-      }
-    }
-  }
-  if (options.include_node_policy || options.explicit_default_node_policy) {
-    const bool defaults = options.explicit_default_node_policy;
-    tree.emplace_back(
-        "recovery_policy",
-        CanonicalValue(CanonicalValue::Object{
-            {"allow_intervention", CanonicalValue(!defaults)},
-            {"max_retries", CanonicalValue(defaults ? 0.0 : 2.0)},
-        }));
-    tree.emplace_back("operator_stop_policy",
-                      CanonicalValue(defaults ? "inherit" : "hold"));
-  }
-
-  CanonicalValue::Object root{
-      {"api_version", CanonicalValue("manyforge.program.v2")},
-      {"program_id", CanonicalValue("i6_contract_program")},
-      {"program_revision", CanonicalValue(std::string(kZeroDigest))},
-      {"program_profile", CanonicalValue("composable-cell-v1")},
-      {"name", CanonicalValue("I6 Program contract fixture")},
-      {"catalog",
-       CanonicalValue(CanonicalValue::Object{
-           {"api_version", CanonicalValue("manyforge.node_catalog.v2")},
-           {"content_version", CanonicalValue(options.catalog_content_version)},
-       })},
-      {"component_roles",
-       CanonicalValue(CanonicalValue::Object{
-           {"robot",
-            CanonicalValue(CanonicalValue::Object{
-                {"required_component_type_tags",
-                 CanonicalValue(
-                     CanonicalValue::Array{CanonicalValue("articulated-arm")})},
-                {"required_model_roles", CanonicalValue(CanonicalValue::Array{
-                                             CanonicalValue("arm_model")})},
-            })},
-       })},
-      {"target_roles",
-       CanonicalValue(CanonicalValue::Object{
-           {"arm",
-            CanonicalValue(CanonicalValue::Object{
-                {"component_role", CanonicalValue("robot")},
-                {"required_capabilities",
-                 CanonicalValue(std::move(capabilities))},
-                {"required_frame_roles", text_array(options.frame_roles)},
-                {"required_resource_roles", text_array(options.resource_roles)},
-                {"required_collision_body_roles",
-                 CanonicalValue(
-                     CanonicalValue::Array{CanonicalValue("arm_collision")})},
-                {"required_model_roles", CanonicalValue(CanonicalValue::Array{
-                                             CanonicalValue("arm_model")})},
-            })},
-       })},
-      {"tree", CanonicalValue(std::move(tree))},
-  };
-  if (options.include_legacy_robot) {
-    root.emplace_back("robot", CanonicalValue(CanonicalValue::Object{
-                                   {"robot_id", CanonicalValue("legacy_robot")},
-                                   {"group_id", CanonicalValue("legacy_group")},
-                               }));
-  }
-  if (!options.value_source_kind.empty()) {
-    root.emplace_back(
-        "parameters",
-        CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-            {"parameter_id", CanonicalValue("wait_s")},
-            {"type", CanonicalValue("float64")},
-            {"default", CanonicalValue(0.5)},
-        })}));
-    const auto key = [](std::string name, std::string type) {
-      return CanonicalValue::Object{
-          {"key", CanonicalValue(std::move(name))},
-          {"type", CanonicalValue(std::move(type))},
-          {"access", CanonicalValue("read_write")},
-          {"persistence", CanonicalValue("run")},
-      };
-    };
-    auto plan = key("plan", "pick_planning_result");
-    plan.emplace_back(
-        "fields",
-        CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-            {"field", CanonicalValue("wait_s")},
-            {"type", CanonicalValue("float64")},
-        })}));
-    root.emplace_back(
-        "blackboard",
-        CanonicalValue(CanonicalValue::Object{
-            {"namespaces", CanonicalValue(CanonicalValue::Array{})},
-            {"keys", CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue(std::move(plan)),
-                         CanonicalValue(key("wait_s", "float64"))})},
-        }));
-  }
-  if (options.include_contact_grasp) {
-    root.emplace_back(
-        "blackboard",
-        CanonicalValue(CanonicalValue::Object{
-            {"namespaces", CanonicalValue(CanonicalValue::Array{})},
-            {"keys", CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue(CanonicalValue::Object{
-                             {"key", CanonicalValue("selected_object")},
-                             {"type", CanonicalValue("scene_resource")},
-                             {"access", CanonicalValue("read_write")},
-                             {"persistence", CanonicalValue("run")},
-                         })})},
-        }));
-    root.emplace_back("contact_policies", CanonicalValue(CanonicalValue::Array{
-                                              make_contact_grasp_policy()}));
-  }
-  return CanonicalValue(std::move(root));
-}
-
-[[nodiscard]] CanonicalValue with_program_revision(CanonicalValue root) {
-  const std::string revision =
-      compute_content_identity(root, ContentIdentitySpec{
-                                         .identity_domain = "program-revision",
-                                         .api_version = "manyforge.program.v2",
-                                         .own_field = "program_revision",
-                                     });
-  CanonicalValue::Object members = root.as_object();
-  for (auto &[name, value] : members) {
-    if (name == "program_revision") {
-      value = CanonicalValue(revision);
-      return CanonicalValue(std::move(members));
-    }
-  }
-  throw std::logic_error("test Program omitted program_revision");
-}
 
 [[nodiscard]] std::shared_ptr<const RetainedBundle>
 make_bundle(const std::filesystem::path &root) {
@@ -472,6 +218,45 @@ TEST(ProgramContractTest,
             CapabilityId("state.observed.current"));
   EXPECT_EQ(target.required_capabilities.front().disposition,
             ProgramCapabilityDisposition::kRequired);
+}
+
+TEST(ProgramContractTest, SealsLogicOnlyProgramWithoutComponentRoles) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  ProgramOptions logic_options = valid_options(*bundle);
+  logic_options.logic_only = true;
+  const CanonicalValue logic = with_program_revision(make_program_root(logic_options));
+
+  const auto contract = verify_program_binding_contract(canonical_json(logic), *bundle);
+  ASSERT_NE(contract, nullptr);
+  EXPECT_TRUE(contract->value().component_roles.empty());
+  EXPECT_TRUE(contract->value().target_roles.empty());
+  EXPECT_EQ(contract->normalized_program_root(), logic);
+
+  // An absent role map is still malformed; only an explicit empty map is
+  // logic-only.
+  CanonicalValue::Object absent = logic.as_object();
+  erase_member(absent, "component_roles");
+  EXPECT_THROW(static_cast<void>(verify_program_binding_contract(
+                   canonical_json(with_program_revision(
+                       CanonicalValue(CanonicalValue::Object(absent)))),
+                   *bundle)),
+               ProgramContractError);
+
+  CanonicalValue::Object too_many;
+  for (std::size_t index = 0U;
+       index <= manyforge::core::kMaxProgramContractRoles; ++index) {
+    too_many.emplace_back("role_" + std::to_string(index),
+                          CanonicalValue(CanonicalValue::Object{}));
+  }
+  CanonicalValue::Object members =
+      make_program_root(valid_options(*bundle)).as_object();
+  replace_member(members, "component_roles", CanonicalValue(std::move(too_many)));
+  EXPECT_THROW(static_cast<void>(verify_program_binding_contract(
+                   canonical_json(with_program_revision(
+                       CanonicalValue(CanonicalValue::Object(members)))),
+                   *bundle)),
+               ProgramContractError);
 }
 
 TEST(ProgramContractTest,
@@ -644,6 +429,60 @@ TEST(ProgramContractTest, ZeroRetryBudgetIsUnlimitedNotDefault) {
   const auto &policy = contract->value().node_policies.front();
   EXPECT_TRUE(policy.recovery_policy.allow_intervention);
   EXPECT_EQ(policy.recovery_policy.max_retries, 0U);
+}
+
+TEST(ProgramContractTest, InterventionStopScopeDefaultsAndNormalizesAll) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  const auto omitted = verify_program_binding_contract(
+      canonical_json(make_policy_program(*bundle, [](auto &) {})), *bundle);
+  auto explicit_members =
+      make_policy_program(*bundle, [](auto &tree) {
+        mutate_object_member(tree, "recovery_policy", [](auto &policy) {
+          policy.emplace_back("intervention_stop_scope", CanonicalValue("all"));
+        });
+      }).as_object();
+  replace_member(explicit_members, "program_revision",
+                 CanonicalValue(omitted->value().program_revision.value()));
+  const auto explicit_all = verify_program_binding_contract(
+      canonical_json(CanonicalValue(std::move(explicit_members))), *bundle);
+  EXPECT_EQ(omitted->value()
+                .node_policies.front()
+                .recovery_policy.intervention_stop_scope,
+            manyforge::core::ProgramInterventionStopScope::kAll);
+  EXPECT_EQ(omitted->canonical_program_bytes(),
+            explicit_all->canonical_program_bytes());
+  const auto own_groups = verify_program_binding_contract(
+      canonical_json(make_policy_program(
+          *bundle,
+          [](auto &tree) {
+            mutate_object_member(tree, "recovery_policy", [](auto &policy) {
+              policy.emplace_back("intervention_stop_scope",
+                                  CanonicalValue("own_groups"));
+            });
+          })),
+      *bundle);
+  EXPECT_EQ(own_groups->value()
+                .node_policies.front()
+                .recovery_policy.intervention_stop_scope,
+            manyforge::core::ProgramInterventionStopScope::kOwnGroups);
+  EXPECT_NE(own_groups->value().program_revision,
+            omitted->value().program_revision);
+  for (const auto &invalid : {CanonicalValue("own_group"), CanonicalValue(true),
+                              CanonicalValue(nullptr)}) {
+    EXPECT_THROW(static_cast<void>(verify_program_binding_contract(
+                     canonical_json(make_policy_program(
+                         *bundle,
+                         [&](auto &tree) {
+                           mutate_object_member(
+                               tree, "recovery_policy", [&](auto &policy) {
+                                 policy.emplace_back("intervention_stop_scope",
+                                                     invalid);
+                               });
+                         })),
+                     *bundle)),
+                 ProgramContractError);
+  }
 }
 
 TEST(ProgramContractTest,
@@ -935,6 +774,243 @@ selection_node(std::string instance, CanonicalValue groups,
                             {"execution_policy", CanonicalValue(policy)}}));
   }
   return CanonicalValue(std::move(result));
+}
+
+[[nodiscard]] CanonicalValue
+automatic_retry_program(const RetainedBundle &bundle,
+                        const std::string &node_id,
+                        CanonicalValue::Object extra_parameters = {},
+                        CanonicalValue::Object value_sources = {}) {
+  auto options = valid_options(bundle);
+  options.capability_ids = {
+      "execution.feedback.phase_events",
+      "execution.trajectory.execute",
+      node_id == "motion.move_to_joint_target" ? "planning.motion.joint_goal"
+      : node_id == "motion.move_to_pose"       ? "planning.motion.pose_goal"
+                                         : "planning.motion.cartesian_path",
+      "planning.profile.balanced",
+      "planning.trajectory.time_parameterized",
+      "state.observed.current",
+      "validation.trajectory.non_collision"};
+  CanonicalValue::Object parameters{
+      {"target_role", CanonicalValue("arm")},
+      {"base_frame_role", CanonicalValue("base")},
+      {"tcp_frame_role", CanonicalValue("tcp")},
+  };
+  if (node_id == "motion.move_to_joint_target") {
+    parameters.emplace_back(
+        "goal",
+        CanonicalValue(CanonicalValue::Array{CanonicalValue(
+            CanonicalValue::Object{{"joint_name", CanonicalValue("joint1")},
+                                   {"position_rad", CanonicalValue(0.0)}})}));
+  } else {
+    CanonicalValue pose(CanonicalValue::Object{
+        {"position_m",
+         CanonicalValue(CanonicalValue::Array{
+             CanonicalValue(0.0), CanonicalValue(0.0), CanonicalValue(0.0)})},
+        {"orientation",
+         CanonicalValue(CanonicalValue::Object{
+             {"xyzw", CanonicalValue(CanonicalValue::Array{
+                          CanonicalValue(0.0), CanonicalValue(0.0),
+                          CanonicalValue(0.0), CanonicalValue(1.0)})}})},
+    });
+    parameters.emplace_back(node_id == "motion.move_to_pose" ? "goal" : "path",
+                            node_id == "motion.move_to_pose"
+                                ? pose
+                                : CanonicalValue(CanonicalValue::Array{pose}));
+  }
+  parameters.insert(parameters.end(), extra_parameters.begin(),
+                    extra_parameters.end());
+  CanonicalValue::Object node{
+      {"node_id", CanonicalValue(node_id)},
+      {"instance_id", CanonicalValue("move")},
+      {"parameters", CanonicalValue(std::move(parameters))},
+      {"children", CanonicalValue(CanonicalValue::Array{})},
+  };
+  if (!value_sources.empty())
+    node.emplace_back("value_sources",
+                      CanonicalValue(std::move(value_sources)));
+  return with_tree(options, CanonicalValue(std::move(node)));
+}
+
+TEST(ProgramContractTest,
+     AcceptsLiteralAutomaticRetryPolicyWithoutKernelBudgetCapture) {
+  const auto bundle = maintained_motion_bundle();
+  for (const std::string node_id :
+       {"motion.move_to_joint_target", "motion.move_to_pose",
+        "motion.follow_cartesian_path"}) {
+    SCOPED_TRACE(node_id);
+    const auto defaults = verify_program_binding_contract(
+        canonical_json(automatic_retry_program(*bundle, node_id)), *bundle);
+    ASSERT_EQ(defaults->execution_table().nodes.size(), 1U);
+    for (const double count : {0.0, 4.0, 10.0}) {
+      for (const auto *mode : {"absolute", "relative"}) {
+        const auto authored = verify_program_binding_contract(
+            canonical_json(automatic_retry_program(
+                *bundle, node_id,
+                {{"automatic_retries", CanonicalValue(count)},
+                 {"target_mode", CanonicalValue(mode)}})),
+            *bundle);
+        // Retry policy remains in the Program revision, not Kernel capture.
+        EXPECT_EQ(authored->execution_table(), defaults->execution_table());
+      }
+    }
+  }
+  const auto timer = verify_program_binding_contract(
+      canonical_json(with_tree(valid_options(*bundle),
+                               selection_node("timer", CanonicalValue("all")))),
+      *bundle);
+  ASSERT_EQ(timer->execution_table().nodes.size(), 1U);
+}
+
+TEST(ProgramContractTest, SealsLiteralMotionPriorityFromQualifiedCatalog) {
+  ScopedTrustedRoot root;
+  const auto bundle = maintained_motion_bundle();
+  for (const std::string node_id :
+       {"motion.move_to_joint_target", "motion.move_to_pose",
+        "motion.follow_cartesian_path"}) {
+    SCOPED_TRACE(node_id);
+    const auto omitted = verify_program_binding_contract(
+        canonical_json(automatic_retry_program(*bundle, node_id)), *bundle);
+    EXPECT_EQ(omitted->execution_table().nodes.front().preemption_priority, 0U);
+    for (const double priority : {0.0, 1.0, 100.0}) {
+      const auto authored = verify_program_binding_contract(
+          canonical_json(automatic_retry_program(
+              *bundle, node_id,
+              {{"preemption_priority", CanonicalValue(priority)}})),
+          *bundle);
+      EXPECT_EQ(authored->execution_table().nodes.front().preemption_priority,
+                static_cast<std::uint8_t>(priority));
+    }
+    for (const auto &invalid :
+         {CanonicalValue(-1.0), CanonicalValue(100.5), CanonicalValue(101.0),
+          CanonicalValue(256.0), CanonicalValue(true), CanonicalValue("1")}) {
+      EXPECT_THROW(
+          static_cast<void>(verify_program_binding_contract(
+              canonical_json(automatic_retry_program(
+                  *bundle, node_id, {{"preemption_priority", invalid}})),
+              *bundle)),
+          ProgramContractError);
+    }
+    EXPECT_THROW(static_cast<void>(verify_program_binding_contract(
+                     canonical_json(automatic_retry_program(
+                         *bundle, node_id, {},
+                         {{"preemption_priority",
+                           CanonicalValue(CanonicalValue::Object{
+                               {"kind", CanonicalValue("expression")},
+                               {"expression", CanonicalValue("1")}})}})),
+                     *bundle)),
+                 ProgramContractError);
+  }
+  const auto captured = verify_program_binding_contract(
+      canonical_json(automatic_retry_program(
+          *bundle, "motion.move_to_joint_target",
+          {{"preemption_priority", CanonicalValue(100.0)}})),
+      *bundle);
+  FilesystemProgramRepository repository(root.path());
+  ASSERT_TRUE(repository.put_if_absent(captured, *bundle));
+  const auto reopened =
+      repository.get_verified(captured->value().program_id,
+                              captured->value().program_revision, *bundle);
+  ASSERT_NE(reopened, nullptr);
+  EXPECT_EQ(reopened->execution_table(), captured->execution_table());
+}
+
+TEST(ProgramContractTest, RejectsMalformedAutomaticRetryCountBeforeNarrowing) {
+  const auto bundle = maintained_motion_bundle();
+  const std::vector<CanonicalValue> malformed{
+      CanonicalValue(-1.0),  CanonicalValue(0.5),         CanonicalValue(11.0),
+      CanonicalValue(256.0), CanonicalValue(1'000'000.0), CanonicalValue(true),
+      CanonicalValue("3")};
+  for (const std::string node_id :
+       {"motion.move_to_joint_target", "motion.move_to_pose",
+        "motion.follow_cartesian_path"}) {
+    for (const auto &count : malformed) {
+      SCOPED_TRACE(node_id + ": " + canonical_json(count));
+      EXPECT_THROW(static_cast<void>(verify_program_binding_contract(
+                       canonical_json(automatic_retry_program(
+                           *bundle, node_id, {{"automatic_retries", count}})),
+                       *bundle)),
+                   ProgramContractError);
+    }
+  }
+}
+
+TEST(ProgramContractTest, AutomaticRetryPolicyRejectsValueSources) {
+  const auto bundle = maintained_motion_bundle();
+  for (const auto *parameter :
+       {"automatic_retries", "automatic_retry_delay_s"}) {
+    try {
+      static_cast<void>(verify_program_binding_contract(
+          canonical_json(automatic_retry_program(
+              *bundle, "motion.move_to_joint_target", {},
+              {{parameter, CanonicalValue(CanonicalValue::Object{
+                               {"kind", CanonicalValue("expression")},
+                               {"expression", CanonicalValue("3")}})}})),
+          *bundle));
+      FAIL() << "automatic retry policy accepted a dynamic source";
+    } catch (const ProgramContractError &error) {
+      EXPECT_NE(std::string(error.what()).find(parameter), std::string::npos);
+      EXPECT_NE(
+          std::string(error.what())
+              .find("cannot dynamically select runtime/binding semantics"),
+          std::string::npos);
+    }
+  }
+}
+
+TEST(ProgramContractTest, AutomaticRetryPolicyPreservesDynamicTargetMode) {
+  const auto bundle = maintained_motion_bundle();
+  auto program =
+      automatic_retry_program(
+          *bundle, "motion.move_to_joint_target",
+          {{"automatic_retries", CanonicalValue(4.0)}},
+          {{"target_mode", CanonicalValue(CanonicalValue::Object{
+                               {"kind", CanonicalValue("program_parameter")},
+                               {"reference", CanonicalValue("mode")}})}})
+          .as_object();
+  program.emplace_back(
+      "parameters",
+      CanonicalValue(CanonicalValue::Array{CanonicalValue(
+          CanonicalValue::Object{{"parameter_id", CanonicalValue("mode")},
+                                 {"type", CanonicalValue("string")},
+                                 {"default", CanonicalValue("relative")}})}));
+  const auto contract = verify_program_binding_contract(
+      canonical_json(with_program_revision(CanonicalValue(std::move(program)))),
+      *bundle);
+  ASSERT_EQ(contract->execution_table().nodes.size(), 1U);
+}
+
+TEST(ProgramContractTest,
+     AutomaticRetryPolicyRemainsInProgramRevisionAcrossRepositoryReopen) {
+  ScopedTrustedRoot root;
+  const auto bundle = maintained_motion_bundle();
+  const auto contract = verify_program_binding_contract(
+      canonical_json(automatic_retry_program(
+          *bundle, "motion.move_to_joint_target",
+          {{"automatic_retries", CanonicalValue(4.0)}})),
+      *bundle);
+  const auto changed = verify_program_binding_contract(
+      canonical_json(automatic_retry_program(
+          *bundle, "motion.move_to_joint_target",
+          {{"automatic_retries", CanonicalValue(6.0)}})),
+      *bundle);
+  EXPECT_NE(contract->value().program_revision,
+            changed->value().program_revision);
+  EXPECT_EQ(contract->execution_table(), changed->execution_table());
+  EXPECT_NE(contract->canonical_program_bytes(), changed->canonical_program_bytes());
+  {
+    FilesystemProgramRepository repository(root.path());
+    ASSERT_TRUE(repository.put_if_absent(contract, *bundle));
+  }
+  FilesystemProgramRepository reopened(root.path());
+  const auto read =
+      reopened.get_verified(contract->value().program_id,
+                            contract->value().program_revision, *bundle);
+  ASSERT_NE(read, nullptr);
+  EXPECT_EQ(read->execution_table(), contract->execution_table());
+  EXPECT_EQ(read->canonical_program_bytes(),
+            contract->canonical_program_bytes());
 }
 
 [[nodiscard]] CanonicalValue
@@ -2038,6 +2114,352 @@ TEST(ProgramContractTest, ChecksComputedKeysAndRefusesTheirCycles) {
           "a computed key must be bool, int64, float64 or string");
   rejects({computed_key("z_next", "param.unknown")},
           "expression: unknown_name at character 0");
+}
+
+TEST(ProgramContractTest,
+     CapturesExactBlackboardDeclarationTypesWithoutSelectingSubscriptions) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  const auto program = key_typed_program(
+      valid_options(*bundle),
+      CanonicalValue(
+          key_typed_node("logic.set_value", {{"key", CanonicalValue("count")},
+                                             {"value", CanonicalValue(1.0)}})),
+      {computed_key("flag", "true", {{"type", CanonicalValue("bool")}}),
+       computed_key("label", "\"ready\"",
+                    {{"type", CanonicalValue("string")}})});
+  const auto bytes = canonical_json(program);
+  const auto verified = verify_program_binding_contract(bytes, *bundle);
+  EXPECT_EQ(verified->blackboard_key_declarations(),
+            (std::vector<manyforge::core::ProgramBlackboardKeyDeclarationDTO>{
+                {"count", "int64"},
+                {"flag", "bool"},
+                {"label", "string"},
+                {"limit", "int64"},
+                {"place", "stored_pose"},
+                {"ratio", "float64"}}));
+  EXPECT_EQ(verified->normalized_program_root(), program);
+  EXPECT_EQ(verified->canonical_program_bytes(), bytes);
+}
+
+TEST(ProgramContractTest,
+     ImplicitMotionOutcomesAreReadableWithoutChangingAuthoredIdentity) {
+  const auto bundle = maintained_motion_bundle();
+  for (const std::string node_id :
+       {"motion.move_to_joint_target", "motion.move_to_pose",
+        "motion.follow_cartesian_path"}) {
+    for (const auto &instance : {std::string("move"), std::string(128U, 'm')}) {
+      const auto outcome = "node_outcome." + instance;
+      auto members = automatic_retry_program(*bundle, node_id).as_object();
+      auto motion = conformance_member(members, "tree").as_object();
+      replace_member(motion, "instance_id", CanonicalValue(instance));
+      auto reader = key_typed_node("logic.check_value",
+                                   {{"key", CanonicalValue(outcome)},
+                                    {"value", CanonicalValue("completed")}});
+      replace_member(
+          members, "tree",
+          selection_node("root", CanonicalValue("inherit"),
+                         {CanonicalValue(motion), CanonicalValue(reader)}));
+      members.emplace_back(
+          "blackboard",
+          CanonicalValue(CanonicalValue::Object{
+              {"namespaces", CanonicalValue(CanonicalValue::Array{})},
+              {"keys", CanonicalValue(CanonicalValue::Array{computed_key(
+                           "finished", "key." + outcome + " == \"completed\"",
+                           {{"type", CanonicalValue("bool")}})})}}));
+      auto program = with_program_revision(CanonicalValue(std::move(members)));
+      const auto bytes = canonical_json(program);
+      const auto contract = verify_program_binding_contract(bytes, *bundle);
+      EXPECT_EQ(contract->canonical_program_bytes(), bytes);
+      EXPECT_EQ(contract->normalized_program_root(), program);
+      EXPECT_EQ(
+          contract->blackboard_key_declarations(),
+          (std::vector<manyforge::core::ProgramBlackboardKeyDeclarationDTO>{
+              {"finished", "bool"}, {outcome, "string"}}));
+      // The computed read and literal key read use the same implicit
+      // declaration.
+      auto sourced = reader;
+      mutate_object_member(sourced, "parameters", [](auto &parameters) {
+        erase_member(parameters, "value");
+      });
+      sourced.emplace_back(
+          "value_sources",
+          CanonicalValue(CanonicalValue::Object{
+              {"value", CanonicalValue(CanonicalValue::Object{
+                            {"kind", CanonicalValue("blackboard_key")},
+                            {"reference", CanonicalValue(outcome)}})}}));
+      auto source_members = program.as_object();
+      replace_member(source_members, "tree",
+                     selection_node("root", CanonicalValue("inherit"),
+                                    {CanonicalValue(motion),
+                                     CanonicalValue(std::move(sourced))}));
+      EXPECT_NO_THROW(static_cast<void>(verify_program_binding_contract(
+          canonical_json(
+              with_program_revision(CanonicalValue(std::move(source_members)))),
+          *bundle)));
+    }
+  }
+}
+
+TEST(ProgramContractTest, RefusesAuthoredOutcomeDeclarationsAndCatalogWrites) {
+  const auto bundle = maintained_motion_bundle();
+  const auto base =
+      automatic_retry_program(*bundle, "motion.move_to_joint_target");
+  const auto rejects = [&](CanonicalValue::Object members,
+                           std::string_view reason) {
+    try {
+      static_cast<void>(verify_program_binding_contract(
+          canonical_json(
+              with_program_revision(CanonicalValue(std::move(members)))),
+          *bundle));
+      ADD_FAILURE() << "accepted reserved outcome authoring";
+    } catch (const ProgramContractError &error) {
+      EXPECT_NE(std::string(error.what()).find(reason), std::string::npos)
+          << error.what();
+    }
+  };
+  auto namespaces = base.as_object();
+  namespaces.emplace_back(
+      "blackboard",
+      CanonicalValue(CanonicalValue::Object{
+          {"namespaces",
+           CanonicalValue(
+               CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                   {"namespace_id", CanonicalValue("node_outcome")},
+                   {"owner", CanonicalValue("program")}})})},
+          {"keys", CanonicalValue(CanonicalValue::Array{})}}));
+  rejects(std::move(namespaces), "node_outcome is reserved");
+  auto keys = base.as_object();
+  keys.emplace_back(
+      "blackboard",
+      CanonicalValue(CanonicalValue::Object{
+          {"namespaces", CanonicalValue(CanonicalValue::Array{})},
+          {"keys", CanonicalValue(CanonicalValue::Array{
+                       CanonicalValue(CanonicalValue::Object{
+                           {"key", CanonicalValue("node_outcome.move")},
+                           {"type", CanonicalValue("string")},
+                           {"access", CanonicalValue("read")},
+                           {"persistence", CanonicalValue("run")}})})}}));
+  rejects(std::move(keys), "cannot be authored");
+  auto writer = base.as_object();
+  replace_member(
+      writer, "tree",
+      selection_node(
+          "root", CanonicalValue("inherit"),
+          {conformance_member(base.as_object(), "tree"),
+           CanonicalValue(key_typed_node(
+               "logic.set_value", {{"key", CanonicalValue("node_outcome.move")},
+                                   {"value", CanonicalValue("failed")}}))}));
+  rejects(std::move(writer), "cannot be written by catalog bindings");
+  auto absent = base.as_object();
+  replace_member(
+      absent, "tree",
+      selection_node("root", CanonicalValue("inherit"),
+                     {conformance_member(base.as_object(), "tree"),
+                      CanonicalValue(key_typed_node(
+                          "logic.check_value",
+                          {{"key", CanonicalValue("node_outcome.other")},
+                           {"value", CanonicalValue("failed")}}))}));
+  rejects(std::move(absent), "names no declared blackboard key");
+}
+
+TEST(ProgramContractTest,
+     SignalMotionOutcomesHaveImplicitReadOnlyDeclarations) {
+  const auto bundle = maintained_motion_bundle();
+  for (const std::string node_id :
+       {"motion.move_until_signal", "motion.probe_search"}) {
+    auto members =
+        automatic_retry_program(*bundle, "motion.move_to_pose").as_object();
+    auto signal = conformance_member(members, "tree").as_object();
+    replace_member(signal, "node_id", CanonicalValue(node_id));
+    mutate_object_member(signal, "parameters", [&](auto &parameters) {
+      erase_member(parameters, "base_frame_role");
+      erase_member(parameters, "tcp_frame_role");
+      mutate_object_member(parameters, "goal", [](auto &goal) {
+        goal.emplace_back("frame_ref",
+                          CanonicalValue(CanonicalValue::Object{
+                              {"kind", CanonicalValue("target_frame")},
+                              {"target_role", CanonicalValue("arm")},
+                              {"frame_role", CanonicalValue("base")}}));
+      });
+      parameters.emplace_back("interrupt_policy_id",
+                              CanonicalValue("signal_policy"));
+      parameters.emplace_back("stop_mode", CanonicalValue("spring_back_hold"));
+      if (node_id == "motion.probe_search")
+        parameters.emplace_back("contact_policy_id",
+                                CanonicalValue("contact_policy"));
+    });
+    auto reader = key_typed_node("logic.check_value",
+                                 {{"key", CanonicalValue("node_outcome.move")},
+                                  {"value", CanonicalValue("signal_trip")}});
+    replace_member(
+        members, "tree",
+        selection_node("root", CanonicalValue("inherit"),
+                       {CanonicalValue(signal), CanonicalValue(reader)}));
+    members.emplace_back(
+        "blackboard",
+        CanonicalValue(CanonicalValue::Object{
+            {"namespaces", CanonicalValue(CanonicalValue::Array{})},
+            {"keys",
+             CanonicalValue(CanonicalValue::Array{computed_key(
+                 "no_trip", "key.node_outcome.move == \"no_signal_trip\"",
+                 {{"type", CanonicalValue("bool")}})})}}));
+    const auto program = with_program_revision(CanonicalValue(members));
+    const auto verified =
+        verify_program_binding_contract(canonical_json(program), *bundle);
+    EXPECT_EQ(verified->normalized_program_root(), program);
+    // This verifier supplies readable types, not an outcome value or an
+    // activated interrupt. Runtime availability keeps its existing owner.
+    mutate_object_member(reader, "parameters", [](auto &parameters) {
+      replace_member(parameters, "value", CanonicalValue("no_signal_trip"));
+    });
+    replace_member(reader, "node_id", CanonicalValue("logic.set_value"));
+    replace_member(
+        members, "tree",
+        selection_node("root", CanonicalValue("inherit"),
+                       {CanonicalValue(signal), CanonicalValue(reader)}));
+    EXPECT_THROW(static_cast<void>(verify_program_binding_contract(
+                     canonical_json(with_program_revision(
+                         CanonicalValue(std::move(members)))),
+                     *bundle)),
+                 ProgramContractError);
+  }
+}
+
+TEST(ProgramContractTest,
+     SystemNamespaceNamesAreRefusedForParametersKeysAndNamespaceDeclarations) {
+  const auto bundle = maintained_motion_bundle();
+  const auto base =
+      automatic_retry_program(*bundle, "motion.move_to_joint_target");
+  for (const auto *name : {"node_outcome", "node_outcome.move",
+                           "interrupt_state", "interrupt_state.guard"}) {
+    for (const auto *kind : {"parameter", "key", "namespace"}) {
+      SCOPED_TRACE(name);
+      SCOPED_TRACE(kind);
+      auto members = base.as_object();
+      if (std::string_view(kind) == "parameter") {
+        members.emplace_back(
+            "parameters",
+            CanonicalValue(CanonicalValue::Array{CanonicalValue(
+                CanonicalValue::Object{{"parameter_id", CanonicalValue(name)},
+                                       {"type", CanonicalValue("string")},
+                                       {"default", CanonicalValue("none")}})}));
+      } else {
+        CanonicalValue::Array namespaces, keys;
+        if (std::string_view(kind) == "namespace")
+          namespaces.emplace_back(
+              CanonicalValue::Object{{"namespace_id", CanonicalValue(name)},
+                                     {"owner", CanonicalValue("program")}});
+        else
+          keys.emplace_back(
+              CanonicalValue::Object{{"key", CanonicalValue(name)},
+                                     {"type", CanonicalValue("string")},
+                                     {"access", CanonicalValue("read_write")},
+                                     {"persistence", CanonicalValue("run")},
+                                     {"initial", CanonicalValue("none")}});
+        members.emplace_back(
+            "blackboard",
+            CanonicalValue(CanonicalValue::Object{
+                {"namespaces", CanonicalValue(std::move(namespaces))},
+                {"keys", CanonicalValue(std::move(keys))}}));
+      }
+      try {
+        (void)verify_program_binding_contract(
+            canonical_json(
+                with_program_revision(CanonicalValue(std::move(members)))),
+            *bundle);
+        ADD_FAILURE() << "authored system name was admitted";
+      } catch (const ProgramContractError &error) {
+        EXPECT_NE(std::string(error.what()).find("reserved_system_namespace"),
+                  std::string::npos)
+            << error.what();
+      }
+    }
+  }
+}
+
+TEST(ProgramContractTest,
+     NodeOutcomeNoneIsReadableAsLiteralAndExpressionWithoutAuthoredInitial) {
+  const auto bundle = maintained_motion_bundle();
+  auto members =
+      automatic_retry_program(*bundle, "motion.move_to_pose").as_object();
+  auto reader = key_typed_node("logic.check_value",
+                               {{"key", CanonicalValue("node_outcome.move")},
+                                {"value", CanonicalValue("none")}});
+  replace_member(members, "tree",
+                 selection_node("root", CanonicalValue("inherit"),
+                                {conformance_member(members, "tree"),
+                                 CanonicalValue(reader)}));
+  members.emplace_back(
+      "blackboard",
+      CanonicalValue(CanonicalValue::Object{
+          {"namespaces", CanonicalValue(CanonicalValue::Array{})},
+          {"keys", CanonicalValue(CanonicalValue::Array{computed_key(
+                       "started", "key.node_outcome.move != \"none\"",
+                       {{"type", CanonicalValue("bool")}})})}}));
+  const auto program =
+      with_program_revision(CanonicalValue(std::move(members)));
+  const auto verified =
+      verify_program_binding_contract(canonical_json(program), *bundle);
+  EXPECT_EQ(verified->normalized_program_root(), program);
+  const auto &keys = verified->blackboard_key_declarations();
+  const auto system =
+      std::find_if(keys.begin(), keys.end(), [](const auto &key) {
+        return key.name == "node_outcome.move";
+      });
+  ASSERT_NE(system, keys.end());
+  EXPECT_EQ(system->declared_type, "string");
+  EXPECT_FALSE(system->has_declared_initial);
+}
+
+
+TEST(ProgramContractTest, NodeMockSimulationAcceptsCatalogLiteralsAndRefusesDynamicSources) {
+  const auto bundle = maintained_motion_bundle();
+  auto options = valid_options(*bundle);
+  options.capability_ids = {"io.gpio.get_input"};
+  options.resource_roles = {"ready"};
+  const CanonicalValue rows(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+      {"signal", CanonicalValue(CanonicalValue::Object{
+          {"target_role", CanonicalValue("arm")},
+          {"resource_role", CanonicalValue("ready")}})},
+      {"start_value", CanonicalValue(false)},
+      {"change", CanonicalValue(CanonicalValue::Object{
+          {"after_ms", CanonicalValue(0.0)}, {"value", CanonicalValue(true)}})}})});
+  const CanonicalValue::Object literal_node{
+      {"node_id", CanonicalValue("io.check_input")},
+      {"instance_id", CanonicalValue("reader")},
+      {"parameters", CanonicalValue(CanonicalValue::Object{
+          {"target_role", CanonicalValue("arm")},
+          {"resource_role", CanonicalValue("ready")},
+          {"expected_value", CanonicalValue(true)},
+          {"mock_simulation", rows}})},
+      {"children", CanonicalValue(CanonicalValue::Array{})}};
+  // This control must succeed with the actual S1 embedded catalog. An unknown
+  // parameter refusal from an older catalog cannot qualify the negatives.
+  const auto literal = with_tree(options, CanonicalValue(literal_node));
+  const auto verified = verify_program_binding_contract(canonical_json(literal), *bundle);
+  ASSERT_NE(verified, nullptr);
+  EXPECT_EQ(verified->normalized_program_root(), literal);
+  for (const std::string path : {"mock_simulation", "mock_simulation[0].start_value",
+                                  "mock_simulation[0].change.value"}) {
+    SCOPED_TRACE(path);
+    auto node = literal_node;
+    node.emplace_back("value_sources", CanonicalValue(CanonicalValue::Object{
+        {path, CanonicalValue(CanonicalValue::Object{
+            {"kind", CanonicalValue("expression")},
+            {"expression", CanonicalValue("false")}})}}));
+    try {
+      (void)verify_program_binding_contract(
+          canonical_json(with_tree(options, CanonicalValue(std::move(node)))), *bundle);
+      ADD_FAILURE() << "node Mock simulation admitted a dynamic source at " << path;
+    } catch (const ProgramContractError& error) {
+      const std::string message(error.what());
+      EXPECT_NE(message.find(path), std::string::npos) << message;
+      EXPECT_NE(message.find("cannot dynamically select runtime/binding semantics"),
+                std::string::npos) << message;
+      EXPECT_EQ(message.find("unknown catalog parameter"), std::string::npos) << message;
+    }
+  }
 }
 
 } // namespace

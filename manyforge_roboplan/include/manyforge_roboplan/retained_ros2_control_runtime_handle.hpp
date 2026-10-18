@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -97,9 +98,12 @@ struct MockResetPositionTransition final {
   bool target_published{false};
 };
 
-using MockResetPositionPhaseCommit = std::function<core::Result<void>()>;
+using MockResetPositionStepDeadline = std::chrono::steady_clock::time_point;
+/// The existing step budget starts at entry, including validation/dispatch
+/// (explicit maintainer approval, contract142). Owner and SDK consume the SAME
+/// absolute deadline; no new overall Reset budget or timer is introduced.
 using MockResetPositionPhaseCallback = std::function<core::Result<void>(
-    const MockResetPositionTransition &, const MockResetPositionPhaseCommit &)>;
+    const MockResetPositionTransition &, MockResetPositionStepDeadline)>;
 
 /// Host sequencing of the arm controller around a lane-specific guard (the
 /// Isaac command-age guard, design §4.3, Q41, Q43). Every member is required.
@@ -386,15 +390,10 @@ public:
   [[nodiscard]] bool mock_reset_successor_ready() const;
   [[nodiscard]] std::shared_ptr<RetainedObservationWake>
   mock_reset_observation_wake() const noexcept;
-  /// Compares evidence minted from the supplied observation's own raw inputs;
-  /// never substitutes a later healthy read for a faulted observation.
-  [[nodiscard]] bool IsExpectedMockPositionResetTransition(
-      const core::BrandLifecycleObservationDTO &observation,
-      const MockResetPositionTransition &transition) const;
   /// Owner-private transport primitive. The CCLC owner pins the exact Reset
   /// claim/product before calling; callbacks run without a handle state lock.
-  /// The callback invokes its nonblocking local commit under the existing
-  /// driver run mutex, atomically advancing Core/handle phase before waits.
+  /// The callback arms the existing Core scope with the supplied actual step
+  /// deadline before SDK effects or waits; no driver lock spans SDK calls.
   /// A switching callback runs before send, then again only after positive
   /// ACK; that second callback waits for exact CM destination observation.
   /// SettingState(target_published=true) proves one fresh exact loopback ACK
@@ -475,7 +474,7 @@ private:
   SendControllerSwitch(std::vector<std::string> activate,
                        std::vector<std::string> deactivate,
                        std::stop_token cancellation,
-                       std::optional<core::Duration> response_timeout_ns = {});
+                       std::optional<MockResetPositionStepDeadline> response_deadline = {});
 
   struct DomainGenerationState final {
     std::uint64_t publication_generation{};

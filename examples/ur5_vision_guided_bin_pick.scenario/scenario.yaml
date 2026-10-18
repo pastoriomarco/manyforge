@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:97a61aed742ff302a7ccf3c68eedb6b9c5e80516ef145a131db5f27b51538a60",
     "deployment.yaml": "sha256:363bbc76798b30f74ce87d01651aa8cc18adadb46afb04f726473329d041b6c4",
-    "program.yaml": "sha256:0d81eeefa757fb5d1362e20005a810bdb0d0f83a6b88e78fcac9181837f3171b"
+    "program.yaml": "sha256:bbfe7202fcc96586e517a78998690152f2a5272ea3cb821715349417671bcbd3"
   },
   "name": "ur5_roboplan_local_vision_guided_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:3e5242f57a18206201353f9f87e91fc6b8a431bcee665443ea00ee033e0a52a8",
+    "checked_content_digest": "sha256:a600eea8a41f1e0da28365c17cd72ecc1d94f3012a2d0361a58f8a2a511e2cb2",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

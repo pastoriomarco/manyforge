@@ -290,6 +290,52 @@ def _validate_controlled_stop(value: Any, label: str) -> dict[str, Any]:
     return result
 
 
+IO_DEVICE_PROFILE_ID = "io_device_v0"
+IO_PROVIDER_RUNTIME_KIND = "io_provider"
+
+
+def _is_io_provider_component(component: dict[str, Any]) -> bool:
+    configuration = component.get("configuration")
+    return (
+        isinstance(configuration, dict)
+        and configuration.get("runtime_kind") == IO_PROVIDER_RUNTIME_KIND
+    )
+
+
+def _validate_io_provider_component(
+    component: dict[str, Any], label: str
+) -> dict[str, Any]:
+    """Validate a model-free I/O device envelope (runtime_kind io_provider).
+
+    It has no model source, root pose, frame prefix or Stop fields and empty
+    target settings; its runtime configuration stays opaque here (the closed
+    io_provider execution schema owns it).
+    """
+
+    _require_exact_fields(
+        component,
+        required={
+            "component_id",
+            "component_profile_id",
+            "target_settings",
+            "configuration",
+        },
+        label=label,
+    )
+    if component["target_settings"] != {}:
+        _fail(f"{label}.target_settings must be empty for an I/O device")
+    return {
+        "component_id": _require_id(component["component_id"], f"{label}.component_id"),
+        "component_profile_id": _require_id(
+            component["component_profile_id"], f"{label}.component_profile_id"
+        ),
+        "target_settings": {},
+        "configuration": deepcopy(
+            _require_object(component["configuration"], f"{label}.configuration")
+        ),
+    }
+
+
 def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
     """Validate and normalize the profile-independent authored envelope.
 
@@ -336,6 +382,13 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
     for index, raw_component in enumerate(components):
         label = f"{source}: components[{index}]"
         component = _require_object(raw_component, label)
+        if _is_io_provider_component(component):
+            normalized = _validate_io_provider_component(component, label)
+            if normalized["component_id"] in component_ids:
+                _fail(f"{source}: duplicate component_id {normalized['component_id']!r}")
+            component_ids.add(normalized["component_id"])
+            normalized_components.append(normalized)
+            continue
         _require_exact_fields(
             component,
             required={
@@ -441,6 +494,8 @@ def iter_source_references(
 
     normalized = validate_deployment_intent(intent, source="<Deployment intent>")
     for component_index, component in enumerate(normalized["components"]):
+        if "model_source" not in component:
+            continue  # A model-free I/O device references no source.
         base: tuple[str | int, ...] = (
             "components",
             component_index,

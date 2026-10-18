@@ -287,7 +287,7 @@ function baseSource(
     observed_at_ns: 1_000_000_000,
     payload,
     policy_id: 'viewer.measured_robot',
-    quality: 'good',
+    payload_quality: 'good',
     source_epoch: 'epoch-1',
     source_epoch_order: 1,
     source_id: 'observer-1',
@@ -328,7 +328,7 @@ function runtime(sources: SceneRuntimePoseSource[]): SceneRuntimeProjection {
     api_version: 'manyforge.scene_runtime_source.v1',
     cell_id: 'cell-1',
     state: {
-      api_version: 'manyforge.scene_runtime_state.v1',
+      api_version: 'manyforge.scene_runtime_state.v2',
       active_replay_id: null,
       counters: {},
       deferred: false,
@@ -372,6 +372,19 @@ describe('runtime scene presentation', () => {
     const mismatched = executionStatus();
     mismatched.graphRevision = 'another-graph';
     expect(executionRobotPresentation(mismatched, sourceModel(), manifest())).toBeNull();
+  });
+
+  it('skips a model-free I/O device component (not drawn in the 3D scene)', () => {
+    const status = executionStatus();
+    status.components = [...status.components, {
+      controllableComponentId: 'station_io',
+      commandEligible: true,
+      unavailableReason: null,
+      unsupportedTargets: [],
+    }];
+    expect(executionRobotPresentation(status, sourceModel(), manifest()))
+      .toEqual(executionRobotPresentation(executionStatus(), sourceModel(), manifest()));
+    expect(executionRobotPresentation(status, sourceModel(), manifest())?.objectId).toBe('robot-1');
   });
 
   it('projects every observed robot instead of fabricating unselected robots at neutral', () => {
@@ -590,7 +603,7 @@ describe('runtime scene presentation', () => {
       fresh: false,
       object_id: 'other',
       policy_id: 'before_planning',
-      quality: 'unknown',
+      payload_quality: 'unknown',
       source_sequence: 4,
     });
 

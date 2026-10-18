@@ -238,11 +238,19 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   if (components.size() > kMaximumComponents) {
     fail("has an invalid component count");
   }
-  if (components.size() != captured_sources.size()) {
+  const bool has_io = std::any_of(
+      components.begin(), components.end(), [](const auto &component) {
+        const auto *configuration =
+            component.find_object_member("configuration");
+        const auto *kind =
+            configuration ? configuration->find_object_member("runtime_kind")
+                          : nullptr;
+        return kind && kind->is_string() && kind->as_string() == "io_provider";
+      });
+  if (!has_io && components.size() != captured_sources.size())
     fail("component count differs from the captured source closure");
-  }
-  const auto &attachments = array(member(value, "attachments", "root"),
-                                  "attachments");
+  const auto &attachments =
+      array(member(value, "attachments", "root"), "attachments");
   if (attachments.size() > kMaximumAttachments) {
     fail("attachments exceed their bound");
   }
@@ -259,13 +267,28 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   parsed_components.reserve(components.size());
   std::set<std::string, std::less<>> component_ids;
   std::string previous_component_id;
+  std::size_t captured_index = 0U;
   for (std::size_t index = 0U; index < components.size(); ++index) {
     const auto &component = components[index];
     const std::string label = "components[" + std::to_string(index) + "]";
-    require_fields(component,
-                   {"component_id", "component_profile_id", "configuration",
-                    "model_source", "root_pose_in_cell", "target_settings"},
-                   {"frame_prefix"}, label);
+    const auto *raw_configuration =
+        component.find_object_member("configuration");
+    const auto *runtime_kind =
+        raw_configuration == nullptr
+            ? nullptr
+            : raw_configuration->find_object_member("runtime_kind");
+    const bool io_provider = runtime_kind && runtime_kind->is_string() &&
+                             runtime_kind->as_string() == "io_provider";
+    if (io_provider)
+      require_fields(component,
+                     {"component_id", "component_profile_id", "configuration",
+                      "target_settings"},
+                     {}, label);
+    else
+      require_fields(component,
+                     {"component_id", "component_profile_id", "configuration",
+                      "model_source", "root_pose_in_cell", "target_settings"},
+                     {"frame_prefix"}, label);
     const auto &component_id = portable_identifier(
         member(component, "component_id", label), label + ".component_id");
     const auto &profile_id = portable_identifier(
@@ -276,18 +299,27 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       fail("components are not uniquely canonical-sorted");
     }
     previous_component_id = component_id;
-    auto &captured = captured_sources[index];
-    if (captured.component_id != component_id) {
-      fail("component identities differ from the captured source closure");
-    }
-    require_model_source(member(component, "model_source", label),
-                         captured.srdf.has_value(), label + ".model_source");
-    const auto &pose = member(component, "root_pose_in_cell", label);
     const auto &target_settings = member(component, "target_settings", label);
     const auto &configuration = member(component, "configuration", label);
-    require_pose(pose, label + ".root_pose_in_cell");
     require_target_settings(target_settings, label + ".target_settings");
     static_cast<void>(object(configuration, label + ".configuration"));
+    std::optional<CapturedComponentModelSource> captured;
+    std::optional<CanonicalValue> pose;
+    if (io_provider) {
+      require_fields(configuration, {"runtime_kind", "runtime_configuration"},
+                     {}, label + ".configuration");
+      if (profile_id != "io_device_v0" || !target_settings.as_object().empty())
+        fail(label + " requires io_device_v0 and empty target_settings");
+    } else {
+      if (captured_index == captured_sources.size() ||
+          captured_sources[captured_index].component_id != component_id)
+        fail("component identities differ from the captured source closure");
+      captured = std::move(captured_sources[captured_index++]);
+      require_model_source(member(component, "model_source", label),
+                           captured->srdf.has_value(), label + ".model_source");
+      pose = member(component, "root_pose_in_cell", label);
+      require_pose(*pose, label + ".root_pose_in_cell");
+    }
     std::string frame_prefix;
     if (const auto *prefix = component.find_object_member("frame_prefix"); prefix != nullptr) {
       if (!prefix->is_string()) fail(label + ".frame_prefix must be a string");
@@ -302,6 +334,8 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
          std::move(captured), std::move(frame_prefix)});
   }
 
+  if (captured_index != captured_sources.size())
+    fail("captured source closure contains an unowned model row");
   const auto &deployment_id = portable_identifier(
       member(value, "deployment_artifact_id", "root"),
       "deployment_artifact_id");

@@ -2,6 +2,7 @@
 
 export type CatalogRecordKind = 'model_asset' | 'runtime_profile' | 'component_type' | 'control_interface_contract' | 'controller_topology' | 'provider_manifest' | 'command_schema' | 'capability_definition' | 'contact_policy' | 'stop_evidence_policy';
 export type ProgramOperatorStopPolicy = 'inherit' | 'hold' | 'continue';
+export type ProgramInterventionStopScope = 'all' | 'own_groups';
 export interface ProgramBindingDocument {
   api_version: 'manyforge.program_binding.v2';
   program_binding_id: string;
@@ -43,6 +44,7 @@ export interface ProgramTargetRoleBinding {
   resource_role_bindings: ProgramResourceRoleBinding[];
   collision_body_role_bindings: ProgramCollisionBodyRoleBinding[];
   capability_bindings: ProgramCapabilityBinding[];
+  signal_role_bindings?: ProgramSignalRoleBinding[];
 }
 export interface ProgramFrameRoleBinding {
   frame_role_id: string;
@@ -76,6 +78,7 @@ export interface ProgramNodePolicy {
 export interface ProgramNodeRecoveryPolicy {
   allow_intervention: boolean;
   max_retries: number;
+  intervention_stop_scope?: ProgramInterventionStopScope;
 }
 export interface ProgramControlBindingRef {
   control_binding_id: string;
@@ -118,4 +121,12 @@ export interface ProgramBindingProvenanceRecord {
   record_kind: CatalogRecordKind;
   record_id: string;
   revision: string;
+}
+export interface ProgramSignalRoleBinding {
+  resource_role_id: string;
+  signal_name: string;
+  value_type: 'bool';
+  direction: 'input' | 'output';
+  transition_capability: 'sampled_only' | 'captured';
+  signal_descriptor_digest: string;
 }

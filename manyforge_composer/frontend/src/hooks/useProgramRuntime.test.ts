@@ -52,7 +52,7 @@ function admissionFixtures() {
       state: 'idle_after_reset', programRunId: null,
       cycleClaimGeneration: null, terminalOrSettlementReference: null,
       runRevision: null, nodeStatusRevision: null,
-      runtimeControlRevision: null, recoveryOffer: null,
+      runtimeControlRevision: null,
       executionControlRevision: 1,
       causalCorrelationId: null, causalSessionId: null,
       causalClientSequence: null, currentCommandKind: null,
@@ -119,7 +119,6 @@ describe('Program runtime idle selection', () => {
         runRevision: null,
         nodeStatusRevision: null,
         runtimeControlRevision: null,
-        recoveryOffer: null,
       },
       authoringWorkspace: {
         workspaceEpoch: 'workspace.epoch.1',
@@ -506,37 +505,64 @@ describe('Program command settlement', () => {
     expect(programPendingAfterProjection('motion-stop', run, resetOnly)).toBe('motion-stop');
   });
 
-  it('keeps Resume disabled until the exact recovery offer changes', () => {
+  it('keeps a recovery command pending until its own hold offer changes', () => {
     const run = {
       ownerEpoch: 'runner.epoch.1',
       state: 'running',
       capture: { programRunId: 'run-1' },
     } as unknown as ProgramRunStatus;
+    const offerOne = `sha256:${'1'.repeat(64)}`;
+    const offerTwo = `sha256:${'2'.repeat(64)}`;
+    const holds = (one: number | null, two: number) => [
+      ...(one === null ? [] : [{ motionGroupIds: ['left'], offer: { offerId: offerOne, offerRevision: one } }]),
+      { motionGroupIds: ['right'], offer: { offerId: offerTwo, offerRevision: two } },
+    ];
     const retainedOffer = {
       ownerEpoch: 'runner.epoch.1',
       programRunId: 'run-1',
-      recoveryOffer: { offerId: 'offer-1', offerRevision: 3 },
+      recoveryOffer: null,
+      recoveryHolds: holds(3, 1),
     } as unknown as NonNullable<
       Parameters<typeof controlPendingAfterProjection>[1]
     >;
-    expect(controlPendingAfterProjection(
-      'recovery:replan_from_stopped_state',
-      retainedOffer,
-      retainedOffer,
-      run,
-    )).toBe('recovery:replan_from_stopped_state');
-    expect(controlPendingAfterProjection(
-      'recovery:replan_from_stopped_state',
-      retainedOffer,
-      { ...retainedOffer, recoveryOffer: null },
-      run,
-    )).toBeNull();
+    const pending = `recovery:${offerOne}:retry_motion_from_current_state`;
+    expect(controlPendingAfterProjection(pending, retainedOffer, retainedOffer, run))
+      .toBe(pending);
+    // Another hold changing leaves this command pending.
+    expect(controlPendingAfterProjection(pending, retainedOffer, {
+      ...retainedOffer, recoveryHolds: holds(3, 2),
+    } as typeof retainedOffer, run)).toBe(pending);
+    expect(controlPendingAfterProjection(pending, retainedOffer, {
+      ...retainedOffer, recoveryHolds: holds(4, 1),
+    } as typeof retainedOffer, run)).toBeNull();
+    expect(controlPendingAfterProjection(pending, retainedOffer, {
+      ...retainedOffer, recoveryHolds: holds(null, 1),
+    } as typeof retainedOffer, run)).toBeNull();
     expect(controlPendingAfterProjection(
       'override:activate:one',
       retainedOffer,
       retainedOffer,
       run,
     )).toBe('override:activate:one');
+  });
+
+  it('keeps an operator Stop Retry pending until its focused offer changes or is retired', () => {
+    const run = {
+      ownerEpoch: 'runner.epoch.1',
+      state: 'intervention_required',
+      capture: { programRunId: 'run-1' },
+    } as unknown as ProgramRunStatus;
+    const stopId = `sha256:${'3'.repeat(64)}`;
+    const focused = (offerRevision: number | null) => ({
+      ownerEpoch: 'runner.epoch.1',
+      programRunId: 'run-1',
+      recoveryOffer: offerRevision === null ? null : { offerId: stopId, offerRevision },
+      recoveryHolds: [],
+    } as unknown as NonNullable<Parameters<typeof controlPendingAfterProjection>[1]>);
+    const pending = `recovery:${stopId}:retry_motion_from_current_state`;
+    expect(controlPendingAfterProjection(pending, focused(2), focused(2), run)).toBe(pending);
+    expect(controlPendingAfterProjection(pending, focused(2), focused(3), run)).toBeNull();
+    expect(controlPendingAfterProjection(pending, focused(2), focused(null), run)).toBeNull();
   });
 });
 
@@ -618,7 +644,7 @@ describe('Program runtime authority requests', () => {
         programRunId: 'run-1', cycleClaimGeneration: 12,
         terminalOrSettlementReference: terminalReference,
         runRevision: null, nodeStatusRevision: null,
-        runtimeControlRevision: null, recoveryOffer: null,
+        runtimeControlRevision: null,
         executionControlRevision: 1,
         causalCorrelationId: null, causalSessionId: null,
         causalClientSequence: null, currentCommandKind: null,

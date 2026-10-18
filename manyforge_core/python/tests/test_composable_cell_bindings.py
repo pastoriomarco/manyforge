@@ -900,7 +900,7 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
             == core.CapabilityProviderBindingKind.kCapabilityProviderBinding
             for row in registry
         )
-        == 47
+        == 50
     )
     assert (
         sum(
@@ -908,11 +908,11 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
             == core.CapabilityProviderBindingKind.kControlBinding
             for row in registry
         )
-        == 20
+        == 17
     )
     assert all(row.requirement_parameters_schema_ref is None for row in registry)
     assert core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST == (
-        "sha256:ae8aae9ef416f40457225858d8d56829dce5c512cb842b803393bfaa24741e22"
+        "sha256:f16fbfaf20185c184fee1ed014592eb443f2c5f5144de84eaae685504c0d38f9"
     )
     assert core.find_builtin_capability_definition("context.state.current") is None
 
@@ -1832,7 +1832,7 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kUnqualified
     )
-    assert len(registry.value_schemas) == 5
+    assert len(registry.value_schemas) == 6
     assert {
         (entry.schema_id.value, entry.schema_revision.value)
         for entry in registry.value_schemas
@@ -1855,7 +1855,11 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:c4e6e1a1418852f773520a2c3c02ffde66883e2dca3963a218bf28e2356ca16c",
+            "sha256:34fbeab889c274ca724eb992e7bcc4305229e8bcce484b0857c4ca5e9d35e379",
+        ),
+        (
+            "manyforge.value_schema.runtime.io_provider_execution.v1",
+            "sha256:c6518470d89236c3b91dfd88b77203ed30d3c6476f3358b2ec9f2514cd19f0a5",
         ),
     }
     assert (
@@ -2156,3 +2160,17 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
         match="bridge external resource is not a service_endpoint",
     ):
         core.qualify_assistant_settings(assistant_candidate, wrong_resources)
+
+
+def test_direct_component_provider_target_has_no_fabricated_control_identity():
+    target = core.ComponentTargetCapabilityProviderTargetDTO(
+        controllable_component_id=core.ControllableComponentId("device.io"),
+        component_type_revision=core.ComponentTypeRevision(ZERO_DIGEST),
+        command_target_id=core.CommandTargetId("gpio"),
+    )
+    assert target.command_target_id.value == "gpio"
+    assert not hasattr(target, "control_binding_id")
+    _, kwargs, _ = _applicability_constructor_fixture()["endpoint_bindings"]
+    kwargs = dict(kwargs, scope=core.CapabilityScope.kTargetBinding, target=target)
+    provider = core.CapabilityProviderBindingDTO(**kwargs)
+    assert provider.target == target

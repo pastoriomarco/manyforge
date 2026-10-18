@@ -34,6 +34,13 @@
   ],
   "runtime_restoration_profiles": [
     {
+      "runtime_restoration_profile_id": "io_device_v0",
+      "io_provider_runtime": {},
+      "source_fields": {},
+      "stop_profiles": {},
+      "acceptance_obligations": []
+    },
+    {
       "runtime_restoration_profile_id": "lite6_isaac_commanded_v0",
       "model_family_id": "lite6_lite_gripper",
       "source_fields": {

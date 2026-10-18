@@ -12,11 +12,17 @@
 #include <future>
 #include <iterator>
 #include <limits>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/component_lifecycle_admission.hpp>
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/detail/motion_resume_intent.hpp>
 #include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/gripper_participant_engine.hpp>
+#include <manyforge_core/io_output_participant_engine.hpp>
+#include <manyforge_core/io_condition_evaluator.hpp>
+#include <manyforge_core/io_rule_stop_response.hpp>
+#include <manyforge_core/io_signal_descriptor.hpp>
+#include <manyforge_core/io_signal_subsystem.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
 #include <manyforge_core/ports/imotion_preview.hpp>
 #include <manyforge_core/ports/icclc_journal.hpp>
@@ -46,6 +52,7 @@
 #include <vector>
 
 #include "../src/component_lifecycle_journal_codec_internal.hpp"
+#include "../src/program_stop_projection_internal.hpp"
 
 namespace {
 
@@ -255,6 +262,11 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       settlement.controller_goal_generation =
           ControllerGoalGeneration(stage.controller_goal_generation.value() + 1U);
     }
+    if (supports_motion_replacement && !return_mismatched_participant_stop_settlement) {
+      std::lock_guard lock(prepared_motion_mutex_);
+      settled_stop_certificate = certificate;
+      settled_stop_execution_id = request.execution_id;
+    }
     return Result<AddressedParticipantStopSettlementDTO>::Ok(std::move(settlement));
   }
 
@@ -263,10 +275,63 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     Trace("engine:prepare_motion");
     if (prepare_motion_hook) prepare_motion_hook();
     if (prepare_call_failure.has_value()) return Result<std::uint64_t>::Err(*prepare_call_failure);
+    if (request.replacement) {
+      std::lock_guard lock(prepared_motion_mutex_);
+      if (!supports_motion_replacement ||
+          (replacement_snapshot &&
+           replacement_snapshot->state !=
+               ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch)) {
+        return Result<std::uint64_t>::Err(ErrorCode::kUnsupportedCapability);
+      }
+      auto participant = MakePreparedMotionParticipant(request);
+      if (!participant.ok()) return Result<std::uint64_t>::Err(participant.error());
+      auto retained =
+          std::make_shared<const PreparedOperationParticipantDTO>(std::move(participant.value()));
+      std::optional<PrepareParticipantResultDTO> prepared;
+      const bool cold = request.replacement->spring_return.has_value();
+      if (!cold) {
+        auto result =
+            MakePrepareParticipantResult(*retained, PrepareParticipantResultStateDTO::kPrepared);
+        if (!result.ok()) return Result<std::uint64_t>::Err(result.error());
+        prepared = std::move(result.value());
+      } else {
+        const auto& spring = *request.replacement->spring_return;
+        if (!spring.stage || !spring.point || !prepared_snapshot || !last_dispatched_participant) {
+          return Result<std::uint64_t>::Err(ErrorCode::kInvalidRequest);
+        }
+        const ExecutionGoalKey goal{spring.stage->controller_goal_id,
+                                    spring.stage->controller_goal_generation};
+        if (spring.point->source_goal != goal ||
+            spring.point->binding_epoch != spring.point->trip.binding_epoch ||
+            !spring.point->canonical_return_path_time_s) {
+          return Result<std::uint64_t>::Err(ErrorCode::kInvalidRequest);
+        }
+        auto& source = request.replacement->source;
+        source.execution_id = prepared_snapshot->execution_id;
+        source.execution_generation = replacement_execution_generation;
+        source.goal = spring.point->source_goal;
+        source.binding_epoch = spring.point->binding_epoch;
+        source.prepared_contract_digest = last_dispatched_participant->prepared_contract_digest;
+        source.controller_sample = spring.point->trip;
+      }
+      replacement_request = std::move(request);
+      replacement_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+          next_replacement_id++,
+          defer_prepare_completion ? ResolvedPreparedMotionExecutionStateDTO::kPreparing
+          : cold                   ? ResolvedPreparedMotionExecutionStateDTO::kColdPrepared
+                                   : ResolvedPreparedMotionExecutionStateDTO::kPrepared,
+          retained, std::move(prepared), std::nullopt};
+      replacement_phase.store(defer_prepare_completion
+                                  ? PreparedMotionReplacementPhaseDTO::kPreparing
+                                  : PreparedMotionReplacementPhaseDTO::kPrepared);
+      return Result<std::uint64_t>::Ok(replacement_snapshot->execution_id);
+    }
     {
       std::lock_guard lock(prepared_motion_mutex_);
       last_prepared_request = request;
       last_dispatched_participant.reset();
+      settled_stop_certificate.reset();
+      cold_backend_prepared = false;
       if (defer_prepare_completion) {
         prepared_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
             next_execution_id,
@@ -288,6 +353,14 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     {
       std::lock_guard lock(prepared_motion_mutex_);
       defer_prepare_completion = false;
+      if (replacement_snapshot &&
+          replacement_snapshot->state == ResolvedPreparedMotionExecutionStateDTO::kPreparing) {
+        replacement_snapshot->state = replacement_request->replacement->spring_return
+                                          ? ResolvedPreparedMotionExecutionStateDTO::kColdPrepared
+                                          : ResolvedPreparedMotionExecutionStateDTO::kPrepared;
+        replacement_phase.store(PreparedMotionReplacementPhaseDTO::kPrepared);
+        return Result<void>::Ok();
+      }
     }
     return CompletePreparation();
   }
@@ -297,6 +370,11 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     ++observe_prepared_motion_calls;
     auto result = [&] {
       std::lock_guard lock(prepared_motion_mutex_);
+      if (replacement_snapshot && replacement_snapshot->execution_id == execution_id) {
+        auto snapshot = *replacement_snapshot;
+        snapshot.replacement = PreparedMotionReplacementObservationDTO{replacement_phase.load()};
+        return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Ok(std::move(snapshot));
+      }
       if (!prepared_snapshot || prepared_snapshot->execution_id != execution_id) {
         return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Err(
             ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
@@ -318,6 +396,17 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     std::optional<ExecuteRequestDTO> execution_request;
     {
       std::lock_guard lock(prepared_motion_mutex_);
+      if (replacement_snapshot && replacement_snapshot->execution_id == execution_id) {
+        if (!replacement_snapshot->participant ||
+            replacement_snapshot->participant->prepared_contract_digest !=
+                prepared_contract_digest ||
+            replacement_snapshot->state != ResolvedPreparedMotionExecutionStateDTO::kPrepared) {
+          return Result<void>::Err(ErrorCode::kInvalidRequest);
+        }
+        replacement_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
+        replacement_phase.store(replacement_dispatch_phase);
+        return Result<void>::Ok();
+      }
       if (!prepared_snapshot || !prepared_snapshot->participant ||
           prepared_snapshot->execution_id != execution_id ||
           prepared_snapshot->participant->prepared_contract_digest != prepared_contract_digest ||
@@ -342,9 +431,11 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         std::lock_guard lock(prepared_motion_mutex_);
         participant = prepared_snapshot->participant;
       }
-      const auto prepared = execution_backend->Prepare(*participant, execution_id);
-      if (prepared.state != PrepareParticipantResultStateDTO::kPrepared) {
-        return Result<void>::Err(prepared.error.value_or(ErrorDTO{"backend_prepare_rejected", "", {}}));
+      if (!cold_backend_prepared) {
+        const auto prepared = execution_backend->Prepare(*participant, execution_id);
+        if (prepared.state != PrepareParticipantResultStateDTO::kPrepared) {
+          return Result<void>::Err(prepared.error.value_or(ErrorDTO{"backend_prepare_rejected", "", {}}));
+        }
       }
       const auto& binding = execution_request->binding;
       const auto handle = execution_backend->Dispatch(*participant, binding.controller_goal_id,
@@ -370,6 +461,16 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     const auto prior = get_status();
     {
       std::lock_guard lock(prepared_motion_mutex_);
+      if (replacement_snapshot && replacement_snapshot->execution_id == execution_id) {
+        if (replacement_snapshot->state == ResolvedPreparedMotionExecutionStateDTO::kDispatched &&
+            replacement_phase.load() != PreparedMotionReplacementPhaseDTO::kNoEffect) {
+          return Result<void>::Err(ErrorCode::kInvalidStateTransition);
+        }
+        replacement_snapshot->state =
+            ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+        replacement_phase.store(PreparedMotionReplacementPhaseDTO::kNoEffect);
+        return Result<void>::Ok();
+      }
       if (!prepared_snapshot || prepared_snapshot->execution_id != execution_id) {
         return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
                                           "fake prepared execution is unavailable",
@@ -396,6 +497,238 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     return Result<void>::Ok();
   }
 
+  Result<PreparedMotionReplacementSourceDTO> CaptureMotionReplacementSource(
+      std::uint64_t execution_id) const override {
+    ++capture_replacement_source_calls;
+    std::lock_guard lock(prepared_motion_mutex_);
+    if (!supports_motion_replacement) {
+      return Result<PreparedMotionReplacementSourceDTO>::Err(ErrorCode::kUnsupportedCapability);
+    }
+    const auto current = get_status();
+    if (!prepared_snapshot || !last_prepared_request || !last_dispatched_participant ||
+        prepared_snapshot->execution_id != execution_id || current.execution_id != execution_id ||
+        current.state != ExecutionState::kExecuting || current.fact) {
+      return Result<PreparedMotionReplacementSourceDTO>::Err(ErrorCode::kInvalidStateTransition);
+    }
+    const auto& binding = last_prepared_request->execution_request.binding;
+    PreparedMotionReplacementSourceDTO source;
+    source.execution_id = execution_id;
+    source.execution_generation = replacement_execution_generation;
+    source.goal = {binding.controller_goal_id, binding.controller_goal_generation};
+    source.binding_epoch = ExecutionBindingEpoch(1U);
+    source.prepared_contract_digest = last_dispatched_participant->prepared_contract_digest;
+    source.controller_sample.binding_epoch = source.binding_epoch;
+    source.controller_sample.local_receipt_count = ExecutionReceiptCount(1U);
+    source.controller_sample.cursor_s = 0.25;
+    source.controller_sample.applied_factor = 1.0;
+    const auto dimensions = binding.resources.size();
+    source.controller_sample.reference_positions_rad.assign(dimensions, 0.0);
+    source.controller_sample.reference_velocities_rad_s.assign(dimensions, 0.1);
+    source.controller_sample.reference_accelerations_rad_s2.assign(dimensions, 0.0);
+    source.progress.sequence = 1U;
+    source.progress.execution_generation = source.execution_generation;
+    source.progress.trajectory_time_ns = 250'000'000;
+    source.progress.valid = true;
+    return Result<PreparedMotionReplacementSourceDTO>::Ok(std::move(source));
+  }
+
+  Result<bool> RetireCancelledPreparedMotion(std::uint64_t candidate_id) override {
+    ++retire_cancelled_replacement_calls;
+    std::lock_guard lock(prepared_motion_mutex_);
+    if (!replacement_snapshot || replacement_snapshot->execution_id != candidate_id) {
+      return Result<bool>::Err(ErrorCode::kMissingReference);
+    }
+    const bool no_effect = replacement_snapshot->state ==
+                               ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch &&
+                           replacement_phase.load() == PreparedMotionReplacementPhaseDTO::kNoEffect;
+    bool stopped = false;
+    if (replacement_request && replacement_request->replacement && settled_stop_certificate &&
+        last_stop_stage && prepared_snapshot && last_prepared_request &&
+        last_dispatched_participant) {
+      const auto& source = replacement_request->replacement->source;
+      const auto& binding = last_prepared_request->execution_request.binding;
+      const auto current = get_status();
+      stopped = prepared_snapshot->execution_id == source.execution_id &&
+                settled_stop_execution_id == source.execution_id &&
+                source.execution_generation == replacement_execution_generation &&
+                source.goal == ExecutionGoalKey{binding.controller_goal_id,
+                                                binding.controller_goal_generation} &&
+                source.prepared_contract_digest ==
+                    last_dispatched_participant->prepared_contract_digest &&
+                settled_stop_certificate->stop_id == last_stop_stage->stop_id &&
+                settled_stop_certificate->stop_generation == last_stop_stage->stop_generation &&
+                source.goal == ExecutionGoalKey{last_stop_stage->controller_goal_id,
+                                                last_stop_stage->controller_goal_generation} &&
+                current.execution_id == source.execution_id && current.fact &&
+                current.fact->kind == ParticipantExecutionFactKind::kPreemptedByAddressedStop &&
+                current.fact->effect == ParticipantEffectKnowledge::kEffectSettled;
+    }
+    if (!no_effect && !stopped) {
+      return Result<bool>::Err(ErrorCode::kInvalidStateTransition);
+    }
+    replacement_snapshot.reset();
+    replacement_request.reset();
+    return Result<bool>::Ok(true);
+  }
+
+  Result<bool> PrepareColdMotionAfterStop(std::uint64_t candidate_id,
+                                          const StopCertificateDTO& certificate) override {
+    ++prepare_cold_motion_calls;
+    std::unique_lock lock(prepared_motion_mutex_);
+    if (!replacement_snapshot || !replacement_request || !replacement_request->replacement ||
+        !replacement_request->replacement->spring_return ||
+        replacement_snapshot->execution_id != candidate_id) {
+      return Result<bool>::Err(ErrorCode::kInvalidRequest);
+    }
+    if (replacement_snapshot->state == ResolvedPreparedMotionExecutionStateDTO::kPreparing) {
+      return Result<bool>::Ok(false);
+    }
+    const auto& context = *replacement_request->replacement;
+    const auto& spring = *context.spring_return;
+    const auto current = get_status();
+    if (replacement_snapshot->state != ResolvedPreparedMotionExecutionStateDTO::kColdPrepared ||
+        replacement_snapshot->backend_prepare_result || !replacement_snapshot->participant ||
+        !spring.stage || !spring.point || !spring.point->canonical_return_path_time_s ||
+        !settled_stop_certificate || settled_stop_execution_id != context.source.execution_id ||
+        certificate.stop_id != spring.stage->stop_id ||
+        certificate.stop_generation != spring.stage->stop_generation ||
+        certificate.stop_certificate_id != settled_stop_certificate->stop_certificate_id ||
+        certificate.stop_certificate_revision !=
+            settled_stop_certificate->stop_certificate_revision ||
+        certificate.stop_id != settled_stop_certificate->stop_id ||
+        certificate.stop_generation != settled_stop_certificate->stop_generation ||
+        certificate.result != StopCertificateResultDTO::kSucceededNominal ||
+        certificate.terminal_error || certificate.fault_latch_id ||
+        !certificate.unsettled.empty() || !certificate.failed.empty() ||
+        current.execution_id != context.source.execution_id || !current.fact ||
+        current.fact->kind != ParticipantExecutionFactKind::kPreemptedByAddressedStop ||
+        current.fact->effect != ParticipantEffectKnowledge::kEffectSettled ||
+        !last_dispatched_participant ||
+        last_dispatched_participant->prepared_contract_digest !=
+            context.source.prepared_contract_digest) {
+      return Result<bool>::Err(ErrorCode::kInvalidStateTransition);
+    }
+    const bool returned =
+        std::any_of(certificate.attempted_stage_results.begin(),
+                    certificate.attempted_stage_results.end(), [&](const auto& attempt) {
+                      return attempt.authority == StopStageResultAuthorityDTO::kAuthoritative &&
+                             attempt.result.request == *spring.stage &&
+                             attempt.result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded &&
+                             attempt.result.attempt_disposition ==
+                                 StopStageAttemptDispositionDTO::kDispatched &&
+                             !attempt.result.error &&
+                             attempt.result.actual_provider_contract_mode ==
+                                 MotionControlledStopMode::kSpringBackHold;
+                    });
+    if (!returned) return Result<bool>::Err(ErrorCode::kInvalidStateTransition);
+    auto prepared = MakePrepareParticipantResult(*replacement_snapshot->participant,
+                                                 PrepareParticipantResultStateDTO::kPrepared);
+    if (!prepared.ok()) return Result<bool>::Err(prepared.error());
+    if (execution_backend) {
+      const auto retained = replacement_snapshot->participant;
+      const auto expected_certificate = *settled_stop_certificate;
+      lock.unlock();
+      const auto backend = execution_backend->Prepare(*retained, candidate_id);
+      lock.lock();
+      if (backend.state != PrepareParticipantResultStateDTO::kPrepared) {
+        return Result<bool>::Err(
+            backend.error.value_or(ErrorDTO{"backend_prepare_rejected", "", {}}));
+      }
+      if (!replacement_snapshot || replacement_snapshot->execution_id != candidate_id ||
+          replacement_snapshot->state != ResolvedPreparedMotionExecutionStateDTO::kColdPrepared ||
+          !settled_stop_certificate || *settled_stop_certificate != expected_certificate) {
+        return Result<bool>::Err(ErrorCode::kInvalidStateTransition);
+      }
+    }
+    replacement_snapshot->backend_prepare_result = std::move(prepared.value());
+    replacement_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kPrepared;
+    prepared_snapshot = std::move(replacement_snapshot);
+    replacement_snapshot.reset();
+    last_prepared_request = std::move(replacement_request);
+    replacement_request.reset();
+    last_prepared_request->replacement.reset();
+    last_dispatched_participant.reset();
+    next_execution_id = candidate_id;
+    next_execute_result = Result<std::uint64_t>::Ok(candidate_id);
+    cold_backend_prepared = true;
+    ++cold_participant_preparations;
+    Trace("engine:prepare_cold_after_stop");
+    {
+      std::lock_guard status_lock(status_mutex_);
+      status.state = ExecutionState::kIdle;
+      status.execution_id = candidate_id;
+      status.fact.reset();
+    }
+    return Result<bool>::Ok(true);
+  }
+
+  Result<bool> CommitPreparedMotionReplacement(std::uint64_t candidate_id,
+                                               const PreparedMotionReplacementSourceDTO& source,
+                                               PreparedMotionReplacementCommitDTO commit) override {
+    ++commit_replacement_calls;
+    std::lock_guard lock(prepared_motion_mutex_);
+    if (!replacement_snapshot || !replacement_request || !replacement_request->replacement ||
+        replacement_snapshot->execution_id != candidate_id || !prepared_snapshot ||
+        prepared_snapshot->execution_id != source.execution_id || !last_dispatched_participant ||
+        !last_prepared_request) {
+      return Result<bool>::Err(ErrorCode::kInvalidRequest);
+    }
+    const auto& captured = replacement_request->replacement->source;
+    const auto current = get_status();
+    const auto& binding = last_prepared_request->execution_request.binding;
+    const ExecutionGoalKey current_goal{binding.controller_goal_id,
+                                        binding.controller_goal_generation};
+    const auto same_progress = [](const auto& left, const auto& right) {
+      return left.sequence == right.sequence &&
+             left.execution_generation == right.execution_generation &&
+             left.trajectory_time_ns == right.trajectory_time_ns &&
+             left.source_kind == right.source_kind &&
+             left.authority_profile == right.authority_profile &&
+             left.source_timestamp_ns == right.source_timestamp_ns &&
+             left.received_timestamp_ns == right.received_timestamp_ns &&
+             left.freshness_budget_ns == right.freshness_budget_ns && left.valid == right.valid &&
+             left.terminal == right.terminal;
+    };
+    if (source.execution_id != captured.execution_id ||
+        source.execution_generation != captured.execution_generation ||
+        source.execution_generation != replacement_execution_generation ||
+        current_goal != source.goal || current.execution_id != source.execution_id ||
+        current.state != ExecutionState::kExecuting || current.fact ||
+        addressed_stop_fence_execution_id.load() == source.execution_id ||
+        source.goal != captured.goal || source.binding_epoch != captured.binding_epoch ||
+        source.prepared_contract_digest != captured.prepared_contract_digest ||
+        source.controller_sample != captured.controller_sample ||
+        !same_progress(source.progress, captured.progress) ||
+        last_dispatched_participant->prepared_contract_digest != source.prepared_contract_digest) {
+      return Result<bool>::Err(ErrorCode::kInvalidRequest);
+    }
+    if (replacement_phase.load() != PreparedMotionReplacementPhaseDTO::kReadyToCommit) {
+      return Result<bool>::Ok(false);
+    }
+    if (!commit.owner_commit) return Result<bool>::Err(ErrorCode::kInvalidRequest);
+    const auto accepted = commit.owner_commit(commit.context);
+    if (!accepted.ok()) return Result<bool>::Err(accepted.error());
+    ++replacement_owner_commits;
+    Trace("engine:commit_replacement");
+    prepared_snapshot = std::move(replacement_snapshot);
+    replacement_snapshot.reset();
+    last_prepared_request = std::move(replacement_request);
+    replacement_request.reset();
+    last_dispatched_participant = prepared_snapshot->participant;
+    last_execute = last_prepared_request->execution_request;
+    next_execution_id = candidate_id;
+    next_execute_result = Result<std::uint64_t>::Ok(candidate_id);
+    ++replacement_execution_generation;
+    replacement_phase.store(PreparedMotionReplacementPhaseDTO::kCommitted);
+    {
+      std::lock_guard status_lock(status_mutex_);
+      status.execution_id = candidate_id;
+      status.state = ExecutionState::kExecuting;
+      status.fact.reset();
+    }
+    return Result<bool>::Ok(true);
+  }
+
   Result<std::uint64_t> PrepareCapabilityCommand(
       ResolvedPreparedCapabilityCommandExecutionRequestDTO request) override {
     ++prepare_command_calls;
@@ -406,7 +739,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                    "fake command preparation has no participant",
                    {{"reason", "prepared_command_participant_missing"}}});
     }
-    auto private_validation = validate_gripper_command(request.command_request);
+    auto private_validation = validate_gripper_command(request.gripper().command_request);
     if (!private_validation.ok()) {
       return Result<std::uint64_t>::Err(private_validation.error());
     }
@@ -486,7 +819,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     }
     prepared_command_snapshot->controller_goal_id = controller_goal_id;
     prepared_command_snapshot->controller_goal_generation = controller_goal_generation;
-    auto dispatched = command_gripper(last_prepared_command_request->command_request);
+    auto dispatched = command_gripper(last_prepared_command_request->gripper().command_request);
     prepared_command_snapshot->dispatch_result = dispatched;
     prepared_command_snapshot->error = dispatched.error;
     prepared_command_snapshot->state =
@@ -551,6 +884,56 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                            std::nullopt},
         Pose3DTO{}, projection_inventory.projection_binding,
         projection_inventory.bundle.world->revision, 0U});
+  }
+
+  ParticipantStopStageResultDTO TranslateStopStageForTakeover(
+      const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+      std::stop_token cancellation, IStopStageSpringReturnObserver& observer) override {
+    ++takeover_stop_stage_calls;
+    const auto& profile = stage.participant_stop_plan.participant_stop_profile;
+    const bool spring =
+        profile &&
+        (profile->stop_mode == MotionInterruptStopMode::kSpringBackHold ||
+         (profile->stop_mode == MotionInterruptStopMode::kSoftOnPath &&
+          profile->recoverable_substitution_mode == MotionInterruptStopMode::kSpringBackHold));
+    if (spring) {
+      std::optional<SpringBackReturnPointDTO> point;
+      {
+        std::lock_guard lock(prepared_motion_mutex_);
+        if (last_prepared_request) {
+          point.emplace();
+          point->source_goal = {stage.controller_goal_id, stage.controller_goal_generation};
+          point->binding_epoch = ExecutionBindingEpoch(1U);
+          point->trip.binding_epoch = point->binding_epoch;
+          point->trip.local_receipt_count = ExecutionReceiptCount(1U);
+          point->trip.cursor_s = 0.25;
+          point->trip.applied_factor = 1.0;
+          point->initial.joint_names = last_prepared_request->execution_request.binding
+                                           .model_group_binding.compiled_joint_names;
+          const auto dimensions = point->initial.joint_names.size();
+          point->trip.reference_positions_rad.assign(dimensions, 0.0);
+          point->trip.reference_velocities_rad_s.assign(dimensions, 0.1);
+          point->trip.reference_accelerations_rad_s2.assign(dimensions, 0.0);
+          point->initial.command_path_time_s = 0.25;
+          point->initial.path_time_rate = 1.0;
+          point->initial.spring_back_return_point.positions_rad.assign(dimensions, 0.0);
+          point->initial.spring_back_return_point.velocities_rad_s.assign(dimensions, 0.0);
+          point->initial.spring_back_return_point.accelerations_rad_s2.assign(dimensions, 0.0);
+          point->canonical_return_path_time_s = 0.25;
+        }
+      }
+      if (point) static_cast<void>(observer.SpringReturnPointReady(*point));
+    }
+    // Existing hook runs after publishing the actual point, allowing a test
+    // to hold the physical return while successor preparation proceeds.
+    auto result = TranslateStopStage(stage, budget, cancellation);
+    if (spring && result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded) {
+      result.actual_provider_contract_mode = MotionControlledStopMode::kSpringBackHold;
+      if (profile->stop_mode == MotionInterruptStopMode::kSoftOnPath) {
+        result.recoverable_substitution_reason = "takeover_spring_return";
+      }
+    }
+    return result;
   }
 
   ParticipantStopStageResultDTO TranslateStopStage(const ResolvedParticipantStopStageDTO& stage,
@@ -965,6 +1348,13 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   mutable std::atomic<int> status_read_calls{};
   std::atomic<int> dispatch_prepared_motion_calls{};
   std::atomic<int> cancel_prepared_motion_calls{};
+  mutable std::atomic<int> capture_replacement_source_calls{};
+  std::atomic<int> commit_replacement_calls{};
+  std::atomic<int> replacement_owner_commits{};
+  std::atomic<int> retire_cancelled_replacement_calls{};
+  std::atomic<int> prepare_cold_motion_calls{};
+  std::atomic<int> cold_participant_preparations{};
+  std::atomic<int> takeover_stop_stage_calls{};
   std::atomic<int> prepare_command_calls{};
   mutable std::atomic<int> observe_prepared_command_calls{};
   std::atomic<int> dispatch_prepared_command_calls{};
@@ -1006,6 +1396,16 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   mutable std::mutex prepared_command_mutex_;
   std::optional<KernelEvent> event_during_execute;
   bool defer_prepare_completion{};
+  bool supports_motion_replacement{};
+  bool cold_backend_prepared{};
+  std::optional<StopCertificateRefDTO> settled_stop_certificate;
+  std::uint64_t settled_stop_execution_id{};
+  std::uint64_t next_replacement_id{1001U};
+  std::uint64_t replacement_execution_generation{1U};
+  std::atomic<PreparedMotionReplacementPhaseDTO> replacement_phase{
+      PreparedMotionReplacementPhaseDTO::kPreparing};
+  PreparedMotionReplacementPhaseDTO replacement_dispatch_phase{
+      PreparedMotionReplacementPhaseDTO::kPossiblySent};
   bool prepare_bounded_time_law{};
   /// Optional prepared trajectory waypoints and bounds (the binding's joints).
   std::optional<TrajectoryDTO> prepared_trajectory;
@@ -1044,6 +1444,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::optional<ExecuteRequestDTO> last_execute;
   std::optional<ResolvedPreparedMotionExecutionRequestDTO> last_prepared_request;
   mutable std::optional<ResolvedPreparedMotionExecutionSnapshotDTO> prepared_snapshot;
+  std::optional<ResolvedPreparedMotionExecutionRequestDTO> replacement_request;
+  std::optional<ResolvedPreparedMotionExecutionSnapshotDTO> replacement_snapshot;
   std::shared_ptr<const PreparedOperationParticipantDTO> last_dispatched_participant;
   std::optional<ResolvedPreparedCapabilityCommandExecutionRequestDTO> last_prepared_command_request;
   mutable std::optional<ResolvedPreparedCapabilityCommandSnapshotDTO> prepared_command_snapshot;
@@ -1166,11 +1568,25 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
 
     std::vector<PreparedMotionInterruptScopeDTO> scopes;
     for (const auto& scope : request.motion_interrupt_scopes) {
-      if (!scope.stop_profile) {
+      const auto action = std::find_if(
+          authority.interrupt_scope_actions.begin(), authority.interrupt_scope_actions.end(),
+          [&](const auto& value) { return value.scope_id.value() == scope.scope_id; });
+      const bool desired =
+          action != authority.interrupt_scope_actions.end() &&
+          action->preemption_action == InterruptPreemptionAction::kCompleteMoveOnSignal;
+      const bool fault = action != authority.interrupt_scope_actions.end() &&
+                         action->preemption_action == InterruptPreemptionAction::kPreemptTrajectory;
+      if ((!desired && !fault) || desired != scope.stop_profile.has_value() ||
+          (fault && !authority.ordinary_stop_plan)) {
         return Result<PreparedOperationParticipantDTO>::Err(
             ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
                      "fake prepared scope has no Stop profile",
                      {{"reason", "stop_profile_missing"}}});
+      }
+      if (desired) {
+        const auto mode = ValidateIoRuleNominalStopMode(
+            authority.stop_readiness.value().resolved_stop_base_plan, *scope.stop_profile);
+        if (!mode.ok()) return Result<PreparedOperationParticipantDTO>::Err(mode.error());
       }
       PreparedParticipantStopPlanContextDTO context{
           request.binding.operation_id,
@@ -1184,16 +1600,25 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
           ParticipantStopProfilePurposeDTO::kMotionInterruptScope,
           scope.scope_id,
           scope.node_category};
-      auto stop = MakePreparedParticipantStopPlan(
-          authority.stop_readiness.value().resolved_stop_base_plan, std::move(context),
-          binding.resources, authority.retained_default_stop_limits);
+      auto stop =
+          fault ? Result<PreparedParticipantStopPlanDTO>::Ok(*authority.ordinary_stop_plan)
+                : MakePreparedParticipantStopPlan(
+                      authority.stop_readiness.value().resolved_stop_base_plan, std::move(context),
+                      binding.resources, authority.retained_default_stop_limits);
       if (!stop.ok()) {
         return Result<PreparedOperationParticipantDTO>::Err(stop.error());
       }
+      const auto entry = ResolvePreparedIoRuleStopEntry(stop.value(), action->stop_entry_stage_id);
+      if (!entry.ok()) return Result<PreparedOperationParticipantDTO>::Err(entry.error());
+      const auto success_through = ResolvePreparedIoRuleSuccessThrough(
+          stop.value(), entry.value(), action->success_through_stage_id);
+      if (!success_through.ok())
+        return Result<PreparedOperationParticipantDTO>::Err(success_through.error());
       scopes.push_back({MotionInterruptScopeId(scope.scope_id), InterruptPolicyId(scope.policy_id),
-                        scope.activation_mode, scope.arm_timeout_ns, scope.result_binding_key,
-                        scope.required, *scope.stop_profile, scope.node_category, scope.metadata,
-                        std::move(stop.value())});
+                        scope.activation_mode, scope.arm_timeout_ns, scope.required,
+                        scope.stop_profile, scope.node_category, scope.metadata,
+                        std::move(stop.value()), action->preemption_action, entry.value(),
+                        success_through.value()});
     }
     std::sort(scopes.begin(), scopes.end(),
               [](const auto& left, const auto& right) { return left.scope_id < right.scope_id; });
@@ -1507,6 +1932,39 @@ class FakeOperationJournal final : public IOperationJournal {
     return Result<std::uint64_t>::Ok(next_sequence++);
   }
 
+  Result<std::uint64_t> RecordGlobalIoRuleCleared(
+      const IoGlobalRuleRecoveryRecordDTO& record) override {
+    if (global_rule_recovery_hook) global_rule_recovery_hook(record);
+    std::lock_guard lock(mutex);
+    ++global_rule_recovery_calls;
+    const auto existing = std::find_if(global_rule_recoveries.begin(), global_rule_recoveries.end(),
+        [&](const auto& value) {
+          return value.first.intent.request_context.request_id ==
+                 record.intent.request_context.request_id;
+        });
+    if (existing != global_rule_recoveries.end()) {
+      if (existing->first != record)
+        return Result<std::uint64_t>::Err({"request_id_conflict", "recovery payload changed", {}});
+      return Result<std::uint64_t>::Ok(existing->second);
+    }
+    const auto sequence = next_sequence++;
+    global_rule_recoveries.emplace_back(record, sequence);
+    if (fail_after_global_rule_recovery_commit) {
+      fail_after_global_rule_recovery_commit = false;
+      return Result<std::uint64_t>::Err(
+          {"operation_journal_outcome_unknown", "injected committed reply loss", {}});
+    }
+    return Result<std::uint64_t>::Ok(sequence);
+  }
+
+  Result<std::uint64_t> RecordInterruptRuleStateChanged(
+      const IoRuleStateChangeDTO& change) override {
+    if (record_hook) record_hook("interrupt_rule_state_changed");
+    std::lock_guard lock(mutex);
+    interrupt_rule_state_changes.push_back(change);
+    return Result<std::uint64_t>::Ok(next_sequence++);
+  }
+
   Result<std::uint64_t> CloseOwnerEpoch(const RequestOwnerEpoch&, std::int64_t) override {
     std::lock_guard lock(mutex);
     calls.push_back("owner_closed");
@@ -1565,6 +2023,10 @@ class FakeOperationJournal final : public IOperationJournal {
     }
     std::lock_guard lock(mutex);
     calls.push_back("cell_admission_generation_advanced");
+    if (fail_next_kind == "cell_admission_generation_advanced") {
+      fail_next_kind.reset();
+      return Result<std::uint64_t>::Err(ErrorDTO{"journal_write_failed", "readiness generation write failed", {}});
+    }
     return Result<std::uint64_t>::Ok(next_sequence++);
   }
 
@@ -1586,11 +2048,16 @@ class FakeOperationJournal final : public IOperationJournal {
                                                  {{"reason", "injected_journal_failure"}}});
     }
     states.push_back(state);
+    if (throw_after_capture_kind == kind) {
+      throw_after_capture_kind.reset();
+      throw std::runtime_error("journal reply lost after capture");
+    }
     return Result<std::uint64_t>::Ok(next_sequence++);
   }
 
   OperationJournalRecoveryDTO recovery;
   std::optional<std::string> fail_next_kind;
+  std::optional<std::string> throw_after_capture_kind;
   bool fail_next_cell_release{};
   std::vector<std::string> calls;
   std::atomic<int> stop_acceptance_calls{};
@@ -1617,6 +2084,11 @@ class FakeOperationJournal final : public IOperationJournal {
   std::function<void()> cell_admission_acquire_hook;
   std::function<void()> cell_admission_generation_hook;
   std::function<void(std::string_view)> record_hook;
+  std::function<void(const IoGlobalRuleRecoveryRecordDTO&)> global_rule_recovery_hook;
+  std::vector<std::pair<IoGlobalRuleRecoveryRecordDTO, std::uint64_t>> global_rule_recoveries;
+  std::size_t global_rule_recovery_calls{};
+  bool fail_after_global_rule_recovery_commit{};
+  std::vector<IoRuleStateChangeDTO> interrupt_rule_state_changes;
   std::vector<StopId> projected_stop_acceptances;
   std::vector<StopId> projected_stop_terminals;
   std::uint64_t next_sequence{1U};
@@ -4461,6 +4933,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto operation = kernel.get_operation_state(accepted.value().operation_id);
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   EXPECT_EQ(operation.value().state, OperationStateKind::kStopped);
+  ASSERT_TRUE(operation.value().participants.front().terminal_fact);
+  EXPECT_EQ(operation.value().participants.front().terminal_fact->kind,
+            ParticipantExecutionFactKind::kCancelledBeforeDispatch);
+  EXPECT_EQ(operation.value().participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kNoEffect);
   EXPECT_EQ(engine.participant_stop_settlement_calls, 1);
   const auto recovery = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
   ASSERT_TRUE(recovery.ok()) << recovery.error().message;
@@ -4614,6 +5091,10 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_TRUE(certificate.attempted_stage_results.empty());
     ASSERT_TRUE(certificate.terminal_error.has_value());
     EXPECT_EQ(certificate.terminal_error->details.at("reason"), "prepared_motion_cancel_threw");
+    EXPECT_FALSE(kernel.get_operation_state(operation.value().operation_id)
+                     .value()
+                     .participants.front()
+                     .terminal_fact);
     // Q29: InterventionRequired without a cell-wide Stop-fault latch.
     EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
     EXPECT_EQ(kernel.get_operation_state(operation.value().operation_id).value().state,
@@ -5149,6 +5630,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_EQ(state.value().participants.size(), 2U);
   EXPECT_EQ(state.value().participants[0].state, OperationStateKind::kCancelledPreDispatch);
   EXPECT_EQ(state.value().participants[1].state, OperationStateKind::kInterventionRequired);
+  for (const auto& row : state.value().participants) {
+    ASSERT_TRUE(row.terminal_fact);
+    EXPECT_EQ(row.terminal_fact->effect, ParticipantEffectKnowledge::kNoEffect);
+    EXPECT_EQ(row.terminal_fact->error, row.terminal_error);
+  }
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -5178,6 +5664,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_TRUE(held.Entered());
   const auto before = kernel.get_operation_state(operation.value().operation_id);
   EXPECT_TRUE(before.ok());
+  for (const auto& row : before.value().participants) EXPECT_FALSE(row.terminal_fact);
   EXPECT_FALSE(
       kernel.reset(control_request("request.abort-lifetime.reset", operation.value(), 1U)).ok());
   EXPECT_FALSE(kernel
@@ -5720,8 +6207,8 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_FALSE(arm_engine.last_stop_budget->remaining_controlled_deadline_ns);
     ASSERT_TRUE(arm_engine.last_dispatched_participant);
     EXPECT_EQ(stage.participant_stop_plan,
-              arm_engine.last_dispatched_participant->ordinary_stop_plan);
-    EXPECT_FALSE(arm_engine.last_dispatched_participant->fault_stop_plan);
+              arm_engine.last_dispatched_participant->controller().ordinary_stop_plan);
+    EXPECT_FALSE(arm_engine.last_dispatched_participant->controller().fault_stop_plan);
     EXPECT_EQ(arm_engine.translate_stop_stage_calls.load(), 1);
     EXPECT_EQ(idle_gripper.prepare_command_calls.load(), 0);
     EXPECT_EQ(idle_gripper.command_calls.load(), 0);
@@ -5765,6 +6252,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto arm =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto gripper = coordinated_occurrence(grouped_command_binding(), "2");
+  gripper_engine.gripper_status.gripper_id = gripper.value().command_target_id.value();
+  gripper_engine.gripper_status.generation = gripper_engine.next_command_result.generation;
   ResourceAddressedExecutionKernel kernel(
       {registration(arm, arm_engine), registration(gripper, gripper_engine)}, clock, scheduler,
       journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
@@ -5804,9 +6293,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(gripper_engine.last_stop_stage->participant_stop_plan.participant_stop_profile_purpose,
             ParticipantStopProfilePurposeDTO::kOrdinary);
   EXPECT_EQ(gripper_engine.last_stop_stage->controller_goal_id,
-            before.value().participants[1].controller_goal_id);
+            before.value().participants[1].command_id);
   EXPECT_EQ(gripper_engine.last_stop_stage->controller_goal_generation,
-            before.value().participants[1].controller_goal_generation);
+            before.value().participants[1].command_generation);
   EXPECT_EQ(gripper_engine.last_stop_stage->stop_id, *stop_id);
   EXPECT_EQ(arm_engine.last_stop_stage->stop_id, *stop_id);
   EXPECT_EQ(arm_engine.translate_stop_stage_calls.load(), 1);
@@ -6428,6 +6917,41 @@ TEST(ResourceAddressedExecutionKernelTest,
                 "engine:dispatch_prepared_command", "engine:command_gripper"}));
   EXPECT_EQ(motion_engine.dispatch_prepared_motion_calls, 1);
   EXPECT_EQ(command_engine.dispatch_prepared_command_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, UnscopedMixedOperationCannotPreemptBusyArm) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine motion_engine, command_engine;
+  motion_engine.supports_motion_replacement = true;
+  const auto motion =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto command =
+      coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                          CoordinateKind::kLinear, schema),
+                             "2");
+  auto motion_registration = registration(motion, motion_engine);
+  motion_registration.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernel kernel(
+      {motion_registration, registration(command, command_engine)}, clock, scheduler,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto incumbent = kernel.execute(motion_operation("mixed.unscoped.incumbent"));
+  ASSERT_TRUE(incumbent.ok()) << incumbent.error().message;
+  motion_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto mixed = kernel.execute(coordinated_motion_command_operation("mixed.unscoped.refused"));
+  ASSERT_FALSE(mixed.ok());
+  EXPECT_EQ(mixed.error().details.at("reason"), "participant_engine_busy");
+  const auto incumbent_state = kernel.get_operation_state(incumbent.value().operation_id);
+  ASSERT_TRUE(incumbent_state.ok());
+  EXPECT_FALSE(incumbent_state.value().preemption);
+  EXPECT_EQ(motion_engine.prepare_motion_calls, 1);
+  EXPECT_EQ(motion_engine.execute_calls, 1);
+  EXPECT_EQ(motion_engine.capture_replacement_source_calls, 0);
+  EXPECT_EQ(command_engine.prepare_command_calls, 0);
+  EXPECT_EQ(command_engine.command_calls, 0);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -7621,6 +8145,71 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramResumeReleasesMixedStoppedAndR
   ASSERT_TRUE(admitted.ok()) << admitted.error().message;
 }
 
+TEST(ResourceAddressedExecutionKernelTest, IndividualReleaseDoesNotWaitForUnrelatedUnnamedHolds) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  auto capture = program_execution_capture();
+  auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+  table->nodes.insert(
+      table->nodes.begin() + 1,
+      {ProgramNodeInstanceId("place"),
+       "kernel.operation",
+       {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}});
+  table->named_selections.clear();
+  capture.table = table;
+  ASSERT_TRUE(kernel.register_program_run_capture(std::move(capture)).ok());
+  start_program_motion(kernel);
+  const auto held = kernel.stop_program_selection(program_selection_request("hold.unnamed", "all"));
+  ASSERT_TRUE(held.ok()) << held.error().message;
+  ASSERT_TRUE(held.value().state.has_value());
+  ASSERT_EQ(held.value().state->held_nodes.size(), 3U);
+  const auto revision = held.value().state->selection_revision;
+  auto release = program_selection_request("release.one.unnamed", "all");
+  release.group_ids.clear();
+  release.node_instance_id = ProgramNodeInstanceId("move");
+  const auto rejected = [&](const auto& request, std::uint64_t expected, std::string_view reason) {
+    const auto result = kernel.release_program_selection(request, expected);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"), reason);
+    EXPECT_EQ(kernel.get_program_execution_scope(ProgramRunId("run.1")).value().selection_revision,
+              revision);
+  };
+  rejected(release, revision - 1U, "program_selection_revision_stale");
+  auto mixed = release;
+  mixed.group_ids = {"all"};
+  rejected(mixed, revision, "program_selection_invalid");
+  auto unknown = release;
+  unknown.node_instance_id = ProgramNodeInstanceId("missing");
+  rejected(unknown, revision, "program_selection_unknown");
+  auto stale = release;
+  stale.claim_generation = CellAdmissionClaimGeneration(2U);
+  rejected(stale, revision, "program_selection_stale");
+  const auto start = kernel.start_program_selection(release, revision);
+  ASSERT_FALSE(start.ok());
+  EXPECT_EQ(start.error().details.at("reason"), "program_selection_invalid");
+  const auto resumed = kernel.release_program_selection(release, revision);
+  ASSERT_TRUE(resumed.ok()) << resumed.error().message;
+  EXPECT_EQ(resumed.value().selection_revision, revision + 1U);
+  ASSERT_EQ(resumed.value().held_nodes.size(), 2U);
+  EXPECT_EQ(resumed.value().held_nodes[0].node_index, 1U);
+  EXPECT_EQ(resumed.value().held_nodes[1].node_index, 2U);
+  // The released node can proceed while its unrelated unnamed peers remain held.
+  const auto admitted = kernel.execute(scoped_motion_operation("unnamed.after.release"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+  ASSERT_TRUE(wait_until([&] { return engine.execute_calls == 1; }));
+  EXPECT_EQ(engine.stop_calls.load(), 0);
+}
+
 TEST(ResourceAddressedExecutionKernelTest, ProgramSceneClaimOrdersAgainstStopWithoutDelayingIt) {
   using namespace std::chrono_literals;
   FakeClock clock;
@@ -8728,6 +9317,685 @@ TEST(ResourceAddressedExecutionKernelTest,
   }
 }
 
+TEST(
+    ResourceAddressedExecutionKernelTest,
+    CollisionRetryEligibilityRequiresConclusiveExactNominalControlledSettlement) {
+  for (const std::string fault :
+       {"nominal", "later_stop", "cancel", "stale", "inconclusive", "contact",
+        "old_certificate", "observation_expired"}) {
+    SCOPED_TRACE(fault);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine, other_engine;
+    const auto binding = make_binding(
+        "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    auto registered = registration_with_collision_cancel(binding, engine);
+    if (fault == "cancel")
+      registered.default_fault_stop_profile.reset();
+    ResourceAddressedExecutionKernel kernel(
+        {std::move(registered),
+         registration(coordinated_occurrence(binding, "2"), other_engine)},
+        clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    const auto accepted =
+        kernel.execute(motion_operation("retry.collision.matrix"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    engine.emit_transition(ExecutionState::kPlanning,
+                           ExecutionState::kExecuting);
+    std::map<std::string, std::string> details;
+    if (fault == "stale")
+      details = {{"reason", "stale_observed_robot_state"},
+                 {"in_collision", "false"}};
+    if (fault == "inconclusive")
+      details = {{"runtime_query_engine_status", "diagnostic_incomplete"}};
+    if (fault == "contact")
+      details = {{"contact_policy_violation", "penetration_exceeded"}};
+    engine.emit_collision(std::move(details));
+    std::optional<StopId> stop_id;
+    ASSERT_TRUE(wait_until([&] {
+      const auto state =
+          kernel.get_operation_state(accepted.value().operation_id);
+      if (!state.ok() || !state.value().active_stop_id)
+        return false;
+      stop_id = state.value().active_stop_id;
+      const auto status = kernel.get_stop_status(*stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    if (fault == "later_stop") {
+      auto other = motion_operation("retry.disjoint.stop");
+      other.participants.front().component_role_id = ComponentRoleId("robot_2");
+      other.participants.front().target_role_id = TargetRoleId("arm_2");
+      const auto other_accepted = kernel.execute(other);
+      ASSERT_TRUE(other_accepted.ok()) << other_accepted.error().message;
+      other_engine.emit_transition(ExecutionState::kPlanning,
+                                   ExecutionState::kExecuting);
+      const auto other_stop = kernel.stop(stop_request(
+          "retry.disjoint.stop.request", other_accepted.value(), 1U));
+      ASSERT_TRUE(other_stop.ok());
+      ASSERT_TRUE(wait_until([&] {
+        const auto status = kernel.get_stop_status(other_stop.value().stop_id);
+        return status.ok() && status.value().stop_certificate.has_value();
+      }));
+      ASSERT_NE(other_stop.value().stop_id, *stop_id);
+    }
+    // The participant's local owner generation is a separate namespace from
+    // the aggregate Stop generation; exact certificate identity joins them.
+    engine.recovery_assessment.stop_owner_generation = 37U;
+    engine.recovery_assessment.observed_state_available = true;
+    engine.recovery_assessment.observed_state_fresh = true;
+    engine.recovery_assessment.observed_state_at_rest = true;
+    engine.recovery_assessment.observed_state_valid_until_ns =
+        clock.now() + 1'000'000'000;
+    if (fault == "observation_expired")
+      engine.recovery_assessment.observed_state_valid_until_ns = clock.now();
+    if (fault == "old_certificate")
+      engine.recovery_assessment.stop_certificate_id = "unrelated.certificate";
+    const auto assessed =
+        kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+    ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+    EXPECT_EQ(assessed.value().assessment.retry_eligibility.eligible,
+              (fault == "nominal" || fault == "later_stop"));
+    EXPECT_EQ(assessed.value().assessment.recovery_class,
+              RecoveryClass::kRuntimeCollision);
+    EXPECT_EQ(assessed.value().assessment.allowed_actions,
+              engine.recovery_assessment.allowed_actions);
+    const auto polled =
+        kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+    ASSERT_TRUE(polled.ok());
+    EXPECT_EQ(polled.value().assessment.assessment_revision,
+              assessed.value().assessment.assessment_revision);
+    engine.recovery_assessment.observed_state_fresh = false;
+    const auto lost =
+        kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+    ASSERT_TRUE(lost.ok());
+    EXPECT_FALSE(lost.value().assessment.retry_eligibility.eligible);
+    EXPECT_GT(lost.value().assessment.assessment_revision,
+              assessed.value().assessment.assessment_revision);
+  }
+}
+
+TEST(
+    ResourceAddressedExecutionKernelTest,
+    FreshProgramRecoveryClearsOnlyRetiredNodeContinuationAndRejectsConflictingReplay) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{
+      RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+                                 CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  auto capture = program_execution_capture();
+  auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+  capture.table = table;
+  ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  start_program_motion(kernel);
+  const auto first = kernel.execute(scoped_motion_operation("fresh.first"));
+  ASSERT_TRUE(first.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto stopped = kernel.stop_program_selection(
+      program_selection_request("fresh.manual.stop", "arm"));
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto scope =
+        kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    return scope.ok() && scope.value().pending_effects.empty();
+  }));
+  auto current = kernel.get_operation_state(first.value().operation_id);
+  ASSERT_TRUE(current.ok());
+  KernelRecoveryActionRequestDTO manual{"fresh.manual.recover",
+                                        RecoveryAction::kReplanFromStoppedState,
+                                        "operator",
+                                        1U,
+                                        1U,
+                                        41U,
+                                        "",
+                                        "",
+                                        0U,
+                                        "manual"};
+  engine.next_recovery_result = {
+      manual.request_id, manual.action, true, {}, std::nullopt};
+  ASSERT_TRUE(kernel
+                  .apply_operation_recovery_action(
+                      first.value().operation_id,
+                      current.value().operation_revision, manual)
+                  .ok());
+  const auto scope = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(scope.ok());
+  ASSERT_TRUE(kernel
+                  .release_program_selection(
+                      program_selection_request("fresh.manual.resume", "arm"),
+                      scope.value().selection_revision)
+                  .ok());
+  auto failed_request = scoped_motion_operation("fresh.failed.preparation");
+  failed_request.participants.front().execution_scope->node_attempt_id =
+      "move.attempt.2";
+  engine.prepare_call_failure =
+      ErrorDTO{"planning_failed", "transient planning failure", {}};
+  const auto failed = kernel.execute(failed_request);
+  ASSERT_TRUE(failed.ok());
+  engine.recovery_assessment.assessment_revision += 1U;
+  engine.recovery_assessment.execution_state = ExecutionState::kFailed;
+  engine.recovery_assessment.recovery_class = RecoveryClass::kFailedValidation;
+  engine.recovery_assessment.retry_admissible = true;
+  engine.recovery_assessment.allowed_actions = {
+      RecoveryAction::kRetryAfterSceneRepair};
+  engine.recovery_assessment.retry_eligibility = {
+      true, MotionRetryCause::kPlanningNoEffect,
+      MotionRetryEffect::kKnownNoEffect, MotionRetryIneligibilityReason::kNone};
+  const auto projection =
+      kernel.get_operation_recovery_assessment(failed.value().operation_id);
+  ASSERT_TRUE(projection.ok());
+  const auto &assessment = projection.value().assessment;
+  KernelRecoveryActionRequestDTO fresh{"fresh.automatic.recover",
+                                       RecoveryAction::kRetryAfterSceneRepair,
+                                       "program_runner",
+                                       assessment.assessment_revision,
+                                       assessment.control_command_epoch,
+                                       assessment.execution_id,
+                                       assessment.latch_id,
+                                       assessment.stop_certificate_id,
+                                       assessment.stop_owner_generation,
+                                       "retry",
+                                       true};
+  engine.next_recovery_result = {
+      fresh.request_id, fresh.action, true, {}, std::nullopt};
+  const auto observation_count = engine.observe_prepared_motion_calls.load();
+  const auto recovered = kernel.apply_operation_recovery_action(
+      failed.value().operation_id, projection.value().operation_revision,
+      fresh);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_TRUE(recovered.value().accepted);
+  const auto retired = kernel.get_operation_state(failed.value().operation_id);
+  ASSERT_TRUE(retired.ok());
+  EXPECT_EQ(retired.value().participants.front().execution_scope,
+            failed_request.participants.front().execution_scope);
+  ASSERT_TRUE(retired.value().participants.front().terminal_error);
+  EXPECT_EQ(retired.value().participants.front().terminal_error->code, "planning_failed");
+  EXPECT_EQ(engine.observe_prepared_motion_calls.load(), observation_count);
+  ASSERT_TRUE(engine.last_recovery_request);
+  EXPECT_FALSE(engine.last_recovery_request->fresh_motion_attempt);
+  const auto replay = kernel.apply_operation_recovery_action(
+      failed.value().operation_id, projection.value().operation_revision,
+      fresh);
+  ASSERT_TRUE(replay.ok());
+  auto conflict = fresh;
+  conflict.fresh_motion_attempt = false;
+  const auto rejected = kernel.apply_operation_recovery_action(
+      failed.value().operation_id, projection.value().operation_revision,
+      conflict);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code, "invalid_request");
+  EXPECT_EQ(rejected.error().details.at("reason"), "request_id_conflict");
+  engine.prepare_call_failure.reset();
+  auto next = scoped_motion_operation("fresh.changed.target");
+  next.participants.front().execution_scope->node_attempt_id = "move.attempt.3";
+  std::get<JointGoalDTO>(
+      std::get<MotionParticipantIntentDTO>(next.participants.front().payload)
+          .motion)
+      .positions_rad = {0.8};
+  const auto executed = kernel.execute(next);
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  ASSERT_TRUE(engine.last_prepared_request);
+  EXPECT_FALSE(engine.last_prepared_request->continuation);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     FreshRecoveryRejectsManualOperationAndEligibilityLostBeforeEffect) {
+  for (const bool program_scope : {false, true}) {
+    SCOPED_TRACE(program_scope);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    ResourceAddressedExecutionKernelConfig config{
+        RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel(
+        {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+                                   CoordinateKind::kAngular),
+                      engine)},
+        clock, scheduler, default_journal, std::move(config));
+    if (program_scope) {
+      ASSERT_TRUE(claim_program_execution(kernel).ok());
+      auto capture = program_execution_capture();
+      auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+      capture.table = table;
+      ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+      start_program_motion(kernel);
+    }
+    engine.prepare_call_failure = ErrorDTO{"planning_failed", "transient", {}};
+    auto intent = program_scope ? scoped_motion_operation("fresh.fence")
+                                : motion_operation("fresh.fence");
+
+    const auto operation = kernel.execute(intent);
+    ASSERT_TRUE(operation.ok());
+    engine.recovery_assessment.assessment_revision = 4U;
+    engine.recovery_assessment.retry_admissible = true;
+    engine.recovery_assessment.allowed_actions = {
+        RecoveryAction::kRetryAfterSceneRepair};
+    engine.recovery_assessment.retry_eligibility = {
+        true, MotionRetryCause::kPlanningNoEffect,
+        MotionRetryEffect::kKnownNoEffect,
+        MotionRetryIneligibilityReason::kNone};
+    const auto projection = kernel.get_operation_recovery_assessment(
+        operation.value().operation_id);
+    ASSERT_TRUE(projection.ok());
+    const auto &a = projection.value().assessment;
+    KernelRecoveryActionRequestDTO request{
+        "fresh.fence.recover",
+        RecoveryAction::kRetryAfterSceneRepair,
+        "program_runner",
+        a.assessment_revision,
+        a.control_command_epoch,
+        a.execution_id,
+        a.latch_id,
+        a.stop_certificate_id,
+        a.stop_owner_generation,
+        "retry",
+        true};
+    engine.next_recovery_result = {
+        request.request_id, request.action, true, {}, std::nullopt};
+    const auto reads = engine.recovery_assessment_calls.load();
+    engine.recovery_assessment_hook = [&] {
+      if (engine.recovery_assessment_calls.load() >= reads + 2)
+        engine.recovery_assessment.retry_eligibility = {};
+    };
+    const auto rejected = kernel.apply_operation_recovery_action(
+        operation.value().operation_id, projection.value().operation_revision,
+        request);
+    EXPECT_FALSE(rejected.ok());
+    EXPECT_EQ(engine.recovery_action_calls.load(), 0);
+
+    EXPECT_TRUE(kernel.get_operation_projection(operation.value().operation_id)
+                    .value()
+                    .resident);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     SingleRecoveryRejectsOuterRevisionThatCoincidesWithCurrentLocalRevision) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+                                 CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto operation = kernel.execute(motion_operation("owner.revision"));
+  ASSERT_TRUE(operation.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  engine.emit_collision();
+  ASSERT_TRUE(wait_until([&] {
+    const auto state =
+        kernel.get_operation_state(operation.value().operation_id);
+    if (!state.ok() || !state.value().active_stop_id)
+      return false;
+    const auto status = kernel.get_stop_status(*state.value().active_stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  auto &local = engine.recovery_assessment;
+  local.assessment_revision = 2U;
+  local.observed_state_available = true;
+  local.observed_state_fresh = true;
+  local.observed_state_at_rest = true;
+  local.observed_state_valid_until_ns = 100;
+  const auto initial =
+      kernel.get_operation_recovery_assessment(operation.value().operation_id);
+  ASSERT_TRUE(initial.ok());
+  ASSERT_EQ(initial.value().assessment.assessment_revision, 2U);
+  clock.set(100);
+  const auto current =
+      kernel.get_operation_recovery_assessment(operation.value().operation_id);
+  ASSERT_TRUE(current.ok());
+  ASSERT_EQ(current.value().assessment.assessment_revision, 3U);
+  ASSERT_EQ(local.assessment_revision, 2U);
+  const auto &assessment = current.value().assessment;
+  KernelRecoveryActionRequestDTO request{
+      "owner.revision.recover",
+      RecoveryAction::kReplanFromStoppedState,
+      "operator",
+      2U,
+      assessment.control_command_epoch,
+      assessment.execution_id,
+      assessment.latch_id,
+      assessment.stop_certificate_id,
+      assessment.stop_owner_generation,
+      "manual"};
+  engine.next_recovery_result = {
+      request.request_id, request.action, true, {}, std::nullopt};
+  const auto stale = kernel.apply_operation_recovery_action(
+      operation.value().operation_id, current.value().operation_revision,
+      request);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().code, "stale_generation");
+  EXPECT_EQ(stale.error().details.at("reason"), "operation_recovery_stale");
+  EXPECT_EQ(engine.recovery_action_calls.load(), 0);
+  request.expected_assessment_revision = assessment.assessment_revision;
+  const auto accepted = kernel.apply_operation_recovery_action(
+      operation.value().operation_id, current.value().operation_revision,
+      request);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_TRUE(accepted.value().accepted);
+  ASSERT_TRUE(engine.last_recovery_request);
+  EXPECT_EQ(engine.last_recovery_request->expected_assessment_revision,
+            local.assessment_revision);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     OperatorStopCannotReuseParticipantPlanningRetryProof) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+                                 CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto operation =
+      kernel.execute(motion_operation("operator.stop.retry"));
+  ASSERT_TRUE(operation.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto stopped = kernel.stop(
+      stop_request("operator.stop.retry.stop", operation.value(), 1U));
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  engine.recovery_assessment.retry_eligibility = {
+      true, MotionRetryCause::kPlanningNoEffect,
+      MotionRetryEffect::kKnownNoEffect, MotionRetryIneligibilityReason::kNone};
+  const auto projection =
+      kernel.get_operation_recovery_assessment(operation.value().operation_id);
+  ASSERT_TRUE(projection.ok());
+  EXPECT_FALSE(projection.value().assessment.retry_eligibility.eligible);
+  EXPECT_EQ(projection.value().assessment.allowed_actions,
+            engine.recovery_assessment.allowed_actions);
+  EXPECT_EQ(engine.recovery_action_calls.load(), 0);
+}
+TEST(ResourceAddressedExecutionKernelTest,
+     RunEndFencesFreshRecoveryForExactCapturedRun) {
+  for (const std::string condition :
+       {"terminal", "resetting", "foreign_run", "foreign_owner", "foreign_claim", "claim_retired", "during_cleanup"}) {
+    SCOPED_TRACE(condition);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeOperationJournal journal;
+    FakeParticipantEngine engine;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    config.cell_admission_reconcile_validator = [](const auto& held, const auto&,
+                                                   const auto& request) {
+      CellAdmissionReconcileValidationDTO validation{request.current_owner_epochs, {}};
+      for (const auto& claim : held)
+        validation.settlements.push_back({claim, CellAdmissionOwnerRoleDTO::kProgramRunner,
+                                          RequestOwnerEpoch("program.successor"),
+                                          CellAdmissionSettlementKindDTO::kReconciled,
+                                          request.reconciliation_evidence_digest});
+      return Result<CellAdmissionReconcileValidationDTO>::Ok(std::move(validation));
+    };
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, journal, std::move(config));
+    const auto claim = claim_program_execution(kernel);
+    ASSERT_TRUE(claim.ok());
+    auto capture = program_execution_capture();
+    auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+    capture.table = table;
+    ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+    start_program_motion(kernel);
+    auto intent = scoped_motion_operation("lifetime.failure");
+    const auto operation = kernel.execute(intent);
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    const ErrorDTO failure{"planning_failed", "transient", {}};
+    const ParticipantExecutionFact fact{ParticipantExecutionFactKind::kLocalFailure,
+                                        ParticipantEffectKnowledge::kNoEffect, failure};
+    {
+      std::lock_guard lock(engine.status_mutex_);
+      engine.status.state = ExecutionState::kPlanning;
+      engine.status.fact = fact;
+      engine.status.execution_id = engine.next_execution_id;
+    }
+    const MotionRetryEligibilityDTO eligible{true, MotionRetryCause::kPlanningNoEffect,
+                                             MotionRetryEffect::kKnownNoEffect,
+                                             MotionRetryIneligibilityReason::kNone};
+    KernelEvent settled{KernelEventType::kParticipantSettled,
+                        engine.next_execution_id,
+                        0,
+                        ExecutionState::kPlanning,
+                        ExecutionState::kPlanning,
+                        failure,
+                        {}};
+    settled.participant_fact = fact;
+    settled.retry_eligibility = eligible;
+    engine.deliver_event(settled);
+    engine.recovery_assessment.assessment_revision = 1U;
+    engine.recovery_assessment.control_command_epoch = 1U;
+    engine.recovery_assessment.execution_id = engine.next_execution_id;
+    engine.recovery_assessment.execution_state = ExecutionState::kFailed;
+    engine.recovery_assessment.recovery_class = RecoveryClass::kFailedValidation;
+    engine.recovery_assessment.status = RecoveryAssessmentStatus::kRetryReady;
+    engine.recovery_assessment.retry_admissible = true;
+    engine.recovery_assessment.allowed_actions = {RecoveryAction::kRetryAfterSceneRepair};
+    engine.recovery_assessment.retry_eligibility = eligible;
+    const auto before = kernel.get_operation_recovery_assessment(operation.value().operation_id);
+    ASSERT_TRUE(before.ok());
+    ASSERT_TRUE(before.value().assessment.retry_eligibility.eligible);
+    CellAdmissionReadinessSnapshotDTO readiness{
+        true,
+        ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 2U,
+                              ProgramCycleStateDTO::kTerminalAwaitingReset, ProgramRunId("run.1"),
+                              claim.value().claim_generation, ContentDigest(test_digest('2'))},
+        true,
+        1U,
+        1U,
+        true,
+        true,
+        0U,
+        0U,
+        0U};
+    if (condition == "terminal" || condition == "resetting") {
+      readiness.program_cycle_status_current = true;
+      readiness.program_cycle_status->state = condition == "terminal"
+                                                  ? ProgramCycleStateDTO::kTerminalAwaitingReset
+                                                  : ProgramCycleStateDTO::kResetting;
+      if (condition == "terminal")
+        readiness.program_cycle_status->terminal_or_settlement_reference =
+            ContentDigest(test_digest('2'));
+    }
+    if (condition == "foreign_run")
+      readiness.program_cycle_status->program_run_id = ProgramRunId("run.old");
+    if (condition == "foreign_owner")
+      readiness.program_cycle_status->program_runner_owner_epoch = RequestOwnerEpoch("program.old");
+    if (condition == "foreign_claim")
+      readiness.program_cycle_status->cycle_claim_generation =
+          CellAdmissionClaimGeneration(claim.value().claim_generation.value() + 1U);
+    if (condition == "during_cleanup") {
+      engine.recovery_action_hook = [&] {
+        ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(readiness).ok());
+      };
+      const auto& a = before.value().assessment;
+      KernelRecoveryActionRequestDTO request{"lifetime.cleanup",
+                                             RecoveryAction::kRetryAfterSceneRepair,
+                                             "program_runner",
+                                             a.assessment_revision,
+                                             a.control_command_epoch,
+                                             a.execution_id,
+                                             a.latch_id,
+                                             a.stop_certificate_id,
+                                             a.stop_owner_generation,
+                                             "retry",
+                                             true};
+      engine.next_recovery_result = {request.request_id, request.action, true, {}, std::nullopt};
+      const auto recovered = kernel.apply_operation_recovery_action(
+          operation.value().operation_id, before.value().operation_revision, request);
+      ASSERT_FALSE(recovered.ok());
+      EXPECT_EQ(recovered.error().code, "invariant_violation");
+      EXPECT_EQ(recovered.error().details.at("reason"),
+                "operation_recovery_outcome_unresolved");
+      EXPECT_EQ(engine.recovery_action_calls.load(), 1);
+      auto next = intent;
+      next.request_context.request_id = RequestId("lifetime.no-fresh-execute");
+      next.participants.front().execution_scope->node_attempt_id = "attempt.next";
+      EXPECT_FALSE(kernel.execute(next).ok());
+    } else if (condition == "claim_retired") {
+      // No transient terminal/Resetting status is observed: the existing
+      // exact claim reconciliation is the retirement authority.
+      const CellAdmissionReconcileDTO reconcile{
+          RequestOwnerEpoch("kernel.epoch.1"),
+          {claim.value()},
+          {{CellAdmissionOwnerRoleDTO::kProgramRunner, RequestOwnerEpoch("program.successor")}},
+          ContentDigest(test_digest('2'))};
+      ASSERT_TRUE(kernel.ReconcileCellAdmissionClaims(reconcile).ok());
+    } else {
+      ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(readiness).ok());
+    }
+    const bool foreign = condition.starts_with("foreign_");
+    const auto state = kernel.get_operation_projection(operation.value().operation_id);
+    ASSERT_TRUE(state.ok());
+    EXPECT_TRUE(state.value().resident);
+    if (!foreign) {
+      const auto after = kernel.get_operation_recovery_assessment(operation.value().operation_id);
+      ASSERT_TRUE(after.ok());
+      EXPECT_FALSE(after.value().assessment.retry_eligibility.eligible);
+    }
+  }
+}
+TEST(ResourceAddressedExecutionKernelTest,
+     FreshRetirementChecksOwnershipAndPreservesFailureWithoutAlarmHandshake) {
+  for (const std::string phase : {"normal", "owner_mismatch", "collision"}) {
+    SCOPED_TRACE(phase);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeOperationJournal journal;
+    FakeParticipantEngine engine;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    const bool collision = phase == "collision";
+    const auto binding = make_binding(
+        "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    ResourceAddressedExecutionKernel kernel(
+        {collision ? registration_with_collision_cancel(binding, engine)
+                   : registration(binding, engine)},
+        clock, scheduler, journal, std::move(config));
+    const auto claim = claim_program_execution(kernel);
+    ASSERT_TRUE(claim.ok());
+    auto capture = program_execution_capture();
+    auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+    capture.table = table;
+    ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+    start_program_motion(kernel);
+    auto intent = scoped_motion_operation("retirement.first");
+    const auto operation = kernel.execute(intent);
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    if (collision) {
+      engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+      engine.emit_collision();
+      ASSERT_TRUE(wait_until([&] {
+        const auto state = kernel.get_operation_state(operation.value().operation_id);
+        if (!state.ok() || !state.value().active_stop_id) return false;
+        const auto stopped = kernel.get_stop_status(*state.value().active_stop_id);
+        return stopped.ok() && stopped.value().stop_certificate.has_value();
+      }));
+      engine.recovery_assessment.stop_owner_generation = 37U;
+      engine.recovery_assessment.observed_state_available = true;
+      engine.recovery_assessment.observed_state_fresh = true;
+      engine.recovery_assessment.observed_state_at_rest = true;
+      engine.recovery_assessment.observed_state_valid_until_ns = clock.now() + 1'000'000'000;
+    } else {
+      const MotionRetryEligibilityDTO eligible{true, MotionRetryCause::kPlanningNoEffect,
+                                               MotionRetryEffect::kKnownNoEffect,
+                                               MotionRetryIneligibilityReason::kNone};
+      auto failure = engine.record_transition(ExecutionState::kPlanning, ExecutionState::kFailed,
+                                              ErrorDTO{"planning_failed", "transient", {}});
+      failure.retry_eligibility = eligible;
+      engine.deliver_event(failure);
+      engine.recovery_assessment.assessment_revision = 1U;
+      engine.recovery_assessment.control_command_epoch = 1U;
+      engine.recovery_assessment.execution_id = engine.next_execution_id;
+      engine.recovery_assessment.execution_state = ExecutionState::kFailed;
+      engine.recovery_assessment.recovery_class = RecoveryClass::kFailedValidation;
+      engine.recovery_assessment.status = RecoveryAssessmentStatus::kRetryReady;
+      engine.recovery_assessment.retry_admissible = true;
+      engine.recovery_assessment.allowed_actions = {RecoveryAction::kRetryAfterSceneRepair};
+      engine.recovery_assessment.retry_eligibility = eligible;
+    }
+    const auto projection =
+        kernel.get_operation_recovery_assessment(operation.value().operation_id);
+    ASSERT_TRUE(projection.ok());
+    const auto& a = projection.value().assessment;
+    ASSERT_TRUE(a.retry_eligibility.eligible);
+    KernelRecoveryActionRequestDTO request{"retirement.recover",
+                                           collision ? RecoveryAction::kReplanFromStoppedState
+                                                     : RecoveryAction::kRetryAfterSceneRepair,
+                                           "program_runner",
+                                           a.assessment_revision,
+                                           a.control_command_epoch,
+                                           a.execution_id,
+                                           a.latch_id,
+                                           a.stop_certificate_id,
+                                           a.stop_owner_generation,
+                                           "retry",
+                                           true};
+    engine.next_recovery_result = {request.request_id, request.action, true, {}, std::nullopt};
+    if (phase == "owner_mismatch") {
+      engine.recovery_action_hook = [&] {
+        // Adversarially replace the exact reservation after local cleanup;
+        // accepted retirement must not bypass final ownership validation.
+        auto slots = std::const_pointer_cast<ResourceSlotTable>(kernel.resource_admission_table());
+        const auto snapshot = slots->coherent_snapshot();
+        ASSERT_EQ(snapshot.slots.size(), 1U);
+        ASSERT_TRUE(snapshot.slots.front().owner);
+        const auto owner = *snapshot.slots.front().owner;
+        const std::vector<ResourceId> resources{snapshot.slots.front().resource_id};
+        ASSERT_TRUE(slots->release(owner, resources).ok());
+        auto foreign = owner;
+        foreign.operation_id = OperationId("retirement.foreign");
+        foreign.participant_id = OperationParticipantId("retirement.foreign.participant");
+        ASSERT_TRUE(slots->reserve(foreign, resources).ok());
+      };
+    }
+    const auto writes_before = journal.states.size();
+    const auto recovered = kernel.apply_operation_recovery_action(
+        operation.value().operation_id, projection.value().operation_revision, request);
+    const auto current = kernel.get_operation_projection(operation.value().operation_id);
+    ASSERT_TRUE(current.ok());
+    EXPECT_EQ(journal.states.size(), writes_before);
+    ASSERT_FALSE(current.value().operation.participants.empty());
+    EXPECT_TRUE(current.value().operation.participants.front().terminal_error);
+    EXPECT_EQ(current.value().operation.participants.front().execution_scope,
+              intent.participants.front().execution_scope);
+    if (phase == "owner_mismatch") {
+      EXPECT_FALSE(recovered.ok());
+      EXPECT_TRUE(current.value().resident);
+    } else {
+      ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+      EXPECT_TRUE(recovered.value().accepted);
+      EXPECT_FALSE(current.value().resident);
+      for (const auto& slot : kernel.resource_snapshot()) {
+        EXPECT_EQ(slot.state, ResourceSlotState::kFree);
+        EXPECT_FALSE(slot.owner);
+      }
+      const auto replay = kernel.apply_operation_recovery_action(
+          operation.value().operation_id, projection.value().operation_revision, request);
+      ASSERT_TRUE(replay.ok());
+      EXPECT_TRUE(replay.value().accepted);
+      EXPECT_EQ(engine.recovery_action_calls.load(), 1);
+      EXPECT_EQ(journal.states.size(), writes_before);
+    }
+  }
+}
 TEST(ResourceAddressedExecutionKernelTest,
      ProgramContinuationObservationFailureHasNoCleanupEffect) {
   for (const bool throws : {false, true}) {
@@ -8966,13 +10234,21 @@ TEST(ResourceAddressedExecutionKernelTest, RecoveryWaitsForSharedStopCertificate
     const auto status = kernel.get_stop_status(stop.value().stop_id);
     return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
   }));
-  state = kernel.get_operation_state(operations.front().operation_id);
-  ASSERT_TRUE(state.ok());
+  const auto settled_assessment =
+      kernel.get_operation_recovery_assessment(operations.front().operation_id);
+  ASSERT_TRUE(settled_assessment.ok());
+  const auto& current = settled_assessment.value().assessment;
+  recovery.expected_assessment_revision = current.assessment_revision;
+  recovery.expected_control_command_epoch = current.control_command_epoch;
+  recovery.expected_execution_id = current.execution_id;
+  recovery.expected_latch_id = current.latch_id;
+  recovery.expected_stop_certificate_id = current.stop_certificate_id;
+  recovery.expected_stop_owner_generation = current.stop_owner_generation;
   recovery.request_id = "shared.recovery.after-settlement";
   first_engine.next_recovery_result =
       KernelRecoveryActionResultDTO{recovery.request_id, recovery.action, true, {}, std::nullopt};
   const auto recovered = kernel.apply_operation_recovery_action(
-      operations.front().operation_id, state.value().operation_revision, recovery);
+      operations.front().operation_id, settled_assessment.value().operation_revision, recovery);
   ASSERT_TRUE(recovered.ok()) << recovered.error().message;
   EXPECT_TRUE(recovered.value().accepted);
   EXPECT_EQ(first_engine.recovery_action_calls.load(), 1);
@@ -13309,71 +14585,214 @@ TEST(ResourceAddressedExecutionKernelTest, ThrownObservationWriteReleasesCommitF
   };
   EXPECT_NO_THROW(engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted));
   EXPECT_EQ(kernel.get_operation_state(operation.value().operation_id).value(), before.value());
+  const auto fault = kernel.get_operation_journal_write_fault();
+  ASSERT_TRUE(fault);
+  EXPECT_EQ(fault->write_kind, "subordinate_state_observed");
+  const auto captured = journal.states.size();
+  // DX1133 preserves this existing background reconciliation append. Its
+  // success cannot repair the sticky infrastructure fault or reopen motion.
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(journal.states.size(), captured + 1U);
   EXPECT_EQ(kernel.get_operation_state(operation.value().operation_id).value().state,
             OperationStateKind::kCompleted);
+  EXPECT_EQ(kernel.get_operation_journal_write_fault(), fault);
+  EXPECT_FALSE(kernel.execute(motion_operation("journal.after-successful-reappend")).ok());
 }
 
-TEST(ResourceAddressedExecutionKernelTest, ThrownAdmissionWritesReleaseTheirNondurableClaims) {
+TEST(ResourceAddressedExecutionKernelTest,
+     ThrownAdmissionWritesReleaseReservationsButKeepFirstFaultThroughReconfiguration) {
   for (const bool coordinated : {false, true}) {
     SCOPED_TRACE(coordinated);
     FakeClock clock;
     ManualScheduler scheduler;
-    FakeParticipantEngine first_engine;
-    FakeParticipantEngine second_engine;
-    second_engine.next_command_result.command_id = second_engine.next_execution_id;
-    second_engine.gripper_status.command_id = second_engine.next_execution_id;
+    FakeParticipantEngine first_engine, second_engine;
     FakeOperationJournal journal;
     const auto first =
         make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto second = coordinated_occurrence(grouped_command_binding(), "2");
     ResourceAddressedExecutionKernel kernel(
-        {registration(first, first_engine),
-         registration(coordinated_occurrence(grouped_command_binding(), "2"), second_engine)},
+        {registration(first, first_engine), registration(second, second_engine)},
         clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    EXPECT_FALSE(kernel.get_operation_journal_write_fault());
     journal.record_hook = [](std::string_view kind) {
       if (kind == "operation_accepted") throw std::runtime_error("admission write threw");
     };
-    const auto rejected =
-        kernel.execute(coordinated ? grouped_motion_commands_operation("request.throw-admission")
-                                   : motion_operation("request.throw-admission"));
+    const auto intent = coordinated
+                            ? grouped_motion_commands_operation("request.throw-admission")
+                            : motion_operation("request.throw-admission");
+    const auto rejected = kernel.execute(intent);
     ASSERT_FALSE(rejected.ok());
     EXPECT_EQ(rejected.error().code, "operation_journal_exception");
-    for (const auto& slot : kernel.resource_snapshot())
+    for (const auto& slot : kernel.resource_snapshot()) {
       EXPECT_EQ(slot.state, ResourceSlotState::kFree);
+      EXPECT_FALSE(slot.owner);
+    }
     EXPECT_EQ(first_engine.execute_calls, 0);
     EXPECT_EQ(second_engine.command_calls, 0);
+    const auto fault = kernel.get_operation_journal_write_fault();
+    ASSERT_TRUE(fault);
+    EXPECT_EQ(fault->request_owner_epoch, RequestOwnerEpoch("kernel.epoch.1"));
+    EXPECT_EQ(fault->write_kind, "operation_accepted");
+    EXPECT_EQ(fault->error.code, "operation_journal_exception");
+    EXPECT_EQ(fault->error.message, "admission write threw");
+    EXPECT_TRUE(fault->error.details.empty());
+    EXPECT_EQ(fault->request_id, intent.request_context.request_id);
+    EXPECT_EQ(fault->program_run_id, intent.program_run_id);
+    EXPECT_TRUE(fault->operation_id);
+    EXPECT_TRUE(fault->operation_revision);
     journal.record_hook = {};
-    const auto operation = kernel.execute(
-        coordinated ? grouped_motion_commands_operation("request.after-throw-admission")
-                    : motion_operation("request.after-throw-admission"));
-    ASSERT_TRUE(operation.ok());
-    first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
-    if (coordinated) {
-      second_engine.gripper_status.state = GripperCommandState::kCompleted;
-      second_engine.gripper_status.progress = 1.0;
-      ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
-    }
-    ASSERT_TRUE(wait_until([&] {
-      const auto state = kernel.get_operation_state(operation.value().operation_id);
-      return state.ok() && state.value().state == OperationStateKind::kCompleted;
-    }));
-    journal.record_hook = [](std::string_view kind) {
-      if (kind == "control_accepted") throw std::runtime_error("control write threw");
-    };
-    const auto failed_control = kernel.acknowledge_completed(
-        control_request("request.throw-acknowledge", operation.value(), 1U));
-    ASSERT_FALSE(failed_control.ok());
-    EXPECT_EQ(failed_control.error().code, "operation_journal_exception");
-    const auto current = kernel.get_operation_projection(operation.value().operation_id);
-    ASSERT_TRUE(current.ok());
-    EXPECT_FALSE(current.value().control_pending);
-    EXPECT_EQ(current.value().operation.operation_revision.value(), 1U);
-    journal.record_hook = {};
-    EXPECT_TRUE(kernel
-                    .acknowledge_completed(control_request("request.after-throw-acknowledge",
-                                                           operation.value(), 1U))
-                    .ok());
+    ASSERT_TRUE(kernel.reconfigure_runtime_participants(
+        {registration(first, first_engine), registration(second, second_engine)}).ok());
+    const auto writes = journal.calls.size();
+    EXPECT_EQ(kernel.get_operation_journal_write_fault(), fault);
+    EXPECT_EQ(journal.calls.size(), writes);  // getter is independent of storage
+    EXPECT_FALSE(kernel.execute(coordinated
+                                    ? grouped_motion_commands_operation("request.after-fault")
+                                    : motion_operation("request.after-fault")).ok());
+    EXPECT_EQ(kernel.get_operation_journal_write_fault(), fault);
   }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ControlAndScaleJournalFailuresPublishStickyFaultWithoutDispatchingTheirEffects) {
+  for (const bool scale : {false, true}) {
+    SCOPED_TRACE(scale);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    ResourceAddressedExecutionKernel kernel(
+        {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+                                   CoordinateKind::kAngular), engine)},
+        clock, scheduler, journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    const auto operation = kernel.execute(motion_operation("journal.control-or-scale"));
+    ASSERT_TRUE(operation.ok());
+    engine.emit_transition(ExecutionState::kPlanning,
+                           scale ? ExecutionState::kExecuting : ExecutionState::kCompleted);
+    const auto writes_before = journal.calls.size();
+    const auto effects_before = scale ? engine.runtime_scale_calls.load() : engine.acknowledge_calls.load();
+    const std::string kind = scale ? "runtime_scale_accepted" : "control_accepted";
+    journal.fail_next_kind = kind;
+    if (scale) {
+      EXPECT_FALSE(kernel.set_runtime_scale(
+          runtime_scale_request("journal.scale.failed", operation.value(), 1U, 0U, 0.5)).ok());
+    } else {
+      EXPECT_FALSE(kernel.acknowledge_completed(
+          control_request("journal.control.failed", operation.value(), 1U)).ok());
+    }
+    const auto fault = kernel.get_operation_journal_write_fault();
+    ASSERT_TRUE(fault);
+    EXPECT_EQ(fault->write_kind, kind);
+    EXPECT_EQ(fault->error.code, "operation_journal_test_failure");
+    EXPECT_TRUE(fault->error.details.empty());
+    EXPECT_EQ(fault->operation_id, operation.value().operation_id);
+    EXPECT_EQ(fault->operation_revision, OperationRevision(scale ? 1U : 2U));
+    EXPECT_EQ(scale ? engine.runtime_scale_calls.load() : engine.acknowledge_calls.load(), effects_before);
+    EXPECT_EQ(journal.calls.size(), writes_before + 1U);
+    if (!scale) {
+      // Existing explicit Reset may settle this operation; it does not repair
+      // the journal infrastructure condition or re-open motion admission.
+      const auto current = kernel.get_operation_state(operation.value().operation_id);
+      ASSERT_TRUE(current.ok());
+      const auto reset = kernel.reset(control_request("journal.reset.explicit", operation.value(),
+                                                       current.value().operation_revision.value()));
+      ASSERT_TRUE(reset.ok()) << reset.error().message;
+      ASSERT_TRUE(wait_until([&] {
+        return kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
+      }));
+      EXPECT_EQ(kernel.get_operation_journal_write_fault(), fault);
+      EXPECT_FALSE(kernel.execute(motion_operation("journal.motion.after-reset")).ok());
+    }
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     JournalFaultDiagnosticsPreserveCanonicalTextAndEscapeUnrepresentableBytes) {
+  const std::string decomposed = "e\xcc\x81";
+  const std::string invalid = std::string("bad:") + static_cast<char>(0xff) + "\\tail";
+  const auto escaped_decomposed = bounded_operation_journal_diagnostic_text(decomposed, 1024U);
+  const auto escaped_invalid = bounded_operation_journal_diagnostic_text(invalid, 1024U);
+  EXPECT_EQ(escaped_decomposed, "escaped bytes: e\\xcc\\x81");
+  EXPECT_EQ(escaped_invalid, "escaped bytes: bad:\\xff\\\\tail");
+  for (const auto& text : {std::string("valid \xc3\xa9"), decomposed, invalid}) {
+    const auto encoded = bounded_operation_journal_diagnostic_text(text, 1024U);
+    EXPECT_TRUE(manyforge::content_identity::is_utf8_nfc(encoded));
+    EXPECT_NO_THROW((void)manyforge::content_identity::CanonicalValue(encoded));
+  }
+  EXPECT_EQ(bounded_operation_journal_diagnostic_text("valid \xc3\xa9", 1024U), "valid \xc3\xa9");
+  EXPECT_EQ(bounded_operation_journal_diagnostic_text("valid \xc3\xa9", 7U), "valid ");
+  EXPECT_EQ(bounded_operation_journal_diagnostic_text(decomposed, 18U), "escaped bytes: e");
+  EXPECT_TRUE(bounded_operation_journal_diagnostic_text(invalid, 0U).empty());
+  // Fault publication itself must retain canonical-safe text; the transport
+  // does not need its own sanitizer and an exception cannot hide the alarm.
+  for (const auto& message : {decomposed, invalid}) {
+    SCOPED_TRACE(message);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    ResourceAddressedExecutionKernel kernel(
+        {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+                                   CoordinateKind::kAngular), engine)},
+        clock, scheduler, journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    journal.record_hook = [&](std::string_view kind) {
+      if (kind == "operation_accepted") throw std::runtime_error(message);
+    };
+    EXPECT_FALSE(kernel.execute(motion_operation("journal.invalid-text")).ok());
+    const auto fault = kernel.get_operation_journal_write_fault();
+    ASSERT_TRUE(fault);
+    EXPECT_EQ(fault->error.message, bounded_operation_journal_diagnostic_text(message, 1024U));
+    EXPECT_NO_THROW((void)manyforge::content_identity::CanonicalValue(fault->error.message));
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     OrdinaryStateJournalFaultKeepsBoundedFirstErrorAndReadonlyAttribution) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+                                 CoordinateKind::kAngular), engine)},
+      clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(kernel);
+  const auto operation = kernel.execute(scoped_motion_operation("journal.scoped-state"));
+  ASSERT_TRUE(operation.ok());
+  journal.record_hook = [](std::string_view kind) {
+    if (kind == "state:subordinate_state_observed")
+      throw std::runtime_error(std::string(2048U, 'x'));
+  };
+  EXPECT_NO_THROW(engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted));
+  const auto fault = kernel.get_operation_journal_write_fault();
+  ASSERT_TRUE(fault);
+  EXPECT_EQ(fault->write_kind, "subordinate_state_observed");
+  EXPECT_EQ(fault->error.message, std::string(1024U, 'x'));
+  EXPECT_TRUE(fault->error.details.empty());
+  EXPECT_EQ(fault->operation_id, operation.value().operation_id);
+  EXPECT_EQ(fault->program_run_id, ProgramRunId("run.1"));
+  ASSERT_TRUE(fault->execution_scope);
+  EXPECT_EQ(fault->execution_scope->node_attempt_id, "move.attempt.1");
+  const auto writes = journal.calls.size();
+  EXPECT_EQ(kernel.get_operation_journal_write_fault(), fault);
+  EXPECT_EQ(kernel.get_operation_journal_write_fault(), fault);
+  EXPECT_EQ(journal.calls.size(), writes);
+  // A later independently attempted control write cannot replace the first
+  // owner fault, regardless of the backend's newer error.
+  journal.record_hook = {};
+  journal.fail_next_kind = "control_accepted";
+  const auto state = kernel.get_operation_state(operation.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  (void)kernel.reset(control_request("journal.second-write-failure", operation.value(),
+                                      state.value().operation_revision.value()));
+  EXPECT_EQ(kernel.get_operation_journal_write_fault(), fault);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -14257,14 +15676,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(state.ok()) << state.error().message;
   ASSERT_EQ(state.value().participants.size(), 1U);
   const auto& participant = state.value().participants.front();
-  EXPECT_EQ(participant.controller_goal_id, engine.last_execute->binding.controller_goal_id);
+  EXPECT_EQ(participant.command_id, engine.last_execute->binding.controller_goal_id);
   EXPECT_EQ(participant.resources, engine.last_execute->binding.resources);
   const auto slots = kernel.resource_snapshot();
   ASSERT_EQ(slots.size(), 1U);
   ASSERT_TRUE(slots.front().owner.has_value());
   EXPECT_EQ(slots.front().owner->operation_id, executed.value().operation_id);
   EXPECT_EQ(slots.front().owner->participant_id, participant.participant_id);
-  EXPECT_EQ(slots.front().owner->control_binding_id, participant.control_binding_id);
+  EXPECT_EQ(slots.front().owner->binding_identity.controller()->control_binding_id, participant.binding_identity.controller()->control_binding_id);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -16322,45 +17741,52 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      TerminalProjectionFailureRetainsCertificateAndLatchesPersistenceFault) {
-  FakeClock clock;
-  ManualScheduler scheduler;
-  FakeParticipantEngine engine;
-  FakeOperationJournal journal;
-  journal.fail_next_kind = "stop_terminal";
-  ResourceAddressedExecutionKernel kernel(
-      {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
-          engine)},
-      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
-  const auto operation = kernel.execute(motion_operation("request.terminal-projection.execute"));
-  ASSERT_TRUE(operation.ok()) << operation.error().message;
-  const auto stopped =
-      kernel.stop(stop_request("request.terminal-projection.stop", operation.value(), 1U));
-  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
-  ASSERT_TRUE(wait_until([&] {
+  for (const std::string failed_write : {"stop_terminal", "state:stop_terminal_committed"}) {
+    SCOPED_TRACE(failed_write);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    journal.fail_next_kind = failed_write;
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    const auto operation = kernel.execute(motion_operation("request.terminal-projection.execute"));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    const auto stopped =
+        kernel.stop(stop_request("request.terminal-projection.stop", operation.value(), 1U));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() &&
+             status.value().terminal_projection.state == StopDurableProjectionStateDTO::kFailed;
+    }));
     const auto status = kernel.get_stop_status(stopped.value().stop_id);
-    return status.ok() &&
-           status.value().terminal_projection.state == StopDurableProjectionStateDTO::kFailed;
-  }));
-  const auto status = kernel.get_stop_status(stopped.value().stop_id);
-  ASSERT_TRUE(status.ok()) << status.error().message;
-  ASSERT_TRUE(status.value().stop_certificate.has_value());
-  const auto certificate =
-      kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
-  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
-  EXPECT_FALSE(stop_certificate_field_error(certificate.value()).has_value());
-  ASSERT_TRUE(status.value().fault_latch.has_value());
-  EXPECT_EQ(status.value().fault_latch->trigger, StopFaultTriggerDTO::kPersistenceDegraded);
-  EXPECT_EQ(status.value().fault_latch->terminal_projection.state,
-            StopDurableProjectionStateDTO::kFailed);
-  // One projection attempt: a journal failure is a storage fault, never
-  // retried on a timer.
-  ASSERT_TRUE(status.value().terminal_projection.retry_generation.has_value());
-  EXPECT_EQ(*status.value().terminal_projection.retry_generation, 1U);
-  EXPECT_EQ(journal.stop_terminal_calls.load(), 1);
-  EXPECT_EQ(scheduler.pending_count(SchedulerPriority::Background), 0U);
-  EXPECT_EQ(engine.stop_calls.load(), 1);
+    ASSERT_TRUE(status.ok()) << status.error().message;
+    ASSERT_TRUE(status.value().stop_certificate.has_value());
+    const auto certificate =
+        kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+    EXPECT_FALSE(stop_certificate_field_error(certificate.value()).has_value());
+    ASSERT_TRUE(status.value().fault_latch.has_value());
+    EXPECT_EQ(status.value().fault_latch->trigger, StopFaultTriggerDTO::kPersistenceDegraded);
+    EXPECT_EQ(status.value().fault_latch->terminal_projection.state,
+              StopDurableProjectionStateDTO::kFailed);
+    // One projection attempt: a journal failure is a storage fault, never
+    // retried on a timer.
+    ASSERT_TRUE(status.value().terminal_projection.retry_generation.has_value());
+    EXPECT_EQ(*status.value().terminal_projection.retry_generation, 1U);
+    EXPECT_EQ(journal.stop_terminal_calls.load(), 1);
+    EXPECT_EQ(scheduler.pending_count(SchedulerPriority::Background), 0U);
+    EXPECT_EQ(engine.stop_calls.load(), 1);
+    // Both the Stop certificate projection and its owned operation-state write
+    // use the existing Stop persistence fault, without a second generic alarm.
+    EXPECT_FALSE(kernel.get_operation_journal_write_fault());
+  }
 }
+
 
 TEST(ResourceAddressedExecutionKernelTest,
      ReplacementAdoptsProjectedTerminalCertificateWithoutRedispatch) {
@@ -21716,22 +23142,33 @@ TEST(ResourceAddressedExecutionKernelTest, AddressedKernelDerivesOutcomesFromPar
   const ErrorDTO timeout{"planning_timeout", "Planning timed out", {}};
   const ErrorDTO failure{"validation_collision", "collision", {{"reason", "validation_failed"}}};
   const std::vector<Case> cases{
-      {"completion", ExecutionState::kExecuting,
+      {"completion",
+       ExecutionState::kExecuting,
        {ParticipantExecutionFactKind::kComputedCompletion,
         ParticipantEffectKnowledge::kEffectSettled, std::nullopt},
        OperationStateKind::kCompleted},
-      {"planning_timeout", ExecutionState::kPlanning,
+      {"planning_timeout",
+       ExecutionState::kPlanning,
        {ParticipantExecutionFactKind::kLocalFailure, ParticipantEffectKnowledge::kNoEffect,
         timeout},
        OperationStateKind::kFailed},
-      {"local_failure", ExecutionState::kValidating,
-       {ParticipantExecutionFactKind::kLocalFailure, ParticipantEffectKnowledge::kNoEffect, failure},
+      {"local_failure",
+       ExecutionState::kValidating,
+       {ParticipantExecutionFactKind::kLocalFailure, ParticipantEffectKnowledge::kNoEffect,
+        failure},
        OperationStateKind::kFailed},
-      {"uncertain_effect", ExecutionState::kExecuting,
+      {"settled_failure",
+       ExecutionState::kExecuting,
+       {ParticipantExecutionFactKind::kLocalFailure, ParticipantEffectKnowledge::kEffectSettled,
+        failure},
+       OperationStateKind::kFailed},
+      {"uncertain_effect",
+       ExecutionState::kExecuting,
        {ParticipantExecutionFactKind::kLocalFailure, ParticipantEffectKnowledge::kEffectUncertain,
         failure},
        OperationStateKind::kInterventionRequired},
-      {"preempted_without_stop", ExecutionState::kExecuting,
+      {"preempted_without_stop",
+       ExecutionState::kExecuting,
        {ParticipantExecutionFactKind::kPreemptedByAddressedStop,
         ParticipantEffectKnowledge::kEffectSettled, std::nullopt},
        OperationStateKind::kInterventionRequired},
@@ -21741,12 +23178,12 @@ TEST(ResourceAddressedExecutionKernelTest, AddressedKernelDerivesOutcomesFromPar
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
+    FakeOperationJournal journal;
     ResourceAddressedExecutionKernel kernel(
         {registration(
             make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
-        clock, scheduler, default_journal,
-        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+        clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
     const auto operation = kernel.execute(motion_operation(std::string("request.fact.") + item.name));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
     {
@@ -21761,10 +23198,32 @@ TEST(ResourceAddressedExecutionKernelTest, AddressedKernelDerivesOutcomesFromPar
                         item.fact.error,
                         {}};
     settled.participant_fact = item.fact;
+    // A delayed completion callback cannot overwrite the actual newer fact.
+    if (std::string_view(item.name) == "local_failure")
+      settled.participant_fact =
+          ParticipantExecutionFact{ParticipantExecutionFactKind::kComputedCompletion,
+                                   ParticipantEffectKnowledge::kEffectSettled, std::nullopt};
     engine.deliver_event(settled);
     const auto state = kernel.get_operation_state(operation.value().operation_id);
     ASSERT_TRUE(state.ok());
     EXPECT_EQ(state.value().participants.front().state, item.expected);
+    ASSERT_FALSE(journal.states.empty());
+    if (std::string_view(item.name) == "preempted_without_stop") {
+      // Retain the reported kind/effect independently of the selected
+      // fallback cause; it still cannot grant that cause Stop authority.
+      EXPECT_EQ(state.value().participants.front().terminal_fact, std::optional(item.fact));
+      EXPECT_EQ(journal.states.back().participants.front().terminal_fact, std::optional(item.fact));
+      ASSERT_TRUE(state.value().participants.front().terminal_error);
+      EXPECT_EQ(state.value().participants.front().terminal_error->code,
+                std::string(to_string(engine.get_status().last_error)));
+      EXPECT_EQ(state.value().participants.front().terminal_error->details.at("reason"),
+                "subordinate_terminal_error");
+      EXPECT_EQ(journal.states.back().participants.front().terminal_error,
+                state.value().participants.front().terminal_error);
+    } else {
+      EXPECT_EQ(state.value().participants.front().terminal_fact, std::optional(item.fact));
+      EXPECT_EQ(journal.states.back().participants.front().terminal_fact, std::optional(item.fact));
+    }
     // The existing operation aggregate keeps its rule: a failed participant
     // makes the operation InterventionRequired.
     EXPECT_EQ(state.value().state, item.expected == OperationStateKind::kFailed
@@ -21890,6 +23349,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto state = kernel.get_operation_state(operation.value().operation_id);
   ASSERT_TRUE(state.ok());
   EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+  const auto recovery = kernel.get_operation_recovery_assessment(operation.value().operation_id);
+  ASSERT_TRUE(recovery.ok());
+  EXPECT_FALSE(recovery.value().assessment.retry_eligibility.eligible);
+  EXPECT_EQ(recovery.value().assessment.retry_eligibility.reason,
+      MotionRetryIneligibilityReason::kStopNotNominal);
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+
   ASSERT_TRUE(state.value().participants.front().terminal_error.has_value());
   EXPECT_EQ(state.value().participants.front().terminal_error->details.at("reason"),
             "stop_path_collision");
@@ -23446,6 +24912,8573 @@ TEST(ResourceAddressedExecutionKernelTest, OrdinaryPneumaticAckRetiresOnceAcross
       EXPECT_EQ(backend.opens, 0);
       EXPECT_EQ(backend.closes, 0);
     }
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     AuthoredScopeIsCapturedBeforeDispatchAndReplayExact) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.defer_prepare_completion = true;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  auto capture = program_execution_capture();
+  auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+  capture.table = table;
+  ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  start_program_motion(kernel);
+  auto intent = scoped_motion_operation("retry.context.accepted");
+  const auto accepted = kernel.execute(intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().participants.front().execution_scope,
+            intent.participants.front().execution_scope);
+  EXPECT_EQ(engine.execute_calls, 0);
+  const auto replay = kernel.execute(intent);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  intent.participants.front().execution_scope->node_attempt_id = "attempt.changed";
+  const auto conflicting = kernel.execute(intent);
+  ASSERT_FALSE(conflicting.ok());
+  EXPECT_EQ(conflicting.error().details.at("reason"), "request_id_conflict");
+  intent.participants.front().execution_scope.reset();
+  EXPECT_FALSE(kernel.execute(intent).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RunnerLossRequiresExactManagerAndHeldRunBeforeFirstCapture) {
+  for (const auto scenario : {0, 1, 2, 3, 4}) {
+    SCOPED_TRACE(scenario);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, journal, std::move(config));
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+    ProgramRunnerContactLossDTO loss{
+        RequestOwnerEpoch("manager.owner.1"),
+        RuntimeEpoch("manager.epoch.1"),
+        {RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kRunning,
+         ProgramRunId("run.1"), CellAdmissionClaimGeneration(1U), std::nullopt},
+        "program_runner_liveness_probe",
+        "connection refused"};
+    if (scenario == 0) loss.manager_owner_epoch = RequestOwnerEpoch("foreign.manager");
+    if (scenario == 1)
+      loss.established_cycle.program_runner_owner_epoch = RequestOwnerEpoch("foreign.runner");
+    if (scenario == 2) loss.established_cycle.program_run_id = ProgramRunId("other.run");
+    if (scenario == 3)
+      loss.established_cycle.cycle_claim_generation = CellAdmissionClaimGeneration(9U);
+    CellAdmissionReadinessSnapshotDTO closed{
+        false, loss.established_cycle, false, 1U, 0U, false, false, 0U, 0U, 0U};
+    closed.program_runner_loss = loss;
+    if (scenario == 4) journal.fail_next_kind = "cell_admission_generation_advanced";
+    const auto result = kernel.UpdateCellAdmissionReadiness(closed);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(kernel.get_program_runner_loss(),
+              scenario == 4 ? std::optional<ProgramRunnerContactLossDTO>(loss) : std::nullopt);
+    EXPECT_EQ(engine.prepare_motion_calls, 0);
+    EXPECT_EQ(engine.execute_calls, 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RunnerLossRemainsFirstAndMatchingReplaySurvivesClaimRetirement) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  config.cell_admission_settlement_validator = [](const auto&, const auto&) {
+    return Result<void>::Ok();
+  };
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal, std::move(config));
+  const auto acquired = claim_program_execution(kernel);
+  ASSERT_TRUE(acquired.ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  ProgramRunnerContactLossDTO loss{
+      RequestOwnerEpoch("manager.owner.1"),
+      RuntimeEpoch("manager.epoch.1"),
+      {RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kRunning,
+       ProgramRunId("run.1"), acquired.value().claim_generation, std::nullopt},
+      "program_runner_liveness_probe",
+      "connection refused"};
+  CellAdmissionReadinessSnapshotDTO closed{
+      false, loss.established_cycle, false, 1U, 0U, false, false, 0U, 0U, 0U};
+  closed.program_runner_loss = loss;
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(closed).ok());
+  const auto& claim = acquired.value();
+  ASSERT_TRUE(kernel
+                  .ReleaseCellAdmissionClaim({claim.intent.owner_role,
+                                              claim.intent.owner_epoch,
+                                              claim.intent.owner_transaction_id,
+                                              claim.intent.request_id,
+                                              claim.intent.request_payload_digest,
+                                              claim.acquired_admission_generation,
+                                              claim.claim_generation,
+                                              {CellAdmissionSettlementKindDTO::kExplicitReset,
+                                               ContentDigest(test_digest('b'))}})
+                  .ok());
+  ASSERT_FALSE(kernel.ReadHeldCellAdmissionClaim(CellAdmissionClaimKindDTO::kProgramCycle));
+  EXPECT_TRUE(kernel.UpdateCellAdmissionReadiness(closed).ok());
+  closed.program_runner_loss.reset();
+  EXPECT_TRUE(kernel.UpdateCellAdmissionReadiness(closed).ok());
+  EXPECT_EQ(kernel.get_program_runner_loss(), loss);
+  closed.program_runner_loss = loss;
+  closed.program_runner_loss->message = "another failure";
+  EXPECT_FALSE(kernel.UpdateCellAdmissionReadiness(closed).ok());
+  EXPECT_EQ(kernel.get_program_runner_loss(), loss);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GeneralCloseRetiresNonRetryableNoEffectFailureAndReplays) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.prepare_call_failure =
+      ErrorDTO{"request_refused", "non-retryable preparation failure", {}};
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(motion_operation("close.no_effect"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto projection = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  const auto& assessment = projection.value().assessment;
+  ASSERT_TRUE(assessment.eligible_close);
+  EXPECT_FALSE(assessment.retry_eligibility.eligible);
+  KernelRecoveryActionRequestDTO request{"close.request",
+                                         RecoveryAction::kCloseOperation,
+                                         "program_runner",
+                                         assessment.assessment_revision,
+                                         assessment.control_command_epoch,
+                                         assessment.execution_id,
+                                         assessment.latch_id,
+                                         assessment.stop_certificate_id,
+                                         assessment.stop_owner_generation,
+                                         "failure leaving node",
+                                         false};
+  auto stale = request;
+  ++stale.expected_control_command_epoch;
+  EXPECT_FALSE(kernel
+                   .apply_operation_recovery_action(accepted.value().operation_id,
+                                                    projection.value().operation_revision, stale)
+                   .ok());
+  auto fresh = request;
+  fresh.fresh_motion_attempt = true;
+  EXPECT_FALSE(kernel
+                   .apply_operation_recovery_action(accepted.value().operation_id,
+                                                    projection.value().operation_revision, fresh)
+                   .ok());
+  const auto closed = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, projection.value().operation_revision, request);
+  ASSERT_TRUE(closed.ok()) << closed.error().message;
+  ASSERT_TRUE(closed.value().accepted);
+  const auto history = kernel.get_operation_projection(accepted.value().operation_id);
+  ASSERT_TRUE(history.ok());
+  EXPECT_FALSE(history.value().resident);
+  ASSERT_TRUE(history.value().operation.participants.front().terminal_error);
+  EXPECT_EQ(history.value().operation.participants.front().terminal_error->code, "request_refused");
+  for (const auto& slot : kernel.resource_snapshot()) {
+    EXPECT_EQ(slot.state, ResourceSlotState::kFree);
+    EXPECT_FALSE(slot.owner);
+  }
+  const auto replay = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, projection.value().operation_revision, request);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_TRUE(replay.value().accepted);
+  auto conflict = request;
+  conflict.principal_id = "different_owner";
+  const auto refused = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, projection.value().operation_revision, conflict);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "invalid_request");
+  EXPECT_EQ(refused.error().details.at("reason"), "request_id_conflict");
+  EXPECT_EQ(engine.recovery_action_calls, 0);
+  EXPECT_EQ(engine.certified_reset_calls, 0);
+  EXPECT_EQ(engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, GeneralCloseConsumesFinalPneumaticFailureWithoutReset) {
+  FinalPneumaticTestBackend backend;
+  backend.reject_delivery = true;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  GripperParticipantEngine gripper(backend, clock);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  auto row =
+      LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                              CoordinateKind::kLinear, schema),
+                                 gripper);
+  ResourceAddressedExecutionKernel kernel(
+      {row}, clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(command_operation("close.pneumatic"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto projection = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(projection.ok());
+  const auto& assessment = projection.value().assessment;
+  ASSERT_TRUE(assessment.eligible_close);
+  EXPECT_FALSE(assessment.retry_admissible);
+  KernelRecoveryActionRequestDTO request{"close.pneumatic.request",
+                                         RecoveryAction::kCloseOperation,
+                                         "program_runner",
+                                         assessment.assessment_revision,
+                                         assessment.control_command_epoch,
+                                         assessment.execution_id,
+                                         assessment.latch_id,
+                                         assessment.stop_certificate_id,
+                                         assessment.stop_owner_generation,
+                                         "tree failure",
+                                         false};
+  const auto closed = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, projection.value().operation_revision, request);
+  ASSERT_TRUE(closed.ok()) << closed.error().message;
+  ASSERT_TRUE(closed.value().accepted);
+  EXPECT_EQ(backend.commands, 1);
+  EXPECT_EQ(backend.opens, 0);
+  EXPECT_EQ(backend.closes, 0);
+  const auto history = kernel.get_operation_projection(accepted.value().operation_id);
+  ASSERT_TRUE(history.ok());
+  EXPECT_FALSE(history.value().resident);
+  EXPECT_EQ(history.value().operation.state, OperationStateKind::kFailed);
+  ASSERT_TRUE(history.value().operation.participants.front().terminal_error);
+  EXPECT_EQ(history.value().operation.participants.front().terminal_error->code,
+            "pneumatic_delivery_timeout");
+  const auto replay = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, projection.value().operation_revision, request);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_TRUE(replay.value().accepted);
+  EXPECT_EQ(backend.commands, 1);
+  backend.reject_delivery = false;
+  EXPECT_TRUE(kernel.execute(command_operation("close.pneumatic.next")).ok());
+  EXPECT_EQ(backend.commands, 2);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GeneralCloseRefusesActiveAndUnknownEffectsDespiteLocalOffer) {
+  for (const bool unknown : {false, true}) {
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    const auto accepted = kernel.execute(motion_operation("close.unknown"));
+    ASSERT_TRUE(accepted.ok());
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    if (unknown)
+      engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kInterventionRequired,
+                             ErrorDTO{"execution_failed", "effects unknown", {}});
+    engine.recovery_assessment.eligible_close = true;
+    const auto projection = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+    ASSERT_TRUE(projection.ok());
+    const auto& assessment = projection.value().assessment;
+    EXPECT_FALSE(assessment.eligible_close);
+    KernelRecoveryActionRequestDTO request{"close.unknown.request",
+                                           RecoveryAction::kCloseOperation,
+                                           "program_runner",
+                                           assessment.assessment_revision,
+                                           assessment.control_command_epoch,
+                                           assessment.execution_id,
+                                           assessment.latch_id,
+                                           assessment.stop_certificate_id,
+                                           assessment.stop_owner_generation,
+                                           "abandoned node",
+                                           false};
+    const auto result = kernel.apply_operation_recovery_action(
+        accepted.value().operation_id, projection.value().operation_revision, request);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(engine.recovery_action_calls, 0);
+    EXPECT_TRUE(kernel.get_operation_projection(accepted.value().operation_id).value().resident);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GeneralClosePublishesAfterCertifiedStopCleanupAndResourceRelease) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(motion_operation("close.stopped"));
+  ASSERT_TRUE(accepted.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto stopped = kernel.stop(stop_request("close.stop", accepted.value(), 1U));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  engine.recovery_assessment.eligible_close = true;
+  const auto projection = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(projection.ok());
+  const auto& assessment = projection.value().assessment;
+  ASSERT_TRUE(assessment.eligible_close);
+  ASSERT_FALSE(assessment.stop_certificate_id.empty());
+  KernelRecoveryActionRequestDTO request{"close.stopped.request",
+                                         RecoveryAction::kCloseOperation,
+                                         "program_runner",
+                                         assessment.assessment_revision,
+                                         assessment.control_command_epoch,
+                                         assessment.execution_id,
+                                         assessment.latch_id,
+                                         assessment.stop_certificate_id,
+                                         assessment.stop_owner_generation,
+                                         "abandoned node after settlement",
+                                         false};
+  auto stale = request;
+  stale.expected_stop_certificate_id = "older.certificate";
+  EXPECT_FALSE(kernel
+                   .apply_operation_recovery_action(accepted.value().operation_id,
+                                                    projection.value().operation_revision, stale)
+                   .ok());
+  EXPECT_EQ(engine.recovery_action_calls, 0);
+  bool cleanup_observed = false;
+  engine.recovery_action_hook = [&] {
+    cleanup_observed = true;
+    EXPECT_TRUE(kernel.get_operation_projection(accepted.value().operation_id).value().resident);
+    for (const auto& slot : kernel.resource_snapshot()) EXPECT_TRUE(slot.owner);
+    // Read-only assessment during cleanup must not revoke the admitted owner's
+    // captured permission or publish retirement before the cleanup returns.
+    const auto observed = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+    EXPECT_TRUE(observed.ok());
+    if (observed.ok()) {
+      EXPECT_FALSE(observed.value().assessment.eligible_close);
+    }
+  };
+  engine.next_recovery_result = {request.request_id, request.action, true, {}, std::nullopt};
+  const auto closed = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, projection.value().operation_revision, request);
+  ASSERT_TRUE(closed.ok()) << closed.error().message;
+  ASSERT_TRUE(closed.value().accepted);
+  EXPECT_TRUE(cleanup_observed);
+  EXPECT_EQ(engine.recovery_action_calls, 1);
+  EXPECT_EQ(engine.certified_reset_calls, 0);
+  EXPECT_EQ(engine.reset_gripper_calls, 0);
+  EXPECT_FALSE(kernel.get_operation_projection(accepted.value().operation_id).value().resident);
+  for (const auto& slot : kernel.resource_snapshot()) EXPECT_FALSE(slot.owner);
+  engine.recovery_action_hook = {};
+  const auto replay = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, projection.value().operation_revision, request);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_TRUE(replay.value().accepted);
+  EXPECT_EQ(engine.recovery_action_calls, 1);
+}
+
+}  // namespace
+
+namespace {
+void expect_detached_source_close(ResourceAddressedExecutionKernel& kernel,
+                                  FakeParticipantEngine& engine, const OperationAcceptedDTO& source,
+                                  const OperationAcceptedDTO& successor,
+                                  bool successor_owns_resources = true) {
+  const auto before = kernel.get_operation_state(source.operation_id);
+  ASSERT_TRUE(before.ok());
+  const auto assessment_calls = engine.recovery_assessment_calls.load();
+  const auto action_calls = engine.recovery_action_calls.load();
+  const bool close_ready = wait_until([&] {
+    const auto observed = kernel.get_operation_recovery_assessment(source.operation_id);
+    return observed.ok() && observed.value().assessment.eligible_close;
+  });
+  const auto projection = kernel.get_operation_recovery_assessment(source.operation_id);
+  ASSERT_TRUE(projection.ok()) << source.operation_id.value() << ": " << projection.error().message;
+  ASSERT_TRUE(close_ready) << "Detached source " << source.operation_id.value()
+                           << " did not finish its existing handover borrow; assessment: "
+                           << projection.value().assessment.reason_code;
+  ASSERT_TRUE(projection.value().assessment.eligible_close);
+  const auto& assessment = projection.value().assessment;
+  KernelRecoveryActionRequestDTO request{"close.detached." + source.operation_id.value(),
+                                         RecoveryAction::kCloseOperation,
+                                         "test",
+                                         assessment.assessment_revision,
+                                         assessment.control_command_epoch,
+                                         assessment.execution_id,
+                                         assessment.latch_id,
+                                         assessment.stop_certificate_id,
+                                         assessment.stop_owner_generation,
+                                         "release the already detached source",
+                                         false};
+  const auto closed = kernel.apply_operation_recovery_action(
+      source.operation_id, projection.value().operation_revision, request);
+  ASSERT_TRUE(closed.ok()) << closed.error().message;
+  ASSERT_TRUE(closed.value().accepted);
+  const auto historical = kernel.get_operation_projection(source.operation_id);
+  ASSERT_TRUE(historical.ok());
+  EXPECT_FALSE(historical.value().resident);
+  EXPECT_EQ(historical.value().operation.participants.front().terminal_fact,
+            before.value().participants.front().terminal_fact);
+  EXPECT_EQ(engine.recovery_assessment_calls.load(), assessment_calls);
+  EXPECT_EQ(engine.recovery_action_calls.load(), action_calls);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    if (!successor_owns_resources) {
+      EXPECT_FALSE(slot.owner);
+      continue;
+    }
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, successor.operation_id);
+  }
+}
+
+// Spring fallback integration uses the ordinary captured Program and Stop
+// fixtures; the fake exposes the same cold/backend-Prepare boundary as Kernel.
+ProgramRunExecutionCaptureDTO spring_fallback_capture() {
+  auto capture = program_execution_capture();
+  auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+  auto successor = table->nodes.front();
+  successor.instance_id = ProgramNodeInstanceId("move.next");
+  table->nodes = {table->nodes.front(), std::move(successor)};
+  table->named_selections = {{"arm", {0U, 1U}}};
+  capture.table = std::move(table);
+  return capture;
+}
+
+OperationIntentDTO spring_fallback_intent(std::string request) {
+  auto intent = scoped_motion_operation(std::move(request));
+  intent.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("move.next"), "move.next.attempt.1"};
+  return intent;
+}
+
+void reject_first_smooth_preparation(FakeParticipantEngine& engine) {
+  engine.prepare_motion_hook = [&engine] {
+    if (engine.prepare_motion_calls.load() == 2)
+      engine.prepare_call_failure = ErrorDTO{"planning_failed", "smooth candidate rejected", {}};
+    else
+      engine.prepare_call_failure.reset();
+  };
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     SpringFallbackComputesColdWhileReturningAndDispatchesOnlyAfterExactSettlement) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.default_operator_stop_profile->stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  row.default_operator_stop_profile->allow_natural_completion_on_short_path = false;
+  row.motion_takeover_preparation_budget_s = 10.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(spring_fallback_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(scoped_motion_operation("spring.original"));
+  ASSERT_TRUE(original.ok()) << original.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  reject_first_smooth_preparation(engine);
+  HeldSettlementCall returning;
+  engine.translate_stop_stage_hook = returning.Blocker();
+  const auto candidate = kernel.execute(spring_fallback_intent("spring.candidate"));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  ASSERT_TRUE(returning.Entered());
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    std::lock_guard lock(engine.prepared_motion_mutex_);
+    return engine.replacement_snapshot &&
+           engine.replacement_snapshot->state == ResolvedPreparedMotionExecutionStateDTO::kColdPrepared;
+  }));
+  std::uint64_t cold_id{};
+  ContentDigest cold_digest{std::string{}};
+  {
+    std::lock_guard lock(engine.prepared_motion_mutex_);
+    ASSERT_TRUE(engine.replacement_snapshot->participant);
+    EXPECT_FALSE(engine.replacement_snapshot->backend_prepare_result);
+    cold_id = engine.replacement_snapshot->execution_id;
+    cold_digest = engine.replacement_snapshot->participant->prepared_contract_digest;
+  }
+  EXPECT_EQ(engine.cold_participant_preparations.load(), 0);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 1);
+  EXPECT_EQ(engine.commit_replacement_calls.load(), 0);
+  const auto stopping = kernel.get_operation_state(original.value().operation_id);
+  ASSERT_TRUE(stopping.ok());
+  EXPECT_EQ(stopping.value().state, OperationStateKind::kStopping);
+  ASSERT_TRUE(stopping.value().preemption);
+  EXPECT_EQ(stopping.value().preemption->by.operation_id, candidate.value().operation_id);
+  returning.Release();
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    return engine.dispatch_prepared_motion_calls.load() == 2;
+  }));
+  EXPECT_EQ(engine.cold_participant_preparations.load(), 1);
+  EXPECT_EQ(engine.commit_replacement_calls.load(), 0);
+  EXPECT_EQ(engine.prepare_motion_calls.load(), 3);
+  {
+    std::lock_guard lock(engine.prepared_motion_mutex_);
+    ASSERT_TRUE(engine.prepared_snapshot);
+    EXPECT_EQ(engine.prepared_snapshot->execution_id, cold_id);
+    EXPECT_EQ(engine.prepared_snapshot->participant->prepared_contract_digest, cold_digest);
+  }
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, candidate.value().operation_id);
+  }
+  const auto scope = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(scope.ok());
+  EXPECT_TRUE(scope.value().held_nodes.empty());
+  expect_detached_source_close(kernel, engine, original.value(), candidate.value());
+  engine.prepare_motion_hook = {};
+  engine.translate_stop_stage_hook = {};
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     SpringFallbackCannotInventPermissionOrDispatchAfterFailedContainment) {
+  for (const bool spring_permitted : {false, true}) {
+    SCOPED_TRACE(spring_permitted);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    engine.supports_motion_replacement = true;
+    auto row = registration(
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+    row.motion_takeover_preparation_budget_s = 10.0;
+    if (spring_permitted) {
+      row.default_operator_stop_profile->stop_mode = MotionInterruptStopMode::kSpringBackHold;
+      row.default_operator_stop_profile->allow_natural_completion_on_short_path = false;
+    }
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(spring_fallback_capture()).ok());
+    start_program_motion(kernel);
+    const auto original = kernel.execute(scoped_motion_operation("spring.refusal.original"));
+    ASSERT_TRUE(original.ok()) << original.error().message;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    reject_first_smooth_preparation(engine);
+    if (spring_permitted)
+      engine.next_stop_result = {false, ErrorDTO{"stop_failed", "containment unproved", {}}};
+    const auto candidate = kernel.execute(spring_fallback_intent("spring.refusal.candidate"));
+    ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      static_cast<void>(kernel.reconcile_subordinate_state());
+      const auto source = kernel.get_operation_state(original.value().operation_id);
+      return source.ok() && source.value().state != OperationStateKind::kStopping;
+    }));
+    EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 1);
+    EXPECT_EQ(engine.cold_participant_preparations.load(), 0);
+    EXPECT_EQ(engine.commit_replacement_calls.load(), 0);
+    const auto source = kernel.get_operation_state(original.value().operation_id);
+    ASSERT_TRUE(source.ok());
+    EXPECT_EQ(source.value().state, spring_permitted ? OperationStateKind::kInterventionRequired
+                                                   : OperationStateKind::kStopped);
+    if (!spring_permitted) {
+      EXPECT_EQ(engine.takeover_stop_stage_calls.load(), 0);
+    }
+    engine.prepare_motion_hook = {};
+  }
+}
+}  // namespace
+
+namespace {
+ProgramRunExecutionCaptureDTO takeover_capture(const std::array<std::uint8_t, 4>& priorities = {}) {
+  auto capture = program_execution_capture();
+  auto table = std::make_shared<ProgramExecutionTableDTO>();
+  const auto prototype = capture.table->nodes.front();
+  for (std::size_t index = 0; index != priorities.size(); ++index) {
+    auto node = prototype;
+    node.instance_id = ProgramNodeInstanceId("move." + std::to_string(index));
+    node.preemption_priority = priorities[index];
+    table->nodes.push_back(std::move(node));
+  }
+  table->named_selections = {{"arm", {0U, 1U, 2U, 3U}}};
+  capture.table = std::move(table);
+  return capture;
+}
+
+OperationIntentDTO takeover_intent(std::size_t node, std::string request) {
+  auto intent = scoped_motion_operation(std::move(request));
+  const auto name = "move." + std::to_string(node);
+  intent.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId(name), name + ".attempt.1"};
+  return intent;
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     MovingTakeoverTransfersOnePhysicalOwnerAndRetainsTheOldExactFact) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "takeover.original"));
+  ASSERT_TRUE(original.ok()) << original.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto candidate = kernel.execute(takeover_intent(1U, "takeover.candidate"));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  const auto logically_preempted = kernel.get_operation_state(original.value().operation_id);
+  ASSERT_TRUE(logically_preempted.ok());
+  ASSERT_TRUE(logically_preempted.value().preemption);
+  EXPECT_EQ(logically_preempted.value().state, OperationStateKind::kExecuting);
+  EXPECT_FALSE(logically_preempted.value().participants.front().terminal_fact);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, original.value().operation_id);
+  }
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // actual replacement submission
+  EXPECT_EQ(engine.execute_calls, 1);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls, 2);
+  const auto before = kernel.resource_table_snapshot();
+  engine.replacement_phase.store(PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(engine.replacement_owner_commits, 1);
+  const auto after = kernel.resource_table_snapshot();
+  EXPECT_EQ(after.operation_resource_generation, before.operation_resource_generation + 1U);
+  ASSERT_EQ(after.slots.size(), before.slots.size());
+  for (std::size_t index = 0; index != after.slots.size(); ++index) {
+    ASSERT_TRUE(after.slots[index].owner);
+    EXPECT_EQ(after.slots[index].owner->operation_id, candidate.value().operation_id);
+    EXPECT_EQ(after.slots[index].state, ResourceSlotState::kDispatched);
+    EXPECT_EQ(after.slots[index].stop_generation, before.slots[index].stop_generation);
+  }
+  const auto old = kernel.get_operation_state(original.value().operation_id);
+  ASSERT_TRUE(old.ok());
+  EXPECT_EQ(old.value().state, OperationStateKind::kStopped);
+  ASSERT_TRUE(old.value().participants.front().terminal_fact);
+  EXPECT_EQ(old.value().participants.front().terminal_fact->kind,
+            ParticipantExecutionFactKind::kPreemptedByReplacement);
+  EXPECT_EQ(old.value().participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kEffectSettled);
+  EXPECT_FALSE(old.value().participants.front().terminal_error);
+  EXPECT_EQ(kernel.get_operation_state(candidate.value().operation_id).value().state,
+            OperationStateKind::kExecuting);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     TakeoverPriorityRefusalNamesTheActualWinnerWithoutPreparingOrPreemptingIt) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture({10U, 5U, 10U, 0U})).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "priority.original"));
+  ASSERT_TRUE(original.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto refused = kernel.execute(takeover_intent(1U, "priority.lower"));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "refused_by_priority");
+  EXPECT_EQ(refused.error().details.size(), 3U);
+  EXPECT_EQ(refused.error().details.at("winner_operation_id"),
+            original.value().operation_id.value());
+  EXPECT_EQ(refused.error().details.at("winner_node_instance_id"), "move.0");
+  EXPECT_EQ(refused.error().details.at("winner_node_attempt_id"), "move.0.attempt.1");
+  EXPECT_EQ(engine.prepare_motion_calls, 1);
+  EXPECT_FALSE(kernel.get_operation_state(original.value().operation_id).value().preemption);
+  const auto equal = kernel.execute(takeover_intent(2U, "priority.equal"));
+  ASSERT_TRUE(equal.ok()) << equal.error().message;
+  EXPECT_EQ(engine.prepare_motion_calls, 2);
+  EXPECT_EQ(
+      kernel.get_operation_state(original.value().operation_id).value().preemption->by.operation_id,
+      equal.value().operation_id);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     TakeoverChainHasOneReplaceableNextSlotAndPreparesItOnlyAfterHandover) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "chain.original"));
+  ASSERT_TRUE(original.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto pending = kernel.execute(takeover_intent(1U, "chain.pending"));
+  ASSERT_TRUE(pending.ok());
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto next = kernel.execute(takeover_intent(2U, "chain.next"));
+  ASSERT_TRUE(next.ok()) << next.error().message;
+  const auto newest = kernel.execute(takeover_intent(3U, "chain.newest"));
+  ASSERT_TRUE(newest.ok()) << newest.error().message;
+  EXPECT_EQ(engine.prepare_motion_calls, 2);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls, 2);
+  const auto overwritten = kernel.get_operation_projection(next.value().operation_id);
+  ASSERT_TRUE(overwritten.ok());
+  EXPECT_FALSE(overwritten.value().resident);
+  ASSERT_TRUE(overwritten.value().operation.preemption);
+  EXPECT_EQ(overwritten.value().operation.preemption->kind,
+            OperationPreemptionKind::kSupersededUnsent);
+  EXPECT_EQ(overwritten.value().operation.preemption->by.operation_id, newest.value().operation_id);
+  ASSERT_TRUE(overwritten.value().operation.participants.front().terminal_fact);
+  EXPECT_EQ(overwritten.value().operation.participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kNoEffect);
+  engine.replacement_phase.store(PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(engine.replacement_owner_commits, 1);
+  EXPECT_EQ(engine.prepare_motion_calls, 2);  // no nested preparation in the commit
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(engine.prepare_motion_calls, 3);
+  std::lock_guard lock(engine.prepared_motion_mutex_);
+  ASSERT_TRUE(engine.replacement_request);
+  EXPECT_EQ(engine.replacement_request->execution_request.binding.operation_id,
+            newest.value().operation_id);
+  EXPECT_EQ(engine.replacement_request->replacement->source.execution_id,
+            engine.prepared_snapshot->execution_id);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     StopThroughPendingIdentityWinsBeforeOwnerCasAndKeepsOnePhysicalPresenter) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "stop.cas.original"));
+  ASSERT_TRUE(original.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto candidate = kernel.execute(takeover_intent(1U, "stop.cas.pending"));
+  ASSERT_TRUE(candidate.ok());
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  engine.replacement_phase.store(PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+  std::atomic<bool> stop_once{};
+  engine.observe_prepared_motion_hook = [&] {
+    if (stop_once.exchange(true)) return;
+    auto request = stop_request("stop.cas.pending.selector", candidate.value(), 1U);
+    auto& targets = std::get<std::vector<StopOperationTargetDTO>>(request.selector);
+    targets.push_back({original.value().operation_id, OperationRevision(1U), StopGeneration(0U)});
+    std::sort(targets.begin(), targets.end(), [](const auto& left, const auto& right) {
+      return left.operation_id < right.operation_id;
+    });
+    const auto stopped = kernel.stop(request);
+    EXPECT_TRUE(stopped.ok());
+    if (stopped.ok()) {
+      ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 1U);
+      EXPECT_EQ(stopped.value().affected_operation_revisions.front().operation_id,
+                original.value().operation_id);
+    }
+  };
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  engine.observe_prepared_motion_hook = {};
+  EXPECT_TRUE(stop_once.load());
+  EXPECT_EQ(engine.replacement_owner_commits, 0);
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    const auto state = kernel.get_operation_state(original.value().operation_id);
+    return state.ok() && state.value().state != OperationStateKind::kStopping;
+  }));
+  EXPECT_EQ(engine.replacement_owner_commits, 0);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, original.value().operation_id);
+  }
+  ASSERT_TRUE(journal.last_stop_affected_state);
+  ASSERT_EQ(journal.last_stop_affected_state->operations.size(), 1U);
+  EXPECT_EQ(journal.last_stop_affected_state->operations.front().operation_id,
+            original.value().operation_id);
+}
+}  // namespace
+
+namespace {
+TEST(ResourceAddressedExecutionKernelTest,
+     NeverDispatchedTakeoverUsesExactLocalCloseBeforeOrdinaryWinnerPreparation) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  engine.defer_prepare_completion = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "unsent.original"));
+  ASSERT_TRUE(original.ok());
+  EXPECT_EQ(engine.execute_calls, 0);
+  // The scripted ordinary worker is still in planning; it publishes a real
+  // CancelledBeforeDispatch/NoEffect fact when its cancellation is consumed.
+  engine.status.execution_id = engine.next_execution_id;
+  engine.status.state = ExecutionState::kPlanning;
+  engine.recovery_assessment.execution_id = engine.next_execution_id;
+  engine.recovery_assessment.eligible_close = true;
+  engine.recovery_action_hook = [&] {
+    ASSERT_TRUE(engine.last_recovery_request);
+    const auto& request = *engine.last_recovery_request;
+    EXPECT_EQ(request.action, RecoveryAction::kCloseOperation);
+    EXPECT_FALSE(request.fresh_motion_attempt);
+    EXPECT_EQ(engine.prepare_motion_calls, 1);
+    EXPECT_EQ(engine.execute_calls, 0);
+    for (const auto& slot : kernel.resource_snapshot()) {
+      ASSERT_TRUE(slot.owner);
+      EXPECT_EQ(slot.owner->operation_id, original.value().operation_id);
+    }
+    engine.next_recovery_result =
+        KernelRecoveryActionResultDTO{request.request_id, request.action, true, {}, std::nullopt};
+    engine.defer_prepare_completion = false;
+    engine.next_execution_id = 2U;
+    engine.next_execute_result = Result<std::uint64_t>::Ok(2U);
+    {
+      std::lock_guard lock(engine.prepared_motion_mutex_);
+      engine.prepared_snapshot.reset();
+    }
+    engine.status = {};
+  };
+  const auto candidate = kernel.execute(takeover_intent(1U, "unsent.winner"));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  EXPECT_EQ(engine.recovery_action_calls, 1);
+  EXPECT_EQ(engine.capture_replacement_source_calls, 0);
+  EXPECT_EQ(engine.commit_replacement_calls, 0);
+  EXPECT_EQ(engine.prepare_motion_calls, 2);
+  EXPECT_EQ(engine.execute_calls, 1);
+  EXPECT_EQ(engine.certified_reset_calls, 0);
+  const auto source = kernel.get_operation_state(original.value().operation_id);
+  ASSERT_TRUE(source.ok());
+  ASSERT_TRUE(source.value().preemption);
+  EXPECT_EQ(source.value().preemption->kind, OperationPreemptionKind::kSupersededUnsent);
+  ASSERT_TRUE(source.value().participants.front().terminal_fact);
+  EXPECT_EQ(source.value().participants.front().terminal_fact->kind,
+            ParticipantExecutionFactKind::kCancelledBeforeDispatch);
+  EXPECT_EQ(source.value().participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kNoEffect);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, candidate.value().operation_id);
+  }
+  expect_detached_source_close(kernel, engine, original.value(), candidate.value());
+  engine.recovery_action_hook = {};
+}
+}  // namespace
+
+namespace {
+// Disjoint integration gaps after the parent owner's takeover tests. Reuse the
+// existing fixture and its real identity-fenced replacement/Stop hooks.
+TEST(ResourceAddressedExecutionKernelTest,
+     UncertainSentTakeoverEndsUnsentNextWithNoEffectAndRetainsThePhysicalOwner) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "uncertain.chain.original"));
+  ASSERT_TRUE(original.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto pending = kernel.execute(takeover_intent(1U, "uncertain.chain.sent"));
+  ASSERT_TRUE(pending.ok());
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // Y possibly sent
+  const auto next = kernel.execute(takeover_intent(2U, "uncertain.chain.unsent"));
+  ASSERT_TRUE(next.ok());
+  EXPECT_EQ(engine.prepare_motion_calls.load(), 2);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+  // Neither failed handover nor unproved containment may fabricate settlement
+  // of Y. Z never acquired an engine membership or a controller command.
+  engine.next_stop_result = {false, ErrorDTO{"takeover_stop_failed", "containment unproved", {}}};
+  engine.replacement_phase.store(PreparedMotionReplacementPhaseDTO::kEffectUncertain);
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    const auto observed = kernel.get_operation_projection(next.value().operation_id);
+    return observed.ok() && !observed.value().resident &&
+           observed.value().operation.participants.front().terminal_fact.has_value();
+  }));
+  const auto ended_next = kernel.get_operation_projection(next.value().operation_id);
+  ASSERT_TRUE(ended_next.ok());
+  EXPECT_FALSE(ended_next.value().resident);
+  EXPECT_EQ(ended_next.value().operation.state, OperationStateKind::kFailed);
+  const auto& next_row = ended_next.value().operation.participants.front();
+  ASSERT_TRUE(next_row.terminal_error);
+  EXPECT_EQ(next_row.terminal_error->code, "predecessor_handover_failed");
+  ASSERT_TRUE(next_row.terminal_fact);
+  EXPECT_EQ(next_row.terminal_fact->kind, ParticipantExecutionFactKind::kLocalFailure);
+  EXPECT_EQ(next_row.terminal_fact->effect, ParticipantEffectKnowledge::kNoEffect);
+  EXPECT_EQ(next_row.terminal_fact->error, next_row.terminal_error);
+  const auto unresolved = kernel.get_operation_projection(pending.value().operation_id);
+  ASSERT_TRUE(unresolved.ok());
+  EXPECT_TRUE(unresolved.value().resident);
+  EXPECT_EQ(unresolved.value().operation.state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(unresolved.value().operation.participants.front().terminal_fact);
+  EXPECT_EQ(unresolved.value().operation.participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kEffectUncertain);
+  ASSERT_TRUE(unresolved.value().operation.participants.front().terminal_error);
+  EXPECT_EQ(engine.replacement_owner_commits.load(), 0);
+  EXPECT_EQ(engine.execute_calls.load(), 1);
+  EXPECT_EQ(engine.prepare_motion_calls.load(), 2);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+  EXPECT_EQ(engine.certified_reset_calls.load(), 0);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, original.value().operation_id);
+  }
+  // Wait for the same failed Stop, without replacing its physical owner or
+  // allowing the logically preempted incumbent to resume automatically.
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    const auto state = kernel.get_operation_state(original.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kInterventionRequired;
+  }));
+  ASSERT_TRUE(engine.last_stop_stage);
+  EXPECT_EQ(engine.last_stop_stage->operation_id, original.value().operation_id);
+  EXPECT_FALSE(kernel.execute(takeover_intent(3U, "uncertain.chain.after_fault")).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PostCommitStopSelectsOnlyTheSuccessorAndLatePredecessorFactsCannotMutateIt) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "post.cas.original"));
+  ASSERT_TRUE(original.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto original_execution = engine.get_status().execution_id;
+  const auto successor = kernel.execute(takeover_intent(1U, "post.cas.successor"));
+  ASSERT_TRUE(successor.ok());
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  engine.replacement_phase.store(PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  ASSERT_EQ(engine.replacement_owner_commits.load(), 1);
+  const auto successor_execution = engine.get_status().execution_id;
+  ASSERT_NE(successor_execution, original_execution);
+  const auto old_fact = kernel.get_operation_state(original.value().operation_id);
+  const auto current = kernel.get_operation_state(successor.value().operation_id);
+  ASSERT_TRUE(old_fact.ok() && current.ok());
+  ASSERT_TRUE(old_fact.value().participants.front().terminal_fact);
+  EXPECT_EQ(old_fact.value().participants.front().terminal_fact->kind,
+            ParticipantExecutionFactKind::kPreemptedByReplacement);
+  const auto before_late = kernel.resource_table_snapshot();
+  const ErrorDTO late_error{"late_predecessor_error", "late callback from the detached source", {}};
+  KernelEvent late{
+      KernelEventType::kParticipantSettled, original_execution, 0, ExecutionState::kExecuting,
+      ExecutionState::kExecuting,           late_error,         {}};
+  late.participant_fact =
+      ParticipantExecutionFact{ParticipantExecutionFactKind::kLocalFailure,
+                               ParticipantEffectKnowledge::kEffectUncertain, late_error};
+  engine.deliver_event(late);
+  EXPECT_EQ(kernel.get_operation_state(original.value().operation_id).value(), old_fact.value());
+  EXPECT_EQ(kernel.get_operation_state(successor.value().operation_id).value(), current.value());
+  EXPECT_EQ(kernel.resource_table_snapshot().operation_resource_generation,
+            before_late.operation_resource_generation);
+
+  const auto physical_stop_calls = engine.translate_stop_stage_calls.load();
+  const auto old_stop = kernel.stop(stop_request("post.cas.detached.source.stop", original.value(),
+                                                 old_fact.value().operation_revision.value()));
+  ASSERT_TRUE(old_stop.ok()) << old_stop.error().message;
+  EXPECT_EQ(old_stop.value().resolution_disposition,
+            StopResolutionDispositionDTO::kAlreadyTerminalNoEffect);
+  EXPECT_TRUE(old_stop.value().affected_operation_revisions.empty());
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), physical_stop_calls);
+  EXPECT_EQ(kernel.get_operation_state(original.value().operation_id).value(), old_fact.value());
+  EXPECT_EQ(kernel.get_operation_state(successor.value().operation_id).value(), current.value());
+
+  const auto stop = kernel.stop(stop_request("post.cas.successor.stop", successor.value(), 1U));
+  ASSERT_TRUE(stop.ok()) << stop.error().message;
+  ASSERT_EQ(stop.value().affected_operation_revisions.size(), 1U);
+  EXPECT_EQ(stop.value().affected_operation_revisions.front().operation_id,
+            successor.value().operation_id);
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    const auto state = kernel.get_operation_state(successor.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kStopped;
+  }));
+  EXPECT_EQ(engine.addressed_stop_fence_execution_id.load(), successor_execution);
+  ASSERT_TRUE(engine.last_stop_stage);
+  EXPECT_EQ(engine.last_stop_stage->operation_id, successor.value().operation_id);
+  std::optional<OperationStateDTO> captured_successor_stop;
+  ASSERT_TRUE(wait_until([&] {
+    std::lock_guard lock(journal.mutex);
+    if (std::find(journal.projected_stop_acceptances.begin(),
+                  journal.projected_stop_acceptances.end(),
+                  stop.value().stop_id) == journal.projected_stop_acceptances.end())
+      return false;
+    const auto captured =
+        std::find_if(journal.states.begin(), journal.states.end(), [&](const auto& state) {
+          return state.operation_id == successor.value().operation_id &&
+                 state.active_stop_id == stop.value().stop_id &&
+                 state.state == OperationStateKind::kStopping;
+        });
+    if (captured == journal.states.end()) return false;
+    captured_successor_stop = *captured;
+    return true;
+  })) << "Missing journal capture for successor "
+      << successor.value().operation_id.value() << " and Stop " << stop.value().stop_id.value();
+  ASSERT_TRUE(captured_successor_stop);
+  EXPECT_EQ(captured_successor_stop->operation_id, successor.value().operation_id);
+  EXPECT_EQ(captured_successor_stop->active_stop_id, stop.value().stop_id);
+  const auto stopped = kernel.get_operation_state(successor.value().operation_id);
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(stopped.value().participants.front().terminal_fact);
+  EXPECT_EQ(stopped.value().participants.front().terminal_fact->kind,
+            ParticipantExecutionFactKind::kPreemptedByAddressedStop);
+  EXPECT_EQ(stopped.value().participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kEffectSettled);
+  EXPECT_FALSE(stopped.value().participants.front().terminal_error);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, successor.value().operation_id);
+  }
+  const auto stopped_generation = kernel.resource_table_snapshot().operation_resource_generation;
+  engine.deliver_event(late);
+  EXPECT_EQ(kernel.get_operation_state(original.value().operation_id).value(), old_fact.value());
+  EXPECT_EQ(kernel.get_operation_state(successor.value().operation_id).value(), stopped.value());
+  EXPECT_EQ(kernel.resource_table_snapshot().operation_resource_generation, stopped_generation);
+  EXPECT_EQ(engine.execute_calls.load(), 1);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+  EXPECT_EQ(engine.replacement_owner_commits.load(), 1);
+}
+TEST(ResourceAddressedExecutionKernelTest,
+     SuccessfulResetRetainsAcceptedTakeoversUntilPendingAndNextHistoryDrain) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "reset.chain.original"));
+  ASSERT_TRUE(original.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto pending = kernel.execute(takeover_intent(1U, "reset.chain.sent"));
+  ASSERT_TRUE(pending.ok());
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto next = kernel.execute(takeover_intent(2U, "reset.chain.unsent"));
+  ASSERT_TRUE(next.ok());
+  ASSERT_EQ(engine.prepare_motion_calls.load(), 2);
+  ASSERT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+
+  HeldSettlementCall reset_effect;
+  engine.reset_effect_hook = [&, hold = reset_effect.Blocker()] {
+    // The genuine Kernel retires pending membership before active membership.
+    // Model that successful effect with the existing hook, then hold its result
+    // so the parent cannot mistake backend Missing for completed Reset proof.
+    {
+      std::lock_guard lock(engine.prepared_motion_mutex_);
+      engine.replacement_snapshot.reset();
+      engine.replacement_request.reset();
+    }
+    hold();
+  };
+  const auto before_reset = kernel.get_operation_state(original.value().operation_id);
+  ASSERT_TRUE(before_reset.ok());
+  const auto accepted_reset = kernel.reset(control_request(
+      "reset.chain.control", original.value(), before_reset.value().operation_revision.value()));
+  ASSERT_TRUE(accepted_reset.ok()) << accepted_reset.error().message;
+  ASSERT_TRUE(reset_effect.Entered());
+  EXPECT_EQ(engine.certified_reset_calls.load(), 1);
+  for (const auto& operation : {original.value(), pending.value(), next.value()}) {
+    const auto retained = kernel.get_operation_projection(operation.operation_id);
+    ASSERT_TRUE(retained.ok());
+    EXPECT_TRUE(retained.value().resident);
+  }
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, original.value().operation_id);
+  }
+  EXPECT_EQ(engine.prepare_motion_calls.load(), 2);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+  EXPECT_EQ(engine.replacement_owner_commits.load(), 0);
+
+  reset_effect.Release();
+  std::optional<ErrorDTO> reconcile_failure;
+  ASSERT_TRUE(wait_until([&] {
+    const auto reconciled = kernel.reconcile_subordinate_state();
+    if (!reconciled.ok()) {
+      reconcile_failure = reconciled.error();
+      return true;
+    }
+    const auto source = kernel.get_operation_projection(original.value().operation_id);
+    return source.ok() && !source.value().resident;
+  }));
+  ASSERT_FALSE(reconcile_failure) << (reconcile_failure ? reconcile_failure->message : "");
+  for (const auto& operation : {pending.value(), next.value()}) {
+    const auto retained = kernel.get_operation_projection(operation.operation_id);
+    ASSERT_TRUE(retained.ok());
+    EXPECT_FALSE(retained.value().resident);
+    EXPECT_EQ(retained.value().operation.state, OperationStateKind::kStopped);
+    ASSERT_TRUE(retained.value().operation.participants.front().terminal_fact);
+    EXPECT_EQ(retained.value().operation.participants.front().terminal_fact->effect,
+              operation.operation_id == pending.value().operation_id
+                  ? ParticipantEffectKnowledge::kEffectSettled
+                  : ParticipantEffectKnowledge::kNoEffect);
+  }
+  for (const auto& slot : kernel.resource_snapshot()) {
+    EXPECT_FALSE(slot.owner);
+    EXPECT_EQ(slot.state, ResourceSlotState::kFree);
+  }
+  EXPECT_EQ(engine.certified_reset_calls.load(), 1);
+  EXPECT_EQ(engine.retire_cancelled_replacement_calls.load(), 0);
+  EXPECT_EQ(engine.recovery_action_calls.load(), 0);
+  EXPECT_EQ(engine.prepare_motion_calls.load(), 2);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+  EXPECT_EQ(engine.replacement_owner_commits.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     OrdinaryReplanCannotRetireStoppedSourceBeforeAcceptedTakeoversDrain) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "replan.chain.original"));
+  ASSERT_TRUE(original.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto pending = kernel.execute(takeover_intent(1U, "replan.chain.sent"));
+  ASSERT_TRUE(pending.ok());
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto next = kernel.execute(takeover_intent(2U, "replan.chain.unsent"));
+  ASSERT_TRUE(next.ok());
+  const auto before_stop = kernel.get_operation_state(original.value().operation_id);
+  ASSERT_TRUE(before_stop.ok());
+  const auto stopped = kernel.stop(stop_request("replan.chain.stop", original.value(),
+                                                before_stop.value().operation_revision.value()));
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto stop = kernel.get_stop_status(stopped.value().stop_id);
+    return stop.ok() && stop.value().stop_certificate.has_value();
+  }));
+  const auto projection = kernel.get_operation_recovery_assessment(original.value().operation_id);
+  ASSERT_TRUE(projection.ok());
+  const auto& assessment = projection.value().assessment;
+  ASSERT_TRUE(assessment.retry_admissible);
+  ASSERT_NE(std::find(assessment.allowed_actions.begin(), assessment.allowed_actions.end(),
+                      RecoveryAction::kReplanFromStoppedState),
+            assessment.allowed_actions.end());
+  KernelRecoveryActionRequestDTO request{"replan.chain.request",
+                                         RecoveryAction::kReplanFromStoppedState,
+                                         "operator",
+                                         assessment.assessment_revision,
+                                         assessment.control_command_epoch,
+                                         assessment.execution_id,
+                                         assessment.latch_id,
+                                         assessment.stop_certificate_id,
+                                         assessment.stop_owner_generation,
+                                         "resume stopped node",
+                                         false};
+  engine.next_recovery_result = {request.request_id, request.action, true, {}, std::nullopt};
+  const auto attempted = kernel.apply_operation_recovery_action(
+      original.value().operation_id, projection.value().operation_revision, request);
+  ASSERT_FALSE(attempted.ok());
+  EXPECT_EQ(attempted.error().details.at("reason"), "operation_recovery_busy");
+  EXPECT_EQ(engine.recovery_action_calls.load(), 0);
+  for (const auto& operation : {original.value(), pending.value(), next.value()}) {
+    const auto retained = kernel.get_operation_projection(operation.operation_id);
+    ASSERT_TRUE(retained.ok());
+    EXPECT_TRUE(retained.value().resident);
+  }
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, original.value().operation_id);
+  }
+  EXPECT_EQ(engine.prepare_motion_calls.load(), 2);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+  EXPECT_EQ(engine.replacement_owner_commits.load(), 0);
+}
+
+}  // namespace
+
+namespace {
+TEST(ResourceAddressedExecutionKernelTest,
+     PreparationExceptionsReleaseMovingAndOrdinaryTakeoverBorrowsForStopAndReset) {
+  for (const bool moving : {false, true}) {
+    SCOPED_TRACE(moving);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    engine.supports_motion_replacement = true;
+    engine.defer_prepare_completion = !moving;
+    auto row = registration(
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        engine);
+    row.motion_takeover_preparation_budget_s = 1.0;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+    start_program_motion(kernel);
+    const auto original = kernel.execute(takeover_intent(0U, "throw.original"));
+    ASSERT_TRUE(original.ok());
+    if (moving) {
+      engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    } else {
+      engine.status.execution_id = engine.next_execution_id;
+      engine.status.state = ExecutionState::kPlanning;
+      engine.recovery_assessment.execution_id = engine.next_execution_id;
+      engine.recovery_assessment.eligible_close = true;
+      engine.recovery_action_hook = [&] {
+        const auto& request = *engine.last_recovery_request;
+        engine.next_recovery_result = {request.request_id, request.action, true, {}, std::nullopt};
+        engine.defer_prepare_completion = false;
+        engine.next_execution_id = 2U;
+        engine.next_execute_result = Result<std::uint64_t>::Ok(2U);
+        {
+          std::lock_guard lock(engine.prepared_motion_mutex_);
+          engine.prepared_snapshot.reset();
+        }
+        engine.status = {};
+      };
+    }
+    engine.prepare_motion_hook = [&] {
+      if (engine.prepare_motion_calls.load() == 2)
+        throw std::runtime_error("injected pure Prepare failure");
+    };
+    const auto candidate = kernel.execute(takeover_intent(1U, "throw.successor"));
+    ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      static_cast<void>(kernel.reconcile_subordinate_state());
+      const auto result = kernel.get_operation_projection(candidate.value().operation_id);
+      return result.ok() && !result.value().resident;
+    }));
+    const auto failed = kernel.get_operation_state(candidate.value().operation_id);
+    ASSERT_TRUE(failed.ok());
+    EXPECT_EQ(failed.value().state,
+              moving ? OperationStateKind::kFailed : OperationStateKind::kInterventionRequired);
+    ASSERT_TRUE(failed.value().participants.front().terminal_fact);
+    EXPECT_EQ(failed.value().participants.front().terminal_fact->effect,
+              ParticipantEffectKnowledge::kNoEffect);
+    ASSERT_TRUE(failed.value().participants.front().terminal_error);
+    EXPECT_EQ(failed.value().participants.front().terminal_error->details.at("reason"),
+              "motion_takeover_prepare_exception");
+    EXPECT_EQ(engine.prepare_motion_calls.load(), 2);
+    EXPECT_EQ(engine.execute_calls.load(), moving ? 1 : 0);
+    EXPECT_EQ(engine.replacement_owner_commits.load(), 0);
+    if (moving) {
+      ASSERT_TRUE(wait_until([&] {
+        const auto source = kernel.get_operation_state(original.value().operation_id);
+        return source.ok() && source.value().state == OperationStateKind::kStopped;
+      }));
+      EXPECT_GT(engine.translate_stop_stage_calls.load(), 0);
+    }
+    engine.prepare_motion_hook = {};
+    engine.recovery_action_hook = {};
+    if (moving) {
+      const auto source = kernel.get_operation_state(original.value().operation_id);
+      ASSERT_TRUE(source.ok());
+      const auto reset = kernel.reset(control_request("throw.cleanup.reset", original.value(),
+                                                      source.value().operation_revision.value()));
+      ASSERT_TRUE(reset.ok()) << reset.error().message;
+      ASSERT_TRUE(wait_until([&] {
+        static_cast<void>(kernel.reconcile_subordinate_state());
+        const auto result = kernel.get_operation_projection(original.value().operation_id);
+        return result.ok() && !result.value().resident;
+      }));
+    } else {
+      expect_detached_source_close(kernel, engine, original.value(), candidate.value(), false);
+    }
+    for (const auto& slot : kernel.resource_snapshot()) EXPECT_FALSE(slot.owner);
+  }
+}
+}  // namespace
+
+namespace {
+TEST(ResourceAddressedExecutionKernelTest,
+     SpringFallbackAfterSubmissionGatePublishesFreshKeyOnlyAtSettledTransfer) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  // Exercise the parent submission fence even when the physical adapter later
+  // proves NoEffect. Strict possibly-sent replay/overlap is a Kernel test.
+  engine.replacement_dispatch_phase = PreparedMotionReplacementPhaseDTO::kNoEffect;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.default_operator_stop_profile->stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  row.default_operator_stop_profile->allow_natural_completion_on_short_path = false;
+  row.motion_takeover_preparation_budget_s = 10.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(spring_fallback_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(scoped_motion_operation("fresh.key.original"));
+  ASSERT_TRUE(original.ok()) << original.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  HeldSettlementCall returning;
+  engine.translate_stop_stage_hook = returning.Blocker();
+  const auto candidate = kernel.execute(spring_fallback_intent("fresh.key.candidate"));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    std::lock_guard lock(engine.prepared_motion_mutex_);
+    return engine.replacement_snapshot && engine.replacement_request &&
+           engine.replacement_snapshot->state ==
+               ResolvedPreparedMotionExecutionStateDTO::kColdPrepared;
+  }));
+  ASSERT_TRUE(returning.Entered());
+  const auto held = kernel.get_operation_state(candidate.value().operation_id);
+  ASSERT_TRUE(held.ok());
+  const auto old_key = held.value().participants.front().command_id;
+  EXPECT_EQ(held.value().participants.front().command_generation,
+            ControllerGoalGeneration(1U));
+  std::uint64_t cold_id{};
+  {
+    std::lock_guard lock(engine.prepared_motion_mutex_);
+    ASSERT_TRUE(engine.replacement_request);
+    ASSERT_TRUE(engine.replacement_snapshot);
+    cold_id = engine.replacement_snapshot->execution_id;
+    const auto& future = engine.replacement_request->execution_request.binding;
+    EXPECT_EQ(future.operation_id, candidate.value().operation_id);
+    EXPECT_EQ(future.controller_goal_id, old_key);
+    EXPECT_EQ(future.controller_goal_generation, ControllerGoalGeneration(2U));
+  }
+  EXPECT_EQ(engine.cold_participant_preparations.load(), 0);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+  returning.Release();
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    return engine.dispatch_prepared_motion_calls.load() == 3 &&
+           engine.get_status().execution_id == cold_id;
+  }));
+  const auto adopted = kernel.get_operation_state(candidate.value().operation_id);
+  ASSERT_TRUE(adopted.ok());
+  EXPECT_EQ(adopted.value().participants.front().command_id, old_key);
+  EXPECT_EQ(adopted.value().participants.front().command_generation,
+            ControllerGoalGeneration(2U));
+  ASSERT_TRUE(engine.last_execute);
+  EXPECT_EQ(engine.last_execute->binding.operation_id, candidate.value().operation_id);
+  EXPECT_EQ(engine.last_execute->binding.controller_goal_id, old_key);
+  EXPECT_EQ(engine.last_execute->binding.controller_goal_generation, ControllerGoalGeneration(2U));
+  {
+    std::lock_guard lock(journal.mutex);
+    EXPECT_TRUE(std::any_of(journal.states.begin(), journal.states.end(), [&](const auto& state) {
+      return state.operation_id == candidate.value().operation_id &&
+             state.participants.front().command_id == old_key &&
+             state.participants.front().command_generation == ControllerGoalGeneration(2U);
+    }));
+  }
+  engine.translate_stop_stage_hook = {};
+}
+}  // namespace
+
+namespace {
+TEST(ResourceAddressedExecutionKernelTest,
+     CoordinatedCancellationFailureRetainsKnownSiblingFactAndSelectedCause) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm;
+  FakeParticipantEngine command;
+  FakeOperationJournal journal;
+  const auto motion =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto output =
+      coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                          CoordinateKind::kLinear, schema),
+                             "2");
+  ResourceAddressedExecutionKernel kernel(
+      {registration(motion, arm), registration(output, command)}, clock, scheduler, journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const OperationId operation_id("operation.kernel.epoch.1.1");
+  const ErrorDTO original_failure{"planner_failed", "recorded sibling failure", {}};
+  const ParticipantExecutionFact reported{ParticipantExecutionFactKind::kLocalFailure,
+                                          ParticipantEffectKnowledge::kNoEffect, original_failure};
+  command.prepare_command_failure = ErrorDTO{"prepare_failed", "selected preparation failure", {}};
+  // Report a sibling's ending at the existing provider-call boundary, before
+  // the final preparation returns its failure and cancellation then fails.
+  command.prepare_command_hook = [&] {
+    {
+      std::lock_guard lock(arm.status_mutex_);
+      arm.status = fact_status(arm.next_execution_id, ExecutionState::kPlanning, reported);
+    }
+    KernelEvent completed{KernelEventType::kParticipantSettled,
+                          arm.next_execution_id,
+                          0,
+                          ExecutionState::kPlanning,
+                          ExecutionState::kPlanning,
+                          std::nullopt,
+                          {}};
+    // As with ordinary delayed completion feedback, current status wins.
+    completed.participant_fact =
+        ParticipantExecutionFact{ParticipantExecutionFactKind::kComputedCompletion,
+                                 ParticipantEffectKnowledge::kEffectSettled, std::nullopt};
+    arm.deliver_event(completed);
+    const auto before = kernel.get_operation_state(operation_id);
+    ASSERT_TRUE(before.ok());
+    EXPECT_EQ(before.value().participants.front().terminal_fact, std::optional(reported));
+  };
+  arm.cancel_prepared_motion_hook = [] {
+    throw std::runtime_error("selected cancellation failure");
+  };
+  const auto accepted =
+      kernel.execute(coordinated_motion_command_operation("retained.sibling.cancel"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto state = kernel.get_operation_state(operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(state.value().participants.front().state, OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(state.value().participants.front().terminal_fact, std::optional(reported));
+  ASSERT_TRUE(state.value().participants.front().terminal_error);
+  EXPECT_NE(state.value().participants.front().terminal_error, reported.error);
+  EXPECT_EQ(state.value().participants.front().terminal_error->code, "invariant_violation");
+  EXPECT_EQ(state.value().participants.front().terminal_error->details.at("reason"),
+            "prepared_participant_cancel_threw");
+  ASSERT_TRUE(state.value().participants.back().terminal_error);
+  EXPECT_EQ(state.value().participants.back().terminal_error->code, "prepare_failed");
+  EXPECT_EQ(arm.dispatch_prepared_motion_calls.load(), 0);
+  EXPECT_EQ(command.dispatch_prepared_command_calls.load(), 0);
+  EXPECT_EQ(arm.translate_stop_stage_calls.load(), 0);
+  {
+    std::lock_guard lock(journal.mutex);
+    ASSERT_FALSE(journal.states.empty());
+    EXPECT_EQ(journal.states.back().participants.front().terminal_fact, std::optional(reported));
+    EXPECT_EQ(journal.states.back().participants.front().terminal_error,
+              state.value().participants.front().terminal_error);
+  }
+  arm.cancel_prepared_motion_hook = {};
+  command.prepare_command_hook = {};
+}
+
+IoSignalDescriptorDTO program_io_descriptor() {
+  return {{ControllableComponentId("robot.1"), "ready"},
+          InterruptSourceId("gpio.source"),
+          IoSignalValueType::kBoolean,
+          IoSignalDirection::kInput,
+          IoSignalUpdateMode::kSampled,
+          IoTransitionCapability::kSampledOnly,
+          {IoFreshnessMode::kSampleAge, 100}, {}, IoSignalLivenessMode::kPeriodic};
+}
+
+ProgramRunExecutionCaptureDTO program_io_capture() {
+  auto capture = program_execution_capture();
+  auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
+  binding->target_role_bindings.front().signal_role_bindings.push_back(
+      {ResourceRoleId("ready"), "ready", IoSignalValueType::kBoolean, IoSignalDirection::kInput,
+       IoTransitionCapability::kSampledOnly,
+       ComputeIoSignalDescriptorDigest(program_io_descriptor()).value()});
+  capture.binding = std::move(binding);
+  auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+  table->nodes.push_back({ProgramNodeInstanceId("wait"),
+                          "kernel.command_target",
+                          {{TargetRoleId("arm"), CapabilityId("io.gpio.wait_for_input"), false}}});
+  capture.table = std::move(table);
+  return capture;
+}
+
+ProgramIoWatchRequestDTO program_io_watch_request() {
+  const auto capture = program_io_capture();
+  return {capture.request_owner_epoch,
+          capture.program_binding_id,
+          capture.program_runner_owner_epoch,
+          capture.claim_generation,
+          capture.program_run_id,
+          {ProgramNodeInstanceId("wait"), "wait.attempt.1"},
+          TargetRoleId("arm"),
+          ResourceRoleId("ready"),
+          true};
+}
+
+std::shared_ptr<IoSignalSubsystem> program_io_service(
+    FakeClock& clock, IoSignalDescriptorDTO descriptor = program_io_descriptor()) {
+  auto created =
+      IoSignalSubsystem::Create({RequestOwnerEpoch("kernel.epoch.1"), 1U, {std::move(descriptor)}},
+                                {1U, 1U, 4U, 8U, 512U, 1024U}, clock);
+  if (!created.ok()) throw std::logic_error("I/O fixture service did not construct");
+  return std::shared_ptr<IoSignalSubsystem>(std::move(created.value()));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramIoWatchUsesCapturedBindingAndRetiresBeforeLateSourceWrites) {
+  for (const bool runner_loss : {false, true}) {
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, default_journal, std::move(config));
+    auto service = program_io_service(clock);
+    ASSERT_TRUE(kernel
+                    .InstallProgramIoSignalService(service, RetainedBundleId(test_digest('6')),
+                                                   GraphRevision(test_digest('7')))
+                    .ok());
+    const auto claim = claim_program_execution(kernel);
+    ASSERT_TRUE(claim.ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(program_io_capture()).ok());
+    // Retrying installation of the identical immutable service is inert even
+    // with a live capture; a different instance remains fenced.
+    ASSERT_TRUE(kernel.InstallProgramIoSignalService(service, RetainedBundleId(test_digest('6')),
+                                                     GraphRevision(test_digest('7'))).ok());
+    auto request = program_io_watch_request();
+    const auto registered = kernel.RegisterProgramIoWatch(request);
+    ASSERT_TRUE(registered.ok()) << registered.error().message;
+    EXPECT_EQ(kernel.ReadProgramIoWatch(registered.value()).value().state, IoWatchState::kPending);
+    ASSERT_TRUE(
+        service
+            ->InstallSource(InterruptSourceId("gpio.source"), IoSourceIncarnation("provider.1"), {})
+            .ok());
+    ASSERT_TRUE(
+        service
+            ->Publish({InterruptSourceId("gpio.source"),
+                       IoSourceIncarnation("provider.1"),
+                       1U,
+                       clock.now(),
+                       {{program_io_descriptor().signal_id, IoSampleValidity::kValid, true, {}}}})
+            .ok());
+    EXPECT_EQ(kernel.ReadProgramIoWatch(registered.value()).value().state, IoWatchState::kMatched);
+    ASSERT_TRUE(kernel.ReleaseProgramIoWatch(registered.value()).ok());
+    const auto retiring = kernel.RegisterProgramIoWatch(request);
+    ASSERT_TRUE(retiring.ok());
+    if (runner_loss) {
+      ProgramRunnerContactLossDTO loss{
+          RequestOwnerEpoch("manager.owner.1"),
+          RuntimeEpoch("manager.epoch.1"),
+          {RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kRunning,
+           ProgramRunId("run.1"), claim.value().claim_generation, std::nullopt},
+          "program_runner_liveness_probe",
+          "connection refused"};
+      CellAdmissionReadinessSnapshotDTO closed{
+          false, loss.established_cycle, false, 1U, 0U, false, false, 0U, 0U, 0U};
+      closed.program_runner_loss = loss;
+      ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(closed).ok());
+    } else {
+      CellAdmissionReadinessSnapshotDTO ended{
+          true,
+          ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 2U,
+                                ProgramCycleStateDTO::kTerminalAwaitingReset, ProgramRunId("run.1"),
+                                claim.value().claim_generation, ContentDigest(test_digest('2'))},
+          true,
+          1U,
+          1U,
+          true,
+          true,
+          0U,
+          0U,
+          0U};
+      ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(ended).ok());
+    }
+    EXPECT_EQ(kernel.ReadProgramIoWatch(retiring.value()).value().state, IoWatchState::kReleased);
+    EXPECT_FALSE(kernel.RegisterProgramIoWatch(request).ok());
+    ASSERT_TRUE(
+        service
+            ->Publish({InterruptSourceId("gpio.source"),
+                       IoSourceIncarnation("provider.1"),
+                       2U,
+                       clock.now(),
+                       {{program_io_descriptor().signal_id, IoSampleValidity::kValid, true, {}}}})
+            .ok());
+    EXPECT_EQ(kernel.ReadProgramIoWatch(retiring.value()).value().state, IoWatchState::kReleased);
+    EXPECT_TRUE(kernel.ReleaseProgramIoWatch(retiring.value()).ok());
+    EXPECT_EQ(engine.execute_calls, 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ProgramIoWatchRefusesStaleScopeAndUninstalledService) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  auto request = program_io_watch_request();
+  EXPECT_FALSE(kernel.RegisterProgramIoWatch(request).ok());
+  auto service = program_io_service(clock);
+  EXPECT_FALSE(kernel
+                   .InstallProgramIoSignalService(service, RetainedBundleId(test_digest('e')),
+                                                  GraphRevision(test_digest('7')))
+                   .ok());
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_io_capture()).ok());
+  auto refused = kernel.RegisterProgramIoWatch(request);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "io_signal_service_unavailable");
+  EXPECT_FALSE(kernel
+                   .InstallProgramIoSignalService(service, RetainedBundleId(test_digest('6')),
+                                                  GraphRevision(test_digest('7')))
+                   .ok());
+  request.claim_generation = CellAdmissionClaimGeneration(2U);
+  refused = kernel.RegisterProgramIoWatch(request);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "io_watch_scope_stale");
+  request = program_io_watch_request();
+  request.node.node_instance_id = ProgramNodeInstanceId("move");
+  refused = kernel.RegisterProgramIoWatch(request);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "io_watch_node_unsupported");
+  request = program_io_watch_request();
+  request.resource_role_id = ResourceRoleId("another.input");
+  refused = kernel.RegisterProgramIoWatch(request);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "io_signal_unbound");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramIoWatchChecksInstalledDescriptorAgainstSealedDigest) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  auto changed = program_io_descriptor();
+  changed.freshness.maximum_age_ns = 101;
+  ASSERT_TRUE(kernel
+                  .InstallProgramIoSignalService(program_io_service(clock, changed),
+                                                 RetainedBundleId(test_digest('6')),
+                                                 GraphRevision(test_digest('7')))
+                  .ok());
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_io_capture()).ok());
+  const auto refused = kernel.RegisterProgramIoWatch(program_io_watch_request());
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "io_signal_descriptor_stale");
+  EXPECT_EQ(engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ProgramIoWatchRetiresWhenKernelOwnerDiesBeforeService) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  auto service = program_io_service(clock);
+  std::optional<IoWatchRegistrationDTO> token;
+  {
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, default_journal, std::move(config));
+    ASSERT_TRUE(kernel
+                    .InstallProgramIoSignalService(service, RetainedBundleId(test_digest('6')),
+                                                   GraphRevision(test_digest('7')))
+                    .ok());
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(program_io_capture()).ok());
+    const auto registered = kernel.RegisterProgramIoWatch(program_io_watch_request());
+    ASSERT_TRUE(registered.ok());
+    token = registered.value();
+  }
+  ASSERT_TRUE(token);
+  EXPECT_EQ(service->ReadWatch(*token).value().state, IoWatchState::kReleased);
+  ASSERT_TRUE(
+      service
+          ->InstallSource(InterruptSourceId("gpio.source"), IoSourceIncarnation("provider.1"), {})
+          .ok());
+  ASSERT_TRUE(
+      service
+          ->Publish({InterruptSourceId("gpio.source"),
+                     IoSourceIncarnation("provider.1"),
+                     1U,
+                     clock.now(),
+                     {{program_io_descriptor().signal_id, IoSampleValidity::kValid, true, {}}}})
+          .ok());
+  EXPECT_EQ(service->ReadWatch(*token).value().state, IoWatchState::kReleased);
+}
+
+ProgramIoWatchScopeReleaseRequestDTO program_io_scope_release(
+    const ProgramIoWatchRequestDTO& request) {
+  return {
+      request.request_owner_epoch, request.program_binding_id, request.program_runner_owner_epoch,
+      request.claim_generation,    request.program_run_id,     request.node};
+}
+
+struct ProgramIoScopeFixture final {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel;
+  std::shared_ptr<IoSignalSubsystem> service;
+
+  static ResourceAddressedExecutionKernelConfig config() {
+    ResourceAddressedExecutionKernelConfig value{RequestOwnerEpoch("kernel.epoch.1"),
+                                                 CellId("cell.test"), 8U};
+    value.manager_liveness_required_set = EmptyManagerLivenessSet();
+    return value;
+  }
+
+  ProgramIoScopeFixture()
+      : kernel({registration(make_binding("arm", "arm", "execution.trajectory.execute",
+                                          CoordinateKind::kAngular),
+                             engine)},
+               clock, scheduler, default_journal, config()),
+        service(program_io_service(clock)) {
+    if (!kernel
+             .InstallProgramIoSignalService(service, RetainedBundleId(test_digest('6')),
+                                            GraphRevision(test_digest('7')))
+             .ok() ||
+        !claim_program_execution(kernel).ok() ||
+        !kernel.register_program_run_capture(program_io_capture()).ok())
+      throw std::logic_error("Program I/O cancellation fixture did not capture its Run");
+  }
+
+  void retire() {
+    const auto capture = program_io_capture();
+    const CellAdmissionReadinessSnapshotDTO ended{
+        true,
+        ProgramCycleStatusDTO{capture.program_runner_owner_epoch, 2U,
+                              ProgramCycleStateDTO::kTerminalAwaitingReset, capture.program_run_id,
+                              capture.claim_generation, ContentDigest(test_digest('2'))},
+        true,
+        1U,
+        1U,
+        true,
+        true,
+        0U,
+        0U,
+        0U};
+    ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(ended).ok());
+  }
+};
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramIoScopeCancellationRetiresAcceptedUnknownReplyAndRejectsLateOriginal) {
+  ProgramIoScopeFixture fixture;
+  const auto request = program_io_watch_request();
+  // The owner accepted this registration, but its caller did not get the token.
+  const auto accepted = fixture.kernel.RegisterProgramIoWatch(request);
+  ASSERT_TRUE(accepted.ok());
+  const auto release = program_io_scope_release(request);
+  ASSERT_TRUE(fixture.kernel.ReleaseProgramIoWatchScope(release).ok());
+  EXPECT_TRUE(fixture.kernel.ReleaseProgramIoWatchScope(release).ok());
+  EXPECT_EQ(fixture.service->ReadWatch(accepted.value()).value().state, IoWatchState::kReleased);
+  // A delayed known-token release cannot erase the uncertain end fence.
+  EXPECT_TRUE(fixture.kernel.ReleaseProgramIoWatch(accepted.value()).ok());
+  const auto late = fixture.kernel.RegisterProgramIoWatch(request);
+  ASSERT_FALSE(late.ok());
+  EXPECT_EQ(late.error().details.at("reason"), "io_watch_scope_released");
+  ASSERT_TRUE(
+      fixture.service
+          ->InstallSource(InterruptSourceId("gpio.source"), IoSourceIncarnation("provider.1"), {})
+          .ok());
+  fixture.clock.advance(1);
+  ASSERT_TRUE(
+      fixture.service
+          ->Publish({InterruptSourceId("gpio.source"),
+                     IoSourceIncarnation("provider.1"),
+                     1U,
+                     fixture.clock.now(),
+                     {{program_io_descriptor().signal_id, IoSampleValidity::kValid, true, {}}}})
+          .ok());
+  EXPECT_EQ(fixture.service->ReadWatch(accepted.value()).value().state, IoWatchState::kReleased);
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramIoScopeCancellationBeforeRegisterFencesOnlyThatAttempt) {
+  ProgramIoScopeFixture fixture;
+  auto request = program_io_watch_request();
+  ASSERT_TRUE(fixture.kernel.ReleaseProgramIoWatchScope(program_io_scope_release(request)).ok());
+  const auto late = fixture.kernel.RegisterProgramIoWatch(request);
+  ASSERT_FALSE(late.ok());
+  EXPECT_EQ(late.error().details.at("reason"), "io_watch_scope_released");
+  request.node.node_attempt_id = "wait.attempt.2";
+  const auto next = fixture.kernel.RegisterProgramIoWatch(request);
+  ASSERT_TRUE(next.ok());
+  EXPECT_EQ(next.value().registration_id, 1U);  // The late original had no service effect.
+  EXPECT_TRUE(fixture.kernel.ReleaseProgramIoWatch(next.value()).ok());
+  // A known-token release cannot erase an older uncertain-scope fence.
+  request.node.node_attempt_id = "wait.attempt.1";
+  EXPECT_FALSE(fixture.kernel.RegisterProgramIoWatch(request).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramIoKnownReleasesRecycleReservationWithoutLimitingOrdinaryLoops) {
+  ProgramIoScopeFixture fixture;
+  auto request = program_io_watch_request();
+  const auto count = program_io_capture().table->nodes.size();
+  for (std::size_t index = 0U; index < count * 4U; ++index) {
+    request.node.node_attempt_id = "known.attempt." + std::to_string(index);
+    const auto token = fixture.kernel.RegisterProgramIoWatch(request);
+    ASSERT_TRUE(token.ok()) << token.error().message;
+    ASSERT_TRUE(fixture.kernel.ReleaseProgramIoWatch(token.value()).ok());
+    EXPECT_TRUE(fixture.kernel.ReleaseProgramIoWatch(token.value()).ok());
+  }
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramIoScopeCancellationUsesCapturedOwnerClaimBindingAndNodeGate) {
+  ProgramIoScopeFixture fixture;
+  const auto request = program_io_watch_request();
+  const auto token = fixture.kernel.RegisterProgramIoWatch(request);
+  ASSERT_TRUE(token.ok());
+  for (unsigned index = 0U; index < 6U; ++index) {
+    auto wrong = program_io_scope_release(request);
+    if (index == 0U) wrong.request_owner_epoch = RequestOwnerEpoch("kernel.other");
+    if (index == 1U) wrong.program_runner_owner_epoch = RequestOwnerEpoch("runner.other");
+    if (index == 2U) wrong.program_run_id = ProgramRunId("run.other");
+    if (index == 3U) wrong.claim_generation = CellAdmissionClaimGeneration(2U);
+    if (index == 4U) wrong.program_binding_id = ProgramBindingId(test_digest('b'));
+    if (index == 5U) wrong.node.node_instance_id = ProgramNodeInstanceId("move");
+    EXPECT_FALSE(fixture.kernel.ReleaseProgramIoWatchScope(wrong).ok());
+    EXPECT_EQ(fixture.service->ReadWatch(token.value()).value().state, IoWatchState::kPending);
+  }
+  auto malformed = program_io_scope_release(request);
+  malformed.node.node_attempt_id.clear();
+  EXPECT_FALSE(fixture.kernel.ReleaseProgramIoWatchScope(malformed).ok());
+  ASSERT_TRUE(fixture.kernel.ReleaseProgramIoWatchScope(program_io_scope_release(request)).ok());
+  EXPECT_EQ(fixture.service->ReadWatch(token.value()).value().state, IoWatchState::kReleased);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramIoFullBudgetStillCancelsReservedScopesAndRefusesNewEffects) {
+  ProgramIoScopeFixture fixture;
+  auto request = program_io_watch_request();
+  std::vector<IoWatchRegistrationDTO> tokens;
+  const auto count = program_io_capture().table->nodes.size();
+  for (std::size_t index = 0U; index < count; ++index) {
+    request.node.node_attempt_id = "reserved.attempt." + std::to_string(index);
+    const auto accepted = fixture.kernel.RegisterProgramIoWatch(request);
+    ASSERT_TRUE(accepted.ok());
+    tokens.push_back(accepted.value());
+  }
+  request.node.node_attempt_id = "new.attempt";
+  const auto refused = fixture.kernel.RegisterProgramIoWatch(request);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "io_watch_scope_capacity_exhausted");
+  for (const auto& token : tokens) {
+    request.node = token.scope.node;
+    EXPECT_TRUE(fixture.kernel.ReleaseProgramIoWatchScope(program_io_scope_release(request)).ok());
+    EXPECT_EQ(fixture.service->ReadWatch(token).value().state, IoWatchState::kReleased);
+  }
+  // Every accepted watch had cancellation capacity even at the full bound.
+  request.node.node_attempt_id = "new.attempt";
+  EXPECT_FALSE(fixture.kernel.RegisterProgramIoWatch(request).ok());
+  fixture.retire();
+  EXPECT_TRUE(fixture.kernel.ReleaseProgramIoWatchScope(program_io_scope_release(request)).ok());
+  const auto ended = fixture.kernel.RegisterProgramIoWatch(request);
+  ASSERT_FALSE(ended.ok());
+  EXPECT_EQ(ended.error().details.at("reason"), "io_watch_run_retired");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramIoUnknownCancellationOverflowFencesLateArrivalAfterKnownSlotsFree) {
+  ProgramIoScopeFixture fixture;
+  auto request = program_io_watch_request();
+  std::vector<IoWatchRegistrationDTO> tokens;
+  for (std::size_t index = 0U; index < program_io_capture().table->nodes.size(); ++index) {
+    request.node.node_attempt_id = "live.attempt." + std::to_string(index);
+    const auto accepted = fixture.kernel.RegisterProgramIoWatch(request);
+    ASSERT_TRUE(accepted.ok());
+    tokens.push_back(accepted.value());
+  }
+  request.node.node_attempt_id = "unknown.late.attempt";
+  const auto cancelled =
+      fixture.kernel.ReleaseProgramIoWatchScope(program_io_scope_release(request));
+  ASSERT_FALSE(cancelled.ok());
+  EXPECT_EQ(cancelled.error().details.at("reason"), "io_watch_scope_capacity_exhausted");
+  EXPECT_EQ(cancelled.error().details.at("watch_admission_fenced"), "true");
+  EXPECT_EQ(cancelled.error().details.at("matching_watches_released"), "true");
+  for (const auto& token : tokens) {
+    EXPECT_EQ(fixture.service->ReadWatch(token).value().state, IoWatchState::kPending);
+    ASSERT_TRUE(fixture.kernel.ReleaseProgramIoWatch(token).ok());
+  }
+  // Known releases free every slot, but cannot reopen this faulted Run.
+  const auto late = fixture.kernel.RegisterProgramIoWatch(request);
+  ASSERT_FALSE(late.ok());
+  EXPECT_EQ(late.error().details.at("reason"), "io_watch_scope_capacity_exhausted");
+  request.node.node_attempt_id = "another.attempt";
+  EXPECT_FALSE(fixture.kernel.RegisterProgramIoWatch(request).ok());
+  fixture.retire();
+  const auto ended = fixture.kernel.RegisterProgramIoWatch(request);
+  ASSERT_FALSE(ended.ok());
+  EXPECT_EQ(ended.error().details.at("reason"), "io_watch_run_retired");
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+}
+
+// Rule wiring fixtures use the real shared signal/evaluator module and the
+// existing addressed Stop fake. No alternate interruption/containment owner.
+struct IoRuleIntegrationFixture final {
+  static RuntimeParticipantBinding CodecQualifiedPlannerBinding(
+      const RuntimeParticipantBinding& source, char binding_digest_digit) {
+    auto value = source.value();
+    for (auto& planner : value.supporting_capability_provider_paths) {
+      planner.capability_provider_binding_id =
+          CapabilityProviderBindingId(test_digest(binding_digest_digit));
+      planner.capability_provider_binding_revision =
+          CapabilityProviderBindingRevision(test_digest('b'));
+    }
+    auto sealed = verify_runtime_participant_binding(std::move(value));
+    if (!sealed.ok()) throw std::logic_error(sealed.error().message);
+    return std::move(sealed.value());
+  }
+
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeParticipantEngine other_engine;
+  FakeParticipantEngine third_engine;
+  FakeOperationJournal journal;
+  RuntimeParticipantBinding binding = CodecQualifiedPlannerBinding(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), '1');
+  RuntimeParticipantBinding other_binding =
+      CodecQualifiedPlannerBinding(coordinated_occurrence(binding, "2"), '2');
+  RuntimeParticipantBinding third_binding =
+      CodecQualifiedPlannerBinding(coordinated_occurrence(binding, "3"), '3');
+  std::shared_ptr<IoSignalSubsystem> service;
+  MotionInterruptStopProfileDTO profile;
+  std::unique_ptr<ResourceAddressedExecutionKernel> kernel;
+  bool second_is_fault_{};
+
+  static IoRulePolicyScopeDTO MaximumScope(const RuntimeParticipantBinding& binding) {
+    const auto& value = binding.value();
+    std::vector<ResourceId> resources;
+    for (const auto& resource : value.resources) resources.push_back(resource.resource_id);
+    std::sort(resources.begin(), resources.end());
+    return {{value.controllable_component_id},
+            {value.command_target_id},
+            {value.control_path->control_domain_id},
+            {value.control_path->control_binding_id},
+            std::move(resources),
+            IoRuleStopScopeDTO::kAffectedResources};
+  }
+
+  explicit IoRuleIntegrationFixture(bool two_policies = false, bool second_is_fault = false,
+                                    int second_priority = 18, bool second_maskable = false,
+                                    bool unqualified = false, bool disjoint = false,
+                                    bool partial_three = false, int maximum_scope_mode = 0,
+                                    std::optional<std::size_t> entry_index = {},
+                                    std::optional<std::size_t> success_through_index = {},
+                                    bool controller_cancel_entry = false,
+                                    bool independent_companion = false) {
+    second_is_fault_ = second_is_fault;
+    auto resolved = controller_cancel_entry ? registration_with_collision_cancel(binding, engine)
+                                            : registration(binding, engine);
+    profile = *resolved.default_operator_stop_profile;
+    profile.profile_id = "io.search.nominal";
+    profile.allow_natural_completion_on_short_path = false;
+    IoConditionDefinitionDTO expression;
+    expression.inputs.push_back(
+        {program_io_descriptor().signal_id, IoConditionValueKind::kBoolean});
+    expression.nodes.emplace_back(IoConditionCompareDTO{
+        IoConditionComparison::kEqual, IoConditionInputReferenceDTO{0}, IoConditionValueDTO{true}});
+    auto checked = CheckIoCondition(std::move(expression), {1, 1, 1, 1, 128, 128});
+    if (!checked.ok()) throw std::logic_error("rule fixture condition invalid");
+    resolved.io_motion_rule_policies.push_back(
+        {InterruptPolicyId("io.search"),
+         std::make_shared<const CheckedIoCondition>(std::move(checked.value())),
+         {InterruptSourceId("gpio.source")},
+         {MotionInterruptActivationMode::kRequireInactiveAtArm,
+          MotionInterruptActivationMode::kTripIfAlreadyActive,
+          MotionInterruptActivationMode::kFreshEdgeAfterArm},
+         {MotionInterruptStopMode::kSoftOnPath},
+         17});
+    resolved.io_motion_rule_policies.front().semantics =
+        IoMotionRulePolicySemanticsDTO{InterruptPolicyScopeKind::kMove,
+                                       InterruptPreemptionAction::kCompleteMoveOnSignal,
+                                       {OperationStateKind::kExecuting},
+                                       InterruptPostLatchDisposition::kAutoClearAfterMotionOutcome,
+                                       false,
+                                       {}};
+    if (unqualified) resolved.io_motion_rule_policies.front().semantics.reset();
+    resolved.io_motion_rule_policies.front().maximum_scope = MaximumScope(binding);
+    if (maximum_scope_mode == 1) resolved.io_motion_rule_policies.front().maximum_scope.reset();
+    if (maximum_scope_mode == 2)
+      resolved.io_motion_rule_policies.front().maximum_scope->resource_ids = {
+          ResourceId("foreign")};
+    if (maximum_scope_mode == 3)
+      resolved.io_motion_rule_policies.front().maximum_scope->stop_scope =
+          IoRuleStopScopeDTO::kFullCell;
+    if (entry_index) {
+      resolved.io_motion_rule_policies.front().stop_entry_stage_id =
+          resolved.stop_readiness->value()
+              .resolved_stop_base_plan.escalation_stages.at(*entry_index)
+              .stop_escalation_stage_id;
+    }
+    if (success_through_index) {
+      resolved.io_motion_rule_policies.front().success_through_stage_id =
+          resolved.stop_readiness->value()
+              .resolved_stop_base_plan.escalation_stages.at(*success_through_index)
+              .stop_escalation_stage_id;
+    }
+    if (two_policies) {
+      IoConditionDefinitionDTO other;
+      auto other_signal = program_io_descriptor().signal_id;
+      other_signal.name = "other";
+      other.inputs.push_back({other_signal, IoConditionValueKind::kBoolean});
+      other.nodes.emplace_back(IoConditionCompareDTO{IoConditionComparison::kEqual,
+                                                     IoConditionInputReferenceDTO{0},
+                                                     IoConditionValueDTO{true}});
+      auto checked_other = CheckIoCondition(std::move(other), {1, 1, 1, 1, 128, 128});
+      if (!checked_other.ok()) throw std::logic_error("second rule fixture condition invalid");
+      auto policy = resolved.io_motion_rule_policies.front();
+      policy.policy_id = InterruptPolicyId("aaa.other");
+      policy.condition =
+          std::make_shared<const CheckedIoCondition>(std::move(checked_other.value()));
+      policy.required_sources = {InterruptSourceId("zz.gpio.source")};
+      if (second_is_fault) {
+        policy.effective_priority = second_priority;
+        policy.allowed_stop_modes.clear();
+        policy.semantics = IoMotionRulePolicySemanticsDTO{
+            InterruptPolicyScopeKind::kMove,
+            InterruptPreemptionAction::kPreemptTrajectory,
+            {OperationStateKind::kExecuting, OperationStateKind::kStopping},
+            InterruptPostLatchDisposition::kFaultTerminal,
+            second_maskable,
+            second_maskable ? std::vector{InterruptPolicyId("io.search")}
+                            : std::vector<InterruptPolicyId>{}};
+      }
+      resolved.io_motion_rule_policies.push_back(std::move(policy));
+      if (maximum_scope_mode == 4)
+        resolved.io_motion_rule_policies.back().maximum_scope->stop_scope =
+            IoRuleStopScopeDTO::kFullCell;
+    }
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    std::vector<RuntimeParticipantExecutionRegistration> participants;
+    if (disjoint) {
+      auto other = registration(other_binding, other_engine);
+      if (partial_three) {
+        auto third = registration(third_binding, third_engine);
+        third.io_motion_rule_policies.push_back(resolved.io_motion_rule_policies.back());
+        third.io_motion_rule_policies.back().maximum_scope = MaximumScope(third_binding);
+        participants.push_back(std::move(third));
+        other.io_motion_rule_policies.push_back(resolved.io_motion_rule_policies.front());
+      } else {
+        other.io_motion_rule_policies.push_back(resolved.io_motion_rule_policies.back());
+      }
+      other.io_motion_rule_policies.back().maximum_scope = MaximumScope(other_binding);
+      resolved.io_motion_rule_policies.pop_back();
+      participants.push_back(std::move(other));
+    }
+    if (independent_companion) participants.push_back(registration(other_binding, other_engine));
+    participants.push_back(std::move(resolved));
+    kernel = std::make_unique<ResourceAddressedExecutionKernel>(
+        std::move(participants), clock, scheduler, journal, std::move(config));
+    if (two_policies) {
+      auto other = program_io_descriptor();
+      other.signal_id.name = "other";
+      other.source_id = InterruptSourceId("zz.gpio.source");
+      auto created = IoSignalSubsystem::Create(
+          {RequestOwnerEpoch("kernel.epoch.1"), 1U, {program_io_descriptor(), other}},
+          {2U, 2U, 8U, 8U, 512U, 1024U}, clock);
+      if (!created.ok()) throw std::logic_error("dual rule fixture installation invalid");
+      service = std::shared_ptr<IoSignalSubsystem>(std::move(created.value()));
+      if (!service->InstallSource(other.source_id, IoSourceIncarnation("gpio.2"), std::nullopt)
+               .ok())
+        throw std::logic_error("second rule fixture source invalid");
+    } else {
+      service = program_io_service(clock);
+    }
+    if (!service
+             ->InstallSource(InterruptSourceId("gpio.source"), IoSourceIncarnation("gpio.1"),
+                             std::nullopt)
+             .ok() ||
+        !kernel
+             ->InstallProgramIoSignalService(service, binding.value().retained_bundle_id,
+                                             binding.value().graph_revision)
+             .ok())
+      throw std::logic_error("rule fixture installation invalid");
+    engine.next_stop_evidence =
+        JsonValueDTO{JsonObjectDTO{{"completed_by_natural_completion", JsonValueDTO{false}}}};
+    other_engine.next_stop_evidence = engine.next_stop_evidence;
+    third_engine.next_stop_evidence = engine.next_stop_evidence;
+    // Dispatch acceptance alone leaves this fake in Planning. Report the
+    // normal backend phase before exercising executing-only rule responses.
+    engine.execute_return_hook = [&] {
+      engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    };
+    other_engine.execute_return_hook = [&] {
+      other_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    };
+    third_engine.execute_return_hook = [&] {
+      third_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    };
+  }
+
+  Result<IoSourceCursorDTO> Publish(std::uint64_t sequence, bool value) {
+    return service->Publish(
+        {InterruptSourceId("gpio.source"),
+         IoSourceIncarnation("gpio.1"),
+         sequence,
+         clock.now(),
+         {{program_io_descriptor().signal_id, IoSampleValidity::kValid, value, std::nullopt}}});
+  }
+  Result<IoSourceCursorDTO> PublishOther(std::uint64_t sequence, bool value) {
+    auto id = program_io_descriptor().signal_id;
+    id.name = "other";
+    return service->Publish({InterruptSourceId("zz.gpio.source"),
+                             IoSourceIncarnation("gpio.2"),
+                             sequence,
+                             clock.now(),
+                             {{id, IoSampleValidity::kValid, value, {}}}});
+  }
+  OperationIntentDTO TwoScopeIntent() {
+    auto intent = Intent();
+    auto& scopes = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload)
+                       .motion_interrupt_scopes;
+    auto second = scopes.front();
+    second.scope_id = "other.scope";
+    second.policy_id = "aaa.other";
+    if (second_is_fault_) second.stop_profile.reset();
+    scopes.push_back(std::move(second));
+    return intent;
+  }
+  OperationIntentDTO OtherIntent(bool scoped = true) {
+    auto intent = scoped ? Intent("other.io.rule.operation")
+                         : motion_operation("other.independent.operation");
+    auto& other = intent.participants.front();
+    other.component_role_id = other_binding.value().component_role_id;
+    other.target_role_id = other_binding.value().target_role_id;
+    auto& motion = std::get<MotionParticipantIntentDTO>(other.payload);
+    motion.move_id = MoveId("move.other");
+    if (scoped) {
+      motion.motion_interrupt_scopes.front().scope_id = "other.scope";
+      motion.motion_interrupt_scopes.front().policy_id = "aaa.other";
+      if (second_is_fault_) motion.motion_interrupt_scopes.front().stop_profile.reset();
+    }
+    return intent;
+  }
+  void AddScope(
+      OperationIntentDTO& intent,
+      MotionInterruptActivationMode mode = MotionInterruptActivationMode::kRequireInactiveAtArm) {
+    std::get<MotionParticipantIntentDTO>(intent.participants.front().payload)
+        .motion_interrupt_scopes.push_back({"io.scope",
+                                            "io.search",
+                                            mode,
+                                            std::nullopt,
+                                            std::nullopt,
+                                            true,
+                                            profile,
+                                            MotionInterruptNodeCategory::kGeneric,
+                                            {}});
+  }
+  OperationIntentDTO Intent(
+      std::string request = "io.rule.operation",
+      MotionInterruptActivationMode mode = MotionInterruptActivationMode::kRequireInactiveAtArm) {
+    auto intent = motion_operation(std::move(request));
+    AddScope(intent, mode);
+    return intent;
+  }
+  bool Certified(const OperationId& operation) {
+    const auto state = kernel->get_operation_state(operation);
+    if (!state.ok() || state.value().participants.empty()) return false;
+    const auto& outcomes = state.value().participants.front().io_rule_outcomes;
+    return outcomes.size() == 1U && outcomes.front().stop_certificate_id.has_value();
+  }
+  std::string PreparationDiagnostic(const OperationId& operation) const {
+    const auto state = kernel->get_operation_state(operation);
+    if (!state.ok()) return state.error().code + ": " + state.error().message;
+    std::string result = "operation=" + operation.value();
+    for (const auto& row : state.value().participants) {
+      result += " participant=" + row.participant_id.value();
+      if (row.terminal_error) {
+        result += " error=" + row.terminal_error->code + ": " + row.terminal_error->message;
+        for (const auto& [key, value] : row.terminal_error->details)
+          result += " " + key + "=" + value;
+      }
+      result += " rule_outcomes=" + std::to_string(row.io_rule_outcomes.size());
+    }
+    return result;
+  }
+  ::testing::AssertionResult Registered(const OperationId& operation,
+                                        std::size_t expected = 1U) const {
+    const auto state = kernel->get_operation_state(operation);
+    if (!state.ok() || state.value().participants.empty())
+      return ::testing::AssertionFailure() << PreparationDiagnostic(operation);
+    const auto& outcomes = state.value().participants.front().io_rule_outcomes;
+    if (outcomes.size() != expected)
+      return ::testing::AssertionFailure() << PreparationDiagnostic(operation);
+    return ::testing::AssertionSuccess();
+  }
+};
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationArmsExactPreparedMembershipBeforeDispatch) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  bool observed_arm_before_effect = false;
+  fixture.engine.execute_return_hook = [&] {
+    // This callback runs inside actual dispatch. The rule already owns an
+    // exact registration and can retain a publication before dispatch returns.
+    observed_arm_before_effect = fixture.Publish(2, true).ok();
+    fixture.engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  };
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  ASSERT_TRUE(fixture.engine.last_dispatched_participant)
+      << fixture.PreparationDiagnostic(accepted.value().operation_id);
+  EXPECT_TRUE(observed_arm_before_effect);
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  ASSERT_EQ(state.value().state, OperationStateKind::kExecuting);
+  ASSERT_EQ(state.value().participants.front().io_rule_outcomes.size(), 1U);
+  const auto& registration =
+      state.value().participants.front().io_rule_outcomes.front().registration;
+  const auto& exact = std::get<IoOperationRuleScopeDTO>(registration.scope);
+  EXPECT_EQ(exact.operation_id, accepted.value().operation_id);
+  EXPECT_EQ(exact.controller_goal_id, state.value().participants.front().command_id);
+  EXPECT_EQ(exact.controller_goal_generation,
+            state.value().participants.front().command_generation);
+  EXPECT_EQ(exact.prepared_contract_digest,
+            fixture.engine.last_dispatched_participant->prepared_contract_digest);
+  ASSERT_TRUE(fixture.service->ReadRuleEvidence(registration).value().trip);
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+  const auto ended = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto& outcome = ended.participants.front().io_rule_outcomes.front();
+  EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kSignalTrip);
+  ASSERT_TRUE(fixture.engine.last_stop_stage);
+  EXPECT_EQ(fixture.engine.last_stop_stage->participant_stop_plan.participant_stop_profile_purpose,
+            ParticipantStopProfilePurposeDTO::kMotionInterruptScope);
+  EXPECT_EQ(fixture.engine.last_stop_stage->participant_stop_plan.motion_interrupt_scope_id,
+            "io.scope");
+  EXPECT_EQ(
+      fixture.engine.last_stop_stage->participant_stop_plan.participant_stop_profile->profile_id,
+      fixture.profile.profile_id);
+  EXPECT_EQ(fixture.service->ReadRuleEvidence(registration).value().state,
+            IoRuleRegistrationState::kRetired);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, IoRuleIntegrationActiveRequiredBaselineNeverDispatches) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, true).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
+    return state.ok() && state.value().participants.front().terminal_error.has_value();
+  }));
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 0);
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(state.participants.front().terminal_error->code,
+            kErrorMotionInterruptSourceActiveAtArm)
+      << fixture.PreparationDiagnostic(accepted.value().operation_id);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationAlreadyActiveTripStopsBeforeMotionEffect) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, true).ok());
+  const auto accepted = fixture.kernel->execute(
+      fixture.Intent("io.already.active", MotionInterruptActivationMode::kTripIfAlreadyActive));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto& row = state.participants.front();
+  ASSERT_TRUE(row.terminal_fact);
+  EXPECT_EQ(row.terminal_fact->effect, ParticipantEffectKnowledge::kNoEffect);
+  ASSERT_EQ(row.io_rule_outcomes.size(), 1U);
+  EXPECT_TRUE(row.io_rule_outcomes.front().evidence.trip);
+  EXPECT_EQ(row.io_rule_outcomes.front().terminal_cause, MotionExecutionTerminalCause::kSignalTrip);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationSourceLossIsFailureWithActualStopReference) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  ASSERT_TRUE(fixture.service
+                  ->ReportIngressOverflow(InterruptSourceId("gpio.source"),
+                                          IoSourceIncarnation("gpio.1"),
+                                          {"actual_overflow", "queue lost an acquisition", {}})
+                  .ok());
+  ASSERT_TRUE(fixture.Publish(2, true).ok());  // cannot erase pending loss or manufacture trip
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto& row = state.participants.front();
+  ASSERT_EQ(row.io_rule_outcomes.size(), 1U);
+  const auto& outcome = row.io_rule_outcomes.front();
+  EXPECT_FALSE(outcome.evidence.trip);
+  ASSERT_EQ(outcome.evidence.source_losses.size(), 1U);
+  EXPECT_EQ(outcome.evidence.source_losses.front().source_loss->reason,
+            IoSourceLossReason::kIngressOverflow);
+  EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kFailed);
+  EXPECT_EQ(row.state, OperationStateKind::kFailed);
+  EXPECT_EQ(state.state, OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(row.terminal_error->code, "interrupt_source_unavailable");
+  EXPECT_TRUE(outcome.stop_id);
+  EXPECT_TRUE(outcome.stop_certificate_id);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, IoRuleIntegrationNaturalCompletionKeepsNoSignalTrip) {
+  IoRuleIntegrationFixture fixture;
+  fixture.profile.allow_natural_completion_on_short_path = true;
+  fixture.engine.next_stop_evidence =
+      JsonValueDTO{JsonObjectDTO{{"completed_by_natural_completion", JsonValueDTO{true}}}};
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(state.participants.front().io_rule_outcomes.front().terminal_cause,
+            MotionExecutionTerminalCause::kNoSignalTrip);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationAgeLossUsesExistingConfiguredStopWithoutTrip) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  EXPECT_EQ(fixture.kernel->NextIoRuleExpiry().value(), 101);
+  fixture.clock.set(101);
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto& outcome = state.participants.front().io_rule_outcomes.front();
+  EXPECT_FALSE(outcome.evidence.trip);
+  ASSERT_EQ(outcome.evidence.source_losses.size(), 1U);
+  EXPECT_EQ(outcome.evidence.source_losses.front().kind, IoRuleSourceFailureKind::kStale);
+  EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kFailed);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationLiveManualRuleFencesServiceReplacement) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  ASSERT_TRUE(fixture.kernel
+                  ->InstallProgramIoSignalService(fixture.service,
+                                                  fixture.binding.value().retained_bundle_id,
+                                                  fixture.binding.value().graph_revision)
+                  .ok());
+  auto replacement = program_io_service(fixture.clock);
+  const auto rejected = fixture.kernel->InstallProgramIoSignalService(
+      replacement, fixture.binding.value().retained_bundle_id,
+      fixture.binding.value().graph_revision);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "io_signal_service_rules_active");
+  fixture.engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
+  ASSERT_TRUE(wait_until([&] {
+    return fixture.kernel->get_operation_state(accepted.value().operation_id).value().state ==
+           OperationStateKind::kCompleted;
+  }));
+  EXPECT_TRUE(fixture.kernel
+                  ->InstallProgramIoSignalService(replacement,
+                                                  fixture.binding.value().retained_bundle_id,
+                                                  fixture.binding.value().graph_revision)
+                  .ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest, IoRuleIntegrationRetiredScopeCannotAcquireLaterTrip) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  const auto registered = fixture.kernel->get_operation_state(accepted.value().operation_id)
+                              .value()
+                              .participants.front()
+                              .io_rule_outcomes.front()
+                              .registration;
+  fixture.engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
+  ASSERT_TRUE(wait_until([&] {
+    return fixture.service->ReadRuleEvidence(registered).value().state ==
+           IoRuleRegistrationState::kRetired;
+  }));
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  EXPECT_FALSE(fixture.service->ReadRuleEvidence(registered).value().trip);
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 0);
+  const auto state = fixture.kernel->get_operation_projection(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().operation.participants.front().io_rule_outcomes.front().terminal_cause,
+            MotionExecutionTerminalCause::kNoSignalTrip);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationScopedMovingTakeoverRefusesBeforeLogicalAcceptance) {
+  IoRuleIntegrationFixture fixture;
+  fixture.engine.supports_motion_replacement = true;
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(claim_program_execution(*fixture.kernel).ok());
+  ASSERT_TRUE(fixture.kernel->register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(*fixture.kernel);
+  auto original = takeover_intent(0U, "io.takeover.original");
+  const auto accepted = fixture.kernel->execute(original);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.engine.last_dispatched_participant)
+      << fixture.PreparationDiagnostic(accepted.value().operation_id);
+  const auto before = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  auto candidate = takeover_intent(1U, "io.takeover.scoped");
+  fixture.AddScope(candidate);
+  const auto refused = fixture.kernel->execute(candidate);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "scoped_motion_takeover_unsupported");
+  EXPECT_EQ(fixture.engine.prepare_motion_calls, 1);
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls, 1);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 0);
+  const auto after = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(after.preemption, before.preemption);
+  EXPECT_EQ(after.operation_revision, before.operation_revision);
+  EXPECT_EQ(after.participants.front().command_id,
+            before.participants.front().command_id);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationFreshEdgePreservesAlreadyActiveArmMode) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, true).ok());
+  const auto accepted = fixture.kernel->execute(
+      fixture.Intent("io.fresh.edge", MotionInterruptActivationMode::kFreshEdgeAfterArm));
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls, 1);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 0);
+  ASSERT_TRUE(fixture.Publish(2, true).ok());  // no fabricated inactive transition
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 0);
+  ASSERT_TRUE(fixture.Publish(3, false).ok());
+  ASSERT_TRUE(fixture.Publish(4, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto& outcome = state.participants.front().io_rule_outcomes.front();
+  ASSERT_TRUE(outcome.evidence.trip);
+  EXPECT_EQ(outcome.evidence.trip->matched_samples.front().publication.source_sequence, 4U);
+  EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kSignalTrip);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationEscalatedContainmentCannotBecomeSignalSuccess) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  fixture.engine.next_stop_result = {false, ErrorDTO{"nominal_rejected", "nominal refused", {}}};
+  fixture.engine.translate_stop_stage_hook = [&] {
+    if (fixture.engine.translate_stop_stage_calls >= 2)
+      fixture.engine.next_stop_result = {true, std::nullopt};
+  };
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto& outcome = state.participants.front().io_rule_outcomes.front();
+  EXPECT_TRUE(outcome.evidence.trip);
+  EXPECT_EQ(outcome.stop_result, StopCertificateResultDTO::kSucceededEscalated);
+  EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kFailed);
+  EXPECT_TRUE(outcome.error);
+  EXPECT_GE(fixture.engine.translate_stop_stage_calls, 2);
+  fixture.engine.translate_stop_stage_hook = {};
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationResetRevisionKeepsPreparedEvidenceUntilExactRetirement) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  const auto before = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto registration = before.participants.front().io_rule_outcomes.front().registration;
+  HeldSettlementCall containment;
+  fixture.engine.translate_stop_stage_hook = containment.Blocker();
+  const auto resetting = fixture.kernel->reset(
+      control_request("io.revision.reset", accepted.value(), before.operation_revision.value()));
+  ASSERT_TRUE(resetting.ok()) << resetting.error().message;
+  ASSERT_TRUE(containment.Entered());
+  const auto controlling =
+      fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_GT(controlling.operation_revision.value(), before.operation_revision.value());
+  EXPECT_EQ(controlling.participants.front().io_rule_outcomes.front().registration, registration);
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  const auto during = fixture.service->ReadRuleEvidence(registration);
+  ASSERT_TRUE(during.ok());
+  ASSERT_TRUE(during.value().trip);
+  EXPECT_EQ(during.value().state, IoRuleRegistrationState::kArmed);
+  // Existing Reset/Stop owns reconciliation; retained evidence cannot replace
+  // that transaction or create a second response from its old revision.
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  containment.Release();
+  ASSERT_TRUE(wait_until([&] {
+    return fixture.service->ReadRuleEvidence(registration).value().state ==
+           IoRuleRegistrationState::kRetired;
+  }));
+  ASSERT_TRUE(wait_until([&] {
+    const auto result = fixture.kernel->get_operation_projection(accepted.value().operation_id);
+    return result.ok() && !result.value().resident;
+  }));
+  const auto history =
+      fixture.kernel->get_operation_projection(accepted.value().operation_id).value();
+  const auto& outcome = history.operation.participants.front().io_rule_outcomes.front();
+  ASSERT_TRUE(outcome.evidence.trip);
+  EXPECT_EQ(outcome.evidence.trip->registration, registration);
+  EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kStopped);
+  EXPECT_TRUE(outcome.stop_certificate_id);
+  fixture.engine.translate_stop_stage_hook = {};
+}
+
+TEST(ResourceAddressedExecutionKernelTest, IoRuleIntegrationForbiddenNaturalProofCannotBecomeAllowedNoTrip) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_FALSE(fixture.profile.allow_natural_completion_on_short_path);
+  fixture.engine.next_stop_evidence =
+      JsonValueDTO{JsonObjectDTO{{"completed_by_natural_completion", JsonValueDTO{true}}}};
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto& outcome = state.participants.front().io_rule_outcomes.front();
+  EXPECT_TRUE(outcome.evidence.trip);
+  EXPECT_TRUE(outcome.stop_certificate_id);
+  EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kFailed);
+  ASSERT_TRUE(outcome.error);
+  EXPECT_EQ(outcome.error->code, kErrorMotionInterruptStopStateInvalid);
+  EXPECT_EQ(outcome.error->details.at("reason"), "io_rule_natural_completion_not_allowed");
+}
+
+TEST(ResourceAddressedExecutionKernelTest, IoRuleIntegrationEqualPriorityUsesActualSourceBeforePolicyName) {
+  IoRuleIntegrationFixture fixture(true);
+  auto other_signal = program_io_descriptor().signal_id;
+  other_signal.name = "other";
+  const auto other_frame = [&](std::uint64_t sequence, bool value) {
+    return IoSourceAcquisitionDTO{InterruptSourceId("zz.gpio.source"), IoSourceIncarnation("gpio.2"),
+        sequence, fixture.clock.now(), {{other_signal, IoSampleValidity::kValid, value, std::nullopt}}};
+  };
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(fixture.service->Publish(other_frame(1, false)).ok());
+  auto intent = fixture.Intent();
+  auto& scopes = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload).motion_interrupt_scopes;
+  auto second = scopes.front();
+  second.scope_id = "other.scope";
+  second.policy_id = "aaa.other";
+  scopes.push_back(second);
+  const auto accepted = fixture.kernel->execute(intent);
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id, 2U));
+  ASSERT_TRUE(fixture.service->Publish(other_frame(2, true)).ok());
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
+    return state.ok() && state.value().participants.front().io_rule_outcomes.size() == 2U &&
+      state.value().participants.front().io_rule_outcomes.front().stop_certificate_id.has_value();
+  }));
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  for (const auto& outcome : state.participants.front().io_rule_outcomes) {
+    ASSERT_TRUE(outcome.evidence.trip);
+    if (outcome.registration.policy_id == InterruptPolicyId("io.search"))
+      EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kSignalTrip);
+    else
+      EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kStopped);
+  }
+  ASSERT_TRUE(fixture.engine.last_stop_stage);
+  EXPECT_EQ(fixture.engine.last_stop_stage->participant_stop_plan.motion_interrupt_scope_id, "io.scope");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationHigherStoppingFaultJoinsOriginalStopWithOwnEvidence) {
+  IoRuleIntegrationFixture fixture(true, true);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.TwoScopeIntent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id, 2U));
+  HeldSettlementCall first_stage;
+  fixture.engine.translate_stop_stage_hook = first_stage.Blocker();
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(first_stage.Entered());
+  const auto before = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  ASSERT_TRUE(before.active_stop_id);
+  const auto original = fixture.kernel->get_stop_status(*before.active_stop_id).value();
+  const auto original_plan = fixture.engine.last_stop_stage->participant_stop_plan;
+  const auto original_budget = fixture.engine.last_stop_budget;
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 1);
+  fixture.clock.set(20);
+  ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto joined = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(joined.active_stop_id, before.active_stop_id);
+  EXPECT_EQ(joined.active_stop_generation, before.active_stop_generation);
+  EXPECT_EQ(fixture.kernel->get_stop_status(*before.active_stop_id).value().accepted,
+            original.accepted);
+  EXPECT_EQ(fixture.engine.last_stop_stage->participant_stop_plan, original_plan);
+  EXPECT_EQ(fixture.engine.last_stop_budget, original_budget);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 1);
+  first_stage.Release();
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+    return state.participants.front().io_rule_outcomes.front().stop_certificate_id.has_value();
+  }));
+  const auto ended = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  // Participant fault facts retain Failed; existing generic-motion aggregate
+  // policy requires intervention rather than classifying this as output failure.
+  EXPECT_EQ(ended.state, OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(ended.participants.front().state, OperationStateKind::kFailed);
+  for (const auto& outcome : ended.participants.front().io_rule_outcomes) {
+    ASSERT_TRUE(outcome.evidence.trip);
+    EXPECT_EQ(outcome.stop_id, before.active_stop_id);
+    EXPECT_TRUE(outcome.stop_certificate_id);
+    if (outcome.registration.policy_id == InterruptPolicyId("io.search")) {
+      EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kInterruptedFault);
+      EXPECT_FALSE(outcome.error);
+      EXPECT_EQ(outcome.arbitration_disposition, IoRuleArbitrationDispositionDTO::kSuperseded);
+      EXPECT_EQ(outcome.evidence.trip->matched_samples.front().publication.source_id,
+                InterruptSourceId("gpio.source"));
+    } else {
+      EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kFailed);
+      EXPECT_EQ(outcome.arbitration_disposition, IoRuleArbitrationDispositionDTO::kActive);
+      ASSERT_TRUE(outcome.error);
+      EXPECT_EQ(outcome.error->details.at("policy_id"), "aaa.other");
+      EXPECT_EQ(outcome.evidence.trip->matched_samples.front().publication.source_id,
+                InterruptSourceId("zz.gpio.source"));
+    }
+  }
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 1);
+  fixture.engine.translate_stop_stage_hook = {};
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationFaultFirstUsesOrdinaryPreparedStopPlan) {
+  IoRuleIntegrationFixture fixture(true, true);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.TwoScopeIntent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id, 2U));
+  ASSERT_TRUE(fixture.engine.last_dispatched_participant)
+      << fixture.PreparationDiagnostic(accepted.value().operation_id);
+  const auto ordinary = fixture.engine.last_dispatched_participant->controller().ordinary_stop_plan;
+  const auto& scopes =
+      std::get<PreparedMotionExecutionDTO>(fixture.engine.last_dispatched_participant->payload)
+          .interrupt_scopes;
+  const auto fault = std::find_if(scopes.begin(), scopes.end(), [](const auto& value) {
+    return value.interrupt_policy_id == InterruptPolicyId("aaa.other");
+  });
+  ASSERT_NE(fault, scopes.end());
+  EXPECT_FALSE(fault->stop_profile);
+  EXPECT_EQ(fault->preemption_action, InterruptPreemptionAction::kPreemptTrajectory);
+  EXPECT_EQ(fault->stop_plan, ordinary);
+  ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] {
+    return fixture.kernel->get_operation_state(accepted.value().operation_id)
+        .value()
+        .participants.front()
+        .io_rule_outcomes.front()
+        .stop_certificate_id.has_value();
+  }));
+  ASSERT_TRUE(fixture.engine.last_stop_stage);
+  EXPECT_EQ(fixture.engine.last_stop_stage->participant_stop_plan, ordinary);
+  const auto ended = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  // Participant fault facts retain Failed; existing generic-motion aggregate
+  // policy requires intervention rather than classifying this as output failure.
+  EXPECT_EQ(ended.state, OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(ended.participants.front().state, OperationStateKind::kFailed);
+  EXPECT_EQ(ended.participants.front().io_rule_outcomes.front().terminal_cause,
+            MotionExecutionTerminalCause::kInterruptedFault);
+  EXPECT_FALSE(ended.participants.front().io_rule_outcomes.front().evidence.trip);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationEqualStoppingFaultRetainsQueueOrExplicitMaskWithoutAnotherStop) {
+  for (const bool maskable : {false, true}) {
+    IoRuleIntegrationFixture fixture(true, true, 17, maskable);
+    ASSERT_TRUE(fixture.Publish(1, false).ok());
+    ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+    const auto accepted = fixture.kernel->execute(fixture.TwoScopeIntent());
+    ASSERT_TRUE(accepted.ok());
+    ASSERT_TRUE(fixture.Registered(accepted.value().operation_id, 2U));
+    HeldSettlementCall first_stage;
+    fixture.engine.translate_stop_stage_hook = first_stage.Blocker();
+    ASSERT_TRUE(fixture.Publish(2, true).ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    ASSERT_TRUE(first_stage.Entered());
+    const auto before = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+    ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    const auto during = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+    EXPECT_EQ(during.active_stop_id, before.active_stop_id);
+    const auto& pending = during.participants.front().io_rule_outcomes.back();
+    ASSERT_TRUE(pending.evidence.trip);
+    EXPECT_EQ(pending.arbitration_disposition,
+              maskable ? IoRuleArbitrationDispositionDTO::kSuppressedByActiveMask
+                       : IoRuleArbitrationDispositionDTO::kQueued);
+    EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 1);
+    first_stage.Release();
+    ASSERT_TRUE(wait_until([&] {
+      return fixture.kernel->get_operation_state(accepted.value().operation_id)
+          .value()
+          .participants.front()
+          .io_rule_outcomes.front()
+          .stop_certificate_id.has_value();
+    }));
+    const auto ended = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+    EXPECT_EQ(ended.participants.front().io_rule_outcomes.front().terminal_cause,
+              MotionExecutionTerminalCause::kSignalTrip);
+    EXPECT_EQ(ended.participants.front().io_rule_outcomes.back().terminal_cause,
+              MotionExecutionTerminalCause::kStopped);
+    fixture.engine.translate_stop_stage_hook = {};
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationStoppingMutesLaterDesiredTripButRetainsActualEvidence) {
+  IoRuleIntegrationFixture fixture(true);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.TwoScopeIntent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id, 2U));
+  HeldSettlementCall first_stage;
+  fixture.engine.translate_stop_stage_hook = first_stage.Blocker();
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(first_stage.Entered());
+  const auto before = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto during = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(during.active_stop_id, before.active_stop_id);
+  EXPECT_TRUE(during.participants.front().io_rule_outcomes.back().evidence.trip);
+  EXPECT_FALSE(during.participants.front().io_rule_outcomes.back().arbitration_disposition);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 1);
+  first_stage.Release();
+  ASSERT_TRUE(wait_until([&] {
+    return fixture.kernel->get_operation_state(accepted.value().operation_id)
+        .value()
+        .participants.front()
+        .io_rule_outcomes.front()
+        .stop_certificate_id.has_value();
+  }));
+  const auto ended = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(ended.participants.front().io_rule_outcomes.back().terminal_cause,
+            MotionExecutionTerminalCause::kStopped);
+  fixture.engine.translate_stop_stage_hook = {};
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationLossDuringOrdinaryStopRemainsFailureWithoutSyntheticTrip) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  HeldSettlementCall first_stage;
+  fixture.engine.translate_stop_stage_hook = first_stage.Blocker();
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto stopped = fixture.kernel->stop(
+      stop_request("io.ordinary.stop", accepted.value(), state.operation_revision.value()));
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(first_stage.Entered());
+  ASSERT_TRUE(fixture.service
+                  ->ReportIngressOverflow(InterruptSourceId("gpio.source"),
+                                          IoSourceIncarnation("gpio.1"),
+                                          {"actual_overflow", "acquisition lost", {}})
+                  .ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto during = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(during.active_stop_id, stopped.value().stop_id);
+  EXPECT_FALSE(during.participants.front().io_rule_outcomes.front().evidence.trip);
+  ASSERT_EQ(during.participants.front().io_rule_outcomes.front().evidence.source_losses.size(), 1U);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 1);
+  first_stage.Release();
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+  const auto ended = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(ended.state, OperationStateKind::kInterventionRequired);
+  const auto& outcome = ended.participants.front().io_rule_outcomes.front();
+  EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kFailed);
+  EXPECT_FALSE(outcome.evidence.trip);
+  ASSERT_TRUE(outcome.error);
+  EXPECT_EQ(outcome.error->code, "interrupt_source_unavailable");
+  EXPECT_EQ(outcome.stop_id, stopped.value().stop_id);
+  fixture.engine.translate_stop_stage_hook = {};
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationMissingActionQualificationRefusesBeforePreparation) {
+  IoRuleIntegrationFixture fixture(false, false, 18, false, true);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto refused = fixture.kernel->execute(fixture.Intent());
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "motion_interrupt_action_not_admitted");
+  EXPECT_EQ(fixture.engine.prepare_motion_calls, 0);
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationDisjointParticipantFaultDoesNotSupersedeDesiredOwner) {
+  IoRuleIntegrationFixture fixture(true, true, 18, false, false, true);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  const auto other = fixture.kernel->execute(fixture.OtherIntent());
+  ASSERT_TRUE(other.ok()) << other.error().message;
+  ASSERT_TRUE(fixture.Registered(other.value().operation_id));
+  HeldSettlementCall first_stage, other_stage;
+  fixture.engine.translate_stop_stage_hook = first_stage.Blocker();
+  fixture.other_engine.translate_stop_stage_hook = other_stage.Blocker();
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(first_stage.Entered());
+  EXPECT_EQ(fixture.other_engine.translate_stop_stage_calls, 0);
+  const auto before = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  ASSERT_TRUE(before.active_stop_id);
+  const auto initial = fixture.kernel->get_stop_status(*before.active_stop_id).value().accepted;
+  ASSERT_TRUE(fixture.engine.last_stop_stage);
+  const auto initial_plan = fixture.engine.last_stop_stage->participant_stop_plan;
+  ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(other_stage.Entered());
+  const auto during = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto other_during = fixture.kernel->get_operation_state(other.value().operation_id).value();
+  EXPECT_EQ(during.active_stop_id, before.active_stop_id);
+  ASSERT_TRUE(other_during.active_stop_id);
+  EXPECT_NE(other_during.active_stop_id, before.active_stop_id);
+  EXPECT_EQ(fixture.kernel->get_stop_status(*before.active_stop_id).value().accepted, initial);
+  EXPECT_EQ(fixture.engine.last_stop_stage->participant_stop_plan, initial_plan);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 1);
+  EXPECT_EQ(fixture.other_engine.translate_stop_stage_calls, 1);
+  for (const auto* state : {&during, &other_during}) {
+    ASSERT_EQ(state->participants.front().io_rule_outcomes.size(), 1U);
+    EXPECT_EQ(state->participants.front().io_rule_outcomes.front().arbitration_disposition,
+              IoRuleArbitrationDispositionDTO::kActive);
+  }
+  first_stage.Release();
+  other_stage.Release();
+  ASSERT_TRUE(wait_until([&] {
+    return fixture.Certified(accepted.value().operation_id) &&
+           fixture.Certified(other.value().operation_id);
+  }));
+  const auto ended = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto other_ended = fixture.kernel->get_operation_state(other.value().operation_id).value();
+  const auto& desired = ended.participants.front().io_rule_outcomes.front();
+  EXPECT_EQ(desired.stop_id, before.active_stop_id);
+  EXPECT_EQ(desired.terminal_cause, MotionExecutionTerminalCause::kSignalTrip);
+  EXPECT_FALSE(desired.error);
+  const auto& fault = other_ended.participants.front().io_rule_outcomes.front();
+  EXPECT_EQ(fault.stop_id, other_during.active_stop_id);
+  EXPECT_EQ(fault.terminal_cause, MotionExecutionTerminalCause::kFailed);
+  ASSERT_TRUE(fault.error);
+  EXPECT_EQ(fault.error->details.at("policy_id"), "aaa.other");
+  fixture.engine.translate_stop_stage_hook = {};
+  fixture.other_engine.translate_stop_stage_hook = {};
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationDisjointSimultaneousDesiredTripsFreezeEachPreparedPlan) {
+  IoRuleIntegrationFixture fixture(true, false, 18, false, false, true);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  const auto other = fixture.kernel->execute(fixture.OtherIntent());
+  ASSERT_TRUE(other.ok()) << other.error().message;
+  ASSERT_TRUE(fixture.Registered(other.value().operation_id));
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] {
+    return fixture.Certified(accepted.value().operation_id) &&
+           fixture.Certified(other.value().operation_id);
+  }));
+  const auto ended = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto other_ended = fixture.kernel->get_operation_state(other.value().operation_id).value();
+  for (const auto* state : {&ended, &other_ended}) {
+    const auto& row = state->participants.front();
+    ASSERT_EQ(row.io_rule_outcomes.size(), 1U);
+    const auto& outcome = row.io_rule_outcomes.front();
+    ASSERT_TRUE(outcome.evidence.trip);
+    EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kSignalTrip);
+    EXPECT_EQ(outcome.arbitration_disposition, IoRuleArbitrationDispositionDTO::kActive);
+    EXPECT_EQ(outcome.stop_id, state->active_stop_id);
+  }
+  EXPECT_NE(ended.active_stop_id, other_ended.active_stop_id);
+  ASSERT_TRUE(fixture.engine.last_stop_stage);
+  ASSERT_TRUE(fixture.other_engine.last_stop_stage);
+  EXPECT_EQ(fixture.engine.last_stop_stage->participant_stop_plan.motion_interrupt_scope_id,
+            "io.scope");
+  EXPECT_EQ(fixture.other_engine.last_stop_stage->participant_stop_plan.motion_interrupt_scope_id,
+            "other.scope");
+}
+
+// Provider-domain currentness uses real CCLC observations, not input samples
+// or manufactured controller configurations.
+[[nodiscard]] ComponentLifecycleCurrentSnapshotDTO provider_domain_currentness_snapshot(
+    ComponentLifecycleGeneration generation = ComponentLifecycleGeneration(3U),
+    ComponentLifecycleStateDTO state = ComponentLifecycleStateDTO::kActive) {
+  const ProjectionRevisionDTO revision{
+      RetainedBundleId(test_digest('4')),
+      GraphRevision(test_digest('5')),
+      {SceneId(test_digest('a')), 1U, ContentDigest(test_digest('b'))}};
+  const ActiveBundlePublicationReceiptDTO publication{
+      {BootstrapPublicationTransactionDTO{BootstrapId("bootstrap.provider"),
+                                          BootstrapGeneration(1U)},
+       revision, revision.retained_bundle_id, revision.graph_revision, std::nullopt,
+       ContentDigest("private.provider")},
+      ActiveBundlePublicationGeneration(2U),
+      ContentDigest("pointer.provider")};
+  const ProviderControlDomainDTO provider{ControllableComponentId("device.io"),
+                                          RuntimeUnitId("runtime.io"),
+                                          ProviderInstanceId("provider.io"),
+                                          ProviderManifestId("manifest.io"),
+                                          ProviderManifestRevision(test_digest('6')),
+                                          ContentDigest(test_digest('7')),
+                                          ContentDigest(test_digest('8')),
+                                          {"input.ready"},
+                                          Duration(5'000'000'000LL)};
+  const ControlDomainId domain("domain.io");
+  const ControlDomainRevision domain_revision(test_digest('9'));
+  ComponentLifecycleCurrentSnapshotDTO snapshot{
+      ContentDigest("pending"),
+      provider.controllable_component_id,
+      generation,
+      state,
+      publication,
+      {{domain, domain_revision,
+        ResolvedProviderDomainScopeDTO{provider, RuntimeEpoch("runtime.io.epoch"), std::nullopt}}},
+      {{domain, domain_revision, provider.provider_instance_id, provider.provider_manifest_id,
+        provider.provider_manifest_revision, provider.provider_runtime_unit_id,
+        RuntimeEpoch("runtime.io.epoch"), provider.lifecycle_plan_catalog_digest}}};
+  const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(snapshot);
+  if (!digest.ok()) throw std::logic_error(digest.error().message);
+  snapshot.snapshot_digest = digest.value();
+  return snapshot;
+}
+
+[[nodiscard]] std::vector<BrandLifecycleObservationDTO> provider_domain_driver_observations(
+    const ComponentLifecycleCurrentSnapshotDTO& snapshot, TimePoint now = 0) {
+  std::vector<BrandLifecycleObservationDTO> observations;
+  for (const auto& occurrence : snapshot.provider_occurrences) {
+    observations.push_back({LifecycleTransactionId("lifecycle.provider.actual"),
+                            LifecycleTransactionGeneration(1U),
+                            snapshot.controllable_component_id,
+                            occurrence.control_domain_id,
+                            occurrence.control_domain_revision,
+                            occurrence.provider_instance_id,
+                            occurrence.provider_manifest_id,
+                            occurrence.provider_manifest_revision,
+                            occurrence.provider_runtime_unit_id,
+                            occurrence.provider_runtime_epoch,
+                            1U,
+                            1U,
+                            now,
+                            now,
+                            now + 1'000'000'000LL,
+                            snapshot.component_lifecycle_state,
+                            {}});
+  }
+  return observations;
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProviderDomainCurrentnessUsesActualLifecycleWithoutInputSampleOrControllerConfiguration) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.empty_runtime_retained_bundle_id = RetainedBundleId(test_digest('4'));
+  config.empty_runtime_graph_revision = GraphRevision(test_digest('5'));
+  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal, std::move(config));
+  const auto snapshot = provider_domain_currentness_snapshot();
+  const auto& domain = snapshot.domains.front();
+  const ComponentCommandReadinessPublicationDTO publication{
+      ComponentReadinessAuthorityDTO::kRestartExclusion,
+      std::nullopt,
+      std::nullopt,
+      snapshot.controllable_component_id,
+      snapshot.component_lifecycle_generation,
+      true};
+  EXPECT_FALSE(kernel
+                   .publish_runtime_provider_configuration(
+                       publication, snapshot, provider_domain_driver_observations(snapshot))
+                   .ok());
+  ASSERT_TRUE(kernel.SetRouteRecoveryPending(true).ok());
+  // A durable Active label cannot establish the restarted driver's actual state.
+  EXPECT_FALSE(kernel.publish_runtime_provider_configuration(publication, snapshot, {}).ok());
+  auto unready = provider_domain_driver_observations(snapshot);
+  unready.front().observed_state = ComponentLifecycleStateDTO::kDisabled;
+  EXPECT_FALSE(kernel.publish_runtime_provider_configuration(publication, snapshot, unready).ok());
+  auto stale_driver = provider_domain_driver_observations(snapshot);
+  stale_driver.front().provider_runtime_epoch = RuntimeEpoch("old.driver.epoch");
+  EXPECT_FALSE(
+      kernel.publish_runtime_provider_configuration(publication, snapshot, stale_driver).ok());
+  auto expired = provider_domain_driver_observations(snapshot);
+  expired.front().received_timestamp_ns = 0;
+  expired.front().fresh_until_ns = 1;
+  clock.advance(1);
+  EXPECT_FALSE(kernel.publish_runtime_provider_configuration(publication, snapshot, expired).ok());
+  auto closed_publication = publication;
+  closed_publication.command_eligible = false;
+  const auto metadata =
+      kernel.publish_runtime_provider_configuration(closed_publication, snapshot, {});
+  ASSERT_TRUE(metadata.ok()) << metadata.error().message;
+  EXPECT_FALSE(metadata.value().front().operation_admission_open);
+  EXPECT_EQ(metadata.value().front().driver_observation_generation, 0U);
+  const auto installed = kernel.publish_runtime_provider_configuration(
+      publication, snapshot, provider_domain_driver_observations(snapshot));
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+  ASSERT_EQ(installed.value().size(), 1U);
+  EXPECT_EQ(installed.value().front().provider_occurrence, snapshot.provider_occurrences.front());
+  EXPECT_FALSE(installed.value().front().domain.provider()->active_control_configuration);
+  EXPECT_TRUE(kernel.resource_snapshot().empty());
+  const auto route = kernel.current_runtime_route_configuration(domain.control_domain_id);
+  ASSERT_TRUE(route.ok());
+  EXPECT_FALSE(route.value());
+  const auto ready = kernel.publish_component_command_readiness(publication);
+  ASSERT_TRUE(ready.ok()) << ready.error().message;
+  EXPECT_TRUE(ready.value().command_eligible);
+  EXPECT_EQ(ready.value().component_lifecycle_generation, snapshot.component_lifecycle_generation);
+  const auto repeated = kernel.publish_runtime_provider_configuration(
+      publication, snapshot, provider_domain_driver_observations(snapshot));
+  ASSERT_TRUE(repeated.ok());
+  EXPECT_EQ(repeated.value(), installed.value());
+  ASSERT_TRUE(kernel.SetRouteRecoveryPending(false).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProviderDomainTerminalProofUsesActualDriverBeforeJournalAggregateCommit) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.empty_runtime_retained_bundle_id = RetainedBundleId(test_digest('4'));
+  config.empty_runtime_graph_revision = GraphRevision(test_digest('5'));
+  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal, std::move(config));
+  // CCLC has accepted this generation and observed Active. Its terminal
+  // aggregate is committed only after the Kernel readiness readback succeeds.
+  const auto snapshot = provider_domain_currentness_snapshot(ComponentLifecycleGeneration(3U),
+                                                             ComponentLifecycleStateDTO::kPrepared);
+  auto observations = provider_domain_driver_observations(snapshot);
+  observations.front().observed_state = ComponentLifecycleStateDTO::kActive;
+  const ComponentCommandReadinessPublicationDTO publication{
+      ComponentReadinessAuthorityDTO::kRestartExclusion,
+      std::nullopt,
+      std::nullopt,
+      snapshot.controllable_component_id,
+      snapshot.component_lifecycle_generation,
+      true};
+  EXPECT_FALSE(
+      kernel.publish_runtime_provider_configuration(publication, snapshot, observations).ok());
+  ASSERT_TRUE(kernel.SetRouteRecoveryPending(true).ok());
+  auto crossed = observations;
+  crossed.front().control_domain_id = ControlDomainId("foreign.domain");
+  EXPECT_FALSE(kernel.publish_runtime_provider_configuration(publication, snapshot, crossed).ok());
+  auto inactive = observations;
+  inactive.front().observed_state = ComponentLifecycleStateDTO::kPrepared;
+  EXPECT_FALSE(kernel.publish_runtime_provider_configuration(publication, snapshot, inactive).ok());
+  auto expired = observations;
+  expired.front().fresh_until_ns = 1;
+  clock.advance(1);
+  EXPECT_FALSE(kernel.publish_runtime_provider_configuration(publication, snapshot, expired).ok());
+  const auto absent =
+      kernel.current_runtime_provider_configuration(snapshot.domains.front().control_domain_id);
+  ASSERT_TRUE(absent.ok());
+  EXPECT_FALSE(absent.value());
+  const auto published =
+      kernel.publish_runtime_provider_configuration(publication, snapshot, observations);
+  ASSERT_TRUE(published.ok()) << published.error().message;
+  ASSERT_EQ(published.value().size(), 1U);
+  EXPECT_TRUE(published.value().front().operation_admission_open);
+  EXPECT_EQ(snapshot.component_lifecycle_state, ComponentLifecycleStateDTO::kPrepared);
+  EXPECT_EQ(published.value().front().component_lifecycle_generation,
+            snapshot.component_lifecycle_generation);
+  ASSERT_TRUE(kernel.SetRouteRecoveryPending(false).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProviderDomainCurrentnessRejectsStaleConflictingAndForeignProductWithoutMutation) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.empty_runtime_retained_bundle_id = RetainedBundleId(test_digest('4'));
+  config.empty_runtime_graph_revision = GraphRevision(test_digest('5'));
+  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(kernel.SetRouteRecoveryPending(true).ok());
+  const auto original = provider_domain_currentness_snapshot();
+  const auto publish = [&](const ComponentLifecycleCurrentSnapshotDTO& snapshot,
+                           bool eligible = true) {
+    return kernel.publish_runtime_provider_configuration(
+        {ComponentReadinessAuthorityDTO::kRestartExclusion, std::nullopt, std::nullopt,
+         snapshot.controllable_component_id, snapshot.component_lifecycle_generation, eligible},
+        snapshot, provider_domain_driver_observations(snapshot));
+  };
+  ASSERT_TRUE(publish(original).ok());
+  auto conflicting = provider_domain_currentness_snapshot(original.component_lifecycle_generation,
+                                                          ComponentLifecycleStateDTO::kDisabled);
+  const auto conflict = publish(conflicting, false);
+  ASSERT_FALSE(conflict.ok());
+  EXPECT_EQ(conflict.error().details.at("reason"), "runtime_provider_readback_not_current");
+  auto foreign = original;
+  foreign.active_publication_receipt.request.candidate_projection_revision.graph_revision =
+      GraphRevision(test_digest('f'));
+  foreign.active_publication_receipt.request.candidate_graph_revision =
+      GraphRevision(test_digest('f'));
+  const auto foreign_digest = ComputeComponentLifecycleCurrentSnapshotDigest(foreign);
+  ASSERT_TRUE(foreign_digest.ok());
+  foreign.snapshot_digest = foreign_digest.value();
+  EXPECT_FALSE(publish(foreign).ok());
+  const auto next = provider_domain_currentness_snapshot(ComponentLifecycleGeneration(4U));
+  ASSERT_TRUE(publish(next).ok());
+  EXPECT_FALSE(publish(original).ok());
+  const auto current =
+      kernel.current_runtime_provider_configuration(next.domains.front().control_domain_id);
+  ASSERT_TRUE(current.ok());
+  ASSERT_TRUE(current.value());
+  EXPECT_EQ(current.value()->component_lifecycle_generation, next.component_lifecycle_generation);
+  EXPECT_EQ(current.value()->domain, next.domains.front());
+  const auto stale_generation = kernel.publish_component_command_readiness(
+      {ComponentReadinessAuthorityDTO::kRestartExclusion, std::nullopt, std::nullopt,
+       original.controllable_component_id, original.component_lifecycle_generation, true});
+  EXPECT_FALSE(stale_generation.ok());
+  ASSERT_TRUE(kernel.SetRouteRecoveryPending(false).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProviderDomainApplyCurrentnessRequiresExactFencedOccurrenceWithoutPhysicalCoordinates) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeResourceAdmissionGate gate;
+  gate.held_fence_id = ConfigurationFenceId("fence.provider.apply");
+  const auto snapshot = provider_domain_currentness_snapshot();
+  const auto& domain = snapshot.domains.front();
+  const auto& provider = *domain.provider();
+  const ConfigurationFenceScopeDTO scope{
+      {snapshot.controllable_component_id},
+      {{domain.control_domain_id, std::nullopt, domain.control_domain_revision,
+        ProviderConfigurationFenceDomainDTO{
+            std::nullopt,
+            ProviderConfigurationFenceOccurrenceDTO{
+                snapshot.controllable_component_id, provider.provider.provider_instance_id,
+                provider.provider.signal_configuration_digest, provider.output_resources}}}},
+      {},
+      {}};
+  ASSERT_TRUE(scope.valid());
+  ResourceAddressedExecutionKernelConfig config{
+      RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate};
+  config.empty_runtime_retained_bundle_id = RetainedBundleId(test_digest('4'));
+  config.empty_runtime_graph_revision = GraphRevision(test_digest('5'));
+  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal, std::move(config));
+  ComponentCommandReadinessPublicationDTO publication{
+      ComponentReadinessAuthorityDTO::kParentApplyFence,
+      std::nullopt,
+      gate.held_fence_id,
+      snapshot.controllable_component_id,
+      snapshot.component_lifecycle_generation,
+      true,
+      scope};
+  auto wrong = publication;
+  auto& fenced = std::get<ProviderConfigurationFenceDomainDTO>(
+      wrong.parent_apply_scope->domains.front().payload);
+  fenced.candidate_provider->provider_instance_id = ProviderInstanceId("different.provider");
+  gate.held_scope = wrong.parent_apply_scope;
+  EXPECT_FALSE(kernel
+                   .publish_runtime_provider_configuration(
+                       wrong, snapshot, provider_domain_driver_observations(snapshot))
+                   .ok());
+  ASSERT_TRUE(kernel.current_runtime_provider_configuration(domain.control_domain_id).ok());
+  EXPECT_FALSE(kernel.current_runtime_provider_configuration(domain.control_domain_id).value());
+  gate.held_scope = scope;
+  const auto installed = kernel.publish_runtime_provider_configuration(
+      publication, snapshot, provider_domain_driver_observations(snapshot));
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+  auto closed = publication;
+  closed.command_eligible = false;
+  auto missing_scope = closed;
+  missing_scope.parent_apply_scope.reset();
+  ASSERT_TRUE(missing_scope.locally_valid());
+  const auto missing = kernel.publish_component_command_readiness(missing_scope);
+  ASSERT_FALSE(missing.ok());
+  EXPECT_EQ(missing.error().details.at("reason"), "component_readiness_apply_fence_not_held");
+  auto foreign_scope = closed;
+  std::get<ProviderConfigurationFenceDomainDTO>(
+      foreign_scope.parent_apply_scope->domains.front().payload)
+      .candidate_provider->provider_instance_id = ProviderInstanceId("another.provider.owner");
+  ASSERT_TRUE(foreign_scope.parent_apply_scope->valid());
+  ASSERT_TRUE(foreign_scope.locally_valid());
+  // The gate still holds the actual scope, not this valid foreign owner.
+  ASSERT_EQ(gate.held_scope, std::optional(scope));
+  const auto foreign_readiness = kernel.publish_component_command_readiness(foreign_scope);
+  ASSERT_FALSE(foreign_readiness.ok());
+  EXPECT_EQ(foreign_readiness.error().details.at("reason"),
+            "component_readiness_apply_fence_not_held");
+  const auto closed_readiness = kernel.publish_component_command_readiness(closed);
+  ASSERT_TRUE(closed_readiness.ok()) << closed_readiness.error().message;
+  EXPECT_FALSE(closed_readiness.value().command_eligible);
+  const auto ready = kernel.publish_component_command_readiness(publication);
+  ASSERT_TRUE(ready.ok()) << ready.error().message;
+  EXPECT_TRUE(ready.value().command_eligible);
+  EXPECT_TRUE(kernel.resource_snapshot().empty());
+  EXPECT_FALSE(kernel.current_runtime_route_configuration(domain.control_domain_id).value());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationPartialStopPromotionRetainsInheritedFaultUntilAggregateCertificate) {
+  // Two independently accepted operations exercise the same inherited logical
+  // winner lifetime without admitting the withdrawn multi-motion operation.
+  // Only the fault policy selects FullCell; the first desired response is partial.
+  IoRuleIntegrationFixture fixture(true, true, 18, false, false, false, false, 4, {}, {}, false,
+                                   true);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.TwoScopeIntent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id, 2U));
+  const auto other = fixture.kernel->execute(fixture.OtherIntent(false));
+  ASSERT_TRUE(other.ok()) << other.error().message;
+  ASSERT_TRUE(fixture.other_engine.last_dispatched_participant)
+      << fixture.PreparationDiagnostic(other.value().operation_id);
+  HeldSettlementCall first_stage, second_stage;
+  fixture.engine.translate_stop_stage_hook = first_stage.Blocker();
+  fixture.other_engine.translate_stop_stage_hook = second_stage.Blocker();
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(first_stage.Entered());
+  EXPECT_EQ(fixture.other_engine.translate_stop_stage_calls, 0);
+  const auto operation = accepted.value().operation_id;
+  const auto before = fixture.kernel->get_operation_state(operation).value();
+  ASSERT_TRUE(before.active_stop_id);
+  const auto predecessor = *before.active_stop_id;
+  ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(second_stage.Entered());
+  const auto promoted = fixture.kernel->get_operation_state(operation).value();
+  ASSERT_EQ(promoted.participants.front().io_rule_outcomes.size(), 2U);
+  const auto find_fault = [](const OperationStateDTO& state) {
+    const auto& outcomes = state.participants.front().io_rule_outcomes;
+    return std::find_if(outcomes.begin(), outcomes.end(), [](const auto& outcome) {
+      return outcome.registration.policy_id == InterruptPolicyId("aaa.other");
+    });
+  };
+  const auto pending = find_fault(promoted);
+  ASSERT_NE(pending, promoted.participants.front().io_rule_outcomes.end());
+  ASSERT_TRUE(pending->evidence.trip);
+  ASSERT_TRUE(pending->stop_id);
+  const auto aggregate = *pending->stop_id;
+  EXPECT_NE(aggregate, predecessor);
+  EXPECT_FALSE(pending->stop_certificate_id);
+  EXPECT_EQ(promoted.state, OperationStateKind::kStopping);
+  const auto status = fixture.kernel->get_stop_status(aggregate);
+  ASSERT_TRUE(status.ok());
+  EXPECT_TRUE(std::any_of(status.value().accepted.joined_predecessor_stops.begin(),
+                          status.value().accepted.joined_predecessor_stops.end(),
+                          [&](const auto& joined) { return joined.predecessor_stop_id == predecessor; }));
+  const auto readiness = fixture.kernel->get_operation_recovery_assessment(operation);
+  ASSERT_FALSE(readiness.ok());
+  EXPECT_EQ(readiness.error().details.at("reason"), "operation_recovery_unavailable");
+  first_stage.Release();
+  ASSERT_TRUE(wait_until([&] {
+    const auto completed = fixture.kernel->get_stop_status(predecessor);
+    return completed.ok() && completed.value().stop_certificate.has_value();
+  }));
+  const auto still_pending = fixture.kernel->get_operation_state(operation).value();
+  const auto retained = find_fault(still_pending);
+  ASSERT_NE(retained, still_pending.participants.front().io_rule_outcomes.end());
+  EXPECT_EQ(retained->stop_id, aggregate);
+  EXPECT_FALSE(retained->stop_certificate_id);
+  EXPECT_EQ(still_pending.state, OperationStateKind::kStopping);
+  second_stage.Release();
+  ASSERT_TRUE(wait_until([&] {
+    const auto current = fixture.kernel->get_operation_state(operation).value();
+    const auto row = find_fault(current);
+    return row != current.participants.front().io_rule_outcomes.end() &&
+           row->stop_certificate_id.has_value();
+  }));
+  const auto final = fixture.kernel->get_operation_state(operation).value();
+  const auto ended = find_fault(final);
+  ASSERT_NE(ended, final.participants.front().io_rule_outcomes.end());
+  EXPECT_EQ(ended->stop_id, aggregate);
+  EXPECT_EQ(ended->terminal_cause, MotionExecutionTerminalCause::kFailed);
+  ASSERT_TRUE(ended->error);
+  EXPECT_EQ(ended->error->details.at("policy_id"), "aaa.other");
+  const auto certificate = fixture.kernel->get_stop_certificate(*ended->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok());
+  EXPECT_EQ(certificate.value().stop_id, aggregate);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 1);
+  EXPECT_EQ(fixture.other_engine.translate_stop_stage_calls, 1);
+  fixture.engine.translate_stop_stage_hook = {};
+  fixture.other_engine.translate_stop_stage_hook = {};
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationMissingOrForeignMaximumScopeRefusesBeforePreparation) {
+  for (const int scope_mode : {1, 2}) {
+    IoRuleIntegrationFixture fixture(false, false, 18, false, false, false, false, scope_mode);
+    ASSERT_TRUE(fixture.Publish(1, false).ok());
+    const auto refused = fixture.kernel->execute(fixture.Intent());
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"), "motion_interrupt_scope_not_admitted");
+    EXPECT_EQ(fixture.engine.prepare_motion_calls, 0);
+    EXPECT_EQ(fixture.engine.execute_calls, 0);
+    EXPECT_TRUE(fixture.kernel->get_resident_operations({}).empty());
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationConfiguredFullCellStopCapturesIndependentOperation) {
+  IoRuleIntegrationFixture fixture(true, false, 18, false, false, true, false, 3);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+  auto other_intent = motion_operation("other.independent.operation");
+  other_intent.participants.front().component_role_id =
+      fixture.other_binding.value().component_role_id;
+  other_intent.participants.front().target_role_id = fixture.other_binding.value().target_role_id;
+  const auto independent = fixture.kernel->execute(other_intent);
+  ASSERT_TRUE(independent.ok()) << independent.error().message;
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto& outcome = state.participants.front().io_rule_outcomes.front();
+  ASSERT_TRUE(outcome.stop_id);
+  const auto status = fixture.kernel->get_stop_status(*outcome.stop_id);
+  ASSERT_TRUE(status.ok());
+  EXPECT_TRUE(std::any_of(
+      status.value().accepted.affected_operation_revisions.begin(),
+      status.value().accepted.affected_operation_revisions.end(),
+      [&](const auto& value) { return value.operation_id == independent.value().operation_id; }));
+  EXPECT_EQ(fixture.other_engine.translate_stop_stage_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationRequestedEntryKeepsOriginalStageAndCertificateIndex) {
+  for (const bool controller_cancel : {false, true}) {
+    SCOPED_TRACE(controller_cancel);
+    IoRuleIntegrationFixture fixture(false, false, 18, false, false, false, false, 0, 1U, {},
+                                     controller_cancel);
+    ASSERT_TRUE(fixture.Publish(1, false).ok());
+    const auto accepted = fixture.kernel->execute(fixture.Intent());
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+    ASSERT_TRUE(fixture.engine.last_dispatched_participant)
+        << fixture.PreparationDiagnostic(accepted.value().operation_id);
+    const auto& scope =
+        std::get<PreparedMotionExecutionDTO>(fixture.engine.last_dispatched_participant->payload)
+            .interrupt_scopes.front();
+    ASSERT_TRUE(scope.stop_entry);
+    ASSERT_TRUE(scope.success_through);
+    EXPECT_EQ(scope.stop_entry->stage_index, 1U);
+    EXPECT_EQ(*scope.success_through, *scope.stop_entry);  // Omission accepts the entry only.
+    ASSERT_TRUE(fixture.engine.last_prepared_request);
+    const auto& authority = *fixture.engine.last_prepared_request;
+    const auto encoded = EncodePreparedOperationParticipant(
+        *fixture.engine.last_dispatched_participant, authority.binding, authority.stop_readiness,
+        authority.retained_default_stop_limits, authority.stop_node_category);
+    ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+    const auto decoded = DecodePreparedOperationParticipant(
+        encoded.value(), authority.binding, authority.stop_readiness,
+        authority.retained_default_stop_limits, authority.stop_node_category);
+    ASSERT_TRUE(decoded.ok())
+        << decoded.error().message << "; reason="
+        << (decoded.error().details.contains("reason") ? decoded.error().details.at("reason")
+                                                       : "<absent>");
+    EXPECT_EQ(std::get<PreparedMotionExecutionDTO>(decoded.value().payload)
+                  .interrupt_scopes.front()
+                  .success_through,
+              scope.success_through);
+    auto tampered = *fixture.engine.last_dispatched_participant;
+    ++std::get<PreparedMotionExecutionDTO>(tampered.payload)
+          .interrupt_scopes.front()
+          .success_through->stage_index;
+    EXPECT_FALSE(MakePreparedOperationParticipant(
+                     std::move(tampered), authority.binding, authority.stop_readiness,
+                     authority.retained_default_stop_limits, authority.stop_node_category)
+                     .ok());
+    auto forged_threshold = *scope.success_through;
+    forged_threshold.resolved_stop_base_plan_id = ResolvedStopBasePlanId("foreign.chain");
+    EXPECT_FALSE(
+        VerifyPreparedIoRuleSuccessThrough(scope.stop_plan, *scope.stop_entry, forged_threshold)
+            .ok());
+    forged_threshold = *scope.success_through;
+    ++forged_threshold.stage_index;
+    EXPECT_FALSE(
+        VerifyPreparedIoRuleSuccessThrough(scope.stop_plan, *scope.stop_entry, forged_threshold)
+            .ok());
+    ASSERT_TRUE(fixture.Publish(2, true).ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+    ASSERT_TRUE(fixture.engine.last_stop_stage);
+    EXPECT_EQ(fixture.engine.last_stop_stage->stage_index, 1U);
+    EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 1);
+    EXPECT_EQ(fixture.engine.last_stop_stage->participant_stop_plan, scope.stop_plan);
+    const auto current = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+    const auto& outcome = current.participants.front().io_rule_outcomes.front();
+    EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kSignalTrip);
+    const auto certificate = fixture.kernel->get_stop_certificate(*outcome.stop_certificate_id);
+    ASSERT_TRUE(certificate.ok());
+    EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
+    ASSERT_EQ(certificate.value().attempted_stage_results.size(), 1U);
+    EXPECT_EQ(certificate.value().attempted_stage_results.front().result.request.stage_index, 1U);
+    EXPECT_EQ(scope.stop_plan.stage_commands[1].resolved_stage.containment_command.command_kind,
+              controller_cancel ? StopContainmentCommandKind::kControllerGoalCancel
+                                : StopContainmentCommandKind::kRegistered);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationContainedStageMustBeWithinSealedSuccessThreshold) {
+  for (const auto success_through_index :
+       {std::optional<std::size_t>{}, std::optional<std::size_t>{1U}}) {
+    IoRuleIntegrationFixture fixture(false, false, 18, false, false, false, false, 0, {},
+                                     success_through_index);
+    ASSERT_TRUE(fixture.Publish(1, false).ok());
+    const auto accepted = fixture.kernel->execute(fixture.Intent());
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+    fixture.engine.translate_stop_stage_hook = [&] {
+      const bool fallback = fixture.engine.last_stop_stage->stage_index > 0U;
+      fixture.engine.next_stop_result =
+          fallback
+              ? StopResultDTO{true, std::nullopt}
+              : StopResultDTO{false, ErrorDTO{"nominal_rejected", "injected nominal failure", {}}};
+    };
+    ASSERT_TRUE(fixture.Publish(2, true).ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+    const auto current = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+    const auto& outcome = current.participants.front().io_rule_outcomes.front();
+    EXPECT_EQ(outcome.terminal_cause, success_through_index.has_value()
+                                          ? MotionExecutionTerminalCause::kSignalTrip
+                                          : MotionExecutionTerminalCause::kFailed);
+    const auto certificate = fixture.kernel->get_stop_certificate(*outcome.stop_certificate_id);
+    ASSERT_TRUE(certificate.ok());
+    EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
+    EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 2);
+    EXPECT_EQ(certificate.value().attempted_stage_results.back().result.request.stage_index, 1U);
+    fixture.engine.translate_stop_stage_hook = {};
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationIntermediateThresholdAcceptsBoundaryAndRejectsLaterContainment) {
+  for (const std::uint64_t containing_stage : {1U, 2U}) {
+    IoRuleIntegrationFixture fixture(false, false, 18, false, false, false, false, 0, {}, 1U, true,
+                                     true);
+    ASSERT_TRUE(fixture.Publish(1, false).ok());
+    const auto accepted = fixture.kernel->execute(fixture.Intent());
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+    ASSERT_TRUE(fixture.engine.last_dispatched_participant);
+    const auto& scope =
+        std::get<PreparedMotionExecutionDTO>(fixture.engine.last_dispatched_participant->payload)
+            .interrupt_scopes.front();
+    ASSERT_TRUE(scope.success_through);
+    EXPECT_EQ(scope.success_through->stage_index, 1U);
+    fixture.engine.translate_stop_stage_hook = [&] {
+      fixture.engine.next_stop_result =
+          fixture.engine.last_stop_stage->stage_index == containing_stage
+              ? StopResultDTO{true, std::nullopt}
+              : StopResultDTO{false,
+                              ErrorDTO{"stage_refused", "injected earlier-stage refusal", {}}};
+    };
+    ASSERT_TRUE(fixture.Publish(2, true).ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+    const auto current = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+    const auto& outcome = current.participants.front().io_rule_outcomes.front();
+    EXPECT_EQ(outcome.terminal_cause, containing_stage == 1U
+                                          ? MotionExecutionTerminalCause::kSignalTrip
+                                          : MotionExecutionTerminalCause::kFailed);
+    if (containing_stage == 2U) {
+      ASSERT_TRUE(outcome.error);
+      EXPECT_EQ(outcome.error->details.at("reason"), "io_rule_success_through_exceeded");
+    }
+    ASSERT_TRUE(outcome.stop_certificate_id);
+    const auto certificate = fixture.kernel->get_stop_certificate(*outcome.stop_certificate_id);
+    ASSERT_TRUE(certificate.ok());
+    EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
+    EXPECT_EQ(certificate.value().attempted_stage_results.back().result.request.stage_index,
+              containing_stage);
+    // Escalation changes the factual certificate, not the independent cell
+    // fault latch. Both desired outcomes permit ordinary tree continuation.
+    EXPECT_FALSE(fixture.kernel->get_stop_fault_latch());
+    const auto continued = fixture.kernel->execute(fixture.OtherIntent(false));
+    ASSERT_TRUE(continued.ok()) << continued.error().message;
+    ASSERT_TRUE(fixture.other_engine.last_dispatched_participant)
+        << fixture.PreparationDiagnostic(continued.value().operation_id);
+    EXPECT_FALSE(fixture.kernel->get_stop_fault_latch());
+    fixture.engine.translate_stop_stage_hook = {};
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationThresholdCannotConvertFailedContainmentOrSourceLossToTrip) {
+  for (const bool source_loss : {false, true}) {
+    IoRuleIntegrationFixture fixture(false, false, 18, false, false, false, false, 0, {}, 1U);
+    ASSERT_TRUE(fixture.Publish(1, false).ok());
+    const auto accepted = fixture.kernel->execute(fixture.Intent());
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+    if (source_loss) {
+      ASSERT_TRUE(fixture.service
+                      ->MarkSourceUnavailable(
+                          InterruptSourceId("gpio.source"), IoSourceIncarnation("gpio.1"), 1U,
+                          ErrorDTO{"source_disconnected", "injected source loss", {}})
+                      .ok());
+    } else {
+      fixture.engine.next_stop_result =
+          StopResultDTO{false, ErrorDTO{"containment_rejected", "injected all-stage failure", {}}};
+      ASSERT_TRUE(fixture.Publish(2, true).ok());
+    }
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+    const auto current = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+    const auto& outcome = current.participants.front().io_rule_outcomes.front();
+    EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kFailed);
+    if (source_loss) {
+      EXPECT_FALSE(outcome.evidence.trip);
+      EXPECT_FALSE(outcome.evidence.source_losses.empty());
+    }
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationThresholdAllowsContainedLaterStageAfterEarlierStageTimeout) {
+  IoRuleIntegrationFixture fixture(false, false, 18, false, false, false, false, 0, {}, 1U);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  HeldSettlementCall nominal;
+  fixture.engine.translate_stop_stage_hook = [&, block = nominal.Blocker()] {
+    if (fixture.engine.last_stop_stage->stage_index == 0U) block();
+  };
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(nominal.Entered());
+  ASSERT_TRUE(fixture.engine.last_stop_budget);
+  const auto budget = *fixture.engine.last_stop_budget;
+  ASSERT_TRUE(budget.remaining_controlled_deadline_ns);
+  const auto before = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  ASSERT_TRUE(before.active_stop_id);
+  const auto stop = fixture.kernel->get_stop_status(*before.active_stop_id).value();
+  fixture.clock.set(stop.accepted.accepted_at_ns + budget.elapsed_since_stop_ns +
+                    *budget.remaining_controlled_deadline_ns);
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); },
+                         std::chrono::seconds(4)));
+  const auto current = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto& outcome = current.participants.front().io_rule_outcomes.front();
+  EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kSignalTrip);
+  const auto certificate = fixture.kernel->get_stop_certificate(*outcome.stop_certificate_id);
+  ASSERT_TRUE(certificate.ok());
+  EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 2);
+  ASSERT_TRUE(current.participants.front().terminal_error);
+  EXPECT_EQ(current.participants.front().terminal_error->details.at("reason"),
+            "in_stop_completion_timeout");
+  EXPECT_EQ(current.participants.front().terminal_error->details.at("controlled_stop_error_code"),
+            std::string(to_string(ErrorCode::kExecutionTimeout)));
+  EXPECT_EQ(fixture.engine.last_stop_stage->stage_index, 1U);
+  nominal.Release();
+  EXPECT_EQ(fixture.kernel->get_stop_certificate(*outcome.stop_certificate_id).value(),
+            certificate.value());
+  const auto retained = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(retained.participants.front().io_rule_outcomes.front().terminal_cause,
+            MotionExecutionTerminalCause::kSignalTrip);
+  fixture.engine.translate_stop_stage_hook = {};
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoRuleIntegrationCollisionDuringSelectedSuffixStillJumpsToSoftwareFloor) {
+  IoRuleIntegrationFixture fixture(false, false, 18, false, false, false, false, 0, {}, 1U, true);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  HeldSettlementCall nominal;
+  struct Attempts final {
+    std::mutex mutex;
+    std::vector<std::size_t> indices;
+  };
+  const auto attempts = std::make_shared<Attempts>();
+  fixture.engine.translate_stop_stage_hook = [&, attempts, block = nominal.Blocker()] {
+    const auto index = fixture.engine.last_stop_stage->stage_index;
+    {
+      std::lock_guard lock(attempts->mutex);
+      attempts->indices.push_back(index);
+    }
+    if (index == 0U) block();
+  };
+  ASSERT_TRUE(fixture.Publish(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(nominal.Entered());
+  fixture.engine.emit_collision({{"contact_a", "component/robot/body/tool/collision/0"},
+                                 {"contact_b", "scene/fixture/shape/0"}});
+  ASSERT_TRUE(wait_until([&] {
+    std::lock_guard lock(attempts->mutex);
+    return attempts->indices.size() >= 2U;
+  }));
+  {
+    std::lock_guard lock(attempts->mutex);
+    EXPECT_EQ(attempts->indices, (std::vector<std::size_t>{0U, 2U}));
+  }
+  nominal.Release();
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(state.state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(state.participants.front().terminal_error);
+  EXPECT_EQ(state.participants.front().terminal_error->details.at("reason"), "stop_path_collision");
+  const auto& outcome = state.participants.front().io_rule_outcomes.front();
+  ASSERT_TRUE(outcome.stop_certificate_id);
+  const auto certificate = fixture.kernel->get_stop_certificate(*outcome.stop_certificate_id);
+  ASSERT_TRUE(certificate.ok());
+  EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
+  EXPECT_FALSE(fixture.kernel->get_stop_fault_latch());
+  fixture.engine.translate_stop_stage_hook = {};
+}
+
+// Provider output integration: real existing Kernel admission/barrier/resource
+// owners with a bounded fake transport, no controller or Stop plan aliases.
+class KernelBooleanOutputProvider final : public IIoOutputProvider {
+ public:
+  explicit KernelBooleanOutputProvider(FakeClock& clock) : clock_(clock) {}
+  IoOutputEvidence StrongestOutputEvidence() const noexcept override { return strongest; }
+  Result<IoOutputObservationDTO> SubmitOutput(const IoOutputWriteRequestDTO& request) override {
+    {
+      std::lock_guard lock(mutex);
+      ++submissions;
+      current = IoOutputObservationDTO{request.identity, next, clock_.now(), {}};
+      if (next == IoOutputEvidence::kSourceRejected)
+        current->error =
+            ErrorDTO{"io_output_source_rejected", "Source refused this exact write", {}};
+    }
+    if (submit_return_hook) submit_return_hook();
+    std::lock_guard lock(mutex);
+    return Result<IoOutputObservationDTO>::Ok(*current);
+  }
+  Result<IoOutputObservationDTO> ObserveOutputResult(
+      const IoOutputCommandIdentityDTO& identity) const override {
+    std::lock_guard lock(mutex);
+    if (!current || current->identity != identity)
+      return Result<IoOutputObservationDTO>::Err(ErrorCode::kMissingReference);
+    return Result<IoOutputObservationDTO>::Ok(*current);
+  }
+  Result<void> RetireOutput(const IoOutputCommandIdentityDTO& identity) override {
+    std::lock_guard lock(mutex);
+    if (current && current->identity != identity)
+      return Result<void>::Err(ErrorCode::kInvalidRequest);
+    ++retirements;
+    current.reset();
+    return Result<void>::Ok();
+  }
+  void AcceptLate() {
+    std::lock_guard lock(mutex);
+    if (current) {
+      current->evidence = IoOutputEvidence::kSourceAccepted;
+      current->error.reset();
+    }
+  }
+  FakeClock& clock_;
+  mutable std::mutex mutex;
+  std::optional<IoOutputObservationDTO> current;
+  std::atomic<std::size_t> submissions{}, retirements{};
+  IoOutputEvidence next{IoOutputEvidence::kSourceAccepted};
+  IoOutputEvidence strongest{IoOutputEvidence::kSourceAccepted};
+  std::function<void()> submit_return_hook;
+};
+
+[[nodiscard]] ComponentLifecycleCurrentSnapshotDTO output_kernel_snapshot() {
+  auto snapshot = provider_domain_currentness_snapshot();
+  auto& provider = std::get<ResolvedProviderDomainScopeDTO>(snapshot.domains.front().payload);
+  provider.provider.signal_names = {"output.command"};
+  provider.output_resources = {ResourceId("actual.output.channel")};
+  const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(snapshot);
+  if (!digest.ok()) throw std::logic_error(digest.error().message);
+  snapshot.snapshot_digest = digest.value();
+  return snapshot;
+}
+
+[[nodiscard]] RuntimeParticipantBinding output_kernel_binding() {
+  const auto schema = builtin_io_signal_write_command_schema();
+  auto value = make_binding("gpio", "io.target", "io.gpio.set_output", CoordinateKind::kLinear,
+                            ProgramCommandSchemaRefDTO{schema.command_schema_id,
+                                                       schema.command_schema_revision})
+                   .value();
+  const auto snapshot = output_kernel_snapshot();
+  value.retained_bundle_id =
+      snapshot.active_publication_receipt.request.candidate_retained_bundle_id;
+  value.graph_revision = snapshot.active_publication_receipt.request.candidate_graph_revision;
+  value.controllable_component_id = snapshot.controllable_component_id;
+  value.component_type_id = ComponentTypeId("io.device");
+  value.component_type_revision = ComponentTypeRevision(test_digest('c'));
+  const auto* capability = find_builtin_capability_definition("io.gpio.set_output");
+  value.capability_definition_revision =
+      CapabilityDefinitionRevision(std::string(capability->capability_definition_revision));
+  value.resources.clear();
+  value.model_bindings.clear();
+  value.model_groups.clear();
+  value.frame_bindings.clear();
+  value.control_path.reset();
+  value.collision_body_bindings.clear();
+  value.contact_grasp_bindings.clear();
+  value.supporting_capability_provider_paths.clear();
+  const auto& provider = snapshot.provider_occurrences.front();
+  value.runtime_unit_epochs = {
+      {provider.provider_runtime_unit_id, provider.provider_runtime_epoch}};
+  value.capability_provider_path =
+      RuntimeCapabilityProviderPathDTO{value.capability_id,
+                                       value.capability_definition_revision,
+                                       CapabilityProviderBindingId("io.output.binding"),
+                                       CapabilityProviderBindingRevision(test_digest('d')),
+                                       provider.provider_instance_id,
+                                       provider.provider_manifest_id,
+                                       provider.provider_manifest_revision,
+                                       provider.provider_runtime_unit_id,
+                                       provider.provider_runtime_epoch};
+  IoSignalDescriptorDTO descriptor{{value.controllable_component_id, "output.command"},
+                                   InterruptSourceId("io.outputs"),
+                                   IoSignalValueType::kBoolean,
+                                   IoSignalDirection::kOutput,
+                                   IoSignalUpdateMode::kChangeOnly,
+                                   IoTransitionCapability::kSampledOnly,
+                                   {IoFreshnessMode::kProviderValidity, {}},
+                                   ResourceId("actual.output.channel")};
+  const auto digest = ComputeIoSignalDescriptorDigest(descriptor);
+  if (!digest.ok()) throw std::logic_error(digest.error().message);
+  value.io_output_binding = RuntimeIoOutputBindingDTO{
+      ResourceRoleId("valve"),
+      descriptor,
+      digest.value(),
+      snapshot.component_lifecycle_generation,
+      provider,
+      snapshot.domains.front().provider()->provider.signal_configuration_digest,
+      IoOutputCompletionPolicyDTO(IoOutputSourceAckBudgetDTO{2'000'000'000LL})};
+  auto sealed = verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) throw std::logic_error(sealed.error().message);
+  return std::move(sealed.value());
+}
+
+class IoOutputRecoveryAdmissionGate final : public IResourceOperationAdmissionGate {
+ public:
+  std::shared_ptr<std::recursive_mutex> shared_admission_mutex() const override { return mutex_; }
+  Result<void> reserve(ResourceSlotTable& table, const ResourceSlotOwnerDTO& owner,
+                       const std::vector<ResourceId>& resources) override {
+    std::lock_guard lock(*mutex_);
+    return table.reserve(owner, resources);
+  }
+  Result<void> reserve_batch(ResourceSlotTable& table,
+                             const std::vector<ResourceSlotReservationOwnerDTO>& owners) override {
+    std::lock_guard lock(*mutex_);
+    return table.reserve_batch(owners);
+  }
+  std::vector<ResourceId> current_fenced_resources(const std::vector<ResourceId>&) const override {
+    return {};
+  }
+  bool has_held_configuration_fences() const override { return held; }
+  bool held{};
+
+ private:
+  std::shared_ptr<std::recursive_mutex> mutex_ = std::make_shared<std::recursive_mutex>();
+};
+
+class IoOutputKernelIntegrationFixture final {
+ public:
+  explicit IoOutputKernelIntegrationFixture(
+      bool shared_component_alias = false,
+      std::function<
+          Result<IoOutputLocalResynchronizationProofDTO>(const RuntimeParticipantBindingDTO&)>
+          recovery_source = {},
+      bool lifecycle_recovery_admission = false, bool mixed_physical = false)
+      : provider(clock), engine(provider, clock), binding(output_kernel_binding()) {
+    RuntimeParticipantExecutionRegistration output_registration{
+        binding,      std::nullopt, {},          MotionInterruptNodeCategory::kGeneric,
+        &engine,      nullptr,      {},          &engine,
+        std::nullopt, std::nullopt, std::nullopt};
+    std::vector<RuntimeParticipantExecutionRegistration> registrations{output_registration};
+    if (mixed_physical) {
+      registrations.push_back(registration(
+          MixedArmBinding(), arm_engine));
+    }
+    if (shared_component_alias) {
+      auto alias = binding.value();
+      alias.component_role_id = ComponentRoleId("gpio.other");
+      alias.target_role_id = TargetRoleId("io.other");
+      alias.controllable_component_id = ControllableComponentId("device.other");
+      auto& output = *alias.io_output_binding;
+      output.signal.signal_id.controllable_component_id = alias.controllable_component_id;
+      output.provider.control_domain_id = ControlDomainId("domain.other");
+      output.provider.control_domain_revision = ControlDomainRevision(test_digest('e'));
+      output.provider.provider_instance_id = ProviderInstanceId("provider.other");
+      alias.capability_provider_path->provider_instance_id = output.provider.provider_instance_id;
+      alias.capability_provider_path->capability_provider_binding_id =
+          CapabilityProviderBindingId("io.other.binding");
+      const auto descriptor = ComputeIoSignalDescriptorDigest(output.signal);
+      if (!descriptor.ok()) throw std::logic_error(descriptor.error().message);
+      output.signal_descriptor_digest = descriptor.value();
+      auto sealed = verify_runtime_participant_binding(std::move(alias));
+      if (!sealed.ok()) throw std::logic_error(sealed.error().message);
+      auto shared = output_registration;
+      shared.binding = std::move(sealed.value());
+      registrations.push_back(std::move(shared));
+    }
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 16U};
+    config.io_output_local_resynchronization_source = std::move(recovery_source);
+    if (lifecycle_recovery_admission) {
+      config.manager_liveness_required_set = EmptyManagerLivenessSet();
+      config.operation_admission_gate = &recovery_admission_gate;
+    }
+    kernel = std::make_unique<ResourceAddressedExecutionKernel>(
+        std::move(registrations), clock, scheduler, journal, std::move(config));
+  }
+  RuntimeParticipantBinding MixedArmBinding() const {
+    auto value = make_binding("arm", "arm", "execution.trajectory.execute",
+                              CoordinateKind::kAngular).value();
+    value.retained_bundle_id = binding.value().retained_bundle_id;
+    value.graph_revision = binding.value().graph_revision;
+    auto sealed = verify_runtime_participant_binding(std::move(value));
+    if (!sealed.ok()) throw std::logic_error(sealed.error().message);
+    return std::move(sealed.value());
+  }
+  void Enable() {
+    const auto snapshot = output_kernel_snapshot();
+    const ComponentCommandReadinessPublicationDTO authority{
+        ComponentReadinessAuthorityDTO::kRestartExclusion,
+        {},
+        {},
+        snapshot.controllable_component_id,
+        snapshot.component_lifecycle_generation,
+        true};
+    const auto pending = kernel->SetRouteRecoveryPending(true);
+    if (!pending.ok()) throw std::logic_error(pending.error().message);
+    const auto installed = kernel->publish_runtime_provider_configuration(
+        authority, snapshot, provider_domain_driver_observations(snapshot, clock.now()));
+    if (!installed.ok()) throw std::logic_error(installed.error().message);
+    const auto enabled = kernel->publish_component_command_readiness(authority);
+    if (!enabled.ok()) throw std::logic_error(enabled.error().message);
+    const auto complete = kernel->SetRouteRecoveryPending(false);
+    if (!complete.ok()) throw std::logic_error(complete.error().message);
+  }
+  OperationIntentDTO Intent(std::string request = "request.output") const {
+    auto intent = motion_operation(std::move(request));
+    intent.expected_graph_revision = binding.value().graph_revision;
+    intent.expected_retained_bundle_id = binding.value().retained_bundle_id;
+    auto& participant = intent.participants.front();
+    participant.target_role_id = binding.value().target_role_id;
+    participant.required_capability_id = binding.value().capability_id;
+    const auto schema = builtin_io_signal_write_command_schema();
+    participant.payload =
+        CapabilityCommandIntentDTO{schema.command_schema_id,
+                                   schema.command_schema_revision,
+                                   IoSignalWriteCommandValueDTO{ResourceRoleId("valve"), true},
+                                   std::nullopt,
+                                   {}};
+    return intent;
+  }
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  KernelBooleanOutputProvider provider;
+  IoOutputParticipantEngine engine;
+  RuntimeParticipantBinding binding;
+  FakeParticipantEngine arm_engine;
+  IoOutputRecoveryAdmissionGate recovery_admission_gate;
+  std::unique_ptr<ResourceAddressedExecutionKernel> kernel;
+};
+
+TEST(ResourceAddressedExecutionKernelTest,
+     InputOnlyComponentIncidentBlocksMotionAndLogicalOutputInTheSameMixedCell) {
+  IoOutputKernelIntegrationFixture fixture(false, {}, false, true);
+  fixture.Enable();
+  const auto arm = registration(fixture.MixedArmBinding(), fixture.arm_engine);
+  ASSERT_TRUE(fixture.kernel->publish_runtime_route_configuration(
+      route_configuration_for(arm), {arm}).ok());
+  enable_component_commands(*fixture.kernel, arm);
+  ASSERT_TRUE(fixture.kernel->component_command_readiness(
+      fixture.binding.value().controllable_component_id).value().command_eligible);
+  ASSERT_TRUE(fixture.kernel->component_command_readiness(
+      arm.binding.value().controllable_component_id).value().command_eligible);
+
+  // CCLC's incident port needs only its actual component identity. This
+  // input-only device owns no command registration or fabricated resource.
+  const ComponentIncidentContainmentIntentDTO fault{
+      "incident.input-only.connection-lost", ControllableComponentId("device.inputs"),
+      LifecycleBlockingCauseClassDTO::kProviderLost};
+  const auto contained = fixture.kernel->RequestComponentIncidentContainment(fault);
+  ASSERT_TRUE(contained.ok()) << contained.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    return stop_terminal_recorded(*fixture.kernel, contained.value().stop_id);
+  }));
+  const auto replay = fixture.kernel->RequestComponentIncidentContainment(fault);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value().stop_id, contained.value().stop_id);
+  EXPECT_EQ(replay.value().stop_generation, contained.value().stop_generation);
+  const auto latch = fixture.kernel->get_stop_fault_latch();
+  ASSERT_TRUE(latch);
+  EXPECT_EQ(fixture.kernel->get_stop_fault_latch_origin(*latch),
+            StopFaultLatchOriginDTO::kComponentIncident);
+
+  auto motion_intent = motion_operation("request.after.input-fault");
+  motion_intent.expected_retained_bundle_id = fixture.binding.value().retained_bundle_id;
+  motion_intent.expected_graph_revision = fixture.binding.value().graph_revision;
+  const auto motion = fixture.kernel->execute(motion_intent);
+  ASSERT_FALSE(motion.ok());
+  EXPECT_EQ(motion.error().details.at("reason"), "motion_admission_closed");
+  const auto output = fixture.kernel->execute(fixture.Intent("request.output.after.input-fault"));
+  ASSERT_FALSE(output.ok());
+  EXPECT_EQ(output.error().details.at("reason"), "motion_admission_closed");
+  EXPECT_EQ(fixture.arm_engine.execute_calls, 0);
+  EXPECT_EQ(fixture.provider.submissions, 0U);
+  // Readiness returning is not the operator's existing Stop-fault recovery.
+  enable_component_commands(*fixture.kernel, arm);
+  EXPECT_TRUE(fixture.kernel->get_stop_fault_latch().has_value());
+  EXPECT_FALSE(fixture.kernel->execute(fixture.Intent("request.after.readiness-return")).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoOutputApplyStagesNoPhysicalConfigurationOrProviderReadiness) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeResourceAdmissionGate gate;
+  KernelBooleanOutputProvider provider(clock);
+  IoOutputParticipantEngine engine(provider, clock);
+  const auto binding = output_kernel_binding();
+  const auto snapshot = output_kernel_snapshot();
+  const auto& domain = snapshot.domains.front();
+  const auto& actual = *domain.provider();
+  const ConfigurationFenceScopeDTO scope{
+      {snapshot.controllable_component_id},
+      {{domain.control_domain_id, std::nullopt, domain.control_domain_revision,
+        ProviderConfigurationFenceDomainDTO{
+            std::nullopt,
+            ProviderConfigurationFenceOccurrenceDTO{
+                snapshot.controllable_component_id, actual.provider.provider_instance_id,
+                actual.provider.signal_configuration_digest, actual.output_resources}}}},
+      {},
+      actual.output_resources};
+  ASSERT_TRUE(scope.valid());
+  RuntimeParticipantExecutionRegistration registration{
+      binding,      std::nullopt, {},          MotionInterruptNodeCategory::kGeneric,
+      &engine,      nullptr,      {},          &engine,
+      std::nullopt, std::nullopt, std::nullopt};
+  ResourceAddressedExecutionKernel kernel(
+      {registration}, clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+  const auto staged = kernel.stage_current_runtime_configuration_facts_under_apply_fence(scope);
+  ASSERT_TRUE(staged.ok()) << staged.error().message;
+  const auto admission = kernel.resource_admission_table()->admission_snapshot(scope.resources);
+  EXPECT_TRUE(admission.active_control_configurations.empty());
+  EXPECT_TRUE(admission.route_published_active_control_configurations.empty());
+  const auto current = kernel.current_runtime_provider_configuration(domain.control_domain_id);
+  ASSERT_TRUE(current.ok());
+  EXPECT_FALSE(current.value());
+  const auto readiness = kernel.component_command_readiness(snapshot.controllable_component_id);
+  ASSERT_TRUE(readiness.ok());
+  EXPECT_FALSE(readiness.value().command_eligible);
+  EXPECT_EQ(provider.submissions, 0U);
+  gate.reject_reservation = false;
+  const auto unfenced = kernel.stage_current_runtime_configuration_facts_under_apply_fence(scope);
+  ASSERT_FALSE(unfenced.ok());
+  EXPECT_EQ(unfenced.error().details.at("reason"), "runtime_configuration_staging_fence_missing");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoOutputKernelIntegrationRequiresActualEnabledProviderThenSendsOnce) {
+  IoOutputKernelIntegrationFixture fixture;
+  EXPECT_FALSE(fixture.kernel->execute(fixture.Intent("not.enabled")).ok());
+  EXPECT_EQ(fixture.provider.submissions, 0U);
+  fixture.Enable();
+  const auto intent = fixture.Intent();
+  const auto accepted = fixture.kernel->execute(intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().state, OperationStateKind::kCompleted);
+  const auto& participant = state.value().participants.front();
+  EXPECT_NE(participant.binding_identity.provider(), nullptr);
+  EXPECT_EQ(participant.binding_identity.controller(), nullptr);
+  EXPECT_EQ(participant.output_evidence, IoOutputEvidence::kSourceAccepted);
+  ASSERT_TRUE(participant.terminal_fact);
+  EXPECT_EQ(participant.terminal_fact->kind, ParticipantExecutionFactKind::kComputedCompletion);
+  const auto slots = fixture.kernel->resource_snapshot();
+  ASSERT_EQ(slots.size(), 1U);
+  ASSERT_TRUE(slots.front().owner);
+  EXPECT_FALSE(slots.front().owner->controller_authority);
+  EXPECT_EQ(slots.front().resource_id, ResourceId("actual.output.channel"));
+  const auto replay = fixture.kernel->execute(intent);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value().operation_id, accepted.value().operation_id);
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(fixture.provider.submissions, 1U);
+  const auto acknowledged = fixture.kernel->acknowledge_completed(
+      control_request("ack.output", accepted.value(), state.value().operation_revision.value()));
+  ASSERT_TRUE(acknowledged.ok()) << acknowledged.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto history = fixture.kernel->get_operation_projection(accepted.value().operation_id);
+    return history.ok() && !history.value().resident;
+  }));
+  EXPECT_EQ(fixture.provider.retirements, 1U);
+  ASSERT_TRUE(fixture.kernel->execute(fixture.Intent("request.output.after.ack")).ok());
+  EXPECT_EQ(fixture.provider.submissions, 2U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoOutputKernelIntegrationUnknownIsStickyAndCannotCloseOrResend) {
+  IoOutputKernelIntegrationFixture fixture;
+  fixture.provider.next = IoOutputEvidence::kSubmitted;
+  fixture.Enable();
+  const auto intent = fixture.Intent();
+  const auto accepted = fixture.kernel->execute(intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  fixture.clock.advance(2'000'000'000LL);
+  ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(state.state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(state.participants.front().terminal_fact);
+  EXPECT_EQ(state.participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kEffectUncertain);
+  EXPECT_EQ(state.participants.front().output_evidence, IoOutputEvidence::kAcceptanceUnknown);
+  fixture.provider.AcceptLate();
+  ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  EXPECT_EQ(fixture.kernel->get_operation_state(accepted.value().operation_id).value(), state);
+  const auto assessment =
+      fixture.kernel->get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(assessment.ok());
+  EXPECT_FALSE(assessment.value().assessment.eligible_close);
+  ASSERT_TRUE(fixture.kernel->execute(intent).ok());
+  EXPECT_EQ(fixture.provider.submissions, 1U);
+  EXPECT_EQ(fixture.provider.retirements, 0U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoOutputLocalLifecycleRecoveryAllowsOnlyItsExactCurrentProgramAncestors) {
+  for (const unsigned scenario : {0U, 1U, 2U, 3U}) {
+    SCOPED_TRACE(scenario);
+    const bool unrelated_child = scenario == 1U;
+    IoOutputKernelIntegrationFixture fixture(false, {}, true);
+    fixture.Enable();
+    ASSERT_TRUE(ready_cell_admission(*fixture.kernel).ok());
+    const auto& binding = fixture.binding.value();
+    const CellAdmissionClaimIntentDTO cycle_intent{
+        CellAdmissionClaimKindDTO::kProgramCycle,
+        CellAdmissionOwnerRoleDTO::kProgramRunner,
+        RequestOwnerEpoch("program.owner"),
+        "run.1",
+        RequestId("io.recovery.cycle"),
+        ContentDigest(test_digest('0')),
+        fixture.kernel->GetAuthoringAdmission().admission_generation,
+        {},
+        ProgramCycleAdmissionEvidenceDTO{binding.program_revision, binding.program_revision},
+        {}};
+    const auto cycle = fixture.kernel->AcquireCellAdmissionClaim(cycle_intent);
+    ASSERT_TRUE(cycle.ok()) << cycle.error().message;
+    auto capture = program_execution_capture();
+    capture.claim_generation = cycle.value().claim_generation;
+    capture.program_id = binding.program_id;
+    capture.program_revision = binding.program_revision;
+    capture.program_binding_id = binding.program_binding_id;
+    capture.retained_bundle_id = binding.retained_bundle_id;
+    capture.graph_revision = binding.graph_revision;
+    auto program_binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
+    program_binding->program_id = capture.program_id;
+    program_binding->program_revision = capture.program_revision;
+    program_binding->program_binding_id = capture.program_binding_id;
+    program_binding->retained_bundle_id = capture.retained_bundle_id;
+    program_binding->graph_revision = capture.graph_revision;
+    program_binding->target_role_bindings = {{binding.target_role_id,
+                                              binding.component_role_id,
+                                              binding.controllable_component_id,
+                                              binding.command_target_id,
+                                              {},
+                                              {},
+                                              {},
+                                              {}}};
+    capture.binding = std::move(program_binding);
+    auto table = std::make_shared<ProgramExecutionTableDTO>();
+    table->nodes = {{ProgramNodeInstanceId("other.scene"), "scene.transaction", {}},
+                    {ProgramNodeInstanceId("write"),
+                     "kernel.command_target",
+                     {{binding.target_role_id, binding.capability_id, true}}}};
+    table->named_selections = {{"io", {1U}}, {"scene", {0U}}};
+    capture.table = std::move(table);
+    ASSERT_TRUE(fixture.kernel->register_program_run_capture(capture).ok());
+    start_program_motion(*fixture.kernel, "all", "run.1", "program.owner",
+                         cycle.value().claim_generation.value());
+    CellAdmissionReadinessSnapshotDTO running{
+        true,
+        ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"),
+                              2U,
+                              ProgramCycleStateDTO::kRunning,
+                              ProgramRunId("run.1"),
+                              cycle.value().claim_generation,
+                              {}},
+        true,
+        1U,
+        1U,
+        true,
+        true,
+        0U,
+        0U,
+        0U};
+    ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(running).ok());
+    if (unrelated_child) {
+      const CellAdmissionClaimIntentDTO other{
+          CellAdmissionClaimKindDTO::kAuthoredScene,
+          CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner,
+          RequestOwnerEpoch("scene.owner"),
+          "unrelated.scene",
+          RequestId("unrelated.scene"),
+          ContentDigest(test_digest('1')),
+          fixture.kernel->GetAuthoringAdmission().admission_generation,
+          {},
+          {},
+          {},
+          ProgramNodeAdmissionEvidenceDTO{RequestOwnerEpoch("program.owner"), ProgramRunId("run.1"),
+                                          cycle.value().claim_generation, "other.scene",
+                                          "scene.attempt", "scene.transaction"}};
+      ASSERT_TRUE(fixture.kernel->AcquireCellAdmissionClaim(other).ok());
+    }
+    fixture.provider.next = IoOutputEvidence::kSubmitted;
+    auto write = fixture.Intent("program.unknown.write");
+    write.participants.front().execution_scope =
+        ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("write"), "write.attempt"};
+    const auto accepted = fixture.kernel->execute(write);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    fixture.clock.advance(2'000'000'000LL);
+    ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+    const auto unknown = fixture.kernel->get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(unknown.ok());
+    ASSERT_EQ(unknown.value().state, OperationStateKind::kInterventionRequired);
+    ASSERT_EQ(unknown.value().participants.front().output_evidence,
+              IoOutputEvidence::kAcceptanceUnknown);
+    // Existing current Runner recovery publication retains its exact parent;
+    // no claim, source evidence or unknown resource is released for this test.
+    running.program_cycle_status->cycle_generation = 3U;
+    running.program_cycle_status->state = ProgramCycleStateDTO::kInterventionOrRecovery;
+    if (scenario == 3U) running.unsettled_effect_count = 1U;
+    ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(running).ok());
+    if (scenario == 2U) fixture.recovery_admission_gate.held = true;
+    const auto snapshot = output_kernel_snapshot();
+    const ComponentLifecycleIntentDTO lifecycle{
+        {RequestId("io.recovery.disable"), RequestOwnerEpoch("cclc.owner"), "operator", {}},
+        binding.controllable_component_id,
+        ComponentLifecycleIntentKindDTO::kDisable,
+        binding.graph_revision,
+        snapshot.component_lifecycle_generation,
+        {{snapshot.domains.front().control_domain_id,
+          snapshot.domains.front().control_domain_revision,
+          ExpectedProviderDomainScopeDTO{
+              snapshot.domains.front().provider()->provider,
+              {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, {}, {}}}}},
+        {},
+        {},
+        fixture.kernel->GetAuthoringAdmission().admission_generation};
+    const CellAdmissionClaimIntentDTO claim{
+        CellAdmissionClaimKindDTO::kComponentLifecycle,
+        CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
+        lifecycle.request_context.request_owner_epoch,
+        "lifecycle.io.recovery",
+        lifecycle.request_context.request_id,
+        ContentDigest(detail::ComponentLifecycleSemanticIntentDigest(lifecycle)),
+        lifecycle.expected_admission_generation,
+        {},
+        {},
+        {}};
+    EXPECT_FALSE(fixture.kernel->AcquireCellAdmissionClaim(claim).ok());
+    const auto recovered = fixture.kernel->AcquireIoOutputRecoveryLifecycleClaim(claim, lifecycle);
+    if (scenario != 0U) {
+      ASSERT_FALSE(recovered.ok());
+      EXPECT_EQ(recovered.error().details.at("reason"),
+                scenario == 1U   ? "io_output_recovery_claim_conflict"
+                : scenario == 2U ? "io_output_recovery_owner_not_exact"
+                                 : "io_output_recovery_dependencies_not_current");
+    } else {
+      ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+      EXPECT_EQ(recovered.value().intent, claim);
+      EXPECT_TRUE(
+          fixture.kernel->ReadHeldCellAdmissionClaim(CellAdmissionClaimKindDTO::kProgramCycle));
+    }
+    EXPECT_EQ(fixture.kernel->get_operation_state(accepted.value().operation_id).value(),
+              unknown.value());
+    EXPECT_TRUE(fixture.kernel->resource_snapshot().front().owner);
+    EXPECT_EQ(fixture.provider.submissions, 1U);
+    EXPECT_EQ(fixture.provider.retirements, 0U);
+  }
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoOutputUnknownResetRefusesAbsentExtraAndUnprovedOperatorAcknowledgement) {
+  IoOutputKernelIntegrationFixture fixture;
+  fixture.provider.next = IoOutputEvidence::kSubmitted;
+  fixture.Enable();
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  fixture.clock.advance(2'000'000'000LL);
+  ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  ASSERT_EQ(state.state, OperationStateKind::kInterventionRequired);
+  auto request =
+      control_request("operator.reset.unknown", accepted.value(), state.operation_revision.value());
+  const auto absent = fixture.kernel->reset(request);
+  ASSERT_FALSE(absent.ok());
+  EXPECT_EQ(absent.error().details.at("reason"),
+            "io_output_explicit_uncertainty_acknowledgement_required");
+  EXPECT_EQ(absent.error().details.at("operation_id"), state.operation_id.value());
+  request.acknowledged_uncertain_outputs = std::vector<UncertainOutputAcknowledgementDTO>{};
+  EXPECT_FALSE(fixture.kernel->reset(request).ok());
+  request.acknowledged_uncertain_outputs = std::vector<UncertainOutputAcknowledgementDTO>{
+      {state.operation_id, state.operation_revision},
+      {OperationId("unrelated.output"), OperationRevision(1U)}};
+  EXPECT_FALSE(fixture.kernel->reset(request).ok());
+  request.acknowledged_uncertain_outputs = std::vector<UncertainOutputAcknowledgementDTO>{
+      {state.operation_id, state.operation_revision}};
+  EXPECT_FALSE(fixture.kernel->acknowledge_completed(request).ok());
+  const auto no_history = fixture.kernel->reset(request);
+  ASSERT_FALSE(no_history.ok());
+  EXPECT_EQ(no_history.error().details.at("reason"),
+            "io_output_local_resynchronization_unavailable");
+  EXPECT_EQ(fixture.kernel->get_operation_state(state.operation_id).value(), state);
+  ASSERT_EQ(fixture.kernel->resource_snapshot().size(), 1U);
+  EXPECT_TRUE(fixture.kernel->resource_snapshot().front().owner);
+  EXPECT_EQ(fixture.provider.retirements, 0U);
+  EXPECT_EQ(fixture.provider.submissions, 1U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, IoOutputUnknownResetRefusesForeignDurableRecoveryProof) {
+  IoOutputKernelIntegrationFixture fixture(false, [](const RuntimeParticipantBindingDTO& binding) {
+    const auto& output = *binding.io_output_binding;
+    auto provider = output.provider;
+    provider.provider_runtime_epoch = RuntimeEpoch("different.provider.epoch");
+    return Result<IoOutputLocalResynchronizationProofDTO>::Ok(
+        {binding.retained_bundle_id, binding.graph_revision, binding.controllable_component_id,
+         provider, LifecycleTransactionId("completed.disable"),
+         LifecycleTransactionId("completed.enable"),
+         ComponentLifecycleGeneration(output.component_lifecycle_generation.value() + 1U),
+         ComponentLifecycleGeneration(output.component_lifecycle_generation.value() + 2U)});
+  });
+  fixture.provider.next = IoOutputEvidence::kSubmitted;
+  fixture.Enable();
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok());
+  fixture.clock.advance(2'000'000'000LL);
+  ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  auto request =
+      control_request("operator.reset.foreign", accepted.value(), state.operation_revision.value());
+  request.acknowledged_uncertain_outputs = std::vector<UncertainOutputAcknowledgementDTO>{
+      {state.operation_id, state.operation_revision}};
+  const auto refused = fixture.kernel->reset(request);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "io_output_local_resynchronization_not_proved");
+  EXPECT_EQ(fixture.kernel->get_operation_state(state.operation_id).value(), state);
+  EXPECT_EQ(fixture.provider.retirements, 0U);
+  EXPECT_EQ(fixture.provider.submissions, 1U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoOutputKernelIntegrationFullStopDoesNotUndoOrResendSubmittedTransaction) {
+  IoOutputKernelIntegrationFixture fixture;
+  fixture.Enable();
+  HeldSettlementCall return_gate;
+  fixture.provider.submit_return_hook = return_gate.Blocker();
+  auto executing =
+      std::async(std::launch::async, [&] { return fixture.kernel->execute(fixture.Intent()); });
+  ASSERT_TRUE(return_gate.Entered());
+  const auto stopped = fixture.kernel->full_stop(
+      {{RequestId("stop.outputs"), RequestOwnerEpoch("kernel.epoch.1"), "operator", {}},
+       StopGeneration(0U),
+       {}});
+  EXPECT_TRUE(stopped.ok()) << (stopped.ok() ? "" : stopped.error().message);
+  EXPECT_EQ(fixture.provider.submissions, 1U);
+  EXPECT_EQ(fixture.provider.retirements, 0U);
+  return_gate.Release();
+  const auto accepted = executing.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  ASSERT_TRUE(state.participants.front().terminal_fact);
+  EXPECT_EQ(state.participants.front().terminal_fact->kind,
+            ParticipantExecutionFactKind::kComputedCompletion);
+  EXPECT_EQ(fixture.provider.submissions, 1U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoOutputKernelIntegrationFullStopPreservesTwoComponentAliasesOfOneActualChannel) {
+  IoOutputKernelIntegrationFixture fixture(true);
+  fixture.Enable();
+  HeldSettlementCall return_gate;
+  fixture.provider.submit_return_hook = return_gate.Blocker();
+  auto executing =
+      std::async(std::launch::async, [&] { return fixture.kernel->execute(fixture.Intent()); });
+  ASSERT_TRUE(return_gate.Entered());
+  const auto stopped = fixture.kernel->full_stop(
+      {{RequestId("stop.shared.outputs"), RequestOwnerEpoch("kernel.epoch.1"), "operator", {}},
+       StopGeneration(0U),
+       {}});
+  EXPECT_TRUE(stopped.ok()) << (stopped.ok() ? "" : stopped.error().message);
+  EXPECT_EQ(fixture.provider.submissions, 1U);
+  EXPECT_EQ(fixture.provider.retirements, 0U);
+  return_gate.Release();
+  ASSERT_TRUE(executing.get().ok());
+  ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  const auto slots = fixture.kernel->resource_snapshot();
+  ASSERT_EQ(slots.size(), 1U);
+  EXPECT_EQ(slots.front().resource_id, ResourceId("actual.output.channel"));
+  EXPECT_EQ(fixture.provider.submissions, 1U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoOutputKernelIntegrationDefinitelyNotSubmittedIsOrdinaryFailureWithNoEffect) {
+  IoOutputKernelIntegrationFixture fixture;
+  fixture.provider.next = IoOutputEvidence::kNotSubmitted;
+  fixture.Enable();
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(state.state, OperationStateKind::kFailed);
+  ASSERT_TRUE(state.participants.front().terminal_fact);
+  EXPECT_EQ(state.participants.front().output_evidence, IoOutputEvidence::kNotSubmitted);
+  EXPECT_EQ(state.participants.front().terminal_fact->kind,
+            ParticipantExecutionFactKind::kLocalFailure);
+  EXPECT_EQ(state.participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kNoEffect);
+  const auto recovery =
+      fixture.kernel->get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(recovery.ok());
+  EXPECT_TRUE(recovery.value().assessment.eligible_close);
+  EXPECT_EQ(fixture.provider.submissions, 1U);  // One local Submit attempt, no resend.
+  EXPECT_EQ(fixture.provider.retirements, 0U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IoOutputKernelIntegrationSourceRejectionClosesExactTransactionWithoutWriteUndo) {
+  IoOutputKernelIntegrationFixture fixture;
+  fixture.provider.next = IoOutputEvidence::kSourceRejected;
+  fixture.Enable();
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(state.state, OperationStateKind::kFailed);
+  const auto& participant = state.participants.front();
+  EXPECT_EQ(participant.output_evidence, IoOutputEvidence::kSourceRejected);
+  ASSERT_TRUE(participant.terminal_fact);
+  EXPECT_EQ(participant.terminal_fact->effect, ParticipantEffectKnowledge::kEffectSettled);
+  ASSERT_TRUE(participant.terminal_error);
+  EXPECT_EQ(participant.terminal_error->code, "io_output_source_rejected");
+  const auto projection =
+      fixture.kernel->get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(projection.ok());
+  const auto& assessment = projection.value().assessment;
+  ASSERT_TRUE(assessment.eligible_close);
+  ASSERT_EQ(projection.value().participants.size(), 1U);
+  EXPECT_FALSE(projection.value().participants.front().control_binding_id);
+  EXPECT_FALSE(projection.value().participants.front().active_control_configuration_id);
+  EXPECT_TRUE(projection.value().participants.front().capability_provider_binding_id);
+  KernelRecoveryActionRequestDTO close{"close.output",
+                                       RecoveryAction::kCloseOperation,
+                                       "program_runner",
+                                       assessment.assessment_revision,
+                                       assessment.control_command_epoch,
+                                       assessment.execution_id,
+                                       assessment.latch_id,
+                                       assessment.stop_certificate_id,
+                                       assessment.stop_owner_generation,
+                                       "tree failure",
+                                       false};
+  const auto closed = fixture.kernel->apply_operation_recovery_action(
+      accepted.value().operation_id, projection.value().operation_revision, close);
+  ASSERT_TRUE(closed.ok()) << closed.error().message;
+  ASSERT_TRUE(closed.value().accepted);
+  EXPECT_EQ(fixture.provider.submissions, 1U);
+  EXPECT_EQ(fixture.provider.retirements, 1U);
+  const auto replay = fixture.kernel->apply_operation_recovery_action(
+      accepted.value().operation_id, projection.value().operation_revision, close);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_TRUE(replay.value().accepted);
+  EXPECT_EQ(fixture.provider.retirements, 1U);
+  const auto history = fixture.kernel->get_operation_projection(accepted.value().operation_id);
+  ASSERT_TRUE(history.ok());
+  EXPECT_FALSE(history.value().resident);
+  EXPECT_EQ(history.value().operation.participants.front().terminal_error->code,
+            "io_output_source_rejected");
+  fixture.provider.next = IoOutputEvidence::kSourceAccepted;
+  EXPECT_TRUE(fixture.kernel->execute(fixture.Intent("request.output.next")).ok());
+  EXPECT_EQ(fixture.provider.submissions, 2U);
+}
+
+class BbKernelAdmissionGate final : public IResourceOperationAdmissionGate {
+ public:
+  std::shared_ptr<std::recursive_mutex> shared_admission_mutex() const override { return mutex; }
+  Result<void> reserve(ResourceSlotTable& table, const ResourceSlotOwnerDTO& owner,
+                       const std::vector<ResourceId>& resources) override {
+    return table.reserve(owner, resources);
+  }
+  Result<void> reserve_batch(ResourceSlotTable& table,
+                             const std::vector<ResourceSlotReservationOwnerDTO>& owners) override {
+    return table.reserve_batch(owners);
+  }
+  std::vector<ResourceId> current_fenced_resources(const std::vector<ResourceId>&) const override {
+    return {};  // The meaningful case is an Apply with no physical scope.
+  }
+  bool has_held_configuration_fences() const override { return empty_apply_held; }
+  std::shared_ptr<std::recursive_mutex> mutex = std::make_shared<std::recursive_mutex>();
+  bool empty_apply_held{};
+};
+
+// Fault at the service result boundary after actual source invalidation. This
+// verifies mandatory containment on an error result without test-only access
+// to the subsystem's private uint64 record counters.
+class BbRetirementErrorService final : public IIoSignalService {
+ public:
+  explicit BbRetirementErrorService(std::shared_ptr<IoSignalSubsystem> actual)
+      : actual_(std::move(actual)) {}
+  Result<void> InstallProgramBlackboardSource(
+      const IoProgramBlackboardSourceBindingDTO& binding,
+      const std::optional<IoSourceIncarnation>& expected) override {
+    return actual_->InstallProgramBlackboardSource(binding, expected);
+  }
+  Result<IoProgramBlackboardAcknowledgementDTO> PublishProgramBlackboardBaseline(
+      const IoProgramBlackboardSourceBindingDTO& binding,
+      const std::optional<IoSourceIncarnation>& expected,
+      const IoProgramBlackboardPublicationDTO& publication) override {
+    return actual_->PublishProgramBlackboardBaseline(binding, expected, publication);
+  }
+  Result<IoProgramBlackboardAcknowledgementDTO> PublishProgramBlackboard(
+      const IoProgramBlackboardPublicationDTO& frame) override {
+    return actual_->PublishProgramBlackboard(frame);
+  }
+  Result<void> RetireProgramBlackboardSource(
+      const IoProgramBlackboardSourceBindingDTO& binding) override {
+    auto retired = actual_->RetireProgramBlackboardSource(binding);
+    if (!retired.ok()) return retired;
+    ++reported_retirement_errors;
+    return Result<void>::Err(
+        {"io_signal_record_exhausted", "injected retirement result failure", {}});
+  }
+  Result<IoSignalObservationDTO> ReadSignal(const IoSignalId& id) const override {
+    return actual_->ReadSignal(id);
+  }
+  Result<IoWatchRegistrationDTO> RegisterLevelWatch(
+      const IoLevelWatchRequestDTO& request) override {
+    return actual_->RegisterLevelWatch(request);
+  }
+  Result<IoWatchResultDTO> ReadWatch(const IoWatchRegistrationDTO& token) const override {
+    return actual_->ReadWatch(token);
+  }
+  Result<void> ReleaseWatch(const IoWatchRegistrationDTO& token) override {
+    return actual_->ReleaseWatch(token);
+  }
+  Result<void> ReleaseRunWatches(const RequestOwnerEpoch& runner,
+                                 const ProgramRunId& run) override {
+    return actual_->ReleaseRunWatches(runner, run);
+  }
+  std::size_t reported_retirement_errors{};
+
+ private:
+  std::shared_ptr<IoSignalSubsystem> actual_;
+};
+
+struct BbKernelIntegrationFixture final {
+  static AppliedProgramBlackboardContextDTO Context() {
+    const auto capture = program_execution_capture();
+    return {capture.request_owner_epoch,
+               ActiveBundlePublicationGeneration(1U),
+               capture.program_id,
+               capture.program_revision,
+               capture.program_binding_id,
+               capture.retained_bundle_id,
+               capture.graph_revision,
+               capture.binding,
+               std::make_shared<const std::vector<ProgramBlackboardKeyDeclarationDTO>>(
+                   std::vector<ProgramBlackboardKeyDeclarationDTO>{{"flag", "bool"}}),
+               std::make_shared<const ProgramIoConditionProjectionDTO>(),
+               {{"flag", IoConditionValueKind::kBoolean}},
+               1024U};
+  }
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  BbKernelAdmissionGate gate;
+  ManagerLivenessRequiredSetDTO liveness = EmptyManagerLivenessSet();
+  std::shared_ptr<IoSignalSubsystem> service;
+  std::shared_ptr<IIoSignalService> installed_service;
+  std::unique_ptr<ResourceAddressedExecutionKernel> kernel;
+  AppliedProgramBlackboardContextDTO context{Context()};
+  CellAdmissionReadinessSnapshotDTO readiness;
+
+  explicit BbKernelIntegrationFixture(bool receiver = false, bool no_effect_settlement = false,
+                                      bool retirement_error = false, bool install_context = true,
+      std::function<void(const std::shared_ptr<IIoSignalService>&)> notification = {},
+                                      bool direct_control = false) {
+    liveness.active_bundle_id = RetainedBundleId(test_digest('6'));
+    if (receiver)
+      liveness.required_receivers.push_back(
+          {RuntimeUnitId("runtime.bb"), RuntimeEpoch("runtime.bb.1"), RuntimePolicyId("policy.bb"),
+           RuntimePolicyRevision("1")});
+    liveness.required_runtime_set_digest =
+        ComputeRequiredRuntimeSetDigest(liveness.required_receivers);
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 16U};
+    config.operation_admission_gate = &gate;
+    config.manager_liveness_required_set = liveness;
+    config.io_rule_evidence_processing_notification = std::move(notification);
+    if (no_effect_settlement)
+      config.cell_admission_settlement_validator = [](const auto&, const auto&) {
+        // This fixture never submits an operation. Supply the external owner's
+        // Reset settlement proof to exercise actual claim release, not motion.
+        return Result<void>::Ok();
+      };
+    auto participant = registration(
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+    participant.intrinsic_direct_control = direct_control;
+    kernel = std::make_unique<ResourceAddressedExecutionKernel>(
+        std::vector<RuntimeParticipantExecutionRegistration>{std::move(participant)},
+        clock, scheduler, journal, std::move(config));
+    auto created = IoSignalSubsystem::Create({RequestOwnerEpoch("kernel.epoch.1"), 1U, {}},
+                                             {1U, 1U, 16U, 8U, 512U, 1024U}, clock);
+    if (!created.ok()) throw std::logic_error("BB fixture source failed");
+    service = std::shared_ptr<IoSignalSubsystem>(std::move(created.value()));
+    installed_service =
+        retirement_error
+            ? std::shared_ptr<IIoSignalService>(std::make_shared<BbRetirementErrorService>(service))
+            : service;
+    if (!kernel
+             ->InstallProgramIoSignalService(installed_service, RetainedBundleId(test_digest('6')),
+                                             GraphRevision(test_digest('7')))
+             .ok())
+      throw std::logic_error("BB fixture service failed");
+    readiness = {true,
+                 ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
+                                       ProgramCycleStateDTO::kIdleAfterReset, std::nullopt,
+                                       std::nullopt, std::nullopt},
+                 false,
+                 1U,
+                 0U,
+                 false,
+                 false,
+                 1U,
+                 0U,
+                 0U};
+    // Actual Runner/cycle proof permits BB observation independently of
+    // physical Ready/idle/fault admission. This frame requests no effect.
+    if (!kernel->UpdateCellAdmissionReadiness(readiness).ok())
+      throw std::logic_error("BB fixture readiness failed");
+    if (receiver && !kernel->Publish(observation(1U, true)).ok())
+      throw std::logic_error("BB fixture receiver failed");
+    if (install_context &&
+        !kernel->InstallAppliedProgramBlackboardContext(context, installed_service).ok())
+      throw std::logic_error("BB fixture Applied context failed");
+  }
+  ManagerLivenessObservationDTO observation(std::uint64_t sequence, bool current) const {
+    const auto& receiver = liveness.required_receivers.front();
+    ManagerLivenessStatusDTO status{
+        liveness.cell_id,
+        receiver.runtime_unit_id,
+        receiver.runtime_epoch,
+        liveness.manager_runtime_unit_id,
+        liveness.manager_runtime_epoch,
+        liveness.manager_owner_epoch,
+        receiver.runtime_policy_id,
+        receiver.runtime_policy_revision,
+        1U,
+        sequence,
+        0,
+        current ? ManagerLivenessStateDTO::kCurrent : ManagerLivenessStateDTO::kExpired,
+        !current,
+        std::nullopt};
+    return {status, liveness.active_bundle_id, liveness.required_runtime_set_digest,
+            ComputeManagerLivenessStatusDigest(status)};
+  }
+  IoProgramBlackboardScopeDTO scope() const {
+    const auto& cycle = *readiness.program_cycle_status;
+    return {context.request_owner_epoch,
+            cycle.program_runner_owner_epoch,
+            cycle.cycle_generation,
+            cycle.cycle_claim_generation,
+            cycle.program_run_id,
+            context.program_binding_id,
+            context.active_publication_generation};
+  }
+  IoProgramBlackboardPublicationDTO baseline(bool value = false) const {
+    return {scope(),
+            IoBlackboardPublicationKind::kBaseline,
+            1U,
+            0U,
+            {{"flag", IoConditionValueKind::kBoolean, IoConditionValueDTO{value}}},
+            999'999};
+  }
+  IoProgramBlackboardPublicationDTO update(std::uint64_t sequence, bool value = false) const {
+    auto frame = baseline(value);
+    frame.kind = IoBlackboardPublicationKind::kUpdate;
+    frame.message_sequence = sequence;
+    frame.previous_sequence = sequence - 1U;
+    return frame;
+  }
+  Result<IoRuleRegistrationDTO> arm_guard() const {
+    IoConditionDefinitionDTO definition;
+    definition.inputs.push_back(
+        {IoConditionBlackboardKeyDTO{"flag"}, IoConditionValueKind::kBoolean});
+    definition.nodes.emplace_back(std::in_place_type<IoConditionCompareDTO>,
+                                  IoConditionComparison::kEqual,
+                                  IoConditionInputReferenceDTO{0U}, IoConditionValueDTO{true});
+    auto checked = CheckIoCondition(std::move(definition), {1U, 1U, 1U, 1U, 512U, 1024U});
+    if (!checked.ok()) return Result<IoRuleRegistrationDTO>::Err(checked.error());
+    return service->ArmRule(
+        {InterruptPolicyId("bb.health.guard"),
+         IoActivationRuleScopeDTO{context.retained_bundle_id, context.graph_revision},
+         std::make_shared<const CheckedIoCondition>(std::move(checked.value())),
+         MotionInterruptActivationMode::kRequireInactiveAtArm,
+         {InterruptSourceId("program.blackboard")}});
+  }
+};
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationNoRunSourceIgnoresPhysicalReadinessAndUsesReceiverTime) {
+  BbKernelIntegrationFixture fixture;
+  const auto admitted = fixture.kernel->PublishProgramBlackboard(fixture.baseline());
+  ASSERT_TRUE(admitted.ok());
+  EXPECT_EQ(admitted.value().accepted_sequence, 1U);
+  EXPECT_FALSE(admitted.value().program_run_id);
+  const auto records = fixture.service->ReadRecords(
+      {RequestOwnerEpoch("kernel.epoch.1"), 1U, InterruptSourceId("program.blackboard"), 0U}, 16U);
+  ASSERT_TRUE(records.ok());
+  ASSERT_TRUE(records.value().records.back().blackboard_snapshot);
+  EXPECT_EQ(records.value().records.back().blackboard_snapshot->trusted_received_at_ns,
+            fixture.clock.now());
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationEmptyApplyBlocksInstallAndFramesWithoutErasingSequence) {
+  BbKernelIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+  fixture.gate.empty_apply_held = true;
+  auto changed = fixture.context;
+  changed.active_publication_generation = ActiveBundlePublicationGeneration(2U);
+  EXPECT_FALSE(
+      fixture.kernel->InstallAppliedProgramBlackboardContext(changed, fixture.service).ok());
+  const auto refused = fixture.kernel->PublishProgramBlackboard(fixture.update(2U, true));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "program_bb_apply_fence_held");
+  EXPECT_EQ(fixture.kernel->applied_program_blackboard_context()->active_publication_generation,
+            ActiveBundlePublicationGeneration(1U));
+  fixture.gate.empty_apply_held = false;
+  const auto accepted = fixture.kernel->PublishProgramBlackboard(fixture.update(2U, true));
+  ASSERT_TRUE(accepted.ok());
+  EXPECT_EQ(accepted.value().accepted_sequence, 2U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationRunEndRetainsSourceResetReplacesBeforeNextRun) {
+  BbKernelIntegrationFixture fixture(false, true);
+  const auto claim = claim_program_execution(*fixture.kernel);
+  ASSERT_TRUE(claim.ok());
+  ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+  auto& cycle = *fixture.readiness.program_cycle_status;
+  cycle.program_run_id = ProgramRunId("run.1");
+  cycle.cycle_claim_generation = claim.value().claim_generation;
+  cycle.state = ProgramCycleStateDTO::kRunning;
+  ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(fixture.readiness).ok());
+  const auto started = fixture.kernel->PublishProgramBlackboard(fixture.baseline());
+  ASSERT_TRUE(started.ok());
+  cycle.state = ProgramCycleStateDTO::kTerminalAwaitingReset;
+  cycle.terminal_or_settlement_reference = ContentDigest(test_digest('1'));
+  ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(fixture.readiness).ok());
+  const auto finished = fixture.kernel->PublishProgramBlackboard(fixture.update(2U, true));
+  ASSERT_TRUE(finished.ok());
+  EXPECT_EQ(finished.value().source_epoch, started.value().source_epoch);
+  auto obsolete = fixture.update(3U, false);
+  const auto& held = claim.value();
+  ASSERT_TRUE(fixture.kernel
+                  ->ReleaseCellAdmissionClaim({held.intent.owner_role,
+                                               held.intent.owner_epoch,
+                                               held.intent.owner_transaction_id,
+                                               held.intent.request_id,
+                                               held.intent.request_payload_digest,
+                                               held.acquired_admission_generation,
+                                               held.claim_generation,
+                                               {CellAdmissionSettlementKindDTO::kExplicitReset,
+                                                held.intent.request_payload_digest}})
+                  .ok());
+  cycle = {RequestOwnerEpoch("program.owner"),
+           2U,
+           ProgramCycleStateDTO::kIdleAfterReset,
+           std::nullopt,
+           std::nullopt,
+           std::nullopt};
+  ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(fixture.readiness).ok());
+  EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(obsolete).ok());
+  auto baseline = fixture.baseline();
+  baseline.values[0].value.reset();
+  const auto reset = fixture.kernel->PublishProgramBlackboard(baseline);
+  ASSERT_TRUE(reset.ok());
+  EXPECT_NE(reset.value().source_epoch, started.value().source_epoch);
+  EXPECT_FALSE(reset.value().program_run_id);
+  const auto old = fixture.kernel->PublishProgramBlackboard(obsolete);
+  ASSERT_TRUE(old.ok());
+  EXPECT_EQ(old.value().status, IoProgramBlackboardAcknowledgementStatus::kSuperseded);
+  EXPECT_FALSE(old.value().accepted_sequence);
+  EXPECT_EQ(old.value().source_epoch, reset.value().source_epoch);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationPublicationABAUsesActualEpochAndOnlyExactRetiredProof) {
+  BbKernelIntegrationFixture fixture;
+  const auto first = fixture.kernel->PublishProgramBlackboard(fixture.baseline());
+  ASSERT_TRUE(first.ok());
+  auto old = fixture.update(2U, true);
+  fixture.context.active_publication_generation = ActiveBundlePublicationGeneration(2U);
+  ASSERT_TRUE(
+      fixture.kernel->InstallAppliedProgramBlackboardContext(fixture.context, fixture.service)
+          .ok());
+  const auto second = fixture.kernel->PublishProgramBlackboard(fixture.baseline());
+  ASSERT_TRUE(second.ok());
+  EXPECT_NE(second.value().source_epoch, first.value().source_epoch);
+  fixture.context.active_publication_generation = ActiveBundlePublicationGeneration(3U);
+  ASSERT_TRUE(
+      fixture.kernel->InstallAppliedProgramBlackboardContext(fixture.context, fixture.service)
+          .ok());
+  const auto third = fixture.kernel->PublishProgramBlackboard(fixture.baseline());
+  ASSERT_TRUE(third.ok());
+  EXPECT_NE(third.value().source_epoch, first.value().source_epoch);
+  const auto superseded = fixture.kernel->PublishProgramBlackboard(old);
+  ASSERT_TRUE(superseded.ok());
+  EXPECT_EQ(superseded.value().status, IoProgramBlackboardAcknowledgementStatus::kSuperseded);
+  EXPECT_FALSE(superseded.value().accepted_sequence);
+  EXPECT_EQ(superseded.value().active_publication_generation,
+            ActiveBundlePublicationGeneration(3U));
+  old.scope.program_binding_id = ProgramBindingId("never.installed");
+  EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(old).ok());
+  // Same actual publication notice is inert and preserves the admitted sequence.
+  ASSERT_TRUE(
+      fixture.kernel->InstallAppliedProgramBlackboardContext(fixture.context, fixture.service)
+          .ok());
+  const auto next = fixture.kernel->PublishProgramBlackboard(fixture.update(2U, true));
+  ASSERT_TRUE(next.ok());
+  EXPECT_EQ(next.value().source_epoch, third.value().source_epoch);
+  EXPECT_EQ(next.value().accepted_sequence, 2U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationHealthLossClosesBeforeBlockedGenerationJournalCompletes) {
+  BbKernelIntegrationFixture fixture(true);
+  ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+  const auto guard = fixture.arm_guard();
+  ASSERT_TRUE(guard.ok());
+  std::promise<void> loss_known_promise;
+  auto loss_known = loss_known_promise.get_future();
+  std::promise<void> finish_loss_promise;
+  auto finish_loss = finish_loss_promise.get_future().share();
+  fixture.journal.cell_admission_generation_hook = [&] {
+    loss_known_promise.set_value();
+    finish_loss.wait();
+  };
+  auto losing = std::async(std::launch::async,
+                           [&] { return fixture.kernel->Publish(fixture.observation(2U, false)); });
+  if (loss_known.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+    finish_loss_promise.set_value();
+    static_cast<void>(losing.get());
+    FAIL() << "Actual health-loss publication did not reach journal boundary";
+  }
+  const auto refused = fixture.kernel->PublishProgramBlackboard(fixture.update(2U, true));
+  EXPECT_FALSE(refused.ok());
+  if (!refused.ok()) {
+    EXPECT_EQ(refused.error().details.at("reason"), "program_bb_owner_not_current");
+  }
+  const auto evidence = fixture.service->ReadRuleEvidence(guard.value());
+  EXPECT_TRUE(evidence.ok());
+  if (evidence.ok()) {
+    EXPECT_FALSE(evidence.value().trip);
+    EXPECT_EQ(evidence.value().source_losses.size(), 1U);
+    if (!evidence.value().source_losses.empty()) {
+      const auto& loss = evidence.value().source_losses.front();
+      EXPECT_TRUE(loss.source_loss.has_value());
+      if (loss.source_loss) {
+        EXPECT_EQ(loss.source_loss->reason, IoSourceLossReason::kDisconnected);
+      }
+      EXPECT_TRUE(loss.blackboard.has_value());
+      if (loss.blackboard) {
+        EXPECT_EQ(loss.blackboard->last_accepted_message_sequence, 1U);
+      }
+    }
+  }
+  finish_loss_promise.set_value();
+  EXPECT_TRUE(losing.get().ok());
+  fixture.journal.cell_admission_generation_hook = {};
+  EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(fixture.update(2U, true)).ok());
+  EXPECT_FALSE(fixture.service->WasProgramBlackboardScopeRetired(fixture.scope()).value());
+  // A later health observation cannot silently restore the retired source.
+  ASSERT_TRUE(fixture.kernel->Publish(fixture.observation(3U, true)).ok());
+  EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(fixture.update(2U, true)).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationRunnerLossRemainsClosedWhenReadinessJournalWriteFails) {
+  BbKernelIntegrationFixture fixture;
+  const auto claim = claim_program_execution(*fixture.kernel);
+  ASSERT_TRUE(claim.ok());
+  ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+  auto baseline = fixture.baseline();
+  baseline.scope.program_run_id = ProgramRunId("run.1");
+  baseline.scope.claim_generation = claim.value().claim_generation;
+  ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(baseline).ok());
+  auto closed = fixture.readiness;
+  closed.program_cycle_status_current = false;
+  auto established = *fixture.readiness.program_cycle_status;
+  established.state = ProgramCycleStateDTO::kRunning;
+  established.program_run_id = baseline.scope.program_run_id;
+  established.cycle_claim_generation = baseline.scope.claim_generation;
+  closed.program_runner_loss = ProgramRunnerContactLossDTO{
+      fixture.liveness.manager_owner_epoch, fixture.liveness.manager_runtime_epoch, established,
+      "program_runner_publication_fault", "publisher failed"};
+  fixture.journal.fail_next_kind = "cell_admission_generation_advanced";
+  EXPECT_FALSE(fixture.kernel->UpdateCellAdmissionReadiness(closed).ok());
+  EXPECT_TRUE(fixture.kernel->get_program_runner_loss().has_value());
+  // Commit the advanced actual readiness cycle, not merely a mismatched
+  // request field. The retained publisher loss still closes owner admission.
+  ++closed.program_cycle_status->cycle_generation;
+  ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(closed).ok());
+  fixture.readiness = closed;
+  auto claiming_current = closed;
+  claiming_current.program_cycle_status_current = true;
+  const auto rejected_current = fixture.kernel->UpdateCellAdmissionReadiness(claiming_current);
+  ASSERT_FALSE(rejected_current.ok());
+  EXPECT_EQ(rejected_current.error().details.at("reason"), "program_runner_contact_loss_invalid");
+  // The Reset baseline first refuses because the installed snapshot is still
+  // not current. claiming_current above separately proves that the retained
+  // Runner loss prevents making that advanced cycle current.
+  const auto reset_baseline = fixture.baseline();
+  const auto reset_refused = fixture.kernel->PublishProgramBlackboard(reset_baseline);
+  ASSERT_FALSE(reset_refused.ok());
+  EXPECT_EQ(reset_refused.error().details.at("reason"), "program_bb_owner_not_current");
+  EXPECT_EQ(fixture.kernel->get_program_runner_loss(), closed.program_runner_loss);
+  auto update = fixture.update(2U, true);
+  update.scope = baseline.scope;
+  const auto refused = fixture.kernel->PublishProgramBlackboard(update);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "program_bb_owner_not_current");
+  const auto records = fixture.service->ReadRecords(
+      {RequestOwnerEpoch("kernel.epoch.1"), 1U, InterruptSourceId("program.blackboard"), 0U}, 16U);
+  ASSERT_TRUE(records.ok());
+  ASSERT_TRUE(records.value().records.back().loss);
+  EXPECT_EQ(records.value().records.back().loss->reason, IoSourceLossReason::kDisconnected);
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationOwnerDestructionRetiresRetainedServiceSource) {
+  BbKernelIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+  const auto guard = fixture.arm_guard();
+  ASSERT_TRUE(guard.ok());
+  fixture.kernel.reset();
+  const auto evidence = fixture.service->ReadRuleEvidence(guard.value());
+  ASSERT_TRUE(evidence.ok());
+  EXPECT_FALSE(evidence.value().trip);
+  EXPECT_EQ(evidence.value().source_losses.size(), 1U);
+  const auto records = fixture.service->ReadRecords(
+      {RequestOwnerEpoch("kernel.epoch.1"), 1U, InterruptSourceId("program.blackboard"), 0U}, 16U);
+  ASSERT_TRUE(records.ok());
+  ASSERT_TRUE(records.value().records.back().loss);
+  EXPECT_EQ(records.value().records.back().loss->reason, IoSourceLossReason::kDisconnected);
+  ASSERT_TRUE(records.value().records.back().retired_blackboard_scope);
+  EXPECT_EQ(*records.value().records.back().retired_blackboard_scope, fixture.scope());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationRequiredOwnerReplacementInvalidatesAcquiredRuleSource) {
+  BbKernelIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+  const auto guard = fixture.arm_guard();
+  ASSERT_TRUE(guard.ok());
+  auto replacement = fixture.liveness;
+  replacement.manager_owner_epoch = RequestOwnerEpoch("manager.replacement");
+  replacement.manager_runtime_epoch = RuntimeEpoch("manager.replacement.1");
+  ASSERT_TRUE(fixture.kernel->ReplaceManagerLivenessRequiredSet(replacement).ok());
+  const auto evidence = fixture.service->ReadRuleEvidence(guard.value());
+  ASSERT_TRUE(evidence.ok());
+  EXPECT_FALSE(evidence.value().trip);
+  ASSERT_EQ(evidence.value().source_losses.size(), 1U);
+  ASSERT_TRUE(evidence.value().source_losses.front().source_loss);
+  EXPECT_EQ(evidence.value().source_losses.front().source_loss->reason,
+            IoSourceLossReason::kDisconnected);
+  // The newly installed required owner does not silently requalify the old
+  // acquired occurrence, even when it has no additional receiver rows.
+  EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(fixture.update(2U, true)).ok());
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationRetirementErrorCannotSuppressMandatoryLivenessStop) {
+  BbKernelIntegrationFixture fixture(true, false, true);
+  ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+  const auto guard = fixture.arm_guard();
+  ASSERT_TRUE(guard.ok());
+  const auto& set = fixture.liveness;
+  const auto& receiver = set.required_receivers.front();
+  const ManagerLivenessLossIntentDTO loss{set.cell_id,
+                                          set.active_bundle_id,
+                                          set.required_runtime_set_digest,
+                                          receiver.runtime_unit_id,
+                                          receiver.runtime_epoch,
+                                          receiver.runtime_policy_id,
+                                          receiver.runtime_policy_revision,
+                                          set.manager_runtime_unit_id,
+                                          set.manager_runtime_epoch,
+                                          set.manager_owner_epoch,
+                                          2U,
+                                          ManagerLivenessLossKindDTO::kExpiry};
+  const auto before = fixture.kernel->cell_stop_action_projection().expected_stop_generation;
+  fixture.kernel->LatchAndContain(loss);
+  EXPECT_GT(fixture.kernel->cell_stop_action_projection().expected_stop_generation, before);
+  EXPECT_EQ(std::static_pointer_cast<BbRetirementErrorService>(fixture.installed_service)
+                ->reported_retirement_errors,
+            1U);
+  const auto evidence = fixture.service->ReadRuleEvidence(guard.value());
+  ASSERT_TRUE(evidence.ok());
+  EXPECT_FALSE(evidence.value().trip);
+  ASSERT_EQ(evidence.value().source_losses.size(), 1U);
+  ASSERT_TRUE(evidence.value().source_losses.front().source_loss);
+  EXPECT_EQ(evidence.value().source_losses.front().source_loss->reason,
+            IoSourceLossReason::kDisconnected);
+  EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(fixture.update(2U, true)).ok());
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationCapturedFirstFrameOvertakesStartingWithoutReopeningNoRun) {
+  BbKernelIntegrationFixture fixture;
+  const auto predecessor = fixture.baseline();
+  ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(predecessor).ok());
+  const auto claim = claim_program_execution(*fixture.kernel);
+  ASSERT_TRUE(claim.ok());
+  ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+  auto first = fixture.baseline(true);
+  first.scope.program_run_id = ProgramRunId("run.1");
+  first.scope.claim_generation = claim.value().claim_generation;
+  EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(predecessor).ok());
+  const auto captured = fixture.kernel->PublishProgramBlackboard(first);
+  ASSERT_TRUE(captured.ok());
+  // Manager still reports the same current Idle predecessor. Repeating it
+  // cannot retire the actual held/captured source or revive its no-Run parent.
+  ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(fixture.readiness).ok());
+  const auto retired = fixture.kernel->PublishProgramBlackboard(predecessor);
+  ASSERT_TRUE(retired.ok());
+  EXPECT_EQ(retired.value().status, IoProgramBlackboardAcknowledgementStatus::kSuperseded);
+  EXPECT_FALSE(retired.value().accepted_sequence);
+  auto next = fixture.update(2U, false);
+  next.scope = first.scope;
+  const auto continued = fixture.kernel->PublishProgramBlackboard(next);
+  ASSERT_TRUE(continued.ok());
+  EXPECT_EQ(continued.value().source_epoch, captured.value().source_epoch);
+  fixture.readiness.program_cycle_status->state = ProgramCycleStateDTO::kStarting;
+  fixture.readiness.program_cycle_status->program_run_id = first.scope.program_run_id;
+  // The existing Starting publication may itself precede claim publication.
+  ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(fixture.readiness).ok());
+  next.message_sequence = 3U;
+  next.previous_sequence = 2U;
+  ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(next).ok());
+  auto wrong = next;
+  wrong.scope.claim_generation =
+      CellAdmissionClaimGeneration(claim.value().claim_generation.value() + 1U);
+  EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(wrong).ok());
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationFirstFrameRejectsDifferentCapturedBinding) {
+  BbKernelIntegrationFixture fixture;
+  const auto claim = claim_program_execution(*fixture.kernel);
+  ASSERT_TRUE(claim.ok());
+  auto capture = program_execution_capture();
+  auto other_binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
+  other_binding->program_binding_id = ProgramBindingId(test_digest('9'));
+  capture.program_binding_id = other_binding->program_binding_id;
+  capture.binding = std::move(other_binding);
+  ASSERT_TRUE(fixture.kernel->register_program_run_capture(std::move(capture)).ok());
+  auto first = fixture.baseline();
+  first.scope.program_run_id = ProgramRunId("run.1");
+  first.scope.claim_generation = claim.value().claim_generation;
+  const auto refused = fixture.kernel->PublishProgramBlackboard(first);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "program_bb_scope_stale");
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationReleasedParentCannotCreateFirstRunSourceFromIdlePredecessor) {
+  BbKernelIntegrationFixture fixture(false, true);
+  const auto claim = claim_program_execution(*fixture.kernel);
+  ASSERT_TRUE(claim.ok());
+  ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+  auto first = fixture.baseline();
+  first.scope.program_run_id = ProgramRunId("run.1");
+  first.scope.claim_generation = claim.value().claim_generation;
+  const auto& held = claim.value();
+  ASSERT_TRUE(fixture.kernel
+                  ->ReleaseCellAdmissionClaim({held.intent.owner_role,
+                                               held.intent.owner_epoch,
+                                               held.intent.owner_transaction_id,
+                                               held.intent.request_id,
+                                               held.intent.request_payload_digest,
+                                               held.acquired_admission_generation,
+                                               held.claim_generation,
+                                               {CellAdmissionSettlementKindDTO::kExplicitReset,
+                                                held.intent.request_payload_digest}})
+                  .ok());
+  EXPECT_FALSE(
+      fixture.kernel->ReadHeldCellAdmissionClaim(CellAdmissionClaimKindDTO::kProgramCycle));
+  const auto refused = fixture.kernel->PublishProgramBlackboard(first);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "program_bb_scope_stale");
+  EXPECT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationPendingScopeObservationDoesNotInstallOrAdmitValues) {
+  BbKernelIntegrationFixture fixture(false, false, false, false);
+  fixture.gate.empty_apply_held = true;
+  const auto scope = fixture.scope();
+  // Trusted host candidate input only: the actual pending journal/selection
+  // proof belongs to the host, not this no-effect Kernel scope observation.
+  ASSERT_TRUE(fixture.kernel
+                  ->ValidatePendingProgramBlackboardScope(
+                      scope, *fixture.context.program_binding,
+                      fixture.context.active_publication_generation, fixture.installed_service)
+                  .ok());
+  EXPECT_FALSE(fixture.kernel->applied_program_blackboard_context());
+  EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+  fixture.gate.empty_apply_held = false;
+  const auto absent = fixture.kernel->PublishProgramBlackboard(fixture.baseline());
+  ASSERT_FALSE(absent.ok());
+  EXPECT_EQ(absent.error().details.at("reason"), "program_bb_source_not_installed");
+  EXPECT_FALSE(fixture.service
+                   ->ReadRecords({RequestOwnerEpoch("kernel.epoch.1"), 1U,
+                                  InterruptSourceId("program.blackboard"), 0U},
+                                 16U)
+                   .ok());
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationPendingScopeRefusesForeignTupleAndServiceWithoutMutation) {
+  BbKernelIntegrationFixture fixture(false, false, false, false);
+  for (int mutation = 0; mutation != 7; ++mutation) {
+    auto scope = fixture.scope();
+    if (mutation == 0) scope.request_owner_epoch = RequestOwnerEpoch("foreign.kernel");
+    if (mutation == 1) scope.program_runner_owner_epoch = RequestOwnerEpoch("foreign.runner");
+    if (mutation == 2) ++scope.cycle_generation;
+    if (mutation == 3) scope.program_binding_id = ProgramBindingId(test_digest('9'));
+    if (mutation == 4) scope.active_publication_generation = ActiveBundlePublicationGeneration(2U);
+    if (mutation == 5) scope.program_run_id = ProgramRunId("uncaptured.run");
+    if (mutation == 6) scope.claim_generation = CellAdmissionClaimGeneration(1U);
+    const auto refused = fixture.kernel->ValidatePendingProgramBlackboardScope(
+        scope, *fixture.context.program_binding, fixture.context.active_publication_generation,
+        fixture.installed_service);
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"), "program_bb_scope_stale");
+  }
+  EXPECT_FALSE(
+      fixture.kernel
+          ->ValidatePendingProgramBlackboardScope(fixture.scope(), *fixture.context.program_binding,
+                                                  fixture.context.active_publication_generation, {})
+          .ok());
+  auto stale = fixture.readiness;
+  stale.program_cycle_status_current = false;
+  ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(stale).ok());
+  EXPECT_FALSE(fixture.kernel
+                   ->ValidatePendingProgramBlackboardScope(
+                       fixture.scope(), *fixture.context.program_binding,
+                       fixture.context.active_publication_generation, fixture.installed_service)
+                   .ok());
+  EXPECT_FALSE(fixture.kernel->applied_program_blackboard_context());
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelIntegrationPendingScopeUsesActualHeldCaptureBeforeStartingPublication) {
+  BbKernelIntegrationFixture fixture(false, false, false, false);
+  const auto claim = claim_program_execution(*fixture.kernel);
+  ASSERT_TRUE(claim.ok());
+  ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+  auto scope = fixture.scope();
+  scope.program_run_id = ProgramRunId("run.1");
+  scope.claim_generation = claim.value().claim_generation;
+  ASSERT_TRUE(fixture.kernel
+                  ->ValidatePendingProgramBlackboardScope(
+                      scope, *fixture.context.program_binding,
+                      fixture.context.active_publication_generation, fixture.installed_service)
+                  .ok());
+  EXPECT_FALSE(fixture.kernel
+                   ->ValidatePendingProgramBlackboardScope(
+                       fixture.scope(), *fixture.context.program_binding,
+                       fixture.context.active_publication_generation, fixture.installed_service)
+                   .ok());
+  auto other = *fixture.context.program_binding;
+  other.program_id = ProgramId(test_digest('9'));
+  EXPECT_FALSE(fixture.kernel
+                   ->ValidatePendingProgramBlackboardScope(
+                       scope, other, fixture.context.active_publication_generation,
+                       fixture.installed_service)
+                   .ok());
+  EXPECT_FALSE(fixture.kernel->applied_program_blackboard_context());
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     InitialInputProviderBringUpUsesTypedClosedScopeWithoutControllerOrSample) {
+  for (int scenario = 0; scenario < 6; ++scenario) {
+    SCOPED_TRACE(scenario);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeOperationJournal journal;
+    const auto candidate = provider_domain_currentness_snapshot(
+        ComponentLifecycleGeneration(3U), ComponentLifecycleStateDTO::kDeclared);
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 16U};
+    config.empty_runtime_retained_bundle_id =
+        candidate.active_publication_receipt.request.candidate_retained_bundle_id;
+    config.empty_runtime_graph_revision =
+        candidate.active_publication_receipt.request.candidate_graph_revision;
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal, std::move(config));
+    CellAdmissionReadinessSnapshotDTO readiness{
+        true,
+        ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"),
+                              1U,
+                              ProgramCycleStateDTO::kIdleAfterReset,
+                              {},
+                              {},
+                              {}},
+        true,
+        1U,
+        1U,
+        true,
+        true,
+        0U,
+        0U,
+        0U};
+    ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(readiness).ok());
+    const auto& domain = candidate.domains.front();
+    const auto& provider = *domain.provider();
+    ConfigurationFenceScopeDTO scope{
+        {candidate.controllable_component_id},
+        {{domain.control_domain_id, std::nullopt, domain.control_domain_revision,
+          ProviderConfigurationFenceDomainDTO{
+              std::nullopt,
+              ProviderConfigurationFenceOccurrenceDTO{candidate.controllable_component_id,
+                                                      provider.provider.provider_instance_id,
+                                                      provider.provider.signal_configuration_digest,
+                                                      {}}}}},
+        {},
+        {}};
+    const auto& revision =
+        candidate.active_publication_receipt.request.candidate_projection_revision;
+    ApplyBringUpAdmissionOfferDTO offer{
+        {{ApplyId("apply.provider.initial"), ApplyGeneration(1U)}, ContentDigest(test_digest('1'))},
+        {{scope, EmptyManagerLivenessSet().manager_runtime_epoch},
+         {provider.provider.provider_runtime_unit_id, provider.provider_runtime_epoch,
+          RequestOwnerEpoch("kernel.epoch.1"), ContentDigest(test_digest('e')),
+          candidate.active_publication_receipt.publication_generation},
+         revision,
+         candidate.active_publication_receipt.durable_public_pointer_content_digest,
+         1U,
+         ConfigurationFenceGeneration(1U),
+         {},
+         0U,
+         0U,
+         ContentDigest(test_digest('f'))},
+        {candidate.controllable_component_id},
+        {{candidate.controllable_component_id,
+          ApplyBringUpAdmissionComponentKindDTO::kInitial,
+          {},
+          {},
+          {},
+          {domain}}}};
+    if (scenario == 1)
+      std::get<ResolvedProviderDomainScopeDTO>(
+          offer.needed_components.front().candidate_provider_domains.front().payload)
+          .provider_runtime_epoch = RuntimeEpoch("old.provider.epoch");
+    if (scenario == 2)
+      offer.admission.echoed_query.affected_scope.domains.front().payload =
+          ControllerConfigurationFenceDomainDTO{};
+    if (scenario == 3) {
+      ASSERT_TRUE(kernel.SetRouteRecoveryPending(true).ok());
+      const auto installed = kernel.publish_runtime_provider_configuration(
+          {ComponentReadinessAuthorityDTO::kRestartExclusion,
+           {},
+           {},
+           candidate.controllable_component_id,
+           candidate.component_lifecycle_generation,
+           false},
+          candidate, {});
+      ASSERT_TRUE(installed.ok()) << installed.error().message;
+      EXPECT_FALSE(installed.value().front().operation_admission_open);
+      EXPECT_EQ(installed.value().front().driver_source_sequence, 0U);
+      ASSERT_TRUE(kernel.SetRouteRecoveryPending(false).ok());
+    }
+    if (scenario == 4)
+      std::get<ResolvedProviderDomainScopeDTO>(
+          offer.needed_components.front().candidate_provider_domains.front().payload)
+          .provider.signal_configuration_digest = ContentDigest(test_digest('c'));
+    if (scenario == 5) offer.needed_components.front().candidate_provider_domains.clear();
+    const CellAdmissionClaimIntentDTO intent{CellAdmissionClaimKindDTO::kManagerApply,
+                                             CellAdmissionOwnerRoleDTO::kManager,
+                                             EmptyManagerLivenessSet().manager_owner_epoch,
+                                             offer.parent.owner.apply_id.value(),
+                                             RequestId("apply.provider.initial"),
+                                             offer.parent.plan_digest,
+                                             kernel.GetAuthoringAdmission().admission_generation,
+                                             {},
+                                             {},
+                                             {},
+                                             {}};
+    const auto acquired = kernel.AcquireApplyBringUpCellAdmissionClaim(intent, offer);
+    EXPECT_EQ(acquired.ok(), scenario == 0);
+    if (scenario == 0) {
+      ASSERT_TRUE(acquired.ok()) << acquired.error().message;
+      EXPECT_EQ(kernel.AcquireApplyBringUpCellAdmissionClaim(intent, offer).value(),
+                acquired.value());
+      EXPECT_FALSE(kernel.current_runtime_provider_configuration(domain.control_domain_id).value());
+    }
+    if (scenario == 3) {
+      ASSERT_FALSE(acquired.ok());
+      EXPECT_EQ(acquired.error().details.at("reason"), "apply_bring_up_initial_not_current");
+    }
+    EXPECT_TRUE(kernel.resource_snapshot().empty());
+    EXPECT_FALSE(kernel.current_runtime_route_configuration(domain.control_domain_id).value());
+    EXPECT_FALSE(kernel.get_stop_fault_latch());
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProviderFenceReconciliationRequiresOnlyActualCandidateControllerConfigurations) {
+  const auto snapshot = provider_domain_currentness_snapshot();
+  const auto& domain = snapshot.domains.front();
+  const auto& provider = *domain.provider();
+  const ProviderConfigurationFenceOccurrenceDTO proof{snapshot.controllable_component_id,
+                                                      provider.provider.provider_instance_id,
+                                                      provider.provider.signal_configuration_digest,
+                                                      {}};
+  ConfigurationFenceScopeDTO scope{
+      {snapshot.controllable_component_id},
+      {{domain.control_domain_id, domain.control_domain_revision, domain.control_domain_revision,
+        ProviderConfigurationFenceDomainDTO{proof, proof}}},
+      {},
+      {}};
+  const auto& revision = snapshot.active_publication_receipt.request.candidate_projection_revision;
+  ConfigurationFenceReconciliationEvidenceDTO apply{
+      {provider.provider.provider_runtime_unit_id, provider.provider_runtime_epoch,
+       RequestOwnerEpoch("kernel.epoch.1"), ContentDigest(test_digest('e')),
+       snapshot.active_publication_receipt.publication_generation},
+      {ApplyId("apply.provider"), ApplyGeneration(1U)},
+      ConfigurationFenceId("fence.provider"),
+      ConfigurationFenceGeneration(1U),
+      scope,
+      1U,
+      revision.graph_revision,
+      revision,
+      snapshot.active_publication_receipt.publication_generation,
+      ContentDigest("pointer.provider"),
+      {},
+      0U,
+      0U,
+      ContentDigest("evidence.provider")};
+  SelectedBringUpConfigurationFenceReconciliationEvidenceDTO selected{
+      apply.execution_host_epoch,
+      {LifecycleTransactionId("selected-lifecycle.1"), LifecycleTransactionGeneration(1U),
+       CellAdmissionClaimGeneration(1U)},
+      apply.configuration_fence_id,
+      apply.configuration_fence_generation,
+      scope,
+      1U,
+      revision.graph_revision,
+      revision,
+      apply.active_publication_generation,
+      apply.active_public_pointer_digest,
+      {},
+      0U,
+      0U,
+      apply.evidence_digest};
+  EXPECT_TRUE(apply.valid());
+  EXPECT_TRUE(selected.valid());
+  // Provider predecessor -> controller candidate still requires real configuration evidence.
+  auto& typed = std::get<ProviderConfigurationFenceDomainDTO>(scope.domains.front().payload);
+  typed.candidate_provider.reset();
+  scope.bindings.push_back(
+      {ControlBindingId("physical.binding"), {}, ControlBindingRevision("revision")});
+  scope.resources.push_back(ResourceId("physical.resource"));
+  ASSERT_TRUE(scope.valid());
+  apply.reconciled_scope = selected.reconciled_scope = scope;
+  EXPECT_FALSE(apply.valid());
+  EXPECT_FALSE(selected.valid());
+  apply.active_control_configurations = selected.active_control_configurations = {
+      {domain.control_domain_id, ActiveControlConfigurationId("actual.configuration"),
+       ActiveControlConfigurationGeneration(1U)}};
+  EXPECT_TRUE(apply.valid());
+  EXPECT_TRUE(selected.valid());
+  // Controller predecessor -> provider candidate has no candidate controller configuration.
+  typed.predecessor_provider.reset();
+  typed.candidate_provider = proof;
+  apply.reconciled_scope = selected.reconciled_scope = scope;
+  apply.active_control_configurations.clear();
+  selected.active_control_configurations.clear();
+  EXPECT_TRUE(apply.valid());
+  EXPECT_TRUE(selected.valid());
+  typed.candidate_provider.reset();
+  apply.reconciled_scope = selected.reconciled_scope = scope;
+  EXPECT_FALSE(apply.valid());
+  EXPECT_FALSE(selected.valid());
+}
+
+
+// Input-boundary tests exercise the Kernel's CLOSED staging port only. The
+// coordinator/real-journal producer and host Apply pin are separate fixtures;
+// membership below supplies no CurrentSnapshot or fabricated Active evidence.
+class ProviderCandidateClosedGate final : public IResourceOperationAdmissionGate {
+ public:
+  FakeResourceAdmissionGate actual;
+  std::function<void()> before_exact_check;
+  std::shared_ptr<std::recursive_mutex> shared_admission_mutex() const override {
+    return actual.shared_admission_mutex();
+  }
+  Result<void> reserve(ResourceSlotTable& table, const ResourceSlotOwnerDTO& owner,
+                       const std::vector<ResourceId>& resources) override {
+    return actual.reserve(table, owner, resources);
+  }
+  Result<void> reserve_batch(ResourceSlotTable& table,
+                             const std::vector<ResourceSlotReservationOwnerDTO>& owners) override {
+    return actual.reserve_batch(table, owners);
+  }
+  std::vector<ResourceId> current_fenced_resources(
+      const std::vector<ResourceId>& resources) const override {
+    return actual.current_fenced_resources(resources);
+  }
+  bool exact_fence_is_held(const ConfigurationFenceId& id,
+                           const ConfigurationFenceScopeDTO& scope) const override {
+    if (before_exact_check) before_exact_check();
+    return actual.exact_fence_is_held(id, scope);
+  }
+};
+
+struct ProviderCandidateClosedFixture final {
+  static InstalledProviderCandidateFactsDTO Facts() {
+    const auto membership = provider_domain_currentness_snapshot(
+        ComponentLifecycleGeneration(3U), ComponentLifecycleStateDTO::kDeclared);
+    return {RetainedBundleId(test_digest('4')),
+             GraphRevision(test_digest('5')),
+             membership.controllable_component_id,
+             membership.component_lifecycle_generation,
+             membership.domains,
+             membership.provider_occurrences,
+             InstalledNativeApplyCandidateSourceDTO{
+                 RequestOwnerEpoch("cclc.original"),
+                 {ApplyId("apply.provider.closed"), ApplyGeneration(1U)}}};
+  }
+  static ConfigurationFenceStatusQueryDTO Fence(const InstalledProviderCandidateFactsDTO& facts) {
+    const auto& domain = facts.domains.front();
+    const auto& provider = domain.provider()->provider;
+    ConfigurationFenceScopeDTO scope{
+        {facts.controllable_component_id},
+        {{domain.control_domain_id,
+          {},
+          domain.control_domain_revision,
+          ProviderConfigurationFenceDomainDTO{
+              {},
+              ProviderConfigurationFenceOccurrenceDTO{facts.controllable_component_id,
+                                                      provider.provider_instance_id,
+                                                      provider.signal_configuration_digest,
+                                                      {}}}}},
+        {},
+        {}};
+    return {{ApplyId("apply.provider.closed"), ApplyGeneration(1U)},
+             ConfigurationFenceId("fence.provider.closed"),
+             ConfigurationFenceGeneration(1U),
+             scope,
+             RuntimeEpoch("manager.epoch.1")};
+  }
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  ProviderCandidateClosedGate gate;
+  InstalledProviderCandidateFactsDTO facts{Facts()};
+  ConfigurationFenceStatusQueryDTO fence{Fence(facts)};
+  std::unique_ptr<ResourceAddressedExecutionKernel> kernel;
+  CellAdmissionClaimDTO parent;
+
+  ProviderCandidateClosedFixture() : parent(AcquireParent()) {
+    gate.actual.held_fence_id = fence.configuration_fence_id;
+    gate.actual.held_scope = fence.expected_scope;
+    gate.actual.reject_reservation = true;
+  }
+
+  CellAdmissionClaimDTO AcquireParent() {
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 16U};
+    config.empty_runtime_retained_bundle_id = facts.retained_bundle_id;
+    config.empty_runtime_graph_revision = facts.graph_revision;
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    config.operation_admission_gate = &gate;
+    gate.actual.reject_reservation = false;
+    kernel = std::make_unique<ResourceAddressedExecutionKernel>(
+        std::vector<RuntimeParticipantExecutionRegistration>{}, clock, scheduler, journal,
+        std::move(config));
+    if (!ready_cell_admission(*kernel).ok())
+      throw std::logic_error("closed provider fixture readiness failed");
+    const auto acquired =
+        kernel->AcquireCellAdmissionClaim({CellAdmissionClaimKindDTO::kAuthoringMutation,
+                                           CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+                                           RequestOwnerEpoch("authoring.provider"),
+                                           "edit.original.provider",
+                                           RequestId("request.provider.closed"),
+                                           ContentDigest(test_digest('1')),
+                                           kernel->GetAuthoringAdmission().admission_generation,
+                                           {},
+                                           {},
+                                           {},
+                                           {}});
+    if (!acquired.ok()) throw std::logic_error(acquired.error().message);
+    return acquired.value();
+  }
+};
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProviderCandidateClosedInstallsOnlyMetadataWithoutPublicSnapshotOrReadiness) {
+  ProviderCandidateClosedFixture fixture;
+  const auto installed = fixture.kernel->publish_installed_provider_candidate_closed(
+      fixture.fence, fixture.parent, fixture.facts);
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+  ASSERT_EQ(installed.value().size(), 1U);
+  const auto& row = installed.value().front();
+  EXPECT_FALSE(row.operation_admission_open);
+  EXPECT_EQ(row.driver_source_sequence, 0U);
+  EXPECT_EQ(row.driver_observation_generation, 0U);
+  EXPECT_EQ(row.component_lifecycle_generation, fixture.facts.component_lifecycle_generation);
+  EXPECT_FALSE(row.domain.provider()->active_control_configuration);
+  const auto readiness =
+      fixture.kernel->component_command_readiness(fixture.facts.controllable_component_id);
+  if (readiness.ok()) {
+    EXPECT_FALSE(readiness.value().command_eligible);
+  }
+  EXPECT_TRUE(fixture.kernel->resource_snapshot().empty());
+  EXPECT_FALSE(fixture.kernel->get_stop_fault_latch());
+  EXPECT_FALSE(
+      fixture.kernel
+          ->current_runtime_route_configuration(fixture.facts.domains.front().control_domain_id)
+          .value());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProviderCandidateClosedRefusesForeignSourceProductParentAndMembershipAtomically) {
+  for (unsigned scenario = 0U; scenario < 8U; ++scenario) {
+    SCOPED_TRACE(scenario);
+    ProviderCandidateClosedFixture fixture;
+    ASSERT_TRUE(fixture.kernel
+                    ->publish_installed_provider_candidate_closed(fixture.fence, fixture.parent,
+                                                                  fixture.facts)
+                    .ok());
+    const auto original = fixture.kernel
+                              ->current_runtime_provider_configuration(
+                                  fixture.facts.domains.front().control_domain_id)
+                              .value();
+    auto wrong = fixture.facts;
+    auto parent = fixture.parent;
+    if (scenario == 0U)
+      std::get<InstalledNativeApplyCandidateSourceDTO>(wrong.source).apply.apply_id =
+          ApplyId("foreign.apply");
+    if (scenario == 1U) wrong.retained_bundle_id = RetainedBundleId(test_digest('c'));
+    if (scenario == 2U) wrong.component_lifecycle_generation = ComponentLifecycleGeneration(2U);
+    if (scenario == 3U) {
+      wrong.domains.push_back(wrong.domains.front());
+      wrong.provider_occurrences.push_back(wrong.provider_occurrences.front());
+    }
+    if (scenario == 4U)
+      std::get<InstalledNativeApplyCandidateSourceDTO>(wrong.source).lifecycle_owner_epoch =
+          RequestOwnerEpoch("");
+    if (scenario == 5U) parent.claim_generation = CellAdmissionClaimGeneration(999U);
+    if (scenario == 6U) fixture.gate.actual.reject_reservation = false;
+    if (scenario == 7U)
+      wrong.source = InstalledApplyChildCandidateSourceDTO{
+          RequestOwnerEpoch("cclc.original"),
+          {fixture.fence.owner_transaction, ContentDigest(test_digest('1'))},
+          {RequestId("child.provider"), RequestReplayStatusDTO::kAcceptedNew,
+           LifecycleTransactionId("apply-lifecycle.1"), LifecycleTransactionGeneration(1U),
+           wrong.component_lifecycle_generation, 0, 1'000'000'000LL},
+          ContentDigest(test_digest('2'))};  // Authoring authority cannot impersonate a child.
+    EXPECT_FALSE(
+        fixture.kernel->publish_installed_provider_candidate_closed(fixture.fence, parent, wrong)
+            .ok());
+    EXPECT_EQ(fixture.kernel
+                  ->current_runtime_provider_configuration(
+                      fixture.facts.domains.front().control_domain_id)
+                  .value(),
+              original);
+    EXPECT_TRUE(fixture.kernel->resource_snapshot().empty());
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProviderCandidateClosedCannotEraseActualDriverWatermarksOrReopenCommands) {
+  ProviderCandidateClosedFixture fixture;
+  ASSERT_TRUE(fixture.kernel
+                  ->publish_installed_provider_candidate_closed(fixture.fence, fixture.parent,
+                                                                fixture.facts)
+                  .ok());
+  const auto actual = provider_domain_currentness_snapshot();
+  const ComponentCommandReadinessPublicationDTO observed{
+      ComponentReadinessAuthorityDTO::kParentApplyFence,
+      {},
+      fixture.fence.configuration_fence_id,
+      fixture.facts.controllable_component_id,
+      fixture.facts.component_lifecycle_generation,
+      true,
+      fixture.fence.expected_scope};
+  const auto active = fixture.kernel->publish_runtime_provider_configuration(
+      observed, actual, provider_domain_driver_observations(actual));
+  ASSERT_TRUE(active.ok()) << active.error().message;
+  ASSERT_TRUE(active.value().front().operation_admission_open);
+  EXPECT_FALSE(fixture.kernel
+                   ->publish_installed_provider_candidate_closed(fixture.fence, fixture.parent,
+                                                                 fixture.facts)
+                   .ok());
+  EXPECT_EQ(
+      fixture.kernel
+          ->current_runtime_provider_configuration(fixture.facts.domains.front().control_domain_id)
+          .value(),
+      std::optional(active.value().front()));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProviderCandidateClosedCommitPrecedesConcurrentFenceRemoval) {
+  ProviderCandidateClosedFixture fixture;
+  HeldSettlementCall checking;
+  fixture.gate.before_exact_check = checking.Blocker();
+  auto publishing = std::async(std::launch::async, [&] {
+    return fixture.kernel->publish_installed_provider_candidate_closed(
+        fixture.fence, fixture.parent, fixture.facts);
+  });
+  ASSERT_TRUE(checking.Entered());
+  std::promise<void> removal_attempt;
+  auto attempted = removal_attempt.get_future();
+  auto removing = std::async(std::launch::async, [&] {
+    removal_attempt.set_value();
+    std::lock_guard lock(*fixture.gate.shared_admission_mutex());
+    const auto committed = fixture.kernel->current_runtime_provider_configuration(
+        fixture.facts.domains.front().control_domain_id);
+    fixture.gate.actual.reject_reservation = false;
+    return committed;
+  });
+  attempted.wait();
+  EXPECT_EQ(removing.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+  checking.Release();
+  const auto published = publishing.get();
+  ASSERT_TRUE(published.ok()) << published.error().message;
+  const auto at_removal = removing.get();
+  ASSERT_TRUE(at_removal.ok());
+  ASSERT_TRUE(at_removal.value());
+  EXPECT_EQ(at_removal.value(), std::optional(published.value().front()));
+  EXPECT_FALSE(at_removal.value()->operation_admission_open);
+  fixture.gate.before_exact_check = {};
+  EXPECT_FALSE(fixture.kernel
+                   ->publish_installed_provider_candidate_closed(fixture.fence, fixture.parent,
+                                                                 fixture.facts)
+                   .ok());
+}
+
+
+// Global catalog ownership tests use the actual shared signal service and
+// actual existing authoring claim. The test gate represents the empty physical
+// scope of an Apply; it never fabricates a signal catalog generation.
+class GlobalRuleCatalogTestGate final : public IResourceOperationAdmissionGate {
+ public:
+  std::shared_ptr<std::recursive_mutex> shared_admission_mutex() const override { return mutex; }
+  Result<void> reserve(ResourceSlotTable& table, const ResourceSlotOwnerDTO& owner,
+                       const std::vector<ResourceId>& resources) override {
+    return table.reserve(owner, resources);
+  }
+  Result<void> reserve_batch(ResourceSlotTable& table,
+                             const std::vector<ResourceSlotReservationOwnerDTO>& owners) override {
+    return table.reserve_batch(owners);
+  }
+  std::vector<ResourceId> current_fenced_resources(const std::vector<ResourceId>&) const override {
+    return {};
+  }
+  bool has_held_configuration_fences() const override { return held.has_value(); }
+  bool exact_fence_is_held(const ConfigurationFenceId& id,
+                           const ConfigurationFenceScopeDTO& scope) const override {
+    return held && held->configuration_fence_id == id && held->expected_scope == scope;
+  }
+  std::shared_ptr<std::recursive_mutex> mutex = std::make_shared<std::recursive_mutex>();
+  std::optional<ConfigurationFenceStatusQueryDTO> held;
+};
+
+struct GlobalRuleCatalogFixture final {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  GlobalRuleCatalogTestGate gate;
+  std::unique_ptr<ResourceAddressedExecutionKernel> kernel;
+  const IoRuleAppliedContextDTO context{RequestOwnerEpoch("kernel.epoch.1"),
+                                        ActiveBundlePublicationGeneration(1U),
+                                        RetainedBundleId("bundle.test"), GraphRevision("graph.test")};
+  const ConfigurationFenceStatusQueryDTO fence{
+      {ApplyId("apply.global.catalog"), ApplyGeneration(1U)},
+      ConfigurationFenceId("fence.global.catalog"), ConfigurationFenceGeneration(1U),
+      {{}, {}, {}, {}}, RuntimeEpoch("manager.epoch.1")};
+
+  GlobalRuleCatalogFixture() {
+    ResourceAddressedExecutionKernelConfig config{context.owner_epoch, CellId("cell.test"), 16U};
+    config.empty_runtime_retained_bundle_id = context.retained_bundle_id;
+    config.empty_runtime_graph_revision = context.graph_revision;
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    config.operation_admission_gate = &gate;
+    kernel = std::make_unique<ResourceAddressedExecutionKernel>(
+        std::vector<RuntimeParticipantExecutionRegistration>{}, clock, scheduler, journal,
+        std::move(config));
+    if (!ready_cell_admission(*kernel).ok())
+      throw std::logic_error("global catalog fixture readiness failed");
+  }
+
+  Result<CellAdmissionClaimDTO> Claim() {
+    return kernel->AcquireCellAdmissionClaim(
+        {CellAdmissionClaimKindDTO::kAuthoringMutation,
+         CellAdmissionOwnerRoleDTO::kAuthoringOwner, RequestOwnerEpoch("authoring.global"),
+         "edit.global.catalog", RequestId("request.global.catalog"), ContentDigest(test_digest('1')),
+         kernel->GetAuthoringAdmission().admission_generation, {}, {}, {}, {}});
+  }
+
+  std::shared_ptr<IoSignalSubsystem> Service(std::uint64_t generation) {
+    auto created = IoSignalSubsystem::Create({context.owner_epoch, generation, {}},
+                                             {1U, 1U, 8U, 8U, 512U, 1024U}, clock);
+    if (!created.ok()) throw std::logic_error(created.error().message);
+    return std::shared_ptr<IoSignalSubsystem>(std::move(created.value()));
+  }
+
+  std::shared_ptr<const IoActivationRuleCatalogDTO> EmptyCatalog(
+      const IoRuleAppliedContextDTO& applied, const std::shared_ptr<IoSignalSubsystem>& service) {
+    const auto configuration = service->RuleServiceConfiguration();
+    if (!configuration.ok()) throw std::logic_error(configuration.error().message);
+    return std::make_shared<const IoActivationRuleCatalogDTO>(IoActivationRuleCatalogDTO{
+        {applied.owner_epoch, configuration.value().catalog_generation,
+         applied.active_publication_generation, applied.retained_bundle_id, applied.graph_revision},
+        {}, std::nullopt, {}});
+  }
+};
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleCatalogStageStaysPrivateUntilSuccessfulActivationAndFinalFenceRelease) {
+  GlobalRuleCatalogFixture fixture;
+  const auto parent = fixture.Claim();
+  ASSERT_TRUE(parent.ok()) << parent.error().message;
+  const auto service = fixture.Service(9U);
+  const auto catalog = fixture.EmptyCatalog(fixture.context, service);
+  fixture.gate.held = fixture.fence;
+  ASSERT_TRUE(fixture.kernel->StageGlobalIoRuleCatalog(
+      fixture.context, catalog, service, fixture.fence, parent.value()).ok());
+  EXPECT_FALSE(fixture.kernel->ReadInterruptRuleStateBaseline());
+  EXPECT_FALSE(fixture.kernel->installed_global_io_rule_catalog());
+  const auto early = fixture.kernel->ActivateGlobalIoRuleCatalog(fixture.context, service);
+  ASSERT_FALSE(early.ok());
+  EXPECT_EQ(early.error().details.at("reason"), "io_global_rule_apply_fence_held");
+  EXPECT_FALSE(fixture.kernel->ReadInterruptRuleStateBaseline());
+  fixture.gate.held.reset();
+  ASSERT_TRUE(fixture.kernel->ActivateGlobalIoRuleCatalog(fixture.context, service).ok());
+  const auto installed = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(installed);
+  ASSERT_EQ(installed->catalog, catalog);
+  ASSERT_TRUE(installed->baseline);
+  EXPECT_EQ(installed->status, IoRuleStateProjectionStatusDTO::kReady);
+  EXPECT_EQ(installed->baseline->context.catalog_generation, 9U);
+  EXPECT_TRUE(installed->baseline->states.empty());
+  EXPECT_FALSE(installed->verified_empty);
+  EXPECT_TRUE(fixture.kernel->ActivateGlobalIoRuleCatalog(fixture.context, service).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleCatalogColdRestoreNeedsExistingRouteExclusionAndSupportsNoService) {
+  GlobalRuleCatalogFixture fixture;
+  const auto unexcluded = fixture.kernel->RestoreGlobalIoRuleCatalog(fixture.context, nullptr, nullptr);
+  ASSERT_FALSE(unexcluded.ok());
+  EXPECT_EQ(unexcluded.error().details.at("reason"), "io_global_rule_restore_not_excluded");
+  EXPECT_FALSE(fixture.kernel->ReadInterruptRuleStateBaseline());
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(true).ok());
+  ASSERT_TRUE(fixture.kernel->RestoreGlobalIoRuleCatalog(fixture.context, nullptr, nullptr).ok());
+  const auto installed = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(installed);
+  EXPECT_EQ(installed->verified_empty, fixture.context);
+  EXPECT_FALSE(installed->catalog);
+  EXPECT_FALSE(installed->baseline);
+  EXPECT_FALSE(fixture.kernel->installed_global_io_rule_catalog());
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(false).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleWarmEmptyApplyActivatesBeforeParentReleaseAndAcceptsNextCatalog) {
+  GlobalRuleCatalogFixture fixture;
+  const auto parent = fixture.Claim();
+  ASSERT_TRUE(parent.ok()) << parent.error().message;
+  fixture.gate.held = fixture.fence;
+  ASSERT_TRUE(fixture.kernel->StageGlobalIoRuleCatalog(
+      fixture.context, nullptr, nullptr, fixture.fence, parent.value()).ok());
+  EXPECT_FALSE(fixture.kernel->ReadInterruptRuleStateBaseline());
+  EXPECT_FALSE(fixture.kernel->ActivateGlobalIoRuleCatalog(fixture.context, nullptr).ok());
+
+  // Model the cadence after durable Succeeded/fence release, before the
+  // existing parent-claim release callback consumes the staged empty product.
+  fixture.gate.held.reset();
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(true).ok());
+  const auto cold_restore =
+      fixture.kernel->RestoreGlobalIoRuleCatalog(fixture.context, nullptr, nullptr);
+  ASSERT_FALSE(cold_restore.ok());
+  EXPECT_EQ(cold_restore.error().details.at("reason"), "io_global_rule_candidate_conflict");
+  EXPECT_FALSE(fixture.kernel->ReadInterruptRuleStateBaseline());
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(false).ok());
+  ASSERT_TRUE(fixture.kernel->ActivateGlobalIoRuleCatalog(fixture.context, nullptr).ok());
+  EXPECT_EQ(fixture.kernel->ReadHeldCellAdmissionClaim(
+                parent.value().intent.claim_kind, parent.value().intent.owner_transaction_id),
+            parent.value());
+  const auto empty = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(empty);
+  EXPECT_EQ(empty->verified_empty, fixture.context);
+  EXPECT_FALSE(empty->catalog);
+  // Both the next cadence and the eventual claim-release callback are inert.
+  ASSERT_TRUE(fixture.kernel->ActivateGlobalIoRuleCatalog(fixture.context, nullptr).ok());
+  EXPECT_EQ(fixture.kernel->ReadInterruptRuleStateBaseline()->verified_empty, fixture.context);
+
+  auto next = fixture.context;
+  next.active_publication_generation = ActiveBundlePublicationGeneration(2U);
+  const auto service = fixture.Service(19U);
+  const auto catalog = fixture.EmptyCatalog(next, service);
+  fixture.gate.held = fixture.fence;
+  ASSERT_TRUE(fixture.kernel->StageGlobalIoRuleCatalog(
+      next, catalog, service, fixture.fence, parent.value()).ok());
+  EXPECT_EQ(fixture.kernel->ReadInterruptRuleStateBaseline()->verified_empty, fixture.context);
+  fixture.gate.held.reset();
+  ASSERT_TRUE(fixture.kernel->ActivateGlobalIoRuleCatalog(next, service).ok());
+  const auto installed = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(installed);
+  EXPECT_EQ(installed->catalog, catalog);
+  EXPECT_FALSE(installed->verified_empty);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleNoProgramNoServiceWaitingUsesSameApplyOwnerWithoutFabricatedStateContext) {
+  GlobalRuleCatalogFixture fixture;
+  auto waiting = std::make_shared<const IoRuleWaitingForProgramCatalogDTO>(
+      IoRuleWaitingForProgramCatalogDTO{fixture.context,
+        {{InterruptPolicyId("global.key"), nullptr, {}, IoActivationAllMotionScopeDTO{},
+          std::nullopt, 20, std::nullopt, InterruptPostLatchDisposition::kAwaitOperatorAck,
+          {"flag"}}}});
+  // Startup uses the same existing exclusion, without a synthetic held Apply.
+  EXPECT_FALSE(fixture.kernel->RestoreGlobalIoRuleCatalog(
+      fixture.context, nullptr, nullptr, waiting).ok());
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(true).ok());
+  ASSERT_TRUE(fixture.kernel->RestoreGlobalIoRuleCatalog(
+      fixture.context, nullptr, nullptr, waiting).ok());
+  ASSERT_TRUE(fixture.kernel->RestoreGlobalIoRuleCatalog(
+      fixture.context, nullptr, nullptr, waiting).ok());
+  auto conflict = std::make_shared<IoRuleWaitingForProgramCatalogDTO>(*waiting);
+  conflict->rules.front().waiting_for_program_keys = {"other"};
+  EXPECT_FALSE(fixture.kernel->RestoreGlobalIoRuleCatalog(
+      fixture.context, nullptr, nullptr, conflict).ok());
+  const auto installed = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(installed);
+  EXPECT_EQ(installed->waiting_for_program, waiting);
+  EXPECT_EQ(installed->status, IoRuleStateProjectionStatusDTO::kPending);
+  EXPECT_FALSE(installed->catalog);
+  EXPECT_FALSE(installed->baseline);
+  EXPECT_FALSE(installed->verified_empty);
+  EXPECT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto expiry = fixture.kernel->NextIoRuleExpiry();
+  ASSERT_TRUE(expiry.ok());
+  EXPECT_FALSE(expiry.value());
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  // A waiting product cannot coexist with a real service/catalog.
+  const auto service = fixture.Service(17U);
+  const auto catalog = fixture.EmptyCatalog(fixture.context, service);
+  EXPECT_FALSE(fixture.kernel->RestoreGlobalIoRuleCatalog(
+      fixture.context, catalog, service, waiting).ok());
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(false).ok());
+  const auto parent = fixture.Claim();
+  ASSERT_TRUE(parent.ok());
+  auto removed = fixture.context;
+  removed.active_publication_generation = ActiveBundlePublicationGeneration(2U);
+  fixture.gate.held = fixture.fence;
+  ASSERT_TRUE(fixture.kernel->StageGlobalIoRuleCatalog(
+      removed, nullptr, nullptr, fixture.fence, parent.value()).ok());
+  EXPECT_EQ(fixture.kernel->ReadInterruptRuleStateBaseline()->waiting_for_program, waiting);
+  fixture.gate.held.reset();
+  ASSERT_TRUE(fixture.kernel->ActivateGlobalIoRuleCatalog(removed, nullptr).ok());
+  const auto empty = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(empty);
+  EXPECT_FALSE(empty->waiting_for_program);
+  EXPECT_EQ(empty->verified_empty, removed);
+  EXPECT_FALSE(empty->baseline);
+  std::lock_guard lock(fixture.journal.mutex);
+  EXPECT_TRUE(fixture.journal.interrupt_rule_state_changes.empty());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleNoServiceWaitingStageRemainsPrivateUntilActualActivation) {
+  GlobalRuleCatalogFixture fixture;
+  const auto parent = fixture.Claim();
+  ASSERT_TRUE(parent.ok());
+  auto waiting = std::make_shared<const IoRuleWaitingForProgramCatalogDTO>(
+      IoRuleWaitingForProgramCatalogDTO{fixture.context,
+        {{InterruptPolicyId("global.key"), nullptr, {}, IoActivationEverythingScopeDTO{},
+          std::nullopt, 20, std::nullopt, InterruptPostLatchDisposition::kAwaitOperatorAck,
+          {"flag"}}}});
+  fixture.gate.held = fixture.fence;
+  ASSERT_TRUE(fixture.kernel->StageGlobalIoRuleCatalog(
+      fixture.context, nullptr, nullptr, fixture.fence, parent.value(), waiting).ok());
+  EXPECT_FALSE(fixture.kernel->ReadInterruptRuleStateBaseline());
+  EXPECT_FALSE(fixture.kernel->ActivateGlobalIoRuleCatalog(fixture.context, nullptr).ok());
+  fixture.gate.held.reset();
+  ASSERT_TRUE(fixture.kernel->ActivateGlobalIoRuleCatalog(fixture.context, nullptr).ok());
+  const auto actual = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(actual);
+  EXPECT_EQ(actual->waiting_for_program, waiting);
+  EXPECT_EQ(actual->status, IoRuleStateProjectionStatusDTO::kPending);
+  EXPECT_FALSE(actual->baseline);
+  EXPECT_FALSE(actual->catalog);
+  EXPECT_FALSE(actual->verified_empty);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleCatalogRemovalKeepsPredecessorVisibleUntilActualSuccess) {
+  GlobalRuleCatalogFixture fixture;
+  auto service = fixture.Service(11U);
+  auto catalog = fixture.EmptyCatalog(fixture.context, service);
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(true).ok());
+  ASSERT_TRUE(fixture.kernel->RestoreGlobalIoRuleCatalog(fixture.context, catalog, service).ok());
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(false).ok());
+  const auto parent = fixture.Claim();
+  ASSERT_TRUE(parent.ok()) << parent.error().message;
+  auto successor = fixture.context;
+  successor.active_publication_generation = ActiveBundlePublicationGeneration(2U);
+  fixture.gate.held = fixture.fence;
+  ASSERT_TRUE(fixture.kernel->StageGlobalIoRuleCatalog(
+      successor, nullptr, nullptr, fixture.fence, parent.value()).ok());
+  EXPECT_EQ(fixture.kernel->installed_global_io_rule_catalog(), catalog);
+  const auto before = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(before);
+  EXPECT_EQ(before->catalog, catalog);
+  EXPECT_FALSE(before->verified_empty);
+  fixture.gate.held.reset();
+  ASSERT_TRUE(fixture.kernel->ActivateGlobalIoRuleCatalog(successor, nullptr).ok());
+  const auto after = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(after);
+  EXPECT_FALSE(after->catalog);
+  EXPECT_FALSE(after->baseline);
+  EXPECT_EQ(after->verified_empty, successor);
+  EXPECT_FALSE(fixture.kernel->ActivateGlobalIoRuleCatalog(fixture.context, service).ok());
+}
+
+class GlobalRuleCatalogObservedService final : public IIoSignalService {
+ public:
+  explicit GlobalRuleCatalogObservedService(std::shared_ptr<IoSignalSubsystem> source)
+      : source_(std::move(source)) {}
+  Result<IoRuleServiceConfigurationDTO> RuleServiceConfiguration() const override {
+    return source_->RuleServiceConfiguration();
+  }
+  Result<IoRuleRegistrationDTO> ArmRule(const IoRuleArmRequestDTO& request) override {
+    auto registered = source_->ArmRule(request);
+    if (registered.ok()) last_registration = registered.value();
+    return registered;
+  }
+  Result<IoRuleEvidenceDTO> ReadRuleEvidence(const IoRuleRegistrationDTO& token) const override {
+    return source_->ReadRuleEvidence(token);
+  }
+  Result<IoRuleEvidenceDTO> RetireRule(const IoRuleRegistrationDTO& token) override {
+    auto retired = source_->RetireRule(token);
+    if (retired.ok()) {
+      retired_evidence = retired.value();
+      auto after = std::exchange(after_retire, {});
+      if (after) after();
+    }
+    return retired;
+  }
+  Result<IoRuleConditionSnapshotDTO> ReadRuleConditionSnapshot(
+      const IoRuleRegistrationDTO& token) const override {
+    return source_->ReadRuleConditionSnapshot(token);
+  }
+  Result<void> EvaluateRules() override { return source_->EvaluateRules(); }
+  Result<std::optional<TimePoint>> NextRuleExpiry() const override {
+    return source_->NextRuleExpiry();
+  }
+  Result<IoSignalObservationDTO> ReadSignal(const IoSignalId& signal) const override {
+    return source_->ReadSignal(signal);
+  }
+  Result<IoWatchRegistrationDTO> RegisterLevelWatch(const IoLevelWatchRequestDTO& request) override {
+    return source_->RegisterLevelWatch(request);
+  }
+  Result<IoWatchResultDTO> ReadWatch(const IoWatchRegistrationDTO& token) const override {
+    return source_->ReadWatch(token);
+  }
+  Result<void> ReleaseWatch(const IoWatchRegistrationDTO& token) override {
+    return source_->ReleaseWatch(token);
+  }
+  Result<void> ReleaseRunWatches(const RequestOwnerEpoch& runner, const ProgramRunId& run) override {
+    return source_->ReleaseRunWatches(runner, run);
+  }
+  std::optional<IoRuleRegistrationDTO> last_registration;
+  std::optional<IoRuleEvidenceDTO> retired_evidence;
+  std::function<void()> after_retire;
+
+ private:
+  std::shared_ptr<IoSignalSubsystem> source_;
+};
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleCatalogDiscardNeedsExactHeldParentAndKeepsCandidatePrivate) {
+  GlobalRuleCatalogFixture fixture;
+  const auto parent = fixture.Claim();
+  ASSERT_TRUE(parent.ok()) << parent.error().message;
+  const auto service = fixture.Service(13U);
+  const auto catalog = fixture.EmptyCatalog(fixture.context, service);
+  fixture.gate.held = fixture.fence;
+  ASSERT_TRUE(fixture.kernel->StageGlobalIoRuleCatalog(
+      fixture.context, catalog, service, fixture.fence, parent.value()).ok());
+  auto foreign = parent.value();
+  foreign.intent.request_id = RequestId("foreign.global.request");
+  EXPECT_FALSE(fixture.kernel->DiscardStagedGlobalIoRuleCatalog(fixture.fence, foreign).ok());
+  ASSERT_TRUE(fixture.kernel->DiscardStagedGlobalIoRuleCatalog(fixture.fence, parent.value()).ok());
+  fixture.gate.held.reset();
+  EXPECT_FALSE(fixture.kernel->ActivateGlobalIoRuleCatalog(fixture.context, service).ok());
+  EXPECT_FALSE(fixture.kernel->ReadInterruptRuleStateBaseline());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleCatalogRemovalRetiresExactTokenWithPendingEvidenceAndLateSamplesStayRetired) {
+  GlobalRuleCatalogFixture fixture;
+  auto source = program_io_service(fixture.clock);
+  ASSERT_TRUE(source);
+  const auto signal = program_io_descriptor();
+  const IoSourceIncarnation incarnation("global.source.1");
+  ASSERT_TRUE(source->InstallSource(signal.source_id, incarnation, std::nullopt).ok());
+  const auto publish = [&](std::uint64_t sequence, bool value) {
+    return source->Publish({signal.source_id, incarnation, sequence, fixture.clock.now(),
+        {{signal.signal_id, IoSampleValidity::kValid, value, std::nullopt}}});
+  };
+  ASSERT_TRUE(publish(1U, false).ok());
+  IoConditionDefinitionDTO definition;
+  definition.inputs.push_back({signal.signal_id, IoConditionValueKind::kBoolean});
+  definition.nodes.emplace_back(IoConditionCompareDTO{IoConditionComparison::kEqual,
+      IoConditionInputReferenceDTO{0U}, IoConditionValueDTO{true}});
+  auto checked = CheckIoCondition(std::move(definition), {1U, 1U, 1U, 1U, 128U, 128U});
+  ASSERT_TRUE(checked.ok());
+  auto observed = std::make_shared<GlobalRuleCatalogObservedService>(source);
+  const auto configuration = source->RuleServiceConfiguration();
+  ASSERT_TRUE(configuration.ok());
+  auto catalog = std::make_shared<const IoActivationRuleCatalogDTO>(IoActivationRuleCatalogDTO{
+      {fixture.context.owner_epoch, configuration.value().catalog_generation,
+       fixture.context.active_publication_generation, fixture.context.retained_bundle_id,
+       fixture.context.graph_revision},
+      {{InterruptPolicyId("global.ready"),
+        std::make_shared<const CheckedIoCondition>(std::move(checked.value())),
+        {signal.source_id}, IoActivationAllMotionScopeDTO{}, std::nullopt, 7, std::nullopt}},
+      std::nullopt, {}});
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(true).ok());
+  ASSERT_TRUE(fixture.kernel->RestoreGlobalIoRuleCatalog(fixture.context, catalog, observed).ok());
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(false).ok());
+  ASSERT_TRUE(observed->last_registration);
+  const auto token = *observed->last_registration;
+  ASSERT_TRUE(publish(2U, true).ok());
+  const auto matched = source->ReadRuleEvidence(token);
+  ASSERT_TRUE(matched.ok());
+  ASSERT_TRUE(matched.value().trip);
+  const auto parent = fixture.Claim();
+  ASSERT_TRUE(parent.ok()) << parent.error().message;
+  auto successor = fixture.context;
+  successor.active_publication_generation = ActiveBundlePublicationGeneration(2U);
+  fixture.gate.held = fixture.fence;
+  ASSERT_TRUE(fixture.kernel->StageGlobalIoRuleCatalog(
+      successor, nullptr, nullptr, fixture.fence, parent.value()).ok());
+  fixture.gate.held.reset();
+  ASSERT_TRUE(fixture.kernel->ActivateGlobalIoRuleCatalog(successor, nullptr).ok());
+  ASSERT_TRUE(observed->retired_evidence);
+  ASSERT_TRUE(observed->retired_evidence->trip);
+  EXPECT_EQ(observed->retired_evidence->trip->registration, token);
+  const auto retired = source->ReadRuleEvidence(token);
+  ASSERT_TRUE(retired.ok());
+  EXPECT_EQ(retired.value().state, IoRuleRegistrationState::kRetired);
+  EXPECT_FALSE(retired.value().trip);
+  EXPECT_TRUE(retired.value().source_losses.empty());
+  EXPECT_FALSE(retired.value().evaluation_error);
+  ASSERT_TRUE(publish(3U, false).ok());
+  ASSERT_TRUE(publish(4U, true).ok());
+  const auto after_late_samples = source->ReadRuleEvidence(token);
+  ASSERT_TRUE(after_late_samples.ok());
+  EXPECT_EQ(after_late_samples.value(), retired.value());
+  EXPECT_EQ(fixture.kernel->ReadInterruptRuleStateBaseline()->verified_empty, successor);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleCatalogRemovalWaitsForPriorDurableTransitionBeforeVerifiedEmptyReady) {
+  GlobalRuleCatalogFixture fixture;
+  // Declared after the fixture: even an assertion failure releases the journal
+  // before Kernel teardown waits for its existing projection worker.
+  HeldSettlementCall blocked_journal;
+  fixture.journal.record_hook = [block = blocked_journal.Blocker()](std::string_view kind) {
+    if (kind == "interrupt_rule_state_changed") block();
+  };
+  auto service = program_io_service(fixture.clock);
+  ASSERT_TRUE(service);
+  const auto signal = program_io_descriptor();
+  const IoSourceIncarnation incarnation("global.initial.source");
+  ASSERT_TRUE(service->InstallSource(signal.source_id, incarnation, std::nullopt).ok());
+  ASSERT_TRUE(service->Publish({signal.source_id, incarnation, 1U, fixture.clock.now(),
+      {{signal.signal_id, IoSampleValidity::kValid, true, std::nullopt}}}).ok());
+  IoConditionDefinitionDTO definition;
+  definition.inputs.push_back({signal.signal_id, IoConditionValueKind::kBoolean});
+  definition.nodes.emplace_back(IoConditionCompareDTO{IoConditionComparison::kEqual,
+      IoConditionInputReferenceDTO{0U}, IoConditionValueDTO{true}});
+  auto checked = CheckIoCondition(std::move(definition), {1U, 1U, 1U, 1U, 128U, 128U});
+  ASSERT_TRUE(checked.ok());
+  const auto configuration = service->RuleServiceConfiguration();
+  ASSERT_TRUE(configuration.ok());
+  const auto catalog = std::make_shared<const IoActivationRuleCatalogDTO>(IoActivationRuleCatalogDTO{
+      {fixture.context.owner_epoch, configuration.value().catalog_generation,
+       fixture.context.active_publication_generation, fixture.context.retained_bundle_id,
+       fixture.context.graph_revision},
+      {{InterruptPolicyId("global.baseline"),
+        std::make_shared<const CheckedIoCondition>(std::move(checked.value())),
+        {signal.source_id}, IoActivationAllMotionScopeDTO{}, std::nullopt, 5, std::nullopt}},
+      std::nullopt, {}});
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(true).ok());
+  ASSERT_TRUE(fixture.kernel->RestoreGlobalIoRuleCatalog(fixture.context, catalog, service).ok());
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(false).ok());
+  ASSERT_TRUE(blocked_journal.Entered());
+  const auto parent = fixture.Claim();
+  ASSERT_TRUE(parent.ok()) << parent.error().message;
+  auto successor = fixture.context;
+  successor.active_publication_generation = ActiveBundlePublicationGeneration(2U);
+  fixture.gate.held = fixture.fence;
+  ASSERT_TRUE(fixture.kernel->StageGlobalIoRuleCatalog(
+      successor, nullptr, nullptr, fixture.fence, parent.value()).ok());
+  fixture.gate.held.reset();
+  ASSERT_TRUE(fixture.kernel->ActivateGlobalIoRuleCatalog(successor, nullptr).ok());
+  const auto pending = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(pending);
+  EXPECT_EQ(pending->status, IoRuleStateProjectionStatusDTO::kPending);
+  EXPECT_EQ(pending->verified_empty, successor);
+  EXPECT_FALSE(pending->catalog);
+  EXPECT_FALSE(pending->baseline);
+  {
+    std::lock_guard lock(fixture.journal.mutex);
+    EXPECT_TRUE(fixture.journal.interrupt_rule_state_changes.empty());
+  }
+  blocked_journal.Release();
+  ASSERT_TRUE(wait_until([&] {
+    const auto actual = fixture.kernel->ReadInterruptRuleStateBaseline();
+    return actual && actual->status == IoRuleStateProjectionStatusDTO::kReady;
+  }));
+  const auto ready = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(ready);
+  EXPECT_EQ(ready->verified_empty, successor);
+  EXPECT_FALSE(ready->catalog);
+  EXPECT_FALSE(ready->baseline);
+  std::lock_guard lock(fixture.journal.mutex);
+  ASSERT_EQ(fixture.journal.interrupt_rule_state_changes.size(), 1U);
+  EXPECT_EQ(fixture.journal.interrupt_rule_state_changes.front().context, catalog->context);
+  EXPECT_EQ(fixture.journal.interrupt_rule_state_changes.front().rule.state,
+            IoGlobalRuleState::kTripped);
+}
+
+// Product reseal is a private transition under the existing exact Apply claim.
+// These tests reuse the actual Kernel owner/map and the prior trusted-source
+// contract fixture; they do not qualify a host's retained-driver witness producer.
+TEST(ResourceAddressedExecutionKernelTest,
+     RetainedInputOnlyProviderProductResealPreservesActualFactsAtSameGeneration) {
+  for (bool open : {false, true}) {
+    SCOPED_TRACE(open);
+    ProviderCandidateClosedFixture fixture;
+    ASSERT_TRUE(fixture.kernel
+                    ->publish_installed_provider_candidate_closed(fixture.fence, fixture.parent,
+                                                                  fixture.facts)
+                    .ok());
+    if (open) {
+      const auto snapshot = provider_domain_currentness_snapshot();
+      const ComponentCommandReadinessPublicationDTO authority{
+          ComponentReadinessAuthorityDTO::kParentApplyFence,
+          {},
+          fixture.fence.configuration_fence_id,
+          fixture.facts.controllable_component_id,
+          fixture.facts.component_lifecycle_generation,
+          true,
+          fixture.fence.expected_scope};
+      auto observations = provider_domain_driver_observations(snapshot);
+      observations.front().source_sequence = 7U;
+      observations.front().observation_generation = 9U;
+      ASSERT_TRUE(
+          fixture.kernel->publish_runtime_provider_configuration(authority, snapshot, observations)
+              .ok());
+    }
+    const auto domain = fixture.facts.domains.front().control_domain_id;
+    const auto before = fixture.kernel->current_runtime_provider_configuration(domain);
+    ASSERT_TRUE(before.ok());
+    ASSERT_TRUE(before.value());
+    const ConfigurationFenceScopeDTO unchanged{};
+    fixture.gate.actual.held_scope = unchanged;
+    const RetainedBundleId next_bundle(test_digest('c'));
+    const GraphRevision next_graph(test_digest('d'));
+    const auto resealed = fixture.kernel->reconfigure_runtime_component_set(
+        {}, {}, next_bundle, next_graph, fixture.fence.configuration_fence_id, unchanged,
+        {fixture.facts.controllable_component_id}, {}, fixture.facts.domains,
+        fixture.facts.provider_occurrences, &fixture.parent);
+    ASSERT_TRUE(resealed.ok()) << resealed.error().message;
+    auto expected = *before.value();
+    expected.retained_bundle_id = next_bundle;
+    expected.graph_revision = next_graph;
+    const auto after = fixture.kernel->current_runtime_provider_configuration(domain);
+    ASSERT_TRUE(after.ok());
+    EXPECT_EQ(after.value(), std::optional(expected));
+    EXPECT_TRUE(fixture.kernel->resource_snapshot().empty());  // genuine input-only map
+
+    // The normal publication guard remains strict. An old product cannot
+    // overwrite the re-anchored fact, even at exactly the same generation.
+    ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(true).ok());
+    auto snapshot = provider_domain_currentness_snapshot();
+    const ComponentCommandReadinessPublicationDTO authority{
+        ComponentReadinessAuthorityDTO::kRestartExclusion,
+        {},
+        {},
+        snapshot.controllable_component_id,
+        snapshot.component_lifecycle_generation,
+        open};
+    EXPECT_FALSE(fixture.kernel
+                     ->publish_runtime_provider_configuration(
+                         authority, snapshot,
+                         open ? provider_domain_driver_observations(snapshot)
+                              : std::vector<BrandLifecycleObservationDTO>{})
+                     .ok());
+    auto& publication = snapshot.active_publication_receipt.request;
+    publication.candidate_retained_bundle_id = next_bundle;
+    publication.candidate_graph_revision = next_graph;
+    publication.candidate_projection_revision.retained_bundle_id = next_bundle;
+    publication.candidate_projection_revision.graph_revision = next_graph;
+    const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(snapshot);
+    ASSERT_TRUE(digest.ok());
+    snapshot.snapshot_digest = digest.value();
+    auto observations = provider_domain_driver_observations(snapshot);
+    observations.front().source_sequence = 7U;
+    observations.front().observation_generation = 9U;
+    EXPECT_TRUE(fixture.kernel
+                    ->publish_runtime_provider_configuration(
+                        authority, snapshot,
+                        open ? observations : std::vector<BrandLifecycleObservationDTO>{})
+                    .ok());
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RetainedProviderProductResealRefusesIncompleteForeignAndLostAuthorityAtomically) {
+  for (unsigned scenario = 0U; scenario < 9U; ++scenario) {
+    SCOPED_TRACE(scenario);
+    ProviderCandidateClosedFixture fixture;
+    ASSERT_TRUE(fixture.kernel
+                    ->publish_installed_provider_candidate_closed(fixture.fence, fixture.parent,
+                                                                  fixture.facts)
+                    .ok());
+    const auto id = fixture.facts.domains.front().control_domain_id;
+    const auto before = fixture.kernel->current_runtime_provider_configuration(id).value();
+    auto domains = fixture.facts.domains;
+    auto occurrences = fixture.facts.provider_occurrences;
+    auto parent = fixture.parent;
+    std::vector<ControllableComponentId> retained{fixture.facts.controllable_component_id};
+    ConfigurationFenceScopeDTO scope{};
+    fixture.gate.actual.held_scope = scope;
+    if (scenario == 0U) {
+      domains.clear();
+      occurrences.clear();
+    }
+    if (scenario == 1U) occurrences.front().provider_runtime_epoch = RuntimeEpoch("foreign.epoch");
+    if (scenario == 2U) {
+      std::get<ResolvedProviderDomainScopeDTO>(domains.front().payload)
+          .provider.signal_configuration_digest = ContentDigest(test_digest('a'));
+    }
+    if (scenario == 3U) {
+      scope = fixture.fence.expected_scope; // A changed provider cannot borrow reseal proof.
+      fixture.gate.actual.held_scope = scope;
+    }
+    if (scenario == 4U) parent.claim_generation = CellAdmissionClaimGeneration(999U);
+    if (scenario == 5U) {
+      domains.push_back(domains.front());
+      occurrences.push_back(occurrences.front());
+    }
+    if (scenario == 6U) occurrences.clear();
+    unsigned checks = 0U;
+    if (scenario == 7U)
+      fixture.gate.before_exact_check = [&] {
+        if (++checks > 1U) fixture.gate.actual.reject_reservation = false;
+      };
+    const auto rejected = fixture.kernel->reconfigure_runtime_component_set(
+        {}, {}, RetainedBundleId(test_digest('c')), GraphRevision(test_digest('d')),
+        fixture.fence.configuration_fence_id, scope, retained, {}, domains, occurrences,
+        scenario == 8U ? nullptr : &parent);
+    EXPECT_FALSE(rejected.ok());
+    EXPECT_EQ(fixture.kernel->current_runtime_provider_configuration(id).value(), before);
+    EXPECT_TRUE(fixture.kernel->resource_snapshot().empty());
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RetainedProviderProductResealCommitsOnlyAfterSuccessfulPublicationCallback) {
+  ProviderCandidateClosedFixture fixture;
+  ASSERT_TRUE(fixture.kernel
+                  ->publish_installed_provider_candidate_closed(fixture.fence, fixture.parent,
+                                                                fixture.facts)
+                  .ok());
+  const auto id = fixture.facts.domains.front().control_domain_id;
+  const auto before = fixture.kernel->current_runtime_provider_configuration(id).value();
+  const ConfigurationFenceScopeDTO scope{};
+  fixture.gate.actual.held_scope = scope;
+  bool called = false;
+  const auto rejected = fixture.kernel->reconfigure_runtime_component_set(
+      {}, {}, RetainedBundleId(test_digest('c')), GraphRevision(test_digest('d')),
+      fixture.fence.configuration_fence_id, scope, {fixture.facts.controllable_component_id},
+      [&] {
+        called = true;
+        return Result<void>::Err({"publication_failed", "actual commit refusal", {}});
+      },
+      fixture.facts.domains, fixture.facts.provider_occurrences, &fixture.parent);
+  EXPECT_TRUE(called);
+  EXPECT_FALSE(rejected.ok());
+  EXPECT_EQ(fixture.kernel->current_runtime_provider_configuration(id).value(), before);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RetainedProviderResealKeepsChangedDomainClosedStagingSeparate) {
+  ProviderCandidateClosedFixture fixture;
+  ASSERT_TRUE(fixture.kernel
+                  ->publish_installed_provider_candidate_closed(fixture.fence, fixture.parent,
+                                                                fixture.facts)
+                  .ok());
+  auto changed = fixture.facts;
+  changed.controllable_component_id = ControllableComponentId("device.changed");
+  auto& domain = changed.domains.front();
+  domain.control_domain_id = ControlDomainId("domain.changed");
+  auto& provider = std::get<ResolvedProviderDomainScopeDTO>(domain.payload).provider;
+  provider.controllable_component_id = changed.controllable_component_id;
+  provider.provider_instance_id = ProviderInstanceId("provider.changed");
+  auto& occurrence = changed.provider_occurrences.front();
+  occurrence.control_domain_id = domain.control_domain_id;
+  occurrence.provider_instance_id = provider.provider_instance_id;
+  const ProviderConfigurationFenceOccurrenceDTO membership{changed.controllable_component_id,
+                                                           provider.provider_instance_id,
+                                                           provider.signal_configuration_digest,
+                                                           {}};
+  auto scope = fixture.fence.expected_scope;
+  scope.controllable_component_ids = {changed.controllable_component_id};
+  scope.domains = {{domain.control_domain_id,
+                    {},
+                    domain.control_domain_revision,
+                    ProviderConfigurationFenceDomainDTO{{}, membership}}};
+  fixture.fence.expected_scope = scope;
+  fixture.gate.actual.held_scope = scope;
+  ASSERT_TRUE(
+      fixture.kernel
+          ->publish_installed_provider_candidate_closed(fixture.fence, fixture.parent, changed)
+          .ok());
+  const auto old =
+      fixture.kernel
+          ->current_runtime_provider_configuration(fixture.facts.domains.front().control_domain_id)
+          .value();
+  ASSERT_TRUE(old);
+  changed.retained_bundle_id = RetainedBundleId(test_digest('c'));
+  changed.graph_revision = GraphRevision(test_digest('d'));
+  domain.control_domain_revision = ControlDomainRevision(test_digest('e'));
+  occurrence.control_domain_revision = domain.control_domain_revision;
+  scope.domains.front().predecessor_control_domain_revision =
+      fixture.facts.domains.front().control_domain_revision;
+  scope.domains.front().candidate_control_domain_revision = domain.control_domain_revision;
+  scope.domains.front().payload = ProviderConfigurationFenceDomainDTO{membership, membership};
+  fixture.fence.expected_scope = scope;
+  fixture.gate.actual.held_scope = scope;
+  const auto installed = fixture.kernel->reconfigure_runtime_component_set(
+      {}, {}, changed.retained_bundle_id, changed.graph_revision,
+      fixture.fence.configuration_fence_id, scope, {fixture.facts.controllable_component_id}, {},
+      fixture.facts.domains, fixture.facts.provider_occurrences, &fixture.parent);
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+  auto expected = *old;
+  expected.retained_bundle_id = changed.retained_bundle_id;
+  expected.graph_revision = changed.graph_revision;
+  EXPECT_EQ(
+      fixture.kernel
+          ->current_runtime_provider_configuration(fixture.facts.domains.front().control_domain_id)
+          .value(),
+      std::optional(expected));
+  EXPECT_FALSE(
+      fixture.kernel->current_runtime_provider_configuration(domain.control_domain_id).value());
+  const auto staged = fixture.kernel->publish_installed_provider_candidate_closed(
+      fixture.fence, fixture.parent, changed);
+  ASSERT_TRUE(staged.ok()) << staged.error().message;
+  EXPECT_FALSE(staged.value().front().operation_admission_open);
+  EXPECT_EQ(staged.value().front().driver_source_sequence, 0U);
+  EXPECT_EQ(staged.value().front().driver_observation_generation, 0U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ChangedPhysicalOwnerCanKeepSameComponentProviderFactsWithoutPhysicalRetention) {
+  // Both physical engines outlive the real Kernel's subscription teardown.
+  FakeParticipantEngine original_engine, replacement_engine;
+  ProviderCandidateClosedFixture fixture;
+  auto physical_value =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular).value();
+  physical_value.retained_bundle_id = fixture.facts.retained_bundle_id;
+  physical_value.graph_revision = fixture.facts.graph_revision;
+  physical_value.controllable_component_id = fixture.facts.controllable_component_id;
+  const auto physical = verify_runtime_participant_binding(physical_value);
+  ASSERT_TRUE(physical.ok()) << physical.error().message;
+  ASSERT_TRUE(
+      fixture.kernel
+          ->reconfigure_runtime_participants({registration(physical.value(), original_engine)})
+          .ok());
+  const auto snapshot = provider_domain_currentness_snapshot();
+  const ComponentCommandReadinessPublicationDTO authority{
+      ComponentReadinessAuthorityDTO::kParentApplyFence,
+      {},
+      fixture.fence.configuration_fence_id,
+      fixture.facts.controllable_component_id,
+      fixture.facts.component_lifecycle_generation,
+      true,
+      fixture.fence.expected_scope};
+  auto observations = provider_domain_driver_observations(snapshot);
+  observations.front().source_sequence = 11U;
+  observations.front().observation_generation = 13U;
+  const auto active =
+      fixture.kernel->publish_runtime_provider_configuration(authority, snapshot, observations);
+  ASSERT_TRUE(active.ok()) << active.error().message;
+  const auto before = active.value().front();
+  const auto& path = *physical_value.control_path;
+  const ConfigurationFenceScopeDTO physical_change{
+      {physical_value.controllable_component_id},
+      {{path.control_domain_id, path.control_domain_revision, path.control_domain_revision}},
+      {{path.control_binding_id, path.control_binding_revision, path.control_binding_revision}},
+      {physical_value.resources.front().resource_id}};
+  ASSERT_TRUE(physical_change.valid());
+  fixture.gate.actual.held_scope = physical_change;
+  physical_value.retained_bundle_id = RetainedBundleId(test_digest('c'));
+  physical_value.graph_revision = GraphRevision(test_digest('d'));
+  const auto candidate = verify_runtime_participant_binding(physical_value);
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  const auto installed = fixture.kernel->reconfigure_runtime_component_set(
+      {registration(candidate.value(), replacement_engine)}, {}, physical_value.retained_bundle_id,
+      physical_value.graph_revision, fixture.fence.configuration_fence_id, physical_change,
+      {},  // The component's physical owner changed: no whole-component retention.
+      {}, fixture.facts.domains, fixture.facts.provider_occurrences, &fixture.parent);
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+  auto expected = before;
+  expected.retained_bundle_id = physical_value.retained_bundle_id;
+  expected.graph_revision = physical_value.graph_revision;
+  EXPECT_EQ(
+      fixture.kernel
+          ->current_runtime_provider_configuration(fixture.facts.domains.front().control_domain_id)
+          .value(),
+      std::optional(expected));
+  EXPECT_FALSE(fixture.kernel->participant_engine_in_use(&original_engine));
+  EXPECT_TRUE(fixture.kernel->participant_engine_in_use(&replacement_engine));
+  EXPECT_EQ(original_engine.execute_calls, 0);
+  EXPECT_EQ(replacement_engine.execute_calls, 0);
+}
+
+struct GlobalMotionRuleFixture final {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine engine, other_engine;
+  GlobalRuleCatalogTestGate gate;
+  RuntimeParticipantBinding binding = IoRuleIntegrationFixture::CodecQualifiedPlannerBinding(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), '1');
+  RuntimeParticipantBinding other_binding = IoRuleIntegrationFixture::CodecQualifiedPlannerBinding(
+      coordinated_occurrence(binding, "2"), '2');
+  std::shared_ptr<IoSignalSubsystem> service;
+  std::unique_ptr<ResourceAddressedExecutionKernel> kernel;
+  const IoRuleAppliedContextDTO context{RequestOwnerEpoch("kernel.epoch.1"),
+      ActiveBundlePublicationGeneration(1U), binding.value().retained_bundle_id,
+      binding.value().graph_revision};
+  std::uint64_t sequence{};
+  std::optional<MotionInterruptStopProfileDTO> node_profile;
+
+  GlobalMotionRuleFixture(bool group = false, bool initial = true,
+      InterruptPostLatchDisposition release = InterruptPostLatchDisposition::kAwaitOperatorAck,
+      IoRuleIdleBehaviourDTO idle = IoRuleIdleBehaviourDTO::kLatch,
+      std::optional<int> node_priority = {}, int global_priority = 20,
+      std::string global_rule_id = "global.guard", bool additional_loss_guard = false,
+      bool command_sibling = false, bool waiting_program_key = false,
+      std::shared_ptr<GlobalRuleCatalogObservedService>* observe_retirement = nullptr,
+      bool no_applied_program = false) {
+    IoConditionDefinitionDTO definition;
+    definition.inputs.push_back({program_io_descriptor().signal_id, IoConditionValueKind::kBoolean});
+    definition.nodes.emplace_back(IoConditionCompareDTO{IoConditionComparison::kEqual,
+        IoConditionInputReferenceDTO{0U}, IoConditionValueDTO{true}});
+    if (waiting_program_key && !no_applied_program) {
+      definition.inputs.push_back(
+          {IoConditionBlackboardKeyDTO{"flag"}, IoConditionValueKind::kBoolean});
+      definition.nodes.emplace_back(std::in_place_type<IoConditionCompareDTO>,
+          IoConditionComparison::kEqual,
+          IoConditionOperandDTO{IoConditionInputReferenceDTO{1U}},
+          IoConditionOperandDTO{IoConditionValueDTO{true}});
+      definition.nodes.emplace_back(std::in_place_type<IoConditionAllDTO>,
+                                    std::vector<std::size_t>{0U, 1U});
+    }
+    const IoConditionLimitsDTO limits = waiting_program_key && !no_applied_program
+        ? IoConditionLimitsDTO{2U, 3U, 2U, 2U, 128U, 128U}
+        : IoConditionLimitsDTO{1U, 1U, 1U, 1U, 128U, 128U};
+    auto checked = CheckIoCondition(std::move(definition), limits);
+    if (!checked.ok()) throw std::logic_error("condition failed");
+    std::shared_ptr<const CheckedIoCondition> condition =
+        std::make_shared<const CheckedIoCondition>(std::move(checked.value()));
+    if (waiting_program_key && no_applied_program) condition.reset();
+    ResourceAddressedExecutionKernelConfig config{context.owner_epoch, CellId("cell.test"), 16U};
+    auto managers = EmptyManagerLivenessSet();
+    managers.active_bundle_id = context.retained_bundle_id;
+    config.manager_liveness_required_set = managers;
+    config.operation_admission_gate = &gate;
+    if (command_sibling) {
+      other_binding = coordinated_occurrence(grouped_command_binding(), "2");
+      other_engine.next_command_result.command_id = other_engine.next_execution_id;
+      other_engine.gripper_status.command_id = other_engine.next_execution_id;
+      other_engine.gripper_status.gripper_id = other_binding.value().command_target_id.value();
+      other_engine.gripper_status.generation = other_engine.next_command_result.generation;
+      other_engine.gripper_status.state = GripperCommandState::kExecuting;
+    }
+    auto primary = registration(binding, engine);
+    if (node_priority) {
+      node_profile = *primary.default_operator_stop_profile;
+      node_profile->profile_id = "node.search.profile";
+      node_profile->allow_natural_completion_on_short_path = false;
+      IoMotionRulePolicyBindingDTO policy{InterruptPolicyId("node.search"), condition,
+          {program_io_descriptor().source_id}, {MotionInterruptActivationMode::kRequireInactiveAtArm},
+          {MotionInterruptStopMode::kSoftOnPath}, *node_priority};
+      policy.semantics = IoMotionRulePolicySemanticsDTO{InterruptPolicyScopeKind::kMove,
+          InterruptPreemptionAction::kCompleteMoveOnSignal, {OperationStateKind::kExecuting},
+          InterruptPostLatchDisposition::kAutoClearAfterMotionOutcome, false, {}};
+      policy.maximum_scope = IoRuleIntegrationFixture::MaximumScope(binding);
+      primary.io_motion_rule_policies.push_back(std::move(policy));
+    }
+    kernel = std::make_unique<ResourceAddressedExecutionKernel>(
+        std::vector{std::move(primary), registration(other_binding, other_engine)},
+        clock, scheduler, journal, std::move(config));
+    if (!ready_cell_admission(*kernel).ok()) throw std::logic_error("global readiness failed");
+    if (additional_loss_guard) {
+      auto other = program_io_descriptor();
+      other.signal_id.name = "other_ready";
+      other.source_id = InterruptSourceId("gpio.other");
+      auto made = IoSignalSubsystem::Create(
+          {context.owner_epoch, 1U, {program_io_descriptor(), other}},
+          {2U, 2U, 4U, 8U, 512U, 1024U}, clock);
+      if (!made.ok()) throw std::logic_error("two-source service failed");
+      service = std::shared_ptr<IoSignalSubsystem>(std::move(made.value()));
+      const IoSourceIncarnation other_incarnation("global.other.1");
+      if (!service->InstallSource(other.source_id, other_incarnation, std::nullopt).ok() ||
+          !service->Publish({other.source_id, other_incarnation, 1U, clock.now(),
+              {{other.signal_id, IoSampleValidity::kValid, false, std::nullopt}}}).ok())
+        throw std::logic_error("other source baseline failed");
+    } else {
+      service = program_io_service(clock);
+    }
+    if (!service->InstallSource(program_io_descriptor().source_id, IoSourceIncarnation("global.1"),
+                                 std::nullopt).ok()) throw std::logic_error("source failed");
+    if (initial && !Publish(false).ok()) throw std::logic_error("baseline failed");
+    IoActivationRuleScopeSelectionDTO scope = IoActivationAllMotionScopeDTO{};
+    const auto program = program_execution_capture().program_binding_id;
+    if (group) {
+      const auto& actual = binding.value();
+      const auto& path = *actual.control_path;
+      scope = IoActivationExecutionGroupsScopeDTO{program, {"arm"},
+          {{actual.controllable_component_id, actual.command_target_id, path.control_domain_id,
+            path.control_binding_id, path.control_binding_revision}}};
+    }
+    std::shared_ptr<const IoActivationRuleCatalogDTO> catalog =
+        std::make_shared<const IoActivationRuleCatalogDTO>(IoActivationRuleCatalogDTO{
+        {context.owner_epoch, 1U, context.active_publication_generation,
+         context.retained_bundle_id, context.graph_revision},
+        {{InterruptPolicyId(std::move(global_rule_id)),
+          condition,
+          {program_io_descriptor().source_id}, std::move(scope), idle, global_priority, std::nullopt, release,
+          waiting_program_key && no_applied_program ? std::vector<std::string>{"flag"}
+                                                    : std::vector<std::string>{}}},
+        (group || waiting_program_key) && !no_applied_program ? std::optional(program) : std::nullopt,
+        waiting_program_key && !no_applied_program ? std::vector<std::string>{"flag"}
+                                                 : std::vector<std::string>{}});
+    if (additional_loss_guard) {
+      auto other = program_io_descriptor();
+      other.signal_id.name = "other_ready";
+      other.source_id = InterruptSourceId("gpio.other");
+      IoConditionDefinitionDTO other_definition;
+      other_definition.inputs.push_back({other.signal_id, IoConditionValueKind::kBoolean});
+      other_definition.nodes.emplace_back(IoConditionCompareDTO{IoConditionComparison::kEqual,
+          IoConditionInputReferenceDTO{0U}, IoConditionValueDTO{true}});
+      auto checked_other = CheckIoCondition(std::move(other_definition),
+                                            {1U, 1U, 1U, 1U, 128U, 128U});
+      if (!checked_other.ok()) throw std::logic_error("other condition failed");
+      auto extended = std::make_shared<IoActivationRuleCatalogDTO>(*catalog);
+      extended->rules.push_back({InterruptPolicyId("global.loss"),
+          std::make_shared<const CheckedIoCondition>(std::move(checked_other.value())),
+          {other.source_id}, extended->rules.front().scope, idle, global_priority - 1,
+          std::nullopt, release});
+      catalog = std::move(extended);
+    }
+    std::shared_ptr<IIoSignalService> active_service = service;
+    if (observe_retirement) {
+      *observe_retirement = std::make_shared<GlobalRuleCatalogObservedService>(service);
+      active_service = *observe_retirement;
+    }
+    if (!kernel->SetRouteRecoveryPending(true).ok() ||
+        !kernel->RestoreGlobalIoRuleCatalog(context, catalog, active_service).ok() ||
+        !kernel->SetRouteRecoveryPending(false).ok())
+      throw std::logic_error("global catalog failed");
+    engine.execute_return_hook = [&] {
+      engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    };
+    other_engine.execute_return_hook = [&] {
+      other_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    };
+    engine.next_stop_evidence = JsonValueDTO{JsonObjectDTO{
+        {"completed_by_natural_completion", JsonValueDTO{false}}}};
+    other_engine.next_stop_evidence = engine.next_stop_evidence;
+  }
+  Result<IoSourceCursorDTO> Publish(bool value) {
+    return service->Publish({program_io_descriptor().source_id, IoSourceIncarnation("global.1"),
+        ++sequence, clock.now(), {{program_io_descriptor().signal_id,
+          IoSampleValidity::kValid, value, std::nullopt}}});
+  }
+  OperationIntentDTO Intent(bool other = false, std::string id = "global.motion") {
+    auto intent = motion_operation(std::move(id));
+    if (other) {
+      intent.participants.front().component_role_id = other_binding.value().component_role_id;
+      intent.participants.front().target_role_id = other_binding.value().target_role_id;
+    }
+    if (!other && node_profile)
+      std::get<MotionParticipantIntentDTO>(intent.participants.front().payload)
+          .motion_interrupt_scopes.push_back({"node.scope", "node.search",
+              MotionInterruptActivationMode::kRequireInactiveAtArm, {}, {}, true,
+              *node_profile, MotionInterruptNodeCategory::kGeneric, {}});
+    return intent;
+  }
+  bool Certified(const OperationId& operation) {
+    const auto state = kernel->get_operation_state(operation);
+    if (!state.ok() || !state.value().active_stop_id) return false;
+    const auto status = kernel->get_stop_status(*state.value().active_stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }
+  IoGlobalRuleRecoveryIntentDTO Recovery() {
+    const auto offers = kernel->ReadGlobalIoRuleRecoveryOffers();
+    if (!offers.ok() || offers.value().size() != 1U) throw std::logic_error("missing global offer");
+    return {{RequestId("global.operator.recovery"), context.owner_epoch, "operator.test", {}},
+            offers.value().front().selector, std::string("operator acknowledged")};
+  }
+};
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleFirstReadingBlocksOnlyResolvedMotionGroupWithoutFabricatedLatch) {
+  GlobalMotionRuleFixture fixture(true, false);
+  const auto initial_projection = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(initial_projection);
+  EXPECT_EQ(initial_projection->status, IoRuleStateProjectionStatusDTO::kPending);
+  EXPECT_FALSE(initial_projection->baseline);
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  const auto blocked = fixture.kernel->execute(fixture.Intent());
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_source_not_ready");
+  EXPECT_EQ(blocked.error().details.at("rule_id"), "global.guard");
+  const auto other = fixture.kernel->execute(fixture.Intent(true));
+  ASSERT_TRUE(other.ok()) << other.error().message;
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+  EXPECT_EQ(fixture.other_engine.execute_calls, 1);
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto allowed = fixture.kernel->execute(fixture.Intent(false, "global.after.first"));
+  EXPECT_TRUE(allowed.ok());
+}
+
+// The catalog here already has a checked, typed Program key. This tests
+// admission while its baseline is absent, not no-Program authored lowering.
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleMixedKeyWaitingForBaselineGatesOnlyItsActualSignalFirstReading) {
+  GlobalMotionRuleFixture fixture(true, false,
+      InterruptPostLatchDisposition::kAwaitOperatorAck, IoRuleIdleBehaviourDTO::kLatch,
+      {}, 20, "global.guard", false, false, true);
+  const auto blocked = fixture.kernel->execute(fixture.Intent(false, "global.mixed.missing"));
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_source_not_ready");
+  EXPECT_EQ(blocked.error().details.at("rule_id"), "global.guard");
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+  // A true signal still does not invent a value for the missing key operand.
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto projection = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(projection);
+  EXPECT_EQ(projection->status, IoRuleStateProjectionStatusDTO::kPending);
+  EXPECT_FALSE(projection->baseline);
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  const auto allowed = fixture.kernel->execute(fixture.Intent(false, "global.mixed.fresh"));
+  ASSERT_TRUE(allowed.ok()) << allowed.error().message;
+  EXPECT_EQ(fixture.engine.execute_calls, 1);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 0);
+  GlobalMotionRuleFixture stale_fixture(true, true,
+      InterruptPostLatchDisposition::kAwaitOperatorAck, IoRuleIdleBehaviourDTO::kLatch,
+      {}, 20, "global.guard", false, false, true);
+  stale_fixture.clock.advance(101);
+  const auto stale = stale_fixture.kernel->execute(stale_fixture.Intent());
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"), "global_interrupt_source_not_ready");
+  EXPECT_EQ(stale_fixture.engine.execute_calls, 0);
+  EXPECT_TRUE(stale_fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleConsumedSignalStillRequiresInactiveRearmBeforeMotion) {
+  std::shared_ptr<GlobalRuleCatalogObservedService> observed;
+  GlobalMotionRuleFixture fixture(true, true,
+      InterruptPostLatchDisposition::kAwaitOperatorAck, IoRuleIdleBehaviourDTO::kIgnore,
+      {}, 20, "global.guard", false, false, false, &observed);
+  ASSERT_TRUE(observed);
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  // A real source change overtakes the consumed observer's retirement, before
+  // its next inactive rearm. Publish through the same actual subsystem after
+  // RetireRule has released its source mutex, without changing Kernel state.
+  auto replacement = std::make_shared<std::optional<Result<IoSourceCursorDTO>>>();
+  observed->after_retire = [source = fixture.service, replacement,
+      signal = program_io_descriptor(), received_at = fixture.clock.now()] {
+    *replacement = source->Publish({signal.source_id, IoSourceIncarnation("global.1"),
+        4U, received_at, {{signal.signal_id, IoSampleValidity::kValid, true, std::nullopt}}});
+  };
+  ASSERT_TRUE(fixture.Publish(false).ok());  // Sequence3: the consumed level clears.
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(replacement->has_value());
+  ASSERT_TRUE(replacement->value().ok());
+  fixture.sequence = 4U;
+  const auto pending = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(pending);
+  EXPECT_EQ(pending->status, IoRuleStateProjectionStatusDTO::kPending);
+  const auto refused = fixture.kernel->execute(fixture.Intent(false, "global.active.rearm"));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "global_interrupt_source_not_ready");
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 0);
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto resumed = fixture.kernel->execute(fixture.Intent(false, "global.inactive.rearmed"));
+  ASSERT_TRUE(resumed.ok()) << resumed.error().message;
+  EXPECT_EQ(fixture.engine.execute_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleNoProgramMixedConditionWaitsWhollyWithoutSignalFreshnessOrPartialTrip) {
+  GlobalMotionRuleFixture fixture(false, false,
+      InterruptPostLatchDisposition::kAwaitOperatorAck, IoRuleIdleBehaviourDTO::kLatch,
+      {}, 20, "global.waiting", false, false, true, nullptr, true);
+  auto projection = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(projection);
+  ASSERT_TRUE(projection->catalog);
+  EXPECT_EQ(projection->status, IoRuleStateProjectionStatusDTO::kPending);
+  const auto& rule = projection->catalog->rules.front();
+  EXPECT_FALSE(rule.condition);
+  EXPECT_EQ(rule.waiting_for_program_keys, std::vector<std::string>{"flag"});
+  EXPECT_FALSE(projection->catalog->program_binding_id);
+  EXPECT_TRUE(projection->catalog->referenced_program_blackboard_keys.empty());
+  // Even an unavailable signal cannot activate or gate this whole waiting rule.
+  const auto moving = fixture.kernel->execute(fixture.Intent(false, "global.wait.no.sample"));
+  ASSERT_TRUE(moving.ok()) << moving.error().message;
+  EXPECT_EQ(fixture.engine.execute_calls, 1);
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  fixture.clock.advance(101);
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 0);
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  projection = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(projection);
+  EXPECT_EQ(projection->status, IoRuleStateProjectionStatusDTO::kPending);
+  EXPECT_FALSE(projection->baseline);
+  std::lock_guard lock(fixture.journal.mutex);
+  EXPECT_TRUE(fixture.journal.interrupt_rule_state_changes.empty());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleNoProgramWaitingDoesNotDisableSeparateSignalOnlyRule) {
+  GlobalMotionRuleFixture fixture(false, true,
+      InterruptPostLatchDisposition::kAwaitOperatorAck, IoRuleIdleBehaviourDTO::kLatch,
+      {}, 20, "global.guard", true, false, true, nullptr, true);
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  auto signal = program_io_descriptor();
+  signal.signal_id.name = "other_ready";
+  signal.source_id = InterruptSourceId("gpio.other");
+  ASSERT_TRUE(fixture.service->Publish({signal.source_id, IoSourceIncarnation("global.other.1"),
+      2U, fixture.clock.now(), {{signal.signal_id, IoSampleValidity::kValid, true, std::nullopt}}}).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(offers.ok());
+  ASSERT_EQ(offers.value().size(), 1U);
+  EXPECT_EQ(offers.value().front().selector.rule_id, InterruptPolicyId("global.loss"));
+  EXPECT_EQ(offers.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kCondition);
+  const auto blocked = fixture.kernel->execute(fixture.Intent());
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("rule_id"), "global.loss");
+  EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_latched");
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleIdleConditionLatchKeepsUnrelatedMotionAvailableAndNeedsActualFalse) {
+  GlobalMotionRuleFixture fixture(true);
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto recovery = fixture.Recovery();
+  const auto blocked = fixture.kernel->execute(fixture.Intent());
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_latched");
+  EXPECT_TRUE(fixture.kernel->execute(fixture.Intent(true)).ok());
+  EXPECT_FALSE(fixture.kernel->recover_global_io_rule(recovery).ok());
+  EXPECT_EQ(fixture.journal.global_rule_recovery_calls, 0U);
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto cleared = fixture.kernel->recover_global_io_rule(recovery);
+  ASSERT_TRUE(cleared.ok()) << cleared.error().message;
+  EXPECT_TRUE(cleared.value().accepted);
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  const auto resumed = fixture.kernel->execute(fixture.Intent(false, "global.after.operator"));
+  EXPECT_TRUE(resumed.ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleUnknownRecoveryCommitRetainsExactPayloadLatchAndReturnsCompletedReplayFirst) {
+  GlobalMotionRuleFixture fixture;
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto intent = fixture.Recovery();
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  fixture.journal.fail_after_global_rule_recovery_commit = true;
+  const auto unknown = fixture.kernel->recover_global_io_rule(intent);
+  ASSERT_FALSE(unknown.ok());
+  EXPECT_EQ(unknown.error().code, "operation_journal_outcome_unknown");
+  const auto still_latched = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(still_latched.ok());
+  ASSERT_EQ(still_latched.value().size(), 1U);
+  EXPECT_EQ(still_latched.value().front().selector, intent.selector);
+  const auto blocked = fixture.kernel->execute(fixture.Intent());
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_latched");
+  const auto completed = fixture.kernel->recover_global_io_rule(intent);
+  ASSERT_TRUE(completed.ok()) << completed.error().message;
+  EXPECT_TRUE(completed.value().accepted);
+  ASSERT_EQ(fixture.journal.global_rule_recoveries.size(), 1U);
+  EXPECT_EQ(fixture.journal.global_rule_recovery_calls, 2U);
+  ASSERT_TRUE(fixture.Publish(true).ok());  // New state cannot change exact replay.
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto replay = fixture.kernel->recover_global_io_rule(intent);
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(fixture.journal.global_rule_recovery_calls, 2U);
+  EXPECT_EQ(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().size(), 1U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleRetainedSuccessorTripCannotOpenAdmissionDuringDurableClear) {
+  GlobalMotionRuleFixture fixture;
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto intent = fixture.Recovery();
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  HeldSettlementCall blocked_journal;
+  fixture.journal.global_rule_recovery_hook = [block = blocked_journal.Blocker()](const auto&) {
+    block();
+  };
+  auto clearing = std::async(std::launch::async, [&] {
+    return fixture.kernel->recover_global_io_rule(intent);
+  });
+  struct ReleaseBeforeFutureWait {
+    HeldSettlementCall& held;
+    ~ReleaseBeforeFutureWait() { held.Release(); }
+  } release_before_future_wait{blocked_journal};
+  ASSERT_TRUE(blocked_journal.Entered());
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  const auto while_pending = fixture.kernel->execute(fixture.Intent());
+  ASSERT_FALSE(while_pending.ok());
+  EXPECT_EQ(while_pending.error().details.at("reason"), "global_interrupt_latched");
+  blocked_journal.Release();
+  ASSERT_TRUE(clearing.get().ok());
+  const auto after = fixture.kernel->execute(fixture.Intent(false, "global.after.successor"));
+  ASSERT_FALSE(after.ok());
+  EXPECT_EQ(after.error().details.at("reason"), "global_interrupt_latched");
+  const auto successor = fixture.Recovery();
+  EXPECT_NE(successor.selector.expected_rule_registration_id,
+            intent.selector.expected_rule_registration_id);
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleActualIdleLossOverridesAutoClearAndRequiresFreshFalseOperatorRecovery) {
+  GlobalMotionRuleFixture fixture(false, true,
+      InterruptPostLatchDisposition::kAutoClearOnSignalRelease, IoRuleIdleBehaviourDTO::kIgnore);
+  fixture.clock.advance(101);
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(offers.ok());
+  ASSERT_EQ(offers.value().size(), 1U);
+  EXPECT_EQ(offers.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kSourceLoss);
+  EXPECT_EQ(offers.value().front().post_latch_disposition,
+            InterruptPostLatchDisposition::kAwaitOperatorAck);
+  EXPECT_FALSE(offers.value().front().current_condition);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 0);
+  const auto intent = fixture.Recovery();
+  EXPECT_FALSE(fixture.kernel->recover_global_io_rule(intent).ok());
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_EQ(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().size(), 1U);
+  EXPECT_TRUE(fixture.kernel->recover_global_io_rule(intent).ok());
+  ASSERT_EQ(fixture.journal.global_rule_recoveries.size(), 1U);
+  ASSERT_TRUE(fixture.journal.global_rule_recoveries.front().first.source_loss_evidence);
+  EXPECT_FALSE(fixture.journal.global_rule_recoveries.front().first.prior_latched_evidence.trip);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleMovingGroupUsesExactParticipantStopAndRetainsDisjointMotion) {
+  GlobalMotionRuleFixture fixture(true);
+  const auto first = fixture.kernel->execute(fixture.Intent());
+  const auto other = fixture.kernel->execute(fixture.Intent(true, "global.disjoint"));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  ASSERT_TRUE(other.ok()) << other.error().message;
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(first.value().operation_id); }));
+  const auto ended = fixture.kernel->get_operation_state(first.value().operation_id).value();
+  EXPECT_EQ(ended.participants.front().state, OperationStateKind::kFailed);
+  ASSERT_TRUE(ended.participants.front().terminal_error);
+  EXPECT_EQ(ended.participants.front().terminal_error->code, "interrupt_fault");
+  const auto running = fixture.kernel->get_operation_state(other.value().operation_id).value();
+  EXPECT_EQ(running.state, OperationStateKind::kExecuting);
+  EXPECT_FALSE(running.active_stop_id);
+  EXPECT_EQ(fixture.other_engine.translate_stop_stage_calls, 0);
+  const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(offers.ok());
+  ASSERT_EQ(offers.value().size(), 1U);
+  EXPECT_EQ(offers.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kCondition);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleMovingSourceLossUsesActualStopAndDoesNotManufactureConditionTrip) {
+  GlobalMotionRuleFixture fixture(true);
+  const auto motion = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(motion.ok()) << motion.error().message;
+  fixture.clock.advance(101);
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(motion.value().operation_id); }));
+  const auto ended = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+  EXPECT_EQ(ended.participants.front().state, OperationStateKind::kFailed);
+  ASSERT_TRUE(ended.participants.front().terminal_error);
+  EXPECT_EQ(ended.participants.front().terminal_error->code, "interrupt_source_unavailable");
+  const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(offers.ok());
+  ASSERT_EQ(offers.value().size(), 1U);
+  EXPECT_EQ(offers.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kSourceLoss);
+  ASSERT_TRUE(ended.active_stop_id);
+  EXPECT_TRUE(fixture.kernel->get_stop_status(*ended.active_stop_id).value().stop_certificate);
+  ASSERT_TRUE(wait_until([&] {
+    const auto snapshot = fixture.kernel->ReadInterruptRuleStateBaseline();
+    return snapshot && snapshot->baseline.has_value();
+  }));
+  const auto baseline = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_EQ(baseline->baseline->states.size(), 1U);
+  EXPECT_EQ(baseline->status, IoRuleStateProjectionStatusDTO::kReady);
+  EXPECT_EQ(baseline->baseline->states.front().state, IoGlobalRuleState::kLatched);
+  EXPECT_FALSE(baseline->baseline->states.front().triggering_acquisition);
+  // Ready describes the durable factual latch, not a fresh source or recovery
+  // permission. The actual current condition is still unknown.
+  EXPECT_FALSE(offers.value().front().current_condition.has_value());
+  EXPECT_FALSE(fixture.kernel->recover_global_io_rule(fixture.Recovery()).ok());
+  EXPECT_EQ(fixture.journal.global_rule_recovery_calls, 0U);
+  std::lock_guard lock(fixture.journal.mutex);
+  EXPECT_TRUE(std::none_of(fixture.journal.interrupt_rule_state_changes.begin(),
+      fixture.journal.interrupt_rule_state_changes.end(), [](const auto& event) {
+        return event.rule.state == IoGlobalRuleState::kTripped;
+      }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleHigherPriorityThanNodeUsesOrdinaryChainAndInterruptsDesiredOutcome) {
+  GlobalMotionRuleFixture fixture(true, true, InterruptPostLatchDisposition::kAwaitOperatorAck,
+                                  IoRuleIdleBehaviourDTO::kLatch, 17, 30);
+  const auto motion = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(motion.ok()) << motion.error().message;
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(motion.value().operation_id); }));
+  const auto ended = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+  ASSERT_EQ(ended.participants.front().io_rule_outcomes.size(), 1U);
+  const auto& outcome = ended.participants.front().io_rule_outcomes.front();
+  EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kInterruptedFault);
+  ASSERT_TRUE(outcome.evidence.trip);  // Actual independent node match remains factual.
+  ASSERT_TRUE(outcome.stop_certificate_id);
+  EXPECT_NE(outcome.terminal_cause, MotionExecutionTerminalCause::kSignalTrip);
+  ASSERT_TRUE(fixture.engine.last_stop_stage);
+  EXPECT_EQ(fixture.engine.last_stop_stage->participant_stop_plan.participant_stop_profile_purpose,
+            ParticipantStopProfilePurposeDTO::kOperator);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleLowerPriorityDuringNodeStopIsTrippedThenReevaluatesActualIdle) {
+  GlobalMotionRuleFixture fixture(true, true, InterruptPostLatchDisposition::kAwaitOperatorAck,
+                                  IoRuleIdleBehaviourDTO::kLatch, 30, 17);
+  const auto motion = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(motion.ok()) << motion.error().message;
+  HeldSettlementCall held_stage;
+  fixture.engine.translate_stop_stage_hook = held_stage.Blocker();
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(held_stage.Entered());
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  ASSERT_TRUE(wait_until([&] {
+    const auto snapshot = fixture.kernel->ReadInterruptRuleStateBaseline();
+    return snapshot && snapshot->baseline.has_value();
+  }));
+  const auto during = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_EQ(during->baseline->states.size(), 1U);
+  EXPECT_EQ(during->baseline->states.front().state, IoGlobalRuleState::kTripped);
+  held_stage.Release();
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(motion.value().operation_id); }));
+  const auto ended = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+  ASSERT_EQ(ended.participants.front().io_rule_outcomes.size(), 1U);
+  EXPECT_EQ(ended.participants.front().io_rule_outcomes.front().terminal_cause,
+            MotionExecutionTerminalCause::kSignalTrip);
+  ASSERT_TRUE(wait_until([&] {
+    return fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().size() == 1U;
+  }));  // Existing terminal boundary, not another sample or polling source.
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleEqualPrioritySourceLossDuringNodeStopKeepsExactStopAndOperatorLatch) {
+  GlobalMotionRuleFixture fixture(true, true, InterruptPostLatchDisposition::kAutoClearOnSignalRelease,
+                                  IoRuleIdleBehaviourDTO::kIgnore, 30, 30, "zglobal.guard");
+  const auto motion = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(motion.ok()) << motion.error().message;
+  HeldSettlementCall held_stage;
+  fixture.engine.translate_stop_stage_hook = held_stage.Blocker();
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(held_stage.Entered());
+  const auto before = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+  ASSERT_TRUE(before.active_stop_id);
+  const auto original = fixture.kernel->get_stop_status(*before.active_stop_id).value().accepted;
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  // The equal-priority condition is factual but cannot supersede the node's
+  // desired Stop. Actual registered-source age loss is a separate fault.
+  fixture.clock.advance(101);
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto during = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+  EXPECT_EQ(during.active_stop_id, before.active_stop_id);
+  EXPECT_EQ(fixture.kernel->get_stop_status(*before.active_stop_id).value().accepted, original);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 1);
+  const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(offers.ok());
+  ASSERT_EQ(offers.value().size(), 1U);
+  EXPECT_EQ(offers.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kSourceLoss);
+  EXPECT_EQ(offers.value().front().post_latch_disposition,
+            InterruptPostLatchDisposition::kAwaitOperatorAck);
+  EXPECT_FALSE(offers.value().front().current_condition);
+  EXPECT_FALSE(fixture.kernel->recover_global_io_rule(fixture.Recovery()).ok());
+  held_stage.Release();
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(motion.value().operation_id); }));
+  const auto ended = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+  EXPECT_EQ(ended.active_stop_id, before.active_stop_id);
+  ASSERT_EQ(ended.participants.size(), 1U);
+  const auto& participant = ended.participants.front();
+  EXPECT_EQ(participant.state, OperationStateKind::kFailed);
+  ASSERT_TRUE(participant.terminal_error);
+  EXPECT_EQ(participant.terminal_error->code, "interrupt_source_unavailable");
+  ASSERT_EQ(participant.io_rule_outcomes.size(), 1U);
+  const auto& outcome = participant.io_rule_outcomes.front();
+  EXPECT_EQ(outcome.terminal_cause, MotionExecutionTerminalCause::kFailed);
+  // Keep the original true acquisition; loss must not become desired success.
+  ASSERT_TRUE(outcome.evidence.trip);
+  EXPECT_FALSE(outcome.evidence.source_losses.empty());
+  EXPECT_EQ(outcome.stop_id, before.active_stop_id);
+  EXPECT_TRUE(outcome.stop_certificate_id);
+  const auto remaining = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(remaining.ok());
+  ASSERT_EQ(remaining.value().size(), 1U);
+  EXPECT_EQ(remaining.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kSourceLoss);
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleRecoveryExactDurableAckAfterAppliedReplacementIsHistoricalOnly) {
+  GlobalMotionRuleFixture fixture;
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto intent = fixture.Recovery();
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  HeldSettlementCall blocked_journal;
+  fixture.journal.global_rule_recovery_hook = [block = blocked_journal.Blocker()](const auto&) {
+    block();
+  };
+  auto recovering = std::async(std::launch::async, [&] {
+    return fixture.kernel->recover_global_io_rule(intent);
+  });
+  struct ReleaseBeforeFutureWait {
+    HeldSettlementCall& held;
+    ~ReleaseBeforeFutureWait() { held.Release(); }
+  } release_before_future_wait{blocked_journal};
+  ASSERT_TRUE(blocked_journal.Entered());
+  auto made = IoSignalSubsystem::Create(
+      {fixture.context.owner_epoch, 2U, {program_io_descriptor()}},
+      {1U, 1U, 4U, 8U, 512U, 1024U}, fixture.clock);
+  ASSERT_TRUE(made.ok());
+  auto successor_service = std::shared_ptr<IoSignalSubsystem>(std::move(made.value()));
+  const auto source = program_io_descriptor().source_id;
+  const IoSourceIncarnation incarnation("global.replacement.2");
+  ASSERT_TRUE(successor_service->InstallSource(source, incarnation, std::nullopt).ok());
+  ASSERT_TRUE(successor_service->Publish({source, incarnation, 1U, fixture.clock.now(),
+      {{program_io_descriptor().signal_id, IoSampleValidity::kValid, true, std::nullopt}}}).ok());
+  auto successor_catalog = std::make_shared<IoActivationRuleCatalogDTO>(
+      *fixture.kernel->installed_global_io_rule_catalog());
+  successor_catalog->context.catalog_generation = 2U;
+  successor_catalog->context.active_publication_generation = ActiveBundlePublicationGeneration(2U);
+  auto successor_context = fixture.context;
+  successor_context.active_publication_generation = ActiveBundlePublicationGeneration(2U);
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(true).ok());
+  ASSERT_TRUE(fixture.kernel->RestoreGlobalIoRuleCatalog(
+      successor_context, successor_catalog, successor_service).ok());
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto successor_offer = fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value();
+  ASSERT_EQ(successor_offer.size(), 1U);
+  EXPECT_EQ(successor_offer.front().selector.context, successor_catalog->context);
+  blocked_journal.Release();
+  const auto accepted = recovering.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(accepted.value().context, intent.selector.context);
+  EXPECT_EQ(fixture.kernel->installed_global_io_rule_catalog(), successor_catalog);
+  EXPECT_EQ(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value(), successor_offer);
+  const auto replay = fixture.kernel->recover_global_io_rule(intent);
+  ASSERT_TRUE(replay.ok());
+  auto historical = accepted.value();
+  historical.replay_status = RequestReplayStatusDTO::kReplayedExact;
+  EXPECT_EQ(replay.value(), historical);
+  EXPECT_EQ(fixture.journal.global_rule_recovery_calls, 1U);
+  EXPECT_EQ(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value(), successor_offer);
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleLossUpgradeRetainsOriginalLatchAndDistinctObserverProvenance) {
+  GlobalMotionRuleFixture fixture(false, true,
+      InterruptPostLatchDisposition::kAutoClearOnSignalRelease);
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto original = fixture.Recovery();
+  // The first loss retires an observation token, not the original latch.
+  fixture.clock.advance(101);
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_EQ(fixture.Recovery().selector, original.selector);
+  // A genuinely later observer also loses its source. Keep this occurrence
+  // separately from the immutable original trip and its latch nonce.
+  fixture.clock.advance(101);
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value();
+  ASSERT_EQ(offers.size(), 1U);
+  EXPECT_EQ(offers.front().selector, original.selector);
+  EXPECT_EQ(offers.front().latch_cause, IoGlobalRuleLatchCauseDTO::kSourceLoss);
+  EXPECT_EQ(offers.front().post_latch_disposition,
+            InterruptPostLatchDisposition::kAwaitOperatorAck);
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(fixture.kernel->recover_global_io_rule(original).ok());
+  std::lock_guard lock(fixture.journal.mutex);
+  ASSERT_EQ(fixture.journal.global_rule_recoveries.size(), 1U);
+  const auto& record = fixture.journal.global_rule_recoveries.front().first;
+  ASSERT_TRUE(record.prior_latched_evidence.trip);
+  EXPECT_EQ(record.prior_latched_evidence.trip->registration.registration_id,
+            original.selector.expected_rule_registration_id);
+  ASSERT_TRUE(record.source_loss_evidence);
+  ASSERT_FALSE(record.source_loss_evidence->source_losses.empty());
+  EXPECT_NE(record.source_loss_evidence->source_losses.front().registration.registration_id,
+            record.prior_latched_evidence.trip->registration.registration_id);
+  EXPECT_NE(record.successor_registration.registration_id,
+            record.source_loss_evidence->source_losses.front().registration.registration_id);
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleRecoveryRetainsSubmittedSuccessorLossUntilDurableCommit) {
+  for (const bool deliver_expiry_wake : {false, true}) {
+    GlobalMotionRuleFixture fixture;
+    ASSERT_TRUE(fixture.Publish(true).ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    const auto intent = fixture.Recovery();
+    ASSERT_TRUE(fixture.Publish(false).ok());
+    HeldSettlementCall blocked_journal;
+    fixture.journal.global_rule_recovery_hook = [block = blocked_journal.Blocker()](const auto&) {
+      block();
+    };
+    auto recovering = std::async(std::launch::async, [&] {
+      return fixture.kernel->recover_global_io_rule(intent);
+    });
+    struct ReleaseBeforeFutureWait {
+      HeldSettlementCall& held;
+      ~ReleaseBeforeFutureWait() { held.Release(); }
+    } release_before_future_wait{blocked_journal};
+    ASSERT_TRUE(blocked_journal.Entered());
+    fixture.clock.advance(101);
+    if (deliver_expiry_wake) {
+      ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    }
+    EXPECT_FALSE(fixture.kernel->execute(fixture.Intent()).ok());
+    blocked_journal.Release();
+    ASSERT_TRUE(recovering.get().ok());
+    const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value();
+    ASSERT_EQ(offers.size(), 1U);
+    EXPECT_EQ(offers.front().latch_cause, IoGlobalRuleLatchCauseDTO::kSourceLoss);
+    EXPECT_EQ(offers.front().post_latch_disposition,
+              InterruptPostLatchDisposition::kAwaitOperatorAck);
+    EXPECT_NE(offers.front().selector, intent.selector);
+    EXPECT_FALSE(fixture.kernel->execute(fixture.Intent(false, "global.after.pending.loss")).ok());
+    std::lock_guard lock(fixture.journal.mutex);
+    ASSERT_EQ(fixture.journal.global_rule_recoveries.size(), 1U);
+    EXPECT_EQ(offers.front().selector.expected_rule_registration_id,
+              fixture.journal.global_rule_recoveries.front().first.successor_registration.registration_id);
+  }
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleLossDiagnosticUsesActualLossRuleRatherThanHigherConditionWinner) {
+  GlobalMotionRuleFixture fixture(true, true, InterruptPostLatchDisposition::kAwaitOperatorAck,
+      IoRuleIdleBehaviourDTO::kLatch, {}, 30, "global.guard", true);
+  const auto motion = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(motion.ok()) << motion.error().message;
+  HeldSettlementCall stage;
+  fixture.engine.translate_stop_stage_hook = stage.Blocker();
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(stage.Entered());
+  const auto before = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+  ASSERT_TRUE(before.active_stop_id);
+  fixture.clock.advance(50);
+  ASSERT_TRUE(fixture.Publish(false).ok());  // Refresh A before either source's deadline.
+  fixture.clock.advance(51);               // Only B now expires; A's actual receipt is fresh.
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto during = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+  EXPECT_EQ(during.active_stop_id, before.active_stop_id);
+  stage.Release();
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(motion.value().operation_id); }));
+  const auto ended = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+  ASSERT_EQ(ended.participants.size(), 1U);
+  EXPECT_EQ(ended.participants.front().state, OperationStateKind::kFailed);
+  ASSERT_TRUE(ended.participants.front().terminal_error);
+  EXPECT_EQ(ended.participants.front().terminal_error->code, "interrupt_source_unavailable");
+  EXPECT_EQ(ended.participants.front().terminal_error->details.at("rule_id"), "global.loss");
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleScopedStopKeepsSameOperationCommandSiblingExecuting) {
+  GlobalMotionRuleFixture fixture(true, true, InterruptPostLatchDisposition::kAwaitOperatorAck,
+      IoRuleIdleBehaviourDTO::kLatch, {}, 20, "global.guard", false, true);
+  const auto motion = fixture.kernel->execute(
+      grouped_motion_commands_operation("global.mixed.scope"));
+  ASSERT_TRUE(motion.ok()) << motion.error().message;
+  ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  const auto before = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+  ASSERT_EQ(before.participants.size(), 2U);
+  const auto sibling = std::find_if(before.participants.begin(), before.participants.end(),
+      [](const auto& row) { return row.payload_kind == OperationParticipantPayloadKind::kCapabilityCommand; });
+  ASSERT_NE(sibling, before.participants.end());
+  ASSERT_EQ(sibling->state, OperationStateKind::kExecuting);
+  HeldSettlementCall stage;
+  fixture.engine.translate_stop_stage_hook = stage.Blocker();
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(stage.Entered());
+  const auto check_sibling = [&] {
+    const auto state = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+    const auto current = std::find_if(state.participants.begin(), state.participants.end(),
+        [&](const auto& row) { return row.participant_id == sibling->participant_id; });
+    EXPECT_NE(current, state.participants.end());
+    if (current != state.participants.end()) {
+      EXPECT_EQ(current->state, OperationStateKind::kExecuting);
+      EXPECT_EQ(current->terminal_fact, sibling->terminal_fact);
+      EXPECT_EQ(current->io_rule_outcomes, sibling->io_rule_outcomes);
+    }
+    EXPECT_EQ(fixture.other_engine.translate_stop_stage_calls, 0);
+  };
+  check_sibling();
+  stage.Release();
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(motion.value().operation_id); }));
+  check_sibling();
+  const auto stopped = fixture.kernel->get_operation_state(motion.value().operation_id).value();
+  ASSERT_TRUE(stopped.active_stop_id);
+  const auto status = fixture.kernel->get_stop_status(*stopped.active_stop_id).value();
+  ASSERT_TRUE(status.stop_certificate);
+  const auto certificate = fixture.kernel->get_stop_certificate(
+      status.stop_certificate->stop_certificate_id).value();
+  ASSERT_EQ(certificate.scope_entries.size(), 1U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleEverythingFirstReadingDoesNotReplaceLogicalOutputLifecycleAdmission) {
+  IoOutputKernelIntegrationFixture fixture(false, {}, true);
+  auto managers = EmptyManagerLivenessSet();
+  managers.active_bundle_id = fixture.binding.value().retained_bundle_id;
+  ASSERT_TRUE(fixture.kernel->ReplaceManagerLivenessRequiredSet(managers).ok());
+  ASSERT_TRUE(ready_cell_admission(*fixture.kernel).ok());
+  auto service = program_io_service(fixture.clock);
+  IoConditionDefinitionDTO definition;
+  definition.inputs.push_back({program_io_descriptor().signal_id, IoConditionValueKind::kBoolean});
+  definition.nodes.emplace_back(IoConditionCompareDTO{IoConditionComparison::kEqual,
+      IoConditionInputReferenceDTO{0U}, IoConditionValueDTO{true}});
+  auto checked = CheckIoCondition(std::move(definition), {1U, 1U, 1U, 1U, 128U, 128U});
+  ASSERT_TRUE(checked.ok());
+  const IoRuleAppliedContextDTO context{RequestOwnerEpoch("kernel.epoch.1"),
+      ActiveBundlePublicationGeneration(2U), fixture.binding.value().retained_bundle_id,
+      fixture.binding.value().graph_revision};
+  auto catalog = std::make_shared<const IoActivationRuleCatalogDTO>(IoActivationRuleCatalogDTO{
+      {context.owner_epoch, 1U, context.active_publication_generation,
+       context.retained_bundle_id, context.graph_revision},
+      {{InterruptPolicyId("global.everything"),
+        std::make_shared<const CheckedIoCondition>(std::move(checked.value())),
+        {program_io_descriptor().source_id}, IoActivationEverythingScopeDTO{},
+        IoRuleIdleBehaviourDTO::kLatch, 20, std::nullopt}}, {}, {}});
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(true).ok());
+  ASSERT_TRUE(fixture.kernel->RestoreGlobalIoRuleCatalog(context, catalog, service).ok());
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(false).ok());
+  EXPECT_FALSE(fixture.kernel->execute(fixture.Intent("global.output.disabled")).ok());
+  EXPECT_EQ(fixture.provider.submissions, 0U);
+  fixture.Enable();
+  const auto output = fixture.kernel->execute(fixture.Intent("global.output.enabled"));
+  ASSERT_TRUE(output.ok()) << output.error().message;
+  EXPECT_EQ(fixture.provider.submissions, 1U);
+  ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  const auto completed = fixture.kernel->get_operation_state(output.value().operation_id);
+  ASSERT_TRUE(completed.ok());
+  ASSERT_EQ(completed.value().state, OperationStateKind::kCompleted);
+  ASSERT_TRUE(fixture.kernel->acknowledge_completed(control_request(
+      "global.output.ack", output.value(), completed.value().operation_revision.value())).ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto projection = fixture.kernel->get_operation_projection(output.value().operation_id);
+    return projection.ok() && !projection.value().resident;
+  }));
+  EXPECT_EQ(fixture.provider.retirements, 1U);
+  const IoSourceIncarnation incarnation("global.everything.1");
+  ASSERT_TRUE(service->InstallSource(program_io_descriptor().source_id, incarnation, {}).ok());
+  ASSERT_TRUE(service->Publish({program_io_descriptor().source_id, incarnation, 1U,
+      fixture.clock.now(), {{program_io_descriptor().signal_id,
+          IoSampleValidity::kValid, true, std::nullopt}}}).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto blocked = fixture.kernel->execute(fixture.Intent("global.output.latched"));
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_latched");
+  EXPECT_EQ(fixture.provider.submissions, 1U);
+}
+
+
+Result<void> InstallAtomicBlackboardGlobalRule(BbKernelIntegrationFixture& fixture,
+    InterruptPostLatchDisposition release = InterruptPostLatchDisposition::kAwaitOperatorAck) {
+  IoConditionDefinitionDTO definition;
+  definition.inputs.push_back(
+      {IoConditionBlackboardKeyDTO{"flag"}, IoConditionValueKind::kBoolean});
+  definition.nodes.emplace_back(IoConditionCompareDTO{IoConditionComparison::kEqual,
+      IoConditionInputReferenceDTO{0U}, IoConditionValueDTO{true}});
+  auto checked = CheckIoCondition(std::move(definition), {1U, 1U, 1U, 1U, 512U, 1024U});
+  if (!checked.ok()) return Result<void>::Err(checked.error());
+  const auto& context = fixture.context;
+  const IoRuleAppliedContextDTO applied{context.request_owner_epoch,
+      context.active_publication_generation, context.retained_bundle_id, context.graph_revision};
+  auto catalog = std::make_shared<const IoActivationRuleCatalogDTO>(IoActivationRuleCatalogDTO{
+      {context.request_owner_epoch, 1U, context.active_publication_generation,
+       context.retained_bundle_id, context.graph_revision},
+      {{InterruptPolicyId("global.atomic.bb"),
+        std::make_shared<const CheckedIoCondition>(std::move(checked.value())), {},
+        IoActivationAllMotionScopeDTO{}, IoRuleIdleBehaviourDTO::kLatch, 20, std::nullopt, release}},
+      context.program_binding_id, {"flag"}});
+  auto result = fixture.kernel->SetRouteRecoveryPending(true);
+  if (!result.ok()) return result;
+  result = fixture.kernel->RestoreGlobalIoRuleCatalog(applied, catalog, fixture.installed_service);
+  if (!result.ok()) return result;
+  result = fixture.kernel->SetRouteRecoveryPending(false);
+  if (!result.ok()) return result;
+  return fixture.kernel->InstallAppliedProgramBlackboardContext(context, fixture.installed_service);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelGlobalKeyFirstBaselineDoesNotBecomeSignalReadinessForUnscopedMotion) {
+  BbKernelIntegrationFixture fixture(false, false, false, false);
+  ASSERT_TRUE(InstallAtomicBlackboardGlobalRule(fixture).ok());
+  ASSERT_TRUE(ready_cell_admission(*fixture.kernel).ok());
+  const auto projection = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(projection);
+  EXPECT_EQ(projection->status, IoRuleStateProjectionStatusDTO::kPending);
+  EXPECT_FALSE(projection->baseline);
+  const auto motion = fixture.kernel->execute(motion_operation("bb.key.wait.manual"));
+  ASSERT_TRUE(motion.ok()) << motion.error().message;
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 1);
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelAtomicResetKeepsGlobalRuleUntilAcceptedFalseOrTrueReplacement) {
+  for (const bool active : {false, true}) {
+    SCOPED_TRACE(active);
+    BbKernelIntegrationFixture fixture(false, false, false, false);
+    ASSERT_TRUE(InstallAtomicBlackboardGlobalRule(fixture).ok());
+    const auto initial = fixture.kernel->PublishProgramBlackboard(fixture.baseline());
+    ASSERT_TRUE(initial.ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    const auto guard = fixture.arm_guard();
+    ASSERT_TRUE(guard.ok());
+    const auto obsolete = fixture.update(2U, true);
+    ++fixture.readiness.program_cycle_status->cycle_generation;
+    std::shared_ptr<IIoSignalService> affected;
+    ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(fixture.readiness, &affected).ok());
+    EXPECT_FALSE(affected);  // A healthy Reset is not a source teardown.
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+    auto retained = fixture.service->ReadRuleEvidence(guard.value());
+    ASSERT_TRUE(retained.ok());
+    EXPECT_TRUE(retained.value().source_losses.empty());
+    EXPECT_FALSE(retained.value().trip);
+    EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(obsolete).ok());
+    auto malformed = fixture.baseline(active);
+    malformed.values[0].value_kind = IoConditionValueKind::kString;
+    EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(malformed).ok());
+    EXPECT_EQ(fixture.service->ReadRuleEvidence(guard.value()).value(), retained.value());
+    const auto replacement = fixture.kernel->PublishProgramBlackboard(fixture.baseline(active));
+    ASSERT_TRUE(replacement.ok());
+    EXPECT_NE(replacement.value().source_epoch, initial.value().source_epoch);
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    const auto actual = fixture.service->ReadRuleEvidence(guard.value());
+    ASSERT_TRUE(actual.ok());
+    EXPECT_EQ(actual.value().state, IoRuleRegistrationState::kArmed);
+    EXPECT_TRUE(actual.value().source_losses.empty());
+    EXPECT_EQ(actual.value().trip.has_value(), active);
+    if (actual.value().trip) {
+      ASSERT_TRUE(actual.value().trip->blackboard);
+      EXPECT_EQ(actual.value().trip->blackboard->scope, fixture.scope());
+    }
+    const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+    ASSERT_TRUE(offers.ok());
+    ASSERT_EQ(offers.value().size(), active ? 1U : 0U);
+    if (active) {
+      EXPECT_EQ(offers.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kCondition);
+    }
+    const auto old = fixture.kernel->PublishProgramBlackboard(obsolete);
+    ASSERT_TRUE(old.ok());
+    EXPECT_EQ(old.value().status, IoProgramBlackboardAcknowledgementStatus::kSuperseded);
+    EXPECT_FALSE(old.value().accepted_sequence);
+    auto unavailable = fixture.readiness;
+    unavailable.program_cycle_status_current = false;
+    ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(unavailable, &affected).ok());
+    EXPECT_EQ(affected, fixture.installed_service);  // Genuine teardown requests a deferred wake.
+    EXPECT_FALSE(fixture.service->ReadRuleEvidence(guard.value()).value().source_losses.empty());
+    EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelAtomicNewRunCannotDispatchAgainstRetainedPredecessorValues) {
+  for (const bool replacement : {false, true}) {
+    SCOPED_TRACE(replacement);
+    BbKernelIntegrationFixture fixture(false, false, false, false);
+    ASSERT_TRUE(InstallAtomicBlackboardGlobalRule(fixture).ok());
+    ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    const auto guard = fixture.arm_guard();
+    ASSERT_TRUE(guard.ok());
+    const auto claim = claim_program_execution(*fixture.kernel);
+    ASSERT_TRUE(claim.ok());
+    ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+    start_program_motion(*fixture.kernel);
+    if (replacement) {
+      auto first = fixture.baseline();
+      first.scope.program_run_id = ProgramRunId("run.1");
+      first.scope.claim_generation = claim.value().claim_generation;
+      ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(first).ok());
+      ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    }
+    const auto accepted = fixture.kernel->execute(scoped_motion_operation("atomic.run.motion"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(state.ok());
+    EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), replacement ? 1 : 0);
+    if (!replacement) {
+      ASSERT_EQ(state.value().participants.size(), 1U);
+      ASSERT_TRUE(state.value().participants.front().terminal_error);
+      EXPECT_EQ(state.value().participants.front().terminal_error->details.at("reason"),
+                "global_interrupt_source_not_ready");
+    }
+    const auto retained = fixture.service->ReadRuleEvidence(guard.value());
+    ASSERT_TRUE(retained.ok());
+    EXPECT_TRUE(retained.value().source_losses.empty());
+    EXPECT_FALSE(retained.value().trip);
+    EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  }
+}
+
+
+ManagerLivenessLossIntentDTO AtomicBlackboardHealthLoss(const BbKernelIntegrationFixture& fixture) {
+  const auto& set = fixture.liveness;
+  const auto& receiver = set.required_receivers.front();
+  return {set.cell_id, set.active_bundle_id, set.required_runtime_set_digest,
+          receiver.runtime_unit_id, receiver.runtime_epoch, receiver.runtime_policy_id,
+          receiver.runtime_policy_revision, set.manager_runtime_unit_id, set.manager_runtime_epoch,
+          set.manager_owner_epoch, 2U, ManagerLivenessLossKindDTO::kExpiry};
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelHealthTeardownNotifiesExactServiceAfterOwnerAndStateLocks) {
+  for (int path = 0; path != 3; ++path) {
+    SCOPED_TRACE(path);
+    ResourceAddressedExecutionKernel* current_kernel{};
+    std::shared_ptr<IIoSignalService> observed;
+    std::optional<IoRuleRegistrationDTO> guard;
+    std::size_t notifications{};
+    bool loss_visible{};
+    BbKernelIntegrationFixture fixture(true, false, false, true,
+        [&](const std::shared_ptr<IIoSignalService>& affected) {
+          ++notifications;
+          observed = affected;
+          // These acquire the existing owner/state/signal locks again. The
+          // notification is post-lock, not a health observer reentry.
+          static_cast<void>(current_kernel->GetAuthoringAdmission());
+          static_cast<void>(current_kernel->get_stop_fault_latch());
+          const auto actual = affected->ReadRuleEvidence(*guard);
+          loss_visible = actual.ok() && !actual.value().source_losses.empty() && !actual.value().trip;
+        });
+    current_kernel = fixture.kernel.get();
+    ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+    const auto armed = fixture.arm_guard();
+    ASSERT_TRUE(armed.ok());
+    guard = armed.value();
+    const auto before = fixture.kernel->cell_stop_action_projection().expected_stop_generation;
+    if (path == 0) {
+      ASSERT_TRUE(fixture.kernel->Publish(fixture.observation(2U, false)).ok());
+      ASSERT_TRUE(fixture.kernel->Publish(fixture.observation(3U, false)).ok());
+    } else if (path == 1) {
+      auto replacement = fixture.liveness;
+      replacement.manager_owner_epoch = RequestOwnerEpoch("health.notification.successor");
+      replacement.manager_runtime_epoch = RuntimeEpoch("health.notification.successor.1");
+      ASSERT_TRUE(fixture.kernel->ReplaceManagerLivenessRequiredSet(replacement).ok());
+      ASSERT_TRUE(fixture.kernel->ReplaceManagerLivenessRequiredSet(replacement).ok());
+    } else {
+      fixture.kernel->LatchAndContain(AtomicBlackboardHealthLoss(fixture));
+      EXPECT_GT(fixture.kernel->cell_stop_action_projection().expected_stop_generation, before);
+      fixture.kernel->LatchAndContain(AtomicBlackboardHealthLoss(fixture));
+    }
+    EXPECT_EQ(notifications, 1U);  // No-op/replay does not invent another mutation.
+    EXPECT_EQ(observed, fixture.installed_service);
+    EXPECT_TRUE(loss_visible);
+    EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(fixture.update(2U, true)).ok());
+    EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelHealthNotificationFailurePreservesLossErrorAndMandatoryContainment) {
+  for (int path = 0; path != 4; ++path) {
+    SCOPED_TRACE(path);
+    std::size_t attempts{};
+    const bool retirement_error = path >= 2;
+    BbKernelIntegrationFixture fixture(true, false, retirement_error, true,
+        [&](const std::shared_ptr<IIoSignalService>&) {
+          ++attempts;
+          throw std::runtime_error("actual scheduler notification failed");
+        });
+    ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+    const auto guard = fixture.arm_guard();
+    ASSERT_TRUE(guard.ok());
+    const auto before = fixture.kernel->cell_stop_action_projection().expected_stop_generation;
+    if (path == 0 || path == 3) {
+      const auto result = fixture.kernel->Publish(fixture.observation(2U, false));
+      ASSERT_FALSE(result.ok());
+      if (path == 0) {
+        EXPECT_EQ(result.error().details.at("reason"),
+                  "io_rule_evidence_processing_notification_failed");
+      } else {
+        EXPECT_EQ(result.error().code, "io_signal_record_exhausted");
+        EXPECT_EQ(result.error().details.at("io_rule_notification_error"), "internal_error");
+      }
+    } else if (path == 1) {
+      auto replacement = fixture.liveness;
+      replacement.manager_owner_epoch = RequestOwnerEpoch("health.notification.successor");
+      replacement.manager_runtime_epoch = RuntimeEpoch("health.notification.successor.1");
+      const auto result = fixture.kernel->ReplaceManagerLivenessRequiredSet(replacement);
+      ASSERT_FALSE(result.ok());
+      EXPECT_EQ(result.error().details.at("reason"),
+                "io_rule_evidence_processing_notification_failed");
+    } else {
+      fixture.kernel->LatchAndContain(AtomicBlackboardHealthLoss(fixture));
+      EXPECT_GT(fixture.kernel->cell_stop_action_projection().expected_stop_generation, before);
+    }
+    EXPECT_EQ(attempts, 1U);
+    const auto evidence = fixture.service->ReadRuleEvidence(guard.value());
+    ASSERT_TRUE(evidence.ok());
+    EXPECT_FALSE(evidence.value().trip);
+    EXPECT_FALSE(evidence.value().source_losses.empty());
+    EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(fixture.update(2U, true)).ok());
+  }
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelFreshSourceRestoresLossObservationButKeepsOperatorOnlyLatch) {
+  for (int source_loss = 0; source_loss != 4; ++source_loss) {
+    SCOPED_TRACE(source_loss);
+    BbKernelIntegrationFixture fixture(false, false, false, false);
+    ASSERT_TRUE(InstallAtomicBlackboardGlobalRule(
+        fixture, InterruptPostLatchDisposition::kAutoClearOnSignalRelease).ok());
+    const auto initial = fixture.kernel->PublishProgramBlackboard(fixture.baseline());
+    ASSERT_TRUE(initial.ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    const auto guard = fixture.arm_guard();
+    ASSERT_TRUE(guard.ok());
+    if (source_loss == 0) {
+      EXPECT_FALSE(fixture.kernel->PublishProgramBlackboard(fixture.update(3U, true)).ok());
+    } else if (source_loss == 1) {
+      ASSERT_TRUE(fixture.service->ReportIngressOverflow(InterruptSourceId("program.blackboard"),
+          initial.value().source_epoch, {"ingress_overflow", "actual source overflow", {}}).ok());
+    } else if (source_loss == 2) {
+      fixture.readiness.program_cycle_status_current = false;
+      ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(fixture.readiness).ok());
+    } else {
+      // Actual typed unset is admitted truth, not a failed publisher ACK.
+      auto unavailable = fixture.update(2U);
+      unavailable.values.front().value.reset();
+      const auto acknowledged = fixture.kernel->PublishProgramBlackboard(unavailable);
+      ASSERT_TRUE(acknowledged.ok());
+      EXPECT_EQ(acknowledged.value().accepted_sequence, 2U);
+      EXPECT_EQ(acknowledged.value().source_epoch, initial.value().source_epoch);
+    }
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    const auto before = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+    ASSERT_TRUE(before.ok());
+    ASSERT_EQ(before.value().size(), 1U);
+    EXPECT_EQ(before.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kSourceLoss);
+    const auto old_evidence = fixture.service->ReadRuleEvidence(guard.value()).value();
+    ASSERT_FALSE(old_evidence.source_losses.empty());
+    fixture.readiness.program_cycle_status_current = true;
+    if (source_loss != 3) ++fixture.readiness.program_cycle_status->cycle_generation;
+    ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(fixture.readiness).ok());
+    const auto fresh = fixture.kernel->PublishProgramBlackboard(
+        source_loss == 3 ? fixture.update(3U, false) : fixture.baseline());
+    ASSERT_TRUE(fresh.ok());
+    if (source_loss == 3) {
+      EXPECT_EQ(fresh.value().source_epoch, initial.value().source_epoch);
+      EXPECT_EQ(fresh.value().accepted_sequence, 3U);
+    } else {
+      EXPECT_NE(fresh.value().source_epoch, initial.value().source_epoch);
+    }
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    const auto observed = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+    ASSERT_TRUE(observed.ok());
+    ASSERT_EQ(observed.value().size(), 1U);
+    EXPECT_EQ(observed.value().front().selector, before.value().front().selector);
+    EXPECT_EQ(observed.value().front().current_condition, std::optional(false));
+    EXPECT_EQ(observed.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kSourceLoss);
+    EXPECT_EQ(observed.value().front().post_latch_disposition,
+              InterruptPostLatchDisposition::kAwaitOperatorAck);
+    EXPECT_EQ(fixture.journal.global_rule_recovery_calls, 0U); // No authored-auto clear of loss.
+    EXPECT_EQ(fixture.service->ReadRuleEvidence(guard.value()).value().source_losses,
+              old_evidence.source_losses);
+    EXPECT_FALSE(fixture.service->ReadRuleEvidence(guard.value()).value().trip);
+    const IoGlobalRuleRecoveryIntentDTO intent{
+        {RequestId("bb.loss.operator.recovery"), fixture.context.request_owner_epoch,
+         "operator.test", {}}, observed.value().front().selector, std::string("source restored")};
+    const auto recovered = fixture.kernel->recover_global_io_rule(intent);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    EXPECT_TRUE(recovered.value().accepted);
+    EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+    ASSERT_EQ(fixture.journal.global_rule_recoveries.size(), 1U);
+    EXPECT_EQ(fixture.journal.global_rule_recoveries.front().first.intent.selector,
+              before.value().front().selector);
+    EXPECT_FALSE(fixture.journal.global_rule_recoveries.front().first.prior_latched_evidence.source_losses.empty());
+    EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), 0);
+  }
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest,
+     BbKernelHeldManualHandoverRequiresActualParentRunBaseline) {
+  for (const bool replacement : {false, true}) {
+    SCOPED_TRACE(replacement);
+    BbKernelIntegrationFixture fixture(false, false, false, false, {}, true);
+    ASSERT_TRUE(InstallAtomicBlackboardGlobalRule(fixture).ok());
+    ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    const auto claim = claim_program_execution(*fixture.kernel);
+    ASSERT_TRUE(claim.ok());
+    ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+    fixture.readiness = {true,
+        ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
+            ProgramCycleStateDTO::kRunning, ProgramRunId("run.1"),
+            claim.value().claim_generation, std::nullopt},
+        true, 1U, 1U, true, true, 0U, 0U, 0U};
+    ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(fixture.readiness).ok());
+    start_program_motion(*fixture.kernel);
+    ASSERT_TRUE(fixture.kernel->stop_program_selection(
+        program_selection_request("atomic.manual.hold", "arm")).ok());
+    auto manual = motion_operation("atomic.manual.motion");
+    manual.program_run_id = ProgramRunId("manual.bookkeeping.run");
+    const auto held = fixture.kernel->get_manual_program_handover(manual);
+    ASSERT_TRUE(held.ok());
+    ASSERT_TRUE(held.value());
+    manual.manual_handover = ManualProgramHandoverContextDTO{
+        RequestOwnerEpoch("program.owner"), ProgramRunId("run.1"),
+        claim.value().claim_generation, held.value()->selection_revision};
+    if (replacement) {
+      ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
+      ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    }
+    const auto accepted = fixture.kernel->execute(manual);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls.load(), replacement ? 1 : 0);
+    if (!replacement) {
+      const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
+      ASSERT_TRUE(state.ok());
+      ASSERT_EQ(state.value().participants.size(), 1U);
+      ASSERT_TRUE(state.value().participants.front().terminal_error);
+      EXPECT_EQ(state.value().participants.front().terminal_error->details.at("reason"),
+                "global_interrupt_source_not_ready");
+    }
+  }
+}
+
+}  // namespace
+
+
+namespace {
+// Existing IClock injection exposes accept_stop's accepted-at read after the
+// incident's first State mark and before acceptance. No production test hook.
+class IncidentContainmentAcceptanceClock final : public IClock {
+ public:
+  TimePoint now() const override {
+    std::function<std::optional<TimePoint>()> callback;
+    {
+      std::lock_guard lock(mutex_);
+      callback = callback_;
+    }
+    if (callback) {
+      if (const auto replacement = callback()) return *replacement;
+    }
+    return clock_.now();
+  }
+  void set(TimePoint value) { clock_.set(value); }
+  void advance(Duration value) { clock_.advance(value); }
+  void SetCallback(std::function<std::optional<TimePoint>()> callback) {
+    std::lock_guard lock(mutex_);
+    callback_ = std::move(callback);
+  }
+ private:
+  FakeClock clock_;
+  mutable std::mutex mutex_;
+  std::function<std::optional<TimePoint>()> callback_;
+};
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PendingComponentContainmentCannotReopenMotionAcrossDurableOldLatchClear) {
+  for (const bool fail_acceptance : {false, true}) {
+    SCOPED_TRACE(fail_acceptance);
+    IncidentContainmentAcceptanceClock clock;
+    ManualScheduler scheduler;
+    clock.set(100);
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    const auto binding =
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 16U};
+    config.stop_fault_recovery_facts_resolver = installed_domain_recovery_facts({binding});
+    ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, scheduler,
+                                            journal, std::move(config));
+    const auto initial = kernel.RequestComponentIncidentContainment(
+        {"incident.prior", ControllableComponentId("component.arm"),
+         LifecycleBlockingCauseClassDTO::kProviderLost});
+    ASSERT_TRUE(initial.ok()) << initial.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      return stop_terminal_recorded(kernel, initial.value().stop_id);
+    }));
+    std::optional<StopFaultRecoveryOfferDTO> ready;
+    ASSERT_TRUE(wait_until([&] {
+      clock.advance(10'000'000);
+      scheduler.advance_to(clock.now());
+      static_cast<void>(kernel.refresh_stop_fault_recovery_assessment());
+      const auto offer = kernel.get_stop_fault_recovery_offer();
+      if (!offer.ok() || !offer.value() ||
+          offer.value()->latch.recovery_status != StopFaultRecoveryStatusDTO::kReady)
+        return false;
+      ready = *offer.value();
+      return true;
+    }));
+    const auto recovery_intent = idle_stop_recovery_intent(
+        "request.clear.prior", "kernel.epoch.1", *ready);
+    const ComponentIncidentContainmentIntentDTO next{
+        "incident.new.pending", ControllableComponentId("device.input.only"),
+        LifecycleBlockingCauseClassDTO::kProviderLost};
+    HeldSettlementCall old_clear, new_acceptance;
+    std::future<Result<StopFaultRecoveryResultDTO>> recovering;
+    std::future<Result<ComponentIncidentContainmentReceiptDTO>> containing;
+    // Release before future destructors join on every fatal-assert path. The
+    // journal/clock/kernel and copied hook state outlive both joined workers.
+    struct ReleaseBeforeJoin {
+      IncidentContainmentAcceptanceClock& clock;
+      HeldSettlementCall& old_clear;
+      HeldSettlementCall& new_acceptance;
+      ~ReleaseBeforeJoin() {
+        clock.SetCallback({});
+        old_clear.Release();
+        new_acceptance.Release();
+      }
+    } release{clock, old_clear, new_acceptance};
+    journal.stop_fault_clear_hook = old_clear.Blocker();
+    recovering = std::async(std::launch::async, [&] {
+      return kernel.recover_stop_fault(recovery_intent);
+    });
+    ASSERT_TRUE(old_clear.Entered());  // actual facts proof already returned
+    containing = std::async(std::launch::async, [&, fail_acceptance] {
+      const auto incident_thread = std::this_thread::get_id();
+      auto first_read = std::make_shared<std::atomic_bool>(true);
+      clock.SetCallback([incident_thread, first_read, fail_acceptance,
+                         block = new_acceptance.Blocker()]() -> std::optional<TimePoint> {
+        if (std::this_thread::get_id() != incident_thread || !first_read->exchange(false))
+          return std::nullopt;
+        block();
+        // Invalid accepted-at fails existing checked_deadline validation
+        // before reserve acceptance; no Stop receipt/latch is manufactured.
+        return fail_acceptance ? std::optional<TimePoint>(-1) : std::nullopt;
+      });
+      return kernel.RequestComponentIncidentContainment(next);
+    });
+    ASSERT_TRUE(new_acceptance.Entered());
+    old_clear.Release();
+    ASSERT_EQ(recovering.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    const auto cleared = recovering.get();
+    ASSERT_TRUE(cleared.ok()) << cleared.error().message;
+    EXPECT_TRUE(cleared.value().accepted);
+    EXPECT_EQ(cleared.value().latch.stop_id, initial.value().stop_id);
+    EXPECT_EQ(cleared.value().latch.state, StopFaultLatchStateDTO::kCleared);
+    EXPECT_EQ(journal.stop_fault_clear_calls.load(), 1);
+    // A new receipt does not yet exist. This refusal must come from the
+    // pending incident's owner exclusion, not from a fabricated new Stop.
+    const auto during_gap = kernel.execute(motion_operation("request.in.pending.gap"));
+    ASSERT_FALSE(during_gap.ok());
+    EXPECT_EQ(during_gap.error().details.at("reason"), "motion_admission_closed");
+    EXPECT_EQ(engine.execute_calls, 0);
+    new_acceptance.Release();
+    ASSERT_EQ(containing.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    const auto contained = containing.get();
+    clock.SetCallback({});
+    journal.stop_fault_clear_hook = {};
+    if (fail_acceptance) {
+      ASSERT_FALSE(contained.ok());
+      EXPECT_EQ(contained.error().details.at("reason"), "stop_deadline_overflow");
+      const auto after_failure = kernel.execute(motion_operation("request.after.failed.accept"));
+      ASSERT_FALSE(after_failure.ok());
+      EXPECT_EQ(after_failure.error().details.at("reason"), "motion_admission_closed");
+      // The same actual incident can retry acceptance once the source clock
+      // is valid; no zero/placeholder receipt is replayed from the failed call.
+      const auto retry = kernel.RequestComponentIncidentContainment(next);
+      ASSERT_TRUE(retry.ok()) << retry.error().message;
+      EXPECT_NE(retry.value().stop_id, initial.value().stop_id);
+      EXPECT_GT(retry.value().stop_generation, initial.value().stop_generation);
+    } else {
+      ASSERT_TRUE(contained.ok()) << contained.error().message;
+      EXPECT_NE(contained.value().stop_id, initial.value().stop_id);
+      const auto newest = kernel.get_stop_fault_latch();
+      ASSERT_TRUE(newest);
+      EXPECT_EQ(newest->stop_id, contained.value().stop_id);
+      EXPECT_EQ(newest->state, StopFaultLatchStateDTO::kLatched);
+      const auto after_acceptance = kernel.execute(motion_operation("request.after.new.accept"));
+      ASSERT_FALSE(after_acceptance.ok());
+      EXPECT_EQ(after_acceptance.error().details.at("reason"), "motion_admission_closed");
+    }
+    const auto exact_replay = kernel.recover_stop_fault(recovery_intent);
+    ASSERT_TRUE(exact_replay.ok()) << exact_replay.error().message;
+    EXPECT_EQ(exact_replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+    EXPECT_EQ(exact_replay.value().latch, cleared.value().latch);
+    EXPECT_EQ(journal.stop_fault_clear_calls.load(), 1);
+    EXPECT_EQ(engine.execute_calls, 0);
+  }
+}
+
+// This boundary double delegates all source observations to the real subsystem.
+// It scripts only the host result: actual Mock/non-Mock classification and
+// timer/index ownership are qualified by the HostIoSignalRuntime tests.
+class MockNodeStartBoundaryService final : public IIoSignalService {
+ public:
+  explicit MockNodeStartBoundaryService(std::shared_ptr<IoSignalSubsystem> actual)
+      : actual(std::move(actual)) {}
+  Result<IoSignalObservationDTO> ReadSignal(const IoSignalId& id) const override {
+    return actual->ReadSignal(id);
+  }
+  Result<IoWatchRegistrationDTO> RegisterLevelWatch(const IoLevelWatchRequestDTO& request) override {
+    return actual->RegisterLevelWatch(request);
+  }
+  Result<IoWatchResultDTO> ReadWatch(const IoWatchRegistrationDTO& token) const override {
+    return actual->ReadWatch(token);
+  }
+  Result<void> ReleaseWatch(const IoWatchRegistrationDTO& token) override {
+    return actual->ReleaseWatch(token);
+  }
+  Result<void> ReleaseRunWatches(const RequestOwnerEpoch& runner, const ProgramRunId& run) override {
+    ++retire_calls;
+    { std::lock_guard lock(events_mutex); events.push_back("retire"); }
+    last_retired_run = std::pair(runner, run);
+    if (retirement_failure) return Result<void>::Err(*retirement_failure);
+    return actual->ReleaseRunWatches(runner, run);
+  }
+  Result<ProgramNodeMockSimulationAcknowledgementDTO> StartProgramNodeMockSimulation(
+      const ProgramNodeMockSimulationRequestDTO& request,
+      std::span<const ResolvedProgramMockSimulationSignalDTO> resolved,
+      std::size_t maximum_node_entries) override {
+    ++start_calls;
+    last_request = request;
+    last_resolved.assign(resolved.begin(), resolved.end());
+    last_capacity = maximum_node_entries;
+    { std::lock_guard lock(events_mutex); events.push_back("start"); }
+    if (start_hook) start_hook();
+    { std::lock_guard lock(events_mutex); events.push_back("return"); }
+    if (failure) return Result<ProgramNodeMockSimulationAcknowledgementDTO>::Err(*failure);
+    ProgramNodeMockSimulationAcknowledgementDTO reply{request.scope, 123, {}};
+    for (const auto& signal : request.signals)
+      reply.signals.push_back({signal.target_role_id, signal.resource_role_id, disposition});
+    return Result<ProgramNodeMockSimulationAcknowledgementDTO>::Ok(std::move(reply));
+  }
+  Result<void> EndProgramNodeMockSimulation(
+      const ProgramNodeMockSimulationScopeDTO& scope, std::size_t maximum_node_entries) override {
+    ++end_calls;
+    last_end = scope;
+    last_capacity = maximum_node_entries;
+    if (end_failure) return Result<void>::Err(*end_failure);
+    return Result<void>::Ok();
+  }
+  Result<void> SetProgramRunMockSimulationPaused(
+      const ProgramRunMockSimulationPauseRequestDTO& request) override {
+    ++pause_calls;
+    last_pause = request;
+    if (pause_failure) return Result<void>::Err(*pause_failure);
+    return Result<void>::Ok();
+  }
+  std::atomic_uint pause_calls{};
+  std::optional<ProgramRunMockSimulationPauseRequestDTO> last_pause;
+  std::optional<ErrorDTO> pause_failure;
+  std::shared_ptr<IoSignalSubsystem> actual;
+  std::atomic_uint end_calls{};
+  std::optional<ProgramNodeMockSimulationScopeDTO> last_end;
+  std::optional<ErrorDTO> end_failure;
+  std::atomic_uint start_calls{}, retire_calls{};
+  std::optional<ErrorDTO> retirement_failure;
+  std::optional<std::pair<RequestOwnerEpoch, ProgramRunId>> last_retired_run;
+  std::optional<ProgramNodeMockSimulationRequestDTO> last_request;
+  std::vector<ResolvedProgramMockSimulationSignalDTO> last_resolved;
+  std::size_t last_capacity{};
+  ProgramMockSimulationSignalDisposition disposition{ProgramMockSimulationSignalDisposition::kApplied};
+  std::optional<ErrorDTO> failure;
+  std::function<void()> start_hook;
+  std::mutex events_mutex;
+  std::vector<std::string> events;
+};
+
+struct MockNodeStartKernelFixture final {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  std::shared_ptr<MockNodeStartBoundaryService> service;
+  ResourceAddressedExecutionKernel kernel;
+  explicit MockNodeStartKernelFixture(IoSignalDescriptorDTO descriptor = program_io_descriptor(),
+                                      bool install_service = true)
+      : service(std::make_shared<MockNodeStartBoundaryService>(program_io_service(clock, std::move(descriptor)))),
+        kernel({registration(make_binding("arm", "arm", "execution.trajectory.execute",
+                                           CoordinateKind::kAngular), engine)},
+               clock, scheduler, default_journal, ProgramIoScopeFixture::config()) {
+    if ((install_service &&
+         !kernel.InstallProgramIoSignalService(service, RetainedBundleId(test_digest('6')),
+                                               GraphRevision(test_digest('7'))).ok()) ||
+        !claim_program_execution(kernel).ok() ||
+        !kernel.register_program_run_capture(program_io_capture()).ok())
+      throw std::logic_error("Mock node boundary fixture did not capture its actual Run");
+  }
+  static ProgramNodeMockSimulationRequestDTO request() {
+    const auto watch = program_io_watch_request();
+    return {{watch.request_owner_epoch, watch.program_binding_id, watch.program_runner_owner_epoch,
+             watch.claim_generation, watch.program_run_id, watch.node,
+             std::numeric_limits<std::uint64_t>::max()},
+            {{watch.target_role_id, watch.resource_role_id, false,
+              ProgramMockSimulationChangeDTO{0U, true}}}};
+  }
+  Result<void> retire() {
+    const auto capture = program_io_capture();
+    const auto result = kernel.UpdateCellAdmissionReadiness({
+        true, ProgramCycleStatusDTO{capture.program_runner_owner_epoch, 2U,
+          ProgramCycleStateDTO::kTerminalAwaitingReset, capture.program_run_id,
+          capture.claim_generation, ContentDigest(test_digest('2'))},
+        true, 1U, 1U, true, true, 0U, 0U, 0U});
+    return result.ok() ? Result<void>::Ok() : Result<void>::Err(result.error());
+  }
+};
+
+TEST(ResourceAddressedExecutionKernelTest, MockNodeStartChecksCurrentCapturedScopeBeforeServiceEffect) {
+  MockNodeStartKernelFixture fixture;
+  const auto original = fixture.request();
+  auto refused = [&](ProgramNodeMockSimulationRequestDTO request, const std::string& reason) {
+    const auto result = fixture.kernel.StartProgramNodeMockSimulation(request);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"), reason);
+    EXPECT_EQ(fixture.service->start_calls.load(), 0U);
+    EXPECT_EQ(fixture.engine.execute_calls, 0);
+  };
+  auto request = original;
+  request.scope.request_owner_epoch = RequestOwnerEpoch("foreign.owner");
+  refused(request, "io_watch_scope_stale");
+  request = original; request.scope.program_binding_id = ProgramBindingId("foreign.binding");
+  refused(request, "io_watch_scope_stale");
+  request = original; request.scope.program_runner_owner_epoch = RequestOwnerEpoch("foreign.runner");
+  refused(request, "io_watch_scope_stale");
+  request = original; request.scope.claim_generation = CellAdmissionClaimGeneration(2U);
+  refused(request, "io_watch_scope_stale");
+  request = original; request.scope.program_run_id = ProgramRunId("foreign.run");
+  refused(request, "io_watch_scope_stale");
+  request = original; request.scope.node.node_instance_id = ProgramNodeInstanceId("unknown");
+  refused(request, "io_watch_node_unsupported");
+  request = original; request.scope.node.node_attempt_id.clear();
+  refused(request, "io_watch_scope_invalid");
+  request = original; request.scope.node.node_instance_id = ProgramNodeInstanceId("timer");
+  refused(request, "mock_simulation_node_mismatch");
+  request = original; request.signals.front().resource_role_id = ResourceRoleId("unbound");
+  refused(request, "io_signal_unbound");
+  request = original; request.scope.node_start_index = 0U;
+  refused(request, "mock_simulation_invalid");
+  request = original; request.signals.push_back(request.signals.front());
+  refused(request, "mock_simulation_invalid");
+}
+
+TEST(ResourceAddressedExecutionKernelTest, MockNodeStartResolvesActualSourceAndPassesHostReceiptsUnchanged) {
+  for (const auto disposition : {ProgramMockSimulationSignalDisposition::kApplied,
+                                  ProgramMockSimulationSignalDisposition::kInactive}) {
+    MockNodeStartKernelFixture fixture;
+    fixture.service->disposition = disposition;
+    ASSERT_TRUE(fixture.service->actual->InstallSource(InterruptSourceId("gpio.source"),
+                                                       IoSourceIncarnation("provider.1"), {}).ok());
+    const auto request = fixture.request();
+    const auto result = fixture.kernel.StartProgramNodeMockSimulation(request);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    EXPECT_EQ(result.value().scope, request.scope);
+    EXPECT_EQ(result.value().started_at_ns, 123);
+    ASSERT_EQ(result.value().signals.size(), 1U);
+    EXPECT_EQ(result.value().signals.front().disposition, disposition);
+    EXPECT_EQ(fixture.service->last_request, std::optional(request));
+    EXPECT_EQ(fixture.service->last_capacity, program_io_capture().table->nodes.size());
+    const std::vector<ResolvedProgramMockSimulationSignalDTO> expected{{
+        program_io_descriptor().signal_id,
+        ComputeIoSignalDescriptorDigest(program_io_descriptor()).value(), 1U,
+        IoSourceIncarnation("provider.1")}};
+    EXPECT_EQ(fixture.service->last_resolved, expected);
+    const ErrorDTO error{"scripted_host_failure", "same host diagnosis", {{"reason", "boundary_failure"}}};
+    fixture.service->failure = error;
+    const auto failed = fixture.kernel.StartProgramNodeMockSimulation(request);
+    ASSERT_FALSE(failed.ok());
+    EXPECT_EQ(failed.error(), error);
+    EXPECT_EQ(fixture.engine.execute_calls, 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, MockNodeStartRejectsDescriptorDriftBeforeServiceEffect) {
+  auto descriptor = program_io_descriptor();
+  descriptor.freshness.maximum_age_ns = 101;
+  MockNodeStartKernelFixture fixture(descriptor);
+  const auto result = fixture.kernel.StartProgramNodeMockSimulation(fixture.request());
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "io_signal_descriptor_stale");
+  EXPECT_EQ(fixture.service->start_calls.load(), 0U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, MockNodeStartSerializesWithActualRunRetirementAndRejectsLateStart) {
+  MockNodeStartKernelFixture fixture;
+  HeldSettlementCall gate;
+  std::future<Result<ProgramNodeMockSimulationAcknowledgementDTO>> started;
+  std::future<Result<void>> retired;
+  struct ReleaseBeforeJoin final {
+    HeldSettlementCall& gate;
+    ~ReleaseBeforeJoin() { gate.Release(); }
+  } release{gate};
+  fixture.service->start_hook = gate.Blocker();
+  const auto request = fixture.request();
+  started = std::async(std::launch::async, [&fixture, request] {
+    return fixture.kernel.StartProgramNodeMockSimulation(request);
+  });
+  ASSERT_TRUE(gate.Entered());
+  auto retirement_requested = std::make_shared<std::promise<void>>();
+  auto retirement_started = retirement_requested->get_future();
+  retired = std::async(std::launch::async, [&fixture, retirement_requested] {
+    retirement_requested->set_value();
+    return fixture.retire();
+  });
+  ASSERT_EQ(retirement_started.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+  EXPECT_EQ(fixture.service->retire_calls.load(), 0U);
+  gate.Release();
+  ASSERT_EQ(started.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+  ASSERT_TRUE(started.get().ok());
+  ASSERT_EQ(retired.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+  ASSERT_TRUE(retired.get().ok());
+  fixture.service->start_hook = {};
+  EXPECT_EQ(fixture.service->events, (std::vector<std::string>{"start", "return", "retire"}));
+  const auto late = fixture.kernel.StartProgramNodeMockSimulation(request);
+  ASSERT_FALSE(late.ok());
+  EXPECT_EQ(late.error().details.at("reason"), "mock_simulation_scope_stale");
+  EXPECT_EQ(fixture.service->start_calls.load(), 1U);
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest, MockNodeEndRejectsStaleRunAndMalformedScopeBeforeServiceEffect) {
+  MockNodeStartKernelFixture fixture;
+  const auto original = fixture.request().scope;
+  auto refused = [&](ProgramNodeMockSimulationScopeDTO scope, const std::string& reason) {
+    const auto result = fixture.kernel.EndProgramNodeMockSimulation(scope);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"), reason);
+    EXPECT_EQ(fixture.service->end_calls.load(), 0U);
+    EXPECT_EQ(fixture.service->start_calls.load(), 0U);
+    EXPECT_EQ(fixture.engine.execute_calls, 0);
+  };
+  auto scope = original;
+  scope.request_owner_epoch = RequestOwnerEpoch("foreign.owner");
+  refused(scope, "io_watch_scope_stale");
+  scope = original; scope.program_binding_id = ProgramBindingId("foreign.binding");
+  refused(scope, "io_watch_scope_stale");
+  scope = original; scope.program_runner_owner_epoch = RequestOwnerEpoch("foreign.runner");
+  refused(scope, "io_watch_scope_stale");
+  scope = original; scope.claim_generation = CellAdmissionClaimGeneration(2U);
+  refused(scope, "io_watch_scope_stale");
+  scope = original; scope.program_run_id = ProgramRunId("foreign.run");
+  refused(scope, "io_watch_scope_stale");
+  scope = original; scope.node.node_instance_id = ProgramNodeInstanceId("unknown");
+  refused(scope, "io_watch_node_unsupported");
+  scope = original; scope.node.node_attempt_id.clear();
+  refused(scope, "io_watch_scope_invalid");
+  scope = original; scope.node_start_index = 0U;
+  refused(scope, "mock_simulation_invalid");
+  ASSERT_TRUE(fixture.retire().ok());
+  EXPECT_EQ(fixture.service->retire_calls.load(), 1U);
+  ASSERT_TRUE(fixture.kernel.EndProgramNodeMockSimulation(original).ok());
+  EXPECT_EQ(fixture.service->retire_calls.load(), 2U);
+  EXPECT_EQ(fixture.service->end_calls.load(), 0U);
+}
+TEST(ResourceAddressedExecutionKernelTest, MockNodeEndPassesExactScopeCapacityAndHostErrorWithoutStarting) {
+  MockNodeStartKernelFixture fixture;
+  const auto scope = fixture.request().scope;
+  ASSERT_TRUE(fixture.kernel.EndProgramNodeMockSimulation(scope).ok());
+  EXPECT_EQ(fixture.service->last_end, std::optional(scope));
+  EXPECT_EQ(fixture.service->last_capacity, program_io_capture().table->nodes.size());
+  EXPECT_EQ(fixture.service->end_calls.load(), 1U);
+  EXPECT_EQ(fixture.service->start_calls.load(), 0U);
+  const ErrorDTO error{"scripted_end_failure", "same END diagnosis", {{"reason", "end_boundary_failure"}}};
+  fixture.service->end_failure = error;
+  const auto failed = fixture.kernel.EndProgramNodeMockSimulation(scope);
+  ASSERT_FALSE(failed.ok());
+  EXPECT_EQ(failed.error(), error);
+  EXPECT_EQ(fixture.service->end_calls.load(), 2U);
+  EXPECT_EQ(fixture.service->retire_calls.load(), 0U);
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+}
+
+
+ProgramRunMockSimulationPauseRequestDTO mock_run_pause_request() {
+  const auto node = MockNodeStartKernelFixture::request().scope;
+  return {{node.request_owner_epoch, node.program_binding_id, node.program_runner_owner_epoch,
+            node.claim_generation, node.program_run_id},
+          std::numeric_limits<std::uint64_t>::max(), false, {}};
+}
+TEST(ResourceAddressedExecutionKernelTest, MockRunPauseRequiresCurrentRunAndRevisionBeforeServiceEffect) {
+  MockNodeStartKernelFixture fixture;
+  auto original = mock_run_pause_request();
+  original.held_node_instance_ids = {ProgramNodeInstanceId("move"), ProgramNodeInstanceId("wait")};
+  auto refused = [&](ProgramRunMockSimulationPauseRequestDTO request, const std::string& reason) {
+    const auto result = fixture.kernel.SetProgramRunMockSimulationPaused(request);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"), reason);
+    EXPECT_EQ(fixture.service->pause_calls.load(), 0U);
+    EXPECT_EQ(fixture.service->start_calls.load(), 0U);
+    EXPECT_EQ(fixture.engine.execute_calls, 0);
+  };
+  auto request = original;
+  request.scope.request_owner_epoch = RequestOwnerEpoch("foreign.owner");
+  refused(request, "io_watch_scope_stale");
+  request = original; request.scope.program_binding_id = ProgramBindingId("foreign.binding");
+  refused(request, "io_watch_scope_stale");
+  request = original; request.scope.program_runner_owner_epoch = RequestOwnerEpoch("foreign.runner");
+  refused(request, "io_watch_scope_stale");
+  request = original; request.scope.claim_generation = CellAdmissionClaimGeneration(2U);
+  refused(request, "io_watch_scope_stale");
+  request = original; request.scope.program_run_id = ProgramRunId("foreign.run");
+  refused(request, "io_watch_scope_stale");
+  request = original; request.run_revision = 0U;
+  refused(request, "mock_simulation_invalid");
+  ASSERT_TRUE(fixture.retire().ok());
+  refused(original, "mock_simulation_scope_stale");
+}
+TEST(ResourceAddressedExecutionKernelTest, MockRunPausePassesExplicitRunClockRequestAndHostErrorUnchanged) {
+  MockNodeStartKernelFixture fixture;
+  auto request = mock_run_pause_request();
+  request.held_node_instance_ids = {ProgramNodeInstanceId("move"), ProgramNodeInstanceId("wait")};
+  ASSERT_TRUE(fixture.kernel.SetProgramRunMockSimulationPaused(request).ok());
+  EXPECT_EQ(fixture.service->last_pause, std::optional(request));
+  request.paused = true;
+  ASSERT_TRUE(fixture.kernel.SetProgramRunMockSimulationPaused(request).ok());
+  EXPECT_EQ(fixture.service->last_pause, std::optional(request));
+  EXPECT_EQ(fixture.service->pause_calls.load(), 2U);
+  // This double reports a host conflict; Core does not grow a second revision
+  // ledger. The actual same-revision conflict and timer policy live in runtime.
+  const ErrorDTO error{"scripted_pause_failure", "same Run pause diagnosis",
+                        {{"reason", "mock_simulation_stale"}}};
+  fixture.service->pause_failure = error;
+  const auto failed = fixture.kernel.SetProgramRunMockSimulationPaused(request);
+  ASSERT_FALSE(failed.ok());
+  EXPECT_EQ(failed.error(), error);
+  EXPECT_EQ(fixture.service->start_calls.load(), 0U);
+  EXPECT_EQ(fixture.service->end_calls.load(), 0U);
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest, MockRunSnapshotRejectsNoncanonicalAndUncapturedHeldNodesBeforeEffect) {
+  MockNodeStartKernelFixture fixture;
+  auto request = mock_run_pause_request();
+  auto refused = [&](std::vector<ProgramNodeInstanceId> mask, const std::string& reason) {
+    request.held_node_instance_ids = std::move(mask);
+    const auto result = fixture.kernel.SetProgramRunMockSimulationPaused(request);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"), reason);
+    EXPECT_EQ(fixture.service->pause_calls.load(), 0U);
+    EXPECT_EQ(fixture.service->start_calls.load(), 0U);
+    EXPECT_EQ(fixture.service->end_calls.load(), 0U);
+    EXPECT_EQ(fixture.engine.execute_calls, 0);
+  };
+  refused({ProgramNodeInstanceId("wait"), ProgramNodeInstanceId("wait")}, "mock_simulation_invalid");
+  refused({ProgramNodeInstanceId("wait"), ProgramNodeInstanceId("move")}, "mock_simulation_invalid");
+  refused({ProgramNodeInstanceId("unknown")}, "mock_simulation_node_unknown");
+  // Existing capture has move, timer and wait. Canonical but over-count masks
+  // cannot install unbounded state or relabel uncaptured nodes.
+  ASSERT_EQ(program_io_capture().table->nodes.size(), 3U);
+  refused({ProgramNodeInstanceId("a"), ProgramNodeInstanceId("b"),
+            ProgramNodeInstanceId("c"), ProgramNodeInstanceId("d")}, "mock_simulation_invalid");
+  request.held_node_instance_ids = {ProgramNodeInstanceId("move"), ProgramNodeInstanceId("wait")};
+  const auto accepted = fixture.kernel.SetProgramRunMockSimulationPaused(request);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(fixture.service->last_pause, std::optional(request));
+  EXPECT_EQ(fixture.service->pause_calls.load(), 1U);
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest, RetiredMockNodeEndReturnsActualCleanupFailureAndExactRetrySuccess) {
+  MockNodeStartKernelFixture fixture;
+  const auto scope = fixture.request().scope;
+  const ErrorDTO failure{"scripted_retirement_failed", "actual service cleanup did not complete",
+                          {{"reason", "retirement_boundary_failure"}}};
+  fixture.service->retirement_failure = failure;
+  // Real owner readiness retires the captured Run first. The existing owner
+  // retirement path has no success receipt to substitute for this service error.
+  ASSERT_TRUE(fixture.retire().ok());
+  EXPECT_EQ(fixture.service->retire_calls.load(), 1U);
+  const auto failed = fixture.kernel.EndProgramNodeMockSimulation(scope);
+  ASSERT_FALSE(failed.ok());
+  EXPECT_EQ(failed.error(), failure);
+  EXPECT_EQ(fixture.service->retire_calls.load(), 2U);
+  EXPECT_EQ(fixture.service->last_retired_run,
+      std::optional(std::pair(scope.program_runner_owner_epoch, scope.program_run_id)));
+  auto refused = [&](ProgramNodeMockSimulationScopeDTO stale, const std::string& reason) {
+    const auto result = fixture.kernel.EndProgramNodeMockSimulation(stale);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"), reason);
+    EXPECT_EQ(fixture.service->retire_calls.load(), 2U);
+  };
+  auto stale = scope;
+  stale.request_owner_epoch = RequestOwnerEpoch("foreign.owner");
+  refused(stale, "io_watch_scope_stale");
+  stale = scope; stale.program_binding_id = ProgramBindingId("foreign.binding");
+  refused(stale, "io_watch_scope_stale");
+  stale = scope; stale.program_runner_owner_epoch = RequestOwnerEpoch("foreign.runner");
+  refused(stale, "io_watch_scope_stale");
+  stale = scope; stale.claim_generation = CellAdmissionClaimGeneration(2U);
+  refused(stale, "io_watch_scope_stale");
+  stale = scope; stale.program_run_id = ProgramRunId("foreign.run");
+  refused(stale, "io_watch_scope_stale");
+  stale = scope; stale.node.node_instance_id = ProgramNodeInstanceId("unknown");
+  refused(stale, "io_watch_node_unsupported");
+  stale = scope; stale.node.node_attempt_id.clear();
+  refused(stale, "io_watch_scope_invalid");
+  stale = scope; stale.node_start_index = 0U;
+  refused(stale, "mock_simulation_invalid");
+  const auto start = fixture.kernel.StartProgramNodeMockSimulation(fixture.request());
+  ASSERT_FALSE(start.ok());
+  EXPECT_EQ(start.error().details.at("reason"), "mock_simulation_scope_stale");
+  const auto pause = fixture.kernel.SetProgramRunMockSimulationPaused(mock_run_pause_request());
+  ASSERT_FALSE(pause.ok());
+  EXPECT_EQ(pause.error().details.at("reason"), "mock_simulation_scope_stale");
+  fixture.service->retirement_failure.reset();
+  const auto completed = fixture.kernel.EndProgramNodeMockSimulation(scope);
+  ASSERT_TRUE(completed.ok()) << completed.error().message;
+  EXPECT_EQ(fixture.service->retire_calls.load(), 3U);
+  EXPECT_EQ(fixture.service->last_retired_run,
+      std::optional(std::pair(scope.program_runner_owner_epoch, scope.program_run_id)));
+  EXPECT_EQ(fixture.service->start_calls.load(), 0U);
+  EXPECT_EQ(fixture.service->end_calls.load(), 0U);
+  EXPECT_EQ(fixture.service->pause_calls.load(), 0U);
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, RetiredMockNodeEndCannotAcknowledgeAnUninstalledService) {
+  MockNodeStartKernelFixture fixture(program_io_descriptor(), false);
+  const auto scope = fixture.request().scope;
+  const auto before_retirement = fixture.kernel.EndProgramNodeMockSimulation(scope);
+  ASSERT_FALSE(before_retirement.ok());
+  EXPECT_EQ(before_retirement.error().details.at("reason"), "io_signal_service_unavailable");
+  ASSERT_TRUE(fixture.retire().ok());
+  const auto retired = fixture.kernel.EndProgramNodeMockSimulation(scope);
+  ASSERT_FALSE(retired.ok());
+  EXPECT_EQ(retired.error().details.at("reason"), "io_signal_service_unavailable");
+  EXPECT_EQ(fixture.service->retire_calls.load(), 0U);
+  EXPECT_EQ(fixture.service->end_calls.load(), 0U);
+  EXPECT_EQ(fixture.service->start_calls.load(), 0U);
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     FailedWholeRunStopAdvancesChangedFaultProjectionOnce) {
+  for (const bool fail : {false, true}) {
+    SCOPED_TRACE(fail);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                 CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel(
+        {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+                                   CoordinateKind::kAngular), engine)},
+        clock, scheduler, journal, std::move(config));
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    auto capture = program_execution_capture();
+    auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+    // Retain actual captured Ready, Running reader and Held reader states
+    // beside the moving effect. Only the latter is Stopping at acceptance.
+    table->nodes.insert(table->nodes.begin() + 1,
+        {ProgramNodeInstanceId("place"), "kernel.operation",
+         {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}});
+    table->nodes.insert(table->nodes.begin() + 2,
+        {ProgramNodeInstanceId("reader"), "orchestration.clock", {}});
+    table->named_selections = {{"arm", {0U}}, {"place", {1U}},
+                              {"reader", {2U}}, {"supervision", {3U}}};
+    capture.table = table;
+    ASSERT_TRUE(kernel.register_program_run_capture(std::move(capture)).ok());
+    start_program_motion(kernel, "arm");
+    const auto held_reader = kernel.stop_program_selection(
+        program_selection_request("projection.hold.reader", "supervision"));
+    ASSERT_TRUE(held_reader.ok()) << held_reader.error().message;
+    ASSERT_FALSE(held_reader.value().fresh_containment);
+    const auto operation = kernel.execute(scoped_motion_operation("projection.motion"));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    if (fail) {
+      engine.next_stop_result = StopResultDTO{false, ErrorDTO{
+          "controller_stop_rejected", "fixture rejects every retained stage",
+          {{"reason", "controller_stop_rejected"}}}};
+    }
+    HeldSettlementCall stage;
+    engine.translate_stop_stage_hook = stage.Blocker();
+    // Keep a genuine selected effect pending while the whole-Run fence
+    // adopts its Stop. Terminal reduction then visits BOTH reducers; an
+    // already Faulted selected row must not advance the revision twice.
+    const auto selected = kernel.stop_program_selection(
+        program_selection_request("projection.selected.before.whole", "arm"));
+    ASSERT_TRUE(selected.ok()) << selected.error().message;
+    ASSERT_TRUE(selected.value().fresh_containment);
+    ASSERT_TRUE(stage.Entered());
+    const auto request = program_run_stop_request("projection.whole.stop", "run.1");
+    const auto accepted = kernel.stop(request);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_EQ(accepted.value().stop_id, selected.value().fresh_containment->stop_id);
+    const auto stopping = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(stopping.ok()) << stopping.error().message;
+    ASSERT_EQ(stopping.value().held_nodes.size(), 3U);
+    EXPECT_EQ(stopping.value().held_nodes[0].state, ProgramNodeHoldStateDTO::kStopping);
+    EXPECT_EQ(stopping.value().held_nodes[1].state, ProgramNodeHoldStateDTO::kReady);
+    EXPECT_EQ(stopping.value().held_nodes[2].state, ProgramNodeHoldStateDTO::kHeld);
+    stage.Release();
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(accepted.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    const auto terminal = kernel.get_stop_status(accepted.value().stop_id);
+    ASSERT_TRUE(terminal.ok());
+    ASSERT_TRUE(terminal.value().stop_certificate);
+    const auto certificate = kernel.get_stop_certificate(
+        terminal.value().stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+    EXPECT_EQ(certificate.value().result,
+              fail ? StopCertificateResultDTO::kFailedUncontained
+                   : StopCertificateResultDTO::kSucceededNominal);
+    const auto after = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(after.ok()) << after.error().message;
+    EXPECT_EQ(after.value().selection_revision,
+              stopping.value().selection_revision + (fail ? 1U : 0U));
+    EXPECT_TRUE(after.value().pending_effects.empty());
+    if (fail) {
+      ASSERT_EQ(after.value().held_nodes.size(), 4U);
+      for (const auto& node : after.value().held_nodes)
+        EXPECT_EQ(node.state, ProgramNodeHoldStateDTO::kFaulted);
+      const auto release = kernel.release_program_run_stop_fence(
+          ProgramRunId("run.1"), accepted.value().stop_id, accepted.value().stop_generation);
+      ASSERT_FALSE(release.ok());
+      // The terminal revision preserves the legacy equality relation: this
+      // remains the actual failed Stop, not a fabricated newer selection.
+      EXPECT_EQ(release.error().details.at("reason"), "program_run_stop_fence_not_releasable");
+    } else {
+      ASSERT_EQ(after.value().held_nodes.size(), 3U);
+      EXPECT_EQ(after.value().held_nodes[0].state, ProgramNodeHoldStateDTO::kHeld);
+      EXPECT_EQ(after.value().held_nodes[1].state, ProgramNodeHoldStateDTO::kReady);
+      EXPECT_EQ(after.value().held_nodes[2].state, ProgramNodeHoldStateDTO::kHeld);
+    }
+    const auto replay = kernel.stop(request);
+    ASSERT_TRUE(replay.ok()) << replay.error().message;
+    EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+    EXPECT_EQ(replay.value().stop_id, accepted.value().stop_id);
+    const auto replay_scope = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(replay_scope.ok());
+    EXPECT_EQ(replay_scope.value().selection_revision, after.value().selection_revision);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     SelectedStopStoppingSettlementKeepsItsAcceptedRevision) {
+  for (const bool fail : {false, true}) {
+    SCOPED_TRACE(fail);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                 CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel(
+        {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+                                   CoordinateKind::kAngular), engine)},
+        clock, scheduler, journal, std::move(config));
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+    start_program_motion(kernel);
+    const auto operation = kernel.execute(scoped_motion_operation("projection.selected.motion"));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    if (fail) {
+      engine.next_stop_result = StopResultDTO{false, ErrorDTO{
+          "controller_stop_rejected", "fixture rejects every retained stage",
+          {{"reason", "controller_stop_rejected"}}}};
+    }
+    HeldSettlementCall stage;
+    engine.translate_stop_stage_hook = stage.Blocker();
+    const auto request = program_selection_request("projection.selected.stop", "arm");
+    const auto stopped = kernel.stop_program_selection(request);
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    ASSERT_TRUE(stopped.value().state);
+    ASSERT_TRUE(stopped.value().fresh_containment);
+    ASSERT_TRUE(stage.Entered());
+    const auto stopping = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(stopping.ok());
+    ASSERT_EQ(stopping.value().held_nodes.size(), 1U);
+    EXPECT_EQ(stopping.value().held_nodes[0].state, ProgramNodeHoldStateDTO::kStopping);
+    ASSERT_FALSE(stopping.value().pending_effects.empty());
+    stage.Release();
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().fresh_containment->stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    const auto after = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+    ASSERT_TRUE(after.ok()) << after.error().message;
+    EXPECT_EQ(after.value().selection_revision, stopping.value().selection_revision);
+    EXPECT_TRUE(after.value().pending_effects.empty());
+    ASSERT_EQ(after.value().held_nodes.size(), 1U);
+    EXPECT_EQ(after.value().held_nodes[0].state,
+              fail ? ProgramNodeHoldStateDTO::kFaulted : ProgramNodeHoldStateDTO::kHeld);
+    const auto replay = kernel.stop_program_selection(request);
+    ASSERT_TRUE(replay.ok()) << replay.error().message;
+    EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+    ASSERT_TRUE(replay.value().state);
+    EXPECT_EQ(replay.value().state->selection_revision, after.value().selection_revision);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     TerminalFaultRevisionPreservesOlderLegacySelectionAndSaturatesWithoutWrap) {
+  using namespace manyforge::core::resource_addressed_kernel_detail;
+  for (const auto before : {ProgramNodeHoldStateDTO::kRunning, ProgramNodeHoldStateDTO::kReady,
+                            ProgramNodeHoldStateDTO::kHeld})
+    EXPECT_TRUE(terminal_program_fault_changes_selection(before));
+  EXPECT_FALSE(terminal_program_fault_changes_selection(ProgramNodeHoldStateDTO::kStopping));
+  EXPECT_FALSE(terminal_program_fault_changes_selection(ProgramNodeHoldStateDTO::kFaulted));
+  constexpr std::uint64_t maximum = 9'007'199'254'740'991ULL;
+  for (const bool legacy_current : {false, true}) {
+    std::uint64_t revision = maximum - 1U;
+    std::uint64_t legacy = legacy_current ? revision : revision - 1U;
+    const auto older_legacy = legacy;
+    advance_terminal_program_fault_selection(revision, legacy, maximum);
+    EXPECT_EQ(revision, maximum);
+    EXPECT_EQ(legacy, legacy_current ? maximum : older_legacy);
+    advance_terminal_program_fault_selection(revision, legacy, maximum);
+    EXPECT_EQ(revision, maximum);
+    EXPECT_EQ(legacy, legacy_current ? maximum : older_legacy);
   }
 }
 

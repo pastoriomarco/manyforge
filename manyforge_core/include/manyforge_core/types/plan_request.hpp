@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/ports/iexecution_port.hpp>
 #include <manyforge_core/types/action_span.hpp>
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
@@ -63,6 +64,22 @@ struct PlannerCapabilityBindingDTO final {
 
   friend bool operator==(const PlannerCapabilityBindingDTO&,
                          const PlannerCapabilityBindingDTO&) = default;
+};
+
+/// Immutable Kernel-selected source for one speculative moving replacement.
+/// This carries provenance, not Replace permission or an execution owner.
+struct MovingReplacementInputDTO final {
+  ExecutionGoalKey source_goal;
+  ExecutionBindingEpoch source_binding_epoch;
+  double source_cursor_s{};
+  TrajectoryDTO source_prefix_trajectory;
+  double divergence_cursor_s{};
+  ControlledStateDTO suffix_start_state;
+  ResolvedFrameDTO source_base_frame;
+  ResolvedFrameDTO source_tcp_frame;
+  SpeedProfileDTO source_speed_profile;
+  PerResourceDynamicsLimitsDTO source_per_resource_dynamics_limits;
+  double remaining_preparation_budget_s{};
 };
 
 /// Kernel-produced, fully resolved planning request (spec 210 section 3.6).
@@ -140,6 +157,7 @@ struct PlanRequestDTO final {
   /// validation remains Kernel-owned.
   CollisionWorldSnapshotPtr retained_collision_world{};
   std::shared_ptr<const CollisionPolicySnapshot> retained_collision_policy{};
+  std::optional<MovingReplacementInputDTO> moving_replacement{};
 };
 
 /// Planning result (spec §3.6)

@@ -3,9 +3,16 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import type { CCLCComponentSnapshot } from '../types/cclc';
 import { PROGRAM_RESET_READINESS_MESSAGE } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
-import type { CycleRecoveryOffer, ProgramRunStateName } from '../types/api';
+import type {
+  AutomaticRetryAuditEvent,
+  CycleRecoveryOffer,
+  ProgramRunStateName,
+  RuntimeControlAuditEvent,
+  StructuredError,
+} from '../types/api';
 import type {
   RuntimeScaleControlSelector,
   RuntimeScaleControlStatus,
@@ -20,6 +27,10 @@ import {
   MotionControlSettings,
   ProgramRuntimePanel,
   ProgramTransportControls,
+  automaticRetryFailureText,
+  automaticRetryText,
+  ioSourceAuditText,
+  ioSourceUnavailableNodes,
   resetKeptMessage,
 } from './ProgramRuntimePanel';
 import { readStyleSource } from '../styles/readStyleSource';
@@ -56,14 +67,12 @@ function ordinaryMotionStopOffer(): CycleRecoveryOffer {
     recoveryClass: 'ordinary_operator_stop',
     actions: [{
       actionId: 'replan_from_stopped_state',
-      labelKey: 'recovery.replan_from_stopped_state',
       requiresConfirmation: false,
       performsBackendReset: false,
       enabled: true,
       disabledReasonCode: null,
     }, {
       actionId: 'reset_cycle',
-      labelKey: 'recovery.reset_cycle',
       requiresConfirmation: true,
       performsBackendReset: true,
       enabled: true,
@@ -73,7 +82,6 @@ function ordinaryMotionStopOffer(): CycleRecoveryOffer {
       enabled: false,
       disabledReasonCode: 'manual_result_not_available',
     },
-    primaryAction: 'replan_from_stopped_state',
     reason: {
       code: 'ordinary_operator_stop',
       message: 'Stopped by the operator.',
@@ -93,6 +101,8 @@ function ordinaryMotionStopControls(): NonNullable<
     ownerEpoch: 'program-runner.epoch.1',
     programRunId: 'program-run.1',
     recoveryOffer: ordinaryMotionStopOffer(),
+    // An operator Stop is not a failure hold.
+    recoveryHolds: [],
     executionSelections: {
       selectionRevision: 1,
       motionHeld: true,
@@ -127,7 +137,6 @@ function robotController(): RobotControlController {
     runtimeScaleError: null,
     runtimeScaleDraft: 1,
     runtimeScalePending: false,
-    fullStopError: null,
     stopFaultRecoveryPending: false,
     stopFaultRecoveryError: null,
     componentIncidents: [],
@@ -270,6 +279,7 @@ function controller(
         nodeStatusRevision: 2,
         nodeStatuses: { root: 'running' },
         activeOperationCount: 1,
+        operationFailures: [],
         reason: null,
         message: '',
       },
@@ -294,6 +304,8 @@ function controller(
     refresh: vi.fn(),
     dismissError: vi.fn(),
     activationOffer: null,
+    activationComponentHealth: {},
+    activationProgress: null,
     activationPending: false,
     activationWaiting: false,
     confirmActivationExecute: vi.fn(async () => {}),
@@ -351,6 +363,120 @@ describe('Program runtime projection', () => {
     };
     expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={view} />))
       .toContain('authored-cell · no Program');
+  });
+
+  it('names each automatic retry in the runtime-control events', () => {
+    const retry = (attempt: number, cause: string, eventRevision: number): AutomaticRetryAuditEvent => ({
+      eventRevision,
+      kind: 'program_node_automatic_retry',
+      facts: {
+        nodeInstanceId: 'move', attempt, maxAttempts: 4, cause, delayS: 1, failure: null,
+      },
+    });
+    const collision = retry(2, 'collision_stop_nominal', 2);
+    const planning = retry(3, 'planning_no_effect', 3);
+    expect(automaticRetryText(collision)).toBe('Attempt 2 of 4 for move after collision Stop');
+    expect(automaticRetryText(planning)).toBe('Attempt 3 of 4 for move after planning failed');
+    expect(automaticRetryText({ eventRevision: 4, kind: 'program_node_retry', facts: {} })).toBeNull();
+    const base = controller();
+    const audit = [collision, planning];
+    type RuntimeControls = NonNullable<NonNullable<ProgramRuntimeController['state']['controls']>['runtimeControls']>;
+    const withAudit: ProgramRuntimeController = {
+      ...base,
+      state: {
+        ...base.state,
+        controls: {
+          ...ordinaryMotionStopControls(),
+          runtimeControls: { audit } as unknown as RuntimeControls,
+        },
+      },
+    };
+    const markup = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={withAudit} />);
+    expect(markup).toContain('Attempt 2 of 4 for move after collision Stop');
+    expect(markup).toContain('Attempt 3 of 4 for move after planning failed');
+  });
+
+  it('shows a running io wait whose input source is unavailable in amber, and both transitions as events', () => {
+    const io = (eventRevision: number, available: boolean, node = 'wait_part'): RuntimeControlAuditEvent => ({
+      eventRevision,
+      kind: available ? 'program_node_io_source_available' : 'program_node_io_source_unavailable',
+      facts: { node_instance_id: node, node_attempt_id: `${node}.1`, quality: available ? 'fresh' : 'stale' },
+    });
+    expect(ioSourceAuditText(io(2, false))).toBe('Input source unavailable for wait_part (stale) — still waiting');
+    expect(ioSourceAuditText(io(3, true))).toBe('Input source available again for wait_part');
+    expect(ioSourceAuditText({ eventRevision: 4, kind: 'program_node_retry', facts: {} })).toBeNull();
+    // Only the newest transition per node counts, and only while the node runs.
+    const running = { wait_part: 'running', other: 'running', done: 'success' } as const;
+    expect(ioSourceUnavailableNodes([io(2, false), io(3, true)], running)).toEqual([]);
+    expect(ioSourceUnavailableNodes([io(2, false, 'done')], running)).toEqual([]);
+    expect(ioSourceUnavailableNodes([io(2, true), io(3, false)], running))
+      .toEqual([{ unavailable: true, nodeInstanceId: 'wait_part', quality: 'stale' }]);
+
+    const base = controller();
+    type RuntimeControls = NonNullable<NonNullable<ProgramRuntimeController['state']['controls']>['runtimeControls']>;
+    const view = (audit: RuntimeControlAuditEvent[]): ProgramRuntimeController => ({
+      ...base,
+      state: {
+        ...base.state,
+        run: { ...base.state.run!, nodeStatuses: { root: 'running', wait_part: 'running' } },
+        controls: {
+          ...ordinaryMotionStopControls(),
+          runtimeControls: { audit } as unknown as RuntimeControls,
+        },
+      },
+    });
+    const waiting = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={view([io(2, false)])} />);
+    expect(waiting).toMatch(/class="inline-message severity-warning" role="status">Waiting on wait_part: input source unavailable \(stale\)/);
+    expect(waiting).toContain('<span class="inline-message severity-warning">Input source unavailable for wait_part (stale) — still waiting</span>');
+    const recovered = renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={view([io(2, false), io(3, true)])} />,
+    );
+    expect(recovered).not.toContain('Waiting on wait_part');
+    expect(recovered).toContain('Input source available again for wait_part');
+  });
+
+  it('shows the failed attempt in red before its retry, with the Kernel failure when there is one', () => {
+    const failed = (
+      failure: StructuredError | null,
+      cause = 'collision_stop_nominal',
+    ): AutomaticRetryAuditEvent => ({
+      eventRevision: 2,
+      kind: 'program_node_automatic_retry',
+      facts: {
+        nodeInstanceId: 'move', attempt: 2, maxAttempts: 4, cause, delayS: 1, failure,
+      },
+    });
+    const kernel: StructuredError = {
+      code: 'kernel_timeout', message: 'planner timed out', details: null, origin: null,
+    };
+    // The code is shown as the structured-error display humanises it.
+    expect(automaticRetryFailureText(failed(kernel)))
+      .toBe('Collision Stop on move: kernel timeout — planner timed out');
+    expect(automaticRetryFailureText(failed({ ...kernel, code: 'ik_failed' }, 'planning_no_effect')))
+      .toBe('Planning failed on move: ik failed — planner timed out');
+    // The cause alone when the owner has no Kernel failure.
+    expect(automaticRetryFailureText(failed(null))).toBe('Collision Stop on move');
+    expect(automaticRetryFailureText(failed(null, 'planning_no_effect'))).toBe('Planning failed on move');
+
+    const base = controller();
+    type RuntimeControls = NonNullable<NonNullable<ProgramRuntimeController['state']['controls']>['runtimeControls']>;
+    const withAudit: ProgramRuntimeController = {
+      ...base,
+      state: {
+        ...base.state,
+        controls: {
+          ...ordinaryMotionStopControls(),
+          runtimeControls: {
+            audit: [failed(kernel)],
+          } as unknown as RuntimeControls,
+        },
+      },
+    };
+    const markup = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={withAudit} />);
+    const red = 'Collision Stop on move: kernel timeout — planner timed out';
+    const retry = 'Attempt 2 of 4 for move after collision Stop';
+    expect(markup).toContain(`<p class="inline-message severity-error">${red}</p>`);
+    expect(markup.indexOf(red)).toBeLessThan(markup.indexOf(retry));
   });
 
   it('shows exact owner status without duplicating the standard commands', () => {
@@ -675,12 +801,12 @@ describe('Program runtime projection', () => {
     offer.nodeInstanceId = 'move.1';
     offer.actions = [{
       actionId: 'retry_motion_from_current_state',
-      labelKey: 'recovery.retry_motion_from_current_state',
       requiresConfirmation: false,
       performsBackendReset: false,
       enabled: false,
       disabledReasonCode: 'failure_pause_containment_unconfirmed',
     }];
+    controls.recoveryHolds = [{ motionGroupIds: ['all'], interventionStopScope: 'all', offer }];
     paused.state.controls = controls;
     const render = () => renderToStaticMarkup(
       <ProgramTransportControls enabled program={paused} robot={robotController()} />,
@@ -739,12 +865,12 @@ describe('Program runtime projection', () => {
     offer.participants = [{ operation_participant_id: 'p1', resource_ids: ['robot.joint_1'] }];
     offer.actions = [{
       actionId: 'retry_motion_from_current_state',
-      labelKey: 'recovery.retry_motion_from_current_state',
       requiresConfirmation: false,
       performsBackendReset: false,
       enabled: true,
       disabledReasonCode: null,
     }];
+    failed.recoveryHolds = [{ motionGroupIds: ['all'], interventionStopScope: 'all', offer }];
     paused.state.controls = failed;
     expect(render(withAlarms(paused, [
       gatingMember('arm', 'returned_unacknowledged', ['robot.joint_1']),
@@ -803,8 +929,12 @@ describe('Program runtime projection', () => {
       source.indexOf('const requestProgramHalt'),
     );
     // Not executing: reset at once. Executing: stop motion, then ask.
-    expect(flow).toMatch(/if \(!executionActive\) \{\s*if \(endedReset && preferences\.confirmReset\) setResetIntent\('confirm'\);\s*else void program\.reset\(\);/);
-    expect(flow).toContain("setResetIntent(preferences.confirmReset ? 'stopping' : 'automatic');");
+    // confirmReset = the preference, or retained uncertain outputs (contract 66).
+    expect(source).toContain('const confirmReset = preferences.confirmReset || resetUncertain.length > 0;');
+    // The list also covers held Program-run operations (their recovery offers).
+    expect(source).toMatch(/programRunUncertainOutputs\(\[\s*\.\.\.\(program\.state\.controls\?\.recoveryHolds \?\? \[\]\)\.map\(\(hold\) => hold\.offer\),\s*program\.state\.controls\?\.recoveryOffer,/);
+    expect(flow).toMatch(/if \(!executionActive\) \{\s*if \(endedReset && confirmReset\) setResetIntent\('confirm'\);\s*else void program\.reset\(\);/);
+    expect(flow).toContain("setResetIntent(confirmReset ? 'stopping' : 'automatic');");
     expect(flow).toContain("await program.stopMotion(['all'])");
     // Halted: motion is already contained, so no refused motion Stop is sent.
     expect(source).toContain('allGroup === undefined || allMotionQuiesced || programFullStopped');
@@ -837,7 +967,9 @@ describe('Program runtime projection', () => {
     expect(source).toContain('disabled={!positionAvailable}');
     expect(source).toContain('void program.reset(resetSelectionApplied);');
     // An idle Reset with nothing selected would restore nothing.
-    expect(source).toContain('disabled={!canReset || !motionSettled || (idleReset && resetNothingSelected)}');
+    expect(source).toContain('disabled={!canReset || (!motionSettled && !endedReset && !idleReset) || !uncertainApproved}');
+    // An idle Reset may restore nothing (contract 141).
+    expect(source).not.toContain('resetNothingSelected');
     // The automatic (unconfirmed) running Reset keeps both options off.
     expect(source).toMatch(/if \(resetIntent === 'automatic' && motionSettled\) \{\s*setResetIntent\(null\);\s*void program\.reset\(\);/);
   });
@@ -1367,7 +1499,7 @@ describe('Program runtime projection', () => {
       reasonCode: 'physical_rest_unproven', certificate: null,
     };
     robot.componentIncidents = [{
-      componentId: 'component.arm',
+      controllableComponentId: 'component.arm',
       incident: {
         incidentId: 'incident.1',
         causeClass: 'external_control',
@@ -1554,4 +1686,302 @@ it('shows a failed accepted start and native comparison facts while Reset remain
   expect(notice.message).toContain('Admission generation after: 37');
   expect(notice.message).toContain('Snapshot changed: false');
   expect(notice.message).toContain('Claim generation: 9');
+});
+
+/**
+ * Mounts the transport controls on a stub DOM. `press` runs the onClick of the
+ * last mounted control whose props match; `unmount` restores the globals.
+ */
+async function mountTransport(program: ProgramRuntimeController) {
+  const created: Record<string, unknown>[] = [];
+  const document: Record<string, unknown> = {
+    nodeType: 9, activeElement: null, defaultView: {},
+    addEventListener: () => undefined, removeEventListener: () => undefined,
+    createTextNode: (text: string) => ({ nodeType: 3, nodeValue: text, ownerDocument: document }),
+  };
+  const node = (tag: string): Record<string, unknown> => {
+    const element: Record<string, unknown> = {
+      nodeType: 1, nodeName: tag.toUpperCase(), tagName: tag.toUpperCase(),
+      namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: document,
+      style: { setProperty: () => undefined }, options: [],
+      addEventListener: () => undefined, removeEventListener: () => undefined,
+      appendChild: () => undefined, insertBefore: () => undefined, removeChild: () => undefined,
+      setAttribute: () => undefined, removeAttribute: () => undefined,
+    };
+    created.push(element);
+    return element;
+  };
+  document.createElement = node;
+  document.documentElement = node('html');
+  const window = {
+    document, HTMLIFrameElement: class {},
+    addEventListener: () => undefined, removeEventListener: () => undefined,
+    setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout,
+    requestAnimationFrame: () => 0,
+  };
+  document.defaultView = window;
+  vi.stubGlobal('window', window);
+  vi.stubGlobal('document', document);
+  vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+  type Props = Record<string, unknown> & { onClick?: () => void };
+  const propsOf = (element: Record<string, unknown>) => element[
+    Object.keys(element).find((name) => name.startsWith('__reactProps$')) ?? ''] as Props | undefined;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const root = createRoot(node('div') as unknown as Element);
+  await act(() => { root.render(<ProgramTransportControls enabled program={program} robot={robotController()} />); });
+  return {
+    press: async (match: (props: Props) => boolean) => {
+      const found = created.map(propsOf).filter((candidate): candidate is Props => (
+        candidate !== undefined && match(candidate)
+      )).at(-1);
+      if (found === undefined) throw new Error('Mounted control not found');
+      await act(() => { found.onClick!(); });
+    },
+    unmount: async () => {
+      await act(() => { root.unmount(); });
+      vi.unstubAllGlobals();
+    },
+  };
+}
+
+describe('Per-hold Retry and Continue', () => {
+  /** Two failure holds, left and right, each owning its own group; middle is owned by none. */
+  function twoHolds(): ProgramRuntimeController {
+    const program = controller('intervention_required');
+    const controls = ordinaryMotionStopControls();
+    const base = controls.executionSelections.groups[0];
+    controls.executionSelections.groups = ['all', 'left', 'middle', 'right'].map((groupId) => ({
+      ...base, groupId, resumeAllowed: true, resumeUnavailableReason: null,
+    }));
+    const holdOffer = (node: string, digit: string): CycleRecoveryOffer => ({
+      ...ordinaryMotionStopOffer(),
+      offerId: `sha256:${digit.repeat(64)}`,
+      offerRevision: Number(digit),
+      nodeInstanceId: node,
+      recoveryClass: 'node_failure_pause',
+      actions: [{
+        actionId: 'retry_motion_from_current_state',
+        requiresConfirmation: false, performsBackendReset: false,
+        enabled: true, disabledReasonCode: null,
+      }, {
+        actionId: 'continue_with_failure',
+        requiresConfirmation: true, performsBackendReset: false,
+        enabled: true, disabledReasonCode: null,
+      }],
+    });
+    controls.recoveryOffer = holdOffer('left.move', '1');
+    controls.recoveryHolds = [
+      { motionGroupIds: ['left'], interventionStopScope: 'own_groups', offer: holdOffer('left.move', '1') },
+      { motionGroupIds: ['right'], interventionStopScope: 'own_groups', offer: holdOffer('right.move', '2') },
+    ];
+    program.state.controls = controls;
+    return program;
+  }
+
+  it('renders Retry and a red Continue per owning hold and disables groups owned by none', () => {
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={twoHolds()} robot={robotController()} />,
+    );
+    expect(markup).toMatch(
+      /class="transport-group-resume"(?![^>]*disabled)[^>]*title="Retry left.move and let its groups continue."[^>]*>Retry<\/button>/,
+    );
+    expect(markup).toMatch(
+      /class="transport-group-resume"(?![^>]*disabled)[^>]*title="Retry right.move and let its groups continue."[^>]*>Retry<\/button>/,
+    );
+    expect(markup).toMatch(
+      /class="transport-group-resume"[^>]*disabled=""[^>]*title="middle waits for held nodes left.move, right.move: Retry or Continue them first."[^>]*>Resume<\/button>/,
+    );
+    expect(markup).toMatch(
+      /class="danger-button transport-group-stop transport-group-continue"(?![^>]*disabled)[^>]*title="Continuing fails the node"[^>]*aria-label="Continue left: fail held node left.move"[^>]*>Continue<\/button>/,
+    );
+    expect(markup).toContain('aria-label="Continue right: fail held node right.move"');
+    // Groups no hold owns keep their ordinary Stop.
+    expect(markup.match(/>Continue<\/button>/g)).toHaveLength(2);
+    expect(markup).toMatch(/class="danger-button transport-group-stop"[^>]*>Stopped<\/button>/);
+
+    // Continue the backend does not offer, or disables, keeps Stop or shows why.
+    const noContinue = twoHolds();
+    for (const hold of noContinue.state.controls!.recoveryHolds) {
+      hold.offer.actions = hold.offer.actions.slice(0, 1);
+    }
+    expect(renderToStaticMarkup(
+      <ProgramTransportControls enabled program={noContinue} robot={robotController()} />,
+    )).not.toContain('>Continue</button>');
+    const disabled = twoHolds();
+    disabled.state.controls!.recoveryHolds[0].offer.actions[1] = {
+      ...disabled.state.controls!.recoveryHolds[0].offer.actions[1],
+      enabled: false, disabledReasonCode: 'recovery_close_not_eligible',
+    };
+    expect(renderToStaticMarkup(
+      <ProgramTransportControls enabled program={disabled} robot={robotController()} />,
+    )).toMatch(/transport-group-continue"[^>]*disabled=""[^>]*title="Continuing fails the node"[^>]*aria-label="Continue left/);
+  });
+
+  it('lets a hold in no named group own every group no other hold names (item 43)', () => {
+    const program = twoHolds();
+    const [left, right] = program.state.controls!.recoveryHolds;
+    program.state.controls!.recoveryHolds = [
+      { ...right, motionGroupIds: ['all'], interventionStopScope: 'all' },
+      left,
+    ];
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+    // left stays with its own hold; middle and right go to the unnamed hold.
+    expect(markup).toContain('aria-label="Continue left: fail held node left.move"');
+    expect(markup).toContain('aria-label="Continue middle: fail held node right.move"');
+    expect(markup).toContain('aria-label="Continue right: fail held node right.move"');
+    expect(markup).not.toContain('waits for held');
+    expect(markup.match(
+      /title="Retry right.move and let the Program&#x27;s motion continue, except groups other held nodes own."[^>]*>Retry<\/button>/g,
+    )?.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('gives a running group under a hold its ordinary Stop, without the waiting tooltip', () => {
+    const program = twoHolds();
+    const middle = program.state.controls!.executionSelections.groups
+      .find((group) => group.groupId === 'middle')!;
+    middle.state = 'running';
+    middle.stopAllowed = true;
+    middle.resumeAllowed = false;
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+    expect(markup).toMatch(
+      /class="transport-group-resume"[^>]*disabled=""[^>]*title="middle motion is running\."[^>]*>Running<\/button>/,
+    );
+    expect(markup).toMatch(
+      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*title="Stop motion in middle without resetting the Program\."[^>]*>Stop<\/button>/,
+    );
+    expect(markup).not.toContain('middle waits for held');
+  });
+
+  it('keeps an operator Stop Retry on the group button, as before the per-hold change', () => {
+    const stopped = controller('intervention_required');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer!.actions = [{
+      actionId: 'retry_motion_from_current_state', requiresConfirmation: false,
+      performsBackendReset: false, enabled: true, disabledReasonCode: null,
+    }, {
+      actionId: 'reset_cycle', requiresConfirmation: true,
+      performsBackendReset: true, enabled: true, disabledReasonCode: null,
+    }];
+    stopped.state.controls = controls;
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={stopped} robot={robotController()} />,
+    );
+    expect(markup).toMatch(
+      /class="transport-group-resume"(?![^>]*disabled)[^>]*title="Retry root and let all the Program&#x27;s motion continue."[^>]*>Retry<\/button>/,
+    );
+    expect(markup).not.toContain('>Continue</button>');
+    expect(markup).not.toContain('waits for held');
+  });
+
+  it('sends an operator Stop Retry for its own offer from the group button', async () => {
+    const stopped = controller('intervention_required');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer!.actions = [{
+      actionId: 'retry_motion_from_current_state', requiresConfirmation: false,
+      performsBackendReset: false, enabled: true, disabledReasonCode: null,
+    }];
+    stopped.state.controls = controls;
+    const transport = await mountTransport(stopped);
+    try {
+      await transport.press((props) => props.title === 'Retry root and let all the Program\'s motion continue.');
+      expect(stopped.applyRecoveryAction).toHaveBeenCalledExactlyOnceWith(
+        controls.recoveryOffer, 'retry_motion_from_current_state',
+      );
+    } finally {
+      await transport.unmount();
+    }
+  });
+
+  it('sends each group its own hold offer, and Continue only after confirmation', async () => {
+    const program = twoHolds();
+    const [left, right] = program.state.controls!.recoveryHolds;
+    const transport = await mountTransport(program);
+    try {
+      await transport.press((props) => props.title === 'Retry right.move and let its groups continue.');
+      await transport.press((props) => props.title === 'Retry left.move and let its groups continue.');
+      expect(program.applyRecoveryAction).toHaveBeenNthCalledWith(1, right.offer, 'retry_motion_from_current_state');
+      expect(program.applyRecoveryAction).toHaveBeenNthCalledWith(2, left.offer, 'retry_motion_from_current_state');
+
+      // Continue asks first; Cancel sends nothing.
+      await transport.press((props) => props['aria-label'] === 'Continue right: fail held node right.move');
+      expect(program.applyRecoveryAction).toHaveBeenCalledTimes(2);
+      await transport.press((props) => props.children === 'Cancel');
+      expect(program.applyRecoveryAction).toHaveBeenCalledTimes(2);
+      await transport.press((props) => props['aria-label'] === 'Continue right: fail held node right.move');
+      await transport.press((props) => props.className === 'danger-button' && props.children === 'Continue');
+      expect(program.applyRecoveryAction).toHaveBeenCalledTimes(3);
+      expect(program.applyRecoveryAction).toHaveBeenLastCalledWith(right.offer, 'continue_with_failure');
+    } finally {
+      await transport.unmount();
+    }
+  });
+});
+
+function activationComponent(id: string): CCLCComponentSnapshot {
+  return { controllableComponentId: id, lifecycleState: 'declared', lifecycleGeneration: 1,
+    retainedBundleId: 'bundle', graphRevision: 'graph', publicationGeneration: 3,
+    activePublicPointerDigest: 'pointer.3', domains: [], providers: [], lifecycleTarget: null,
+    lifecycleProgress: null, readiness: { requestOwnerEpoch: 'cclc.1', evaluatedAtNs: 1,
+      nextIntent: 'prepare', requestedState: 'prepared', ready: false,
+      error: { code: 'component_lifecycle_transition_missing', message: 'No lifecycle transition is satisfied',
+        details: { reason: 'no_transition_satisfied' } }, providerOccurrences: [],
+      measuredState: { required: false, available: null, error: null } } };
+}
+
+describe('Execute activation live presentation', () => {
+  function activating() {
+    const program = controller();
+    const arm = activationComponent('lite6_robot');
+    const plc = activationComponent('plc_io');
+    program.activationOffer = { identity: 'captured.confirmation', components: [arm, plc] };
+    program.activationPending = true;
+    program.activationComponentHealth = {
+      lite6_robot: { snapshot: { ...arm, lifecycleState: 'active', lifecycleGeneration: 3 }, error: null },
+      plc_io: { snapshot: plc, error: null },
+    };
+    program.activationProgress = 'plc_io: Not ready — [component_lifecycle_transition_missing] No lifecycle transition is satisfied · no_transition_satisfied';
+    return program;
+  }
+  function render(program: ProgramRuntimeController) {
+    return renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robotController()} />);
+  }
+
+  it('shows the active arm and actual PLC wait while retaining the original confirmation', () => {
+    const program = activating();
+    const offer = structuredClone(program.activationOffer);
+    const markup = render(program);
+    expect(markup).toContain('lite6_robot (active)');
+    expect(markup).toContain('plc_io (declared)');
+    expect(markup).toContain(program.activationProgress!);
+    expect(program.activationOffer).toEqual(offer);
+    expect(program.run).not.toHaveBeenCalled();
+    expect(program.confirmActivationExecute).not.toHaveBeenCalled();
+    expect(program.cancelActivationExecute).not.toHaveBeenCalled();
+  });
+
+  it.each(['component', 'bundle', 'graph', 'publication', 'pointer', 'owner', 'missing', 'error'])(
+    'does not present %s health as current for the offered component', (mismatch) => {
+      const program = activating();
+      const health = program.activationComponentHealth.lite6_robot;
+      const current = health.snapshot!;
+      if (mismatch === 'component') current.controllableComponentId = 'other.robot';
+      if (mismatch === 'bundle') current.retainedBundleId = 'other.bundle';
+      if (mismatch === 'graph') current.graphRevision = 'other.graph';
+      if (mismatch === 'publication') current.publicationGeneration += 1;
+      if (mismatch === 'pointer') current.activePublicPointerDigest = 'other.pointer';
+      if (mismatch === 'owner') current.readiness = { ...current.readiness, requestOwnerEpoch: 'other.owner' };
+      if (mismatch === 'missing') delete program.activationComponentHealth.lite6_robot;
+      if (mismatch === 'error') { health.snapshot = null; health.error = 'Current component read failed'; }
+      const markup = render(program);
+      expect(markup).not.toContain('lite6_robot (active)');
+      expect(markup).not.toContain('lite6_robot (declared)');
+      expect(markup).toContain(mismatch === 'error' ? 'Current component read failed'
+        : 'Current component health has not been read.');
+    },
+  );
 });

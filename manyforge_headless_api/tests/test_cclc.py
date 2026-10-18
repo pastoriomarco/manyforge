@@ -164,7 +164,7 @@ def _target_snapshot() -> dict[str, Any]:
             "controller_topology_id": "topology.arm", "topology_revision": "topology.revision.1",
             "active_control_configuration": None, "current_control_bindings": [{
                 "control_binding_id": "binding.arm", "control_binding_revision": "binding.1", "control_route_id": "route.arm"}],
-            "current_resources": ["joint.1"]}],
+            "kind": "controller", "resources": ["joint.1"]}],
         "provider_occurrences": [_provider_occurrence()],
         "readiness": {"request_owner_epoch": "cclc-owner.1", "evaluated_at_ns": 100,
             "next_intent": "enable", "requested_state": "active", "ready": False,
@@ -336,12 +336,13 @@ def _incident_diagnostic() -> dict[str, Any]:
                 "observed_utc": "2026-10-11T18:00:00Z",
             },
             "context": {
-                "component_id": "component.arm", "request_context": "Apply request.1",
+                "controllable_component_id": "component.arm",
+                "request_context": "Apply request.1",
                 "runtime_unit_id": "runtime.arm", "runtime_epoch": "epoch.1",
-                "bundle_id": "bundle.1", "graph_revision": "graph.1",
+                "retained_bundle_id": "bundle.1", "graph_revision": "graph.1",
                 "generator_identity": None, "launch_identity": "launch.1",
             },
-            "readiness": {
+            "launch_readiness": {
                 "known": True, "controller_manager_present": True,
                 "controller_observed": True, "controller_loaded": True,
                 "controller_bound": False, "arm_controller_active": None,
@@ -390,7 +391,7 @@ def test_launch_identity_uses_close_packet_bound_without_widening_other_fields()
     with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
         _validate_lifecycle_target_facts(snapshot)
     diagnostic["snapshot"]["context"]["launch_identity"] = "launch.1"
-    diagnostic["snapshot"]["context"]["component_id"] = "x" * 129
+    diagnostic["snapshot"]["context"]["controllable_component_id"] = "x" * 129
     with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
         _validate_lifecycle_target_facts(snapshot)
 
@@ -461,11 +462,11 @@ def test_client_preserves_diagnostic_bom_and_literal_detail_keys(tmp_path: Path)
         (("snapshot", "extra"), {}),
         (("snapshot", "exit", "signal"), True),
         (("snapshot", "exit", "status"), 256),
-        (("snapshot", "context", "component_id"), "x" * 129),
-        (("snapshot", "readiness", "controller_bound"), "unknown"),
-        (("snapshot", "readiness", "sample_age_ns"), 2**53),
-        (("snapshot", "readiness", "sample_age_ns"), str(2**63)),
-        (("snapshot", "readiness", "binding_epoch"), str(2**64)),
+        (("snapshot", "context", "controllable_component_id"), "x" * 129),
+        (("snapshot", "launch_readiness", "controller_bound"), "unknown"),
+        (("snapshot", "launch_readiness", "sample_age_ns"), 2**53),
+        (("snapshot", "launch_readiness", "sample_age_ns"), str(2**63)),
+        (("snapshot", "launch_readiness", "binding_epoch"), str(2**64)),
         (("snapshot", "settings", "retained_configuration_json"), {"escape": True}),
         (("snapshot", "settings", "frame_prefix"), "Cafe\u0301"),
         (("snapshot", "settings", "argv"), ["\ud800"]),
@@ -488,12 +489,27 @@ def test_rejects_malformed_closed_diagnostic(path: tuple[str, ...], invalid: Any
         _validate_lifecycle_target_facts(snapshot)
 
 
+@pytest.mark.parametrize(("group", "new", "old"), [
+    ("context", "controllable_component_id", "component_id"),
+    ("context", "retained_bundle_id", "bundle_id"),
+    (None, "launch_readiness", "readiness"),
+])
+def test_diagnostic_refuses_superseded_names(group: str | None, new: str, old: str) -> None:
+    snapshot = _incident_snapshot()
+    diagnostic = _incident_diagnostic()
+    facts = diagnostic["snapshot"] if group is None else diagnostic["snapshot"][group]
+    facts[old] = facts.pop(new)
+    snapshot["lifecycle_progress"]["incident"]["diagnostic"] = diagnostic
+    with pytest.raises(HeadlessApiError, match="lifecycle_progress"):
+        _validate_lifecycle_target_facts(snapshot)
+
+
 def test_diagnostic_caps_encoded_tail_and_preserves_nullable_facts() -> None:
     snapshot = _incident_snapshot()
     diagnostic = _incident_diagnostic()
     snapshot["lifecycle_progress"]["incident"]["diagnostic"] = diagnostic
     facts = diagnostic["snapshot"]
-    facts["readiness"] = dict.fromkeys(facts["readiness"])
+    facts["launch_readiness"] = dict.fromkeys(facts["launch_readiness"])
     output = facts["output"]
     for tail, lines in [("", 0), ("a\nb", 2), ("a\n" * 2000, 2000), ('"' * 65535, 1)]:
         output.update(tail=tail, line_count=lines)
@@ -605,6 +621,7 @@ def _lifecycle_request(*, confirmed: bool) -> dict[str, Any]:
         "expected_component_lifecycle_generation": 4,
         "expected_control_domains": [
             {
+                "kind": "controller",
                 "control_domain_id": "domain.arm",
                 "control_domain_revision": "domain.revision.1",
                 "controller_topology_id": "topology.arm",
@@ -795,6 +812,67 @@ def test_http_lifecycle_route_is_thin_and_requires_confirmation() -> None:
     invalid = _lifecycle_request(confirmed=True)
     invalid["caller_asserted_principal"] = "operator"
     assert client.post("/api/cclc/lifecycle/requests", json=invalid).status_code == 422
+
+
+def _provider_lifecycle_request() -> dict[str, Any]:
+    domain = json.loads(_CORE_PROVIDER_DOMAIN_SAMPLE)
+    configuration = domain["active_control_configuration"]
+    request = _lifecycle_request(confirmed=True)
+    request["expected_control_domains"] = [{
+        "kind": "io_provider",
+        "control_domain_id": domain["control_domain_id"],
+        "control_domain_revision": domain["control_domain_revision"],
+        "provider": domain["provider"],
+        "expected_active_control_configuration": {
+            "presence": "present",
+            "active_control_configuration_id": configuration["active_control_configuration_id"],
+            "active_control_configuration_generation":
+                configuration["active_control_configuration_generation"],
+        },
+    }]
+    return request
+
+
+def test_http_lifecycle_forwards_exact_provider_expected_domain() -> None:
+    fake = FakeCCLC()
+    service = HeadlessService(  # type: ignore[arg-type]
+        object(), object(), cell_admission=FakeAdmission()
+    )
+    client = TestClient(create_app(service=service, cclc=fake))
+    request = _provider_lifecycle_request()
+    assert client.post("/api/cclc/lifecycle/requests", json=request).status_code == 200
+    assert fake.lifecycle[0]["expected_control_domains"] == request["expected_control_domains"]
+    for mutate in (
+        lambda d: d.update(controller_topology_id="topology.arm"),
+        lambda d: d.update(expected_control_bindings=[]),
+        lambda d: d.update(kind="controller"),
+        lambda d: d.update(kind="provider"),
+        lambda d: d.pop("kind"),
+        lambda d: d["provider"].update(signal_names=[]),
+        lambda d: d["provider"].update(extra=True),
+        lambda d: d["provider"].update(lifecycle_command_timeout_ns="30000000000"),
+    ):
+        invalid = _provider_lifecycle_request()
+        mutate(invalid["expected_control_domains"][0])
+        assert client.post("/api/cclc/lifecycle/requests", json=invalid).status_code == 422
+    assert len(fake.lifecycle) == 1
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d.pop("kind"),
+    lambda d: d.update(kind="provider"),
+    lambda d: d.update(kind="io_provider"),
+])
+def test_http_lifecycle_refuses_kindless_or_superseded_controller_domain(mutate) -> None:
+    fake = FakeCCLC()
+    service = HeadlessService(  # type: ignore[arg-type]
+        object(), object(), cell_admission=FakeAdmission()
+    )
+    client = TestClient(create_app(service=service, cclc=fake))
+    request = _lifecycle_request(confirmed=True)
+    mutate(request["expected_control_domains"][0])
+    assert client.post("/api/cclc/lifecycle/requests", json=request).status_code == 422
+    assert fake.lifecycle == []
 
 
 def _through_client(
@@ -1148,6 +1226,142 @@ def test_q115_rejects_nonboolean_activation_fact(value: Any) -> None:
 def test_q115_extended_domain_wire_stays_closed() -> None:
     snapshot = _target_snapshot()
     snapshot["readiness"]["domains"][0]["hasActivationStep"] = False
+    with pytest.raises(HeadlessApiError, match="readiness is invalid"):
+        _validate_component_readiness(snapshot)
+
+
+# Source-derived provider-domain sample in the agreed contract 125/128 response shape
+# (kind "io_provider", common `resources`). It is NOT a capture from the normal producer;
+# it is re-pinned from Track 2's real capture later.
+_CORE_PROVIDER_DOMAIN_SAMPLE = """{
+  "control_domain_id": "domain.arm",
+  "control_domain_revision": "domain.rev.1",
+  "kind": "io_provider",
+  "provider": {
+    "controllable_component_id": "component.arm",
+    "provider_runtime_unit_id": "runtime.arm",
+    "provider_instance_id": "provider.arm",
+    "provider_manifest_id": "manifest.arm",
+    "provider_manifest_revision": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "lifecycle_plan_catalog_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "signal_configuration_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "signal_names": [
+      "ready"
+    ],
+    "lifecycle_command_timeout_ns": 30000000000
+  },
+  "provider_runtime_epoch": "epoch.1",
+  "resources": [],
+  "active_control_configuration": {
+    "active_control_configuration_id": "provider.configuration",
+    "active_control_configuration_generation": 9007199254740991,
+    "source_runtime_unit_id": "runtime.arm",
+    "source_runtime_epoch": "epoch.1",
+    "source_sequence": 9007199254740991,
+    "signal_configuration_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+}
+"""
+
+
+def _provider_domain_snapshot() -> dict[str, Any]:
+    """Snapshot around the pinned Core provider domain with its paired occurrence."""
+    snapshot = _target_snapshot()
+    domain = json.loads(_CORE_PROVIDER_DOMAIN_SAMPLE)
+    provider = domain["provider"]
+    occurrence = {"control_domain_id": domain["control_domain_id"],
+        **{key: provider[key] for key in ("provider_instance_id", "provider_manifest_id",
+            "provider_manifest_revision", "provider_runtime_unit_id", "lifecycle_plan_catalog_digest")},
+        "provider_runtime_epoch": domain["provider_runtime_epoch"]}
+    snapshot["domains"] = [domain]
+    snapshot["provider_occurrences"] = [occurrence]
+    snapshot["readiness"]["domains"][0]["provider_occurrence"] = {
+        **occurrence, "control_domain_revision": domain["control_domain_revision"]}
+    snapshot["readiness"]["measured_state"] = {"required": False, "available": None, "error": None}
+    return snapshot
+
+
+def test_provider_domain_readiness_parses() -> None:
+    snapshot = _provider_domain_snapshot()
+    _validate_component_readiness(snapshot)
+    lifecycle_only = {key: value for key, value in snapshot.items()
+                      if key not in {"lifecycle_progress", "lifecycle_target", "readiness"}}
+    _validate_component_readiness(lifecycle_only, lifecycle_only=True)
+    domain = snapshot["domains"][0]
+    domain["active_control_configuration"] = None
+    _validate_component_readiness(snapshot)
+    domain["resources"] = ["io.do.1", "io.do.2"]
+    _validate_component_readiness(snapshot)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d.update(current_control_bindings=[]),
+    lambda d: d.update(current_resources=[]),
+    lambda d: d.update(output_resources=[]),
+    lambda d: d.update(output_resources=d.pop("resources")),
+    lambda d: d.update(controller_topology_id="topology.arm"),
+    lambda d: d.update(kind="controller"),
+    lambda d: d.pop("kind"),
+    lambda d: d.pop("active_control_configuration"),
+    lambda d: d.pop("resources"),
+    lambda d: d.update(resources=["io.2", "io.1"]),
+    lambda d: d.update(resources=[""]),
+    lambda d: d["provider"].update(signal_names=[]),
+    lambda d: d["provider"].update(signal_names=["b", "a"]),
+    lambda d: d["provider"].update(lifecycle_command_timeout_ns=0),
+    lambda d: d["provider"].update(lifecycle_command_timeout_ns="5"),
+    lambda d: d["provider"].update(provider_manifest_revision="rev.1"),
+    lambda d: d["provider"].update(extra=True),
+    lambda d: d["provider"].pop("signal_configuration_digest"),
+    lambda d: d["active_control_configuration"].update(source_runtime_unit_id="foreign"),
+    lambda d: d["active_control_configuration"].update(source_runtime_epoch="foreign"),
+    lambda d: d["active_control_configuration"].update(signal_configuration_digest="sha256:" + "9" * 64),
+    lambda d: d["active_control_configuration"].update(source_sequence=0),
+    lambda d: d["active_control_configuration"].update(activation_set_id="set.1"),
+    lambda d: d["provider"].update(controllable_component_id="component.foreign"),
+    lambda d: d["provider"].update(provider_instance_id="provider.foreign"),
+    lambda d: d.update(provider_runtime_epoch="epoch.foreign"),
+])
+def test_provider_domain_physical_or_malformed_shape_is_refused(mutate) -> None:
+    snapshot = _provider_domain_snapshot()
+    mutate(snapshot["domains"][0])
+    with pytest.raises(HeadlessApiError, match="readiness is invalid"):
+        _validate_component_readiness(snapshot)
+
+
+def test_provider_domain_requires_exactly_its_paired_occurrence() -> None:
+    snapshot = _provider_domain_snapshot()
+    snapshot["provider_occurrences"] = []
+    with pytest.raises(HeadlessApiError, match="readiness is invalid"):
+        _validate_component_readiness(snapshot)
+    snapshot = _provider_domain_snapshot()
+    snapshot["provider_occurrences"][0]["lifecycle_plan_catalog_digest"] = "sha256:" + "9" * 64
+    with pytest.raises(HeadlessApiError, match="readiness is invalid"):
+        _validate_component_readiness(snapshot)
+
+
+@pytest.mark.parametrize("field", ["current_control_bindings", "resources"])
+def test_controller_domain_without_physical_scope_is_still_refused(field: str) -> None:
+    snapshot = _target_snapshot()
+    snapshot["domains"][0][field] = []
+    with pytest.raises(HeadlessApiError, match="readiness is invalid"):
+        _validate_component_readiness(snapshot)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d.pop("kind"),
+    lambda d: d.update(kind=None),
+    lambda d: d.update(kind="io"),
+    lambda d: d.update(kind="provider"),
+    lambda d: d.update(kind="io_provider"),
+    lambda d: d.pop("resources"),
+    lambda d: d.update(current_resources=d.pop("resources")),
+    lambda d: d.update(current_resources=["joint.1"]),
+    lambda d: d.update(output_resources=["joint.1"]),
+])
+def test_controller_domain_requires_kind_and_common_resources(mutate) -> None:
+    snapshot = _target_snapshot()
+    mutate(snapshot["domains"][0])
     with pytest.raises(HeadlessApiError, match="readiness is invalid"):
         _validate_component_readiness(snapshot)
 

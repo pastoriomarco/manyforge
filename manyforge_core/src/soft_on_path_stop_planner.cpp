@@ -86,10 +86,11 @@ const char* source_string(SoftOnPathStateSource source) {
   return "unknown";
 }
 
-Result<SoftOnPathStopPlanDTO> err(std::string reason, std::string message,
-                                  std::map<std::string, std::string> details = {}) {
+template <typename T = SoftOnPathStopPlanDTO>
+Result<T> err(std::string reason, std::string message,
+              std::map<std::string, std::string> details = {}) {
   details["reason"] = reason;
-  return Result<SoftOnPathStopPlanDTO>::Err(
+  return Result<T>::Err(
       ErrorDTO{std::string(to_string(ErrorCode::kMotionInterruptBackendStopFailed)),
                std::move(message), std::move(details)});
 }
@@ -988,39 +989,48 @@ Result<AliStopProfileDTO> compute_ali_backtracking_stop_profile(
   return Result<AliStopProfileDTO>::Ok(std::move(best_failure));
 }
 
-}  // namespace
+struct ResolvedStopInitialState {
+  PathCursor cursor;
+  Projection projection;
+  std::map<std::string, double> per_joint_max_deceleration_rad_s2;
+  double effective_ramp_s;
+  double command_path_time_s;
+  double path_time_rate;
+  double initial_velocity_deviation_rad_s;
+  bool used_model_velocity;
+};
 
-Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
+Result<ResolvedStopInitialState> resolve_stop_initial_state(
     const TrajectoryDTO& accepted_trajectory, const MotionInterruptStopProfileDTO& stop_profile,
     const SoftOnPathInitialStateDTO& initial_state, const SoftOnPathPlannerConfig& config) {
   if (stop_profile.stop_mode != MotionInterruptStopMode::kSoftOnPath) {
-    return err("stop_mode_not_soft_on_path",
-               "soft_on_path planner called for a non-soft_on_path profile");
+    return err<ResolvedStopInitialState>(
+        "stop_mode_not_soft_on_path", "soft_on_path planner called for a non-soft_on_path profile");
   }
   if (!stop_profile.deceleration_time_s || !finite_positive(*stop_profile.deceleration_time_s)) {
-    return err("soft_on_path_deceleration_time_required",
-               "soft_on_path requires a positive deceleration_time_s");
+    return err<ResolvedStopInitialState>("soft_on_path_deceleration_time_required",
+                                         "soft_on_path requires a positive deceleration_time_s");
   }
   if (!std::isfinite(config.stop_traj_delta_s) || config.stop_traj_delta_s < 0.0) {
-    return err("invalid_stop_traj_delta_s",
-               "soft_on_path stop_traj_delta_s must be finite and >= 0");
+    return err<ResolvedStopInitialState>("invalid_stop_traj_delta_s",
+                                         "soft_on_path stop_traj_delta_s must be finite and >= 0");
   }
   if (!finite_positive(config.sample_period_s)) {
-    return err("invalid_sample_period_s",
-               "soft_on_path sample_period_s must be finite and positive");
+    return err<ResolvedStopInitialState>(
+        "invalid_sample_period_s", "soft_on_path sample_period_s must be finite and positive");
   }
   const auto valid_shape = validate_trajectory_shape(accepted_trajectory);
   if (!valid_shape.ok()) {
-    return Result<SoftOnPathStopPlanDTO>::Err(valid_shape.error());
+    return Result<ResolvedStopInitialState>::Err(valid_shape.error());
   }
   if (const auto bounds_error = runtime_scale_bounds_error(accepted_trajectory)) {
-    return err(bounds_error->first, bounds_error->second,
-               {{"recommended_disposition", "hard_stop"}});
+    return err<ResolvedStopInitialState>(bounds_error->first, bounds_error->second,
+                                         {{"recommended_disposition", "hard_stop"}});
   }
   const auto ordered_state_result =
       order_state_for_trajectory(initial_state.state, accepted_trajectory.joint_names);
   if (!ordered_state_result.ok()) {
-    return Result<SoftOnPathStopPlanDTO>::Err(ordered_state_result.error());
+    return Result<ResolvedStopInitialState>::Err(ordered_state_result.error());
   }
   const OrderedState& ordered_state = ordered_state_result.value();
   const size_t joint_count = accepted_trajectory.joint_names.size();
@@ -1031,38 +1041,41 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   // time, so the ramp itself lasts deceleration_time_s - stop_traj_delta_s.
   const double effective_ramp_s = *stop_profile.deceleration_time_s - config.stop_traj_delta_s;
   if (effective_ramp_s <= kEpsilon) {
-    return err("deceleration_time_not_larger_than_handoff",
-               "soft_on_path deceleration_time_s must exceed stop_traj_delta_s",
-               {{"deceleration_time_s", format_double(*stop_profile.deceleration_time_s)},
-                {"stop_traj_delta_s", format_double(config.stop_traj_delta_s)},
-                {"recommended_disposition", "hard_stop"}});
+    return err<ResolvedStopInitialState>(
+        "deceleration_time_not_larger_than_handoff",
+        "soft_on_path deceleration_time_s must exceed stop_traj_delta_s",
+        {{"deceleration_time_s", format_double(*stop_profile.deceleration_time_s)},
+         {"stop_traj_delta_s", format_double(config.stop_traj_delta_s)},
+         {"recommended_disposition", "hard_stop"}});
   }
 
-  const auto typed_acceleration_limits = angular_deceleration_limits(stop_profile);
+  auto typed_acceleration_limits = angular_deceleration_limits(stop_profile);
   if (!typed_acceleration_limits.has_value()) {
-    return err("soft_on_path_coordinate_kind_unsupported",
-               "legacy angular planner cannot consume a linear coordinate");
+    return err<ResolvedStopInitialState>(
+        "soft_on_path_coordinate_kind_unsupported",
+        "legacy angular planner cannot consume a linear coordinate");
   }
   const auto& per_joint_max_deceleration_rad_s2 = *typed_acceleration_limits;
   for (const auto& joint_name : accepted_trajectory.joint_names) {
     const auto it = per_joint_max_deceleration_rad_s2.find(joint_name);
     if (it == per_joint_max_deceleration_rad_s2.end() || !finite_positive(it->second)) {
-      return err("missing_joint_deceleration_limit",
-                 "soft_on_path requires positive per-joint acceleration limits",
-                 {{"joint", joint_name}});
+      return err<ResolvedStopInitialState>(
+          "missing_joint_deceleration_limit",
+          "soft_on_path requires positive per-joint acceleration limits", {{"joint", joint_name}});
     }
   }
 
   const Projection projection = project_to_path(accepted_trajectory, ordered_state.positions);
   if (!std::isfinite(projection.distance_rad) || !std::isfinite(projection.time_from_start_s)) {
-    return err("initial_path_projection_failed",
-               "soft_on_path could not project observed feedback onto the "
-               "accepted path; escalate to hard stop",
-               {{"recommended_disposition", "hard_stop"}});
+    return err<ResolvedStopInitialState>(
+        "initial_path_projection_failed",
+        "soft_on_path could not project observed feedback onto the "
+        "accepted path; escalate to hard stop",
+        {{"recommended_disposition", "hard_stop"}});
   }
   if (config.max_initial_path_deviation_rad.has_value() &&
       projection.distance_rad > *config.max_initial_path_deviation_rad) {
-    return err(
+    return err<ResolvedStopInitialState>(
         "initial_path_deviation_exceeds_limit",
         "soft_on_path observed state is outside the configured path drift limit",
         {{"initial_path_deviation_rad", format_double(projection.distance_rad)},
@@ -1076,8 +1089,9 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
       !ordered_state.has_velocity ||
       initial_state.velocity_source == SoftOnPathStateSource::kModelDerived;
   if (use_model_velocity && !config.allow_model_velocity_fallback) {
-    return err("model_velocity_not_authorized",
-               "soft_on_path requires measured velocity unless model fallback is authorized");
+    return err<ResolvedStopInitialState>(
+        "model_velocity_not_authorized",
+        "soft_on_path requires measured velocity unless model fallback is authorized");
   }
 
   // Seam cursor (TARGET §4.8 authority): the lead-in and ramp anchor here, so it
@@ -1089,30 +1103,33 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   double seam_cursor_s = projection.time_from_start_s;
   if (use_model_velocity) {
     if (!initial_state.trajectory_time_from_start_s.has_value()) {
-      return err("missing_command_cursor",
-                 "soft_on_path model/command authority requires "
-                 "trajectory_time_from_start_s (the active command cursor)");
+      return err<ResolvedStopInitialState>(
+          "missing_command_cursor",
+          "soft_on_path model/command authority requires "
+          "trajectory_time_from_start_s (the active command cursor)");
     }
     // A non-finite cursor would defeat every downstream guard (NaN compares
     // false), letting the planner emit a defensive zero-filled replacement
     // trajectory that commands all joints to zero. Reject it here.
     if (!std::isfinite(*initial_state.trajectory_time_from_start_s)) {
-      return err("non_finite_command_cursor",
-                 "soft_on_path command cursor (trajectory_time_from_start_s) "
-                 "must be finite; escalate to hard stop",
-                 {{"recommended_disposition", "hard_stop"}});
+      return err<ResolvedStopInitialState>(
+          "non_finite_command_cursor",
+          "soft_on_path command cursor (trajectory_time_from_start_s) "
+          "must be finite; escalate to hard stop",
+          {{"recommended_disposition", "hard_stop"}});
     }
     if (*initial_state.trajectory_time_from_start_s < path_start_s - kEpsilon ||
         *initial_state.trajectory_time_from_start_s > path_end_s + kEpsilon) {
-      return err("command_cursor_out_of_range",
-                 "soft_on_path command cursor (trajectory_time_from_start_s) "
-                 "must be inside the accepted trajectory time range; escalate "
-                 "to hard stop",
-                 {{"trajectory_time_from_start_s",
-                   format_double(*initial_state.trajectory_time_from_start_s)},
-                  {"trajectory_start_time_s", format_double(path_start_s)},
-                  {"trajectory_end_time_s", format_double(path_end_s)},
-                  {"recommended_disposition", "hard_stop"}});
+      return err<ResolvedStopInitialState>(
+          "command_cursor_out_of_range",
+          "soft_on_path command cursor (trajectory_time_from_start_s) "
+          "must be inside the accepted trajectory time range; escalate "
+          "to hard stop",
+          {{"trajectory_time_from_start_s",
+            format_double(*initial_state.trajectory_time_from_start_s)},
+           {"trajectory_start_time_s", format_double(path_start_s)},
+           {"trajectory_end_time_s", format_double(path_end_s)},
+           {"recommended_disposition", "hard_stop"}});
     }
     seam_cursor_s = *initial_state.trajectory_time_from_start_s;
   }
@@ -1122,8 +1139,9 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   if (use_model_velocity) {
     if (!std::isfinite(initial_state.runtime_velocity_scale_at_trip) ||
         initial_state.runtime_velocity_scale_at_trip < 0.0) {
-      return err("invalid_runtime_velocity_scale_at_trip",
-                 "soft_on_path runtime_velocity_scale_at_trip must be finite and >= 0");
+      return err<ResolvedStopInitialState>(
+          "invalid_runtime_velocity_scale_at_trip",
+          "soft_on_path runtime_velocity_scale_at_trip must be finite and >= 0");
     }
     path_time_rate = std::min(1.0, initial_state.runtime_velocity_scale_at_trip);
   } else {
@@ -1135,8 +1153,9 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
       path_time_rate =
           dot(ordered_state.velocities, projected_sample.d_position_dt) / tangent_norm2;
       if (!std::isfinite(path_time_rate)) {
-        return err("invalid_projected_velocity",
-                   "soft_on_path could not project observed velocity onto the path");
+        return err<ResolvedStopInitialState>(
+            "invalid_projected_velocity",
+            "soft_on_path could not project observed velocity onto the path");
       }
       path_time_rate = std::max(0.0, path_time_rate);
     }
@@ -1150,13 +1169,57 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
           : 0.0;
   if (config.max_initial_velocity_deviation_rad_s.has_value() &&
       initial_velocity_deviation > *config.max_initial_velocity_deviation_rad_s) {
-    return err("initial_velocity_deviation_exceeds_limit",
-               "soft_on_path observed velocity is not coherent with the accepted path",
-               {{"initial_velocity_deviation_rad_s", format_double(initial_velocity_deviation)},
-                {"max_initial_velocity_deviation_rad_s",
-                 format_double(*config.max_initial_velocity_deviation_rad_s)},
-                {"recommended_disposition", "hard_stop"}});
+    return err<ResolvedStopInitialState>(
+        "initial_velocity_deviation_exceeds_limit",
+        "soft_on_path observed velocity is not coherent with the accepted path",
+        {{"initial_velocity_deviation_rad_s", format_double(initial_velocity_deviation)},
+         {"max_initial_velocity_deviation_rad_s",
+          format_double(*config.max_initial_velocity_deviation_rad_s)},
+         {"recommended_disposition", "hard_stop"}});
   }
+
+  return Result<ResolvedStopInitialState>::Ok(
+      {std::move(cursor), projection, std::move(*typed_acceleration_limits), effective_ramp_s,
+       seam_cursor_s, path_time_rate, initial_velocity_deviation, use_model_velocity});
+}
+
+}  // namespace
+
+Result<SoftOnPathResolvedInitialStateDTO> resolve_soft_on_path_stop_initial_state(
+    const TrajectoryDTO& accepted_trajectory, const MotionInterruptStopProfileDTO& stop_profile,
+    const SoftOnPathInitialStateDTO& initial_state, const SoftOnPathPlannerConfig& config) {
+  auto resolved =
+      resolve_stop_initial_state(accepted_trajectory, stop_profile, initial_state, config);
+  if (!resolved.ok()) return Result<SoftOnPathResolvedInitialStateDTO>::Err(resolved.error());
+  auto& value = resolved.value();
+  const auto at_return = value.cursor.sample(value.command_path_time_s);
+  const auto joints = accepted_trajectory.joint_names.size();
+  return Result<SoftOnPathResolvedInitialStateDTO>::Ok(
+      {value.command_path_time_s, value.path_time_rate,
+       initial_state.runtime_velocity_scale_at_trip, accepted_trajectory.joint_names,
+       TrajectoryWaypointDTO{0.0, at_return.position, std::vector<double>(joints, 0.0),
+                             std::vector<double>(joints, 0.0)},
+       value.projection.time_from_start_s, value.projection.distance_rad,
+       value.initial_velocity_deviation_rad_s, value.used_model_velocity});
+}
+
+Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
+    const TrajectoryDTO& accepted_trajectory, const MotionInterruptStopProfileDTO& stop_profile,
+    const SoftOnPathInitialStateDTO& initial_state, const SoftOnPathPlannerConfig& config) {
+  auto resolved =
+      resolve_stop_initial_state(accepted_trajectory, stop_profile, initial_state, config);
+  if (!resolved.ok()) return Result<SoftOnPathStopPlanDTO>::Err(resolved.error());
+  auto& cursor = resolved.value().cursor;
+  const auto& projection = resolved.value().projection;
+  const auto& per_joint_max_deceleration_rad_s2 =
+      resolved.value().per_joint_max_deceleration_rad_s2;
+  const double effective_ramp_s = resolved.value().effective_ramp_s;
+  const double seam_cursor_s = resolved.value().command_path_time_s;
+  const double path_time_rate = resolved.value().path_time_rate;
+  const double initial_velocity_deviation = resolved.value().initial_velocity_deviation_rad_s;
+  const bool use_model_velocity = resolved.value().used_model_velocity;
+  const size_t joint_count = accepted_trajectory.joint_names.size();
+  const double path_end_s = accepted_trajectory.waypoints.back().time_from_start_s;
 
   // Exact-time feasibility gate: refuse (escalate to hard stop) a soft stop
   // that cannot bring the robot to rest on this path, in the requested time,

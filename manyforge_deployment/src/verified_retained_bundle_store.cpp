@@ -31,6 +31,7 @@
 #include "manyforge_deployment/controller_topology_codec.hpp"
 #include "manyforge_deployment/model_asset_codec.hpp"
 #include "manyforge_deployment/model_source.hpp"
+#include "manyforge_deployment/io_signal_catalog.hpp"
 #include "manyforge_deployment/program_binding.hpp"
 #include "manyforge_deployment/program_contract.hpp"
 #include "manyforge_deployment/provider_manifest_codec.hpp"
@@ -1366,8 +1367,9 @@ build_runtime_kinematic_paths(const DecodedRetainedModelMap &decoded,
   return result;
 }
 
-void require_symbol_role_map_matches_retained_graph(
-    const CanonicalValue &map, const core::CellGraphDTO &graph) {
+void require_symbol_role_map_matches_retained_bundle_impl(
+    const CanonicalValue &map, const core::RetainedBundleDTO &bundle) {
+  const auto &graph = bundle.cell_graph;
   if (require_map_text(map, "cell_id") != graph.cell_id.value()) {
     detail::fail_retained_bundle(
         "retained symbol/role map belongs to another cell");
@@ -1454,6 +1456,24 @@ void require_symbol_role_map_matches_retained_graph(
     expected_targets.emplace(binding.controllable_component_id.value(),
                              binding.command_target_id.value());
   }
+  // Physical target/coordinate expectations stay bound to actual control
+  // bindings. Direct IO targets instead use the retained, already structural
+  // capability witness; revalidate it here before accepting any extra target.
+  std::set<std::pair<std::string, std::string>> non_coordinate_targets;
+  for (const auto &provider : bundle.capability_provider_bindings) {
+    const auto *target =
+        std::get_if<core::ComponentTargetCapabilityProviderTargetDTO>(
+            &provider.target);
+    if (!target)
+      continue;
+    const auto verified = ValidateNonCoordinateProviderTarget(graph, provider);
+    if (!verified.ok())
+      detail::fail_retained_bundle(verified.error().details.at("reason"));
+    const auto key = std::pair{target->controllable_component_id.value(),
+                               target->command_target_id.value()};
+    if (expected_targets.insert(key).second)
+      non_coordinate_targets.insert(key);
+  }
   std::set<std::string, std::less<>> found_bindings;
   for (const auto &row :
        require_map_array(map, "control_binding_coordinate_maps")) {
@@ -1483,8 +1503,16 @@ void require_symbol_role_map_matches_retained_graph(
 
   std::set<std::pair<std::string, std::string>> found_targets;
   for (const auto &row : require_map_array(map, "target_role_maps")) {
-    found_targets.emplace(require_map_text(row, "controllable_component_id"),
-                          require_map_text(row, "command_target_id"));
+    const auto key =
+        std::pair{require_map_text(row, "controllable_component_id"),
+                  require_map_text(row, "command_target_id")};
+    if (non_coordinate_targets.contains(key) &&
+        (!require_map_array(row, "model_groups").empty() ||
+         !require_map_array(row, "frames").empty() ||
+         !require_map_array(row, "collision_bodies").empty()))
+      detail::fail_retained_bundle(
+          "retained non-coordinate target contains model geometry roles");
+    found_targets.insert(key);
   }
   if (found_targets != expected_targets) {
     detail::fail_retained_bundle(
@@ -1588,8 +1616,8 @@ load_retained_control_catalog_closure(
   }
   for (const auto &topology : available.controller_topologies) {
     if (topology.value().controller_topology_id ==
-            domain->controller_topology_id &&
-        topology.value().topology_revision == domain->topology_revision) {
+            domain->controller().controller_topology_id &&
+        topology.value().topology_revision == domain->controller().topology_revision) {
       result.controller_topologies.push_back(topology);
     }
   }
@@ -1672,8 +1700,9 @@ void require_verified_product_artifacts(
             "symbol/role-map product has an unexpected artifact role");
       }
       const CanonicalValue map =
-          detail::parse_and_verify_composed_model_symbol_role_map(bytes);
-      require_symbol_role_map_matches_retained_graph(map, bundle.cell_graph);
+          detail::parse_and_verify_composed_model_symbol_role_map(
+              bytes, bundle.cell_graph.model_instances.empty());
+      detail::require_symbol_role_map_matches_retained_bundle(map, bundle);
     } else if (product.product_kind ==
                core::RetainedProductKind::kControlDomainControl) {
       const std::string_view role = artifact.artifact_role_id.value();
@@ -2210,6 +2239,11 @@ read_verified_planning_resources(
 
 } // namespace
 
+void detail::require_symbol_role_map_matches_retained_bundle(
+    const CanonicalValue &map, const core::RetainedBundleDTO &bundle) {
+  require_symbol_role_map_matches_retained_bundle_impl(map, bundle);
+}
+
 std::optional<VerifiedRetainedModelMap>
 detail::RetainedModelMapVerificationAuthority::verify(
     const RetainedBundle &bundle, const RetainedModelMapQuery &query,
@@ -2244,9 +2278,10 @@ detail::RetainedModelMapVerificationAuthority::verify(
         "retained model-map artifact differs from its exact product reference");
   }
   const CanonicalValue parsed =
-      detail::parse_and_verify_composed_model_symbol_role_map(artifact_bytes);
-  require_symbol_role_map_matches_retained_graph(parsed,
-                                                  bundle.value().cell_graph);
+      detail::parse_and_verify_composed_model_symbol_role_map(
+          artifact_bytes, bundle.value().cell_graph.model_instances.empty());
+  detail::require_symbol_role_map_matches_retained_bundle(parsed,
+                                                          bundle.value());
   DecodedRetainedModelMap decoded = decode_retained_model_map(parsed);
   std::vector<core::KinematicFramePathDTO> kinematic_frame_paths =
       build_runtime_kinematic_paths(decoded, bundle.value().cell_graph);
@@ -2652,9 +2687,10 @@ FilesystemVerifiedRetainedProductArtifactSource::get_verified(
           "selected symbol/role-map artifact has an incoherent contract");
     }
     const CanonicalValue map =
-        detail::parse_and_verify_composed_model_symbol_role_map(bytes);
-    require_symbol_role_map_matches_retained_graph(map,
-                                                   bundle->value().cell_graph);
+        detail::parse_and_verify_composed_model_symbol_role_map(
+            bytes, bundle->value().cell_graph.model_instances.empty());
+    detail::require_symbol_role_map_matches_retained_bundle(map,
+                                                            bundle->value());
   } else if (product->product_kind ==
              core::RetainedProductKind::kControlDomainControl) {
     const core::ControlDomainId *subject = nullptr;
@@ -2923,9 +2959,10 @@ FilesystemVerifiedRetainedModelMapSource::get_verified(
             selected->content_digest, selected->byte_size,
             "selected retained model-map artifact");
         const CanonicalValue parsed =
-            detail::parse_and_verify_composed_model_symbol_role_map(bytes);
-        require_symbol_role_map_matches_retained_graph(parsed,
-                                                       bundle->value().cell_graph);
+            detail::parse_and_verify_composed_model_symbol_role_map(
+                bytes, bundle->value().cell_graph.model_instances.empty());
+        detail::require_symbol_role_map_matches_retained_bundle(
+            parsed, bundle->value());
         DecodedRetainedModelMap decoded = decode_retained_model_map(parsed);
         std::vector<core::KinematicFramePathDTO> kinematic_frame_paths =
             build_runtime_kinematic_paths(decoded, bundle->value().cell_graph);

@@ -18,7 +18,11 @@ import rfc8785
 
 from manyforge_behavior.failure_details import failure_wire_fields
 from manyforge_behavior.json_scalars import nonnegative_int64, nonnegative_int64_value
-from manyforge_behavior.recovery import recovery_retry_permitted
+from manyforge_behavior.recovery import (
+    OWNER_RECOVERY_ACTIONS,
+    is_non_moving_recovery,
+    recovery_retry_permitted,
+)
 
 
 RUNTIME_CONTROL_SCHEMA: Final = "manyforge.program_runtime_controls.v3"
@@ -146,8 +150,8 @@ class ProgramRuntimeControls:
         self._audit: list[dict[str, Any]] = []
         self._retry_counts: dict[str, int] = {}
         self._offer_revision = 0
-        self._offer_key: str | None = None
-        self._offer: dict[str, Any] | None = None
+        # The current offer of each held node: (semantic key, offer).
+        self._offers: dict[str, tuple[str, dict[str, Any]]] = {}
         self._lock = RLock()
 
     @property
@@ -415,12 +419,7 @@ class ProgramRuntimeControls:
             return None
         actions: list[dict[str, Any]] = []
         for action_id in owner_actions:
-            if action_id not in {
-                "retry_motion_from_current_state",
-                "acknowledge_and_continue",
-                "retry_after_scene_repair",
-                "replan_from_stopped_state",
-            }:
+            if action_id not in OWNER_RECOVERY_ACTIONS:
                 continue
             if action_id == "acknowledge_and_continue":
                 enabled_by_policy = intervention_allowed
@@ -430,7 +429,6 @@ class ProgramRuntimeControls:
             actions.append(
                 {
                     "action_id": action_id,
-                    "label_key": f"recovery.{action_id}",
                     "requires_confirmation": action_id == "acknowledge_and_continue",
                     "performs_backend_reset": False,
                     "enabled": enabled,
@@ -463,11 +461,42 @@ class ProgramRuntimeControls:
             actions.append(
                 {
                     "action_id": "retry_runtime_step",
-                    "label_key": "recovery.retry_runtime_step",
                     "requires_confirmation": False,
                     "performs_backend_reset": False,
                     "enabled": True,
                     "disabled_reason_code": None,
+                }
+            )
+        if not operator_stop_recovery:
+            # Continue: close the held operation, the node returns FAILURE to
+            # the tree, and the hold's groups resume (contract item 40).
+            closable = intervention.owner_task_id is None or (
+                isinstance(owner, dict)
+                and (
+                    owner.get("eligible_close") is True
+                    or owner.get("acknowledged_non_moving") is True
+                )
+            )
+            continue_enabled = intervention_allowed and observation_current and closable
+            actions.append(
+                {
+                    "action_id": "continue_with_failure",
+                    "requires_confirmation": True,
+                    "performs_backend_reset": False,
+                    "enabled": continue_enabled,
+                    "disabled_reason_code": (
+                        None
+                        if continue_enabled
+                        else (
+                            "recovery_action_forbidden_by_captured_policy"
+                            if not intervention_allowed
+                            else (
+                                "recovery_owner_observation_expired"
+                                if not observation_current
+                                else "recovery_close_not_eligible"
+                            )
+                        )
+                    ),
                 }
             )
         operator_stop_settled = (
@@ -500,7 +529,6 @@ class ProgramRuntimeControls:
         actions.append(
             {
                 "action_id": "reset_cycle",
-                "label_key": "recovery.reset_cycle",
                 "requires_confirmation": True,
                 "performs_backend_reset": True,
                 "enabled": held_reset_enabled,
@@ -521,7 +549,7 @@ class ProgramRuntimeControls:
         )
         if containment_pending and not operator_stop_recovery:
             for action in actions:
-                if action["action_id"] not in {"acknowledge_and_continue", "reset_cycle"}:
+                if not is_non_moving_recovery(action["action_id"]):
                     action["enabled"] = False
                     action["disabled_reason_code"] = (
                         "failure_pause_containment_unconfirmed"
@@ -560,13 +588,14 @@ class ProgramRuntimeControls:
             material["selection_revision"] = selection_revision
         offer_key = _digest("manyforge.cycle_recovery_offer.semantic.v4", material)
         with self._lock:
-            if self._offer_key == offer_key and self._offer is not None:
-                self._offer["valid_until_ns"] = (
+            cached = self._offers.get(identity.node_instance_id)
+            if cached is not None and cached[0] == offer_key:
+                cached[1]["valid_until_ns"] = (
                     nonnegative_int64_value(valid_until_ns)
                     if valid_until_ns is not None
                     else None
                 )
-                return deepcopy(self._offer)
+                return deepcopy(cached[1])
             if self._offer_revision >= _MAX_REVISION:
                 raise ProgramRuntimeControlError(
                     "program_recovery_offer_revision_exhausted",
@@ -659,9 +688,6 @@ class ProgramRuntimeControls:
                     "enabled": manual_result_enabled,
                     "disabled_reason_code": manual_result_disabled_reason,
                 },
-                "primary_action": next(
-                    (row["action_id"] for row in actions if row["enabled"]), None
-                ),
                 **failure,
                 "evidence_refs": (
                     owner.get("evidence_refs", []) if isinstance(owner, dict) else []
@@ -669,8 +695,8 @@ class ProgramRuntimeControls:
                 "policy": deepcopy(projected_policy),
                 "retries_used": retries_used,
             }
-            self._offer_key = offer_key
-            self._offer = deepcopy(result)
+            # Bounded by the captured nodes: one current offer per held node.
+            self._offers[identity.node_instance_id] = (offer_key, deepcopy(result))
             return deepcopy(result)
 
     def snapshot(self) -> dict[str, Any]:

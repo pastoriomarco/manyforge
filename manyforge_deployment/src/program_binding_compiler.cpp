@@ -24,6 +24,9 @@
 #include "manyforge_deployment/component_type_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "program_binding_internal.hpp"
+#include "program_io_condition_compiler_internal.hpp"
+#include <manyforge_core/io_signal_descriptor.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 
 namespace manyforge::deployment {
 namespace {
@@ -633,6 +636,10 @@ struct ResolvedResourceRole final {
                           Target, core::CellGlobalCapabilityProviderTargetDTO>) {
           return provider.scope == core::CapabilityScope::kCellGlobal &&
                  target.cell_id == graph.cell_id;
+        } else if constexpr (std::is_same_v<Target, core::ComponentTargetCapabilityProviderTargetDTO>) {
+          return target.controllable_component_id == component.controllable_component_id &&
+                 target.component_type_revision == component.component_type_revision &&
+                 target.command_target_id == target_id && ValidateNonCoordinateProviderTarget(graph, provider).ok();
         } else if constexpr (std::is_same_v<
                                  Target,
                                  core::TargetBindingCapabilityProviderTargetDTO>) {
@@ -663,23 +670,66 @@ struct ResolvedResourceRole final {
                        binding.command_target_id == target_id &&
                        binding.control_domain_id == target.control_domain_id;
               });
+          if (domain && target.provider()) {
+            const auto* driver = domain->provider();
+            const auto configured = ResolveRetainedIoSignalCatalog(graph);
+            return driver && configured.ok() && provider.scope == core::CapabilityScope::kControlDomain &&
+                target.control_domain_revision == domain->control_domain_revision &&
+                driver->controllable_component_id == component.controllable_component_id &&
+                driver->provider_instance_id == provider.provider_instance_id &&
+                driver->provider_manifest_id == provider.provider_manifest_id &&
+                driver->provider_manifest_revision == provider.provider_manifest_revision &&
+                std::any_of(configured.value().begin(), configured.value().end(), [&](const auto& row) {
+                  return row.runtime_unit_id == driver->provider_runtime_unit_id &&
+                         row.descriptor.signal_id.controllable_component_id == component.controllable_component_id &&
+                         row.command_target_id == target_id;
+                });
+          }
           return provider.scope == core::CapabilityScope::kControlDomain &&
                  domain != nullptr && target_uses_domain &&
+                 !domain->provider() && !target.provider() &&
                  target.control_domain_revision ==
                      domain->control_domain_revision &&
-                 target.controller_topology_id ==
-                     domain->controller_topology_id &&
-                 target.topology_revision == domain->topology_revision;
+                 target.controller().controller_topology_id ==
+                     domain->controller().controller_topology_id &&
+                 target.controller().topology_revision == domain->controller().topology_revision;
         }
       },
       provider.target);
 }
 
 void validate_command_schema_target(
-    const QualifiedCommandSchema& schema,
-    const core::ComponentTypeCommandTargetDTO& target_type,
-    const VerifiedRetainedModelMap& model_map,
-    const core::ControllableComponentId& component_id) {
+    const QualifiedCommandSchema &schema,
+    const core::ComponentTypeCommandTargetDTO &target_type,
+    const VerifiedRetainedModelMap &model_map,
+    const core::ControllableComponentId &component_id,
+    const core::CellGraphDTO &graph) {
+  if (std::holds_alternative<core::IoSignalWriteCommandValueContractDTO>(
+          schema.value().command_value)) {
+    const auto signals = ResolveRetainedIoSignalCatalog(graph);
+    if (!signals.ok())
+      fail(signals.error().details.at("reason"));
+    const bool qualified_output = std::any_of(
+        signals.value().begin(), signals.value().end(),
+        [&](const auto &signal) {
+          if (signal.descriptor.signal_id.controllable_component_id != component_id ||
+              signal.command_target_id != target_type.command_target_id ||
+              signal.descriptor.direction != core::IoSignalDirection::kOutput)
+            return false;
+          return std::any_of(
+              target_type.resource_roles.begin(),
+              target_type.resource_roles.end(), [&](const auto &role) {
+                const auto *local =
+                    std::get_if<core::ComponentTypeLocalResourceRoleDTO>(&role);
+                return local && !local->coordinate_kind &&
+                       local->resource_role_id == signal.resource_role_id;
+              });
+        });
+    if (!qualified_output)
+      fail("io_signal_unbound: output schema needs an actual non-coordinate "
+           "output");
+    return;
+  }
   const auto* contract = std::get_if<core::GripperPositionCommandValueContractDTO>(
       &schema.value().command_value);
   if (contract == nullptr) {
@@ -863,7 +913,8 @@ resolve_capability(
     selected_schema = &schema;
   }
   const bool requires_current_command_schema =
-      requirement.capability_id.value() == "tool.gripper.command";
+      requirement.capability_id.value() == "tool.gripper.command" ||
+      requirement.capability_id.value() == "io.gpio.set_output";
   if (requires_current_command_schema != (selected_schema != nullptr)) {
     fail("Program capability command-schema closure is incomplete or "
          "incompatible");
@@ -872,7 +923,7 @@ resolve_capability(
   std::optional<core::ProgramCommandSchemaRefDTO> command_schema;
   if (selected_schema != nullptr) {
     validate_command_schema_target(*selected_schema, target_type, model_map,
-                                   component.controllable_component_id);
+                                   component.controllable_component_id, graph);
     command_schema = core::ProgramCommandSchemaRefDTO{
         selected_schema->value().command_schema_id,
         selected_schema->value().command_schema_revision};
@@ -1090,6 +1141,120 @@ resolve_contact_grasp_bindings(
 
 namespace {
 
+using IoSignalRoles =
+    std::map<std::pair<core::TargetRoleId, core::ResourceRoleId>,
+             core::IoSignalDirection>;
+
+// Signal requirements retain their authored resource association; target-level
+// capability unions may also contain unrelated coordinate roles.
+IoSignalRoles
+require_supported_io_signal_roles(const ProgramBindingContract &contract) {
+  IoSignalRoles roles;
+  const auto *tree =
+      contract.normalized_program_root().find_object_member("tree");
+  if (tree == nullptr)
+    fail("Program has no verified tree");
+  std::vector<const CanonicalValue *> pending{tree};
+  while (!pending.empty()) {
+    const auto *node = pending.back();
+    pending.pop_back();
+    const auto *id = node->find_object_member("node_id");
+    if (id == nullptr || !id->is_string())
+      fail("Program node has no verified identity");
+    if (id->as_string() == "io.get_input" ||
+        id->as_string() == "io.check_input" ||
+        id->as_string() == "io.wait_for_input" ||
+        id->as_string() == "io.set_output") {
+      const auto *parameters = node->find_object_member("parameters");
+      const auto *target =
+          parameters ? parameters->find_object_member("target_role") : nullptr;
+      const auto *resource =
+          parameters ? parameters->find_object_member("resource_role")
+                     : nullptr;
+      if (!target || !target->is_string() || !resource ||
+          !resource->is_string())
+        fail(
+            "io_signal_unbound: I/O roles must be literal verified identities");
+      if (id->as_string() == "io.wait_for_input") {
+        const auto *edge = parameters->find_object_member("edge");
+        if (edge && (!edge->is_string() || edge->as_string() != "level"))
+          fail("io_signal_transition_unsupported: only level watches are "
+               "installed");
+      }
+      const auto direction = id->as_string() == "io.set_output"
+                                 ? core::IoSignalDirection::kOutput
+                                 : core::IoSignalDirection::kInput;
+      if (direction == core::IoSignalDirection::kOutput) {
+        const auto *sources = node->find_object_member("value_sources");
+        if (sources && (sources->find_object_member("target_role") ||
+                        sources->find_object_member("resource_role")))
+          fail("io_signal_unbound: output roles must be literal verified "
+               "identities");
+        const auto &requirements = contract.value().target_roles;
+        const auto required_target = std::find_if(
+            requirements.begin(), requirements.end(), [&](const auto &role) {
+              return role.target_role_id.value() == target->as_string();
+            });
+        const auto *builtin =
+            core::find_builtin_capability_definition("io.gpio.set_output");
+        if (required_target == requirements.end() || !builtin ||
+            std::none_of(
+                required_target->required_capabilities.begin(),
+                required_target->required_capabilities.end(),
+                [&](const auto &capability) {
+                  return capability.capability_id.value() ==
+                             builtin->capability_id &&
+                         capability.capability_definition_revision.value() ==
+                             builtin->capability_definition_revision;
+                }) ||
+            std::none_of(required_target->required_resource_roles.begin(),
+                         required_target->required_resource_roles.end(),
+                         [&](const auto &role) {
+                           return role.value() == resource->as_string();
+                         }))
+          fail("io_signal_unbound: output needs its required capability and "
+               "resource role");
+      }
+      const auto [existing, inserted] =
+          roles.emplace(std::pair{core::TargetRoleId(target->as_string()),
+                                  core::ResourceRoleId(resource->as_string())},
+                        direction);
+      if (!inserted && existing->second != direction)
+        fail("io_signal_direction_mismatch: one signal role cannot be both "
+             "read and written");
+    }
+    const auto condition_roles =
+        detail::collect_program_node_io_signal_roles(*node);
+    if (!condition_roles.ok())
+      fail(condition_roles.error().details.at("reason") + ": " +
+           condition_roles.error().message);
+    for (const auto &[target_id, resource_id] : condition_roles.value()) {
+      const auto &requirements = contract.value().target_roles;
+      const auto target = std::find_if(
+          requirements.begin(), requirements.end(),
+          [&](const auto &row) { return row.target_role_id == target_id; });
+      if (target == requirements.end() ||
+          std::find(target->required_resource_roles.begin(),
+                    target->required_resource_roles.end(),
+                    resource_id) == target->required_resource_roles.end())
+        fail("io_signal_unbound: condition input needs its exact required "
+             "target/resource role");
+      const auto [existing, inserted] = roles.emplace(
+          std::pair{target_id, resource_id}, core::IoSignalDirection::kInput);
+      if (!inserted && existing->second != core::IoSignalDirection::kInput)
+        fail("io_signal_direction_mismatch: one signal role cannot be both "
+             "read and written");
+    }
+    if (const auto *children = node->find_object_member("children")) {
+      if (!children->is_array())
+        fail("Program children are not verified");
+      for (const auto &child : children->as_array())
+        pending.push_back(&child);
+    }
+  }
+  return roles;
+}
+
 struct UnresolvedRoleCollector final {
   std::vector<ProgramBindingUnresolvedRoleDTO> rows;
   std::optional<core::ContentDigest> role_assignment_digest;
@@ -1098,12 +1263,13 @@ struct UnresolvedRoleCollector final {
 
 [[nodiscard]] std::shared_ptr<const ProgramBinding>
 compile_program_binding_contract(
-    const core::ProgramBindingContractDTO& program_contract,
+    const core::ProgramBindingContractDTO &program_contract,
     core::ProgramRoleAssignmentDTO role_assignment,
-    const RetainedBundle& retained_bundle,
-    const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactSource& catalog_artifact_store,
-    UnresolvedRoleCollector* collector = nullptr) {
+    const RetainedBundle &retained_bundle,
+    const VerifiedRetainedModelMap &retained_model_map,
+    const ICatalogArtifactSource &catalog_artifact_store,
+    UnresolvedRoleCollector *collector = nullptr,
+    const IoSignalRoles *io_signal_roles = nullptr) {
   try {
     if (!verify_retained_bundle_identity(retained_bundle) ||
         retained_model_map.query().retained_bundle_id !=
@@ -1111,6 +1277,9 @@ compile_program_binding_contract(
       fail("binding compiler inputs do not share one verified retained bundle");
     }
     const auto& bundle = retained_bundle.value();
+    const auto io_catalog = ResolveRetainedIoSignalCatalog(bundle.cell_graph);
+    if (!io_catalog.ok())
+      fail(io_catalog.error().details.at("reason"));
     if (program_contract.node_environment != bundle.catalogs.node_environment) {
       fail("Program contract selects another retained node environment");
     }
@@ -1266,6 +1435,7 @@ compile_program_binding_contract(
         }
 
         std::vector<core::ProgramResourceRoleBindingDTO> resources;
+        std::vector<core::ProgramSignalRoleBindingDTO> signals;
         for (const auto& role : requirement.required_resource_roles) {
           if (std::none_of(target_type.resource_roles.begin(),
                            target_type.resource_roles.end(), [&](const auto& value) {
@@ -1274,6 +1444,53 @@ compile_program_binding_contract(
             unavailable(ProgramBindingUnresolvedReason::kTargetIncompatible,
                         "target role requires a resource absent from its "
                         "component type");
+          }
+          if (io_signal_roles &&
+              io_signal_roles->contains({requirement.target_role_id, role})) {
+            const auto direction =
+                io_signal_roles->at({requirement.target_role_id, role});
+            const auto declared = std::find_if(
+                target_type.resource_roles.begin(),
+                target_type.resource_roles.end(), [&](const auto &value) {
+                  return core::resource_role_id(value) == role;
+                });
+            const auto *local =
+                std::get_if<core::ComponentTypeLocalResourceRoleDTO>(
+                    &*declared);
+            const auto resolved =
+                std::find_if(io_catalog.value().begin(),
+                             io_catalog.value().end(), [&](const auto &value) {
+                               return value.descriptor.signal_id.controllable_component_id ==
+                                          component.controllable_component_id &&
+                                      value.command_target_id ==
+                                          target_assignment.command_target_id &&
+                                      value.resource_role_id == role;
+                             });
+            if (!local || local->coordinate_kind ||
+                resolved == io_catalog.value().end())
+              unavailable(ProgramBindingUnresolvedReason::kTargetIncompatible,
+                          direction == core::IoSignalDirection::kInput
+                              ? "io_signal_unbound: input role needs one "
+                                "declared non-coordinate signal"
+                              : "io_signal_unbound: output role needs one "
+                                "declared non-coordinate signal");
+            if (resolved->descriptor.direction != direction)
+              unavailable(ProgramBindingUnresolvedReason::kTargetIncompatible,
+                          direction == core::IoSignalDirection::kInput
+                              ? "io_signal_direction_mismatch: output has no "
+                                "independent input readback"
+                              : "io_signal_direction_mismatch: input cannot be "
+                                "written");
+            const auto digest =
+                core::ComputeIoSignalDescriptorDigest(resolved->descriptor);
+            if (!digest.ok())
+              fail(digest.error().details.at("reason"));
+            signals.push_back({role, resolved->descriptor.signal_id.name,
+                               resolved->descriptor.value_type,
+                               resolved->descriptor.direction,
+                               resolved->descriptor.transition_capability,
+                               digest.value()});
+            continue;
           }
           resources.push_back(resolve_resource_role(
                                   retained_model_map, target_type,
@@ -1316,7 +1533,7 @@ compile_program_binding_contract(
             component.controllable_component_id,
             target_assignment.command_target_id, std::move(frames),
             std::move(resources), std::move(collision_bodies),
-            std::move(capabilities)});
+            std::move(capabilities), std::move(signals)});
       } catch (const TargetUnavailable& error) {
         record(error, requirement.component_role_id, requirement.target_role_id,
                component_assignment.controllable_component_id,
@@ -1545,11 +1762,77 @@ make_direct_control_motion_contract(
       {}};
 }
 
+[[nodiscard]] core::ProgramBindingContractDTO make_direct_control_io_contract(
+    const core::RetainedNodeEnvironmentDTO &node_environment,
+    const core::ComponentTypeCommandTargetDTO &target,
+    const std::vector<core::ResourceRoleId> &resource_roles,
+    bool include_inputs, bool include_outputs) {
+  const auto *capability = find_target_capability(
+      target, include_inputs ? "io.gpio.get_input" : "io.gpio.set_output");
+  const auto *output =
+      include_outputs ? find_target_capability(target, "io.gpio.set_output")
+                      : nullptr;
+  if (!capability || (include_outputs && !output) || resource_roles.empty())
+    fail("direct-control input target has no qualified input-read contract");
+  auto projection_fields = CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.direct_control_io_program.v1")},
+      {"program_id", CanonicalValue(std::string(kDirectControlIoProgramId))},
+      {"component_role_id",
+       CanonicalValue(std::string(kDirectControlComponentRoleId))},
+      {"target_role_id",
+       CanonicalValue(std::string(kDirectControlTargetRoleId))},
+      {"capability_id", CanonicalValue(capability->capability_id.value())},
+      {"capability_definition_revision",
+       CanonicalValue(capability->capability_definition_revision.value())},
+      {"resource_roles", strong_id_array(resource_roles)},
+      {"node_environment",
+       CanonicalValue(CanonicalValue::Object{
+           {"catalog_id", CanonicalValue(node_environment.catalog_id)},
+           {"content_version",
+            CanonicalValue(node_environment.content_version)},
+           {"catalog_digest",
+            CanonicalValue(node_environment.catalog_digest.value())},
+           {"environment_digest",
+            CanonicalValue(node_environment.environment_digest.value())}})}};
+  std::vector<core::ProgramCapabilityRequirementDTO> capabilities{
+      {capability->capability_id, capability->capability_definition_revision,
+       core::ProgramCapabilityDisposition::kRequired}};
+  if (include_inputs && include_outputs) {
+    projection_fields.emplace_back(
+        "output_capability_id", CanonicalValue(output->capability_id.value()));
+    projection_fields.emplace_back(
+        "output_capability_definition_revision",
+        CanonicalValue(output->capability_definition_revision.value()));
+    capabilities.push_back({output->capability_id,
+                            output->capability_definition_revision,
+                            core::ProgramCapabilityDisposition::kRequired});
+  }
+  const CanonicalValue projection(std::move(projection_fields));
+  std::string preimage("manyforge.direct-control-io-program-revision.v1");
+  preimage.push_back('\0');
+  preimage.append(canonical_json(projection));
+  return {core::ProgramId(std::string(kDirectControlIoProgramId)),
+          core::ProgramRevision(sha256_digest(preimage)),
+          node_environment,
+          {{core::ComponentRoleId(std::string(kDirectControlComponentRoleId)),
+            {},
+            {},
+            {}}},
+          {{core::TargetRoleId(std::string(kDirectControlTargetRoleId)),
+            core::ComponentRoleId(std::string(kDirectControlComponentRoleId)),
+            std::move(capabilities),
+            {},
+            resource_roles,
+            {},
+            {}}},
+          {}};
+}
+
 [[nodiscard]] core::ProgramBindingContractDTO
 make_direct_control_gripper_contract(
-    const core::RetainedNodeEnvironmentDTO& node_environment,
-    const core::ComponentTypeCommandTargetDTO& target) {
-  const auto* command_capability =
+    const core::RetainedNodeEnvironmentDTO &node_environment,
+    const core::ComponentTypeCommandTargetDTO &target) {
+  const auto *command_capability =
       find_target_capability(target, "tool.gripper.command");
   if (command_capability == nullptr) {
     fail("direct-control gripper target omits tool.gripper.command");
@@ -1685,9 +1968,11 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
     const ICatalogArtifactSource& catalog_artifact_store) {
+  const auto io_signal_roles =
+      require_supported_io_signal_roles(program_contract);
   return compile_program_binding_contract(
       program_contract.value(), std::move(role_assignment), retained_bundle,
-      retained_model_map, catalog_artifact_store);
+      retained_model_map, catalog_artifact_store, nullptr, &io_signal_roles);
 }
 
 ProgramBindingOutcome compile_program_binding_outcome(
@@ -1697,9 +1982,11 @@ ProgramBindingOutcome compile_program_binding_outcome(
     const VerifiedRetainedModelMap& retained_model_map,
     const ICatalogArtifactSource& catalog_artifact_store) {
   UnresolvedRoleCollector collector;
+  const auto io_signal_roles =
+      require_supported_io_signal_roles(program_contract);
   auto binding = compile_program_binding_contract(
       program_contract.value(), std::move(role_assignment), retained_bundle,
-      retained_model_map, catalog_artifact_store, &collector);
+      retained_model_map, catalog_artifact_store, &collector, &io_signal_roles);
   if (binding != nullptr) {
     if (!collector.rows.empty()) {
       fail("Program Binding outcome is both bound and unresolved");
@@ -1949,11 +2236,73 @@ compile_direct_control_gripper_program_binding(
   }
 }
 
+std::shared_ptr<const ProgramBinding> compile_direct_control_io_program_binding(
+    const core::ControllableComponentId &controllable_component_id,
+    const core::CommandTargetId &command_target_id,
+    const RetainedBundle &retained_bundle,
+    const VerifiedRetainedModelMap &retained_model_map,
+    const ICatalogArtifactSource &catalog_artifact_store) {
+  try {
+    if (!verify_retained_bundle_identity(retained_bundle) ||
+        retained_model_map.query().retained_bundle_id !=
+            retained_bundle.retained_bundle_id())
+      fail("direct-control input compiler inputs do not share one verified "
+           "retained bundle");
+    const auto &bundle = retained_bundle.value();
+    const auto &component =
+        require_component(bundle.cell_graph, controllable_component_id);
+    const auto catalog =
+        load_qualified_catalog_closure(bundle, catalog_artifact_store);
+    const auto component_type = load_component_type(
+        bundle, component, catalog.capabilities, catalog_artifact_store);
+    const auto &target = require_target_type(component_type, command_target_id);
+    const auto signals = ResolveRetainedIoSignalCatalog(bundle.cell_graph);
+    if (!signals.ok())
+      fail(signals.error().details.at("reason"));
+    std::set<std::string> role_names;
+    IoSignalRoles signal_roles;
+    bool include_inputs = false;
+    bool include_outputs = false;
+    for (const auto &signal : signals.value())
+      if (signal.descriptor.signal_id.controllable_component_id ==
+              controllable_component_id &&
+          signal.command_target_id == command_target_id) {
+        role_names.insert(signal.resource_role_id.value());
+        include_inputs |=
+            signal.descriptor.direction == core::IoSignalDirection::kInput;
+        include_outputs |=
+            signal.descriptor.direction == core::IoSignalDirection::kOutput;
+        signal_roles.emplace(std::pair{core::TargetRoleId(std::string(
+                                           kDirectControlTargetRoleId)),
+                                       signal.resource_role_id},
+                             signal.descriptor.direction);
+      }
+    const auto roles = sorted_ids<core::ResourceRoleId>(role_names);
+    const auto contract = make_direct_control_io_contract(
+        bundle.catalogs.node_environment, target, roles, include_inputs,
+        include_outputs);
+    return compile_program_binding_contract(
+        contract,
+        {{{core::ComponentRoleId(std::string(kDirectControlComponentRoleId)),
+           controllable_component_id}},
+         {{core::TargetRoleId(std::string(kDirectControlTargetRoleId)),
+           command_target_id}}},
+        retained_bundle, retained_model_map, catalog_artifact_store, nullptr,
+        &signal_roles);
+  } catch (const ProgramBindingCompilerError &) {
+    throw;
+  } catch (const std::exception &error) {
+    fail(std::string(
+             "Direct-control input Program Binding compilation failed: ") +
+         error.what());
+  }
+}
+
 DirectControlProgramBindingInventory
 compile_direct_control_program_binding_inventory(
-    const RetainedBundle& retained_bundle,
-    const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactSource& catalog_artifact_store) {
+    const RetainedBundle &retained_bundle,
+    const VerifiedRetainedModelMap &retained_model_map,
+    const ICatalogArtifactSource &catalog_artifact_store) {
   try {
     if (!verify_retained_bundle_identity(retained_bundle) ||
         retained_model_map.query().retained_bundle_id !=
@@ -1996,8 +2345,13 @@ compile_direct_control_program_binding_inventory(
               retained_bundle, retained_model_map,
               catalog_artifact_store));
         }
-        if (find_target_capability(target, "tool.gripper.command") !=
-            nullptr) {
+        if (find_target_capability(target, "io.gpio.get_input") != nullptr ||
+            find_target_capability(target, "io.gpio.set_output") != nullptr) {
+          result.io.push_back(compile_direct_control_io_program_binding(
+              component.controllable_component_id, target.command_target_id,
+              retained_bundle, retained_model_map, catalog_artifact_store));
+        }
+        if (find_target_capability(target, "tool.gripper.command") != nullptr) {
           auto contract = make_direct_control_gripper_contract(
               bundle.catalogs.node_environment, target);
           result.gripper.push_back(compile_program_binding_contract(
@@ -2017,9 +2371,9 @@ compile_direct_control_program_binding_inventory(
       }
     }
     return result;
-  } catch (const ProgramBindingCompilerError&) {
+  } catch (const ProgramBindingCompilerError &) {
     throw;
-  } catch (const std::exception& error) {
+  } catch (const std::exception &error) {
     fail(std::string("Direct-control Program Binding inventory compilation "
                      "failed: ") +
          error.what());

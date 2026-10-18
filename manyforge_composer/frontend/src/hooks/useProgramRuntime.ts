@@ -10,6 +10,7 @@ import type {
   CurrentScenarioResponse,
   JsonValue,
   CycleRecoveryActionId,
+  CycleRecoveryOffer,
   PersistentKeyValues,
   ProgramRuntimeControlProjection,
   ProgramGroupRuntimeScaleState,
@@ -233,7 +234,20 @@ function controlsKey(value: ProgramRuntimeControlProjection | null): string {
       + `${value.runtimeControls.runtimeControlRevision}:`
       + `${value.recoveryOffer?.offerId ?? 'no-offer'}:`
       + `${value.recoveryOffer?.offerRevision ?? 0}:`
+      + (value.recoveryHolds ?? []).map((hold) => (
+        `${hold.offer.offerId}@${hold.offer.offerRevision}`
+      )).join(',') + ':'
       + JSON.stringify(value.executionSelections);
+}
+
+/** The offer with this ID: the focused one (an operator Stop too) or a failure hold's. */
+function offerWithId(
+  value: ProgramRuntimeControlProjection | null,
+  offerId: string,
+): CycleRecoveryOffer | null {
+  const focused = value?.recoveryOffer ?? null;
+  if (focused?.offerId === offerId) return focused;
+  return value?.recoveryHolds.find((hold) => hold.offer.offerId === offerId)?.offer ?? null;
 }
 
 export function controlPendingAfterProjection(
@@ -246,12 +260,14 @@ export function controlPendingAfterProjection(
   if (run !== null && ['stopped', 'succeeded', 'failed'].includes(run.state)) {
     return null;
   }
-  const expected = previous?.recoveryOffer ?? null;
-  const current = observed?.recoveryOffer ?? null;
+  // `recovery:<offer id>:<action id>` is pending until that offer's revision
+  // changes or the owner retires it (offer IDs are digests and contain a
+  // colon; action IDs do not).
+  const offerId = pending.slice('recovery:'.length, pending.lastIndexOf(':'));
+  const expected = offerWithId(previous, offerId);
+  const current = offerWithId(observed, offerId);
   if (expected === null) return pending;
-  return current === null
-    || current.offerId !== expected.offerId
-    || current.offerRevision !== expected.offerRevision
+  return current === null || current.offerRevision !== expected.offerRevision
     ? null
     : pending;
 }
@@ -1571,11 +1587,18 @@ export function useProgramRuntime(
     }
   }, [beginControlCommand, controlSource, recordCommandFailure]);
 
-  const applyRecoveryAction = useCallback((actionId: CycleRecoveryActionId) => {
-    const offer = state.controls?.recoveryOffer;
+  /** Applies one action of one offer (a failure hold's, or the focused operator Stop's), only while that exact revision is current. */
+  const applyRecoveryAction = useCallback((
+    target: Pick<CycleRecoveryOffer, 'offerId' | 'offerRevision'>,
+    actionId: CycleRecoveryActionId,
+  ) => {
+    const current = offerWithId(state.controls, target.offerId);
+    const offer = current !== null && current.offerRevision === target.offerRevision
+      ? current
+      : null;
     const action = offer?.actions.find((row) => row.actionId === actionId);
     if (
-      offer === null || offer === undefined || action?.enabled !== true
+      offer === null || action?.enabled !== true
       || state.controlPending !== null
       // Retry and continue resume the run; only a Reset ends it.
       || (!action.performsBackendReset && draftUnappliedReason !== null)
@@ -1593,7 +1616,7 @@ export function useProgramRuntime(
       reason: 'operator-selected recovery action',
     } satisfies Record<string, JsonValue>;
     void performRuntimeControl(
-      `recovery:${actionId}`,
+      `recovery:${offer.offerId}:${actionId}`,
       requestId,
       'execution_recovery',
       body,
@@ -1713,6 +1736,8 @@ export function useProgramRuntime(
   ), [draftUnappliedReason, snapshot]);
 
   const [activationOffer, setActivationOffer] = useState<ActivationSequenceObservation | null>(null);
+  const activationComponentHealth: CCLCController['componentHealth'] = cclc?.componentHealth ?? {};
+  const activationProgress = cclc?.activationProgress ?? null;
   const [activationPending, setActivationPending] = useState(false);
   const [activationWaiting, setActivationWaiting] = useState(false);
   const executeFlow = useRef<{
@@ -1844,6 +1869,8 @@ export function useProgramRuntime(
     refresh,
     dismissError,
     activationOffer,
+    activationComponentHealth,
+    activationProgress,
     activationPending,
     activationWaiting,
     confirmActivationExecute,
@@ -1865,6 +1892,8 @@ export function useProgramRuntime(
   }), [
     active,
     activationOffer,
+    activationComponentHealth,
+    activationProgress,
     activationPending,
     activationWaiting,
     confirmActivationExecute,

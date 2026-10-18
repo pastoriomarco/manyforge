@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -74,11 +75,10 @@ class ExecutionProgressPublication final {
   /// Publish the definitive natural-completion boundary for one generation.
   /// The marker remains valid until kernel terminal handoff retires it. Once
   /// terminal, late same-generation progress callbacks cannot reopen motion.
-  ExecutionProgressPublishResult publish_terminal(
-      std::uint64_t execution_generation,
-      std::int64_t trajectory_time_ns,
-      std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns) noexcept;
+  ExecutionProgressPublishResult publish_terminal(std::uint64_t execution_generation,
+                                                  std::int64_t trajectory_time_ns,
+                                                  std::int64_t source_timestamp_ns,
+                                                  std::int64_t received_timestamp_ns) noexcept;
 
   /// Atomically arbitrate a completed lookahead hazard against natural
   /// completion for one generation. The first authority boundary wins:
@@ -87,6 +87,13 @@ class ExecutionProgressPublication final {
   /// cursor remains claimable so authority loss still fails closed.
   ExecutionProgressHazardClaimResult claim_hazard_authority(
       std::uint64_t execution_generation) noexcept;
+
+  /// Read existing hazard authority for one exact generation. Nullopt means
+  /// another/no generation; this never claims or clears authority. Handover
+  /// callers serialize this read through publication with the same Kernel
+  /// protection lock used by claim_hazard_authority.
+  [[nodiscard]] std::optional<bool> hazard_authority_claimed(
+      std::uint64_t execution_generation) const noexcept;
 
   /// Lifecycle-bound invalidation is guaranteed, not best effort, and retires
   /// the current generation. Readers see either the preceding complete even
@@ -107,12 +114,11 @@ class ExecutionProgressPublication final {
   [[nodiscard]] std::int64_t freshness_budget_ns() const noexcept { return freshness_budget_ns_; }
 
  private:
-  ExecutionProgressPublishResult publish_impl(
-      std::uint64_t execution_generation,
-      std::int64_t trajectory_time_ns,
-      std::int64_t source_timestamp_ns,
-      std::int64_t received_timestamp_ns,
-      bool terminal) noexcept;
+  ExecutionProgressPublishResult publish_impl(std::uint64_t execution_generation,
+                                              std::int64_t trajectory_time_ns,
+                                              std::int64_t source_timestamp_ns,
+                                              std::int64_t received_timestamp_ns,
+                                              bool terminal) noexcept;
   void begin_write() noexcept;
   void end_write() noexcept;
 

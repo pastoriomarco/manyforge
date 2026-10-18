@@ -16,13 +16,17 @@ import type {
   ObservedMotionTarget,
   OperationObservation,
   OperationStateName,
+  OutputEvidence,
   ResourceSourceKind,
   SceneRevisionValue,
+  TargetStopResponse,
   ManualControlAvailability,
   ManualProgramHandoverContext,
 } from '../../types/robotControl';
 import type { JsonObject } from './shared';
+import { ioSignalBindingsAt } from './ioSignals';
 import {
+  allowedKeysAt,
   arrayAt,
   booleanAt,
   boundedArrayAt,
@@ -729,7 +733,11 @@ export function parseExecutionControlStatus(
   // execution_targets.v3 + execution_control_state.v6 (H1a-IF.2): every
   // managed cell uses one component-based shape; no primary target exists.
   const targets = objectAt(targetsEnvelope.targets, 'executionTargets.targets');
-  exactKeysAt(targets, ['components', 'schema_version'], 'executionTargets.targets');
+  allowedKeysAt(targets, ['components', 'schema_version'], ['io_signal_bindings'], 'executionTargets.targets');
+  // Optional and static per activation: every target's bound boolean signals.
+  const ioSignalBindings = targets.io_signal_bindings === undefined
+    ? undefined
+    : ioSignalBindingsAt(targets.io_signal_bindings, 'executionTargets.targets.io_signal_bindings');
   if (stringAt(targets.schema_version, 'executionTargets.targets.schema_version')
     !== 'manyforge.execution_targets.v3') {
     return fail('executionTargets.targets.schema_version', 'manyforge.execution_targets.v3');
@@ -800,6 +808,7 @@ export function parseExecutionControlStatus(
     return rest;
   };
   const normalizedComponents: JsonObject[] = [];
+  const stopResponses = new Map<string, TargetStopResponse>();
   const motionRows: JsonObject[] = [];
   const gripperRows: JsonObject[] = [];
   boundedArrayAt(
@@ -857,11 +866,18 @@ export function parseExecutionControlStatus(
           operation_capability_id: operationCapabilityId,
         };
         if (presentation === 'motion') {
-          exactKeysAt(command, [
+          allowedKeysAt(command, [
             'base_frame_role_id', 'component_role_id', 'frame_role_ids', 'joints',
             'manual_control', 'planning_capability_ids', 'target_descriptor',
             'target_role_id', 'tcp_frame_role_id',
-          ], `${targetPath}.command`);
+          ], ['stop_response'], `${targetPath}.command`);
+          if (command.stop_response !== undefined) {
+            stopResponses.set(
+              JSON.stringify([componentId, commandTargetId]),
+              targetStopResponseAt(command.stop_response, `${targetPath}.command.stop_response`),
+            );
+            delete (addressed as JsonObject).stop_response;
+          }
           motionRows.push({
             ...addressed,
             observed_state: observationFor(componentId, target, 'joint_positions', targetPath),
@@ -989,10 +1005,55 @@ export function parseExecutionControlStatus(
       );
     }
   }
+  const withStopResponse = (target: DirectControlMotionStatus): DirectControlMotionStatus => {
+    const stopResponse = stopResponses.get(
+      JSON.stringify([target.controllableComponentId, target.commandTargetId]),
+    );
+    return stopResponse === undefined ? target : { ...target, stopResponse };
+  };
   return {
     ...status,
+    directControl: status.directControl === null ? null : withStopResponse(status.directControl),
+    directControlTargets: status.directControlTargets.map(withStopResponse),
     manualOperations,
     runtimeScaleControl,
+    ...(ioSignalBindings === undefined ? {} : { ioSignalBindings }),
+  };
+}
+
+/**
+ * The optional `target.command.stop_response` (SX-2167): strict, with its
+ * stages in qualified chain order and unique stage ids.
+ */
+export function targetStopResponseAt(value: unknown, path: string): TargetStopResponse {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'control_binding_id', 'control_binding_revision', 'control_route_id', 'nominal_stop_mode', 'stages',
+  ], path);
+  const text = (field: string) => {
+    const entry = stringAt(record[field], `${path}.${field}`);
+    return entry === '' ? fail(`${path}.${field}`, 'nonempty text') : entry;
+  };
+  const stages = boundedArrayAt(record.stages, `${path}.stages`, 16).map((item, index) => {
+    const stagePath = `${path}.stages[${index}]`;
+    const stage = objectAt(item, stagePath);
+    exactKeysAt(stage, ['command_kind', 'stage_id', 'stage_kind'], stagePath);
+    const field = (key: string) => {
+      const entry = stringAt(stage[key], `${stagePath}.${key}`);
+      return entry === '' ? fail(`${stagePath}.${key}`, 'nonempty text') : entry;
+    };
+    return { stageId: field('stage_id'), stageKind: field('stage_kind'), commandKind: field('command_kind') };
+  });
+  if (stages.length === 0) return fail(`${path}.stages`, 'at least one qualified stage');
+  if (new Set(stages.map((stage) => stage.stageId)).size !== stages.length) {
+    return fail(`${path}.stages`, 'unique stage ids');
+  }
+  return {
+    controlBindingId: text('control_binding_id'),
+    controlBindingRevision: text('control_binding_revision'),
+    controlRouteId: text('control_route_id'),
+    nominalStopMode: nullableStringAt(record.nominal_stop_mode, `${path}.nominal_stop_mode`),
+    stages,
   };
 }
 
@@ -1362,6 +1423,18 @@ function directControlGripperAt(value: unknown): {
       );
     }
     observedGripper = {
+      targetRoleId: stringAt(
+        directGripper.target_role_id,
+        'executionStatus.status.direct_control_gripper.target_role_id',
+      ),
+      controllableComponentId: stringAt(
+        directGripper.controllable_component_id,
+        'executionStatus.status.direct_control_gripper.controllable_component_id',
+      ),
+      commandTargetId: stringAt(
+        directGripper.command_target_id,
+        'executionStatus.status.direct_control_gripper.command_target_id',
+      ),
       sequence: integerAt(
         gripperObserved.sequence,
         'executionStatus.status.direct_control_gripper.observed_state.sequence',
@@ -1736,14 +1809,8 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
     );
   }
   const observedGrippers = gripperEntries
-    .map((entry) => (
-      entry.observedGripper === null || entry.directControlGripper === null ? null : {
-        ...entry.observedGripper,
-        targetRoleId: entry.directControlGripper.targetRoleId,
-        controllableComponentId: entry.directControlGripper.controllableComponentId,
-        commandTargetId: entry.directControlGripper.commandTargetId,
-      }))
-    .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+    .map((entry) => entry.observedGripper)
+    .filter((entry): entry is ObservedGripperTarget => entry !== null);
   return {
     ownerEpoch: stringAt(status.owner_epoch, 'executionStatus.status.owner_epoch'),
     cellId: stringAt(status.cell_id, 'executionStatus.status.cell_id'),
@@ -2414,6 +2481,39 @@ const OPERATION_STATES = new Set<OperationStateName>([
   'cancelled_pre_dispatch',
 ]);
 
+const OUTPUT_EVIDENCE = new Set<OutputEvidence>([
+  'not_submitted', 'submitted', 'source_accepted', 'source_rejected', 'acceptance_unknown',
+]);
+
+/**
+ * One participant's binding identity and optional correlated output evidence
+ * (SX-2119): a provider participant has both control-binding fields null and a
+ * real capability-provider binding; evidence is omitted when absent and an
+ * explicit null or unknown spelling is invalid. Evidence is the source's
+ * acceptance, never the physical effect.
+ */
+export function participantOutputEvidenceAt(
+  participant: Record<string, unknown>,
+  path: string,
+): OutputEvidence | undefined {
+  const text = (key: string) => typeof participant[key] === 'string' && participant[key] !== '';
+  if ('control_binding_id' in participant || 'control_binding_revision' in participant) {
+    if (participant.control_binding_id === null && participant.control_binding_revision === null) {
+      if (!text('capability_provider_binding_id') || !text('capability_provider_binding_revision')) {
+        return fail(path, 'a provider participant with its capability-provider binding');
+      }
+    } else if (!text('control_binding_id') || !text('control_binding_revision')) {
+      return fail(path, 'a paired control binding or both control-binding fields null');
+    }
+  }
+  if (!('output_evidence' in participant)) return undefined;
+  const evidence = participant.output_evidence;
+  if (typeof evidence !== 'string' || !OUTPUT_EVIDENCE.has(evidence as OutputEvidence)) {
+    return fail(`${path}.output_evidence`, 'a known output evidence value');
+  }
+  return evidence as OutputEvidence;
+}
+
 export function parseOperationObservation(value: unknown): OperationObservation {
   const envelope = objectAt(value, 'operationObservation');
   if (
@@ -2475,6 +2575,10 @@ export function parseOperationObservation(value: unknown): OperationObservation 
   if (revision < 1) {
     return fail('operationObservation.operation.operation_revision', 'positive');
   }
+  const outputEvidence = participantOutputEvidenceAt(
+    participant,
+    'operationObservation.operation.participants[0]',
+  );
   const optionalParticipantText = (key: string): string | undefined => (
     typeof participant[key] === 'string' && participant[key] !== ''
       ? participant[key] as string
@@ -2507,5 +2611,6 @@ export function parseOperationObservation(value: unknown): OperationObservation 
     targetRoleId: optionalParticipantText('target_role_id'),
     controllableComponentId: optionalParticipantText('controllable_component_id'),
     commandTargetId: optionalParticipantText('command_target_id'),
+    ...(outputEvidence === undefined ? {} : { outputEvidence }),
   };
 }

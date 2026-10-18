@@ -45,8 +45,9 @@ struct ActivationPreparedModel final {
 
 /// Join the three independently validated preparation inputs exactly once.
 ///
-/// Component order comes from the authored intent.  Prepared rows and profile
-/// rows must cover that same set exactly; there is no family/catalog fallback.
+/// Profiles cover the exact authored component set. Only physical components
+/// contribute prepared model rows, in canonical physical-component order; a
+/// model-free provider cannot contribute a model. No family/catalog fallback.
 /// Resource bytes are reused from the captured closure and renamed only by the
 /// preparation receipt that the model qualifier verifies independently.
 [[nodiscard]] std::vector<ActivationPreparedModel>

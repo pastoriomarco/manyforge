@@ -215,13 +215,18 @@ export type ProgramValueSource =
 
 export type ProgramOperatorStopPolicy = 'inherit' | 'hold' | 'continue';
 
+/** Which motion groups stop while a run waits for the operator. */
+export type ProgramInterventionStopScope = 'all' | 'own_groups';
+
 /**
  * The captured failure-recovery policy of one node. `max_retries` 0 is
- * Unlimited, never "disabled"; intervention stays an explicit opt-in.
+ * Unlimited, never "disabled"; intervention stays an explicit opt-in. The
+ * stop scope is omitted when it is the default `all`.
  */
 export interface ProgramNodeRecoveryPolicy {
   allow_intervention: boolean;
   max_retries: number;
+  intervention_stop_scope?: 'own_groups';
 }
 
 export interface ProgramTreeNode {
@@ -756,6 +761,18 @@ export interface ProgramRunCapture {
   ownerIdentities: ProgramRunOwnerIdentity[];
 }
 
+/** Exact owner-published operation failure provenance; display/history data only. */
+export interface ProgramRunOperationFailure {
+  nodeInstanceId: string;
+  nodeAttemptId: string;
+  operatorFacingRunRevision: number;
+  operation: { sourceOwnerEpoch: string; operationId: string; operationRevision: number };
+  resourceIds: string[];
+  failure: { code: string; message: string };
+  recoveryClass: string;
+  terminalFacts: Array<{ kind: string; effect: string }>;
+}
+
 export interface ProgramRunStatus {
   schemaVersion: 'manyforge.program_run_status.v3';
   ownerId: string;
@@ -770,6 +787,7 @@ export interface ProgramRunStatus {
     'idle' | 'running' | 'held' | 'success' | 'failure' | 'interrupted'
   >;
   activeOperationCount: number | null;
+  operationFailures: ProgramRunOperationFailure[];
   /**
    * Why the run is in its state (a failure, a Stop or a pause), null when the
    * owner names no reason. Its message is the status `message`.
@@ -815,7 +833,6 @@ export interface ProgramCycleStatus {
     allowed: boolean;
     disabledReason: string | null;
   }>;
-  recoveryOffer: CycleRecoveryOffer | null;
   run: ProgramRunStatus | null;
   runtimeControls: ProgramRuntimeControlProjection | null;
 }
@@ -910,11 +927,33 @@ export interface PersistentKeyValuesCleared {
   removed: number;
 }
 
-export interface RuntimeControlAuditEvent {
+/** The facts of one automatic motion retry, parsed strictly from its audit event. */
+export interface AutomaticRetryAuditFacts {
+  nodeInstanceId: string;
+  /** 1-based attempt that is starting; the first retry is 2. */
+  attempt: number;
+  maxAttempts: number;
+  /** The cause as the runner names it, for example collision_stop_nominal. */
+  cause: string;
+  delayS: number;
+  /** The failed attempt's Kernel failure; null when the owner has none. */
+  failure: StructuredError | null;
+}
+
+export interface AutomaticRetryAuditEvent {
+  eventRevision: number;
+  kind: 'program_node_automatic_retry';
+  facts: AutomaticRetryAuditFacts;
+}
+
+/** Every other runtime-control event: its facts are kept as the owner sent them. */
+export interface GenericRuntimeControlAuditEvent {
   eventRevision: number;
   kind: string;
   facts: Record<string, JsonValue>;
 }
+
+export type RuntimeControlAuditEvent = AutomaticRetryAuditEvent | GenericRuntimeControlAuditEvent;
 
 export interface ProgramRuntimeControlsSnapshot {
   schemaVersion: 'manyforge.program_runtime_controls.v3';
@@ -926,7 +965,6 @@ export interface ProgramRuntimeControlsSnapshot {
     sceneAdmissionEpoch: number;
     poseSourceApplyGeneration: number;
   };
-  retryCounts: Record<string, number>;
   audit: RuntimeControlAuditEvent[];
 }
 
@@ -936,11 +974,11 @@ export type CycleRecoveryActionId =
   | 'retry_after_scene_repair'
   | 'replan_from_stopped_state'
   | 'retry_runtime_step'
+  | 'continue_with_failure'
   | 'reset_cycle';
 
 export interface CycleRecoveryAction {
   actionId: CycleRecoveryActionId;
-  labelKey: string;
   requiresConfirmation: boolean;
   performsBackendReset: boolean;
   enabled: boolean;
@@ -981,10 +1019,9 @@ export interface CycleRecoveryOffer {
     enabled: boolean;
     disabledReasonCode: string | null;
   };
-  primaryAction: CycleRecoveryActionId | null;
   /**
    * The held node's own failure (or the Stop that holds it). Several nodes can
-   * be held at once, so each offer carries its full reason.
+   * be held at once (see `recoveryHolds`), so each offer carries its full reason.
    */
   reason: StructuredError;
   evidenceRefs: string[];
@@ -1024,6 +1061,14 @@ export interface ProgramGroupRuntimeScaleState {
   error: string | null;
 }
 
+/** One active failure hold: the held node's own motion groups and its offer. */
+export interface ProgramRecoveryHold {
+  /** The groups this hold owns; `['all']` for a node in no named group. */
+  motionGroupIds: string[];
+  interventionStopScope: ProgramInterventionStopScope;
+  offer: CycleRecoveryOffer;
+}
+
 export interface ProgramRuntimeControlProjection {
   schemaVersion: 'manyforge.program_runtime_control_projection.v9';
   ownerId: string;
@@ -1031,7 +1076,10 @@ export interface ProgramRuntimeControlProjection {
   programRunId: string;
   runRevision: number;
   runtimeControls: ProgramRuntimeControlsSnapshot;
+  /** The focused offer (also covers an operator Stop); Retry/Continue use `recoveryHolds`. */
   recoveryOffer: CycleRecoveryOffer | null;
+  /** Every active failure hold, in arrival order. */
+  recoveryHolds: ProgramRecoveryHold[];
   executionSelections: ProgramExecutionSelectionControls;
 }
 
@@ -1348,21 +1396,21 @@ export type SceneRuntimePoseSource =
       eligible: boolean;
       fresh: boolean;
       payload: SceneRuntimeGoodObservationPayload;
-      quality: 'good';
+      payload_quality: 'good';
     })
   | (SceneRuntimePoseSourceBase & {
       buffered: false;
       eligible: false;
       fresh: false;
       payload: SceneRuntimeUnknownObservationPayload;
-      quality: 'unknown';
+      payload_quality: 'unknown';
     });
 
 export interface SceneRuntimeProjection {
   api_version: 'manyforge.scene_runtime_source.v1';
   cell_id: string;
   state: {
-    api_version: 'manyforge.scene_runtime_state.v1';
+    api_version: 'manyforge.scene_runtime_state.v2';
     active_replay_id: number | null;
     counters: Record<string, number>;
     deferred: boolean;

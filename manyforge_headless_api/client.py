@@ -999,6 +999,14 @@ class HeadlessHttpClient:
     def execution_control_state(self) -> dict[str, Any]:
         return self.request("GET", "/api/execution/control-state")
 
+    def read_io_signal(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Read one bound boolean signal (`query_target` kind `io_signal`)."""
+        return self.request("POST", "/api/execution/io-signals/read", body=body)
+
+    def set_mock_io_input(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Set one installed Mock input; never a hardware command."""
+        return self.request("POST", "/api/execution/io-signals/mock-input", body=body)
+
     def control_projection(self) -> dict[str, Any]:
         """Read the public transport-neutral execution-control projection."""
 

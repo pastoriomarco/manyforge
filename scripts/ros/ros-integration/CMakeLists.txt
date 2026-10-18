@@ -23,8 +23,17 @@ set(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME ON)
 
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_core" core)
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_deployment" deployment)
+option(MANYFORGE_BUILD_CORE_PYTHON_BINDINGS
+  "Register the existing Core Python module against this graph's targets" OFF)
+if(MANYFORGE_BUILD_CORE_PYTHON_BINDINGS)
+  add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_core/python"
+    core-python EXCLUDE_FROM_ALL)
+endif()
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_ros2_control_execution" adapter)
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_roboplan" roboplan)
+# Register the existing package targets while keeping unrelated lifecycle targets out of the build.
+add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_xarm_control"
+  xarm_control EXCLUDE_FROM_ALL)
 # Preserve the runtime helper's established host/worker artifact locations.
 set_target_properties(manyforge_ros2_control_execution_host
   manyforge_roboplan_candidate_worker

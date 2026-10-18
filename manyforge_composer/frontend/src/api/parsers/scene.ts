@@ -989,8 +989,9 @@ export function parseSceneRuntimeProjection(value: unknown): SceneRuntimeProject
     'sceneRuntime.state',
   );
   const stateApiVersion = stringAt(state.api_version, 'sceneRuntime.state.api_version');
-  if (stateApiVersion !== 'manyforge.scene_runtime_state.v1') {
-    return fail('sceneRuntime.state.api_version', 'manyforge.scene_runtime_state.v1');
+  // Contract 130 (SX-2377): v2 carries the pose-source `payload_quality`; v1 is refused.
+  if (stateApiVersion !== 'manyforge.scene_runtime_state.v2') {
+    return fail('sceneRuntime.state.api_version', 'manyforge.scene_runtime_state.v2');
   }
   const counters = objectAt(state.counters, 'sceneRuntime.state.counters');
   exactKeysAt(
@@ -1268,8 +1269,8 @@ function parseSceneRuntimePoseSource(
       'object_id',
       'observed_at_ns',
       'payload',
+      'payload_quality',
       'policy_id',
-      'quality',
       'source_epoch',
       'source_epoch_order',
       'source_id',
@@ -1299,7 +1300,8 @@ function parseSceneRuntimePoseSource(
       `${path}.source_sequence`,
     ),
   };
-  const quality = stringAt(record.quality, `${path}.quality`);
+  // Scene pose payload quality (good|unknown); not the I/O sample quality.
+  const quality = stringAt(record.payload_quality, `${path}.payload_quality`);
   const eligible = booleanAt(record.eligible, `${path}.eligible`);
   const fresh = booleanAt(record.fresh, `${path}.fresh`);
   if (quality === 'unknown') {
@@ -1312,11 +1314,11 @@ function parseSceneRuntimePoseSource(
       eligible: false,
       fresh: false,
       payload: parseSceneRuntimeUnknownPayload(record.payload, `${path}.payload`),
-      quality,
+      payload_quality: quality,
     };
   }
   if (quality !== 'good') {
-    return fail(`${path}.quality`, '"good" or "unknown"');
+    return fail(`${path}.payload_quality`, '"good" or "unknown"');
   }
   if (base.buffered && (!eligible || !fresh)) {
     return fail(path, 'a buffered observation to be eligible and fresh');
@@ -1326,7 +1328,7 @@ function parseSceneRuntimePoseSource(
     eligible,
     fresh,
     payload: parseSceneRuntimeGoodPayload(record.payload, `${path}.payload`),
-    quality,
+    payload_quality: quality,
   };
 }
 

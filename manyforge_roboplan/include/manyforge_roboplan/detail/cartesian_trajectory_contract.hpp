@@ -39,6 +39,32 @@ struct CartesianJointDynamicsEnvelope {
   std::vector<core::detail::TrajectoryDerivativeBounds> joint_derivatives;
 };
 
+struct QuinticPositionEndpoint {
+  double position;
+  double velocity;
+  double acceleration;
+};
+
+enum class QuinticPositionBoundResult {
+  kProvenWithin,
+  kProvenViolation,
+  kInconclusive,
+};
+
+/// Connector-only conservative position qualification. The bounds and their
+/// tolerance belong to the caller's resolved joint limits. No timing or PVA
+/// is changed. Each visited Bernstein interval consumes one work unit; an
+/// exhausted budget or numerically unresolved boundary is never a pass.
+core::Result<QuinticPositionBoundResult> check_quintic_position_bounds(
+    const QuinticPositionEndpoint& start,
+    const QuinticPositionEndpoint& end,
+    double duration_s,
+    double lower_limit,
+    double upper_limit,
+    double tolerance,
+    std::size_t max_interval_checks,
+    const CartesianPlanningControl& control);
+
 struct CartesianFrameDynamicsEnvelope {
   bool complete = true;
   double linear_speed_ratio = 0.0;
@@ -67,6 +93,15 @@ struct CartesianInterpolantPath {
   double unsampled_translation_bound_m = 0.0;
   double unsampled_rotation_bound_rad = 0.0;
 };
+
+/// Checks canonical joint order, finite PVA samples, and strictly increasing
+/// times beginning at zero, without changing moving endpoint derivatives.
+/// A timed replacement carrying negative history requires a separate exact
+/// future-only view; this check does not certify limits or collision freedom.
+std::optional<core::ErrorDTO> validate_cartesian_trajectory_output(
+    const roboplan::JointTrajectory& trajectory,
+    const std::vector<std::string>& expected_joint_names,
+    const CartesianPlanningControl& control);
 
 /// Validates untrusted planner output before applying ManyForge's neutral
 /// rest-boundary convention. Keeping both operations behind one checked seam

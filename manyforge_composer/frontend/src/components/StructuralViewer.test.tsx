@@ -193,7 +193,8 @@ describe('viewer failure isolation', () => {
     expect(source.includes('else if (!generalTransformEnabled) return;')).toBe(true);
     expect(css).toMatch(/\.viewer-header-controls\s*\{[^}]*flex:\s*1 1 auto/s);
     expect(css).toMatch(/\.viewer-surface-launchers\s*\{[^}]*margin-left:\s*auto/s);
-    expect(source.slice(launchers, stage).match(/aria-pressed=\{inspectorPanel ===/g)).toHaveLength(2);
+    // Robot, Object and Tool & I/O.
+    expect(source.slice(launchers, stage).match(/aria-pressed=\{inspectorPanel ===/g)).toHaveLength(3);
     expect(css).toMatch(
       /\.viewer-surface-launchers > button\[aria-pressed='true'\]\s*\{[^}]*border-color:\s*#68cadd;[^}]*background:\s*#17404c;/s,
     );

@@ -1,12 +1,15 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/json_value.hpp>
 #include <manyforge_core/types/placement_pose.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace manyforge::core {
@@ -152,15 +155,71 @@ struct ControllableComponentDTO {
                          const ControllableComponentDTO&) = default;
 };
 
-/// One of exactly six mutable graph-record kinds.
+struct ControllerControlDomainDTO final {
+  ControllerTopologyId controller_topology_id;
+  TopologyRevision topology_revision;
+  friend bool operator==(const ControllerControlDomainDTO&,
+                         const ControllerControlDomainDTO&) = default;
+};
+
+/// Compiler-derived ownership of one genuine I/O driver. Signal membership
+/// and its normalized configuration digest cover only this provider's rows.
+/// No motion controller/topology/route is implied by this alternative.
+struct ProviderControlDomainDTO final {
+  ControllableComponentId controllable_component_id;
+  RuntimeUnitId provider_runtime_unit_id;
+  ProviderInstanceId provider_instance_id;
+  ProviderManifestId provider_manifest_id;
+  ProviderManifestRevision provider_manifest_revision;
+  ContentDigest lifecycle_plan_catalog_digest;
+  ContentDigest signal_configuration_digest;
+  std::vector<std::string> signal_names;
+  Duration lifecycle_command_timeout_ns;
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const ProviderControlDomainDTO&,
+                         const ProviderControlDomainDTO&) = default;
+};
+
+/// One of exactly six mutable graph-record kinds. The controller alternative
+/// retains its existing canonical wire representation.
 struct ControlDomainDTO {
   ControlDomainId control_domain_id;
   ControlDomainRevision control_domain_revision;
   std::vector<RuntimeUnitId> runtime_unit_ids;
   EndpointRoleId control_coordinator_endpoint_role;
-  ControllerTopologyId controller_topology_id;
-  TopologyRevision topology_revision;
   ContainmentGranularity containment_granularity;
+  std::variant<ControllerControlDomainDTO, ProviderControlDomainDTO> payload;
+
+  ControlDomainDTO(ControlDomainId id, ControlDomainRevision revision,
+                   std::vector<RuntimeUnitId> units, EndpointRoleId endpoint,
+                   ControllerTopologyId topology, TopologyRevision topology_revision,
+                   ContainmentGranularity containment)
+      : control_domain_id(std::move(id)),
+        control_domain_revision(std::move(revision)),
+        runtime_unit_ids(std::move(units)),
+        control_coordinator_endpoint_role(std::move(endpoint)),
+        containment_granularity(containment),
+        payload(ControllerControlDomainDTO{std::move(topology), std::move(topology_revision)}) {}
+
+  ControlDomainDTO(ControlDomainId id, ControlDomainRevision revision,
+                   std::vector<RuntimeUnitId> units, EndpointRoleId endpoint,
+                   ContainmentGranularity containment, ProviderControlDomainDTO provider)
+      : control_domain_id(std::move(id)),
+        control_domain_revision(std::move(revision)),
+        runtime_unit_ids(std::move(units)),
+        control_coordinator_endpoint_role(std::move(endpoint)),
+        containment_granularity(containment),
+        payload(std::move(provider)) {}
+
+  [[nodiscard]] ControllerControlDomainDTO& controller() {
+    return std::get<ControllerControlDomainDTO>(payload);
+  }
+  [[nodiscard]] const ControllerControlDomainDTO& controller() const {
+    return std::get<ControllerControlDomainDTO>(payload);
+  }
+  [[nodiscard]] const ProviderControlDomainDTO* provider() const noexcept {
+    return std::get_if<ProviderControlDomainDTO>(&payload);
+  }
 
   friend bool operator==(const ControlDomainDTO&, const ControlDomainDTO&) = default;
 };

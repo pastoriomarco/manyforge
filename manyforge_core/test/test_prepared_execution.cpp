@@ -213,6 +213,30 @@ TEST(PreparedExecutionTest, BackendStatusEnforcesStateAndEvidencePresence) {
                    .ok());
 }
 
+TEST(PreparedExecutionMembershipTest, PendingReplacementKeepsCurrentAndRetiredHighWatermark) {
+  auto original = PreparedParticipant();
+  auto successor = original;
+  successor.operation_id = OperationId("operation.new");
+  successor.prepared_contract_digest = ContentDigest(Digest('9'));
+  PreparedExecutionMembership membership;
+  ASSERT_FALSE(membership.prepare(10U, original));
+  ASSERT_FALSE(membership.prepare_replacement(10U, 11U, successor));
+  EXPECT_EQ(membership.active_execution_id(), 10U);
+  EXPECT_TRUE(membership.matches(original));
+  EXPECT_TRUE(membership.replacement_matches(11U, successor));
+  EXPECT_FALSE(membership.retire(10U));
+  EXPECT_TRUE(membership.retire(11U));
+  EXPECT_FALSE(membership.prepare(10U, original));
+  EXPECT_TRUE(membership.prepare_replacement(10U, 11U, successor));
+  ASSERT_FALSE(membership.prepare_replacement(10U, 12U, successor));
+  ASSERT_TRUE(membership.can_adopt(10U, 12U));
+  membership.adopt_replacement();
+  EXPECT_EQ(membership.active_execution_id(), 12U);
+  EXPECT_TRUE(membership.matches(successor));
+  EXPECT_TRUE(membership.retire(10U));
+  EXPECT_EQ(membership.active_execution_id(), 12U);
+}
+
 TEST(PreparedExecutionMembershipTest, RetiredRequestsNeverReopenOrClearANewerExecution) {
   PreparedExecutionMembership membership;
   auto participant = PreparedParticipant();

@@ -10,7 +10,7 @@
 
 namespace manyforge::deployment::detail {
 
-enum class ActivationRuntimeKind { kRos2Control = 1 };
+enum class ActivationRuntimeKind { kRos2Control = 1, kIoProvider = 2 };
 
 /// Exact repository-owned semantics selected by one authored component.
 ///
@@ -20,6 +20,8 @@ enum class ActivationRuntimeKind { kRos2Control = 1 };
 struct ActivationComponentProfile final {
   std::string component_id;
   std::string component_profile_id;
+  // Model identity fields are empty and model_family is null for kIoProvider;
+  // that explicit kind never selects a model or physical component type.
   std::string model_family_id;
   std::string model_asset_id;
   std::string accepted_package_uri_prefix;

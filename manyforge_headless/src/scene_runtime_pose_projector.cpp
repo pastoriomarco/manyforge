@@ -336,7 +336,7 @@ SceneRuntimePoseProjector::Apply(
     const std::optional<SceneRuntimePoseApplicationResult> &prior_application) {
   if (!observation.valid() || observation.source_epoch_order == 0U ||
       observation.source_sequence == 0U ||
-      observation.quality != PoseSourceQuality::kGood ||
+      observation.payload_quality != PoseSourceQuality::kGood ||
       !observation.eligible ||
       (observation.key.policy_id != "continuous_unattached" &&
        observation.key.policy_id != "before_planning")) {

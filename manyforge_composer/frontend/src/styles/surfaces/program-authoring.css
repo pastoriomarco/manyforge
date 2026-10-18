@@ -1557,3 +1557,59 @@
   margin-top: 0.6rem;
   font-size: var(--mf-font-size-076);
 }
+
+/* Interrupt rule editors (node and global rules, schema04). */
+.interrupt-condition-editor {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.interrupt-condition-compare {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  align-items: center;
+}
+
+.interrupt-condition-compare > select,
+.interrupt-condition-compare > input {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.interrupt-condition-group {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid var(--mf-border-neutral-23);
+  border-radius: var(--mf-radius-sm);
+}
+
+.interrupt-condition-group > legend {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+  padding: 0 0.2rem;
+}
+
+.stop-stage-picker {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.stop-stage-labels {
+  margin: 0;
+  padding-left: 1.2rem;
+  color: var(--mf-text-neutral-51);
+  font-size: var(--mf-font-size-062);
+}
+
+.uncertain-output-confirmation {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.4rem 0;
+  padding: 0.45rem;
+  border: 1px solid var(--mf-border-neutral-23);
+  border-radius: var(--mf-radius-sm);
+}

@@ -255,6 +255,8 @@ struct RetainedBundleDTO final {
   std::vector<ExternalResourceDTO> external_resources;
   std::optional<RetainedAssistantProjectionDTO> assistant;
   std::vector<RetainedRuntimeContractRequirementDTO> runtime_contract_requirements;
+  /// Optional whole moving-takeover preparation budget from the applied cell.
+  std::optional<double> motion_takeover_preparation_budget_s{};
 
   friend bool operator==(const RetainedBundleDTO&, const RetainedBundleDTO&) = default;
 };

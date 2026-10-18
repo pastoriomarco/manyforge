@@ -29,7 +29,9 @@ from manyforge_behavior.executable_node_resolver import (
 )
 from manyforge_behavior.orchestration_ports import (
     PROGRAM_MOTION_STOP_RECOVERY_CLASSES,
+    recovery_outcome,
     NodeAdapterPorts,
+    OwnerTaskSettlementPendingError,
     OwnerTaskState,
     ProgramRunPortContext,
     ProgramRunScopeSnapshot,
@@ -49,7 +51,7 @@ from manyforge_behavior.program_runtime import (
     ProgramRunOwnerIdentity,
     ProgramRuntimeError,
 )
-from manyforge_behavior.orchestration_values import ProgramValueError
+from manyforge_behavior.orchestration_values import ProgramValueError, ProgramValueStore
 
 
 PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v3"
@@ -351,6 +353,9 @@ class ProgramRunSnapshot:
     # (a Stop, a success) and when the failure carries none.
     details: Mapping[str, Any] | None
     origin: Mapping[str, Any] | None
+    # Operator-facing operation failures (held, or of a failed/stopped run
+    # until Reset): node attempt, operation and the Kernel's own facts.
+    operation_failures: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.owner_id, field="owner_id")
@@ -418,6 +423,8 @@ class ProgramRunSnapshot:
             "reason_code": self.reason_code,
             "message": self.message,
             **failure_wire_fields(self.details, self.origin),
+            # Always present (empty when none): a missing key is unknown.
+            "operation_failures": deepcopy([dict(row) for row in self.operation_failures]),
         }
 
 
@@ -427,9 +434,13 @@ class _RunEntry:
     program_binding: Mapping[str, Any]
     state: ProgramRunState = ProgramRunState.RUNNING
     revision: int = 1
+    # Decision 138: the held-node mask last carried by a run_revision.
+    mock_held: tuple[str, ...] = ()
     tree_status: str = "invalid"
     node_status_revision: int = 1
     node_statuses: Mapping[str, str] = field(default_factory=dict)
+    # Audit facts of automatic motion retries decided since the runner's last take.
+    pending_node_history_events: list[dict[str, Any]] = field(default_factory=list)
     active_operation_count: int | None = 0
     reason_code: str | None = None
     message: str = ""
@@ -440,6 +451,13 @@ class _RunEntry:
     # A failure pause stops the Program's other motion, like Halt. Set when
     # the pause is entered; applied after the tick, outside the run locks.
     failure_pause_stop_pending: bool = False
+    # Each held node is its own failure hold. The tree is dormant from a new
+    # hold until the operator releases one; the others stay held meanwhile.
+    failure_paused: bool = False
+    known_holds: frozenset[str] = frozenset()
+    # Operator-facing operation failures by hold attempt ("" for the failed
+    # tree); a row leaves with its released hold, the rest at Reset.
+    operation_failures: dict[str, dict[str, Any]] = field(default_factory=dict)
     state_after_stop: ProgramRunState = ProgramRunState.STOPPED
     state_after_stop_reason_code: str | None = None
     state_after_stop_message: str = ""
@@ -509,6 +527,44 @@ class ProgramRunOwner:
 
         entry.run.program_clock.set_running(tree_ticks)
 
+    @staticmethod
+    def _mock_paused(entry: _RunEntry) -> bool:
+        """Under the owner lock: the Run is Halted (decision 135), so a
+        mask-only snapshot keeps the Mock paused."""
+
+        return entry.state in {ProgramRunState.FULL_STOPPING, ProgramRunState.FULL_STOPPED}
+
+    @staticmethod
+    def _note_mock_held(entry: _RunEntry) -> tuple[str, ...] | None:
+        """Under the owner lock, with a revision just taken: the Run's new
+        held-node mask if it changed (decision 138), else None."""
+
+        held = entry.run.mock_held_nodes()
+        if held == entry.mock_held:
+            return None
+        entry.mock_held = held
+        return held
+
+    def _notify_mock_run_paused(
+        self,
+        program_run_id: str,
+        run_revision: int,
+        paused: bool,
+        held: tuple[str, ...] = (),
+    ) -> None:
+        """Decision 135: the Run's Halt state for its nodes' Mock timers,
+        outside the owner lock; best effort. The port only records it until
+        the Run's first Mock START (SX-2416): a Run without Mock nodes makes
+        no Mock call and needs no I/O service."""
+
+        notify = getattr(self._ports.mock_simulation, "set_run_paused", None)
+        if notify is None:
+            return
+        try:
+            notify(program_run_id, run_revision, paused, held)
+        except Exception:
+            pass
+
     def _snapshot(self, entry: _RunEntry) -> ProgramRunSnapshot:
         return ProgramRunSnapshot(
             owner_id=self._owner_id,
@@ -534,6 +590,7 @@ class ProgramRunOwner:
             message=entry.message,
             details=entry.details,
             origin=entry.origin,
+            operation_failures=tuple(entry.operation_failures.values()),
         )
 
     @staticmethod
@@ -742,6 +799,12 @@ class ProgramRunOwner:
                     readiness=admission.readiness,
                     ports=self._ports,
                     program_clock=ProgramClock(self._program_clock_source),
+                    # Automatic motion retry asks the owner's own attention check.
+                    motion_attention=lambda node_instance_id, request_id: (
+                        self.check_motion_attention(
+                            admitted_program_run_id, node_instance_id, request_id
+                        )
+                    ),
                 )
                 run.refresh_operator_stop_scope()
                 entry = _RunEntry(
@@ -757,8 +820,14 @@ class ProgramRunOwner:
                 with self._lock:
                     if admitted_program_run_id in self._runs:
                         raise ProgramRunOwnerError("Program-run identity was reused")
+                    entry.mock_held = run.mock_held_nodes()
                     self._runs[admitted_program_run_id] = entry
-                    return self._snapshot(entry)
+                    snapshot = self._snapshot(entry)
+                # Recorded, not sent: the first Mock START sends it.
+                self._notify_mock_run_paused(
+                    admitted_program_run_id, snapshot.run_revision, False, entry.mock_held
+                )
+                return snapshot
             except Exception:
                 try:
                     if context_bound and context_port is not None:
@@ -776,6 +845,22 @@ class ProgramRunOwner:
 
         with self._lock:
             return self._snapshot(self._entry(program_run_id))
+
+    def value_store(self, program_run_id: str) -> ProgramValueStore:
+        """The run's value store, for its BB publication subscription."""
+
+        with self._lock:
+            return self._entry(program_run_id).run.value_store
+
+    def take_node_history_events(self, program_run_id: str) -> tuple[dict[str, Any], ...]:
+        """Node history events (automatic retries, preemptions) since the last take."""
+        with self._lock:
+            entry = self._entry(program_run_id)
+            events, entry.pending_node_history_events = (
+                tuple(entry.pending_node_history_events),
+                [],
+            )
+            return events
 
     def take_diagnostic(self, program_run_id: str) -> dict[str, Any] | None:
         """Transfer one transition capture to the optional asynchronous recorder."""
@@ -830,6 +915,25 @@ class ProgramRunOwner:
             )
         return port.read(program_run_id)
 
+    def failure_holds(self, program_run_id: str) -> tuple[Any, ...]:
+        """Every active failure hold of the run, one per held node."""
+
+        self._entry(program_run_id)
+        port = self._ports.program_interventions
+        return () if port is None else port.read_holds(program_run_id)
+
+    def hold_motion_groups(
+        self, program_run_id: str, node_instance_id: str
+    ) -> tuple[tuple[str, ...], str]:
+        """A held node's own motion groups and its captured Stop scope."""
+
+        with self._lock:
+            run = self._entry(program_run_id).run
+        return (
+            run.node_motion_groups(node_instance_id),
+            self._hold_stop_scope(run, node_instance_id),
+        )
+
     def preview_node_inputs(
         self,
         program_run_id: str,
@@ -874,8 +978,9 @@ class ProgramRunOwner:
             if entry.state is not ProgramRunState.INTERVENTION_REQUIRED:
                 return False
         port = self._ports.program_interventions
-        return _failure_assessment_has_deadline(
-            None if port is None else port.read(program_run_id)
+        return port is not None and any(
+            _failure_assessment_has_deadline(hold)
+            for hold in port.read_holds(program_run_id)
         )
 
     def _refresh_failure_assessment(self, intervention) -> None:
@@ -1056,9 +1161,25 @@ class ProgramRunOwner:
             ):
                 raise ProgramRunOwnerError("Program recovery attempt is stale")
             port.resolve(intervention.identity, action=action, result=result)
-            entry.state = ProgramRunState.RUNNING
-            self._schedule_program_time(entry, tree_ticks=True)
-            self._set_reason(entry, None, "")
+            # The operator released this hold: the tree ticks again while any
+            # other failure hold stays held (its groups stay stopped).
+            if intervention.policy_parameter != "operator_stop_policy":
+                entry.failure_paused = False
+            entry.operation_failures.pop(intervention.identity.node_attempt_id, None)
+            remaining = port.read_holds(program_run_id)
+            if remaining:
+                entry.state = ProgramRunState.INTERVENTION_REQUIRED
+                self._set_reason(
+                    entry,
+                    remaining[0].reason_code,
+                    remaining[0].message,
+                    details=remaining[0].details,
+                    origin=remaining[0].origin,
+                )
+            else:
+                entry.state = ProgramRunState.RUNNING
+                self._set_reason(entry, None, "")
+            self._schedule_program_time(entry, tree_ticks=not entry.failure_paused)
             entry.revision += 1
             return self._snapshot(entry)
 
@@ -1364,14 +1485,23 @@ class ProgramRunOwner:
                     )
                 entry.active_operation_count = None
                 entry.revision += 1
-                if accepted.get("selection_error") is not None:
-                    raise ProgramRunOwnerOutcomeUnknownError(
-                        "Kernel conservatively contained an invalid selection: "
-                        + str(accepted["selection_error"])
-                    )
-                # The existing tick host schedules settlement. No tree/owner
-                # read may extend this command or retain Stop serialization.
-                return self._snapshot(entry)
+                held = self._note_mock_held(entry)
+                held_revision, held_paused = entry.revision, self._mock_paused(entry)
+                selection_error = accepted.get("selection_error")
+                snapshot = self._snapshot(entry)
+            if held is not None:
+                # Decision 138: the new mask under this command's revision.
+                self._notify_mock_run_paused(
+                    program_run_id, held_revision, held_paused, held
+                )
+            if selection_error is not None:
+                raise ProgramRunOwnerOutcomeUnknownError(
+                    "Kernel conservatively contained an invalid selection: "
+                    + str(selection_error)
+                )
+            # The existing tick host schedules settlement. No tree/owner
+            # read may extend this command or retain Stop serialization.
+            return snapshot
 
     def _selection_recovery_candidates(
         self,
@@ -1673,11 +1803,12 @@ class ProgramRunOwner:
             ).hexdigest(),
             reason=reason,
         )
-        if not isinstance(result, Mapping) or type(result.get("accepted")) is not bool:
+        outcome = recovery_outcome(result)
+        if outcome is None:
             raise ProgramRunOwnerOutcomeUnknownError(
                 "selected owner recovery outcome is unknown"
             )
-        if not result["accepted"]:
+        if not outcome:
             error = result.get("error")
             raise ProgramRunOwnerError(
                 str(error.get("message"))
@@ -1691,6 +1822,70 @@ class ProgramRunOwner:
             node_ids=frozenset({item.identity.node_instance_id})
         )
 
+    @staticmethod
+    def _hold_stop_scope(run: ExecutableProgramRun, node_instance_id: str) -> str:
+        """The held node's captured `intervention_stop_scope` (default all)."""
+        policy = run.capture.node_policy_by_instance_id.get(node_instance_id)
+        scope = None if policy is None else policy.recovery_policy.get(
+            "intervention_stop_scope"
+        )
+        return "own_groups" if scope == "own_groups" else "all"
+
+    def _failure_pause_stop_groups(
+        self, run: ExecutableProgramRun, holds: Sequence[Any]
+    ) -> str | list[str]:
+        """What a failure pause stops: all groups, or only the held nodes'
+        own motion groups when every hold's scope is `own_groups`."""
+        groups: set[str] = set()
+        for hold in holds:
+            node = hold.identity.node_instance_id
+            own = run.node_motion_groups(node)
+            if self._hold_stop_scope(run, node) == "all" or own == ("all",):
+                return "all"
+            groups.update(own)
+        return sorted(groups) if groups else "all"
+
+    def _failure_hold_release(
+        self, run: ExecutableProgramRun, failure: Any, holds: Sequence[Any]
+    ) -> str | list[str]:
+        """The groups released for one hold (contract items 39, 43): its own
+        motion groups (`own_groups`), or every group not owned by another
+        active hold (`all`, the default). Its own groups are always released.
+
+        A hold whose node is in no named group owns every named group that no
+        other active hold names ("all" when it is the only hold) and, while
+        other holds are active, releases its own node by node_instance_id
+        (SX-2020); while it is active, another hold releases only its own
+        groups.
+        """
+        node = failure.identity.node_instance_id
+        own = run.node_motion_groups(node)
+        taken = {
+            group
+            for hold in holds
+            if hold.identity != failure.identity
+            for group in run.node_motion_groups(hold.identity.node_instance_id)
+        }
+        if own == ("all",):
+            if not taken:
+                return "all"
+            return [
+                group
+                for group in run.execution_selections
+                if group != "all" and group not in taken
+            ]
+        if self._hold_stop_scope(run, node) == "own_groups":
+            return list(own)
+        if not taken:
+            return "all"
+        if "all" in taken:
+            return list(own)
+        return [
+            group
+            for group in run.execution_selections
+            if group != "all" and (group in own or group not in taken)
+        ]
+
     def retry_failure_pause(
         self,
         program_run_id: str,
@@ -1700,15 +1895,56 @@ class ProgramRunOwner:
         request_id: str,
         reason: str | None,
     ) -> ProgramRunSnapshot:
-        """Retry a node failure pause and release all Program motion.
+        """Retry one failure hold and release its motion groups.
 
-        One operation, in order: verify that the pause's containment Stop is
-        confirmed; capture the current selection revision; recover the
-        Stop-interrupted tasks and the failed step while every node stays
-        held; then release all Ready and Held motion against that revision,
-        so a Stop that lands meanwhile wins. The caller then resolves the
-        pause so the tree ticks again. ``action`` is the failed step's owner
-        recovery, or ``None`` for a step without an owner task.
+        ``action`` is the failed step's owner recovery, or ``None`` for a
+        step without an owner task. The caller then resolves the hold so the
+        tree ticks again.
+        """
+        return self._release_failure_hold(
+            program_run_id,
+            node_attempt_id=node_attempt_id,
+            action=action,
+            close_held=False,
+            request_id=request_id,
+            reason=reason,
+        )
+
+    def continue_failure_pause(
+        self,
+        program_run_id: str,
+        *,
+        node_attempt_id: str,
+        request_id: str,
+        reason: str | None,
+    ) -> ProgramRunSnapshot:
+        """Continue (contract item 40): close the held operation and release
+        the hold's groups like Retry. The caller then resolves the hold with a
+        failure, so the held node returns FAILURE to the tree."""
+        return self._release_failure_hold(
+            program_run_id,
+            node_attempt_id=node_attempt_id,
+            action=None,
+            close_held=True,
+            request_id=request_id,
+            reason=reason,
+        )
+
+    def _release_failure_hold(
+        self,
+        program_run_id: str,
+        *,
+        node_attempt_id: str,
+        action: str | None,
+        close_held: bool,
+        request_id: str,
+        reason: str | None,
+    ) -> ProgramRunSnapshot:
+        """One operation, in order: verify that the pause's containment Stop
+        is confirmed; capture the current selection revision; recover the
+        Stop-interrupted tasks and the failed step (or close it) while every
+        node stays held; then release the hold's groups (Ready and Held work)
+        against that revision, so a Stop that lands meanwhile wins.
         """
         _text(request_id, field="request_id")
         with self._lock:
@@ -1717,16 +1953,22 @@ class ProgramRunOwner:
             interventions = self._ports.program_interventions
             with self._lock:
                 entry = self._entry(program_run_id)
-                failure = (
-                    None
+                holds = (
+                    ()
                     if interventions is None
-                    else interventions.read(program_run_id)
+                    else interventions.read_holds(program_run_id)
+                )
+                failure = next(
+                    (
+                        hold
+                        for hold in holds
+                        if hold.identity.node_attempt_id == node_attempt_id
+                    ),
+                    None,
                 )
                 if (
                     entry.state is not ProgramRunState.INTERVENTION_REQUIRED
                     or failure is None
-                    or failure.identity.node_attempt_id != node_attempt_id
-                    or failure.policy_parameter == "operator_stop_policy"
                 ):
                     raise ProgramRunOwnerError("failure Retry attempt is stale")
                 if entry.failure_pause_stop_pending:
@@ -1735,6 +1977,7 @@ class ProgramRunOwner:
                         "Retry waits for it"
                     )
                 run, run_revision = entry.run, entry.revision
+            release = self._failure_hold_release(run, failure, holds)
             scope = run.read_operator_stop_scope()
             if run.scope_node_ids(
                 (*scope["stopping_node_indices"], *scope["faulted_node_indices"])
@@ -1743,14 +1986,37 @@ class ProgramRunOwner:
                     "Program motion is still stopping or faulted; Retry waits for it"
                 )
             captured_revision = scope["selection_revision"]
-            selected = run.execution_selection("all") & (
-                run.scope_node_ids(scope["held_node_indices"])
-                | run.scope_node_ids(scope["ready_node_indices"])
+            kept = (
+                frozenset()
+                if release == "all"
+                else run.execution_selection(
+                    [
+                        group
+                        for group in run.execution_selections
+                        if group != "all" and group not in release
+                    ]
+                )
             )
-            failed_node = failure.identity.node_instance_id
+            selected = (
+                run.execution_selection(release)
+                & (
+                    run.scope_node_ids(scope["held_node_indices"])
+                    | run.scope_node_ids(scope["ready_node_indices"])
+                )
+            ) - kept
+            # A hold in no named group is only in "all": while other holds
+            # are active it releases its own node by node_instance_id
+            # (contract 43, SX-2020) next to the free groups.
+            node = failure.identity.node_instance_id
+            node_release = (
+                release != "all"
+                and run.node_motion_groups(node) == ("all",)
+                and node in run.scope_node_ids(scope["held_node_indices"])
+            )
             batch, blocked = self._selection_recovery_candidates(run, selected)
-            # The failed step is recovered below by this same operation.
-            blocked.pop(failed_node, None)
+            # The held failed steps are resolved by their own holds.
+            for hold in holds:
+                blocked.pop(hold.identity.node_instance_id, None)
             if blocked:
                 raise ProgramRunOwnerError(next(iter(blocked.values())))
             cleanup_accepted = False
@@ -1758,8 +2024,29 @@ class ProgramRunOwner:
                 for item in batch:
                     self._recover_stopped_item(run, item, request_id, reason)
                     cleanup_accepted = True
+                port = getattr(self._ports, failure.owner_port_name or "", None)
+                if close_held and failure.owner_task_id is not None:
+                    close = getattr(port, "close", None)
+                    if not callable(close):
+                        raise ProgramRunOwnerError(
+                            "the held operation has no addressed closure"
+                        )
+                    try:
+                        closed = close(
+                            failure.owner_task_id,
+                            failure.identity,
+                            request_id=request_id,
+                        )
+                    except OwnerTaskSettlementPendingError as error:
+                        raise ProgramRunOwnerOutcomeUnknownError(
+                            "held operation closure outcome is unknown"
+                        ) from error
+                    if closed is not True:
+                        raise ProgramRunOwnerError(
+                            "the held operation is not eligible to close"
+                        )
+                    cleanup_accepted = True
                 if action is not None:
-                    port = getattr(self._ports, failure.owner_port_name or "", None)
                     recover = getattr(port, "recover", None)
                     if failure.owner_task_id is None or not callable(recover):
                         raise ProgramRunOwnerError(
@@ -1795,16 +2082,28 @@ class ProgramRunOwner:
                         raise ProgramRunOwnerError(
                             "Program changed during Retry; motion stays held"
                         )
+                releases: list[tuple[dict[str, Any], frozenset[str]]] = []
                 if selected:
-                    try:
-                        released = self._scope.release_selection(
-                            run.execution_selection_request("all", request_id),
-                            captured_revision,
+                    releases.append(
+                        (run.execution_selection_request(release, request_id), selected)
+                    )
+                if node_release:
+                    releases.append(
+                        (
+                            run.execution_selection_request(
+                                [], request_id, node_instance_id=node
+                            ),
+                            frozenset({node}),
                         )
+                    )
+                revision = captured_revision
+                for request, nodes in releases:
+                    try:
+                        released = self._scope.release_selection(request, revision)
                         run.publish_operator_stop_scope(
                             released,
-                            expected_revision=captured_revision + 1,
-                            released_nodes=selected,
+                            expected_revision=revision + 1,
+                            released_nodes=nodes,
                             notify_observation=False,
                         )
                     except ProgramSelectionReleaseRejectedError as error:
@@ -1813,6 +2112,9 @@ class ProgramRunOwner:
                         raise ProgramRunOwnerOutcomeUnknownError(
                             f"Retry release outcome is unconfirmed: {error}"
                         ) from error
+                    run.note_operator_release(nodes)
+                    revision += 1
+                    cleanup_accepted = True
             except ProgramRunOwnerOutcomeUnknownError:
                 raise
             except ProgramRunOwnerError as error:
@@ -1942,6 +2244,7 @@ class ProgramRunOwner:
                         raise ProgramRunOwnerOutcomeUnknownError(
                             f"selected release outcome is unconfirmed: {error}"
                         ) from error
+                    run.note_operator_release(selected)
             except ProgramRunOwnerOutcomeUnknownError:
                 raise
             except ProgramRunOwnerError as error:
@@ -1974,8 +2277,7 @@ class ProgramRunOwner:
                         )
                         self._schedule_program_time(
                             entry,
-                            tree_ticks=remaining is None
-                            or remaining.policy_parameter == "operator_stop_policy",
+                            tree_ticks=remaining is None or not entry.failure_paused,
                         )
                         if remaining is None:
                             self._set_reason(entry, None, "")
@@ -1988,6 +2290,16 @@ class ProgramRunOwner:
                                 origin=remaining.origin,
                             )
                         entry.revision += 1
+                        held = self._note_mock_held(entry)
+                        held_revision = entry.revision
+                        held_paused = self._mock_paused(entry)
+                    else:
+                        held = None
+                if held is not None:
+                    # Decision 138: the released mask under this revision.
+                    self._notify_mock_run_paused(
+                        program_run_id, held_revision, held_paused, held
+                    )
             return self.read(program_run_id)
 
     def _complete_full_stop(
@@ -2093,6 +2405,10 @@ class ProgramRunOwner:
                     )
                 entry.revision += 1
                 request_revision = entry.revision
+                entry.mock_held = entry.run.mock_held_nodes()
+                held = entry.mock_held
+            # Halt pauses the Run's pending Mock changes (not a node end).
+            self._notify_mock_run_paused(program_run_id, request_revision, True, held)
             # This is an explicit command, not passive reconciliation. Let
             # the Kernel join/recapture even after an earlier lost reply.
             try:
@@ -2254,7 +2570,14 @@ class ProgramRunOwner:
                 entry.active_operation_count = active_count
                 self._set_reason(entry, None, "")
                 entry.revision += 1
-                return self._snapshot(entry)
+                entry.mock_held = entry.run.mock_held_nodes()
+                held = entry.mock_held
+                snapshot = self._snapshot(entry)
+            # Resume continues the pending Mock changes. A node START that
+            # reaches the host before this arrives is applied paused by the
+            # host (decision 135B); the Runner does not defer it.
+            self._notify_mock_run_paused(program_run_id, snapshot.run_revision, False, held)
+            return snapshot
 
     def begin_reset_containment(
         self, program_run_id: str, *, stop_request_id: str
@@ -2448,9 +2771,10 @@ class ProgramRunOwner:
     def _stop_motion_for_failure_pause(
         self, program_run_id: str, snapshot: ProgramRunSnapshot
     ) -> ProgramRunSnapshot:
-        """A node failure that pauses for the operator also stops all other
-        Program motion, like Halt; the tree is already dormant. Retried on the
-        next tick if the Stop outcome is not confirmed."""
+        """A node failure that pauses for the operator also stops Program
+        motion, like Halt: all groups, or only the held nodes' own groups
+        (`intervention_stop_scope: own_groups`); the tree is already dormant.
+        Retried on the next tick if the Stop outcome is not confirmed."""
         with self._lock:
             entry = self._entry(program_run_id)
             if not entry.failure_pause_stop_pending:
@@ -2460,10 +2784,14 @@ class ProgramRunOwner:
                 return snapshot
             entry.failure_pause_stop_pending = False
             revision = entry.revision
+            run = entry.run
+        port = self._ports.program_interventions
         try:
             stopped = self.stop_motion(
                 program_run_id,
-                group_id="all",
+                group_id=self._failure_pause_stop_groups(
+                    run, () if port is None else port.read_holds(program_run_id)
+                ),
                 reason="Program paused on a node failure",
                 stop_request_id=f"failure-pause-stop:{program_run_id}:{revision}",
             )
@@ -2526,17 +2854,23 @@ class ProgramRunOwner:
                         if intervention_port is None
                         else intervention_port.read(program_run_id)
                     )
-                    dormant = (
-                        intervention is None
-                        or intervention.policy_parameter != "operator_stop_policy"
-                    )
+                    # Dormant from a new failure hold until the operator
+                    # releases one; other holds stay held while it ticks.
+                    dormant = intervention is None or entry.failure_paused
                     self._schedule_program_time(entry, tree_ticks=not dormant)
                     if dormant:
                         if not self.operator_stop_observation_required(program_run_id):
                             dormant_snapshot = self._snapshot(entry)
-                            if _failure_assessment_has_deadline(intervention):
-                                failure_refresh = intervention
-                            else:
+                            failure_refresh = tuple(
+                                hold
+                                for hold in (
+                                    ()
+                                    if intervention_port is None
+                                    else intervention_port.read_holds(program_run_id)
+                                )
+                                if _failure_assessment_has_deadline(hold)
+                            )
+                            if not failure_refresh:
                                 return dormant_snapshot
                         # A separate intervention keeps ordinary tree work
                         # dormant, but cannot hide already-accepted Stop work.
@@ -2552,9 +2886,10 @@ class ProgramRunOwner:
                     reconcile_full_stop = False
                     reconcile_finalize = False
                     run = entry.run
-            if failure_refresh is not None:
+            if failure_refresh:
                 # Owner I/O outside the run lock; the tree stays dormant.
-                self._refresh_failure_assessment(failure_refresh)
+                for hold in failure_refresh:
+                    self._refresh_failure_assessment(hold)
                 return dormant_snapshot
             if reconcile_stop:
                 return self.reconcile_stop(program_run_id)
@@ -2565,6 +2900,21 @@ class ProgramRunOwner:
 
             try:
                 run.refresh_pending_stop_settlement()
+                # Decision 138: a changed held-node mask takes its own run
+                # revision and reaches the Mock port before this tick can
+                # START anything (the port settles it before a START).
+                with self._lock:
+                    entry = self._entry(program_run_id)
+                    held = None
+                    if entry.run is run and run.mock_held_nodes() != entry.mock_held:
+                        entry.revision += 1
+                        held = self._note_mock_held(entry)
+                        held_revision = entry.revision
+                        held_paused = self._mock_paused(entry)
+                if held is not None:
+                    self._notify_mock_run_paused(
+                        program_run_id, held_revision, held_paused, held
+                    )
                 if observe_only:
                     held = run.operator_stop_scope().held_nodes
                     run.reconcile_full_stop_tasks(node_ids=held or None)
@@ -2572,6 +2922,7 @@ class ProgramRunOwner:
                 else:
                     tree_status = run.tick_once()
                 node_statuses = run.node_statuses
+                node_history_events = run.take_node_history_events()
                 stop_observation_changed = run.take_stop_observation_change()
             except Exception as exc:
                 return self._begin_stop(
@@ -2585,10 +2936,12 @@ class ProgramRunOwner:
 
             status_name = tree_status.name.lower()
             intervention = None
+            holds: tuple[Any, ...] = ()
             intervention_port = self._ports.program_interventions
             if intervention_port is not None:
                 try:
                     intervention = intervention_port.read(program_run_id)
+                    holds = intervention_port.read_holds(program_run_id)
                 except Exception as exc:
                     return self._begin_stop(
                         program_run_id,
@@ -2610,9 +2963,53 @@ class ProgramRunOwner:
                     entry.revision += 1
                 if stop_observation_changed:
                     entry.revision += 1
+                if node_history_events:
+                    # The run revision moves, so the runner's observer drains them.
+                    entry.pending_node_history_events.extend(node_history_events)
+                    entry.revision += 1
                 if entry.node_statuses != node_statuses:
                     entry.node_statuses = node_statuses
                     entry.node_status_revision += 1
+                new_holds = [
+                    hold
+                    for hold in holds
+                    if hold.identity.node_attempt_id not in entry.known_holds
+                ]
+                entry.known_holds = frozenset(
+                    hold.identity.node_attempt_id for hold in holds
+                )
+                if new_holds:
+                    # A node failure reaches the operator: pause the whole
+                    # run (dormant tree, frozen clock) and stop its scope.
+                    first = new_holds[0]
+                    entry.state = ProgramRunState.INTERVENTION_REQUIRED
+                    entry.failure_paused = True
+                    entry.failure_pause_stop_pending = True
+                    self._schedule_program_time(entry, tree_ticks=False)
+                    self._set_reason(
+                        entry,
+                        first.reason_code,
+                        first.message,
+                        details=first.details,
+                        origin=first.origin,
+                    )
+                    entry.revision += 1
+                    for hold in new_holds:
+                        row = run.operation_failure(hold.identity.node_instance_id)
+                        if row is not None:
+                            entry.operation_failures[hold.identity.node_attempt_id] = {
+                                **row,
+                                "operator_facing_run_revision": entry.revision,
+                            }
+                    self._capture_diagnostic(
+                        entry,
+                        "intervention_required",
+                        reason_code=first.reason_code,
+                        message=first.message,
+                        details=first.details,
+                        origin=first.origin,
+                    )
+                    return self._snapshot(entry)
                 if intervention is not None and entry.state is ProgramRunState.RUNNING:
                     entry.state = ProgramRunState.INTERVENTION_REQUIRED
                     # A node-failure pause keeps the tree dormant, like Halt;
@@ -2666,6 +3063,11 @@ class ProgramRunOwner:
                 if terminal_state is ProgramRunState.FAILED
                 else None
             )
+            terminal_row = (
+                run.operation_failure()
+                if terminal_state is ProgramRunState.FAILED
+                else None
+            )
             try:
                 scope_snapshot = self._scope.observe(program_run_id)
                 _active_count, scope_settled, _scope_reason = self._scope_fields(
@@ -2713,6 +3115,12 @@ class ProgramRunOwner:
                     self._mark_finalizing(
                         entry, state_after_finalize=terminal_state, **terminal
                     )
+                    if terminal_row is not None:
+                        # The failed run's operation failure, until Reset.
+                        entry.operation_failures[""] = {
+                            **terminal_row,
+                            "operator_facing_run_revision": entry.revision,
+                        }
             return self._reconcile_finalizing(program_run_id)
 
 

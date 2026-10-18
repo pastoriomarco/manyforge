@@ -1,3 +1,5 @@
+import type { IoSignalBinding } from '../api/parsers/ioSignals';
+
 export interface SceneRevisionValue {
   scene_id: string;
   revision_id: number;
@@ -140,6 +142,24 @@ export interface ManualControlGripperDescriptor {
   contracts: ManualControlContracts;
 }
 
+/** One stage of a target's qualified Stop chain (SX-2167), in chain order. */
+export interface TargetStopResponseStage {
+  stageId: string;
+  stageKind: string;
+  commandKind: string;
+}
+
+/** `target.command.stop_response`: the Applied qualified Stop chain of one
+ * motion target (the same artifact Program Stop validation uses), exposed
+ * before Enable; it does not assert the commands are ready. */
+export interface TargetStopResponse {
+  controlBindingId: string;
+  controlBindingRevision: string;
+  controlRouteId: string;
+  nominalStopMode: string | null;
+  stages: TargetStopResponseStage[];
+}
+
 export interface DirectControlMotionStatus {
   controllableComponentId: string;
   commandTargetId: string;
@@ -156,6 +176,8 @@ export interface DirectControlMotionStatus {
   programRunId: string;
   joints: DirectControlJoint[];
   targetDescriptor: ManualControlMotionDescriptor;
+  /** Present only when the owner publishes the target's qualified Stop chain. */
+  stopResponse?: TargetStopResponse;
 }
 
 export type CoordinateKind = 'angular_rad' | 'linear_m';
@@ -194,10 +216,9 @@ export interface ObservedMotionTarget {
 }
 
 export interface ObservedGripperTarget {
-  /** Identity is present for multi-target projections; optional for old peers. */
-  targetRoleId?: string;
-  controllableComponentId?: string;
-  commandTargetId?: string;
+  targetRoleId: string;
+  controllableComponentId: string;
+  commandTargetId: string;
   sequence: number;
   sourceEpoch: string;
   sourceCoordinateName: string;
@@ -237,6 +258,41 @@ export interface StopFaultRecoveryOffer {
   }>;
   /** Why recovery is unavailable (certified latch without a proof); null otherwise. */
   recoveryUnavailableReason: string | null;
+}
+
+/**
+ * The exact selector of one latched global rule's recovery offer (SX-2206),
+ * kept in its wire form so the clear command sends it back unchanged.
+ */
+export interface GlobalRuleRecoverySelector {
+  context: {
+    owner_epoch: string;
+    /** Canonical uint64 decimal text. */
+    catalog_generation: string;
+    active_publication_generation: number;
+    bundle: string;
+    graph: string;
+  };
+  rule_id: string;
+  /** Canonical uint64 decimal text. */
+  expected_rule_registration_id: string;
+}
+
+/** One actually latched global rule offered for operator recovery (contracts 78/86). */
+export interface GlobalRuleRecoveryOffer {
+  selector: GlobalRuleRecoverySelector;
+  /** Null while unknown (a source not fresh). */
+  currentCondition: boolean | null;
+  postLatchDisposition: 'auto_clear_on_signal_release' | 'await_operator_ack';
+  latchCause: 'condition' | 'source_loss';
+}
+
+/** The owner's result of one global-rule latch clear request. */
+export interface GlobalRuleRecoveryResult {
+  accepted: boolean;
+  replayStatus: string | null;
+  ruleState: 'clear' | 'tripped' | 'latched' | null;
+  error: string | null;
 }
 
 export interface CellStopStageSummary {
@@ -319,6 +375,8 @@ export interface ExecutionOwnerStatus {
   manualOperations: (OperationObservation & { programRunId: string })[];
   cellStopAction: CellStopActionStatus;
   runtimeScaleControl: RuntimeScaleControlStatus | null;
+  /** `targets.io_signal_bindings` when the owner publishes it (static per activation). */
+  ioSignalBindings?: IoSignalBinding[];
 }
 
 export interface ExecutionIdentity {
@@ -523,6 +581,14 @@ export type OperationStateName =
   | 'intervention_required'
   | 'cancelled_pre_dispatch';
 
+/** Correlated source facts of an output write (contract 53), never its effect. */
+export type OutputEvidence =
+  | 'not_submitted'
+  | 'submitted'
+  | 'source_accepted'
+  | 'source_rejected'
+  | 'acceptance_unknown';
+
 export interface OperationObservation {
   operationId: string;
   operationRevision: number;
@@ -537,6 +603,8 @@ export interface OperationObservation {
   targetRoleId?: string;
   controllableComponentId?: string;
   commandTargetId?: string;
+  /** Present only when the participant reports output evidence. */
+  outputEvidence?: OutputEvidence;
 }
 
 export type RuntimeScaleApplicationState =

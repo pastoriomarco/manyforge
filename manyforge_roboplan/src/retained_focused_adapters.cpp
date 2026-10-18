@@ -497,6 +497,35 @@ RoboPlanTrajectoryValidator::validate_non_collision(
         "Cartesian candidate fidelity evidence is invalid",
         "cartesian_fidelity_evidence_invalid");
   }
+  std::optional<core::MovingReplacementValidationEvidenceDTO> moving_metrics;
+  if (options.retained_prefix) {
+    const auto &prefix = *options.retained_prefix;
+    const double duration = trajectory.waypoints.back().time_from_start_s;
+    if (!std::isfinite(prefix.end_time_s) || !(prefix.end_time_s > 0.0) ||
+        !std::isfinite(duration) || !(prefix.end_time_s < duration) ||
+        trajectory.waypoints.front().time_from_start_s != 0.0 ||
+        !std::isfinite(prefix.max_tcp_linear_speed_mps) ||
+        !(prefix.max_tcp_linear_speed_mps > 0.0) ||
+        !(options.max_tcp_linear_speed_mps > 0.0) || prefix.tcp_frame.empty() ||
+        prefix.base_frame.empty() || options.tcp_frame.empty() ||
+        options.base_frame.empty()) {
+      return validation_error(core::ErrorCode::kInvalidRequest,
+                              "Moving replacement requires an interior prefix "
+                              "boundary and resolved TCP limits",
+                              "trajectory_retained_prefix_invalid");
+    }
+    moving_metrics.emplace();
+    moving_metrics->unchanged_prefix.trajectory_duration_s = prefix.end_time_s;
+    moving_metrics->changed_future.trajectory_duration_s =
+        duration - prefix.end_time_s;
+    for (auto *piece :
+         {&moving_metrics->unchanged_prefix, &moving_metrics->changed_future}) {
+      piece->peak_abs_joint_velocity_rad_s.assign(trajectory.joint_names.size(),
+                                                  0.0);
+      piece->peak_abs_joint_acceleration_rad_s2.assign(
+          trajectory.joint_names.size(), 0.0);
+    }
+  }
   const bool canonical_joint_order =
       trajectory.joint_names == model_joint_names_;
   std::vector<std::size_t> trajectory_to_model;
@@ -539,6 +568,23 @@ RoboPlanTrajectoryValidator::validate_non_collision(
   std::vector<double> peak_joint_velocity(trajectory.joint_names.size(), 0.0);
   std::vector<double> peak_joint_acceleration(trajectory.joint_names.size(), 0.0);
   bool joint_acceleration_measured = false;
+  bool prefix_boundary_seen = false;
+  const auto record_piece_joint_peak = [&](std::size_t joint, double value,
+                                           bool acceleration, double time,
+                                           bool knot) {
+    if (!moving_metrics)
+      return;
+    const double boundary = options.retained_prefix->end_time_s;
+    const auto record = [&](core::TrajectoryValidationMetricsDTO &piece) {
+      auto &peaks = acceleration ? piece.peak_abs_joint_acceleration_rad_s2
+                                 : piece.peak_abs_joint_velocity_rad_s;
+      peaks[joint] = std::max(peaks[joint], std::abs(value));
+    };
+    if (time <= boundary)
+      record(moving_metrics->unchanged_prefix);
+    if (time > boundary || (knot && time == boundary))
+      record(moving_metrics->changed_future);
+  };
   double previous_time = -1.0;
   for (std::size_t waypoint_index = 0;
        waypoint_index < trajectory.waypoints.size(); ++waypoint_index) {
@@ -546,6 +592,9 @@ RoboPlanTrajectoryValidator::validate_non_collision(
       return cancelled();
     }
     const auto& waypoint = trajectory.waypoints[waypoint_index];
+    if (options.retained_prefix &&
+        waypoint.time_from_start_s == options.retained_prefix->end_time_s)
+      prefix_boundary_seen = true;
     if (!std::isfinite(waypoint.time_from_start_s) ||
         waypoint.time_from_start_s < 0.0 ||
         (waypoint_index > 0 &&
@@ -626,6 +675,8 @@ RoboPlanTrajectoryValidator::validate_non_collision(
             velocity_limits_rad_s_[model_joint_index];
         peak_joint_velocity[joint_index] =
             std::max(peak_joint_velocity[joint_index], std::abs(velocity));
+        record_piece_joint_peak(joint_index, velocity, false,
+                                waypoint.time_from_start_s, true);
         if (std::abs(velocity) > velocity_limit + kLimitTolerance) {
           return validation_error(
               core::ErrorCode::kValidationLimitsViolation,
@@ -654,6 +705,8 @@ RoboPlanTrajectoryValidator::validate_non_collision(
             acceleration_limits_rad_s2_[model_joint_index];
         peak_joint_acceleration[joint_index] = std::max(
             peak_joint_acceleration[joint_index], std::abs(acceleration));
+        record_piece_joint_peak(joint_index, acceleration, true,
+                                waypoint.time_from_start_s, true);
         joint_acceleration_measured = true;
         if (std::abs(acceleration) >
             acceleration_limit + kLimitTolerance) {
@@ -680,6 +733,8 @@ RoboPlanTrajectoryValidator::validate_non_collision(
             velocity_limits_rad_s_[model_joint_index];
         peak_joint_velocity[joint_index] = std::max(
             peak_joint_velocity[joint_index], std::abs(segment_velocity));
+        record_piece_joint_peak(joint_index, segment_velocity, false,
+                                waypoint.time_from_start_s, false);
         if (std::abs(segment_velocity) >
             velocity_limit + kLimitTolerance) {
           return validation_error(
@@ -712,6 +767,8 @@ RoboPlanTrajectoryValidator::validate_non_collision(
               acceleration_limits_rad_s2_[model_joint_index];
           peak_joint_acceleration[joint_index] = std::max(
               peak_joint_acceleration[joint_index], std::abs(acceleration));
+          record_piece_joint_peak(joint_index, acceleration, true,
+                                  waypoint.time_from_start_s, false);
           joint_acceleration_measured = true;
           if (std::abs(acceleration) >
               acceleration_limit + kLimitTolerance) {
@@ -729,6 +786,12 @@ RoboPlanTrajectoryValidator::validate_non_collision(
       }
     }
     previous_time = waypoint.time_from_start_s;
+  }
+  if (options.retained_prefix && !prefix_boundary_seen) {
+    return validation_error(
+        core::ErrorCode::kInvalidRequest,
+        "Moving replacement prefix boundary must be an exact knot",
+        "trajectory_retained_prefix_boundary_missing");
   }
 
   std::optional<double> peak_tcp_linear_speed_mps;
@@ -749,6 +812,28 @@ RoboPlanTrajectoryValidator::validate_non_collision(
       double max_speed = 0.0;
       std::size_t max_segment_index = 0;
       double max_segment_duration_s = 0.0;
+      double prefix_max_speed = 0.0;
+      std::size_t prefix_max_segment_index = 0;
+      double prefix_max_segment_duration_s = 0.0;
+      double future_max_speed = 0.0;
+      std::size_t future_max_segment_index = 0;
+      double future_max_segment_duration_s = 0.0;
+      const auto position_in_frames = [&](const Eigen::VectorXd &q,
+                                          const std::string &tcp_frame,
+                                          const std::string &base_frame) {
+        const Eigen::Matrix4d robot_base_from_tcp =
+            scene_->forwardKinematics(q, tcp_frame);
+        Eigen::Matrix4d requested_base_from_robot_base =
+            Eigen::Matrix4d::Identity();
+        if (!is_world_frame(base_frame)) {
+          requested_base_from_robot_base =
+              scene_->forwardKinematics(q, base_frame).inverse();
+        }
+        const Eigen::Matrix4d tcp_transform =
+            requested_base_from_robot_base * robot_base_from_tcp;
+        return Eigen::Vector3d{tcp_transform(0, 3), tcp_transform(1, 3),
+                               tcp_transform(2, 3)};
+      };
       for (std::size_t waypoint_index = 0;
            waypoint_index < trajectory.waypoints.size(); ++waypoint_index) {
         if (cancel.is_cancel_requested()) {
@@ -764,37 +849,97 @@ RoboPlanTrajectoryValidator::validate_non_collision(
         }
         const Eigen::VectorXd q =
             scene_->toFullJointPositions(group_name_, group_q);
-        const Eigen::Matrix4d robot_base_from_tcp =
-            scene_->forwardKinematics(q, options.tcp_frame);
-        Eigen::Matrix4d requested_base_from_robot_base =
-            Eigen::Matrix4d::Identity();
-        if (!is_world_frame(options.base_frame)) {
-          requested_base_from_robot_base =
-              scene_->forwardKinematics(q, options.base_frame).inverse();
+        const bool prefix_point =
+            options.retained_prefix &&
+            waypoint.time_from_start_s <= options.retained_prefix->end_time_s;
+        const auto &tcp_frame = prefix_point
+                                    ? options.retained_prefix->tcp_frame
+                                    : options.tcp_frame;
+        const auto &base_frame = prefix_point
+                                     ? options.retained_prefix->base_frame
+                                     : options.base_frame;
+        const Eigen::Vector3d tcp_position =
+            position_in_frames(q, tcp_frame, base_frame);
+        if (moving_metrics && !tcp_position.allFinite()) {
+          return validation_error(
+              core::ErrorCode::kInvalidRequest,
+              "Moving replacement TCP position is non-finite",
+              "tcp_speed_validation_nonfinite");
         }
-        const Eigen::Matrix4d tcp_transform =
-            requested_base_from_robot_base * robot_base_from_tcp;
-        const Eigen::Vector3d tcp_position{
-            tcp_transform(0, 3), tcp_transform(1, 3),
-            tcp_transform(2, 3)};
         if (have_previous) {
           const double duration =
               waypoint.time_from_start_s -
               trajectory.waypoints[waypoint_index - 1].time_from_start_s;
           const double speed =
               (tcp_position - previous_position).norm() / duration;
+          if (moving_metrics && !std::isfinite(speed)) {
+            return validation_error(
+                core::ErrorCode::kInvalidRequest,
+                "Moving replacement TCP speed is non-finite",
+                "tcp_speed_validation_nonfinite");
+          }
           if (speed > max_speed) {
             max_speed = speed;
             max_segment_index = waypoint_index - 1;
             max_segment_duration_s = duration;
           }
+          if (moving_metrics) {
+            auto &piece_speed =
+                prefix_point ? prefix_max_speed : future_max_speed;
+            auto &piece_index = prefix_point ? prefix_max_segment_index
+                                             : future_max_segment_index;
+            auto &piece_duration = prefix_point ? prefix_max_segment_duration_s
+                                                : future_max_segment_duration_s;
+            if (speed > piece_speed) {
+              piece_speed = speed;
+              piece_index = waypoint_index - 1;
+              piece_duration = duration;
+            }
+          }
         }
         previous_position = tcp_position;
+        if (options.retained_prefix &&
+            waypoint.time_from_start_s == options.retained_prefix->end_time_s &&
+            (options.retained_prefix->tcp_frame != options.tcp_frame ||
+             options.retained_prefix->base_frame != options.base_frame)) {
+          // Restart only TCP position history in the successor frames at the
+          // exact shared knot. Joint secant/triple history stays intact.
+          previous_position =
+              position_in_frames(q, options.tcp_frame, options.base_frame);
+          if (!previous_position.allFinite()) {
+            return validation_error(
+                core::ErrorCode::kInvalidRequest,
+                "Moving replacement seam TCP position is non-finite",
+                "tcp_speed_validation_nonfinite");
+          }
+        }
         have_previous = true;
       }
       peak_tcp_linear_speed_mps = max_speed;
-      if (max_speed >
-          options.max_tcp_linear_speed_mps + kLimitTolerance) {
+      double speed_limit = options.max_tcp_linear_speed_mps;
+      std::string measured_tcp_frame = options.tcp_frame;
+      std::string measured_base_frame = options.base_frame;
+      if (moving_metrics) {
+        moving_metrics->unchanged_prefix.peak_tcp_linear_speed_mps =
+            prefix_max_speed;
+        moving_metrics->changed_future.peak_tcp_linear_speed_mps =
+            future_max_speed;
+        if (prefix_max_speed >
+            options.retained_prefix->max_tcp_linear_speed_mps +
+                kLimitTolerance) {
+          max_speed = prefix_max_speed;
+          max_segment_index = prefix_max_segment_index;
+          max_segment_duration_s = prefix_max_segment_duration_s;
+          speed_limit = options.retained_prefix->max_tcp_linear_speed_mps;
+          measured_tcp_frame = options.retained_prefix->tcp_frame;
+          measured_base_frame = options.retained_prefix->base_frame;
+        } else {
+          max_speed = future_max_speed;
+          max_segment_index = future_max_segment_index;
+          max_segment_duration_s = future_max_segment_duration_s;
+        }
+      }
+      if (max_speed > speed_limit + kLimitTolerance) {
         const auto speed_duration_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - speed_started)
@@ -806,18 +951,15 @@ RoboPlanTrajectoryValidator::validate_non_collision(
             {{"limit_type", "tcp_linear_speed"},
              {"segment_index", std::to_string(max_segment_index)},
              {"max_segment_index", std::to_string(max_segment_index)},
-             {"max_segment_dt_s",
-              std::to_string(max_segment_duration_s)},
-             {"tcp_frame", options.tcp_frame},
-             {"base_frame", options.base_frame},
+             {"max_segment_dt_s", std::to_string(max_segment_duration_s)},
+             {"tcp_frame", measured_tcp_frame},
+             {"base_frame", measured_base_frame},
              {"measured", std::to_string(max_speed)},
-             {"limit", std::to_string(options.max_tcp_linear_speed_mps)},
+             {"limit", std::to_string(speed_limit)},
              {"units", "m/s"},
-             {"waypoint_count",
-              std::to_string(trajectory.waypoints.size())},
+             {"waypoint_count", std::to_string(trajectory.waypoints.size())},
              {"trajectory_duration_s",
-              std::to_string(
-                  trajectory.waypoints.back().time_from_start_s)},
+              std::to_string(trajectory.waypoints.back().time_from_start_s)},
              {"speed_validation_duration_ns",
               std::to_string(speed_duration_ns)},
              {"collision_validation_duration_ns", "0"}});
@@ -838,7 +980,16 @@ RoboPlanTrajectoryValidator::validate_non_collision(
                                   : std::vector<double>{},
       peak_tcp_linear_speed_mps,
       trajectory.cartesian_fidelity_metrics};
-  return core::ValidationResultDTO{true, std::nullopt, std::move(metrics)};
+  core::ValidationResultDTO result{true, std::nullopt, std::move(metrics)};
+  if (moving_metrics) {
+    if (!joint_acceleration_measured) {
+      moving_metrics->unchanged_prefix.peak_abs_joint_acceleration_rad_s2
+          .clear();
+      moving_metrics->changed_future.peak_abs_joint_acceleration_rad_s2.clear();
+    }
+    result.moving_replacement = std::move(moving_metrics);
+  }
+  return result;
 }
 
 core::Result<core::TrajectoryDTO>

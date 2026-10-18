@@ -1,5 +1,6 @@
 #include "manyforge_deployment/apply_affected_scope.hpp"
 #include <manyforge_deployment/execution_runtime_contract.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 
 #include "apply_affected_scope_internal.hpp"
 #include "native_execution_runtime_unit_internal.hpp"
@@ -210,6 +211,15 @@ void MarkProviderTarget(const core::CapabilityProviderBindingDTO &provider,
           MarkAllBindings(graph, resources);
         } else if constexpr (
             std::is_same_v<Target,
+                           core::ComponentTargetCapabilityProviderTargetDTO>) {
+          for (const auto &binding : graph.control_bindings) {
+            if (binding.controllable_component_id ==
+                    target.controllable_component_id &&
+                binding.command_target_id == target.command_target_id)
+              MarkBinding(binding, resources);
+          }
+        } else if constexpr (
+            std::is_same_v<Target,
                            core::TargetBindingCapabilityProviderTargetDTO>) {
           MarkBindingId(graph, target.control_binding_id, resources);
         } else {
@@ -314,6 +324,80 @@ void CloseResourceOverlap(
   }
 }
 
+struct ProviderFenceSource final {
+  const core::ControlDomainDTO *domain;
+  std::vector<core::ResourceId> outputs;
+};
+
+using ProviderFenceSources =
+    std::map<core::ControlDomainId, ProviderFenceSource>;
+
+[[nodiscard]] ProviderFenceSources
+ProviderSources(const core::RetainedBundleDTO &bundle) {
+  ProviderFenceSources result;
+  const auto catalog = ResolveRetainedIoSignalCatalog(bundle.cell_graph);
+  if (!catalog.ok())
+    Fail("verified provider signal catalog is not closed");
+  for (const auto &domain : bundle.cell_graph.control_domains) {
+    const auto *provider = domain.provider();
+    if (!provider)
+      continue;
+    ProviderFenceSource source{&domain, {}};
+    std::vector<std::string> members;
+    for (const auto &row : catalog.value()) {
+      if (row.runtime_unit_id != provider->provider_runtime_unit_id ||
+          row.descriptor.signal_id.controllable_component_id !=
+              provider->controllable_component_id ||
+          !std::binary_search(provider->signal_names.begin(),
+                              provider->signal_names.end(),
+                              row.descriptor.signal_id.name))
+        continue;
+      members.push_back(row.descriptor.signal_id.name);
+      if (row.descriptor.output_resource)
+        source.outputs.push_back(*row.descriptor.output_resource);
+    }
+    std::sort(members.begin(), members.end());
+    if (members != provider->signal_names)
+      Fail("verified provider domain has incomplete signal membership");
+    std::sort(source.outputs.begin(), source.outputs.end());
+    source.outputs.erase(
+        std::unique(source.outputs.begin(), source.outputs.end()),
+        source.outputs.end());
+    result.emplace(domain.control_domain_id, std::move(source));
+  }
+  return result;
+}
+
+[[nodiscard]] core::ProviderConfigurationFenceOccurrenceDTO
+ProviderFenceProof(const ProviderFenceSource &source) {
+  const auto &provider = *source.domain->provider();
+  return {provider.controllable_component_id, provider.provider_instance_id,
+          provider.signal_configuration_digest, source.outputs};
+}
+
+[[nodiscard]] bool
+ProviderTargetMatches(const core::CapabilityProviderBindingDTO &binding,
+                      const ProviderFenceSource &source) {
+  const auto &owner = *source.domain->provider();
+  return binding.provider_instance_id == owner.provider_instance_id ||
+         std::visit(
+             [&](const auto &target) {
+               using Target = std::decay_t<decltype(target)>;
+               if constexpr (std::is_same_v<
+                                 Target,
+                                 core::CellGlobalCapabilityProviderTargetDTO>)
+                 return true;
+               else if constexpr (
+                   std::is_same_v<
+                       Target, core::ControlDomainCapabilityProviderTargetDTO>)
+                 return target.control_domain_id ==
+                        source.domain->control_domain_id;
+               else
+                 return false;
+             },
+             binding.target);
+}
+
 } // namespace
 
 namespace detail {
@@ -332,6 +416,9 @@ derive_apply_configuration_fence_scope_verified_values(
 
   const auto &old_graph = old_bundle.cell_graph;
   const auto &new_graph = new_bundle.cell_graph;
+  auto old_provider_sources = ProviderSources(old_bundle);
+  const auto new_provider_sources = ProviderSources(new_bundle);
+  std::set<core::ControlDomainId> affected_provider_domains;
   std::set<core::ResourceId> affected_resources;
 
   // Retained policy records are a runtime dependency of every component
@@ -343,7 +430,10 @@ derive_apply_configuration_fence_scope_verified_values(
           new_bundle.compiled_products.symbol_role_maps ||
       old_graph.model_instances != new_graph.model_instances ||
       old_graph.component_attachments != new_graph.component_attachments ||
-      old_bundle.retained_policy_records != new_bundle.retained_policy_records;
+      old_bundle.retained_policy_records !=
+          new_bundle.retained_policy_records ||
+      old_bundle.motion_takeover_preparation_budget_s !=
+          new_bundle.motion_takeover_preparation_budget_s;
   if (cell_wide_product_changed) {
     MarkAllBindings(old_graph, affected_resources);
     MarkAllBindings(new_graph, affected_resources);
@@ -521,6 +611,26 @@ derive_apply_configuration_fence_scope_verified_values(
     if (!source || source->cell_graph.cell_id != old_graph.cell_id)
       Fail("actual_installed_state_unknown: terminal product has a foreign "
            "cell");
+    for (auto &[id, provider_source] : ProviderSources(*source)) {
+      const auto &component =
+          provider_source.domain->provider()->controllable_component_id;
+      if (!std::binary_search(actual_restart_components.begin(),
+                              actual_restart_components.end(), component))
+        continue;
+      actual_components.insert(component);
+      const auto [actual, inserted] =
+          actual_domains.emplace(id, provider_source.domain);
+      if (!inserted && *actual->second != *provider_source.domain)
+        Fail("actual_installed_state_unknown: terminal provider domains "
+             "conflict");
+      const auto [old, added] =
+          old_provider_sources.emplace(id, provider_source);
+      if (!added && (*old->second.domain != *provider_source.domain ||
+                     old->second.outputs != provider_source.outputs))
+        Fail("actual_installed_state_unknown: terminal provider source "
+             "conflicts with predecessor");
+      affected_provider_domains.insert(id);
+    }
     for (const auto &binding : source->cell_graph.control_bindings) {
       if (!std::binary_search(actual_restart_components.begin(),
                               actual_restart_components.end(),
@@ -544,6 +654,31 @@ derive_apply_configuration_fence_scope_verified_values(
              "actual domain revision");
     }
   }
+  const auto mark_provider_changes = [&](const ProviderFenceSources &sources) {
+    for (const auto &[id, source] : sources) {
+      const auto &owner = *source.domain->provider();
+      const bool changed_provider =
+          std::any_of(changed_providers.begin(), changed_providers.end(),
+                      [&](const auto &changed) {
+                        const auto old = old_providers.find(changed);
+                        const auto next = new_providers.find(changed);
+                        return (old != old_providers.end() &&
+                                ProviderTargetMatches(*old->second, source)) ||
+                               (next != new_providers.end() &&
+                                ProviderTargetMatches(*next->second, source));
+                      });
+      if (cell_wide_product_changed ||
+          changed_components.contains(owner.controllable_component_id) ||
+          changed_domains.contains(id) || changed_provider ||
+          affected_runtime_units.contains(owner.provider_runtime_unit_id) ||
+          std::binary_search(actual_restart_components.begin(),
+                             actual_restart_components.end(),
+                             owner.controllable_component_id))
+        affected_provider_domains.insert(id);
+    }
+  };
+  mark_provider_changes(old_provider_sources);
+  mark_provider_changes(new_provider_sources);
   for (const auto &component : actual_restart_components) {
     const auto present = [&](const auto &graph) {
       return std::any_of(graph.controllable_components.begin(),
@@ -560,9 +695,32 @@ derive_apply_configuration_fence_scope_verified_values(
     MarkComponent(old_graph, component, affected_resources);
     MarkComponent(new_graph, component, affected_resources);
   }
-  CloseResourceOverlap(old_graph, new_graph, affected_resources,
-                       actual_bindings);
-  if (affected_resources.empty()) {
+  bool provider_overlap_changed;
+  do {
+    const auto domain_count = affected_provider_domains.size();
+    const auto resource_count = affected_resources.size();
+    const auto close_providers = [&](const ProviderFenceSources &sources) {
+      for (const auto &[id, source] : sources) {
+        if (affected_provider_domains.contains(id) ||
+            std::any_of(source.outputs.begin(), source.outputs.end(),
+                        [&](const auto &resource) {
+                          return affected_resources.contains(resource);
+                        })) {
+          affected_provider_domains.insert(id);
+          affected_resources.insert(source.outputs.begin(),
+                                    source.outputs.end());
+        }
+      }
+    };
+    close_providers(old_provider_sources);
+    close_providers(new_provider_sources);
+    CloseResourceOverlap(old_graph, new_graph, affected_resources,
+                         actual_bindings);
+    provider_overlap_changed =
+        domain_count != affected_provider_domains.size() ||
+        resource_count != affected_resources.size();
+  } while (provider_overlap_changed);
+  if (affected_resources.empty() && affected_provider_domains.empty()) {
     return {};
   }
 
@@ -597,6 +755,17 @@ derive_apply_configuration_fence_scope_verified_values(
 
   std::set<core::ControllableComponentId> component_ids;
   std::set<core::ControlDomainId> domain_ids;
+  for (const auto &id : affected_provider_domains) {
+    domain_ids.insert(id);
+    if (const auto old = old_provider_sources.find(id);
+        old != old_provider_sources.end())
+      component_ids.insert(
+          old->second.domain->provider()->controllable_component_id);
+    if (const auto next = new_provider_sources.find(id);
+        next != new_provider_sources.end())
+      component_ids.insert(
+          next->second.domain->provider()->controllable_component_id);
+  }
   std::vector<core::ConfigurationFenceBindingScopeDTO> bindings;
   bindings.reserve(selected_binding_ids.size());
   for (const auto &id : selected_binding_ids) {
@@ -654,6 +823,18 @@ derive_apply_configuration_fence_scope_verified_values(
             ? std::nullopt
             : std::optional(new_found->second->control_domain_revision),
     });
+    const auto predecessor = old_provider_sources.find(id);
+    const auto candidate = new_provider_sources.find(id);
+    if (predecessor != old_provider_sources.end() ||
+        candidate != new_provider_sources.end()) {
+      domains.back().payload = core::ProviderConfigurationFenceDomainDTO{
+          predecessor == old_provider_sources.end()
+              ? std::nullopt
+              : std::optional(ProviderFenceProof(predecessor->second)),
+          candidate == new_provider_sources.end()
+              ? std::nullopt
+              : std::optional(ProviderFenceProof(candidate->second))};
+    }
   }
 
   core::ConfigurationFenceScopeDTO result{

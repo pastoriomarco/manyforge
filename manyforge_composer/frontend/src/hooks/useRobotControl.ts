@@ -40,6 +40,7 @@ import type {
   RobotControlState,
 } from '../state/robotControl';
 import type { RobotControlMode } from '../state/robotControl';
+import { acknowledgedUncertainOutputs, type UncertainOutput } from '../utils/uncertainOutputs';
 import type { CartesianMoveDraftOptions, MoveToDraftSource } from '../utils/moveTo';
 import type {
   DirectControlOperationIntent,
@@ -225,7 +226,7 @@ export function buildManualAvailabilityIntent(
 export function manualAvailabilityScopeFence(
   snapshot: ComposerHeadlessState | null,
   mode: RobotControlMode,
-  selection?: Pick<RobotControlState, 'selectedComponentId' | 'selectedMotionTargetId' | 'selectedGripperTargetId'>,
+  selection?: Pick<RobotControlState, 'selectedControllableComponentId' | 'selectedMotionTargetId' | 'selectedGripperTargetId'>,
 ): string | null {
   const status = snapshot?.executionControlStatus;
   if (status == null || snapshot == null) return null;
@@ -267,14 +268,12 @@ export interface RobotControlController {
   runtimeScaleDraft: number;
   runtimeScalePending: boolean;
   runtimeScaleError: string | null;
-  fullStopPending: boolean;
-  fullStopError: string | null;
   stopFaultRecoveryPending: boolean;
   stopFaultRecoveryError: string | null;
   /** Open component incidents (CCLC snapshots) while the cell is latched. */
   componentIncidents: OpenComponentIncident[];
   componentIncidentsUnavailableReason: string | null;
-  selectRobot: (componentId: string, motionTargetId: string) => void;
+  selectRobot: (controllableComponentId: string, motionTargetId: string) => void;
   selectTool: (gripperTargetId: string) => void;
   selectMode: (mode: RobotControlMode) => void;
   selectMoveToSource: (source: MoveToDraftSource) => void;
@@ -291,12 +290,17 @@ export interface RobotControlController {
   approve: () => Promise<void>;
   revert: () => void;
   stop: () => Promise<void>;
-  fullStop: () => Promise<void>;
   recoverStopFault: () => Promise<void>;
-  dismissFullStopError: () => void;
   dismissRuntimeScaleError: () => void;
   dismissError: () => void;
-  reset: () => Promise<void>;
+  /** Reset the current terminal operation; approved uncertain outputs of it are acknowledged (contract 66). */
+  reset: (approvedUncertainOutputs?: readonly UncertainOutput[]) => Promise<void>;
+  /**
+   * One targeted operation Reset per approved acceptance-unknown output's
+   * operation, each acknowledging only its own outputs. Null when every
+   * Reset was received, else why; stops at the first refusal.
+   */
+  resetUncertainOutputs: (approved: readonly UncertainOutput[]) => Promise<string | null>;
   setRuntimeScale: (scale: number) => void;
   commitRuntimeScale: () => void;
   retry: () => void;
@@ -322,9 +326,6 @@ export function useRobotControl(
   const [runtimeScaleDraft, setRuntimeScaleDraft] = useState(1);
   const [runtimeScalePending, setRuntimeScalePending] = useState(false);
   const [runtimeScaleError, setRuntimeScaleError] = useState<string | null>(null);
-  const [fullStopPending, setFullStopPending] = useState(false);
-  const [fullStopError, setFullStopError] = useState<string | null>(null);
-  const fullStopRequest = useRef<{ ownerEpoch: string } | null>(null);
   const [stopFaultRecoveryPending, setStopFaultRecoveryPending] = useState(false);
   const [stopFaultRecoveryError, setStopFaultRecoveryError] = useState<string | null>(null);
   const stopFaultRecoveryRequest = useRef<{ ownerEpoch: string } | null>(null);
@@ -363,17 +364,17 @@ export function useRobotControl(
   const latestSnapshot = useRef(headlessSnapshot);
   latestSnapshot.current = headlessSnapshot;
   const ownerStatus = state.status;
-  const selectedComponentId = state.selectedComponentId;
+  const selectedControllableComponentId = state.selectedControllableComponentId;
   const selectedMotionTargetId = state.selectedMotionTargetId;
   const selectedGripperTargetId = state.selectedGripperTargetId;
   const selectedStatus = useMemo(
     () => selectedStatusForState({
       status: ownerStatus,
-      selectedComponentId,
+      selectedControllableComponentId,
       selectedMotionTargetId,
       selectedGripperTargetId,
     }),
-    [ownerStatus, selectedComponentId, selectedMotionTargetId,
+    [ownerStatus, selectedControllableComponentId, selectedMotionTargetId,
       selectedGripperTargetId],
   );
   const motionTargets = useMemo(
@@ -403,7 +404,7 @@ export function useRobotControl(
     ? null
     : selectedStatusForState({
       status: headlessSnapshot.executionControlStatus,
-      selectedComponentId, selectedMotionTargetId, selectedGripperTargetId,
+      selectedControllableComponentId, selectedMotionTargetId, selectedGripperTargetId,
     });
   // A pneumatic transition must query the same snapshot as its scope fence.
   // Missing/invalid current descriptors must never fall back to the old one.
@@ -606,8 +607,8 @@ export function useRobotControl(
     dispatch({ type: 'select_mode', mode });
   }, []);
 
-  const selectRobot = useCallback((componentId: string, motionTargetId: string) => {
-    dispatch({ type: 'select_robot', componentId, motionTargetId });
+  const selectRobot = useCallback((controllableComponentId: string, motionTargetId: string) => {
+    dispatch({ type: 'select_robot', controllableComponentId, motionTargetId });
   }, []);
 
   const selectTool = useCallback((gripperTargetId: string) => {
@@ -628,11 +629,6 @@ export function useRobotControl(
   }, [state.status?.ownerEpoch, state.operation?.operationId]);
 
   useEffect(() => {
-    if (fullStopRequest.current?.ownerEpoch !== state.status?.ownerEpoch) {
-      fullStopRequest.current = null;
-      setFullStopPending(false);
-      setFullStopError(null);
-    }
     if (stopFaultRecoveryRequest.current?.ownerEpoch !== state.status?.ownerEpoch) {
       stopFaultRecoveryRequest.current = null;
       setStopFaultRecoveryPending(false);
@@ -984,42 +980,6 @@ export function useRobotControl(
     });
   }, [clearRuntimeScaleQueue, sendOperationControl, state]);
 
-  const fullStop = useCallback(async () => {
-    const action = state.status?.cellStopAction;
-    if (
-      !enabled
-      || fullStopRequest.current !== null
-      || state.status === null
-      || action === undefined
-      || !action.available
-    ) return;
-    const pending = { ownerEpoch: state.status.ownerEpoch };
-    fullStopRequest.current = pending;
-    try {
-      if (controlSource === null) {
-        throw new Error('Control connection is not synchronized.');
-      }
-      clearRuntimeScaleQueue();
-      const response = controlSource.sendExecutionCommand(
-        'cell_full_stop',
-        {
-          expected_stop_generation: action.expectedStopGeneration,
-        },
-        requestId(),
-      );
-      setFullStopPending(true);
-      setFullStopError(null);
-      await response;
-    } catch (error: unknown) {
-      if (fullStopRequest.current === pending) setFullStopError(errorMessage(error, 'Full Stop was rejected.'));
-    } finally {
-      if (fullStopRequest.current === pending) {
-        fullStopRequest.current = null;
-        setFullStopPending(false);
-      }
-    }
-  }, [clearRuntimeScaleQueue, controlSource, enabled, state.status]);
-
   const cellFaultOpen = state.status?.cellStopAction.fault != null
     && state.status.cellStopAction.fault.state !== 'cleared';
   const statusComponents = state.status?.components;
@@ -1074,16 +1034,41 @@ export function useRobotControl(
     }
   }, [enabled, refreshComponentIncidents, state.status]);
 
-  const reset = useCallback(async () => {
+  const reset = useCallback(async (approvedUncertainOutputs: readonly UncertainOutput[] = []) => {
     const operation = state.operation;
     if (pendingOperationControl.current !== null || state.status === null || operation === null
       || !operation.resident || !operationStateIsTerminal(operation.state)) return;
+    const acknowledged = acknowledgedUncertainOutputs(operation.operationId, approvedUncertainOutputs);
     await sendOperationControl('reset', 'operation_reset', {
       operation_id: operation.operationId,
       expected_operation_revision: operation.operationRevision,
       reason: 'operator Reset of terminal Robot Control operation',
+      ...(acknowledged === null ? {} : { acknowledged_uncertain_outputs: acknowledged }),
     });
   }, [sendOperationControl, state.operation, state.status]);
+
+  const resetUncertainOutputs = useCallback(async (approved: readonly UncertainOutput[]) => {
+    if (approved.length === 0) return null;
+    if (controlSource === null) return 'Control connection is not synchronized.';
+    const operations = new Map<string, number>();
+    for (const output of approved) {
+      operations.set(output.operationId, Math.max(operations.get(output.operationId) ?? 0, output.operationRevision));
+    }
+    for (const [operationId, revision] of [...operations.entries()].sort(([left], [right]) => (left < right ? -1 : 1))) {
+      try {
+        const receipt = await controlSource.sendExecutionCommand('operation_reset', {
+          operation_id: operationId,
+          expected_operation_revision: revision,
+          reason: 'operator Reset acknowledging outputs with unknown acceptance',
+          acknowledged_uncertain_outputs: acknowledgedUncertainOutputs(operationId, approved),
+        }, requestId());
+        if (receipt.disposition === 'rejected') return `Reset of ${operationId} was refused (${receipt.code}).`;
+      } catch (error: unknown) {
+        return `Reset of ${operationId}: ${errorMessage(error, 'rejected.')}`;
+      }
+    }
+    return null;
+  }, [controlSource]);
 
   const retry = useCallback(() => {
     if (manualControlBlocked.current) {
@@ -1093,9 +1078,6 @@ export function useRobotControl(
       return;
     }
     dispatch({ type: 'retry_preview' });
-  }, []);
-  const dismissFullStopError = useCallback(() => {
-    setFullStopError(null);
   }, []);
   const dismissRuntimeScaleError = useCallback(() => {
     setRuntimeScaleError(null);
@@ -1122,8 +1104,6 @@ export function useRobotControl(
     runtimeScaleDraft,
     runtimeScalePending,
     runtimeScaleError,
-    fullStopPending,
-    fullStopError,
     stopFaultRecoveryPending,
     stopFaultRecoveryError,
     componentIncidents: componentIncidents.incidents,
@@ -1145,12 +1125,11 @@ export function useRobotControl(
     approve,
     revert,
     stop,
-    fullStop,
     recoverStopFault,
-    dismissFullStopError,
     dismissRuntimeScaleError,
     dismissError,
     reset,
+    resetUncertainOutputs,
     setRuntimeScale,
     commitRuntimeScale,
     retry,
@@ -1163,12 +1142,11 @@ export function useRobotControl(
     editJoint,
     editPose,
     reset,
+    resetUncertainOutputs,
     retry,
     revert,
     runtimeScaleDraft,
     runtimeScaleError,
-    fullStopPending,
-    fullStopError,
     stopFaultRecoveryPending,
     stopFaultRecoveryError,
     componentIncidents.incidents,
@@ -1193,11 +1171,9 @@ export function useRobotControl(
     unappliedChanges,
     controlSource,
     stop,
-    fullStop,
     recoverStopFault,
     selectRobot,
     selectTool,
-    dismissFullStopError,
     dismissRuntimeScaleError,
     dismissError,
   ]);

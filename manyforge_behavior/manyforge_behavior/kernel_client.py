@@ -22,6 +22,20 @@ class ExecutionTransport(Protocol):
 
     def query_operation(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
+    def register_io_watch(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def read_io_watch(self, registration: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def release_io_watch(self, registration: Mapping[str, Any]) -> None: ...
+
+    def release_io_watch_scope(self, scope_request: Mapping[str, Any]) -> None: ...
+
+    def start_mock_io_node_simulation(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def end_mock_io_node_simulation(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def set_mock_io_run_paused(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
     def full_stop(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def set_operation_runtime_scale(
@@ -82,6 +96,18 @@ class ExecutionTransport(Protocol):
     def stop_fault(self) -> dict[str, Any]: ...
 
     def recover_stop_fault(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+
+# Transport loss and malformed or mismatched replies: they cannot prove what
+# the owner did, so they are never an owner refusal (or a teardown).
+EXECUTION_TRANSPORT_FAILURE_CODES = frozenset(
+    {
+        "execution_owner_unavailable",
+        "execution_command_transport_failure",
+        "execution_command_response_invalid",
+        "execution_command_response_identity_mismatch",
+    }
+)
 
 
 class KernelClientResponseError(RuntimeError):
@@ -224,6 +250,70 @@ class KernelClient:
             self._transport.query_target(body), label="target observation"
         )
 
+    def _io_watch_method(self, name: str):
+        method = getattr(self._transport, name, None)
+        if not callable(method):
+            raise TypeError(f"execution transport has no callable {name}")
+        return method
+
+    def register_io_watch(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Register one zero-claim level watch: ``{registration, result}``."""
+
+        response = self._io_watch_method("register_io_watch")(request)
+        if (
+            not isinstance(response, dict)
+            or not isinstance(response.get("registration"), dict)
+            or not isinstance(response.get("result"), dict)
+        ):
+            raise KernelClientResponseError("I/O watch registration is malformed")
+        return response
+
+    def read_io_watch(self, registration: Mapping[str, Any]) -> dict[str, Any]:
+        """The watch's current ``{state, observation, matched_sample}``."""
+
+        result = self._io_watch_method("read_io_watch")(registration)
+        if not isinstance(result, dict) or result.get("state") not in {
+            "pending", "matched", "released"
+        }:
+            raise KernelClientResponseError("I/O watch read is malformed")
+        return result
+
+    def release_io_watch(self, registration: Mapping[str, Any]) -> None:
+        self._io_watch_method("release_io_watch")(registration)
+
+    def release_io_watch_scope(self, scope_request: Mapping[str, Any]) -> None:
+        """Release one exact node attempt's watch without its token."""
+
+        self._io_watch_method("release_io_watch_scope")(scope_request)
+
+    def start_mock_io_node_simulation(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Decision 133: the host's exact accepted acknowledgement."""
+
+        ack = self._io_watch_method("start_mock_io_node_simulation")(request)
+        if (
+            not isinstance(ack, dict)
+            or ack.get("status") != "accepted"
+            or not isinstance(ack.get("signals"), list)
+        ):
+            raise KernelClientResponseError("Mock simulation acknowledgement is malformed")
+        return ack
+
+    def end_mock_io_node_simulation(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Decision 135: the host's reply to one node attempt's end."""
+
+        reply = self._io_watch_method("end_mock_io_node_simulation")(request)
+        if not isinstance(reply, dict):
+            raise KernelClientResponseError("Mock simulation end reply is malformed")
+        return reply
+
+    def set_mock_io_run_paused(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Decision 135: the host's reply to the Run's Halt state."""
+
+        reply = self._io_watch_method("set_mock_io_run_paused")(request)
+        if not isinstance(reply, dict):
+            raise KernelClientResponseError("Mock Run pause reply is malformed")
+        return reply
+
     def _projection(self, method_name: str) -> dict[str, Any]:
         method = getattr(self._transport, method_name, None)
         if not callable(method):
@@ -238,12 +328,7 @@ class KernelClient:
             # Transport loss and malformed or mismatched replies cannot prove
             # whether the owner accepted the request. All other typed owner
             # errors are explicit pre-acceptance rejections.
-            if isinstance(code, str) and code not in {
-                "execution_owner_unavailable",
-                "execution_command_transport_failure",
-                "execution_command_response_invalid",
-                "execution_command_response_identity_mismatch",
-            }:
+            if isinstance(code, str) and code not in EXECUTION_TRANSPORT_FAILURE_CODES:
                 details = getattr(exc, "details", None)
                 raise KernelOperationAdmissionRejectedError(
                     code,
@@ -550,6 +635,7 @@ class MockKernelClient:
 
 __all__ = [
     "ActionSpan",
+    "EXECUTION_TRANSPORT_FAILURE_CODES",
     "ExecutionState",
     "ExecutionTransport",
     "KernelClient",

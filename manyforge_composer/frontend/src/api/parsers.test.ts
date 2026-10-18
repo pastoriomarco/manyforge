@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import actualHeldRun from '../testFixtures/programRunHeld64.fixture.json';
 import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
 import {
   StructuralContractError,
@@ -643,7 +644,7 @@ function sceneRuntimeFixture(): Record<string, unknown> {
     cell_id: 'cell-a',
     state: {
       active_replay_id: null,
-      api_version: 'manyforge.scene_runtime_state.v1',
+      api_version: 'manyforge.scene_runtime_state.v2',
       counters: {
         buffer_replaced: 0,
         buffered: 0,
@@ -687,7 +688,7 @@ function poseSourceFixture(
     observed_at_ns: 1_000_000_000,
     payload,
     policy_id: 'viewer.measured_robot',
-    quality: 'good',
+    payload_quality: 'good',
     source_epoch: 'observer-epoch-1',
     source_epoch_order: 1,
     source_id: 'isaac-observer',
@@ -815,6 +816,7 @@ describe('Program product projections', () => {
       node_status_revision: 2,
       node_statuses: { root: 'running' },
       active_operation_count: 1,
+      operation_failures: [],
       reason_code: null,
       message: '',
       details: null,
@@ -869,13 +871,11 @@ describe('Program product projections', () => {
       recovery_class: 'node_failure_pause',
       actions: [{
         action_id: 'reset_cycle',
-        label_key: 'recovery.reset_cycle',
         requires_confirmation: true,
         performs_backend_reset: true,
         enabled: true,
         disabled_reason_code: null,
       }],
-      primary_action: null,
       reason_code: 'node_input_unavailable',
       message: "missing input duration_s from blackboard_key 'delay'",
       details: {
@@ -913,6 +913,7 @@ describe('Program product projections', () => {
         audit: [],
       },
       recovery_offer: null,
+      recovery_offers: [],
       execution_selections: {
         selection_revision: 0,
         motion_held: false,
@@ -1044,6 +1045,82 @@ describe('Program product projections', () => {
     })).toThrow(/closed record/);
   });
 
+  // Same eight-field provenance row as the actual Runner/Headless contract.
+  function operationFailureRow() {
+    return { node_instance_id: 'retry_move', node_attempt_id: 'retry_move.attempt.1',
+      operator_facing_run_revision: 3,
+      operation: { source_owner_epoch: 'kernel.1', operation_id: 'operation.1', operation_revision: 2 },
+      resource_ids: ['lite6_robot.arm.coordinate.000000'],
+      failure: { code: 'planning_failed', message: 'original failure' },
+      recovery_class: 'failed_validation', terminal_facts: [{ kind: 'local_failure', effect: 'no_effect' }] };
+  }
+
+  it('accepts the actual held R5a Run with its required empty operation failures', () => {
+    const run = parseProgramRunStatus(actualHeldRun);
+    expect(run.capture.programRunId).toBe('program-cycle.1');
+    expect(run.state).toBe('running');
+    expect(run.nodeStatuses.start_rest).toBe('held');
+    expect(run.operationFailures).toEqual([]);
+    const missing = { ...actualHeldRun } as Record<string, unknown>;
+    delete missing.operation_failures;
+    expect(() => parseProgramRunStatus(missing)).toThrow();
+  });
+
+  it('retains exact nonempty operation failure provenance without inferring new authority', () => {
+    const run = parseProgramRunStatus({ ...actualHeldRun, operation_failures: [operationFailureRow()] });
+    expect(run.operationFailures).toEqual([{ nodeInstanceId: 'retry_move', nodeAttemptId: 'retry_move.attempt.1',
+      operatorFacingRunRevision: 3,
+      operation: { sourceOwnerEpoch: 'kernel.1', operationId: 'operation.1', operationRevision: 2 },
+      resourceIds: ['lite6_robot.arm.coordinate.000000'],
+      failure: { code: 'planning_failed', message: 'original failure' },
+      recoveryClass: 'failed_validation', terminalFacts: [{ kind: 'local_failure', effect: 'no_effect' }] }]);
+  });
+
+  it('accepts producer bounds and Unicode code-point resource ordering', () => {
+    const row = operationFailureRow();
+    row.operator_facing_run_revision = Number.MAX_SAFE_INTEGER;
+    row.operation.operation_revision = Number.MAX_SAFE_INTEGER;
+    row.node_instance_id = 'é'.repeat(64); // Exactly 128 UTF-8 bytes.
+    row.failure.message = '';
+    row.resource_ids = ['\uE000', '\u{10000}']; // Python order differs from UTF-16 sort.
+    row.terminal_facts = []; // No terminal facts are inferred.
+    expect(parseProgramRunStatus({ ...runStatus(), operation_failures: [row] }).operationFailures[0])
+      .toMatchObject({ nodeInstanceId: row.node_instance_id, resourceIds: row.resource_ids,
+        operatorFacingRunRevision: Number.MAX_SAFE_INTEGER, failure: { message: '' }, terminalFacts: [] });
+  });
+
+  it.each([null, {}, Array(4097).fill(operationFailureRow())])(
+    'rejects missing collection shape or over-bound operation failures (%#)', (rows) => {
+      expect(() => parseProgramRunStatus({ ...runStatus(), operation_failures: rows })).toThrow();
+    },
+  );
+  it.each([
+    null,
+    { ...operationFailureRow(), extra: true },
+    { ...operationFailureRow(), node_attempt_id: '' },
+    { ...operationFailureRow(), node_instance_id: 'é'.repeat(65) },
+    { ...operationFailureRow(), node_instance_id: 'e\u0301' },
+    { ...operationFailureRow(), operator_facing_run_revision: 0 },
+    { ...operationFailureRow(), operator_facing_run_revision: true },
+    { ...operationFailureRow(), operation: { ...operationFailureRow().operation, operation_revision: 2 ** 53 } },
+    { ...operationFailureRow(), operation: { ...operationFailureRow().operation, extra: true } },
+    { ...operationFailureRow(), operation: { ...operationFailureRow().operation, source_owner_epoch: 'é'.repeat(1025) } },
+    { ...operationFailureRow(), resource_ids: [] },
+    { ...operationFailureRow(), resource_ids: ['b', 'a'] },
+    { ...operationFailureRow(), resource_ids: ['a', 'a'] },
+    { ...operationFailureRow(), resource_ids: ['a'.repeat(1025)] },
+    { ...operationFailureRow(), resource_ids: Array.from({ length: 4097 }, (_, index) => String(index).padStart(4, '0')) },
+    { ...operationFailureRow(), failure: { code: '', message: '' } },
+    { ...operationFailureRow(), failure: { code: 'failed', message: 'é'.repeat(2049) } },
+    { ...operationFailureRow(), failure: { code: 'failed', message: '', extra: true } },
+    { ...operationFailureRow(), recovery_class: '' },
+    { ...operationFailureRow(), terminal_facts: [{ kind: 'failed', effect: '', extra: true }] },
+    { ...operationFailureRow(), terminal_facts: [{ kind: 'failed', effect: 1 }] },
+    { ...operationFailureRow(), terminal_facts: Array(4097).fill({ kind: 'failed', effect: 'no_effect' }) },
+  ])('rejects malformed or unbounded failure provenance row (%#)', (row) => {
+    expect(() => parseProgramRunStatus({ ...runStatus(), operation_failures: [row] })).toThrow();
+  });
+
   it('keeps run status tied to one exact runner owner', () => {
     const status = parseProgramRunStatus(runStatus());
 
@@ -1141,6 +1218,78 @@ describe('Program product projections', () => {
       .toThrow(/nonempty identity/);
     expect(() => origin({ kind: 'owner', node_instance_id: 'm'.repeat(257), owner_api: null }))
       .toThrow(/at most 256 bytes/);
+  });
+
+  it('parses one recovery offer per active failure hold, with Continue', () => {
+    const offer = (node: string, offerId: string) => ({
+      ...recoveryOffer(),
+      offer_id: offerId,
+      node_instance_id: node,
+      node_attempt_id: `${node}.attempt.1`,
+      actions: [{
+        action_id: 'retry_motion_from_current_state',
+        requires_confirmation: false,
+        performs_backend_reset: false,
+        enabled: true,
+        disabled_reason_code: null,
+      }, {
+        action_id: 'continue_with_failure',
+        requires_confirmation: true,
+        performs_backend_reset: false,
+        enabled: true,
+        disabled_reason_code: null,
+      }],
+    });
+    const hold = (node: string, offerId: string, groups: string[], scope = 'all') => ({
+      motion_group_ids: groups,
+      intervention_stop_scope: scope,
+      offer: offer(node, offerId),
+    });
+    const parsed = parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offers: [
+        hold('left.move', digestA, ['left']),
+        hold('right.move', digestB, ['right'], 'own_groups'),
+      ],
+    });
+    expect(parsed.recoveryHolds.map((row) => [
+      row.motionGroupIds, row.interventionStopScope, row.offer.nodeInstanceId, row.offer.offerId,
+    ])).toEqual([
+      [['left'], 'all', 'left.move', digestA],
+      [['right'], 'own_groups', 'right.move', digestB],
+    ]);
+    expect(parsed.recoveryHolds[0].offer.actions[1]).toEqual({
+      actionId: 'continue_with_failure',
+      requiresConfirmation: true,
+      performsBackendReset: false,
+      enabled: true,
+      disabledReasonCode: null,
+    });
+    expect(parseProgramRuntimeControlProjection(runtimeControlsProjection()).recoveryHolds)
+      .toEqual([]);
+
+    const refuses = (holds: unknown) => () => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(), recovery_offers: holds,
+    });
+    const projection = runtimeControlsProjection();
+    delete projection.recovery_offers;
+    expect(() => parseProgramRuntimeControlProjection(projection)).toThrow(/exactly/);
+    expect(refuses(null)).toThrow(/recovery_offers/);
+    expect(refuses([{ ...hold('a', digestA, ['left']), extra: 1 }])).toThrow(/exactly/);
+    expect(refuses([hold('a', digestA, [])])).toThrow(/motion_group_ids/);
+    expect(refuses([hold('a', digestA, ['left', 'left'])])).toThrow(/motion_group_ids/);
+    expect(refuses([hold('a', digestA, [''])])).toThrow(/motion_group_ids/);
+    expect(refuses([hold('a', digestA, ['left'], 'some')])).toThrow(/intervention_stop_scope/);
+    expect(refuses([hold('a', digestA, ['left']), hold('b', digestA, ['right'])]))
+      .toThrow(/one offer per held node/);
+    expect(refuses([hold('a', digestA, ['left']), hold('a', digestB, ['right'])]))
+      .toThrow(/one offer per held node/);
+    expect(refuses([{ ...hold('a', digestA, ['left']),
+      offer: { ...offer('a', digestA), program_run_id: 'program-run.2' } }]))
+      .toThrow(/one exact Program-run identity/);
+    expect(refuses([{ ...hold('a', digestA, ['left']),
+      offer: { ...offer('a', digestA), actions: [{ ...offer('a', digestA).actions[1], action_id: 'continue' }] } }]))
+      .toThrow(/supported recovery action/);
   });
 
   it('carries the held failure details and origin on the recovery offer', () => {
@@ -1338,14 +1487,100 @@ describe('Program product projections', () => {
     expect(() => parseProgramRuntimeControlProjection(input)).toThrow();
   });
 
-  it('accepts retry counts beyond 255 and refuses removed override state', () => {
+  it('parses an automatic retry audit event into typed facts, with or without its Kernel failure', () => {
+    const input = runtimeControlsProjection();
+    const controls = input.runtime_controls as Record<string, unknown>;
+    controls.runtime_control_revision = 4;
+    const retry = {
+      event_revision: 1, kind: 'program_node_automatic_retry', node_instance_id: 'move',
+      attempt: 2, max_attempts: 4, cause: 'collision_stop_nominal', delay_s: 1,
+    };
+    controls.audit = [
+      { ...retry, code: 'kernel_timeout', message: 'planner timed out' },
+      { ...retry, event_revision: 2, code: null, message: null },
+      { ...retry, event_revision: 3 },
+    ];
+    const audit = parseProgramRuntimeControlProjection(input).runtimeControls.audit;
+    expect(audit).toEqual([
+      {
+        eventRevision: 1,
+        kind: 'program_node_automatic_retry',
+        facts: {
+          nodeInstanceId: 'move', attempt: 2, maxAttempts: 4, cause: 'collision_stop_nominal', delayS: 1,
+          failure: { code: 'kernel_timeout', message: 'planner timed out', details: null, origin: null },
+        },
+      },
+      {
+        eventRevision: 2,
+        kind: 'program_node_automatic_retry',
+        facts: {
+          nodeInstanceId: 'move', attempt: 2, maxAttempts: 4, cause: 'collision_stop_nominal', delayS: 1,
+          failure: null,
+        },
+      },
+      {
+        eventRevision: 3,
+        kind: 'program_node_automatic_retry',
+        facts: {
+          nodeInstanceId: 'move', attempt: 2, maxAttempts: 4, cause: 'collision_stop_nominal', delayS: 1,
+          failure: null,
+        },
+      },
+    ]);
+  });
+
+  it('accepts the io wait source transitions the Runner records as audit events', () => {
+    const input = runtimeControlsProjection();
+    const controls = input.runtime_controls as Record<string, unknown>;
+    controls.runtime_control_revision = 3;
+    controls.audit = [
+      { event_revision: 1, kind: 'program_node_io_source_unavailable',
+        node_instance_id: 'wait_part', node_attempt_id: 'attempt.1', quality: 'stale' },
+      { event_revision: 2, kind: 'program_node_io_source_available',
+        node_instance_id: 'wait_part', node_attempt_id: 'attempt.1', quality: 'fresh' },
+    ];
+    expect(parseProgramRuntimeControlProjection(input).runtimeControls.audit).toEqual([
+      { eventRevision: 1, kind: 'program_node_io_source_unavailable',
+        facts: { node_instance_id: 'wait_part', node_attempt_id: 'attempt.1', quality: 'stale' } },
+      { eventRevision: 2, kind: 'program_node_io_source_available',
+        facts: { node_instance_id: 'wait_part', node_attempt_id: 'attempt.1', quality: 'fresh' } },
+    ]);
+  });
+
+  it('refuses a malformed automatic retry audit event', () => {
+    const valid = {
+      event_revision: 1, kind: 'program_node_automatic_retry', node_instance_id: 'move',
+      attempt: 2, max_attempts: 4, cause: 'collision_stop_nominal', delay_s: 1,
+    };
+    const refuses = (patch: Record<string, unknown>) => {
+      const input = runtimeControlsProjection();
+      const controls = input.runtime_controls as Record<string, unknown>;
+      controls.runtime_control_revision = 2;
+      controls.audit = [{ ...valid, ...patch }];
+      return () => parseProgramRuntimeControlProjection(input);
+    };
+    expect(refuses({ node_instance_id: '' })).toThrow(/node_instance_id/);
+    expect(refuses({ node_instance_id: undefined })).toThrow(/node_instance_id/);
+    expect(refuses({ attempt: 1 })).toThrow(/attempt from 2/);
+    expect(refuses({ attempt: 5 })).toThrow(/attempt from 2/);
+    expect(refuses({ max_attempts: 'four' })).toThrow(/max_attempts/);
+    expect(refuses({ cause: '' })).toThrow(/cause/);
+    expect(refuses({ delay_s: '1' })).toThrow(/delay_s/);
+    expect(refuses({ delay_s: -1 })).toThrow(/delay_s/);
+    expect(refuses({ code: 'kernel_timeout' })).toThrow(/both code and message, or neither/);
+    expect(refuses({ message: 'planner timed out' })).toThrow(/both code and message, or neither/);
+    expect(refuses({ code: 5, message: 'planner timed out' })).toThrow(/code/);
+    expect(refuses({ code: '', message: '' })).toThrow(/code/);
+  });
+
+  it('keeps retry counts an exact wire key and refuses removed override state', () => {
     const input = runtimeControlsProjection();
     const controls = input.runtime_controls as Record<string, unknown>;
     controls.retry_counts = { move: 300 };
-    expect(parseProgramRuntimeControlProjection(input).runtimeControls.retryCounts)
-      .toEqual({ move: 300 });
-    controls.retry_counts = { move: 0 };
-    expect(() => parseProgramRuntimeControlProjection(input)).toThrow();
+    expect(parseProgramRuntimeControlProjection(input).runtimeControls)
+      .not.toHaveProperty('retryCounts');
+    delete controls.retry_counts;
+    expect(() => parseProgramRuntimeControlProjection(input)).toThrow(/exactly/);
     controls.retry_counts = {};
     controls.overrides = [];
     expect(() => parseProgramRuntimeControlProjection(input)).toThrow(/exactly/);
@@ -2262,7 +2497,19 @@ describe('Program workspace parsers', () => {
     });
     expect(parsed.draft.program?.tree.operator_stop_policy).toBe('hold');
 
+    // The optional stop scope is kept only in its non-default form.
+    tree.recovery_policy = { allow_intervention: true, max_retries: 2, intervention_stop_scope: 'own_groups' };
+    expect(parseProgramWorkspaceResponse(fixture).draft.program?.tree.recovery_policy).toEqual({
+      allow_intervention: true,
+      max_retries: 2,
+      intervention_stop_scope: 'own_groups',
+    });
+
     const cases = [
+      { recovery_policy: { allow_intervention: true, max_retries: 2, intervention_stop_scope: 'all' } },
+      { recovery_policy: { allow_intervention: true, max_retries: 2, intervention_stop_scope: 'groups' } },
+      { recovery_policy: { allow_intervention: true, max_retries: 2, intervention_stop_scope: null } },
+      { recovery_policy: { allow_intervention: true, max_retries: 2, intervention_stop_scope: 'own_groups', extra: true } },
       // Removed policy surfaces are refused, not ignored.
       {
         modification_policy: {
@@ -2488,7 +2735,7 @@ describe('headless projection parsers', () => {
         fresh: false,
         object_id: 'graspable',
         policy_id: 'before_planning',
-        quality: 'unknown',
+        payload_quality: 'unknown',
         source_sequence: 9,
       }),
     ];
@@ -2496,7 +2743,7 @@ describe('headless projection parsers', () => {
     const parsed = parseSceneRuntimeProjection(fixture).state.pose_sources;
     expect(parsed[0]?.payload.kind).toBe('joint_state');
     expect(parsed[1]?.payload.kind).toBe('simulation_entity_pose');
-    expect(parsed[2]?.quality).toBe('unknown');
+    expect(parsed[2]?.payload_quality).toBe('unknown');
   });
 
   it('rejects ambiguous or dishonest ROS observation shapes', () => {
@@ -2544,11 +2791,25 @@ describe('headless projection parsers', () => {
           detail: 'offline',
           source_key: '/isaac_joint_states',
         },
-      }, { quality: 'unknown' }),
+      }, { payload_quality: 'unknown' }),
     ];
     expect(() => parseSceneRuntimeProjection(dishonestUnknown)).toThrow(
       'unknown quality to be unbuffered, ineligible, and stale',
     );
+
+    // Hard switch: the superseded pose-source `quality` key is refused.
+    const superseded = sceneRuntimeFixture();
+    const joint = {
+      api_version: 'manyforge.ros_pose_observation.v2', joint_names: ['joint_1'],
+      kind: 'joint_state', positions: [0.1], source_stamp_ns: null, topic: '/isaac_joint_states',
+    };
+    const { payload_quality: quality, ...rest } = poseSourceFixture(joint);
+    (superseded.state as Record<string, unknown>).pose_sources = [{ ...rest, quality }];
+    expect(() => parseSceneRuntimeProjection(superseded)).toThrow();
+    (superseded.state as Record<string, unknown>).pose_sources = [poseSourceFixture(joint)];
+    expect(parseSceneRuntimeProjection(superseded).state.pose_sources).toHaveLength(1);
+    (superseded.state as Record<string, unknown>).api_version = 'manyforge.scene_runtime_state.v1';
+    expect(() => parseSceneRuntimeProjection(superseded)).toThrow('manyforge.scene_runtime_state.v2');
   });
 
   it('rejects stale shapes and cross-owner scene revisions', () => {
@@ -3675,6 +3936,54 @@ describe('addressed Robot Control parsers', () => {
     }]);
     // The direct-control binding is per target, never a runtime identity.
     expect(scoped.directControl!.programBindingId).toBe(motionTarget.program_binding_id);
+    expect(scoped.directControlTargets[0].stopResponse).toBeUndefined();
+
+    // SX-2167: the optional qualified Stop chain of a motion target.
+    const stopResponse = {
+      control_binding_id: 'arm.control',
+      control_binding_revision: 'r1',
+      control_route_id: 'arm.route',
+      nominal_stop_mode: null,
+      stages: [
+        { stage_id: 'stage.nominal', stage_kind: 'nominal', command_kind: 'controlled_stop' },
+        { stage_id: 'stage.cancel', stage_kind: 'controlled_fallback', command_kind: 'controller_goal_cancel' },
+        { stage_id: 'stage.hard', stage_kind: 'software_hard', command_kind: 'software_hard_stop' },
+      ],
+    };
+    const withStop = (patch: unknown) => {
+      const wire = structuredClone(targetsResponse) as {
+        targets: { components: Array<{ targets: Array<{ presentation: string; command: Record<string, unknown> }> }> };
+      };
+      wire.targets.components[0].targets
+        .find((row) => row.presentation === 'motion')!.command.stop_response = patch;
+      return parseExecutionControlStatus(wire, controlResponse);
+    };
+    const chained = withStop(stopResponse);
+    expect(chained.directControlTargets[0].stopResponse).toEqual({
+      controlBindingId: 'arm.control',
+      controlBindingRevision: 'r1',
+      controlRouteId: 'arm.route',
+      nominalStopMode: null,
+      stages: [
+        { stageId: 'stage.nominal', stageKind: 'nominal', commandKind: 'controlled_stop' },
+        { stageId: 'stage.cancel', stageKind: 'controlled_fallback', commandKind: 'controller_goal_cancel' },
+        { stageId: 'stage.hard', stageKind: 'software_hard', commandKind: 'software_hard_stop' },
+      ],
+    });
+    expect(chained.directControl!.stopResponse?.controlRouteId).toBe('arm.route');
+    expect(withStop({ ...stopResponse, nominal_stop_mode: 'soft_on_path' }).directControlTargets[0]
+      .stopResponse?.nominalStopMode).toBe('soft_on_path');
+    for (const malformed of [
+      null,
+      { ...stopResponse, extra: 1 },
+      { ...stopResponse, control_route_id: '' },
+      { ...stopResponse, stages: [] },
+      { ...stopResponse, stages: [stopResponse.stages[0], stopResponse.stages[0]] },
+      { ...stopResponse, stages: [{ ...stopResponse.stages[0], stage_index: 0 }] },
+      { ...stopResponse, nominal_stop_mode: 3 },
+    ]) {
+      expect(() => withStop(malformed)).toThrow();
+    }
 
     // Pneumatic dwell may be zero; position duration stays strictly positive.
     // The snapshot and paired targets/control delta use the same descriptor rule.
@@ -4132,7 +4441,8 @@ describe('addressed Robot Control parsers', () => {
     Object.assign(leaked.status.direct_control, {
       compiled_joint_names: ['robot-a__joint1'],
     });
-    expect(() => parseExecutionOwnerStatus(composed(leaked))).toThrow(/exactly/);
+    // The motion command allows only its fields (and the optional stop_response).
+    expect(() => parseExecutionOwnerStatus(composed(leaked))).toThrow(/optional \[stop_response\]/);
 
     const crossedDescriptor = structuredClone(response);
     crossedDescriptor.status.direct_control.target_descriptor.frames.reverse();

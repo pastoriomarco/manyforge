@@ -1,3 +1,4 @@
+#include <manyforge_deployment/io_signal_catalog.hpp>
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 #include "native_execution_runtime_unit_internal.hpp"
@@ -762,6 +763,47 @@ bool require_ros2_control_execution_runtime_required_rows(
       (void)require_ros_gripper_delivery_result_timeout(*fields, *kind);
     }
   }
+  const auto io_catalog =
+      ResolveRetainedIoSignalCatalog(graph, unit.runtime_unit_id);
+  if (!io_catalog.ok()) {
+    fail_retained_bundle(
+        "ros2_control runtime has invalid retained I/O signals: " +
+        io_catalog.error().details.at("reason"));
+  }
+  const auto io_devices =
+      ResolveRetainedIoProviderDevices(graph, unit.runtime_unit_id);
+  if (!io_devices.ok()) {
+    fail_retained_bundle(
+        "ros2_control runtime has invalid retained I/O devices: " +
+        io_devices.error().details.at("reason"));
+  }
+  const bool has_actuator = std::any_of(
+      graph.control_bindings.begin(), graph.control_bindings.end(),
+      [&](const auto &binding) {
+        return binding.provider_runtime_unit_id == unit.runtime_unit_id &&
+               (binding.capability_id.value() ==
+                    "execution.trajectory.execute" ||
+                binding.capability_id.value() == "tool.gripper.command");
+      });
+  const bool io_only_host =
+      !has_actuator &&
+      std::all_of(
+          graph.controllable_components.begin(),
+          graph.controllable_components.end(), [&](const auto &component) {
+            const bool hosted = std::find(component.runtime_unit_ids.begin(),
+                                          component.runtime_unit_ids.end(),
+                                          unit.runtime_unit_id) !=
+                                component.runtime_unit_ids.end();
+            return !hosted ||
+                   std::any_of(
+                       io_catalog.value().begin(), io_catalog.value().end(),
+                       [&](const auto &signal) {
+                         return signal.runtime_unit_id ==
+                                    unit.runtime_unit_id &&
+                                signal.descriptor.signal_id.controllable_component_id ==
+                                    component.controllable_component_id;
+                       });
+          });
   const bool empty_host = std::none_of(
       graph.controllable_components.begin(), graph.controllable_components.end(),
       [&](const auto &component) {
@@ -783,7 +825,7 @@ bool require_ros2_control_execution_runtime_required_rows(
       const auto *rows = member == unit.configuration.end()
                              ? nullptr
                              : std::get_if<core::JsonValueDTO::Array>(&member->second.value);
-      if (!has_motion && field != "controller_profiles") {
+      if (!has_motion && (field != "controller_profiles" || io_only_host)) {
         if (rows == nullptr || !rows->empty()) {
           fail_retained_bundle("ros2_control runtime requires empty " +
                                std::string(field) +
@@ -1608,8 +1650,11 @@ CanonicalValue component_configuration_projection(
         CanonicalValue::Array positions;
         for (const auto position : selected.initial_joint_positions_rad) positions.emplace_back(position);
         value = CanonicalValue(std::move(positions));
-      } else if (name == "controller_profiles" || name == "motion_target_limits" ||
-                 name == "default_fault_stop_profiles" || name == "gripper_target_configurations") {
+      } else if (name == "controller_profiles" ||
+                 name == "motion_target_limits" ||
+                 name == "default_fault_stop_profiles" ||
+                 name == "gripper_target_configurations" ||
+                 name == "io_signals" || name == "io_provider_devices") {
         CanonicalValue::Array rows;
         for (const auto &row : value.as_array()) {
           const auto *owner = row.find_object_member("controllable_component_id");

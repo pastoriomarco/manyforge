@@ -1326,7 +1326,6 @@ def main() -> None:
     workbench.MANAGER_BINARY = workbench.HEADLESS_BUILD / "manyforge_manager_daemon"
     # These only locate already qualified build/package inputs. Normal owner
     # construction, exact tuple checks, lifecycle convergence and teardown run.
-    workbench._import_package = lambda: None
     workbench._ensure_activation_preparer = lambda: activation_preparer
     if args.ordinary_jerk or stop_profile_edit:
         # Verify the private, compiler-produced Deployment with the same

@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { JsonValue, ProgramAuthoringDocument } from '../types/api';
+import { groupByNamespace } from '../utils/blackboardNamespaces';
+import { NamespaceGroupOptions, useNamespaceGroups } from './common/NamespaceGroupOptions';
 import { ProgramSupportContactEditor } from './ProgramSupportContactEditor';
 
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
@@ -171,6 +173,7 @@ export function ProgramContactPolicyEditor({
   const blockedTitle = busy ? busyReason ?? undefined : undefined;
   const options = useMemo(() => targetOptions(program), [program]);
   const keys = useMemo(() => runtimeObjectKeys(program), [program]);
+  const keyNamespaces = useNamespaceGroups();
   const policies = program.contact_policies ?? EMPTY_POLICIES;
   const [selectedId, setSelectedId] = useState(() => policyId(policies[0] ?? null) ?? '');
   const selected = policies.find((row) => policyId(row) === selectedId) ?? null;
@@ -330,11 +333,18 @@ export function ProgramContactPolicyEditor({
               value={draft.runtimeObjectKey}
               disabled={busy}
               title={blockedTitle}
-              onChange={(event) => update(
-                { ...draft, runtimeObjectKey: event.target.value }, existing,
-              )}
+              onChange={(event) => {
+                if (keyNamespaces.handleToggle(event.target.value)) return;
+                update({ ...draft, runtimeObjectKey: event.target.value }, existing);
+              }}
             >
-              {keys.map((key) => <option key={key} value={key}>{key}</option>)}
+              <NamespaceGroupOptions
+                groups={groupByNamespace(keys, (key) => key)}
+                expanded={keyNamespaces.expanded}
+                current={draft.runtimeObjectKey}
+                valueOf={(key) => key}
+                option={(key) => <option key={key} value={key}>{key}</option>}
+              />
             </select>
           </label>
           <label>

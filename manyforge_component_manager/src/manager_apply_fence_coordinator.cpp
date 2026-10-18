@@ -139,6 +139,7 @@ PrepareFence(const SqliteManagerApplyJournal &apply_journal,
       expectation.expected_fence_generation,
       expectation.expected_active_control_configurations,
       "component-manager named Apply affected-scope admission",
+      expectation.expected_provider_lineages,
   };
   if (!affected_scope.valid() || !fence_intent.valid()) {
     Fail("Manager-owned Apply-fence expectation is incoherent with the "

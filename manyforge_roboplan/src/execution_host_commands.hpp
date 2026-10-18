@@ -1,12 +1,16 @@
 #pragma once
 
 #include "execution_host_config.hpp"
-#include <manyforge_roboplan/program_reset_position.hpp>
 #include <array>
-#include <manyforge_core/resource_addressed_execution_kernel.hpp>
-#include <manyforge_core/pick_place_planning_owner.hpp>
-#include <manyforge_core/types/program_execution_control.hpp>
 #include <manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp>
+#include <manyforge_core/pick_place_planning_owner.hpp>
+#include <manyforge_core/resource_addressed_execution_kernel.hpp>
+#include <manyforge_core/types/io_blackboard.hpp>
+#include <manyforge_core/types/io_rule_recovery.hpp>
+#include <manyforge_core/types/program_execution_control.hpp>
+#include <manyforge_core/types/program_io.hpp>
+#include <manyforge_core/types/program_mock_simulation.hpp>
+#include <manyforge_roboplan/program_reset_position.hpp>
 
 namespace manyforge::roboplan_backend::host_detail {
 
@@ -160,6 +164,14 @@ enum class CommandKind {
   kResetRobotPosition,
   kTargets,
   kQueryTarget,
+  kStartMockIoNodeSimulation,
+  kEndMockIoNodeSimulation,
+  kSetMockIoRunPaused,
+  kRegisterIoWatch,
+  kReadIoWatch,
+  kReleaseIoWatch,
+  kSetMockIoInput,
+  kPublishProgramBlackboard,
   kQueryOperation,
   kControlState,
   kObservation,
@@ -206,6 +218,11 @@ enum class CommandLane {
 /// submission-ordered lane, FIFO in accept order, and never occupy the
 /// ordinary lane that serves Stop status, Reset, events, cell admission and
 /// operator-alarm attention.
+/// Shared closed row decoder, also used after normalizing actual sealed
+/// Program authoring omission/order. This never resolves/authorizes inputs.
+[[nodiscard]] std::vector<core::ProgramMockSimulationSignalDTO>
+DecodeProgramMockSimulationSignals(const CanonicalValue& rows);
+
 [[nodiscard]] bool IsSubmissionOrdered(const CommandKind kind) noexcept;
 
 /// Ordinary projections that first read the live Scene revision from Manager.
@@ -258,6 +275,13 @@ struct TargetObservationQuery final {
   std::optional<core::FrameRoleId> frame_role_id;
   std::optional<core::FrameRoleId> relative_to_frame_role_id;
   std::optional<FrameTransformQuery> frame_transform{};
+  std::optional<core::ResourceRoleId> io_signal_role{};
+};
+
+struct MockIoInputSetRequest final {
+  TargetObservationQuery query;
+  core::IoSourceIncarnation expected_source_epoch;
+  bool value;
 };
 
 struct ProgramOperationQuery final {
@@ -272,6 +296,17 @@ struct Command final {
 
   CommandKind kind;
   std::optional<TargetObservationQuery> target_query;
+  std::optional<MockIoInputSetRequest> mock_io_input_set{};
+  std::optional<core::ProgramNodeMockSimulationRequestDTO> mock_node_simulation{};
+  std::optional<core::ProgramNodeMockSimulationScopeDTO> mock_node_simulation_end{};
+  std::optional<core::ProgramRunMockSimulationPauseRequestDTO> mock_run_simulation_pause{};
+  std::optional<core::ProgramIoWatchRequestDTO> io_watch_request{};
+  std::optional<core::IoWatchRegistrationDTO> io_watch_registration{};
+  std::optional<core::ProgramIoWatchScopeReleaseRequestDTO>
+      io_watch_scope_release{};
+  bool io_watch_condition_unsupported{};
+  std::optional<core::IoProgramBlackboardPublicationDTO>
+      blackboard_publication{};
   std::optional<ProgramOperationQuery> operation_query;
   std::optional<core::OperationIntentDTO> operation;
   std::optional<core::ProgramRunExecutionCaptureDTO> program_capture;
@@ -291,6 +326,7 @@ struct Command final {
   std::optional<core::FullStopIntentDTO> full_stop;
   std::optional<MalformedStopCommand> malformed_stop;
   std::optional<core::StopFaultRecoveryIntentDTO> stop_fault_recovery;
+  std::optional<core::IoGlobalRuleRecoveryIntentDTO> global_io_rule_recovery{};
   std::optional<core::RuntimeScaleControlRequestDTO> runtime_scale_control;
   std::optional<core::RuntimeScaleRequestDTO> operation_runtime_scale;
   std::optional<core::RuntimeScaleControlSelectorDTO>

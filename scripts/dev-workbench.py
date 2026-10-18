@@ -207,6 +207,30 @@ def _ensure_current_backend() -> Path:
     return extensions[0]
 
 
+def _ros_setup_environment(
+    setups: Sequence[Path], environment: dict[str, str]
+) -> dict[str, str]:
+    """Import explicitly selected ROS setups in order, using literal paths."""
+
+    completed = subprocess.run(
+        ("bash", "-c", 'for setup in "$@"; do source "$setup" >/dev/null || exit; done; env -0',
+         "bash", *(str(setup) for setup in setups)),
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        raise WorkbenchError(
+            "cannot source ROS setup scripts: " + ", ".join(str(setup) for setup in setups)
+        )
+    imported = {}
+    for entry in completed.stdout.split(b"\0"):
+        if entry:
+            key, value = os.fsdecode(entry).split("=", 1)
+            imported[key] = value
+    return imported
+
+
 def _ensure_current_ros_backend() -> tuple[Path, Path]:
     """Prepare the separately installed ROS product; never launch a provider."""
 
@@ -214,6 +238,17 @@ def _ensure_current_ros_backend() -> tuple[Path, Path]:
     ros_build = BUILD_ROOT / "ros-integration"
     overlay = build_root / "ros-overlay/install/setup.bash"
     environment = os.environ.copy()
+    configured_setups = environment.get("MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS", "")
+    if configured_setups:
+        setups = []
+        for configured in configured_setups.split(os.pathsep):
+            setup = Path(configured)
+            if not configured or not setup.is_absolute() or not setup.is_file():
+                raise WorkbenchError(
+                    f"configured ROS dependency setup is unavailable: {configured!r}"
+                )
+            setups.append(setup)
+        environment = _ros_setup_environment(setups, environment)
     environment.update(
         WORKSPACE=str(WORKSPACE),
         MANYFORGE_ROS2_CONTROL_BUILD_ROOT=str(build_root),
@@ -244,18 +279,7 @@ def _ensure_current_ros_backend() -> tuple[Path, Path]:
     # The build helper's exports belong to its subprocess. Import the generated
     # overlay before spawning the Runner or Manager; Manager's installed-target
     # children inherit this same environment through their existing protocol.
-    completed = subprocess.run(
-        ("bash", "-c", 'source "$1" >/dev/null && env -0', "bash", str(overlay)),
-        check=False,
-        capture_output=True,
-        env=environment,
-    )
-    if completed.returncode != 0:
-        raise WorkbenchError("cannot source the current ROS overlay")
-    for entry in completed.stdout.split(b"\0"):
-        if entry:
-            key, value = os.fsdecode(entry).split("=", 1)
-            os.environ[key] = value
+    os.environ.update(_ros_setup_environment((overlay,), environment))
     return targets
 
 

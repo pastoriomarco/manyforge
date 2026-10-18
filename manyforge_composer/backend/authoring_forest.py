@@ -70,7 +70,7 @@ def empty_authoring(catalog: NodeCatalog) -> dict[str, Any]:
             "api_version": catalog.api_version,
             "content_version": catalog.content_version,
         },
-        "component_roles": {"component": {}},
+        "component_roles": {},
         "target_roles": {},
         "parameters": [
             {

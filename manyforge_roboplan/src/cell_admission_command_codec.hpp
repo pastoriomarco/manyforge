@@ -25,6 +25,10 @@ DecodeCellAdmissionClaimIntent(std::string_view bytes);
 [[nodiscard]] manyforge::core::CellAdmissionClaimReleaseDTO
 DecodeCellAdmissionClaimRelease(std::string_view bytes);
 
+[[nodiscard]] manyforge::content_identity::CanonicalValue ProgramRunnerLossValue(
+    const manyforge::core::ProgramRunnerContactLossDTO &loss,
+    const manyforge::core::RequestOwnerEpoch &kernel_owner_epoch);
+
 /// Returns nullopt only when a well-formed command names another command.
 /// Recognized cell-admission commands are decoded as closed, canonical DTOs.
 [[nodiscard]] std::optional<

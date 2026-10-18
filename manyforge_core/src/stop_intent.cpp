@@ -183,6 +183,18 @@ std::optional<std::string_view> operation_control_request_field_error(
       !valid_program_node_execution_scope(*request.execution_scope)) {
     return "operation_control_scope_invalid";
   }
+  if (request.acknowledged_uncertain_outputs) {
+    const auto& rows = *request.acknowledged_uncertain_outputs;
+    if (rows.size() > kMaximumStopSelectorTargets)
+      return "operation_control_uncertain_outputs_invalid";
+    for (std::size_t i = 0U; i < rows.size(); ++i) {
+      if (!bounded_identity(rows[i].operation_id) || !rows[i].operation_revision.nonzero() ||
+          rows[i].operation_revision.value() >
+              static_cast<std::uint64_t>(kMaximumStopDurationNs) ||
+          (i != 0U && rows[i - 1U].operation_id >= rows[i].operation_id))
+        return "operation_control_uncertain_outputs_invalid";
+    }
+  }
   return std::nullopt;
 }
 

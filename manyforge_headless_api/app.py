@@ -65,7 +65,9 @@ from .models import (
     CanonicalEmptyActivationPreparationRequest,
     FullStopIntentRequest,
     HistorianReconcileRequest,
+    IoSignalReadRequest,
     ManagerApplyRequest,
+    MockIoInputRequest,
     ManagerDeploymentCandidatePreviewRequest,
     AuthoringMutationContext,
     AuthoringMutationRecoveryRequest,
@@ -92,6 +94,7 @@ from .models import (
     PersistentKeyValuesClearRequest,
     RuntimeBlackboardWriteRequest,
     OperationControlRequest,
+    OperationResetRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
@@ -103,7 +106,7 @@ from .models import (
     RouteSelectionRequestResultQuery,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
-    StopFaultRecoveryIntentRequest,
+    StopFaultRecoveryRequest,
     StopIntentRequest,
 )
 from .native import (
@@ -553,6 +556,11 @@ def create_app(
             None if config is None else config.freshness_milliseconds * 1_000_000
         ),
         incident_recorder=getattr(service, "record_client_incident", None),
+        # The owned native core raises the ordinary Program-failure alarm from
+        # the accepted Run; an injected service keeps the demand-only reader.
+        program_failure_observer=(
+            service.core.observe_program_failure_condition if owns_core else None
+        ),
     )
     if alarm_attention is not None:
         # Alarm projections carry the Kernel-held attention copy; a change of
@@ -564,6 +572,7 @@ def create_app(
         event_pump.set_change_observer(control_state_source.notify_cold)
         event_pump.set_settled_observer(control_state_source.notify_motion_settled)
         event_pump.set_progress_observer(control_state_source.notify_operation_progress)
+        event_pump.set_global_rules_observer(control_state_source.notify_global_rules)
     service_cclc = getattr(service, "cclc", None)
     if cclc is None:
         cclc = service_cclc
@@ -666,6 +675,10 @@ def create_app(
         if alarm_attention is not None:
             alarm_attention.start()
         try:
+            if owns_core:
+                # Application-lifetime demand on the one Program reader, so the
+                # Program-failure condition is followed with no browser connected.
+                await control_state_source.start_program_demand()
             yield
         finally:
             try:
@@ -1520,6 +1533,16 @@ def create_app(
     def execution_targets() -> JSONResponse:
         return execution_response(service.execution_targets())
 
+    @app.post("/api/execution/io-signals/read")
+    def execution_read_io_signal(body: IoSignalReadRequest) -> JSONResponse:
+        """Read one bound boolean signal; no claim, no effect."""
+        return execution_response(service.execution_read_io_signal(body))
+
+    @app.post("/api/execution/io-signals/mock-input")
+    def execution_set_mock_io_input(body: MockIoInputRequest) -> JSONResponse:
+        """Set one Mock input (simulation; never a hardware command)."""
+        return execution_response(service.execution_set_mock_io_input(body))
+
     @app.get("/api/execution/control-state")
     def execution_control_state() -> JSONResponse:
         return execution_response(service.execution_control_state())
@@ -1700,7 +1723,7 @@ def create_app(
     @app.post("/api/execution/operations/{operation_id}/reset")
     async def execution_reset(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: OperationControlRequest,
+        body: OperationResetRequest,
         request: Request,
     ) -> JSONResponse:
         require_matching_operation(operation_id, body.operation_id)
@@ -1763,7 +1786,7 @@ def create_app(
 
     @app.post("/api/execution/stop-fault/recover")
     async def execution_recover_stop_fault(
-        body: StopFaultRecoveryIntentRequest,
+        body: StopFaultRecoveryRequest,
         request: Request,
     ) -> JSONResponse:
         return execution_response(

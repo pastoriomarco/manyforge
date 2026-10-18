@@ -205,6 +205,30 @@ class RuntimeCollisionLookaheadSession final {
   RuntimeCollisionLookaheadSession(const RuntimeCollisionLookaheadSession&) = delete;
   RuntimeCollisionLookaheadSession& operator=(const RuntimeCollisionLookaheadSession&) = delete;
 
+  /// Allocation/copy stage for adoption by the existing owner. This contains
+  /// no running task or second monitoring authority. Generation may remain
+  /// zero until the actual dispatch receipt is verified, then assigned before
+  /// publication; ordinary arm() still refuses generation zero.
+  struct PreparedArm final {
+    std::uint64_t execution_id{};
+    std::uint64_t execution_generation{};
+    std::shared_ptr<const TrajectoryDTO> trajectory;
+    std::string contact_policy_id;
+    std::optional<ProjectionRevisionDTO> admission_projection_revision;
+    std::optional<ProjectionRevisionDTO> latest_projection_revision;
+    std::string active_cancel_reason;
+    std::string pending_cancel_reason;
+  };
+
+  [[nodiscard]] static PreparedArm prepare_arm(
+      std::uint64_t execution_id, std::uint64_t execution_generation,
+      std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id,
+      std::optional<ProjectionRevisionDTO> admission_projection_revision = std::nullopt);
+  /// Only accepts the product of prepare_arm. The owning Kernel rechecks its
+  /// source/Stop/scene fence before its CAS and publishes while holding the
+  /// existing protection mutex, after backend adoption exposes new progress.
+  void publish_prepared_arm(PreparedArm prepared) noexcept;
+
   void arm(std::uint64_t execution_id, std::uint64_t execution_generation,
            std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id,
            std::optional<ProjectionRevisionDTO> admission_projection_revision = std::nullopt);

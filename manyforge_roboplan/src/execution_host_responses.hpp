@@ -1,5 +1,7 @@
 #pragma once
 
+#include <manyforge_core/types/io_activation_rule.hpp>
+
 #include "execution_host_commands.hpp"
 #include <manyforge_core/stop_journal_projection_codec.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
@@ -99,6 +101,11 @@ StopProjectionStatusValue(const core::StopDurableProjectionStatusDTO &value);
 
 [[nodiscard]] CanonicalValue
 StopFaultLatchValue(const core::StopFaultLatchDTO &value);
+
+[[nodiscard]] CanonicalValue
+GlobalIoRuleRecoveryOfferValue(const core::IoGlobalRuleRecoveryOfferDTO &offer);
+[[nodiscard]] CanonicalValue
+GlobalIoRuleRecoveryResultValue(const core::IoGlobalRuleRecoveryResultDTO &result);
 
 [[nodiscard]] CanonicalValue
 StopFaultOfferValue(const core::StopFaultRecoveryOfferDTO &offer);
@@ -207,9 +214,28 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value);
 [[nodiscard]] CanonicalValue
 OperationStateValue(const core::OperationStateDTO &value);
 
+/// Both existing events siblings derive from this one actual owner snapshot.
+[[nodiscard]] CanonicalValue::Object InterruptRuleEventMetadataFields(
+    const std::optional<core::IoRuleStateProjectionDTO> &actual,
+    const core::RequestOwnerEpoch &owner_epoch);
+
+
 [[nodiscard]] CanonicalValue
 OperationEventPageValue(const core::OperationJournalEventPageDTO &page);
 
+[[nodiscard]] CanonicalValue RuntimeFaultsValue(
+    const core::ResourceAddressedExecutionKernel &owner);
+
 [[nodiscard]] CanonicalValue
 CoordinatePositionValue(const core::CoordinatePositionDTO &position);
+[[nodiscard]] CanonicalValue
+IoSourceCursorValue(const core::IoSourceCursorDTO &value);
+
+[[nodiscard]] CanonicalValue IoSignalObservationValue(
+    const core::IoSignalObservationDTO& value);
+[[nodiscard]] CanonicalValue IoWatchRegistrationValue(
+    const core::IoWatchRegistrationDTO& value);
+[[nodiscard]] CanonicalValue IoWatchResultValue(
+    const core::IoWatchResultDTO& value);
+
 } // namespace manyforge::roboplan_backend::host_detail

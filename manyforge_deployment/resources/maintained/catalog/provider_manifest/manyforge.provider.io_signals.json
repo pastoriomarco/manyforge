@@ -1,0 +1,58 @@
+{
+  "api_version": "manyforge.provider_manifest.v1",
+  "lifecycle_plan_catalog": {
+    "catalog_api_version": "manyforge.brand_lifecycle_plan_catalog.v1",
+    "semantic_digest": "sha256:9b800748e1f4e43d14936c2cdb831e4233812ecd2bef76435b08f6d1dd5d3f2a"
+  },
+  "offered_capabilities": [
+    {
+      "capability_definition_revision": "sha256:578cd871bc7248d18f1ccafe2659acb9d9ad35570c17b30758312d65b37fb4d1",
+      "capability_id": "component.lifecycle.disable",
+      "required_endpoint_role_ids": []
+    },
+    {
+      "capability_definition_revision": "sha256:c0d8704375f520e69f04dccbdbe1f8856bab2c0c185ea59cddc4f34f50cbc1f7",
+      "capability_id": "component.lifecycle.enable",
+      "required_endpoint_role_ids": []
+    },
+    {
+      "capability_definition_revision": "sha256:deb6815e681e8879c172e1a7dcd03a55154bc599efaa35167c9d23f54d6b9104",
+      "capability_id": "component.lifecycle.observe",
+      "required_endpoint_role_ids": []
+    },
+    {
+      "capability_definition_revision": "sha256:c61d01109243632bd3a4184061863cee480a35f253aabac7719fea634e2defd3",
+      "capability_id": "component.lifecycle.prepare",
+      "required_endpoint_role_ids": []
+    },
+    {
+      "capability_definition_revision": "sha256:7303e9db6f3c6d94b00ed8c448bb98abe156775f562e122cb8046799a7d41e9a",
+      "capability_id": "component.lifecycle.recover",
+      "required_endpoint_role_ids": []
+    },
+    {
+      "capability_definition_revision": "sha256:abe7c9eed8b4b76ada84aa770ae3111691dfdd07001f4abd68a38bed56ed3d84",
+      "capability_id": "io.gpio.get_input",
+      "required_endpoint_role_ids": [
+        "io_signal_service"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:b7f9e3ae6ed12dd59fd78193db902c6ad09528372ad0f5e2423f936833cb49f8",
+      "capability_id": "io.gpio.set_output",
+      "required_endpoint_role_ids": [
+        "io_signal_service"
+      ]
+    },
+    {
+      "capability_definition_revision": "sha256:f5520f864f38d6f658039b8a338da9ef1fec014d70e9e354c5e40935717b4747",
+      "capability_id": "io.gpio.wait_for_input",
+      "required_endpoint_role_ids": [
+        "io_signal_service"
+      ]
+    }
+  ],
+  "provider_contracts": [],
+  "provider_manifest_id": "manyforge.provider.io_signals",
+  "provider_manifest_revision": "sha256:980d23bd0d9015262a7dee81293121af85f8f865c29c4d37b82b081775019e36"
+}

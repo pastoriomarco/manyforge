@@ -291,6 +291,138 @@ RecoveryAuthorityCapture make_interrupted_capture(InterruptPreemptionResult resu
   return capture;
 }
 
+RecoveryAuthorityCapture make_automatic_planning_capture(const std::string& code) {
+  RecoveryAuthorityCapture capture;
+  capture.execution_id = 42;
+  capture.execution_state = ExecutionState::kFailed;
+  capture.failed_validation_retryable = true;
+  capture.failed_validation_code = code;
+  capture.failed_execution_effect = ParticipantEffectKnowledge::kNoEffect;
+  capture.failed_preparation_never_dispatched = true;
+  return capture;
+}
+
+TEST(RecoveryAssessmentTest, AutomaticPlanningRetryRequiresClosedCauseAndExactNoEffectProof) {
+  for (const auto* code : {kErrorPlanningFailed, kErrorPlanningTimeout, kErrorIkFailed,
+                           kErrorCartesianIncomplete, kErrorValidationCollision}) {
+    SCOPED_TRACE(code);
+    auto capture = make_automatic_planning_capture(code);
+    capture.failed_validation_conclusive_collision = true;
+    const auto eligible = build_recovery_assessment(capture, RecoveryReadinessPolicy{}, 0);
+    EXPECT_TRUE(eligible.retry_admissible);
+    EXPECT_TRUE(eligible.retry_eligibility.eligible);
+    EXPECT_EQ(eligible.retry_eligibility.cause, MotionRetryCause::kPlanningNoEffect);
+    EXPECT_EQ(eligible.retry_eligibility.effect, MotionRetryEffect::kKnownNoEffect);
+    EXPECT_EQ(eligible.retry_eligibility.reason, MotionRetryIneligibilityReason::kNone);
+
+    capture.failed_preparation_never_dispatched = false;
+    const auto unproven = build_recovery_assessment(capture, RecoveryReadinessPolicy{}, 0);
+    EXPECT_TRUE(unproven.retry_admissible);  // Existing manual repair remains available.
+    EXPECT_FALSE(unproven.retry_eligibility.eligible);
+    EXPECT_EQ(unproven.retry_eligibility.reason,
+              MotionRetryIneligibilityReason::kDispatchAbsenceUnproven);
+
+    capture.failed_preparation_never_dispatched = true;
+    for (const auto effect : {ParticipantEffectKnowledge::kEffectSettled,
+                              ParticipantEffectKnowledge::kEffectUncertain}) {
+      capture.failed_execution_effect = effect;
+      const auto effectful = build_recovery_assessment(capture, RecoveryReadinessPolicy{}, 0);
+      EXPECT_FALSE(effectful.retry_eligibility.eligible);
+      EXPECT_EQ(effectful.retry_eligibility.effect,
+                effect == ParticipantEffectKnowledge::kEffectSettled
+                    ? MotionRetryEffect::kEffectObserved
+                    : MotionRetryEffect::kEffectUncertain);
+    }
+  }
+}
+
+TEST(RecoveryAssessmentTest, AutomaticRetryDoesNotInheritBroaderManualFailureRecovery) {
+  for (const auto* code : {kErrorContactPolicyViolation, kErrorSceneChangedDuringValidation,
+                           kErrorExecutionRejected, kErrorValidationDeferred, "signal_trip",
+                           "no_signal_trip", "interrupted_fault", "vendor_fault", "unknown"}) {
+    SCOPED_TRACE(code);
+    auto capture = make_automatic_planning_capture(code);
+    capture.failed_validation_reason = "validation_failed";
+    capture.failed_validation_conclusive_collision = true;
+    const auto assessment = build_recovery_assessment(capture, RecoveryReadinessPolicy{}, 0);
+    EXPECT_TRUE(assessment.retry_admissible);
+    EXPECT_FALSE(assessment.retry_eligibility.eligible);
+    EXPECT_EQ(assessment.retry_eligibility.reason,
+              MotionRetryIneligibilityReason::kFailureCauseNotRetryable);
+  }
+
+  // The same validation_collision code also covers inconclusive/cancelled
+  // validation. Only the retained typed authoritative collision can qualify.
+  const auto inconclusive = build_recovery_assessment(
+      make_automatic_planning_capture(kErrorValidationCollision), RecoveryReadinessPolicy{}, 0);
+  EXPECT_TRUE(inconclusive.retry_admissible);
+  EXPECT_FALSE(inconclusive.retry_eligibility.eligible);
+  EXPECT_EQ(inconclusive.retry_eligibility.reason,
+            MotionRetryIneligibilityReason::kValidationNotConclusiveCollision);
+}
+
+TEST(RecoveryAssessmentTest, AutomaticPlanningRetryIsRevokedByExistingAuthorities) {
+  const auto check = [](RecoveryAuthorityCapture capture, MotionRetryIneligibilityReason reason) {
+    const auto assessment = build_recovery_assessment(capture, RecoveryReadinessPolicy{}, 0);
+    EXPECT_FALSE(assessment.retry_eligibility.eligible);
+    EXPECT_EQ(assessment.retry_eligibility.reason, reason);
+  };
+  auto capture = make_automatic_planning_capture(kErrorPlanningFailed);
+  capture.operator_stop_active = true;
+  check(capture, MotionRetryIneligibilityReason::kStopOwnerActive);
+  capture.operator_stop_active = false;
+  capture.stronger_authority_active = true;
+  check(capture, MotionRetryIneligibilityReason::kStrongerAuthorityActive);
+  capture.stronger_authority_active = false;
+  capture.queued_latch_present = true;
+  check(capture, MotionRetryIneligibilityReason::kQueuedLatchPresent);
+  capture.queued_latch_present = false;
+  capture.active_latch = make_collision_latch("active", 42, InterruptPreemptionResult::kSucceeded);
+  check(capture, MotionRetryIneligibilityReason::kLatchPresent);
+}
+
+TEST(RecoveryAssessmentTest, AutomaticPlanningRetryDoesNotClassifyOtherExecutionStates) {
+  for (const auto state :
+       {ExecutionState::kIdle, ExecutionState::kPlanning, ExecutionState::kValidating,
+        ExecutionState::kExecuting, ExecutionState::kCompleted, ExecutionState::kStopped,
+        ExecutionState::kInterrupted, ExecutionState::kInterventionRequired}) {
+    auto capture = make_automatic_planning_capture(kErrorPlanningFailed);
+    capture.execution_state = state;
+    const auto assessment = build_recovery_assessment(capture, RecoveryReadinessPolicy{}, 0);
+    EXPECT_EQ(assessment.retry_eligibility, MotionRetryEligibilityDTO{});
+  }
+  EXPECT_FALSE(KernelRecoveryActionRequestDTO{}.fresh_motion_attempt);
+}
+
+TEST(RecoveryAssessmentTest, AutomaticEligibilityChangesAdvanceSemanticRevision) {
+  auto capture = make_automatic_planning_capture(kErrorValidationCollision);
+  const auto previous = build_recovery_assessment(capture, RecoveryReadinessPolicy{}, 7);
+  capture.failed_validation_conclusive_collision = true;
+  const auto publication = prepare_recovery_assessment_publication(
+      previous, capture, RecoveryReadinessPolicy{}, "typed_collision_decision");
+  EXPECT_TRUE(publication.changed);
+  EXPECT_GT(publication.candidate.assessment_revision, previous.assessment_revision);
+  EXPECT_EQ(publication.event_details.at("automatic_retry_eligible"), "true");
+  EXPECT_EQ(publication.event_details.at("automatic_retry_cause"), "planning_no_effect");
+  EXPECT_EQ(publication.event_details.at("automatic_retry_effect"), "known_no_effect");
+  EXPECT_EQ(publication.event_details.at("automatic_retry_reason"), "none");
+  EXPECT_FALSE(prepare_recovery_assessment_publication(publication.candidate, capture,
+                                                       RecoveryReadinessPolicy{}, "same_decision")
+                   .changed);
+}
+
+TEST(RecoveryAssessmentTest, AutomaticRetryWireVocabularyIsClosed) {
+  EXPECT_STREQ(motion_retry_cause_name(MotionRetryCause::kPlanningNoEffect), "planning_no_effect");
+  EXPECT_STREQ(motion_retry_cause_name(MotionRetryCause::kCollisionStopNominal),
+               "collision_stop_nominal");
+  EXPECT_STREQ(motion_retry_cause_name(MotionRetryCause::kNotEligible), "not_eligible");
+  EXPECT_STREQ(motion_retry_effect_name(MotionRetryEffect::kKnownNoEffect), "known_no_effect");
+  EXPECT_STREQ(motion_retry_effect_name(MotionRetryEffect::kEffectObserved), "effect_observed");
+  EXPECT_STREQ(motion_retry_effect_name(MotionRetryEffect::kEffectUncertain), "effect_uncertain");
+  EXPECT_STREQ(motion_retry_ineligibility_reason_name(MotionRetryIneligibilityReason::kNone),
+               "none");
+}
+
 TEST(RecoveryAssessmentTest, PendingPreemptIsWaitingNotCertified) {
   const auto assessment = build_recovery_assessment(
       make_interrupted_capture(InterruptPreemptionResult::kPending, true, false),
@@ -632,6 +764,55 @@ TEST(RecoveryAssessmentTest, StrongerAuthorityRevokesStoppedAndFailedOffers) {
   EXPECT_EQ(failed_assessment.status, RecoveryAssessmentStatus::kWaiting);
   EXPECT_EQ(failed_assessment.reason_code, reason_codes::kRecoveryQueuedLatchPresent);
   EXPECT_FALSE(failed_assessment.retry_admissible);
+}
+
+TEST(RecoveryAssessmentTest, GeneralCloseUsesTerminalEffectAndCleanupRatherThanRetryCause) {
+  for (const auto effect :
+       {ParticipantEffectKnowledge::kNoEffect, ParticipantEffectKnowledge::kEffectSettled,
+        ParticipantEffectKnowledge::kEffectUncertain}) {
+    RecoveryAuthorityCapture capture;
+    capture.execution_id = 17U;
+    capture.execution_state = ExecutionState::kFailed;
+    capture.failed_validation_code = "non_retryable_operation_failure";
+    capture.terminal_effect = effect;
+    capture.terminal_cleanup_complete = true;
+    const auto assessment = build_recovery_assessment(capture, {}, 0U);
+    EXPECT_FALSE(assessment.retry_eligibility.eligible);
+    EXPECT_FALSE(assessment.retry_admissible);
+    EXPECT_EQ(assessment.eligible_close, effect != ParticipantEffectKnowledge::kEffectUncertain);
+    auto request = make_bound_request(assessment);
+    request.action = RecoveryAction::kCloseOperation;
+    EXPECT_EQ(evaluate_recovery_admission(request, capture, assessment).admitted,
+              assessment.eligible_close);
+    request.fresh_motion_attempt = true;
+    EXPECT_FALSE(evaluate_recovery_admission(request, capture, assessment).admitted);
+  }
+}
+
+TEST(RecoveryAssessmentTest, GeneralCloseWaitsForCleanupAndRetainsEveryAuthorityFence) {
+  RecoveryAuthorityCapture capture;
+  capture.execution_id = 19U;
+  capture.execution_state = ExecutionState::kCompleted;
+  capture.terminal_effect = ParticipantEffectKnowledge::kEffectSettled;
+  EXPECT_FALSE(build_recovery_assessment(capture, {}, 0U).eligible_close);
+  capture.terminal_cleanup_complete = true;
+  const auto ready = build_recovery_assessment(capture, {}, 0U);
+  ASSERT_TRUE(ready.eligible_close);
+  EXPECT_FALSE(recovery_assessment_semantically_differs(ready, ready));
+  auto request = make_bound_request(ready);
+  request.action = RecoveryAction::kCloseOperation;
+  EXPECT_TRUE(evaluate_recovery_admission(request, capture, ready).admitted);
+  ++request.expected_execution_id;
+  EXPECT_FALSE(evaluate_recovery_admission(request, capture, ready).admitted);
+  for (const int fence : {0, 1, 2}) {
+    auto held = capture;
+    held.operator_stop_active = fence == 0;
+    held.stronger_authority_active = fence == 1;
+    held.queued_latch_present = fence == 2;
+    const auto assessment = build_recovery_assessment(held, {}, ready.assessment_revision);
+    EXPECT_FALSE(assessment.eligible_close);
+    EXPECT_TRUE(recovery_assessment_semantically_differs(ready, assessment));
+  }
 }
 
 }  // namespace

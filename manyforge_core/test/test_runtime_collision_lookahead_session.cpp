@@ -1445,6 +1445,42 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   EXPECT_EQ(session.status().stale_generation_results_total, 1u);
 }
 
+TEST(RuntimeCollisionLookaheadSessionTest, PreparingReplacementArmDoesNotReplaceCurrentAuthority) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
+                                        ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                        "isaac", 0);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-staged");
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult) {},
+      accept_test_authority());
+  auto curve = std::make_shared<const TrajectoryDTO>(trajectory());
+  session.arm(7, 9, curve, "old");
+  const auto old = session.status();
+  auto prepared = RuntimeCollisionLookaheadSession::prepare_arm(8, 10, curve, "new");
+  EXPECT_EQ(session.status().execution_id, 7U);
+  EXPECT_EQ(session.status().arm_generation, old.arm_generation);
+  EXPECT_TRUE(session.accept_result_for_current_arm(old.execution_id, old.execution_generation,
+                                                    old.arm_generation, old.permit_generation));
+  session.publish_prepared_arm(std::move(prepared));
+  const auto next = session.status();
+  EXPECT_EQ(next.execution_id, 8U);
+  EXPECT_EQ(next.execution_generation, 10U);
+  EXPECT_TRUE(next.armed);
+  EXPECT_FALSE(session.accept_result_for_current_arm(old.execution_id, old.execution_generation,
+                                                     old.arm_generation, old.permit_generation));
+  EXPECT_TRUE(session.accept_result_for_current_arm(next.execution_id, next.execution_generation,
+                                                    next.arm_generation, next.permit_generation));
+  EXPECT_THROW((void)RuntimeCollisionLookaheadSession::prepare_arm(0, 11, curve, "bad"),
+               std::invalid_argument);
+  EXPECT_EQ(session.status().execution_id, 8U);
+}
+
 TEST(RuntimeCollisionLookaheadSessionTest, RejectsQueryBudgetLongerThanTheCycleBudget) {
   FakeClock clock;
   ManualScheduler scheduler;

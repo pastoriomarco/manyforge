@@ -26,6 +26,8 @@ from manyforge_behavior.geometry import (
     rpy_deg_to_xyzw,
 )
 from manyforge_behavior.program import (
+    DEFAULT_INTERVENTION_STOP_SCOPE,
+    INTERVENTION_STOP_SCOPE_VALUES,
     MAX_RECOVERY_POLICY_RETRIES,
     Program,
     ProgramValidationError,
@@ -419,10 +421,15 @@ def _node_policy_arguments(
         )
 
     recovery = arguments["recovery_policy"]
-    if type(recovery) is not dict or set(recovery) != _RECOVERY_POLICY_FIELDS:
+    if type(recovery) is not dict or not (
+        _RECOVERY_POLICY_FIELDS
+        <= set(recovery)
+        <= _RECOVERY_POLICY_FIELDS | {"intervention_stop_scope"}
+    ):
         _error(
             "draft_arguments_invalid",
-            "recovery_policy must contain exactly allow_intervention and max_retries",
+            "recovery_policy must contain exactly allow_intervention and max_retries, "
+            "optionally intervention_stop_scope",
         )
     if type(recovery["allow_intervention"]) is not bool:
         _error(
@@ -437,6 +444,16 @@ def _node_policy_arguments(
             f"0..{MAX_RECOVERY_POLICY_RETRIES} (0 is Unlimited)",
         )
 
+    recovery = deepcopy(recovery)
+    scope = recovery.pop("intervention_stop_scope", DEFAULT_INTERVENTION_STOP_SCOPE)
+    if type(scope) is not str or scope not in INTERVENTION_STOP_SCOPE_VALUES:
+        _error(
+            "draft_arguments_invalid",
+            "recovery_policy.intervention_stop_scope must be all or own_groups",
+        )
+    if scope != DEFAULT_INTERVENTION_STOP_SCOPE:
+        recovery["intervention_stop_scope"] = scope
+
     operator_stop = arguments["operator_stop_policy"]
     if (
         type(operator_stop) is not str
@@ -446,7 +463,7 @@ def _node_policy_arguments(
             "draft_arguments_invalid",
             "operator_stop_policy must be inherit, hold, or continue",
         )
-    return instance_id, deepcopy(recovery), operator_stop
+    return instance_id, recovery, operator_stop
 
 
 def _insert_index(arguments: dict[str, Any], child_count: int) -> int:

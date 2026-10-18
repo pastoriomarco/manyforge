@@ -136,6 +136,13 @@ class ICCLCLifecycleTargetStore {
       const ComponentIncidentRecordDTO& record, std::uint64_t recovery_generation) = 0;
   [[nodiscard]] virtual Result<std::optional<ComponentIncidentRecordDTO>>
   LoadOpenComponentIncident(const ControllableComponentId& component) = 0;
+  /// Any unacknowledged component or cell-observer incident (134), including
+  /// removed components. Their distinct recovery owners are unchanged.
+  /// Store failure must not authorize clearing the cell Stop latch.
+  [[nodiscard]] virtual Result<bool> HasOpenIncident() {
+    return Result<bool>::Err({"incident_query_unavailable",
+                              "open incident query is not composed", {}});
+  }
   /// Record the containment outcome of a pending open incident and append its
   /// `component_incident` history event in the same transaction. Returns
   /// false (writing nothing) when the incident is no longer pending.

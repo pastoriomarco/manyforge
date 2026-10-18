@@ -28,9 +28,9 @@ const incident: CCLCComponentIncident = {
   acknowledged: false,
 };
 
-function snapshot(componentId: string, open: boolean): CCLCComponentSnapshot {
+function snapshot(controllableComponentId: string, open: boolean): CCLCComponentSnapshot {
   return {
-    componentId,
+    controllableComponentId,
     lifecycleGeneration: 4,
     lifecycleState: 'active',
     publicationGeneration: 1, activePublicPointerDigest: 'pointer.1',
@@ -41,7 +41,7 @@ function snapshot(componentId: string, open: boolean): CCLCComponentSnapshot {
     lifecycleTarget: { requestedState: 'active', origin: 'startup', targetGeneration: 1 },
     readiness: { requestOwnerEpoch: 'cclc.epoch.1', evaluatedAtNs: 100, nextIntent: null, requestedState: null,
       ready: !open, error: open ? { code: 'incident_open', message: 'Collision detected', details: {} } : null,
-      domains: [], measuredState: { required: false, available: null, error: null } },
+      providerOccurrences: [], measuredState: { required: false, available: null, error: null } },
     lifecycleProgress: {
       phase: open ? 'blocked' : 'satisfied',
       nextIntent: null,
@@ -58,7 +58,7 @@ function mockOwner(snapshots: Record<string, CCLCComponentSnapshot>, mode = exec
   vi.spyOn(api.execution, 'identity').mockResolvedValue(mode);
   vi.spyOn(api.cclc, 'owner').mockResolvedValue({ requestOwnerEpoch: 'cclc.epoch.1' });
   vi.spyOn(api.cclc, 'component').mockImplementation(
-    async (componentId: string) => snapshots[componentId]!,
+    async (controllableComponentId: string) => snapshots[controllableComponentId]!,
   );
 }
 
@@ -70,7 +70,7 @@ describe('component incidents for Recover cell', () => {
   it('reads only the incidents CCLC currently reports', async () => {
     mockOwner({ arm: snapshot('arm', true), gripper: snapshot('gripper', false) });
     await expect(readOpenComponentIncidents(['arm', 'gripper'])).resolves.toEqual([
-      { componentId: 'arm', incident },
+      { controllableComponentId: 'arm', incident },
     ]);
   });
 
@@ -113,7 +113,7 @@ describe('component incidents for Recover cell', () => {
       status: null,
       incidentRecovery: {
         incidentId: 'incident.arm.1',
-        componentId: 'arm',
+        controllableComponentId: 'arm',
         causeClass: 'collision',
         acknowledgedBy: 'manyforge_composer',
         acknowledgedAtNs: 2_000,

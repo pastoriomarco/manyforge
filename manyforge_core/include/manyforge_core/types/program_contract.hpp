@@ -81,6 +81,9 @@ struct ProgramExecutionNodeDTO final {
   /// Parent in the same canonical nodes vector; absent for the tree root.
   /// The existing held-node projection supplies dynamic subtree coverage.
   std::optional<std::uint32_t> parent_node_index{};
+  /// Literal priority sealed from the qualified plain-motion node catalog.
+  /// Kernel uses this only for competing motions in the same Program Run.
+  std::uint8_t preemption_priority{0U};
 
   friend bool operator==(const ProgramExecutionNodeDTO&, const ProgramExecutionNodeDTO&) = default;
 };
@@ -149,6 +152,21 @@ struct ProgramNodeExecutionScopeDTO final {
          scope.node_attempt_id.find('\0') == std::string::npos;
 }
 
+/// Declaration metadata derived from the sealed Program's validation view.
+struct ProgramBlackboardKeyDeclarationDTO final {
+  std::string name;
+  // Preserve the actual Program type, including non-scalar declarations. Only
+  // checked rule inputs can select a supported scalar subscription later.
+  std::string declared_type;
+  /// Presence in the qualified authored declaration; false/zero are present.
+  /// This grants no runtime value or fallback for an interrupt subscription.
+  bool has_declared_initial{false};
+  friend bool operator==(const ProgramBlackboardKeyDeclarationDTO&,
+                         const ProgramBlackboardKeyDeclarationDTO&) = default;
+};
+
+struct ProgramIoConditionProjectionDTO;
+
 /// Process-local input from the sealed Program/Binding composition boundary.
 /// Transports carry the identities only, never a caller-supplied table.
 /// Kernel installation independently joins current claim/owner/configuration.
@@ -167,16 +185,40 @@ struct ProgramRunExecutionCaptureDTO final {
   /// Required at Kernel installation; public registration carries IDs only
   /// and cannot populate either this reference or the execution table.
   std::shared_ptr<const ProgramBindingDTO> binding{};
+  /// Alias of the same sealed Program validation view (including implicit
+  /// system-owned outcome declarations), never caller-supplied key authority.
+  std::shared_ptr<const std::vector<ProgramBlackboardKeyDeclarationDTO>>
+      blackboard_key_declarations{};
+  /// Immutable Program-only condition projection compiled from this exact
+  /// sealed Program/Binding; Deployment rule references remain a separate join.
+  std::shared_ptr<const ProgramIoConditionProjectionDTO> io_conditions{};
 };
 
 /// Largest authored finite failure-retry budget; zero means Unlimited.
 inline constexpr std::uint8_t kMaxProgramRecoveryRetries = 255U;
+
+enum class ProgramInterventionStopScope : std::uint8_t {
+  kAll = 0,
+  kOwnGroups,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(ProgramInterventionStopScope value) noexcept {
+  switch (value) {
+    case ProgramInterventionStopScope::kAll:
+      return "all";
+    case ProgramInterventionStopScope::kOwnGroups:
+      return "own_groups";
+  }
+  return {};
+}
 
 struct ProgramNodeRecoveryPolicyDTO final {
   /// Explicit opt-in to failure intervention; never implied by the budget.
   bool allow_intervention{false};
   /// Explicit failure retries of this node per captured run; 0 is Unlimited.
   std::uint8_t max_retries{0U};
+  /// Physical Stop scope; intervention still holds the complete Program Run.
+  ProgramInterventionStopScope intervention_stop_scope{ProgramInterventionStopScope::kAll};
 
   friend bool operator==(const ProgramNodeRecoveryPolicyDTO&,
                          const ProgramNodeRecoveryPolicyDTO&) = default;

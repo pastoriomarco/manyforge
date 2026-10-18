@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
 import hashlib
+import os
 import shutil
 import sys
 from tempfile import TemporaryDirectory
@@ -18,7 +19,7 @@ from typing import Any, Callable, Iterator
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
-from manyforge_headless_api.models import TargetObservationQuery
+from manyforge_headless_api.models import OperationIntentRequest, TargetObservationQuery
 from manyforge_headless_api.process_tests.test_process_stack import (
     keep_failure_evidence,
     ProcessStack,
@@ -31,6 +32,11 @@ from manyforge_headless_api.process_tests.test_process_stack import (
 
 
 CELL_ID = "ui6i_ur5e_lite6_wall_cell"
+# One budget per activation operation; nested reads share it, never reset it.
+# PROVISIONAL (maintainer 2026-10-18, contract 122): 20 s is not measured. Refine from live
+# command->Prepared/Active timings and component_read_changed re-read counts per component kind
+# (r5-live-trial-checklist.md "Provisional values").
+ACTIVATION_READ_TIMEOUT_SECONDS = 20.0
 ADMISSION_FILENAME = f"canonical-empty-admission.{CELL_ID}.json"
 GROUPED_SCENARIO = "ur5e_lite6_wall_grouped"
 ISOLATION_SCENARIO = "ur5e_lite6_wall_isolation"
@@ -88,6 +94,7 @@ def _dual_robot_stack() -> Iterator[ProcessStack]:
 
 def _applied_activation_order(stack: ProcessStack) -> list[str]:
     """Use the captured applied Deployment order, never the mutable Draft."""
+    deadline = time.monotonic() + ACTIVATION_READ_TIMEOUT_SECONDS
     with (
         HeadlessHttpClient(stack.composer_url, timeout_seconds=10.0) as composer,
         HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
@@ -106,37 +113,184 @@ def _applied_activation_order(stack: ProcessStack) -> list[str]:
         assert isinstance(component_ids, list) and component_ids, order
         assert len(component_ids) == len(set(component_ids)), order
         for component_id in component_ids:
-            current = headless.cclc_component(component_id)
+            current = read_activation_component(headless, component_id, deadline=deadline)
             assert current["retained_bundle_id"] == order["retainedBundleId"], current
             assert current["graph_revision"] == order["graphRevision"], current
         return component_ids
 
 
+# Evidence only (contract 122): per-component activation timings to refine the
+# provisional deadline. Never alters deadlines, retries, commands or assertions.
+ACTIVATION_TIMING_SCHEMA = "manyforge.process_test.activation_timing.v1"
+ACTIVATION_TIMING_MAX_ROWS = 32
+ACTIVATION_TIMING_MAX_FILES = 32
+
+
+def _timing_row(
+    component_id: str, current: dict[str, Any] | None, intent: str | None
+) -> dict[str, Any]:
+    # Exact domain kind values only; anything else (incl. the superseded
+    # "provider") is labelled "unknown", never guessed.
+    kinds = {row.get("kind") if row.get("kind") in ("controller", "io_provider") else "unknown"
+             for row in (current or {}).get("domains", [])}
+    return {
+        "component_id": str(component_id)[:128],
+        "kind": kinds.pop() if len(kinds) == 1 else ("mixed" if kinds else "unknown"),
+        "intent": intent,
+        "deadline_seconds": ACTIVATION_READ_TIMEOUT_SECONDS,
+        "readiness_wait_ms": None, "readiness_wait_iterations": 0,
+        "admission_wait_ms": None,
+        "submit_to_terminal_ms": None, "submit_to_ready_ms": None,
+        "component_read_changed_count": 0,
+        "terminal_result": None, "terminal_state": None,
+        "target_state": {"prepare": "prepared", "enable": "active", "disable": "disabled"}.get(intent),
+        "final_state": None,
+        "outcome": None,  # "ok" once the target state is read back; "error" if the span failed first.
+    }
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.monotonic() - started) * 1000.0, 3)
+
+
+def _write_activation_timing(
+    stack: Any, span: str, started: float, rows: list[dict[str, Any]], error: BaseException | None
+) -> None:
+    """Write one bounded JSON file for one activation span; never raises."""
+    try:
+        raw = os.environ.get("MANYFORGE_PROCESS_TEST_EVIDENCE_ROOT")
+        if raw:  # Same per-test directory naming as keep_failure_evidence.
+            test = os.environ.get("PYTEST_CURRENT_TEST", "unknown").split(" ", 1)[0]
+            directory = Path(raw) / test.replace("/", "_").replace("::", "__")
+        else:
+            directory = Path(stack.root)
+        sequence = getattr(stack, "_activation_timing_sequence", 0)
+        stack._activation_timing_sequence = sequence + 1
+        if sequence >= ACTIVATION_TIMING_MAX_FILES:
+            return
+        document = {
+            "schema": ACTIVATION_TIMING_SCHEMA, "span": span, "sequence": sequence,
+            "clock": "time.monotonic", "deadline_seconds": ACTIVATION_READ_TIMEOUT_SECONDS,
+            "span_ms": _elapsed_ms(started),
+            "outcome": "ok" if error is None else "error",
+            "error": None if error is None else f"{type(error).__name__}: {error}"[:512],
+            "rows": [{**row, "outcome": row["outcome"] or ("error" if error is not None else None)}
+                     for row in rows[:ACTIVATION_TIMING_MAX_ROWS]],
+            "rows_dropped": max(0, len(rows) - ACTIVATION_TIMING_MAX_ROWS),
+        }
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"activation-timing.{sequence:02d}.json").write_text(
+            json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+    except Exception as failure:  # Evidence must never change the test outcome.
+        try:
+            print(f"activation timing evidence not written: {failure!r}", file=sys.stderr)
+        except Exception:
+            pass  # Best-effort diagnostic; never replaces the original exception.
+
+
+def _is_component_read_changed(error: HeadlessClientError) -> bool:
+    # Exactly useCCLC.ts readCurrent(observeComponentReadChanges=true).
+    return (
+        error.status_code == 409
+        and error.code == "component_lifecycle_facts_stale"
+        and error.details.get("reason") == "component_read_changed"
+    )
+
+
+def read_activation_component(
+    headless: Any, component_id: str, *, deadline: float, timing: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Activation-path CCLC read; re-reads only the torn-read transient.
+
+    Mirrors the Composer activation observer: the read alone is repeated at
+    POLL_INTERVAL_MS=250 ms, no command is re-sent, and any other error fails
+    at once. Composer is bounded by operator cancel; this fixture by the
+    caller's absolute ``deadline`` (time.monotonic), which is shared and never
+    extended: no read starts at or after it.
+    """
+    last_error: HeadlessClientError | None = None
+    while True:
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"CCLC read of {component_id!r} reached the shared activation deadline"
+                + ("" if last_error is None
+                   else f" while reporting component_read_changed: {last_error.details!r}")
+            ) from last_error
+        try:
+            return headless.cclc_component(component_id)
+        except HeadlessClientError as error:
+            if not _is_component_read_changed(error):
+                raise
+            last_error = error
+            if timing is not None:
+                timing["component_read_changed_count"] += 1
+        time.sleep(0.25)
+
+
+def expected_control_domains(current: dict[str, Any]) -> list[dict[str, Any]]:
+    """Exactly useCCLC.ts lifecycleRequestFromSnapshot's expected domains."""
+    expected_domains = []
+    for domain in current["domains"]:
+        active = domain["active_control_configuration"]
+        expected_active = {"presence": "absent"} if active is None else {
+            "presence": "present",
+            "active_control_configuration_id": active["active_control_configuration_id"],
+            "active_control_configuration_generation": active["active_control_configuration_generation"],
+        }
+        assert domain["kind"] in ("controller", "io_provider"), domain
+        if domain["kind"] == "io_provider":
+            # CCLCExpectedProviderDomainRequest: no topology, bindings or routes.
+            expected_domains.append({
+                "kind": "io_provider",
+                "control_domain_id": domain["control_domain_id"],
+                "control_domain_revision": domain["control_domain_revision"],
+                "provider": domain["provider"],
+                "expected_active_control_configuration": expected_active,
+            })
+            continue
+        expected_domains.append({
+            "kind": "controller",
+            **{key: domain[key] for key in (
+                "control_domain_id", "control_domain_revision",
+                "controller_topology_id", "topology_revision",
+            )},
+            "expected_active_control_configuration": expected_active,
+            "expected_control_bindings": domain["current_control_bindings"],
+        })
+    return expected_domains
+
+
 def _component_lifecycle(
-    stack: ProcessStack, component_id: str, intent: str, owner_epoch: str
+    stack: ProcessStack, component_id: str, intent: str, owner_epoch: str,
+    timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Submit one ordinary confirmed command with actual current CAS facts."""
     achieved = {"prepare": "prepared", "enable": "active", "disable": "disabled"}[intent]
+    deadline = time.monotonic() + ACTIVATION_READ_TIMEOUT_SECONDS
     with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
         assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
-        current = headless.cclc_component(component_id)
-        expected_domains = []
-        for domain in current["domains"]:
-            active = domain["active_control_configuration"]
-            expected_active = {"presence": "absent"} if active is None else {
-                "presence": "present",
-                "active_control_configuration_id": active["active_control_configuration_id"],
-                "active_control_configuration_generation": active["active_control_configuration_generation"],
-            }
-            expected_domains.append({
-                **{key: domain[key] for key in (
-                    "control_domain_id", "control_domain_revision",
-                    "controller_topology_id", "topology_revision",
-                )},
-                "expected_active_control_configuration": expected_active,
-                "expected_control_bindings": domain["current_control_bindings"],
-            })
-        admission = stack.wait_authoring_admission(expected_allowed=True)
+        current = read_activation_component(headless, component_id, deadline=deadline, timing=timing)
+        if timing is not None and timing["kind"] == "unknown":
+            timing["kind"] = _timing_row(component_id, current, intent)["kind"]
+        expected_domains = expected_control_domains(current)
+
+        def require_budget(step: str) -> float:
+            # Shared budget: no new work (admission, command, poll) starts at or after it.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    f"{intent} of {component_id!r} reached the shared activation deadline before "
+                    f"{step} ({-remaining:.3f} s late); "
+                    + ("the accepted command's terminal status is unobserved"
+                       if step == "terminal status poll" else "no command was sent")
+                )
+            return remaining
+
+        admission_started = time.monotonic()
+        admission = stack.wait_authoring_admission(
+            require_budget("authoring admission"), expected_allowed=True)
+        if timing is not None:
+            timing["admission_wait_ms"] = _elapsed_ms(admission_started)
         request = {
             "request_context": {
                 "request_id": f"ui6i.{component_id}.{intent}.{uuid.uuid4().hex}",
@@ -152,19 +306,28 @@ def _component_lifecycle(
             "confirmed": True,
         }
         # A refusal or unknown response stops the sequence. Never repeat effects.
+        require_budget("command dispatch")
+        submitted_at = time.monotonic()
         submitted = headless.submit_component_lifecycle(request)
         acceptance = submitted["acceptance"]
         assert acceptance is not None, submitted
-        deadline = time.monotonic() + 20.0
+        status = None
         while True:
+            try:
+                require_budget("terminal status poll")
+            except AssertionError as error:
+                raise AssertionError(f"{error}; acceptance={acceptance!r}; last status={status!r}") from None
             status = headless.component_lifecycle_status(acceptance["lifecycle_transaction_id"])["status"]
             assert status is not None, acceptance
             assert status["status_owner_epoch"] == owner_epoch, status
             assert status["acceptance"] == acceptance, status
             if status["terminal_result"] is not None:
+                if timing is not None:
+                    timing["submit_to_terminal_ms"] = _elapsed_ms(submitted_at)
+                    timing["terminal_result"] = str(status["terminal_result"])[:64]
+                    timing["terminal_state"] = str(status.get("current_state"))[:64]
                 assert status["terminal_result"] == "succeeded", status
                 break
-            assert time.monotonic() < deadline, status
             time.sleep(0.01)
         assert status["current_state"] == achieved, status
         assert {row["control_domain_id"] for row in status["domains"]} == {
@@ -172,18 +335,40 @@ def _component_lifecycle(
         }, status
         assert len(status["domains"]) == len(expected_domains), status
         assert all(row["current_state"] == achieved for row in status["domains"]), status
-        installed = headless.cclc_component(component_id)
+        installed = read_activation_component(headless, component_id, deadline=deadline, timing=timing)
+        if timing is not None:
+            # Honest: the state actually read back, not the one requested.
+            if installed.get("component_lifecycle_state") == achieved:
+                timing["submit_to_ready_ms"] = _elapsed_ms(submitted_at)
+                timing["outcome"] = "ok"
+            timing["final_state"] = str(installed.get("component_lifecycle_state"))[:64]
         assert installed["component_lifecycle_state"] == achieved, installed
         assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
         return status
 
 
 def _activate_loaded_components(stack: ProcessStack) -> list[str]:
+    span_started = time.monotonic()
+    timing_rows: list[dict[str, Any]] = []
+    try:
+        component_ids = _activate_loaded_components_timed(stack, timing_rows)
+    except BaseException as error:
+        _write_activation_timing(stack, "activate_loaded_components", span_started, timing_rows, error)
+        raise
+    _write_activation_timing(stack, "activate_loaded_components", span_started, timing_rows, None)
+    return component_ids
+
+
+def _activate_loaded_components_timed(
+    stack: ProcessStack, timing_rows: list[dict[str, Any]]
+) -> list[str]:
     component_ids = _applied_activation_order(stack)
     with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
         owner_epoch = headless.cclc_owner_identity()["request_owner_epoch"]
 
-        def wait_ready(initial: dict[str, Any], intent: str, requested: str) -> None:
+        def wait_ready(
+            initial: dict[str, Any], intent: str, requested: str, timing: dict[str, Any]
+        ) -> None:
             identity_fields = (
                 "controllable_component_id", "retained_bundle_id", "graph_revision",
                 "publication_generation", "active_public_pointer_digest",
@@ -193,13 +378,15 @@ def _activate_loaded_components(stack: ProcessStack) -> list[str]:
             identity = {key: initial[key] for key in identity_fields}
             start_wallclock = time.time()
             started = time.monotonic()
-            deadline = started + 20.0
+            deadline = started + ACTIVATION_READ_TIMEOUT_SECONDS
             trace: list[dict[str, Any]] = []
             trace_dropped = 0
             previous_facts = None
             while True:
+                timing["readiness_wait_iterations"] += 1
                 assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
-                current = headless.cclc_component(initial["controllable_component_id"])
+                current = read_activation_component(
+                    headless, initial["controllable_component_id"], deadline=deadline, timing=timing)
                 assert {key: current[key] for key in identity_fields} == identity, current
                 readiness = current["readiness"]
                 assert readiness["request_owner_epoch"] == owner_epoch, current
@@ -232,15 +419,19 @@ def _activate_loaded_components(stack: ProcessStack) -> list[str]:
                         trace_dropped += 1
                     previous_facts = facts
                 if readiness["ready"]:
+                    timing["readiness_wait_ms"] = _elapsed_ms(started)
                     return
                 assert readiness["error"] is not None, current
+                # Match useCCLC.ts POLL_INTERVAL_MS=250. Check the shared
+                # deadline after the wait so no read starts past it.
+                time.sleep(0.25)
                 if time.monotonic() >= deadline:
                     encoded = json.dumps(current, sort_keys=True, separators=(",", ":")).encode()
                     evidence: dict[str, Any] = {
                         "start_wallclock_seconds": start_wallclock,
                         "join_identity": identity,
                         "request_owner_epoch": owner_epoch,
-                        "provider_runtime_epochs": [row.get("runtime_epoch")
+                        "provider_runtime_epochs": [row.get("provider_runtime_epoch")
                                                     for row in current["provider_occurrences"]],
                         "intent": intent, "requested_state": requested,
                         "snapshot_sha256": hashlib.sha256(encoded).hexdigest(),
@@ -287,23 +478,40 @@ def _activate_loaded_components(stack: ProcessStack) -> list[str]:
                         "truncated": evidence["truncated"],
                     })[:2048]
                     raise AssertionError(summary)
-                # Match useCCLC.ts POLL_INTERVAL_MS=250; retain the same bound.
-                time.sleep(0.25)
 
         for component_id in component_ids:
-            before = headless.cclc_component(component_id)
+            first_read: dict[str, Any] = {"component_read_changed_count": 0}
+            try:
+                before = read_activation_component(
+                    headless, component_id,
+                    deadline=time.monotonic() + ACTIVATION_READ_TIMEOUT_SECONDS, timing=first_read)
+            except BaseException:
+                # Failed initial observation: real id and count; no intent or state invented.
+                failed = _timing_row(component_id, None, None)
+                failed["component_read_changed_count"] = first_read["component_read_changed_count"]
+                timing_rows.append(failed)
+                raise
             assert before["controllable_component_id"] == component_id, before
             state = before["component_lifecycle_state"]
             if state == "active":
                 continue  # Unchanged Active owners never cycle on config-only Apply.
             assert state in {"declared", "disabled", "prepared"}, before
             if state != "prepared":
-                wait_ready(before, "prepare", "prepared")
-                _component_lifecycle(stack, component_id, "prepare", owner_epoch)
-                before = headless.cclc_component(component_id)
+                timing = _timing_row(component_id, before, "prepare")
+                timing["component_read_changed_count"] += first_read["component_read_changed_count"]
+                timing_rows.append(timing)
+                wait_ready(before, "prepare", "prepared", timing)
+                _component_lifecycle(stack, component_id, "prepare", owner_epoch, timing)
+                before = read_activation_component(
+                    headless, component_id,
+                    deadline=time.monotonic() + ACTIVATION_READ_TIMEOUT_SECONDS, timing=timing)
                 assert before["component_lifecycle_state"] == "prepared", before
-            wait_ready(before, "enable", "active")
-            _component_lifecycle(stack, component_id, "enable", owner_epoch)
+                first_read["component_read_changed_count"] = 0
+            timing = _timing_row(component_id, before, "enable")
+            timing["component_read_changed_count"] += first_read["component_read_changed_count"]
+            timing_rows.append(timing)
+            wait_ready(before, "enable", "active", timing)
+            _component_lifecycle(stack, component_id, "enable", owner_epoch, timing)
         assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
     assert _applied_activation_order(stack) == component_ids
     return component_ids
@@ -314,7 +522,14 @@ def _disable_for_reload(stack: ProcessStack, component_id: str) -> None:
         current = headless.cclc_component(component_id)
         assert current["component_lifecycle_state"] == "active", current
         owner_epoch = headless.cclc_owner_identity()["request_owner_epoch"]
-    _component_lifecycle(stack, component_id, "disable", owner_epoch)
+    span_started = time.monotonic()
+    timing = _timing_row(component_id, current, "disable")
+    try:
+        _component_lifecycle(stack, component_id, "disable", owner_epoch, timing)
+    except BaseException as error:
+        _write_activation_timing(stack, "disable_for_reload", span_started, [timing], error)
+        raise
+    _write_activation_timing(stack, "disable_for_reload", span_started, [timing], None)
 
 
 def _wait_components_reached_requested_target(
@@ -326,7 +541,7 @@ def _wait_components_reached_requested_target(
         while True:
             states: dict[str, Any] = {}
             for component_id in component_ids:
-                snapshot = headless.cclc_component(component_id)
+                snapshot = read_activation_component(headless, component_id, deadline=deadline)
                 target = snapshot.get("lifecycle_target")
                 progress = snapshot.get("lifecycle_progress")
                 states[component_id] = {
@@ -1731,6 +1946,163 @@ def test_grouped_dual_robot_run_scales_stops_and_resumes() -> None:
             terminal = _wait_run_state(client, program_run_id, {"succeeded"})
             assert terminal["state"] == "succeeded"
             _reset_cycle(client, program_run_id)
+
+
+def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_closed() -> None:
+    # This fixture has no production Workbench supervisor: it keeps the API
+    # alive to inspect the process chain, not browser visibility during teardown.
+    with _dual_robot_stack() as stack:
+        _load_scenario(stack, GROUPED_SCENARIO)
+        applied = _save_and_reopen_current_scenario(stack, GROUPED_SCENARIO)
+        selector = _group_selector(applied["program_binding_id"])
+        with (
+            HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
+            HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
+        ):
+            started = _start_run(
+                stack, scenario_id=applied["scenario_id"],
+                source_document_digest=applied["source_document_digest"], applied=applied,
+            )
+            program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
+            _start_motion(composer, started, request_id="r5.runner-loss.motion-start")
+            accepted = _operation_acceptances(stack, program_run_id)
+            original_ids = {event["operation_id"] for event in accepted}
+            assert len(original_ids) == 2
+            # Reuse the genuine fixture's runtime scale control to keep the
+            # authored motions active across the existing lease/Stop interval.
+            _set_scale(composer, selector, 0.05, "r5.runner-loss.slow-active-motion")
+            _wait_scale_applied(composer, selector, 0.05)
+            native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+            native_epoch = native.identity()["identity"]["owner_epoch"]
+            deadline = time.monotonic() + 20.0
+            while True:
+                before_loss = {operation_id: native.read(operation_id)["operation"]
+                               for operation_id in original_ids}
+                executing_ids = {operation_id for operation_id, operation in before_loss.items()
+                                 if operation["state"] == "executing"}
+                if executing_ids:
+                    break
+                assert time.monotonic() < deadline, before_loss
+                time.sleep(0.01)
+            cycle_before = composer.program_cycle_status()
+            assert cycle_before["program_run_id"] == program_run_id
+            assert cycle_before["state"] == "running", cycle_before
+            # This read is the final execution witness before the real process
+            # kill; mere admission/planning is not enough for this regression.
+            executing_ids = {operation_id for operation_id in executing_ids
+                             if native.read(operation_id)["operation"]["state"] == "executing"}
+            assert executing_ids, before_loss
+            killed_at = time.monotonic()
+            stack.kill_program_runner()
+
+            alarm_deadline = killed_at + 20.0
+            while True:
+                alarms = headless.alarms()
+                loss = [alarm for alarm in alarms["alarms"]
+                        if alarm["definition_id"] == "manyforge.runtime.program_runner_loss"]
+                if loss:
+                    break
+                assert time.monotonic() < alarm_deadline, alarms
+                time.sleep(0.01)
+            alarm_observed_after_s = time.monotonic() - killed_at
+            assert len(loss) == 1, loss
+            first_alarm = loss[0]
+            assert first_alarm["active"] is True
+            assert first_alarm["lifecycle_state"] == "active_unacknowledged"
+            assert first_alarm["acknowledgement_required"] is True
+            assert first_alarm["priority"] == "high"
+            assert first_alarm["activation_count"] == 1
+            assert first_alarm["correlations"]["source_owner_epoch"] == native_epoch
+            established = first_alarm["details"]["established_cycle"]
+            assert established["program_run_id"] == program_run_id
+            for key in ("program_runner_owner_epoch", "cycle_generation", "cycle_claim_generation"):
+                assert established[key] == cycle_before[key], (first_alarm, cycle_before)
+            assert first_alarm["details"]["failure_predicate"] in {
+                "program_runner_liveness_probe", "program_runner_liveness_renewal",
+                "program_runner_reconciliation_renewal",
+            }
+            # Do not issue Stop here. The already-configured Manager-presence
+            # lease owns containment; the alarm itself is not proof of rest.
+            containment_deadline = time.monotonic() + 20.0
+            while True:
+                events = _native_events(stack)
+                lease_stops = [event for event in events
+                               if event["record_kind"] == "stop_acceptance_projected"
+                               and event["payload"]["intent"]["intent_kind"] == "full_stop"
+                               and event["payload"]["intent"]["value"]["request_context"][
+                                   "source_label"] == "kernel.manager_liveness"]
+                terminals = []
+                if lease_stops:
+                    assert len(lease_stops) == 1, lease_stops
+                    stop_id = lease_stops[0]["payload"]["acceptance"]["stop_id"]
+                    terminals = [event for event in events
+                                 if event["record_kind"] == "stop_terminal_projected"
+                                 and event["payload"]["stop_id"] == stop_id]
+                if terminals:
+                    break
+                assert time.monotonic() < containment_deadline, events
+                time.sleep(0.01)
+            stop = lease_stops[0]["payload"]
+            assert executing_ids <= {operation["operation_id"]
+                                     for operation in stop["affected_state"]["operations"]}
+            assert len(terminals) == 1, terminals
+            terminal = terminals[0]["payload"]
+            assert terminal["state"] == "succeeded", terminal
+            assert terminal["result"] in {"succeeded_nominal", "succeeded_escalated"}, terminal
+            assert terminal["stop_generation"] == stop["acceptance"]["stop_generation"]
+            assert terminal["stop_certificate_id"]
+            assert terminal["failed_count"] == terminal["unsettled_count"] == 0
+            assert terminal["dispatched_stopped_count"] >= len(executing_ids)
+            if not terminal["details_truncated"]:
+                stopped_ids = {entry["subject"]["operation_id"]
+                               for entry in terminal["dispatched_stopped"]
+                               if entry["subject"]["kind"] == "participant"}
+                assert executing_ids <= stopped_ids, terminal
+            for operation_id in executing_ids:
+                contained = native.read(operation_id)["operation"]
+                assert contained["state"] == "stopped", contained
+                assert contained["active_stop_id"] == terminal["stop_id"]
+                assert contained["active_stop_generation"] == terminal["stop_generation"]
+
+            assert headless.authoring_admission()["authoring_allowed"] is False
+            # A distinct valid Execute must reach the authoritative host lease
+            # gate, not merely fail against the retained operation's engine.
+            refused_intent = deepcopy(accepted[0]["payload"]["intent"])
+            refused_intent.pop("request_attribution")  # Journal-only provenance.
+            refused_intent["program_run_id"] = "r5.runner-loss.manual-refusal-run"
+            refused_intent["request_context"]["request_id"] = "r5.runner-loss.refused-execute"
+            refused_intent["request_context"]["correlation_id"] = "r5.runner-loss.refused-execute"
+            for participant in refused_intent["participants"]:
+                participant.pop("execution_scope", None)
+                participant.pop("automatic_retry_context", None)
+                participant["action_span"] = None
+            refused = native.submit(OperationIntentRequest.model_validate(refused_intent),
+                                    trusted_principal_id=None)
+            assert refused["ok"] is False, refused
+            assert refused["error"]["code"] == "manager_liveness_not_current", refused
+            after_events = _native_events(stack)
+            assert not any(
+                event["record_kind"] == "operation_accepted"
+                and (event["request_id"] == "r5.runner-loss.refused-execute"
+                     or event["payload"]["intent"]["program_run_id"]
+                     == "r5.runner-loss.manual-refusal-run")
+                for event in after_events
+            )
+            assert {event["operation_id"] for event in after_events
+                    if event["record_kind"] == "operation_accepted"
+                    and event["payload"]["intent"]["program_run_id"] == program_run_id} == original_ids
+            retained = [alarm for alarm in headless.alarms()["alarms"]
+                        if alarm["definition_id"] == "manyforge.runtime.program_runner_loss"]
+            assert len(retained) == 1
+            for key in ("condition_id", "activation_id", "activation_count", "lifecycle_state"):
+                assert retained[0][key] == first_alarm[key]
+            print(json.dumps({"runner_loss_alarm_observed_after_s": alarm_observed_after_s,
+                              "contained_operation_ids": sorted(executing_ids),
+                              "stop_id": terminal["stop_id"],
+                              "stop_certificate_id": terminal["stop_certificate_id"]}, sort_keys=True))
+            # No ACK, Reset, replacement Runner or recovery: this sticky fault
+            # requires Workbench restart. Fixture teardown owns process cleanup.
 
 
 def test_separate_group_stop_does_not_stop_the_other_robot() -> None:

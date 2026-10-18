@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: semantic_shape_pick
-program_revision: sha256:49fdb4df42559940f4f7a0467e35abfbd55c53ae2d5beef20896555d8441cf68
+program_revision: sha256:aa80cf45af56f515a790c5e5f3a88cd35169d3a8d70f57a6d1d8b3cf253e47cb
 program_profile: composable-cell-v1
 name: semantic_shape_pick
 description: >-
@@ -11,7 +11,7 @@ description: >-
   remains visible in the Program.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.5.0
+  content_version: 2.7.0
 compatibility:
   lanes: [manyforge-only]
   assistant: required

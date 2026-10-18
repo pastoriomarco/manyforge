@@ -17,9 +17,6 @@ _GENERATOR = _REPO_ROOT / "scripts" / "regen-public-contracts.py"
 _FRESHNESS_WRAPPER = (
     _REPO_ROOT / "scripts" / "ci" / "check-public-contracts-fresh.sh"
 )
-_STEP18_RELEASE_GATE_VERIFIER = (
-    _REPO_ROOT / "scripts" / "qualification" / "verify_step18_release_gates.py"
-)
 _UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
 
 
@@ -256,11 +253,46 @@ def test_explicit_freshness_selector_routes_to_the_bounded_generator(
     assert calls.read_text(encoding="utf-8").splitlines() == [expected]
 
 
-def test_step18_hygiene_uses_the_explicit_check_and_tracks_its_script() -> None:
-    source = _STEP18_RELEASE_GATE_VERIFIER.read_text(encoding="utf-8")
 
-    assert (
-        '"bash scripts/ci/check-public-contracts-fresh.sh structural-rest"'
-        in source
-    )
-    assert "command.split()[1]" in source
+def test_removed_contact_release_clearance_field_stays_out_of_the_repository() -> None:
+    # Moved from the retired Step 18 release-gate removed-field hygiene check
+    # (decision 120): the field may survive only in tests that prove its
+    # rejection. The historical baseline patches were retired (decision 121).
+    removed_field = "min_separation_" + "clearance_m"
+    removed_bytes = removed_field.encode("ascii")
+    listed = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "ls-files", "-z", "--cached", "--others",
+         "--exclude-standard"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    failures: list[str] = []
+    for relative in sorted({p.decode() for p in listed.split(b"\0") if p}):
+        path = _REPO_ROOT / relative
+        if path.is_symlink() or not path.is_file():
+            continue
+        payload = path.read_bytes()
+        if removed_bytes not in payload:
+            continue
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            failures.append(f"{relative}: hygiene source is not valid UTF-8")
+            continue
+        parts = Path(relative).parts
+        if ("tests" in parts or "test" in parts) and Path(relative).name.startswith(
+            "test_"
+        ):
+            lowered = text.lower()
+            if not any(
+                word in lowered for word in ("unknown", "reject", "legacy", "baseline")
+            ):
+                failures.append(
+                    f"{relative}: removed field is not rejection/baseline evidence"
+                )
+            continue
+        failures.append(
+            f"{relative}: removed field remains outside strict test/baseline evidence"
+        )
+
+    assert failures == []

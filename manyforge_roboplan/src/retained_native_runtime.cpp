@@ -491,6 +491,27 @@ retained_controlled_stop_profiles(
                                         std::move(frozen_fault.value())};
 }
 
+// This policy belongs to the currently installed cell product, not a retained
+// component's bundle or a planner configuration captured before Apply.
+[[nodiscard]] std::optional<double>
+current_cell_takeover_budget(const RetainedNativeCellRuntime *cell,
+                             const core::RuntimeParticipantBinding &binding) {
+  if (cell == nullptr ||
+      binding.value().capability_id.value() != "execution.trajectory.execute") {
+    return std::nullopt;
+  }
+  for (const auto &row : cell->participant_registrations()) {
+    const auto &source = row.binding.value();
+    if (source.controllable_component_id ==
+            binding.value().controllable_component_id &&
+        source.command_target_id == binding.value().command_target_id &&
+        source.capability_id == binding.value().capability_id) {
+      return row.motion_takeover_preparation_budget_s;
+    }
+  }
+  return std::nullopt;
+}
+
 [[nodiscard]] core::RuntimeParticipantExecutionRegistration
 runtime_registration(
     core::RuntimeParticipantBinding binding,
@@ -547,6 +568,21 @@ runtime_registration(
       std::move(default_operator_stop_profile),
       std::move(default_fault_stop_profile),
       deployment_maximum_tcp_linear_speed_mps};
+}
+
+// Rebuilding route/readiness facts must retain the active cell's motion
+// policy. Ordinary participant construction still starts without this policy.
+template <typename... Args>
+[[nodiscard]] core::RuntimeParticipantExecutionRegistration
+runtime_registration(const RetainedNativeRuntime &owner, Args &&...args) {
+  auto registration = runtime_registration(std::forward<Args>(args)...);
+  const auto *cell = owner.cell_runtime_owner;
+  if (cell == nullptr && owner.cell_runtime_root != nullptr) {
+    cell = owner.cell_runtime_root->cell_runtime_owner;
+  }
+  registration.motion_takeover_preparation_budget_s =
+      current_cell_takeover_budget(cell, registration.binding);
+  return registration;
 }
 
 [[nodiscard]] core::RuntimeParticipantExecutionRegistration
@@ -746,6 +782,7 @@ readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
          left.frame_bindings == right.frame_bindings &&
          left.resources == right.resources &&
          left.collision_body_bindings == right.collision_body_bindings &&
+         left.io_output_binding == right.io_output_binding &&
          left.control_path == right.control_path &&
          left.capability_provider_path == right.capability_provider_path &&
          (left.supporting_capability_provider_paths ==
@@ -956,10 +993,15 @@ make_kernel_participant_resolver(
       return core::Result<core::RuntimeParticipantExecutionRegistration>::Err(
           binding.error());
     }
+    const auto& selected = binding.value().binding;
+    const bool exact_output = selected.value().io_output_binding &&
+        std::any_of(physical_registrations.begin(), physical_registrations.end(),
+                    [&](const auto& row) { return row.binding.value() == selected.value(); });
     const core::RuntimeParticipantExecutionRegistration *physical = nullptr;
     for (const auto &candidate : physical_registrations) {
-      if (!same_physical_binding(candidate.binding, binding.value().binding,
-                                 true)) {
+      if (exact_output
+              ? candidate.binding.value() != selected.value()
+              : !same_physical_binding(candidate.binding, selected, true)) {
         continue;
       }
       if (physical != nullptr) {
@@ -978,6 +1020,16 @@ make_kernel_participant_resolver(
           core::ErrorCode::kMissingReference);
     }
     try {
+      // Logical outputs already have their exact composed provider engine and
+      // prepared-command port. They have no physical Stop defaults to rebuild.
+      if (binding.value().binding.value().io_output_binding) {
+        auto registration = *physical;
+        registration.binding = std::move(binding.value().binding);
+        registration.intrinsic_direct_control =
+            binding.value().intrinsic_direct_control;
+        return core::Result<core::RuntimeParticipantExecutionRegistration>::Ok(
+            std::move(registration));
+      }
       auto registration = runtime_registration(
           std::move(binding.value().binding), physical->stop_readiness,
           physical->engine, physical->stop_execution_port,
@@ -991,6 +1043,8 @@ make_kernel_participant_resolver(
           binding.value().intrinsic_direct_control;
       registration.direct_control_joint_limits =
           physical->direct_control_joint_limits;
+      registration.motion_takeover_preparation_budget_s =
+          physical->motion_takeover_preparation_budget_s;
       return core::Result<core::RuntimeParticipantExecutionRegistration>::Ok(
           std::move(registration));
     } catch (const std::exception &exception) {
@@ -1053,7 +1107,9 @@ make_kernel_participant_resolver(
          predecessor.intrinsic_direct_control ==
              candidate.intrinsic_direct_control &&
          predecessor.direct_control_joint_limits ==
-             candidate.direct_control_joint_limits;
+             candidate.direct_control_joint_limits &&
+         predecessor.motion_takeover_preparation_budget_s ==
+             candidate.motion_takeover_preparation_budget_s;
 }
 
 } // namespace
@@ -2550,6 +2606,30 @@ void for_each_cell_runtime(RetainedNativeRuntime &runtime, Visitor visitor) {
   for (const auto &peer : root->participant_peers) visitor(*peer);
 }
 
+[[nodiscard]] std::vector<core::RuntimeParticipantBinding> composed_bindings(
+    const std::vector<core::RuntimeParticipantExecutionRegistration>& rows) {
+  std::vector<core::RuntimeParticipantBinding> result;
+  result.reserve(rows.size());
+  for (const auto& row : rows) result.push_back(row.binding);
+  return result;
+}
+
+[[nodiscard]] std::vector<core::RuntimeParticipantExecutionRegistration>
+physical_registration_cache(
+    std::vector<core::RuntimeParticipantExecutionRegistration> rows) {
+  std::erase_if(rows, [](const auto& row) {
+    return row.binding.value().io_output_binding.has_value();
+  });
+  return rows;
+}
+
+void append_io_output_registrations(
+    std::vector<core::RuntimeParticipantExecutionRegistration>& owners,
+    const std::vector<core::RuntimeParticipantExecutionRegistration>& rows) {
+  for (const auto& row : rows)
+    if (row.binding.value().io_output_binding) owners.push_back(row);
+}
+
 struct CellParticipantSet final {
   std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
   std::vector<core::RuntimeParticipantBinding> physical_bindings;
@@ -2589,6 +2669,14 @@ struct CellParticipantSet final {
     const auto aliases = gripper->registrations();
     result.registrations.insert(result.registrations.end(), aliases.begin(), aliases.end());
     result.physical_bindings.push_back(gripper->binding());
+  }
+  // Provider outputs belong to the stable cell, not a subordinate arm cache.
+  // Route adoption replaces physical rows only; retain these exact installed
+  // rows, including their actual engine, occurrence and lifecycle generation.
+  if (root->cell_runtime_owner) {
+    for (const auto& row : root->cell_runtime_owner->participant_registrations())
+      if (row.binding.value().io_output_binding)
+        result.registrations.push_back(row);
   }
   return result;
 }
@@ -2646,7 +2734,7 @@ RetainedNativeRuntime::participant_engine_for(const bool motion) const {
 }
 
 void RetainedNativeRuntime::BindCellRuntimeOwner(
-    RetainedNativeCellRuntime& cell, const std::string& runtime_epoch,
+    RetainedNativeCellRuntime& cell, const std::string& /*runtime_epoch*/,
     const std::string& cell_id) {
   auto& runtime = *this;
   auto* const stable_kernel_owner = &cell.addressed_kernel();
@@ -2654,15 +2742,30 @@ void RetainedNativeRuntime::BindCellRuntimeOwner(
   runtime.cell_addressed_kernel = stable_kernel_owner;
   runtime.cell_operation_journal = stable_operation_journal;
   runtime.addressed_request_owner_epoch =
-      core::RequestOwnerEpoch("kernel-owner-" + runtime_epoch);
+      stable_kernel_owner->request_owner_epoch();
   runtime.addressed_cell_id = core::CellId(cell_id);
+  const auto seed_current_policy = [&](RetainedNativeRuntime &component) {
+    for (auto &row : component.participant_registrations) {
+      row.motion_takeover_preparation_budget_s =
+          current_cell_takeover_budget(&cell, row.binding);
+    }
+  };
+  seed_current_policy(runtime);
   for (const auto &peer : runtime.participant_peers) {
     peer->cell_addressed_kernel = stable_kernel_owner;
     peer->cell_operation_journal = stable_operation_journal;
     peer->addressed_request_owner_epoch =
         runtime.addressed_request_owner_epoch;
     peer->addressed_cell_id = runtime.addressed_cell_id;
+    seed_current_policy(*peer);
   }
+}
+
+void RetainedNativeRuntime::AdoptVerifiedParticipantResolverFactory(
+    RetainedRuntimeParticipantResolverFactory &&factory) {
+  auto *root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(root->route_publication_mutex_);
+  root->participant_resolver_factory.swap(factory);
 }
 
 void RetainedNativeRuntime::BindIndependentGripperPeers(
@@ -2734,18 +2837,11 @@ RetainedNativeRuntime::CurrentIndependentGripperRouteOwner(const core::ControlDo
     });
     if (primary == replacement.end()) return CandidateResult::Err(
         {"missing_reference", "scalar candidate has no primary command registration", {}});
-    std::vector<core::RuntimeParticipantBinding> physical;
-    for_each_cell_runtime(*current, [&](RetainedNativeRuntime& runtime) {
-      physical.push_back(runtime.motion_binding);
-      if (runtime.gripper_binding) physical.push_back(*runtime.gripper_binding);
-    });
-    for (const auto& gripper : current->independent_gripper_peers)
-      physical.push_back(gripper == selected ? primary->binding : gripper->binding());
-    auto binding_resolver = current->participant_resolver_factory(std::move(physical));
+    auto binding_resolver = current->participant_resolver_factory(composed_bindings(rows));
     if (!binding_resolver) return CandidateResult::Err(
         {"missing_reference", "current scalar participant resolver factory returned no resolver", {}});
     auto resolver = make_retained_cell_kernel_participant_resolver(std::move(binding_resolver), rows);
-    auto cache = rows;
+    auto cache = physical_registration_cache(rows);
     auto cached_resolver = resolver;
     std::function<void()> adopt = [current = std::move(current), cache = std::move(cache),
         cached_resolver = std::move(cached_resolver)]() mutable noexcept {
@@ -3075,10 +3171,16 @@ core::Result<void> ValidateRetainedMeasuredReadinessSnapshot(
       return unavailable();
     domains.insert(value.control_path->control_domain_id);
   }
-  if (domains.size() != snapshot.domains.size() ||
-      domains.size() != snapshot.provider_occurrences.size())
+  const auto controller_domains = std::count_if(
+      snapshot.domains.begin(), snapshot.domains.end(),
+      [](const auto &scope) { return scope.provider() == nullptr; });
+  if (domains.size() != static_cast<std::size_t>(controller_domains))
     return unavailable();
   for (const auto &scope : snapshot.domains) {
+    // Generic provider membership is checked by the host's actual driver
+    // capture. This helper owns only physical route/coordinate association.
+    if (scope.provider())
+      continue;
     if (!domains.contains(scope.control_domain_id))
       return unavailable();
     const auto current =
@@ -3088,13 +3190,14 @@ core::Result<void> ValidateRetainedMeasuredReadinessSnapshot(
     if (current == readbacks.end() || !current->second)
       return unavailable();
     const auto &readback = *current->second;
-    if (!scope.active_control_configuration ||
-        *scope.active_control_configuration != readback.active_configuration ||
+    if (scope.provider() || !scope.controller().active_control_configuration ||
+        *scope.controller().active_control_configuration !=
+            readback.active_configuration ||
         scope.control_domain_revision !=
             readback.active_configuration.control_domain_revision ||
-        scope.controller_topology_id !=
+        scope.controller().controller_topology_id !=
             readback.active_configuration.controller_topology_id ||
-        scope.topology_revision !=
+        scope.controller().topology_revision !=
             readback.active_configuration.topology_revision ||
         readback.active_configuration.state !=
             core::ActiveControlConfigurationStateDTO::kReconciled ||
@@ -3149,8 +3252,8 @@ core::Result<void> ValidateRetainedMeasuredReadinessSnapshot(
     std::sort(resources.begin(), resources.end());
     resources.erase(std::unique(resources.begin(), resources.end()),
                     resources.end());
-    if (bindings != scope.current_control_bindings ||
-        resources != scope.current_resources)
+    if (bindings != scope.control_bindings() ||
+        resources != scope.physical_resources())
       return unavailable();
   }
   return core::Result<void>::Ok();
@@ -3612,13 +3715,13 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           representative.value() ==
           (motion_owner ? next_motion.value() : next_gripper->value());
       registrations.push_back(runtime_registration(
-          representative, readiness_for_binding(representative),
+          *this, representative, readiness_for_binding(representative),
           participant_engine_for(motion_owner),
           motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
                              execution.get())
                        : gripper_stop_execution_port,
           representative_participant_policy(primary, motion_owner,
-                                        motion_participant_policy),
+                                            motion_participant_policy),
           motion_owner ? motion_operator_stop_profile
                        : std::optional<core::MotionInterruptStopProfileDTO>{},
           motion_owner ? motion_fault_stop_profile
@@ -3629,15 +3732,15 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
-          alias, motion_readiness, participant_engine.get(), execution.get(),
-          motion_participant_policy, motion_operator_stop_profile,
-          motion_fault_stop_profile,
+          *this, alias, motion_readiness, participant_engine.get(),
+          execution.get(), motion_participant_policy,
+          motion_operator_stop_profile, motion_fault_stop_profile,
           deployment_maximum_tcp_linear_speed_mps,
           motion_fault_stop_profile_from_deployment));
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
-          alias, gripper_readiness, gripper_participant_engine.get(),
+          *this, alias, gripper_readiness, gripper_participant_engine.get(),
           gripper_stop_execution_port, std::nullopt));
     }
 
@@ -3647,7 +3750,6 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     registrations = std::move(cell_participants.registrations);
     std::vector<core::RuntimeParticipantExecutionRegistration>
         cell_physical_registrations;
-    cell_physical_registrations.reserve(cell_participants.physical_bindings.size());
     for (const auto &physical_binding : cell_participants.physical_bindings) {
       const auto registration = std::find_if(
           registrations.begin(), registrations.end(), [&](const auto &candidate) {
@@ -3660,10 +3762,11 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
       }
       cell_physical_registrations.push_back(*registration);
     }
+    append_io_output_registrations(cell_physical_registrations, registrations);
     RetainedRuntimeParticipantResolver binding_resolver;
     if (cell_root->participant_resolver_factory) {
       binding_resolver = cell_root->participant_resolver_factory(
-          std::move(cell_participants.physical_bindings));
+          composed_bindings(registrations));
       if (!binding_resolver) {
         return route_publication_error<
             core::RuntimeRouteConfigurationReadbackDTO>(
@@ -3832,6 +3935,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
       stable_cell_registrations = registrations;
       stable_cell_resolver = kernel_resolver;
     }
+    auto root_physical_cache = physical_registration_cache(registrations);
     auto published = kernel->publish_runtime_route_configuration(
         configuration, registrations, kernel_resolver);
     if (!published.ok()) {
@@ -3865,10 +3969,10 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     gripper_binding_aliases = std::move(next_gripper_aliases);
     control_binding_representatives = std::move(next_representatives);
     if (cell_root == this) {
-      participant_registrations.swap(registrations);
+      participant_registrations.swap(root_physical_cache);
     } else {
       participant_registrations.swap(local_registrations);
-      cell_root->participant_registrations.swap(registrations);
+      cell_root->participant_registrations.swap(root_physical_cache);
     }
     participant_resolver.swap(kernel_resolver);
     displaced_local_resolver.swap(kernel_resolver);
@@ -3908,20 +4012,27 @@ rebind_component_registrations(
     const core::ControllableComponentId &component,
     const core::ComponentLifecycleGeneration generation) {
   for (auto &registration : registrations) {
-    if (registration.binding.value().controllable_component_id != component ||
-        !registration.stop_readiness.has_value() ||
-        registration.stop_readiness->value().component_lifecycle_generation ==
-            generation) {
+    if (registration.binding.value().controllable_component_id != component)
       continue;
+    if (registration.stop_readiness.has_value() &&
+        registration.stop_readiness->value().component_lifecycle_generation != generation) {
+      auto refreshed = core::rebind_runtime_participant_stop_readiness_generation(
+          *registration.stop_readiness, generation);
+      if (!refreshed.ok())
+        return core::Result<std::vector<core::RuntimeParticipantExecutionRegistration>>::Err(
+            refreshed.error());
+      registration.stop_readiness = std::move(refreshed.value());
     }
-    auto refreshed = core::rebind_runtime_participant_stop_readiness_generation(
-        *registration.stop_readiness, generation);
-    if (!refreshed.ok()) {
-      return core::Result<
-          std::vector<core::RuntimeParticipantExecutionRegistration>>::Err(
-          refreshed.error());
+    if (registration.binding.value().io_output_binding &&
+        registration.binding.value().io_output_binding->component_lifecycle_generation != generation) {
+      auto value = registration.binding.value();
+      value.io_output_binding->component_lifecycle_generation = generation;
+      auto refreshed = core::verify_runtime_participant_binding(std::move(value));
+      if (!refreshed.ok())
+        return core::Result<std::vector<core::RuntimeParticipantExecutionRegistration>>::Err(
+            refreshed.error());
+      registration.binding = std::move(refreshed.value());
     }
-    registration.stop_readiness = std::move(refreshed.value());
   }
   return core::Result<
       std::vector<core::RuntimeParticipantExecutionRegistration>>::Ok(
@@ -4005,8 +4116,8 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
         core::ErrorCode::kMissingReference);
   }
   try {
-    // Stage the re-sealed caches for every robot runtime in the cell. The
-    // root's cache is the complete cell registration set the Kernel holds.
+    // Stage subordinate physical caches separately from the authoritative
+    // complete stable-cell inventory; neither is mutated before readback.
     std::vector<std::pair<RetainedNativeRuntime *,
                           std::vector<core::RuntimeParticipantExecutionRegistration>>>
         staged;
@@ -4018,7 +4129,7 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
     for_each_cell_runtime(*this, [&](RetainedNativeRuntime &runtime) {
       if (failure.has_value()) return;
       auto rebound = rebind_component_registrations(
-          runtime.participant_registrations,
+          physical_registration_cache(runtime.participant_registrations),
           publication.controllable_component_id,
           publication.component_lifecycle_generation);
       if (!rebound.ok()) {
@@ -4060,10 +4171,17 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
       if (registration.binding.value().controllable_component_id == publication.controllable_component_id)
         staged_grippers.emplace_back(gripper, std::move(primary_readiness), std::move(rebound.value()));
     }
-    const auto &cell_registrations = staged.front().second;
+    auto complete = rebind_component_registrations(
+        cell_root->cell_runtime_owner
+            ? cell_root->cell_runtime_owner->participant_registrations()
+            : staged.front().second,
+        publication.controllable_component_id,
+        publication.component_lifecycle_generation);
+    if (!complete.ok())
+      return core::Result<core::ComponentCommandReadinessDTO>::Err(complete.error());
+    const auto &cell_registrations = complete.value();
     std::vector<core::RuntimeParticipantExecutionRegistration>
         cell_physical_registrations;
-    cell_physical_registrations.reserve(physical_bindings.size());
     for (const auto &physical_binding : physical_bindings) {
       const auto registration = std::find_if(
           cell_registrations.begin(), cell_registrations.end(),
@@ -4078,10 +4196,11 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
       }
       cell_physical_registrations.push_back(*registration);
     }
+    append_io_output_registrations(cell_physical_registrations, cell_registrations);
     RetainedRuntimeParticipantResolver binding_resolver;
     if (cell_root->participant_resolver_factory) {
       binding_resolver =
-          cell_root->participant_resolver_factory(std::move(physical_bindings));
+          cell_root->participant_resolver_factory(composed_bindings(cell_registrations));
       if (!binding_resolver) {
         return route_publication_error<core::ComponentCommandReadinessDTO>(
             "component_readiness_resolver_factory_failed",
@@ -4136,6 +4255,39 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
     return route_publication_error<core::ComponentCommandReadinessDTO>(
         "component_readiness_native_composition_failed", exception.what());
   }
+}
+
+core::Result<core::ComponentCommandReadinessDTO>
+RetainedNativeRuntime::PublishComponentCommandReadiness(
+    const core::ComponentCommandReadinessPublicationDTO &publication,
+    const core::ComponentLifecycleCurrentSnapshotDTO &actual_snapshot,
+    const std::vector<core::BrandLifecycleObservationDTO>
+        &actual_observations) {
+  const bool has_provider = std::any_of(
+      actual_snapshot.domains.begin(), actual_snapshot.domains.end(),
+      [](const auto &domain) { return domain.provider() != nullptr; });
+  if (has_provider) {
+    auto *const root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+    auto *const kernel = root->addressed_kernel != nullptr
+                             ? root->addressed_kernel.get()
+                             : root->cell_addressed_kernel;
+    if (kernel == nullptr) {
+      return route_publication_error<core::ComponentCommandReadinessDTO>(
+          "component_readiness_kernel_missing",
+          "native component readiness has no stable addressed Kernel owner",
+          core::ErrorCode::kMissingReference);
+    }
+    const auto provider_publication =
+        kernel->publish_runtime_provider_configuration(
+            publication, actual_snapshot, actual_observations);
+    if (!provider_publication.ok()) {
+      return core::Result<core::ComponentCommandReadinessDTO>::Err(
+          provider_publication.error());
+    }
+  }
+  // This owns route exclusion and the complete component reseal; provider-map
+  // publication alone never establishes whole-component command eligibility.
+  return PublishComponentCommandReadiness(publication);
 }
 
 core::Result<core::ComponentCommandReadinessDTO>
@@ -4453,13 +4605,13 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
           representative.value() ==
           (motion_owner ? next_motion.value() : next_gripper->value());
       registrations.push_back(runtime_registration(
-          representative, readiness_for_binding(representative),
+          *this, representative, readiness_for_binding(representative),
           participant_engine_for(motion_owner),
           motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
                              execution.get())
                        : gripper_stop_execution_port,
           representative_participant_policy(primary, motion_owner,
-                                        motion_participant_policy),
+                                            motion_participant_policy),
           motion_owner ? motion_operator_stop_profile
                        : std::optional<core::MotionInterruptStopProfileDTO>{},
           motion_owner ? motion_fault_stop_profile
@@ -4470,25 +4622,24 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
-          alias, motion_readiness, participant_engine.get(), execution.get(),
-          motion_participant_policy, motion_operator_stop_profile,
-          motion_fault_stop_profile,
+          *this, alias, motion_readiness, participant_engine.get(),
+          execution.get(), motion_participant_policy,
+          motion_operator_stop_profile, motion_fault_stop_profile,
           deployment_maximum_tcp_linear_speed_mps,
           motion_fault_stop_profile_from_deployment));
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
-          alias, gripper_readiness, gripper_participant_engine.get(),
+          *this, alias, gripper_readiness, gripper_participant_engine.get(),
           gripper_stop_execution_port, std::nullopt));
     }
 
-    const auto local_registrations = registrations;
+    auto local_registrations = registrations;
     auto cell_participants = compose_cell_participants(
         *this, registrations, next_motion, next_gripper);
     registrations = std::move(cell_participants.registrations);
     std::vector<core::RuntimeParticipantExecutionRegistration>
         cell_physical_registrations;
-    cell_physical_registrations.reserve(cell_participants.physical_bindings.size());
     for (const auto &physical_binding : cell_participants.physical_bindings) {
       const auto registration = std::find_if(
           registrations.begin(), registrations.end(), [&](const auto &candidate) {
@@ -4501,10 +4652,11 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
       }
       cell_physical_registrations.push_back(*registration);
     }
+    append_io_output_registrations(cell_physical_registrations, registrations);
     RetainedRuntimeParticipantResolver binding_resolver;
     if (cell_root->participant_resolver_factory) {
       binding_resolver = cell_root->participant_resolver_factory(
-          std::move(cell_participants.physical_bindings));
+          composed_bindings(registrations));
       if (!binding_resolver) {
         return route_publication_error<
             core::RuntimeRouteConfigurationReadbackDTO>(
@@ -4594,6 +4746,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
       stable_cell_registrations = registrations;
       stable_cell_resolver = kernel_resolver;
     }
+    auto root_physical_cache = physical_registration_cache(registrations);
     auto published =
         kernel->adopt_runtime_route_configuration_predecessor(
             configuration, registrations, kernel_resolver);
@@ -4638,10 +4791,10 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     gripper_binding_aliases = std::move(next_gripper_aliases);
     control_binding_representatives = std::move(next_representatives);
     if (cell_root == this) {
-      participant_registrations = registrations;
+      participant_registrations.swap(root_physical_cache);
     } else {
-      participant_registrations = local_registrations;
-      cell_root->participant_registrations = registrations;
+      participant_registrations.swap(local_registrations);
+      cell_root->participant_registrations.swap(root_physical_cache);
     }
     participant_resolver = std::move(kernel_resolver);
     if (cell_root != this) {

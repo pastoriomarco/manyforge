@@ -28,6 +28,8 @@ struct StopStageAttemptRequest final {
   IControlDomainExecutionPort* port{};
   std::shared_ptr<const ResolvedParticipantStopStageDTO> stage;
   std::shared_ptr<const RemainingStopBudgetDTO> budget;
+  /// Transient private selection; never changes the sealed stage command.
+  bool force_spring_return{};
 };
 
 enum class StopStageAttemptStartStatus : std::uint8_t {
@@ -66,6 +68,7 @@ enum class StopStageAttemptReleaseStatus : std::uint8_t {
 class IStopStageAttemptCompletionReceiver {
  public:
   virtual ~IStopStageAttemptCompletionReceiver() = default;
+  /// Also wakes on a first spring point; TryTake remains the completion truth.
   virtual void StageAttemptCompleted(StopStageAttemptHandle handle) noexcept = 0;
 };
 
@@ -97,6 +100,9 @@ class BoundedStopStageAttemptExecutor final {
   [[nodiscard]] StopStageAttemptStartResult TryStart(StopStageAttemptRequest request) noexcept;
   [[nodiscard]] bool RequestCancel(StopStageAttemptHandle handle) noexcept;
   [[nodiscard]] StopStageAttemptTakeResult TryTake(StopStageAttemptHandle handle) noexcept;
+  /// Exact lane-generation progress, never a completion or dispatch permit.
+  [[nodiscard]] std::shared_ptr<const SpringBackReturnPointDTO> ReadSpringReturnPoint(
+      StopStageAttemptHandle handle) noexcept;
   [[nodiscard]] StopStageAttemptReleaseStatus Release(StopStageAttemptHandle handle) noexcept;
   void CloseIngress() noexcept;
   [[nodiscard]] bool DrainFor(std::chrono::nanoseconds timeout) noexcept;

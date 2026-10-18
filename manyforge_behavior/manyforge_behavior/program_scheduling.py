@@ -151,6 +151,25 @@ class ProgramInterventionRegistry:
                     first = entry.record
             return first
 
+    def read_holds(
+        self, program_run_id: str
+    ) -> tuple[ProgramInterventionSnapshot, ...]:
+        """Every unresolved failure hold of the run, in arrival order.
+
+        Each held node is its own hold (operator Stops are not listed); the
+        runner publishes one offer per hold.
+        """
+        with self._lock:
+            run = self._runs.get(program_run_id)
+            if run is None:
+                return ()
+            return tuple(
+                entry.record
+                for entry in run.entries.values()
+                if entry.resolution is None
+                and entry.record.policy_parameter != "operator_stop_policy"
+            )
+
     def has_operator_stop(self, program_run_id: str) -> bool:
         """Scheduling query without allocating an all-entry projection."""
         with self._lock:
@@ -305,6 +324,13 @@ class ProgramRunTickHost:
                 daemon=True,
             )
             self._thread.start()
+
+    def submit_run_work(self, work: Callable[[], None]) -> Future[None]:
+        """Run one Run-owned side task (BB key publication) on the tick pool."""
+
+        with self._condition:
+            self._raise_if_unavailable()
+        return self._executor.submit(work)
 
     def schedule(self, program_run_id: str) -> None:
         if not isinstance(program_run_id, str) or not program_run_id:

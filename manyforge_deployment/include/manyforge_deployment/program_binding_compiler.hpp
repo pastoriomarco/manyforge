@@ -16,7 +16,7 @@
 namespace manyforge::deployment {
 
 class ProgramBindingCompilerError final : public std::invalid_argument {
- public:
+public:
   using std::invalid_argument::invalid_argument;
 };
 
@@ -24,10 +24,11 @@ inline constexpr std::string_view kDirectControlMotionProgramId =
     "manyforge.direct_control.motion";
 inline constexpr std::string_view kDirectControlGripperProgramId =
     "manyforge.direct_control.gripper";
+inline constexpr std::string_view kDirectControlIoProgramId =
+    "manyforge.direct_control.io";
 inline constexpr std::string_view kDirectControlComponentRoleId =
     "controlled_component";
-inline constexpr std::string_view kDirectControlTargetRoleId =
-    "command_target";
+inline constexpr std::string_view kDirectControlTargetRoleId = "command_target";
 inline constexpr std::string_view kDirectControlBaseFrameRoleId = "base";
 inline constexpr std::string_view kDirectControlTcpFrameRoleId = "tcp";
 
@@ -37,6 +38,8 @@ inline constexpr std::string_view kDirectControlTcpFrameRoleId = "tcp";
 struct DirectControlProgramBindingInventory final {
   std::vector<std::shared_ptr<const ProgramBinding>> motion;
   std::vector<std::shared_ptr<const ProgramBinding>> gripper;
+  /// Logical input bindings only; these create no physical participant.
+  std::vector<std::shared_ptr<const ProgramBinding>> io;
 };
 
 /// Resolve one complete authored role assignment against one exact retained
@@ -46,12 +49,12 @@ struct DirectControlProgramBindingInventory final {
 /// role assignment remains untrusted authored selection. Catalog bytes are
 /// point-read only by exact key/digest from the retained closure; no path,
 /// active alias, runtime state, endpoint, or fallback selector is accepted.
-[[nodiscard]] std::shared_ptr<const ProgramBinding> compile_program_binding(
-    const ProgramBindingContract& program_contract,
-    core::ProgramRoleAssignmentDTO role_assignment,
-    const RetainedBundle& retained_bundle,
-    const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactSource& catalog_artifact_store);
+[[nodiscard]] std::shared_ptr<const ProgramBinding>
+compile_program_binding(const ProgramBindingContract &program_contract,
+                        core::ProgramRoleAssignmentDTO role_assignment,
+                        const RetainedBundle &retained_bundle,
+                        const VerifiedRetainedModelMap &retained_model_map,
+                        const ICatalogArtifactSource &catalog_artifact_store);
 
 /// Exactly one of a sealed binding for the candidate cell or a named
 /// non-executable result.
@@ -72,21 +75,21 @@ struct ProgramBindingOutcome final {
 /// retained facts and unexpected failures still throw
 /// ProgramBindingCompilerError: they never become a non-executable Program.
 [[nodiscard]] ProgramBindingOutcome compile_program_binding_outcome(
-    const ProgramBindingContract& program_contract,
+    const ProgramBindingContract &program_contract,
     core::ProgramRoleAssignmentDTO role_assignment,
-    const RetainedBundle& retained_bundle,
-    const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactSource& catalog_artifact_store);
+    const RetainedBundle &retained_bundle,
+    const VerifiedRetainedModelMap &retained_model_map,
+    const ICatalogArtifactSource &catalog_artifact_store);
 
 /// As above, with no model map for an empty candidate cell. This overload
 /// can only return a named non-executable outcome when all assigned component
 /// roles are absent; it never creates a binding without verified model data.
 [[nodiscard]] ProgramBindingOutcome compile_program_binding_outcome(
-    const ProgramBindingContract& program_contract,
+    const ProgramBindingContract &program_contract,
     core::ProgramRoleAssignmentDTO role_assignment,
-    const RetainedBundle& retained_bundle,
-    const std::optional<VerifiedRetainedModelMap>& retained_model_map,
-    const ICatalogArtifactSource& catalog_artifact_store);
+    const RetainedBundle &retained_bundle,
+    const std::optional<VerifiedRetainedModelMap> &retained_model_map,
+    const ICatalogArtifactSource &catalog_artifact_store);
 
 /// Compile the build-owned direct Robot Control motion contract for one exact
 /// retained command target.
@@ -102,11 +105,11 @@ struct ProgramBindingOutcome final {
 /// borrow a scenario Program Binding.
 [[nodiscard]] std::shared_ptr<const ProgramBinding>
 compile_direct_control_motion_program_binding(
-    const core::ControllableComponentId& controllable_component_id,
-    const core::CommandTargetId& command_target_id,
-    const RetainedBundle& retained_bundle,
-    const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactSource& catalog_artifact_store);
+    const core::ControllableComponentId &controllable_component_id,
+    const core::CommandTargetId &command_target_id,
+    const RetainedBundle &retained_bundle,
+    const VerifiedRetainedModelMap &retained_model_map,
+    const ICatalogArtifactSource &catalog_artifact_store);
 
 /// Compile the build-owned direct Robot Control gripper contract for one exact
 /// retained command target.
@@ -117,11 +120,22 @@ compile_direct_control_motion_program_binding(
 /// physical gripper engine only after exact owner equality is verified.
 [[nodiscard]] std::shared_ptr<const ProgramBinding>
 compile_direct_control_gripper_program_binding(
-    const core::ControllableComponentId& controllable_component_id,
-    const core::CommandTargetId& command_target_id,
-    const RetainedBundle& retained_bundle,
-    const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactSource& catalog_artifact_store);
+    const core::ControllableComponentId &controllable_component_id,
+    const core::CommandTargetId &command_target_id,
+    const RetainedBundle &retained_bundle,
+    const VerifiedRetainedModelMap &retained_model_map,
+    const ICatalogArtifactSource &catalog_artifact_store);
+
+/// Compile a logical input-read binding from the exact retained input roles and
+/// qualified io.gpio.get_input offer. It carries no motion/control resources
+/// and must not be used to fabricate a physical execution participant.
+[[nodiscard]] std::shared_ptr<const ProgramBinding>
+compile_direct_control_io_program_binding(
+    const core::ControllableComponentId &controllable_component_id,
+    const core::CommandTargetId &command_target_id,
+    const RetainedBundle &retained_bundle,
+    const VerifiedRetainedModelMap &retained_model_map,
+    const ICatalogArtifactSource &catalog_artifact_store);
 
 /// Compile every complete direct-control target in deterministic retained-cell
 /// order. A target is included only when its qualified component type declares
@@ -129,8 +143,8 @@ compile_direct_control_gripper_program_binding(
 /// model/resource/control closure fails rather than being silently skipped.
 [[nodiscard]] DirectControlProgramBindingInventory
 compile_direct_control_program_binding_inventory(
-    const RetainedBundle& retained_bundle,
-    const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactSource& catalog_artifact_store);
+    const RetainedBundle &retained_bundle,
+    const VerifiedRetainedModelMap &retained_model_map,
+    const ICatalogArtifactSource &catalog_artifact_store);
 
-}  // namespace manyforge::deployment
+} // namespace manyforge::deployment

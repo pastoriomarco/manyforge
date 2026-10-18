@@ -204,6 +204,25 @@ protected:
 };
 
 TEST_F(AlarmOwnerTest,
+       ExactConditionLookupIsReadonlyAndReturnsAnIndependentCopy) {
+  auto owner = MakeOwner();
+  RegisterScene(*owner);
+  const auto update = SceneUpdate(1U, true);
+  const auto generation = owner->Snapshot().generation;
+  EXPECT_FALSE(owner->ConditionPoint(kSceneDefinition, update.subject));
+  EXPECT_EQ(owner->Snapshot().generation, generation);
+  static_cast<void>(owner->Submit(update));
+  auto point = owner->ConditionPoint(kSceneDefinition, update.subject);
+  ASSERT_TRUE(point);
+  ASSERT_TRUE(point->record);
+  EXPECT_EQ(point->record->details, update.details);
+  point->record->details = EmptyObject();
+  const auto actual = owner->ConditionPoint(kSceneDefinition, update.subject);
+  ASSERT_TRUE(actual);
+  EXPECT_EQ(actual->record->details, update.details);
+  EXPECT_EQ(actual->cursor->source_sequence, 1U);
+}
+TEST_F(AlarmOwnerTest,
        ActivationRepeatAcknowledgementReturnAndRecurrencePreserveSemantics) {
   auto owner = MakeOwner();
   RegisterScene(*owner);

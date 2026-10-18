@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -8,6 +9,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -396,6 +398,164 @@ steps:
             R"([{"name":"second"},{"name":"first"}])");
 }
 
+[[nodiscard]] std::string keyed_tagged_union_schema() {
+  return R"({
+  "api_version": "manyforge.closed_schema.v1",
+  "schema_id": "manyforge.closed_schema.keyed_union_probe.v1",
+  "schema_revision": "sha256:9d5c3aad5f1b022d9bbae59a3dc94c760604474ae493ab9c2c75c8ddedee7651",
+  "schema_purpose": "value",
+  "root_definition_id": "rows",
+  "definitions": [
+    {
+      "definition_id": "rows",
+      "value_schema": {
+        "kind": "array",
+        "min_items": 0,
+        "max_items": 4,
+        "collection": {
+          "kind": "keyed_record_set",
+          "key_paths": [
+            [
+              "id"
+            ]
+          ]
+        },
+        "item_schema": {
+          "kind": "local_ref",
+          "definition_id": "row"
+        }
+      }
+    },
+    {
+      "definition_id": "row",
+      "value_schema": {
+        "kind": "tagged_union",
+        "tag_field": "kind",
+        "alternatives": [
+          {
+            "tag_value": "input",
+            "value_schema": {
+              "kind": "object",
+              "fields": [
+                {
+                  "field_id": "kind",
+                  "presence": "required",
+                  "default": {
+                    "kind": "absent"
+                  },
+                  "value_schema": {
+                    "kind": "scalar",
+                    "scalar_type": "string",
+                    "constraints": [
+                      {
+                        "kind": "enum",
+                        "values": [
+                          "input"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "field_id": "id",
+                  "presence": "required",
+                  "default": {
+                    "kind": "absent"
+                  },
+                  "value_schema": {
+                    "kind": "scalar",
+                    "scalar_type": "string",
+                    "constraints": []
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "tag_value": "output",
+            "value_schema": {
+              "kind": "object",
+              "fields": [
+                {
+                  "field_id": "kind",
+                  "presence": "required",
+                  "default": {
+                    "kind": "absent"
+                  },
+                  "value_schema": {
+                    "kind": "scalar",
+                    "scalar_type": "string",
+                    "constraints": [
+                      {
+                        "kind": "enum",
+                        "values": [
+                          "output"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "field_id": "id",
+                  "presence": "required",
+                  "default": {
+                    "kind": "absent"
+                  },
+                  "value_schema": {
+                    "kind": "scalar",
+                    "scalar_type": "string",
+                    "constraints": []
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+})";
+}
+
+TEST(ClosedSchema,
+     KeyedTaggedUnionsKeepCanonicalOrderingAndCrossBranchUniqueness) {
+  const auto schema = compile_closed_schema_descriptor(
+      parse_strict_json_model_yaml(keyed_tagged_union_schema()));
+  const auto normalized = validate_and_normalize_unqualified_artifact_candidate(
+      schema, parse_strict_json_model_yaml(
+                  R"([{"kind":"output","id":"z"},{"kind":"input","id":"a"}])"));
+  EXPECT_EQ(canonical_json(normalized.normalized_root()),
+            R"([{"id":"a","kind":"input"},{"id":"z","kind":"output"}])");
+  EXPECT_THROW(
+      validate_and_normalize_unqualified_artifact_candidate(
+          schema,
+          parse_strict_json_model_yaml(
+              R"([{"kind":"input","id":"same"},{"kind":"output","id":"same"}])")),
+      ClosedSchemaError);
+  EXPECT_THROW(validate_and_normalize_unqualified_artifact_candidate(
+                   schema, parse_strict_json_model_yaml(
+                               R"([{"kind":"output","id":"x","extra":true}])")),
+               ClosedSchemaError);
+}
+
+TEST(ClosedSchema,
+     KeyedTaggedUnionsRequireTheSameRequiredScalarPathInEveryBranch) {
+  for (const auto &[before, after, message] :
+       std::array<std::tuple<std::string, std::string, std::string>, 3>{
+           {{"\"field_id\": \"id\"", "\"field_id\": \"other\"",
+             "field id is not declared"},
+            {"\"presence\": \"required\"", "\"presence\": \"optional\"",
+             "key-path fields must be required"},
+            {"\"scalar_type\": \"string\"", "\"scalar_type\": \"integer\"",
+             "key-path scalar type differs"}}}) {
+    auto source = keyed_tagged_union_schema();
+    const auto where = source.rfind(before);
+    ASSERT_NE(where, std::string::npos);
+    source.replace(where, before.size(), after);
+    expect_compile_error(std::move(source), message);
+  }
+}
+
 TEST(ClosedSchema, PythonOracleTaggedUnionGoldenSelectsOneClosedBranch) {
   const auto command = compile_resource(
       "examples/manyforge.closed_schema.example_command.v1.yaml");
@@ -418,6 +578,103 @@ command_kind: position
 value: true
 )")),
                ClosedSchemaError);
+}
+
+TEST(ClosedSchema, ApiDiscriminatedFamilyKeepsBothCommandBranchesClosed) {
+  const auto schema =
+      compile_resource("catalog/manyforge.command_schema.v1.yaml");
+  EXPECT_EQ(schema.schema_id().value(), "manyforge.command_schema.v1");
+  EXPECT_EQ(schema.root_shape(), ClosedSchemaRootShape::kTaggedUnion);
+  for (const auto source : {"../catalog/gripper.command_position.v1.yaml",
+                            "../catalog/io.signal_write_boolean.v1.yaml"}) {
+    const auto candidate = parse_strict_json_model_yaml(read_resource(source));
+    const auto normalized =
+        validate_and_normalize_unqualified_artifact_candidate(schema,
+                                                              candidate);
+    EXPECT_EQ(canonical_json(normalized.normalized_root()),
+              canonical_json(candidate.root()));
+    auto missing = candidate.root().as_object();
+    std::erase_if(missing, [](const auto &field) {
+      return field.first == "command_value";
+    });
+    EXPECT_THROW(validate_and_normalize_unqualified_artifact_candidate(
+                     schema, parse_strict_json_model_yaml(
+                                 canonical_json(CanonicalValue(missing)))),
+                 ClosedSchemaError);
+  }
+  auto io = parse_strict_json_model_yaml(
+                read_resource("../catalog/io.signal_write_boolean.v1.yaml"))
+                .root()
+                .as_object();
+  io.emplace_back("completion_rule",
+                  CanonicalValue("goal_fenced_target_reached"));
+  EXPECT_THROW(validate_and_normalize_unqualified_artifact_candidate(
+                   schema, parse_strict_json_model_yaml(
+                               canonical_json(CanonicalValue(io)))),
+               ClosedSchemaError);
+  EXPECT_THROW(
+      validate_and_normalize_unqualified_artifact_candidate(
+          schema, parse_strict_json_model_yaml(
+                      R"({"api_version":"manyforge.unknown_command.v1"})")),
+      ClosedSchemaError);
+}
+
+TEST(ClosedSchema, ApiDiscriminatedFamilyRequiresAnchorAndExactValidTags) {
+  const auto source = read_resource("catalog/manyforge.command_schema.v1.yaml");
+  const auto replace = [](std::string value, std::string_view before,
+                          std::string_view after, bool all = false) {
+    auto offset = value.find(before);
+    if (offset == std::string::npos)
+      throw std::logic_error("test schema replacement absent");
+    do {
+      value.replace(offset, before.size(), after);
+      offset =
+          all ? value.find(before, offset + after.size()) : std::string::npos;
+    } while (offset != std::string::npos);
+    return value;
+  };
+  expect_compile_error(replace(source, "schema_id: manyforge.command_schema.v1",
+                               "schema_id: manyforge.other_command_family.v1"),
+                       "must include its schema_id family");
+  auto invalid_tag =
+      replace(source, "manyforge.io_signal_write_command_schema.v1",
+              "invalid_api_tag", true);
+  // The root API envelope must hold even without a redundant string-format
+  // constraint on each branch's singleton enum.
+  invalid_tag = replace(invalid_tag,
+                        "              - kind: string_format\n"
+                        "                value: api_version\n",
+                        "", true);
+  expect_compile_error(std::move(invalid_tag),
+                       "tags must be versioned ManyForge APIs");
+  expect_compile_error(
+      replace(source, "tag_value: manyforge.io_signal_write_command_schema.v1",
+              "tag_value: manyforge.command_schema.v1"),
+      "duplicate tag_value");
+  expect_compile_error(
+      replace(source, "values: [manyforge.io_signal_write_command_schema.v1]",
+              "values: [manyforge.command_schema.v1]"),
+      "branch tag field must be a single-value string enum matching tag_value");
+  expect_compile_error(
+      replace(source, "values: [manyforge.io_signal_write_command_schema.v1]",
+              "values: [manyforge.io_signal_write_command_schema.v1, "
+              "manyforge.other.v1]"),
+      "branch tag field must be a single-value string enum matching tag_value");
+}
+
+TEST(ClosedSchema, OrdinaryArtifactRootsStillRequireTheirExactSchemaApi) {
+  for (const auto name : {"inventory", "command"}) {
+    const auto family =
+        "manyforge.closed_schema.example_" + std::string(name) + ".v1";
+    auto source = read_resource("examples/" + family + ".yaml");
+    const auto before = "schema_id: " + family;
+    const auto offset = source.find(before);
+    ASSERT_NE(offset, std::string::npos);
+    source.replace(offset, before.size(),
+                   "schema_id: manyforge.other_family.v1");
+    expect_compile_error(std::move(source),
+                         "single-value string enum equal to schema_id");
+  }
 }
 
 TEST(ClosedSchema, RejectsTaggedUnionBranchesThatDoNotResolveToObjects) {
@@ -513,7 +770,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   const auto &registry = build_qualified_closed_schema_registry();
   ASSERT_EQ(registry.catalog_schemas().size(),
             core::kCatalogRecordTypeRegistry.size());
-  ASSERT_EQ(registry.value_schemas().size(), 5U);
+  ASSERT_EQ(registry.value_schemas().size(), 6U);
   for (const auto &value_schema : registry.value_schemas()) {
     const auto expected_shape = value_schema.schema_id().value() ==
                                         "manyforge.value_schema.provider_"
@@ -548,7 +805,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       EXPECT_EQ(
           entry.compiled_schema()->schema_revision().value(),
           "sha256:"
-          "dd305be4c7071d4b5fcf31c031d80b7adb8d3a29562629a189b167922b1f29da");
+          "fdce9bb1facd259bde85f502197fd534dc05346a030605a55aa951d9e88c73dd");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -748,6 +1005,91 @@ TEST(ClosedSchema,
   EXPECT_THROW(
       validate_and_normalize_build_qualified_value(
           *schema, value_object({{"unexpected", CanonicalValue(true)}})),
+      ClosedSchemaError);
+}
+
+TEST(ClosedSchema, IoComponentWrapperUsesSharedRowsAndMaterializesDeviceLimit) {
+  const auto &registry = build_qualified_closed_schema_registry();
+  const auto *schema = registry.find_qualified_value_schema(
+      core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
+      core::SchemaRevision(
+          "sha256:"
+          "c6518470d89236c3b91dfd88b77203ed30d3c6476f3358b2ec9f2514cd19f0a5"));
+  ASSERT_NE(schema, nullptr);
+  const auto source = parse_strict_json_model_yaml(R"({
+    "io_signals":[
+      {"controllable_component_id":"device.io","command_target_id":"gpio",
+       "resource_role_id":"ready","signal_name":"ready","source_id":"source.ready",
+       "value_type":"bool","direction":"input","update_mode":"change_only",
+       "transition_capability":"sampled_only","freshness":{"mode":"provider_validity"},
+       "provider":{"profile":"mock","initial_value":false,"ingress_depth":64}},
+      {"controllable_component_id":"device.io","command_target_id":"gpio",
+       "resource_role_id":"lamp","signal_name":"lamp","source_id":"source.lamp",
+       "value_type":"bool","direction":"output",
+       "provider":{"profile":"mock_output","channel":"lamp"}}],
+    "io_provider_devices":[{"controllable_component_id":"device.io"}]
+  })");
+  const auto normalized = validate_and_normalize_build_qualified_value(*schema, source.root());
+  const auto &root = normalized.normalized_value();
+  ASSERT_EQ(root.find_object_member("io_signals")->as_array().size(), 2U);
+  const auto &device = root.find_object_member("io_provider_devices")->as_array().front();
+  EXPECT_EQ(canonical_json(*device.find_object_member("lifecycle_command_timeout_s")), "30");
+  const auto &output = root.find_object_member("io_signals")->as_array().front();
+  EXPECT_EQ(output.find_object_member("resource_role_id")->as_string(), "lamp");
+  EXPECT_EQ(output.find_object_member("freshness"), nullptr);
+  EXPECT_EQ(output.find_object_member("output_completion"), nullptr);
+  for (const auto *field : {"auto_answer_delay_ns", "manual_only"}) {
+    auto invalid_rows = source.root().find_object_member("io_signals")->as_array();
+    auto invalid_row = invalid_rows.front().as_object();
+    for (auto &[name, value] : invalid_row) {
+      if (name == "provider") {
+        auto invalid_provider = value.as_object();
+        invalid_provider.emplace_back(
+            field, std::string_view(field) == "auto_answer_delay_ns"
+                       ? CanonicalValue(250000000.0)
+                       : CanonicalValue(false));
+        value = CanonicalValue(std::move(invalid_provider));
+      }
+    }
+    invalid_rows.front() = CanonicalValue(std::move(invalid_row));
+    auto invalid_root = source.root().as_object();
+    for (auto &[name, value] : invalid_root) {
+      if (name == "io_signals")
+        value = CanonicalValue(std::move(invalid_rows));
+    }
+    EXPECT_THROW((void)validate_and_normalize_build_qualified_value(
+                     *schema, CanonicalValue(std::move(invalid_root))),
+                 ClosedSchemaError) << field;
+  }
+}
+
+TEST(ClosedSchema, IoComponentWrapperRefusesEmptySignalsMultipleDevicesAndMotionFields) {
+  const auto &registry = build_qualified_closed_schema_registry();
+  const auto *schema = registry.find_qualified_value_schema(
+      core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
+      core::SchemaRevision(
+          "sha256:"
+          "c6518470d89236c3b91dfd88b77203ed30d3c6476f3358b2ec9f2514cd19f0a5"));
+  ASSERT_NE(schema, nullptr);
+  const std::string signal = R"({"controllable_component_id":"device.io",
+    "command_target_id":"gpio","resource_role_id":"lamp","signal_name":"lamp",
+    "source_id":"source.lamp","value_type":"bool","direction":"output",
+    "provider":{"profile":"ros_set_bool","service":"/device/lamp"}})";
+  const auto normalize = [&](const std::string &signals, const std::string &devices,
+                             const std::string &extra = "") {
+    return validate_and_normalize_build_qualified_value(*schema, parse_strict_json_model_yaml(
+        "{\"io_signals\":" + signals + ",\"io_provider_devices\":" + devices + extra + "}").root());
+  };
+  const std::string device = R"({"controllable_component_id":"device.io"})";
+  EXPECT_NO_THROW((void)normalize("[" + signal + "]", "[" + device + "]"));
+  EXPECT_THROW((void)normalize("[]", "[" + device + "]"), ClosedSchemaError);
+  EXPECT_THROW((void)normalize("[" + signal + "]", "[]"), ClosedSchemaError);
+  EXPECT_THROW((void)normalize("[" + signal + "]", "[" + device + "," + device + "]"),
+               ClosedSchemaError);
+  EXPECT_THROW((void)normalize("[" + signal + "]", "[" + device + "]",
+                               ",\"controller_profiles\":[]"), ClosedSchemaError);
+  EXPECT_THROW((void)normalize("[" + signal + "]",
+      R"([{"controllable_component_id":"device.io","lifecycle_command_timeout_s":3601}])"),
       ClosedSchemaError);
 }
 
@@ -1231,7 +1573,7 @@ TEST(ClosedSchema,
                  core::CatalogRecordKind::kCommandSchema) {
         expected_revision =
             "sha256:"
-            "dd305be4c7071d4b5fcf31c031d80b7adb8d3a29562629a189b167922b1f29da";
+            "fdce9bb1facd259bde85f502197fd534dc05346a030605a55aa951d9e88c73dd";
         expected_path = "catalog/manyforge.command_schema.v1.yaml";
       } else if (built.record_kind() ==
                  core::CatalogRecordKind::kComponentType) {
@@ -1329,6 +1671,7 @@ TEST(ClosedSchema,
       "value/manyforge.value_schema.runtime.empty.v1.yaml",
       "value/manyforge.value_schema.runtime.native_execution.v1.yaml",
       "value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml",
+      "value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml",
   };
   EXPECT_EQ(source_tree_yaml, expected_source_tree_yaml);
 }

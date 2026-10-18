@@ -192,7 +192,18 @@ derive_cell_scoped_canonical_empty_deployment_impl(
     fail("cell-scoped canonical-empty derivation found a divergent runtime "
          "projection");
   }
-  const CanonicalValue empty_runtime_unit = authored_runtime_units.front();
+  auto empty_runtime_fields = authored_runtime_units.front().as_object();
+  // Component-owned I/O declarations cannot survive removal of their owners.
+  // Keep every other execution-host setting exactly as authored.
+  for (auto &[name, value] : empty_runtime_fields) {
+    if (name != "configuration") continue;
+    auto configuration = value.as_object();
+    for (auto &[field, setting] : configuration)
+      if (field == "io_signals" || field == "io_provider_devices")
+        setting = CanonicalValue(CanonicalValue::Array{});
+    value = CanonicalValue(std::move(configuration));
+  }
+  const CanonicalValue empty_runtime_unit(std::move(empty_runtime_fields));
 
   const std::string deployment_id =
       first_deployment.deployment_artifact_id().value() + ".canonical_empty";

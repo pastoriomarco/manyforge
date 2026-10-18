@@ -76,6 +76,17 @@ def _bounded_value(value: object) -> object:
     return _OMITTED
 
 
+def output_may_have_acted(output_evidence: object) -> bool:
+    """I/O output family (contract 53): the write's effect is unresolved.
+
+    Only ``acceptance_unknown`` leaves it open whether the source acted; the
+    other evidence values are settled facts. Other families keep their own
+    value sets and helpers (spec 210 naming glossary).
+    """
+
+    return output_evidence == "acceptance_unknown"
+
+
 def bounded_failure_details(details: object) -> Mapping[str, Any] | None:
     """Project one failure's structured details into the bounded shape.
 

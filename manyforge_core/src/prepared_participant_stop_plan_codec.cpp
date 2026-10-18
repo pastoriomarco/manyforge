@@ -607,6 +607,17 @@ void validate_context(const PreparedParticipantStopPlanContextDTO& context) {
 
 }  // namespace
 
+Result<MotionInterruptStopProfileDTO> DecodeMotionInterruptStopProfile(std::string_view bytes) {
+  try {
+    return Result<MotionInterruptStopProfileDTO>::Ok(
+        parse_profile(content_identity::parse_canonical_json(bytes)));
+  } catch (const ValidationError& error) {
+    return reject<MotionInterruptStopProfileDTO>(error.what());
+  } catch (const std::exception&) {
+    return reject<MotionInterruptStopProfileDTO>("canonical_decoding_failed");
+  }
+}
+
 Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
     const ResolvedStopBasePlanDTO& verified_base_plan,
     PreparedParticipantStopPlanContextDTO context,

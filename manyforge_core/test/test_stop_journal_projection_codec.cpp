@@ -1,3 +1,4 @@
+#include "io_rule_outcome_fixture.hpp"
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -528,5 +529,270 @@ TEST(StopJournalProjectionCodecTest, RoundTripsExactFaultClearAuthorityCanonical
   EXPECT_FALSE(EncodeStopJournalFaultClearProjection(conflict).ok());
 }
 
+}  // namespace
+
+TEST(StopJournalProjectionCodecTest, CapturedScopeUsesVersionSixWithoutRetryPolicy) {
+  auto terminal = TerminalProjection();
+  OperationParticipantStateDTO participant{
+      OperationParticipantId("participant.1"),
+      ControllerGoalId("goal.1"),
+      ControllerGoalGeneration(1U),
+      ControllableComponentId("arm"),
+      CommandTargetId("joints"),
+      CapabilityId("execution.trajectory.execute"),
+      ControlDomainId("domain.1"),
+      ControlDomainRevision(kDigestA),
+      ControlBindingId("binding.1"),
+      ControlBindingRevision(kDigestA),
+      std::nullopt,
+      std::nullopt,
+      OperationParticipantPayloadKind::kMotion,
+      OperationStateKind::kStopped,
+      0.0,
+      {},
+      std::nullopt,
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("pick"), "attempt.2"}};
+  OperationStateDTO operation{OperationId("operation.1"),
+                              OperationRevision(1U),
+                              ProgramBindingId(kDigestB),
+                              ProgramRunId("run.1"),
+                              OperationCoordinationPolicy::kIndependent,
+                              OperationStateKind::kStopped,
+                              {participant},
+                              30,
+                              terminal.certificate.stop_id,
+                              terminal.certificate.stop_generation,
+                              std::nullopt};
+  operation.journal_capture_order = 1U;
+  StopJournalAcceptanceProjectionDTO projection{terminal.stop_status.accepted, {{operation}, {}}};
+  const auto encoded = EncodeStopJournalAcceptanceProjection(projection);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  EXPECT_NE(encoded.value().find("acceptance-projection.v6"), std::string::npos);
+  const auto decoded = DecodeStopJournalAcceptanceProjection(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), projection);
+  auto alias = encoded.value();
+  alias.replace(alias.find("acceptance-projection.v6"),
+                std::string("acceptance-projection.v6").size(), "acceptance-projection.v7");
+  EXPECT_FALSE(DecodeStopJournalAcceptanceProjection(alias).ok());
+}
+
+TEST(StopJournalProjectionCodecTest, ExactParticipantFactUsesVersionEightWithOrWithoutScope) {
+  for (const bool scoped : {false, true}) {
+    auto terminal = TerminalProjection();
+    const ErrorDTO cause{"planning_failed", "exact failure", {{"phase", "planning"}}};
+    OperationParticipantStateDTO participant{OperationParticipantId("participant.1"),
+                                             ControllerGoalId("goal.1"),
+                                             ControllerGoalGeneration(1U),
+                                             ControllableComponentId("arm"),
+                                             CommandTargetId("joints"),
+                                             CapabilityId("execution.trajectory.execute"),
+                                             ControlDomainId("domain.1"),
+                                             ControlDomainRevision(kDigestA),
+                                             ControlBindingId("binding.1"),
+                                             ControlBindingRevision(kDigestA),
+                                             std::nullopt,
+                                             std::nullopt,
+                                             OperationParticipantPayloadKind::kMotion,
+                                             OperationStateKind::kFailed,
+                                             0.0,
+                                             {},
+                                             cause};
+    if (scoped)
+      participant.execution_scope =
+          ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("pick"), "attempt.1"};
+    participant.terminal_fact = ParticipantExecutionFact{
+        ParticipantExecutionFactKind::kLocalFailure, ParticipantEffectKnowledge::kNoEffect, cause};
+    OperationStateDTO operation{OperationId("operation.1"),
+                                OperationRevision(1U),
+                                ProgramBindingId(kDigestB),
+                                ProgramRunId("run.1"),
+                                OperationCoordinationPolicy::kIndependent,
+                                OperationStateKind::kFailed,
+                                {participant},
+                                30,
+                                std::nullopt,
+                                std::nullopt,
+                                std::nullopt};
+    operation.journal_capture_order = 1U;
+    StopJournalAcceptanceProjectionDTO projection{terminal.stop_status.accepted, {{operation}, {}}};
+    const auto bytes = EncodeStopJournalAcceptanceProjection(projection);
+    ASSERT_TRUE(bytes.ok()) << bytes.error().message;
+    EXPECT_NE(bytes.value().find("acceptance-projection.v8"), std::string::npos);
+    const auto decoded = DecodeStopJournalAcceptanceProjection(bytes.value());
+    ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+    EXPECT_EQ(decoded.value(), projection);
+    auto alias = bytes.value();
+    alias.replace(alias.find("acceptance-projection.v8"),
+                  std::string("acceptance-projection.v8").size(), "acceptance-projection.v7");
+    EXPECT_FALSE(DecodeStopJournalAcceptanceProjection(alias).ok());
+    auto nonterminal = projection;
+    nonterminal.affected_state.operations.front().participants.front().state =
+        OperationStateKind::kExecuting;
+    EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(nonterminal).ok());
+    projection.affected_state.operations.front().participants.front().terminal_fact.reset();
+    const auto old_shape = EncodeStopJournalAcceptanceProjection(projection);
+    ASSERT_TRUE(old_shape.ok());
+    auto empty_fact_version = old_shape.value();
+    const std::string old_version =
+        scoped ? "acceptance-projection.v6" : "acceptance-projection.v5";
+    const auto version_at = empty_fact_version.find(old_version);
+    ASSERT_NE(version_at, std::string::npos);
+    empty_fact_version.replace(version_at, old_version.size(), "acceptance-projection.v8");
+    EXPECT_FALSE(DecodeStopJournalAcceptanceProjection(empty_fact_version).ok());
+    projection.affected_state.operations.front().participants.front().terminal_fact =
+        participant.terminal_fact;
+    projection.affected_state.operations.front().participants.front().terminal_error =
+        ErrorDTO{"resource_slot_state_invalid", "selected resource transition failed", {}};
+    const auto retained = EncodeStopJournalAcceptanceProjection(projection);
+    ASSERT_TRUE(retained.ok()) << retained.error().message;
+    const auto retained_roundtrip = DecodeStopJournalAcceptanceProjection(retained.value());
+    ASSERT_TRUE(retained_roundtrip.ok());
+    EXPECT_EQ(retained_roundtrip.value(), projection);
+  }
+}
+
+TEST(StopJournalProjectionCodecTest, LogicalPreemptionHasADistinctVersionAndPreservesPhysicalFacts) {
+  const auto terminal = TerminalProjection();
+  OperationParticipantStateDTO participant{OperationParticipantId("arm.participant"),
+                                           ControllerGoalId("arm.goal"),
+                                           ControllerGoalGeneration(1U),
+                                           ControllableComponentId("arm"),
+                                           CommandTargetId("joints"),
+                                           CapabilityId("execution.trajectory.execute"),
+                                           ControlDomainId("domain.1"),
+                                           ControlDomainRevision(kDigestA),
+                                           ControlBindingId("binding.1"),
+                                           ControlBindingRevision(kDigestA),
+                                           std::nullopt,
+                                           std::nullopt,
+                                           OperationParticipantPayloadKind::kMotion,
+                                           OperationStateKind::kExecuting,
+                                           0.0,
+                                           {},
+                                           std::nullopt};
+  participant.execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("source.node"), "source.attempt"};
+  OperationStateDTO operation{OperationId("source.operation"),
+                              OperationRevision(1U),
+                              ProgramBindingId(kDigestB),
+                              ProgramRunId("run.1"),
+                              OperationCoordinationPolicy::kIndependent,
+                              OperationStateKind::kExecuting,
+                              {participant},
+                              30,
+                              std::nullopt,
+                              std::nullopt,
+                              std::nullopt};
+  operation.journal_capture_order = 1U;
+  operation.preemption = OperationPreemptionDTO{
+      OperationPreemptionKind::kPreempted,
+      {OperationId("winner.operation"), ProgramNodeInstanceId("winner.node"), "winner.attempt"}};
+  StopJournalAcceptanceProjectionDTO projection{terminal.stop_status.accepted, {{operation}, {}}};
+  for (const bool settled : {false, true}) {
+    auto& row = projection.affected_state.operations.front().participants.front();
+    if (settled) {
+      row.state = OperationStateKind::kStopped;
+      row.terminal_fact = ParticipantExecutionFact{
+          ParticipantExecutionFactKind::kPreemptedByReplacement,
+          ParticipantEffectKnowledge::kEffectSettled, std::nullopt};
+    }
+    const auto encoded = EncodeStopJournalAcceptanceProjection(projection);
+    ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+    EXPECT_NE(encoded.value().find("acceptance-projection.v9"), std::string::npos);
+    const auto decoded = DecodeStopJournalAcceptanceProjection(encoded.value());
+    ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+    EXPECT_EQ(decoded.value(), projection);
+    auto alias = encoded.value();
+    alias.replace(alias.find("acceptance-projection.v9"),
+                  std::string("acceptance-projection.v9").size(), "acceptance-projection.v8");
+    EXPECT_FALSE(DecodeStopJournalAcceptanceProjection(alias).ok());
+  }
+  auto invalid = projection;
+  invalid.affected_state.operations.front().preemption->by.operation_id = operation.operation_id;
+  EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(invalid).ok());
+  invalid = projection;
+  invalid.affected_state.operations.front().participants.front().terminal_fact->effect =
+      ParticipantEffectKnowledge::kEffectUncertain;
+  EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(invalid).ok());
+  invalid = projection;
+  invalid.affected_state.operations.front().preemption.reset();
+  EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(invalid).ok());
+}
+
+TEST(StopJournalProjectionCodecTest, ProviderIdentityAndOutputEvidenceUseClosedV10Extension) {
+  const auto terminal = TerminalProjection();
+  OperationStateDTO operation{OperationId("operation.output"),
+                              OperationRevision(1U),
+                              ProgramBindingId(kDigestB),
+                              ProgramRunId("run.output"),
+                              OperationCoordinationPolicy::kIndependent,
+                              OperationStateKind::kStopped,
+                              {},
+                              30,
+                              terminal.certificate.stop_id,
+                              terminal.certificate.stop_generation,
+                              std::nullopt};
+  operation.participants.emplace_back(
+      OperationParticipantId("participant.output"), ControllerGoalId("goal.output"),
+      ControllerGoalGeneration(1U), ControllableComponentId("io"), CommandTargetId("outputs"),
+      CapabilityId("io.signal.write"),
+      ParticipantBindingIdentityDTO{
+          ControlDomainId("domain.io"), ControlDomainRevision(kDigestA),
+          CapabilityProviderBindingIdentityDTO{CapabilityProviderBindingId("provider.io"),
+                                               CapabilityProviderBindingRevision(kDigestB)}},
+      OperationParticipantPayloadKind::kCapabilityCommand, OperationStateKind::kStopped, 0.0,
+      std::vector<ResourceId>{ResourceId("io.output")}, std::nullopt);
+  StopJournalAcceptanceProjectionDTO projection{terminal.stop_status.accepted, {{operation}, {}}};
+  for (const auto evidence :
+       {std::optional<IoOutputEvidence>{}, std::optional{IoOutputEvidence::kNotSubmitted},
+        std::optional{IoOutputEvidence::kSubmitted},
+        std::optional{IoOutputEvidence::kSourceAccepted},
+        std::optional{IoOutputEvidence::kSourceRejected},
+        std::optional{IoOutputEvidence::kAcceptanceUnknown}}) {
+    projection.affected_state.operations.front().participants.front().output_evidence = evidence;
+    const auto encoded = EncodeStopJournalAcceptanceProjection(projection);
+    ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+    EXPECT_NE(encoded.value().find("acceptance-projection.v10"), std::string::npos);
+    const auto decoded = DecodeStopJournalAcceptanceProjection(encoded.value());
+    ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+    EXPECT_EQ(decoded.value(), projection);
+    const auto reencoded = EncodeStopJournalAcceptanceProjection(decoded.value());
+    ASSERT_TRUE(reencoded.ok());
+    EXPECT_EQ(reencoded.value(), encoded.value());
+    auto downgraded = encoded.value();
+    downgraded.replace(downgraded.find("acceptance-projection.v10"),
+                       std::string("acceptance-projection.v10").size(), "acceptance-projection.v9");
+    EXPECT_FALSE(DecodeStopJournalAcceptanceProjection(downgraded).ok());
+  }
+  auto& row = projection.affected_state.operations.front().participants.front();
+  row.output_evidence = static_cast<IoOutputEvidence>(999);
+  EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(projection).ok());
+  row.output_evidence.reset();
+  row.binding_identity.binding = CapabilityProviderBindingIdentityDTO{
+      CapabilityProviderBindingId(""), CapabilityProviderBindingRevision(kDigestB)};
+  EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(projection).ok());
+}
+
+}  // namespace manyforge::core
+
+namespace manyforge::core {
+namespace {
+TEST(StopJournalProjectionCodecTest, RuleEvidenceRoundTripsAndOldEnvelopeCannotAliasIt) {
+  auto terminal = TerminalProjection();
+  auto operation = rule_codec_test::State();
+  StopJournalAcceptanceProjectionDTO projection{terminal.stop_status.accepted, {{operation}, {ResourceId("joint.1")}}};
+  const auto encoded = EncodeStopJournalAcceptanceProjection(projection);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  ASSERT_NE(encoded.value().find("acceptance-projection.v10"), std::string::npos);
+  const auto decoded = DecodeStopJournalAcceptanceProjection(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), projection);
+  auto aliased = encoded.value();
+  aliased.replace(aliased.find("acceptance-projection.v10"), std::string("acceptance-projection.v10").size(), "acceptance-projection.v9");
+  EXPECT_FALSE(DecodeStopJournalAcceptanceProjection(aliased).ok());
+  projection.affected_state.operations.front().participants.front().command_generation = ControllerGoalGeneration(2U);
+  EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(projection).ok());
+}
 }  // namespace
 }  // namespace manyforge::core

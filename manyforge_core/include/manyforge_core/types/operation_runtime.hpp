@@ -3,10 +3,17 @@
 #include <cstdint>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/execution_status.hpp>
+#include <manyforge_core/types/io_motion_rule.hpp>
+#include <manyforge_core/types/io_output.hpp>
+#include <manyforge_core/types/participant_binding_identity.hpp>
 #include <manyforge_core/types/operation_intent.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
+#include <manyforge_core/types/stop_certificate.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
+#include <stdexcept>
+#include <utility>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -49,26 +56,99 @@ enum class OperationParticipantPayloadKind {
 
 struct OperationParticipantStateDTO final {
   OperationParticipantId participant_id;
-  ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
+  ControllerGoalId command_id;
+  ControllerGoalGeneration command_generation;
   ControllableComponentId controllable_component_id;
   CommandTargetId command_target_id;
   CapabilityId capability_id;
-  ControlDomainId control_domain_id;
-  ControlDomainRevision control_domain_revision;
-  ControlBindingId control_binding_id;
-  ControlBindingRevision control_binding_revision;
-  std::optional<CapabilityProviderBindingId> capability_provider_binding_id;
-  std::optional<CapabilityProviderBindingRevision> capability_provider_binding_revision;
+  ParticipantBindingIdentityDTO binding_identity;
   OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
   OperationStateKind state{OperationStateKind::kResolving};
   double progress{};
   std::vector<ResourceId> resources;
   std::optional<ErrorDTO> terminal_error;
   std::optional<ProgramNodeExecutionScopeDTO> execution_scope{};
+  /// Actual participant proof; absence grants no effect/settlement knowledge.
+  std::optional<ParticipantExecutionFact> terminal_fact{};
+  std::vector<IoMotionRuleOutcomeDTO> io_rule_outcomes{};
+  /// Actual correlated provider fact, separate from a local dispatch receipt.
+  std::optional<IoOutputEvidence> output_evidence{};
+
+  OperationParticipantStateDTO() = default;
+
+  OperationParticipantStateDTO(
+      OperationParticipantId participant, ControllerGoalId goal, ControllerGoalGeneration goal_generation,
+      ControllableComponentId component, CommandTargetId target, CapabilityId capability,
+      ParticipantBindingIdentityDTO identity, OperationParticipantPayloadKind kind,
+      OperationStateKind phase, double supplied_progress, std::vector<ResourceId> owned_resources,
+      std::optional<ErrorDTO> error, std::optional<ProgramNodeExecutionScopeDTO> scope = {},
+      std::optional<ParticipantExecutionFact> fact = {}, std::vector<IoMotionRuleOutcomeDTO> rules = {},
+      std::optional<IoOutputEvidence> output = {})
+      : participant_id(std::move(participant)), command_id(std::move(goal)),
+        command_generation(goal_generation), controllable_component_id(std::move(component)),
+        command_target_id(std::move(target)), capability_id(std::move(capability)),
+        binding_identity(std::move(identity)), payload_kind(kind), state(phase), progress(supplied_progress),
+        resources(std::move(owned_resources)), terminal_error(std::move(error)), execution_scope(std::move(scope)),
+        terminal_fact(std::move(fact)), io_rule_outcomes(std::move(rules)), output_evidence(output) {}
+
+  OperationParticipantStateDTO(
+      OperationParticipantId participant, ControllerGoalId goal, ControllerGoalGeneration goal_generation,
+      ControllableComponentId component, CommandTargetId target, CapabilityId capability,
+      ControlDomainId domain, ControlDomainRevision domain_revision, ControlBindingId control_binding,
+      ControlBindingRevision control_revision, std::optional<CapabilityProviderBindingId> provider,
+      std::optional<CapabilityProviderBindingRevision> provider_revision,
+      OperationParticipantPayloadKind kind, OperationStateKind phase, double supplied_progress,
+      std::vector<ResourceId> owned_resources, std::optional<ErrorDTO> error,
+      std::optional<ProgramNodeExecutionScopeDTO> scope = {}, std::optional<ParticipantExecutionFact> fact = {},
+      std::vector<IoMotionRuleOutcomeDTO> rules = {})
+      : OperationParticipantStateDTO(
+            std::move(participant), std::move(goal), goal_generation, std::move(component), std::move(target),
+            std::move(capability),
+            ParticipantBindingIdentityDTO{std::move(domain), std::move(domain_revision),
+                ControllerParticipantBindingIdentityDTO{std::move(control_binding), std::move(control_revision),
+                    provider && provider_revision
+                        ? std::optional(CapabilityProviderBindingIdentityDTO{std::move(*provider), std::move(*provider_revision)})
+                        : std::nullopt}},
+            kind, phase, supplied_progress, std::move(owned_resources), std::move(error), std::move(scope),
+            std::move(fact), std::move(rules)) {
+    if (provider.has_value() != provider_revision.has_value())
+      throw std::invalid_argument("participant capability provider identity is partial");
+  }
 
   friend bool operator==(const OperationParticipantStateDTO&,
                          const OperationParticipantStateDTO&) = default;
+};
+
+/// Logical Program outcome, independent of physical participant settlement.
+enum class OperationPreemptionKind : std::uint8_t {
+  kPreempted,
+  kSupersededUnsent,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(OperationPreemptionKind value) noexcept {
+  switch (value) {
+    case OperationPreemptionKind::kPreempted:
+      return "preempted";
+    case OperationPreemptionKind::kSupersededUnsent:
+      return "superseded_unsent";
+  }
+  return {};
+}
+
+struct OperationPreemptionActorDTO final {
+  OperationId operation_id;
+  ProgramNodeInstanceId node_instance_id;
+  std::string node_attempt_id;
+
+  friend bool operator==(const OperationPreemptionActorDTO&,
+                         const OperationPreemptionActorDTO&) = default;
+};
+
+struct OperationPreemptionDTO final {
+  OperationPreemptionKind kind{OperationPreemptionKind::kPreempted};
+  OperationPreemptionActorDTO by;
+
+  friend bool operator==(const OperationPreemptionDTO&, const OperationPreemptionDTO&) = default;
 };
 
 /// Bounded observation for one Kernel-owned operation. It carries final
@@ -90,6 +170,8 @@ struct OperationStateDTO final {
   // Zero is reserved for unsequenced historical records; fresh Kernel captures
   // use a checked int64-range value independent of clock and control revision.
   std::uint64_t journal_capture_order{};
+  /// Acceptance-time logical outcome; never proves stopped/settled effects.
+  std::optional<OperationPreemptionDTO> preemption{};
 
   friend bool operator==(const OperationStateDTO&, const OperationStateDTO&) = default;
 };
@@ -355,6 +437,13 @@ enum class OperationControlKind {
   kAcknowledgeCompleted,
 };
 
+struct UncertainOutputAcknowledgementDTO final {
+  OperationId operation_id;
+  OperationRevision operation_revision;
+  friend bool operator==(const UncertainOutputAcknowledgementDTO&,
+                         const UncertainOutputAcknowledgementDTO&) = default;
+};
+
 struct OperationControlRequestDTO final {
   PublicRequestContextDTO request_context;
   OperationId operation_id;
@@ -365,6 +454,9 @@ struct OperationControlRequestDTO final {
   /// Private authored control-node origin, distinct from the target operation.
   /// Public control payloads cannot supply this field.
   std::optional<ProgramNodeExecutionScopeDTO> execution_scope{};
+  /// Reset only, explicit operator choice. Absence never acknowledges unknown
+  /// output effects; automatic retirement/Scenario Close cannot populate it.
+  std::optional<std::vector<UncertainOutputAcknowledgementDTO>> acknowledged_uncertain_outputs{};
 
   friend bool operator==(const OperationControlRequestDTO&,
                          const OperationControlRequestDTO&) = default;

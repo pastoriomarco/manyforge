@@ -311,8 +311,12 @@ std::vector<ActivationPreparedModel> qualify_activation_prepared_models(
     const ActivationDeploymentIntent &intent,
     const std::vector<ActivationComponentProfile> &profiles,
     std::vector<PreparedComponentModelSource> prepared_sources) {
+  const auto physical_count = static_cast<std::size_t>(
+      std::count_if(profiles.begin(), profiles.end(), [](const auto &profile) {
+        return profile.runtime_kind != ActivationRuntimeKind::kIoProvider;
+      }));
   if (intent.components.size() != profiles.size() ||
-      intent.components.size() != prepared_sources.size()) {
+      physical_count != prepared_sources.size()) {
     fail("component/profile/prepared sets differ");
   }
 
@@ -331,6 +335,14 @@ std::vector<ActivationPreparedModel> qualify_activation_prepared_models(
     if (profile.component_id != component.component_id) {
       fail("component profile order differs from authored intent");
     }
+    if (profile.runtime_kind == ActivationRuntimeKind::kIoProvider) {
+      if (component.model_source || component.root_pose_in_cell ||
+          prepared.contains(component.component_id))
+        fail("I/O component cannot carry a prepared model");
+      continue;
+    }
+    if (!component.model_source)
+      fail("physical component has no captured model");
     auto found = prepared.find(component.component_id);
     if (found == prepared.end()) {
       fail("authored component has no prepared model");
@@ -345,7 +357,7 @@ std::vector<ActivationPreparedModel> qualify_activation_prepared_models(
 
     std::map<std::string, const CapturedModelSourceArtifact *, std::less<>>
         captured_resources;
-    for (const auto &resource : component.model_source.resources) {
+    for (const auto &resource : component.model_source->resources) {
       if (!captured_resources.emplace(resource.logical_uri, &resource).second) {
         fail("captured component contains duplicate resource identities");
       }
@@ -394,13 +406,12 @@ std::vector<ActivationPreparedModel> qualify_activation_prepared_models(
     const auto &semantics =
         member(profile.model_family, "semantics", "model family");
     result.push_back(qualify_activation_prepared_model(
-        profile.model_asset_id, semantics,
-        profile.accepted_package_uri_prefix,
+        profile.model_asset_id, semantics, profile.accepted_package_uri_prefix,
         canonical_json(source.preparation_receipt),
-        component.model_source.urdf.bytes,
-        component.model_source.srdf.has_value()
+        component.model_source->urdf.bytes,
+        component.model_source->srdf.has_value()
             ? std::optional<std::string_view>(
-                  component.model_source.srdf->bytes)
+                  component.model_source->srdf->bytes)
             : std::nullopt,
         std::move(artifacts)));
   }

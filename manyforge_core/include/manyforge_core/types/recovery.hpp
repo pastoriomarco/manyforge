@@ -51,8 +51,8 @@ enum class RecoveryClass {
   kUnknownFault,
 };
 
-/// Shared recovery action identifiers. The first four are valid non-resetting
-/// kernel commands. `reset_cycle` is offer-only: assessments may advertise it
+/// Shared recovery and motion-free closure action identifiers. `reset_cycle`
+/// is offer-only: assessments may advertise it
 /// and untrusted wire input may contain it, but ApplyRecoveryAction always
 /// rejects it because the existing cycle Reset route owns execution
 /// (spec/230 §3.7.1).
@@ -64,6 +64,8 @@ enum class RecoveryAction {
   /// Offer-only action. ApplyRecoveryAction always rejects this value because
   /// the existing cycle Reset command is its sole execution path.
   kResetCycle,
+  /// Retire settled ownership without motion, Reset or fault clearance.
+  kCloseOperation,
 };
 
 /// Assessment status published to consumers.
@@ -73,6 +75,51 @@ enum class RecoveryAssessmentStatus {
   kActionRequired,  ///< Explicit operator choice is required.
   kRetryReady,      ///< A non-resetting action is currently admissible.
   kResetRequired,   ///< Only the cycle Reset route can clear this state.
+};
+
+/// Automatic retry is narrower than the existing manual recovery actions.
+enum class MotionRetryCause {
+  kNotEligible,
+  kPlanningNoEffect,
+  kCollisionStopNominal,
+};
+
+enum class MotionRetryEffect {
+  kKnownNoEffect,
+  kEffectObserved,
+  kEffectUncertain,
+};
+
+/// Closed Kernel-owned reasons; adapter error text never becomes policy.
+enum class MotionRetryIneligibilityReason {
+  kNone,
+  kNotRetryableState,
+  kFailureCauseNotRetryable,
+  kDispatchAbsenceUnproven,
+  kEffectUncertain,
+  kEffectObserved,
+  kValidationNotConclusiveCollision,
+  kStopOwnerActive,
+  kStrongerAuthorityActive,
+  kQueuedLatchPresent,
+  kLatchPresent,
+  kStopNotSettled,
+  kStopNotNominal,
+  kStopNotControlled,
+  kObservationNotQualified,
+  kCollisionNotConclusive,
+  kOperationInFlight,
+  kProgramScopeRequired,
+};
+
+struct MotionRetryEligibilityDTO final {
+  bool eligible{false};
+  MotionRetryCause cause{MotionRetryCause::kNotEligible};
+  MotionRetryEffect effect{MotionRetryEffect::kEffectUncertain};
+  MotionRetryIneligibilityReason reason{MotionRetryIneligibilityReason::kNotRetryableState};
+
+  friend bool operator==(const MotionRetryEligibilityDTO&,
+                         const MotionRetryEligibilityDTO&) = default;
 };
 
 /// Immutable record that a stop authority reached a definitive result.
@@ -177,6 +224,10 @@ struct KernelRecoveryAssessmentDTO {
   /// assessment (spec/500 correlation spine).
   std::vector<std::string> evidence_refs;
 
+  MotionRetryEligibilityDTO retry_eligibility;
+  /// General motion-free retirement permission, independent of retry policy.
+  bool eligible_close{false};
+
   friend bool operator==(const KernelRecoveryAssessmentDTO&,
                          const KernelRecoveryAssessmentDTO&) = default;
 };
@@ -193,6 +244,9 @@ struct KernelRecoveryActionRequestDTO {
   std::string expected_stop_certificate_id;
   std::uint64_t expected_stop_owner_generation = 0;
   std::string reason;
+  /// The addressed owner requires exact captured node scope and effect proof.
+  /// False preserves manual recovery continuation; close_operation requires false.
+  bool fresh_motion_attempt{false};
 };
 
 /// Result of `ApplyRecoveryAction`. On rejection the kernel state, latch,
@@ -212,5 +266,8 @@ const char* at_rest_evidence_name(AtRestEvidence evidence);
 const char* recovery_class_name(RecoveryClass recovery_class);
 const char* recovery_action_name(RecoveryAction action);
 const char* recovery_assessment_status_name(RecoveryAssessmentStatus status);
+const char* motion_retry_cause_name(MotionRetryCause cause);
+const char* motion_retry_effect_name(MotionRetryEffect effect);
+const char* motion_retry_ineligibility_reason_name(MotionRetryIneligibilityReason reason);
 
 }  // namespace manyforge::core

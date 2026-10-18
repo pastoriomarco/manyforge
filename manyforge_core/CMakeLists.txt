@@ -77,6 +77,19 @@ add_library(manyforge_core
   src/execution_stop_support.cpp
   src/execution_worker_signals.cpp
   src/external_observed_state_provider.cpp
+  src/io_signal_subsystem.cpp
+  src/io_signal_descriptor.cpp
+  src/io_signal_ingress.cpp
+  src/io_condition_evaluator.cpp
+  src/resource_addressed_kernel_io_rules.cpp
+  src/resource_addressed_kernel_program_blackboard.cpp
+  src/io_rule_stop_response.cpp
+  src/io_rule_outcome_codec.cpp
+  src/resource_addressed_kernel_global_io_rules.cpp
+  src/resource_addressed_kernel_global_io_recovery.cpp
+  src/io_provider_lifecycle_catalog.cpp
+  src/io_output_participant_engine.cpp
+  src/io_blackboard_snapshot.cpp
   src/kernel_event_publisher.cpp
   src/kernel_flight_recorder.cpp
   src/kernel_event_factories.cpp
@@ -98,6 +111,8 @@ add_library(manyforge_core
   src/resource_addressed_kernel_status.cpp
   src/resource_addressed_kernel_operations.cpp
   src/resource_addressed_kernel_events.cpp
+  src/resource_addressed_kernel_takeover.cpp
+  src/resource_addressed_kernel_takeover_fallback.cpp
   src/resource_addressed_kernel_stop.cpp
   src/resolved_stop_base_plan_codec.cpp
   src/resolved_stop_base_plan_decoder.cpp
@@ -132,6 +147,7 @@ add_library(manyforge_core
   src/trajectory_cache_intent.cpp
   src/trajectory_cache_compatibility.cpp
   src/trajectory_sampler.cpp
+  src/trajectory_splice.cpp
   src/collision_policy_evaluator.cpp
   src/collision_validation_coordinator.cpp
   src/ordered_contact_validation.cpp
@@ -495,6 +511,48 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_runtime_scale_governor
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_io_blackboard_snapshot test/test_io_blackboard_snapshot.cpp)
+  target_include_directories(test_io_blackboard_snapshot PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_io_blackboard_snapshot PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_io_blackboard_snapshot
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_io_program_blackboard test/test_io_program_blackboard.cpp)
+  target_include_directories(test_io_program_blackboard PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_io_program_blackboard PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_io_program_blackboard
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_io_source_ingress_sender test/test_io_source_ingress_sender.cpp)
+  target_link_libraries(test_io_source_ingress_sender PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_io_source_ingress_sender
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_io_rule_stop_response test/test_io_rule_stop_response.cpp)
+  target_link_libraries(test_io_rule_stop_response PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_io_rule_stop_response
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_io_signal_rules test/test_io_signal_rules.cpp)
+  target_link_libraries(test_io_signal_rules PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_io_signal_rules
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_io_signal_subsystem test/test_io_signal_subsystem.cpp)
+  target_link_libraries(test_io_signal_subsystem PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_io_signal_subsystem
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_io_signal_ingress test/test_io_signal_ingress.cpp)
+  target_link_libraries(test_io_signal_ingress PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_io_signal_ingress
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_io_condition_evaluator test/test_io_condition_evaluator.cpp)
+  target_link_libraries(test_io_condition_evaluator PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_io_condition_evaluator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_stop_terminal_state
     test/test_stop_terminal_state.cpp)
   target_link_libraries(test_stop_terminal_state PRIVATE
@@ -517,7 +575,8 @@ if(BUILD_TESTING)
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_stop_journal_projection_codec
-    test/test_stop_journal_projection_codec.cpp)
+    test/test_stop_journal_projection_codec.cpp
+    test/test_io_rule_outcome_codec.cpp)
   target_link_libraries(test_stop_journal_projection_codec PRIVATE
     manyforge_core manyforge::content_identity GTest::gtest_main)
   gtest_discover_tests(test_stop_journal_projection_codec
@@ -631,7 +690,8 @@ if(BUILD_TESTING)
     add_executable(test_component_lifecycle_coordinator
       test/test_component_lifecycle_coordinator.cpp)
     target_link_libraries(test_component_lifecycle_coordinator PRIVATE
-      manyforge_core_sqlite_cclc_journal SQLite::SQLite3 GTest::gtest_main)
+      manyforge_core_sqlite_cclc_journal manyforge_core_sqlite_operation_journal
+      SQLite::SQLite3 GTest::gtest_main)
     gtest_discover_tests(test_component_lifecycle_coordinator
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
@@ -941,6 +1001,11 @@ if(BUILD_TESTING)
   add_executable(test_stop_replacement test/test_stop_replacement.cpp)
   target_link_libraries(test_stop_replacement PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_stop_replacement
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_trajectory_splice test/test_trajectory_splice.cpp)
+  target_link_libraries(test_trajectory_splice PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_trajectory_splice
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_participant_stop_stage_helper

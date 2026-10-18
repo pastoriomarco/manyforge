@@ -104,7 +104,9 @@ public:
     return {true, core::AdmissionGeneration(7U)};
   }
   core::Result<core::AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
-      const core::CellAdmissionReadinessSnapshotDTO &) override {
+      const core::CellAdmissionReadinessSnapshotDTO &,
+      std::shared_ptr<core::IIoSignalService>* actual_retired_service = nullptr) override {
+    if (actual_retired_service) actual_retired_service->reset();
     ++calls;
     return core::Result<core::AuthoringAdmissionDTO>::Ok(
         {true, core::AdmissionGeneration(8U)});
@@ -657,6 +659,48 @@ TEST(CellAdmissionCommandCodec,
   EXPECT_EQ(inbound, outbound);
   ::close(descriptors[0]);
   ::close(descriptors[1]);
+}
+
+TEST(CellAdmissionCommandCodec, RunnerContactLossSharesTheClosedCycleCodec) {
+  const core::ProgramRunnerContactLossDTO loss{
+      core::RequestOwnerEpoch("manager.1"), core::RuntimeEpoch("runtime.1"),
+      {core::RequestOwnerEpoch("runner.1"), 3U, core::ProgramCycleStateDTO::kRunning,
+       core::ProgramRunId("run.1"), core::CellAdmissionClaimGeneration(7U), std::nullopt},
+      "program_runner_liveness_probe", "Runner contact failed"};
+  const auto projection = ProgramRunnerLossValue(loss, core::RequestOwnerEpoch("kernel.1"));
+  EXPECT_EQ(projection.find_object_member("request_owner_epoch")->as_string(), "kernel.1");
+  auto loss_fields = projection.as_object();
+  std::erase_if(loss_fields, [](const auto& member) {
+    return member.first == "request_owner_epoch";
+  });
+  const auto decode = [&](Value fault) {
+    auto readiness = Readiness().as_object();
+    readiness.emplace_back("program_runner_loss", std::move(fault));
+    return TryDecodeCellAdmissionCommand(ci::canonical_json(
+        Envelope("cell_admission_update_readiness", Value(std::move(readiness)))));
+  };
+  const auto decoded = decode(Value(loss_fields));
+  ASSERT_TRUE(decoded);
+  EXPECT_EQ(std::get<core::CellAdmissionReadinessSnapshotDTO>(decoded->request)
+                .program_runner_loss, loss);
+  const auto legacy = TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_update_readiness", Readiness())));
+  ASSERT_TRUE(legacy);
+  EXPECT_FALSE(std::get<core::CellAdmissionReadinessSnapshotDTO>(legacy->request)
+                   .program_runner_loss);
+  for (const auto& name : {"failure_predicate", "established_cycle", "message"}) {
+    auto malformed = loss_fields;
+    for (auto& [key, value] : malformed)
+      if (key == name) value = Value(false);
+    EXPECT_THROW(decode(Value(std::move(malformed))), std::invalid_argument);
+  }
+  auto unknown = loss_fields;
+  unknown.emplace_back("future", Value(true));
+  EXPECT_THROW(decode(Value(std::move(unknown))), std::invalid_argument);
+  auto ineligible = loss_fields;
+  for (auto& [key, value] : ineligible)
+    if (key == "failure_predicate") value = Value("readiness_closed");
+  EXPECT_THROW(decode(Value(std::move(ineligible))), std::invalid_argument);
 }
 
 TEST(CellAdmissionCommandCodec, SelectedIdleResetHasClosedAcceptedContext) {

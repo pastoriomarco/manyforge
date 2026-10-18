@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:fe4fe32b76167ec3c2593aa9afd6643f68b85b3676df142a20e31464eeb4e42e",
     "deployment.yaml": "sha256:d8ad822295fe1ba9e4e178e77076d22250b36d0dd38e9caa4972ec6fc2d75ffd",
-    "program.yaml": "sha256:c58d2f0331772b636647825e17cadbfd567456941cb4eacf2b96f83efd8b7517"
+    "program.yaml": "sha256:e6cefe8d3166bd8f8684d576b6758dbd09e54c4cf9d1b5bc01b9e16de5eb82c9"
   },
   "name": "ur10e_robotiq_assistant_modes_scene_authoring",
   "saved_status": {
-    "checked_content_digest": "sha256:f22b3d6edc776840947670f41a5d17958187c3ce87fd71aec121b239f5fe2f98",
+    "checked_content_digest": "sha256:0fb03c308bc6de14139768e77f1880a3836596487272a2727798dd64858b34cd",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

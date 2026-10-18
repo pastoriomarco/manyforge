@@ -94,6 +94,11 @@ def _policy() -> dict[str, object]:
     return {"allow_intervention": True, "max_retries": 2}
 
 
+def _first_enabled(offer: dict[str, object]) -> str | None:
+    """The first enabled action of an offer, in the producer's order."""
+    return next((row["action_id"] for row in offer["actions"] if row["enabled"]), None)
+
+
 def test_revision_read_does_not_construct_a_full_snapshot(monkeypatch) -> None:
     controls = ProgramRuntimeControls(_capture())
     controls.audit_value("test_control", value={"nested": [1, 2, 3]})
@@ -215,7 +220,7 @@ def test_positive_budget_is_exhausted_explicitly_for_offer_and_command() -> None
             policy=policy,
         )
         assert offer["retries_used"] == used
-        assert offer["primary_action"] == "retry_runtime_step"
+        assert _first_enabled(offer) == "retry_runtime_step"
         assert controls.note_retry("move.1") == used + 1
     assert controls.retry_permitted("move.1", policy) is False
     with pytest.raises(ProgramRuntimeControlError) as error:
@@ -344,7 +349,7 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
         "owner_api": "kernel.operation",
     }
     assert offer["valid_until_ns"] is None
-    assert offer["primary_action"] == "acknowledge_and_continue"
+    assert _first_enabled(offer) == "acknowledge_and_continue"
     assert all(offer[field] == value for field, value in _fences().items())
     assert (
         controls.recovery_offer(
@@ -364,7 +369,7 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
     )
     assert forbidden is not None
     assert forbidden["offer_revision"] == offer["offer_revision"] + 1
-    assert forbidden["primary_action"] is None
+    assert _first_enabled(forbidden) is None
     assert all(not action["enabled"] for action in forbidden["actions"])
 
     acknowledged = controls.recovery_offer(
@@ -410,7 +415,7 @@ def test_failure_retry_waits_for_confirmed_containment() -> None:
             assert action["disabled_reason_code"] == (
                 "failure_pause_containment_unconfirmed"
             )
-    assert pending["primary_action"] != "retry_runtime_step"
+    assert _first_enabled(pending) != "retry_runtime_step"
 
 
 def test_operator_stop_recovery_uses_owner_fence_not_failure_retry_policy() -> None:
@@ -449,7 +454,6 @@ def test_operator_stop_recovery_uses_owner_fence_not_failure_retry_policy() -> N
     reset = next(row for row in offer["actions"] if row["action_id"] == "reset_cycle")
     assert reset == {
         "action_id": "reset_cycle",
-        "label_key": "recovery.reset_cycle",
         "requires_confirmation": True,
         "performs_backend_reset": True,
         "enabled": True,
@@ -598,7 +602,7 @@ def test_recovery_offer_projects_immutable_owner_facts_and_policy() -> None:
     assert offer is not None
     assert offer["participants"] == [{"operation_participant_id": "participant.1"}]
     assert offer["policy"] == {"allow_intervention": True, "max_retries": 2}
-    assert offer["primary_action"] == "retry_motion_from_current_state"
+    assert _first_enabled(offer) == "retry_motion_from_current_state"
 
 
 def test_recovery_fence_shape_is_closed() -> None:
@@ -698,7 +702,7 @@ def test_expired_owner_observation_disables_every_recovery_effect() -> None:
     )
 
     assert offer is not None
-    assert offer["primary_action"] is None
+    assert _first_enabled(offer) is None
     assert all(not action["enabled"] for action in offer["actions"])
     assert {
         action["disabled_reason_code"]
@@ -744,7 +748,7 @@ def test_never_dispatched_owner_failure_offers_retry_under_captured_policy() -> 
     assert offer is not None
     assert offer["status"] == "retry_ready"
     assert offer["recovery_class"] == "failed_validation"
-    assert offer["primary_action"] == "retry_after_scene_repair"
+    assert _first_enabled(offer) == "retry_after_scene_repair"
     retry = next(
         action
         for action in offer["actions"]
@@ -760,7 +764,7 @@ def test_never_dispatched_owner_failure_offers_retry_under_captured_policy() -> 
         policy={"allow_intervention": False, "max_retries": 0},
     )
     assert forbidden is not None
-    assert forbidden["primary_action"] is None
+    assert _first_enabled(forbidden) is None
     assert {
         action["disabled_reason_code"]
         for action in forbidden["actions"]
@@ -795,7 +799,7 @@ def test_owner_deadline_extension_keeps_retry_offer_and_expiry_disables_it() -> 
         )
 
     first = offer()
-    assert first["primary_action"] == "retry_after_scene_repair"
+    assert _first_enabled(first) == "retry_after_scene_repair"
     intervention.owner_assessment = {
         **intervention.owner_assessment,
         "observed_state_valid_until_ns": now + 120_000_000_000,
@@ -804,7 +808,7 @@ def test_owner_deadline_extension_keeps_retry_offer_and_expiry_disables_it() -> 
     assert extended["offer_id"] == first["offer_id"]
     assert extended["offer_revision"] == first["offer_revision"]
     assert extended["valid_until_ns"] == now + 120_000_000_000
-    assert extended["primary_action"] == "retry_after_scene_repair"
+    assert _first_enabled(extended) == "retry_after_scene_repair"
 
     intervention.owner_assessment = {
         **intervention.owner_assessment,
@@ -812,10 +816,85 @@ def test_owner_deadline_extension_keeps_retry_offer_and_expiry_disables_it() -> 
     }
     stale = offer()
     assert stale["offer_id"] != first["offer_id"]
-    assert stale["primary_action"] is None
+    assert _first_enabled(stale) is None
     retry = next(
         action
         for action in stale["actions"]
         if action["action_id"] == "retry_after_scene_repair"
     )
     assert retry["disabled_reason_code"] == "recovery_owner_observation_expired"
+
+
+def _continue_action(offer):
+    return next(
+        action for action in offer["actions"] if action["action_id"] == "continue_with_failure"
+    )
+
+
+def test_continue_is_offered_for_failure_holds_with_confirmation_and_close_fact() -> None:
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    held = _intervention()
+    not_closable = controls.recovery_offer(
+        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=held, policy=_policy()
+    )
+    action = _continue_action(not_closable)
+    assert action["requires_confirmation"] is True
+    assert action["performs_backend_reset"] is False
+    assert action["enabled"] is False
+    assert action["disabled_reason_code"] == "recovery_close_not_eligible"
+
+    closable = _intervention()
+    closable.owner_assessment = {**closable.owner_assessment, "eligible_close": True}
+    offer = controls.recovery_offer(
+        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=closable, policy=_policy()
+    )
+    assert _continue_action(offer)["enabled"] is True
+    # Continue releases motion: it waits for confirmed containment like Retry.
+    pending = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=closable,
+        policy=_policy(),
+        containment_pending=True,
+    )
+    assert _continue_action(pending)["enabled"] is False
+    assert _continue_action(pending)["disabled_reason_code"] == (
+        "failure_pause_containment_unconfirmed"
+    )
+    # A step without an owner task has nothing to close.
+    logic = _intervention()
+    logic.owner_task_id = None
+    logic.owner_assessment = None
+    assert _continue_action(
+        controls.recovery_offer(
+            cycle_generation=6, owner_epoch="runner.epoch.1", intervention=logic, policy=_policy()
+        )
+    )["enabled"] is True
+    stop = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=_intervention(policy_parameter="operator_stop_policy"),
+        policy=_policy(),
+    )
+    assert all(row["action_id"] != "continue_with_failure" for row in stop["actions"])
+
+
+def test_each_held_node_keeps_its_own_stable_offer() -> None:
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    first = _intervention()
+    second = _intervention()
+    second.identity = SimpleNamespace(
+        program_run_id="program-run.1", node_instance_id="move.2", node_attempt_id="attempt.2"
+    )
+
+    def offer(intervention):
+        return controls.recovery_offer(
+            cycle_generation=6, owner_epoch="runner.epoch.1", intervention=intervention, policy=_policy()
+        )
+
+    one, two = offer(first), offer(second)
+    assert one["node_instance_id"] == "move.1" and two["node_instance_id"] == "move.2"
+    assert one["offer_id"] != two["offer_id"]
+    # Publishing the other hold does not churn this hold's offer revision.
+    assert offer(first)["offer_revision"] == one["offer_revision"]
+    assert offer(second)["offer_revision"] == two["offer_revision"]

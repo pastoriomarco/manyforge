@@ -163,8 +163,6 @@ def _case(name: str) -> Mutation:
             target["frame_role_bindings"][0]["compiled_frame_name"] = "é" * 2049
         elif name == "invalid_utf8":
             target["frame_role_bindings"][0]["compiled_frame_name"] = "\ud800"
-        elif name == "root_minimum":
-            value["component_role_bindings"] = []
         elif name == "root_maximum":
             value["component_role_bindings"] = [component] * 4097
         elif name == "nested_maximum":
@@ -286,7 +284,6 @@ CASES = (
     ("identity_bytes", "bounded non-empty string"),
     ("text_bytes", "bounded non-empty string"),
     ("invalid_utf8", "valid UTF-8"),
-    ("root_minimum", "bounded array"),
     ("root_maximum", "bounded array"),
     ("nested_maximum", "bounded array"),
     ("provenance_maximum", "bounded array"),
@@ -352,6 +349,71 @@ def test_generated_parser_accepts_a_nonempty_sparse_node_policy() -> None:
     assert document["node_policies"][0]["instance_id"] == "root"
 
 
+def test_intervention_scope_omission_preserves_exact_transport_identity() -> None:
+    document = _fixture()
+    before = copy.deepcopy(document)
+    assert validate_program_binding(document) is document
+    assert document == before
+    assert "intervention_stop_scope" not in document["node_policies"][0]["recovery_policy"]
+
+
+@pytest.mark.parametrize("scope", ["all", "own_groups"])
+def test_intervention_scope_is_closed_and_preserved_without_repair(scope: str) -> None:
+    document = _fixture()
+    document["node_policies"][0]["recovery_policy"]["intervention_stop_scope"] = scope
+    _rehash(document)
+    before = copy.deepcopy(document)
+    assert validate_program_binding(document) is document
+    assert document == before
+
+
+def test_own_group_scope_alone_is_a_nondefault_node_policy() -> None:
+    document = _fixture()
+    document["node_policies"] = [{
+        "instance_id": "root",
+        "recovery_policy": {
+            "allow_intervention": False,
+            "max_retries": 0,
+            "intervention_stop_scope": "own_groups",
+        },
+        "operator_stop_policy": "inherit",
+    }]
+    _rehash(document)
+    assert validate_program_binding(document) is document
+
+
+def test_explicit_all_scope_does_not_make_a_default_policy_nondefault() -> None:
+    document = _fixture()
+    document["node_policies"] = [{
+        "instance_id": "root",
+        "recovery_policy": {
+            "allow_intervention": False,
+            "max_retries": 0,
+            "intervention_stop_scope": "all",
+        },
+        "operator_stop_policy": "inherit",
+    }]
+    _rehash(document)
+    with pytest.raises(ProgramBindingTransportError, match="default node-policy rows must be omitted"):
+        validate_program_binding(document)
+
+
+@pytest.mark.parametrize("scope", [None, True, 0, [], {}, "own_group", "selected"])
+def test_intervention_scope_rejects_malformed_or_unknown_values(scope: object) -> None:
+    document = _fixture()
+    document["node_policies"][0]["recovery_policy"]["intervention_stop_scope"] = scope
+    _rehash(document)
+    with pytest.raises(ProgramBindingTransportError, match="intervention_stop_scope"):
+        validate_program_binding(document)
+
+
+def test_intervention_scope_change_requires_a_fresh_content_identity() -> None:
+    document = _fixture()
+    document["node_policies"][0]["recovery_policy"]["intervention_stop_scope"] = "own_groups"
+    with pytest.raises(ProgramBindingTransportError, match="content identity"):
+        validate_program_binding(document)
+
+
 @pytest.mark.parametrize(("expected", "mutation"), SHAPE_MUTATIONS)
 def test_every_binding_record_is_closed(expected: str, mutation: Mutation) -> None:
     document = _fixture()
@@ -374,6 +436,24 @@ def test_binding_transport_invariant_mutation_corpus(
         validate_program_binding(document)
 
 
+def test_logic_only_binding_accepts_empty_component_and_target_tables() -> None:
+    # A zero-component Program binds against the empty model map.
+    document = _fixture()
+    document["component_role_bindings"] = []
+    document["target_role_bindings"] = []
+    document["contact_grasp_bindings"] = []
+    _rehash(document)
+    assert validate_program_binding(document) is document
+
+
+def test_binding_transport_still_requires_the_component_table() -> None:
+    document = _fixture()
+    del document["component_role_bindings"]
+    _rehash(document)
+    with pytest.raises(ProgramBindingTransportError):
+        validate_program_binding(document)
+
+
 def test_binding_transport_rejects_stale_identity() -> None:
     document = _fixture()
     document["graph_revision"] = "sha256:" + "f" * 64
@@ -386,3 +466,45 @@ def test_transport_does_not_infer_native_bundle_context() -> None:
     document["retained_bundle_id"] = "sha256:" + "f" * 64
     _rehash(document)
     assert validate_program_binding(document) is document
+
+
+
+def _signal_binding_fixture() -> dict[str, Any]:
+    document = _native_fixture()
+    document["target_role_bindings"][0]["signal_role_bindings"] = [{
+        "resource_role_id": "input_ready",
+        "signal_name": "ready",
+        "value_type": "bool",
+        "direction": "input",
+        "transition_capability": "sampled_only",
+        "signal_descriptor_digest": "sha256:" + "a" * 64,
+    }]
+    _rehash(document)
+    return document
+
+
+def test_signal_binding_optional_absence_and_closed_row_preserve_document() -> None:
+    ordinary = _native_fixture()
+    assert "signal_role_bindings" not in ordinary["target_role_bindings"][0]
+    assert validate_program_binding(ordinary) is ordinary
+    document = _signal_binding_fixture()
+    assert validate_program_binding(document) is document
+    assert document["program_binding_id"] != ordinary["program_binding_id"]
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda target: target.__setitem__("signal_role_bindings", []),
+    lambda target: target["signal_role_bindings"][0].__setitem__("unknown", True),
+    lambda target: target["signal_role_bindings"][0].__setitem__("value_type", True),
+    lambda target: target["signal_role_bindings"][0].__setitem__("direction", "bidirectional"),
+    lambda target: target["signal_role_bindings"][0].__setitem__("transition_capability", "inferred"),
+    lambda target: target["signal_role_bindings"][0].__setitem__("signal_descriptor_digest", "sha256:" + "A" * 64),
+    lambda target: target["signal_role_bindings"].append(copy.deepcopy(target["signal_role_bindings"][0])),
+    lambda target: target["signal_role_bindings"][0].__setitem__("resource_role_id", target["resource_role_bindings"][0]["resource_role_id"]),
+])
+def test_signal_binding_shape_and_coordinate_exclusivity_fail_closed(mutation: Callable[[dict[str, Any]], None]) -> None:
+    document = _signal_binding_fixture()
+    mutation(document["target_role_bindings"][0])
+    _rehash(document)
+    with pytest.raises(ProgramBindingTransportError):
+        validate_program_binding(document)

@@ -5,6 +5,10 @@
 #include <manyforge_core/types/coordinate_state.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/observed_state.hpp>
+#include <manyforge_core/types/io_signal.hpp>
+#include <manyforge_core/types/io_output_policy.hpp>
+#include <manyforge_core/types/lifecycle_provider_occurrence.hpp>
+#include <manyforge_core/types/participant_binding_identity.hpp>
 #include <manyforge_core/types/program_binding.hpp>
 #include <optional>
 #include <span>
@@ -92,6 +96,21 @@ struct RuntimeCapabilityProviderPathDTO final {
                          const RuntimeCapabilityProviderPathDTO&) = default;
 };
 
+/// A real logical output channel. It has no coordinate unit, URDF joint,
+/// controller route or fabricated physical Stop evidence.
+struct RuntimeIoOutputBindingDTO final {
+  ResourceRoleId resource_role_id;
+  IoSignalDescriptorDTO signal;
+  ContentDigest signal_descriptor_digest;
+  ComponentLifecycleGeneration component_lifecycle_generation;
+  ResolvedLifecycleProviderOccurrenceDTO provider;
+  ContentDigest signal_configuration_digest;
+  IoOutputCompletionPolicyDTO completion_policy;
+
+  friend bool operator==(const RuntimeIoOutputBindingDTO&,
+                         const RuntimeIoOutputBindingDTO&) = default;
+};
+
 /// Complete owner-to-owner value before sealing. Public operation callers
 /// never construct or submit this record.
 struct RuntimeParticipantBindingDTO final {
@@ -125,10 +144,17 @@ struct RuntimeParticipantBindingDTO final {
   /// Exact Program-owned templates copied from the sealed Program Binding.
   /// Runtime object selection remains unresolved until operation admission.
   std::vector<ProgramContactGraspBindingDTO> contact_grasp_bindings{};
+  /// Mutually exclusive with coordinate resources/control_path. The ordinary
+  /// capability provider path still identifies the exact installed command port.
+  std::optional<RuntimeIoOutputBindingDTO> io_output_binding{};
 
   friend bool operator==(const RuntimeParticipantBindingDTO&,
                          const RuntimeParticipantBindingDTO&) = default;
 };
+
+/// Shared observation/preparation identity projected only from sealed owner facts.
+[[nodiscard]] Result<ParticipantBindingIdentityDTO> runtime_participant_binding_identity(
+    const RuntimeParticipantBindingDTO& binding);
 
 /// Exact semantic-body to projected-physical-body alias produced from one
 /// verified retained model map. Distinct portable collision-body roles may

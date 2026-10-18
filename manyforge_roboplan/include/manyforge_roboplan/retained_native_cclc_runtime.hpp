@@ -14,13 +14,14 @@
 
 namespace manyforge::roboplan_backend {
 
-/// A verified empty cell has no physical route publication surface. This
-/// dependency refuses every physical-domain operation and fabricates no
-/// participant or configuration readback. Recreate it with the real route
+/// A verified cell without controller domains has no physical route publication
+/// surface. This dependency refuses every physical-domain operation and
+/// fabricates no participant or configuration readback. Genuine provider
+/// domains retain their normal CCLC lifecycle. Recreate it with the real route
 /// owner only after the original CCLC owner and callers have fully settled.
 [[nodiscard]] core::Result<
     std::unique_ptr<deployment::IRouteConfigurationKernelPublicationOwner>>
-MakeVerifiedEmptyCellRoutePublicationOwner(
+MakeVerifiedNoControllerRoutePublicationOwner(
     const deployment::RetainedBundle &retained_bundle);
 
 /// Plain construction dependencies, owned by the existing product context.
@@ -82,7 +83,8 @@ DeriveRetainedNativeApplyPlanRequest(
         actual_removed_components = std::nullopt);
 
 /// Parent-Apply candidate initialization delegated to CCLC. The caller must
-/// hold and verify the exact Manager fence around this call and pass the plan
+/// hold and verify the exact Manager fence around this call, pass that full
+/// acquired fence query (including its exact scope), and pass the plan
 /// CCLC recorded for this Apply before any route is published. Each route uses
 /// the planned generation and component expectation; a component that keeps
 /// an explicit Disable stays command-closed. This uses the same retained
@@ -98,7 +100,7 @@ DeriveRetainedNativeApplyPlanRequest(
     const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
     std::span<const core::RuntimeParticipantBinding> physical_bindings,
     const std::filesystem::path &execution_run_root,
-    const core::ConfigurationFenceId &parent_apply_fence_id);
+    const core::ConfigurationFenceStatusQueryDTO &actual_parent_fence);
 
 /// Construct the CCLC owner and verified observation sources without starting
 /// workers or request admission. The caller explicitly invokes Start.
@@ -171,7 +173,9 @@ PrepareRetainedNativeCCLCProductContext(
 /// domain or resource scope. Startup adopts and reconciles routes through the
 /// same owner even with a retained Stop fault. Private recovery can publish
 /// verified current truth but cannot change controllers; Kernel keeps ordinary
-/// admission closed until the fault is explicitly cleared.
+/// admission closed until the fault is explicitly cleared. An optional
+/// construction callback reads this same unstarted facade before Start. Failure
+/// keeps the existing recovery exclusion and does not install reconciliation.
 [[nodiscard]] core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>
 CreateRetainedNativeCCLCRuntime(
     RetainedNativeCCLCRuntimeConfig config,
@@ -186,7 +190,9 @@ CreateRetainedNativeCCLCRuntime(
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     RetainedExternallyManagedDomainSnapshotSource
-        externally_managed_controller_snapshot_source = {});
+        externally_managed_controller_snapshot_source = {},
+    std::function<core::Result<void>(
+        const deployment::CCLCRuntimeComposition &)> before_start = {});
 
 /// Restart variant for a stable native cell with any mix of component owner
 /// kinds. It adopts durable predecessor routes under route-recovery exclusion,
@@ -194,6 +200,11 @@ CreateRetainedNativeCCLCRuntime(
 /// committed CCLC facts, and starts CCLC. The returned callback advances any
 /// old-runtime-epoch route recovery; the host retains it until composition
 /// detachment and never clears recovery admission before it succeeds.
+/// An optional construction callback reads the SAME actual unstarted facade
+/// after recovery and source construction, before transports/target following
+/// start. It can finish paused participant installation from real journal
+/// generations; refusal neither starts nor releases existing recovery
+/// exclusion.
 [[nodiscard]] core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>
 CreateRecoveredRetainedNativeCellCCLCRuntime(
     RetainedNativeCCLCRuntimeConfig config,
@@ -208,13 +219,15 @@ CreateRecoveredRetainedNativeCellCCLCRuntime(
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     deployment::IRouteConfigurationKernelPublicationOwner &route_owner,
     core::ICCLCComponentCommandReadinessPort &readiness_owner,
-    core::ResourceAddressedExecutionKernel &kernel,
-    core::IClock &clock, core::IScheduler &scheduler,
+    core::ResourceAddressedExecutionKernel &kernel, core::IClock &clock,
+    core::IScheduler &scheduler,
     std::function<core::Result<core::RuntimeRouteConfigurationReadbackDTO>(
         const core::ActiveControlConfigurationDTO &)> adopt_predecessor,
     std::function<core::Result<void>()> reconcile_command_free_orphans,
     std::function<core::Result<void>()> &reconcile_after_start,
     RetainedExternallyManagedDomainSnapshotSource
-        externally_managed_controller_snapshot_source = {});
+        externally_managed_controller_snapshot_source = {},
+    std::function<core::Result<void>(
+        const deployment::CCLCRuntimeComposition &)> before_start = {});
 
 } // namespace manyforge::roboplan_backend

@@ -437,31 +437,53 @@ RuntimeCollisionLookaheadSession::~RuntimeCollisionLookaheadSession() {
   }
 }
 
+RuntimeCollisionLookaheadSession::PreparedArm RuntimeCollisionLookaheadSession::prepare_arm(
+    std::uint64_t execution_id, std::uint64_t execution_generation,
+    std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id,
+    std::optional<ProjectionRevisionDTO> admission_projection_revision) {
+  if (execution_id == 0 || !trajectory || trajectory->waypoints.empty() ||
+      (admission_projection_revision.has_value() && !admission_projection_revision->valid())) {
+    throw std::invalid_argument("runtime collision lookahead arm invalid");
+  }
+  auto latest_projection_revision = admission_projection_revision;
+  return PreparedArm{execution_id,
+                     execution_generation,
+                     std::move(trajectory),
+                     std::move(contact_policy_id),
+                     std::move(admission_projection_revision),
+                     std::move(latest_projection_revision),
+                     "lookahead_rearmed",
+                     "lookahead_rearmed"};
+}
+
 void RuntimeCollisionLookaheadSession::arm(
     std::uint64_t execution_id, std::uint64_t execution_generation,
     std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id,
     std::optional<ProjectionRevisionDTO> admission_projection_revision) {
-  if (execution_id == 0 || execution_generation == 0 || !trajectory ||
-      trajectory->waypoints.empty() ||
-      (admission_projection_revision.has_value() && !admission_projection_revision->valid())) {
+  if (execution_generation == 0)
     throw std::invalid_argument("runtime collision lookahead arm invalid");
-  }
+  publish_prepared_arm(prepare_arm(execution_id, execution_generation, std::move(trajectory),
+                                   std::move(contact_policy_id),
+                                   std::move(admission_projection_revision)));
+}
+
+void RuntimeCollisionLookaheadSession::publish_prepared_arm(PreparedArm prepared) noexcept {
   accepting_clear_permits_.store(false, std::memory_order_release);
   const auto arm_permit_generation = permit_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
   std::lock_guard<std::mutex> lock(mutex_);
   if (const auto active_cancel = active_cancel_.load(std::memory_order_acquire)) {
-    active_cancel->request_cancel("lookahead_rearmed");
+    active_cancel->request_cancel(std::move(prepared.active_cancel_reason));
   }
   if (pending_job_ && pending_job_->cancel) {
-    pending_job_->cancel->request_cancel("lookahead_rearmed");
+    pending_job_->cancel->request_cancel(std::move(prepared.pending_cancel_reason));
   }
-  arm_ = ArmState{execution_id,
-                  execution_generation,
+  arm_ = ArmState{prepared.execution_id,
+                  prepared.execution_generation,
                   next_arm_generation_++,
-                  std::move(trajectory),
-                  std::move(contact_policy_id),
-                  admission_projection_revision,
-                  std::move(admission_projection_revision)};
+                  std::move(prepared.trajectory),
+                  std::move(prepared.contact_policy_id),
+                  std::move(prepared.admission_projection_revision),
+                  std::move(prepared.latest_projection_revision)};
   pending_job_.reset();
   indexed_arm_generation_ = 0;
   // A stop/reset revocation can invalidate the permit generation without
@@ -472,8 +494,8 @@ void RuntimeCollisionLookaheadSession::arm(
   accepting_clear_permits_.store(permit_authorized, std::memory_order_release);
   {
     std::lock_guard<std::mutex> status_lock(status_mutex_);
-    status_.execution_id = execution_id;
-    status_.execution_generation = execution_generation;
+    status_.execution_id = arm_.execution_id;
+    status_.execution_generation = arm_.execution_generation;
     status_.arm_generation = arm_.arm_generation;
     status_.armed = true;
     status_.permit_pending = false;

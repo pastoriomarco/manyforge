@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/types/program_contract.hpp>
+#include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 
 #include <cstddef>
@@ -104,6 +105,18 @@ struct ProgramCapabilityBindingDTO final {
                          const ProgramCapabilityBindingDTO&) = default;
 };
 
+struct ProgramSignalRoleBindingDTO final {
+  ResourceRoleId resource_role_id;
+  std::string signal_name;
+  IoSignalValueType value_type;
+  IoSignalDirection direction;
+  IoTransitionCapability transition_capability;
+  ContentDigest signal_descriptor_digest;
+
+  friend bool operator==(const ProgramSignalRoleBindingDTO&,
+                         const ProgramSignalRoleBindingDTO&) = default;
+};
+
 struct ProgramTargetRoleBindingDTO final {
   TargetRoleId target_role_id;
   ComponentRoleId component_role_id;
@@ -114,6 +127,8 @@ struct ProgramTargetRoleBindingDTO final {
   std::vector<ProgramCollisionBodyRoleBindingDTO>
       collision_body_role_bindings;
   std::vector<ProgramCapabilityBindingDTO> capability_bindings;
+  // Omitted from canonical binding bytes when empty.
+  std::vector<ProgramSignalRoleBindingDTO> signal_role_bindings{};
 
   friend bool operator==(const ProgramTargetRoleBindingDTO&,
                          const ProgramTargetRoleBindingDTO&) = default;

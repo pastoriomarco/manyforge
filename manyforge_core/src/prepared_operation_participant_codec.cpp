@@ -1,3 +1,4 @@
+#include <manyforge_core/io_rule_stop_response.hpp>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -410,6 +411,10 @@ template <class Id>
 }
 
 [[nodiscard]] CanonicalValue command_value(const CapabilityCommandValueDTO& value) {
+  if (const auto* output = std::get_if<IoSignalWriteCommandValueDTO>(&value))
+    return CanonicalValue(CanonicalValue::Object{{"io_signal_write", CanonicalValue(CanonicalValue::Object{
+        {"resource_role_id", CanonicalValue(output->resource_role_id.value())},
+        {"value", CanonicalValue(output->value)}})}});
   const auto& command = std::get<GripperPositionCommandValueDTO>(value);
   CanonicalValue::Object fields{{"position", position_value(command.position)}};
   if (command.max_effort) fields.emplace_back("max_effort", effort_value(*command.max_effort));
@@ -418,6 +423,12 @@ template <class Id>
 }
 
 [[nodiscard]] CapabilityCommandValueDTO parse_command_value(const CanonicalValue& value) {
+  if (const auto* selected = value.find_object_member("io_signal_write")) {
+    exact(value, {"io_signal_write"});
+    exact(*selected, {"resource_role_id", "value"});
+    return IoSignalWriteCommandValueDTO{ResourceRoleId(text(member(*selected, "resource_role_id"))),
+                                       boolean(member(*selected, "value"))};
+  }
   exact(value, {"gripper_position"});
   const auto& gripper = member(value, "gripper_position");
   const bool has_effort = gripper.find_object_member("max_effort") != nullptr;
@@ -581,19 +592,53 @@ template <class Id>
   if (!stop.ok()) fail("interrupt_scope_stop_plan_invalid");
   const auto stop_value = content_identity::parse_canonical_json(stop.value());
   const auto* profile = stop_value.find_object_member("participant_stop_profile");
-  if (profile == nullptr || !value.stop_plan.participant_stop_profile ||
-      *value.stop_plan.participant_stop_profile != value.stop_profile) {
+  const bool desired = value.preemption_action == InterruptPreemptionAction::kCompleteMoveOnSignal;
+  const bool fault = value.preemption_action == InterruptPreemptionAction::kPreemptTrajectory;
+  if ((!desired && !fault) ||
+      (desired && (profile == nullptr || !value.stop_profile ||
+                   value.stop_plan.participant_stop_profile != value.stop_profile)) ||
+      (fault && value.stop_profile))
     fail("interrupt_scope_stop_profile_invalid");
-  }
   CanonicalValue::Object fields{
       {"scope_id", CanonicalValue(value.scope_id.value())},
       {"interrupt_policy_id", CanonicalValue(value.interrupt_policy_id.value())},
       {"activation_mode", CanonicalValue(activation_mode_token(value.activation_mode))},
       {"required", CanonicalValue(value.required)},
-      {"stop_profile", *profile},
+      {"stop_profile", desired ? *profile : CanonicalValue(nullptr)},
       {"node_category", CanonicalValue(node_category_token(value.node_category))},
       {"metadata", structured_value(value.metadata)},
       {"stop_plan", std::move(stop_value)}};
+  if (fault)
+    fields.emplace_back("preemption_action", CanonicalValue(std::string("preempt_trajectory")));
+  if (value.stop_entry) {
+    if (desired && !ValidateIoRuleNominalStopMode(base, *value.stop_profile).ok())
+      fail("interrupt_scope_nominal_mode_mismatch");
+    if (!value.success_through ||
+        !VerifyPreparedIoRuleSuccessThrough(value.stop_plan, *value.stop_entry,
+                                            *value.success_through)
+             .ok() ||
+        (fault && *value.success_through != *value.stop_entry))
+      fail("interrupt_scope_stop_entry_invalid");
+    fields.emplace_back(
+        "stop_entry",
+        CanonicalValue(CanonicalValue::Object{
+            {"resolved_stop_base_plan_id",
+             CanonicalValue(value.stop_entry->resolved_stop_base_plan_id.value())},
+            {"stop_escalation_stage_id",
+             CanonicalValue(value.stop_entry->stop_escalation_stage_id.value())},
+            {"stage_index", CanonicalValue(static_cast<double>(value.stop_entry->stage_index))}}));
+    fields.emplace_back(
+        "success_through",
+        CanonicalValue(CanonicalValue::Object{
+            {"resolved_stop_base_plan_id",
+             CanonicalValue(value.success_through->resolved_stop_base_plan_id.value())},
+            {"stop_escalation_stage_id",
+             CanonicalValue(value.success_through->stop_escalation_stage_id.value())},
+            {"stage_index",
+             CanonicalValue(static_cast<double>(value.success_through->stage_index))}}));
+  } else if (value.success_through) {
+    fail("interrupt_scope_stop_entry_missing");
+  }
   if (value.arm_timeout_ns) {
     if (*value.arm_timeout_ns < 0 ||
         static_cast<double>(*value.arm_timeout_ns) > kMaximumSafeInteger)
@@ -601,8 +646,6 @@ template <class Id>
     fields.emplace_back("arm_timeout_ns",
                         CanonicalValue(static_cast<double>(*value.arm_timeout_ns)));
   }
-  if (value.result_binding_key)
-    fields.emplace_back("result_binding_key", CanonicalValue(*value.result_binding_key));
   return CanonicalValue(std::move(fields));
 }
 
@@ -611,12 +654,17 @@ template <class Id>
     std::span<const RuntimeResourceBindingDTO> resources,
     std::span<const HardStopResourceLimitDTO> defaults) {
   const bool arm = value.find_object_member("arm_timeout_ns") != nullptr;
-  const bool result_key = value.find_object_member("result_binding_key") != nullptr;
+  const bool fault = value.find_object_member("preemption_action") != nullptr;
+  const bool entry_present = value.find_object_member("stop_entry") != nullptr;
   std::vector<std::string_view> names{
       "scope_id",     "interrupt_policy_id", "activation_mode", "required",
       "stop_profile", "node_category",       "metadata",        "stop_plan"};
   if (arm) names.push_back("arm_timeout_ns");
-  if (result_key) names.push_back("result_binding_key");
+  if (fault) names.push_back("preemption_action");
+  if (entry_present) {
+    names.push_back("stop_entry");
+    names.push_back("success_through");
+  }
   if (!value.is_object() || value.as_object().size() != names.size())
     fail("interrupt_scope_fields_invalid");
   for (const auto name : names) static_cast<void>(member(value, name));
@@ -624,35 +672,65 @@ template <class Id>
   auto stop = DecodePreparedParticipantStopPlan(
       content_identity::canonical_json(member(value, "stop_plan")), base, resources, defaults,
       category);
-  if (!stop.ok() || !stop.value().participant_stop_profile)
-    fail("interrupt_scope_stop_plan_invalid");
-  const auto expected_profile = content_identity::parse_canonical_json(
-      EncodePreparedParticipantStopPlan(base, stop.value(), resources, defaults, category).value());
-  if (content_identity::canonical_json(member(value, "stop_profile")) !=
-      content_identity::canonical_json(member(expected_profile, "participant_stop_profile"))) {
-    fail("interrupt_scope_stop_profile_mismatch");
+  if (!stop.ok()) fail("interrupt_scope_stop_plan_invalid");
+  if (fault) {
+    if (text(member(value, "preemption_action")) != "preempt_trajectory" ||
+        !member(value, "stop_profile").is_null())
+      fail("interrupt_scope_action_invalid");
+  } else {
+    if (!stop.value().participant_stop_profile) fail("interrupt_scope_stop_plan_invalid");
+    const auto expected_profile = content_identity::parse_canonical_json(
+        EncodePreparedParticipantStopPlan(base, stop.value(), resources, defaults, category)
+            .value());
+    if (content_identity::canonical_json(member(value, "stop_profile")) !=
+        content_identity::canonical_json(member(expected_profile, "participant_stop_profile")))
+      fail("interrupt_scope_stop_profile_mismatch");
+  }
+  std::optional<IoRulePreparedStopEntryDTO> entry;
+  std::optional<IoRulePreparedStopEntryDTO> success_through;
+  if (entry_present) {
+    const auto& value_entry = member(value, "stop_entry");
+    if (!value_entry.is_object() || value_entry.as_object().size() != 3U)
+      fail("interrupt_scope_stop_entry_invalid");
+    entry = IoRulePreparedStopEntryDTO{
+        ResolvedStopBasePlanId(text(member(value_entry, "resolved_stop_base_plan_id"))),
+        StopEscalationStageId(text(member(value_entry, "stop_escalation_stage_id"))),
+        unsigned_integer(member(value_entry, "stage_index"))};
+    const auto& threshold = member(value, "success_through");
+    if (!threshold.is_object() || threshold.as_object().size() != 3U)
+      fail("interrupt_scope_success_through_invalid");
+    success_through = IoRulePreparedStopEntryDTO{
+        ResolvedStopBasePlanId(text(member(threshold, "resolved_stop_base_plan_id"))),
+        StopEscalationStageId(text(member(threshold, "stop_escalation_stage_id"))),
+        unsigned_integer(member(threshold, "stage_index"))};
+    if (!VerifyPreparedIoRuleSuccessThrough(stop.value(), *entry, *success_through).ok() ||
+        (fault && *success_through != *entry))
+      fail("interrupt_scope_stop_entry_invalid");
   }
   std::optional<std::int64_t> arm_timeout;
   if (arm)
     arm_timeout = static_cast<std::int64_t>(unsigned_integer(member(value, "arm_timeout_ns")));
-  std::optional<std::string> binding_key;
-  if (result_key) binding_key = text(member(value, "result_binding_key"));
   return {MotionInterruptScopeId(text(member(value, "scope_id"))),
           InterruptPolicyId(text(member(value, "interrupt_policy_id"))),
           parse_activation_mode(text(member(value, "activation_mode"))),
           std::move(arm_timeout),
-          std::move(binding_key),
           boolean(member(value, "required")),
-          *stop.value().participant_stop_profile,
+          fault ? std::nullopt : stop.value().participant_stop_profile,
           category,
           parse_structured(member(value, "metadata")),
-          std::move(stop.value())};
+          std::move(stop.value()),
+          fault ? InterruptPreemptionAction::kPreemptTrajectory
+                : InterruptPreemptionAction::kCompleteMoveOnSignal,
+          entry,
+          success_through};
 }
 
 [[nodiscard]] CanonicalValue motion_payload_value(
     const PreparedMotionExecutionDTO& value, const ResolvedStopBasePlanDTO& base,
     std::span<const RuntimeResourceBindingDTO> resources,
     std::span<const HardStopResourceLimitDTO> defaults) {
+  const auto* replacement =
+      value.plan_request.moving_replacement ? &*value.plan_request.moving_replacement : nullptr;
   CanonicalValue::Array scopes;
   for (const auto& scope : value.interrupt_scopes)
     scopes.push_back(motion_scope_value(scope, base, resources, defaults));
@@ -660,19 +738,19 @@ template <class Id>
       {"move_id", CanonicalValue(value.move_id.value())},
       {"plan_request", embedded(EncodePreparedPlanRequest(value.plan_request),
                                 "prepared_plan_request_encoding_invalid")},
-      {"trajectory", embedded(EncodePreparedTrajectory(value.trajectory),
+      {"trajectory", embedded(EncodePreparedTrajectory(value.trajectory, replacement),
                               "prepared_trajectory_encoding_invalid")},
       {"start_state", embedded(EncodePreparedControlledState(value.start_state),
                                "prepared_start_state_encoding_invalid")},
-      {"planning_evidence", embedded(EncodePreparedMotionPlanningEvidence(value.planning_evidence),
-                                     "prepared_planning_evidence_encoding_invalid")},
+      {"planning_evidence",
+       embedded(EncodePreparedMotionPlanningEvidence(value.planning_evidence, replacement),
+                "prepared_planning_evidence_encoding_invalid")},
       {"validation_evidence",
        embedded(EncodePreparedMotionValidationEvidence(value.validation_evidence),
                 "prepared_validation_evidence_encoding_invalid")},
-      {"requested_tcp_linear_speed_mps",
-       value.requested_tcp_linear_speed_mps.has_value()
-           ? CanonicalValue(*value.requested_tcp_linear_speed_mps)
-           : CanonicalValue(nullptr)},
+      {"requested_tcp_linear_speed_mps", value.requested_tcp_linear_speed_mps.has_value()
+                                             ? CanonicalValue(*value.requested_tcp_linear_speed_mps)
+                                             : CanonicalValue(nullptr)},
       {"deployment_maximum_tcp_linear_speed_mps",
        CanonicalValue(value.deployment_maximum_tcp_linear_speed_mps)},
       {"interrupt_scopes", CanonicalValue(std::move(scopes))},
@@ -702,12 +780,15 @@ template <class Id>
     static_cast<void>(member(value, name));
   auto request =
       DecodePreparedPlanRequest(content_identity::canonical_json(member(value, "plan_request")));
-  auto trajectory =
-      DecodePreparedTrajectory(content_identity::canonical_json(member(value, "trajectory")));
+  if (!request.ok()) fail("motion_nested_value_invalid");
+  const auto* replacement =
+      request.value().moving_replacement ? &*request.value().moving_replacement : nullptr;
+  auto trajectory = DecodePreparedTrajectory(
+      content_identity::canonical_json(member(value, "trajectory")), replacement);
   auto state =
       DecodePreparedControlledState(content_identity::canonical_json(member(value, "start_state")));
   auto planning = DecodePreparedMotionPlanningEvidence(
-      content_identity::canonical_json(member(value, "planning_evidence")));
+      content_identity::canonical_json(member(value, "planning_evidence")), replacement);
   auto validation = DecodePreparedMotionValidationEvidence(
       content_identity::canonical_json(member(value, "validation_evidence")));
   if (!request.ok() || !trajectory.ok() || !state.ok() || !planning.ok() || !validation.ok())
@@ -744,12 +825,97 @@ template <class Id>
           finite_number(member(value, "execution_timeout_s"))};
 }
 
+[[nodiscard]] CanonicalValue output_policy_value(const IoOutputCompletionPolicyDTO& policy) {
+  if (!policy.locally_valid()) fail("prepared_output_policy_invalid");
+  if (const auto* budget = policy.source_ack_budget()) {
+    return CanonicalValue(
+        CanonicalValue::Object{{"kind", CanonicalValue("source_ack_budget")},
+                               {"timeout_ns", CanonicalValue(std::to_string(budget->timeout_ns))}});
+  }
+  if (policy.submitted_only())
+    return CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue("submitted_only")}});
+  return CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue("immediate")}});
+}
+
+[[nodiscard]] CanonicalValue output_participant_value(const PreparedOperationParticipantDTO& value,
+                                                      bool include_digest) {
+  const auto* authority = value.provider();
+  const auto* payload = std::get_if<PreparedIoOutputCommandDTO>(&value.payload);
+  const auto* identity = value.binding_identity.provider();
+  if (!authority || !payload || !identity) fail("prepared_output_authority_required");
+  const auto& provider = authority->lifecycle_provider;
+  CanonicalValue::Object fields{
+      {"api_version", CanonicalValue(std::string(kPreparedOperationParticipantApiVersion))},
+      {"operation_id", CanonicalValue(value.operation_id.value())},
+      {"operation_revision", CanonicalValue(static_cast<double>(value.operation_revision.value()))},
+      {"participant_id", CanonicalValue(value.participant_id.value())},
+      {"program_id", CanonicalValue(value.program_id.value())},
+      {"program_revision", CanonicalValue(value.program_revision.value())},
+      {"program_binding_id", CanonicalValue(value.program_binding_id.value())},
+      {"program_run_id", CanonicalValue(value.program_run_id.value())},
+      {"retained_bundle_id", CanonicalValue(value.retained_bundle_id.value())},
+      {"graph_revision", CanonicalValue(value.graph_revision.value())},
+      {"controllable_component_id", CanonicalValue(value.controllable_component_id.value())},
+      {"component_lifecycle_generation",
+       CanonicalValue(static_cast<double>(value.component_lifecycle_generation.value()))},
+      {"component_type_id", CanonicalValue(value.component_type_id.value())},
+      {"component_type_revision", CanonicalValue(value.component_type_revision.value())},
+      {"command_target_id", CanonicalValue(value.command_target_id.value())},
+      {"capability_id", CanonicalValue(value.capability_id.value())},
+      {"capability_definition_revision",
+       CanonicalValue(value.capability_definition_revision.value())},
+      {"control_domain_id", CanonicalValue(value.binding_identity.control_domain_id.value())},
+      {"control_domain_revision",
+       CanonicalValue(value.binding_identity.control_domain_revision.value())},
+      {"capability_provider", capability_provider_value(authority->capability_provider)},
+      {"lifecycle_provider",
+       CanonicalValue(CanonicalValue::Object{
+           {"control_domain_id", CanonicalValue(provider.control_domain_id.value())},
+           {"control_domain_revision", CanonicalValue(provider.control_domain_revision.value())},
+           {"provider_instance_id", CanonicalValue(provider.provider_instance_id.value())},
+           {"provider_manifest_id", CanonicalValue(provider.provider_manifest_id.value())},
+           {"provider_manifest_revision",
+            CanonicalValue(provider.provider_manifest_revision.value())},
+           {"provider_runtime_unit_id", CanonicalValue(provider.provider_runtime_unit_id.value())},
+           {"provider_runtime_epoch", CanonicalValue(provider.provider_runtime_epoch.value())},
+           {"lifecycle_plan_catalog_digest",
+            CanonicalValue(provider.lifecycle_plan_catalog_digest.value())}})},
+      {"signal_configuration_digest",
+       CanonicalValue(authority->signal_configuration_digest.value())},
+      {"resources", id_array(value.resources)},
+      {"runtime_unit_epochs", epochs_value(value.runtime_unit_epochs)},
+      {"payload",
+       CanonicalValue(CanonicalValue::Object{
+           {"io_signal_write",
+            CanonicalValue(CanonicalValue::Object{
+                {"command_schema_id", CanonicalValue(payload->command_schema_id.value())},
+                {"command_schema_revision",
+                 CanonicalValue(payload->command_schema_revision.value())},
+                {"resource_role_id",
+                 CanonicalValue(payload->command_value.resource_role_id.value())},
+                {"value", CanonicalValue(payload->command_value.value)},
+                {"signal_id",
+                 CanonicalValue(CanonicalValue::Object{
+                     {"controllable_component_id", CanonicalValue(payload->signal_id.controllable_component_id.value())},
+                     {"name", CanonicalValue(payload->signal_id.name)}})},
+                {"output_resource", CanonicalValue(payload->output_resource.value())},
+                {"signal_descriptor_digest",
+                 CanonicalValue(payload->signal_descriptor_digest.value())},
+                {"completion_policy", output_policy_value(payload->completion_policy)}})}})}};
+  if (include_digest)
+    fields.emplace_back("prepared_contract_digest",
+                        CanonicalValue(value.prepared_contract_digest.value()));
+  return CanonicalValue(std::move(fields));
+}
+
 [[nodiscard]] CanonicalValue participant_value(const PreparedOperationParticipantDTO& value,
                                                const ResolvedStopBasePlanDTO& base,
                                                std::span<const RuntimeResourceBindingDTO> resources,
                                                std::span<const HardStopResourceLimitDTO> defaults,
                                                MotionInterruptNodeCategory node_category,
                                                bool include_digest) {
+  if (value.provider() || !value.binding_identity.controller())
+    fail("prepared_controller_authority_required");
   CanonicalValue::Object fields{
       {"api_version", CanonicalValue(std::string(kPreparedOperationParticipantApiVersion))},
       {"operation_id", CanonicalValue(value.operation_id.value())},
@@ -772,43 +938,43 @@ template <class Id>
        CanonicalValue(value.capability_definition_revision.value())},
       {"model_bindings", model_bindings_value(value.model_bindings)},
       {"frame_bindings", frame_bindings_value(value.frame_bindings)},
-      {"control_domain_id", CanonicalValue(value.control_domain_id.value())},
-      {"control_domain_revision", CanonicalValue(value.control_domain_revision.value())},
-      {"control_binding_id", CanonicalValue(value.control_binding_id.value())},
-      {"control_binding_revision", CanonicalValue(value.control_binding_revision.value())},
+      {"control_domain_id", CanonicalValue(value.binding_identity.control_domain_id.value())},
+      {"control_domain_revision", CanonicalValue(value.binding_identity.control_domain_revision.value())},
+      {"control_binding_id", CanonicalValue(value.binding_identity.controller()->control_binding_id.value())},
+      {"control_binding_revision", CanonicalValue(value.binding_identity.controller()->control_binding_revision.value())},
       {"control_interface_contract_id",
-       CanonicalValue(value.control_interface_contract_id.value())},
-      {"control_interface_revision", CanonicalValue(value.control_interface_revision.value())},
-      {"controller_topology_id", CanonicalValue(value.controller_topology_id.value())},
-      {"topology_revision", CanonicalValue(value.topology_revision.value())},
-      {"control_route_id", CanonicalValue(value.control_route_id.value())},
-      {"activation_set_id", CanonicalValue(value.activation_set_id.value())},
-      {"control_provider", provider_value(value.control_provider)},
+       CanonicalValue(value.controller().control_interface_contract_id.value())},
+      {"control_interface_revision", CanonicalValue(value.controller().control_interface_revision.value())},
+      {"controller_topology_id", CanonicalValue(value.controller().controller_topology_id.value())},
+      {"topology_revision", CanonicalValue(value.controller().topology_revision.value())},
+      {"control_route_id", CanonicalValue(value.controller().control_route_id.value())},
+      {"activation_set_id", CanonicalValue(value.controller().activation_set_id.value())},
+      {"control_provider", provider_value(value.controller().control_provider)},
       {"resources", id_array(value.resources)},
-      {"endpoint_contract", endpoint_contract_value(value.endpoint_contract)},
-      {"claimed_command_interfaces", interfaces_value(value.claimed_command_interfaces)},
-      {"claimed_state_interfaces", interfaces_value(value.claimed_state_interfaces)},
+      {"endpoint_contract", endpoint_contract_value(value.controller().endpoint_contract)},
+      {"claimed_command_interfaces", interfaces_value(value.controller().claimed_command_interfaces)},
+      {"claimed_state_interfaces", interfaces_value(value.controller().claimed_state_interfaces)},
       {"active_control_configuration_id",
-       CanonicalValue(value.active_control_configuration_id.value())},
+       CanonicalValue(value.controller().active_control_configuration_id.value())},
       {"active_control_configuration_generation",
-       CanonicalValue(static_cast<double>(value.active_control_configuration_generation.value()))},
+       CanonicalValue(static_cast<double>(value.controller().active_control_configuration_generation.value()))},
       {"runtime_unit_epochs", epochs_value(value.runtime_unit_epochs)},
-      {"stop_evidence_policy_id", CanonicalValue(value.stop_evidence_policy_id.value())},
+      {"stop_evidence_policy_id", CanonicalValue(value.controller().stop_evidence_policy_id.value())},
       {"stop_evidence_policy_revision",
-       CanonicalValue(value.stop_evidence_policy_revision.value())},
+       CanonicalValue(value.controller().stop_evidence_policy_revision.value())},
       {"ordinary_stop_plan",
-       embedded(EncodePreparedParticipantStopPlan(base, value.ordinary_stop_plan, resources,
+       embedded(EncodePreparedParticipantStopPlan(base, value.controller().ordinary_stop_plan, resources,
                                                   defaults, node_category),
                 "prepared_ordinary_stop_plan_encoding_invalid")}};
-  if (value.fault_stop_plan.has_value()) {
+  if (value.controller().fault_stop_plan.has_value()) {
     fields.emplace_back("fault_stop_plan", embedded(EncodePreparedParticipantStopPlan(
-                                                        base, *value.fault_stop_plan, resources,
+                                                        base, *value.controller().fault_stop_plan, resources,
                                                         defaults, node_category),
                                                     "prepared_fault_stop_plan_encoding_invalid"));
   }
-  if (value.capability_provider)
+  if (value.controller().capability_provider)
     fields.emplace_back("capability_provider",
-                        capability_provider_value(*value.capability_provider));
+                        capability_provider_value(*value.controller().capability_provider));
   if (std::holds_alternative<PreparedMotionExecutionDTO>(value.payload)) {
     fields.emplace_back(
         "payload", CanonicalValue(CanonicalValue::Object{
@@ -902,6 +1068,8 @@ void validate_command_payload(const PreparedCapabilityCommandDTO& command,
           })) {
     fail("capability_command_schema_projection_invalid");
   }
+  if (!std::holds_alternative<GripperPositionCommandValueDTO>(command.command_value))
+    fail("capability_command_gripper_value_required");
   const auto& gripper = std::get<GripperPositionCommandValueDTO>(command.command_value);
   const auto position_kind = coordinate_kind(gripper.position);
   if (!std::isfinite(std::visit(
@@ -981,9 +1149,64 @@ void validate_command_payload(const PreparedCapabilityCommandDTO& command,
     fail("capability_command_binding_invalid");
 }
 
+void validate_moving_validation_join(const PreparedMotionExecutionDTO& motion) {
+  const auto& input = motion.plan_request.moving_replacement;
+  const auto& result = motion.validation_evidence.noncollision_result;
+  if (input.has_value() != result.moving_replacement.has_value())
+    fail("moving_replacement_validation_context_mismatch");
+  if (!input) return;
+  if (!result.trajectory_metrics || motion.trajectory.waypoints.empty() ||
+      !motion.plan_request.speed_profile.max_tcp_linear_speed_mps)
+    fail("moving_replacement_metrics_required");
+  const auto& whole = *result.trajectory_metrics;
+  const auto& prefix = result.moving_replacement->unchanged_prefix;
+  const auto& future = result.moving_replacement->changed_future;
+  const double seam = input->divergence_cursor_s - input->source_cursor_s;
+  const double end = motion.trajectory.waypoints.back().time_from_start_s;
+  const auto width = motion.trajectory.joint_names.size();
+  const auto complete = [width, &whole](const auto& metrics) {
+    const auto finite_nonnegative = [](double value) {
+      return std::isfinite(value) && value >= 0.0;
+    };
+    return metrics.peak_abs_joint_velocity_rad_s.size() == width &&
+           metrics.peak_abs_joint_acceleration_rad_s2.size() ==
+               whole.peak_abs_joint_acceleration_rad_s2.size() &&
+           std::all_of(metrics.peak_abs_joint_velocity_rad_s.begin(),
+                       metrics.peak_abs_joint_velocity_rad_s.end(), finite_nonnegative) &&
+           std::all_of(metrics.peak_abs_joint_acceleration_rad_s2.begin(),
+                       metrics.peak_abs_joint_acceleration_rad_s2.end(), finite_nonnegative) &&
+           metrics.peak_tcp_linear_speed_mps &&
+           finite_nonnegative(*metrics.peak_tcp_linear_speed_mps);
+  };
+  if (!std::isfinite(seam) || !(seam > 0.0 && seam < end) || prefix.trajectory_duration_s != seam ||
+      future.trajectory_duration_s != end - seam || whole.trajectory_duration_s != end ||
+      !complete(prefix) || !complete(future) || !whole.peak_tcp_linear_speed_mps ||
+      !input->source_speed_profile.max_tcp_linear_speed_mps ||
+      *prefix.peak_tcp_linear_speed_mps >
+          *input->source_speed_profile.max_tcp_linear_speed_mps + 1.0e-8 ||
+      *future.peak_tcp_linear_speed_mps >
+          *motion.plan_request.speed_profile.max_tcp_linear_speed_mps + 1.0e-8 ||
+      *whole.peak_tcp_linear_speed_mps !=
+          std::max(*prefix.peak_tcp_linear_speed_mps, *future.peak_tcp_linear_speed_mps))
+    fail("moving_replacement_metrics_join_invalid");
+  for (std::size_t j = 0; j < width; ++j) {
+    if (j >= whole.peak_abs_joint_velocity_rad_s.size() ||
+        whole.peak_abs_joint_velocity_rad_s[j] != std::max(prefix.peak_abs_joint_velocity_rad_s[j],
+                                                           future.peak_abs_joint_velocity_rad_s[j]))
+      fail("moving_replacement_metrics_join_invalid");
+  }
+  for (std::size_t j = 0; j < whole.peak_abs_joint_acceleration_rad_s2.size(); ++j) {
+    if (whole.peak_abs_joint_acceleration_rad_s2[j] !=
+        std::max(prefix.peak_abs_joint_acceleration_rad_s2[j],
+                 future.peak_abs_joint_acceleration_rad_s2[j]))
+      fail("moving_replacement_metrics_join_invalid");
+  }
+}
+
 void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
                              const PreparedOperationParticipantDTO& enclosing,
                              const RuntimeParticipantBindingDTO& binding) {
+  validate_moving_validation_join(motion);
   const auto* cartesian_path = std::get_if<CartesianPathDTO>(&motion.plan_request.motion);
   if (!motion.trajectory.cartesian_waypoint_times_s.empty()) {
     if (cartesian_path == nullptr ||
@@ -1014,26 +1237,26 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
       motion.plan_request.capability_id != enclosing.capability_id ||
       motion.plan_request.capability_definition_revision !=
           enclosing.capability_definition_revision ||
-      motion.plan_request.control_domain_id != enclosing.control_domain_id ||
-      motion.plan_request.control_domain_revision != enclosing.control_domain_revision ||
-      motion.plan_request.control_binding_id != enclosing.control_binding_id ||
-      motion.plan_request.control_binding_revision != enclosing.control_binding_revision ||
+      motion.plan_request.control_domain_id != enclosing.binding_identity.control_domain_id ||
+      motion.plan_request.control_domain_revision != enclosing.binding_identity.control_domain_revision ||
+      motion.plan_request.control_binding_id != enclosing.binding_identity.controller()->control_binding_id ||
+      motion.plan_request.control_binding_revision != enclosing.binding_identity.controller()->control_binding_revision ||
       motion.plan_request.control_interface_contract_id !=
-          enclosing.control_interface_contract_id ||
-      motion.plan_request.control_interface_revision != enclosing.control_interface_revision ||
-      motion.plan_request.controller_topology_id != enclosing.controller_topology_id ||
-      motion.plan_request.topology_revision != enclosing.topology_revision ||
-      motion.plan_request.control_route_id != enclosing.control_route_id ||
-      motion.plan_request.activation_set_id != enclosing.activation_set_id ||
+          enclosing.controller().control_interface_contract_id ||
+      motion.plan_request.control_interface_revision != enclosing.controller().control_interface_revision ||
+      motion.plan_request.controller_topology_id != enclosing.controller().controller_topology_id ||
+      motion.plan_request.topology_revision != enclosing.controller().topology_revision ||
+      motion.plan_request.control_route_id != enclosing.controller().control_route_id ||
+      motion.plan_request.activation_set_id != enclosing.controller().activation_set_id ||
       motion.plan_request.active_control_configuration_id !=
-          enclosing.active_control_configuration_id ||
+          enclosing.controller().active_control_configuration_id ||
       motion.plan_request.active_control_configuration_generation !=
-          enclosing.active_control_configuration_generation ||
-      motion.plan_request.provider_instance_id != enclosing.control_provider.provider_instance_id ||
-      motion.plan_request.provider_manifest_id != enclosing.control_provider.provider_manifest_id ||
+          enclosing.controller().active_control_configuration_generation ||
+      motion.plan_request.provider_instance_id != enclosing.controller().control_provider.provider_instance_id ||
+      motion.plan_request.provider_manifest_id != enclosing.controller().control_provider.provider_manifest_id ||
       motion.plan_request.provider_manifest_revision !=
-          enclosing.control_provider.provider_manifest_revision ||
-      motion.plan_request.provider_runtime_epoch != enclosing.control_provider.runtime_epoch ||
+          enclosing.controller().control_provider.provider_manifest_revision ||
+      motion.plan_request.provider_runtime_epoch != enclosing.controller().control_provider.runtime_epoch ||
       motion.plan_request.resources != enclosing.resources ||
       motion.start_state != motion.plan_request.start_state ||
       !std::isfinite(motion.deployment_maximum_tcp_linear_speed_mps) ||
@@ -1072,8 +1295,9 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
       !trajectory_metrics->peak_tcp_linear_speed_mps.has_value() ||
       !std::isfinite(*trajectory_metrics->peak_tcp_linear_speed_mps) ||
       *trajectory_metrics->peak_tcp_linear_speed_mps < 0.0 ||
-      *trajectory_metrics->peak_tcp_linear_speed_mps >
-          *motion.plan_request.speed_profile.max_tcp_linear_speed_mps + 1.0e-8 ||
+      (!motion.plan_request.moving_replacement &&
+       *trajectory_metrics->peak_tcp_linear_speed_mps >
+           *motion.plan_request.speed_profile.max_tcp_linear_speed_mps + 1.0e-8) ||
       motion.plan_request.retained_collision_world ||
       motion.plan_request.retained_collision_policy) {
     fail("motion_payload_join_invalid");
@@ -1107,11 +1331,13 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
           planner_path->provider_runtime_epoch) {
     fail("motion_planner_runtime_join_invalid");
   }
-  auto trajectory = EncodePreparedTrajectory(motion.trajectory);
-  auto planned =
-      motion.planning_evidence.planning_result.trajectory
-          ? EncodePreparedTrajectory(*motion.planning_evidence.planning_result.trajectory)
-          : Result<std::string>::Err(ErrorDTO{});
+  const auto* replacement =
+      motion.plan_request.moving_replacement ? &*motion.plan_request.moving_replacement : nullptr;
+  auto trajectory = EncodePreparedTrajectory(motion.trajectory, replacement);
+  auto planned = motion.planning_evidence.planning_result.trajectory
+                     ? EncodePreparedTrajectory(
+                           *motion.planning_evidence.planning_result.trajectory, replacement)
+                     : Result<std::string>::Err(ErrorDTO{});
   if (!trajectory.ok() || !planned.ok() || trajectory.value() != planned.value() ||
       motion.planning_evidence.planning_attempt_index !=
           motion.plan_request.planning_attempt_index ||
@@ -1121,8 +1347,38 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
           motion.plan_request.projection_binding.projection_revision) {
     fail("motion_planning_evidence_join_invalid");
   }
-  // No motion-interrupt policy is admitted until a per-robot mechanism exists.
-  if (!motion.interrupt_scopes.empty()) fail("motion_interrupt_policy_not_admitted");
+  if (motion.interrupt_scopes.size() > kMaximumScopes) fail("interrupt_scopes_invalid");
+  std::set<std::string> scope_ids;
+  for (const auto& scope : motion.interrupt_scopes) {
+    const bool desired =
+        scope.preemption_action == InterruptPreemptionAction::kCompleteMoveOnSignal;
+    const bool fault = scope.preemption_action == InterruptPreemptionAction::kPreemptTrajectory;
+    if ((scope.stop_entry &&
+         !VerifyPreparedIoRuleStopEntry(scope.stop_plan, *scope.stop_entry).ok()) ||
+        (scope.stop_entry.has_value() != scope.success_through.has_value()) ||
+        (scope.stop_entry && !VerifyPreparedIoRuleSuccessThrough(scope.stop_plan, *scope.stop_entry,
+                                                                 *scope.success_through)
+                                  .ok()) ||
+        (fault && scope.success_through && *scope.success_through != *scope.stop_entry) ||
+        (!desired && !fault) || !scope.required || scope.scope_id.value().empty() ||
+        scope.interrupt_policy_id.value().empty() ||
+        !scope_ids.insert(scope.scope_id.value()).second ||
+        (desired && (!scope.stop_profile ||
+                     scope.stop_plan.participant_stop_profile_purpose !=
+                         ParticipantStopProfilePurposeDTO::kMotionInterruptScope ||
+                     scope.stop_plan.motion_interrupt_scope_id != scope.scope_id.value() ||
+                     scope.stop_plan.participant_stop_profile != scope.stop_profile)) ||
+        (fault &&
+         (scope.stop_profile || scope.stop_plan != enclosing.controller().ordinary_stop_plan)) ||
+        scope.stop_plan.operation_id != enclosing.operation_id ||
+        scope.stop_plan.operation_revision != enclosing.operation_revision ||
+        scope.stop_plan.participant_id != enclosing.participant_id ||
+        scope.stop_plan.program_id != enclosing.program_id ||
+        scope.stop_plan.program_revision != enclosing.program_revision ||
+        scope.stop_plan.program_binding_id != enclosing.program_binding_id ||
+        scope.stop_plan.program_run_id != enclosing.program_run_id)
+      fail("motion_interrupt_scope_invalid");
+  }
 }
 
 [[nodiscard]] PreparedOperationParticipantDTO parse_participant(
@@ -1253,6 +1509,136 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
 
 }  // namespace
 
+Result<PreparedOperationParticipantDTO> MakePreparedIoOutputParticipant(
+    const OperationId& operation_id, OperationRevision operation_revision,
+    const OperationParticipantId& participant_id, const ProgramRunId& program_run_id,
+    const CapabilityCommandIntentDTO& command, const RuntimeParticipantBinding& sealed_binding) {
+  const auto& binding = sealed_binding.value();
+  const auto* value = std::get_if<IoSignalWriteCommandValueDTO>(&command.command_value);
+  if (!value || command.completion_timeout_s || !command.caller_options.empty() ||
+      !binding.io_output_binding || !binding.io_output_binding->signal.output_resource ||
+      !binding.capability_provider_path)
+    return rejected<PreparedOperationParticipantDTO>("prepared_output_contract_invalid");
+  const auto identity = runtime_participant_binding_identity(binding);
+  if (!identity.ok()) return Result<PreparedOperationParticipantDTO>::Err(identity.error());
+  const auto& output = *binding.io_output_binding;
+  PreparedOperationParticipantDTO candidate{
+      ContentDigest(""),
+      operation_id,
+      operation_revision,
+      participant_id,
+      binding.program_id,
+      binding.program_revision,
+      binding.program_binding_id,
+      program_run_id,
+      binding.retained_bundle_id,
+      binding.graph_revision,
+      binding.controllable_component_id,
+      output.component_lifecycle_generation,
+      binding.component_type_id,
+      binding.component_type_revision,
+      binding.command_target_id,
+      binding.capability_id,
+      binding.capability_definition_revision,
+      {},
+      {},
+      identity.value(),
+      {*output.signal.output_resource},
+      binding.runtime_unit_epochs,
+      PreparedIoOutputCommandDTO{command.command_schema_id, command.command_schema_revision, *value,
+                                 output.signal.signal_id, *output.signal.output_resource,
+                                 output.signal_descriptor_digest, output.completion_policy},
+      PreparedProviderExecutionAuthorityDTO{output.provider, output.signal_configuration_digest,
+                                            provider_from(*binding.capability_provider_path)}};
+  return MakePreparedIoOutputParticipant(std::move(candidate), sealed_binding);
+}
+
+Result<PreparedOperationParticipantDTO> MakePreparedIoOutputParticipant(
+    PreparedOperationParticipantDTO candidate, const RuntimeParticipantBinding& sealed_binding) {
+  try {
+    const auto& binding = sealed_binding.value();
+    const auto* output = binding.io_output_binding ? &*binding.io_output_binding : nullptr;
+    auto* command = std::get_if<PreparedIoOutputCommandDTO>(&candidate.payload);
+    const auto schema = builtin_io_signal_write_command_schema();
+    require_portable(candidate.operation_id.value(), "operation_id_invalid");
+    require_portable(candidate.participant_id.value(), "participant_id_invalid");
+    require_portable(candidate.program_run_id.value(), "program_run_id_invalid");
+    if (!candidate.operation_revision.nonzero() ||
+        static_cast<double>(candidate.operation_revision.value()) > kMaximumSafeInteger ||
+        !output || !binding.capability_provider_path || !binding.command_schema || !command ||
+        *binding.command_schema !=
+            ProgramCommandSchemaRefDTO{schema.command_schema_id, schema.command_schema_revision} ||
+        command->command_schema_id != schema.command_schema_id ||
+        command->command_schema_revision != schema.command_schema_revision ||
+        command->command_value.resource_role_id != output->resource_role_id ||
+        !command->completion_policy.locally_valid() ||
+        command->completion_policy != output->completion_policy || !output->signal.output_resource)
+      fail("prepared_output_contract_invalid");
+    const auto identity = runtime_participant_binding_identity(binding);
+    if (!identity.ok()) return Result<PreparedOperationParticipantDTO>::Err(identity.error());
+    candidate.program_id = binding.program_id;
+    candidate.program_revision = binding.program_revision;
+    candidate.program_binding_id = binding.program_binding_id;
+    candidate.retained_bundle_id = binding.retained_bundle_id;
+    candidate.graph_revision = binding.graph_revision;
+    candidate.controllable_component_id = binding.controllable_component_id;
+    candidate.component_lifecycle_generation = output->component_lifecycle_generation;
+    candidate.component_type_id = binding.component_type_id;
+    candidate.component_type_revision = binding.component_type_revision;
+    candidate.command_target_id = binding.command_target_id;
+    candidate.capability_id = binding.capability_id;
+    candidate.capability_definition_revision = binding.capability_definition_revision;
+    candidate.model_bindings.clear();
+    candidate.frame_bindings.clear();
+    candidate.binding_identity = identity.value();
+    candidate.resources = {*output->signal.output_resource};
+    candidate.runtime_unit_epochs = binding.runtime_unit_epochs;
+    candidate.execution_authority =
+        PreparedProviderExecutionAuthorityDTO{output->provider, output->signal_configuration_digest,
+                                              provider_from(*binding.capability_provider_path)};
+    command->signal_id = output->signal.signal_id;
+    command->output_resource = *output->signal.output_resource;
+    command->signal_descriptor_digest = output->signal_descriptor_digest;
+    candidate.prepared_contract_digest = ContentDigest(content_identity::framed_sha256(
+        kPreparedOperationParticipantIdentityDomain, kPreparedOperationParticipantApiVersion,
+        output_participant_value(candidate, false)));
+    if (content_identity::canonical_json(output_participant_value(candidate, true)).size() >
+        content_identity::kMaximumCanonicalJsonBytes)
+      fail("canonical_byte_bound_exceeded");
+    return Result<PreparedOperationParticipantDTO>::Ok(std::move(candidate));
+  } catch (const std::exception& error) {
+    return rejected<PreparedOperationParticipantDTO>(error.what());
+  }
+}
+
+Result<void> VerifyPreparedIoOutputParticipant(const PreparedOperationParticipantDTO& value,
+                                               const RuntimeParticipantBinding& binding) {
+  const auto rebuilt = MakePreparedIoOutputParticipant(value, binding);
+  if (!rebuilt.ok()) return Result<void>::Err(rebuilt.error());
+  try {
+    if (!value.model_bindings.empty() || !value.frame_bindings.empty() ||
+        value.binding_identity != rebuilt.value().binding_identity ||
+        content_identity::canonical_json(output_participant_value(value, true)) !=
+            content_identity::canonical_json(output_participant_value(rebuilt.value(), true)))
+      fail("prepared_output_referent_mismatch");
+    return Result<void>::Ok();
+  } catch (const std::exception& error) {
+    return rejected<void>(error.what());
+  }
+}
+
+Result<std::string> EncodePreparedIoOutputParticipant(const PreparedOperationParticipantDTO& value,
+                                                      const RuntimeParticipantBinding& binding) {
+  const auto verified = VerifyPreparedIoOutputParticipant(value, binding);
+  if (!verified.ok()) return Result<std::string>::Err(verified.error());
+  try {
+    return Result<std::string>::Ok(
+        content_identity::canonical_json(output_participant_value(value, true)));
+  } catch (const std::exception& error) {
+    return rejected<std::string>(error.what());
+  }
+}
+
 Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
     PreparedOperationParticipantDTO candidate, const RuntimeParticipantBinding& sealed_binding,
     const RuntimeParticipantStopReadiness& sealed_readiness,
@@ -1261,6 +1647,7 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
   try {
     const auto& binding = sealed_binding.value();
     const auto& readiness = sealed_readiness.value();
+    if (candidate.provider()) fail("prepared_controller_authority_required");
     if (!binding.control_path) fail("control_path_required");
     const auto& path = *binding.control_path;
     require_portable(candidate.operation_id.value(), "operation_id_invalid");
@@ -1284,28 +1671,27 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
     candidate.capability_definition_revision = binding.capability_definition_revision;
     candidate.model_bindings = binding.model_bindings;
     candidate.frame_bindings = binding.frame_bindings;
-    candidate.control_domain_id = path.control_domain_id;
-    candidate.control_domain_revision = path.control_domain_revision;
-    candidate.control_binding_id = path.control_binding_id;
-    candidate.control_binding_revision = path.control_binding_revision;
-    candidate.control_interface_contract_id = path.control_interface_contract_id;
-    candidate.control_interface_revision = path.control_interface_revision;
-    candidate.controller_topology_id = path.controller_topology_id;
-    candidate.topology_revision = path.topology_revision;
-    candidate.control_route_id = path.control_route_id;
-    candidate.activation_set_id = path.activation_set_id;
-    candidate.control_provider = provider_from(path);
-    candidate.capability_provider =
+    auto binding_identity = runtime_participant_binding_identity(binding);
+    if (!binding_identity.ok()) return Result<PreparedOperationParticipantDTO>::Err(binding_identity.error());
+    candidate.binding_identity = std::move(binding_identity.value());
+    candidate.controller().control_interface_contract_id = path.control_interface_contract_id;
+    candidate.controller().control_interface_revision = path.control_interface_revision;
+    candidate.controller().controller_topology_id = path.controller_topology_id;
+    candidate.controller().topology_revision = path.topology_revision;
+    candidate.controller().control_route_id = path.control_route_id;
+    candidate.controller().activation_set_id = path.activation_set_id;
+    candidate.controller().control_provider = provider_from(path);
+    candidate.controller().capability_provider =
         binding.capability_provider_path
             ? std::optional(provider_from(*binding.capability_provider_path))
             : std::nullopt;
     candidate.resources = binding_resources(binding);
-    candidate.active_control_configuration_id = path.active_control_configuration_id;
-    candidate.active_control_configuration_generation =
+    candidate.controller().active_control_configuration_id = path.active_control_configuration_id;
+    candidate.controller().active_control_configuration_generation =
         path.active_control_configuration_generation;
     candidate.runtime_unit_epochs = binding.runtime_unit_epochs;
-    candidate.stop_evidence_policy_id = path.stop_evidence_policy_id;
-    candidate.stop_evidence_policy_revision = path.stop_evidence_policy_revision;
+    candidate.controller().stop_evidence_policy_id = path.stop_evidence_policy_id;
+    candidate.controller().stop_evidence_policy_revision = path.stop_evidence_policy_revision;
 
     const auto expected_binding = std::find_if(
         readiness.expected_controller_domain.expected_bindings.begin(),
@@ -1315,8 +1701,8 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
         });
     if (expected_binding == readiness.expected_controller_domain.expected_bindings.end())
       fail("expected_interface_contract_missing");
-    candidate.claimed_command_interfaces = expected_binding->claimed_command_interfaces;
-    candidate.claimed_state_interfaces = expected_binding->claimed_state_interfaces;
+    candidate.controller().claimed_command_interfaces = expected_binding->claimed_command_interfaces;
+    candidate.controller().claimed_state_interfaces = expected_binding->claimed_state_interfaces;
     const auto& nominal =
         readiness.resolved_stop_base_plan.escalation_stages.front().command_target;
     if (nominal.endpoint_role_id) {
@@ -1328,19 +1714,19 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
           selected.endpoints.push_back(endpoint);
       }
       if (selected.endpoints.empty()) fail("selected_route_endpoints_missing");
-      candidate.endpoint_contract = std::move(selected);
+      candidate.controller().endpoint_contract = std::move(selected);
     } else {
       const auto& receiver =
           std::holds_alternative<PreparedCapabilityCommandDTO>(candidate.payload) &&
-                  candidate.capability_provider
-              ? candidate.capability_provider->provider
-              : candidate.control_provider;
-      candidate.endpoint_contract = PreparedParticipantFocusedPortDTO{receiver.runtime_unit_id};
+                  candidate.controller().capability_provider
+              ? candidate.controller().capability_provider->provider
+              : candidate.controller().control_provider;
+      candidate.controller().endpoint_contract = PreparedParticipantFocusedPortDTO{receiver.runtime_unit_id};
     }
 
-    if (candidate.ordinary_stop_plan.participant_stop_profile_purpose !=
+    if (candidate.controller().ordinary_stop_plan.participant_stop_profile_purpose !=
             ParticipantStopProfilePurposeDTO::kOrdinary &&
-        candidate.ordinary_stop_plan.participant_stop_profile_purpose !=
+        candidate.controller().ordinary_stop_plan.participant_stop_profile_purpose !=
             ParticipantStopProfilePurposeDTO::kOperator) {
       fail("ordinary_stop_plan_purpose_invalid");
     }
@@ -1352,18 +1738,18 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
         candidate.program_revision,
         candidate.program_binding_id,
         candidate.program_run_id,
-        candidate.ordinary_stop_plan.participant_stop_profile,
-        candidate.ordinary_stop_plan.participant_stop_profile_purpose,
+        candidate.controller().ordinary_stop_plan.participant_stop_profile,
+        candidate.controller().ordinary_stop_plan.participant_stop_profile_purpose,
         std::nullopt,
         node_category};
     auto ordinary =
         MakePreparedParticipantStopPlan(readiness.resolved_stop_base_plan, std::move(ordinary_context),
                                         binding_resource_span(binding), retained_default_limits);
     if (!ordinary.ok()) fail("ordinary_stop_plan_make_failed");
-    candidate.ordinary_stop_plan = std::move(ordinary.value());
+    candidate.controller().ordinary_stop_plan = std::move(ordinary.value());
 
-    if (candidate.fault_stop_plan.has_value()) {
-      const auto& fault = *candidate.fault_stop_plan;
+    if (candidate.controller().fault_stop_plan.has_value()) {
+      const auto& fault = *candidate.controller().fault_stop_plan;
       if (!std::holds_alternative<PreparedMotionExecutionDTO>(candidate.payload) ||
           fault.operation_id != candidate.operation_id ||
           fault.operation_revision != candidate.operation_revision ||

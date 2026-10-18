@@ -39,6 +39,7 @@ export {
   parseApiErrorDto,
   parseKnownProgramRunOutcome,
   parseProgramRunStatus,
+  isAutomaticRetryAuditEvent,
   parseProgramRuntimeControlsSnapshot,
   parseProgramRuntimeControlProjection,
   parsePersistentKeyValues,
@@ -67,6 +68,8 @@ export {
   parseComponentOverviewProjection,
   parseComposerHeadlessState,
   parseObjectResponse,
+  parseGlobalRuleRecoveryOffers,
+  parseGlobalRuleRecoveryResult,
   parseStopFaultRecoveryOffer,
   parseStopFaultRecoveryResult,
 } from './parsers/headless';

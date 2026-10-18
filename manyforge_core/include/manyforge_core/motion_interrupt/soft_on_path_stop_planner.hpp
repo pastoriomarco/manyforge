@@ -71,6 +71,34 @@ struct SoftOnPathPlannerConfig {
   std::optional<double> stop_deadline_s;
 };
 
+/// Pure initial-condition resolution shared by Stop planning and speculative
+/// spring-back successor preparation. This is neither a feasible Stop plan
+/// nor evidence that any mechanism reached the return point. The caller owns
+/// current goal/binding/sample/frozen-factor authority and dispatch permission.
+struct SoftOnPathResolvedInitialStateDTO {
+  /// Original accepted trajectory occurrence, before the command lead-in.
+  double command_path_time_s = 0.0;
+  double path_time_rate = 0.0;
+  /// Supplied factor provenance, without a new normalization or authority rule.
+  double runtime_velocity_scale_at_trip = 1.0;
+  std::vector<std::string> joint_names;
+  /// q at command_path_time_s with zero velocity/acceleration, in joint_names
+  /// order. time_from_start_s is zero; it does not predict physical arrival.
+  TrajectoryWaypointDTO spring_back_return_point{0.0, {}, {}, {}};
+  double projected_time_from_start_s = 0.0;
+  double initial_path_deviation_rad = 0.0;
+  double initial_velocity_deviation_rad_s = 0.0;
+  bool used_model_velocity = false;
+};
+
+/// Resolve the existing soft Stop initial-condition checks, in their original
+/// order, before braking feasibility/trajectory generation. A spring-back
+/// caller supplies its same derived forward-half soft profile. Success grants
+/// no return-plan feasibility, freshness, effect or successor authorization.
+[[nodiscard]] Result<SoftOnPathResolvedInitialStateDTO> resolve_soft_on_path_stop_initial_state(
+    const TrajectoryDTO& accepted_trajectory, const MotionInterruptStopProfileDTO& stop_profile,
+    const SoftOnPathInitialStateDTO& initial_state, const SoftOnPathPlannerConfig& config = {});
+
 struct SoftOnPathStopPlanDTO {
   TrajectoryDTO replacement_trajectory;
   double projected_time_from_start_s = 0.0;

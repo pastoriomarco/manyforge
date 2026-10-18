@@ -4528,6 +4528,11 @@
               }
             ]
           },
+          "s_2cacfecb9ac0e75b": {
+            "not": {
+              "$ref": "#/$defs/s_b4e8de2f44d7cc3e"
+            }
+          },
           "s_37246640995e786a": {
             "additionalProperties": false,
             "allOf": [
@@ -5085,6 +5090,39 @@
               }
             ]
           },
+          "s_4845265691f87da8": {
+            "not": {
+              "$ref": "#/$defs/s_f94c51e599a6af48"
+            }
+          },
+          "s_4a81fcf7fc6f0a83": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "automatic_retries"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "automatic_retries"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_4c54ede36e5884d0": {
             "not": {
               "$ref": "#/$defs/s_1b98ea2c295cd89c"
@@ -5328,6 +5366,11 @@
             ],
             "type": "object"
           },
+          "s_789395dfcfbb8d00": {
+            "not": {
+              "$ref": "#/$defs/s_4a81fcf7fc6f0a83"
+            }
+          },
           "s_7a7c8fbffe8c1502": {
             "not": {
               "$ref": "#/$defs/s_46e0d3d08937f9d8"
@@ -5470,6 +5513,34 @@
             },
             "type": "object"
           },
+          "s_b4e8de2f44d7cc3e": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "automatic_retry_delay_s"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "automatic_retry_delay_s"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_b50417c15ae8053c": {
             "allOf": [
               {
@@ -5582,6 +5653,11 @@
                 ]
               }
             ]
+          },
+          "s_cd2573d83d141d30": {
+            "not": {
+              "$ref": "#/$defs/s_fa490c14f1bfb3c5"
+            }
           },
           "s_d848331fe3f4a42e": {
             "allOf": [
@@ -5752,6 +5828,62 @@
             "not": {
               "$ref": "#/$defs/s_21a07e4c82277387"
             }
+          },
+          "s_f94c51e599a6af48": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "preempted_result"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "preempted_result"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_fa490c14f1bfb3c5": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "preemption_priority"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "preemption_priority"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -6553,6 +6685,12 @@
                     "$ref": "#/$defs/s_1eaef583327742b4"
                   },
                   {
+                    "$ref": "#/$defs/s_789395dfcfbb8d00"
+                  },
+                  {
+                    "$ref": "#/$defs/s_2cacfecb9ac0e75b"
+                  },
+                  {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
@@ -6817,6 +6955,12 @@
                     "$ref": "#/$defs/s_ab38980932f15fa2"
                   },
                   {
+                    "$ref": "#/$defs/s_4845265691f87da8"
+                  },
+                  {
+                    "$ref": "#/$defs/s_cd2573d83d141d30"
+                  },
+                  {
                     "$ref": "#/$defs/s_921a14af5104da5e"
                   },
                   {
@@ -6842,6 +6986,16 @@
                       "acceleration_scale": {
                         "exclusiveMinimum": 0.0,
                         "maximum": 1.0,
+                        "type": "number"
+                      },
+                      "automatic_retries": {
+                        "maximum": 10,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "automatic_retry_delay_s": {
+                        "maximum": 60.0,
+                        "minimum": 0.0,
                         "type": "number"
                       },
                       "base_frame_role": {
@@ -6932,6 +7086,18 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "preempted_result": {
+                        "enum": [
+                          "success",
+                          "failure"
+                        ],
+                        "type": "string"
+                      },
+                      "preemption_priority": {
+                        "maximum": 100,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
                       "rotation_tol_rad": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -6972,6 +7138,12 @@
                     "minProperties": 1,
                     "properties": {
                       "acceleration_scale": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retries": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retry_delay_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
@@ -7022,6 +7194,12 @@
                       "planning_timeout_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "preempted_result": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preemption_priority": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "rotation_tol_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -7054,6 +7232,12 @@
                     "$ref": "#/$defs/s_1eaef583327742b4"
                   },
                   {
+                    "$ref": "#/$defs/s_789395dfcfbb8d00"
+                  },
+                  {
+                    "$ref": "#/$defs/s_2cacfecb9ac0e75b"
+                  },
+                  {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
@@ -7070,6 +7254,12 @@
                   },
                   {
                     "$ref": "#/$defs/s_ab38980932f15fa2"
+                  },
+                  {
+                    "$ref": "#/$defs/s_4845265691f87da8"
+                  },
+                  {
+                    "$ref": "#/$defs/s_cd2573d83d141d30"
                   },
                   {
                     "$ref": "#/$defs/s_921a14af5104da5e"
@@ -7094,6 +7284,16 @@
                       "acceleration_scale": {
                         "exclusiveMinimum": 0.0,
                         "maximum": 1.0,
+                        "type": "number"
+                      },
+                      "automatic_retries": {
+                        "maximum": 10,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "automatic_retry_delay_s": {
+                        "maximum": 60.0,
+                        "minimum": 0.0,
                         "type": "number"
                       },
                       "base_frame_role": {
@@ -7157,6 +7357,18 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "preempted_result": {
+                        "enum": [
+                          "success",
+                          "failure"
+                        ],
+                        "type": "string"
+                      },
+                      "preemption_priority": {
+                        "maximum": 100,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
                       "rotation_tol_rad": {
                         "minimum": 0.0,
                         "type": "number"
@@ -7196,6 +7408,12 @@
                       "acceleration_scale": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "automatic_retries": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retry_delay_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "cache_mode": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -7212,6 +7430,12 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preempted_result": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preemption_priority": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "rotation_tol_rad": {
@@ -7241,6 +7465,12 @@
                 "allOf": [
                   {
                     "$ref": "#/$defs/s_1eaef583327742b4"
+                  },
+                  {
+                    "$ref": "#/$defs/s_789395dfcfbb8d00"
+                  },
+                  {
+                    "$ref": "#/$defs/s_2cacfecb9ac0e75b"
                   },
                   {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
@@ -7297,6 +7527,12 @@
                     "$ref": "#/$defs/s_ab38980932f15fa2"
                   },
                   {
+                    "$ref": "#/$defs/s_4845265691f87da8"
+                  },
+                  {
+                    "$ref": "#/$defs/s_cd2573d83d141d30"
+                  },
+                  {
                     "$ref": "#/$defs/s_921a14af5104da5e"
                   },
                   {
@@ -7322,6 +7558,16 @@
                       "acceleration_scale": {
                         "exclusiveMinimum": 0.0,
                         "maximum": 1.0,
+                        "type": "number"
+                      },
+                      "automatic_retries": {
+                        "maximum": 10,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "automatic_retry_delay_s": {
+                        "maximum": 60.0,
+                        "minimum": 0.0,
                         "type": "number"
                       },
                       "base_frame_role": {
@@ -7376,6 +7622,18 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "preempted_result": {
+                        "enum": [
+                          "success",
+                          "failure"
+                        ],
+                        "type": "string"
+                      },
+                      "preemption_priority": {
+                        "maximum": 100,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
                       "rotation_tol_rad": {
                         "minimum": 0.0,
                         "type": "number"
@@ -7418,6 +7676,12 @@
                       "acceleration_scale": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "automatic_retries": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retry_delay_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "cache_mode": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -7443,6 +7707,12 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preempted_result": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preemption_priority": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "rotation_tol_rad": {
@@ -8994,6 +9264,12 @@
                     "$ref": "#/$defs/s_1eaef583327742b4"
                   },
                   {
+                    "$ref": "#/$defs/s_789395dfcfbb8d00"
+                  },
+                  {
+                    "$ref": "#/$defs/s_2cacfecb9ac0e75b"
+                  },
+                  {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
@@ -9258,6 +9534,12 @@
                     "$ref": "#/$defs/s_ab38980932f15fa2"
                   },
                   {
+                    "$ref": "#/$defs/s_4845265691f87da8"
+                  },
+                  {
+                    "$ref": "#/$defs/s_cd2573d83d141d30"
+                  },
+                  {
                     "$ref": "#/$defs/s_921a14af5104da5e"
                   },
                   {
@@ -9324,6 +9606,16 @@
                       "acceleration_scale": {
                         "exclusiveMinimum": 0.0,
                         "maximum": 1.0,
+                        "type": "number"
+                      },
+                      "automatic_retries": {
+                        "maximum": 10,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "automatic_retry_delay_s": {
+                        "maximum": 60.0,
+                        "minimum": 0.0,
                         "type": "number"
                       },
                       "base_frame_role": {
@@ -9414,6 +9706,18 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "preempted_result": {
+                        "enum": [
+                          "success",
+                          "failure"
+                        ],
+                        "type": "string"
+                      },
+                      "preemption_priority": {
+                        "maximum": 100,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
                       "rotation_tol_rad": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -9459,6 +9763,12 @@
                     "minProperties": 1,
                     "properties": {
                       "acceleration_scale": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retries": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retry_delay_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
@@ -9509,6 +9819,12 @@
                       "planning_timeout_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "preempted_result": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preemption_priority": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "rotation_tol_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -9543,6 +9859,12 @@
                     "$ref": "#/$defs/s_1eaef583327742b4"
                   },
                   {
+                    "$ref": "#/$defs/s_789395dfcfbb8d00"
+                  },
+                  {
+                    "$ref": "#/$defs/s_2cacfecb9ac0e75b"
+                  },
+                  {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
@@ -9559,6 +9881,12 @@
                   },
                   {
                     "$ref": "#/$defs/s_ab38980932f15fa2"
+                  },
+                  {
+                    "$ref": "#/$defs/s_4845265691f87da8"
+                  },
+                  {
+                    "$ref": "#/$defs/s_cd2573d83d141d30"
                   },
                   {
                     "$ref": "#/$defs/s_921a14af5104da5e"
@@ -9596,6 +9924,16 @@
                       "acceleration_scale": {
                         "exclusiveMinimum": 0.0,
                         "maximum": 1.0,
+                        "type": "number"
+                      },
+                      "automatic_retries": {
+                        "maximum": 10,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "automatic_retry_delay_s": {
+                        "maximum": 60.0,
+                        "minimum": 0.0,
                         "type": "number"
                       },
                       "base_frame_role": {
@@ -9659,6 +9997,18 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "preempted_result": {
+                        "enum": [
+                          "success",
+                          "failure"
+                        ],
+                        "type": "string"
+                      },
+                      "preemption_priority": {
+                        "maximum": 100,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
                       "rotation_tol_rad": {
                         "minimum": 0.0,
                         "type": "number"
@@ -9704,6 +10054,12 @@
                       "acceleration_scale": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "automatic_retries": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retry_delay_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "cache_mode": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -9720,6 +10076,12 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preempted_result": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preemption_priority": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "rotation_tol_rad": {
@@ -9751,6 +10113,12 @@
                 "allOf": [
                   {
                     "$ref": "#/$defs/s_1eaef583327742b4"
+                  },
+                  {
+                    "$ref": "#/$defs/s_789395dfcfbb8d00"
+                  },
+                  {
+                    "$ref": "#/$defs/s_2cacfecb9ac0e75b"
                   },
                   {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
@@ -9805,6 +10173,12 @@
                   },
                   {
                     "$ref": "#/$defs/s_ab38980932f15fa2"
+                  },
+                  {
+                    "$ref": "#/$defs/s_4845265691f87da8"
+                  },
+                  {
+                    "$ref": "#/$defs/s_cd2573d83d141d30"
                   },
                   {
                     "$ref": "#/$defs/s_921a14af5104da5e"
@@ -9875,6 +10249,16 @@
                         "maximum": 1.0,
                         "type": "number"
                       },
+                      "automatic_retries": {
+                        "maximum": 10,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "automatic_retry_delay_s": {
+                        "maximum": 60.0,
+                        "minimum": 0.0,
+                        "type": "number"
+                      },
                       "base_frame_role": {
                         "type": "string",
                         "x-manyforge-semantic-scope-parameter": "target_role",
@@ -9927,6 +10311,18 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "preempted_result": {
+                        "enum": [
+                          "success",
+                          "failure"
+                        ],
+                        "type": "string"
+                      },
+                      "preemption_priority": {
+                        "maximum": 100,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
                       "rotation_tol_rad": {
                         "minimum": 0.0,
                         "type": "number"
@@ -9974,6 +10370,12 @@
                       "acceleration_scale": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "automatic_retries": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retry_delay_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "cache_mode": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -9999,6 +10401,12 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preempted_result": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preemption_priority": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "rotation_tol_rad": {
@@ -11132,6 +11540,11 @@
               }
             ]
           },
+          "s_2cacfecb9ac0e75b": {
+            "not": {
+              "$ref": "#/$defs/s_b4e8de2f44d7cc3e"
+            }
+          },
           "s_37246640995e786a": {
             "additionalProperties": false,
             "allOf": [
@@ -11689,6 +12102,39 @@
               }
             ]
           },
+          "s_4845265691f87da8": {
+            "not": {
+              "$ref": "#/$defs/s_f94c51e599a6af48"
+            }
+          },
+          "s_4a81fcf7fc6f0a83": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "automatic_retries"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "automatic_retries"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_4c54ede36e5884d0": {
             "not": {
               "$ref": "#/$defs/s_1b98ea2c295cd89c"
@@ -11960,6 +12406,11 @@
             ],
             "type": "object"
           },
+          "s_789395dfcfbb8d00": {
+            "not": {
+              "$ref": "#/$defs/s_4a81fcf7fc6f0a83"
+            }
+          },
           "s_7a7c8fbffe8c1502": {
             "not": {
               "$ref": "#/$defs/s_46e0d3d08937f9d8"
@@ -12130,6 +12581,34 @@
               }
             ]
           },
+          "s_b4e8de2f44d7cc3e": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "automatic_retry_delay_s"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "automatic_retry_delay_s"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_b50417c15ae8053c": {
             "allOf": [
               {
@@ -12242,6 +12721,11 @@
                 ]
               }
             ]
+          },
+          "s_cd2573d83d141d30": {
+            "not": {
+              "$ref": "#/$defs/s_fa490c14f1bfb3c5"
+            }
           },
           "s_d848331fe3f4a42e": {
             "allOf": [
@@ -12412,6 +12896,62 @@
             "not": {
               "$ref": "#/$defs/s_21a07e4c82277387"
             }
+          },
+          "s_f94c51e599a6af48": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "preempted_result"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "preempted_result"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_fa490c14f1bfb3c5": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "preemption_priority"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "preemption_priority"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           },
           "s_fff72238bc423091": {
             "oneOf": [
@@ -13472,6 +14012,12 @@
                     "$ref": "#/$defs/s_1eaef583327742b4"
                   },
                   {
+                    "$ref": "#/$defs/s_789395dfcfbb8d00"
+                  },
+                  {
+                    "$ref": "#/$defs/s_2cacfecb9ac0e75b"
+                  },
+                  {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
@@ -13736,6 +14282,12 @@
                     "$ref": "#/$defs/s_ab38980932f15fa2"
                   },
                   {
+                    "$ref": "#/$defs/s_4845265691f87da8"
+                  },
+                  {
+                    "$ref": "#/$defs/s_cd2573d83d141d30"
+                  },
+                  {
                     "$ref": "#/$defs/s_921a14af5104da5e"
                   },
                   {
@@ -13802,6 +14354,16 @@
                       "acceleration_scale": {
                         "exclusiveMinimum": 0.0,
                         "maximum": 1.0,
+                        "type": "number"
+                      },
+                      "automatic_retries": {
+                        "maximum": 10,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "automatic_retry_delay_s": {
+                        "maximum": 60.0,
+                        "minimum": 0.0,
                         "type": "number"
                       },
                       "base_frame_role": {
@@ -13892,6 +14454,18 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "preempted_result": {
+                        "enum": [
+                          "success",
+                          "failure"
+                        ],
+                        "type": "string"
+                      },
+                      "preemption_priority": {
+                        "maximum": 100,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
                       "rotation_tol_rad": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -13937,6 +14511,12 @@
                     "minProperties": 1,
                     "properties": {
                       "acceleration_scale": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retries": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retry_delay_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
@@ -13987,6 +14567,12 @@
                       "planning_timeout_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "preempted_result": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preemption_priority": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "rotation_tol_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -14021,6 +14607,12 @@
                     "$ref": "#/$defs/s_1eaef583327742b4"
                   },
                   {
+                    "$ref": "#/$defs/s_789395dfcfbb8d00"
+                  },
+                  {
+                    "$ref": "#/$defs/s_2cacfecb9ac0e75b"
+                  },
+                  {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
@@ -14037,6 +14629,12 @@
                   },
                   {
                     "$ref": "#/$defs/s_ab38980932f15fa2"
+                  },
+                  {
+                    "$ref": "#/$defs/s_4845265691f87da8"
+                  },
+                  {
+                    "$ref": "#/$defs/s_cd2573d83d141d30"
                   },
                   {
                     "$ref": "#/$defs/s_921a14af5104da5e"
@@ -14074,6 +14672,16 @@
                       "acceleration_scale": {
                         "exclusiveMinimum": 0.0,
                         "maximum": 1.0,
+                        "type": "number"
+                      },
+                      "automatic_retries": {
+                        "maximum": 10,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "automatic_retry_delay_s": {
+                        "maximum": 60.0,
+                        "minimum": 0.0,
                         "type": "number"
                       },
                       "base_frame_role": {
@@ -14137,6 +14745,18 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "preempted_result": {
+                        "enum": [
+                          "success",
+                          "failure"
+                        ],
+                        "type": "string"
+                      },
+                      "preemption_priority": {
+                        "maximum": 100,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
                       "rotation_tol_rad": {
                         "minimum": 0.0,
                         "type": "number"
@@ -14182,6 +14802,12 @@
                       "acceleration_scale": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "automatic_retries": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retry_delay_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "cache_mode": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -14198,6 +14824,12 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preempted_result": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preemption_priority": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "rotation_tol_rad": {
@@ -14229,6 +14861,12 @@
                 "allOf": [
                   {
                     "$ref": "#/$defs/s_1eaef583327742b4"
+                  },
+                  {
+                    "$ref": "#/$defs/s_789395dfcfbb8d00"
+                  },
+                  {
+                    "$ref": "#/$defs/s_2cacfecb9ac0e75b"
                   },
                   {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
@@ -14283,6 +14921,12 @@
                   },
                   {
                     "$ref": "#/$defs/s_ab38980932f15fa2"
+                  },
+                  {
+                    "$ref": "#/$defs/s_4845265691f87da8"
+                  },
+                  {
+                    "$ref": "#/$defs/s_cd2573d83d141d30"
                   },
                   {
                     "$ref": "#/$defs/s_921a14af5104da5e"
@@ -14353,6 +14997,16 @@
                         "maximum": 1.0,
                         "type": "number"
                       },
+                      "automatic_retries": {
+                        "maximum": 10,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "automatic_retry_delay_s": {
+                        "maximum": 60.0,
+                        "minimum": 0.0,
+                        "type": "number"
+                      },
                       "base_frame_role": {
                         "type": "string",
                         "x-manyforge-semantic-scope-parameter": "target_role",
@@ -14405,6 +15059,18 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "preempted_result": {
+                        "enum": [
+                          "success",
+                          "failure"
+                        ],
+                        "type": "string"
+                      },
+                      "preemption_priority": {
+                        "maximum": 100,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
                       "rotation_tol_rad": {
                         "minimum": 0.0,
                         "type": "number"
@@ -14452,6 +15118,12 @@
                       "acceleration_scale": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "automatic_retries": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "automatic_retry_delay_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "cache_mode": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -14477,6 +15149,12 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preempted_result": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "preemption_priority": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "rotation_tol_rad": {
@@ -15610,6 +16288,11 @@
               }
             ]
           },
+          "s_2cacfecb9ac0e75b": {
+            "not": {
+              "$ref": "#/$defs/s_b4e8de2f44d7cc3e"
+            }
+          },
           "s_37246640995e786a": {
             "additionalProperties": false,
             "allOf": [
@@ -16167,6 +16850,39 @@
               }
             ]
           },
+          "s_4845265691f87da8": {
+            "not": {
+              "$ref": "#/$defs/s_f94c51e599a6af48"
+            }
+          },
+          "s_4a81fcf7fc6f0a83": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "automatic_retries"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "automatic_retries"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_4c54ede36e5884d0": {
             "not": {
               "$ref": "#/$defs/s_1b98ea2c295cd89c"
@@ -16438,6 +17154,11 @@
             ],
             "type": "object"
           },
+          "s_789395dfcfbb8d00": {
+            "not": {
+              "$ref": "#/$defs/s_4a81fcf7fc6f0a83"
+            }
+          },
           "s_7a7c8fbffe8c1502": {
             "not": {
               "$ref": "#/$defs/s_46e0d3d08937f9d8"
@@ -16608,6 +17329,34 @@
               }
             ]
           },
+          "s_b4e8de2f44d7cc3e": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "automatic_retry_delay_s"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "automatic_retry_delay_s"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_b50417c15ae8053c": {
             "allOf": [
               {
@@ -16720,6 +17469,11 @@
                 ]
               }
             ]
+          },
+          "s_cd2573d83d141d30": {
+            "not": {
+              "$ref": "#/$defs/s_fa490c14f1bfb3c5"
+            }
           },
           "s_d848331fe3f4a42e": {
             "allOf": [
@@ -16890,6 +17644,62 @@
             "not": {
               "$ref": "#/$defs/s_21a07e4c82277387"
             }
+          },
+          "s_f94c51e599a6af48": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "preempted_result"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "preempted_result"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_fa490c14f1bfb3c5": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "preemption_priority"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "preemption_priority"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           },
           "s_fff72238bc423091": {
             "oneOf": [
@@ -17170,6 +17980,11 @@
                 ]
               }
             ]
+          },
+          "s_2cacfecb9ac0e75b": {
+            "not": {
+              "$ref": "#/$defs/s_b4e8de2f44d7cc3e"
+            }
           },
           "s_37246640995e786a": {
             "additionalProperties": false,
@@ -17832,6 +18647,39 @@
             ],
             "type": "object"
           },
+          "s_4845265691f87da8": {
+            "not": {
+              "$ref": "#/$defs/s_f94c51e599a6af48"
+            }
+          },
+          "s_4a81fcf7fc6f0a83": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "automatic_retries"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "automatic_retries"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_4c54ede36e5884d0": {
             "not": {
               "$ref": "#/$defs/s_1b98ea2c295cd89c"
@@ -18091,6 +18939,11 @@
             ],
             "type": "object"
           },
+          "s_789395dfcfbb8d00": {
+            "not": {
+              "$ref": "#/$defs/s_4a81fcf7fc6f0a83"
+            }
+          },
           "s_7a7c8fbffe8c1502": {
             "not": {
               "$ref": "#/$defs/s_46e0d3d08937f9d8"
@@ -18234,6 +19087,34 @@
               }
             ]
           },
+          "s_b4e8de2f44d7cc3e": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "automatic_retry_delay_s"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "automatic_retry_delay_s"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_b50417c15ae8053c": {
             "allOf": [
               {
@@ -18346,6 +19227,11 @@
                 ]
               }
             ]
+          },
+          "s_cd2573d83d141d30": {
+            "not": {
+              "$ref": "#/$defs/s_fa490c14f1bfb3c5"
+            }
           },
           "s_d848331fe3f4a42e": {
             "allOf": [
@@ -18623,6 +19509,62 @@
             "not": {
               "$ref": "#/$defs/s_21a07e4c82277387"
             }
+          },
+          "s_f94c51e599a6af48": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "preempted_result"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "preempted_result"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
+          "s_fa490c14f1bfb3c5": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "preemption_priority"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "preemption_priority"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           }
         },
         "oneOf": [
@@ -19572,6 +20514,12 @@
                 "$ref": "#/$defs/s_1eaef583327742b4"
               },
               {
+                "$ref": "#/$defs/s_789395dfcfbb8d00"
+              },
+              {
+                "$ref": "#/$defs/s_2cacfecb9ac0e75b"
+              },
+              {
                 "$ref": "#/$defs/s_a47a9cc21283b82f"
               },
               {
@@ -19836,6 +20784,12 @@
                 "$ref": "#/$defs/s_ab38980932f15fa2"
               },
               {
+                "$ref": "#/$defs/s_4845265691f87da8"
+              },
+              {
+                "$ref": "#/$defs/s_cd2573d83d141d30"
+              },
+              {
                 "$ref": "#/$defs/s_921a14af5104da5e"
               },
               {
@@ -19890,6 +20844,16 @@
                   "acceleration_scale": {
                     "exclusiveMinimum": 0.0,
                     "maximum": 1.0,
+                    "type": "number"
+                  },
+                  "automatic_retries": {
+                    "maximum": 10,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "automatic_retry_delay_s": {
+                    "maximum": 60.0,
+                    "minimum": 0.0,
                     "type": "number"
                   },
                   "base_frame_role": {
@@ -19980,6 +20944,18 @@
                     "exclusiveMinimum": 0.0,
                     "type": "number"
                   },
+                  "preempted_result": {
+                    "enum": [
+                      "success",
+                      "failure"
+                    ],
+                    "type": "string"
+                  },
+                  "preemption_priority": {
+                    "maximum": 100,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
                   "rotation_tol_rad": {
                     "exclusiveMinimum": 0.0,
                     "type": "number"
@@ -20020,6 +20996,12 @@
                 "minProperties": 1,
                 "properties": {
                   "acceleration_scale": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "automatic_retries": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "automatic_retry_delay_s": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "cache_mode": {
@@ -20070,6 +21052,12 @@
                   "planning_timeout_s": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
+                  "preempted_result": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "preemption_priority": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
                   "rotation_tol_rad": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
@@ -20102,6 +21090,12 @@
                 "$ref": "#/$defs/s_1eaef583327742b4"
               },
               {
+                "$ref": "#/$defs/s_789395dfcfbb8d00"
+              },
+              {
+                "$ref": "#/$defs/s_2cacfecb9ac0e75b"
+              },
+              {
                 "$ref": "#/$defs/s_a47a9cc21283b82f"
               },
               {
@@ -20118,6 +21112,12 @@
               },
               {
                 "$ref": "#/$defs/s_ab38980932f15fa2"
+              },
+              {
+                "$ref": "#/$defs/s_4845265691f87da8"
+              },
+              {
+                "$ref": "#/$defs/s_cd2573d83d141d30"
               },
               {
                 "$ref": "#/$defs/s_921a14af5104da5e"
@@ -20171,6 +21171,16 @@
                   "acceleration_scale": {
                     "exclusiveMinimum": 0.0,
                     "maximum": 1.0,
+                    "type": "number"
+                  },
+                  "automatic_retries": {
+                    "maximum": 10,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "automatic_retry_delay_s": {
+                    "maximum": 60.0,
+                    "minimum": 0.0,
                     "type": "number"
                   },
                   "base_frame_role": {
@@ -20234,6 +21244,18 @@
                     "exclusiveMinimum": 0.0,
                     "type": "number"
                   },
+                  "preempted_result": {
+                    "enum": [
+                      "success",
+                      "failure"
+                    ],
+                    "type": "string"
+                  },
+                  "preemption_priority": {
+                    "maximum": 100,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
                   "rotation_tol_rad": {
                     "minimum": 0.0,
                     "type": "number"
@@ -20273,6 +21295,12 @@
                   "acceleration_scale": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
+                  "automatic_retries": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "automatic_retry_delay_s": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
                   "cache_mode": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
@@ -20289,6 +21317,12 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "planning_timeout_s": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "preempted_result": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "preemption_priority": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "rotation_tol_rad": {
@@ -20318,6 +21352,12 @@
             "allOf": [
               {
                 "$ref": "#/$defs/s_1eaef583327742b4"
+              },
+              {
+                "$ref": "#/$defs/s_789395dfcfbb8d00"
+              },
+              {
+                "$ref": "#/$defs/s_2cacfecb9ac0e75b"
               },
               {
                 "$ref": "#/$defs/s_a47a9cc21283b82f"
@@ -20372,6 +21412,12 @@
               },
               {
                 "$ref": "#/$defs/s_ab38980932f15fa2"
+              },
+              {
+                "$ref": "#/$defs/s_4845265691f87da8"
+              },
+              {
+                "$ref": "#/$defs/s_cd2573d83d141d30"
               },
               {
                 "$ref": "#/$defs/s_921a14af5104da5e"
@@ -20430,6 +21476,16 @@
                     "maximum": 1.0,
                     "type": "number"
                   },
+                  "automatic_retries": {
+                    "maximum": 10,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "automatic_retry_delay_s": {
+                    "maximum": 60.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
                   "base_frame_role": {
                     "type": "string",
                     "x-manyforge-semantic-scope-parameter": "target_role",
@@ -20482,6 +21538,18 @@
                     "exclusiveMinimum": 0.0,
                     "type": "number"
                   },
+                  "preempted_result": {
+                    "enum": [
+                      "success",
+                      "failure"
+                    ],
+                    "type": "string"
+                  },
+                  "preemption_priority": {
+                    "maximum": 100,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
                   "rotation_tol_rad": {
                     "minimum": 0.0,
                     "type": "number"
@@ -20524,6 +21592,12 @@
                   "acceleration_scale": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
+                  "automatic_retries": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "automatic_retry_delay_s": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
                   "cache_mode": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
@@ -20549,6 +21623,12 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "planning_timeout_s": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "preempted_result": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "preemption_priority": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "rotation_tol_rad": {

@@ -21,9 +21,8 @@
 
 namespace manyforge::ros2_control_execution {
 Ros2TransportResources::Ros2TransportResources(
-    std::string node_name, std::string node_namespace, std::size_t executor_thread_count,
-    std::shared_ptr<core::IExecutionStateSink> execution_state_sink, std::string arm_group_id,
-    core::IClock& clock) {
+    std::string node_name, std::string node_namespace,
+    std::size_t executor_thread_count) {
   context_ = std::make_shared<rclcpp::Context>();
   int argc = 0;
   char **argv = nullptr;
@@ -37,6 +36,15 @@ Ros2TransportResources::Ros2TransportResources(
   executor_ = std::make_shared<rclcpp::executors::MultiThreadedExecutor>(
       executor_options, executor_thread_count);
   executor_->add_node(node_);
+}
+
+Ros2TransportResources::Ros2TransportResources(
+    std::string node_name, std::string node_namespace,
+    std::size_t executor_thread_count,
+    std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+    std::string arm_group_id, core::IClock &clock)
+    : Ros2TransportResources(std::move(node_name), std::move(node_namespace),
+                             executor_thread_count) {
   scene_projection_worker_ = std::make_unique<detail::SceneProjectionWorker>(
       std::move(execution_state_sink), std::move(arm_group_id), clock);
 }
@@ -44,7 +52,9 @@ Ros2TransportResources::Ros2TransportResources(
 Ros2TransportResources::~Ros2TransportResources() { quiesce(); }
 
 detail::SceneProjectionWorker &
-Ros2TransportResources::projection_worker() const noexcept {
+Ros2TransportResources::projection_worker() const {
+  if (!scene_projection_worker_)
+    throw std::logic_error("ROS transport has no scene projection worker");
   return *scene_projection_worker_;
 }
 
@@ -82,7 +92,8 @@ void Ros2TransportResources::quiesce() noexcept {
     spin_thread_.join();
   executor_->remove_node(node_);
   context_->shutdown("manyforge ROS transport shutdown");
-  if (!scene_projection_worker_->stop_and_join_for(std::chrono::seconds(1))) {
+  if (scene_projection_worker_ &&
+      !scene_projection_worker_->stop_and_join_for(std::chrono::seconds(1))) {
     RCLCPP_FATAL(node_->get_logger(),
                  "Timed out draining scene projection callbacks during ROS "
                  "transport shutdown");

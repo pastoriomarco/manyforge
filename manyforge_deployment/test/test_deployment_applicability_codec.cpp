@@ -1285,5 +1285,120 @@ TEST(DeploymentApplicabilityCodec, PerBindingStopTimingIsNoLongerAPolicyField) {
       "unknown field");
 }
 
+TEST(DeploymentApplicabilityCodec,
+     MotionTakeoverBudgetIsOptionalPositiveAndPreserved) {
+  const auto document_for = [](std::string_view value) {
+    auto policies = interrupt_policy_envelope("", "");
+    policies.pop_back();
+    return with_policies(minimal_document(),
+                         policies +
+                             ",\"motion_takeover_preparation_budget_s\":" +
+                             std::string(value) + "}");
+  };
+  const auto no_policies = decode(minimal_document());
+  EXPECT_FALSE(
+      no_policies.value().motion_takeover_preparation_budget_s.has_value());
+  const auto omitted = decode(
+      with_policies(minimal_document(), interrupt_policy_envelope("", "")));
+  EXPECT_FALSE(
+      omitted.value().motion_takeover_preparation_budget_s.has_value());
+  EXPECT_EQ(omitted.normalized_policies()->find_object_member(
+                "motion_takeover_preparation_budget_s"),
+            nullptr);
+  for (const auto *seconds : {"0.001", "1", "2.5"}) {
+    const auto candidate = decode(document_for(seconds));
+    ASSERT_TRUE(
+        candidate.value().motion_takeover_preparation_budget_s.has_value());
+    EXPECT_DOUBLE_EQ(*candidate.value().motion_takeover_preparation_budget_s,
+                     std::stod(seconds));
+    const auto revisioned =
+        compute_capability_provider_binding_revisions(candidate);
+    EXPECT_EQ(revisioned.value().motion_takeover_preparation_budget_s,
+              candidate.value().motion_takeover_preparation_budget_s);
+    EXPECT_EQ(canonical_json(*revisioned.normalized_policies()),
+              canonical_json(*candidate.normalized_policies()));
+  }
+  for (const auto *invalid : {"0", "-1", "true", "null", "\"1\""}) {
+    expect_decode_error_containing(
+        document_for(invalid),
+        "$.policies.motion_takeover_preparation_budget_s");
+  }
+}
+
 } // namespace
+
+TEST(DeploymentApplicabilityCodec, DirectComponentTargetIsDistinctClosedAndIdentitySensitive) {
+  const std::string direct = "{\"controllable_component_id\":\"arm_component\","
+      "\"component_type_revision\":\"" + std::string(kZeroDigest) + "\","
+      "\"command_target_id\":\"gpio\"}";
+  const auto document = minimal_document("[]", "[" + provider_binding("io.read", kZeroDigest,
+      "target_binding", direct) + "]");
+  const auto typed = decode(document);
+  ASSERT_EQ(typed.value().capability_provider_bindings.size(), 1U);
+  EXPECT_TRUE(std::holds_alternative<core::ComponentTargetCapabilityProviderTargetDTO>(
+      typed.value().capability_provider_bindings.front().target));
+  const auto verified = compute_capability_provider_binding_revisions(typed);
+  const auto reparsed = decode(minimal_document("[]",
+      canonical_json(verified.normalized_capability_provider_bindings())));
+  EXPECT_EQ(reparsed.value().capability_provider_bindings, verified.value().capability_provider_bindings);
+  const auto old = decode(minimal_document("[]", "[" + provider_binding() + "]"));
+  EXPECT_TRUE(std::holds_alternative<core::TargetBindingCapabilityProviderTargetDTO>(
+      old.value().capability_provider_bindings.front().target));
+  EXPECT_NE(canonical_json(typed.normalized_capability_provider_bindings()),
+            canonical_json(old.normalized_capability_provider_bindings()));
+  for (const auto* extra : {",\"control_binding_id\":\"fake\"", ",\"unknown\":true"}) {
+    auto invalid_target = direct;
+    invalid_target.pop_back();
+    invalid_target += std::string(extra) + "}";
+    EXPECT_THROW(static_cast<void>(decode(minimal_document("[]", "[" + provider_binding(
+        "io.read", kZeroDigest, "target_binding", invalid_target) + "]"))), DeploymentApplicabilityCodecError);
+  }
+}
+
+
+TEST(DeploymentApplicabilityCodecTest, GlobalConditionUsesOnlyExistingNodeAndDepthBounds) {
+  constexpr std::size_t maximum_nodes = 64U;
+  const auto comparison = [](std::size_t index) {
+    return CanonicalValue(CanonicalValue::Object{{"compare", CanonicalValue(CanonicalValue::Object{
+        {"operand", CanonicalValue(CanonicalValue::Object{{"signal", CanonicalValue(CanonicalValue::Object{
+            {"controllable_component_id", CanonicalValue("device")},
+            {"signal_name", CanonicalValue("input." + std::to_string(index))}})}})},
+        {"op", CanonicalValue("==")}, {"value", CanonicalValue(true)}})}});
+  };
+  const auto document = [&](const CanonicalValue& condition) {
+    const CanonicalValue rule(CanonicalValue::Object{
+        {"rule_id", CanonicalValue("many_sources")}, {"condition", condition},
+        {"scope", CanonicalValue("all_motion")}});
+    auto policies = interrupt_policy_envelope("", "");
+    policies.pop_back();
+    policies += ",\"interrupt_rules\":[" + canonical_json(rule) + "]}";
+    return with_policies(minimal_document(), std::move(policies));
+  };
+  // A single comparison remains legal without an otherwise unnecessary parent.
+  EXPECT_NO_THROW(static_cast<void>(decode(document(comparison(0U)))));
+  CanonicalValue::Array children;
+  for (std::size_t index = 0; index < maximum_nodes - 1U; ++index)
+    children.push_back(comparison(index));
+  const CanonicalValue largest(CanonicalValue::Object{{"all", CanonicalValue(children)}});
+  const auto decoded = decode(document(largest));
+  ASSERT_TRUE(decoded.normalized_policies());
+  const auto* rules = decoded.normalized_policies()->find_object_member("interrupt_rules");
+  ASSERT_NE(rules, nullptr);
+  ASSERT_EQ(rules->as_array().size(), 1U);
+  EXPECT_EQ(*rules->as_array().front().find_object_member("condition"), largest);
+  // Aliasing every operand does not alter the authored node bound either.
+  CanonicalValue::Array aliases(maximum_nodes - 1U, comparison(0U));
+  EXPECT_NO_THROW(static_cast<void>(decode(document(CanonicalValue(
+      CanonicalValue::Object{{"any", CanonicalValue(aliases)}})))));
+  children.push_back(comparison(maximum_nodes - 1U));
+  EXPECT_THROW(static_cast<void>(decode(document(CanonicalValue(
+      CanonicalValue::Object{{"all", CanonicalValue(children)}})))), DeploymentApplicabilityCodecError);
+  auto deepest = comparison(0U);
+  for (std::size_t depth = 1U; depth < 8U; ++depth)
+    deepest = CanonicalValue(CanonicalValue::Object{{"not", deepest}});
+  EXPECT_NO_THROW(static_cast<void>(decode(document(deepest))));
+  deepest = CanonicalValue(CanonicalValue::Object{{"not", deepest}});
+  EXPECT_THROW(static_cast<void>(decode(document(deepest))), DeploymentApplicabilityCodecError);
+}
+
 } // namespace manyforge::deployment

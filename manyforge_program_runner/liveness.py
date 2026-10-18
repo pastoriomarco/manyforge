@@ -17,6 +17,7 @@ import struct
 from threading import Event, RLock, Thread
 import time
 from typing import Any, Final
+import unicodedata
 
 from manyforge_headless_api.program_cycle import AcceptedProgramResetDTO
 
@@ -32,6 +33,8 @@ RENEWAL_INTERVAL_NS: Final = 250_000_000
 EXPIRY_TIMEOUT_NS: Final = 1_000_000_000
 MAXIMUM_PACKET_BYTES: Final = 16_384
 MAXIMUM_SEQUENCE: Final = 9_007_199_254_740_991
+PUBLISHER_FAULT_CODE: Final = "program_bbkey_publication_failed"
+_MAXIMUM_PUBLISHER_FAULT_MESSAGE_BYTES: Final = 1_024
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -64,6 +67,7 @@ class ProgramRunnerLivenessReceiver:
         on_reconciliation: Callable[[str, str, str], None],
         cycle_status: Callable[[], Mapping[str, Any]],
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        publication_check: Callable[[], None] | None = None,
     ) -> None:
         if not path.is_absolute() or path.name in {"", ".", ".."}:
             raise ValueError("Program Runner liveness socket must be absolute")
@@ -75,6 +79,8 @@ class ProgramRunnerLivenessReceiver:
         self._on_reconciliation = on_reconciliation
         self._cycle_status = cycle_status
         self._clock = monotonic_ns
+        # BB key publication budget check (contract 52), run on the watchdog.
+        self._publication_check = publication_check
         self._started_ns = self._clock()
         self._lock = RLock()
         self._stop = Event()
@@ -95,6 +101,10 @@ class ProgramRunnerLivenessReceiver:
         self._fault_reference = retained.fault_reference
         self._predecessor_expired = retained.expired
         self._last_rejection: str | None = None
+        # Independent of Manager presence: no heartbeat or reconciliation
+        # clears it, and it keeps commands fenced while Manager stays current.
+        self._publisher_fault: dict[str, Any] | None = None
+        self._publisher_fault_reference: str | None = None
 
     @staticmethod
     def _safe_run_root(metadata: os.stat_result) -> bool:
@@ -348,10 +358,63 @@ class ProgramRunnerLivenessReceiver:
 
     def require_current(self) -> None:
         with self._lock:
+            if self._publisher_fault is not None:
+                raise ProgramRunnerLivenessError(
+                    "Program Runner is fenced by a BB key publication fault"
+                )
             if self._state != "current" or self._fenced:
                 raise ProgramRunnerLivenessError(
                     "Program Runner is fenced by Manager-presence liveness"
                 )
+
+    @property
+    def manager_fault_reference(self) -> str | None:
+        """The Manager-loss reference only, never a publisher fault."""
+
+        with self._lock:
+            return self._fault_reference
+
+    def latch_publisher_fault(
+        self, fault: Mapping[str, Any], reference: str
+    ) -> None:
+        """Latch the first BB publication fault for this receiver's lifetime."""
+
+        message = fault.get("message")
+        if (
+            set(fault) != {"code", "message", "details"}
+            or fault.get("code") != PUBLISHER_FAULT_CODE
+            or fault.get("details") != {}
+            or not isinstance(message, str)
+            or not message
+            or len(message.encode("utf-8")) > _MAXIMUM_PUBLISHER_FAULT_MESSAGE_BYTES
+            or unicodedata.normalize("NFC", message) != message
+            or not isinstance(reference, str)
+            or len(reference) != 71
+            or not reference.startswith("sha256:")
+        ):
+            raise ProgramRunnerLivenessError("malformed BB publication fault")
+        with self._lock:
+            if self._publisher_fault is not None:
+                return
+            self._publisher_fault = {
+                "code": PUBLISHER_FAULT_CODE,
+                "message": message,
+                "details": {},
+            }
+            self._publisher_fault_reference = reference
+            if self._receiver_status_sequence < MAXIMUM_SEQUENCE:
+                self._receiver_status_sequence += 1
+
+    def check_publication(self) -> None:
+        """Run the BB publication budget check (watchdog; also used by tests)."""
+
+        check = self._publication_check
+        if check is None:
+            return
+        try:
+            check()
+        except Exception:
+            _LOGGER.exception("BB key publication budget check failed")
 
     def status(self) -> dict[str, Any]:
         now = self._clock()
@@ -360,6 +423,9 @@ class ProgramRunnerLivenessReceiver:
                 None
                 if self._last_accepted_ns is None
                 else max(0, now - self._last_accepted_ns)
+            )
+            publisher_fault = (
+                None if self._publisher_fault is None else dict(self._publisher_fault)
             )
             return {
                 "schema_version": "manyforge.program_runner_liveness_status.v1",
@@ -373,8 +439,16 @@ class ProgramRunnerLivenessReceiver:
                 "receiver_status_sequence": self._receiver_status_sequence,
                 "local_heartbeat_age_ns": age,
                 "state": self._state,
-                "command_fenced": self._fenced,
-                "fault_reference": self._fault_reference,
+                # A publisher fault reuses the digested fence; its reference
+                # is the digest of the emitted publisher ErrorDTO (SX-2210a).
+                # A Manager-loss reference stays in manager_fault_reference.
+                "command_fenced": self._fenced or publisher_fault is not None,
+                "fault_reference": (
+                    self._fault_reference
+                    if publisher_fault is None
+                    else self._publisher_fault_reference
+                ),
+                "publisher_fault": publisher_fault,
                 "runtime_policy_id": POLICY_ID,
                 "runtime_policy_revision": POLICY_REVISION,
                 "local_safe_state_contract_id": LOCAL_SAFE_STATE_CONTRACT_ID,
@@ -744,6 +818,7 @@ class ProgramRunnerLivenessReceiver:
     def _watchdog(self) -> None:
         while not self._stop.wait(RENEWAL_INTERVAL_NS / 1_000_000_000 / 4):
             self.check_expiry()
+            self.check_publication()
 
     def check_expiry(self) -> bool:
         """Perform one deterministic watchdog check (also used by tests)."""
@@ -803,6 +878,7 @@ __all__ = [
     "LOCAL_SAFE_STATE_CONTRACT_REVISION",
     "POLICY_ID",
     "POLICY_REVISION",
+    "PUBLISHER_FAULT_CODE",
     "ProgramRunnerLivenessError",
     "ProgramRunnerLivenessReceiver",
     "RENEWAL_INTERVAL_NS",

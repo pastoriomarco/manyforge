@@ -19,6 +19,12 @@ const form: BlackboardKeyForm = {
 };
 
 describe('Program declarations editor', () => {
+  it('refuses a key in a system namespace (contract 105(c))', () => {
+    for (const key of ['node_outcome.pick', 'interrupt_state', 'interrupt_state.guard']) {
+      expect(() => buildBlackboardKeyDeclaration({ ...form, key })).toThrow('reserved for the system-owned');
+    }
+  });
+
   it('saves a key without an initial value as an empty-until-written row', () => {
     expect(buildBlackboardKeyDeclaration(form)).toEqual({
       key: 'cell.count',

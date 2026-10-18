@@ -8,6 +8,7 @@ import {
   parseCCLCRouteTemplateSet,
   parseCCLCStatusEnvelope,
 } from './cclcParsers';
+import { lifecycleRequestFromSnapshot } from '../hooks/useCCLC';
 
 function componentSnapshot(): Record<string, unknown> {
   const snapshot = {
@@ -25,7 +26,8 @@ function componentSnapshot(): Record<string, unknown> {
         control_binding_revision: 'binding.revision.1',
         control_route_id: 'route.normal',
       }],
-      current_resources: ['joint.1'],
+      kind: 'controller',
+      resources: ['joint.1'],
       topology_revision: 'topology.revision.1',
     }],
     graph_revision: 'graph.1',
@@ -89,11 +91,11 @@ function incidentDiagnostic(): CCLCIncidentDiagnostic & {
     snapshot: {
       exit: { status: null, signal: 11, core_dumped: false, observed_utc: '2026-10-11T18:00:00Z' },
       context: {
-        component_id: 'component.arm', request_context: 'Apply request.1', runtime_unit_id: 'runtime.arm',
-        runtime_epoch: 'epoch.1', bundle_id: 'bundle.1', graph_revision: 'graph.1',
+        controllable_component_id: 'component.arm', request_context: 'Apply request.1', runtime_unit_id: 'runtime.arm',
+        runtime_epoch: 'epoch.1', retained_bundle_id: 'bundle.1', graph_revision: 'graph.1',
         generator_identity: null, launch_identity: 'launch.1',
       },
-      readiness: {
+      launch_readiness: {
         known: true, controller_manager_present: true, controller_observed: true,
         controller_loaded: true, controller_bound: false, arm_controller_active: null,
         hardware_ready: null, joint_sample_available: false, binding_epoch: '18446744073709551615',
@@ -141,7 +143,7 @@ describe('CCLC closed response parsers', () => {
     diagnostic.snapshot.context.launch_identity += 'x';
     expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic))).toThrow();
     diagnostic.snapshot.context.launch_identity = 'launch.1';
-    diagnostic.snapshot.context.component_id = 'x'.repeat(129);
+    diagnostic.snapshot.context.controllable_component_id = 'x'.repeat(129);
     expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic))).toThrow();
   });
 
@@ -150,7 +152,7 @@ describe('CCLC closed response parsers', () => {
     const incident = parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic)).lifecycleProgress?.incident;
     expect(incident?.summary).toBe('Controller launch exited');
     expect(incident?.diagnostic).toEqual(diagnostic);
-    expect(incident?.diagnostic?.snapshot?.readiness.sample_age_ns).toBe('9223372036854775807');
+    expect(incident?.diagnostic?.snapshot?.launch_readiness.sample_age_ns).toBe('9223372036854775807');
     expect(incident?.diagnostic?.snapshot?.output.dropped_forward_lines).toBe('18446744073709551615');
     const bom = incidentDiagnostic();
     bom.snapshot.settings.controllers_yaml = '\ufeffcontrollers: {}\n';
@@ -160,8 +162,8 @@ describe('CCLC closed response parsers', () => {
     expect(Object.keys(preserved!.error.details)).toEqual(['__proto__']);
     expect(parseCCLCComponentSnapshot(componentWithDiagnostic(null)).lifecycleProgress?.incident?.diagnostic).toBeNull();
     const unknownFacts = incidentDiagnostic();
-    for (const key of Object.keys(unknownFacts.snapshot.readiness)) {
-      (unknownFacts.snapshot.readiness as unknown as Record<string, unknown>)[key] = null;
+    for (const key of Object.keys(unknownFacts.snapshot.launch_readiness)) {
+      (unknownFacts.snapshot.launch_readiness as unknown as Record<string, unknown>)[key] = null;
     }
     expect(parseCCLCComponentSnapshot(componentWithDiagnostic(unknownFacts)).lifecycleProgress?.incident?.diagnostic).toEqual(unknownFacts);
   });
@@ -215,11 +217,11 @@ describe('CCLC closed response parsers', () => {
       [['snapshot', 'extra'], {}],
       [['snapshot', 'exit', 'signal'], true],
       [['snapshot', 'exit', 'status'], 256],
-      [['snapshot', 'context', 'component_id'], 'x'.repeat(129)],
-      [['snapshot', 'readiness', 'controller_bound'], 'unknown'],
-      [['snapshot', 'readiness', 'sample_age_ns'], 2 ** 53],
-      [['snapshot', 'readiness', 'sample_age_ns'], '9223372036854775808'],
-      [['snapshot', 'readiness', 'binding_epoch'], '18446744073709551616'],
+      [['snapshot', 'context', 'controllable_component_id'], 'x'.repeat(129)],
+      [['snapshot', 'launch_readiness', 'controller_bound'], 'unknown'],
+      [['snapshot', 'launch_readiness', 'sample_age_ns'], 2 ** 53],
+      [['snapshot', 'launch_readiness', 'sample_age_ns'], '9223372036854775808'],
+      [['snapshot', 'launch_readiness', 'binding_epoch'], '18446744073709551616'],
       [['snapshot', 'settings', 'retained_configuration_json'], { escape: true }],
       [['snapshot', 'settings', 'frame_prefix'], 'Cafe\u0301'],
       [['snapshot', 'settings', 'argv'], ['\ud800']],
@@ -237,8 +239,20 @@ describe('CCLC closed response parsers', () => {
       expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(diagnostic))).toThrow();
     }
     const missing = incidentDiagnostic();
-    delete (missing.snapshot.readiness as unknown as Record<string, unknown>).known;
+    delete (missing.snapshot.launch_readiness as unknown as Record<string, unknown>).known;
     expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(missing))).toThrow('closed fields');
+    // Hard switch: superseded diagnostic names are refused.
+    for (const [group, next, old] of [
+      ['context', 'controllable_component_id', 'component_id'],
+      ['context', 'retained_bundle_id', 'bundle_id'],
+      [null, 'launch_readiness', 'readiness'],
+    ] as const) {
+      const superseded = incidentDiagnostic();
+      const facts = (group === null ? superseded.snapshot : superseded.snapshot[group]) as unknown as Record<string, unknown>;
+      facts[old] = facts[next];
+      delete facts[next];
+      expect(() => parseCCLCComponentSnapshot(componentWithDiagnostic(superseded))).toThrow('closed fields');
+    }
   });
 
   it('enforces both tail caps including escaping and the diagnostic JSON budget', () => {
@@ -271,7 +285,7 @@ describe('CCLC closed response parsers', () => {
     const value = componentSnapshot();
     const parsed = parseCCLCComponentSnapshot(value);
     expect(parsed).toMatchObject({
-      componentId: 'component.arm',
+      controllableComponentId: 'component.arm',
       lifecycleGeneration: 4,
       lifecycleState: 'prepared',
       graphRevision: 'graph.1',
@@ -284,7 +298,7 @@ describe('CCLC closed response parsers', () => {
 
     const torn = structuredClone(value);
     const domain = (torn.domains as Array<Record<string, unknown>>)[0]!;
-    domain.current_resources = ['joint.2', 'joint.1'];
+    domain.resources = ['joint.2', 'joint.1'];
     expect(() => parseCCLCComponentSnapshot(torn)).toThrow('canonical');
   });
 
@@ -535,7 +549,7 @@ describe('CCLC closed response parsers', () => {
         status: null,
         incidentRecovery: {
           incidentId: 'incident.component.arm.5000',
-          componentId: 'component.arm',
+          controllableComponentId: 'component.arm',
           causeClass: 'emergency_stop',
           acknowledgedBy: 'manyforge_composer',
           acknowledgedAtNs: 9_000,
@@ -676,14 +690,14 @@ describe('Q114 closed readiness', () => {
   it.each([true, false])('preserves optional activation fact %s without changing readiness', (value) => {
     const wire = changeReadiness(['readiness', 'domains', '0', 'has_activation_step'], value);
     const parsed = parseCCLCComponentSnapshot(wire).readiness;
-    expect(parsed.domains[0]?.hasActivationStep).toBe(value);
+    expect(parsed.providerOccurrences[0]?.hasActivationStep).toBe(value);
     expect(parsed.ready).toBe(false);
     expect(parsed.nextIntent).toBe('enable');
-    expect(parsed.domains[0]?.health).toEqual(parseCCLCComponentSnapshot(componentSnapshot()).readiness.domains[0]?.health);
+    expect(parsed.providerOccurrences[0]?.health).toEqual(parseCCLCComponentSnapshot(componentSnapshot()).readiness.providerOccurrences[0]?.health);
     expect(parsed.error?.details.reason).toBe('no_transition_satisfied');
   });
   it('keeps an absent activation fact unstated', () => {
-    const domain = parseCCLCComponentSnapshot(componentSnapshot()).readiness.domains[0]!;
+    const domain = parseCCLCComponentSnapshot(componentSnapshot()).readiness.providerOccurrences[0]!;
     expect(domain.hasActivationStep).toBeUndefined();
     expect(Object.hasOwn(domain, 'hasActivationStep')).toBe(false);
   });
@@ -699,7 +713,7 @@ describe('Q114 closed readiness', () => {
     const parsed = parseCCLCComponentSnapshot(componentSnapshot()).readiness;
     expect(parsed.requestOwnerEpoch).toBe('cclc-owner.1');
     expect(parsed.ready).toBe(false);
-    expect(parsed.domains[0]?.health?.facts[0]?.value).toEqual({ kind: 'boolean', booleanValue: false });
+    expect(parsed.providerOccurrences[0]?.health?.facts[0]?.value).toEqual({ kind: 'boolean', booleanValue: false });
     expect(parsed.error?.details.reason).toBe('no_transition_satisfied');
     expect(parseCCLCComponentSnapshot(changeReadiness(['readiness', 'evaluated_at_ns'], '9223372036854775807')).readiness.evaluatedAtNs)
       .toBe('9223372036854775807');
@@ -754,7 +768,7 @@ describe('Q114 original diagnostic bounds', () => {
     const parsed = parseCCLCComponentSnapshot(snapshot).readiness;
     expect(parsed.error).toEqual(error);
     expect(parsed.measuredState.error).toEqual(error);
-    expect(parsed.domains[0]?.error).toEqual(error);
+    expect(parsed.providerOccurrences[0]?.error).toEqual(error);
     error.details.extra = 'actual';
     expect(() => parseCCLCComponentSnapshot(snapshot)).toThrow();
   });
@@ -762,8 +776,155 @@ describe('Q114 original diagnostic bounds', () => {
     const diagnostic = { code: 'provider_diagnostic', message: 'm'.repeat(1024),
       details: Object.fromEntries(Array.from({ length: 8 }, (_, index) => [`fact.${index}`, `actual.${index}`])) };
     const snapshot = changeReadiness(['readiness', 'domains', '0', 'health', 'diagnostic'], diagnostic);
-    expect(parseCCLCComponentSnapshot(snapshot).readiness.domains[0]?.health?.diagnostic).toEqual(diagnostic);
+    expect(parseCCLCComponentSnapshot(snapshot).readiness.providerOccurrences[0]?.health?.diagnostic).toEqual(diagnostic);
     diagnostic.details.extra = 'actual';
+    expect(() => parseCCLCComponentSnapshot(snapshot)).toThrow();
+  });
+});
+
+// Source-derived provider-domain sample in the agreed contract 125/128 response shape
+// (kind "io_provider", common `resources`). It is NOT a capture from the normal producer;
+// it is re-pinned from Track 2's real capture later.
+const CORE_PROVIDER_DOMAIN_SAMPLE = `{
+  "control_domain_id": "domain.arm",
+  "control_domain_revision": "domain.rev.1",
+  "kind": "io_provider",
+  "provider": {
+    "controllable_component_id": "component.arm",
+    "provider_runtime_unit_id": "runtime.arm",
+    "provider_instance_id": "provider.arm",
+    "provider_manifest_id": "manifest.arm",
+    "provider_manifest_revision": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "lifecycle_plan_catalog_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "signal_configuration_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "signal_names": [
+      "ready"
+    ],
+    "lifecycle_command_timeout_ns": 30000000000
+  },
+  "provider_runtime_epoch": "epoch.1",
+  "resources": [],
+  "active_control_configuration": {
+    "active_control_configuration_id": "provider.configuration",
+    "active_control_configuration_generation": 9007199254740991,
+    "source_runtime_unit_id": "runtime.arm",
+    "source_runtime_epoch": "epoch.1",
+    "source_sequence": 9007199254740991,
+    "signal_configuration_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+}`;
+
+type Wire = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+
+function providerDomainSnapshot(): Wire {
+  const snapshot = componentSnapshot() as Wire;
+  const domain = JSON.parse(CORE_PROVIDER_DOMAIN_SAMPLE) as Wire;
+  const provider = domain.provider as Wire;
+  const occurrence = {
+    control_domain_id: domain.control_domain_id,
+    lifecycle_plan_catalog_digest: provider.lifecycle_plan_catalog_digest,
+    provider_instance_id: provider.provider_instance_id,
+    provider_manifest_id: provider.provider_manifest_id,
+    provider_manifest_revision: provider.provider_manifest_revision,
+    provider_runtime_epoch: domain.provider_runtime_epoch,
+    provider_runtime_unit_id: provider.provider_runtime_unit_id,
+  };
+  snapshot.domains = [domain];
+  snapshot.provider_occurrences = [occurrence];
+  snapshot.readiness.domains[0].provider_occurrence = {
+    ...occurrence, control_domain_revision: domain.control_domain_revision,
+  };
+  snapshot.readiness.measured_state = { required: false, available: null, error: null };
+  return snapshot;
+}
+
+describe('provider-domain component snapshot', () => {
+  it('parses the pinned Core provider domain and echoes it as the provider expected scope', () => {
+    const parsed = parseCCLCComponentSnapshot(providerDomainSnapshot());
+    const domain = JSON.parse(CORE_PROVIDER_DOMAIN_SAMPLE) as Wire;
+    expect(parsed.domains).toEqual([{
+      kind: 'io_provider',
+      controlDomainId: 'domain.arm',
+      controlDomainRevision: 'domain.rev.1',
+      provider: domain.provider,
+      providerRuntimeEpoch: 'epoch.1',
+      resources: [],
+      activeConfiguration: { id: 'provider.configuration', generation: 9007199254740991 },
+    }]);
+    const context = {
+      request_id: 'request.1', request_owner_epoch: 'owner.1', source_label: 'composer', correlation_id: null,
+    };
+    expect(lifecycleRequestFromSnapshot(parsed, 'enable', context, 7).expected_control_domains).toEqual([{
+      kind: 'io_provider',
+      control_domain_id: 'domain.arm',
+      control_domain_revision: 'domain.rev.1',
+      provider: domain.provider,
+      expected_active_control_configuration: {
+        presence: 'present',
+        active_control_configuration_id: 'provider.configuration',
+        active_control_configuration_generation: 9007199254740991,
+      },
+    }]);
+    const unconfigured = providerDomainSnapshot();
+    unconfigured.domains[0].active_control_configuration = null;
+    unconfigured.domains[0].resources = ['io.do.1', 'io.do.2'];
+    expect(parseCCLCComponentSnapshot(unconfigured).domains[0]?.activeConfiguration).toBeNull();
+  });
+
+  it.each<[string, (snapshot: Wire) => void]>([
+    ['physical bindings', (s) => { s.domains[0].current_control_bindings = []; }],
+    ['old controller resources', (s) => { s.domains[0].current_resources = ['joint.1']; }],
+    ['old output resources', (s) => { s.domains[0].output_resources = s.domains[0].resources; }],
+    ['renamed output resources', (s) => {
+      s.domains[0].output_resources = s.domains[0].resources;
+      delete s.domains[0].resources;
+    }],
+    ['absent resources', (s) => { delete s.domains[0].resources; }],
+    ['controller topology', (s) => { s.domains[0].controller_topology_id = 'topology.arm'; }],
+    ['controller kind', (s) => { s.domains[0].kind = 'controller'; }],
+    ['absent kind', (s) => { delete s.domains[0].kind; }],
+    ['superseded provider kind', (s) => { s.domains[0].kind = 'provider'; }],
+    ['absent configuration member', (s) => { delete s.domains[0].active_control_configuration; }],
+    ['unsorted outputs', (s) => { s.domains[0].resources = ['io.2', 'io.1']; }],
+    ['empty signals', (s) => { s.domains[0].provider.signal_names = []; }],
+    ['string timeout', (s) => { s.domains[0].provider.lifecycle_command_timeout_ns = '30000000000'; }],
+    ['non-digest revision', (s) => { s.domains[0].provider.provider_manifest_revision = 'rev.1'; }],
+    ['extra provider field', (s) => { s.domains[0].provider.extra = true; }],
+    ['controller configuration fields', (s) => { s.domains[0].active_control_configuration.state = 'reconciled'; }],
+    ['foreign configuration epoch', (s) => { s.domains[0].active_control_configuration.source_runtime_epoch = 'epoch.2'; }],
+    ['foreign signal digest', (s) => {
+      s.domains[0].active_control_configuration.signal_configuration_digest = `sha256:${'9'.repeat(64)}`;
+    }],
+    ['foreign component', (s) => { s.domains[0].provider.controllable_component_id = 'component.other'; }],
+    ['foreign occurrence', (s) => { s.provider_occurrences[0].provider_instance_id = 'provider.other'; }],
+    ['missing occurrence', (s) => { s.provider_occurrences = []; }],
+  ])('refuses a provider domain with %s', (_label, mutate) => {
+    const snapshot = providerDomainSnapshot();
+    mutate(snapshot);
+    expect(() => parseCCLCComponentSnapshot(snapshot)).toThrow();
+  });
+
+  it.each(['current_control_bindings', 'resources'])(
+    'still refuses a controller domain with empty %s',
+    (field) => {
+      const snapshot = componentSnapshot() as Wire;
+      snapshot.domains[0][field] = [];
+      expect(() => parseCCLCComponentSnapshot(snapshot)).toThrow();
+    },
+  );
+
+  it.each<[string, (domain: Wire) => void]>([
+    ['absent kind', (d) => { delete d.kind; }],
+    ['unknown kind', (d) => { d.kind = 'io'; }],
+    ['superseded provider kind', (d) => { d.kind = 'provider'; }],
+    ['io_provider kind', (d) => { d.kind = 'io_provider'; }],
+    ['absent resources', (d) => { delete d.resources; }],
+    ['renamed current_resources', (d) => { d.current_resources = d.resources; delete d.resources; }],
+    ['extra current_resources', (d) => { d.current_resources = ['joint.1']; }],
+    ['extra output_resources', (d) => { d.output_resources = ['joint.1']; }],
+  ])('refuses a controller domain with %s', (_label, mutate) => {
+    const snapshot = componentSnapshot() as Wire;
+    mutate(snapshot.domains[0]);
     expect(() => parseCCLCComponentSnapshot(snapshot)).toThrow();
   });
 });

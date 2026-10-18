@@ -2,7 +2,6 @@
 
 #include <manyforge_core/types/execute_request.hpp>
 #include <manyforge_core/types/execution_result.hpp>
-
 #include <map>
 #include <mutex>
 #include <optional>
@@ -18,6 +17,10 @@ namespace manyforge::core {
 class ExecutionCorrelationTracker {
  public:
   void set_from_request(const ExecuteRequestDTO& request);
+  /// Publish a fully prepared same-owner handover correlation without copying
+  /// strings/bindings after the physical ownership CAS. Both objects remain
+  /// their existing leaf owners; the displaced values move into prepared.
+  void swap_prepared(ExecutionCorrelationTracker& prepared) noexcept;
   void clear_all();
   void clear_move_id();
   void clear_program_run_and_action_span();

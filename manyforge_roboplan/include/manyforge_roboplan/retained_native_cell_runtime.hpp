@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
@@ -121,8 +122,7 @@ class RetainedNativeCellRuntime final {
   /// Install a Manager-selected component delta beneath its exact held fence.
   /// The optional commit callback executes at the Kernel publication boundary.
   [[nodiscard]] core::Result<void> reconfigure_runtime_component_set(
-      std::vector<core::RuntimeParticipantExecutionRegistration>
-          registrations,
+      std::vector<core::RuntimeParticipantExecutionRegistration> registrations,
       core::RuntimeParticipantAdmissionResolver participant_resolver,
       std::vector<RetainedStopSurveillanceSourceInput> candidate_stop_sources,
       core::RetainedBundleId candidate_retained_bundle_id,
@@ -130,9 +130,14 @@ class RetainedNativeCellRuntime final {
       const core::ConfigurationFenceId &apply_fence_id,
       const core::ConfigurationFenceScopeDTO &scope,
       const std::vector<core::ControllableComponentId> &retained_components,
-      std::function<core::Result<void>()> commit_publication = {});
+      std::function<core::Result<void>()> commit_publication = {},
+      std::span<const core::ResolvedLifecycleControlDomainScopeDTO>
+          retained_provider_domains = {},
+      std::span<const core::ResolvedLifecycleProviderOccurrenceDTO>
+          retained_provider_occurrences = {},
+      const core::CellAdmissionClaimDTO *actual_parent_claim = nullptr);
 
- private:
+private:
   /// Declaration order is a lifetime contract: the Kernel is last and is
   /// therefore retired before these values during any unwinding path.
   std::shared_ptr<WallClock> clock_;

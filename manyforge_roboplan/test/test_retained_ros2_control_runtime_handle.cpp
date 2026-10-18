@@ -159,7 +159,8 @@ struct ArmWorld final {
       std::size_t *participant_constructions = nullptr,
       core::RuntimeParticipantBinding initial_binding = ArmBinding(),
       std::shared_ptr<core::IClock> receiver_clock = {},
-      bool mock_reset_position = false)
+      bool mock_reset_position = false,
+      std::function<std::optional<std::string>()> process_fault = {})
       : owning_clock(receiver_clock ? std::move(receiver_clock)
                                     : std::make_shared<WallClock>()),
         clock(*owning_clock), binding(std::move(initial_binding)),
@@ -218,12 +219,15 @@ struct ArmWorld final {
         },
         nullptr, binding, std::nullopt, successor_occurrence);
     if (!bound.ok()) throw std::logic_error(bound.error().message);
-    if (mock_reset_position)
+    if (mock_reset_position) {
+      auto fault_source = process_fault ? std::move(process_fault)
+          : std::function<std::optional<std::string>()>(
+                [] { return std::optional<std::string>{}; });
       handle->InstallControllerProcessFaultSource(
-          [] { return std::optional<std::string>{}; },
-          [] {
-            return core::Result<std::optional<std::string>>::Ok(std::nullopt);
+          fault_source, [fault_source] {
+            return core::Result<std::optional<std::string>>::Ok(fault_source());
           });
+    }
   }
 
   [[nodiscard]] RetainedExternallyManagedDomainSnapshot Snapshot() {
@@ -1007,10 +1011,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   const auto predecessor = world.handle->current_port();
   std::vector<MockResetPositionPhase> phases;
   const auto reset = world.handle->ResetMockPosition(
-      {}, [&](const auto &transition, const auto &commit) {
-        const auto advanced = commit();
-        if (!advanced.ok())
-          return advanced;
+      {}, [&](const auto &transition, const auto &) {
         phases.push_back(transition.phase);
         EXPECT_EQ(transition.predecessor_epoch,
                   core::ExecutionBindingEpoch(1U));
@@ -1085,9 +1086,8 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   EXPECT_TRUE(world.handle->current_port()->ReadReadiness().controller_bound);
 }
 
-TEST(
-    RetainedRos2ControlRuntimeHandleTest,
-    MockResetPositiveAckWaitsForActivityAndQualifiesOnlyTheSameHealthyObservation) {
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     MockResetSwitchActivityUsesOrdinaryHealthWithoutPhaseEvidence) {
   ArmWorld world("arm_controller", {}, nullptr, ArmBinding(), {}, true);
   world.handle->StartBackend();
   ASSERT_TRUE(fake::WaitUntil(
@@ -1095,98 +1095,151 @@ TEST(
   ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
             Outcome::kSucceeded);
   ASSERT_TRUE(world.WaitForState(State::kActive));
-  const auto as_brand =
-      [&](const RetainedExternallyManagedDomainSnapshot &snapshot) {
-        const auto &binding = world.binding.value();
-        const auto &path = *binding.control_path;
-        const auto now = world.clock.now();
-        return core::BrandLifecycleObservationDTO{
-            core::LifecycleTransactionId("reset.test"),
-            core::LifecycleTransactionGeneration(1U),
-            binding.controllable_component_id,
-            path.control_domain_id,
-            path.control_domain_revision,
-            path.provider_instance_id,
-            path.provider_manifest_id,
-            path.provider_manifest_revision,
-            path.provider_runtime_unit_id,
-            path.provider_runtime_epoch,
-            snapshot.source_generation,
-            snapshot.source_generation,
-            now,
-            now,
-            now + 1'000'000'000,
-            snapshot.component_state,
-            snapshot.facts,
-            snapshot.diagnostic,
-            snapshot.diagnostic_snapshot};
-      };
   bool saw_delayed_activity = false;
-  bool checked_fault = false;
+  std::size_t inactive_switch_samples = 0U;
+  std::optional<MockResetPositionStepDeadline> writer_deadline;
+  const auto check_inactive = [&] {
+    world.manager.SetControllerActivity(false, false);
+    EXPECT_TRUE(fake::WaitUntil([&] {
+      return !world.handle->arm_activity().controller_active &&
+             !world.handle->mock_reset_writer_active();
+    }));
+    const auto snapshot = world.Snapshot();
+    EXPECT_EQ(snapshot.component_state, State::kDegraded);
+    EXPECT_EQ(ArmWorld::Cause(snapshot), "availability");
+    EXPECT_EQ(ArmWorld::Fact(snapshot, "external.controller_loaded"), true);
+    EXPECT_EQ(ArmWorld::Fact(snapshot, "external.transport_ready"), true);
+    EXPECT_EQ(ArmWorld::Fact(snapshot, "external.fault_present"), false);
+    EXPECT_TRUE(std::none_of(snapshot.facts.begin(), snapshot.facts.end(),
+                            [](const auto& fact) {
+      return fact.lifecycle_fact_id.value() ==
+             "external.mock_reset_position_transition";
+    }));
+    ++inactive_switch_samples;
+    world.manager.SetControllerActivity(false, true);
+    EXPECT_TRUE(fake::WaitUntil(
+        [&] { return world.handle->mock_reset_writer_active(); }));
+  };
   const auto reset = world.handle->ResetMockPosition(
-      {}, [&](const auto &transition, const auto &commit) {
-        const auto advanced = commit();
-        if (!advanced.ok())
-          return advanced;
+      {}, [&](const auto &transition, const auto &deadline) {
         if (transition.phase == MockResetPositionPhase::kSwitchingToWriter) {
           if (!transition.switch_acknowledged) {
             world.manager.SetActivityPublicationEnabled(false);
           } else {
+            // A positive service reply does not stand in for CM activity.
             EXPECT_FALSE(world.handle->mock_reset_writer_active());
-            const auto prior = as_brand(world.Snapshot());
-            EXPECT_TRUE(world.handle->IsExpectedMockPositionResetTransition(
-                prior, transition));
             saw_delayed_activity = true;
             world.manager.SetActivityPublicationEnabled(true);
             EXPECT_TRUE(fake::WaitUntil(
                 [&] { return world.handle->mock_reset_writer_active(); }));
+            check_inactive();
           }
         }
-        if (transition.phase == MockResetPositionPhase::kSettingState &&
-            transition.target_published) {
-          EXPECT_TRUE(fake::WaitUntil(
-              [&] { return world.manager.reset_commands().size() == 1U; }));
-          const auto healthy = as_brand(world.Snapshot());
-          EXPECT_TRUE(world.handle->IsExpectedMockPositionResetTransition(
-              healthy, transition));
-          auto retained_fault = healthy;
-          for (auto &fact : retained_fault.facts)
-            if (fact.lifecycle_fact_id.value() ==
-                core::kLifecycleBlockingCauseFactId)
-              fact.value.token_value = std::string(core::to_string(
-                  core::LifecycleBlockingCauseClassDTO::kFault));
-          EXPECT_FALSE(world.handle->IsExpectedMockPositionResetTransition(
-              retained_fault, transition));
-          auto wrong_phase = transition;
-          wrong_phase.phase = MockResetPositionPhase::kSwitchingToJtc;
-          EXPECT_FALSE(world.handle->IsExpectedMockPositionResetTransition(
-              healthy, wrong_phase));
-          auto foreign = healthy;
-          foreign.provider_runtime_epoch = core::RuntimeEpoch("foreign.epoch");
-          EXPECT_FALSE(world.handle->IsExpectedMockPositionResetTransition(
-              foreign, transition));
-          world.manager.SetHardwareActive(false);
-          EXPECT_TRUE(fake::WaitUntil(
-              [&] { return !world.handle->arm_activity().hardware_active; }));
-          const auto fault = as_brand(world.Snapshot());
-          EXPECT_FALSE(world.handle->IsExpectedMockPositionResetTransition(
-              fault, transition));
-          world.manager.SetHardwareActive(true);
-          EXPECT_TRUE(fake::WaitUntil(
-              [&] { return world.handle->arm_activity().hardware_active; }));
-          // A later healthy physical read cannot rewrite the earlier fault row.
-          EXPECT_FALSE(world.handle->IsExpectedMockPositionResetTransition(
-              fault, transition));
-          checked_fault = true;
-          return core::Result<void>::Err(
-              {"execution_rejected", "hardware loss observed", {}});
+        if (transition.phase == MockResetPositionPhase::kSettingState) {
+          if (!transition.target_published) writer_deadline = deadline;
+          else {
+            EXPECT_EQ(writer_deadline, deadline);
+            EXPECT_TRUE(fake::WaitUntil(
+                [&] { return world.manager.reset_commands().size() == 1U; }));
+          }
+        }
+        if (transition.phase == MockResetPositionPhase::kSwitchingToJtc) {
+          if (!transition.switch_acknowledged) check_inactive();
+          else EXPECT_TRUE(fake::WaitUntil(
+              [&] { return world.handle->mock_reset_successor_ready(); }));
         }
         return core::Result<void>::Ok();
       });
   EXPECT_TRUE(saw_delayed_activity);
-  EXPECT_TRUE(checked_fault);
-  EXPECT_EQ(reset.outcome, Outcome::kUncertain);
+  EXPECT_EQ(inactive_switch_samples, 2U);
+  EXPECT_EQ(reset.outcome, Outcome::kSucceeded) << SwitchFailureText(reset);
   EXPECT_FALSE(world.manager.writer_active());
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     MockResetStepEntryDeadlineIncludesValidationBeforeAnySwitch) {
+  ArmWorld world("arm_controller", {}, nullptr, ArmBinding(), {}, true);
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return world.handle->mock_reset_writer_inactive(); }));
+  ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
+            Outcome::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kActive));
+  const auto reset = world.handle->ResetMockPosition(
+      {}, [&](const auto &transition, const MockResetPositionStepDeadline deadline) {
+        EXPECT_EQ(transition.phase, MockResetPositionPhase::kSwitchingToWriter);
+        EXPECT_FALSE(transition.switch_acknowledged);
+        // Contract142 explicitly includes local validation in the same stock
+        // step limit. No fresh one-second response budget starts afterwards.
+        std::this_thread::sleep_until(deadline);
+        return core::Result<void>::Ok();
+      });
+  EXPECT_EQ(reset.outcome, Outcome::kNotSent);
+  ASSERT_TRUE(reset.error);
+  EXPECT_EQ(reset.error->details.at("reason"), "mock_reset_step_timeout");
+  EXPECT_EQ(world.manager.switch_requests(), 1U);  // Initial Enable only.
+  EXPECT_TRUE(world.manager.reset_commands().empty());
+  EXPECT_TRUE(world.handle->current_port()->ReadReadiness().controller_bound);
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     MockResetDoesNotHideProcessExitTransportLossOrHardwareFailure) {
+  for (const int failure : {0, 1, 2}) {
+    const bool process_exit = failure == 0;
+    const bool hardware_failure = failure == 2;
+    std::atomic<bool> exited{false};
+    ArmWorld world("arm_controller", {}, nullptr, ArmBinding(), {}, true, [&] {
+      return exited.load() ? std::optional<std::string>("controller exited")
+                           : std::nullopt;
+    });
+    world.handle->StartBackend();
+    ASSERT_TRUE(fake::WaitUntil(
+        [&] { return world.handle->mock_reset_writer_inactive(); }));
+    ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
+              Outcome::kSucceeded);
+    ASSERT_TRUE(world.WaitForState(State::kActive));
+    bool checked_failure = false;
+    const auto reset = world.handle->ResetMockPosition(
+        {}, [&](const auto &transition, const auto &) {
+      if (transition.phase == MockResetPositionPhase::kSwitchingToWriter &&
+          transition.switch_acknowledged) {
+        EXPECT_TRUE(fake::WaitUntil(
+            [&] { return world.handle->mock_reset_writer_active(); }));
+      }
+      if (transition.phase != MockResetPositionPhase::kSettingState ||
+          !transition.target_published)
+        return core::Result<void>::Ok();
+      if (process_exit) exited = true;
+      else if (hardware_failure) world.manager.SetHardwareActive(false);
+      else world.manager.StopAndDestroyEndpoints();
+      EXPECT_TRUE(fake::WaitUntil([&] {
+        const auto snapshot = world.Snapshot();
+        return process_exit
+            ? snapshot.component_state == State::kFaulted
+            : hardware_failure ? ArmWorld::Cause(snapshot) == "unknown"
+            : ArmWorld::Fact(snapshot, "external.transport_ready") == false;
+      }));
+      const auto snapshot = world.Snapshot();
+      if (process_exit) {
+        EXPECT_EQ(ArmWorld::Cause(snapshot), "fault");
+        EXPECT_EQ(ArmWorld::Fact(snapshot, "external.fault_present"), true);
+        EXPECT_EQ(snapshot.component_state, State::kFaulted);
+      } else if (hardware_failure) {
+        EXPECT_EQ(ArmWorld::Cause(snapshot), "unknown");
+        EXPECT_EQ(ArmWorld::Fact(snapshot, "external.controller_loaded"), false);
+      } else {
+        EXPECT_EQ(ArmWorld::Fact(snapshot, "external.transport_ready"), false);
+        EXPECT_FALSE(snapshot.exact_controller_configuration_active);
+        EXPECT_TRUE(snapshot.diagnostic.has_value());
+      }
+      checked_failure = true;
+      return core::Result<void>::Err(
+          {"execution_rejected", "actual source failed during Reset", {}});
+    });
+    EXPECT_TRUE(checked_failure);
+    EXPECT_NE(reset.outcome, Outcome::kSucceeded);
+    EXPECT_FALSE(world.handle->current_port()->ReadReadiness().controller_bound);
+  }
 }
 
 TEST(RetainedRos2ControlRuntimeHandleTest,
@@ -1201,10 +1254,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
       [&] { return world.handle->arm_activity().controller_active; }));
   std::vector<MockResetPositionPhase> phases;
   const auto reset = world.handle->ResetMockPosition(
-      {}, [&](const auto &transition, const auto &commit) {
-        const auto advanced = commit();
-        if (!advanced.ok())
-          return advanced;
+      {}, [&](const auto &transition, const auto &) {
         phases.push_back(transition.phase);
         if (transition.phase == MockResetPositionPhase::kSwitchingToWriter &&
             transition.switch_acknowledged) {
@@ -1261,10 +1311,10 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   auto operation = std::async(std::launch::async, [&] {
     return world.handle->ResetMockPosition(
         cancellation.get_token(),
-        [&](const auto &transition, const auto &commit) {
+        [&](const auto &transition, const auto &) {
           if (transition.switch_acknowledged)
             saw_positive_ack = true;
-          return commit();
+          return core::Result<void>::Ok();
         });
   });
   const bool dispatched =
@@ -1302,10 +1352,10 @@ TEST(
   std::atomic<bool> saw_positive_ack{false};
   auto operation = std::async(std::launch::async, [&] {
     return world.handle->ResetMockPosition(
-        {}, [&](const auto &transition, const auto &commit) {
+        {}, [&](const auto &transition, const auto &) {
           if (transition.switch_acknowledged)
             saw_positive_ack = true;
-          return commit();
+          return core::Result<void>::Ok();
         });
   });
   const bool dispatched =
@@ -1584,6 +1634,60 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
 
 
 TEST(RetainedRos2ControlRuntimeHandleTest,
+     ActualRosArmRefusesMotionWhileDeclaredAndPreparedBeforeEnable) {
+  ArmWorld world;
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    const auto activity = world.handle->arm_activity();
+    return activity.observed && activity.controller_loaded &&
+           activity.hardware_active && !activity.controller_active;
+  }));
+  const auto status_topic =
+      world.prefix + "/arm_controller/follow_joint_trajectory/_action/status";
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    return world.handle->node()->count_publishers(status_topic) > 0U;
+  }));
+  const auto initial_goals = world.jtc.goals_received();
+  const auto initial_switches = world.manager.switch_requests();
+  core::TrajectoryDTO hold;
+  hold.joint_names = {"joint_1"};
+  hold.waypoints = {{0.0, {0.0}, {0.0}, {0.0}},
+                    {1.0, {0.0}, {0.0}, {0.0}}};
+  const core::ExecutionGoalKey key{
+      core::ControllerGoalId("goal.before-enable"),
+      core::ControllerGoalGeneration(1U)};
+  const auto expect_closed = [&](State expected) {
+    EXPECT_EQ(world.Snapshot().component_state, expected);
+    const auto port = world.handle->current_port();
+    ASSERT_NE(port, nullptr);
+    const auto readiness = port->ReadReadiness();
+    EXPECT_FALSE(readiness.controller_active);
+    EXPECT_FALSE(readiness.controller_bound);
+    EXPECT_TRUE(readiness.hardware_active);
+    const auto refused = port->Submit(key, hold);
+    EXPECT_EQ(refused.dispatch, core::ExecutionPortDispatch::kNotDispatched);
+    EXPECT_EQ(refused.refusal, core::ExecutionPortRefusal::kNotReady);
+    EXPECT_EQ(world.jtc.goals_received(), initial_goals);
+    EXPECT_EQ(world.manager.switch_requests(), initial_switches);
+  };
+  expect_closed(State::kDeclared);
+  ASSERT_EQ(world.handle->PrepareArmController().outcome, Outcome::kSucceeded);
+  expect_closed(State::kPrepared);
+
+  // The same valid trajectory/key becomes usable only after this handle's
+  // actual activation switch and exact Active postcondition.
+  ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
+            Outcome::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kActive));
+  const auto enabled = world.handle->current_port();
+  ASSERT_NE(enabled, nullptr);
+  EXPECT_EQ(world.manager.switch_requests(), initial_switches + 1U);
+  const auto sent = enabled->Submit(key, hold);
+  ASSERT_EQ(sent.dispatch, core::ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(fake::WaitUntil([&] { return world.jtc.goals_received() == initial_goals + 1U; }));
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
      CclcPrimitivesSwitchTheInactiveLoadedControllerAndReportItsLifecycle) {
   ArmWorld world;
   world.handle->StartBackend();
@@ -1681,7 +1785,7 @@ TestLaunchDiagnosticSnapshot() {
   return std::make_shared<
       const content_identity::
           CanonicalValue>(content_identity::parse_canonical_json(
-      R"snapshot({"context":{"bundle_id":"bundle.1","component_id":"component.arm","generator_identity":null,"graph_revision":"graph.1","launch_identity":"sha256:0000000000000000000000000000000000000000000000000000000000000000","request_context":"Apply=apply.7","runtime_epoch":"epoch.1","runtime_unit_id":"robot_cell.ros2_control_execution"},"core_dump_link":null,"exit":{"core_dumped":false,"observed_utc":"2026-10-11T18:00:00Z","signal":11,"status":null},"generated":{"controllers_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222","robot_description_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},"output":{"dropped_forward_bytes":0,"dropped_forward_lines":0,"invalid_text_bytes":0,"line_count":1,"tail":"controller crashed\n","truncated":false},"readiness":{"arm_controller_active":null,"binding_epoch":null,"captured_utc":null,"controller_bound":null,"controller_loaded":null,"controller_manager_present":null,"controller_observed":null,"hardware_ready":null,"joint_sample_available":null,"known":null,"sample_age_ns":null},"settings":{"argv":["ros2","launch"],"arm_controller_name":"arm","controller_profile":"ur5","controllers_yaml":"arm: effective settings","frame_prefix":"","gripper_controller_name":null,"retained_configuration_json":"{}","runtime_namespace":"/robot"}})snapshot"));
+      R"snapshot({"context":{"controllable_component_id":"component.arm","generator_identity":null,"graph_revision":"graph.1","launch_identity":"sha256:0000000000000000000000000000000000000000000000000000000000000000","request_context":"Apply=apply.7","retained_bundle_id":"bundle.1","runtime_epoch":"epoch.1","runtime_unit_id":"robot_cell.ros2_control_execution"},"core_dump_link":null,"exit":{"core_dumped":false,"observed_utc":"2026-10-11T18:00:00Z","signal":11,"status":null},"generated":{"controllers_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222","robot_description_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},"launch_readiness":{"arm_controller_active":null,"binding_epoch":null,"captured_utc":null,"controller_bound":null,"controller_loaded":null,"controller_manager_present":null,"controller_observed":null,"hardware_ready":null,"joint_sample_available":null,"known":null,"sample_age_ns":null},"output":{"dropped_forward_bytes":0,"dropped_forward_lines":0,"invalid_text_bytes":0,"line_count":1,"tail":"controller crashed\n","truncated":false},"settings":{"argv":["ros2","launch"],"arm_controller_name":"arm","controller_profile":"ur5","controllers_yaml":"arm: effective settings","frame_prefix":"","gripper_controller_name":null,"retained_configuration_json":"{}","runtime_namespace":"/robot"}})snapshot"));
 }
 
 TEST(RetainedRos2ControlRuntimeHandleTest,

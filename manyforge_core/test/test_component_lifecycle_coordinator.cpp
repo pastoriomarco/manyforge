@@ -16,6 +16,13 @@
 #include <manyforge_core/component_lifecycle_coordinator.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
+#include <manyforge_core/types/command_schema.hpp>
+#include <manyforge_core/io_signal_descriptor.hpp>
+#include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/resource_addressed_execution_kernel.hpp>
+#include <manyforge_core/io_output_participant_engine.hpp>
+#include <manyforge_core/sqlite_operation_journal.hpp>
+#include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
@@ -110,24 +117,24 @@ class ScopedTemporaryDirectory final {
   const auto expected = ExpectedDomain();
   return {expected.control_domain_id,
           expected.control_domain_revision,
-          expected.controller_topology_id,
-          expected.topology_revision,
+          expected.controller().controller_topology_id,
+          expected.controller().topology_revision,
           std::nullopt,
-          expected.expected_control_bindings,
+          expected.controller().expected_control_bindings,
           {ResourceId("resource.1")}};
 }
 
 [[nodiscard]] ActiveControlConfigurationDTO CurrentActiveConfiguration() {
   const auto expected = ExpectedDomain();
-  const auto& binding = expected.expected_control_bindings.front();
+  const auto& binding = expected.controller().expected_control_bindings.front();
   return {
       ActiveControlConfigurationId("configuration.1"),
       expected.control_domain_id,
       expected.control_domain_revision,
       {{binding.control_binding_id, binding.control_binding_revision, binding.control_route_id}},
       ActivationSetId("activation.1"),
-      expected.controller_topology_id,
-      expected.topology_revision,
+      expected.controller().controller_topology_id,
+      expected.controller().topology_revision,
       RuntimeUnitId("runtime.1"),
       RuntimeEpoch("runtime-epoch.1"),
       1U,
@@ -270,20 +277,20 @@ struct DisjointComponentFixture final {
   auto expected = ExpectedDomain();
   expected.control_domain_id = ControlDomainId("domain." + suffix);
   expected.control_domain_revision = ControlDomainRevision("domain-revision." + suffix);
-  expected.controller_topology_id = ControllerTopologyId("topology." + suffix);
-  expected.topology_revision = TopologyRevision("topology-revision." + suffix);
-  expected.expected_control_bindings.front().control_binding_id =
+  expected.controller().controller_topology_id = ControllerTopologyId("topology." + suffix);
+  expected.controller().topology_revision = TopologyRevision("topology-revision." + suffix);
+  expected.controller().expected_control_bindings.front().control_binding_id =
       ControlBindingId("binding." + suffix);
-  expected.expected_control_bindings.front().control_binding_revision =
+  expected.controller().expected_control_bindings.front().control_binding_revision =
       ControlBindingRevision("binding-revision." + suffix);
-  expected.expected_control_bindings.front().control_route_id = ControlRouteId("route." + suffix);
+  expected.controller().expected_control_bindings.front().control_route_id = ControlRouteId("route." + suffix);
 
   ResolvedLifecycleControlDomainScopeDTO current{expected.control_domain_id,
                                                  expected.control_domain_revision,
-                                                 expected.controller_topology_id,
-                                                 expected.topology_revision,
+                                                 expected.controller().controller_topology_id,
+                                                 expected.controller().topology_revision,
                                                  std::nullopt,
-                                                 expected.expected_control_bindings,
+                                                 expected.controller().expected_control_bindings,
                                                  {ResourceId("resource." + suffix)}};
   ResolvedLifecycleProviderOccurrenceDTO provider{current.control_domain_id,
                                                   current.control_domain_revision,
@@ -963,13 +970,13 @@ TEST(ComponentLifecycleCoordinator,
   auto second = CurrentDomain();
   second.control_domain_id = ControlDomainId("domain.2");
   second.control_domain_revision = ControlDomainRevision("domain-revision.2");
-  second.controller_topology_id = ControllerTopologyId("topology.2");
-  second.topology_revision = TopologyRevision("topology-revision.2");
-  second.current_control_bindings.front().control_binding_id = ControlBindingId("binding.2");
-  second.current_control_bindings.front().control_binding_revision =
+  second.controller().controller_topology_id = ControllerTopologyId("topology.2");
+  second.controller().topology_revision = TopologyRevision("topology-revision.2");
+  second.controller().current_control_bindings.front().control_binding_id = ControlBindingId("binding.2");
+  second.controller().current_control_bindings.front().control_binding_revision =
       ControlBindingRevision("binding-revision.2");
-  second.current_control_bindings.front().control_route_id = ControlRouteId("route.2");
-  second.current_resources = {ResourceId("resource.2")};
+  second.controller().current_control_bindings.front().control_route_id = ControlRouteId("route.2");
+  second.controller().current_resources = {ResourceId("resource.2")};
   auto second_provider = Provider(catalog);
   second_provider.control_domain_id = second.control_domain_id;
   second_provider.control_domain_revision = second.control_domain_revision;
@@ -980,9 +987,9 @@ TEST(ComponentLifecycleCoordinator,
   auto expected_second = ExpectedDomain();
   expected_second.control_domain_id = second.control_domain_id;
   expected_second.control_domain_revision = second.control_domain_revision;
-  expected_second.controller_topology_id = second.controller_topology_id;
-  expected_second.topology_revision = second.topology_revision;
-  expected_second.expected_control_bindings = second.current_control_bindings;
+  expected_second.controller().controller_topology_id = second.controller().controller_topology_id;
+  expected_second.controller().topology_revision = second.controller().topology_revision;
+  expected_second.controller().expected_control_bindings = second.controller().current_control_bindings;
   intent.expected_control_domains.push_back(expected_second);
 
   FakeSnapshotSource snapshots({snapshot});
@@ -1055,6 +1062,22 @@ class FakeReadinessPort final : public ICCLCComponentCommandReadinessPort {
     return Result<ComponentCommandReadinessDTO>::Ok(state_);
   }
 
+  Result<ComponentCommandReadinessDTO> PublishComponentCommandReadiness(
+      const ComponentCommandReadinessPublicationDTO& publication,
+      const ComponentLifecycleCurrentSnapshotDTO& snapshot,
+      const std::vector<BrandLifecycleObservationDTO>& observations) override {
+    {
+      std::lock_guard lock(mutex_);
+      provider_proof_domain_count_ = snapshot.domains.size();
+      provider_proof_observations_ = observations;
+    }
+    return PublishComponentCommandReadiness(publication);
+  }
+  std::pair<std::size_t, std::vector<BrandLifecycleObservationDTO>> provider_proof() const {
+    std::lock_guard lock(mutex_);
+    return {provider_proof_domain_count_, provider_proof_observations_};
+  }
+
   [[nodiscard]] Result<ComponentCommandReadinessDTO> ReadComponentCommandReadiness(
       const ControllableComponentId&) const override {
     std::lock_guard lock(mutex_);
@@ -1087,6 +1110,8 @@ class FakeReadinessPort final : public ICCLCComponentCommandReadinessPort {
   std::vector<std::string> calls_;
   std::vector<ComponentCommandReadinessPublicationDTO> publications_;
   ComponentCommandReadinessDTO state_{ControllableComponentId("component.1"), std::nullopt, true};
+  std::size_t provider_proof_domain_count_{};
+  std::vector<BrandLifecycleObservationDTO> provider_proof_observations_;
   std::size_t failures_remaining_{};
 };
 
@@ -1174,6 +1199,593 @@ TEST(ComponentLifecycleCoordinator, EnableOpensEligibilityOnlyAfterVerifiedCompl
   EXPECT_TRUE(run.accepting_after);
 }
 
+class IoRecoveryJournalSnapshotSource final : public ICCLCCurrentComponentSnapshotSource {
+ public:
+  IoRecoveryJournalSnapshotSource(SqliteCCLCJournal& journal,
+                                  ComponentLifecycleCurrentSnapshotDTO installed)
+      : journal_(journal), installed_(std::move(installed)) {}
+  Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponentSnapshot(
+      const ControllableComponentId& component) const override {
+    if (component != installed_.controllable_component_id)
+      return Result<ComponentLifecycleCurrentSnapshotDTO>::Err(
+          {"snapshot_unavailable", "Foreign component", {}});
+    auto result = installed_;
+    const auto actual = journal_.LoadCurrentComponentLifecycleFact(component);
+    if (!actual.ok()) return Result<ComponentLifecycleCurrentSnapshotDTO>::Err(actual.error());
+    if (actual.value().durable_generation) {
+      if (!actual.value().current_state)
+        return Result<ComponentLifecycleCurrentSnapshotDTO>::Err(
+            {"snapshot_unavailable", "Current journal state is unknown", {}});
+      result.component_lifecycle_generation = *actual.value().durable_generation;
+      result.component_lifecycle_state = *actual.value().current_state;
+    }
+    const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(result);
+    if (!digest.ok()) return Result<ComponentLifecycleCurrentSnapshotDTO>::Err(digest.error());
+    result.snapshot_digest = digest.value();
+    return Result<ComponentLifecycleCurrentSnapshotDTO>::Ok(std::move(result));
+  }
+
+ private:
+  SqliteCCLCJournal& journal_;
+  ComponentLifecycleCurrentSnapshotDTO installed_;
+};
+
+class IoRecoveryTimedBrandPort final : public IBrandLifecyclePort {
+ public:
+  IoRecoveryTimedBrandPort(std::shared_ptr<FakeBrandPort> port, IClock& clock)
+      : port_(std::move(port)), clock_(clock) {}
+  Result<BrandLifecycleObservationDTO> Observe(
+      const BrandLifecycleObservationQueryDTO& query) override {
+    auto actual = port_->Observe(query);
+    if (actual.ok()) {
+      actual.value().source_timestamp_ns = clock_.now();
+      actual.value().received_timestamp_ns = clock_.now();
+      actual.value().fresh_until_ns = clock_.now() + 1'000'000;
+    }
+    return actual;
+  }
+  BrandLifecyclePrimitiveResultDTO Dispatch(const BrandLifecyclePrimitiveIntentDTO& intent,
+                                            std::stop_token cancellation) override {
+    return port_->Dispatch(intent, cancellation);
+  }
+
+ private:
+  std::shared_ptr<FakeBrandPort> port_;
+  IClock& clock_;
+};
+
+class IoRecoveryPendingOutput final : public IIoOutputProvider {
+ public:
+  explicit IoRecoveryPendingOutput(IClock& clock) : clock_(clock) {}
+  IoOutputEvidence StrongestOutputEvidence() const noexcept override {
+    return IoOutputEvidence::kSourceAccepted;
+  }
+  Result<IoOutputObservationDTO> SubmitOutput(const IoOutputWriteRequestDTO& request) override {
+    if (request_) {
+      if (*request_ == request) return Result<IoOutputObservationDTO>::Ok(*observation_);
+      return Result<IoOutputObservationDTO>::Err({"busy", "Existing correlation retained", {}});
+    }
+    ++submissions;
+    request_ = request;
+    observation_ =
+        IoOutputObservationDTO{request.identity, IoOutputEvidence::kSubmitted, clock_.now(), {}};
+    return Result<IoOutputObservationDTO>::Ok(*observation_);
+  }
+  Result<IoOutputObservationDTO> ObserveOutputResult(
+      const IoOutputCommandIdentityDTO& identity) const override {
+    if (!request_ || request_->identity != identity)
+      return Result<IoOutputObservationDTO>::Err({"foreign", "No exact correlation", {}});
+    return Result<IoOutputObservationDTO>::Ok(*observation_);
+  }
+  Result<void> RetireOutput(const IoOutputCommandIdentityDTO& identity) override {
+    if (!request_ || request_->identity != identity)
+      return Result<void>::Err({"foreign", "No exact correlation", {}});
+    ++retirements;
+    request_.reset();
+    observation_.reset();
+    return Result<void>::Ok();
+  }
+  unsigned submissions{};
+  unsigned retirements{};
+
+ private:
+  IClock& clock_;
+  std::optional<IoOutputWriteRequestDTO> request_;
+  std::optional<IoOutputObservationDTO> observation_;
+};
+
+class IoRecoveryAdmissionGate final : public IResourceOperationAdmissionGate {
+ public:
+  std::shared_ptr<std::recursive_mutex> shared_admission_mutex() const override { return mutex_; }
+  Result<void> reserve(ResourceSlotTable& table, const ResourceSlotOwnerDTO& owner,
+                       const std::vector<ResourceId>& resources) override {
+    std::lock_guard lock(*mutex_);
+    return table.reserve(owner, resources);
+  }
+  Result<void> reserve_batch(ResourceSlotTable& table,
+                             const std::vector<ResourceSlotReservationOwnerDTO>& owners) override {
+    std::lock_guard lock(*mutex_);
+    return table.reserve_batch(owners);
+  }
+  std::vector<ResourceId> current_fenced_resources(const std::vector<ResourceId>&) const override {
+    return {};
+  }
+  bool has_held_configuration_fences() const override { return false; }
+
+ private:
+  std::shared_ptr<std::recursive_mutex> mutex_ = std::make_shared<std::recursive_mutex>();
+};
+
+class IoRecoveryKernelReadinessPort final : public ICCLCComponentCommandReadinessPort {
+ public:
+  explicit IoRecoveryKernelReadinessPort(ResourceAddressedExecutionKernel& kernel)
+      : kernel_(kernel) {}
+  Result<ComponentCommandReadinessDTO> CloseComponentCommandEligibility(
+      const LifecycleTransactionId& transaction,
+      const ControllableComponentId& component) override {
+    return kernel_.close_component_command_eligibility(transaction, component);
+  }
+  Result<ComponentCommandReadinessDTO> PublishComponentCommandReadiness(
+      const ComponentCommandReadinessPublicationDTO& publication) override {
+    return kernel_.publish_component_command_readiness(publication);
+  }
+  Result<ComponentCommandReadinessDTO> PublishComponentCommandReadiness(
+      const ComponentCommandReadinessPublicationDTO& publication,
+      const ComponentLifecycleCurrentSnapshotDTO& snapshot,
+      const std::vector<BrandLifecycleObservationDTO>& observations) override {
+    const auto installed =
+        kernel_.publish_runtime_provider_configuration(publication, snapshot, observations);
+    if (!installed.ok()) return Result<ComponentCommandReadinessDTO>::Err(installed.error());
+    return kernel_.publish_component_command_readiness(publication);
+  }
+  Result<ComponentCommandReadinessDTO> ReadComponentCommandReadiness(
+      const ControllableComponentId& component) const override {
+    return kernel_.component_command_readiness(component);
+  }
+
+ private:
+  ResourceAddressedExecutionKernel& kernel_;
+};
+
+TEST(ComponentLifecycleCoordinator,
+     OutputResynchronizationRequiresActualCompletedDisableThenEnableInExistingJournal) {
+  ScopedTemporaryDirectory temporary;
+  const auto lifecycle_path =
+      temporary.path() / std::string(kCCLCJournalFilename);
+  SqliteCCLCJournal journal(lifecycle_path, CellId("cell.1"), 8U);
+  CCLCDomainReservationTable reservations;
+  auto plans = EnableCatalog().plans;
+  for (auto& plan : plans) {
+    for (auto& transition : plan.transitions)
+      transition.lifecycle_primitive_id =
+          LifecyclePrimitiveId("io.provider." + std::string(to_string(plan.intent)));
+    if (plan.intent == ComponentLifecycleIntentKindDTO::kPrepare)
+      plan.transitions.front().eligibility_predicate.allowed_states = {
+          ComponentLifecycleStateDTO::kDeclared, ComponentLifecycleStateDTO::kDisabled};
+  }
+  const auto made = MakeBrandLifecyclePlanCatalog(ProviderManifestId("manifest.io"),
+                                                  ProviderManifestRevision(Sha('1')), plans);
+  ASSERT_TRUE(made.ok());
+  const auto catalog = made.value();
+  auto base = Snapshot("io.base", ComponentLifecycleStateDTO::kActive,
+                       ComponentLifecycleGeneration(3U), catalog);
+  const ProviderControlDomainDTO provider{base.controllable_component_id,
+                                          RuntimeUnitId("runtime.1"),
+                                          ProviderInstanceId("provider.io"),
+                                          catalog.provider_manifest_id,
+                                          catalog.provider_manifest_revision,
+                                          catalog.catalog_digest,
+                                          ContentDigest(Sha('8')),
+                                          {"valve"},
+                                          Duration(1'000'000)};
+  base.domains = {
+      {ControlDomainId("domain.io"), ControlDomainRevision(Sha('9')),
+       ResolvedProviderDomainScopeDTO{
+           provider, RuntimeEpoch("runtime-epoch.1"), {}, {ResourceId("output.channel")}}}};
+  base.provider_occurrences = {
+      {base.domains.front().control_domain_id, base.domains.front().control_domain_revision,
+       provider.provider_instance_id, provider.provider_manifest_id,
+       provider.provider_manifest_revision, provider.provider_runtime_unit_id,
+       RuntimeEpoch("runtime-epoch.1"), catalog.catalog_digest}};
+  IoRecoveryJournalSnapshotSource snapshots(journal, base);
+  FakeCatalogSource catalogs(catalog);
+  FakeClock clock;
+  clock.set(100);
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{
+                   ComponentLifecycleStateDTO::kActive, ComponentLifecycleStateDTO::kActive,
+                   ComponentLifecycleStateDTO::kDisabled, ComponentLifecycleStateDTO::kDisabled,
+                   ComponentLifecycleStateDTO::kPrepared, ComponentLifecycleStateDTO::kPrepared,
+                   ComponentLifecycleStateDTO::kActive});
+  auto timed_port = std::make_shared<IoRecoveryTimedBrandPort>(port, clock);
+  RoutedResolver resolver(timed_port, base.provider_occurrences);
+  ManualScheduler scheduler;
+  const auto* definition = find_builtin_capability_definition("io.gpio.set_output");
+  ASSERT_NE(definition, nullptr);
+  const auto schema = builtin_io_signal_write_command_schema();
+  RuntimeParticipantBindingDTO captured{
+      ProgramId("program.io"),
+      ProgramRevision("revision.io"),
+      ProgramBindingId("binding.io"),
+      base.active_publication_receipt.request.candidate_retained_bundle_id,
+      base.active_publication_receipt.request.candidate_graph_revision,
+      ComponentRoleId("io"),
+      TargetRoleId("io"),
+      base.controllable_component_id,
+      ComponentTypeId("io.type"),
+      ComponentTypeRevision("io.type.revision"),
+      CommandTargetId("gpio"),
+      CapabilityId("io.gpio.set_output"),
+      CapabilityDefinitionRevision(
+          std::string(definition->capability_definition_revision)),
+      std::nullopt,
+      {},
+      {},
+      {},
+      {},
+      {},
+      std::nullopt,
+      std::nullopt,
+      {},
+      {},
+      {},
+      std::nullopt};
+  captured.command_schema =
+      ProgramCommandSchemaRefDTO{schema.command_schema_id, schema.command_schema_revision};
+  const auto& occurrence = base.provider_occurrences.front();
+  captured.capability_provider_path =
+      RuntimeCapabilityProviderPathDTO{captured.capability_id,
+                                       captured.capability_definition_revision,
+                                       CapabilityProviderBindingId("io.binding"),
+                                       CapabilityProviderBindingRevision(Sha('4')),
+                                       occurrence.provider_instance_id,
+                                       occurrence.provider_manifest_id,
+                                       occurrence.provider_manifest_revision,
+                                       occurrence.provider_runtime_unit_id,
+                                       occurrence.provider_runtime_epoch};
+  captured.runtime_unit_epochs = {
+      {occurrence.provider_runtime_unit_id, occurrence.provider_runtime_epoch}};
+  const IoSignalDescriptorDTO descriptor{{base.controllable_component_id, "valve"},
+                                         InterruptSourceId("output"),
+                                         IoSignalValueType::kBoolean,
+                                         IoSignalDirection::kOutput,
+                                         IoSignalUpdateMode::kChangeOnly,
+                                         IoTransitionCapability::kSampledOnly,
+                                         {IoFreshnessMode::kProviderValidity, {}},
+                                         ResourceId("output.channel")};
+  const auto descriptor_digest = ComputeIoSignalDescriptorDigest(descriptor);
+  ASSERT_TRUE(descriptor_digest.ok());
+  captured.io_output_binding =
+      RuntimeIoOutputBindingDTO{ResourceRoleId("valve"),
+                                descriptor,
+                                descriptor_digest.value(),
+                                ComponentLifecycleGeneration(3U),
+                                occurrence,
+                                provider.signal_configuration_digest,
+                                IoOutputCompletionPolicyDTO(IoOutputSourceAckBudgetDTO{100})};
+  auto sealed = verify_runtime_participant_binding(captured);
+  ASSERT_TRUE(sealed.ok());
+  SqliteOperationJournal operation_journal(temporary.path() / "operations.sqlite",
+                                           CellId("cell.1"));
+  IoRecoveryPendingOutput output(clock);
+  IoOutputParticipantEngine engine(output, clock);
+  RuntimeParticipantExecutionRegistration registration{
+      sealed.value(),
+      {},
+      {},
+      MotionInterruptNodeCategory::kGeneric,
+      &engine,
+      nullptr,
+      {},
+      &engine,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      false,
+      {},
+      std::nullopt,
+      {}};
+  registration.intrinsic_direct_control = true;
+  IoRecoveryAdmissionGate admission_gate;
+  ResourceAddressedExecutionKernelConfig kernel_config{RequestOwnerEpoch("kernel.io"),
+                                                       CellId("cell.1"), 16U};
+  kernel_config.operation_admission_gate = &admission_gate;
+  ManagerLivenessRequiredSetDTO required{CellId("cell.1"),
+                                         captured.retained_bundle_id,
+                                         ComputeRequiredRuntimeSetDigest({}),
+                                         RuntimeUnitId("manager"),
+                                         RuntimeEpoch("manager.1"),
+                                         RequestOwnerEpoch("manager.owner"),
+                                         {}};
+  kernel_config.manager_liveness_required_set = required;
+  // Use the same actual durable owner readers as the host. Startup epoch
+  // reconciliation and later lifecycle settlement cannot use an accept-all
+  // gate.
+  kernel_config.cell_admission_reconcile_validator =
+      [lifecycle_path](
+          const std::vector<CellAdmissionClaimDTO> &held,
+          const std::vector<CellAdmissionCurrentOwnerEpochDTO> &current,
+          const CellAdmissionReconcileDTO &request) {
+        return ValidateCCLCCellAdmissionReconciliationReadOnly(
+            lifecycle_path, CellId("cell.1"), held, current, request);
+      };
+  kernel_config.cell_admission_settlement_validator =
+      [lifecycle_path](const CellAdmissionClaimDTO &claim,
+                       const CellAdmissionClaimReleaseDTO &release) {
+        return ValidateCCLCCellAdmissionSettlementReadOnly(
+            lifecycle_path, CellId("cell.1"), claim, release);
+      };
+  ComponentLifecycleCoordinator* proof_owner = nullptr;
+  kernel_config.io_output_local_resynchronization_source =
+      [&](const RuntimeParticipantBindingDTO& value) {
+        return proof_owner->ReadIoOutputLocalResynchronization(value);
+      };
+  ResourceAddressedExecutionKernel kernel({registration}, clock, scheduler, operation_journal,
+                                          std::move(kernel_config));
+  IoRecoveryKernelReadinessPort readiness(kernel);
+  const auto context =
+      std::make_shared<const ComponentLifecycleProductContext>(ComponentLifecycleProductContext{
+          snapshots,
+          catalogs,
+          resolver,
+          {},
+          &readiness,
+          ComponentLifecycleProductIdentity{base.active_publication_receipt,
+                                            {base.controllable_component_id}}});
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, context, kernel, clock,
+                                            scheduler);
+  proof_owner = &coordinator;
+  const auto started = coordinator.Start();
+  ASSERT_TRUE(started.ok())
+      << started.error().code << ": " << started.error().message;
+  const auto initial = snapshots.ReadCurrentComponentSnapshot(base.controllable_component_id);
+  ASSERT_TRUE(initial.ok());
+  const BrandLifecycleObservationQueryDTO initial_query{
+      LifecycleTransactionId("initial"),   LifecycleTransactionGeneration(1U),
+      base.controllable_component_id,      occurrence.control_domain_id,
+      occurrence.control_domain_revision,  occurrence.provider_instance_id,
+      occurrence.provider_manifest_id,     occurrence.provider_manifest_revision,
+      occurrence.provider_runtime_unit_id, occurrence.provider_runtime_epoch};
+  const auto initial_observation = timed_port->Observe(initial_query);
+  ASSERT_TRUE(initial_observation.ok());
+  const ComponentCommandReadinessPublicationDTO bootstrap{
+      ComponentReadinessAuthorityDTO::kRestartExclusion,
+      {},
+      {},
+      base.controllable_component_id,
+      ComponentLifecycleGeneration(3U),
+      true};
+  ASSERT_TRUE(kernel.SetRouteRecoveryPending(true).ok());
+  ASSERT_TRUE(kernel
+                  .publish_runtime_provider_configuration(bootstrap, initial.value(),
+                                                          {initial_observation.value()})
+                  .ok());
+  ASSERT_TRUE(kernel.publish_component_command_readiness(bootstrap).ok());
+  ASSERT_TRUE(kernel.SetRouteRecoveryPending(false).ok());
+  const CellAdmissionReadinessSnapshotDTO idle{
+      true,
+      ProgramCycleStatusDTO{
+          RequestOwnerEpoch("runner"), 1U, ProgramCycleStateDTO::kIdleAfterReset, {}, {}, {}},
+      true,
+      1U,
+      1U,
+      true,
+      true,
+      0U,
+      0U,
+      0U};
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(idle).ok());
+  const OperationIntentDTO write{
+      {RequestId("unknown.write"), RequestOwnerEpoch("kernel.io"), "operator", {}},
+      captured.program_id,
+      captured.program_revision,
+      captured.program_binding_id,
+      ProgramRunId("manual.output"),
+      captured.graph_revision,
+      captured.retained_bundle_id,
+      {},
+      {{captured.component_role_id,
+        captured.target_role_id,
+        captured.capability_id,
+        {},
+        CapabilityCommandIntentDTO{schema.command_schema_id,
+                                   schema.command_schema_revision,
+                                   IoSignalWriteCommandValueDTO{ResourceRoleId("valve"), true},
+                                   {},
+                                   {}}}}};
+  const auto accepted_write = kernel.execute(write);
+  ASSERT_TRUE(accepted_write.ok()) << accepted_write.error().message;
+  clock.advance(100);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto unknown = kernel.get_operation_state(accepted_write.value().operation_id);
+  ASSERT_TRUE(unknown.ok());
+  ASSERT_EQ(unknown.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_EQ(unknown.value().participants.front().output_evidence,
+            IoOutputEvidence::kAcceptanceUnknown);
+  const auto retained_slots = kernel.resource_snapshot();
+  OperationControlRequestDTO reset{
+      {RequestId("operator.reset.unknown"), RequestOwnerEpoch("kernel.io"), "operator", {}},
+      unknown.value().operation_id,
+      unknown.value().operation_revision,
+      std::string("Operator accepts remaining remote queued-write uncertainty")};
+  reset.acknowledged_uncertain_outputs = std::vector<UncertainOutputAcknowledgementDTO>{
+      {unknown.value().operation_id, unknown.value().operation_revision}};
+  EXPECT_FALSE(kernel.reset(reset).ok());  // actual durable restart proof still absent
+  EXPECT_EQ(kernel.resource_snapshot(), retained_slots);
+  EXPECT_FALSE(coordinator.ReadIoOutputLocalResynchronization(captured).ok());
+  std::vector<LifecycleTransactionId> completed;
+  for (const auto intent_kind :
+       {ComponentLifecycleIntentKindDTO::kDisable, ComponentLifecycleIntentKindDTO::kPrepare,
+        ComponentLifecycleIntentKindDTO::kEnable}) {
+    const auto current = snapshots.ReadCurrentComponentSnapshot(base.controllable_component_id);
+    ASSERT_TRUE(current.ok());
+    ComponentLifecycleIntentDTO intent{
+        {RequestId("recovery." + std::string(to_string(intent_kind))),
+         coordinator.request_owner_epoch(),
+         "test",
+         {}},
+        base.controllable_component_id,
+        intent_kind,
+        captured.graph_revision,
+        current.value().component_lifecycle_generation,
+        {{base.domains.front().control_domain_id, base.domains.front().control_domain_revision,
+          ExpectedProviderDomainScopeDTO{
+              provider, {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, {}, {}}}}},
+        {}};
+    intent.expected_admission_generation = kernel.GetAuthoringAdmission().admission_generation;
+    const auto accepted = coordinator.SubmitLifecycle(intent);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(accepted.value().acceptance);
+    ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+    const auto actual =
+        coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+    ASSERT_TRUE(actual.ok());
+    ASSERT_TRUE(actual.value());
+    ASSERT_EQ(actual.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+    ASSERT_FALSE(actual.value()->domains.front().primitive_attempts.empty());
+    completed.push_back(actual.value()->acceptance.lifecycle_transaction_id);
+    EXPECT_EQ(kernel.get_operation_state(unknown.value().operation_id).value(), unknown.value());
+    EXPECT_EQ(kernel.resource_snapshot().front().owner, retained_slots.front().owner);
+    EXPECT_EQ(output.submissions, 1U);
+    EXPECT_EQ(output.retirements, 0U);
+    if (intent_kind != ComponentLifecycleIntentKindDTO::kEnable) {
+      EXPECT_FALSE(coordinator.ReadIoOutputLocalResynchronization(captured).ok());
+    }
+  }
+  EXPECT_EQ(port->dispatch_count(), 3U);
+  const auto proof = coordinator.ReadIoOutputLocalResynchronization(captured);
+  ASSERT_TRUE(proof.ok()) << proof.error().message;
+  EXPECT_EQ(proof.value().provider, occurrence);
+  EXPECT_EQ(proof.value().disable_transaction_id, completed.front());
+  EXPECT_EQ(proof.value().enable_transaction_id, completed.back());
+  EXPECT_EQ(proof.value().disabled_generation, ComponentLifecycleGeneration(4U));
+  EXPECT_EQ(proof.value().enabled_generation, ComponentLifecycleGeneration(6U));
+  auto foreign = captured;
+  foreign.retained_bundle_id = RetainedBundleId("foreign.bundle");
+  EXPECT_FALSE(coordinator.ReadIoOutputLocalResynchronization(foreign).ok());
+  auto later_write = captured;
+  later_write.io_output_binding->component_lifecycle_generation = ComponentLifecycleGeneration(4U);
+  EXPECT_FALSE(coordinator.ReadIoOutputLocalResynchronization(later_write).ok());
+  EXPECT_EQ(port->dispatch_count(), 3U);  // proof queries never issue effects
+  auto absent_ack = reset;
+  absent_ack.request_context.request_id = RequestId("operator.reset.no.ack");
+  absent_ack.acknowledged_uncertain_outputs.reset();
+  EXPECT_FALSE(kernel.reset(absent_ack).ok());
+  EXPECT_EQ(kernel.resource_snapshot().front().owner, retained_slots.front().owner);
+  const auto reset_accepted = kernel.reset(reset);
+  ASSERT_TRUE(reset_accepted.ok()) << reset_accepted.error().message;
+  EXPECT_EQ(reset_accepted.value().control, OperationControlKind::kReset);
+  const auto reset_again = kernel.reset(reset);
+  ASSERT_TRUE(reset_again.ok());
+  EXPECT_EQ(reset_again.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(reset_again.value().operation_revision_after_acceptance,
+            reset_accepted.value().operation_revision_after_acceptance);
+  auto conflicting_reset = reset;
+  conflicting_reset.acknowledged_uncertain_outputs->front().operation_revision =
+      OperationRevision(unknown.value().operation_revision.value() + 1U);
+  const auto conflict = kernel.reset(conflicting_reset);
+  ASSERT_FALSE(conflict.ok());
+  EXPECT_EQ(conflict.error().code, "request_id_conflict");
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < end &&
+         kernel.get_operation_projection(unknown.value().operation_id)
+             .value()
+             .resident) {
+    // The real host drives this owner checkpoint after asynchronous Reset:
+    // residency includes the settled manual admission claim until it releases.
+    const auto reconciled = kernel.reconcile_manual_operation_admission();
+    ASSERT_TRUE(reconciled.ok())
+        << reconciled.error().code << ": " << reconciled.error().message;
+    std::this_thread::yield();
+  }
+  const auto retired = kernel.get_operation_projection(unknown.value().operation_id);
+  ASSERT_TRUE(retired.ok());
+  ASSERT_FALSE(retired.value().resident);
+  EXPECT_EQ(retired.value().operation.participants.front().output_evidence,
+            IoOutputEvidence::kAcceptanceUnknown);
+  ASSERT_TRUE(retired.value().operation.participants.front().terminal_fact);
+  EXPECT_EQ(retired.value().operation.participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kEffectUncertain);
+  EXPECT_EQ(output.submissions, 1U);
+  EXPECT_EQ(output.retirements, 1U);
+}
+
+TEST(ComponentLifecycleCoordinator,
+     MixedDomainTerminalProofKeepsPhysicalReadinessAndFiltersProviderObservations) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  const auto catalog = EnableCatalog();
+  auto before = Snapshot("mixed.before", ComponentLifecycleStateDTO::kPrepared,
+                         ComponentLifecycleGeneration(3U), catalog);
+  const ProviderControlDomainDTO provider{before.controllable_component_id,
+                                          RuntimeUnitId("runtime.io"),
+                                          ProviderInstanceId("provider.io"),
+                                          catalog.provider_manifest_id,
+                                          catalog.provider_manifest_revision,
+                                          catalog.catalog_digest,
+                                          ContentDigest(Sha('8')),
+                                          {"input.ready"},
+                                          Duration(1'000'000)};
+  const ControlDomainId generic_id("domain.io");
+  const ControlDomainRevision generic_revision(Sha('9'));
+  before.domains.push_back(
+      {generic_id, generic_revision,
+       ResolvedProviderDomainScopeDTO{provider, RuntimeEpoch("runtime.io.epoch"), std::nullopt}});
+  before.provider_occurrences.push_back(
+      {generic_id, generic_revision, provider.provider_instance_id, provider.provider_manifest_id,
+       provider.provider_manifest_revision, provider.provider_runtime_unit_id,
+       RuntimeEpoch("runtime.io.epoch"), provider.lifecycle_plan_catalog_digest});
+  const auto before_digest = ComputeComponentLifecycleCurrentSnapshotDigest(before);
+  ASSERT_TRUE(before_digest.ok());
+  before.snapshot_digest = before_digest.value();
+  auto accepted_snapshot = before;
+  accepted_snapshot.component_lifecycle_generation = ComponentLifecycleGeneration(4U);
+  const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(accepted_snapshot);
+  ASSERT_TRUE(digest.ok());
+  accepted_snapshot.snapshot_digest = digest.value();
+  FakeSnapshotSource snapshots({before, before, accepted_snapshot});
+  FakeCatalogSource catalogs(catalog);
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kPrepared,
+                                                       ComponentLifecycleStateDTO::kPrepared,
+                                                       ComponentLifecycleStateDTO::kActive});
+  RoutedResolver resolver(port, before.provider_occurrences);
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  FakeReadinessPort readiness;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler, std::nullopt,
+                                            &readiness);
+  ASSERT_TRUE(coordinator.Start().ok());
+  auto intent = PrepareIntent(coordinator.request_owner_epoch());
+  intent.intent = ComponentLifecycleIntentKindDTO::kEnable;
+  intent.expected_control_domains.push_back(
+      {generic_id, generic_revision,
+       ExpectedProviderDomainScopeDTO{
+           provider,
+           {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt}}});
+  const auto accepted = coordinator.SubmitLifecycle(intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance);
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok());
+  ASSERT_TRUE(status.value());
+  EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+  EXPECT_EQ(readiness.calls(), (std::vector<std::string>{"close", "publish_open"}));
+  const auto [all_domains, observations] = readiness.provider_proof();
+  EXPECT_EQ(all_domains, 2U);          // Actual snapshot still carries physical closure.
+  ASSERT_EQ(observations.size(), 1U);  // Generic proof excludes physical observations.
+  EXPECT_EQ(observations.front().control_domain_id, generic_id);
+  EXPECT_EQ(observations.front().observed_state, ComponentLifecycleStateDTO::kActive);
+}
+
 TEST(ComponentLifecycleCoordinator, UnverifiedReadinessPublicationCannotReportSuccess) {
   const auto run = RunEnable(1U);
   ASSERT_TRUE(run.status.has_value());
@@ -1206,13 +1818,13 @@ TEST(ComponentLifecycleCoordinator,
   auto second = CurrentDomain();
   second.control_domain_id = ControlDomainId("domain.2");
   second.control_domain_revision = ControlDomainRevision("domain-revision.2");
-  second.controller_topology_id = ControllerTopologyId("topology.2");
-  second.topology_revision = TopologyRevision("topology-revision.2");
-  second.current_control_bindings.front().control_binding_id = ControlBindingId("binding.2");
-  second.current_control_bindings.front().control_binding_revision =
+  second.controller().controller_topology_id = ControllerTopologyId("topology.2");
+  second.controller().topology_revision = TopologyRevision("topology-revision.2");
+  second.controller().current_control_bindings.front().control_binding_id = ControlBindingId("binding.2");
+  second.controller().current_control_bindings.front().control_binding_revision =
       ControlBindingRevision("binding-revision.2");
-  second.current_control_bindings.front().control_route_id = ControlRouteId("route.2");
-  second.current_resources = {ResourceId("resource.2")};
+  second.controller().current_control_bindings.front().control_route_id = ControlRouteId("route.2");
+  second.controller().current_resources = {ResourceId("resource.2")};
   auto second_provider = Provider(catalog);
   second_provider.control_domain_id = second.control_domain_id;
   second_provider.control_domain_revision = second.control_domain_revision;
@@ -1223,9 +1835,9 @@ TEST(ComponentLifecycleCoordinator,
   auto expected_second = ExpectedDomain();
   expected_second.control_domain_id = second.control_domain_id;
   expected_second.control_domain_revision = second.control_domain_revision;
-  expected_second.controller_topology_id = second.controller_topology_id;
-  expected_second.topology_revision = second.topology_revision;
-  expected_second.expected_control_bindings = second.current_control_bindings;
+  expected_second.controller().controller_topology_id = second.controller().controller_topology_id;
+  expected_second.controller().topology_revision = second.controller().topology_revision;
+  expected_second.controller().expected_control_bindings = second.controller().current_control_bindings;
   intent.expected_control_domains.push_back(expected_second);
 
   FakeSnapshotSource snapshots({snapshot});
@@ -1946,9 +2558,9 @@ struct ApplyCoordinatorData final {
   if (changed) {
     domain.control_domain_revision = ControlDomainRevision("candidate.domain.1");
     expected.control_domain_revision = domain.control_domain_revision;
-    domain.current_control_bindings.front().control_binding_revision =
+    domain.controller().current_control_bindings.front().control_binding_revision =
         ControlBindingRevision("candidate.binding.1");
-    expected.expected_control_bindings = domain.current_control_bindings;
+    expected.controller().expected_control_bindings = domain.controller().current_control_bindings;
   }
   auto provider = Provider(catalog);
   provider.control_domain_revision = domain.control_domain_revision;
@@ -1963,7 +2575,7 @@ struct ApplyCoordinatorData final {
       auto old_only = CurrentDomain();
       old_only.control_domain_id = ControlDomainId("domain.2");
       old_only.control_domain_revision = ControlDomainRevision("old.domain.2");
-      old_only.current_control_bindings.front().control_binding_id = ControlBindingId("binding.2");
+      old_only.controller().current_control_bindings.front().control_binding_id = ControlBindingId("binding.2");
       auto old_provider = Provider(catalog);
       old_provider.control_domain_id = old_only.control_domain_id;
       old_provider.control_domain_revision = old_only.control_domain_revision;
@@ -1984,19 +2596,19 @@ struct ApplyCoordinatorData final {
         predecessor ? std::optional(predecessor->domains.front().control_domain_revision)
                     : std::nullopt,
         domain.control_domain_revision}},
-      {{domain.current_control_bindings.front().control_binding_id,
+      {{domain.controller().current_control_bindings.front().control_binding_id,
         predecessor ? std::optional(predecessor->domains.front()
-                                        .current_control_bindings.front()
+                                        .controller().current_control_bindings.front()
                                         .control_binding_revision)
                     : std::nullopt,
-        domain.current_control_bindings.front().control_binding_revision}},
-      domain.current_resources};
+        domain.controller().current_control_bindings.front().control_binding_revision}},
+      domain.controller().current_resources};
   if (!retired.empty()) {
     const auto& old_only = predecessor->domains.back();
     scope.domains.push_back(
         {old_only.control_domain_id, old_only.control_domain_revision, std::nullopt});
-    scope.bindings.push_back({old_only.current_control_bindings.front().control_binding_id,
-                              old_only.current_control_bindings.front().control_binding_revision,
+    scope.bindings.push_back({old_only.controller().current_control_bindings.front().control_binding_id,
+                              old_only.controller().current_control_bindings.front().control_binding_revision,
                               std::nullopt});
   }
   const ApplyFenceOwnerDTO parent_owner{ApplyId("apply.1"), ApplyGeneration(1U)};
@@ -2310,6 +2922,73 @@ class ApplyCoordinatorFixture final {
   ComponentLifecycleCoordinator coordinator;
 };
 
+TEST(ComponentLifecycleCoordinator,
+     InstalledApplyCandidateReadUsesOriginalJournalWithoutParentReentryOrEffects) {
+  ApplyCoordinatorFixture fixture;
+  const auto& data = fixture.data;
+  const std::vector<BrandLifecyclePortRegistrationDTO> ports{
+      {data.providers.front(), fixture.pinned_port}};
+  EXPECT_FALSE(fixture.coordinator
+                   .ReadInstalledApplyCandidateFacts(data.intent,
+                                                     data.evidence.original_request_payload_digest,
+                                                     data.domains, data.providers, ports)
+                   .ok());
+  const auto accepted = fixture.Accept(fixture.Services());
+  ASSERT_TRUE(accepted.ok() && accepted.value().acceptance);
+  const auto pins = fixture.pin_calls.load();
+  fixture.publication_reader.FailReads();
+  // The actual caller already holds its installation pin. A pure read must
+  // neither re-enter that nonrecursive parent nor observe a provider.
+  std::lock_guard parent_pin(fixture.pin_mutex);
+  const auto facts = fixture.coordinator.ReadInstalledApplyCandidateFacts(
+      data.intent, data.evidence.original_request_payload_digest, data.domains, data.providers,
+      ports);
+  ASSERT_TRUE(facts.ok()) << facts.error().message;
+  EXPECT_EQ(facts.value().component_lifecycle_generation,
+            accepted.value().acceptance->component_lifecycle_generation);
+  EXPECT_EQ(facts.value().domains, data.domains);
+  EXPECT_EQ(facts.value().provider_occurrences, data.providers);
+  EXPECT_EQ(facts.value().retained_bundle_id, data.publication.candidate_retained_bundle_id);
+  EXPECT_EQ(std::get<InstalledApplyChildCandidateSourceDTO>(facts.value().source).parent,
+            data.evidence.parent_authority.parent);
+  EXPECT_EQ(fixture.pin_calls.load(), pins);
+  EXPECT_EQ(fixture.port->observation_count(), 0U);
+  EXPECT_EQ(fixture.port->dispatch_count(), 0U);
+  EXPECT_TRUE(fixture.readiness.publications().empty());
+  auto wrong = ports;
+  wrong.front().provider_occurrence.provider_runtime_epoch = RuntimeEpoch("foreign.epoch");
+  EXPECT_FALSE(fixture.coordinator
+                   .ReadInstalledApplyCandidateFacts(data.intent,
+                                                     data.evidence.original_request_payload_digest,
+                                                     data.domains, data.providers, wrong)
+                   .ok());
+  EXPECT_FALSE(fixture.coordinator
+                   .ReadInstalledApplyCandidateFacts(data.intent, ContentDigest(Sha('f')),
+                                                     data.domains, data.providers, ports)
+                   .ok());
+  auto wrong_child = data.intent;
+  wrong_child.request_context.request_id = RequestId("foreign.original.child");
+  EXPECT_FALSE(fixture.coordinator
+                   .ReadInstalledApplyCandidateFacts(wrong_child,
+                                                     data.evidence.original_request_payload_digest,
+                                                     data.domains, data.providers, ports)
+                   .ok());
+  auto wrong_generation = data.intent;
+  wrong_generation.expected_component_lifecycle_generation = ComponentLifecycleGeneration(
+      wrong_generation.expected_component_lifecycle_generation.value() + 1U);
+  EXPECT_FALSE(fixture.coordinator
+                   .ReadInstalledApplyCandidateFacts(wrong_generation,
+                                                     data.evidence.original_request_payload_digest,
+                                                     data.domains, data.providers, ports)
+                   .ok());
+  fixture.coordinator.CloseAdmission();
+  EXPECT_FALSE(fixture.coordinator
+                   .ReadInstalledApplyCandidateFacts(data.intent,
+                                                     data.evidence.original_request_payload_digest,
+                                                     data.domains, data.providers, ports)
+                   .ok());
+}
+
 TEST(ComponentLifecycleCoordinator, ApplyAcceptIsNoEffectAndContinueHoldsUntilExactPublication) {
   for (const auto kind :
        {ComponentLifecycleIntentKindDTO::kPrepare, ComponentLifecycleIntentKindDTO::kEnable,
@@ -2341,6 +3020,12 @@ TEST(ComponentLifecycleCoordinator, ApplyAcceptIsNoEffectAndContinueHoldsUntilEx
     ASSERT_EQ(fixture.readiness.publications().size(), 1U);
     EXPECT_EQ(fixture.readiness.publications().front().authority,
               ComponentReadinessAuthorityDTO::kParentApplyFence);
+    const auto& actual_parent = fixture.data.evidence.parent_authority.held_fence_query;
+    EXPECT_EQ(fixture.readiness.publications().front().parent_apply_fence_id,
+              actual_parent.configuration_fence_id);
+    ASSERT_TRUE(fixture.readiness.publications().front().parent_apply_scope);
+    EXPECT_EQ(*fixture.readiness.publications().front().parent_apply_scope,
+              actual_parent.expected_scope);
     EXPECT_FALSE(fixture.readiness.publications().front().command_eligible);
     EXPECT_TRUE(fixture.reservations.snapshot().empty());
     EXPECT_FALSE(fixture.Continue().ok());
@@ -2407,12 +3092,12 @@ TEST(ComponentLifecycleCoordinator,
   auto second = fixture.data.domains.front();
   second.control_domain_id = ControlDomainId("domain.2");
   second.control_domain_revision = ControlDomainRevision("domain.revision.2");
-  second.current_control_bindings.front().control_binding_id = ControlBindingId("binding.2");
-  second.current_resources = {ResourceId("resource.2")};
+  second.controller().current_control_bindings.front().control_binding_id = ControlBindingId("binding.2");
+  second.controller().current_resources = {ResourceId("resource.2")};
   auto expected = fixture.data.intent.expected_control_domains.front();
   expected.control_domain_id = second.control_domain_id;
   expected.control_domain_revision = second.control_domain_revision;
-  expected.expected_control_bindings = second.current_control_bindings;
+  expected.controller().expected_control_bindings = second.controller().current_control_bindings;
   auto provider = fixture.data.providers.front();
   provider.control_domain_id = second.control_domain_id;
   provider.control_domain_revision = second.control_domain_revision;
@@ -2424,8 +3109,8 @@ TEST(ComponentLifecycleCoordinator,
   evidence.selected_scope.domains.push_back(
       {second.control_domain_id, std::nullopt, second.control_domain_revision});
   evidence.selected_scope.bindings.push_back(
-      {second.current_control_bindings.front().control_binding_id, std::nullopt,
-       second.current_control_bindings.front().control_binding_revision});
+      {second.controller().current_control_bindings.front().control_binding_id, std::nullopt,
+       second.controller().current_control_bindings.front().control_binding_revision});
   evidence.selected_scope.resources.push_back(ResourceId("resource.2"));
   evidence.parent_authority.held_fence_query.expected_scope = evidence.selected_scope;
   evidence.original_request_payload_digest = ApplyDelegatedComponentLifecycleSemanticRequestDigest(
@@ -3539,7 +4224,8 @@ TEST(ComponentLifecycleCoordinator,
   auto under_fence =
       Snapshot("snapshot.under-fence.changed.1", ComponentLifecycleStateDTO::kDisabling,
                ComponentLifecycleGeneration(4U));
-  under_fence.domains.front().active_control_configuration = CurrentActiveConfiguration();
+  under_fence.domains.front().controller().active_control_configuration =
+      CurrentActiveConfiguration();
   ASSERT_TRUE(under_fence.locally_valid());
   FakeSnapshotSource snapshots({before, before, under_fence, under_fence});
   FakeCatalogSource catalogs(DisableCatalog());
@@ -3737,14 +4423,17 @@ TEST(ComponentLifecycleCoordinator, SelectedOwnerReplacementKeepsClaimAndNeverDi
   auto status = prepared.value().initial_status;
   status.acceptance.lifecycle_transaction_id = LifecycleTransactionId("selected-lifecycle.1");
   const auto configuration = CurrentActiveConfiguration();
-  status.domains.front().current_scope->active_control_configuration = configuration;
+  status.domains.front().current_scope->controller().active_control_configuration = configuration;
   const ExpectedActiveControlConfigurationDTO expected{
       ExpectedActiveControlConfigurationPresenceDTO::kPresent,
       configuration.active_control_configuration_id,
       configuration.active_control_configuration_generation};
-  status.accepted_intent.expected_control_domains.front().expected_active_control_configuration =
-      expected;
-  status.domains.front().expected_domain->expected_active_control_configuration = expected;
+  status.accepted_intent.expected_control_domains.front()
+      .controller()
+      .expected_active_control_configuration = expected;
+  status.domains.front()
+      .expected_domain->controller()
+      .expected_active_control_configuration = expected;
   const ContentDigest digest(Sha('a'));
   const CellAdmissionClaimIntentDTO claim_intent{
       CellAdmissionClaimKindDTO::kInterventionOrRecovery,
@@ -4302,10 +4991,10 @@ class SharedDomainApplyFixture final {
         pinned_port(std::make_shared<PinnedBrandPort>(shared_port, base.pin_depth)) {
     second.intent.controllable_component_id = ControllableComponentId("component.2");
     second.intent.request_context.request_id = RequestId("request.2");
-    second.domains.front().current_resources = {ResourceId("resource.2")};
+    second.domains.front().controller().current_resources = {ResourceId("resource.2")};
     second.evidence.selected_scope.controllable_component_ids =
         {second.intent.controllable_component_id};
-    second.evidence.selected_scope.resources = second.domains.front().current_resources;
+    second.evidence.selected_scope.resources = second.domains.front().controller().current_resources;
     const auto selected = base.journal.ReadApplyComponentGenerationSelection(
         base.coordinator.request_owner_epoch(), second.intent.controllable_component_id);
     if (!selected.ok()) throw std::runtime_error(selected.error().message);
@@ -4315,7 +5004,7 @@ class SharedDomainApplyFixture final {
             ? selected.value().predecessor_generation->value() : 0U);
     auto& parent_scope = base.data.evidence.parent_authority.held_fence_query.expected_scope;
     parent_scope.controllable_component_ids.push_back(second.intent.controllable_component_id);
-    parent_scope.resources.push_back(second.domains.front().current_resources.front());
+    parent_scope.resources.push_back(second.domains.front().controller().current_resources.front());
     second.evidence.parent_authority = base.data.evidence.parent_authority;
     for (auto* child : {&base.data, &second}) {
       child->evidence.original_request_payload_digest =
@@ -4383,10 +5072,10 @@ TEST(ComponentLifecycleCoordinator,
   const auto& second = fixture.second;
   ASSERT_NE(first.intent.controllable_component_id, second.intent.controllable_component_id);
   ASSERT_EQ(first.domains.front().control_domain_id, second.domains.front().control_domain_id);
-  ASSERT_EQ(first.domains.front().current_control_bindings,
-            second.domains.front().current_control_bindings);
+  ASSERT_EQ(first.domains.front().controller().current_control_bindings,
+            second.domains.front().controller().current_control_bindings);
   ASSERT_EQ(first.providers, second.providers);
-  ASSERT_NE(first.domains.front().current_resources, second.domains.front().current_resources);
+  ASSERT_NE(first.domains.front().controller().current_resources, second.domains.front().controller().current_resources);
   ASSERT_EQ(first.evidence.parent_authority, second.evidence.parent_authority);
   const auto& parent_scope = first.evidence.parent_authority.held_fence_query.expected_scope;
   ASSERT_TRUE(parent_scope.valid());

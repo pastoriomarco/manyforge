@@ -21,7 +21,7 @@ import {
   sameActivationScope,
   type DeploymentActivationScope,
 } from './activationScope';
-import type { ManagerApplyIdentity } from './managerApply';
+import { applyMayHaveActed, type ManagerApplyIdentity } from './managerApply';
 
 export type ResetApplyDocument = 'program' | 'deployment';
 
@@ -239,7 +239,7 @@ export function nextResetApplyStep(
         'apply',
         `Apply ${status.state === 'failed' ? 'failed' : 'has an unknown effect'}${status.failure
           ? `: ${status.failure.message || status.failure.code}` : ''}. The Draft keeps its edits; see Activity.`,
-        status.state === 'unknown_effect',
+        applyMayHaveActed(status.state),
         phase.apply,
       );
     }

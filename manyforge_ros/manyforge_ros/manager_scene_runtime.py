@@ -24,6 +24,7 @@ import rfc8785
 
 
 MANAGER_SOCKET_FILE = "manager-command.sock"
+# Stays v1 for the coordinated unreleased 128/130 cut (agreed with Track 2).
 MANAGER_COMMAND_VERSION = "manyforge.manager_command.v1"
 MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v1"
 MAX_MANAGER_REQUEST_BYTES = 128 * 1024 + 4 * 1024
@@ -426,7 +427,8 @@ class ManagerSceneRuntimeClient:
                 "object_id": intent.object_id,
                 "payload": intent.payload_value(),
                 "policy_id": intent.policy_id,
-                "quality": intent.quality,
+                # Wire name `payload_quality` (good|unknown); distinct from I/O quality.
+                "payload_quality": intent.quality,
                 "source_epoch": session.source_epoch,
                 "source_id": session.source_id,
                 "source_sequence": source_sequence,

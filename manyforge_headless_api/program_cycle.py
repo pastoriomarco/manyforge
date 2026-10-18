@@ -6,12 +6,97 @@ These models validate data only. They do not decide or advance the lifecycle.
 from __future__ import annotations
 
 from typing import Annotated, Any, Literal
+import unicodedata
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .control_protocol import AllowedExecutionCommandDTO
 
 PROGRAM_CONTROL_STATE_SCHEMA = "manyforge.program_control_state.v2"
+_MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
+_MAXIMUM_OPERATION_FAILURES = 4_096
+
+
+def _failure_text(value: Any, maximum_bytes: int, *, empty: bool = False) -> bool:
+    return (
+        isinstance(value, str)
+        and (empty or bool(value))
+        and len(value.encode("utf-8")) <= maximum_bytes
+        and unicodedata.normalize("NFC", value) == value
+    )
+
+
+def _failure_counter(value: Any) -> bool:
+    return type(value) is int and 1 <= value <= _MAXIMUM_SAFE_INTEGER
+
+
+def program_operation_failures(run: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The run record's actual operation-failure provenance.
+
+    Each row names one exact failed operation of one node attempt, its
+    resources and the Kernel's own facts about it, one row per active hold.
+    The Runner always publishes the key (an empty list when there are no
+    rows): a run without it is unknown provenance, never "no failure", and
+    is refused. Bounds follow the native Program-failure condition contract;
+    nothing is inferred here.
+    """
+
+    if run is None:
+        return []
+    if "operation_failures" not in run:
+        raise ValueError("Program run omitted its operation failures")
+    rows = run["operation_failures"]
+    if not isinstance(rows, list) or len(rows) > _MAXIMUM_OPERATION_FAILURES:
+        raise ValueError("Program run operation failures are invalid")
+    for row in rows:
+        operation = row.get("operation") if isinstance(row, dict) else None
+        failure = row.get("failure") if isinstance(row, dict) else None
+        resources = row.get("resource_ids") if isinstance(row, dict) else None
+        facts = row.get("terminal_facts") if isinstance(row, dict) else None
+        if (
+            not isinstance(row, dict)
+            or set(row)
+            != {
+                "node_instance_id",
+                "node_attempt_id",
+                "operator_facing_run_revision",
+                "operation",
+                "resource_ids",
+                "failure",
+                "recovery_class",
+                "terminal_facts",
+            }
+            or not _failure_text(row["node_instance_id"], 128)
+            or not _failure_text(row["node_attempt_id"], 512)
+            or not _failure_counter(row["operator_facing_run_revision"])
+            or not isinstance(operation, dict)
+            or set(operation)
+            != {"source_owner_epoch", "operation_id", "operation_revision"}
+            or not _failure_text(operation["source_owner_epoch"], 2048)
+            or not _failure_text(operation["operation_id"], 2048)
+            or not _failure_counter(operation["operation_revision"])
+            or not isinstance(resources, list)
+            or not resources
+            or len(resources) > _MAXIMUM_OPERATION_FAILURES
+            or any(not _failure_text(value, 1024) for value in resources)
+            or resources != sorted(set(resources))
+            or not isinstance(failure, dict)
+            or set(failure) != {"code", "message"}
+            or not _failure_text(failure["code"], 256)
+            or not _failure_text(failure["message"], 4096, empty=True)
+            or not _failure_text(row["recovery_class"], 128)
+            or not isinstance(facts, list)
+            or len(facts) > _MAXIMUM_OPERATION_FAILURES
+            or any(
+                not isinstance(fact, dict)
+                or set(fact) != {"kind", "effect"}
+                or not _failure_text(fact["kind"], 128)
+                or not _failure_text(fact["effect"], 128)
+                for fact in facts
+            )
+        ):
+            raise ValueError("Program run operation failure is invalid")
+    return rows
 
 
 def program_cycle_control_key(cycle: dict[str, Any]) -> tuple[Any, ...]:

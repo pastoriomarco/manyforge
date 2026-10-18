@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:b7f9e3ae6ed12dd59fd78193db902c6ad09528372ad0f5e2423f936833cb49f8",
+  "capability_id": "io.gpio.set_output",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "target_binding"
+}

@@ -262,6 +262,8 @@ struct RetainedExternallyManagedBrandLifecyclePort::State final {
   core::ResolvedLifecycleProviderOccurrenceDTO occurrence;
   RetainedExternallyManagedDomainSnapshotSource source;
   RetainedExternallyManagedPrimitiveDispatcher dispatcher;
+  std::optional<core::ControllableComponentId> component;
+  RetainedProviderDomainPrimitiveDispatcher provider_dispatcher;
   core::IClock *clock;
   core::Duration freshness_ns;
   std::uint64_t next_source_sequence{1U};
@@ -297,6 +299,28 @@ RetainedExternallyManagedBrandLifecyclePort::Create(
                                           std::move(dispatcher)))));
 }
 
+core::Result<std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort>>
+RetainedExternallyManagedBrandLifecyclePort::CreateForProviderDomain(
+    core::ControllableComponentId component,
+    core::ResolvedLifecycleProviderOccurrenceDTO provider_occurrence,
+    RetainedExternallyManagedDomainSnapshotSource snapshot_source,
+    core::IClock &clock, const core::Duration observation_freshness_ns,
+    RetainedProviderDomainPrimitiveDispatcher dispatcher) {
+  if (component.empty() || !dispatcher)
+    return reject<std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort>>(
+        "provider_domain_lifecycle_input_invalid",
+        "provider lifecycle requires its actual component and driver "
+        "dispatcher");
+  auto result =
+      Create(std::move(provider_occurrence), std::move(snapshot_source), clock,
+             observation_freshness_ns);
+  if (result.ok()) {
+    result.value()->state_->component = std::move(component);
+    result.value()->state_->provider_dispatcher = std::move(dispatcher);
+  }
+  return result;
+}
+
 core::Result<core::BrandLifecycleObservationDTO>
 RetainedExternallyManagedBrandLifecyclePort::Observe(
     const core::BrandLifecycleObservationQueryDTO &query) {
@@ -306,6 +330,8 @@ RetainedExternallyManagedBrandLifecyclePort::Observe(
   std::lock_guard lock(state_->mutex);
   const auto now = state_->clock->now();
   if (!query.locally_valid() || !exact_occurrence(state_->occurrence, query) ||
+      (state_->component &&
+       *state_->component != query.controllable_component_id) ||
       now < 0 ||
       now >
           std::numeric_limits<core::TimePoint>::max() - state_->freshness_ns) {
@@ -382,7 +408,9 @@ RetainedExternallyManagedBrandLifecyclePort::Dispatch(
     const core::BrandLifecyclePrimitiveIntentDTO &intent,
     const std::stop_token cancellation) {
   if (!intent.locally_valid() ||
-      !exact_occurrence(state_->occurrence, intent)) {
+      !exact_occurrence(state_->occurrence, intent) ||
+      (state_->component &&
+       *state_->component != intent.controllable_component_id)) {
     return brand_result(intent, "external_brand_lifecycle_intent_invalid",
                         "external lifecycle intent is invalid or stale");
   }
@@ -390,15 +418,18 @@ RetainedExternallyManagedBrandLifecyclePort::Dispatch(
     return brand_result(intent, "external_brand_lifecycle_cancelled",
                         "external lifecycle observation was cancelled");
   }
-  if (!state_->dispatcher) {
+  if (!state_->dispatcher && !state_->provider_dispatcher) {
     return brand_result(
         intent, "external_brand_lifecycle_observer_only",
         "ManyForge observes but does not mutate the external product lifecycle");
   }
   RetainedExternallyManagedPrimitiveOutcome outcome;
   try {
-    outcome = state_->dispatcher(state_->occurrence.control_domain_id,
-                                 intent.lifecycle_primitive_id, cancellation);
+    if (state_->provider_dispatcher)
+      outcome = state_->provider_dispatcher(intent, cancellation);
+    else
+      outcome = state_->dispatcher(state_->occurrence.control_domain_id,
+                                   intent.lifecycle_primitive_id, cancellation);
   } catch (...) {
     // An exception after a possible send cannot prove no effect.
     outcome = {core::LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain,

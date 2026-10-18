@@ -119,7 +119,7 @@ const DEFAULT_MANUAL_MOTION_SETTINGS: ManualMotionSettings = {
 export interface RobotControlState {
   status: ExecutionOwnerStatus | null;
   /** Stable addressed identities selected by this browser only. */
-  selectedComponentId: string | null;
+  selectedControllableComponentId: string | null;
   selectedMotionTargetId: string | null;
   selectedGripperTargetId: string | null;
   phase: RobotControlPhase;
@@ -151,7 +151,7 @@ export type RobotControlAction =
   | { type: 'status_resolved'; status: ExecutionOwnerStatus; cartesianDefaults?: ManualCartesianDefaults | null }
   | { type: 'status_refreshed'; status: ExecutionOwnerStatus; cartesianDefaults?: ManualCartesianDefaults | null }
   | { type: 'program_cartesian_defaults_changed'; defaults: ManualCartesianDefaults }
-  | { type: 'select_robot'; componentId: string; motionTargetId: string }
+  | { type: 'select_robot'; controllableComponentId: string; motionTargetId: string }
   | { type: 'select_tool'; gripperTargetId: string }
   | { type: 'manual_scope_changed' }
   | { type: 'load_failed'; error: string }
@@ -189,7 +189,7 @@ export type RobotControlAction =
 
 export const initialRobotControlState: RobotControlState = {
   status: null,
-  selectedComponentId: null,
+  selectedControllableComponentId: null,
   selectedMotionTargetId: null,
   selectedGripperTargetId: null,
   phase: 'loading',
@@ -241,17 +241,17 @@ function requireSelectedMotion(status: ExecutionOwnerStatus): {
 }
 
 export interface RobotTargetSelection {
-  componentId: string | null;
+  controllableComponentId: string | null;
   motionTargetId: string | null;
   gripperTargetId: string | null;
 }
 
 function selectedStateFields(selection: RobotTargetSelection): Pick<
   RobotControlState,
-  'selectedComponentId' | 'selectedMotionTargetId' | 'selectedGripperTargetId'
+  'selectedControllableComponentId' | 'selectedMotionTargetId' | 'selectedGripperTargetId'
 > {
   return {
-    selectedComponentId: selection.componentId,
+    selectedControllableComponentId: selection.controllableComponentId,
     selectedMotionTargetId: selection.motionTargetId,
     selectedGripperTargetId: selection.gripperTargetId,
   };
@@ -269,14 +269,14 @@ export function reconcileRobotTargetSelection(
     ...motions.map((target) => target.controllableComponentId),
     ...grippers.map((target) => target.controllableComponentId),
   ]);
-  const componentId = selection.componentId !== null && commandable.has(selection.componentId)
-    ? selection.componentId
+  const controllableComponentId = selection.controllableComponentId !== null && commandable.has(selection.controllableComponentId)
+    ? selection.controllableComponentId
     : motions[0]?.controllableComponentId ?? grippers[0]?.controllableComponentId ?? null;
-  if (componentId === null) {
-    return { componentId: null, motionTargetId: null, gripperTargetId: null };
+  if (controllableComponentId === null) {
+    return { controllableComponentId: null, motionTargetId: null, gripperTargetId: null };
   }
-  const ownMotions = motions.filter((target) => target.controllableComponentId === componentId);
-  const ownTools = grippers.filter((target) => target.controllableComponentId === componentId);
+  const ownMotions = motions.filter((target) => target.controllableComponentId === controllableComponentId);
+  const ownTools = grippers.filter((target) => target.controllableComponentId === controllableComponentId);
   const selectedMotion = ownMotions.find((target) => (
     target.commandTargetId === selection.motionTargetId
   )) ?? ownMotions[0];
@@ -284,7 +284,7 @@ export function reconcileRobotTargetSelection(
     target.commandTargetId === selection.gripperTargetId
   )) ?? ownTools[0];
   return {
-    componentId,
+    controllableComponentId,
     motionTargetId: selectedMotion?.commandTargetId ?? null,
     gripperTargetId: selectedTool?.commandTargetId ?? null,
   };
@@ -312,20 +312,20 @@ function observedGripperForSelection(
 
 /** Return the current owner snapshot projected onto one selected robot/tool. */
 export function selectedStatusForState(
-  state: Pick<RobotControlState, 'status' | 'selectedComponentId' | 'selectedMotionTargetId' | 'selectedGripperTargetId'>,
+  state: Pick<RobotControlState, 'status' | 'selectedControllableComponentId' | 'selectedMotionTargetId' | 'selectedGripperTargetId'>,
 ): ExecutionOwnerStatus | null {
   if (state.status === null) return null;
   const selection = reconcileRobotTargetSelection(state.status, {
-    componentId: state.selectedComponentId,
+    controllableComponentId: state.selectedControllableComponentId,
     motionTargetId: state.selectedMotionTargetId,
     gripperTargetId: state.selectedGripperTargetId,
   });
   const motion = motionTargetsForStatus(state.status).find((target) => (
-    target.controllableComponentId === selection.componentId
+    target.controllableComponentId === selection.controllableComponentId
     && target.commandTargetId === selection.motionTargetId
   )) ?? null;
   const gripper = gripperTargetsForStatus(state.status).find((target) => (
-    target.controllableComponentId === selection.componentId
+    target.controllableComponentId === selection.controllableComponentId
     && target.commandTargetId === selection.gripperTargetId
   )) ?? null;
   return {
@@ -674,13 +674,13 @@ function resolveStatus(
   cartesianDefaults: ManualCartesianDefaults | null = null,
 ): RobotControlState {
   const selection = reconcileRobotTargetSelection(status, {
-    componentId: state.selectedComponentId,
+    controllableComponentId: state.selectedControllableComponentId,
     motionTargetId: state.selectedMotionTargetId,
     gripperTargetId: state.selectedGripperTargetId,
   });
   const selectedStatus = selectedStatusForState({
     status,
-    selectedComponentId: selection.componentId,
+    selectedControllableComponentId: selection.controllableComponentId,
     selectedMotionTargetId: selection.motionTargetId,
     selectedGripperTargetId: selection.gripperTargetId,
   });
@@ -720,7 +720,7 @@ function resolveStatus(
     : resolvedOperation === null
       ? 'idle'
       : phaseForOperation(resolvedOperation);
-  const selectionChanged = state.selectedComponentId !== selection.componentId
+  const selectionChanged = state.selectedControllableComponentId !== selection.controllableComponentId
     || state.selectedMotionTargetId !== selection.motionTargetId
     || state.selectedGripperTargetId !== selection.gripperTargetId;
   const selectedBindingChanged = previousSelectedStatus !== null && (
@@ -907,14 +907,14 @@ function changeSelection(
   selection: RobotTargetSelection,
 ): RobotControlState {
   if (state.status === null
-    || (state.selectedComponentId === selection.componentId
+    || (state.selectedControllableComponentId === selection.controllableComponentId
       && state.selectedMotionTargetId === selection.motionTargetId
       && state.selectedGripperTargetId === selection.gripperTargetId)) {
     return state;
   }
   const selected = selectedStatusForState({
     status: state.status,
-    selectedComponentId: selection.componentId,
+    selectedControllableComponentId: selection.controllableComponentId,
     selectedMotionTargetId: selection.motionTargetId,
     selectedGripperTargetId: selection.gripperTargetId,
   });
@@ -980,7 +980,7 @@ export function robotControlReducer(
     case 'select_robot': {
       if (state.status === null) return state;
       const selection = reconcileRobotTargetSelection(state.status, {
-        componentId: action.componentId,
+        controllableComponentId: action.controllableComponentId,
         motionTargetId: action.motionTargetId,
         gripperTargetId: state.selectedGripperTargetId,
       });
@@ -989,7 +989,7 @@ export function robotControlReducer(
     case 'select_tool': {
       if (state.status === null) return state;
       const selection = reconcileRobotTargetSelection(state.status, {
-        componentId: state.selectedComponentId,
+        controllableComponentId: state.selectedControllableComponentId,
         motionTargetId: state.selectedMotionTargetId,
         gripperTargetId: action.gripperTargetId,
       });

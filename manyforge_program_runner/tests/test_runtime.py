@@ -286,6 +286,29 @@ def test_program_component_readiness_does_not_block_an_unbound_peer() -> None:
     )
 
 
+def test_logic_only_binding_has_no_component_to_check() -> None:
+    class NoComponents:
+        def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
+            raise AssertionError(f"unexpected component read: {component_id}")
+
+    runtime = ProgramRuntime.__new__(ProgramRuntime)
+    runtime._headless = NoComponents()  # type: ignore[assignment]
+    applied = {
+        "retained_bundle_id": _DIGEST_A,
+        "graph_revision": _DIGEST_B,
+        "program_binding": {"component_role_bindings": []},
+    }
+    runtime._verify_required_components_active(applied)
+
+    # An absent or non-list table still fails closed; only an empty list is
+    # the logic-only shape.
+    for binding in ({}, {"component_role_bindings": None}, {"component_role_bindings": [{}] * 4097}):
+        malformed = {**applied, "program_binding": binding}
+        with pytest.raises(ProgramRunnerError) as refused:
+            runtime._verify_required_components_active(malformed)
+        assert refused.value.code == "program_run_binding_invalid"
+
+
 def test_disabled_required_component_rejects_program_before_claim(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -418,8 +441,17 @@ class _Owner:
         self.reads += 1
         return self.rows[program_run_id]
 
-    def intervention(self, _program_run_id: str):
+    def intervention(self, _program_run_id: str, *, node_attempt_id=None):
         return None
+
+    def failure_holds(self, _program_run_id: str):
+        return ()
+
+    def hold_motion_groups(self, _program_run_id: str, _node_instance_id: str):
+        return ("all",), "all"
+
+    def take_node_history_events(self, _program_run_id: str):
+        return ()
 
     def take_diagnostic(self, _program_run_id: str):
         return None
@@ -1653,7 +1685,7 @@ def _bypass_reset_scene_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class _PreparedRunAdmission:
     def __init__(self) -> None:
-        self.program = SimpleNamespace(to_dict=_timer_only_program)
+        self.program = SimpleNamespace(to_dict=_timer_only_program, interrupt_condition_keys=())
 
     def port_context(self, program_run_id: str) -> object:
         return SimpleNamespace(
@@ -5875,6 +5907,12 @@ def _simulation_lane_fixture(*, lanes=("mock", "isaac"), simulation=None, admiss
     target.update(target_role_id="other_arm", component_role_id="other_robot",
                   controllable_component_id="robot.other")
     binding["target_role_bindings"].append(target)
+    # A model-free Mock I/O device sharing the ROS runtime unit, as Applied.
+    binding["component_role_bindings"].append({**deepcopy(component), "component_role_id": "station_device",
+                                               "controllable_component_id": "station_io", "model_role_bindings": []})
+    binding["target_role_bindings"].append({**deepcopy(target), "target_role_id": "station",
+        "component_role_id": "station_device", "controllable_component_id": "station_io",
+        "command_target_id": "io"})
     graph = {
         "schema_version": "manyforge.manager_graph_projection.v1",
         "source": {"available": True, "freshness": "fresh", "known_gaps": [],
@@ -5883,7 +5921,13 @@ def _simulation_lane_fixture(*, lanes=("mock", "isaac"), simulation=None, admiss
         "cell_graph": {"graph_revision": _DIGEST_B,
             "controllable_components": [
                 {"controllable_component_id": "lite6_arm", "runtime_unit_ids": ["cell.ros"]},
-                {"controllable_component_id": "robot.other", "runtime_unit_ids": ["cell.ros"]}],
+                {"controllable_component_id": "robot.other", "runtime_unit_ids": ["cell.ros"]},
+                {"controllable_component_id": "station_io", "runtime_unit_ids": ["cell.ros"]}],
+            "control_domains": [{"control_domain_id": "io.provider.station", "kind": "provider",
+                                 "runtime_unit_ids": ["cell.ros"],
+                                 "provider": {"controllable_component_id": "station_io",
+                                              "provider_runtime_unit_id": "cell.ros"}}],
+            "control_bindings": [],
             "runtime_units": [{"runtime_unit_id": "cell.ros",
                 "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
                 "configuration": {"mode": "commanded_sim", "controller_profiles": [
@@ -6179,6 +6223,164 @@ def test_used_isaac_target_requires_but_cannot_supply_an_unconfigured_simulator_
     try:
         assert _simulation_lane_requirement(runtime, binding, _simulation_lane_program("arm")) == (
             True, AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
+    finally:
+        runtime.shutdown()
+
+
+def _io_station_program(*motion_roles: str) -> dict[str, Any]:
+    """Mock station_io I/O nodes (trial d) plus optional motion on robot roles."""
+    io = [{"node_id": node_id, "instance_id": f"io.{index}",
+           "parameters": {"target_role": "station", "resource_role": "clamp", **extra}, "children": []}
+          for index, (node_id, extra) in enumerate((("io.set_output", {"value": True}),
+                                                    ("io.get_input", {}), ("io.check_input", {}),
+                                                    ("io.wait_for_input", {})))]
+    program = _simulation_lane_program(*motion_roles)
+    program["tree"]["children"] = io + program["tree"]["children"]
+    program["target_roles"]["station"] = {}
+    return program
+
+
+@pytest.mark.parametrize("lanes", [("mock", "mock"), ("isaac", "isaac")])
+def test_io_provider_target_needs_no_ros_controller_profile(lanes):
+    # station_io shares the ROS runtime unit but owns a provider-kind domain:
+    # no controller profile, no simulator lane (CCLC activation gates it).
+    runtime, headless, binding = _simulation_lane_fixture(lanes=lanes, simulation=_SimulationControl())
+    try:
+        assert _simulation_lane_requirement(runtime, binding, _io_station_program()) == (
+            False, AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
+        assert headless.graph_reads == 1
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize(("lanes", "motion_role", "required"), [
+    (("mock", "isaac"), "arm", False),
+    (("isaac", "mock"), "arm", True),
+    (("mock", "isaac"), "other_arm", True),
+])
+def test_mixed_motion_and_io_program_selects_only_the_controller_target(lanes, motion_role, required):
+    runtime, headless, binding = _simulation_lane_fixture(lanes=lanes, simulation=_SimulationControl())
+    try:
+        assert _simulation_lane_required(runtime, binding, _io_station_program(motion_role)) is required
+        # The controller target keeps its exact unique-profile requirement.
+        rows = headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"]
+        component = {"arm": "lite6_arm", "other_arm": "robot.other"}[motion_role]
+        rows[:] = [row for row in rows if row["controllable_component_id"] != component]
+        with pytest.raises(ProgramRunOwnerError, match="no unique ROS controller profile"):
+            _simulation_lane_required(runtime, binding, _io_station_program(motion_role))
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("case", ["no_provider_domain", "controller_kind_domain"])
+def test_io_exemption_follows_provider_domain_kind_not_role_or_node_name(case):
+    runtime, headless, binding = _simulation_lane_fixture()
+    domain = headless.graph["cell_graph"]["control_domains"][0]
+    if case == "no_provider_domain":
+        headless.graph["cell_graph"]["control_domains"] = []
+    else:
+        del domain["kind"]  # the controller alternative carries no kind on the wire
+    try:
+        with pytest.raises(ProgramRunOwnerError, match="no unique ROS controller profile"):
+            _simulation_lane_required(runtime, binding, _io_station_program())
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize(("case", "reason"), [
+    ("missing_unit", "runtime is not current"),
+    ("duplicate_unit", "runtime is not current"),
+    ("empty_runtime_profile", "no runtime profile"),
+])
+def test_io_provider_still_passes_exact_runtime_unit_checks(case, reason):
+    runtime, headless, binding = _simulation_lane_fixture()
+    graph = headless.graph["cell_graph"]
+    station = next(row for row in graph["controllable_components"]
+                   if row["controllable_component_id"] == "station_io")
+    if case == "missing_unit":
+        station["runtime_unit_ids"] = ["missing.unit"]
+    elif case == "duplicate_unit":
+        graph["runtime_units"].append(deepcopy(graph["runtime_units"][0]))
+    else:
+        station["runtime_unit_ids"] = ["io.unit"]
+        graph["runtime_units"].append({"runtime_unit_id": "io.unit", "runtime_profile_id": "",
+                                       "configuration": {}})
+    try:
+        with pytest.raises(ProgramRunOwnerError, match=reason):
+            _simulation_lane_required(runtime, binding, _io_station_program())
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("profile", [None, "mock"])
+def test_mixed_provider_and_controller_component_keeps_controller_profile_check(profile):
+    runtime, headless, binding = _simulation_lane_fixture()
+    graph = headless.graph["cell_graph"]
+    # station_io also owns a controller binding: it is not provider-only.
+    graph["control_bindings"].append({"control_binding_id": "station_io.controller",
+                                      "controllable_component_id": "station_io"})
+    if profile is not None:
+        graph["runtime_units"][0]["configuration"]["controller_profiles"].append(
+            {"controllable_component_id": "station_io", "mock_profile": "station_mock"})
+    try:
+        if profile is None:
+            with pytest.raises(ProgramRunOwnerError, match="no unique ROS controller profile"):
+                _simulation_lane_required(runtime, binding, _io_station_program())
+        else:
+            assert _simulation_lane_required(runtime, binding, _io_station_program()) is False
+    finally:
+        runtime.shutdown()
+
+
+def test_motion_target_without_profile_still_refused_with_controller_profile_reason():
+    runtime, headless, binding = _simulation_lane_fixture()
+    headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"][0][
+        "controllable_component_id"] = "foreign.component"
+    try:
+        with pytest.raises(ProgramRunOwnerError, match="no unique ROS controller profile"):
+            _simulation_lane_required(runtime, binding, _simulation_lane_program("arm"))
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize(("program_kind", "reason"), [
+    ("io_only", "reached Applied Program run admission"),
+    ("motion_without_profile", "no unique ROS controller profile"),
+])
+def test_run_start_admits_io_only_program_past_simulation_dependency(monkeypatch, tmp_path, program_kind, reason):
+    admission = _Admission()
+    journal = ProgramCycleJournal(tmp_path / "io-only.sqlite3", owner_epoch="program-runner.test")
+    runtime, headless, binding = _simulation_lane_fixture(lanes=("mock", "mock"),
+        simulation=_SimulationControl(), admission=admission, journal=journal)
+    if program_kind == "io_only":
+        program = _io_station_program()
+    else:
+        program = _simulation_lane_program("arm")
+        del headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"][0]
+    applied = _Headless.program_applied(headless)
+    applied.update(program=program, program_binding=binding)
+    monkeypatch.setattr(headless, "program_applied", lambda: deepcopy(applied))
+    reached = []
+
+    def run_admission(*_args, **kwargs):
+        reached.append(kwargs["owner_availability"]["simulator_control"])
+        raise ProgramRunOwnerError("reached Applied Program run admission")
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("no Run effect is expected in this admission probe")
+
+    monkeypatch.setattr(runtime._host, "start_run", forbidden)  # noqa: SLF001
+    monkeypatch.setattr(runtime, "_prepare_run_scene", forbidden)
+    monkeypatch.setattr("manyforge_program_runner.runtime.build_applied_program_run_admission", run_admission)
+    runtime.start()
+    try:
+        with pytest.raises(ProgramRunnerError) as refused:
+            runtime.start_run(_start_request())
+        assert refused.value.code == "program_run_admission_failed"
+        assert reason in str(refused.value)
+        assert reached == ([AvailabilityFact(False, ("program_runtime_owner_unavailable",))]
+                           if program_kind == "io_only" else [])
+        assert journal.read().state == "idle_after_reset" and admission.claims == []
     finally:
         runtime.shutdown()
 
@@ -6781,5 +6983,118 @@ def test_native_position_errors_preserve_known_vs_unknown_effect_policy(monkeypa
             with pytest.raises(ProgramRunnerError):
                 runtime.reset_cycle(request.model_copy(update={"request_id": "fresh.confirmation"}))
             assert len(effects) == 1
+    finally:
+        runtime.shutdown()
+
+
+def test_continue_closes_releases_and_fails_the_held_node(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+    _bypass_scene_preparation(monkeypatch)
+    runtime, journal, _admission = _reconcile_runtime(
+        tmp_path,
+        journal_owner_epoch="runner.1",
+        runtime_owner_epoch="runner.1",
+        inventory={},
+    )
+    owner = _Owner()
+    host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    runtime._owner, runtime._host = owner, host
+    runtime.start()
+    runtime.start_run(_start_request())
+    owner.rows["program-cycle.1"].capture.node_policy_by_instance_id = {
+        "move.2": SimpleNamespace(
+            recovery_policy={"allow_intervention": True, "max_retries": 1}
+        )
+    }
+    runtime._controls("program-cycle.1").note_retry("move.2")  # Retries spent.
+    focus = SimpleNamespace(
+        identity=SimpleNamespace(
+            program_run_id="program-cycle.1", node_instance_id="move.1", node_attempt_id="attempt.1"
+        ),
+        owner_task_id="operation.1",
+        policy_parameter="recovery_policy",
+    )
+    second = SimpleNamespace(
+        identity=SimpleNamespace(
+            program_run_id="program-cycle.1", node_instance_id="move.2", node_attempt_id="attempt.2"
+        ),
+        owner_task_id="operation.2",
+        policy_parameter="recovery_policy",
+    )
+    lookups: list[Any] = []
+
+    def intervention(_run, *, node_attempt_id=None):
+        lookups.append(node_attempt_id)
+        return second if node_attempt_id == "attempt.2" else focus
+
+    owner.intervention = intervention
+    focus_offer = {"offer_id": _DIGEST_A, "offer_revision": 1, "node_attempt_id": "attempt.1",
+                   "actions": [{"action_id": "retry_runtime_step", "enabled": True}]}
+    second_offer = {"offer_id": _DIGEST_B, "offer_revision": 2, "node_attempt_id": "attempt.2",
+                    "actions": [{"action_id": "continue_with_failure", "enabled": True}]}
+    runtime._recovery_offer = lambda *_args, **_kwargs: deepcopy(focus_offer)
+    runtime._recovery_offers = lambda *_args, **_kwargs: [
+        {"motion_group_ids": ["tools"], "intervention_stop_scope": "all", "offer": deepcopy(second_offer)}
+    ]
+    calls: list[Any] = []
+
+    def continue_failure_pause(run_id, **kwargs):
+        calls.append(("continue_failure_pause", kwargs["node_attempt_id"], kwargs["request_id"]))
+        return owner.read(run_id)
+
+    def resume_recovery(run_id, **kwargs):
+        calls.append(("resume_recovery", kwargs["node_attempt_id"], kwargs["action"]))
+        return owner.read(run_id)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Continue is neither a Retry nor an owner action")
+
+    owner.continue_failure_pause = continue_failure_pause
+    owner.retry_failure_pause = forbidden
+    owner.apply_owner_recovery = forbidden
+    host.resume_recovery = resume_recovery
+    request = CycleRecoveryActionRequest.model_validate(
+        {
+            "request_id": "continue.1",
+            "request_owner_epoch": "client.1",
+            "source_label": "test",
+            "expected_owner_epoch": runtime.owner_epoch,
+            "offer_id": second_offer["offer_id"],
+            "offer_revision": second_offer["offer_revision"],
+            "action_id": "continue_with_failure",
+        }
+    )
+    try:
+        # Continue releases the hold's groups like Retry, so the same
+        # operator-alarm attention gate refuses it before any owner effect.
+        refusal = ProgramRunOwnerError("unacknowledged operator alarms gate this motion")
+        refusal.code = "unacknowledged_operator_alarms"  # type: ignore[attr-defined]
+        owner.attention_refusal = refusal
+        with pytest.raises(ProgramRunnerError) as refused:
+            runtime.apply_recovery_action(request)
+        assert refused.value.code == "unacknowledged_operator_alarms"
+        assert owner.attention_checks == [("program-cycle.1", "move.2", "continue.1")]
+        assert calls == []
+        assert journal.read().state == "running"
+        assert not journal.read().reconciliation_required
+        owner.attention_refusal = None
+        lookups.clear()
+        request = request.model_copy(update={"request_id": "continue.2"})
+        result = runtime.apply_recovery_action(request)
+        assert owner.attention_checks[-1] == ("program-cycle.1", "move.2", "continue.2")
+        # The offer id selected the second hold, not the focused one.
+        assert lookups == ["attempt.2"]
+        assert calls == [
+            ("continue_failure_pause", "attempt.2", "continue.2"),
+            ("resume_recovery", "attempt.2", "manual_failure"),
+        ]
+        assert result["cycle_resumed"] is True
+        assert result["owner_result"] == {"accepted": True, "action": "continue_with_failure"}
+        # Continue counts no Retry, even with the Retry budget spent.
+        assert runtime._controls("program-cycle.1").retry_count("move.2") == 1
+        assert not journal.read().reconciliation_required
     finally:
         runtime.shutdown()

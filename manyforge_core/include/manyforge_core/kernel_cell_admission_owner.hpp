@@ -5,6 +5,7 @@
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/time/iclock.hpp>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -13,6 +14,9 @@
 #include <vector>
 
 namespace manyforge::core {
+
+class IIoSignalService;
+class ResourceAddressedExecutionKernel;
 
 using CellAdmissionInterventionValidator = std::function<Result<void>(
     const CellAdmissionClaimIntentDTO&, const std::optional<CellAdmissionClaimDTO>&)>;
@@ -23,6 +27,9 @@ using CellAdmissionApplyBringUpValidator = std::function<Result<void>(
 using CellAdmissionConfigurationApplyValidator = std::function<Result<void>(
     const CellAdmissionClaimIntentDTO&, std::span<const CellAdmissionClaimDTO>,
     const CellAdmissionReadinessSnapshotDTO&, const RuntimeEpoch&)>;
+/// Private exact local I/O resynchronization; no public request supplies this
+/// validator. Existing held claims and health remain the single authority.
+using CellAdmissionIoOutputRecoveryValidator = CellAdmissionConfigurationApplyValidator;
 using CellAdmissionConfigurationApplySuccessValidator =
     std::function<Result<void>(const CellAdmissionClaimDTO&, const CellAdmissionClaimReleaseDTO&,
                                std::span<const CellAdmissionClaimDTO>)>;
@@ -62,7 +69,52 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
           CellAdmissionClaimGeneration(0U),
       CellAdmissionProgramNodeValidator program_node_validator = {},
       std::function<bool()> stop_fault_active = {},
-      CellAdmissionProgramResetStatusSource program_reset_status_source = {});
+      CellAdmissionProgramResetStatusSource program_reset_status_source = {},
+      std::function<Result<void>(std::shared_ptr<IIoSignalService>*)> required_health_loss_observer = {});
+
+  /// Process-local health/current-cycle admission under this existing owner's
+  /// mutex. Kernel acquires it before state_mutex_ and holds it only across
+  /// bounded snapshot admission, never journal/host I/O or Stop dispatch.
+  class ProgramBlackboardAdmissionGuard final {
+   public:
+    ProgramBlackboardAdmissionGuard(ProgramBlackboardAdmissionGuard&&) = default;
+    ProgramBlackboardAdmissionGuard& operator=(ProgramBlackboardAdmissionGuard&&) = default;
+    ProgramBlackboardAdmissionGuard(const ProgramBlackboardAdmissionGuard&) = delete;
+    ProgramBlackboardAdmissionGuard& operator=(const ProgramBlackboardAdmissionGuard&) = delete;
+    [[nodiscard]] const ProgramCycleStatusDTO& cycle() const noexcept { return cycle_; }
+    [[nodiscard]] const RetainedBundleId& retained_bundle_id() const noexcept { return bundle_; }
+
+   private:
+    friend class KernelCellAdmissionOwner;
+    ProgramBlackboardAdmissionGuard(std::unique_lock<std::mutex> lock, ProgramCycleStatusDTO cycle,
+                                    RetainedBundleId bundle)
+        : lock_(std::move(lock)), cycle_(std::move(cycle)), bundle_(std::move(bundle)) {}
+    std::unique_lock<std::mutex> lock_;
+    ProgramCycleStatusDTO cycle_;
+    RetainedBundleId bundle_;
+  };
+  [[nodiscard]] Result<ProgramBlackboardAdmissionGuard> AcquireProgramBlackboardAdmission() const;
+
+  /// Same owner-held managed-product currentness cut, without importing the
+  /// Program/Runner/cycle permissions of blackboard publication. Global rules
+  /// may exist without an Applied Program or Run. No I/O/effect is permitted
+  /// while this guard is retained.
+  class ManagedProductAdmissionGuard final {
+   public:
+    ManagedProductAdmissionGuard(ManagedProductAdmissionGuard&&) = default;
+    ManagedProductAdmissionGuard& operator=(ManagedProductAdmissionGuard&&) = default;
+    ManagedProductAdmissionGuard(const ManagedProductAdmissionGuard&) = delete;
+    ManagedProductAdmissionGuard& operator=(const ManagedProductAdmissionGuard&) = delete;
+    [[nodiscard]] const RetainedBundleId& retained_bundle_id() const noexcept { return bundle_; }
+
+   private:
+    friend class KernelCellAdmissionOwner;
+    ManagedProductAdmissionGuard(std::unique_lock<std::mutex> lock, RetainedBundleId bundle)
+        : lock_(std::move(lock)), bundle_(std::move(bundle)) {}
+    std::unique_lock<std::mutex> lock_;
+    RetainedBundleId bundle_;
+  };
+  [[nodiscard]] Result<ManagedProductAdmissionGuard> AcquireManagedProductAdmission() const;
 
   /// Process-local proof; only this owner can construct it. Journal I/O is
   /// completed before the composing Kernel takes submission/admission locks.
@@ -111,7 +163,8 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   /// Sticky owner-cache storage uncertainty; status only, cleared by restart.
   [[nodiscard]] std::optional<ErrorDTO> persistence_outcome_unknown() const;
   [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
-      const CellAdmissionReadinessSnapshotDTO& snapshot) override;
+      const CellAdmissionReadinessSnapshotDTO& snapshot,
+      std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr) override;
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent) override;
   /// Process-local Kernel composition: validate its freshly resolved manual
@@ -127,6 +180,12 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireSelectedBringUpClaim(
       const CellAdmissionClaimIntentDTO& intent,
       const CellAdmissionInterventionValidator& validate_offer);
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireIoOutputRecoveryLifecycleClaim(
+      const CellAdmissionClaimIntentDTO& intent,
+      const CellAdmissionIoOutputRecoveryValidator& validate);
+  [[nodiscard]] Result<void> ValidateHeldIoOutputRecoveryLifecycleClaim(
+      const LifecycleTransactionId& transaction,
+      const CellAdmissionIoOutputRecoveryValidator& validate) const;
   /// Private Q91 parent acquisition. The composing Kernel must positively
   /// validate its exact captured plan; ordinary Manager Apply is unchanged.
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireApplyBringUpClaim(
@@ -158,13 +217,18 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] Result<void> Publish(const ManagerLivenessObservationDTO& observation) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
       const ManagerLivenessRequiredSetDTO& required_set);
-  [[nodiscard]] bool LatchManagerLivenessLoss(const ManagerLivenessLossIntentDTO& intent) noexcept;
+  [[nodiscard]] bool LatchManagerLivenessLoss(
+      const ManagerLivenessLossIntentDTO& intent,
+      std::optional<ErrorDTO>* source_invalidation_error = nullptr) noexcept;
 
   [[nodiscard]] bool has_unresolved_claims() const;
   [[nodiscard]] bool has_unresolved_claims_except(CellAdmissionOwnerRoleDTO owner_role) const;
   /// Kernel-owned attachment barrier; Manager readiness cannot clear it.
   [[nodiscard]] Result<void> SetRouteRecoveryPending(bool pending);
   [[nodiscard]] bool route_recovery_pending() const;
+  /// No I/O: validate provenance before a composing owner retains a fault.
+  [[nodiscard]] Result<void> ValidateProgramRunnerContactLossSource(
+      const ProgramRunnerContactLossDTO& loss) const;
   /// Current held authority, excluding released and reconciled predecessors.
   [[nodiscard]] std::optional<CellAdmissionClaimDTO> held_claim(
       CellAdmissionClaimKindDTO kind) const;
@@ -182,18 +246,33 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   manual_owner_reconciliation_request() const;
 
  private:
+  friend class ResourceAddressedExecutionKernel;
+  // The existing owner invalidates under its mutex; only Kernel carries this
+  // ephemeral affected-service pin to a post-lock scheduler notification.
+  [[nodiscard]] Result<void> Publish(
+      const ManagerLivenessObservationDTO& observation,
+      std::shared_ptr<IIoSignalService>* actual_retired_service);
+  [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
+      const ManagerLivenessRequiredSetDTO& required_set,
+      std::shared_ptr<IIoSignalService>* actual_retired_service);
+  [[nodiscard]] bool LatchManagerLivenessLoss(
+      const ManagerLivenessLossIntentDTO& intent,
+      std::optional<ErrorDTO>* source_invalidation_error,
+      std::shared_ptr<IIoSignalService>* actual_retired_service) noexcept;
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireClaim(
       const CellAdmissionClaimIntentDTO& intent,
       const CellAdmissionInterventionValidator& validate_offer,
       bool selected_apply_bring_up = false,
       const CellAdmissionConfigurationApplyValidator& configuration_apply_validator = {},
-      const PreparedProgramResetStatus* reset_proof = nullptr);
+      const PreparedProgramResetStatus* reset_proof = nullptr,
+      const CellAdmissionIoOutputRecoveryValidator& io_output_recovery_validator = {});
   struct Entry final {
     CellAdmissionClaimDTO claim;
     std::optional<CellAdmissionClaimReleaseDTO> release;
     std::optional<CellAdmissionReconcileSettlementDTO> reconcile_settlement;
   };
 
+  [[nodiscard]] bool IoOutputRecoveryDependenciesReadyLocked() const noexcept;
   [[nodiscard]] AuthoringAdmissionDTO AdmissionLocked() const noexcept;
   [[nodiscard]] bool NonCycleReadinessLocked() const noexcept;
   [[nodiscard]] std::optional<std::string_view> LifecycleBlockingReasonLocked() const noexcept;
@@ -237,6 +316,10 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   CellAdmissionReconcileValidator reconcile_validator_;
   CellAdmissionProgramNodeValidator program_node_validator_;
   std::function<bool()> stop_fault_active_;
+  // Fixed at Kernel composition and destroyed with this owner. Runs while
+  // mutex_ is held: bounded state -> signals invalidation only, with no owner
+  // reentry, journal/host I/O or Stop dispatch.
+  std::function<Result<void>(std::shared_ptr<IIoSignalService>*)> required_health_loss_observer_;
   bool published_stop_fault_active_{};
   mutable std::mutex mutex_;
   mutable std::mutex liveness_transition_mutex_;

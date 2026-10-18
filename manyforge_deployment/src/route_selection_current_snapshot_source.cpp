@@ -84,8 +84,12 @@ VerifiedRouteSelectionCurrentSnapshotSource::
             });
   const auto &bundle = retained_bundle_.value();
   const auto &graph = bundle.cell_graph;
+  // Generic provider domains have no controller source. Every actual
+  // controller alternative still requires the existing physical inventory.
   const bool empty_physical_graph =
-      graph.controllable_components.empty() && graph.control_domains.empty() &&
+      std::none_of(
+          graph.control_domains.begin(), graph.control_domains.end(),
+          [](const auto &domain) { return domain.provider() == nullptr; }) &&
       graph.control_bindings.empty() &&
       bundle.desired_control_configurations.empty();
   if ((controller_sources_.empty() && !empty_physical_graph) ||
@@ -153,9 +157,9 @@ VerifiedRouteSelectionCurrentSnapshotSource::ReadCurrentRouteClosure(
       *retained_desired != desired_configuration ||
       domain->control_domain_revision !=
           desired_configuration.control_domain_revision ||
-      domain->controller_topology_id !=
+      domain->controller().controller_topology_id !=
           desired_configuration.controller_topology_id ||
-      domain->topology_revision != desired_configuration.topology_revision) {
+      domain->controller().topology_revision != desired_configuration.topology_revision) {
     return fail<core::RouteSelectionCurrentSnapshotDTO>(
         "desired_domain_not_retained",
         "desired configuration is not the exact retained domain candidate");

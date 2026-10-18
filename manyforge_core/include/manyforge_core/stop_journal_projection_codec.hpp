@@ -7,7 +7,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kStopJournalAcceptanceProjectionApiVersion =
-    "manyforge.internal.stop-journal-acceptance-projection.v6";
+    "manyforge.internal.stop-journal-acceptance-projection.v8";
 inline constexpr std::string_view kStopJournalTerminalProjectionApiVersion =
     "manyforge.internal.stop-journal-terminal-projection.v3";
 inline constexpr std::string_view kStopJournalSurveillanceProjectionApiVersion =

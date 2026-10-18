@@ -14,11 +14,14 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
-#include <manyforge_core/stop_fault_recovery.hpp>
+#include <manyforge_core/io_output_participant_engine.hpp>
+#include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
+#include <manyforge_core/stop_fault_recovery.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/command_schema.hpp>
@@ -534,6 +537,293 @@ StopReadinessFor(const core::RuntimeParticipantBinding &binding,
       "stop_fault_latched",
       {}};
   return status;
+}
+
+class NativeNoWriteOutputProvider final : public core::IIoOutputProvider {
+public:
+  core::IoOutputEvidence StrongestOutputEvidence() const noexcept override {
+    return core::IoOutputEvidence::kSourceAccepted;
+  }
+  core::Result<core::IoOutputObservationDTO>
+  SubmitOutput(const core::IoOutputWriteRequestDTO &) override {
+    ++submissions;
+    return core::Result<core::IoOutputObservationDTO>::Err(
+        core::ErrorCode::kUnsupportedCapability);
+  }
+  core::Result<core::IoOutputObservationDTO>
+  ObserveOutputResult(const core::IoOutputCommandIdentityDTO &) const override {
+    return core::Result<core::IoOutputObservationDTO>::Err(
+        core::ErrorCode::kUnsupportedCapability);
+  }
+  core::Result<void>
+  RetireOutput(const core::IoOutputCommandIdentityDTO &) override {
+    return core::Result<void>::Ok();
+  }
+  std::size_t submissions{};
+};
+
+core::RuntimeParticipantBinding NativeLogicalOutputBinding() {
+  auto value = qualification_fixture::make_binding().value();
+  const auto physical = *value.control_path;
+  value.capability_id = core::CapabilityId("io.gpio.set_output");
+  const auto *capability =
+      core::find_builtin_capability_definition("io.gpio.set_output");
+  value.capability_definition_revision = core::CapabilityDefinitionRevision(
+      std::string(capability->capability_definition_revision));
+  const auto schema = core::builtin_io_signal_write_command_schema();
+  value.command_schema = core::ProgramCommandSchemaRefDTO{
+      schema.command_schema_id, schema.command_schema_revision};
+  value.model_bindings.clear();
+  value.model_groups.clear();
+  value.frame_bindings.clear();
+  value.resources.clear();
+  value.collision_body_bindings.clear();
+  value.contact_grasp_bindings.clear();
+  value.supporting_capability_provider_paths.clear();
+  value.control_path.reset();
+  const auto digest = [](char c) {
+    return std::string("sha256:") + std::string(64U, c);
+  };
+  core::ResolvedLifecycleProviderOccurrenceDTO provider{
+      core::ControlDomainId("domain.output"),
+      core::ControlDomainRevision(digest('1')),
+      physical.provider_instance_id,
+      physical.provider_manifest_id,
+      physical.provider_manifest_revision,
+      physical.provider_runtime_unit_id,
+      physical.provider_runtime_epoch,
+      core::ContentDigest(digest('2'))};
+  value.capability_provider_path = core::RuntimeCapabilityProviderPathDTO{
+      value.capability_id,
+      value.capability_definition_revision,
+      core::CapabilityProviderBindingId("output.binding"),
+      core::CapabilityProviderBindingRevision(digest('3')),
+      provider.provider_instance_id,
+      provider.provider_manifest_id,
+      provider.provider_manifest_revision,
+      provider.provider_runtime_unit_id,
+      provider.provider_runtime_epoch};
+  core::IoSignalDescriptorDTO descriptor{
+      {value.controllable_component_id, "lamp"},
+      core::InterruptSourceId("outputs"),
+      core::IoSignalValueType::kBoolean,
+      core::IoSignalDirection::kOutput,
+      core::IoSignalUpdateMode::kChangeOnly,
+      core::IoTransitionCapability::kSampledOnly,
+      {core::IoFreshnessMode::kProviderValidity, {}},
+      core::ResourceId("actual.output.channel")};
+  const auto descriptor_digest =
+      core::ComputeIoSignalDescriptorDigest(descriptor);
+  if (!descriptor_digest.ok())
+    throw std::logic_error(descriptor_digest.error().message);
+  value.io_output_binding = core::RuntimeIoOutputBindingDTO{
+      core::ResourceRoleId("lamp"),
+      descriptor,
+      descriptor_digest.value(),
+      core::ComponentLifecycleGeneration(3U),
+      provider,
+      core::ContentDigest(digest('4')),
+      core::IoOutputCompletionPolicyDTO(core::IoOutputImmediateDTO{})};
+  auto sealed = core::verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok())
+    throw std::logic_error(sealed.error().message);
+  return std::move(sealed.value());
+}
+
+TEST(RetainedNativeCellRuntimeTest,
+     LogicalOutputRegistrationUsesActualChannelWithoutPhysicalStopSource) {
+  const auto binding = NativeLogicalOutputBinding();
+  auto clock = std::make_shared<WallClock>();
+  NativeNoWriteOutputProvider provider;
+  core::IoOutputParticipantEngine engine(provider, *clock);
+  auto registration = TestRegistration(binding, &engine);
+  registration.prepared_motion_engine = &engine;
+  auto input = EmptyCellInput();
+  input.clock = clock;
+  input.scheduler = std::make_shared<SimpleScheduler>();
+  input.operation_journal_path = TemporaryJournalPath();
+  const auto journal_path = input.operation_journal_path;
+  input.participant_registrations = {registration};
+  input.kernel_config.graph_revision = binding.value().graph_revision;
+  input.kernel_config.participant_resolver = UnusedResolver();
+  {
+    RetainedNativeCellRuntime cell(std::move(input));
+    ASSERT_EQ(cell.participant_registrations().size(), 1U);
+    EXPECT_TRUE(cell.participant_registrations()
+                    .front()
+                    .binding.value()
+                    .resources.empty());
+    EXPECT_FALSE(cell.participant_registrations().front().stop_readiness);
+    EXPECT_TRUE(cell.stop_surveillance_owner()->SnapshotSources().empty());
+    const auto slots = cell.addressed_kernel().resource_snapshot();
+    ASSERT_EQ(slots.size(), 1U);
+    EXPECT_EQ(slots.front().resource_id,
+              core::ResourceId("actual.output.channel"));
+    const auto readiness = cell.addressed_kernel().component_command_readiness(
+        binding.value().controllable_component_id);
+    ASSERT_TRUE(readiness.ok());
+    EXPECT_FALSE(readiness.value().command_eligible);
+    EXPECT_EQ(provider.submissions, 0U);
+  }
+  RemoveJournalFiles(journal_path);
+}
+
+TEST(RetainedNativeCellRuntimeTest,
+     LogicalOutputDoesNotWaivePhysicalOrExplicitStopSourceRequirements) {
+  NativeNoWriteOutputProvider provider;
+  WallClock clock;
+  core::IoOutputParticipantEngine engine(provider, clock);
+  const auto output = TestRegistration(NativeLogicalOutputBinding(), &engine);
+  CellTestExecutionEngine physical_engine;
+  const auto physical =
+      TestRegistration(qualification_fixture::make_binding(), &physical_engine);
+  const auto bootstrap =
+      RetainedStopSurveillanceEmptySourceMode::kManagedCellBootstrapEmpty;
+  EXPECT_TRUE(RetainedNativeCellRuntime::ValidateStopSourceCoverage(
+                  {}, bootstrap, {output})
+                  .ok());
+  EXPECT_FALSE(RetainedNativeCellRuntime::ValidateStopSourceCoverage(
+                   {}, bootstrap, {physical})
+                   .ok());
+  EXPECT_FALSE(RetainedNativeCellRuntime::ValidateStopSourceCoverage(
+                   {}, bootstrap, {output, physical})
+                   .ok());
+  EXPECT_FALSE(RetainedNativeCellRuntime::ValidateStopSourceCoverage(
+                   {},
+                   RetainedStopSurveillanceEmptySourceMode::kRequireNonEmpty,
+                   {output})
+                   .ok());
+  auto invalid = output;
+  invalid.engine = nullptr;
+  EXPECT_FALSE(RetainedNativeCellRuntime::ValidateStopSourceCoverage(
+                   {}, bootstrap, {invalid})
+                   .ok());
+  EXPECT_EQ(provider.submissions, 0U);
+}
+
+TEST(
+    RetainedNativeCellRuntimeTest,
+    LogicalOutputComponentSetRequiresExactCandidateAndPredecessorProviderFence) {
+  NativeNoWriteOutputProvider provider;
+  auto clock = std::make_shared<WallClock>();
+  core::IoOutputParticipantEngine engine(provider, *clock);
+  const auto binding = NativeLogicalOutputBinding();
+  auto registration = TestRegistration(binding, &engine);
+  registration.prepared_motion_engine = &engine;
+  const auto &output = *binding.value().io_output_binding;
+  const auto resource = *output.signal.output_resource;
+  const auto scope_for = [&](bool candidate) {
+    core::ConfigurationFenceDomainScopeDTO domain{
+        output.provider.control_domain_id,
+        {},
+        {},
+        core::ProviderConfigurationFenceDomainDTO{}};
+    auto &proof =
+        std::get<core::ProviderConfigurationFenceDomainDTO>(domain.payload);
+    const core::ProviderConfigurationFenceOccurrenceDTO occurrence{
+        binding.value().controllable_component_id,
+        output.provider.provider_instance_id,
+        output.signal_configuration_digest,
+        {resource}};
+    if (candidate) {
+      domain.candidate_control_domain_revision =
+          output.provider.control_domain_revision;
+      proof.candidate_provider = occurrence;
+    } else {
+      domain.predecessor_control_domain_revision =
+          output.provider.control_domain_revision;
+      proof.predecessor_provider = occurrence;
+    }
+    return core::ConfigurationFenceScopeDTO{
+        {binding.value().controllable_component_id}, {domain}, {}, {resource}};
+  };
+  const auto candidate_scope = scope_for(true);
+  const auto predecessor_scope = scope_for(false);
+  ASSERT_TRUE(candidate_scope.valid());
+  ASSERT_TRUE(predecessor_scope.valid());
+  const core::ConfigurationFenceId fence_id("fence.logical-output");
+  CellTestAdmissionGate gate;
+  auto input = EmptyCellInput();
+  input.clock = clock;
+  input.scheduler = std::make_shared<SimpleScheduler>();
+  input.operation_journal_path = TemporaryJournalPath();
+  input.kernel_config.operation_admission_gate = &gate;
+  const auto journal_path = input.operation_journal_path;
+  {
+    RetainedNativeCellRuntime cell(std::move(input));
+    const auto transition = [&](const auto &scope, bool add) {
+      gate.HoldFence(fence_id, scope);
+      return cell.reconfigure_runtime_component_set(
+          add ? std::vector<
+                    core::RuntimeParticipantExecutionRegistration>{registration}
+              : std::vector<core::RuntimeParticipantExecutionRegistration>{},
+          add ? UnusedResolver() : core::RuntimeParticipantAdmissionResolver{},
+          {}, binding.value().retained_bundle_id,
+          binding.value().graph_revision, fence_id, scope, {});
+    };
+    // Exact held-fence permission alone does not replace provider-side proof.
+    for (unsigned mutation = 0; mutation != 5U; ++mutation) {
+      auto foreign = candidate_scope;
+      auto &domain = foreign.domains.front();
+      auto &proof =
+          std::get<core::ProviderConfigurationFenceDomainDTO>(domain.payload);
+      switch (mutation) {
+      case 0:
+        proof.candidate_provider->provider_instance_id =
+            core::ProviderInstanceId("foreign.provider");
+        break;
+      case 1:
+        proof.candidate_provider->signal_configuration_digest =
+            core::ContentDigest(std::string("sha256:") + std::string(64U, 'f'));
+        break;
+      case 2:
+        domain.candidate_control_domain_revision = core::ControlDomainRevision(
+            std::string("sha256:") + std::string(64U, 'e'));
+        break;
+      case 3:
+        proof.candidate_provider->output_resources.clear();
+        foreign.resources.clear();
+        break;
+      case 4:
+        foreign = predecessor_scope;
+        break;
+      }
+      ASSERT_TRUE(foreign.valid());
+      const auto rejected = transition(foreign, true);
+      ASSERT_FALSE(rejected.ok());
+      EXPECT_EQ(rejected.error().details.at("reason"),
+                "runtime_component_set_scope_incomplete");
+      EXPECT_TRUE(cell.participant_registrations().empty());
+      EXPECT_TRUE(cell.addressed_kernel().resource_snapshot().empty());
+    }
+    const auto installed = transition(candidate_scope, true);
+    ASSERT_TRUE(installed.ok()) << installed.error().message;
+    ASSERT_EQ(cell.participant_registrations().size(), 1U);
+    ASSERT_EQ(cell.addressed_kernel().resource_snapshot().size(), 1U);
+    EXPECT_EQ(cell.addressed_kernel().resource_snapshot().front().resource_id,
+              resource);
+    EXPECT_TRUE(cell.stop_surveillance_owner()->SnapshotSources().empty());
+    const auto readback =
+        cell.addressed_kernel().current_runtime_provider_configuration(
+            output.provider.control_domain_id);
+    ASSERT_TRUE(readback.ok());
+    EXPECT_FALSE(readback.value());
+    const auto readiness = cell.addressed_kernel().component_command_readiness(
+        binding.value().controllable_component_id);
+    ASSERT_TRUE(readiness.ok());
+    EXPECT_FALSE(readiness.value().command_eligible);
+    const auto wrong_side = transition(candidate_scope, false);
+    ASSERT_FALSE(wrong_side.ok());
+    EXPECT_EQ(wrong_side.error().details.at("reason"),
+              "runtime_component_set_scope_incomplete");
+    EXPECT_EQ(cell.participant_registrations().size(), 1U);
+    const auto removed = transition(predecessor_scope, false);
+    ASSERT_TRUE(removed.ok()) << removed.error().message;
+    EXPECT_TRUE(cell.participant_registrations().empty());
+    EXPECT_TRUE(cell.addressed_kernel().resource_snapshot().empty());
+    EXPECT_EQ(provider.submissions, 0U);
+  }
+  RemoveJournalFiles(journal_path);
 }
 
 TEST(RetainedNativeCellRuntimeTest,
@@ -1810,6 +2100,88 @@ TEST(RetainedNativeCellRuntimeTest,
     EXPECT_TRUE(peer_lifetime.expired());
   }
   RemoveJournalFiles(journal_path);
+}
+
+TEST(RetainedNativeCellRuntimeTest,
+     ProgramResolverPreservesTheExactPhysicalMovingTakeoverBudget) {
+  const auto binding = qualification_fixture::make_binding();
+  for (const auto budget :
+       {std::optional<double>{}, std::optional<double>{3.5}}) {
+    auto physical = TestRegistration(binding, nullptr);
+    physical.motion_takeover_preparation_budget_s = budget;
+    auto resolver = make_retained_cell_kernel_participant_resolver(
+        [binding](const core::OperationIntentDTO &, std::size_t) {
+          return core::Result<RetainedResolvedParticipant>::Ok(
+              {binding, false});
+        },
+        {physical});
+    const core::OperationIntentDTO intent{
+        {core::RequestId("request.resolver"), core::RequestOwnerEpoch("owner.resolver"),
+         "test", std::nullopt},
+        binding.value().program_id,
+        binding.value().program_revision,
+        binding.value().program_binding_id,
+        core::ProgramRunId("run.resolver"),
+        binding.value().graph_revision,
+        binding.value().retained_bundle_id,
+        std::nullopt,
+        {}};
+    const auto resolved = resolver(intent, 0U);
+    ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+    EXPECT_EQ(resolved.value().motion_takeover_preparation_budget_s, budget);
+    EXPECT_EQ(resolved.value().binding.value(), binding.value());
+  }
+}
+
+TEST(
+    RetainedNativeCellRuntimeTest,
+    BoundMotionCachesAndReadinessKeepTheCurrentCellBudgetAndScalarsStayAbsent) {
+  const auto motion = qualification_fixture::make_binding();
+  const auto gripper = GripperOnlyBinding();
+  CellTestExecutionEngine engine;
+  auto motion_row = TestRegistration(motion, &engine);
+  motion_row.motion_takeover_preparation_budget_s = 3.5;
+  const auto gripper_row = TestRegistration(gripper, &engine);
+  auto input = EmptyCellInput();
+  input.clock = std::make_shared<WallClock>();
+  input.scheduler = std::make_shared<SimpleScheduler>();
+  input.operation_journal_path = TemporaryJournalPath();
+  input.kernel_config = EmptyKernelConfig();
+  input.kernel_config.graph_revision = motion.value().graph_revision;
+  input.kernel_config.participant_resolver = UnusedResolver();
+  input.participant_registrations = {motion_row, gripper_row};
+  input.stop_sources = {StopSourceFor(motion), StopSourceFor(gripper)};
+  const auto path = input.operation_journal_path;
+  {
+    RetainedNativeCellRuntime cell(std::move(input));
+    auto runtime = std::make_shared<RetainedNativeRuntime>(motion, gripper);
+    runtime->participant_registrations = {TestRegistration(motion, &engine),
+                                          gripper_row};
+    runtime->cell_runtime_owner = &cell;
+    runtime->BindCellRuntimeOwner(cell, "budget-epoch", "budget-cell");
+    EXPECT_EQ(runtime->participant_registrations.front()
+                  .motion_takeover_preparation_budget_s,
+              std::optional<double>(3.5));
+    EXPECT_FALSE(runtime->participant_registrations.back()
+                     .motion_takeover_preparation_budget_s);
+    ASSERT_TRUE(cell.addressed_kernel().SetRouteRecoveryPending(true).ok());
+    const auto published = runtime->PublishComponentCommandReadiness(
+        {core::ComponentReadinessAuthorityDTO::kRestartExclusion, std::nullopt,
+         std::nullopt, motion.value().controllable_component_id,
+         core::ComponentLifecycleGeneration(1U), false});
+    ASSERT_TRUE(published.ok()) << published.error().message;
+    EXPECT_EQ(runtime->participant_registrations.front()
+                  .motion_takeover_preparation_budget_s,
+              std::optional<double>(3.5));
+    EXPECT_EQ(cell.participant_registrations()
+                  .front()
+                  .motion_takeover_preparation_budget_s,
+              std::optional<double>(3.5));
+    EXPECT_FALSE(cell.participant_registrations()
+                     .back()
+                     .motion_takeover_preparation_budget_s);
+  }
+  RemoveJournalFiles(path);
 }
 
 }  // namespace

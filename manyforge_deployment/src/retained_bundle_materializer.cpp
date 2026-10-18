@@ -1,4 +1,5 @@
 #include "manyforge_deployment/retained_bundle.hpp"
+#include <manyforge_deployment/io_provider_domain.hpp>
 
 #include <algorithm>
 #include <array>
@@ -454,6 +455,9 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
                     .retained_projection())
           : std::nullopt,
       std::move(runtime_contract_requirements),
+      deployment.applicability_inputs()
+          .value()
+          .motion_takeover_preparation_budget_s,
   };
 }
 
@@ -524,6 +528,29 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
                              control_domain_products, symbol_role_maps,
                              runtime_unit_products)},
   };
+  // Preserve empty-policy bundle bytes. Non-empty declarations travel only
+  // from the revision-verified deployment projection, never a runtime request.
+  if (const auto &policies =
+          deployment.applicability_inputs().normalized_policies();
+      policies.has_value()) {
+    const auto *sources = policies->find_object_member("interrupt_sources");
+    const auto *rules = policies->find_object_member("interrupt_policies");
+    const auto *config = policies->find_object_member("interrupt_config");
+    if (sources == nullptr || rules == nullptr || config == nullptr)
+      throw std::logic_error(
+          "qualified interrupt policy projection is incomplete");
+    const auto *globals = policies->find_object_member("interrupt_rules");
+    if (!sources->as_array().empty() || !rules->as_array().empty() ||
+        (globals && !globals->as_array().empty())) {
+      CanonicalValue::Object configuration{{"interrupt_sources", *sources},
+                                           {"interrupt_policies", *rules},
+                                           {"interrupt_config", *config}};
+      if (globals && !globals->as_array().empty())
+        configuration.emplace_back("interrupt_rules", *globals);
+      root.emplace_back("interrupt_policy_configuration",
+                        CanonicalValue(std::move(configuration)));
+    }
+  }
   const auto &applicability = qualified.compiler_ir().applicability();
   if (applicability.selected_site_overlay_ref().has_value()) {
     root.emplace_back("site_overlay_ref",
@@ -543,6 +570,13 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
     root.emplace_back(
         "assistant",
         applicability.assistant_settings().normalized_projection());
+  }
+  if (const auto budget = deployment.applicability_inputs()
+                              .value()
+                              .motion_takeover_preparation_budget_s;
+      budget.has_value()) {
+    root.emplace_back("motion_takeover_preparation_budget_s",
+                      CanonicalValue(*budget));
   }
   return CanonicalValue(std::move(root));
 }
@@ -809,22 +843,45 @@ void require_qualified_structural_subset_before_store(
         "provider semantic input");
   }
 
+  const auto provider_domains = ValidateIoProviderDomains(
+      graph, inputs.capability_provider_bindings,
+      applicability.runtime_profiles(), applicability.provider_manifests());
+  if (!provider_domains.ok())
+    detail::fail_retained_bundle(provider_domains.error().details.at("reason"));
+  const auto controller_domain_count = static_cast<std::size_t>(std::count_if(
+      graph.control_domains.begin(), graph.control_domains.end(),
+      [](const auto &domain) { return domain.provider() == nullptr; }));
+  const bool provider_only_subset =
+      graph.model_instances.empty() && !graph.controllable_components.empty() &&
+      !graph.control_domains.empty() && controller_domain_count == 0U &&
+      graph.control_bindings.empty() &&
+      inputs.desired_control_configurations.empty() &&
+      std::all_of(
+          graph.controllable_components.begin(),
+          graph.controllable_components.end(), [&](const auto &component) {
+            return component.model_role_bindings.empty() &&
+                   std::any_of(
+                       graph.control_domains.begin(),
+                       graph.control_domains.end(), [&](const auto &domain) {
+                         return domain.provider()->controllable_component_id ==
+                                component.controllable_component_id;
+                       });
+          });
   const bool passive_subset =
       graph.runtime_units.empty() && graph.controllable_components.empty() &&
       graph.control_domains.empty() && graph.control_bindings.empty() &&
       inputs.desired_control_configurations.empty();
   const bool controllable_subset =
       !graph.model_instances.empty() &&
-      !graph.controllable_components.empty() &&
-      !graph.control_domains.empty() && !graph.control_bindings.empty() &&
-      inputs.desired_control_configurations.size() ==
-          graph.control_domains.size();
+      !graph.controllable_components.empty() && controller_domain_count != 0U &&
+      !graph.control_bindings.empty() &&
+      inputs.desired_control_configurations.size() == controller_domain_count;
   const bool infrastructure_runtime_subset =
       graph.runtime_units.size() == 1U && graph.model_instances.empty() &&
       graph.controllable_components.empty() && graph.control_domains.empty() &&
       graph.control_bindings.empty() &&
       inputs.desired_control_configurations.empty();
-  if (!passive_subset && !controllable_subset &&
+  if (!passive_subset && !controllable_subset && !provider_only_subset &&
       !infrastructure_runtime_subset) {
     detail::fail_retained_bundle(
         "retention accepts passive models, a bounded controllable "
@@ -853,7 +910,7 @@ void require_qualified_structural_subset_before_store(
           "passive structural retention contains component/control "
           "semantics or an unplaced model");
     }
-  } else if (controllable_subset) {
+  } else if (controllable_subset || provider_only_subset) {
     const bool has_runtime_units = !graph.runtime_units.empty();
     const bool exact_execution_runtime_units = std::all_of(
         graph.runtime_units.begin(), graph.runtime_units.end(),
@@ -875,7 +932,15 @@ void require_qualified_structural_subset_before_store(
         composition.targets().empty() ||
         applicability.binding_interfaces().size() !=
             graph.control_bindings.size() ||
-        applicability.controllers().empty() || applicability.routes().empty() ||
+        (controller_domain_count != 0U &&
+         (applicability.controllers().empty() ||
+          applicability.routes().empty())) ||
+        (controller_domain_count == 0U &&
+         (!applicability.controllers().empty() ||
+          !applicability.routes().empty() ||
+          !applicability.control_interface_contracts().empty() ||
+          !applicability.controller_topologies().empty() ||
+          !applicability.stop_evidence_policies().empty())) ||
         applicability.capabilities().empty() ||
         applicability.stop_applicability().size() !=
             applicability.routes().size()) {
@@ -1060,7 +1125,8 @@ prepare_planning_collision_product_before_store(
     const RetentionQualifiedDeployment &qualified,
     const detail::ICompilerInputArtifactSource &input_source,
     std::span<const BuildQualifiedStructuralModelPreparation>
-        structural_model_preparations) {
+        structural_model_preparations,
+    const bool retain_empty_model_map) {
   require_qualified_structural_subset_before_store(qualified);
   const auto &composition =
       qualified.compiler_ir().applicability().composition();
@@ -1411,11 +1477,15 @@ prepare_planning_collision_product_before_store(
       viewer_contract.product_contract_revision(), viewer_inputs);
   std::optional<std::string> symbol_role_map;
   const BuildQualifiedProductContract *symbol_role_map_contract = nullptr;
-  if (!composition.model_occurrences().empty()) {
-    symbol_role_map =
-        detail::emit_composed_model_symbol_role_map(qualified.compiler_ir());
+  // The empty map is accepted only for the Scenario-candidate path of a
+  // model-free cell; every other map stays strictly populated.
+  const bool allow_empty_model_map =
+      composition.model_occurrences().empty() && retain_empty_model_map;
+  if (!composition.model_occurrences().empty() || retain_empty_model_map) {
+    symbol_role_map = detail::emit_composed_model_symbol_role_map(
+        qualified.compiler_ir(), allow_empty_model_map);
     detail::require_composed_model_symbol_role_map_matches(
-        *symbol_role_map, qualified.compiler_ir());
+        *symbol_role_map, qualified.compiler_ir(), allow_empty_model_map);
     const auto &qualified_symbol_contract =
         require_composed_model_symbol_role_map_contract();
     const std::array<detail::RetainedArtifactInput, 1U> symbol_inputs{{
@@ -1434,12 +1504,17 @@ prepare_planning_collision_product_before_store(
   }
   std::vector<detail::PreparedControlDomainArtifact> control_domain_artifacts;
   const BuildQualifiedProductContract *control_domain_contract = nullptr;
-  if (!composition.graph().control_domains.empty()) {
+  if (std::any_of(
+          composition.graph().control_domains.begin(),
+          composition.graph().control_domains.end(),
+          [](const auto &domain) { return domain.provider() == nullptr; })) {
     const auto &qualified_control_contract =
         require_control_domain_control_contract();
     control_domain_artifacts.reserve(
         composition.graph().control_domains.size());
     for (const auto &domain : composition.graph().control_domains) {
+      if (domain.provider())
+        continue;
       auto prepared =
           prepare_control_artifacts(qualified, domain, input_source);
       std::string control_bytes = detail::emit_control_domain_control(
@@ -1791,7 +1866,10 @@ void require_verified_current_bundle_artifacts(
       throw std::runtime_error(
           "reloaded symbol/role-map product differs from its prepared bytes");
     }
-    (void)detail::parse_and_verify_composed_model_symbol_role_map(*bytes);
+    // A model-free bundle may carry its empty candidate map; see
+    // parse_and_verify_composed_model_symbol_role_map.
+    (void)detail::parse_and_verify_composed_model_symbol_role_map(
+        *bytes, value.cell_graph.model_instances.empty());
   }
   if (products.symbol_role_maps.empty() !=
       !prepared.symbol_role_map.has_value()) {
@@ -2061,7 +2139,9 @@ detail::RetainedBundleMaterializer::materialize_prepared(
   }
   if (symbol_role_map.has_value()) {
     detail::require_composed_model_symbol_role_map_matches(
-        *symbol_role_map, qualified.compiler_ir());
+        *symbol_role_map, qualified.compiler_ir(),
+        qualified.compiler_ir().applicability().composition()
+            .model_occurrences().empty());
     const std::array<detail::RetainedArtifactInput, 1U> symbol_artifacts{{
         {core::ArtifactRoleId(
              std::string(detail::kComposedModelSymbolRoleMapArtifactRole)),
@@ -2086,7 +2166,9 @@ detail::RetainedBundleMaterializer::materialize_prepared(
           "symbol/role-map raw artifact vanished after verified retention");
     }
     detail::require_composed_model_symbol_role_map_matches(
-        *readback, qualified.compiler_ir());
+        *readback, qualified.compiler_ir(),
+        qualified.compiler_ir().applicability().composition()
+            .model_occurrences().empty());
   }
 
   if (control_domain_artifacts.empty() !=
@@ -2294,10 +2376,12 @@ detail::RetainedBundleMaterializer::materialize_store_and_reload_production(
         structural_model_preparations,
     ICatalogArtifactStore &catalog_artifact_store,
     IRawArtifactStore &artifact_store,
-    IRetainedBundleRepository &bundle_repository) {
+    IRetainedBundleRepository &bundle_repository,
+    const bool retain_empty_model_map) {
   const PreparedPlanningCollisionProduct prepared =
       prepare_planning_collision_product_before_store(
-          qualified, input_artifact_source, structural_model_preparations);
+          qualified, input_artifact_source, structural_model_preparations,
+          retain_empty_model_map);
   require_runtime_contracts_before_store(qualified);
   const BuildQualifiedRetentionContext context =
       BuildQualifiedRetentionAuthority::qualify_persisted(manifest_repository);
@@ -2345,7 +2429,8 @@ detail::RetainedBundleMaterializer::materialize(
     IRawArtifactStore &artifact_store) {
   const PreparedPlanningCollisionProduct prepared =
       prepare_planning_collision_product_before_store(
-          qualified, input_artifact_source, structural_model_preparations);
+          qualified, input_artifact_source, structural_model_preparations,
+          false);
   require_runtime_contracts_before_store(qualified);
   retain_prepared_inputs(prepared, input_artifact_source,
                          catalog_artifact_store, artifact_store);

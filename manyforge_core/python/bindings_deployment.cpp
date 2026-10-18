@@ -143,9 +143,12 @@ template <typename Projection>
   if (py::isinstance<ControlDomainCapabilityProviderTargetDTO>(value)) {
     return value.cast<ControlDomainCapabilityProviderTargetDTO>();
   }
+  if (py::isinstance<ComponentTargetCapabilityProviderTargetDTO>(value)) {
+    return value.cast<ComponentTargetCapabilityProviderTargetDTO>();
+  }
   throw py::type_error(
       "target must be CellGlobalCapabilityProviderTargetDTO, "
-      "TargetBindingCapabilityProviderTargetDTO, or "
+      "TargetBindingCapabilityProviderTargetDTO, ComponentTargetCapabilityProviderTargetDTO, or "
       "ControlDomainCapabilityProviderTargetDTO");
 }
 
@@ -328,8 +331,17 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
+  py::class_<ProviderControlDomainCapabilityTargetDTO>(
+      module, "ProviderControlDomainCapabilityTargetDTO", py::is_final())
+      .def(py::init<>())
+      .def(py::self == py::self);
+
   py::class_<ControlDomainCapabilityProviderTargetDTO>(
       module, "ControlDomainCapabilityProviderTargetDTO", py::is_final())
+      .def(py::init<ControlDomainId, ControlDomainRevision,
+                    ProviderControlDomainCapabilityTargetDTO>(),
+           py::arg("control_domain_id"), py::arg("control_domain_revision"), py::arg("provider"))
+      .def_property_readonly("is_provider", &ControlDomainCapabilityProviderTargetDTO::provider)
       .def(py::init(
                [](ControlDomainId control_domain_id, ControlDomainRevision control_domain_revision,
                   ControllerTopologyId controller_topology_id, TopologyRevision topology_revision) {
@@ -343,17 +355,44 @@ void register_deployment_candidate_bindings(py::module_& module) {
                     &ControlDomainCapabilityProviderTargetDTO::control_domain_id)
       .def_readonly("control_domain_revision",
                     &ControlDomainCapabilityProviderTargetDTO::control_domain_revision)
-      .def_readonly("controller_topology_id",
-                    &ControlDomainCapabilityProviderTargetDTO::controller_topology_id)
-      .def_readonly("topology_revision",
-                    &ControlDomainCapabilityProviderTargetDTO::topology_revision)
+      .def_property_readonly(
+          "controller_topology_id",
+          [](const ControlDomainCapabilityProviderTargetDTO& value) -> const ControllerTopologyId& {
+            return value.controller().controller_topology_id;
+          },
+          py::return_value_policy::reference_internal)
+      .def_property_readonly(
+          "topology_revision",
+          [](const ControlDomainCapabilityProviderTargetDTO& value) -> const TopologyRevision& {
+            return value.controller().topology_revision;
+          },
+          py::return_value_policy::reference_internal)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::tuple capability_provider_target_types{3U};
+  py::class_<ComponentTargetCapabilityProviderTargetDTO>(
+      module, "ComponentTargetCapabilityProviderTargetDTO", py::is_final())
+      .def(py::init([](ControllableComponentId component, ComponentTypeRevision revision,
+                       CommandTargetId target) {
+             return ComponentTargetCapabilityProviderTargetDTO{
+                 std::move(component), std::move(revision), std::move(target)};
+           }),
+           py::arg("controllable_component_id"), py::arg("component_type_revision"),
+           py::arg("command_target_id"))
+      .def_readonly("controllable_component_id",
+                    &ComponentTargetCapabilityProviderTargetDTO::controllable_component_id)
+      .def_readonly("component_type_revision",
+                    &ComponentTargetCapabilityProviderTargetDTO::component_type_revision)
+      .def_readonly("command_target_id",
+                    &ComponentTargetCapabilityProviderTargetDTO::command_target_id)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
+  py::tuple capability_provider_target_types{4U};
   capability_provider_target_types[0] = module.attr("CellGlobalCapabilityProviderTargetDTO");
   capability_provider_target_types[1] = module.attr("TargetBindingCapabilityProviderTargetDTO");
   capability_provider_target_types[2] = module.attr("ControlDomainCapabilityProviderTargetDTO");
+  capability_provider_target_types[3] = module.attr("ComponentTargetCapabilityProviderTargetDTO");
   module.attr("CapabilityProviderTargetDTO") = py::module_::import("typing").attr("Union").attr(
       "__getitem__")(capability_provider_target_types);
 

@@ -48,7 +48,7 @@ ExpectedControlDomainRevisionDTO expected_domain(
 ActiveControlConfigurationDTO active_configuration(
     const ExpectedControlDomainRevisionDTO& expected) {
   std::vector<ActiveControlConfigurationBindingRouteDTO> routes;
-  for (const auto& selected : expected.expected_control_bindings) {
+  for (const auto& selected : expected.controller().expected_control_bindings) {
     routes.push_back({selected.control_binding_id, selected.control_binding_revision,
                       selected.control_route_id});
   }
@@ -57,8 +57,8 @@ ActiveControlConfigurationDTO active_configuration(
           expected.control_domain_revision,
           std::move(routes),
           ActivationSetId("activation-set-1"),
-          expected.controller_topology_id,
-          expected.topology_revision,
+          expected.controller().controller_topology_id,
+          expected.controller().topology_revision,
           RuntimeUnitId("runtime-1"),
           RuntimeEpoch("runtime-epoch-1"),
           1U,
@@ -71,16 +71,16 @@ ResolvedLifecycleControlDomainScopeDTO current_scope(
     const ExpectedControlDomainRevisionDTO& expected,
     std::vector<ResourceId> resources = {ResourceId("resource-1")}) {
   std::optional<ActiveControlConfigurationDTO> configuration;
-  if (expected.expected_active_control_configuration.presence ==
+  if (expected.controller().expected_active_control_configuration.presence ==
       ExpectedActiveControlConfigurationPresenceDTO::kPresent) {
     configuration = active_configuration(expected);
   }
   return {expected.control_domain_id,
           expected.control_domain_revision,
-          expected.controller_topology_id,
-          expected.topology_revision,
+          expected.controller().controller_topology_id,
+          expected.controller().topology_revision,
           std::move(configuration),
-          expected.expected_control_bindings,
+          expected.controller().expected_control_bindings,
           std::move(resources)};
 }
 
@@ -423,11 +423,11 @@ TEST(ComponentLifecycleExpectation,
   EXPECT_TRUE(domain.locally_valid());
 
   auto noncanonical = domain;
-  std::swap(noncanonical.expected_control_bindings[0], noncanonical.expected_control_bindings[1]);
+  std::swap(noncanonical.controller().expected_control_bindings[0], noncanonical.controller().expected_control_bindings[1]);
   EXPECT_FALSE(noncanonical.locally_valid());
 
   auto duplicate = domain;
-  duplicate.expected_control_bindings[1] = duplicate.expected_control_bindings[0];
+  duplicate.controller().expected_control_bindings[1] = duplicate.controller().expected_control_bindings[0];
   EXPECT_FALSE(duplicate.locally_valid());
 }
 
@@ -594,7 +594,7 @@ TEST(ComponentLifecycleResolvedScope, MatchesExactTopologyBindingRouteAndConfigu
   ASSERT_TRUE(resolved.locally_valid());
   EXPECT_TRUE(ExpectedDomainMatchesResolvedScope(expected, resolved));
 
-  resolved.current_control_bindings[0].control_route_id = ControlRouteId("other-route");
+  resolved.controller().current_control_bindings[0].control_route_id = ControlRouteId("other-route");
   EXPECT_FALSE(resolved.locally_valid());
 
   const auto first_expected = expected_domain("domain-1", absent_configuration());
@@ -665,7 +665,7 @@ TEST(ComponentLifecycleCurrentSnapshot, CanonicalDigestCoversPublicationScopeAnd
   EXPECT_FALSE(VerifyComponentLifecycleCurrentSnapshot(changed_publication).ok());
 
   auto changed_scope = snapshot;
-  changed_scope.domains.front().current_resources.front() = ResourceId("resource-2");
+  changed_scope.domains.front().controller().current_resources.front() = ResourceId("resource-2");
   EXPECT_FALSE(VerifyComponentLifecycleCurrentSnapshot(changed_scope).ok());
 
   auto changed_provider = snapshot;
@@ -1338,15 +1338,19 @@ TEST(SelectedBringUpStatus, AcceptedRequiresExactPredecessorConfigurationAndObse
     EXPECT_THROW((void)detail::EncodeComponentLifecycleStatus(changed), std::invalid_argument);
   };
   check_invalid([](auto& value) {
-    value.domains.front().current_scope->active_control_configuration->active_control_configuration_id =
+    value.domains.front()
+        .current_scope->controller()
+        .active_control_configuration->active_control_configuration_id =
         ActiveControlConfigurationId("foreign-configuration");
   });
   check_invalid([](auto& value) {
-    value.domains.front().current_scope->active_control_configuration->active_control_configuration_generation =
+    value.domains.front()
+        .current_scope->controller()
+        .active_control_configuration->active_control_configuration_generation =
         ActiveControlConfigurationGeneration(8U);
   });
   check_invalid([](auto& value) {
-    value.domains.front().current_scope->active_control_configuration.reset();
+    value.domains.front().current_scope->controller().active_control_configuration.reset();
   });
   check_invalid([](auto& value) {
     auto& domain = value.domains.front();
@@ -1383,7 +1387,8 @@ TEST(SelectedBringUpStatus, AcceptedRequiresExactPredecessorConfigurationAndObse
   evidence.accepted_fence.captured_scope.bindings.push_back({ControlBindingId("binding-2"),
       ControlBindingRevision("binding-revision-1"), ControlBindingRevision("binding-revision-1")});
   ASSERT_TRUE(accepted.locally_valid());
-  accepted.domains.back().current_scope->active_control_configuration = active_configuration(expected);
+  accepted.domains.back().current_scope->controller().active_control_configuration =
+      active_configuration(expected);
   ASSERT_TRUE(accepted.domains.back().locally_valid());
   EXPECT_FALSE(accepted.locally_valid());
 }
@@ -1415,7 +1420,8 @@ TEST(SelectedBringUpStatus, AcceptedNewDomainHasNoObservationAndLaterSameRevisio
   // Actual successor progress can use a fresh adopted configuration with the
   // same domain revision. The immutable selected claim keeps the predecessor.
   accepted.phase = ComponentLifecycleTransactionPhaseDTO::kVerifying;
-  auto& current = *accepted.domains.front().current_scope->active_control_configuration;
+  auto& current =
+      *accepted.domains.front().current_scope->controller().active_control_configuration;
   current.active_control_configuration_id = ActiveControlConfigurationId("successor-configuration");
   current.active_control_configuration_generation = ActiveControlConfigurationGeneration(8U);
   ASSERT_TRUE(accepted.locally_valid());
@@ -1629,9 +1635,15 @@ TEST(ApplyDelegatedComponentLifecycleStatus, RefusesForeignParentScopeAndOrigina
   invalid([](auto& value) { value.apply_bring_up->original_request_payload_digest = ContentDigest("invalid"); });
   invalid([](auto& value) { value.apply_bring_up->candidate_retained_bundle_bytes = 0U; });
   invalid([](auto& value) { value.apply_bring_up->original_execution_host.runtime_epoch = RuntimeEpoch("other"); });
-  invalid([](auto& value) { value.domains.front().current_scope->active_control_configuration->active_control_configuration_id =
-      ActiveControlConfigurationId("foreign-active"); });
-  invalid([](auto& value) { value.domains.front().current_scope->active_control_configuration.reset(); });
+  invalid([](auto& value) {
+    value.domains.front()
+        .current_scope->controller()
+        .active_control_configuration->active_control_configuration_id =
+        ActiveControlConfigurationId("foreign-active");
+  });
+  invalid([](auto& value) {
+    value.domains.front().current_scope->controller().active_control_configuration.reset();
+  });
   invalid([](auto& value) { value.selected_bring_up = selected_bring_up_status().selected_bring_up; });
 }
 
@@ -1658,7 +1670,8 @@ TEST(ApplyDelegatedComponentLifecycleStatus, ValidatesRecoveryPairWithoutInventi
   clean.apply_bring_up->successor_occurrence_floor = status.apply_bring_up->successor_occurrence_floor;
   EXPECT_FALSE(clean.locally_valid());  // A floor-only startup is not an approved data shape.
   status.phase = ComponentLifecycleTransactionPhaseDTO::kVerifying;
-  auto& configuration = *status.domains.front().current_scope->active_control_configuration;
+  auto& configuration =
+      *status.domains.front().current_scope->controller().active_control_configuration;
   configuration.active_control_configuration_id = ActiveControlConfigurationId("actual-successor");
   configuration.active_control_configuration_generation = ActiveControlConfigurationGeneration(8U);
   status.domains.front().current_state = ComponentLifecycleStateDTO::kActive;
@@ -1669,7 +1682,7 @@ TEST(ApplyDelegatedComponentLifecycleStatus, NewAcceptedDomainHasNoInventedObser
   auto status = apply_bring_up_status(ComponentLifecycleIntentKindDTO::kEnable);
   auto& domain = status.domains.front();
   auto& expected = status.accepted_intent.expected_control_domains.front();
-  expected.expected_active_control_configuration = absent_configuration();
+  expected.controller().expected_active_control_configuration = absent_configuration();
   domain.expected_domain = expected;
   domain.current_scope.reset();
   domain.resolved_provider_occurrence.reset();
@@ -1714,8 +1727,9 @@ TEST(ApplyDelegatedComponentLifecycleStatus, InitialInstalledDomainsKeepUnknownA
   auto status = apply_bring_up_status();
   auto& evidence = *status.apply_bring_up;
   auto second_expected = expected_domain("domain-2", absent_configuration(), {binding("binding-2")});
-  status.accepted_intent.expected_control_domains.front().expected_active_control_configuration =
-      absent_configuration();
+  status.accepted_intent.expected_control_domains.front()
+      .controller()
+      .expected_active_control_configuration = absent_configuration();
   status.accepted_intent.expected_control_domains.push_back(second_expected);
   auto second_domain = status.domains.front();
   second_domain.control_domain_id = second_expected.control_domain_id;

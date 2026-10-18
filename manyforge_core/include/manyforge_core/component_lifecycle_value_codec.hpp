@@ -8,6 +8,19 @@
 
 namespace manyforge::core {
 
+namespace detail {
+/// Closed standalone transport records. These restore values only; they do
+/// not establish live fence ownership or provider qualification.
+[[nodiscard]] std::string EncodeConfigurationFenceScopeRecord(
+    const ConfigurationFenceScopeDTO& scope);
+[[nodiscard]] ConfigurationFenceScopeDTO DecodeConfigurationFenceScopeRecord(
+    std::string_view bytes);
+[[nodiscard]] std::string EncodeExpectedControlDomainRevisionRecord(
+    const ExpectedControlDomainRevisionDTO& domain);
+[[nodiscard]] ExpectedControlDomainRevisionDTO DecodeExpectedControlDomainRevisionRecord(
+    std::string_view bytes);
+}  // namespace detail
+
 /// Closed mechanical values only. Decoding never verifies a live receipt or
 /// grants admission, qualification, effect dispatch, or replay authority.
 [[nodiscard]] std::string EncodeComponentLifecycleIntent(

@@ -149,15 +149,14 @@ using namespace manyforge::core;
   for (const auto& domain : predecessor.domains) {
     const ExpectedActiveControlConfigurationDTO expected_active{
         ExpectedActiveControlConfigurationPresenceDTO::kPresent,
-        domain.active_control_configuration->active_control_configuration_id,
-        domain.active_control_configuration->active_control_configuration_generation};
-    ExpectedControlDomainRevisionDTO expected_domain{
-        domain.control_domain_id,
-        domain.control_domain_revision,
-        domain.controller_topology_id,
-        domain.topology_revision,
-        expected_active,
-        domain.current_control_bindings};
+        domain.controller().active_control_configuration->active_control_configuration_id,
+        domain.controller().active_control_configuration->active_control_configuration_generation};
+    ExpectedControlDomainRevisionDTO expected_domain{domain.control_domain_id,
+                                                     domain.control_domain_revision,
+                                                     domain.controller().controller_topology_id,
+                                                     domain.controller().topology_revision,
+                                                     expected_active,
+                                                     domain.controller().current_control_bindings};
     expected_domains.push_back(std::move(expected_domain));
   }
   const ComponentLifecycleIntentDTO request{

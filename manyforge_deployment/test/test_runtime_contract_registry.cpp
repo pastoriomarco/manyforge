@@ -142,7 +142,7 @@ TEST(RuntimeContractRegistry,
       });
   EXPECT_EQ(native, registry.contracts().end());
   ASSERT_NE(ros2_control, registry.contracts().end());
-  check_offer(ros2_control->offer(), 39U);
+  check_offer(ros2_control->offer(), 42U);
   const auto has_operation_scale = [](const auto &offer) {
     return std::any_of(offer.provided_capabilities.begin(),
                        offer.provided_capabilities.end(), [](const auto &ref) {
@@ -151,6 +151,52 @@ TEST(RuntimeContractRegistry,
                        });
   };
   EXPECT_FALSE(has_operation_scale(ros2_control->offer()));
+}
+
+TEST(RuntimeContractRegistry,
+     RealRosOfferCarriesExactIoServicesAndMissingServiceStillRefuses) {
+  const auto &rows = runtime_contract_declaration_registry().contracts();
+  const auto ros = std::find_if(rows.begin(), rows.end(), [](const auto &row) {
+    return row.offer().runtime_implementation_id.value() ==
+           ros2_control_execution_runtime_contract::kImplementationId;
+  });
+  ASSERT_NE(ros, rows.end());
+  std::vector<core::RuntimeCapabilityContractRefDTO> services;
+  for (const auto id : runtime_contract_capabilities::kIoSignalServices) {
+    const auto *builtin = core::find_builtin_capability_definition(id);
+    ASSERT_NE(builtin, nullptr);
+    const core::RuntimeCapabilityContractRefDTO expected{
+        core::CapabilityId(std::string(id)),
+        core::CapabilityDefinitionRevision(
+            std::string(builtin->capability_definition_revision))};
+    services.push_back(expected);
+    EXPECT_NE(std::find(ros->offer().provided_capabilities.begin(),
+                        ros->offer().provided_capabilities.end(), expected),
+              ros->offer().provided_capabilities.end());
+    for (const auto &other : rows)
+      if (&other != &*ros)
+        EXPECT_EQ(std::find(other.offer().provided_capabilities.begin(),
+                            other.offer().provided_capabilities.end(), expected),
+                  other.offer().provided_capabilities.end());
+  }
+  const auto required = core::MakeRuntimeContractRequirement(
+      ros->offer().runtime_implementation_id, {}, services);
+  ASSERT_TRUE(required.ok());
+  EXPECT_TRUE(core::CheckRuntimeContractCompatibility(ros->offer(), required.value()).ok());
+  auto missing = ros->offer().provided_capabilities;
+  std::erase_if(missing, [&](const auto &row) {
+    return row.capability_id == services.front().capability_id;
+  });
+  const auto incomplete = core::MakeRuntimeContractOffer(
+      ros->offer().runtime_implementation_id,
+      ros->offer().provided_api_contract_ids, std::move(missing));
+  ASSERT_TRUE(incomplete.ok());
+  const auto refused =
+      core::CheckRuntimeContractCompatibility(incomplete.value(), required.value());
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "required_capability_missing");
+  EXPECT_EQ(refused.error().details.at("capability_id"),
+            services.front().capability_id.value());
 }
 
 TEST(RuntimeContractRegistry, RetiredNativeProductIsUnavailableBeforeAdmission) {

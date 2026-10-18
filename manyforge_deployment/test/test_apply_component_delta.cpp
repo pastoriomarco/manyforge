@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "activation_deployment_compiler_internal.hpp"
+#include "content_identity_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "retained_bundle_internal.hpp"
 #include "retention_store_fixtures.hpp"
@@ -560,6 +561,56 @@ TEST(ApplyComponentDelta, EveryRuntimeChangeOwningADomainMustBeFenced) {
   auto passive = Change("sensor", ApplyComponentDisposition::kAdd);
   passive.candidate_domains.clear();
   EXPECT_TRUE(apply_component_delta_is_fenced({{passive}, false, {}}, {}));
+}
+
+TEST(ApplyComponentDelta,
+     MovingTakeoverBudgetChangesEveryComponentPolicyIdentity) {
+  const auto with_budget = [](const RetainedBundle &source, double budget_s) {
+    auto root = source.normalized_root().as_object();
+    root.erase(std::remove_if(root.begin(), root.end(),
+                              [](const auto &row) {
+                                return row.first ==
+                                       "motion_takeover_preparation_budget_s";
+                              }),
+               root.end());
+    root.emplace_back("motion_takeover_preparation_budget_s",
+                      CanonicalValue(budget_s));
+    auto projection = CanonicalValue(std::move(root));
+    const auto identity = detail::compute_content_identity(
+        projection,
+        detail::ContentIdentitySpec{
+            .identity_domain = "retained-bundle-id",
+            .api_version = std::string(core::kRetainedBundleApiVersion),
+            .own_field = "retained_bundle_id"});
+    auto sealed = projection.as_object();
+    for (auto &[name, value] : sealed) {
+      if (name == "retained_bundle_id")
+        value = CanonicalValue(identity);
+    }
+    return detail::RetainedBundleReloadAuthority::reload(
+        canonical_json(CanonicalValue(std::move(sealed))));
+  };
+  const auto selected = with_budget(RosTwoArms(), 3.5);
+  const auto changed = with_budget(*selected, 7.0);
+  for (const auto &delta :
+       {derive_apply_component_delta(RosTwoArms(), *selected),
+        derive_apply_component_delta(*selected, *changed),
+        derive_apply_component_delta(*selected, RosTwoArms())}) {
+    ASSERT_TRUE(delta.valid());
+    ASSERT_EQ(delta.components.size(), 2U);
+    for (const auto &row : delta.components) {
+      EXPECT_EQ(row.disposition, ApplyComponentDisposition::kReplace);
+      EXPECT_EQ(row.replacement_reasons,
+                (std::vector<std::string>{
+                    std::string(kApplyComponentReasonRetainedPolicies)}));
+      EXPECT_NE(row.predecessor_runtime_identity,
+                row.candidate_runtime_identity);
+    }
+  }
+  const auto unchanged = derive_apply_component_delta(*selected, *selected);
+  for (const auto &row : unchanged.components) {
+    EXPECT_EQ(row.disposition, ApplyComponentDisposition::kRetain);
+  }
 }
 
 } // namespace

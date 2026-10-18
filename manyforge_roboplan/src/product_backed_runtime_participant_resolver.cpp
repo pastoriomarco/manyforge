@@ -1,9 +1,12 @@
 #include "product_backed_runtime_participant_resolver.hpp"
+#include "sealed_program_execution_capture.hpp"
+#include <manyforge_deployment/program_io_stop_response_validation.hpp>
 
 #include "manyforge_roboplan/retained_collision_world_projector.hpp"
 #include "manyforge_roboplan/retained_native_runtime.hpp"
 
 #include <algorithm>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <map>
 #include <set>
@@ -161,8 +164,20 @@ FindExactPrecomposedBinding(
     const core::OperationParticipantIntentDTO &participant,
     const std::vector<core::RuntimeParticipantBinding> &physical_bindings) {
   const core::RuntimeParticipantBinding *result = nullptr;
+  const auto *command =
+      std::get_if<core::CapabilityCommandIntentDTO>(&participant.payload);
+  const auto *output = command
+                           ? std::get_if<core::IoSignalWriteCommandValueDTO>(
+                                 &command->command_value)
+                           : nullptr;
   for (const auto &binding : physical_bindings) {
     const auto &value = binding.value();
+    if (value.io_output_binding && !output)
+      continue;
+    if (output &&
+        (!value.io_output_binding ||
+         value.io_output_binding->resource_role_id != output->resource_role_id))
+      continue;
     if (value.program_id != operation.program_id ||
         value.program_revision != operation.program_revision ||
         value.program_binding_id != operation.program_binding_id ||
@@ -178,6 +193,95 @@ FindExactPrecomposedBinding(
     result = &binding;
   }
   return result;
+}
+
+[[nodiscard]] const core::RuntimeParticipantBinding &RequireOutputBinding(
+    const deployment::RuntimeProgramTargetBinding &target,
+    const core::ResourceRoleId &resource_role,
+    const std::vector<core::RuntimeParticipantBinding> &composed) {
+  const core::RuntimeParticipantBinding *exact = nullptr;
+  const core::RuntimeParticipantBinding *selected = nullptr;
+  bool canonical_ambiguous = false;
+  for (const auto &binding : composed) {
+    const auto &value = binding.value();
+    if (value.controllable_component_id !=
+            target.component().controllable_component_id ||
+        value.command_target_id != target.target_role().command_target_id ||
+        value.capability_id != target.capability().capability_id ||
+        !value.io_output_binding ||
+        value.io_output_binding->resource_role_id != resource_role)
+      continue;
+    if (value.program_binding_id == target.program_binding_id()) {
+      if (exact)
+        throw std::runtime_error(
+            "Program output resolves to multiple composed channel owners");
+      exact = &binding;
+    }
+    if (selected)
+      canonical_ambiguous = true;
+    else
+      selected = &binding;
+  }
+  // Complete host inventories include direct and Program aliases of the same
+  // channel. Prefer the exact sealed Program identity; retain the existing
+  // unique canonical-owner path when no Program alias is composed.
+  if (exact)
+    return *exact;
+  if (canonical_ambiguous)
+    throw std::runtime_error(
+        "Program output resolves to multiple composed channel owners");
+  if (!selected)
+    throw std::runtime_error(
+        "Program output has no exact composed channel owner");
+  return *selected;
+}
+
+[[nodiscard]] core::RuntimeProviderDomainConfigurationReadbackDTO
+ClosedOutputProvenance(const core::RuntimeParticipantBinding &composed,
+                       const deployment::RetainedBundle &bundle) {
+  const auto &value = composed.value();
+  const auto &output = *value.io_output_binding;
+  const auto &graph = bundle.value().cell_graph;
+  const auto domain = std::find_if(
+      graph.control_domains.begin(), graph.control_domains.end(),
+      [&](const auto &row) {
+        return row.control_domain_id == output.provider.control_domain_id &&
+               row.control_domain_revision ==
+                   output.provider.control_domain_revision;
+      });
+  if (domain == graph.control_domains.end() || !domain->provider())
+    throw std::runtime_error("Composed output has no sealed provider domain");
+  const auto catalog = deployment::ResolveRetainedIoSignalCatalog(graph);
+  if (!catalog.ok())
+    throw std::runtime_error(catalog.error().message);
+  std::vector<core::ResourceId> resources;
+  for (const auto &row : catalog.value()) {
+    if (row.descriptor.signal_id.controllable_component_id ==
+            value.controllable_component_id &&
+        row.runtime_unit_id == output.provider.provider_runtime_unit_id &&
+        std::binary_search(domain->provider()->signal_names.begin(),
+                           domain->provider()->signal_names.end(),
+                           row.descriptor.signal_id.name) &&
+        row.descriptor.output_resource)
+      resources.push_back(*row.descriptor.output_resource);
+  }
+  std::sort(resources.begin(), resources.end());
+  resources.erase(std::unique(resources.begin(), resources.end()),
+                  resources.end());
+  // The composed binding carries the actual CCLC/provider occurrence. This
+  // structural view deliberately asserts no driver observation or eligibility;
+  // ordinary Kernel admission still checks its actual current readiness map.
+  return {value.retained_bundle_id,
+          value.graph_revision,
+          output.component_lifecycle_generation,
+          {domain->control_domain_id, domain->control_domain_revision,
+           core::ResolvedProviderDomainScopeDTO{
+               *domain->provider(), output.provider.provider_runtime_epoch,
+               std::nullopt, std::move(resources)}},
+          output.provider,
+          false,
+          0U,
+          0U};
 }
 
 struct ProviderOccurrence final {
@@ -406,7 +510,8 @@ ProductBackedRuntimeParticipantResolver::
         std::vector<core::RuntimeParticipantBinding> physical_bindings,
         std::vector<core::ProgramBindingId> intrinsic_direct_bindings,
         std::filesystem::path program_artifact_root)
-    : programs_(package_root), bindings_(std::move(package_root)),
+    : package_root_(package_root), programs_(package_root),
+      bindings_(std::move(package_root)),
       artifact_programs_(
           program_artifact_root.empty()
               ? nullptr
@@ -422,7 +527,95 @@ ProductBackedRuntimeParticipantResolver::
       retained_model_map_(std::move(retained_model_map)),
       physical_bindings_(std::move(physical_bindings)),
       intrinsic_direct_bindings_(std::move(intrinsic_direct_bindings)) {
-  if (retained_bundle_ == nullptr || physical_bindings_.empty() ||
+  ValidateComposition();
+}
+
+ProductBackedRuntimeParticipantResolver::
+    ProductBackedRuntimeParticipantResolver(
+        const ProductBackedRuntimeParticipantResolver &source,
+        std::vector<core::RuntimeParticipantBinding> current,
+        std::vector<core::ProgramBindingId> direct_bindings)
+    : package_root_(source.package_root_), programs_(source.programs_),
+      bindings_(source.bindings_),
+      artifact_programs_(
+          source.artifact_programs_
+              ? std::make_unique<deployment::FilesystemVerifiedProgramSource>(
+                    *source.artifact_programs_)
+              : nullptr),
+      artifact_bindings_(
+          source.artifact_bindings_
+              ? std::make_unique<
+                    deployment::FilesystemVerifiedProgramBindingSource>(
+                    *source.artifact_bindings_)
+              : nullptr),
+      retained_bundle_(source.retained_bundle_),
+      retained_model_map_(source.retained_model_map_),
+      physical_bindings_(std::move(current)),
+      intrinsic_direct_bindings_(std::move(direct_bindings)) {
+  ValidateComposition();
+}
+
+core::Result<deployment::CanonicalValue>
+ProductBackedRuntimeParticipantResolver::ReadQualifiedStopResponse(
+    const core::RuntimeParticipantBinding &binding) const {
+  using Reply = core::Result<deployment::CanonicalValue>;
+  const auto &value = binding.value();
+  if (!value.control_path ||
+      value.retained_bundle_id != retained_bundle_->retained_bundle_id() ||
+      value.graph_revision !=
+          retained_bundle_->value().cell_graph.graph_revision ||
+      std::none_of(physical_bindings_.begin(), physical_bindings_.end(),
+                   [&](const auto &actual) {
+                     const auto &installed = actual.value();
+                     return installed.controllable_component_id ==
+                                value.controllable_component_id &&
+                            installed.command_target_id ==
+                                value.command_target_id &&
+                            installed.capability_id == value.capability_id &&
+                            installed.control_path == value.control_path &&
+                            installed.resources == value.resources;
+                   }))
+    return Reply::Err({"invalid_request",
+                       "Stop metadata is outside the exact composed binding",
+                       {}});
+  try {
+    const deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(
+        package_root_);
+    const auto &path = *value.control_path;
+    return deployment::read_qualified_io_stop_response_metadata(
+        *retained_bundle_, retained_model_map_, path.control_binding_id,
+        path.control_binding_revision, path.control_route_id, artifacts);
+  } catch (const std::exception &error) {
+    return Reply::Err({"stop_metadata_unavailable", error.what(), {}});
+  }
+}
+
+std::shared_ptr<ProductBackedRuntimeParticipantResolver>
+ProductBackedRuntimeParticipantResolver::WithComposedParticipants(
+    std::vector<core::RuntimeParticipantBinding> current,
+    std::vector<core::ProgramBindingId> additional_intrinsic_direct_bindings)
+    const {
+  auto direct = intrinsic_direct_bindings_;
+  direct.insert(direct.end(), additional_intrinsic_direct_bindings.begin(),
+                additional_intrinsic_direct_bindings.end());
+  std::sort(direct.begin(), direct.end());
+  direct.erase(std::unique(direct.begin(), direct.end()), direct.end());
+  return std::shared_ptr<ProductBackedRuntimeParticipantResolver>(
+      new ProductBackedRuntimeParticipantResolver(*this, std::move(current),
+                                                  std::move(direct)));
+}
+
+void ProductBackedRuntimeParticipantResolver::ValidateComposition() {
+  const bool provider_only =
+      retained_bundle_ &&
+      !retained_bundle_->value().cell_graph.control_domains.empty() &&
+      retained_bundle_->value().cell_graph.control_bindings.empty() &&
+      std::all_of(
+          retained_bundle_->value().cell_graph.control_domains.begin(),
+          retained_bundle_->value().cell_graph.control_domains.end(),
+          [](const auto &domain) { return domain.provider() != nullptr; });
+  if (retained_bundle_ == nullptr ||
+      (physical_bindings_.empty() && !provider_only) ||
       retained_model_map_.query().retained_bundle_id !=
           retained_bundle_->retained_bundle_id() ||
       std::any_of(
@@ -472,6 +665,15 @@ ProductBackedRuntimeParticipantResolver::
           role.compiled_link_names[index],
       });
     }
+  }
+  if (semantic_bodies.empty() && provider_only &&
+      std::all_of(physical_bindings_.begin(), physical_bindings_.end(),
+                  [](const auto &binding) {
+                    return binding.value().io_output_binding.has_value();
+                  })) {
+    // A genuine model-free provider has no collision-body aliases. Physical
+    // resolution still requires the original nonempty canonical table.
+    return;
   }
   const auto canonical =
       canonicalize_retained_component_bodies(semantic_bodies);
@@ -566,6 +768,24 @@ bool ProductBackedRuntimeParticipantResolver::FrameObservationCovered(
       return false;
   }
   return true;
+}
+
+core::Result<deployment::RuntimeProgramTargetBinding>
+ProductBackedRuntimeParticipantResolver::ResolveBoundTarget(
+    const deployment::ProgramBinding &binding,
+    const core::TargetRoleId &target_role_id,
+    const core::CapabilityId &capability_id) const {
+  try {
+    return core::Result<deployment::RuntimeProgramTargetBinding>::Ok(
+        deployment::resolve_runtime_program_target(
+            binding, target_role_id, capability_id, *retained_bundle_,
+            retained_model_map_));
+  } catch (const std::exception &exception) {
+    return Reject<deployment::RuntimeProgramTargetBinding>(
+        std::string("exact bound target resolution failed: ") +
+            exception.what(),
+        "runtime_bound_target_resolution_failed");
+  }
 }
 
 core::Result<ResolvedTargetObservation>
@@ -699,38 +919,21 @@ core::Result<core::ProgramRunExecutionCaptureDTO>
 ProductBackedRuntimeParticipantResolver::ResolveProgramCapture(
     core::ProgramRunExecutionCaptureDTO capture) const {
   try {
-    if (capture.table != nullptr || capture.binding != nullptr ||
-        capture.retained_bundle_id != retained_bundle_->retained_bundle_id() ||
-        capture.graph_revision !=
-            retained_bundle_->value().cell_graph.graph_revision) {
-      return Reject<core::ProgramRunExecutionCaptureDTO>(
-          "Program capture must name the active product and carry no table",
-          "program_capture_product_mismatch", core::ErrorCode::kInvalidRequest);
-    }
+    const auto request =
+        detail::ValidateSealedProgramCaptureRequest(capture, *retained_bundle_);
+    if (!request.ok())
+      return core::Result<core::ProgramRunExecutionCaptureDTO>::Err(
+          request.error());
     const auto binding = LoadProgramBinding(capture.program_binding_id);
-    if (binding == nullptr ||
-        binding->value().program_id != capture.program_id ||
-        binding->value().program_revision != capture.program_revision) {
-      return Reject<core::ProgramRunExecutionCaptureDTO>(
-          "Program capture has no exact generated Binding",
-          "program_capture_binding_unavailable",
-          core::ErrorCode::kMissingReference);
-    }
+    const auto selected_binding =
+        detail::ValidateSealedProgramCaptureBinding(capture, binding.get());
+    if (!selected_binding.ok())
+      return core::Result<core::ProgramRunExecutionCaptureDTO>::Err(
+          selected_binding.error());
     const auto program =
         LoadProgram(capture.program_id, capture.program_revision);
-    if (program == nullptr || program->value().node_environment !=
-                                  binding->value().node_environment) {
-      return Reject<core::ProgramRunExecutionCaptureDTO>(
-          "Program capture has no exact canonical Program",
-          "program_capture_source_unavailable",
-          core::ErrorCode::kMissingReference);
-    }
-    capture.table = std::shared_ptr<const core::ProgramExecutionTableDTO>(
-        program, &program->execution_table());
-    capture.binding = std::shared_ptr<const core::ProgramBindingDTO>(
-        binding, &binding->value());
-    return core::Result<core::ProgramRunExecutionCaptureDTO>::Ok(
-        std::move(capture));
+    return detail::ResolveSealedProgramCapture(std::move(capture), program,
+                                               binding, *retained_bundle_);
   } catch (const std::exception &exception) {
     return Reject<core::ProgramRunExecutionCaptureDTO>(
         std::string("Program capture product resolution failed: ") +
@@ -767,6 +970,8 @@ ProductBackedRuntimeParticipantResolver::Resolve(
             "direct_control_product_mismatch",
             core::ErrorCode::kInvalidRequest);
       }
+      if (precomposed->value().io_output_binding)
+        return core::Result<core::RuntimeParticipantBinding>::Ok(*precomposed);
       return core::bind_runtime_participant_collision_body_aliases(
           *precomposed, collision_body_aliases_);
     }
@@ -794,6 +999,29 @@ ProductBackedRuntimeParticipantResolver::Resolve(
         *binding, participant.target_role_id,
         participant.required_capability_id, *retained_bundle_,
         retained_model_map_);
+    if (const auto *command = std::get_if<core::CapabilityCommandIntentDTO>(
+            &participant.payload)) {
+      if (const auto *output = std::get_if<core::IoSignalWriteCommandValueDTO>(
+              &command->command_value)) {
+        const auto &composed = RequireOutputBinding(
+            target, output->resource_role_id, physical_bindings_);
+        auto selected = core::verify_runtime_participant_binding(
+            deployment::build_runtime_io_output_binding_dto(
+                target, output->resource_role_id, *retained_bundle_,
+                ClosedOutputProvenance(composed, *retained_bundle_)));
+        if (!selected.ok())
+          return selected;
+        if (selected.value().value().io_output_binding !=
+                composed.value().io_output_binding ||
+            !PhysicallyContainedBy(composed, selected.value()))
+          return Reject<core::RuntimeParticipantBinding>(
+              "resolved Program output crosses its exact composed channel "
+              "owner",
+              "runtime_program_output_crosses_composed_owner",
+              core::ErrorCode::kInvariantViolation);
+        return selected;
+      }
+    }
     std::vector<deployment::RuntimeProgramTargetBinding> supporting;
     if (const auto *motion = std::get_if<core::MotionParticipantIntentDTO>(
             &participant.payload)) {

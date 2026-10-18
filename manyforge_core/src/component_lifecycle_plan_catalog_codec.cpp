@@ -166,8 +166,14 @@ template <typename Value>
       {"intent", CanonicalValue(std::string(intent_token(value.intent)))},
       {"requested_state", CanonicalValue(std::string(state_token(value.requested_state)))},
       {"requested_postcondition", predicate(value.requested_postcondition)},
-      {"timeout_duration_ns", safe_integer(value.timeout_duration_ns)},
       {"transitions", CanonicalValue(std::move(transitions))}};
+  if (const auto* fixed = std::get_if<std::int64_t>(&value.timeout_policy)) {
+    members.emplace_back("timeout_duration_ns", safe_integer(*fixed));
+  } else {
+    members.emplace_back("timeout_policy",
+                         CanonicalValue(CanonicalValue::Object{
+                             {"kind", CanonicalValue("device_configured_limit")}}));
+  }
   if (value.recover_target_eligibility.has_value()) {
     members.emplace_back("recover_target_eligibility",
                          predicate(*value.recover_target_eligibility));

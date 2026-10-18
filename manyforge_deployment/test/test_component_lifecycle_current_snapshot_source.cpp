@@ -256,8 +256,8 @@ active_configuration(const SourceFacts &facts) {
           facts.domain->control_domain_revision,
           std::move(routes),
           facts.desired->activation_set_id,
-          facts.domain->controller_topology_id,
-          facts.domain->topology_revision,
+          facts.domain->controller().controller_topology_id,
+          facts.domain->controller().topology_revision,
           facts.provider.provider_runtime_unit_id,
           facts.provider.provider_runtime_epoch,
           1U,
@@ -312,9 +312,8 @@ TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
   EXPECT_EQ(snapshot.value().component_lifecycle_state,
             core::ComponentLifecycleStateDTO::kDeclared);
   ASSERT_EQ(snapshot.value().domains.size(), 1U);
-  EXPECT_FALSE(snapshot.value()
-                   .domains.front()
-                   .active_control_configuration.has_value());
+  EXPECT_FALSE(
+      snapshot.value().domains.front().controller().active_control_configuration.has_value());
   EXPECT_TRUE(
       core::VerifyComponentLifecycleCurrentSnapshot(snapshot.value()).ok());
 }
@@ -351,12 +350,14 @@ TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
 
   std::vector<core::ExpectedControlDomainRevisionDTO> expected;
   for (const auto &domain : snapshot.value().domains) {
-    ASSERT_FALSE(domain.active_control_configuration);
-    expected.push_back({domain.control_domain_id, domain.control_domain_revision,
-                        domain.controller_topology_id, domain.topology_revision,
-                        {core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
-                         std::nullopt, std::nullopt},
-                        domain.current_control_bindings});
+    ASSERT_FALSE(domain.controller().active_control_configuration);
+    expected.push_back(
+        {domain.control_domain_id,
+         domain.control_domain_revision,
+         domain.controller().controller_topology_id,
+         domain.controller().topology_revision,
+         {core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt},
+         domain.controller().current_control_bindings});
   }
   core::ComponentLifecycleIntentDTO intent{
       {core::RequestId("bootstrap.prepare"), owner.value().request_owner_epoch,
@@ -426,10 +427,9 @@ TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
             core::ComponentLifecycleGeneration(4U));
   EXPECT_EQ(snapshot.value().component_lifecycle_state,
             core::ComponentLifecycleStateDTO::kPrepared);
-  ASSERT_TRUE(snapshot.value()
-                  .domains.front()
-                  .active_control_configuration.has_value());
-  EXPECT_EQ(*snapshot.value().domains.front().active_control_configuration,
+  ASSERT_TRUE(
+      snapshot.value().domains.front().controller().active_control_configuration.has_value());
+  EXPECT_EQ(*snapshot.value().domains.front().controller().active_control_configuration,
             active_configuration(facts));
 }
 

@@ -1,4 +1,8 @@
 #include "resource_addressed_execution_kernel_internal.hpp"
+#include <manyforge_core/io_signal_descriptor.hpp>
+#include <manyforge_core/io_condition_evaluator.hpp>
+#include <manyforge_core/types/program_io_condition.hpp>
+#include "component_lifecycle_journal_codec_internal.hpp"
 
 namespace manyforge::core {
 
@@ -22,18 +26,82 @@ Result<void> ResourceAddressedExecutionKernel::SetRouteRecoveryPending(bool pend
   return cell_admission_owner_->SetRouteRecoveryPending(pending);
 }
 
-Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmissionReadiness(
-    const CellAdmissionReadinessSnapshotDTO& snapshot) {
-  std::lock_guard admission_lock(*admission_mutex_);
-  auto updated = cell_admission_owner_->UpdateCellAdmissionReadiness(snapshot);
-  if (updated.ok()) {
-    std::lock_guard state_lock(state_mutex_);
-    current_program_run_id_ =
-        snapshot.program_cycle_status_current && snapshot.program_cycle_status.has_value()
-            ? snapshot.program_cycle_status->program_run_id
-            : std::nullopt;
+void ResourceAddressedExecutionKernel::mark_motion_retry_run_end_locked(
+    const ProgramRunId& run_id) {
+  retire_program_io_watches_locked(run_id);
+  for (auto& [id, operation] : active_operations_) {
+    static_cast<void>(id);
+    if (operation->state.program_run_id == run_id &&
+        fresh_motion_node_indices_locked(*operation))
+      operation->retry_run_ended = true;
   }
+}
+
+Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmissionReadiness(
+    const CellAdmissionReadinessSnapshotDTO& snapshot,
+    std::shared_ptr<IIoSignalService>* actual_retired_service) {
+  if (actual_retired_service) actual_retired_service->reset();  // Destroy outside Core locks.
+  auto updated = [&] {
+    std::lock_guard admission_lock(*admission_mutex_);
+    if (snapshot.program_runner_loss) {
+      const auto valid = cell_admission_owner_->ValidateProgramRunnerContactLossSource(
+          *snapshot.program_runner_loss);
+      if (!valid.ok()) return Result<AuthoringAdmissionDTO>::Err(valid.error());
+      if (snapshot.program_cycle_status_current)
+        return reject<AuthoringAdmissionDTO>("Runner loss must close currentness",
+                                             "program_runner_contact_loss_invalid",
+                                             ErrorCode::kInvalidRequest);
+      std::lock_guard state_lock(state_mutex_);
+      const auto& cycle = snapshot.program_runner_loss->established_cycle;
+      const bool exact_replay = program_runner_loss_ == snapshot.program_runner_loss;
+      if (!exact_replay &&
+          (!program_cycle_claim_run_ ||
+           program_cycle_claim_run_->program_runner_owner_epoch !=
+               cycle.program_runner_owner_epoch ||
+           program_cycle_claim_run_->program_run_id != cycle.program_run_id ||
+           program_cycle_claim_run_->claim_generation != cycle.cycle_claim_generation)) {
+        return reject<AuthoringAdmissionDTO>("Runner loss does not name the held Program owner",
+                                             "program_runner_contact_loss_stale",
+                                             ErrorCode::kInvalidRequest);
+      }
+      // The first owner-issued fault remains observable even if advancing
+      // ordinary readiness fails its journal write. This grants no recovery.
+      if (!program_runner_loss_) program_runner_loss_ = snapshot.program_runner_loss;
+      const auto bb_retired = retire_program_blackboard_source_locked(actual_retired_service);
+      if (!bb_retired.ok()) return Result<AuthoringAdmissionDTO>::Err(bb_retired.error());
+      if (cycle.program_run_id) retire_program_io_watches_locked(*cycle.program_run_id);
+    }
+    auto result = cell_admission_owner_->UpdateCellAdmissionReadiness(snapshot);
+    if (result.ok()) {
+      std::lock_guard state_lock(state_mutex_);
+      const auto bb_current = reconcile_program_blackboard_cycle_locked(
+          snapshot.program_cycle_status, snapshot.program_cycle_status_current, actual_retired_service);
+      if (!bb_current.ok()) return Result<AuthoringAdmissionDTO>::Err(bb_current.error());
+      current_program_run_id_ =
+          snapshot.program_cycle_status_current && snapshot.program_cycle_status
+              ? snapshot.program_cycle_status->program_run_id
+              : std::nullopt;
+      if (program_cycle_claim_run_ && snapshot.program_cycle_status) {
+        const auto& run = *program_cycle_claim_run_;
+        const auto& status = *snapshot.program_cycle_status;
+        const bool exact = status.program_runner_owner_epoch == run.program_runner_owner_epoch &&
+                           status.program_run_id == run.program_run_id &&
+                           status.cycle_claim_generation == run.claim_generation;
+        if (snapshot.program_cycle_status_current && exact &&
+            (status.state == ProgramCycleStateDTO::kTerminalAwaitingReset ||
+             status.state == ProgramCycleStateDTO::kResetting))
+          mark_motion_retry_run_end_locked(run.program_run_id);
+      }
+    }
+    return result;
+  }();
   return updated;
+}
+
+std::optional<ProgramRunnerContactLossDTO>
+ResourceAddressedExecutionKernel::get_program_runner_loss() const {
+  std::lock_guard state_lock(state_mutex_);
+  return program_runner_loss_;
 }
 
 Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmissionClaim(
@@ -65,7 +133,7 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmis
   if (physical_mutation) {
     submit_lock.lock();
   }
-  std::lock_guard admission_lock(*admission_mutex_);
+  std::unique_lock admission_lock(*admission_mutex_);
   if (physical_mutation) {
     std::lock_guard state_lock(state_mutex_);
     // Every blocking condition and the identities it concerns, so a caller
@@ -119,7 +187,260 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmis
   if (acquired.ok() && intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle) {
     refresh_execution_claims();
   }
+  admission_lock.unlock();
   return acquired;
+}
+
+Result<const ResourceAddressedExecutionKernel::ActiveOperation*>
+ResourceAddressedExecutionKernel::qualify_io_output_recovery_operation_locked(
+    const ControllableComponentId& component) const {
+  using Reply = Result<const ActiveOperation*>;
+  const auto refuse = [] {
+    return Reply::Err(
+        error("invalid_state_transition",
+              "Local output resynchronization requires only its exact retained unknown owner",
+              "io_output_recovery_owner_not_exact"));
+  };
+  if (active_operations_.size() != 1U || pending_program_run_admission_ ||
+      operation_control_reconfiguration_busy_locked() || motion_admission_unreconciled_ ||
+      motion_admission_closed_.restrictive() || manager_liveness_motion_inhibited_ ||
+      operation_journal_write_fault_ || is_active_stop_fault_latch(active_stop_fault_latch_) ||
+      (!config_.operation_admission_gate ||
+       config_.operation_admission_gate->has_held_configuration_fences()) ||
+      std::any_of(stop_transactions_.begin(), stop_transactions_.end(),
+                  [](const auto& stop) { return stop->active && !stop->terminal; }))
+    return refuse();
+  const auto& operation = *active_operations_.begin()->second;
+  if (operation.state.state != OperationStateKind::kInterventionRequired ||
+      operation.participants.empty() ||
+      operation.participants.size() != operation.state.participants.size() ||
+      operation.pending_control || operation.ordinary_acceptance_pending ||
+      operation.ordinary_commit_in_flight || operation.runtime_scale_effect_in_flight ||
+      operation.stop_effect_in_flight || operation.recovery_effect_in_flight ||
+      operation.coordinated_cancellation_in_flight || operation.takeover_advance_in_flight ||
+      !operation.pending_motion_takeover.empty() || !operation.next_motion_takeover.empty())
+    return refuse();
+  for (std::size_t index = 0; index < operation.participants.size(); ++index) {
+    const auto& participant = operation.participants[index];
+    const auto& binding = participant.binding.value();
+    const auto& state = operation.state.participants[index];
+    if (binding.controllable_component_id != component || !binding.io_output_binding ||
+        binding.control_path || !binding.resources.empty() || participant.stop_readiness ||
+        participant.stop_execution_port ||
+        participant.payload_kind != OperationParticipantPayloadKind::kCapabilityCommand ||
+        state.state != OperationStateKind::kInterventionRequired ||
+        state.output_evidence != IoOutputEvidence::kAcceptanceUnknown || !state.terminal_fact ||
+        state.terminal_fact->effect != ParticipantEffectKnowledge::kEffectUncertain ||
+        participant.dispatch_effect_in_flight || participant.prepare_in_flight ||
+        participant.prepared_advance_in_flight || participant.reconciliation_in_flight ||
+        participant.deferred_cancel_settlement || participant.deferred_stop_settlement ||
+        participant.ownership_transferred)
+      return refuse();
+    const auto& output = *binding.io_output_binding;
+    const auto current =
+        runtime_route_configuration_readbacks_.find(output.provider.control_domain_id);
+    if (current == runtime_route_configuration_readbacks_.end() || !current->second.provider())
+      return refuse();
+    const auto& actual = *current->second.provider();
+    if (actual.provider_occurrence != output.provider ||
+        actual.domain.provider()->provider.controllable_component_id != component ||
+        actual.domain.provider()->provider.signal_configuration_digest !=
+            output.signal_configuration_digest ||
+        actual.retained_bundle_id != binding.retained_bundle_id ||
+        actual.graph_revision != binding.graph_revision ||
+        std::find(actual.domain.resource_ids().begin(), actual.domain.resource_ids().end(),
+                  *output.signal.output_resource) == actual.domain.resource_ids().end())
+      return refuse();
+  }
+  // The device must be nonmoving in the actual installed inventory, including
+  // unused registrations. Arm-hosted GPIO never gets this generic exception.
+  if (std::any_of(registrations_.begin(), registrations_.end(), [&](const auto& registration) {
+        const auto& binding = registration.binding.value();
+        return binding.controllable_component_id == component &&
+               (!binding.io_output_binding || binding.control_path || !binding.resources.empty() ||
+                registration.stop_readiness || registration.stop_execution_port);
+      }))
+    return refuse();
+  for (const auto& slot : resource_slots_->snapshot()) {
+    if (slot.state == ResourceSlotState::kFree && !slot.owner) continue;
+    const auto participant = std::find_if(
+        operation.participants.begin(), operation.participants.end(), [&](const auto& row) {
+          return slot.owner && *slot.owner == row.slot_owner &&
+                 std::find(row.resources.begin(), row.resources.end(), slot.resource_id) !=
+                     row.resources.end();
+        });
+    if (participant == operation.participants.end() || slot.state != ResourceSlotState::kTerminal)
+      return refuse();
+  }
+  return Reply::Ok(&operation);
+}
+
+Result<void> ResourceAddressedExecutionKernel::validate_io_output_recovery_claims_locked(
+    const ControllableComponentId& component, std::span<const CellAdmissionClaimDTO> held,
+    const CellAdmissionReadinessSnapshotDTO& readiness) const {
+  const auto qualified = qualify_io_output_recovery_operation_locked(component);
+  if (!qualified.ok()) return Result<void>::Err(qualified.error());
+  const auto& operation = *qualified.value();
+  const auto refuse = [] {
+    return reject<void>("Local output resynchronization conflicts with another current owner",
+                        "io_output_recovery_claim_conflict");
+  };
+  std::optional<CellAdmissionClaimGeneration> parent;
+  const auto& parent_run = operation.manual && operation.manual_handover
+                               ? operation.manual_handover->capture.program_run_id
+                               : operation.state.program_run_id;
+  if (operation.manual) {
+    if (!manual_operation_claim_ || manual_operation_claim_->intent.owner_transaction_id !=
+                                        operation.state.operation_id.value())
+      return refuse();
+    parent = parent_program_cycle_claim(manual_operation_claim_->intent);
+  } else if (has_program_execution_scope(operation.state)) {
+    if (!program_cycle_claim_run_ || !program_cycle_claim_run_->capture ||
+        !program_cycle_claim_run_->capture->table ||
+        program_cycle_claim_run_->program_run_id != operation.state.program_run_id)
+      return refuse();
+    parent = program_cycle_claim_run_->claim_generation;
+  } else if (program_cycle_claim_run_) {
+    // An unscoped request cannot borrow an unrelated live Run's authority.
+    return refuse();
+  }
+  bool saw_manual = !operation.manual;
+  bool saw_parent = !parent;
+  for (const auto& claim : held) {
+    if (operation.manual && claim == *manual_operation_claim_) {
+      saw_manual = true;
+      continue;
+    }
+    if (parent && claim.claim_generation == *parent &&
+        claim.intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle &&
+        claim.intent.owner_transaction_id == parent_run.value() && readiness.program_cycle_status &&
+        readiness.program_cycle_status->program_runner_owner_epoch == claim.intent.owner_epoch &&
+        readiness.program_cycle_status->program_run_id == parent_run &&
+        readiness.program_cycle_status->cycle_claim_generation == parent) {
+      saw_parent = true;
+      continue;
+    }
+    const auto& node = claim.intent.program_node_evidence;
+    if (!node || !parent || node->parent_program_cycle_claim_generation != *parent ||
+        node->program_run_id != parent_run || !program_cycle_claim_run_ ||
+        node->program_runner_owner_epoch != program_cycle_claim_run_->program_runner_owner_epoch ||
+        std::none_of(operation.state.participants.begin(), operation.state.participants.end(),
+                     [&](const auto& row) {
+                       return row.execution_scope &&
+                              row.execution_scope->node_instance_id.value() ==
+                                  node->node_instance_id &&
+                              row.execution_scope->node_attempt_id == node->node_attempt_id;
+                     }))
+      return refuse();
+  }
+  if (!saw_manual || !saw_parent || !readiness.program_cycle_status) return refuse();
+  const auto& cycle = *readiness.program_cycle_status;
+  if (!parent) {
+    if (cycle.state != ProgramCycleStateDTO::kIdleAfterReset) return refuse();
+  } else {
+    if (cycle.state == ProgramCycleStateDTO::kStarting ||
+        cycle.state == ProgramCycleStateDTO::kStopping ||
+        cycle.state == ProgramCycleStateDTO::kResetting ||
+        cycle.state == ProgramCycleStateDTO::kIdleAfterReset)
+      return refuse();
+    if (cycle.state == ProgramCycleStateDTO::kRunning && operation.manual) {
+      if (!operation.manual_handover || !operation.manual_handover->capture.table ||
+          operation.manual_handover->capture.program_run_id != parent_run)
+        return refuse();
+      const auto registration =
+          std::find_if(registrations_.begin(), registrations_.end(), [&](const auto& row) {
+            const auto& binding = row.binding.value();
+            const auto& captured = operation.participants.front().binding.value();
+            return binding.controllable_component_id == captured.controllable_component_id &&
+                   binding.command_target_id == captured.command_target_id &&
+                   binding.io_output_binding.has_value();
+          });
+      if (registration == registrations_.end() ||
+          !validate_manual_program_handover_locked(*operation.manual_handover, &*registration).ok())
+        return refuse();
+    } else if (cycle.state == ProgramCycleStateDTO::kRunning) {
+      const auto fence = std::find_if(
+          program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
+          [&](const auto& row) { return row.program_run_id == operation.state.program_run_id; });
+      if (!program_cycle_claim_run_ || !program_cycle_claim_run_->capture ||
+          !program_cycle_claim_run_->capture->table || fence == program_run_stop_fences_.end())
+        return refuse();
+      const auto& nodes = program_cycle_claim_run_->capture->table->nodes;
+      for (const auto& participant : operation.state.participants) {
+        if (!participant.execution_scope) return refuse();
+        const auto node = std::lower_bound(
+            nodes.begin(), nodes.end(), participant.execution_scope->node_instance_id,
+            [](const auto& row, const auto& id) { return row.instance_id < id; });
+        if (node == nodes.end() ||
+            node->instance_id != participant.execution_scope->node_instance_id ||
+            fence->node_states.size() != nodes.size() ||
+            program_node_effectively_running_locked(operation.state.program_run_id,
+                                                    static_cast<std::size_t>(node - nodes.begin())))
+          return refuse();
+      }
+    }
+  }
+  return Result<void>::Ok();
+}
+
+Result<CellAdmissionClaimDTO>
+ResourceAddressedExecutionKernel::AcquireIoOutputRecoveryLifecycleClaim(
+    const CellAdmissionClaimIntentDTO& claim, const ComponentLifecycleIntentDTO& lifecycle) {
+  if (!lifecycle.locally_valid() ||
+      (lifecycle.intent != ComponentLifecycleIntentKindDTO::kDisable &&
+       lifecycle.intent != ComponentLifecycleIntentKindDTO::kPrepare &&
+       lifecycle.intent != ComponentLifecycleIntentKindDTO::kEnable) ||
+      lifecycle.program_node_evidence || lifecycle.apply_generation_selection ||
+      lifecycle.close_incident_recovery ||
+      claim.claim_kind != CellAdmissionClaimKindDTO::kComponentLifecycle ||
+      claim.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
+      claim.request_id != lifecycle.request_context.request_id ||
+      claim.owner_epoch != lifecycle.request_context.request_owner_epoch ||
+      claim.expected_admission_generation != lifecycle.expected_admission_generation ||
+      claim.request_payload_digest !=
+          ContentDigest(detail::ComponentLifecycleSemanticIntentDigest(lifecycle)))
+    return reject<CellAdmissionClaimDTO>(
+        "Local output recovery has no exact ordinary lifecycle request",
+        "io_output_recovery_lifecycle_request_invalid", ErrorCode::kInvalidRequest);
+  // Idle ordinary lifecycle keeps its exact original admission behavior.
+  bool idle = false;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    idle = active_operations_.empty();
+  }
+  if (idle) return AcquireCellAdmissionClaim(claim);
+  std::lock_guard submit_lock(submission_mutex_);
+  std::lock_guard admission_lock(*admission_mutex_);
+  return cell_admission_owner_->AcquireIoOutputRecoveryLifecycleClaim(
+      claim, [&](const auto&, auto held, const auto& readiness, const auto&) -> Result<void> {
+        std::lock_guard state_lock(state_mutex_);
+        if (!stop_graph_revision_ || lifecycle.expected_graph_revision != *stop_graph_revision_)
+          return reject<void>("Output recovery graph is not current",
+                              "io_output_recovery_product_stale");
+        const auto actual_count = std::count_if(
+            runtime_route_configuration_readbacks_.begin(),
+            runtime_route_configuration_readbacks_.end(), [&](const auto& row) {
+              return row.second.provider() &&
+                     row.second.provider()->domain.provider()->provider.controllable_component_id ==
+                         lifecycle.controllable_component_id;
+            });
+        if (actual_count != static_cast<std::ptrdiff_t>(lifecycle.expected_control_domains.size()))
+          return reject<void>("Output recovery domain coverage is incomplete",
+                              "io_output_recovery_product_stale");
+        for (const auto& expected : lifecycle.expected_control_domains) {
+          const auto actual =
+              runtime_route_configuration_readbacks_.find(expected.control_domain_id);
+          if (!expected.provider() || actual == runtime_route_configuration_readbacks_.end() ||
+              !actual->second.provider() ||
+              actual->second.provider()->domain.provider()->provider.controllable_component_id !=
+                  lifecycle.controllable_component_id ||
+              !ExpectedDomainMatchesResolvedScope(expected, actual->second.provider()->domain))
+            return reject<void>("Output recovery domain is not current",
+                                "io_output_recovery_product_stale");
+        }
+        return validate_io_output_recovery_claims_locked(lifecycle.controllable_component_id, held,
+                                                         readiness);
+      });
 }
 
 Result<CellAdmissionClaimDTO>
@@ -143,9 +464,9 @@ ResourceAddressedExecutionKernel::AcquireRouteRecoveryCellAdmissionClaim(
                 std::vector<CellAdmissionConfigurationScopeDTO>{
                     {predecessor.control_domain_id, predecessor.active_control_configuration_id,
                      predecessor.active_control_configuration_generation}} ||
-            found == runtime_route_configuration_readbacks_.end() ||
-            found->second.active_configuration != predecessor ||
-            found->second.operation_admission_open || !found->second.readiness_rows.empty() ||
+            found == runtime_route_configuration_readbacks_.end() || found->second.provider() != nullptr ||
+            found->second.controller().active_configuration != predecessor ||
+            found->second.controller().operation_admission_open || !found->second.controller().readiness_rows.empty() ||
             !runtime_route_configuration_publication_required_.contains(
                 predecessor.control_domain_id)) {
           return reject<void>("route recovery has no exact admission-closed adopted predecessor",
@@ -261,17 +582,28 @@ Result<void> ResourceAddressedExecutionKernel::validate_selected_bring_up_predec
     return reject<void>("selected bring-up has reserved or unknown physical effects",
                         "selected_bring_up_resources_not_settled");
   }
-  return validate_bring_up_component_closure_locked(
-      offer.predecessor, offer.candidate_participants, offer.fence_admission);
+  return validate_bring_up_component_closure_locked(offer.predecessor, offer.candidate_participants,
+                                                    offer.candidate_provider_domains,
+                                                    offer.fence_admission);
 }
 
 Result<void> ResourceAddressedExecutionKernel::validate_bring_up_component_closure_locked(
     const ComponentLifecycleCurrentSnapshotDTO& predecessor,
     const std::vector<RuntimeParticipantBindingDTO>& candidates,
+    const std::vector<ResolvedLifecycleControlDomainScopeDTO>& candidate_provider_domains,
     const ConfigurationFenceAdmissionSnapshotDTO& admission) {
   const auto& component = predecessor.controllable_component_id;
   std::vector<ResourceId> current_resources;
   std::set<ControlBindingId> current_bindings;
+  for (const auto& [id, readback] : runtime_route_configuration_readbacks_) {
+    const auto* current = readback.provider();
+    if (current && current->domain.provider()->provider.controllable_component_id == component &&
+        std::none_of(predecessor.domains.begin(), predecessor.domains.end(),
+                     [&](const auto& domain) { return domain.control_domain_id == id; })) {
+      return reject<void>("selected bring-up omits an installed predecessor provider domain",
+                          "selected_bring_up_configuration_not_current");
+    }
+  }
   for (const auto& registration : registrations_) {
     const auto& binding = registration.binding.value();
     if (binding.controllable_component_id != component || !binding.control_path) continue;
@@ -288,9 +620,27 @@ Result<void> ResourceAddressedExecutionKernel::validate_bring_up_component_closu
     const auto& domain = predecessor.domains[index];
     const auto& provider = predecessor.provider_occurrences[index];
     const auto adopted = runtime_route_configuration_readbacks_.find(domain.control_domain_id);
-    if (!domain.active_control_configuration ||
-        adopted == runtime_route_configuration_readbacks_.end() ||
-        adopted->second.active_configuration != *domain.active_control_configuration) {
+    if (const auto* provider_scope = domain.provider()) {
+      const auto* current = adopted == runtime_route_configuration_readbacks_.end()
+                                ? nullptr : adopted->second.provider();
+      if (current == nullptr || current->domain != domain ||
+          current->provider_occurrence != provider ||
+          current->component_lifecycle_generation != predecessor.component_lifecycle_generation ||
+          current->retained_bundle_id != admission.active_projection_revision.retained_bundle_id ||
+          current->graph_revision != admission.active_projection_revision.graph_revision ||
+          provider_scope->provider.controllable_component_id != component ||
+          provider.provider_runtime_unit_id != admission.execution_host_epoch.runtime_unit_id ||
+          provider.provider_runtime_epoch != admission.execution_host_epoch.runtime_epoch) {
+        return reject<void>("selected bring-up provider predecessor is not adopted",
+                            "selected_bring_up_configuration_not_current");
+      }
+      current_resources.insert(current_resources.end(), provider_scope->output_resources.begin(),
+                               provider_scope->output_resources.end());
+      continue;
+    }
+    if (!domain.controller().active_control_configuration ||
+        adopted == runtime_route_configuration_readbacks_.end() || adopted->second.provider() != nullptr ||
+        adopted->second.controller().active_configuration != *domain.controller().active_control_configuration) {
       return reject<void>("selected bring-up predecessor configuration is not adopted",
                           "selected_bring_up_configuration_not_current");
     }
@@ -301,8 +651,8 @@ Result<void> ResourceAddressedExecutionKernel::validate_bring_up_component_closu
         continue;
       const auto& path = *binding.control_path;
       const auto control_binding =
-          std::find_if(domain.current_control_bindings.begin(),
-                       domain.current_control_bindings.end(), [&](const auto& row) {
+          std::find_if(domain.control_bindings().begin(),
+                       domain.control_bindings().end(), [&](const auto& row) {
                          return row.control_binding_id == path.control_binding_id &&
                                 row.control_binding_revision == path.control_binding_revision &&
                                 row.control_route_id == path.control_route_id;
@@ -312,9 +662,9 @@ Result<void> ResourceAddressedExecutionKernel::validate_bring_up_component_closu
           binding.graph_revision !=
               admission.active_projection_revision.graph_revision ||
           path.control_domain_revision != domain.control_domain_revision ||
-          path.controller_topology_id != domain.controller_topology_id ||
-          path.topology_revision != domain.topology_revision ||
-          control_binding == domain.current_control_bindings.end() ||
+          path.controller_topology_id != domain.controller().controller_topology_id ||
+          path.topology_revision != domain.controller().topology_revision ||
+          control_binding == domain.control_bindings().end() ||
           path.provider_instance_id != provider.provider_instance_id ||
           path.provider_manifest_id != provider.provider_manifest_id ||
           path.provider_manifest_revision != provider.provider_manifest_revision ||
@@ -330,7 +680,7 @@ Result<void> ResourceAddressedExecutionKernel::validate_bring_up_component_closu
       for (const auto& resource : binding.resources)
         current_resources.push_back(resource.resource_id);
     }
-    for (const auto& binding : domain.current_control_bindings) {
+    for (const auto& binding : domain.control_bindings()) {
       if (!current_bindings.contains(binding.control_binding_id)) {
         return reject<void>("selected bring-up predecessor participant is missing",
                             "selected_bring_up_registration_not_current");
@@ -342,8 +692,8 @@ Result<void> ResourceAddressedExecutionKernel::validate_bring_up_component_closu
                           current_resources.end());
   std::vector<ResourceId> expected_resources;
   for (const auto& domain : predecessor.domains)
-    expected_resources.insert(expected_resources.end(), domain.current_resources.begin(),
-                              domain.current_resources.end());
+    expected_resources.insert(expected_resources.end(), domain.resource_ids().begin(),
+                              domain.resource_ids().end());
   std::sort(expected_resources.begin(), expected_resources.end());
   expected_resources.erase(std::unique(expected_resources.begin(), expected_resources.end()),
                            expected_resources.end());
@@ -351,20 +701,103 @@ Result<void> ResourceAddressedExecutionKernel::validate_bring_up_component_closu
     return reject<void>("selected bring-up predecessor physical closure changed",
                         "selected_bring_up_resources_not_current");
   }
-  return validate_bring_up_candidate_peer_closure_locked(component, candidates, admission);
+  return validate_bring_up_candidate_peer_closure_locked(component, candidates,
+                                                         candidate_provider_domains, admission);
 }
 
 Result<void> ResourceAddressedExecutionKernel::validate_bring_up_candidate_peer_closure_locked(
     const ControllableComponentId& component,
     const std::vector<RuntimeParticipantBindingDTO>& candidates,
+    const std::vector<ResolvedLifecycleControlDomainScopeDTO>& candidate_provider_domains,
     const ConfigurationFenceAdmissionSnapshotDTO& admission) {
+  std::optional<ControlDomainId> previous;
+  for (const auto& domain : candidate_provider_domains) {
+    const auto* provider = domain.provider();
+    if (!domain.locally_valid() || !provider ||
+        provider->provider.controllable_component_id != component ||
+        provider->provider.provider_runtime_unit_id !=
+            admission.execution_host_epoch.runtime_unit_id ||
+        provider->provider_runtime_epoch != admission.execution_host_epoch.runtime_epoch ||
+        (previous && !(*previous < domain.control_domain_id))) {
+      return reject<void>("selected bring-up provider candidate is not exact",
+                          "selected_bring_up_candidate_provider_invalid",
+                          ErrorCode::kInvalidRequest);
+    }
+    previous = domain.control_domain_id;
+    for (const auto& [id, readback] : runtime_route_configuration_readbacks_) {
+      const auto* other = readback.provider();
+      if (!other || other->domain.provider()->provider.controllable_component_id == component)
+        continue;
+      if (id == domain.control_domain_id ||
+          std::any_of(provider->output_resources.begin(), provider->output_resources.end(),
+                      [&](const auto& resource) {
+                        return std::binary_search(other->domain.resource_ids().begin(),
+                                                  other->domain.resource_ids().end(), resource);
+                      })) {
+        return reject<void>("selected bring-up crosses a healthy provider peer",
+                            "selected_bring_up_nonselected_scope_changed");
+      }
+    }
+    for (const auto& registration : registrations_) {
+      const auto& other = registration.binding.value();
+      if (other.controllable_component_id == component) continue;
+      if ((other.control_path &&
+           other.control_path->control_domain_id == domain.control_domain_id) ||
+          std::any_of(other.resources.begin(), other.resources.end(), [&](const auto& resource) {
+            return std::binary_search(provider->output_resources.begin(),
+                                      provider->output_resources.end(), resource.resource_id);
+          })) {
+        return reject<void>("selected bring-up crosses a healthy peer domain or resource",
+                            "selected_bring_up_nonselected_scope_changed");
+      }
+    }
+  }
   for (const auto& candidate : candidates) {
+    if (candidate.io_output_binding) {
+      const auto& output = *candidate.io_output_binding;
+      const auto found =
+          std::find_if(candidate_provider_domains.begin(), candidate_provider_domains.end(),
+                       [&](const auto& domain) {
+                         return domain.control_domain_id == output.provider.control_domain_id;
+                       });
+      if (found == candidate_provider_domains.end() ||
+          candidate.controllable_component_id != component ||
+          !ProviderDomainMatchesOccurrence(
+              found->control_domain_id, found->control_domain_revision, found->provider()->provider,
+              found->provider()->provider_runtime_epoch, output.provider) ||
+          output.signal_configuration_digest !=
+              found->provider()->provider.signal_configuration_digest ||
+          !output.signal.output_resource ||
+          !std::binary_search(found->resource_ids().begin(), found->resource_ids().end(),
+                              *output.signal.output_resource)) {
+        return reject<void>("selected bring-up output candidate has no exact provider domain",
+                            "selected_bring_up_candidate_provider_invalid",
+                            ErrorCode::kInvalidRequest);
+      }
+      continue;
+    }
+    if (!candidate.control_path)
+      return reject<void>("selected bring-up candidate has no actual domain authority",
+                          "selected_bring_up_candidate_invalid", ErrorCode::kInvalidRequest);
     const auto& path = *candidate.control_path;
     if (path.provider_runtime_unit_id !=
             admission.execution_host_epoch.runtime_unit_id ||
         path.provider_runtime_epoch != admission.execution_host_epoch.runtime_epoch) {
       return reject<void>("selected bring-up cannot change the shared host epoch",
                           "selected_bring_up_host_epoch_changed");
+    }
+    for (const auto& [id, readback] : runtime_route_configuration_readbacks_) {
+      const auto* other = readback.provider();
+      if (!other || other->domain.provider()->provider.controllable_component_id == component)
+        continue;
+      if (id == path.control_domain_id ||
+          std::any_of(
+              candidate.resources.begin(), candidate.resources.end(), [&](const auto& resource) {
+                return std::binary_search(other->domain.resource_ids().begin(),
+                                          other->domain.resource_ids().end(), resource.resource_id);
+              }))
+        return reject<void>("selected bring-up crosses a healthy provider peer",
+                            "selected_bring_up_nonselected_scope_changed");
     }
     for (const auto& registration : registrations_) {
       const auto& other = registration.binding.value();
@@ -438,6 +871,22 @@ Result<void> ResourceAddressedExecutionKernel::validate_apply_bring_up_current_l
   std::map<ControlBindingId, ConfigurationFenceBindingScopeDTO> bindings;
   std::set<ResourceId> resources;
   std::map<ResourceId, ControllableComponentId> candidate_resource_owners;
+  const auto attach_provider = [](ConfigurationFenceDomainScopeDTO& target,
+                                  const ResolvedLifecycleControlDomainScopeDTO& scope,
+                                  bool candidate) {
+    const auto* provider = scope.provider();
+    if (!provider) return true;
+    if (!std::holds_alternative<ProviderConfigurationFenceDomainDTO>(target.payload))
+      target.payload = ProviderConfigurationFenceDomainDTO{};
+    auto& typed = std::get<ProviderConfigurationFenceDomainDTO>(target.payload);
+    auto& side = candidate ? typed.candidate_provider : typed.predecessor_provider;
+    const ProviderConfigurationFenceOccurrenceDTO proof{
+        provider->provider.controllable_component_id, provider->provider.provider_instance_id,
+        provider->provider.signal_configuration_digest, provider->output_resources};
+    if (side && *side != proof) return false;
+    side = proof;
+    return true;
+  };
   bool exact_latch = false;
   std::set<std::string> incidents;
   for (const auto& row : offer.needed_components) {
@@ -451,21 +900,23 @@ Result<void> ResourceAddressedExecutionKernel::validate_apply_bring_up_current_l
                           "apply_bring_up_offer_invalid", ErrorCode::kInvalidRequest);
     }
     closure.controllable_component_ids.push_back(component);
-    if (row.candidate_participants.empty() ||
-        row.candidate_participants.size() > kMaximumCellAdmissionScopeEntries) {
+    if ((row.candidate_participants.empty() && row.candidate_provider_domains.empty()) ||
+        row.candidate_participants.size() > kMaximumCellAdmissionScopeEntries ||
+        row.candidate_provider_domains.size() > kMaxLifecycleResolvedDomains) {
       return reject<void>("Apply bring-up candidate closure is absent or exceeds its bound",
                           "apply_bring_up_candidate_invalid", ErrorCode::kInvalidRequest);
     }
     for (const auto& candidate : row.candidate_participants) {
       const auto verified = verify_runtime_participant_binding(candidate);
       if (!verified.ok() || candidate.controllable_component_id != component ||
-          !candidate.control_path) {
+          (!candidate.control_path && !candidate.io_output_binding)) {
         return reject<void>("Apply bring-up candidate binding is not qualified",
                             "apply_bring_up_candidate_invalid", ErrorCode::kInvalidRequest);
       }
       // Preserve derive_stop_static_facts' existing physical attribution:
       // same-component aliases are valid; another component cannot own it.
       for (const auto& resource : candidate.resources) {
+        if (candidate.io_output_binding) continue;
         const auto [owner, inserted] = candidate_resource_owners.emplace(resource.resource_id, component);
         if (!inserted && owner->second != component) {
           return reject<void>("candidate Stop resource belongs to multiple components",
@@ -479,20 +930,34 @@ Result<void> ResourceAddressedExecutionKernel::validate_apply_bring_up_current_l
       // and healthy ordinary prerequisites; absence alone is not authority.
       if (row.predecessor || row.recovery || is_active_stop_fault_latch(active_stop_fault_latch_) ||
           motion_admission_closed_ || component_command_readiness_.contains(component) ||
-          std::any_of(registrations_.begin(), registrations_.end(), [&](const auto& current) {
-            return current.binding.value().controllable_component_id == component;
-          }) || std::any_of(incident_containments_.begin(), incident_containments_.end(),
-                           [&](const auto& current) {
-            return current.controllable_component_id == component;
-          })) {
+          std::any_of(registrations_.begin(), registrations_.end(),
+                      [&](const auto& current) {
+                        return current.binding.value().controllable_component_id == component;
+                      }) ||
+          std::any_of(runtime_route_configuration_readbacks_.begin(),
+                      runtime_route_configuration_readbacks_.end(),
+                      [&](const auto& current) {
+                        const auto* provider = current.second.provider();
+                        return provider &&
+                               provider->domain.provider()->provider.controllable_component_id ==
+                                   component;
+                      }) ||
+          std::any_of(incident_containments_.begin(), incident_containments_.end(),
+                      [&](const auto& current) {
+                        return current.controllable_component_id == component;
+                      })) {
         return reject<void>("initial bring-up has an installed or faulted predecessor",
                             "apply_bring_up_initial_not_current");
       }
       if (auto current = validate_bring_up_candidate_peer_closure_locked(
-              component, row.candidate_participants, offer.admission); !current.ok()) return current;
+              component, row.candidate_participants, row.candidate_provider_domains,
+              offer.admission);
+          !current.ok())
+        return current;
     } else {
       if (row.kind != ApplyBringUpAdmissionComponentKindDTO::kContainedRecovery ||
-          !row.predecessor || !row.recovery || row.candidate_participants.empty() ||
+          !row.predecessor || !row.recovery ||
+          (row.candidate_participants.empty() && row.candidate_provider_domains.empty()) ||
           row.candidate_participants.size() > kMaximumCellAdmissionScopeEntries ||
           row.predecessor->controllable_component_id != component ||
           !VerifyComponentLifecycleCurrentSnapshot(*row.predecessor).ok() ||
@@ -535,24 +1000,47 @@ Result<void> ResourceAddressedExecutionKernel::validate_apply_bring_up_current_l
             });
       }
       if (auto current = validate_bring_up_component_closure_locked(
-              predecessor, row.candidate_participants, offer.admission); !current.ok()) return current;
+              predecessor, row.candidate_participants, row.candidate_provider_domains,
+              offer.admission);
+          !current.ok())
+        return current;
       for (const auto& domain : predecessor.domains) {
         auto& entry = domains.try_emplace(
             domain.control_domain_id,
             ConfigurationFenceDomainScopeDTO{domain.control_domain_id, {}, {}}).first->second;
         entry.control_domain_id = domain.control_domain_id;
         entry.predecessor_control_domain_revision = domain.control_domain_revision;
-        for (const auto& binding : domain.current_control_bindings) {
+        if (!attach_provider(entry, domain, false))
+          return reject<void>("predecessor provider domain closure conflicts",
+                              "apply_bring_up_candidate_invalid");
+        for (const auto& binding : domain.control_bindings()) {
           auto& current = bindings.try_emplace(
               binding.control_binding_id,
               ConfigurationFenceBindingScopeDTO{binding.control_binding_id, {}, {}}).first->second;
           current.control_binding_id = binding.control_binding_id;
           current.predecessor_control_binding_revision = binding.control_binding_revision;
         }
-        resources.insert(domain.current_resources.begin(), domain.current_resources.end());
+        resources.insert(domain.resource_ids().begin(), domain.resource_ids().end());
       }
     }
+    for (const auto& candidate : row.candidate_provider_domains) {
+      auto& domain =
+          domains
+              .try_emplace(candidate.control_domain_id,
+                           ConfigurationFenceDomainScopeDTO{candidate.control_domain_id, {}, {}})
+              .first->second;
+      if (domain.candidate_control_domain_revision &&
+          domain.candidate_control_domain_revision != candidate.control_domain_revision)
+        return reject<void>("candidate provider domain closure conflicts",
+                            "apply_bring_up_candidate_invalid");
+      domain.candidate_control_domain_revision = candidate.control_domain_revision;
+      if (!attach_provider(domain, candidate, true))
+        return reject<void>("candidate provider domain closure conflicts",
+                            "apply_bring_up_candidate_invalid");
+      resources.insert(candidate.resource_ids().begin(), candidate.resource_ids().end());
+    }
     for (const auto& candidate : row.candidate_participants) {
+      if (candidate.io_output_binding) continue;
       const auto& path = *candidate.control_path;
       auto& domain = domains.try_emplace(
           path.control_domain_id,
@@ -633,21 +1121,23 @@ ResourceAddressedExecutionKernel::AcquireSelectedComponentBringUpClaim(
 }
 Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReleaseCellAdmissionClaim(
     const CellAdmissionClaimReleaseDTO& release) {
-  std::lock_guard admission_lock(*admission_mutex_);
+  std::unique_lock admission_lock(*admission_mutex_);
   auto released = cell_admission_owner_->ReleaseCellAdmissionClaim(release);
   if (released.ok()) {
     refresh_execution_claims();
   }
+  admission_lock.unlock();
   return released;
 }
 
 Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReconcileCellAdmissionClaims(
     const CellAdmissionReconcileDTO& reconcile) {
-  std::lock_guard admission_lock(*admission_mutex_);
+  std::unique_lock admission_lock(*admission_mutex_);
   auto reconciled = cell_admission_owner_->ReconcileCellAdmissionClaims(reconcile);
   if (reconciled.ok()) {
     refresh_execution_claims();
   }
+  admission_lock.unlock();
   return reconciled;
 }
 
@@ -661,10 +1151,15 @@ void ResourceAddressedExecutionKernel::refresh_execution_claims() {
   std::lock_guard state_lock(state_mutex_);
   manual_operation_claim_.swap(manual);
   if (!claim.has_value()) {
+    if (program_cycle_claim_run_) mark_motion_retry_run_end_locked(program_cycle_claim_run_->program_run_id);
     retired = std::move(program_cycle_claim_run_);
     program_cycle_claim_run_.reset();
   } else if (!program_cycle_claim_run_.has_value() ||
              program_cycle_claim_run_->claim_generation != claim->claim_generation) {
+    // A new held Run changes dispatch authority immediately, but the previous
+    // factual value store stays installed until its qualified baseline commits.
+    // Exact Run-bound consumers cannot borrow that predecessor occurrence.
+    if (program_cycle_claim_run_) mark_motion_retry_run_end_locked(program_cycle_claim_run_->program_run_id);
     retired = std::move(program_cycle_claim_run_);
     program_cycle_claim_run_ = ProgramCycleClaimRun{
         ProgramRunId(claim->intent.owner_transaction_id), claim->claim_generation,
@@ -931,11 +1426,38 @@ Result<void> ResourceAddressedExecutionKernel::ValidateProgramResetPositionAutho
                                                                                 proof.value());
 }
 
+Result<void> ResourceAddressedExecutionKernel::notify_io_rule_evidence_processing(
+    const std::shared_ptr<IIoSignalService>& affected_service) const {
+  if (!affected_service || !config_.io_rule_evidence_processing_notification)
+    return Result<void>::Ok();
+  try {
+    config_.io_rule_evidence_processing_notification(affected_service);
+    return Result<void>::Ok();
+  } catch (...) {
+    return Result<void>::Err({"internal_error", "Unable to queue affected I/O rule processing",
+        {{"reason", "io_rule_evidence_processing_notification_failed"}}});
+  }
+}
+
 Result<void> ResourceAddressedExecutionKernel::Publish(
     const ManagerLivenessObservationDTO& observation) {
-  // Deliberately bypasses the operation admission mutex: receiver-local
-  // containment and Stop acceptance must not wait on liveness publication.
-  return cell_admission_owner_->Publish(observation);
+  // Deliberately bypasses operation admission. Notify only after the owner's
+  // health/transition mutexes and the invalidation's state/signal locks unwind.
+  std::shared_ptr<IIoSignalService> affected_service;
+  auto notification = Result<void>::Ok();
+  auto result = [&] {
+    const ScopeExit notify([&] {
+      notification = notify_io_rule_evidence_processing(affected_service);
+    });
+    return cell_admission_owner_->Publish(observation, &affected_service);
+  }();
+  if (!notification.ok()) {
+    if (result.ok()) return notification;
+    auto error = result.error();
+    error.details.emplace("io_rule_notification_error", notification.error().code);
+    return Result<void>::Err(std::move(error));
+  }
+  return result;
 }
 
 Result<OperatorAlarmAttentionAcceptedDTO>
@@ -1076,10 +1598,446 @@ Result<void> ResourceAddressedExecutionKernel::check_program_node_motion_attenti
   return Result<void>::Ok();
 }
 
+void ResourceAddressedExecutionKernel::retire_program_io_watches_locked(
+    const ProgramRunId& run_id) {
+  if (!program_cycle_claim_run_ || program_cycle_claim_run_->program_run_id != run_id ||
+      program_cycle_claim_run_->io_watches_retired)
+    return;
+  auto& run = *program_cycle_claim_run_;
+  // Close registration first, under the same Kernel -> signals lock order.
+  run.io_watches_retired = true;
+  run.io_watch_scopes.clear();
+  if (io_signal_service_) {
+    // The installed service must accept an exact owner/run previously accepted
+    // by RegisterLevelWatch. An over-bound identity cannot own any such watch.
+    (void)io_signal_service_->ReleaseRunWatches(run.program_runner_owner_epoch, run.program_run_id);
+  }
+}
+
+Result<void> ResourceAddressedExecutionKernel::InstallProgramIoSignalService(
+    std::shared_ptr<IIoSignalService> service, const RetainedBundleId& expected_retained_bundle_id,
+    const GraphRevision& expected_graph_revision) {
+  std::lock_guard state_lock(state_mutex_);
+  if (!stop_retained_bundle_id_ || !stop_graph_revision_ ||
+      *stop_retained_bundle_id_ != expected_retained_bundle_id ||
+      *stop_graph_revision_ != expected_graph_revision) {
+    return reject<void>("I/O service does not name the current retained activation",
+                        "io_signal_service_context_stale", ErrorCode::kStaleGeneration);
+  }
+  if (service == io_signal_service_) return Result<void>::Ok();
+  if (global_io_rule_applied_context_) {
+    return reject<void>("Current global catalog requires its atomic Applied service transition",
+                        "io_signal_service_global_catalog_active",
+                        ErrorCode::kInvalidStateTransition);
+  }
+  if (has_active_io_rules_locked()) {
+    return reject<void>("Current interrupt rules must retire before I/O service replacement",
+                        "io_signal_service_rules_active", ErrorCode::kInvalidStateTransition);
+  }
+  if (program_cycle_claim_run_ && program_cycle_claim_run_->capture) {
+    return reject<void>("Current Program capture must retire before I/O service replacement",
+                        "io_signal_service_program_active", ErrorCode::kInvalidStateTransition);
+  }
+  const auto retired = retire_program_blackboard_source_locked();
+  if (!retired.ok()) return retired;
+  applied_program_blackboard_context_.reset();
+  program_blackboard_source_.reset();
+  program_blackboard_source_retired_ = false;
+  io_signal_service_ = std::move(service);
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceAddressedExecutionKernel::validate_current_program_io_run_scope_locked(
+    const ProgramRunMockSimulationScopeDTO& request) const {
+  if (request.request_owner_epoch != config_.request_owner_epoch || !program_cycle_claim_run_ ||
+      !program_cycle_claim_run_->capture || !program_cycle_claim_run_->capture->binding ||
+      !program_cycle_claim_run_->capture->table ||
+      request.program_runner_owner_epoch != program_cycle_claim_run_->program_runner_owner_epoch ||
+      request.program_run_id != program_cycle_claim_run_->program_run_id ||
+      request.claim_generation != program_cycle_claim_run_->claim_generation ||
+      request.program_binding_id != program_cycle_claim_run_->capture->program_binding_id) {
+    return reject<void>("I/O watch does not name the current captured Run/claim",
+                        "io_watch_scope_stale", ErrorCode::kStaleGeneration);
+  }
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceAddressedExecutionKernel::validate_current_program_io_node_scope_locked(
+    const ProgramIoWatchScopeReleaseRequestDTO& request) const {
+  const auto current = validate_current_program_io_run_scope_locked(
+      {request.request_owner_epoch, request.program_binding_id, request.program_runner_owner_epoch,
+       request.claim_generation, request.program_run_id});
+  if (!current.ok()) return current;
+  if (!valid_program_node_execution_scope(request.node)) {
+    return reject<void>("I/O watch node scope is malformed", "io_watch_scope_invalid",
+                        ErrorCode::kInvalidRequest);
+  }
+  const auto& nodes = program_cycle_claim_run_->capture->table->nodes;
+  const auto node =
+      std::lower_bound(nodes.begin(), nodes.end(), request.node.node_instance_id,
+                       [](const auto& row, const auto& id) { return row.instance_id < id; });
+  if (node == nodes.end() || node->instance_id != request.node.node_instance_id)
+    return reject<void>("Captured Program does not contain this node", "io_watch_node_unsupported",
+                        ErrorCode::kInvalidRequest);
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceAddressedExecutionKernel::validate_program_io_watch_scope_locked(
+    const ProgramIoWatchScopeReleaseRequestDTO& request) const {
+  const auto current = validate_current_program_io_node_scope_locked(request);
+  if (!current.ok()) return current;
+  const auto& nodes = program_cycle_claim_run_->capture->table->nodes;
+  const auto node = std::lower_bound(nodes.begin(), nodes.end(), request.node.node_instance_id,
+      [](const auto& row, const auto& id) { return row.instance_id < id; });
+  if (!std::any_of(
+          node->target_effects.begin(), node->target_effects.end(), [](const auto& effect) {
+            return effect.capability_id.value() == "io.gpio.wait_for_input" && !effect.effectful;
+          })) {
+    return reject<void>("Captured node does not declare an I/O watch", "io_watch_node_unsupported",
+                        ErrorCode::kInvalidRequest);
+  }
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceAddressedExecutionKernel::SetProgramRunMockSimulationPaused(
+    const ProgramRunMockSimulationPauseRequestDTO& request) {
+  // SAME current Run lock as START/END and actual Run retirement. The service
+  // alone retains revision ordering and the host-monotonic remaining delays.
+  std::lock_guard state_lock(state_mutex_);
+  const auto current = validate_current_program_io_run_scope_locked(request.scope);
+  if (!current.ok()) return current;
+  if (request.run_revision == 0U)
+    return reject<void>("Mock simulation Run revision is unnumbered", "mock_simulation_invalid", ErrorCode::kInvalidRequest);
+  if (program_cycle_claim_run_->io_watches_retired)
+    return reject<void>("Mock simulation Run has retired", "mock_simulation_scope_stale", ErrorCode::kStaleGeneration);
+  const auto& nodes = program_cycle_claim_run_->capture->table->nodes;
+  if (request.held_node_instance_ids.size() > nodes.size())
+    return reject<void>("Mock simulation held mask exceeds its actual capture", "mock_simulation_invalid", ErrorCode::kInvalidRequest);
+  for (std::size_t index = 0U; index < request.held_node_instance_ids.size(); ++index) {
+    const auto& id = request.held_node_instance_ids[index];
+    if (id.empty() || id.value().size() > 128U || id.value().find('\0') != std::string::npos ||
+        (index != 0U && !(request.held_node_instance_ids[index - 1U] < id)))
+      return reject<void>("Mock simulation held mask is not canonical", "mock_simulation_invalid", ErrorCode::kInvalidRequest);
+    const auto found = std::lower_bound(nodes.begin(), nodes.end(), id,
+        [](const auto& node, const auto& identity) { return node.instance_id < identity; });
+    if (found == nodes.end() || found->instance_id != id)
+      return reject<void>("Mock simulation held node is absent from its actual capture", "mock_simulation_node_unknown", ErrorCode::kInvalidRequest);
+  }
+  if (!io_signal_service_)
+    return reject<void>("I/O signal service is not installed", "io_signal_service_unavailable", ErrorCode::kUnsupportedCapability);
+  return io_signal_service_->SetProgramRunMockSimulationPaused(request);
+}
+
+Result<void> ResourceAddressedExecutionKernel::EndProgramNodeMockSimulation(
+    const ProgramNodeMockSimulationScopeDTO& scope) {
+  std::lock_guard state_lock(state_mutex_);
+  const auto current = validate_current_program_io_node_scope_locked(
+      {scope.request_owner_epoch, scope.program_binding_id, scope.program_runner_owner_epoch,
+       scope.claim_generation, scope.program_run_id, scope.node});
+  if (!current.ok()) return current;
+  if (scope.node_start_index == 0U)
+    return reject<void>("Mock simulation end is unnumbered", "mock_simulation_invalid", ErrorCode::kInvalidRequest);
+  const auto& run = *program_cycle_claim_run_;
+  if (!io_signal_service_)
+    return reject<void>("I/O signal service is not installed", "io_signal_service_unavailable", ErrorCode::kUnsupportedCapability);
+  if (run.io_watches_retired) {
+    // Only this already owner-retired, still-exact captured Run can obtain
+    // its cleanup receipt here. Retry the SAME service with retained IDs:
+    // the retired flag alone is not proof of successful cancellation.
+    return io_signal_service_->ReleaseRunWatches(
+        run.program_runner_owner_epoch, run.program_run_id);
+  }
+  return io_signal_service_->EndProgramNodeMockSimulation(scope, run.capture->table->nodes.size());
+}
+
+Result<ProgramNodeMockSimulationAcknowledgementDTO>
+ResourceAddressedExecutionKernel::StartProgramNodeMockSimulation(
+    const ProgramNodeMockSimulationRequestDTO& request) {
+  using Reply = Result<ProgramNodeMockSimulationAcknowledgementDTO>;
+  // SAME current Run owner serializes source mutation against authoritative
+  // ReleaseRunWatches retirement. No duplicated index/replay state lives here.
+  std::lock_guard state_lock(state_mutex_);
+  const auto& scope = request.scope;
+  const auto current = validate_current_program_io_node_scope_locked(
+      {scope.request_owner_epoch, scope.program_binding_id, scope.program_runner_owner_epoch,
+       scope.claim_generation, scope.program_run_id, scope.node});
+  if (!current.ok()) return Reply::Err(current.error());
+  if (scope.node_start_index == 0U || request.signals.empty())
+    return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
+        "Mock simulation start is empty or unnumbered", "mock_simulation_invalid", ErrorCode::kInvalidRequest);
+  const auto& run = *program_cycle_claim_run_;
+  if (run.io_watches_retired)
+    return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
+        "Mock simulation Run has retired", "mock_simulation_scope_stale", ErrorCode::kStaleGeneration);
+  if (!io_signal_service_)
+    return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
+        "I/O signal service is not installed", "io_signal_service_unavailable", ErrorCode::kUnsupportedCapability);
+  const auto& capture = *run.capture;
+  const auto node = std::lower_bound(capture.table->nodes.begin(), capture.table->nodes.end(),
+      scope.node.node_instance_id, [](const auto& row, const auto& id) { return row.instance_id < id; });
+  const ProgramNodeIoConditionDTO* node_condition = nullptr;
+  if (capture.io_conditions) {
+    const auto found = std::find_if(capture.io_conditions->program_node_conditions.begin(),
+        capture.io_conditions->program_node_conditions.end(), [&](const auto& row) {
+          return row.node_instance_id == scope.node.node_instance_id;
+        });
+    if (found != capture.io_conditions->program_node_conditions.end()) node_condition = &*found;
+  }
+  std::vector<ResolvedProgramMockSimulationSignalDTO> resolved;
+  resolved.reserve(request.signals.size());
+  for (std::size_t index = 0; index < request.signals.size(); ++index) {
+    const auto& row = request.signals[index];
+    if (index != 0U) {
+      const auto& previous = request.signals[index - 1U];
+      if (!(previous.target_role_id < row.target_role_id ||
+            (previous.target_role_id == row.target_role_id && previous.resource_role_id < row.resource_role_id)))
+        return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
+            "Mock simulation selectors must be sorted and unique", "mock_simulation_invalid", ErrorCode::kInvalidRequest);
+    }
+    const auto& targets = capture.binding->target_role_bindings;
+    const auto target = std::lower_bound(targets.begin(), targets.end(), row.target_role_id,
+        [](const auto& value, const auto& id) { return value.target_role_id < id; });
+    if (target == targets.end() || target->target_role_id != row.target_role_id)
+      return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
+          "Mock simulation target is unbound", "io_signal_unbound", ErrorCode::kInvalidRequest);
+    const auto& signals = target->signal_role_bindings;
+    const auto signal = std::lower_bound(signals.begin(), signals.end(), row.resource_role_id,
+        [](const auto& value, const auto& id) { return value.resource_role_id < id; });
+    if (signal == signals.end() || signal->resource_role_id != row.resource_role_id ||
+        signal->direction != IoSignalDirection::kInput || signal->value_type != IoSignalValueType::kBoolean)
+      return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
+          "Mock simulation requires a bound boolean input", "io_signal_unbound", ErrorCode::kInvalidRequest);
+    const IoSignalId id{target->controllable_component_id, signal->signal_name};
+    const bool checked_condition_input = node_condition && node_condition->condition &&
+        std::any_of(node_condition->condition->inputs().begin(), node_condition->condition->inputs().end(),
+                    [&](const auto& input) {
+                      const auto* actual = std::get_if<IoSignalId>(&input.source);
+                      return actual && *actual == id;
+                    });
+    const bool direct_read_input = std::any_of(node->target_effects.begin(), node->target_effects.end(),
+        [&](const auto& effect) {
+          return !effect.effectful && effect.target_role_id == row.target_role_id &&
+              (effect.capability_id.value() == "io.gpio.get_input" ||
+               effect.capability_id.value() == "io.gpio.wait_for_input");
+        });
+    if (!checked_condition_input && !direct_read_input)
+      return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
+          "Mock simulation input is not referenced by the captured node", "mock_simulation_node_mismatch", ErrorCode::kInvalidRequest);
+    const auto observation = io_signal_service_->ReadSignal(id);
+    if (!observation.ok()) return Reply::Err(observation.error());
+    const auto digest = ComputeIoSignalDescriptorDigest(observation.value().descriptor);
+    if (!digest.ok()) return Reply::Err(digest.error());
+    if (observation.value().cursor.owner_epoch != config_.request_owner_epoch ||
+        observation.value().cursor.catalog_generation == 0U || digest.value() != signal->signal_descriptor_digest)
+      return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
+          "Mock simulation source differs from the sealed binding", "io_signal_descriptor_stale", ErrorCode::kStaleGeneration);
+    resolved.push_back({id, digest.value(), observation.value().cursor.catalog_generation,
+                        observation.value().installed_incarnation});
+  }
+  return io_signal_service_->StartProgramNodeMockSimulation(request, resolved, capture.table->nodes.size());
+}
+
+Result<IoWatchRegistrationDTO> ResourceAddressedExecutionKernel::RegisterProgramIoWatch(
+    const ProgramIoWatchRequestDTO& request) {
+  std::lock_guard state_lock(state_mutex_);
+  const auto scope_valid = validate_program_io_watch_scope_locked(
+      {request.request_owner_epoch, request.program_binding_id, request.program_runner_owner_epoch,
+       request.claim_generation, request.program_run_id, request.node});
+  if (!scope_valid.ok()) return Result<IoWatchRegistrationDTO>::Err(scope_valid.error());
+  if (program_cycle_claim_run_->io_watches_retired) {
+    return reject<IoWatchRegistrationDTO>("Program watch registration has retired",
+                                          "io_watch_run_retired",
+                                          ErrorCode::kInvalidStateTransition);
+  }
+  const auto& capture = *program_cycle_claim_run_->capture;
+  const auto node = std::lower_bound(
+      capture.table->nodes.begin(), capture.table->nodes.end(), request.node.node_instance_id,
+      [](const auto& row, const auto& id) { return row.instance_id < id; });
+  if (node == capture.table->nodes.end() || node->instance_id != request.node.node_instance_id ||
+      !std::any_of(
+          node->target_effects.begin(), node->target_effects.end(), [&](const auto& effect) {
+            return effect.target_role_id == request.target_role_id &&
+                   effect.capability_id.value() == "io.gpio.wait_for_input" && !effect.effectful;
+          })) {
+    return reject<IoWatchRegistrationDTO>("Captured node does not declare this I/O watch target",
+                                          "io_watch_node_unsupported", ErrorCode::kInvalidRequest);
+  }
+  const auto target =
+      std::lower_bound(capture.binding->target_role_bindings.begin(),
+                       capture.binding->target_role_bindings.end(), request.target_role_id,
+                       [](const auto& row, const auto& id) { return row.target_role_id < id; });
+  if (target == capture.binding->target_role_bindings.end() ||
+      target->target_role_id != request.target_role_id) {
+    return reject<IoWatchRegistrationDTO>("I/O target is absent from the captured binding",
+                                          "io_signal_unbound", ErrorCode::kInvalidRequest);
+  }
+  const auto signal =
+      std::lower_bound(target->signal_role_bindings.begin(), target->signal_role_bindings.end(),
+                       request.resource_role_id,
+                       [](const auto& row, const auto& id) { return row.resource_role_id < id; });
+  if (signal == target->signal_role_bindings.end() ||
+      signal->resource_role_id != request.resource_role_id) {
+    return reject<IoWatchRegistrationDTO>("I/O resource role is absent from the captured binding",
+                                          "io_signal_unbound", ErrorCode::kInvalidRequest);
+  }
+  if (signal->direction != IoSignalDirection::kInput) {
+    return reject<IoWatchRegistrationDTO>("I/O output has no qualified independent input readback",
+                                          "io_signal_direction_mismatch",
+                                          ErrorCode::kUnsupportedCapability);
+  }
+  if (signal->value_type != IoSignalValueType::kBoolean) {
+    return reject<IoWatchRegistrationDTO>("Only boolean level watches are installed",
+                                          "io_signal_type_mismatch",
+                                          ErrorCode::kUnsupportedCapability);
+  }
+  if (!io_signal_service_) {
+    return reject<IoWatchRegistrationDTO>("I/O signal service is not installed",
+                                          "io_signal_service_unavailable",
+                                          ErrorCode::kUnsupportedCapability);
+  }
+  auto& run = *program_cycle_claim_run_;
+  if (run.io_watch_admission_closed) {
+    return reject<IoWatchRegistrationDTO>("Uncertain watch cancellation exhausted this Run's bound",
+                                          "io_watch_scope_capacity_exhausted",
+                                          ErrorCode::kInvalidStateTransition);
+  }
+  if (std::any_of(run.io_watch_scopes.begin(), run.io_watch_scopes.end(), [&](const auto& scope) {
+        return !scope.registration && scope.node == request.node;
+      })) {
+    return reject<IoWatchRegistrationDTO>("This exact node attempt has ended",
+                                          "io_watch_scope_released",
+                                          ErrorCode::kInvalidStateTransition);
+  }
+  if (run.io_watch_scopes.size() >= capture.table->nodes.size()) {
+    return reject<IoWatchRegistrationDTO>("I/O watch scope reservation bound reached",
+                                          "io_watch_scope_capacity_exhausted",
+                                          ErrorCode::kInvalidStateTransition);
+  }
+  const IoSignalId id{target->controllable_component_id, signal->signal_name};
+  const auto observation = io_signal_service_->ReadSignal(id);
+  if (!observation.ok()) return Result<IoWatchRegistrationDTO>::Err(observation.error());
+  const auto digest = ComputeIoSignalDescriptorDigest(observation.value().descriptor);
+  if (!digest.ok()) return Result<IoWatchRegistrationDTO>::Err(digest.error());
+  if (observation.value().cursor.owner_epoch != config_.request_owner_epoch ||
+      digest.value() != signal->signal_descriptor_digest) {
+    return reject<IoWatchRegistrationDTO>(
+        "Installed I/O descriptor differs from the sealed binding", "io_signal_descriptor_stale",
+        ErrorCode::kStaleGeneration);
+  }
+  // Reserve cancellation capacity before the service can schedule any Mock
+  // answer. A known failed registration has no effect and releases its slot.
+  run.io_watch_scopes.push_back({request.node, std::nullopt});
+  const auto registered = io_signal_service_->RegisterLevelWatch(
+      {{request.program_runner_owner_epoch, request.program_run_id, request.node},
+       id,
+       request.expected_value});
+  if (registered.ok()) {
+    run.io_watch_scopes.back().registration = registered.value();
+  } else {
+    run.io_watch_scopes.pop_back();
+  }
+  return registered;
+}
+
+Result<IoWatchResultDTO> ResourceAddressedExecutionKernel::ReadProgramIoWatch(
+    const IoWatchRegistrationDTO& registration) const {
+  std::lock_guard state_lock(state_mutex_);
+  if (!io_signal_service_) {
+    return reject<IoWatchResultDTO>("I/O signal service is not installed",
+                                    "io_signal_service_unavailable",
+                                    ErrorCode::kUnsupportedCapability);
+  }
+  return io_signal_service_->ReadWatch(registration);
+}
+
+Result<void> ResourceAddressedExecutionKernel::ReleaseProgramIoWatch(
+    const IoWatchRegistrationDTO& registration) {
+  std::lock_guard state_lock(state_mutex_);
+  if (!io_signal_service_) {
+    return reject<void>("I/O signal service is not installed", "io_signal_service_unavailable",
+                        ErrorCode::kUnsupportedCapability);
+  }
+  const auto released = io_signal_service_->ReleaseWatch(registration);
+  if (released.ok() && program_cycle_claim_run_) {
+    // The exact known reply proves that this original register preceded its
+    // release. Normal attempts do not accumulate a lifetime history budget.
+    std::erase_if(program_cycle_claim_run_->io_watch_scopes, [&](const auto& scope) {
+      return scope.registration && *scope.registration == registration;
+    });
+  }
+  return released;
+}
+
+Result<void> ResourceAddressedExecutionKernel::ReleaseProgramIoWatchScope(
+    const ProgramIoWatchScopeReleaseRequestDTO& request) {
+  std::lock_guard state_lock(state_mutex_);
+  const auto scope_valid = validate_program_io_watch_scope_locked(request);
+  if (!scope_valid.ok()) return scope_valid;
+  auto& run = *program_cycle_claim_run_;
+  if (run.io_watches_retired) return Result<void>::Ok();
+  if (!io_signal_service_) {
+    return reject<void>("I/O signal service is not installed", "io_signal_service_unavailable",
+                        ErrorCode::kUnsupportedCapability);
+  }
+  // Install the end fence before service calls or allocations can fail. A
+  // failed cancellation is not an ACK, but late registration stays closed.
+  const auto existing = std::find_if(run.io_watch_scopes.begin(), run.io_watch_scopes.end(),
+                                     [&](const auto& scope) { return scope.node == request.node; });
+  bool exhausted = false;
+  if (existing != run.io_watch_scopes.end()) {
+    existing->registration.reset();
+    // Duplicate actual registrations share one retained uncertain-scope fence.
+    const auto keep = static_cast<std::size_t>(existing - run.io_watch_scopes.begin());
+    for (std::size_t index = run.io_watch_scopes.size(); index-- > keep + 1U;) {
+      if (run.io_watch_scopes[index].node == request.node)
+        run.io_watch_scopes.erase(run.io_watch_scopes.begin() + static_cast<std::ptrdiff_t>(index));
+    }
+  } else if (run.io_watch_scopes.size() >= run.capture->table->nodes.size()) {
+    // A known release must never reopen admission for this unrecorded scope.
+    run.io_watch_admission_closed = true;
+    exhausted = true;
+  } else {
+    try {
+      run.io_watch_scopes.push_back({request.node, std::nullopt});
+    } catch (...) {
+      // In particular, allocation failure cannot leave an ended unknown
+      // register admissible. Still cancel any actual matching service watch.
+      run.io_watch_admission_closed = true;
+      exhausted = true;
+    }
+  }
+  const auto released = io_signal_service_->ReleaseNodeWatches(
+      {request.program_runner_owner_epoch, request.program_run_id, request.node});
+  if (!released.ok()) return released;
+  if (exhausted) {
+    // Report the actual fault/fence instead of a false clean-cancel ACK.
+    // Other watches are unchanged and no motion Stop is invented here.
+    return Result<void>::Err({"execution_rejected",
+                              "Uncertain watch scope cancellation exhausted this Run's bound",
+                              {{"reason", "io_watch_scope_capacity_exhausted"},
+                               {"watch_admission_fenced", "true"},
+                               {"matching_watches_released", "true"}}});
+  }
+  return Result<void>::Ok();
+}
+
 void ResourceAddressedExecutionKernel::LatchAndContain(
     const ManagerLivenessLossIntentDTO& intent) noexcept {
+  std::shared_ptr<IIoSignalService> affected_service;
+  // This guard runs after mandatory containment has been attempted and every
+  // owner/state scope has unwound, including an invalidation/storage error.
+  const ScopeExit notify([&] {
+    try {
+      static_cast<void>(notify_io_rule_evidence_processing(affected_service));
+    } catch (...) {
+      // The void fail-safe boundary cannot report queue allocation failure;
+      // actual source unavailability and mandatory containment remain intact.
+    }
+  });
   try {
-    if (!cell_admission_owner_->LatchManagerLivenessLoss(intent)) {
+    std::optional<ErrorDTO> source_invalidation_error;
+    if (!cell_admission_owner_->LatchManagerLivenessLoss(
+            intent, &source_invalidation_error, &affected_service)) {
       return;
     }
     StopGeneration expected_stop_generation(0U);
@@ -1089,6 +2047,10 @@ void ResourceAddressedExecutionKernel::LatchAndContain(
       // liveness timer or state owner and is deliberately set before Stop I/O.
       manager_liveness_motion_inhibited_ = true;
       motion_admission_closed_ = true;
+      // The owner hook already invalidated the exact source before unlocking.
+      // A failed loss append stays visible in Source.error/rule loss evidence;
+      // it creates no forensic record or proof and cannot suppress Full Stop.
+      if (source_invalidation_error) motion_admission_closed_ = true;
       expected_stop_generation = cell_stop_generation_;
     }
     const auto material = config_.request_owner_epoch.value() + "\nmanager-liveness-loss\n" +
@@ -1148,10 +2110,28 @@ ResourceAddressedExecutionKernel::RequestComponentIncidentContainment(
     std::lock_guard state_lock(state_mutex_);
     // Closed before any Stop I/O, exactly like the liveness fail-safe.
     motion_admission_closed_ = true;
-    for (const auto& remembered : incident_containments_) {
-      if (remembered.incident_id == intent.incident_id) {
-        return Result<ComponentIncidentContainmentReceiptDTO>::Ok(remembered.receipt);
+    const auto remembered = std::find_if(
+        incident_containments_.begin(), incident_containments_.end(),
+        [&](const auto& row) { return row.incident_id == intent.incident_id; });
+    if (remembered != incident_containments_.end() && remembered->receipt) {
+      return Result<ComponentIncidentContainmentReceiptDTO>::Ok(*remembered->receipt);
+    }
+    if (remembered == incident_containments_.end()) {
+      constexpr std::size_t kMaximumRememberedIncidentContainments = 64U;
+      if (incident_containments_.size() >= kMaximumRememberedIncidentContainments) {
+        const auto accepted_containment = std::find_if(
+            incident_containments_.begin(), incident_containments_.end(),
+            [](const auto& row) { return row.receipt.has_value(); });
+        if (accepted_containment == incident_containments_.end()) {
+          return reject<ComponentIncidentContainmentReceiptDTO>(
+              "All retained incident containments are pending",
+              "incident_containment_capacity_exhausted", ErrorCode::kInvalidStateTransition);
+        }
+        incident_containments_.erase(accepted_containment);
       }
+      // The same bounded owner table fences recovery's final admission
+      // reopen. Never create a placeholder Stop identity or drop a pending row.
+      incident_containments_.push_back({intent.incident_id, std::nullopt, std::nullopt});
     }
     expected_stop_generation = cell_stop_generation_;
     if (program_cycle_claim_run_.has_value()) {
@@ -1189,22 +2169,37 @@ ResourceAddressedExecutionKernel::RequestComponentIncidentContainment(
       attribute_containment_stop_locked(stopped.value(),
                                         StopFaultLatchOriginDTO::kComponentIncident);
     }
-    constexpr std::size_t kMaximumRememberedIncidentContainments = 64U;
-    if (incident_containments_.size() >= kMaximumRememberedIncidentContainments) {
-      incident_containments_.erase(incident_containments_.begin());
+    const auto remembered = std::find_if(
+        incident_containments_.begin(), incident_containments_.end(),
+        [&](const auto& row) { return row.incident_id == intent.incident_id; });
+    // Pending rows cannot be evicted. A concurrent replay can fill it first;
+    // preserve the original acceptance's component attribution in that case.
+    if (remembered != incident_containments_.end()) {
+      remembered->receipt = receipt;
+      if (stopped.value().replay_status == RequestReplayStatusDTO::kAcceptedNew)
+        remembered->controllable_component_id = intent.controllable_component_id;
     }
-    incident_containments_.push_back(
-        {intent.incident_id, receipt,
-         stopped.value().replay_status == RequestReplayStatusDTO::kAcceptedNew
-             ? std::optional(intent.controllable_component_id)
-             : std::nullopt});
   }
   return Result<ComponentIncidentContainmentReceiptDTO>::Ok(std::move(receipt));
 }
 
 Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReplaceManagerLivenessRequiredSet(
     const ManagerLivenessRequiredSetDTO& required_set) {
-  return cell_admission_owner_->ReplaceManagerLivenessRequiredSet(required_set);
+  std::shared_ptr<IIoSignalService> affected_service;
+  auto notification = Result<void>::Ok();
+  auto result = [&] {
+    const ScopeExit notify([&] {
+      notification = notify_io_rule_evidence_processing(affected_service);
+    });
+    return cell_admission_owner_->ReplaceManagerLivenessRequiredSet(required_set, &affected_service);
+  }();
+  if (!notification.ok()) {
+    if (result.ok()) return Result<AuthoringAdmissionDTO>::Err(notification.error());
+    auto error = result.error();
+    error.details.emplace("io_rule_notification_error", notification.error().code);
+    return Result<AuthoringAdmissionDTO>::Err(std::move(error));
+  }
+  return result;
 }
 
 }  // namespace manyforge::core

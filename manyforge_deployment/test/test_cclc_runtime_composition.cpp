@@ -31,6 +31,7 @@
 #include "../../manyforge_core/src/component_lifecycle_journal_codec_internal.hpp"
 #include "../../manyforge_core/test/cclc_test_admission_port.hpp"
 #include "canonical_empty_admission_internal.hpp"
+#include "io_retained_fixture.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
 
 namespace manyforge::deployment {
@@ -145,7 +146,9 @@ public:
   }
   [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
   UpdateCellAdmissionReadiness(
-      const core::CellAdmissionReadinessSnapshotDTO &) override {
+      const core::CellAdmissionReadinessSnapshotDTO &,
+      std::shared_ptr<core::IIoSignalService>* actual_retired_service = nullptr) override {
+    if (actual_retired_service) actual_retired_service->reset();
     return core::Result<core::AuthoringAdmissionDTO>::Ok(
         GetAuthoringAdmission());
   }
@@ -514,6 +517,44 @@ TEST(CCLCRuntimeComposition,
   ASSERT_FALSE(composition.ok());
   EXPECT_EQ(composition.error().message,
             "route current-snapshot controller-source inventory is invalid");
+}
+
+TEST(CCLCRuntimeComposition,
+     ProviderOnlyRouteSourceHasNoControllerTemplatesAndRejectsPhysicalRoute) {
+  ScopedTrustedRoot root;
+  const auto retained =
+      test::materialize_boolean_io_retained_fixture(root.path());
+  const auto &graph = retained.bundle->value().cell_graph;
+  ASSERT_FALSE(graph.control_domains.empty());
+  ASSERT_TRUE(std::all_of(
+      graph.control_domains.begin(), graph.control_domains.end(),
+      [](const auto &domain) { return domain.provider() != nullptr; }));
+  ASSERT_TRUE(graph.control_bindings.empty());
+  ASSERT_TRUE(retained.bundle->value().desired_control_configurations.empty());
+  const auto receipt = publication(*retained.bundle);
+  ActivePublicationReader reader(receipt);
+  FilesystemVerifiedRetainedProductArtifactSource artifacts(root.path());
+  core::SqliteCCLCJournal journal(root.path() / "route-source.sqlite",
+                                  graph.cell_id);
+  VerifiedRouteSelectionCurrentSnapshotSource source(
+      *retained.bundle, reader, receipt, journal, artifacts, {});
+  const auto templates = source.ReadCurrentRouteSelectionTemplates(
+      graph.controllable_components.front().controllable_component_id);
+  ASSERT_TRUE(templates.ok()) << templates.error().message;
+  EXPECT_TRUE(templates.value().templates.empty());
+
+  // A real qualified physical product supplies this desired row. Its presence
+  // cannot turn the provider-only source into a controller/route authority.
+  const auto physical_root = root.path() / "physical";
+  ASSERT_TRUE(std::filesystem::create_directory(physical_root));
+  const auto physical =
+      test::materialize_lite6_retained_consumer_fixture(physical_root);
+  ASSERT_FALSE(physical.bundle->value().desired_control_configurations.empty());
+  const auto denied = source.ReadCurrentRouteSelectionSnapshot(
+      retained.bundle->retained_bundle_id(), graph.graph_revision,
+      physical.bundle->value().desired_control_configurations.front());
+  ASSERT_FALSE(denied.ok());
+  EXPECT_EQ(denied.error().details.at("reason"), "desired_domain_not_retained");
 }
 
 TEST(CCLCRuntimeComposition,
@@ -983,8 +1024,8 @@ TEST(CCLCRuntimeComposition,
       domain.control_domain_revision,
       {},
       desired.activation_set_id,
-      domain.controller_topology_id,
-      domain.topology_revision,
+      domain.controller().controller_topology_id,
+      domain.controller().topology_revision,
       binding.provider_runtime_unit_id,
       providers.front().provider_runtime_epoch,
       1U,
@@ -1455,15 +1496,15 @@ TEST(CCLCRuntimeComposition,
   }
   std::vector<core::ExpectedControlDomainRevisionDTO> expected_domains;
   for (const auto &scope : snapshot->domains) {
-    ASSERT_FALSE(scope.active_control_configuration);
+    ASSERT_FALSE(scope.controller().active_control_configuration);
     expected_domains.push_back(
         {scope.control_domain_id,
          scope.control_domain_revision,
-         scope.controller_topology_id,
-         scope.topology_revision,
+         scope.controller().controller_topology_id,
+         scope.controller().topology_revision,
          {core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
           std::nullopt, std::nullopt},
-         scope.current_control_bindings});
+         scope.controller().current_control_bindings});
   }
   std::optional<core::ComponentLifecycleIntentDTO> original_intent;
   std::optional<core::ComponentLifecycleAcceptedDTO> original_acceptance;
@@ -1582,6 +1623,149 @@ TEST(CCLCRuntimeComposition,
   const auto pin = composition.value()->coordinator().AcquireProductPin();
   ASSERT_TRUE(pin.ok());
   EXPECT_EQ(pin.value().context().identity->publication, previous);
+}
+
+class UnobservedCandidateBrandPort final : public core::IBrandLifecyclePort {
+public:
+  core::Result<core::BrandLifecycleObservationDTO>
+  Observe(const core::BrandLifecycleObservationQueryDTO &) override {
+    ++observations;
+    return core::Result<core::BrandLifecycleObservationDTO>::Err(unsupported());
+  }
+  core::BrandLifecyclePrimitiveResultDTO
+  Dispatch(const core::BrandLifecyclePrimitiveIntentDTO &,
+           std::stop_token) override {
+    ++dispatches;
+    throw std::logic_error("candidate source must never dispatch");
+  }
+  unsigned observations{};
+  unsigned dispatches{};
+};
+
+TEST(
+    CCLCRuntimeComposition,
+    NativeCandidateFactsUseExactRecordedTransactionWithoutPublicSnapshotOrEffects) {
+  ScopedTrustedRoot root;
+  const auto retained =
+      test::materialize_boolean_io_retained_fixture(root.path());
+  const auto &graph = retained.bundle->value().cell_graph;
+  ASSERT_EQ(graph.control_domains.size(), 1U);
+  const auto &domain = graph.control_domains.front();
+  ASSERT_NE(domain.provider(), nullptr);
+  const auto &provider = *domain.provider();
+  FilesystemVerifiedRetainedProviderManifestSource manifests(root.path());
+  const auto manifest = manifests.get_verified(
+      {retained.bundle->retained_bundle_id(), provider.provider_manifest_id,
+       provider.provider_manifest_revision});
+  ASSERT_TRUE(manifest);
+  const auto catalog = core::MakeIoProviderLifecycleCatalog(manifest->value());
+  ASSERT_TRUE(catalog.ok());
+  CatalogSource catalogs(catalog.value());
+  const auto receipt = publication(*retained.bundle);
+  ActivePublicationReader reader(receipt);
+  FilesystemVerifiedRetainedProductArtifactSource artifacts(root.path());
+  const core::RuntimeEpoch epoch("candidate.actual.epoch");
+  const core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
+      domain.control_domain_id,
+      domain.control_domain_revision,
+      provider.provider_instance_id,
+      provider.provider_manifest_id,
+      provider.provider_manifest_revision,
+      provider.provider_runtime_unit_id,
+      epoch,
+      catalog.value().catalog_digest};
+  const core::ResolvedLifecycleControlDomainScopeDTO scope{
+      domain.control_domain_id, domain.control_domain_revision,
+      core::ResolvedProviderDomainScopeDTO{provider, epoch, std::nullopt, {}}};
+  auto port = std::make_shared<UnobservedCandidateBrandPort>();
+  const std::vector<core::BrandLifecyclePortRegistrationDTO> ports{
+      {occurrence, port}};
+  UnusedKernelPorts kernel;
+  UnusedKernelPublicationOwner publication_owner;
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto composition = CCLCRuntimeComposition::Create(
+      configuration(root.path(), graph.cell_id, "candidate.facts"),
+      retained.bundle, reader, receipt, artifacts, catalogs, {occurrence}, {},
+      ports, {}, {}, kernel, kernel, publication_owner, clock, scheduler);
+  ASSERT_TRUE(composition.ok()) << composition.error().message;
+  ASSERT_TRUE(composition.value()->Start().ok());
+  composition.value()->lifecycle_target_driver().Stop();
+  const core::NamedApplyPublicationTransactionDTO apply{
+      core::ApplyId("actual.pending.apply"), core::ApplyGeneration(1U)};
+  const auto plan = composition.value()->PlanNativeApply(
+      {apply,
+       retained.bundle->retained_bundle_id(),
+       graph.graph_revision,
+       {provider.controllable_component_id},
+       {},
+       {},
+       {},
+       {},
+       {},
+       core::ComponentLifecycleStateDTO::kDeclared});
+  ASSERT_TRUE(plan.ok()) << plan.error().message;
+  const auto observations = port->observations;
+  const auto dispatches = port->dispatches;
+  // No candidate public pointer is supplied or fabricated. The existing
+  // snapshot source fails, while the actual recorded-plan source still works.
+  reader.FailReads();
+  EXPECT_FALSE(
+      composition.value()
+          ->ReadCurrentComponentSnapshot(provider.controllable_component_id)
+          .ok());
+  const auto facts =
+      composition.value()->ReadInstalledNativeApplyCandidateFacts(
+          plan.value(), *retained.bundle, catalogs,
+          provider.controllable_component_id, {scope}, {occurrence}, ports);
+  ASSERT_TRUE(facts.ok()) << facts.error().message;
+  EXPECT_EQ(facts.value().component_lifecycle_generation,
+            plan.value().components.front().generation);
+  EXPECT_EQ(std::get<core::InstalledNativeApplyCandidateSourceDTO>(
+                facts.value().source)
+                .apply,
+            apply);
+  EXPECT_EQ(facts.value().domains, std::vector{scope});
+  EXPECT_EQ(port->observations, observations);
+  EXPECT_EQ(port->dispatches, dispatches);
+  auto wrong_plan = plan.value();
+  wrong_plan.components.front().generation = core::ComponentLifecycleGeneration(
+      wrong_plan.components.front().generation.value() + 1U);
+  EXPECT_FALSE(composition.value()
+                   ->ReadInstalledNativeApplyCandidateFacts(
+                       wrong_plan, *retained.bundle, catalogs,
+                       provider.controllable_component_id, {scope},
+                       {occurrence}, ports)
+                   .ok());
+  auto wrong_transaction = plan.value();
+  wrong_transaction.apply.apply_id = core::ApplyId("foreign.apply");
+  EXPECT_FALSE(composition.value()
+                   ->ReadInstalledNativeApplyCandidateFacts(
+                       wrong_transaction, *retained.bundle, catalogs,
+                       provider.controllable_component_id, {scope},
+                       {occurrence}, ports)
+                   .ok());
+  EXPECT_FALSE(composition.value()
+                   ->ReadInstalledNativeApplyCandidateFacts(
+                       plan.value(), *retained.bundle, catalogs,
+                       provider.controllable_component_id, {}, {}, {})
+                   .ok());
+  auto wrong_ports = ports;
+  wrong_ports.front().provider_occurrence.provider_runtime_epoch =
+      core::RuntimeEpoch("foreign.epoch");
+  EXPECT_FALSE(composition.value()
+                   ->ReadInstalledNativeApplyCandidateFacts(
+                       plan.value(), *retained.bundle, catalogs,
+                       provider.controllable_component_id, {scope},
+                       {occurrence}, wrong_ports)
+                   .ok());
+  composition.value()->coordinator().CloseAdmission();
+  EXPECT_FALSE(composition.value()
+                   ->ReadInstalledNativeApplyCandidateFacts(
+                       plan.value(), *retained.bundle, catalogs,
+                       provider.controllable_component_id, {scope},
+                       {occurrence}, ports)
+                   .ok());
 }
 
 } // namespace

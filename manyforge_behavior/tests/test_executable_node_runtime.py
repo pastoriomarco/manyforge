@@ -270,6 +270,8 @@ def _ports(
         kernel_operations=task_port,
         scene_transactions=invocation_port,
         gripper_status=invocation_port,
+        io_signals=invocation_port,
+        io_watches=task_port,
         model_queries=invocation_port,
         assistant_requests=task_port,
         simulator_control=task_port,
@@ -306,8 +308,8 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
     dispositions = resolver.dispositions
 
     assert len(dispositions) == len(environment.registry.rows) == 49
-    assert sum(item.adapter_build_qualified for item in dispositions) == 43
-    assert sum(not item.adapter_build_qualified for item in dispositions) == 6
+    assert sum(item.adapter_build_qualified for item in dispositions) == 49
+    assert sum(not item.adapter_build_qualified for item in dispositions) == 0
     assert all(
         (
             (item.unavailable_reason_code is None and not item.restoration_gates)
@@ -322,11 +324,58 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
         if not item.adapter_build_qualified
     }
     assert "kernel.full_stop" not in deferred
-    # Check input reads through the same semantic I/O owner as Get input.
-    assert deferred["io.check_input"] == deferred["io.get_input"] == (
-        "semantic_io_node_adapter_unavailable_until_i11",
-        ("I11", "T"),
+    # Reads, level waits, outputs and the signal moves are qualified.
+    assert "io.set_output" not in deferred
+    assert "motion.move_until_signal" not in deferred and "motion.probe_search" not in deferred
+    owners = {item.row.node_id: item.owner_port_name for item in dispositions}
+    assert owners["io.check_input"] == owners["io.get_input"] == "io_signals"
+    assert owners["io.wait_for_input"] == "io_watches"
+
+
+def _deferred_adapters(source: str) -> dict[str, tuple[str, ...]]:
+    """The C++ ``kDeferredAdapters`` rows: an empty ``{}`` or ``{{...}}``
+    initializer whose rows are 4 strings each, matching the array extent."""
+
+    match = re.search(
+        r"std::array<DeferredAdapter,\s*(\d+)U?>\s*kDeferredAdapters"
+        r"\s*(?:\{\s*\}|\{\{(.*?)\}\})\s*;",
+        source,
+        re.DOTALL,
     )
+    assert match is not None, "kDeferredAdapters initializer not found"
+    fields = re.findall(r'"([^"]+)"', match.group(2) or "")
+    assert len(fields) == 4 * int(match.group(1))
+    rows = {
+        fields[index]: tuple(fields[index + 1 : index + 4]) for index in range(0, len(fields), 4)
+    }
+    assert len(rows) == int(match.group(1))
+    return rows
+
+
+def test_deferred_adapter_parser_reads_empty_and_nonempty_initializers() -> None:
+    assert _deferred_adapters(
+        "constexpr std::array<DeferredAdapter, 0U> kDeferredAdapters{};"
+    ) == {}
+    assert _deferred_adapters(
+        "constexpr std::array<DeferredAdapter, 0U> kDeferredAdapters{ };\nint x{{1}};"
+    ) == {}
+    nonempty = (
+        "constexpr std::array<DeferredAdapter, 2U> kDeferredAdapters{{\n"
+        '    {"io.get_input", "reason_a", "I11",\n     "T"},\n'
+        '    {"motion.probe_search", "reason_b", "I8", "P5"},\n'
+        "}};\nint y{{2}};"
+    )
+    assert _deferred_adapters(nonempty) == {
+        "io.get_input": ("reason_a", "I11", "T"),
+        "motion.probe_search": ("reason_b", "I8", "P5"),
+    }
+    for malformed in (
+        nonempty.replace("2U>", "3U>"),
+        "constexpr std::array<DeferredAdapter, 1U> kDeferredAdapters{};",
+        "constexpr std::array<DeferredAdapter, 0U> kOtherAdapters{};",
+    ):
+        with pytest.raises(AssertionError):
+            _deferred_adapters(malformed)
 
 
 def test_headless_static_projection_matches_the_closed_deferred_set() -> None:
@@ -342,14 +391,8 @@ def test_headless_static_projection_matches_the_closed_deferred_set() -> None:
     source = (_ROOT / "manyforge_headless/src/node_environment_projection.cpp").read_text(
         encoding="utf-8"
     )
-    block = source.split("kDeferredAdapters{{", maxsplit=1)[1].split("}};", maxsplit=1)[0]
-    fields = re.findall(r'"([^"]+)"', block)
-    assert len(fields) == 4 * len(expected)
-    observed = {
-        fields[index]: tuple(fields[index + 1 : index + 4]) for index in range(0, len(fields), 4)
-    }
 
-    assert observed == expected
+    assert _deferred_adapters(source) == expected
 
 
 def test_closed_resolver_rejects_unknown_and_missing_algorithm_bindings(
@@ -1501,6 +1544,14 @@ def test_retry_issues_a_fresh_attempt_identity_and_stop_cancels_active_work() ->
     }
     program = Program.from_dict(_identified(document), _catalog())
     task = _TaskPort((OwnerTaskState.FAILED, OwnerTaskState.SUCCEEDED))
+    # A failed attempt carries a settled assessment, as the Kernel always provides.
+    task.metadata = {
+        "recovery_assessment": {
+            "status": "action_required",
+            "execution_state": "Failed",
+            "allowed_actions": [],
+        }
+    }
     run = ExecutableProgramRun(
         program=program,
         environment=build_node_environment(),
@@ -1634,10 +1685,14 @@ def test_every_cancellable_leaf_adapter_reports_interrupted_and_no_other_does() 
         "assistant.validate_scene_selection",
         "gripper.command_position",
         "gripper.wait_for_status",
+        "io.set_output",
+        "io.wait_for_input",
         "logic.wait_for_value",
         "motion.follow_cartesian_path",
         "motion.move_to_joint_target",
         "motion.move_to_pose",
+        "motion.move_until_signal",
+        "motion.probe_search",
         "planning.plan_pick_sequence",
         "planning.plan_place_sequence",
         "simulation.reset",
@@ -3872,3 +3927,34 @@ def test_program_stop_invalidates_dwell_and_retry_has_fresh_attempt():
     now[0] = 202.0
     assert _tick(leaf) is py_trees.common.Status.SUCCESS
     assert len(task.acknowledgements) == 2
+
+
+@pytest.mark.parametrize("saturated", [False, True])
+def test_failed_stop_nonstopping_projection_needs_new_owner_revision(saturated):
+    # Contract139/DX1488: normal terminal Faulted expansion advances the
+    # existing owner revision. At its bounded maximum the unchanged Runner
+    # guard visibly refuses the contradictory same-revision projection.
+    maximum = 2**53 - 1
+    accepted_revision = maximum if saturated else 41
+    state = OperatorMotionStopState(
+        {"move": (), "place": (), "reader": (), "timer": ()}
+    )
+    state.publish(OperatorMotionStopSnapshot(
+        accepted_revision,
+        held_nodes=frozenset({"move", "place", "timer"}),
+        stopping_nodes=frozenset({"move"}),
+        ready_nodes=frozenset({"place"}),
+    ))
+    failed = OperatorMotionStopSnapshot(
+        accepted_revision if saturated else accepted_revision + 1,
+        held_nodes=frozenset({"move", "place", "reader", "timer"}),
+        faulted_nodes=frozenset({"move", "place", "reader", "timer"}),
+    )
+    if saturated:
+        before = state.snapshot()
+        with pytest.raises(ValueError, match="projection changed without a revision"):
+            state.publish(failed)
+        assert state.snapshot() == before
+    else:
+        state.publish(failed)
+        assert state.snapshot() == failed

@@ -5,7 +5,8 @@ import type {
   CCLCComponentExpectation,
   CCLCComponentSnapshot,
   CCLCComponentReadiness,
-  CCLCReadinessDomain,
+  CCLCProviderComponentDomain,
+  CCLCReadinessProviderOccurrence,
   CCLCLifecycleFactValue,
   CCLCOwnerIdentity,
   CCLCDesiredBindingRoute,
@@ -14,7 +15,7 @@ import type {
   CCLCExpectedActiveConfiguration,
   CCLCIncidentCauseClass,
   CCLCIncidentDiagnostic,
-  CCLCIncidentDiagnosticSnapshot,
+  CCLCIncidentDiagnosticSnapshotWire,
   CCLCIncidentRecovery,
   CCLCLifecycleIntent,
   CCLCLifecycleProgress,
@@ -23,7 +24,7 @@ import type {
   CCLCLifecycleTarget,
   CCLCLifecycleTargetOrigin,
   CCLCLifecycleTargetState,
-  CCLCRouteTemplate,
+  CCLCRouteTemplateWire,
   CCLCRouteTemplateSet,
   CCLCTransactionStatus,
 } from '../types/cclc';
@@ -240,7 +241,7 @@ function componentReadinessAt(
   const error = readinessErrorAt(row.error, `${path}.error`);
   const ready = booleanAt(row.ready, `${path}.ready`);
   if (!ready && error === null) fail(`${path}.error`, 'the actual readiness blocker');
-  const occurrences = arrayAt(row.domains, `${path}.domains`, 256).map<CCLCReadinessDomain>((value, index) => {
+  const occurrences = arrayAt(row.domains, `${path}.domains`, 256).map<CCLCReadinessProviderOccurrence>((value, index) => {
     const domainPath = `${path}.domains[${index}]`;
     const domain = objectAt(value, domainPath);
     exact(domain, ['provider_occurrence', 'health', 'decision_kind', 'error',
@@ -317,7 +318,7 @@ function componentReadinessAt(
   )) || (nextIntent === null && state !== 'active'))) fail(path, 'a consistent positive readiness verdict');
   return { requestOwnerEpoch: readinessTextAt(row.request_owner_epoch, `${path}.request_owner_epoch`, 256),
     evaluatedAtNs: parseNanoseconds(row.evaluated_at_ns, `${path}.evaluated_at_ns`),
-    nextIntent, requestedState, ready, error, domains: occurrences,
+    nextIntent, requestedState, ready, error, providerOccurrences: occurrences,
     measuredState: { required: measured.required as boolean | null,
       available: measured.available as boolean | null, error: measuredError } };
 }
@@ -458,7 +459,7 @@ function expectationAt(value: unknown, path: string): CCLCComponentExpectation {
   };
 }
 
-function templateAt(value: unknown, path: string): CCLCRouteTemplate {
+function templateAt(value: unknown, path: string): CCLCRouteTemplateWire {
   const row = objectAt(value, path);
   exact(row, [
     'component_expectations', 'desired_configuration',
@@ -568,10 +569,10 @@ function diagnosticAt(value: unknown, path: string): CCLCIncidentDiagnostic | nu
   const groups = {
     exit: ['status', 'signal', 'core_dumped', 'observed_utc'],
     context: [
-      'component_id', 'request_context', 'runtime_unit_id', 'runtime_epoch',
-      'bundle_id', 'graph_revision', 'generator_identity', 'launch_identity',
+      'controllable_component_id', 'request_context', 'runtime_unit_id', 'runtime_epoch',
+      'retained_bundle_id', 'graph_revision', 'generator_identity', 'launch_identity',
     ],
-    readiness: [
+    launch_readiness: [
       'known', 'controller_manager_present', 'controller_observed', 'controller_loaded',
       'controller_bound', 'arm_controller_active', 'hardware_ready', 'joint_sample_available',
       'binding_epoch', 'sample_age_ns', 'captured_utc',
@@ -606,9 +607,9 @@ function diagnosticAt(value: unknown, path: string): CCLCIncidentDiagnostic | nu
       key === 'launch_identity' ? MAX_LAUNCH_IDENTITY_BYTES
         : key === 'request_context' || key === 'generator_identity' ? 1024 : 128);
   });
-  Object.entries(snapshot.readiness as JsonObject).forEach(([key, fact]) => {
+  Object.entries(snapshot.launch_readiness as JsonObject).forEach(([key, fact]) => {
     if (fact === null) return;
-    const factPath = `${snapshotPath}.readiness.${key}`;
+    const factPath = `${snapshotPath}.launch_readiness.${key}`;
     if (key === 'binding_epoch') diagnosticUnsigned64At(fact, factPath);
     else if (key === 'sample_age_ns') parseNanoseconds(fact, factPath);
     else if (key === 'captured_utc') diagnosticTextAt(fact, factPath, 128);
@@ -652,7 +653,7 @@ function diagnosticAt(value: unknown, path: string): CCLCIncidentDiagnostic | nu
   }
   return {
     error: { code, message, details: parsedDetails },
-    snapshot: snapshot as unknown as CCLCIncidentDiagnosticSnapshot,
+    snapshot: snapshot as unknown as CCLCIncidentDiagnosticSnapshotWire,
   };
 }
 
@@ -729,6 +730,102 @@ function lifecycleProgressAt(
   };
 }
 
+const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/;
+const MAX_LIFECYCLE_TIMEOUT_NS = 3_600_000_000_000;
+
+function identityAt(value: unknown, path: string): string {
+  const text = textAt(value, path);
+  if (new TextEncoder().encode(text).length > 128) fail(path, 'a Core identity of at most 128 bytes');
+  return text;
+}
+
+function digestAt(value: unknown, path: string): string {
+  if (typeof value !== 'string' || !SHA256_DIGEST.test(value)) fail(path, 'an exact sha256 digest');
+  return value as string;
+}
+
+/** Existing Core model-free I/O provider domain; no topology, bindings or physical resources. */
+function providerDomainAt(domain: JsonObject, path: string): CCLCProviderComponentDomain {
+  exact(domain, [
+    'active_control_configuration', 'control_domain_id', 'control_domain_revision',
+    'kind', 'provider', 'provider_runtime_epoch', 'resources',
+  ], path);
+  if (domain.kind !== 'io_provider') fail(`${path}.kind`, 'the io_provider domain kind');
+  const raw = objectAt(domain.provider, `${path}.provider`);
+  exact(raw, [
+    'controllable_component_id', 'lifecycle_command_timeout_ns', 'lifecycle_plan_catalog_digest',
+    'provider_instance_id', 'provider_manifest_id', 'provider_manifest_revision',
+    'provider_runtime_unit_id', 'signal_configuration_digest', 'signal_names',
+  ], `${path}.provider`);
+  const signalNames = canonicalBy(
+    arrayAt(raw.signal_names, `${path}.provider.signal_names`).map((name, index) => {
+      const at = `${path}.provider.signal_names[${index}]`;
+      if (typeof name !== 'string' || name.length === 0 || new TextEncoder().encode(name).length > 128) {
+        fail(at, 'a non-empty signal name of at most 128 bytes');
+      }
+      return name as string;
+    }),
+    (name) => name,
+    `${path}.provider.signal_names`,
+    { nonempty: true },
+  );
+  const timeout = raw.lifecycle_command_timeout_ns;
+  if (!Number.isSafeInteger(timeout) || (timeout as number) < 1
+      || (timeout as number) > MAX_LIFECYCLE_TIMEOUT_NS) {
+    fail(`${path}.provider.lifecycle_command_timeout_ns`, 'a positive bounded timeout');
+  }
+  const provider = {
+    controllable_component_id: identityAt(raw.controllable_component_id, `${path}.provider.controllable_component_id`),
+    provider_runtime_unit_id: identityAt(raw.provider_runtime_unit_id, `${path}.provider.provider_runtime_unit_id`),
+    provider_instance_id: identityAt(raw.provider_instance_id, `${path}.provider.provider_instance_id`),
+    provider_manifest_id: identityAt(raw.provider_manifest_id, `${path}.provider.provider_manifest_id`),
+    provider_manifest_revision: digestAt(raw.provider_manifest_revision, `${path}.provider.provider_manifest_revision`),
+    lifecycle_plan_catalog_digest: digestAt(
+      raw.lifecycle_plan_catalog_digest, `${path}.provider.lifecycle_plan_catalog_digest`),
+    signal_configuration_digest: digestAt(
+      raw.signal_configuration_digest, `${path}.provider.signal_configuration_digest`),
+    signal_names: signalNames,
+    lifecycle_command_timeout_ns: timeout as number,
+  };
+  const providerRuntimeEpoch = identityAt(domain.provider_runtime_epoch, `${path}.provider_runtime_epoch`);
+  const resources = canonicalBy(
+    arrayAt(domain.resources, `${path}.resources`).map((resource, index) => (
+      identityAt(resource, `${path}.resources[${index}]`))),
+    (resource) => resource,
+    `${path}.resources`,
+  );
+  let activeConfiguration = null;
+  if (domain.active_control_configuration !== null) {
+    const at = `${path}.active_control_configuration`;
+    const active = objectAt(domain.active_control_configuration, at);
+    exact(active, [
+      'active_control_configuration_generation', 'active_control_configuration_id',
+      'signal_configuration_digest', 'source_runtime_epoch', 'source_runtime_unit_id',
+      'source_sequence',
+    ], at);
+    integerAt(active.source_sequence, `${at}.source_sequence`);
+    if (active.source_runtime_unit_id !== provider.provider_runtime_unit_id
+        || active.source_runtime_epoch !== providerRuntimeEpoch
+        || active.signal_configuration_digest !== provider.signal_configuration_digest) {
+      fail(at, 'the provider runtime unit, epoch and signal configuration');
+    }
+    activeConfiguration = {
+      id: identityAt(active.active_control_configuration_id, `${at}.active_control_configuration_id`),
+      generation: integerAt(
+        active.active_control_configuration_generation, `${at}.active_control_configuration_generation`),
+    };
+  }
+  return {
+    kind: 'io_provider',
+    controlDomainId: identityAt(domain.control_domain_id, `${path}.control_domain_id`),
+    controlDomainRevision: identityAt(domain.control_domain_revision, `${path}.control_domain_revision`),
+    provider,
+    providerRuntimeEpoch,
+    resources,
+    activeConfiguration,
+  };
+}
+
 export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapshot {
   const row = objectAt(value, 'cclcComponent');
   const hasOutputCounters = 'dropped_output_lines' in row || 'dropped_output_bytes' in row;
@@ -751,10 +848,16 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
     arrayAt(row.domains, 'cclcComponent.domains', 256).map((candidate, index) => {
       const path = `cclcComponent.domains[${index}]`;
       const domain = objectAt(candidate, path);
+      // Discriminate on the kind VALUE; any other value fails closed.
+      switch (domain.kind) {
+        case 'io_provider': return providerDomainAt(domain, path);
+        case 'controller': break;
+        default: fail(`${path}.kind`, 'a controller or io_provider domain kind');
+      }
       exact(domain, [
         'active_control_configuration', 'control_domain_id',
         'control_domain_revision', 'controller_topology_id',
-        'current_control_bindings', 'current_resources', 'topology_revision',
+        'current_control_bindings', 'kind', 'resources', 'topology_revision',
       ], path);
       let activeConfiguration = null;
       if (domain.active_control_configuration !== null) {
@@ -815,12 +918,10 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
         `${path}.current_control_bindings`,
         { nonempty: true },
       );
-      const resources = canonicalTextArrayAt(
-        domain.current_resources,
-        `${path}.current_resources`,
-      );
-      if (resources.length === 0) fail(`${path}.current_resources`, 'a non-empty array');
+      const resources = canonicalTextArrayAt(domain.resources, `${path}.resources`);
+      if (resources.length === 0) fail(`${path}.resources`, 'a non-empty array');
       return {
+        kind: 'controller' as const,
         controlDomainId: textAt(domain.control_domain_id, `${path}.control_domain_id`),
         controlDomainRevision: textAt(
           domain.control_domain_revision,
@@ -833,7 +934,7 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
         topologyRevision: textAt(domain.topology_revision, `${path}.topology_revision`),
         activeConfiguration,
         currentControlBindings: bindings,
-        currentResources: resources,
+        resources,
       };
     }),
     (domain) => domain.controlDomainId,
@@ -869,11 +970,26 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
     (provider) => `${provider.controlDomainId}\u0000${provider.providerInstanceId}`,
     'cclcComponent.provider_occurrences',
   );
+  const controllableComponentId = textAt(row.controllable_component_id, 'cclcComponent.controllable_component_id');
+  domains.forEach((domain, index) => {
+    if (domain.kind !== 'io_provider') return;
+    const paired = providers.filter((provider) => provider.controlDomainId === domain.controlDomainId);
+    const occurrence = paired[0];
+    if (domain.provider.controllable_component_id !== controllableComponentId || paired.length !== 1
+        || occurrence!.providerInstanceId !== domain.provider.provider_instance_id
+        || occurrence!.providerManifestId !== domain.provider.provider_manifest_id
+        || occurrence!.providerManifestRevision !== domain.provider.provider_manifest_revision
+        || occurrence!.providerRuntimeUnitId !== domain.provider.provider_runtime_unit_id
+        || occurrence!.lifecyclePlanCatalogDigest !== domain.provider.lifecycle_plan_catalog_digest
+        || occurrence!.providerRuntimeEpoch !== domain.providerRuntimeEpoch) {
+      fail(`cclcComponent.domains[${index}]`, 'a provider domain paired with exactly its component occurrence');
+    }
+  });
   integerAt(row.publication_generation, 'cclcComponent.publication_generation');
   textAt(row.snapshot_digest, 'cclcComponent.snapshot_digest');
   textAt(row.active_public_pointer_digest, 'cclcComponent.active_public_pointer_digest');
   return {
-    componentId: textAt(
+    controllableComponentId: textAt(
       row.controllable_component_id,
       'cclcComponent.controllable_component_id',
     ),
@@ -925,7 +1041,7 @@ export function parseCCLCRouteTemplateSet(value: unknown): CCLCRouteTemplateSet 
     'cclcRouteTemplates.templates',
   );
   return {
-    componentId: textAt(
+    controllableComponentId: textAt(
       row.controllable_component_id,
       'cclcRouteTemplates.controllable_component_id',
     ),
@@ -1154,7 +1270,7 @@ function incidentRecoveryAt(value: unknown, path: string): CCLCIncidentRecovery 
   return {
     ...('closure_reason' in row ? { closureReason: 'cell_closed_by_operator' as const } : {}),
     incidentId: row.incident_id,
-    componentId: textAt(row.controllable_component_id, `${path}.controllable_component_id`),
+    controllableComponentId: textAt(row.controllable_component_id, `${path}.controllable_component_id`),
     causeClass: closedTextAt(
       row.cause_class, INCIDENT_CAUSE_CLASSES, `${path}.cause_class`,
       'an intervention cause class',

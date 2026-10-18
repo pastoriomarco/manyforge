@@ -424,7 +424,7 @@ void validate_resolved_frame(
 }  // namespace
 
 CanonicalValue parse_and_verify_composed_model_symbol_role_map(
-    std::string_view canonical_bytes) {
+    std::string_view canonical_bytes, const bool allow_empty_model_map) {
   if (canonical_bytes.empty() ||
       canonical_bytes.size() > kMaxComposedModelSymbolRoleMapBytes) {
     fail_retained_bundle(
@@ -474,7 +474,7 @@ CanonicalValue parse_and_verify_composed_model_symbol_role_map(
   const auto& symbol_values = require_array(
       require_member(object, "symbol_rows", "symbol_role_map"),
       "symbol_role_map.symbol_rows");
-  if (symbol_values.empty()) {
+  if (!allow_empty_model_map && symbol_values.empty()) {
     fail_retained_bundle(
         "a retained composed-model map must contain source symbols");
   }
@@ -516,9 +516,16 @@ CanonicalValue parse_and_verify_composed_model_symbol_role_map(
   const auto& occurrence_values = require_array(
       require_member(object, "model_occurrences", "symbol_role_map"),
       "symbol_role_map.model_occurrences");
-  if (occurrence_values.empty()) {
+  // Only the Scenario-candidate empty map (allow_empty_model_map) may have no
+  // occurrences; every other map keeps the strict rule.
+  if (!allow_empty_model_map && occurrence_values.empty()) {
     fail_retained_bundle(
         "a retained composed-model map must contain model occurrences");
+  }
+  if (occurrence_values.empty() != symbol_values.empty()) {
+    fail_retained_bundle(
+        "composed model symbol/role map symbols and occurrences must be empty "
+        "together");
   }
   std::map<std::string, OccurrenceInfo, std::less<>> occurrences;
   using FramePathKey =

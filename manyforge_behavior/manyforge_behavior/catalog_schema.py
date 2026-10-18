@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from manyforge_behavior import interrupt_condition
+
 
 _SCALAR_TYPES = {"string", "float", "int", "bool"}
 _COMPOSITE_TYPES = {"object", "array", "enum"}
@@ -23,7 +25,12 @@ _COMPOSITE_TYPES = {"object", "array", "enum"}
 # type of the blackboard key named by that parameter; without it the value (or
 # its value source) carries one of the admitted types.
 _KEY_VALUE_TYPE = "key_value"
-_ALLOWED_SCHEMA_TYPES = _SCALAR_TYPES | _COMPOSITE_TYPES | {_KEY_VALUE_TYPE}
+# An ``interrupt_condition`` holds one closed per-node interrupt condition
+# (interrupt_condition.py); it takes no other schema keys.
+_CONDITION_TYPE = "interrupt_condition"
+_ALLOWED_SCHEMA_TYPES = (
+    _SCALAR_TYPES | _COMPOSITE_TYPES | {_KEY_VALUE_TYPE, _CONDITION_TYPE}
+)
 KEY_VALUE_TYPES = ("bool", "float64", "int64", "stored_pose", "string", "string_list")
 _KEY_VALUE_ONLY_KEYS = {"value_type_from_key", "value_types"}
 _ALLOWED_INLINE_SCHEMA_KEYS = {
@@ -263,6 +270,14 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
         raise CatalogSchemaError(f"{path}: type must be one of: {allowed}")
     if schema_type == _KEY_VALUE_TYPE:
         return _parse_key_value_schema(raw_schema, path=path)
+    if schema_type == _CONDITION_TYPE:
+        unknown = sorted(set(raw_schema) - {"type", "description"})
+        if unknown:
+            raise CatalogSchemaError(f"{path}: {_CONDITION_TYPE} forbids schema keys {unknown}")
+        return CatalogSchema(
+            schema_type=_CONDITION_TYPE,
+            description=_optional_string(raw_schema, "description", path),
+        )
     present_key_value_keys = sorted(_KEY_VALUE_ONLY_KEYS & set(raw_schema))
     if present_key_value_keys:
         raise CatalogSchemaError(
@@ -587,7 +602,7 @@ def _validate_schema(
     elif schema.schema_type == _KEY_VALUE_TYPE:
         if "stored_pose" in schema.value_types:
             registry.resolve(CatalogSchema(ref="#/schema_types/stored_pose"), stack=stack)
-    elif schema.schema_type in _SCALAR_TYPES | {"enum"}:
+    elif schema.schema_type in _SCALAR_TYPES | {"enum", _CONDITION_TYPE}:
         if schema.properties:
             raise CatalogSchemaError(
                 f"{path}: scalar/enum schemas cannot declare properties"
@@ -645,6 +660,11 @@ def _validate_value(
                     schema_type,
                 )
             )
+    elif schema_type == _CONDITION_TYPE:
+        issue = interrupt_condition.condition_structure_issue(value)
+        if issue is not None:
+            issue_path, message = issue
+            issues.append(_issue(path + issue_path[1:], message, schema_type))
     elif schema_type == "enum":
         if not isinstance(value, str) or value not in schema.enum_values:
             issues.append(
@@ -824,6 +844,8 @@ def _to_json_schema(
         if schema.value_type_from_key is not None:
             result["x-manyforge-value-type-from-key"] = schema.value_type_from_key
         return result
+    elif schema_type == _CONDITION_TYPE:
+        return {**result, **interrupt_condition.json_schema()}
     elif schema_type == "enum":
         result["type"] = "string"
         result["enum"] = list(schema.enum_values)

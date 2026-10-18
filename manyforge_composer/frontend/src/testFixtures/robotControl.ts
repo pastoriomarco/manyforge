@@ -155,6 +155,9 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
       },
     },
     observedGripper: {
+      targetRoleId: 'command_target',
+      controllableComponentId: 'robot-a',
+      commandTargetId: 'gripper',
       sequence: 4,
       sourceEpoch: 'gripper-source-1',
       sourceCoordinateName: 'finger_joint',

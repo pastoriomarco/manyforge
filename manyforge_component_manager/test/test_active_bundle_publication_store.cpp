@@ -787,5 +787,38 @@ TEST(
   EXPECT_NO_THROW(closed.Close());
 }
 
-}  // namespace
+TEST(ActiveBundlePublicationStoreReadOnly,
+     NeverCreatesAndPreservesVerifiedDatabaseAndWal) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "read-only.sqlite3";
+  EXPECT_FALSE(
+      ReadActiveBundlePublicationReadOnly(path, CellId("cell-a")).ok());
+  EXPECT_FALSE(std::filesystem::exists(path));
+  ExpectNoSqliteSidecars(path);
+  SqliteActiveBundlePublicationStore owner(path, CellId("cell-a"));
+  const auto published = owner.PublishActiveBundle(BootstrapRequest());
+  const auto wal = std::filesystem::path(path.string() + "-wal");
+  ASSERT_TRUE(std::filesystem::exists(wal));
+  const auto database_before = ReadFileBytes(path);
+  const auto wal_before = ReadFileBytes(wal);
+  const auto actual =
+      ReadActiveBundlePublicationReadOnly(path, CellId("cell-a"));
+  ASSERT_TRUE(actual.ok()) << actual.error().message;
+  EXPECT_EQ(actual.value(), published);
+  EXPECT_FALSE(
+      ReadActiveBundlePublicationReadOnly(path, CellId("another-cell")).ok());
+  EXPECT_EQ(ReadFileBytes(path), database_before);
+  EXPECT_EQ(ReadFileBytes(wal), wal_before);
+  SqliteExecPath(
+      path,
+      "UPDATE active_bundle_publication_head SET request_digest='corrupt';");
+  const auto corrupt_database = ReadFileBytes(path);
+  const auto corrupt_wal = ReadFileBytes(wal);
+  EXPECT_FALSE(
+      ReadActiveBundlePublicationReadOnly(path, CellId("cell-a")).ok());
+  EXPECT_EQ(ReadFileBytes(path), corrupt_database);
+  EXPECT_EQ(ReadFileBytes(wal), corrupt_wal);
+}
+
+} // namespace
 }  // namespace manyforge::component_manager

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <functional>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -42,6 +43,10 @@ inline constexpr std::string_view kSourceModelContextSchemaVersion =
 inline constexpr std::string_view kAssistantModeContextSchemaVersion =
     "manyforge.assistant_mode_context.v1";
 inline constexpr std::size_t kMaximumViewerModelResourceUriBytes = 4096U;
+/// The existing execution response envelope bound also covers its current
+/// runtime-fault snapshot. Per-field owner contracts remain independently checked.
+inline constexpr std::size_t kMaximumRuntimeFaultSnapshotBytes =
+    manyforge::core::kMaximumCellAdmissionJsonResponseBytes;
 inline constexpr std::string_view kAlarmSourceRefreshSchemaVersion =
     "manyforge.alarm_source_refresh.v1";
 /// Alarm-source currency (spec 530 §11). Source health, the scene adapter and
@@ -307,6 +312,15 @@ public:
           current_stop_fault = std::nullopt);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   MarkOperationEventSourceUnknown(std::string source_owner_epoch);
+  /// Observe two bounded current native-owner fault facts. First occurrences
+  /// remain active for this Workbench lifetime, including across reconnects.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ObserveRuntimeFaultConditions(
+      std::string source_owner_epoch,
+      manyforge::content_identity::CanonicalValue current_runtime_faults);
+  /// Internal accepted Program source; absence/owner replacement never clears an occurrence.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ObserveProgramFailureCondition(manyforge::content_identity::CanonicalValue condition);
   /// Controllable components of the active configuration whose CCLC
   /// snapshots the component-lifecycle alarm conditions are derived from,
   /// that configuration's retained bundle and graph revision (null before
@@ -403,17 +417,29 @@ private:
   RefreshRuntimeHealthAdapterLocked(const HeadlessRuntimeSnapshot &runtime);
   void RefreshSceneAdapterLocked(const HeadlessRuntimeSnapshot &runtime);
   void RegisterOperationEpochLocked(std::string source_owner_epoch);
+  /// Call-local facts parsed once from one immutable committed capture.
+  struct ParsedOperationFacts final {
+    bool captured_origin{};
+    bool terminal_facts_present{};
+    bool preemption_present{};
+    bool captured_failure_effects_known{};
+  };
+  [[nodiscard]] static ParsedOperationFacts
+  ParseOperationFacts(const manyforge::content_identity::CanonicalValue &state,
+                      const manyforge::content_identity::CanonicalValue *intent,
+                      bool captured_origin_allowed, bool terminal_facts_allowed,
+                      bool preemption_allowed);
   void ReconcileRuntimeCollisionStopLocked(
       const manyforge::content_identity::CanonicalValue &journal_payload,
-      std::uint64_t native_sequence, std::string_view payload_digest,
-      std::int64_t occurred_at_ns, std::string_view occurred_at_wall,
-      std::string_view raw_event_id);
+      std::uint64_t native_sequence,
+      std::string_view payload_digest, std::int64_t occurred_at_ns,
+      std::string_view occurred_at_wall, std::string_view raw_event_id);
   void ReconcileOperationFaultLocked(
       const manyforge::content_identity::CanonicalValue &journal_payload,
-      std::string_view record_kind, std::string_view request_id,
-      std::uint64_t native_sequence, std::string_view payload_digest,
-      std::int64_t occurred_at_ns, std::string_view occurred_at_wall,
-      std::string_view raw_event_id);
+      const ParsedOperationFacts &facts, std::string_view record_kind,
+      std::string_view request_id, std::uint64_t native_sequence,
+      std::string_view payload_digest, std::int64_t occurred_at_ns,
+      std::string_view occurred_at_wall, std::string_view raw_event_id);
   void ReconcileStopFaultLocked(
       const manyforge::content_identity::CanonicalValue &journal_payload,
       std::string_view record_kind, std::uint64_t native_sequence,
@@ -427,6 +453,7 @@ private:
     kExecutionFault,
     kRuntimeCollision,
     kStopFault,
+    kProgramFailure,
   };
   /// A still-current activation the alarm owner refused for its scope. It is
   /// reconsidered once whenever the active configuration changes.
@@ -532,9 +559,15 @@ private:
   std::optional<std::pair<std::string, std::string>> alarm_registry_identity_;
   std::map<std::string, RefusedOperationCondition> refused_operation_conditions_;
   AdapterCursor runtime_health_adapter_;
+  AdapterCursor runtime_fault_adapter_;
+  std::set<std::string> active_runtime_fault_kinds_;
   bool runtime_health_baseline_observed_{};
   AdapterCursor scene_adapter_;
   AdapterCursor operation_adapter_;
+  AdapterCursor program_failure_adapter_;
+  std::uint64_t program_failure_control_revision_{};
+  std::uint64_t program_failure_run_revision_{};
+  std::string program_failure_run_id_;
   AdapterCursor alarm_scope_adapter_;
   /// CCLC lifecycle condition (`component_lifecycle_fault`). It follows the
   /// CCLC owner epoch and is registered only after the first complete

@@ -7,13 +7,13 @@ import { describe, expect, it, vi } from 'vitest';
 import { parseCCLCStatusEnvelope } from '../api/cclcParsers';
 import { CCLCPanelView } from './CCLCPanel';
 import type { CCLCController } from '../hooks/useCCLC';
-import type { CCLCReadinessDomain } from '../types/cclc';
+import type { CCLCReadinessProviderOccurrence } from '../types/cclc';
 
 function controller(): CCLCController {
   return {
-    componentId: 'component.arm',
+    controllableComponentId: 'component.arm',
     snapshot: {
-      componentId: 'component.arm',
+      controllableComponentId: 'component.arm',
       lifecycleGeneration: 4,
       lifecycleState: 'prepared',
       retainedBundleId: 'bundle.1',
@@ -24,10 +24,10 @@ function controller(): CCLCController {
       lifecycleTarget: null,
       lifecycleProgress: null,
       readiness: { requestOwnerEpoch: 'owner.1', evaluatedAtNs: 100, nextIntent: 'enable', requestedState: 'active',
-        ready: true, error: null, domains: [], measuredState: { required: false, available: null, error: null } },
+        ready: true, error: null, providerOccurrences: [], measuredState: { required: false, available: null, error: null } },
     },
     routeTemplates: {
-      componentId: 'component.arm',
+      controllableComponentId: 'component.arm',
       retainedBundleId: 'bundle.1',
       graphRevision: 'graph.1',
       templates: [],
@@ -38,7 +38,7 @@ function controller(): CCLCController {
     busy: false,
     readUnavailableReason: null,
     error: null,
-    setComponentId: vi.fn(),
+    setControllableComponentId: vi.fn(),
     refresh: vi.fn(),
     reconcileTransaction: vi.fn(),
     dismissError: vi.fn(),
@@ -111,7 +111,7 @@ describe('CCLC presentation', () => {
 
   it('renders no activation step while preserving faults, transport and refusal diagnostics', () => {
     const current = controller();
-    const domain: CCLCReadinessDomain = {
+    const domain: CCLCReadinessProviderOccurrence = {
       hasActivationStep: false,
       providerOccurrence: { controlDomainId: 'domain.gripper', controlDomainRevision: 'revision.1',
         lifecyclePlanCatalogDigest: 'catalog.1', providerInstanceId: 'provider.1',
@@ -125,7 +125,7 @@ describe('CCLC presentation', () => {
         ] }, decisionKind: null, error: { code: 'not_ready', message: 'Transport unavailable', details: {} },
     };
     current.snapshot!.readiness = { ...current.snapshot!.readiness, ready: false,
-      error: domain.error, domains: [domain] };
+      error: domain.error, providerOccurrences: [domain] };
     const html = renderToStaticMarkup(createElement(CCLCPanelView, { enabled: true,
       mutationAvailable: true, mutationUnavailableReason: null, controller: current }));
     expect(html).toContain('No activation step · faulted');
@@ -155,7 +155,7 @@ describe('CCLC presentation', () => {
   it('shows literal refusal facts and whole-current-list Retry without switching selection', () => {
     const failed = controller();
     failed.activationProgress = 'Activation stopped. Submit a new explicit command after resolving the cause.';
-    failed.activationRefusal = { componentId: 'component.other', transactionId: 'prepare.1', error: {
+    failed.activationRefusal = { controllableComponentId: 'component.other', transactionId: 'prepare.1', error: {
       code: 'component_lifecycle_transition_missing', message: 'No transition satisfied', details: {
         reason: 'no_transition_satisfied', observed_state: 'declared', observed_controller_loaded: 'unknown',
         observed_fault_present: 'true', observed_transport_ready: 'nonboolean' } } };
@@ -165,7 +165,7 @@ describe('CCLC presentation', () => {
     expect(html).toContain('component.other: Fault');
     expect(html).toContain('observed_controller_loaded: unknown');
     expect(html).toContain('observed_transport_ready: nonboolean');
-    expect(failed.setComponentId).not.toHaveBeenCalled();
+    expect(failed.setControllableComponentId).not.toHaveBeenCalled();
   });
   it('retains the exact unknown activation request address for read-only reconciliation', () => {
     const unknown = controller();
@@ -296,7 +296,7 @@ it('renders actual readiness code/reason and owner elapsed without changing acti
 
 it('preserves activation-domain health diagnostic code and cause independently of the plan error', () => {
   const current = controller();
-  current.snapshot!.readiness.domains = [{ hasActivationStep: true,
+  current.snapshot!.readiness.providerOccurrences = [{ hasActivationStep: true,
     providerOccurrence: { controlDomainId: 'domain.arm', controlDomainRevision: 'revision.1', lifecyclePlanCatalogDigest: 'catalog.1',
       providerInstanceId: 'provider.arm', providerManifestId: 'manifest.arm', providerManifestRevision: 'revision.1',
       providerRuntimeEpoch: 'epoch.1', providerRuntimeUnitId: 'unit.1' },
@@ -310,13 +310,13 @@ it('preserves activation-domain health diagnostic code and cause independently o
 it('renders an identical intervention plan error and health diagnostic once', () => {
   const current = controller();
   const error = { code: 'actual_vendor_fault', message: 'Actual arm transport fault', details: { reason: 'actual_fault_bit' } };
-  const domain: CCLCReadinessDomain = { hasActivationStep: true,
+  const domain: CCLCReadinessProviderOccurrence = { hasActivationStep: true,
     providerOccurrence: { controlDomainId: 'domain.arm', controlDomainRevision: 'revision.1', lifecyclePlanCatalogDigest: 'catalog.1',
       providerInstanceId: 'provider.arm', providerManifestId: 'manifest.arm', providerManifestRevision: 'revision.1',
       providerRuntimeEpoch: 'epoch.1', providerRuntimeUnitId: 'unit.1' },
     error, decisionKind: null,
     health: { observedState: 'faulted', facts: [], diagnostic: structuredClone(error) } };
-  current.snapshot!.readiness = { ...current.snapshot!.readiness, ready: false, domains: [domain] };
+  current.snapshot!.readiness = { ...current.snapshot!.readiness, ready: false, providerOccurrences: [domain] };
   const html = renderToStaticMarkup(createElement(CCLCPanelView, { enabled: true, mutationAvailable: true, mutationUnavailableReason: null, controller: current }));
   expect(html.split('[actual_vendor_fault] Actual arm transport fault · actual_fault_bit')).toHaveLength(2);
 });

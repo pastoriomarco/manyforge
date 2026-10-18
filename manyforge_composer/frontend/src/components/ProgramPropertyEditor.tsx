@@ -21,7 +21,31 @@ import type {
 } from '../types/api';
 import type { ManualControlMotionDescriptor } from '../types/robotControl';
 import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
+import {
+  ioEmptyOmits,
+  ioSignalRoleChoices,
+  ioTimeoutHint,
+  ioUnsupportedChoices,
+} from '../utils/ioAuthoring';
+import {
+  globalRuleIds,
+  interruptKeyInitialProblem,
+  INTERRUPT_NODE_IDS,
+  nodeConditionChoices,
+  operandId,
+  stopStagesForTargetRole,
+  successThroughStages,
+  type TargetStopChain,
+} from '../utils/interruptAuthoring';
 import { keyValueParameterRule } from '../utils/keyValueAuthoring';
+import {
+  MOCK_SIMULATION_NODE_IDS,
+  MOCK_SIMULATION_PARAMETER,
+  MOCK_SIMULATION_SOURCE_REFUSED,
+  mockSignalProfiles,
+  mockSimulationProblem,
+  nodeMockSignals,
+} from '../utils/mockSimulation';
 import {
   catalogDefaultParameters,
   deriveProgramMotionConfiguration,
@@ -29,6 +53,7 @@ import {
   inheritedProgramExecutionGroups,
   PROGRAM_MOTION_CEILING_FIELDS,
   PROGRAM_MOTION_FIELDS,
+  programBlackboardKeys,
   programDiagnosticNodeId,
   resolveProgramParameterLiteralValue,
   type ProgramMotionField,
@@ -61,7 +86,11 @@ import {
   valueSourceMenuEntries,
   type ValueSourceController,
 } from './property/ValueSourceField';
+import { InterruptConditionEditor } from './InterruptConditionEditor';
+import { MockSimulationEditor } from './MockSimulationEditor';
+import { IO_LIVENESS_UNPROVEN_WARNING } from '../utils/ioSignalConfiguration';
 import { ProgramPolicyEditor } from './ProgramPolicyEditor';
+import { StopStagePicker } from './StopStagePicker';
 
 interface ProgramPropertyEditorProps {
   embedded?: boolean;
@@ -74,6 +103,8 @@ interface ProgramPropertyEditorProps {
   sourceModelUnavailableReason?: string | null;
   deploymentWorkspace?: DeploymentWorkspaceResponse | null;
   motionDescriptors?: ManualControlMotionDescriptor[];
+  /** Published motion targets' qualified Stop chains (SX-2167); absent = "available after Apply". */
+  stopChains?: TargetStopChain[];
   busy: boolean;
   onMutate: (
     mutation: string,
@@ -227,6 +258,7 @@ export function ProgramPropertyEditor({
   sourceModelUnavailableReason = null,
   deploymentWorkspace = null,
   motionDescriptors = [],
+  stopChains = [],
   busy,
   onMutate,
   onCreateReference,
@@ -238,7 +270,17 @@ export function ProgramPropertyEditor({
   diagnostics = [],
 }: ProgramPropertyEditorProps) {
   const programParameters = program.parameters ?? [];
-  const blackboardKeys = program.blackboard?.keys ?? [];
+  const deploymentDocument = deploymentWorkspace?.draft?.document ?? null;
+  // The Deployment Draft's global rules add read-only `interrupt_state.<rule_id>` keys.
+  const ruleIds = useMemo(
+    () => globalRuleIds(deploymentDocument as Record<string, JsonValue> | null),
+    [deploymentDocument],
+  );
+  const blackboardKeys = useMemo(() => programBlackboardKeys(program, ruleIds), [program, ruleIds]);
+  const conditionChoices = useMemo(() => nodeConditionChoices(
+    program, deploymentWorkspace?.binding, ruleIds,
+    deploymentDocument as Record<string, JsonValue> | null,
+  ), [deploymentDocument, deploymentWorkspace?.binding, program, ruleIds]);
   const motionConfiguration = useMemo(
     () => deriveProgramMotionConfiguration(program, catalogEntries),
     [catalogEntries, program],
@@ -290,6 +332,10 @@ export function ProgramPropertyEditor({
   const selectedDiagnostics = useMemo(() => diagnostics.filter((diagnostic) =>
     programDiagnosticNodeId(roots, diagnostic.path) === selectedId,
   ), [diagnostics, roots, selectedId]);
+  // The bound robot's qualified Stop chain; null keeps "available after Apply".
+  const qualifiedStopStages = useMemo(() => (selected === null ? null : stopStagesForTargetRole(
+    stopChains, deploymentWorkspace?.binding?.target_role_bindings, selected.parameters.target_role,
+  )), [deploymentWorkspace?.binding?.target_role_bindings, selected, stopChains]);
   const selectedDeploymentSpeed = useMemo(() => {
     if (selected === null || deploymentWorkspace?.binding == null) return null;
     const binding = deploymentWorkspace.binding;
@@ -664,6 +710,29 @@ export function ProgramPropertyEditor({
             : { ...parameter.schema, enum: [...rule.choices] };
           const backendDiagnostic = selectedDiagnostics.find((diagnostic) =>
             diagnosticTargetsParameter(diagnostic.path, parameter.id));
+          const signalChoices = parameter.id === 'resource_role'
+            ? ioSignalRoleChoices(
+              selected.node_id,
+              selected.parameters.target_role,
+              deploymentWorkspace?.binding,
+            )
+            : null;
+          const unsupportedChoices = ioUnsupportedChoices(
+            selected.node_id,
+            parameter.id,
+            schema,
+          );
+          const emptyOmits = ioEmptyOmits(selected.node_id, parameter.id);
+          const interruptField = INTERRUPT_NODE_IDS.has(selected.node_id) && source === undefined
+            && !repairMode
+            && (parameter.id === 'interrupt_condition' || parameter.id === 'stop_entry_stage_id'
+              || parameter.id === 'success_through_stage_id')
+            ? parameter.id : null;
+          // Catalog schema type `mock_signal_simulation` (contract 133): literal rows only.
+          const mockField = MOCK_SIMULATION_NODE_IDS.has(selected.node_id)
+            && parameter.id === MOCK_SIMULATION_PARAMETER && !repairMode;
+          const storedText = (id: string) => (typeof selected.parameters[id] === 'string'
+            ? selected.parameters[id] as string : undefined);
           return (
             <div
               className={`program-property${backendDiagnostic ? ' backend-invalid' : ''}`}
@@ -688,13 +757,94 @@ export function ProgramPropertyEditor({
               {rule.inapplicable !== undefined && (
                 <p className="program-form-hint">{rule.inapplicable} Omit it below.</p>
               )}
+              {signalChoices !== null && signalChoices.length === 0 && (
+                <p className="program-form-hint">
+                  The current binding has no {selected.node_id === 'io.set_output' ? 'output' : 'input'} signal for {String(selected.parameters.target_role)}.
+                </p>
+              )}
+              {signalChoices !== null && selected.node_id !== 'io.set_output'
+                && conditionChoices.some((choice) => choice.liveness === 'change_only'
+                  && operandId(choice.operand) === operandId({ signal: {
+                    target_role: selected.parameters.target_role ?? null,
+                    resource_role: selected.parameters.resource_role ?? null,
+                  } })) && (
+                <p className="inline-message severity-warning" role="note">{IO_LIVENESS_UNPROVEN_WARNING}</p>
+              )}
+              {unsupportedChoices !== undefined && (
+                <p className="program-form-hint">{unsupportedChoices.hint}</p>
+              )}
+              {emptyOmits && <p className="program-form-hint">{ioTimeoutHint(parameter.schema)}</p>}
+              {rule.locked !== undefined && (
+                <p className="program-form-hint">{rule.locked}</p>
+              )}
               {rule.choices !== undefined && typeof literal === 'string'
                 && !rule.choices.includes(literal) && (
                 <p className="program-form-error inline-message severity-error">
                   {literal} does not apply to this key; choose {rule.choices.join(' or ')}.
                 </p>
               )}
-              {repairMode ? (
+              {mockField ? (
+                <div id={`property-${selected.instance_id}-${parameter.id}`}>
+                  {(() => {
+                    const signals = nodeMockSignals(selected);
+                    const problem = mockSimulationProblem(selected);
+                    return (
+                      <>
+                        <MockSimulationEditor
+                          value={hasLiteral ? literal : undefined}
+                          signals={signals}
+                          profiles={mockSignalProfiles(signals, deploymentWorkspace?.binding,
+                            deploymentDocument as Record<string, JsonValue> | null)}
+                          disabled={busy || rule.locked !== undefined}
+                          onCommit={(value) => commitLiteral(parameter, value)}
+                          onClear={() => removeLiteral(parameter)}
+                          onInvalidChange={(message) => setFieldError(parameter.id, message)}
+                        />
+                        {problem?.startsWith(MOCK_SIMULATION_SOURCE_REFUSED) && (
+                          <p className="program-form-error inline-message severity-error" role="alert">{problem}</p>
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
+              ) : interruptField === 'interrupt_condition' ? (
+                <div id={`property-${selected.instance_id}-${parameter.id}`}>
+                  <InterruptConditionEditor
+                    label="Interrupt condition"
+                    value={hasLiteral ? literal : undefined}
+                    choices={conditionChoices}
+                    disabled={busy || rule.locked !== undefined}
+                    onCommit={(value) => commitLiteral(parameter, value)}
+                    onInvalidChange={(message) => setFieldError(parameter.id, message)}
+                  />
+                  {(() => {
+                    const problem = interruptKeyInitialProblem(hasLiteral ? literal : undefined, blackboardKeys);
+                    return problem === null ? null : (
+                      <p className="program-form-error inline-message severity-error" aria-label="Interrupt condition key initial">{problem}</p>
+                    );
+                  })()}
+                </div>
+              ) : interruptField !== null ? (
+                <div id={`property-${selected.instance_id}-${parameter.id}`}>
+                  <StopStagePicker
+                    label={interruptField === 'stop_entry_stage_id' ? 'Stop entry stage' : 'Success through stage'}
+                    value={storedText(interruptField)}
+                    stages={qualifiedStopStages === null ? null
+                      : interruptField === 'stop_entry_stage_id' ? qualifiedStopStages
+                        : successThroughStages(qualifiedStopStages, storedText('stop_entry_stage_id'))}
+                    omittedLabel={interruptField === 'stop_entry_stage_id'
+                      ? 'First stage (default)' : 'Only the entry stage counts (default)'}
+                    disabled={busy}
+                    onChange={(next) => (next === undefined
+                      ? removeLiteral(parameter) : commitLiteral(parameter, next))}
+                  />
+                  {interruptField === 'success_through_stage_id' && (
+                    <p className="program-form-hint">
+                      A trip contained up to this stage follows on_signal; containment at a later stage fails the node through its normal failure handling.
+                    </p>
+                  )}
+                </div>
+              ) : repairMode ? (
                 <>
                   <p className="program-form-error inline-message severity-error" role="alert">
                     Catalog-invalid value: {literalValidation}. Repair it as strict JSON; specialized controls are disabled to preserve every represented field.
@@ -703,7 +853,7 @@ export function ProgramPropertyEditor({
                     id={`property-${selected.instance_id}-${parameter.id}`}
                     rows={7}
                     value={JSON.stringify(literal, null, 2)}
-                    disabled={busy}
+                    disabled={busy || rule.locked !== undefined}
                     spellCheck={false}
                     aria-label={`${parameter.id} strict JSON repair`}
                     validate={(text) => {
@@ -732,14 +882,20 @@ export function ProgramPropertyEditor({
                   <ProgramSchemaValueEditor
                     schema={schema}
                     value={literal}
-                    disabled={busy}
+                    disabled={busy || rule.locked !== undefined}
                     context={{
                       entry,
                       node: selected,
                       parameterId: parameter.id,
                       program,
+                      globalRuleIds: ruleIds,
                       sourceJointInventory,
                       onCreateReference,
+                      semanticChoices: signalChoices,
+                      unsupportedChoices,
+                      emptyOmits: emptyOmits
+                        ? { placeholder: 'Wait forever', onOmit: () => removeLiteral(parameter) }
+                        : undefined,
                     }}
                     path={parameter.id}
                     onCommit={(value, moves) => commitLiteral(parameter, value, moves)}
@@ -784,7 +940,7 @@ export function ProgramPropertyEditor({
                 <button
                   type="button"
                   className="text-button"
-                  disabled={busy || selected.parameters[parameter.id] === undefined}
+                  disabled={busy || rule.locked !== undefined || selected.parameters[parameter.id] === undefined}
                   onClick={() => removeLiteral(parameter)}
                 >
                   {isProgramMotionField(parameter.id)

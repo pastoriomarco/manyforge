@@ -119,20 +119,20 @@ TEST(NodeEnvironmentProjection,
   EXPECT_NE(bytes.find("\"implementation_identity_resolved\":true"),
             std::string::npos);
   EXPECT_NE(bytes.find("\"adapter_build_qualified\":true"), std::string::npos);
-  EXPECT_NE(bytes.find("\"adapter_build_qualified\":false"), std::string::npos);
-  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":true"), 43U);
-  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":false"), 6U);
+  EXPECT_EQ(bytes.find("\"adapter_build_qualified\":false"), std::string::npos);
+  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":true"), 49U);
+  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":false"), 0U);
   EXPECT_NE(bytes.find("\"binding_available\":false"), std::string::npos);
   EXPECT_NE(bytes.find("\"owner_health_available\":false"), std::string::npos);
   EXPECT_EQ(Count(bytes, "\"owner_health_available\":true"), 14U);
   EXPECT_EQ(Count(bytes, "\"owner_health_available\":false"), 35U);
   EXPECT_EQ(bytes.find("\"cclc_node_adapter_unavailable_until_i7\""),
             std::string::npos);
-  EXPECT_NE(bytes.find("\"kernel_policy_node_adapter_unavailable_until_i8\""),
+  EXPECT_EQ(bytes.find("\"kernel_policy_node_adapter_unavailable_until_i8\""),
             std::string::npos);
   EXPECT_EQ(bytes.find("\"simulation_node_adapter_unavailable_until_i9\""),
             std::string::npos);
-  EXPECT_NE(bytes.find("\"semantic_io_node_adapter_unavailable_until_i11\""),
+  EXPECT_EQ(bytes.find("\"semantic_io_node_adapter_unavailable_until_i11\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"manager_runtime_converged\":true"),
             std::string::npos);
@@ -149,6 +149,50 @@ TEST(NodeEnvironmentProjection,
             std::string::npos);
   EXPECT_NE(unavailable.find("\"manager_runtime_unavailable\""),
             std::string::npos);
+}
+
+TEST(NodeEnvironmentProjection,
+     IoAndCapturedInterruptAdaptersAreBuildQualifiedWithoutSelectedRuntimeAvailability) {
+  const auto admission = LoadAdmission();
+  const ActiveNodeEnvironmentProjection projection(
+      MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT,
+      MANYFORGE_HEADLESS_TEST_NODE_CATALOG,
+      MANYFORGE_HEADLESS_TEST_NODE_ENVIRONMENT_MANIFEST);
+  const auto value = projection.Project(admission.retained_bundle(), true);
+  const auto member =
+      [](const content_identity::CanonicalValue &object,
+         const std::string &name) -> const content_identity::CanonicalValue & {
+    const auto *found = object.find_object_member(name);
+    if (found == nullptr)
+      throw std::runtime_error("missing projection field " + name);
+    return *found;
+  };
+  const auto &availability = member(value, "availability");
+  EXPECT_FALSE(member(availability, "execution_available").as_bool());
+  std::vector<std::string> io_ids;
+  std::vector<std::string> interrupt_ids;
+  for (const auto &row : member(availability, "implementations").as_array()) {
+    const auto &id = member(row, "node_id").as_string();
+    const bool interrupt = id == "motion.move_until_signal" || id == "motion.probe_search";
+    if (id.starts_with("io.") || interrupt) {
+      if (interrupt) interrupt_ids.push_back(id);
+      else io_ids.push_back(id);
+      EXPECT_TRUE(member(row, "adapter_build_qualified").as_bool()) << id;
+      EXPECT_FALSE(member(row, "binding_available").as_bool()) << id;
+      EXPECT_FALSE(member(row, "execution_available").as_bool()) << id;
+      EXPECT_FALSE(member(row, "owner_health_available").as_bool()) << id;
+      EXPECT_TRUE(member(row, "restoration_gates").as_array().empty()) << id;
+      EXPECT_EQ(content_identity::canonical_json(member(row, "reason_codes")),
+                "[\"program_binding_unselected\",\"program_runtime_owner_"
+                "unavailable\"]")
+          << id;
+    }
+  }
+  EXPECT_EQ(io_ids,
+            (std::vector<std::string>{"io.check_input", "io.get_input",
+                                      "io.set_output", "io.wait_for_input"}));
+  EXPECT_EQ(interrupt_ids,
+            (std::vector<std::string>{"motion.move_until_signal", "motion.probe_search"}));
 }
 
 TEST(NodeEnvironmentProjection, RejectsATamperedCatalogBeforePublication) {

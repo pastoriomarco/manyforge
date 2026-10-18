@@ -216,18 +216,12 @@ struct CCLCProgramResetPositionScopeRequest final {
   ControllableComponentId component;
   ResolvedLifecycleProviderOccurrenceDTO provider;
   ResolvedLifecycleControlDomainScopeDTO domain;
-  /// Adapter-owned raw-fact qualification, called only for a fresh exact
-  /// occurrence reporting availability. It must prove the precise expected
-  /// phase, healthy process/hardware/endpoints and authorized binding epoch.
-  std::function<bool(const BrandLifecycleObservationDTO&, CCLCProgramResetPositionPhase)>
-      expected_transition;
 };
 
-/// The local commit only updates already-prepared phase/epoch state. No ROS,
-/// allocation, transport lock acquisition or blocking work is permitted there.
-/// Lock order is driver RunOnce exclusion, then brief adapter state exclusion.
+/// A deadline is the current SDK switch/readback step's existing deadline on
+/// the same owner clock. nullopt validates without arming or extending a step.
 using CCLCProgramResetPositionAdvance = std::function<Result<void>(
-    CCLCProgramResetPositionPhase, const std::function<Result<void>()>&)>;
+    CCLCProgramResetPositionPhase, std::optional<TimePoint>)>;
 using CCLCProgramResetPositionAction =
     std::function<Result<void>(const CCLCProgramResetPositionAdvance&)>;
 
@@ -308,6 +302,12 @@ class CCLCLifecycleTargetDriver final {
   [[nodiscard]] Result<ComponentLifecycleReadinessTargetFactsDTO> ReadReadinessFacts(
       const ControllableComponentId& component);
 
+  /// Recovery guard across all component and cell-observer incidents in the
+  /// same journal/owner (134), including removed/unrecorded components. Pure
+  /// read; no configured-product subset, fabricated generation or new owner.
+  /// Component Recover and observer BringUp retain their distinct authority.
+  [[nodiscard]] Result<void> CheckNoOpenIncidents();
+
   /// The operator's Recover of an open incident (contract item 3): an
   /// accepted, authorization-only result that closes the incident, clears the
   /// retained cause and wakes the driver; admissible while the cell is
@@ -337,6 +337,7 @@ class CCLCLifecycleTargetDriver final {
     CCLCProgramResetPositionScopeRequest request;
     std::uint64_t target_generation;
     CCLCProgramResetPositionPhase phase{CCLCProgramResetPositionPhase::kSwitchingToWriter};
+    std::optional<TimePoint> step_deadline_ns{};
     bool valid{true};
   };
   [[nodiscard]] bool MatchesProgramResetPositionScope(

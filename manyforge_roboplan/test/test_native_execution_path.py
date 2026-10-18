@@ -182,6 +182,7 @@ def _submit_native_cclc_lifecycle(
     snapshot = client.component_snapshot(component_id)
     expected_domains = [
         {
+            "kind": "controller",
             "control_domain_id": domain["control_domain_id"],
             "control_domain_revision": domain["control_domain_revision"],
             "controller_topology_id": domain["controller_topology_id"],
@@ -1823,11 +1824,32 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
     state_root, run_root = tmp_path / "state", tmp_path / "run"
     state_root.mkdir()
     run_root.mkdir()
-    process = _start_host(fixture_root, state_root, run_root, manifest)
+    # This test exercises refusal before effects on a genuine published
+    # product. It does not initialize physical controllers or qualify their
+    # readiness; the real Manager Apply process test covers that positive path.
+    process = _start_host(
+        fixture_root, state_root, run_root, manifest, qualify_cclc=False
+    )
     client = ProgramRunnerExecutionTransport(run_root, timeout_seconds=2.0)
     admission = CellAdmissionClient(run_root, timeout_seconds=2.0)
     try:
         identity = client.identity()["identity"]
+        assert identity["retained_bundle_id"] == manifest["retained_bundle_id"]
+        assert identity["graph_revision"] == manifest["graph_revision"]
+        component, direct = _execution_target(
+            client.targets()["targets"], presentation="motion"
+        )
+        assert component["availability"]["command_eligible"] is False
+        # These are request operands within the actual declared joint limits,
+        # not an observed pose. Every request below must be refused before
+        # preparation/dispatch, independently of physical source readiness.
+        joints = direct["command"]["joints"]
+        assert joints
+        rejected_goal_positions = []
+        for joint in joints:
+            lower, upper = joint["min_position_rad"], joint["max_position_rad"]
+            assert math.isfinite(lower) and math.isfinite(upper) and lower <= upper
+            rejected_goal_positions.append(min(max(0.0, lower), upper))
         capture = {
             "schema_version": "manyforge.program_run_execution_capture.v1",
             "request_owner_epoch": identity["owner_epoch"],
@@ -1883,6 +1905,9 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
         # real control socket: one union acceptance, exact retry, one release.
         kernel = KernelClient(client)
         before = kernel.read_program_execution_scope(capture["program_run_id"])
+        assert before["request_owner_epoch"] == identity["owner_epoch"]
+        assert before["program_runner_owner_epoch"] == capture["program_runner_owner_epoch"]
+        assert before["claim_generation"] == capture["claim_generation"]
         selection = {
             "schema_version": "manyforge.program_execution_selection.v2",
             **{
@@ -1924,15 +1949,49 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
         )
         assert released["held_node_indices"] == []
 
-        _, direct = _execution_target(
-            client.targets()["targets"], presentation="motion"
+        # Individual release uses the same exact capture/revision guard and
+        # needs no synthetic motion group. Group release above remains valid.
+        held_again = kernel.stop_program_selection(
+            {
+                **selection,
+                "request_context": {
+                    **selection["request_context"],
+                    "request_id": "selection.stop.individual",
+                },
+            }
         )
-        observation = client.observation()["observation"]["targets"][0]
+        individual_revision = held_again["state"]["selection_revision"]
+        individual = {
+            **selection,
+            "group_ids": [],
+            "node_instance_id": "root",
+            "request_context": {
+                **selection["request_context"],
+                "request_id": "selection.resume.individual",
+            },
+        }
+        for malformed in (
+            {**individual, "group_ids": ["selection.a"]},
+            {**individual, "node_instance_id": None},
+            {**individual, "unexpected": True},
+        ):
+            with pytest.raises(HeadlessApiError):
+                client.release_program_selection(malformed, individual_revision)
+        with pytest.raises(HeadlessApiError):
+            client.start_program_selection(individual, individual_revision)
+        assert kernel.read_program_execution_scope(capture["program_run_id"])[
+            "selection_revision"
+        ] == individual_revision
+        individual_released = kernel.release_program_selection(
+            individual, individual_revision
+        )
+        assert individual_released["held_node_indices"] == []
+
         operation = _direct_control_joint_operation(
             identity,
             direct,
             request_id="forged-node-effect",
-            positions_rad=list(observation["positions_si"]),
+            positions_rad=rejected_goal_positions,
         )
         operation.update(
             {
@@ -1950,7 +2009,7 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
             "node_attempt_id": "root.1",
         }
         # The sealed fixture's root is logical. A valid claim and a
-        # physically valid target cannot turn that node into an effect owner.
+        # qualified retained target cannot turn that node into an effect owner.
         with pytest.raises(HeadlessApiError) as logical:
             client.submit(operation)
         assert logical.value.details["reason"] == "program_execution_scope_unknown"
@@ -2005,7 +2064,7 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
             identity,
             direct,
             request_id="forged-direct-product",
-            positions_rad=list(observation["positions_si"]),
+            positions_rad=rejected_goal_positions,
         )
         forged_direct["program_id"] = "forged-direct-program"
         forged = raw.submit(
@@ -2018,7 +2077,7 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
             identity,
             direct,
             request_id="scoped-direct-product",
-            positions_rad=list(observation["positions_si"]),
+            positions_rad=rejected_goal_positions,
         )
         scoped_direct["participants"][0]["execution_scope"] = {
             "node_instance_id": "root",
@@ -2063,7 +2122,14 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
         assert client.register_program_run_capture(capture) == accepted
         with pytest.raises(HeadlessApiError) as held:
             client.submit(operation)
-        assert held.value.details["reason"] == "program_run_stop_fence_active"
+        # This captured root remains logical: scope validation precedes the
+        # RunStop fence. Actual captured-motion fence coverage is provided by
+        # ResourceAddressedExecutionKernelTest.ProgramStopOvertakesResolvedButUnadmittedWork.
+        assert held.value.details["reason"] == "program_execution_scope_unknown"
+        current_component, _ = _execution_target(
+            client.targets()["targets"], presentation="motion"
+        )
+        assert current_component["availability"]["command_eligible"] is False
         with sqlite3.connect(state_root / "operation-journal.sqlite3") as database:
             assert (
                 database.execute("SELECT COUNT(*) FROM operation_snapshots").fetchone()[

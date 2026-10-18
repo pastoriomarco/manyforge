@@ -22,6 +22,8 @@
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_core/types/component_lifecycle_readiness.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/io_output_recovery.hpp>
+#include <manyforge_core/types/provider_candidate_facts.hpp>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,6 +35,8 @@ class CCLCRuntimeComposition;
 }
 
 namespace manyforge::core {
+
+struct RuntimeParticipantBindingDTO;
 
 struct ComponentLifecycleCoordinatorConfig final {
   /// Startup-unique seed. The journal mints the advertised request namespace.
@@ -182,6 +186,11 @@ class ComponentLifecycleCoordinator final {
       const std::function<Result<ComponentLifecycleTargetViewDTO>()>& read_target,
       const std::function<Result<ComponentLifecycleReadinessTargetFactsDTO>()>& read_target_facts) const;
 
+  /// Side-effect-free proof from actual retained completed Disable then Enable
+  /// statuses and the exact current product. This never asserts remote drain.
+  [[nodiscard]] Result<IoOutputLocalResynchronizationProofDTO> ReadIoOutputLocalResynchronization(
+      const RuntimeParticipantBindingDTO& captured_binding) const;
+
   /// Original composition-local publication handoff. Prepared dependencies
   /// carry lifetime/identity only; this method additionally proves the actual
   /// owner's admissions, transactions, worker/callback tails and journal are
@@ -245,6 +254,15 @@ class ComponentLifecycleCoordinator final {
       const std::vector<ResolvedLifecycleControlDomainScopeDTO>& qualified_candidate_domains,
       const std::vector<ResolvedLifecycleProviderOccurrenceDTO>& candidate_provider_occurrences,
       ComponentLifecycleCoordinatorApplyBringUpServices services);
+
+  /// Pure original-owner candidate facts under the caller's existing Apply
+  /// installation guard. Reads the actual journal and immutable accepted
+  /// runtime; never reacquires the parent or waits for admission resolution.
+  [[nodiscard]] Result<InstalledProviderCandidateFactsDTO> ReadInstalledApplyCandidateFacts(
+      const ComponentLifecycleIntentDTO& intent, const ContentDigest& stable_digest,
+      const std::vector<ResolvedLifecycleControlDomainScopeDTO>& installed_candidate_domains,
+      const std::vector<ResolvedLifecycleProviderOccurrenceDTO>& installed_candidate_providers,
+      const std::vector<BrandLifecyclePortRegistrationDTO>& installed_candidate_ports);
 
   /// Single-shot original runtime continuation after real installation. The
   /// live callback must pin the candidate registrations and actual completed

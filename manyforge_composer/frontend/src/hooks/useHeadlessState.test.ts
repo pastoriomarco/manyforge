@@ -85,7 +85,6 @@ function state(
       resetPhase: null, resetOptions: null,
       resetRobotPosition: { available: false, reason: 'unsupported' },
       allowedCommands: [],
-      recoveryOffer: null,
       run: null,
       runtimeControls: null,
     },
@@ -233,7 +232,7 @@ describe('Headless owner-frame admission', () => {
     const poseSource = (overrides: Record<string, unknown> = {}) => ({
       object_id: 'part', policy_id: 'viewer.measured_object', source_id: 'camera',
       source_epoch: 'camera.1', source_epoch_order: 1, source_sequence: 10,
-      observed_at_ns: '100', expires_at_ns: '200', quality: 'good', fresh: true,
+      observed_at_ns: '100', expires_at_ns: '200', payload_quality: 'good', fresh: true,
       eligible: true, buffered: false,
       payload: {
         api_version: 'manyforge.ros_pose_observation.v2',
@@ -269,7 +268,7 @@ describe('Headless owner-frame admission', () => {
       poseSource({ fresh: false }),
     ]))).toBe(false);
     expect(sameViewerProjection(current, withRuntime(2, [
-      poseSource({ quality: 'unknown' }),
+      poseSource({ payload_quality: 'unknown' }),
     ]))).toBe(false);
     // A changed applied pose value: publish.
     const moved = poseSource();
@@ -1343,6 +1342,27 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(shellChanged).not.toHaveBeenCalled();
     expect(viewerChanged).not.toHaveBeenCalled();
 
+    // Global rule states ride the same pump-only delta path; progress stays.
+    expect(source.getGlobalRules()).toBeNull();
+    const rules = [{ rule_id: 'door', state: 'latched', keys: [] }];
+    receiveControl(FakeWebSocket.shell, {
+      schema_version: 'manyforge.execution_control.v2', message_kind: 'delta',
+      control_session_id: CONTROL_SESSION_ID,
+      server_sequence: nextControlServerSequence(FakeWebSocket.shell),
+      state_sequence: '2', received_client_sequence: '2', event_class: 'cold',
+      control: {
+        receiver_incarnation: 'headless.receiver.1', semantic_owner_epoch: 'runner.epoch.1',
+        execution_control_revision: 1, freshness: controlFreshness(1),
+      },
+      shell: { complete: false, global_rules: rules },
+    });
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(source.getGlobalRules()).toEqual([{ ruleId: 'door', state: 'latched', keys: [] }]);
+    expect(source.getOperationProgress()).toEqual(progress);
+    expect(progressChanged).toHaveBeenCalledTimes(2);
+    expect(shellChanged).not.toHaveBeenCalled();
+    expect(viewerChanged).not.toHaveBeenCalled();
+
     const cycle = structuredClone(initial.program_cycle) as Record<string, unknown>;
     cycle.execution_control_revision = 2;
     cycle.state = 'starting';
@@ -2020,6 +2040,159 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
     source.dispose();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('marks retained global rules not current while delayed, stale or unavailable', () => {
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void { this.readyState = 3; this.onclose?.(); }
+      send(): void {}
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    const rulesChanged = vi.fn();
+    source.subscribeGlobalRules(rulesChanged);
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    receiveControlSnapshot(FakeWebSocket.shell, {
+      ...wireState(1), global_rules: [{ rule_id: 'door', state: 'clear', keys: [] }],
+    });
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    const rows = source.getGlobalRules();
+    expect(rows).toEqual([{ ruleId: 'door', state: 'clear', keys: [] }]);
+    expect(source.getGlobalRulesCurrent()).toBe(true);
+
+    // Delayed: same session, rows retained, not current; subscribers woken.
+    rulesChanged.mockClear();
+    vi.advanceTimersByTime(450);
+    expect(source.getShellSnapshot().transportStatus).toBe('delayed');
+    expect(source.getGlobalRulesCurrent()).toBe(false);
+    expect(source.getGlobalRules()).toBe(rows);
+    expect(rulesChanged).toHaveBeenCalledTimes(1);
+
+    // Stale: still not current, rows still retained.
+    vi.advanceTimersByTime(500);
+    expect(source.getShellSnapshot().transportStatus).toBe('stale');
+    expect(source.getGlobalRulesCurrent()).toBe(false);
+    expect(source.getGlobalRules()).toBe(rows);
+
+    // Recovery in the same session: current again, subscribers woken.
+    rulesChanged.mockClear();
+    receiveHeartbeat(FakeWebSocket.shell, 3, '2');
+    receiveHeartbeat(FakeWebSocket.shell, 4, '3');
+    expect(source.getShellSnapshot().transportStatus).toBe('connected');
+    expect(source.getGlobalRulesCurrent()).toBe(true);
+    expect(rulesChanged).toHaveBeenCalledTimes(1);
+
+    // Semantic unavailable on a connected transport: not current.
+    rulesChanged.mockClear();
+    receiveControl(FakeWebSocket.shell, {
+      schema_version: 'manyforge.execution_control.v2',
+      message_kind: 'heartbeat_challenge',
+      control_session_id: CONTROL_SESSION_ID,
+      server_sequence: nextControlServerSequence(FakeWebSocket.shell),
+      challenge_sequence: '5',
+      received_client_sequence: '4',
+      semantic_status: 'unavailable',
+      semantic_reason: 'owner_unavailable',
+      freshness: null,
+    });
+    expect(source.getShellSnapshot()).toMatchObject({
+      transportStatus: 'connected', semanticStatus: 'unavailable',
+    });
+    expect(source.getGlobalRulesCurrent()).toBe(false);
+    expect(source.getGlobalRules()).toBe(rows);
+    expect(rulesChanged).toHaveBeenCalledTimes(1);
+
+    rulesChanged.mockClear();
+    receiveHeartbeat(FakeWebSocket.shell, 6, '5');
+    expect(source.getGlobalRulesCurrent()).toBe(true);
+    expect(rulesChanged).toHaveBeenCalledTimes(1);
+    source.dispose();
+  });
+
+  it('marks global rules not current as soon as a projection error revokes control', () => {
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      static closeRequests = 0;
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      // The browser delivers the close event asynchronously.
+      close(): void { FakeWebSocket.closeRequests += 1; }
+      send(): void {}
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const source = new HeadlessStateSource();
+    const rulesChanged = vi.fn();
+    source.subscribeGlobalRules(rulesChanged);
+    source.setEnabled(true);
+    const withRules = { ...wireState(1), global_rules: [{ rule_id: 'door', state: 'clear', keys: [] }] };
+    synchronizeControl(FakeWebSocket.shell);
+    receiveControlSnapshot(FakeWebSocket.shell, withRules);
+    const rows = source.getGlobalRules();
+    expect(source.getGlobalRulesCurrent()).toBe(true);
+
+    // An invalid projection revokes control before its close arrives.
+    rulesChanged.mockClear();
+    const failing = FakeWebSocket.shell;
+    failing.onmessage?.({ data: '{"not":"a control message"' } as MessageEvent);
+    expect(FakeWebSocket.closeRequests).toBe(1);
+    expect(source.getShellSnapshot().transportStatus).toBe('connected');
+    expect(source.getGlobalRulesCurrent()).toBe(false);
+    expect(source.getGlobalRules()).toBe(rows);
+    expect(rulesChanged).toHaveBeenCalledTimes(1);
+
+    // The close clears the session's rows.
+    rulesChanged.mockClear();
+    failing.readyState = 3;
+    failing.onclose?.();
+    expect(source.getGlobalRules()).toBeNull();
+    expect(source.getGlobalRulesCurrent()).toBe(false);
+    expect(rulesChanged).toHaveBeenCalledTimes(1);
+
+    // Reconnect and recovery: a new session's snapshot is current again.
+    vi.advanceTimersByTime(1000); // RECONNECT_DELAY_MS
+    expect(FakeWebSocket.shell).not.toBe(failing);
+    synchronizeControl(FakeWebSocket.shell, 'control-session.test-2');
+    receiveControlSnapshot(FakeWebSocket.shell, withRules, 'control-session.test-2');
+    expect(source.getGlobalRules()).toEqual([{ ruleId: 'door', state: 'clear', keys: [] }]);
+    // The re-sent disconnect incident took a client sequence: rows stay not
+    // current until the heartbeat confirms the latest echo.
+    expect(source.getGlobalRulesCurrent()).toBe(false);
+    receiveHeartbeat(FakeWebSocket.shell, 3, '3', 'control-session.test-2');
+    expect(source.getShellSnapshot().transportStatus).toBe('connected');
+    expect(source.getGlobalRulesCurrent()).toBe(true);
+    source.dispose();
   });
 
   it('freezes the viewer frame while delayed or stale until identity changes', () => {

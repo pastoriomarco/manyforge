@@ -129,8 +129,9 @@ void require_exact_fields(const CanonicalValue::Object &object,
          (value >= '0' && value <= '9');
 }
 
-void require_identity(std::string_view value, std::string_view path) {
-  if (value.empty() || value.size() > kMaximumIdentityBytes ||
+void require_identity(std::string_view value, std::string_view path,
+                      std::size_t maximum_bytes = kMaximumIdentityBytes) {
+  if (value.empty() || value.size() > maximum_bytes ||
       !is_ascii_alphanumeric(static_cast<unsigned char>(value.front())) ||
       !std::all_of(value.begin() + 1, value.end(), [](unsigned char byte) {
         return is_ascii_alphanumeric(byte) || byte == '.' || byte == '_' ||
@@ -141,8 +142,9 @@ void require_identity(std::string_view value, std::string_view path) {
 }
 
 void require_program_local_identity(std::string_view value,
-                                    std::string_view path) {
-  require_identity(value, path);
+                                    std::string_view path,
+                                    std::size_t maximum_bytes = kMaximumIdentityBytes) {
+  require_identity(value, path, maximum_bytes);
   if (value.front() < 'a' || value.front() > 'z' ||
       !std::all_of(value.begin(), value.end(), [](unsigned char byte) {
         return (byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9') ||
@@ -260,10 +262,11 @@ void verify_value_source(const CanonicalValue &value, std::string_view path) {
                                            child_path(path, "kind"));
   if (kind == "program_parameter" || kind == "blackboard_key") {
     require_exact_fields(source, {"kind", "reference"}, path);
-    require_program_local_identity(
-        require_string(require_member(source, "reference", path),
-                       child_path(path, "reference")),
-        child_path(path, "reference"));
+    const auto &reference = require_string(require_member(source, "reference", path),
+                                           child_path(path, "reference"));
+    require_program_local_identity(reference, child_path(path, "reference"),
+        kind == "blackboard_key" && reference.starts_with("node_outcome.")
+            ? 256U : kMaximumIdentityBytes);
     return;
   }
   if (kind == "expression") {
@@ -334,8 +337,8 @@ parse_node_policy(const CanonicalValue::Object &node, std::string_view path) {
       recovery != nullptr) {
     const auto recovery_path = child_path(path, "recovery_policy");
     const auto &value = require_object(*recovery, recovery_path);
-    require_exact_fields(value, {"allow_intervention", "max_retries"},
-                         recovery_path);
+    require_fields(value, {"allow_intervention", "max_retries"},
+                   {"intervention_stop_scope"}, recovery_path);
     const auto &allow =
         require_member(value, "allow_intervention", recovery_path);
     if (!allow.is_bool()) {
@@ -343,9 +346,20 @@ parse_node_policy(const CanonicalValue::Object &node, std::string_view path) {
            ": expected boolean");
     }
     result.recovery_policy.allow_intervention = allow.as_bool();
-    result.recovery_policy.max_retries = require_retry_count(
-        require_member(value, "max_retries", recovery_path),
-        child_path(recovery_path, "max_retries"));
+    result.recovery_policy.max_retries =
+        require_retry_count(require_member(value, "max_retries", recovery_path),
+                            child_path(recovery_path, "max_retries"));
+    if (const auto *scope = find_member(value, "intervention_stop_scope")) {
+      const auto scope_path =
+          child_path(recovery_path, "intervention_stop_scope");
+      const auto &spelling = require_string(*scope, scope_path);
+      if (spelling == "own_groups") {
+        result.recovery_policy.intervention_stop_scope =
+            core::ProgramInterventionStopScope::kOwnGroups;
+      } else if (spelling != "all") {
+        fail(scope_path + ": expected all or own_groups");
+      }
+    }
   }
 
   if (const auto *stop = find_member(node, "operator_stop_policy");
@@ -360,14 +374,20 @@ parse_node_policy(const CanonicalValue::Object &node, std::string_view path) {
 node_policy_projection(const core::ProgramNodePolicyDTO &policy) {
   CanonicalValue::Object result;
   if (policy.recovery_policy != core::ProgramNodeRecoveryPolicyDTO{}) {
-    result.emplace_back(
-        "recovery_policy",
-        CanonicalValue(CanonicalValue::Object{
-            {"allow_intervention",
-             CanonicalValue(policy.recovery_policy.allow_intervention)},
-            {"max_retries", CanonicalValue(static_cast<double>(
-                                policy.recovery_policy.max_retries))},
-        }));
+    CanonicalValue::Object recovery{
+        {"allow_intervention",
+         CanonicalValue(policy.recovery_policy.allow_intervention)},
+        {"max_retries", CanonicalValue(static_cast<double>(
+                            policy.recovery_policy.max_retries))},
+    };
+    if (policy.recovery_policy.intervention_stop_scope !=
+        core::ProgramInterventionStopScope::kAll) {
+      recovery.emplace_back(
+          "intervention_stop_scope",
+          CanonicalValue(std::string(core::to_string(
+              policy.recovery_policy.intervention_stop_scope))));
+    }
+    result.emplace_back("recovery_policy", CanonicalValue(std::move(recovery)));
   }
   if (policy.operator_stop_policy !=
       core::ProgramOperatorStopPolicy::kInherit) {
@@ -967,10 +987,9 @@ struct QualifiedExecutionCatalog final {
   return catalog;
 }
 
-[[nodiscard]] std::vector<core::ProgramNodeTargetEffectDTO> node_target_effects(
+[[nodiscard]] const CanonicalValue *literal_node_parameter(
     const CanonicalValue::Object &node, const CanonicalValue::Object &entry,
-    const std::vector<core::ProgramTargetRoleRequirementDTO> &targets,
-    std::string_view path) {
+    const std::string &id, std::string_view path, bool condition = false) {
   const auto &parameters =
       require_object(require_member(node, "parameters", path), path);
   const auto *sources_value = find_member(node, "value_sources");
@@ -979,52 +998,57 @@ struct QualifiedExecutionCatalog final {
                             : &require_object(*sources_value, path);
   const auto &definitions =
       require_array(require_member(entry, "parameters", path), path);
+  // Scope attribution must not depend on a later blackboard value or edit.
+  if (sources != nullptr && find_member(*sources, id) != nullptr) {
+    fail(std::string(path) +
+         ": effect scope/condition requires a literal parameter: " + id);
+  }
+  for (const auto &definition : definitions) {
+    const auto &fields = require_object(definition, "catalog.parameter");
+    if (require_string(require_member(fields, "id", path), path) == id) {
+      const auto *value = find_member(parameters, id);
+      if (value == nullptr)
+        value = find_member(fields, "default");
+      if (!condition)
+        return value;
+      const auto *schema = find_member(fields, "schema");
+      if (schema == nullptr) {
+        const auto &ref =
+            require_string(require_member(fields, "schema_ref", path), path);
+        constexpr std::string_view prefix = "#/schema_types/";
+        if (!ref.starts_with(prefix))
+          fail(std::string(path) + ": invalid condition schema reference");
+        schema = execution_catalog().schema_types.find_object_member(
+            ref.substr(prefix.size()));
+      }
+      if (schema == nullptr)
+        fail(std::string(path) + ": absent condition schema");
+      const auto &shape = require_object(*schema, path);
+      // Qualified catalog conditions are enum selections. New condition
+      // types need explicit qualification, never truthy/coercing fallback.
+      if (require_string(require_member(shape, "type", path), path) != "enum") {
+        fail(std::string(path) + ": condition schema is not a qualified enum");
+      }
+      const auto &values =
+          require_array(require_member(shape, "values", path), path);
+      if (value == nullptr || !value->is_string() ||
+          std::find(values.begin(), values.end(), *value) == values.end()) {
+        fail(std::string(path) + ": invalid catalog condition value: " + id);
+      }
+      return value;
+    }
+  }
+  fail(std::string(path) +
+       ": catalog effect selector names no parameter: " + id);
+}
+
+[[nodiscard]] std::vector<core::ProgramNodeTargetEffectDTO> node_target_effects(
+    const CanonicalValue::Object &node, const CanonicalValue::Object &entry,
+    const std::vector<core::ProgramTargetRoleRequirementDTO> &targets,
+    std::string_view path) {
   const auto effective = [&](const std::string &id,
                              bool condition = false) -> const CanonicalValue * {
-    // Scope attribution must not depend on a later blackboard value or edit.
-    if (sources != nullptr && find_member(*sources, id) != nullptr) {
-      fail(std::string(path) +
-           ": effect scope/condition requires a literal parameter: " + id);
-    }
-    for (const auto &definition : definitions) {
-      const auto &fields = require_object(definition, "catalog.parameter");
-      if (require_string(require_member(fields, "id", path), path) == id) {
-        const auto *value = find_member(parameters, id);
-        if (value == nullptr)
-          value = find_member(fields, "default");
-        if (!condition)
-          return value;
-        const auto *schema = find_member(fields, "schema");
-        if (schema == nullptr) {
-          const auto &ref =
-              require_string(require_member(fields, "schema_ref", path), path);
-          constexpr std::string_view prefix = "#/schema_types/";
-          if (!ref.starts_with(prefix))
-            fail(std::string(path) + ": invalid condition schema reference");
-          schema = execution_catalog().schema_types.find_object_member(
-              ref.substr(prefix.size()));
-        }
-        if (schema == nullptr)
-          fail(std::string(path) + ": absent condition schema");
-        const auto &shape = require_object(*schema, path);
-        // Qualified catalog conditions are enum selections. New condition
-        // types need explicit qualification, never truthy/coercing fallback.
-        if (require_string(require_member(shape, "type", path), path) !=
-            "enum") {
-          fail(std::string(path) +
-               ": condition schema is not a qualified enum");
-        }
-        const auto &values =
-            require_array(require_member(shape, "values", path), path);
-        if (value == nullptr || !value->is_string() ||
-            std::find(values.begin(), values.end(), *value) == values.end()) {
-          fail(std::string(path) + ": invalid catalog condition value: " + id);
-        }
-        return value;
-      }
-    }
-    fail(std::string(path) +
-         ": catalog effect selector names no parameter: " + id);
+    return literal_node_parameter(node, entry, id, path, condition);
   };
   std::vector<core::ProgramNodeTargetEffectDTO> effects;
   for (const auto &requirement : require_array(
@@ -1354,6 +1378,102 @@ void verify_blackboard_pose_keys(const CanonicalValue::Object &root,
   return false;
 }
 
+[[nodiscard]] bool reserved_system_namespace(std::string_view name) {
+  return name == "node_outcome" || name.starts_with("node_outcome.") ||
+         name == "interrupt_state" || name.starts_with("interrupt_state.");
+}
+
+// System declarations are a validation view only: the authored root and its
+// ProgramRevision remain unchanged. Runtime owners retain their value lifetime.
+[[nodiscard]] CanonicalValue
+with_node_outcome_declarations(const CanonicalValue::Object &root,
+                               const RetainedBundle &retained_bundle) {
+  CanonicalValue::Object blackboard;
+  if (const auto *value = find_member(root, "blackboard")) {
+    blackboard = require_object(*value, "program.blackboard");
+  }
+  if (const auto *namespaces = find_member(blackboard, "namespaces")) {
+    for (const auto &value :
+         require_array(*namespaces, "program.blackboard.namespaces")) {
+      const auto &row =
+          require_object(value, "program.blackboard.namespaces[]");
+      const auto &name = require_string(
+          require_member(row, "namespace_id", "namespace"), "namespace_id");
+      if (reserved_system_namespace(name))
+        fail("reserved_system_namespace: program.blackboard.namespaces: " +
+             name + " is reserved for system-owned values");
+    }
+  }
+  CanonicalValue::Array keys;
+  if (const auto *value = find_member(blackboard, "keys")) {
+    keys = require_array(*value, "program.blackboard.keys");
+  }
+  for (const auto &value : keys) {
+    const auto &row = require_object(value, "program.blackboard.keys[]");
+    const auto &name = require_string(require_member(row, "key", "key"), "key");
+    if (reserved_system_namespace(name))
+      fail("reserved_system_namespace: program.blackboard.keys: " + name +
+           " is system-owned and cannot be authored");
+  }
+  // verify_tree has already bounded and validated this tree and its IDs.
+  const auto visit = [&](auto &&self, const CanonicalValue &value) -> void {
+    const auto &node = require_object(value, "program.tree");
+    const auto &id =
+        require_string(require_member(node, "node_id", "tree"), "node_id");
+    if (id == "motion.move_to_joint_target" || id == "motion.move_to_pose" ||
+        id == "motion.follow_cartesian_path" || id == "motion.move_until_signal" ||
+        id == "motion.probe_search") {
+      const auto &instance = require_string(
+          require_member(node, "instance_id", "tree"), "instance_id");
+      keys.emplace_back(CanonicalValue::Object{
+          {"key", CanonicalValue("node_outcome." + instance)},
+          {"type", CanonicalValue("string")},
+          {"access", CanonicalValue("read")},
+          {"persistence", CanonicalValue("run")}});
+    }
+    for (const auto &child :
+         require_array(require_member(node, "children", "tree"), "children")) {
+      self(self, child);
+    }
+  };
+  visit(visit, require_member(root, "tree", "program"));
+  // These IDs have crossed the retained-bundle revision/codec boundary. The
+  // final bound Apply check still qualifies Program-dependent keys/groups;
+  // this validation view grants no source, installed key or runtime rule.
+  if (const auto *configuration =
+          retained_bundle.normalized_root().find_object_member(
+              "interrupt_policy_configuration"))
+    if (const auto *rules =
+            configuration->find_object_member("interrupt_rules"))
+      for (const auto &rule : rules->as_array())
+        keys.emplace_back(CanonicalValue::Object{
+            {"key",
+             CanonicalValue("interrupt_state." +
+                            rule.find_object_member("rule_id")->as_string())},
+            {"type", CanonicalValue("string")},
+            {"access", CanonicalValue("read")},
+            {"persistence", CanonicalValue("run")}});
+  std::sort(keys.begin(), keys.end(), [](const auto &left, const auto &right) {
+    return require_string(require_member(left.as_object(), "key", "key"),
+                          "key") <
+           require_string(require_member(right.as_object(), "key", "key"),
+                          "key");
+  });
+  const auto set = [](auto &object, std::string name, CanonicalValue value) {
+    const auto row =
+        std::find_if(object.begin(), object.end(),
+                     [&](const auto &member) { return member.first == name; });
+    if (row == object.end())
+      object.emplace_back(std::move(name), std::move(value));
+    else
+      row->second = std::move(value);
+  };
+  set(blackboard, "keys", CanonicalValue(std::move(keys)));
+  auto view = root;
+  set(view, "blackboard", CanonicalValue(std::move(blackboard)));
+  return CanonicalValue(std::move(view));
+}
+
 // A catalog `key_value` parameter is typed by the blackboard key named by its
 // `value_type_from_key` parameter. The key must be one literal declared key of
 // an admitted type, and a literal must carry exactly that type (value sources
@@ -1536,6 +1656,11 @@ verify_program_expressions(const CanonicalValue::Object &root) {
         fail("program.parameters[].runtime_mutability was removed: Program "
              "parameters always take their Program default; remove the field");
       }
+      if (const auto *name = find_member(fields, "parameter_id");
+          name && name->is_string() &&
+          reserved_system_namespace(name->as_string()))
+        fail("reserved_system_namespace: program.parameters: " +
+             name->as_string() + " is reserved for system-owned values");
       const auto type = expression_type(require_string(
           require_member(fields, "type", "program.parameters[]"),
           "program.parameters[].type"));
@@ -2025,7 +2150,10 @@ void verify_node_value_sources(const CanonicalValue::Object &node,
                                const ProgramExpressionContext &context,
                                std::string_view path) {
   static const std::set<std::string, std::less<>> kForbiddenParameters{
-      "contact_policy_id", "model_endpoint_alias", "prompt_template_id"};
+      "automatic_retries", "automatic_retry_delay_s", "preemption_priority",
+      "preempted_result",  "contact_policy_id",       "model_endpoint_alias",
+      "mock_simulation",
+      "prompt_template_id"};
   static const std::set<std::string, std::less<>> kForbiddenSemantics{
       "blackboard_key", "collision_body_role", "component_role",
       "frame_role",     "resource_role",       "source_joint",
@@ -2135,6 +2263,80 @@ void verify_node_value_sources(const CanonicalValue::Object &node,
   }
 }
 
+void validate_automatic_motion_retry_policy(
+    const CanonicalValue::Object &node, const CanonicalValue::Object &entry,
+    const std::string &node_id, std::string_view path) {
+  if (node_id != "motion.move_to_joint_target" &&
+      node_id != "motion.move_to_pose" &&
+      node_id != "motion.follow_cartesian_path") {
+    return;
+  }
+  const auto *value =
+      literal_node_parameter(node, entry, "automatic_retries", path);
+  if (value == nullptr)
+    fail(child_path(path, "automatic_retries") +
+         ": missing literal or catalog default");
+  const double count =
+      require_number(*value, child_path(path, "automatic_retries"));
+  if (count < 0.0 || count > 10.0 || std::trunc(count) != count) {
+    fail(child_path(path, "automatic_retries") + ": expected integer in 0..10");
+  }
+}
+
+[[nodiscard]] std::uint8_t
+capture_preemption_priority(const CanonicalValue::Object &node,
+                            const CanonicalValue::Object &entry,
+                            const std::string &node_id, std::string_view path) {
+  if (node_id != "motion.move_to_joint_target" &&
+      node_id != "motion.move_to_pose" &&
+      node_id != "motion.follow_cartesian_path") {
+    return 0U;
+  }
+  const auto priority_path = child_path(path, "preemption_priority");
+  const auto *value =
+      literal_node_parameter(node, entry, "preemption_priority", path);
+  if (value == nullptr) {
+    fail(priority_path + ": missing literal or catalog default");
+  }
+  const auto priority = require_number(*value, priority_path);
+  if (priority < 0.0 || priority > 100.0 || std::trunc(priority) != priority) {
+    fail(priority_path + ": expected integer in 0..100");
+  }
+  return static_cast<std::uint8_t>(priority);
+}
+
+void verify_node_outcome_writes(const CanonicalValue::Object &node,
+                                const CanonicalValue::Object &entry,
+                                std::string_view path) {
+  const auto *blackboard = find_member(entry, "blackboard");
+  const auto *writes =
+      blackboard == nullptr
+          ? nullptr
+          : find_member(require_object(*blackboard, "catalog.blackboard"),
+                        "writes");
+  if (writes == nullptr)
+    return;
+  const auto &parameters = require_object(require_member(node, "parameters", path), path);
+  for (const auto &value :
+       require_array(*writes, "catalog.blackboard.writes")) {
+    const auto &binding = require_object(value, "catalog.blackboard.writes[]");
+    const auto &parameter =
+        require_string(require_member(binding, "key_parameter", path), path);
+    const auto *key = find_member(parameters, parameter);
+    if (key == nullptr) {
+      if (const auto *definition = find_declaration(find_member(entry, "parameters"), "id",
+                                                     parameter, "catalog.parameters")) {
+        key = find_member(*definition, "default");
+      }
+    }
+    if (key != nullptr &&
+        require_string(*key, path).starts_with("node_outcome.")) {
+      fail(std::string(path) + ": system-owned node outcome keys cannot be "
+                               "written by catalog bindings");
+    }
+  }
+}
+
 [[nodiscard]] core::ProgramExecutionTableDTO capture_execution_table(
     const CanonicalValue &tree, const CanonicalValue::Object &root,
     const std::set<std::string> &instances,
@@ -2235,8 +2437,11 @@ void verify_node_value_sources(const CanonicalValue::Object &node,
         require_object(require_member(entry, "execution", path), path);
     selected->owner_api =
         require_string(require_member(execution, "owner_api", path), path);
+    verify_node_outcome_writes(node, entry, path);
     verify_key_typed_parameters(node, entry, root, frames, path);
     verify_node_value_sources(node, entry, root, expressions, path);
+    validate_automatic_motion_retry_policy(node, entry, node_id, path);
+    selected->preemption_priority = capture_preemption_priority(node, entry, node_id, path);
     selected->target_effects = node_target_effects(node, entry, targets, path);
     if (selected->target_effects.size() >
         core::kMaxProgramTargetEffects - effect_count) {
@@ -2306,7 +2511,9 @@ void verify_node_value_sources(const CanonicalValue::Object &node,
 [[nodiscard]] core::ProgramBindingContractDTO
 extract_contract(const CanonicalValue &root_value,
                  const RetainedBundle &retained_bundle,
-                 core::ProgramExecutionTableDTO &execution_table) {
+                 core::ProgramExecutionTableDTO &execution_table,
+                 std::vector<core::ProgramBlackboardKeyDeclarationDTO>
+                     &blackboard_declarations) {
   const auto &root = require_object(root_value, "program");
   require_fields(
       root,
@@ -2352,9 +2559,8 @@ extract_contract(const CanonicalValue &root_value,
   const auto &component_roles =
       require_object(require_member(root, "component_roles", "program"),
                      "program.component_roles");
-  if (component_roles.empty() ||
-      component_roles.size() > core::kMaxProgramContractRoles) {
-    fail("program.component_roles: violates fixed non-empty role bound");
+  if (component_roles.size() > core::kMaxProgramContractRoles) {
+    fail("program.component_roles: violates fixed role bound");
   }
   std::vector<core::ProgramComponentRoleRequirementDTO> components;
   components.reserve(component_roles.size());
@@ -2479,9 +2685,27 @@ extract_contract(const CanonicalValue &root_value,
   std::vector<core::ProgramNodePolicyDTO> node_policies;
   verify_tree(require_member(root, "tree", "program"), "program.tree", 0U,
               tree_count, instance_ids, node_policies);
-  const auto expressions = verify_program_expressions(root);
+  const auto validation_view =
+      with_node_outcome_declarations(root, retained_bundle);
+  const auto &validation_root = validation_view.as_object();
+  const auto expressions = verify_program_expressions(validation_root);
+  blackboard_declarations.clear();
+  if (const auto *blackboard = find_member(validation_root, "blackboard")) {
+    if (const auto *keys = find_member(blackboard->as_object(), "keys")) {
+      for (const auto &key : keys->as_array()) {
+        blackboard_declarations.push_back(
+            {require_string(
+                 require_member(key.as_object(), "key", "blackboard key"),
+                 "key"),
+             require_string(
+                 require_member(key.as_object(), "type", "blackboard key"),
+                 "type"),
+             find_member(key.as_object(), "initial") != nullptr});
+      }
+    }
+  }
   execution_table = capture_execution_table(
-      require_member(root, "tree", "program"), root, instance_ids,
+      require_member(root, "tree", "program"), validation_root, instance_ids,
       bundle.catalogs.node_environment, targets,
       execution_group_policies(root, "program"), expressions, frames);
   std::sort(node_policies.begin(), node_policies.end(),
@@ -2516,11 +2740,13 @@ class ProgramBindingContractConstructionAuthority final {
 public:
   [[nodiscard]] static std::shared_ptr<const ProgramBindingContract>
   construct(core::ProgramBindingContractDTO value, CanonicalValue root,
-            std::string bytes, core::ProgramExecutionTableDTO execution_table) {
+            std::string bytes, core::ProgramExecutionTableDTO execution_table,
+            std::vector<core::ProgramBlackboardKeyDeclarationDTO>
+                blackboard_declarations) {
     return std::shared_ptr<const ProgramBindingContract>(
         new ProgramBindingContract(std::move(value), std::move(root),
-                                   std::move(bytes),
-                                   std::move(execution_table)));
+                                   std::move(bytes), std::move(execution_table),
+                                   std::move(blackboard_declarations)));
   }
 };
 
@@ -2559,8 +2785,10 @@ verify_program_binding_contract(std::string_view canonical_program_bytes,
     }
     CanonicalValue root = normalize_program_authoring(source_root);
     core::ProgramExecutionTableDTO execution_table;
-    core::ProgramBindingContractDTO value =
-        extract_contract(root, retained_bundle, execution_table);
+    std::vector<core::ProgramBlackboardKeyDeclarationDTO>
+        blackboard_declarations;
+    core::ProgramBindingContractDTO value = extract_contract(
+        root, retained_bundle, execution_table, blackboard_declarations);
     const std::string normalized_bytes = canonical_json(root);
     if (!detail::verify_content_identity(
             root, detail::ContentIdentitySpec{
@@ -2572,7 +2800,7 @@ verify_program_binding_contract(std::string_view canonical_program_bytes,
     }
     return detail::ProgramBindingContractConstructionAuthority::construct(
         std::move(value), std::move(root), normalized_bytes,
-        std::move(execution_table));
+        std::move(execution_table), std::move(blackboard_declarations));
   } catch (const ProgramContractError &) {
     throw;
   } catch (const std::exception &error) {

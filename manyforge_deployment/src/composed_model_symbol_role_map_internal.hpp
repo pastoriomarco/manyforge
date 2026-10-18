@@ -33,20 +33,24 @@ inline constexpr std::size_t kMaxComposedModelSymbolRoleMapBytes =
 /// The input is the non-caller-constructible final I2 value. No source XML is
 /// reparsed and no consumer-specific name or type is introduced.
 [[nodiscard]] std::string emit_composed_model_symbol_role_map(
-    const CompilerQualifiedCellIr& compiler_ir);
+    const CompilerQualifiedCellIr& compiler_ir,
+    bool allow_empty_model_map = false);
 
 /// Strictly parses and independently verifies one exact map artifact.
 ///
 /// The returned value is its canonical projection. Non-canonical bytes,
 /// unknown fields, an incomplete/non-bijective symbol table, broken role or
-/// coordinate references, and out-of-bound inputs reject.
+/// coordinate references, and out-of-bound inputs reject. A map with no
+/// symbols and no occurrences rejects unless `allow_empty_model_map` names the
+/// Scenario-candidate path of a model-free cell.
 [[nodiscard]] CanonicalValue parse_and_verify_composed_model_symbol_role_map(
-    std::string_view canonical_bytes);
+    std::string_view canonical_bytes, bool allow_empty_model_map = false);
 
 /// Requires exact agreement with the map mechanically derived from the same
 /// final I2 value. This is used before retention and after raw-CAS read-back.
 void require_composed_model_symbol_role_map_matches(
     std::string_view canonical_bytes,
-    const CompilerQualifiedCellIr& compiler_ir);
+    const CompilerQualifiedCellIr& compiler_ir,
+    bool allow_empty_model_map = false);
 
 }  // namespace manyforge::deployment::detail

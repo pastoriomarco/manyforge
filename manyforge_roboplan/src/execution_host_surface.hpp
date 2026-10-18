@@ -104,6 +104,31 @@ private:
   FrameTransformResponse(const TargetObservationQuery &query,
                          Composition &composition) const;
 
+  [[nodiscard]] CanonicalValue IoSignalQueryResponse(
+      const TargetObservationQuery& query, Composition& composition) const;
+  [[nodiscard]] core::Result<core::IoSignalObservationDTO> ReadBoundIoSignal(
+      const TargetObservationQuery& query, Composition& composition) const;
+  [[nodiscard]] CanonicalValue IoSignalResponse(
+      const TargetObservationQuery& query,
+      const core::IoSignalObservationDTO& observation, std::string_view command) const;
+  [[nodiscard]] CanonicalValue MockIoInputResponse(
+      const MockIoInputSetRequest& request, Composition& composition) const;
+
+  [[nodiscard]] CanonicalValue MockRunPauseResponse(
+      const core::ProgramRunMockSimulationPauseRequestDTO& request,
+      core::ResourceAddressedExecutionKernel& owner) const;
+  [[nodiscard]] CanonicalValue MockNodeSimulationResponse(
+      const core::ProgramNodeMockSimulationScopeDTO& requested_scope,
+      const std::vector<core::ProgramMockSimulationSignalDTO>* requested_signals,
+      ExecutionProduct& product, core::ResourceAddressedExecutionKernel& owner) const;
+
+  [[nodiscard]] CanonicalValue
+  IoWatchResponse(const Command &command,
+                  core::ResourceAddressedExecutionKernel &owner) const;
+  [[nodiscard]] CanonicalValue ProgramBlackboardResponse(
+      const core::IoProgramBlackboardPublicationDTO &publication,
+      core::ResourceAddressedExecutionKernel &owner) const;
+
   [[nodiscard]] CanonicalValue
   QueryTargetResponse(const TargetObservationQuery &query,
                       Composition &composition) const;
@@ -140,19 +165,26 @@ private:
   ReadCurrentControlState(Composition &composition) const;
 
   [[nodiscard]] CanonicalValue::Object
-  IdentityFields(Composition &composition,
+  IdentityFields(ExecutionProduct &composition,
                  const core::ProjectionRevisionDTO &projection) const;
 
   [[nodiscard]] CanonicalValue
-  IdentityValue(Composition &composition,
+  IdentityValue(ExecutionProduct &composition,
                 const core::ProjectionRevisionDTO &projection) const;
+
+  [[nodiscard]] std::optional<CanonicalValue>
+  ExecuteProgramCommand(const Command &command, ExecutionProduct &product,
+                        core::ResourceAddressedExecutionKernel *owner);
+
+  [[nodiscard]] CanonicalValue
+  ExecuteLogicalProduct(const Command &command, ExecutionProduct &product);
 
   [[nodiscard]] CanonicalValue
   StatusResponse(Composition &composition,
                  const core::ProjectionRevisionDTO &projection) const;
 
   [[nodiscard]] CanonicalValue
-  IdentityResponse(Composition &composition,
+  IdentityResponse(ExecutionProduct &composition,
                    const core::ProjectionRevisionDTO &projection) const;
 
   [[nodiscard]] CanonicalValue ResetRobotPositionCapabilityResponse(
@@ -196,8 +228,13 @@ private:
   ReadStop(const Command &command,
            core::ResourceAddressedExecutionKernel &addressed_kernel) const;
 
+  [[nodiscard]] CanonicalValue RecoverGlobalIoRule(
+      const core::IoGlobalRuleRecoveryIntentDTO &intent,
+      core::ResourceAddressedExecutionKernel &owner) const;
   [[nodiscard]] CanonicalValue ReadStopFault(
       core::ResourceAddressedExecutionKernel &addressed_kernel) const;
+
+  [[nodiscard]] CanonicalValue EventsResponse(const Command &command) const;
 
   [[nodiscard]] CanonicalValue
   Execute(const Command &command, Composition &composition,

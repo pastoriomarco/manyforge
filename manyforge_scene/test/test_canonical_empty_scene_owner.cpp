@@ -202,7 +202,9 @@ public:
 
   [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
   UpdateCellAdmissionReadiness(
-      const core::CellAdmissionReadinessSnapshotDTO &) override {
+      const core::CellAdmissionReadinessSnapshotDTO &,
+      std::shared_ptr<core::IIoSignalService>* actual_retired_service = nullptr) override {
+    if (actual_retired_service) actual_retired_service->reset();
     return core::Result<core::AuthoringAdmissionDTO>::Ok(
         GetAuthoringAdmission());
   }

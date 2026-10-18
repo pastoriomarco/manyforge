@@ -1,6 +1,6 @@
 schema_version: manyforge.operator_alarm_catalog.v1
-catalog_version: 2.4.0
-descriptor_digest: sha256:e435a7ba1057ce8aa77eb324ae26d217a2dcde03641298e8484bbe8d21385727
+catalog_version: 2.6.0
+descriptor_digest: sha256:eb5d5bdf48e06d8637a9f0d29eff24949f6fa7ff8ac10365375986b42d2616c8
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 2
@@ -51,6 +51,32 @@ definitions:
     runtime_modes:
       - program
       - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: true
+    max_evidence_refs: 32
+
+  - definition_id: manyforge.program.operation_failure
+    version: 1
+    title: Program operation requires attention
+    message_template: "Program operation failure requires attention"
+    alarm_class: motion
+    priority: high
+    priority_rationale: >-
+      An actual operation failure has reached the operator-facing Program
+      failure hold or terminal failure and needs prompt operator attention.
+    consequence: >-
+      The affected Program failure remains unresolved until an accepted
+      operator release or completed Reset resolves that exact occurrence.
+    operator_response: >-
+      Review the original operation failure and recovery offer, repair the
+      cause, acknowledge attention, then use an enabled release or Reset.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.program_runner.failure_condition
+    clear_authority: manyforge.program_runner.failure_condition
+    adapter_id: manyforge.alarm_adapter.program_condition
+    runtime_modes:
+      - program
     acknowledgement_required: true
     acknowledgement_reason_required: false
     requires_motion_attention: true
@@ -245,4 +271,56 @@ definitions:
     acknowledgement_required: true
     acknowledgement_reason_required: false
     requires_motion_attention: false
+    max_evidence_refs: 1
+
+  - definition_id: manyforge.runtime.program_runner_loss
+    version: 1
+    title: Program Runner lost during a run
+    message_template: "Program Runner lost during a run; restart the Workbench"
+    alarm_class: runtime_health
+    priority: high
+    priority_rationale: >-
+      An unrecoverable Workbench runtime fault requires prompt operator
+      attention and a Workbench restart.
+    consequence: >-
+      The Program owner is unavailable. Motion containment remains owned by the existing Manager-presence lease and Stop certificate; this alarm does not prove that motion has stopped.
+    operator_response: >-
+      Review the fault details and containment status, acknowledge attention,
+      then restart the Workbench. Acknowledgement does not clear the fault.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.runtime_fault_condition
+    clear_authority: manyforge.kernel.runtime_fault_condition
+    adapter_id: manyforge.alarm_adapter.runtime_fault_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: true
+    max_evidence_refs: 1
+
+  - definition_id: manyforge.runtime.operation_journal_write_fault
+    version: 1
+    title: Operation history write failed
+    message_template: "Operation history write failed; new motion is inhibited"
+    alarm_class: runtime_health
+    priority: high
+    priority_rationale: >-
+      An unrecoverable Workbench runtime fault requires prompt operator
+      attention and a Workbench restart.
+    consequence: >-
+      The operation journal has failed and admission remains closed. Unresolved write outcomes remain retained; no automatic write retry or in-app Reset clears this fault.
+    operator_response: >-
+      Review the fault details and containment status, acknowledge attention,
+      then restart the Workbench. Acknowledgement does not clear the fault.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.runtime_fault_condition
+    clear_authority: manyforge.kernel.runtime_fault_condition
+    adapter_id: manyforge.alarm_adapter.runtime_fault_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: true
     max_evidence_refs: 1

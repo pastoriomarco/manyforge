@@ -207,18 +207,19 @@ extract_published_active_control_configurations(
 }
 
 [[nodiscard]] inline std::vector<DomainActiveControlConfigurationDTO> route_publication_identities(
-    const std::map<ControlDomainId, RuntimeRouteConfigurationReadbackDTO>& readbacks,
+    const std::map<ControlDomainId, RuntimeDomainConfigurationReadbackDTO>& readbacks,
     const RuntimeRouteConfigurationReadbackDTO* replacement = nullptr) {
   std::vector<DomainActiveControlConfigurationDTO> result;
   result.reserve(readbacks.size() + (replacement != nullptr ? 1U : 0U));
   for (const auto& [domain_id, readback] : readbacks) {
-    if (replacement != nullptr &&
-        domain_id == replacement->active_configuration.control_domain_id) {
+    if (readback.provider() != nullptr ||
+        (replacement != nullptr &&
+         domain_id == replacement->active_configuration.control_domain_id)) {
       continue;
     }
     result.push_back(DomainActiveControlConfigurationDTO{
-        domain_id, readback.active_configuration.active_control_configuration_id,
-        readback.active_configuration.active_control_configuration_generation});
+        domain_id, readback.controller().active_configuration.active_control_configuration_id,
+        readback.controller().active_configuration.active_control_configuration_generation});
   }
   if (replacement != nullptr) {
     result.push_back(DomainActiveControlConfigurationDTO{
@@ -364,7 +365,8 @@ derive_route_readiness_projection(
          left.deployment_maximum_tcp_linear_speed_mps ==
              right.deployment_maximum_tcp_linear_speed_mps &&
          left.intrinsic_direct_control == right.intrinsic_direct_control &&
-         left.direct_control_joint_limits == right.direct_control_joint_limits;
+         left.direct_control_joint_limits == right.direct_control_joint_limits &&
+         left.motion_takeover_preparation_budget_s == right.motion_takeover_preparation_budget_s;
 }
 
 [[nodiscard]] inline bool registration_controller_equal_after_product_reseal(
@@ -399,6 +401,7 @@ derive_route_readiness_projection(
           right.deployment_maximum_tcp_linear_speed_mps ||
       left.intrinsic_direct_control != right.intrinsic_direct_control ||
       left.direct_control_joint_limits != right.direct_control_joint_limits ||
+      left.motion_takeover_preparation_budget_s != right.motion_takeover_preparation_budget_s ||
       left.participant_policy.has_value() != right.participant_policy.has_value() ||
       (left.participant_policy.has_value() &&
        left.participant_policy->value() != right.participant_policy->value()) ||
@@ -494,7 +497,7 @@ struct StopStaticFacts final {
   }
 
   std::map<ControllableComponentId, StopScopeComponentSnapshotDTO> components;
-  std::map<ResourceId, ControllableComponentId> resource_owners;
+  std::map<ResourceId, std::pair<ControllableComponentId, bool>> resource_owners;
   for (const auto& registration : registrations) {
     const auto& binding = registration.binding.value();
     if (!retained_bundle_id.has_value()) {
@@ -511,31 +514,41 @@ struct StopStaticFacts final {
       throw std::invalid_argument(
           "runtime participants do not share one current graph revision for Stop resolution");
     }
-    if (!registration.stop_readiness.has_value()) {
-      // Unqualified registrations remain observable and may later be replaced
-      // under a configuration fence, but Execute cannot admit them. They do
-      // not self-attest component lifecycle membership or a Stop plan here.
+    if (!registration.stop_readiness && !binding.io_output_binding) {
+      // Other unqualified registrations do not self-attest lifecycle membership.
       continue;
     }
-    const auto& readiness = registration.stop_readiness->value();
-
+    // Output membership comes from its sealed logical channel and actual CCLC
+    // generation. It does not create a physical Stop plan or readiness proof.
+    const auto& component_id = binding.io_output_binding
+                                   ? binding.controllable_component_id
+                                   : registration.stop_readiness->value().controllable_component_id;
+    const auto generation =
+        binding.io_output_binding
+            ? binding.io_output_binding->component_lifecycle_generation
+            : registration.stop_readiness->value().component_lifecycle_generation;
     auto [component, inserted] = components.try_emplace(
-        readiness.controllable_component_id,
-        StopScopeComponentSnapshotDTO{
-            readiness.controllable_component_id, readiness.component_lifecycle_generation, {}});
-    if (!inserted && component->second.component_lifecycle_generation !=
-                         readiness.component_lifecycle_generation) {
+        component_id, StopScopeComponentSnapshotDTO{component_id, generation, {}});
+    if (!inserted && component->second.component_lifecycle_generation != generation) {
       throw std::invalid_argument(
           "runtime participant Stop readiness disagrees on component lifecycle generation");
     }
-    for (const auto& resource : binding.resources) {
+    const auto append_resource = [&](const ResourceId& resource_id, bool logical_output) {
       const auto [owner, owner_inserted] =
-          resource_owners.emplace(resource.resource_id, readiness.controllable_component_id);
-      if (!owner_inserted && owner->second != readiness.controllable_component_id) {
+          resource_owners.emplace(resource_id, std::pair{component_id, logical_output});
+      if (!owner_inserted &&
+          ((owner->second.first != component_id && (!logical_output || !owner->second.second)) ||
+           owner->second.second != logical_output)) {
         throw std::invalid_argument(
             "runtime Stop readiness assigns one resource to multiple components");
       }
-      component->second.resources.push_back(resource.resource_id);
+      component->second.resources.push_back(resource_id);
+      if (logical_output) component->second.logical_output_resources.push_back(resource_id);
+    };
+    if (binding.io_output_binding) {
+      append_resource(*binding.io_output_binding->signal.output_resource, true);
+    } else {
+      for (const auto& resource : binding.resources) append_resource(resource.resource_id, false);
     }
   }
 
@@ -554,6 +567,10 @@ struct StopStaticFacts final {
     std::sort(component.resources.begin(), component.resources.end());
     component.resources.erase(std::unique(component.resources.begin(), component.resources.end()),
                               component.resources.end());
+    std::sort(component.logical_output_resources.begin(), component.logical_output_resources.end());
+    component.logical_output_resources.erase(
+        std::unique(component.logical_output_resources.begin(), component.logical_output_resources.end()),
+        component.logical_output_resources.end());
     facts.components.push_back(std::move(component));
   }
   return facts;
@@ -823,7 +840,17 @@ struct StopStaticFacts final {
   if (!effective_speed.ok()) {
     return Result<ExecuteRequestDTO>::Err(effective_speed.error());
   }
-  auto interrupt_admission = validate_motion_interrupt_scope_admission(motion.motion_interrupt_scopes);
+  // Derived node scopes belong to this local preparation request only. The
+  // public intent remains unchanged for journal/replay identity.
+  auto effective_interrupt_scopes = motion.motion_interrupt_scopes;
+  if (registration.captured_node_interrupt_scope) {
+    if (!effective_interrupt_scopes.empty())
+      return reject<ExecuteRequestDTO>("captured node scopes cannot be supplied by the caller",
+                                       "captured_node_interrupt_scope_conflict");
+    effective_interrupt_scopes.push_back(*registration.captured_node_interrupt_scope);
+  }
+  auto interrupt_admission = validate_motion_interrupt_scope_admission(
+      effective_interrupt_scopes, registration.io_motion_rule_policies, &binding);
   if (!interrupt_admission.ok()) {
     return Result<ExecuteRequestDTO>::Err(interrupt_admission.error());
   }
@@ -835,7 +862,7 @@ struct StopStaticFacts final {
   request.target_reference = motion.target_reference;
   request.offset_reference = motion.offset_reference;
   request.goal_frame_reference = motion.goal_frame_reference;
-  request.motion_interrupt_scopes = motion.motion_interrupt_scopes;
+  request.motion_interrupt_scopes = std::move(effective_interrupt_scopes);
   request.action_span = participant.action_span;
   request.contact_policy_id =
       motion.contact_policy_id.has_value() ? motion.contact_policy_id->value() : std::string{};
@@ -1030,7 +1057,7 @@ struct StopStaticFacts final {
   request.transport_kind = "resolved_binding";
   request.evidence = {"command_terminal"};
   request.evidence_state = "required_pending";
-  request.completion_timeout_s = command.completion_timeout_s;
+  request.completion_timeout_s = command.completion_timeout_s.value();
   return Result<GripperCommandRequestDTO>::Ok(std::move(request));
 }
 
@@ -1095,6 +1122,30 @@ struct StopStaticFacts final {
       *motion->plan_request.speed_profile.max_tcp_linear_speed_mps});
 }
 
+[[nodiscard]] inline Result<PreparedOperationParticipantDTO> build_prepared_io_output_participant(
+    const OperationIntentDTO& intent, const CapabilityCommandIntentDTO& command,
+    const RuntimeParticipantBinding& binding, const OperationId& operation,
+    OperationRevision revision, const OperationParticipantId& participant) {
+  const auto* value = std::get_if<IoSignalWriteCommandValueDTO>(&command.command_value);
+  if (!value || !command.caller_options.empty())
+    return reject<PreparedOperationParticipantDTO>(
+        "output command has unsupported value or options", "io_output_command_value_invalid",
+        ErrorCode::kInvalidRequest);
+  return MakePreparedIoOutputParticipant(operation, revision, participant, intent.program_run_id,
+                                         command, binding);
+}
+
+[[nodiscard]] inline ResolvedPreparedCapabilityCommandExecutionRequestDTO
+output_preparation_request(std::shared_ptr<const PreparedOperationParticipantDTO> participant,
+                           const RuntimeParticipantBinding& binding) {
+  const auto& output = std::get<PreparedIoOutputCommandDTO>(participant->payload);
+  const auto provider = participant->provider()->lifecycle_provider;
+  ResolvedPreparedIoOutputCommandAuthorityDTO authority{output.signal_id, output.output_resource,
+                                                        output.command_value.value, provider,
+                                                        output.completion_policy};
+  return {std::move(participant), binding, std::move(authority)};
+}
+
 [[nodiscard]] inline Result<PreparedOperationParticipantDTO> build_prepared_capability_command_participant(
     const OperationIntentDTO& intent, const CapabilityCommandIntentDTO& command,
     const RuntimeParticipantBinding& sealed_binding,
@@ -1115,9 +1166,9 @@ struct StopStaticFacts final {
                                        std::move(validated_options),
                                        {},
                                        {},
-                                       command.completion_timeout_s,
-                                       schema.completion_rule,
-                                       schema.confirmation_rule,
+                                       command.completion_timeout_s.value(),
+                                       schema.completion_rule.value(),
+                                       schema.confirmation_rule.value(),
                                        schema.stop_evidence_requirements};
   std::vector<ResourceId> resources;
   resources.reserve(binding.resources.size());
@@ -1219,6 +1270,9 @@ struct StopStaticFacts final {
       return fact.effect == ParticipantEffectKnowledge::kEffectUncertain
                  ? OperationStateKind::kInterventionRequired
                  : OperationStateKind::kFailed;
+    case ParticipantExecutionFactKind::kPreemptedByReplacement:
+      // Only the exact owner-transfer commit may settle a replacement.
+      return OperationStateKind::kInterventionRequired;
     case ParticipantExecutionFactKind::kPreemptedByAddressedStop:
       // Only an active Stop fences a participant; reaching here means no Stop
       // owns this containment.
@@ -1248,6 +1302,15 @@ struct StopStaticFacts final {
     default:
       return false;
   }
+}
+
+// Retention is independent of cause selection. Existing permissions may use a
+// participant fact only when it belongs to the selected terminal error.
+[[nodiscard]] inline const ParticipantExecutionFact* selected_cause_terminal_fact(
+    const OperationParticipantStateDTO& participant) {
+  return participant.terminal_fact && participant.terminal_fact->error == participant.terminal_error
+             ? &*participant.terminal_fact
+             : nullptr;
 }
 
 [[nodiscard]] inline bool control_admissible(OperationControlKind control,
@@ -1352,6 +1415,61 @@ struct StopStaticFacts final {
   }
 }
 
+struct RuleSourceOrder final {
+  InterruptSourceId source_id;
+  IoSourceIncarnation incarnation;
+  std::uint64_t source_sequence;
+  std::uint64_t record_sequence;
+};
+
+inline bool source_order_less(const RuleSourceOrder& left, const RuleSourceOrder& right) {
+  return std::tie(left.source_id, left.incarnation, left.source_sequence, left.record_sequence) <
+         std::tie(right.source_id, right.incarnation, right.source_sequence, right.record_sequence);
+}
+
+inline std::optional<RuleSourceOrder> rule_source_order(const IoRuleEvidenceDTO& evidence) {
+  std::optional<RuleSourceOrder> selected;
+  const auto consider = [&](RuleSourceOrder key) {
+    if (!selected || source_order_less(key, *selected)) selected = std::move(key);
+  };
+  if (!evidence.source_losses.empty()) {
+    for (const auto& loss : evidence.source_losses) {
+      const auto sequence = loss.sample        ? loss.sample->publication.source_sequence
+                            : loss.source_loss ? loss.source_loss->last_accepted_source_sequence
+                            : loss.blackboard ? loss.blackboard->last_accepted_message_sequence
+                                              : 0U;
+      consider({loss.source_id, loss.incarnation, sequence, loss.cursor.record_sequence});
+    }
+  } else if (evidence.trip) {
+    if (evidence.trip->triggering_acquisition) {
+      const auto& actual = *evidence.trip->triggering_acquisition;
+      consider({actual.source_id, actual.incarnation, actual.source_sequence,
+                actual.source_cursor.record_sequence});
+    } else {
+      // An already-active arm baseline has no causal event. Canonical ordering
+      // uses its real qualified supporting samples/cursors, never a made-up one.
+      if (evidence.trip->blackboard) {
+        const auto& bb = *evidence.trip->blackboard;
+        const auto cursor = std::find_if(
+            evidence.trip->source_cursors.begin(), evidence.trip->source_cursors.end(),
+            [&](const auto& value) { return value.source_id == bb.source_id; });
+        if (cursor == evidence.trip->source_cursors.end()) return std::nullopt;
+        consider({bb.source_id, bb.incarnation, bb.message_sequence, cursor->record_sequence});
+      }
+      for (const auto& sample : evidence.trip->matched_samples) {
+        const auto& publication = sample.publication;
+        const auto cursor = std::find_if(
+            evidence.trip->source_cursors.begin(), evidence.trip->source_cursors.end(),
+            [&](const auto& value) { return value.source_id == publication.source_id; });
+        if (cursor == evidence.trip->source_cursors.end()) return std::nullopt;
+        consider({publication.source_id, publication.incarnation, publication.source_sequence,
+                  cursor->record_sequence});
+      }
+    }
+  }
+  return selected;
+}
+
 }  // namespace resource_addressed_kernel_detail
 
 using namespace resource_addressed_kernel_detail;
@@ -1440,8 +1558,18 @@ struct ResourceAddressedExecutionKernel::RuntimeScaleControlReplayEntry final {
 };
 
 struct ResourceAddressedExecutionKernel::StopFaultRecoveryReplayEntry final {
-  StopFaultRecoveryIntentDTO intent;
-  StopFaultRecoveryResultDTO result;
+  using Intent = std::variant<StopFaultRecoveryIntentDTO, IoGlobalRuleRecoveryIntentDTO>;
+  using Result = std::variant<StopFaultRecoveryResultDTO, IoGlobalRuleRecoveryResultDTO>;
+  Intent intent;
+  Result result;
+  // Uncertain journal commits retry this exact payload, never a newly evaluated
+  // timestamp or a newly minted token. The original latch stays in its row.
+  std::optional<IoGlobalRuleRecoveryRecordDTO> pending_global_record{};
+  [[nodiscard]] const RequestId& request_id() const {
+    return std::visit([](const auto& value) -> const RequestId& {
+      return value.request_context.request_id;
+    }, intent);
+  }
 };
 
 struct ResourceAddressedExecutionKernel::OperationRecoveryReplayEntry final {
@@ -1471,9 +1599,48 @@ struct ResourceAddressedExecutionKernel::ProgramCycleClaimRun::MotionContinuatio
   std::size_t authored_motion_kind{};
 };
 
+[[nodiscard]] inline bool conclusive_runtime_collision(const ErrorDTO& collision) {
+  const auto& details = collision.details;
+  const auto matches = [&](const char* key, const char* value) {
+    const auto found = details.find(key);
+    return found != details.end() && found->second == value;
+  };
+  return matches("in_collision", "true") &&
+      (matches("runtime_collision_reason", "runtime_collision_detected") ||
+       matches("runtime_collision_reason", "runtime_lookahead_collision")) &&
+      !details.contains("contact_policy_violation") &&
+      !details.contains("collision_result_raw_contact_grasp_violation") &&
+      (!details.contains("runtime_query_engine_status") || matches("runtime_query_engine_status", "ok")) &&
+      !details.contains("runtime_query_failure_reason");
+}
+
+[[nodiscard]] inline std::optional<std::int64_t> motion_takeover_budget_ns(
+    const std::optional<double> seconds) noexcept {
+  if (!seconds || !std::isfinite(*seconds) || *seconds <= 0.0) return std::nullopt;
+  // The existing monotonic clock uses integral nanoseconds. Round one unit
+  // conversion upward, without selecting a policy duration or runtime default.
+  const auto ns = std::ceil(static_cast<long double>(*seconds) * 1'000'000'000.0L);
+  if (!std::isfinite(ns) || ns > static_cast<long double>(std::numeric_limits<std::int64_t>::max()))
+    return std::nullopt;
+  return static_cast<std::int64_t>(ns);
+}
+
+inline void bind_recovery_request(KernelRecoveryActionRequestDTO& request,
+                           const KernelRecoveryAssessmentDTO& assessment) {
+  request.expected_assessment_revision = assessment.assessment_revision;
+  request.expected_control_command_epoch = assessment.control_command_epoch;
+  request.expected_execution_id = assessment.execution_id;
+  request.expected_latch_id = assessment.latch_id;
+  request.expected_stop_certificate_id = assessment.stop_certificate_id;
+  request.expected_stop_owner_generation = assessment.stop_owner_generation;
+  // Freshness is authorized and consumed by the addressed owner. Its local
+  // stopped participant does not own aggregate collision provenance.
+  request.fresh_motion_attempt = false;
+}
+
 struct ActiveOperationParticipant final {
   RuntimeParticipantBinding binding;
-  RuntimeParticipantStopReadiness stop_readiness;
+  std::optional<RuntimeParticipantStopReadiness> stop_readiness;
   std::vector<HardStopResourceLimitDTO> retained_default_stop_limits;
   MotionInterruptNodeCategory stop_node_category{MotionInterruptNodeCategory::kGeneric};
   std::optional<MotionInterruptStopProfileDTO> default_operator_stop_profile;
@@ -1531,12 +1698,21 @@ struct ActiveOperationParticipant final {
   // Authority is the exact returned engine session's irreversible precommit
   // cancellation, independently of the earlier historical Kernel release.
   bool prepared_engine_no_effect_confirmed{};
+  /// The exact handover commit detached this private physical owner. Its
+  /// immutable public participant row remains part of the original operation.
+  bool ownership_transferred{};
+  /// Reuses ordinary resolved preparation authority for a pending newcomer;
+  /// no caller-supplied priority, source curve or dispatch permission.
+  std::optional<ResolvedPreparedMotionExecutionRequestDTO> takeover_preparation{};
+  std::optional<std::int64_t> takeover_preparation_budget_ns{};
+
 
   [[nodiscard]] bool non_motion_transaction() const noexcept {
     return payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
-           gripper_actuation == GripperActuationKind::kPneumatic &&
-           stop_readiness.value().resolved_stop_base_plan.gripper_actuation_kind ==
-               GripperActuationKind::kPneumatic;
+           (binding.value().io_output_binding.has_value() ||
+            (gripper_actuation == GripperActuationKind::kPneumatic && stop_readiness &&
+             stop_readiness->value().resolved_stop_base_plan.gripper_actuation_kind ==
+                 GripperActuationKind::kPneumatic));
   }
   [[nodiscard]] bool stop_owns_reconciliation() const noexcept {
     return stop_containment_owned;
@@ -1564,6 +1740,9 @@ struct ActiveOperationParticipant final {
     return prepare_in_flight || prepared_advance_in_flight ||
            deferred_cancel_settlement.has_value();
   }
+  /// Tokens only; the shared signal module owns predicate/source state.
+  std::vector<IoRuleRegistrationDTO> io_rule_registrations{};
+  std::vector<IoMotionRulePolicyBindingDTO> io_motion_rule_policies{};
 };
 
 /// Exact reserved resource set of one operation: the union over its
@@ -1581,6 +1760,9 @@ struct ActiveOperationParticipant final {
 // An authored payload/capability alone never grants the Stop-only exception.
 [[nodiscard]] inline bool non_motion_registration(
     const RuntimeParticipantExecutionRegistration& registration) {
+  if (registration.binding.value().io_output_binding)
+    return registration.engine && registration.prepared_motion_engine &&
+           !registration.stop_readiness && !registration.binding.value().control_path;
   return registration.binding.value().capability_id.value() == "tool.gripper.command" &&
       registration.engine && registration.stop_readiness &&
       registration.stop_readiness->value().resolved_stop_base_plan.gripper_actuation_kind ==
@@ -1608,6 +1790,18 @@ struct PendingOperationControl final {
   std::optional<ProgramNodeExecutionScopeDTO> execution_scope;
 };
 
+/// The accepted candidate's immutable link to the sole physical Stop owner.
+/// Stop/candidate phases are read from their existing owners, never duplicated.
+struct MotionTakeoverSpringFallbackDTO final {
+  StopId stop_id;
+  StopGeneration stop_generation;
+  std::shared_ptr<const ResolvedParticipantStopStageDTO> stage;
+  std::shared_ptr<const SpringBackReturnPointDTO> return_point;
+  ErrorDTO smooth_failure;
+  std::uint64_t abandoned_preparation_id{};
+  std::shared_ptr<const StopCertificateDTO> certificate{};
+};
+
 struct ResourceAddressedExecutionKernel::ActiveOperation final {
   OperationIntentDTO intent;
   OperationAcceptedDTO accepted;
@@ -1631,6 +1825,8 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
     StopId stop_id;
     StopGeneration generation;
     StopCertificateResultDTO result;
+    std::optional<StopCertificateRefDTO> certificate;
+    bool requested_controlled_stop_succeeded{false};
   };
   // One current settlement fact, not a pin on rotating diagnostic history.
   // A newer Stop cannot borrow its predecessor's result.
@@ -1641,8 +1837,19 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   // Run/Resume and motion-producing recovery; they never gate a manual
   // operation, whether or not a manual cell-admission claim still names it.
   bool manual{};
+  bool retry_run_ended{false};
   mutable std::vector<KernelRecoveryAssessmentDTO> recovery_assessment_inputs{};
   mutable std::uint64_t recovery_assessment_revision{};
+  mutable std::optional<KernelRecoveryAssessmentDTO> published_recovery_assessment{};
+  using OperationNode = std::map<OperationId, std::unique_ptr<ActiveOperation>>::node_type;
+  /// Source-owned accepted metadata; neither node presents duplicate physical
+  /// ownership to Stop. The next slot is overwritten, never a waiting queue.
+  OperationNode pending_motion_takeover{};
+  OperationNode next_motion_takeover{};
+  std::optional<PreparedMotionReplacementSourceDTO> takeover_source{};
+  bool takeover_advance_in_flight{};
+  std::optional<MotionTakeoverSpringFallbackDTO> motion_takeover_spring_fallback{};
+
 
   [[nodiscard]] std::optional<StopCertificateResultDTO> terminal_stop_result() const noexcept {
     if (settled_stop.has_value() && state.active_stop_id == settled_stop->stop_id &&
@@ -1695,7 +1902,17 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
     return failed;
   }
 
+  [[nodiscard]] bool has_pending_io_rule_response() const noexcept {
+    return std::any_of(state.participants.begin(), state.participants.end(), [](const auto& row) {
+      return std::any_of(row.io_rule_outcomes.begin(), row.io_rule_outcomes.end(),
+                         [](const auto& outcome) {
+                           return outcome.stop_id && !outcome.stop_certificate_id;
+                         });
+    });
+  }
+
   [[nodiscard]] bool stop_allows_retirement() const noexcept {
+    if (has_pending_io_rule_response()) return false;
     if (!state.active_stop_id.has_value()) return true;
     const auto outcome = terminal_stop_result();
     return outcome == StopCertificateResultDTO::kSucceededNominal ||
@@ -1822,15 +2039,29 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
     return std::any_of(participants.begin(), participants.end(),
                        [&](const auto& participant) { return participant.state == state; });
   };
+  const auto final_output_failure = [](const auto& row) {
+    if (row.state != OperationStateKind::kFailed ||
+        row.payload_kind != OperationParticipantPayloadKind::kCapabilityCommand ||
+        !row.binding_identity.provider() || !row.output_evidence || !row.terminal_fact ||
+        row.terminal_fact->kind != ParticipantExecutionFactKind::kLocalFailure ||
+        row.terminal_fact->error != row.terminal_error)
+      return false;
+    return (*row.output_evidence == IoOutputEvidence::kNotSubmitted &&
+            row.terminal_fact->effect == ParticipantEffectKnowledge::kNoEffect) ||
+           (*row.output_evidence == IoOutputEvidence::kSourceRejected &&
+            row.terminal_fact->effect == ParticipantEffectKnowledge::kEffectSettled);
+  };
   const auto completed_or = [&](const OperationStateKind state) {
     return !participants.empty() &&
            std::all_of(participants.begin(), participants.end(), [&](const auto& participant) {
              return participant.state == OperationStateKind::kCompleted ||
                     participant.state == state ||
-                    (participant.state == OperationStateKind::kFailed &&
-                     participant.terminal_error &&
-                     participant.terminal_error->details.contains("pneumatic_transaction_final") &&
-                     participant.terminal_error->details.at("pneumatic_transaction_final") == "true");
+                    ((participant.state == OperationStateKind::kFailed &&
+                      participant.terminal_error &&
+                      participant.terminal_error->details.contains("pneumatic_transaction_final") &&
+                      participant.terminal_error->details.at("pneumatic_transaction_final") ==
+                          "true") ||
+                     final_output_failure(participant));
            });
   };
   const auto final_pneumatic_failure = [](const auto& row) {
@@ -1841,12 +2072,16 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
   if (any_state(OperationStateKind::kInterventionRequired) ||
       any_state(OperationStateKind::kInterrupted) ||
       std::any_of(participants.begin(), participants.end(), [&](const auto& row) {
-        return row.state == OperationStateKind::kFailed && !final_pneumatic_failure(row);
-      })) return OperationStateKind::kInterventionRequired;
+        return row.state == OperationStateKind::kFailed && !final_pneumatic_failure(row) &&
+               !final_output_failure(row);
+      }))
+    return OperationStateKind::kInterventionRequired;
   if (any_state(OperationStateKind::kFailed) &&
       std::all_of(participants.begin(), participants.end(), [&](const auto& row) {
-        return row.state == OperationStateKind::kCompleted || final_pneumatic_failure(row);
-      })) return OperationStateKind::kFailed;
+        return row.state == OperationStateKind::kCompleted || final_pneumatic_failure(row) ||
+               final_output_failure(row);
+      }))
+    return OperationStateKind::kFailed;
   if (all_state(OperationStateKind::kCompleted)) {
     return OperationStateKind::kCompleted;
   }
@@ -2131,6 +2366,9 @@ struct StopParticipantWork final {
   /// returned. Its exact settlement is deferred to that terminal.
   bool cancel_terminal_deferred{};
   GripperActuationKind gripper_actuation{GripperActuationKind::kPositionCommanded};
+  /// Contract77: an interrupt-selected response follows its qualified suffix
+  /// sequentially. Ordinary/operator and collision strongest jumps stay intact.
+  bool selected_interrupt_suffix{};
 
   /// No subordinate terminal handoff exists for a never-dispatched participant
   /// that either never received an execution identity or whose preparation
@@ -2179,6 +2417,38 @@ inline void settle_failed_preparation(StopParticipantWork& work, ErrorDTO failur
   work.terminal_error = std::move(failure);
 }
 
+struct ResourceAddressedExecutionKernel::InterruptStopSelection final {
+  IoRuleRegistrationDTO registration;
+  IoRuleEvidenceDTO evidence;
+  PreparedParticipantStopPlanDTO plan;
+  InterruptSourceId source_id;
+  InterruptPreemptionAction action;
+  int priority;
+  IoRuleStopScopeDTO stop_scope;
+  IoRulePreparedStopEntryDTO stop_entry;
+  IoRulePreparedStopEntryDTO success_through;
+};
+
+struct ResourceAddressedExecutionKernel::GlobalInterruptStopParticipant final {
+  OperationId operation_id;
+  OperationParticipantId participant_id;
+  std::uint64_t preparation_id;
+  ContentDigest prepared_contract_digest;
+  ControllerGoalId controller_goal_id;
+  ControllerGoalGeneration controller_goal_generation;
+  PreparedParticipantStopPlanDTO plan;
+  IoRulePreparedStopEntryDTO stop_entry;
+};
+
+struct ResourceAddressedExecutionKernel::GlobalInterruptStopSelection final {
+  IoRuleRegistrationDTO registration;
+  IoRuleEvidenceDTO evidence;
+  bool everything;
+  int priority;
+  std::vector<GlobalInterruptStopParticipant> participants;
+  std::vector<ResourceId> scope_resources;
+};
+
 struct ResourceAddressedExecutionKernel::StopTransaction final {
   bool active{};
   StopControlWorkToken token;
@@ -2215,7 +2485,55 @@ struct ResourceAddressedExecutionKernel::StopTransaction final {
   /// consumed when the work is initialized.
   std::vector<std::tuple<OperationId, OperationParticipantId, ErrorDTO>>
       pending_stop_path_collisions;
+  std::optional<OperationId> motion_takeover_candidate_id{};
+  bool force_spring_return{};
+  std::optional<InterruptStopSelection> interrupt_selection{};
+  std::vector<InterruptStopSelection> disjoint_interrupt_selections{};
+  /// Logical arbitration never changes the immutable initial physical plan,
+  /// stage attempts, or deadline. A higher-priority fault owns its own fact.
+  std::vector<InterruptStopSelection> interrupt_winners{};
+  /// Immutable physical selection. Later global logical winners join the
+  /// existing transaction without changing this plan, membership or budget.
+  std::optional<GlobalInterruptStopSelection> global_interrupt_selection{};
+  std::vector<GlobalInterruptStopSelection> global_interrupt_winners{};
 };
+
+// A scoped global Stop owns only its captured physical/logical participants.
+// Sharing an enclosing operation does not transfer a sibling's guard or result.
+template <typename Transaction>
+[[nodiscard]] inline bool scoped_global_stop_excludes_participant(
+    const Transaction& transaction, const OperationId& operation,
+    const OperationParticipantId& participant, const std::vector<ResourceId>& resources) {
+  if (transaction.full_stop || transaction.global_interrupt_winners.empty()) return false;
+  for (const auto& winner : transaction.global_interrupt_winners)
+    for (const auto& selected : winner.participants)
+      if (selected.operation_id == operation && selected.participant_id == participant) return false;
+  for (const auto& winner : transaction.interrupt_winners) {
+    const auto& scope = std::get<IoOperationRuleScopeDTO>(winner.registration.scope);
+    if (scope.operation_id == operation && scope.participant_id == participant) return false;
+  }
+  if (transaction.global_interrupt_selection &&
+      !transaction.global_interrupt_selection->everything)
+    return true;  // Initial addressed selection is an exact participant set.
+  return !std::all_of(resources.begin(), resources.end(), [&](const auto& resource) {
+    return std::binary_search(transaction.resources.begin(), transaction.resources.end(), resource);
+  });
+}
+
+/// Snapshot/result ownership includes logical responses on inherited operations.
+/// Physical command ownership remains exclusively transaction.operations.
+template <typename Transaction>
+[[nodiscard]] inline std::vector<OperationId> stop_operation_snapshot_ids(
+    const Transaction& transaction) {
+  auto ids = transaction.operations;
+  for (const auto& winner : transaction.interrupt_winners)
+    ids.push_back(std::get<IoOperationRuleScopeDTO>(winner.registration.scope).operation_id);
+  for (const auto& winner : transaction.global_interrupt_winners)
+    for (const auto& participant : winner.participants) ids.push_back(participant.operation_id);
+  std::sort(ids.begin(), ids.end());
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  return ids;
+}
 
 struct ResourceAddressedExecutionKernel::StopTerminalRecord final {
   StopStatusDTO status;
@@ -2689,6 +3007,40 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
 
 }  // namespace resource_addressed_kernel_detail
 
+namespace resource_addressed_kernel_detail {
+inline bool global_rule_registration_matches(const IoRuleRegistrationDTO& token,
+    const IoRuleStateContextDTO& context, const InterruptPolicyId& policy) {
+  return token.owner_epoch == context.owner_epoch &&
+         token.catalog_generation == context.catalog_generation && token.registration_id != 0U &&
+         token.policy_id == policy && token.scope == IoRuleScopeDTO{IoActivationRuleScopeDTO{
+             context.retained_bundle_id, context.graph_revision}};
+}
+}  // namespace resource_addressed_kernel_detail
+
+struct ResourceAddressedExecutionKernel::GlobalIoRuleRuntime final {
+  IoRuleStateDTO state;
+  std::optional<IoRuleRegistrationDTO> registration;
+  std::optional<IoRuleEvidenceDTO> evidence;
+  std::optional<ErrorDTO> qualification_error;
+  bool response_consumed{};
+  bool waiting_for_inactive{};
+  std::optional<StopAcceptedDTO> response{};
+  std::optional<IoRuleRegistrationDTO> latch_registration{};
+  std::optional<IoRuleEvidenceDTO> latched_evidence{};
+  std::optional<IoRuleEvidenceDTO> last_source_loss{};
+  bool source_loss_latch{};
+};
+
+struct ResourceAddressedExecutionKernel::StagedGlobalIoRuleCatalog final {
+  IoRuleAppliedContextDTO context;
+  std::shared_ptr<const IoActivationRuleCatalogDTO> catalog;
+  std::shared_ptr<IIoSignalService> service;
+  std::optional<ConfigurationFenceStatusQueryDTO> fence;
+  std::optional<CellAdmissionClaimDTO> parent;
+  std::vector<IoRuleRegistrationDTO> registrations;
+  std::shared_ptr<const IoRuleWaitingForProgramCatalogDTO> waiting_for_program{};
+};
+
 class ResourceAddressedExecutionKernel::StopProjectionWorker final {
  public:
   StopProjectionWorker(const std::size_t capacity, ResourceAddressedExecutionKernel& owner)
@@ -2735,6 +3087,12 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
     NotifyDrainState();
   }
 
+  void PublishGlobalRuleStates() noexcept {
+    if (!accepting_.load(std::memory_order_acquire)) return;
+    global_requested_.store(true, std::memory_order_release);
+    Wake();
+  }
+
   void Close() noexcept {
     accepting_.store(false, std::memory_order_release);
     Wake();
@@ -2745,7 +3103,8 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
     try {
       std::unique_lock lock(drain_mutex_);
       return drain_changed_.wait_for(lock, timeout, [this] {
-        if (callback_in_flight_.load(std::memory_order_acquire)) {
+        if (callback_in_flight_.load(std::memory_order_acquire) ||
+            global_requested_.load(std::memory_order_acquire)) {
           return false;
         }
         if (api_calls_in_flight_.load(std::memory_order_acquire) != 0U) {
@@ -2796,6 +3155,13 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
           NotifyDrainState();
         }
       }
+      if (global_requested_.exchange(false, std::memory_order_acq_rel)) {
+        callback_in_flight_.store(true, std::memory_order_release);
+        owner_.ProjectGlobalIoRuleStates();
+        callback_in_flight_.store(false, std::memory_order_release);
+        progressed = true;
+        NotifyDrainState();
+      }
       if (progressed) {
         continue;
       }
@@ -2817,6 +3183,7 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
   std::atomic_bool accepting_{true};
   std::atomic_bool ready_{};
   std::atomic_bool callback_in_flight_{};
+  std::atomic_bool global_requested_{};
   std::atomic_size_t api_calls_in_flight_{};
   std::atomic_uint64_t wake_sequence_{};
   std::mutex drain_mutex_;

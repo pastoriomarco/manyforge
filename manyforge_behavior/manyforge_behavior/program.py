@@ -11,7 +11,7 @@ import hashlib
 import json
 import math
 import re
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -25,6 +25,12 @@ from manyforge_behavior.canonical_artifact import (
     verify_content_identity,
 )
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.interrupt_condition import (
+    InterruptConditionError,
+    check_condition,
+    condition_keys,
+    condition_signals,
+)
 from manyforge_behavior.catalog_schema import (
     CatalogSchema,
     CatalogSchemaRegistry,
@@ -59,7 +65,9 @@ _MAX_MAPPING_ITEMS: Final = 4096
 _MAX_SEQUENCE_ITEMS: Final = 10_000
 _MAX_VALUE_STRING_CHARS: Final = 1_000_000
 _MAX_DOCUMENT_TEXT_CHARS: Final = 8 * 1024 * 1024
-_MAX_INTEGER_BITS: Final = 256
+# Program integer literals stay exact through canonical JSON: anything
+# outside ±(2^53−1) is refused at parse, never rounded later.
+MAX_SAFE_INTEGER_LITERAL: Final = 9_007_199_254_740_991
 _MAX_CANONICAL_BYTES: Final = 96 * 1024 * 1024
 _PROGRAM_API_VERSION: Final = "manyforge.program.v2"
 _PREVIOUS_PROGRAM_API_VERSION: Final = "manyforge.program.v1"
@@ -160,6 +168,14 @@ def _validate_closed_mapping(
     return value
 
 
+def _require_safe_integer_literal(value: int, *, path: str) -> None:
+    if not -MAX_SAFE_INTEGER_LITERAL <= value <= MAX_SAFE_INTEGER_LITERAL:
+        raise ProgramValidationError(
+            f"{path} integer literal is outside the exact range ±(2^53−1) "
+            f"(±{MAX_SAFE_INTEGER_LITERAL})"
+        )
+
+
 def _bounded_json_value(
     value: Any,
     *,
@@ -178,8 +194,7 @@ def _bounded_json_value(
     if value is None or type(value) is bool:
         return value
     if type(value) is int:
-        if value.bit_length() > _MAX_INTEGER_BITS:
-            raise ProgramValidationError(f"{path} integer exceeds the numeric bound")
+        _require_safe_integer_literal(value, path=path)
         return value
     if type(value) is float:
         if not math.isfinite(value):
@@ -368,10 +383,16 @@ def compute_program_tree_hash(tree: TreeNode) -> str:
 
 
 OPERATOR_STOP_POLICY_VALUES: Final = frozenset({"inherit", "hold", "continue"})
-# The authored recovery policy is exactly two fields: an explicit opt-in to
-# failure intervention (default off) and the explicit failure-retry budget,
-# where zero means Unlimited (never "disabled").
+# The authored recovery policy has two fields: an explicit opt-in to failure
+# intervention (default off) and the explicit failure-retry budget, where zero
+# means Unlimited (never "disabled"). The intervention stop scope is optional
+# and defaults to all groups; the canonical form omits the default.
 _RECOVERY_POLICY_FIELDS: Final = frozenset({"allow_intervention", "max_retries"})
+_RECOVERY_POLICY_ALLOWED_FIELDS: Final = _RECOVERY_POLICY_FIELDS | {
+    "intervention_stop_scope"
+}
+INTERVENTION_STOP_SCOPE_VALUES: Final = frozenset({"all", "own_groups"})
+DEFAULT_INTERVENTION_STOP_SCOPE: Final = "all"
 MAX_RECOVERY_POLICY_RETRIES: Final = 255
 _TREE_FIELDS: Final = frozenset(
     {
@@ -430,7 +451,7 @@ def _parse_recovery_policy(raw_policy: Any, *, path: str) -> dict[str, Any]:
         return {}
     policy = _validate_closed_mapping(
         raw_policy,
-        allowed=_RECOVERY_POLICY_FIELDS,
+        allowed=_RECOVERY_POLICY_ALLOWED_FIELDS,
         path=f"{path}.recovery_policy",
     )
     parsed: dict[str, Any] = {}
@@ -452,7 +473,23 @@ def _parse_recovery_policy(raw_policy: Any, *, path: str) -> dict[str, Any]:
                 f"0..{MAX_RECOVERY_POLICY_RETRIES} (0 is Unlimited)"
             )
         parsed["max_retries"] = retries
+    if "intervention_stop_scope" in policy:
+        scope = _intervention_stop_scope(
+            policy["intervention_stop_scope"],
+            path=f"{path}.recovery_policy",
+        )
+        if scope != DEFAULT_INTERVENTION_STOP_SCOPE:
+            parsed["intervention_stop_scope"] = scope
     return parsed
+
+
+def _intervention_stop_scope(value: Any, *, path: str) -> str:
+    if type(value) is not str or value not in INTERVENTION_STOP_SCOPE_VALUES:
+        allowed = " or ".join(sorted(INTERVENTION_STOP_SCOPE_VALUES))
+        raise ProgramValidationError(
+            f"{path}.intervention_stop_scope must be {allowed}"
+        )
+    return value
 
 
 CANONICAL_DEFAULT_RECOVERY_POLICY: Final = {
@@ -472,12 +509,12 @@ def _parse_canonical_recovery_policy(
         )
     policy = _validate_closed_mapping(
         raw_policy,
-        allowed=_RECOVERY_POLICY_FIELDS,
+        allowed=_RECOVERY_POLICY_ALLOWED_FIELDS,
         path=f"{path}.recovery_policy",
     )
-    if set(policy) != _RECOVERY_POLICY_FIELDS:
+    if not _RECOVERY_POLICY_FIELDS <= set(policy):
         raise ProgramValidationError(
-            f"{path}.recovery_policy must contain exactly "
+            f"{path}.recovery_policy must contain at least "
             f"{sorted(_RECOVERY_POLICY_FIELDS)}"
         )
     allow_intervention = policy["allow_intervention"]
@@ -494,7 +531,14 @@ def _parse_canonical_recovery_policy(
             f"{path}.recovery_policy.max_retries must be an integer in "
             f"0..{MAX_RECOVERY_POLICY_RETRIES} (0 is Unlimited)"
         )
-    return {"allow_intervention": allow_intervention, "max_retries": max_retries}
+    canonical = {"allow_intervention": allow_intervention, "max_retries": max_retries}
+    scope = _intervention_stop_scope(
+        policy.get("intervention_stop_scope", DEFAULT_INTERVENTION_STOP_SCOPE),
+        path=f"{path}.recovery_policy",
+    )
+    if scope != DEFAULT_INTERVENTION_STOP_SCOPE:
+        canonical["intervention_stop_scope"] = scope
+    return canonical
 
 
 def _normalize_canonical_node_policies(
@@ -564,7 +608,18 @@ def _remove_explicit_default_policy_spelling(
                 del migrated["execution_groups"]
             else:
                 migrated["execution_groups"] = _execution_groups_document(groups)
-        if is_default_recovery(migrated.get("recovery_policy")):
+        recovery = migrated.get("recovery_policy")
+        if (
+            type(recovery) is dict
+            and recovery.get("intervention_stop_scope") == DEFAULT_INTERVENTION_STOP_SCOPE
+        ):
+            recovery = {
+                key: value
+                for key, value in recovery.items()
+                if key != "intervention_stop_scope"
+            }
+            migrated["recovery_policy"] = recovery
+        if is_default_recovery(recovery):
             del migrated["recovery_policy"]
         if (
             type(migrated.get("operator_stop_policy")) is str
@@ -1135,13 +1190,347 @@ def _resolve_execution_selections(
     )
 
 
-_COORDINATABLE_MOTION_NODE_IDS: Final = frozenset(
+# The three plain motion nodes: the Program grammar's ordinary motion nodes
+# (execution groups, automatic retry, and the owner's motion routing).
+MOTION_NODE_IDS: Final = frozenset(
     {
         "motion.move_to_joint_target",
         "motion.move_to_pose",
         "motion.follow_cartesian_path",
     }
 )
+
+
+# The two interrupt motion nodes: each carries one per-node interrupt
+# condition (schema02 §2, schema03).
+INTERRUPT_MOTION_NODE_IDS: Final = frozenset(
+    {"motion.move_until_signal", "motion.probe_search"}
+)
+# Signal-reading io nodes: their one signal is (target_role, resource_role).
+IO_SIGNAL_INPUT_NODE_IDS: Final = frozenset(
+    {"io.get_input", "io.check_input", "io.wait_for_input"}
+)
+MOCK_SIMULATION_NODE_IDS: Final = INTERRUPT_MOTION_NODE_IDS | IO_SIGNAL_INPUT_NODE_IDS
+# Node Mock simulation refusals (contract item 133, spec 410 §4.5).
+MOCK_SIMULATION_INVALID: Final = "mock_simulation_invalid"
+MOCK_SIMULATION_SIGNAL_UNUSED: Final = "mock_simulation_signal_unused"
+MOCK_SIMULATION_SIGNAL_DUPLICATE: Final = "mock_simulation_signal_duplicate"
+MOCK_SIMULATION_SOURCE_REFUSED: Final = "mock_simulation_value_source_refused"
+
+# System-owned node outcome keys (contract items 42, 46(f), 105): every
+# motion node's outcome lives in `node_outcome.<instance_id>`, declared
+# implicitly, readable like any run key and written only by that node when it
+# ends. The system defines its start value: `none` (no result yet in this Run)
+# at Run start and after Reset; afterwards it keeps the last outcome (43).
+NODE_OUTCOME_NODE_IDS: Final = MOTION_NODE_IDS | INTERRUPT_MOTION_NODE_IDS
+NODE_OUTCOME_NAMESPACE: Final = "node_outcome"
+NODE_OUTCOME_NONE: Final = "none"
+# The outcomes a node writes when it ends (never `none`).
+NODE_ENDED_OUTCOMES: Final = (
+    "completed",
+    "failed",
+    "preempted",
+    "superseded",
+    "refused_by_priority",
+    "signal_trip",
+    "no_signal_trip",
+)
+# Every value a node outcome key can hold.
+NODE_OUTCOME_VALUES: Final = (*NODE_ENDED_OUTCOMES, NODE_OUTCOME_NONE)
+
+
+def node_outcome_key(instance_id: str) -> str:
+    """The reserved blackboard key holding one motion node's last outcome."""
+
+    return f"{NODE_OUTCOME_NAMESPACE}.{instance_id}"
+
+
+def is_node_outcome_key(key: str) -> bool:
+    return key.startswith(f"{NODE_OUTCOME_NAMESPACE}.")
+
+
+# System-owned global-rule state keys (contract items 63, 64): each Deployment
+# global rule publishes `interrupt_state.<rule_id>`, read-only, readable like
+# any key. Reserved like node_outcome: never authored nor written by nodes.
+# A Program alone cannot see the Deployment, so its validation declares the
+# key of each rule id it references (read-only; writes stay refused). The join
+# against the Deployment's declared rules is where both are known: the native
+# Apply validation view (rules from the retained bundle), the Runner's
+# with_interrupt_state_keys (Applied rule ids) and the Composer GUI (Draft
+# rules); `require_interrupt_state_rules` is the Python form of that check.
+INTERRUPT_STATE_NAMESPACE: Final = "interrupt_state"
+INTERRUPT_STATE_VALUES: Final = ("clear", "tripped", "latched")
+
+
+def is_interrupt_state_key(key: str) -> bool:
+    return key.startswith(f"{INTERRUPT_STATE_NAMESPACE}.")
+
+
+def interrupt_state_key(rule_id: str) -> str:
+    """The reserved key mirroring one global rule's Kernel state (item 64)."""
+
+    return f"{INTERRUPT_STATE_NAMESPACE}.{rule_id}"
+
+
+def interrupt_state_declaration(rule_id: str) -> BlackboardKeyDeclaration:
+    """Read-only, system-written, always current (also between Runs): the
+    Runner's mirror is its only writer and Reset never clears it."""
+
+    if type(rule_id) is not str or _IDENTIFIER_RE.fullmatch(rule_id) is None:
+        raise ProgramValidationError(f"global rule id {rule_id!r} is not an identifier")
+    return BlackboardKeyDeclaration(
+        key=interrupt_state_key(rule_id),
+        type="string",
+        access="read",
+        persistence="run",
+        fields=MappingProxyType({}),
+        description=(
+            f"Current state of global interrupt rule {rule_id}: "
+            + " | ".join(INTERRUPT_STATE_VALUES)
+        ),
+    )
+
+
+_INTERRUPT_STATE_REFERENCE_RE: Final = re.compile(
+    r"(?<![A-Za-z0-9_.])key\.interrupt_state\.([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*)"
+)
+
+
+def _interrupt_state_references(value: Any) -> set[str]:
+    """Rule ids one unvalidated value names: an exact ``interrupt_state.<id>``
+    string (key parameters, condition operands, key value sources) or a
+    ``key.interrupt_state.<id>`` name inside an expression."""
+
+    found: set[str] = set()
+    pending = [value]
+    seen = 0
+    while pending and seen <= _MAX_TREE_NODES:
+        item = pending.pop()
+        seen += 1
+        if type(item) is dict:
+            pending.extend(item.values())
+        elif type(item) is list:
+            pending.extend(item)
+        elif type(item) is str:
+            if is_interrupt_state_key(item):
+                rule_id = item[len(INTERRUPT_STATE_NAMESPACE) + 1 :]
+                if _IDENTIFIER_RE.fullmatch(rule_id) is not None:
+                    found.add(rule_id)
+                continue
+            for match in _INTERRUPT_STATE_REFERENCE_RE.finditer(item):
+                rule_id = match.group(1)
+                # `key.interrupt_state.a.size()`: the last segment is a call.
+                if item[match.end() : match.end() + 1] == "(" and "." in rule_id:
+                    rule_id = rule_id.rsplit(".", 1)[0]
+                found.add(rule_id)
+    return found
+
+
+def _declare_interrupt_state_keys(
+    keys: dict[str, BlackboardKeyDeclaration], roots: Iterable[Any], blackboard: Any
+) -> dict[str, BlackboardKeyDeclaration]:
+    """Add the read-only ``interrupt_state.<rule_id>`` key of every rule id
+    the tree's parameters/value sources or a computed key's expression name.
+
+    A tolerant pre-scan like ``_declare_node_outcome_keys``: validation refuses
+    anything malformed afterwards; the result stays sorted by key.
+    """
+
+    rule_ids: set[str] = set()
+    pending = list(roots)
+    seen = 0
+    while pending and seen <= _MAX_TREE_NODES:
+        node = pending.pop()
+        seen += 1
+        if type(node) is not dict:
+            continue
+        rule_ids |= _interrupt_state_references(
+            [node.get("parameters"), node.get("value_sources")]
+        )
+        children = node.get("children")
+        if type(children) is list:
+            pending.extend(children)
+    rows = blackboard.get("keys") if type(blackboard) is dict else None
+    if type(rows) is list:
+        rule_ids |= _interrupt_state_references(
+            [row.get("expression") for row in rows if type(row) is dict]
+        )
+    for rule_id in rule_ids:
+        declaration = interrupt_state_declaration(rule_id)
+        keys[declaration.key] = declaration
+    return dict(sorted(keys.items()))
+
+
+def require_interrupt_state_rules(program: "Program", rule_ids: Iterable[str]) -> None:
+    """The Program x Deployment join (contract 64): every
+    ``interrupt_state.<rule_id>`` the Program reads names a declared global
+    rule of the Deployment."""
+
+    missing = sorted(set(program.interrupt_state_rule_ids) - set(rule_ids))
+    if missing:
+        raise ProgramValidationError(
+            "Program reads interrupt_state key(s) of global rule(s) the "
+            f"Deployment does not declare: {', '.join(missing)}"
+        )
+
+
+# Contract 87: every blackboard key an interrupt condition reads (a node rule
+# on move_until_signal / probe_search, or a Deployment global rule) declares
+# `initial:` (presence only; false / 0 are valid). Same reason as the Core.
+# System keys (node_outcome.*, interrupt_state.*) are exempt: the system
+# defines their start value (contract 105).
+INTERRUPT_KEY_INITIAL_REQUIRED: Final = "interrupt_key_initial_required"
+
+
+def require_interrupt_key_initials(
+    program: "Program", global_rules: Iterable[Mapping[str, Any]] = ()
+) -> None:
+    """The Program x Deployment check of contract 87, where both are known.
+
+    Undeclared keys and malformed conditions are refused by their own checks
+    and are not reported here.
+    """
+
+    used: dict[str, list[str]] = {}
+    for key in program.interrupt_condition_keys:
+        used.setdefault(key, []).append("a node rule")
+    for rule in global_rules:
+        try:
+            keys = condition_keys(rule.get("condition"))
+        except Exception:  # Malformed: refused by the rule codec.
+            continue
+        for key in keys:
+            used.setdefault(key, []).append(f"global rule {rule.get('rule_id')!r}")
+    missing = sorted(
+        key
+        for key in used
+        if key in program.blackboard_keys
+        and _reserved_namespace(key) is None
+        and not program.blackboard_keys[key].has_initial
+    )
+    if missing:
+        detail = "; ".join(f"{key} (read by {', '.join(used[key])})" for key in missing)
+        raise ProgramValidationError(
+            f"{INTERRUPT_KEY_INITIAL_REQUIRED}: interrupt condition keys must declare "
+            f"an initial value: {detail}"
+        )
+
+
+# Contracts 106, 110, 111: the checks of global rules' key operands.
+GLOBAL_RULE_KEY_UNDECLARED: Final = "global_rule_key_undeclared"
+GLOBAL_RULE_STATE_OPERAND_UNSUPPORTED: Final = "global_rule_state_operand_unsupported"
+
+
+def _global_rule_keys(rule: Mapping[str, Any]) -> frozenset[str]:
+    try:
+        return condition_keys(rule.get("condition"))
+    except Exception:  # Malformed: refused by the rule codec.
+        return frozenset()
+
+
+def require_global_rule_operands(global_rules: Iterable[Mapping[str, Any]]) -> None:
+    """A global rule's condition never reads an ``interrupt_state.*`` key
+    (contract 111); Program nodes and node rules keep reading them."""
+
+    found = sorted(
+        (str(rule.get("rule_id")), key)
+        for rule in global_rules
+        for key in _global_rule_keys(rule)
+        if is_interrupt_state_key(key)
+    )
+    if found:
+        detail = "; ".join(f"global rule {rule!r} reads {key}" for rule, key in found)
+        raise ProgramValidationError(
+            f"{GLOBAL_RULE_STATE_OPERAND_UNSUPPORTED}: a global rule condition "
+            f"cannot read an interrupt_state key: {detail}"
+        )
+
+
+def require_global_rule_keys(
+    program: "Program", global_rules: Iterable[Mapping[str, Any]]
+) -> None:
+    """Applying a Program that does not declare a blackboard key some global
+    rule reads is refused, naming the rule and the key (contract 106).
+
+    ``interrupt_state.*`` operands are refused by
+    ``require_global_rule_operands`` and are not reported here.
+    """
+
+    missing = sorted(
+        (str(rule.get("rule_id")), key)
+        for rule in global_rules
+        for key in _global_rule_keys(rule)
+        if not is_interrupt_state_key(key) and key not in program.blackboard_keys
+    )
+    if missing:
+        detail = "; ".join(f"global rule {rule!r} reads {key}" for rule, key in missing)
+        raise ProgramValidationError(
+            f"{GLOBAL_RULE_KEY_UNDECLARED}: the Program does not declare a key a "
+            f"global rule reads: {detail}"
+        )
+
+
+_RESERVED_NAMESPACES: Final = MappingProxyType(
+    {
+        NODE_OUTCOME_NAMESPACE: "node outcome keys",
+        INTERRUPT_STATE_NAMESPACE: "interrupt rule state keys",
+    }
+)
+
+
+def _reserved_namespace(name: str) -> str | None:
+    """The system namespace a key or parameter name uses (the bare namespace
+    name or any name under it), or None (contract 105(c))."""
+
+    namespace = name.split(".", 1)[0]
+    return namespace if namespace in _RESERVED_NAMESPACES else None
+
+
+def _node_outcome_declaration(instance_id: str) -> BlackboardKeyDeclaration:
+    return BlackboardKeyDeclaration(
+        key=node_outcome_key(instance_id),
+        type="string",
+        access="read",
+        persistence="run",
+        fields=MappingProxyType({}),
+        description=(
+            f"Last outcome of motion node {instance_id}: "
+            + " | ".join(NODE_OUTCOME_VALUES)
+            + f" ({NODE_OUTCOME_NONE} = no result yet in this Run)"
+        ),
+        has_initial=True,
+        initial=NODE_OUTCOME_NONE,
+    )
+
+
+def _declare_node_outcome_keys(
+    keys: dict[str, BlackboardKeyDeclaration], roots: Iterable[Any]
+) -> dict[str, BlackboardKeyDeclaration]:
+    """Add the implicit outcome key of every motion node under ``roots``.
+
+    A tolerant pre-scan of unvalidated tree mappings: tree validation refuses
+    anything malformed afterwards. The result stays sorted by key.
+    """
+
+    pending = list(roots)
+    seen = 0
+    while pending and seen <= _MAX_TREE_NODES:
+        node = pending.pop()
+        seen += 1
+        if type(node) is not dict:
+            continue
+        instance_id = node.get("instance_id")
+        if (
+            node.get("node_id") in NODE_OUTCOME_NODE_IDS
+            and type(instance_id) is str
+            and _IDENTIFIER_RE.fullmatch(instance_id) is not None
+        ):
+            declaration = _node_outcome_declaration(instance_id)
+            keys[declaration.key] = declaration
+        children = node.get("children")
+        if type(children) is list:
+            pending.extend(children)
+    return dict(sorted(keys.items()))
 
 
 _EXECUTION_POLICIES: Final = frozenset(
@@ -1227,7 +1616,7 @@ def _validate_execution_group_policies(
                 f"{policies[group_name]}"
             )
         member_nodes = [nodes[instance_id] for instance_id in members]
-        if any(node.node_id not in _COORDINATABLE_MOTION_NODE_IDS for node in member_nodes):
+        if any(node.node_id not in MOTION_NODE_IDS for node in member_nodes):
             raise ProgramValidationError(
                 f"execution_groups.{group_name} may contain only ordinary motion nodes "
                 f"for {policies[group_name]}"
@@ -1455,8 +1844,8 @@ def _program_identifier(value: Any, *, path: str) -> str:
 def _program_number(value: Any, *, path: str) -> float:
     if type(value) not in {int, float}:
         _program_error(path, "must be a finite number")
-    if type(value) is int and value.bit_length() > _MAX_INTEGER_BITS:
-        _program_error(path, "exceeds the integer bound")
+    if type(value) is int:
+        _require_safe_integer_literal(value, path=path)
     try:
         normalized = float(value)
     except (OverflowError, ValueError):
@@ -1609,6 +1998,21 @@ _DYNAMIC_SOURCE_FORBIDDEN_PARAMETERS: Final = frozenset(
         "contact_policy_id",
         "model_endpoint_alias",
         "prompt_template_id",
+        # Automatic retry settings are literal values (spec 400 §7).
+        "automatic_retries",
+        "automatic_retry_delay_s",
+        # Preemption priority and result are literal values (contract item 33).
+        "preemption_priority",
+        "preempted_result",
+        # Per-node interrupt rules are sealed literals (schema02 §2).
+        "interrupt_condition",
+        "on_signal",
+        "on_no_signal",
+        "priority",
+        "stop_entry_stage_id",
+        "success_through_stage_id",
+        # Node Mock simulation rows are literal-only (contract item 133).
+        "mock_simulation",
     }
 )
 
@@ -1714,9 +2118,10 @@ def _validate_viewer_references(
 
 
 def _validate_component_roles(value: Any, *, path: str) -> dict[str, dict[str, Any]]:
+    # An empty mapping is a logic-only Program (no component role).
     rows = _program_mapping(value, path=path)
-    if not rows or len(rows) > _MAX_PROGRAM_ROLES:
-        _program_error(path, "must be a bounded non-empty mapping")
+    if len(rows) > _MAX_PROGRAM_ROLES:
+        _program_error(path, "must be a bounded mapping")
     _canonical_mapping_keys(rows, path=path)
     result: dict[str, dict[str, Any]] = {}
     allowed = frozenset(
@@ -2403,6 +2808,13 @@ def _validate_parameters(
         parameter_id = _program_identifier(
             row["parameter_id"], path=f"{row_path}.parameter_id"
         )
+        reserved = _reserved_namespace(parameter_id)
+        if reserved is not None:
+            _program_error(
+                f"{row_path}.parameter_id",
+                f"{parameter_id} uses the reserved system name {reserved} "
+                f"({_RESERVED_NAMESPACES[reserved]}); choose another parameter ID",
+            )
         declared_type = _program_identifier(row["type"], path=f"{row_path}.type")
         if declared_type not in _PROGRAM_PARAMETER_TYPES:
             _program_error(f"{row_path}.type", "is not a registered Program type")
@@ -2466,6 +2878,12 @@ def _validate_blackboard(
         namespace_id = _program_identifier(
             row["namespace_id"], path=f"{row_path}.namespace_id"
         )
+        if namespace_id in _RESERVED_NAMESPACES:
+            _program_error(
+                f"{row_path}.namespace_id",
+                f"{namespace_id} is reserved for the system-owned "
+                f"{_RESERVED_NAMESPACES[namespace_id]} and cannot be declared",
+            )
         if row["owner"] != "program":
             _program_error(f"{row_path}.owner", "must be program")
         if "description" in row:
@@ -2500,6 +2918,14 @@ def _validate_blackboard(
             path=row_path,
         )
         key = _program_identifier(row["key"], path=f"{row_path}.key")
+        reserved = _reserved_namespace(key)
+        if reserved is not None:
+            _program_error(
+                f"{row_path}.key",
+                f"{key} is in the reserved {reserved} namespace: "
+                f"{_RESERVED_NAMESPACES[reserved]} are declared by the system, "
+                "never authored",
+            )
         if "." in key and key.split(".", 1)[0] not in namespaces:
             _program_error(
                 f"{row_path}.key",
@@ -3253,6 +3679,18 @@ def _validate_catalog_blackboard_bindings(
                     f"{path}.parameters.{key_parameter}",
                     f"declares type {declaration.type!r}, expected {expected}",
                 )
+            if direction == "write" and is_node_outcome_key(key):
+                _program_error(
+                    f"{path}.parameters.{key_parameter}",
+                    f"names system-owned node outcome key {key!r}, which only "
+                    "its motion node writes",
+                )
+            if direction == "write" and is_interrupt_state_key(key):
+                _program_error(
+                    f"{path}.parameters.{key_parameter}",
+                    f"names system-owned interrupt rule state key {key!r}, "
+                    "which only its rule publishes",
+                )
             if direction == "write" and declaration.expression is not None:
                 _program_error(
                     f"{path}.parameters.{key_parameter}",
@@ -3593,6 +4031,46 @@ def _validate_node_cross_fields(
         )
         if reason is not None:
             _program_error(f"{path}.parameters.operator", reason)
+    if node_id in INTERRUPT_MOTION_NODE_IDS and "interrupt_condition" in parameters:
+        try:
+            check_condition(
+                parameters["interrupt_condition"],
+                key_types={
+                    key: declaration.type
+                    for key, declaration in context.blackboard_keys.items()
+                },
+                target_resource_roles={
+                    role: frozenset(target.get("required_resource_roles", ()))
+                    for role, target in context.target_roles.items()
+                },
+                path=f"{path}.parameters.interrupt_condition",
+            )
+        except InterruptConditionError as error:
+            _program_error(error.path, f"{error.reason}: {error.message}")
+    if node_id in MOCK_SIMULATION_NODE_IDS and "mock_simulation" in parameters:
+        if node_id in INTERRUPT_MOTION_NODE_IDS:
+            used = (
+                condition_signals(parameters["interrupt_condition"])
+                if "interrupt_condition" in parameters
+                else frozenset()
+            )
+        elif {"target_role", "resource_role"} <= set(parameters):
+            used = frozenset({(parameters["target_role"], parameters["resource_role"])})
+        else:
+            used = frozenset()
+        _validate_mock_simulation(
+            parameters["mock_simulation"],
+            used,
+            path=f"{path}.parameters.mock_simulation",
+        )
+    if node_id == "io.wait_for_input" and (
+        "edge" in sourced or parameters.get("edge", "level") != "level"
+    ):
+        # Only level waits run in this slice; an edge is refused, never inert.
+        _program_error(
+            f"{path}.parameters.edge",
+            "io_watch_condition_unsupported: only level waits are supported",
+        )
     if node_id == "geometry.check_pose_bounds":
         _validate_pose_frame_ref(
             parameters["frame_ref"],
@@ -3619,6 +4097,34 @@ def _validate_node_cross_fields(
                 f"{path}.parameters.max_effort",
                 "unit kind does not match the commanded position",
             )
+
+
+def _validate_mock_simulation(
+    rows: list[Mapping[str, Any]],
+    used: frozenset[tuple[str, str]],
+    *,
+    path: str,
+) -> None:
+    """Each row names one distinct signal the node itself reads (catalog
+    schema already checked the row shape and bool values)."""
+
+    seen: set[tuple[str, str]] = set()
+    for index, row in enumerate(rows):
+        signal = (row["signal"]["target_role"], row["signal"]["resource_role"])
+        row_path = f"{path}[{index}].signal"
+        if signal not in used:
+            _program_error(
+                row_path,
+                f"{MOCK_SIMULATION_SIGNAL_UNUSED}: signal {signal[0]}/{signal[1]} "
+                "is not read by this node",
+            )
+        if signal in seen:
+            _program_error(
+                row_path,
+                f"{MOCK_SIMULATION_SIGNAL_DUPLICATE}: signal {signal[0]}/{signal[1]} "
+                "already has a Mock simulation row",
+            )
+        seen.add(signal)
 
 
 def _validate_program_tree(
@@ -3720,6 +4226,12 @@ def _validate_program_tree(
         condition_parameters | target_parameters | component_parameters
     )
     for key, segments in source_paths.items():
+        if segments[0] == "mock_simulation":
+            _program_error(
+                f"{path}.value_sources.{key}",
+                f"{MOCK_SIMULATION_SOURCE_REFUSED}: Mock simulation rows are "
+                "literal values only",
+            )
         if (
             segments[0] in _DYNAMIC_SOURCE_FORBIDDEN_PARAMETERS
             or segments[0] in selector_parameters
@@ -3762,7 +4274,12 @@ def _validate_program_tree(
                 path=f"{path}.parameters.{parameter_id}",
             )
             if issues:
-                _program_error(issues[0].path, issues[0].message)
+                _program_error(
+                    issues[0].path,
+                    f"{MOCK_SIMULATION_INVALID}: {issues[0].message}"
+                    if parameter_id == "mock_simulation"
+                    else issues[0].message,
+                )
             _validate_semantic_value(
                 catalog_parameter.schema,
                 parameters[parameter_id],
@@ -3889,8 +4406,10 @@ def program_value_declarations(
     """
 
     root = _program_mapping(dict(document), path=source)
+    if "component_roles" not in root:
+        _program_error(f"{source}.component_roles", "is required")
     component_roles = _validate_component_roles(
-        root.get("component_roles", {}), path=f"{source}.component_roles"
+        root["component_roles"], path=f"{source}.component_roles"
     )
     target_roles = _validate_target_roles(
         root.get("target_roles", {}),
@@ -3915,7 +4434,11 @@ def program_value_declarations(
         scene_resource_ids=scene_resource_ids,
         target_roles=target_roles,
     )
-    return parameters, keys
+    # A Program's tree, or a Draft's authoring forest.
+    forest = root.get("forest")
+    roots = [root.get("tree"), *(forest if type(forest) is list else [])]
+    keys = _declare_node_outcome_keys(keys, roots)
+    return parameters, _declare_interrupt_state_keys(keys, roots, root.get("blackboard"))
 
 
 def check_draft_formulas(
@@ -4138,6 +4661,10 @@ def _validate_program_document(
         scene_resource_ids=scene_resource_ids,
         target_roles=target_roles,
     )
+    blackboard_keys = _declare_node_outcome_keys(blackboard_keys, [root.get("tree")])
+    blackboard_keys = _declare_interrupt_state_keys(
+        blackboard_keys, [root.get("tree")], root.get("blackboard")
+    )
     expressions = ExpressionEnvironment.from_declarations(parameters, blackboard_keys)
     computed_keys = _check_computed_keys(
         blackboard_keys, expressions, path=f"{source}.blackboard.keys"
@@ -4332,6 +4859,29 @@ class Program:
         self.blackboard_keys = MappingProxyType(dict(blackboard_keys))
         self.expressions = expressions
         self.canonical_bytes = canonical
+        self.interrupt_condition_keys = _interrupt_condition_keys(tree)
+        # The global rule ids this Program reads (`interrupt_state.<rule_id>`).
+        self.interrupt_state_rule_ids = tuple(
+            key[len(INTERRUPT_STATE_NAMESPACE) + 1 :]
+            for key in self.blackboard_keys
+            if is_interrupt_state_key(key)
+        )
+
+    def with_interrupt_state_keys(self, rule_ids: Iterable[str]) -> "Program":
+        """This Program plus the reserved ``interrupt_state.<rule_id>`` key of
+        each Applied global rule (contract 64).
+
+        The Runner calls this with the Applied Deployment's global rule ids.
+        Keys the Program itself reads are already declared by validation.
+        """
+
+        keys = dict(self.blackboard_keys)
+        for rule_id in rule_ids:
+            declaration = interrupt_state_declaration(rule_id)
+            keys[declaration.key] = declaration
+        clone = copy(self)
+        clone.blackboard_keys = MappingProxyType(dict(sorted(keys.items())))
+        return clone
 
     def validate_key_value(self, key: str, value: Any, *, path: str) -> None:
         """Validate one value against the declared type of ``key``.
@@ -4372,6 +4922,23 @@ class Program:
         """Return one detached exact v2 authoring document."""
 
         return deepcopy(self._data)
+
+
+def _interrupt_condition_keys(tree: ProgramTreeNode) -> tuple[str, ...]:
+    """The Run's fixed referenced-key union (contract 52, SX-2091): exactly the
+    keys the Program's interrupt conditions name as operands, sorted. A
+    computed key's own dependencies are not included."""
+
+    keys: set[str] = set()
+    pending = [tree]
+    while pending:
+        node = pending.pop()
+        if node.node_id in INTERRUPT_MOTION_NODE_IDS:
+            condition = node.parameters.get("interrupt_condition")
+            if condition is not None:
+                keys |= condition_keys(condition)
+        pending.extend(node.children)
+    return tuple(sorted(keys))
 
 
 def migrate_program_v1(data: dict[str, Any], catalog: NodeCatalog) -> Program:
@@ -4504,6 +5071,26 @@ __all__ = [
     "migrate_program_execution_groups",
     "program_node_policies",
     "program_value_declarations",
+    "INTERRUPT_MOTION_NODE_IDS",
+    "INTERRUPT_STATE_NAMESPACE",
+    "INTERRUPT_STATE_VALUES",
+    "interrupt_state_declaration",
+    "require_interrupt_state_rules",
+    "require_interrupt_key_initials",
+    "require_global_rule_keys",
+    "require_global_rule_operands",
+    "GLOBAL_RULE_KEY_UNDECLARED",
+    "GLOBAL_RULE_STATE_OPERAND_UNSUPPORTED",
+    "INTERRUPT_KEY_INITIAL_REQUIRED",
+    "interrupt_state_key",
+    "is_interrupt_state_key",
+    "NODE_ENDED_OUTCOMES",
+    "NODE_OUTCOME_NAMESPACE",
+    "NODE_OUTCOME_NODE_IDS",
+    "NODE_OUTCOME_NONE",
+    "NODE_OUTCOME_VALUES",
+    "is_node_outcome_key",
+    "node_outcome_key",
     "require_exact_program_binding_node_policies",
     "tree_node_from_dict",
 ]

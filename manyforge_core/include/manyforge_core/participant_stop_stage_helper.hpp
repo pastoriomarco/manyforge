@@ -119,6 +119,21 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
   void BindDispatchedGoal(StopStageDispatchedGoalDTO goal,
                           std::shared_ptr<ExecutionSampleAssociation> association);
 
+  /// Pending moving replacement, recorded in the sole sent-goal list. All
+  /// storage is reserved before the transport call; Record cannot allocate.
+  [[nodiscard]] bool ReserveReplacement(const ExecutionGoalKey& source);
+  void RecordReplacement(ExecutionGoalKey key, TrajectoryDTO trajectory,
+                         std::shared_ptr<ExecutionSampleAssociation> association) noexcept;
+  [[nodiscard]] bool HasPendingReplacement() const;
+  /// The owning participant has exact rejected/no-effect or scoped Stop proof.
+  void RetireSettledReplacement(const ExecutionGoalKey& key) noexcept;
+  [[nodiscard]] bool CanCompleteNaturally(const ExecutionGoalKey& source) const;
+  /// Requests cancellation newest-first for every possibly live retained key.
+  [[nodiscard]] bool CancelLiveGoals();
+  /// Exact supersession/recognition was checked under the participant mutex.
+  /// Swap prebuilt Stop authority and compact only that proven predecessor.
+  void AdoptReplacement(std::optional<StopStageDispatchedGoalDTO>& goal) noexcept;
+
   [[nodiscard]] ParticipantStopStageResultDTO TranslateStopStage(
       const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
       std::stop_token cancellation) override;
@@ -137,7 +152,15 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
   [[nodiscard]] std::optional<double> OriginalPathCursor(
       const std::optional<ExecutionControllerSampleDTO>& sample) const;
 
+  [[nodiscard]] ParticipantStopStageResultDTO TranslateStopStageForTakeover(
+      const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+      std::stop_token cancellation, IStopStageSpringReturnObserver& observer) override;
+
  private:
+  [[nodiscard]] ParticipantStopStageResultDTO TranslateStopStageImpl(
+      const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+      std::stop_token cancellation, IStopStageSpringReturnObserver* observer);
+
   struct SentGoal {
     ExecutionGoalKey key;
     TrajectoryDTO trajectory;
@@ -145,6 +168,9 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
     std::optional<StopReplacementCursorMapDTO> cursor_map;
     /// The goal's sample association (Q50; shared by copies).
     std::shared_ptr<ExecutionSampleAssociation> association;
+    bool moving_replacement{false};
+    /// Exact terminal port fact read before the bounded native ring evicts it.
+    std::optional<ExecutionGoalObservationDTO> terminal_observation{};
   };
   struct Run;
 
@@ -175,6 +201,7 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
   /// retained on `run` as the stage's failure.
   template <typename Done>
   bool Await(Run& run, TimePoint deadline, Done&& done);
+  [[nodiscard]] bool CancelGoals(const std::vector<SentGoal>& goals);
   /// Non-terminal sent goals, newest first.
   [[nodiscard]] std::vector<SentGoal> LiveGoals() const;
   /// Next replacement key of the dispatched goal (generation advances).
@@ -190,7 +217,7 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
   mutable std::mutex mutex_;
   std::optional<StopStageDispatchedGoalDTO> goal_;
   /// The dispatched goal followed by every Stop replacement sent for it.
-  std::vector<SentGoal> sent_;
+  mutable std::vector<SentGoal> sent_;
 };
 
 }  // namespace manyforge::core

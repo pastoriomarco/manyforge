@@ -202,6 +202,8 @@ build_manyforge_headless() {
     cd "$build"
     cmake "$WORKSPACE/manyforge_headless" -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=ON \
+        -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
+        -DMANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL=ON \
         -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
         -Dpybind11_DIR="$pybind11_cmake_dir" \
         -DMANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="$ros_execution_host" \
@@ -222,6 +224,8 @@ setup_expression_binding() {
         )"
         cmake -S "$WORKSPACE/manyforge_headless" -B "$build" -G "$BUILD_GENERATOR" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
+            -DMANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL=ON \
             -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
             -Dpybind11_DIR="$pybind11_cmake_dir" 2>&1 | tail -3
     fi
@@ -588,6 +592,7 @@ run_python_tests() {
     if pytest \
         manyforge_behavior/tests/ \
         manyforge_operator/tests/ \
+        scripts/qualification/tests/ \
         tests/composable_cell_i4/ \
         tests/test_benchmark.py \
         tests/test_public_contract_entrypoint_reconciliation.py \
@@ -809,6 +814,7 @@ run_ros_tests() {
 UI6I_ROS_PROCESS_TESTS=(
     manyforge_headless_api/process_tests/test_ui6i_grouped_execution.py
     manyforge_headless_api/process_tests/test_operator_alarm_motion_attention.py
+    manyforge_headless_api/process_tests/test_interrupt_signal_nodes_process.py
 )
 
 run_ros_e2e_tests() {
@@ -842,6 +848,8 @@ run_ros_e2e_tests() {
     pybind11_cmake_dir="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"
     if ! cmake -S "$WORKSPACE/manyforge_headless" -B "$headless" -G "$BUILD_GENERATOR" \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+            -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
+            -DMANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL=ON \
             -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON -Dpybind11_DIR="$pybind11_cmake_dir" \
             -DMANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="$ros_build/manyforge_ros2_control_execution_host" \
             -DMANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" \

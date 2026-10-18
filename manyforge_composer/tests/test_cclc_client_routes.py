@@ -27,6 +27,7 @@ def _lifecycle_body() -> dict[str, Any]:
         "expected_component_lifecycle_generation": 4,
         "expected_control_domains": [
             {
+                "kind": "controller",
                 "control_domain_id": "domain.arm",
                 "control_domain_revision": "domain.revision.1",
                 "controller_topology_id": "topology.arm",

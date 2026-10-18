@@ -237,7 +237,15 @@ def _controllable_composition_change_kinds(
                     or not row["component_id"]
                     or not isinstance(row.get("component_profile_id"), str)
                     or not row["component_profile_id"]
-                    or not isinstance(row.get("model_source"), dict)
+                    or not (
+                        isinstance(row.get("model_source"), dict)
+                        or (
+                            "model_source" not in row
+                            and isinstance(row.get("configuration"), dict)
+                            and row["configuration"].get("runtime_kind")
+                            == "io_provider"
+                        )
+                    )
                     or row["component_id"] in indexed
                 ):
                     return None
@@ -273,7 +281,7 @@ def _controllable_composition_change_kinds(
             new = new_by_id[component_id]
             if old["component_profile_id"] != new["component_profile_id"]:
                 changed.add("controllable_components")
-            if old["model_source"] != new["model_source"]:
+            if old.get("model_source") != new.get("model_source"):
                 changed.add("model_instances")
             # The authoring envelope leaves profile configuration and target
             # extensions opaque. A generic Draft edit cannot prove that one of

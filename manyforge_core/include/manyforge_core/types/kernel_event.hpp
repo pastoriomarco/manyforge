@@ -1,13 +1,13 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <functional>
-#include <map>
-#include <string>
-
-#include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/execution_status.hpp>
+#include <manyforge_core/types/recovery.hpp>
+#include <map>
+#include <optional>
+#include <string>
 
 namespace manyforge::core {
 
@@ -114,6 +114,10 @@ struct KernelEvent {
 
   /// For kParticipantSettled: the participant's fact about the ended execution.
   std::optional<ParticipantExecutionFact> participant_fact = std::nullopt;
+
+  /// Original local-failure proof, captured before dispatching its event.
+  /// Current recovery authority is still rechecked by the addressed owner.
+  std::optional<MotionRetryEligibilityDTO> retry_eligibility = std::nullopt;
 };
 
 /// Event callback type. Must be thread-safe.

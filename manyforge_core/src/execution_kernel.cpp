@@ -1,3 +1,4 @@
+#include <manyforge_core/io_rule_stop_response.hpp>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -21,6 +22,10 @@
 #include <manyforge_core/motion_target_resolution.hpp>
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
+#include <manyforge_core/stop_terminal_reducer.hpp>
+#include <manyforge_core/types/spring_back_return_point.hpp>
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
+#include <manyforge_core/trajectory/trajectory_splice.hpp>
 #include <manyforge_core/types/error_code_mapping.hpp>
 #include <manyforge_core/types/kernel_event_factories.hpp>
 #include <manyforge_core/types/reason_codes.hpp>
@@ -30,6 +35,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -38,6 +44,15 @@ namespace {
 
 [[nodiscard]] bool resolved_scale_target_matches(const ResolvedRuntimeScaleCommandDTO& command,
                                                  const ResolvedExecutionBindingDTO& binding);
+
+std::optional<std::int64_t> motion_replacement_elapsed_ns(std::int64_t now,
+                                                          std::int64_t started) noexcept {
+  if (now < started) return std::nullopt;
+  const auto elapsed = static_cast<std::uint64_t>(now) - static_cast<std::uint64_t>(started);
+  if (elapsed > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+    return std::nullopt;
+  return static_cast<std::int64_t>(elapsed);
+}
 
 void resolve_motion_execution_timeout(ExecuteRequestDTO& request, const TrajectoryDTO& trajectory) {
   if (!request.trajectory_relative_timeout) return;
@@ -719,6 +734,11 @@ struct ExecutionKernel::PlanningSuccess final {
   PlanResultDTO result;
 };
 
+struct ExecutionKernel::ValidatedMotionPlan final {
+  PlanningSuccess planning;
+  CollisionValidationSuccess validation;
+};
+
 enum class PreparedMotionDispatchGate : std::uint8_t {
   kOpen = 0,
   kFencedBeforeDispatch,
@@ -743,6 +763,53 @@ struct ExecutionKernel::PreparedMotionSession final {
   std::atomic<PreparedMotionDispatchGate> dispatch_gate{PreparedMotionDispatchGate::kOpen};
   bool dispatch_requested{};
   bool cancel_requested{};
+  bool conclusive_collision_failure{};
+
+  // Only a replacement session uses these staged values. The existing worker
+  // remains the sole physical observer/presenter throughout computation.
+  std::int64_t preparation_started_ns{};
+  std::int64_t preparation_deadline_ns{};
+  bool preparation_completed{};
+  bool worker_parked{};
+  bool replacement_failure_notified{};
+  std::stop_source replacement_cancellation;
+  std::shared_ptr<CollisionCancellationToken> replacement_validation_cancellation;
+  std::unique_ptr<ActiveMotionExecution> replacement_execution;
+  std::unique_ptr<ExecutionCorrelationTracker> replacement_correlation;
+  std::shared_ptr<const TrajectoryDTO> replacement_collision_trajectory;
+  std::optional<RuntimeCollisionLookaheadSession::PreparedArm> replacement_lookahead_arm;
+  std::optional<RuntimeCollisionStateProjection> replacement_projection;
+  std::optional<PreparedMotionReplacementObservationDTO> replacement_observation;
+  std::optional<StopCertificateRefDTO> spring_activation_certificate;
+
+  // Plain work/result under this session's existing task and cancellation.
+  // None of these fields are backend membership or physical effect proof.
+  struct SpringColdProduct final {
+    ResolvedPreparedMotionExecutionRequestDTO authority;
+    std::uint64_t reserved_execution_id{};
+    ResolvedPreparedMotionExecutionStateDTO state{
+        ResolvedPreparedMotionExecutionStateDTO::kPreparing};
+    std::shared_ptr<const PreparedOperationParticipantDTO> participant;
+    std::unique_ptr<ActiveMotionExecution> execution;
+    std::shared_ptr<const TrajectoryDTO> collision_trajectory;
+    std::optional<ErrorDTO> error;
+    bool cancelled{};
+  };
+  std::optional<SpringColdProduct> spring_cold_product;
+  struct SpringPromotionReceipt final {
+    std::uint64_t abandoned_id{};
+    std::uint64_t promoted_id{};
+    StopCertificateRefDTO certificate;
+  };
+  std::optional<SpringPromotionReceipt> spring_promotion_receipt;
+
+  /// Caller holds mutex. The failed execution fact is checked by the caller.
+  [[nodiscard]] bool never_dispatched_for(std::uint64_t expected_execution_id) const {
+    return execution_id == expected_execution_id && !dispatch_requested &&
+           !last_dispatched_participant &&
+           (state == ResolvedPreparedMotionExecutionStateDTO::kPreparing ||
+            state == ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed);
+  }
 };
 
 ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts ports,
@@ -878,6 +945,10 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts 
 }
 
 ExecutionKernel::~ExecutionKernel() {
+  if (replacement_preparation_thread_.joinable()) {
+    replacement_preparation_thread_.request_stop();
+    replacement_preparation_thread_.join();
+  }
   // Retire the lower-priority lookahead workers while every kernel authority
   // they may call is still alive. Relying on member destruction order would
   // permit a final result callback into partially torn-down state.
@@ -995,6 +1066,26 @@ bool ExecutionKernel::settle_execution(const std::uint64_t exec_id, const std::s
                     {{"reason", reason},
                      {"participant_fact", to_string(kind)},
                      {"participant_effect", to_string(effect)}}};
+  if (kind == ParticipantExecutionFactKind::kLocalFailure) {
+    RecoveryAuthorityCapture failed;
+    failed.execution_id = exec_id;
+    failed.execution_state = ExecutionState::kFailed;
+    failed.failed_execution_effect = effect;
+    if (error.has_value()) failed.failed_validation_code = error->code;
+    std::shared_ptr<PreparedMotionSession> session;
+    {
+      std::lock_guard lock(prepared_motion_session_mutex_);
+      session = active_prepared_motion_session_;
+    }
+    if (session) {
+      std::lock_guard lock(session->mutex);
+      failed.failed_preparation_never_dispatched = session->never_dispatched_for(exec_id);
+      failed.failed_validation_conclusive_collision =
+          failed.failed_preparation_never_dispatched && session->conclusive_collision_failure;
+    }
+    failed.failed_validation_retryable = failed.failed_preparation_never_dispatched;
+    event.retry_eligibility = planning_retry_eligibility(failed);
+  }
   event.participant_fact = std::move(fact);
   emit_event(std::move(event));
   return true;
@@ -1896,15 +1987,31 @@ void ExecutionKernel::clear_runtime_collision_state_projection() {
 
 void ExecutionKernel::finish_execute_worker() {
   worker_signals_.mark_complete();
+  schedule_recovery_assessment_refresh("terminal_cleanup_completed");
 }
 
-Result<void> ExecutionKernel::retire_prepared_motion_membership() {
+Result<void> ExecutionKernel::retire_prepared_motion_membership(
+    const PreparedMotionSession* preserve_pending) {
   // Called with lifecycle serialization after the execution worker has joined
   // and the owning cleanup has established settlement. Never a Stop callback.
   std::shared_ptr<PreparedMotionSession> session;
   {
     std::lock_guard lock(prepared_motion_session_mutex_);
     session = active_prepared_motion_session_;
+  }
+  std::shared_ptr<PreparedMotionSession> pending;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    pending = pending_prepared_motion_session_;
+  }
+  if (pending && pending.get() != preserve_pending) {
+    if (pending->backend_prepare_result &&
+        pending->backend_prepare_result->state == PrepareParticipantResultStateDTO::kPrepared) {
+      const auto retired_pending = execution_backend_.RetirePreparedExecution(pending->execution_id);
+      if (!retired_pending.ok()) return retired_pending;
+    }
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    if (pending_prepared_motion_session_ == pending) pending_prepared_motion_session_.reset();
   }
   if (!session) return Result<void>::Ok();
   const auto retired = execution_backend_.RetirePreparedExecution(session->execution_id);
@@ -1931,9 +2038,17 @@ bool ExecutionKernel::retire_execute_worker(std::unique_lock<std::mutex>& lifecy
   }
 
   lifecycle_worker_retirement_in_progress_.store(true, std::memory_order_release);
+  {
+    std::lock_guard owner_lock(prepared_motion_session_mutex_);
+    if (pending_prepared_motion_session_) {
+      pending_prepared_motion_session_->replacement_cancellation.request_stop();
+    }
+  }
+  if (replacement_preparation_thread_.joinable()) replacement_preparation_thread_.request_stop();
   worker_thread_.request_stop();
   worker_signals_.notify();
   lifecycle_lock.unlock();
+  if (replacement_preparation_thread_.joinable()) replacement_preparation_thread_.join();
   worker_thread_.join();
   lifecycle_lock.lock();
   certified_containment_retirement_.store(false, std::memory_order_release);
@@ -2001,6 +2116,15 @@ ExecutionKernel::ExecuteWorkerPlanPhaseResult ExecutionKernel::execute_worker_pl
     return result;
   }
 
+  if (prepared_session && prepared_session->authority.replacement &&
+      prepared_session->authority.replacement->spring_return) {
+    std::lock_guard lock(prepared_session->mutex);
+    const auto& motion = std::get<PreparedMotionExecutionDTO>(prepared_session->participant->payload);
+    result.trajectory = motion.trajectory;
+    result.plan_request = motion.plan_request;
+    result.planning_result = motion.planning_evidence.planning_result;
+    return result;
+  }
   const bool cache_hit = cached_trajectory.has_value();
   result.active_trajectory_from_cache = cache_hit;
   result.cache_revalidation_candidate = cache_hit && cache_revalidation_candidate;
@@ -2139,12 +2263,38 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     ActiveMotionExecution& motion_state,
     const std::shared_ptr<PreparedMotionSession>& prepared_session) {
   ExecuteWorkerValidationPhaseResult phase_result;
+  if (prepared_session && prepared_session->authority.replacement &&
+      prepared_session->authority.replacement->spring_return) {
+    {
+      std::lock_guard lock(prepared_session->mutex);
+      const auto& motion = std::get<PreparedMotionExecutionDTO>(prepared_session->participant->payload);
+      phase_result.collision_world_revision = motion.validation_evidence.collision_world_revision;
+      phase_result.validation_evidence = motion.validation_evidence;
+      phase_result.scene_snapshot_lease = scene_snapshot_lease;
+      phase_result.collision_trajectory = prepared_session->replacement_collision_trajectory;
+    }
+    const TrajectoryDTO missing_curve;
+    auto projection = build_runtime_collision_state_projection(
+        trajectory, phase_result.collision_trajectory ? *phase_result.collision_trajectory
+                                                     : missing_curve);
+    if (!projection.ok()) {
+      emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {},
+                  projection.error(), {}});
+      settle_local_failure(request, exec_id, motion_state, projection.error(),
+                           ParticipantEffectKnowledge::kNoEffect, "validation_failed");
+      phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
+      return phase_result;
+    }
+    set_runtime_collision_state_projection(std::move(projection.value()));
+    return phase_result;
+  }
   const int max_authoritative_validation_attempts =
       std::max(cache_revalidation_candidate ? 2 : 1,
                1 + config_.authoritative_validation_collision_replan_attempts);
   int authoritative_validation_attempt = 0;
   Result<CollisionValidationSuccess> val_result =
       Result<CollisionValidationSuccess>::Err(ErrorCode::kInternalError);
+  bool conclusive_collision_failure = false;
   while (true) {
     emit_event({KernelEventType::kValidationStarted,
                 exec_id,
@@ -2155,8 +2305,9 @@ ExecutionKernel::execute_worker_validate_replan_phase(
                 {{"attempt_index", std::to_string(authoritative_validation_attempt)},
                  {"max_attempts", std::to_string(max_authoritative_validation_attempts)}}});
 
-    val_result = validate_trajectory(trajectory, request, scene_snapshot_lease_inventory,
-                                     scene_snapshot_lease);
+    val_result =
+        validate_trajectory(trajectory, request, scene_snapshot_lease_inventory,
+                            scene_snapshot_lease, nullptr, {}, &conclusive_collision_failure);
     if (finalize_prepared_motion_cancellation_if_requested(
             prepared_session, request, exec_id, motion_state,
             "prepared_motion_cancelled_during_validation")) {
@@ -2361,6 +2512,10 @@ ExecutionKernel::execute_worker_validate_replan_phase(
   }
 
   if (!val_result.ok()) {
+    if (prepared_session) {
+      std::lock_guard lock(prepared_session->mutex);
+      prepared_session->conclusive_collision_failure = conclusive_collision_failure;
+    }
     emit_contact_policy_violation_event(exec_id, val_result.error().details);
     emit_event({KernelEventType::kValidationFailed,
                 exec_id,
@@ -2483,7 +2638,6 @@ ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worke
     phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
     return true;
   };
-
   if (collision_world_revision_is_set(validation_world_revision)) {
     if (scene_snapshot_lease.has_value()) {
       auto validation_context = current_scene_snapshot_lease_validation_context();
@@ -2819,22 +2973,19 @@ void ExecutionKernel::execute_worker_finalize_phase(const ExecuteRequestDTO& req
 }
 
 Result<std::shared_ptr<const PreparedOperationParticipantDTO>>
-ExecutionKernel::make_and_prepare_motion_participant(
+ExecutionKernel::assemble_prepared_motion_participant(
+    const ResolvedPreparedMotionExecutionRequestDTO& authority,
     const ExecuteRequestDTO& request, const TrajectoryDTO& trajectory,
-    const ExecuteWorkerPlanPhaseResult& plan_phase,
-    const ExecuteWorkerValidationPhaseResult& validation_phase,
-    const std::shared_ptr<PreparedMotionSession>& prepared_session) {
+    const PlanRequestDTO& plan_request, const PlanResultDTO& planning_result,
+    const PreparedMotionValidationEvidenceDTO& validation_evidence) {
   const auto reject = [](std::string reason, std::string message) {
     return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(
         ErrorDTO{kErrorExecutionRejected, std::move(message), {{"reason", std::move(reason)}}});
   };
-  if (!prepared_session || !plan_phase.plan_request || !plan_phase.planning_result ||
-      !validation_phase.validation_evidence) {
-    return reject("prepared_motion_evidence_incomplete",
-                  "Prepared motion is missing planning or validation evidence");
+  if (!authority.ordinary_stop_plan) {
+    return reject("ordinary_stop_plan_missing",
+                  "Prepared motion requires the retained ordinary Stop plan");
   }
-
-  const auto& authority = prepared_session->authority;
   const auto& binding = authority.binding.value();
   if (!binding.control_path) {
     return reject("prepared_motion_control_path_missing",
@@ -2842,40 +2993,79 @@ ExecutionKernel::make_and_prepare_motion_participant(
   }
   const auto& path = *binding.control_path;
 
-  PlanRequestDTO canonical_plan_request = *plan_phase.plan_request;
+  PlanRequestDTO canonical_plan_request = plan_request;
   canonical_plan_request.retained_collision_world.reset();
   canonical_plan_request.retained_collision_policy.reset();
 
   std::vector<PreparedMotionInterruptScopeDTO> prepared_scopes;
   prepared_scopes.reserve(request.motion_interrupt_scopes.size());
+  if (authority.interrupt_scope_actions.size() != request.motion_interrupt_scopes.size())
+    return reject("prepared_motion_interrupt_action_missing",
+                  "Every prepared interrupt scope requires its admitted sealed action");
   for (const auto& scope : request.motion_interrupt_scopes) {
-    if (!scope.stop_profile) {
-      return reject("prepared_motion_interrupt_stop_profile_missing",
-                    "Every prepared motion interrupt scope requires its exact Stop profile");
+    const auto action = std::find_if(
+        authority.interrupt_scope_actions.begin(), authority.interrupt_scope_actions.end(),
+        [&](const auto& value) { return value.scope_id.value() == scope.scope_id; });
+    if (action == authority.interrupt_scope_actions.end() ||
+        std::count_if(
+            authority.interrupt_scope_actions.begin(), authority.interrupt_scope_actions.end(),
+            [&](const auto& value) { return value.scope_id.value() == scope.scope_id; }) != 1)
+      return reject("prepared_motion_interrupt_action_missing",
+                    "Interrupt action membership is invalid");
+    const bool desired =
+        action->preemption_action == InterruptPreemptionAction::kCompleteMoveOnSignal;
+    const bool fault = action->preemption_action == InterruptPreemptionAction::kPreemptTrajectory;
+    if ((!desired && !fault) || (desired != scope.stop_profile.has_value()) ||
+        (fault && action->success_through_stage_id))
+      return reject("prepared_motion_interrupt_stop_profile_invalid",
+                    "Interrupt profile does not match its admitted action");
+    if (desired) {
+      const auto mode = ValidateIoRuleNominalStopMode(
+          authority.stop_readiness.value().resolved_stop_base_plan, *scope.stop_profile);
+      if (!mode.ok())
+        return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(mode.error());
     }
-    PreparedParticipantStopPlanContextDTO stop_context{
-        request.binding.operation_id,
-        authority.operation_revision,
-        request.binding.participant_id,
-        request.binding.program_id,
-        request.binding.program_revision,
-        request.binding.program_binding_id,
-        request.binding.program_run_id,
-        scope.stop_profile,
-        ParticipantStopProfilePurposeDTO::kMotionInterruptScope,
-        scope.scope_id,
-        scope.node_category};
-    auto stop_plan =
-        MakePreparedParticipantStopPlan(authority.stop_readiness.value().resolved_stop_base_plan,
-                                        std::move(stop_context), binding.resources,
-                                        authority.retained_default_stop_limits);
-    if (!stop_plan.ok()) {
+    auto stop_plan = [&]() -> Result<PreparedParticipantStopPlanDTO> {
+      if (fault) {
+        if (!authority.ordinary_stop_plan)
+          return Result<PreparedParticipantStopPlanDTO>::Err(
+              ErrorDTO{"invalid_request",
+                       "Fault scope has no ordinary Stop plan",
+                       {{"reason", "prepared_motion_interrupt_stop_plan_missing"}}});
+        return Result<PreparedParticipantStopPlanDTO>::Ok(*authority.ordinary_stop_plan);
+      }
+      PreparedParticipantStopPlanContextDTO stop_context{
+          request.binding.operation_id,
+          authority.operation_revision,
+          request.binding.participant_id,
+          request.binding.program_id,
+          request.binding.program_revision,
+          request.binding.program_binding_id,
+          request.binding.program_run_id,
+          scope.stop_profile,
+          ParticipantStopProfilePurposeDTO::kMotionInterruptScope,
+          scope.scope_id,
+          scope.node_category};
+      return MakePreparedParticipantStopPlan(
+          authority.stop_readiness.value().resolved_stop_base_plan, std::move(stop_context),
+          binding.resources, authority.retained_default_stop_limits);
+    }();
+    if (!stop_plan.ok())
       return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(stop_plan.error());
-    }
+    const auto entry =
+        ResolvePreparedIoRuleStopEntry(stop_plan.value(), action->stop_entry_stage_id);
+    if (!entry.ok())
+      return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(entry.error());
+    const auto success_through = ResolvePreparedIoRuleSuccessThrough(
+        stop_plan.value(), entry.value(), action->success_through_stage_id);
+    if (!success_through.ok())
+      return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(
+          success_through.error());
     prepared_scopes.push_back(PreparedMotionInterruptScopeDTO{
         MotionInterruptScopeId(scope.scope_id), InterruptPolicyId(scope.policy_id),
-        scope.activation_mode, scope.arm_timeout_ns, scope.result_binding_key, scope.required,
-        *scope.stop_profile, scope.node_category, scope.metadata, std::move(stop_plan.value())});
+        scope.activation_mode, scope.arm_timeout_ns, scope.required, scope.stop_profile,
+        scope.node_category, scope.metadata, std::move(stop_plan.value()),
+        action->preemption_action, entry.value(), success_through.value()});
   }
   std::sort(prepared_scopes.begin(), prepared_scopes.end(),
             [](const auto& lhs, const auto& rhs) { return lhs.scope_id < rhs.scope_id; });
@@ -2901,11 +3091,10 @@ ExecutionKernel::make_and_prepare_motion_participant(
       MoveId(request.move_id),
       std::move(canonical_plan_request),
       trajectory,
-      plan_phase.plan_request->start_state,
-      PreparedMotionPlanningEvidenceDTO{*plan_phase.planning_result,
-                                        plan_phase.plan_request->planning_attempt_index,
-                                        plan_phase.plan_request->planner_capability_binding},
-      *validation_phase.validation_evidence,
+      plan_request.start_state,
+      PreparedMotionPlanningEvidenceDTO{planning_result, plan_request.planning_attempt_index,
+                                        plan_request.planner_capability_binding},
+      validation_evidence,
       std::move(contact_policy),
       authority.requested_tcp_linear_speed_mps,
       authority.deployment_maximum_tcp_linear_speed_mps,
@@ -2985,11 +3174,11 @@ ExecutionKernel::make_and_prepare_motion_participant(
   if (!made.ok()) {
     return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(made.error());
   }
-  if (made.value().ordinary_stop_plan != *authority.ordinary_stop_plan) {
+  if (made.value().controller().ordinary_stop_plan != *authority.ordinary_stop_plan) {
     return reject("prepared_motion_ordinary_stop_plan_mismatch",
                   "Prepared participant changed the owner-issued ordinary Stop plan");
   }
-  if (made.value().fault_stop_plan !=
+  if (made.value().controller().fault_stop_plan !=
       (authority.fault_stop_plan
            ? std::optional<PreparedParticipantStopPlanDTO>{*authority.fault_stop_plan}
            : std::nullopt)) {
@@ -3005,10 +3194,44 @@ ExecutionKernel::make_and_prepare_motion_participant(
                   "Prepared participant allocation failed before backend Prepare");
   }
 
+  return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Ok(std::move(participant));
+}
+
+Result<std::shared_ptr<const PreparedOperationParticipantDTO>>
+ExecutionKernel::make_and_prepare_motion_participant(
+    const ExecuteRequestDTO& request, const TrajectoryDTO& trajectory,
+    const ExecuteWorkerPlanPhaseResult& plan_phase,
+    const ExecuteWorkerValidationPhaseResult& validation_phase,
+    const std::shared_ptr<PreparedMotionSession>& prepared_session) {
+  const auto reject = [](std::string reason, std::string message) {
+    return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(
+        ErrorDTO{kErrorExecutionRejected, std::move(message), {{"reason", std::move(reason)}}});
+  };
+  if (!prepared_session || !plan_phase.plan_request || !plan_phase.planning_result ||
+      !validation_phase.validation_evidence) {
+    return reject("prepared_motion_evidence_incomplete",
+                  "Prepared motion is missing planning or validation evidence");
+  }
+  auto assembled = assemble_prepared_motion_participant(
+      prepared_session->authority, request, trajectory, *plan_phase.plan_request,
+      *plan_phase.planning_result, *validation_phase.validation_evidence);
+  if (!assembled.ok()) return assembled;
+  auto participant = std::move(assembled.value());
+  const bool cold_reuse = prepared_session->authority.replacement &&
+                         prepared_session->authority.replacement->spring_return;
+  if (cold_reuse && (!prepared_session->participant ||
+      prepared_session->participant->prepared_contract_digest != participant->prepared_contract_digest))
+    return reject("spring_return_sealed_product_changed",
+                  "Cold activation changed its retained planning or validation evidence");
+
   Result<PrepareParticipantResultDTO> backend_result = [&]() {
     try {
       return Result<PrepareParticipantResultDTO>::Ok(
-          execution_backend_.Prepare(*participant, prepared_session->execution_id));
+          prepared_session->authority.replacement && !cold_reuse
+              ? execution_backend_.PrepareReplacement(
+                    *participant, prepared_session->execution_id,
+                    prepared_session->authority.replacement->source)
+              : execution_backend_.Prepare(*participant, prepared_session->execution_id));
     } catch (const std::exception& error) {
       return MakePrepareParticipantResult(
           *participant, PrepareParticipantResultStateDTO::kRejected,
@@ -3048,15 +3271,27 @@ ExecutionKernel::make_and_prepare_motion_participant(
 }
 
 void ExecutionKernel::async_execute_worker(
-    std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,
+    std::stop_token st, ExecuteRequestDTO initial_request, uint64_t initial_exec_id,
     std::optional<TrajectoryDTO> cached_trajectory, bool cache_revalidation_candidate,
-    RetainedSceneSnapshotLease retained_scene,
-    std::optional<SceneSnapshotLease> scene_snapshot_lease,
-    std::shared_ptr<PreparedMotionSession> prepared_session) {
-  // Worker-local motion-execution state. Lives on this stack frame so two
-  // overlapping workers (should never happen under the lifecycle mutex, but
-  // defense in depth) cannot share state.
-  ActiveMotionExecution motion_state;
+    RetainedSceneSnapshotLease initial_retained_scene,
+    std::optional<SceneSnapshotLease> initial_scene_snapshot_lease,
+    std::shared_ptr<PreparedMotionSession> initial_prepared_session) {
+  // The existing physical worker owns one current context. Candidate planning
+  // never replaces this context until the worker reaches a handover safe point.
+  ActiveMotionExecution motion_state(std::move(initial_request));
+  motion_state.execution_id = initial_exec_id;
+  motion_state.retained_scene = std::move(initial_retained_scene);
+  motion_state.scene_snapshot_lease = std::move(initial_scene_snapshot_lease);
+  motion_state.prepared_session = std::move(initial_prepared_session);
+  auto& request = motion_state.request;
+  auto& exec_id = motion_state.execution_id;
+  auto& retained_scene = motion_state.retained_scene;
+  auto& scene_snapshot_lease = motion_state.scene_snapshot_lease;
+  auto& prepared_session = motion_state.prepared_session;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    active_motion_execution_ = &motion_state;
+  }
   struct WorkerCompletionGuard {
     ExecutionKernel* self;
     ActiveMotionExecution& motion_state;
@@ -3106,6 +3341,11 @@ void ExecutionKernel::async_execute_worker(
       if (motion_state.execution_progress_generation != 0) {
         self->execution_backend_.retire_execution_progress_generation(
             motion_state.execution_progress_generation);
+      }
+      {
+        std::lock_guard lock(self->prepared_motion_session_mutex_);
+        if (self->active_motion_execution_ == &motion_state)
+          self->active_motion_execution_ = nullptr;
       }
       // Completion is the quiescence boundary observed by reset, tests, and
       // callers. Release every worker-owned scene authority handle before
@@ -3233,25 +3473,30 @@ void ExecutionKernel::async_execute_worker(
       prepared_session->last_dispatched_participant = prepared_session->participant;
       prepared_session->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
     }
-    auto execution_handle = std::move(dispatch_phase.execution_handle);
+    motion_state.execution_handle = std::move(dispatch_phase.execution_handle);
+    auto& execution_handle = motion_state.execution_handle;
     motion_state.execution_progress_generation = execution_handle.execution_generation;
-    const auto exec_start_ns = dispatch_phase.exec_start_ns;
-    int64_t exec_timeout_ns = dispatch_phase.exec_timeout_ns;
-    core::ExecutionSnapshot latest_backend_snapshot =
-        std::move(dispatch_phase.latest_backend_snapshot);
+    motion_state.exec_start_ns = dispatch_phase.exec_start_ns;
+    motion_state.exec_timeout_ns = dispatch_phase.exec_timeout_ns;
+    motion_state.latest_backend_snapshot = std::move(dispatch_phase.latest_backend_snapshot);
+    auto& exec_start_ns = motion_state.exec_start_ns;
+    auto& exec_timeout_ns = motion_state.exec_timeout_ns;
+    auto& latest_backend_snapshot = motion_state.latest_backend_snapshot;
 
-    int64_t last_runtime_scale_sample_ns = exec_start_ns;
-    double runtime_scaled_execution_ns = 0.0;
+    motion_state.last_runtime_scale_sample_ns = exec_start_ns;
+    auto& last_runtime_scale_sample_ns = motion_state.last_runtime_scale_sample_ns;
+    auto& runtime_scaled_execution_ns = motion_state.runtime_scaled_execution_ns;
     // Optional user-set zero-speed hold timeout (item 40). Unset keeps
     // `main`: a hold at zero speed never ends the motion.
-    const int64_t zero_speed_hold_timeout_ns =
+    motion_state.zero_speed_hold_timeout_ns =
         request.timeouts.zero_speed_hold_timeout_s.has_value()
             ? static_cast<int64_t>(*request.timeouts.zero_speed_hold_timeout_s * 1e9)
             : 0;
+    auto& zero_speed_hold_timeout_ns = motion_state.zero_speed_hold_timeout_ns;
     // Start of the current continuous zero-speed hold, when holding.
-    bool zero_speed_holding = false;
-    int64_t zero_speed_hold_started_ns = 0;
-    bool zero_speed_hold_stop_requested = false;
+    auto& zero_speed_holding = motion_state.zero_speed_holding;
+    auto& zero_speed_hold_started_ns = motion_state.zero_speed_hold_started_ns;
+    auto& zero_speed_hold_stop_requested = motion_state.zero_speed_hold_stop_requested;
     while (true) {
       if (st.stop_requested()) {
         // Retirement after certified containment (or Kernel teardown).
@@ -3269,6 +3514,7 @@ void ExecutionKernel::async_execute_worker(
         motion_state.record_terminal(std::nullopt);
         return;
       }
+      if (service_motion_replacement(st, motion_state)) continue;
       bool completed = true;
       if (execution_handle.wait_for_completion) {
         completed = execution_handle.wait_for_completion(kExecutionPollNs);
@@ -3548,12 +3794,7 @@ ExecutionKernel::failed_preparation_never_dispatched_locked() {
   }
   if (!session) return nullptr;
   std::lock_guard lock(session->mutex);
-  const bool never_dispatched =
-      session->execution_id == status.execution_id && !session->dispatch_requested &&
-      !session->last_dispatched_participant &&
-      (session->state == ResolvedPreparedMotionExecutionStateDTO::kPreparing ||
-       session->state == ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed);
-  return never_dispatched ? session : nullptr;
+  return session->never_dispatched_for(status.execution_id) ? session : nullptr;
 }
 
 bool ExecutionKernel::failed_preparation_settled_locked() {
@@ -3588,6 +3829,42 @@ struct ExecutionKernel::LifecyclePreemption final {
  private:
   ExecutionKernel& owner_;
 };
+
+Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_motion_plan(
+    const ExecuteRequestDTO& request, CollisionWorldLeaseInventory& projection_inventory,
+    const RobotStateDTO& start_state, const std::uint32_t planning_attempt_index,
+    const std::int64_t planning_start_ns, const std::int64_t planning_timeout_ns,
+    const std::stop_token stop_token,
+    std::shared_ptr<CollisionCancellationToken> validation_cancellation,
+    const std::optional<std::uint64_t> validation_execution_id,
+    const MovingReplacementInputDTO* replacement) {
+  const auto reject = [](const ErrorCode code, std::string message, std::string reason) {
+    return Result<ValidatedMotionPlan>::Err(ErrorDTO{
+        std::string(to_string(code)), std::move(message), {{"reason", std::move(reason)}}});
+  };
+  auto planned = plan_trajectory_with_evidence(request, projection_inventory,
+                                               planning_attempt_index, &start_state, replacement);
+  if ((clock_.now() - planning_start_ns) >= planning_timeout_ns) {
+    return reject(ErrorCode::kPlanningTimeout, "Motion preview planning timed out",
+                  "motion_preview_planning_timeout");
+  }
+  if (stop_token.stop_requested()) {
+    return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during planning",
+                  "motion_preview_cancelled");
+  }
+  if (!planned.ok()) return Result<ValidatedMotionPlan>::Err(planned.error());
+
+  auto validated = validate_trajectory(
+      *planned.value().result.trajectory, request, projection_inventory, std::nullopt,
+      &start_state, stop_token, nullptr, std::move(validation_cancellation), validation_execution_id, replacement);
+  if (stop_token.stop_requested()) {
+    return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during validation",
+                  "motion_preview_cancelled");
+  }
+  if (!validated.ok()) return Result<ValidatedMotionPlan>::Err(validated.error());
+  return Result<ValidatedMotionPlan>::Ok(
+      ValidatedMotionPlan{std::move(planned.value()), std::move(validated.value())});
+}
 
 Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
     ExecuteRequestDTO request, CollisionWorldLeaseInventory projection_inventory,
@@ -3695,31 +3972,12 @@ Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
   } timeout_guard{scheduler_, planning_timeout_handle};
 
   try {
-    auto planned =
-        plan_trajectory(request, projection_inventory, planning_attempt_index, &start_state);
-    const bool planning_timed_out = clock_.now() - planning_start_ns >= planning_timeout_ns;
-    if (planning_timed_out) {
-      return reject(ErrorCode::kPlanningTimeout, "Motion preview planning timed out",
-                    "motion_preview_planning_timeout");
-    }
-    if (stop_token.stop_requested()) {
-      return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during planning",
-                    "motion_preview_cancelled");
-    }
-    if (!planned.ok()) {
-      return Result<MotionPreviewResultDTO>::Err(planned.error());
-    }
-
-    auto trajectory = std::move(planned.value());
-    auto validated = validate_trajectory(trajectory, request, projection_inventory, std::nullopt,
-                                         &start_state, stop_token);
-    if (stop_token.stop_requested()) {
-      return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during validation",
-                    "motion_preview_cancelled");
-    }
-    if (!validated.ok()) {
-      return Result<MotionPreviewResultDTO>::Err(validated.error());
-    }
+    auto computed = compute_validated_motion_plan(
+        request, projection_inventory, start_state, planning_attempt_index,
+        planning_start_ns, planning_timeout_ns, stop_token);
+    if (!computed.ok()) return Result<MotionPreviewResultDTO>::Err(computed.error());
+    auto trajectory = std::move(*computed.value().planning.result.trajectory);
+    auto validated = std::move(computed.value().validation);
 
     RobotStateDTO final_state = start_state;
     if (!trajectory.waypoints.empty()) {
@@ -3740,8 +3998,8 @@ Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
     return Result<MotionPreviewResultDTO>::Ok(MotionPreviewResultDTO{
         std::move(trajectory), std::move(start_state), std::move(final_state),
         std::move(final_controlled_state.value()), std::move(final_tcp_pose.value()),
-        projection_inventory.projection_binding, validated.value().collision_world_revision,
-        validated.value().dynamically_discovered_start_contact_count});
+        projection_inventory.projection_binding, validated.collision_world_revision,
+        validated.dynamically_discovered_start_contact_count});
   } catch (const std::exception& error) {
     return Result<MotionPreviewResultDTO>::Err(
         ErrorDTO{kErrorPlanningFailed,
@@ -3814,6 +4072,10 @@ Result<std::uint64_t> ExecutionKernel::PrepareMotion(
     }
   }
 
+  if (request.replacement && request.replacement->spring_return &&
+      request.replacement->spring_return->abandoned_preparation_id != 0U)
+    return prepare_spring_motion_attachment(std::move(request));
+
   std::shared_ptr<PreparedMotionSession> session;
   try {
     session = std::make_shared<PreparedMotionSession>(std::move(request));
@@ -3823,10 +4085,1124 @@ Result<std::uint64_t> ExecutionKernel::PrepareMotion(
                  "Prepared motion session allocation failed before admission",
                  {{"reason", "prepared_motion_session_allocation_failed"}}});
   }
+  if (session->authority.replacement) return prepare_motion_replacement(std::move(session));
   // Keep the owner stable while evaluating the request reference. Function
   // argument evaluation order must not allow moving `session` before the
   // request argument is formed.
   return execute_impl(session->authority.execution_request, session);
+}
+
+Result<void> ExecutionKernel::qualify_spring_motion_replacement(
+    ResolvedPreparedMotionExecutionRequestDTO& candidate, const PreparedMotionSession& source) {
+  const auto refuse = [](const char* reason) {
+    return Result<void>::Err(
+        ErrorDTO{kErrorExecutionRejected,
+                 "Spring return source is not the exact resident Stop occurrence",
+                 {{"reason", reason}}});
+  };
+  auto& context = *candidate.replacement;
+  if (!context.spring_return || !context.spring_return->stage || !context.spring_return->point ||
+      !source.last_dispatched_participant || source.backend_execution_generation == 0U ||
+      source.state != ResolvedPreparedMotionExecutionStateDTO::kDispatched)
+    return refuse("spring_return_source_unavailable");
+  const auto& stage = *context.spring_return->stage;
+  const auto& point = *context.spring_return->point;
+  const auto& binding = source.authority.execution_request.binding;
+  const auto* motion =
+      std::get_if<PreparedMotionExecutionDTO>(&source.last_dispatched_participant->payload);
+  const auto status = sm_.status();
+  const auto scope_digest = ComputeResolvedParticipantStopScopePolicyDigest(stage);
+  if (!motion || !scope_digest.ok() ||
+      scope_digest.value() != stage.resolved_stop_scope_policy_digest || stage.stage_index != 0U ||
+      stage.operation_id != binding.operation_id ||
+      stage.participant_id != binding.participant_id ||
+      stage.controller_goal_id != binding.controller_goal_id ||
+      stage.controller_goal_generation != binding.controller_goal_generation ||
+      stage.control_binding_id != binding.control_binding_id ||
+      stage.control_binding_revision != binding.control_binding_revision ||
+      stage.participant_stop_plan != source.last_dispatched_participant->controller().ordinary_stop_plan ||
+      point.source_goal !=
+          ExecutionGoalKey{binding.controller_goal_id, binding.controller_goal_generation} ||
+      point.binding_epoch != point.trip.binding_epoch ||
+      status.execution_id != source.execution_id ||
+      addressed_stop_fence_execution_id_.load(std::memory_order_acquire) != source.execution_id ||
+      (!status.fact && status.state != ExecutionState::kExecuting &&
+       status.state != ExecutionState::kStopping))
+    return refuse("spring_return_source_identity_mismatch");
+  if (status.fact &&
+      (status.fact->kind != ParticipantExecutionFactKind::kPreemptedByAddressedStop ||
+       status.fact->effect != ParticipantEffectKnowledge::kEffectSettled))
+    return refuse("spring_return_source_effects_unqualified");
+  const auto& initial = point.initial;
+  const auto& rest = initial.spring_back_return_point;
+  const auto joints = motion->trajectory.joint_names.size();
+  if (initial.joint_names != motion->trajectory.joint_names || joints == 0U ||
+      rest.positions_rad.size() != joints || rest.velocities_rad_s.size() != joints ||
+      rest.accelerations_rad_s2.size() != joints || rest.time_from_start_s != 0.0 ||
+      !std::isfinite(initial.command_path_time_s) || !point.canonical_return_path_time_s ||
+      !std::isfinite(*point.canonical_return_path_time_s) ||
+      *point.canonical_return_path_time_s < 0.0 || motion->trajectory.waypoints.empty() ||
+      *point.canonical_return_path_time_s > motion->trajectory.waypoints.back().time_from_start_s ||
+      !std::isfinite(initial.runtime_velocity_scale_at_trip) ||
+      initial.runtime_velocity_scale_at_trip <= 0.0 ||
+      initial.runtime_velocity_scale_at_trip > 1.0 || !std::isfinite(initial.path_time_rate) ||
+      initial.path_time_rate <= 0.0 ||
+      !std::all_of(rest.positions_rad.begin(), rest.positions_rad.end(),
+                   [](double q) { return std::isfinite(q); }) ||
+      !std::all_of(rest.velocities_rad_s.begin(), rest.velocities_rad_s.end(),
+                   [](double v) { return v == 0.0; }) ||
+      !std::all_of(rest.accelerations_rad_s2.begin(), rest.accelerations_rad_s2.end(),
+                   [](double a) { return a == 0.0; }))
+    return refuse("spring_return_point_invalid");
+  context.source = PreparedMotionReplacementSourceDTO{
+      source.execution_id,
+      source.backend_execution_generation,
+      point.source_goal,
+      point.binding_epoch,
+      source.last_dispatched_participant->prepared_contract_digest,
+      point.trip,
+      {}};
+  return Result<void>::Ok();
+}
+
+Result<void> ExecutionKernel::compute_spring_motion_replacement(
+    const std::stop_token stop_token, const std::shared_ptr<PreparedMotionSession>& session) {
+  const auto refuse = [](const char* reason) {
+    return Result<void>::Err(ErrorDTO{
+        kErrorExecutionRejected, "Spring successor cold preparation failed", {{"reason", reason}}});
+  };
+  // Attachment is installed before this one shared task starts and is retained
+  // until the task is joined; physical session fields stay untouched.
+  auto* attached = session->spring_cold_product ? &*session->spring_cold_product : nullptr;
+  const auto& authority = attached ? attached->authority : session->authority;
+  const auto execution_id = attached ? attached->reserved_execution_id : session->execution_id;
+  const auto& context = *authority.replacement;
+  if (!context.spring_return || !context.spring_return->point || !context.spring_return->stage)
+    return refuse("spring_return_context_missing");
+  const auto& initial = context.spring_return->point->initial;
+  auto staged = std::make_unique<ActiveMotionExecution>(authority.execution_request);
+  staged->execution_id = execution_id;
+  auto& request = staged->request;
+  if (request.target_mode != MotionTargetModeDTO::kAbsolute || request.target_reference ||
+      request.offset_reference || request.goal_frame_reference)
+    return refuse("spring_return_target_not_resolved");
+  auto resolved = resolve_motion_target(request, nullptr, reference_resolver_);
+  if (!resolved.ok()) return Result<void>::Err(resolved.error());
+  request.motion = std::move(resolved.value());
+  RobotStateDTO rest{initial.joint_names, initial.spring_back_return_point.positions_rad,
+                     initial.spring_back_return_point.velocities_rad_s};
+  auto start = controlled_state_for_binding(request, rest);
+  if (!start.ok()) return Result<void>::Err(start.error());
+  auto retained = retain_current_scene_snapshot_lease_inventory(execution_id, request.move_id);
+  if (!retained.ok()) return Result<void>::Err(retained.error());
+  staged->retained_scene = std::move(retained.value());
+  auto& inventory = staged->retained_scene.mutable_inventory();
+  if (inventory.projection_binding.projection_revision.retained_bundle_id !=
+          request.binding.retained_bundle_id ||
+      inventory.projection_binding.projection_revision.graph_revision !=
+          request.binding.graph_revision)
+    return refuse("spring_return_projection_mismatch");
+  if (auto admission = collision_validation_admission_error()) return Result<void>::Err(*admission);
+  auto grasp = install_resolved_contact_grasp_policy(request, inventory);
+  if (!grasp.ok()) return grasp;
+  if (clock_.now() >= session->preparation_deadline_ns || stop_token.stop_requested())
+    return refuse("spring_return_preparation_budget_expired");
+  std::stop_callback cancellation(stop_token, [this, session] {
+    session->replacement_validation_cancellation->request_cancel("spring_return_cancelled");
+    planner_.request_cancel();
+  });
+  const auto deadline = scheduler_.schedule(
+      session->preparation_deadline_ns,
+      [this, session, cancellation = session->replacement_validation_cancellation] {
+        std::lock_guard lock(session->mutex);
+        if (session->replacement_validation_cancellation != cancellation ||
+            session->preparation_completed)
+          return;
+        cancellation->request_cancel("spring_return_budget_expired");
+        planner_.request_cancel();
+      },
+      SchedulerPriority::Monitoring);
+  struct DeadlineGuard {
+    IScheduler& scheduler;
+    ScheduleHandle handle;
+    ~DeadlineGuard() {
+      if (handle != 0U) scheduler.cancel(handle);
+    }
+  } guard{scheduler_, deadline};
+  const auto remaining_ns = session->preparation_deadline_ns - clock_.now();
+  if (remaining_ns <= 0 || stop_token.stop_requested())
+    return refuse("spring_return_preparation_budget_expired");
+  // Bound the actual candidate's PlanRequest without rewriting the authored
+  // execution request. The successor's existing full-B start and outer
+  // watchdog remain the cancellation/containment authority.
+  auto candidate_request = request;
+  candidate_request.timeouts.planning_timeout_s =
+      std::min(request.timeouts.planning_timeout_s, static_cast<double>(remaining_ns) / 1.0e9);
+  auto computed = compute_validated_motion_plan(
+      candidate_request, inventory, rest, 0U, session->preparation_started_ns,
+      context.preparation_budget_ns, stop_token, session->replacement_validation_cancellation,
+      execution_id);
+  if (!computed.ok()) return Result<void>::Err(computed.error());
+  if (clock_.now() >= session->preparation_deadline_ns || stop_token.stop_requested())
+    return refuse("spring_return_preparation_budget_expired");
+  auto& trajectory = *computed.value().planning.result.trajectory;
+  resolve_motion_execution_timeout(request, trajectory);
+  const auto& validation = computed.value().validation;
+  PreparedMotionValidationEvidenceDTO evidence{
+      config_.validation_revision, validation.noncollision_result,
+      validation.collision_world_revision, validation.collision_policy_revision,
+      validation.collision_decision};
+  auto product = assemble_prepared_motion_participant(authority, request, trajectory,
+                                                      computed.value().planning.request,
+                                                      computed.value().planning.result, evidence);
+  if (!product.ok()) return Result<void>::Err(product.error());
+  auto collision_curve = std::make_shared<const TrajectoryDTO>(
+      std::move(computed.value().validation.collision_trajectory));
+  staged->scene_snapshot_lease = std::move(computed.value().validation.scene_snapshot_lease);
+  std::lock_guard lock(session->mutex);
+  if (session->cancel_requested || (attached && attached->cancelled) || stop_token.stop_requested())
+    return refuse("spring_return_cancelled");
+  if (clock_.now() >= session->preparation_deadline_ns)
+    return refuse("spring_return_preparation_budget_expired");
+  if (attached) {
+    attached->participant = std::move(product.value());
+    attached->execution = std::move(staged);
+    attached->collision_trajectory = std::move(collision_curve);
+    attached->state = ResolvedPreparedMotionExecutionStateDTO::kColdPrepared;
+  } else {
+    session->participant = std::move(product.value());
+    session->replacement_execution = std::move(staged);
+    session->replacement_collision_trajectory = std::move(collision_curve);
+    session->state = ResolvedPreparedMotionExecutionStateDTO::kColdPrepared;
+  }
+  return Result<void>::Ok();
+}
+
+Result<bool> ExecutionKernel::PrepareColdMotionAfterStop(const std::uint64_t candidate_id,
+                                                         const StopCertificateDTO& certificate) {
+  std::unique_lock lifecycle_lock(lifecycle_mutex_);
+  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire))
+    return Result<bool>::Ok(false);
+  // An event may be delivered on the preparation thread itself. Existing
+  // reconciliation retries the read; never join that same thread here.
+  if (replacement_preparation_thread_.joinable() &&
+      replacement_preparation_thread_.get_id() == std::this_thread::get_id())
+    return Result<bool>::Ok(false);
+  std::shared_ptr<PreparedMotionSession> candidate;
+  std::shared_ptr<PreparedMotionSession> source;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    candidate = pending_prepared_motion_session_;
+    source = active_prepared_motion_session_;
+  }
+  if (!candidate && source && source->execution_id == candidate_id) {
+    std::lock_guard lock(source->mutex);
+    const StopCertificateRefDTO reference{certificate.stop_certificate_id,
+                                          certificate.stop_certificate_revision,
+                                          certificate.stop_id, certificate.stop_generation};
+    if (source->spring_activation_certificate == reference) return Result<bool>::Ok(true);
+  }
+  const auto refuse = [](const char* reason) {
+    return Result<bool>::Err(ErrorDTO{kErrorExecutionRejected,
+                                      "Spring successor activation lacks exact settled authority",
+                                      {{"reason", reason}}});
+  };
+  if (!candidate || !source || candidate->execution_id != candidate_id)
+    return refuse("spring_return_candidate_stale");
+  std::optional<ExecuteRequestDTO> request;
+  {
+    std::lock_guard lock(candidate->mutex);
+    if (!candidate->authority.replacement || !candidate->authority.replacement->spring_return ||
+        !candidate->authority.replacement->spring_return->stage ||
+        !candidate->authority.replacement->spring_return->point || candidate->cancel_requested)
+      return refuse("spring_return_context_missing");
+    if (candidate->state != ResolvedPreparedMotionExecutionStateDTO::kColdPrepared ||
+        !candidate->preparation_completed)
+      return Result<bool>::Ok(false);
+    if (!candidate->participant || !candidate->replacement_execution ||
+        candidate->backend_prepare_result)
+      return refuse("spring_return_cold_product_unavailable");
+    const auto& stage = *candidate->authority.replacement->spring_return->stage;
+    const auto& captured = candidate->authority.replacement->source;
+    const auto status = sm_.status();
+    const auto* local =
+        addressed_participant_stop_settlement_ ? &*addressed_participant_stop_settlement_ : nullptr;
+    if (certificate.stop_id != stage.stop_id ||
+        certificate.stop_generation != stage.stop_generation ||
+        certificate.result != StopCertificateResultDTO::kSucceededNominal ||
+        certificate.terminal_error || certificate.fault_latch_id ||
+        !certificate.unsettled.empty() || !certificate.failed.empty() || !local ||
+        local->execution_id != captured.execution_id ||
+        local->aggregate_stop_certificate !=
+            StopCertificateRefDTO{certificate.stop_certificate_id,
+                                  certificate.stop_certificate_revision, certificate.stop_id,
+                                  certificate.stop_generation} ||
+        status.execution_id != captured.execution_id ||
+        recovery_execution_state_locked(status) != ExecutionState::kStopped || !status.fact ||
+        status.fact->kind != ParticipantExecutionFactKind::kPreemptedByAddressedStop ||
+        status.fact->effect != ParticipantEffectKnowledge::kEffectSettled)
+      return refuse("spring_return_stop_not_settled");
+    const bool returned = std::any_of(
+        certificate.attempted_stage_results.begin(), certificate.attempted_stage_results.end(),
+        [&](const auto& attempted) {
+          const auto& result = attempted.result;
+          return attempted.authority == StopStageResultAuthorityDTO::kAuthoritative &&
+                 result.request == stage &&
+                 result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded &&
+                 result.attempt_disposition == StopStageAttemptDispositionDTO::kDispatched &&
+                 !result.error &&
+                 result.actual_provider_contract_mode == MotionControlledStopMode::kSpringBackHold;
+        });
+    if (!returned) return refuse("spring_return_not_the_completed_stage");
+    std::lock_guard source_lock(source->mutex);
+    if (source->execution_id != captured.execution_id ||
+        source->backend_execution_generation != captured.execution_generation ||
+        !source->last_dispatched_participant ||
+        source->last_dispatched_participant->prepared_contract_digest !=
+            captured.prepared_contract_digest)
+      return refuse("spring_return_source_stale");
+    request = candidate->replacement_execution->request;
+    candidate->spring_activation_certificate = StopCertificateRefDTO{
+        certificate.stop_certificate_id, certificate.stop_certificate_revision, certificate.stop_id,
+        certificate.stop_generation};
+  }
+  // execute_impl retains ordinary admission and dispatch gates; its spring-only
+  // reuse branch preserves this exact sealed product, projection and identity.
+  lifecycle_lock.unlock();
+  const auto activated = execute_impl(*request, candidate);
+  if (!activated.ok()) {
+    std::lock_guard lock(candidate->mutex);
+    candidate->state = ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
+    candidate->error = activated.error();
+    return Result<bool>::Err(activated.error());
+  }
+  return activated.value() == candidate_id ? Result<bool>::Ok(true)
+                                           : refuse("spring_return_candidate_identity_changed");
+}
+Result<std::uint64_t> ExecutionKernel::prepare_motion_replacement(
+    std::shared_ptr<PreparedMotionSession> session) {
+  const auto reject = [](const char* reason) {
+    return Result<std::uint64_t>::Err(ErrorDTO{kErrorExecutionRejected,
+                                               "Motion replacement preparation was refused",
+                                               {{"reason", reason}}});
+  };
+  std::unique_lock lifecycle_lock(lifecycle_mutex_);
+  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire))
+    return reject("worker_retirement_in_progress");
+  const auto& context = *session->authority.replacement;
+  if (context.preparation_budget_ns <= 0 || session->authority.continuation)
+    return reject("motion_replacement_context_invalid");
+  const auto& timeouts = session->authority.execution_request.timeouts;
+  const double maximum_timeout_s =
+      static_cast<double>(std::numeric_limits<std::int64_t>::max()) / 1e9;
+  if (!std::isfinite(timeouts.execution_timeout_s) || timeouts.execution_timeout_s <= 0.0 ||
+      timeouts.execution_timeout_s >= maximum_timeout_s ||
+      (timeouts.zero_speed_hold_timeout_s &&
+       (!std::isfinite(*timeouts.zero_speed_hold_timeout_s) ||
+        *timeouts.zero_speed_hold_timeout_s <= 0.0 ||
+        *timeouts.zero_speed_hold_timeout_s >= maximum_timeout_s)))
+    return reject("motion_replacement_timeout_invalid");
+  std::shared_ptr<PreparedMotionSession> source;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    source = active_prepared_motion_session_;
+    if (pending_prepared_motion_session_) return reject("motion_replacement_already_pending");
+  }
+  if (!source) return reject("motion_replacement_source_missing");
+  {
+    std::lock_guard lock(source->mutex);
+    const auto status = sm_.status();
+    const auto& incoming = session->authority.execution_request;
+    const auto& incumbent = source->authority.execution_request;
+    if (context.spring_return) {
+      const auto qualified = qualify_spring_motion_replacement(session->authority, *source);
+      if (!qualified.ok()) return Result<std::uint64_t>::Err(qualified.error());
+    }
+    if (!context.spring_return &&
+        (source->execution_id != context.source.execution_id ||
+         source->backend_execution_generation != context.source.execution_generation ||
+         source->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched ||
+         !source->last_dispatched_participant ||
+         source->last_dispatched_participant->prepared_contract_digest !=
+             context.source.prepared_contract_digest ||
+         incumbent.binding.controller_goal_id != context.source.goal.controller_goal_id ||
+         incumbent.binding.controller_goal_generation !=
+             context.source.goal.controller_goal_generation ||
+         status.execution_id != source->execution_id || status.fact ||
+         status.state != ExecutionState::kExecuting ||
+         addressed_stop_fence_execution_id_.load(std::memory_order_acquire) ==
+             source->execution_id))
+      return reject("motion_replacement_source_stale");
+    if (!incoming.action_span || !incumbent.action_span ||
+        incoming.action_span->action_source != ActionSource::kProgramNode ||
+        incumbent.action_span->action_source != ActionSource::kProgramNode ||
+        incoming.binding.program_run_id.empty() ||
+        incoming.binding.program_run_id != incumbent.binding.program_run_id ||
+        incoming.binding.control_binding_id != incumbent.binding.control_binding_id ||
+        incoming.binding.control_binding_revision != incumbent.binding.control_binding_revision ||
+        incoming.binding.resources != incumbent.binding.resources)
+      return reject("motion_replacement_scope_mismatch");
+  }
+  if (replacement_preparation_thread_.joinable()) {
+    if (replacement_preparation_thread_.get_id() == std::this_thread::get_id())
+      return reject("motion_replacement_computation_retiring");
+    lifecycle_worker_retirement_in_progress_.store(true, std::memory_order_release);
+    lifecycle_lock.unlock();
+    replacement_preparation_thread_.join();
+    lifecycle_lock.lock();
+    lifecycle_worker_retirement_in_progress_.store(false, std::memory_order_release);
+    // Joining is never an admission fence; recheck the incumbent after it.
+    if (context.spring_return) {
+      std::lock_guard lock(source->mutex);
+      const auto qualified = qualify_spring_motion_replacement(session->authority, *source);
+      if (!qualified.ok()) return Result<std::uint64_t>::Err(qualified.error());
+    }
+    const auto status = sm_.status();
+    if (!context.spring_return && (status.execution_id != context.source.execution_id ||
+                                   status.fact || status.state != ExecutionState::kExecuting))
+      return reject("motion_replacement_source_stale");
+  }
+  const auto id = next_execution_id_.load(std::memory_order_relaxed);
+  if (id == std::numeric_limits<std::uint64_t>::max()) return reject("execution_id_exhausted");
+  session->execution_id = id;
+  session->preparation_started_ns = clock_.now();
+  if (session->preparation_started_ns >
+      std::numeric_limits<std::int64_t>::max() - context.preparation_budget_ns)
+    return reject("motion_replacement_budget_unrepresentable");
+  session->preparation_deadline_ns =
+      session->preparation_started_ns + context.preparation_budget_ns;
+  session->replacement_validation_cancellation = std::make_shared<CollisionCancellationToken>();
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    if (active_prepared_motion_session_ != source || pending_prepared_motion_session_)
+      return reject("motion_replacement_source_stale");
+    next_execution_id_.store(id + 1U, std::memory_order_relaxed);
+    pending_prepared_motion_session_ = session;
+  }
+  const auto launched = launch_motion_replacement_preparation(session);
+  if (!launched.ok()) {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    if (pending_prepared_motion_session_ == session) pending_prepared_motion_session_.reset();
+    return Result<std::uint64_t>::Err(launched.error());
+  }
+  return Result<std::uint64_t>::Ok(id);
+}
+
+Result<std::uint64_t> ExecutionKernel::prepare_spring_motion_attachment(
+    ResolvedPreparedMotionExecutionRequestDTO request) {
+  const auto reject = [](const char* reason) {
+    return Result<std::uint64_t>::Err(ErrorDTO{kErrorExecutionRejected,
+                                               "Sent replacement cold computation was refused",
+                                               {{"reason", reason}}});
+  };
+  std::unique_lock lifecycle_lock(lifecycle_mutex_);
+  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire))
+    return reject("worker_retirement_in_progress");
+  const auto abandoned_id = request.replacement->spring_return->abandoned_preparation_id;
+  const auto budget = request.replacement->preparation_budget_ns;
+  if (budget <= 0 || request.continuation) return reject("motion_replacement_context_invalid");
+  const auto& timeouts = request.execution_request.timeouts;
+  const double maximum_timeout_s =
+      static_cast<double>(std::numeric_limits<std::int64_t>::max()) / 1e9;
+  if (!std::isfinite(timeouts.execution_timeout_s) || timeouts.execution_timeout_s <= 0.0 ||
+      timeouts.execution_timeout_s >= maximum_timeout_s ||
+      (timeouts.zero_speed_hold_timeout_s &&
+       (!std::isfinite(*timeouts.zero_speed_hold_timeout_s) ||
+        *timeouts.zero_speed_hold_timeout_s <= 0.0 ||
+        *timeouts.zero_speed_hold_timeout_s >= maximum_timeout_s)))
+    return reject("motion_replacement_timeout_invalid");
+  std::shared_ptr<PreparedMotionSession> source;
+  std::shared_ptr<PreparedMotionSession> pending;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    source = active_prepared_motion_session_;
+    pending = pending_prepared_motion_session_;
+  }
+  if (!source || !pending) return reject("spring_return_candidate_stale");
+  const auto qualify = [&]() -> Result<void> {
+    std::scoped_lock lock(source->mutex, pending->mutex);
+    if (pending->execution_id != abandoned_id || !pending->authority.replacement ||
+        pending->spring_cold_product || pending->cancel_requested ||
+        !pending->preparation_completed || !pending->backend_prepare_result ||
+        pending->backend_prepare_result->state != PrepareParticipantResultStateDTO::kPrepared ||
+        pending->dispatch_gate.load(std::memory_order_acquire) !=
+            PreparedMotionDispatchGate::kCommitted)
+      return Result<void>::Err(ErrorCode::kExecutionRejected);
+    const auto& old = pending->authority.execution_request;
+    const auto& next = request.execution_request;
+    const auto& incumbent = source->authority.execution_request;
+    auto same_binding = next.binding;
+    same_binding.controller_goal_generation = old.binding.controller_goal_generation;
+    if (!next.action_span || !old.action_span || !incumbent.action_span ||
+        next.action_span->action_source != ActionSource::kProgramNode ||
+        old.action_span->action_source != ActionSource::kProgramNode ||
+        incumbent.action_span->action_source != ActionSource::kProgramNode ||
+        next.action_span != old.action_span || same_binding != old.binding ||
+        request.operation_revision != pending->authority.operation_revision ||
+        next.binding.operation_id != old.binding.operation_id ||
+        next.binding.participant_id != old.binding.participant_id ||
+        next.binding.program_run_id.empty() ||
+        next.binding.program_run_id != old.binding.program_run_id ||
+        next.binding.program_run_id != incumbent.binding.program_run_id ||
+        next.binding.controller_goal_id != old.binding.controller_goal_id ||
+        old.binding.controller_goal_generation.value() >= 9'007'199'254'740'991ULL ||
+        next.binding.controller_goal_generation.value() !=
+            old.binding.controller_goal_generation.value() + 1U ||
+        next.binding.control_binding_id != old.binding.control_binding_id ||
+        next.binding.control_binding_revision != old.binding.control_binding_revision ||
+        next.binding.resources != old.binding.resources ||
+        next.binding.control_binding_id != incumbent.binding.control_binding_id ||
+        next.binding.control_binding_revision != incumbent.binding.control_binding_revision ||
+        next.binding.resources != incumbent.binding.resources)
+      return Result<void>::Err(ErrorCode::kInvalidRequest);
+    return qualify_spring_motion_replacement(request, *source);
+  };
+  if (const auto qualified = qualify(); !qualified.ok())
+    return Result<std::uint64_t>::Err(qualified.error());
+  if (replacement_preparation_thread_.joinable()) {
+    if (replacement_preparation_thread_.get_id() == std::this_thread::get_id())
+      return reject("motion_replacement_computation_retiring");
+    lifecycle_worker_retirement_in_progress_.store(true, std::memory_order_release);
+    lifecycle_lock.unlock();
+    replacement_preparation_thread_.join();
+    lifecycle_lock.lock();
+    lifecycle_worker_retirement_in_progress_.store(false, std::memory_order_release);
+    if (const auto qualified = qualify(); !qualified.ok())
+      return Result<std::uint64_t>::Err(qualified.error());
+  }
+  const auto id = next_execution_id_.load(std::memory_order_relaxed);
+  const auto started = clock_.now();
+  if (id == std::numeric_limits<std::uint64_t>::max()) return reject("execution_id_exhausted");
+  if (started > std::numeric_limits<std::int64_t>::max() - budget)
+    return reject("motion_replacement_budget_unrepresentable");
+  auto validation_cancellation = std::make_shared<CollisionCancellationToken>();
+  PreparedMotionSession::SpringColdProduct cold{
+      std::move(request), id,   ResolvedPreparedMotionExecutionStateDTO::kPreparing, {}, {}, {},
+      std::nullopt,       false};
+  {
+    std::lock_guard owner_lock(prepared_motion_session_mutex_);
+    if (active_prepared_motion_session_ != source || pending_prepared_motion_session_ != pending)
+      return reject("spring_return_candidate_stale");
+    std::lock_guard lock(pending->mutex);
+    pending->spring_cold_product.emplace(std::move(cold));
+    pending->preparation_started_ns = started;
+    pending->preparation_deadline_ns = started + budget;
+    pending->preparation_completed = false;
+    pending->replacement_cancellation = std::stop_source{};
+    pending->replacement_validation_cancellation = std::move(validation_cancellation);
+    next_execution_id_.store(id + 1U, std::memory_order_relaxed);
+  }
+  const auto launched = launch_motion_replacement_preparation(pending);
+  if (!launched.ok()) {
+    std::lock_guard lock(pending->mutex);
+    pending->spring_cold_product->state =
+        ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
+    pending->spring_cold_product->error = launched.error();
+    pending->preparation_completed = true;
+    return Result<std::uint64_t>::Err(launched.error());
+  }
+  return Result<std::uint64_t>::Ok(abandoned_id);
+}
+
+Result<void> ExecutionKernel::launch_motion_replacement_preparation(
+    const std::shared_ptr<PreparedMotionSession>& session) {
+  try {
+    replacement_preparation_thread_ = std::jthread([this, session](std::stop_token token) {
+      std::stop_callback cancellation(token,
+                                      [&]() { session->replacement_cancellation.request_stop(); });
+      compute_motion_replacement(session->replacement_cancellation.get_token(), session);
+    });
+    return Result<void>::Ok();
+  } catch (...) {
+    return Result<void>::Err(ErrorDTO{kErrorExecutionRejected,
+                                      "Motion replacement computation could not start",
+                                      {{"reason", "motion_replacement_computation_start_failed"}}});
+  }
+}
+
+void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_token,
+                                                 std::shared_ptr<PreparedMotionSession> session) {
+  const auto failed = [](const char* reason) {
+    return ErrorDTO{
+        kErrorExecutionRejected, "Moving replacement preparation failed", {{"reason", reason}}};
+  };
+  auto compute = [&]() -> Result<void> {
+    if (session->spring_cold_product) return compute_spring_motion_replacement(stop_token, session);
+    const auto& context = *session->authority.replacement;
+    if (context.spring_return) return compute_spring_motion_replacement(stop_token, session);
+    const auto& captured = context.source;
+    std::shared_ptr<const PreparedOperationParticipantDTO> source_product;
+    {
+      std::lock_guard owner_lock(prepared_motion_session_mutex_);
+      if (!active_prepared_motion_session_ ||
+          active_prepared_motion_session_->execution_id != captured.execution_id ||
+          pending_prepared_motion_session_ != session)
+        return Result<void>::Err(failed("motion_replacement_source_stale"));
+      std::lock_guard source_lock(active_prepared_motion_session_->mutex);
+      source_product = active_prepared_motion_session_->last_dispatched_participant;
+    }
+    const auto* source = source_product
+                             ? std::get_if<PreparedMotionExecutionDTO>(&source_product->payload)
+                             : nullptr;
+    if (!source || source_product->prepared_contract_digest != captured.prepared_contract_digest ||
+        captured.binding_epoch != captured.controller_sample.binding_epoch ||
+        !captured.controller_sample.applied_factor ||
+        !std::isfinite(*captured.controller_sample.applied_factor) ||
+        *captured.controller_sample.applied_factor <= 0.0 ||
+        *captured.controller_sample.applied_factor > 1.0 || !captured.progress.valid ||
+        captured.progress.terminal ||
+        captured.progress.execution_generation != captured.execution_generation ||
+        captured.progress.trajectory_time_ns < 0 ||
+        captured.progress.received_timestamp_ns !=
+            captured.controller_sample.local_receipt_stamp_ns ||
+        captured.progress.source_timestamp_ns != captured.controller_sample.source_stamp_ns ||
+        !std::isfinite(captured.controller_sample.cursor_s) ||
+        captured.controller_sample.cursor_s < 0.0)
+      return Result<void>::Err(failed("motion_replacement_source_sample_invalid"));
+    // DX1170: this is a forecast for computation only. Actual cursor and
+    // remaining lead are rechecked at send and adoption; scale is not frozen.
+    const double cursor = static_cast<double>(captured.progress.trajectory_time_ns) / 1e9;
+    const double divergence = cursor + static_cast<double>(context.preparation_budget_ns) / 1e9 *
+                                           *captured.controller_sample.applied_factor;
+    if (!std::isfinite(divergence) || divergence <= cursor ||
+        source->trajectory.waypoints.empty() ||
+        divergence >= source->trajectory.waypoints.back().time_from_start_s)
+      return Result<void>::Err(failed("motion_replacement_future_lead_unavailable"));
+    auto prefix = slice_future_trajectory(source->trajectory, cursor);
+    auto cut = sample_trajectory(source->trajectory, divergence);
+    auto start = sample_trajectory(source->trajectory, cursor);
+    if (!prefix.ok()) return Result<void>::Err(prefix.error());
+    if (!cut.ok()) return Result<void>::Err(cut.error());
+    if (!start.ok()) return Result<void>::Err(start.error());
+    auto& points = prefix.value().waypoints;
+    const double lead = divergence - cursor;
+    points.erase(std::lower_bound(
+                     points.begin(), points.end(), lead,
+                     [](const auto& point, double time) { return point.time_from_start_s < time; }),
+                 points.end());
+    points.push_back(TrajectoryWaypointDTO{lead, cut.value().positions_rad,
+                                           cut.value().velocities_rad_s,
+                                           cut.value().accelerations_rad_s2});
+    // Source milestones are not successor-authored obligations. A Cartesian
+    // source requiring a skipped milestone was already refused by the shared
+    // slice; never fabricate a new fidelity certificate for this prefix.
+    prefix.value().cartesian_waypoint_times_s.clear();
+    auto prepared = std::make_unique<ActiveMotionExecution>(session->authority.execution_request);
+    prepared->execution_id = session->execution_id;
+    auto& request = prepared->request;
+    if (request.target_mode != MotionTargetModeDTO::kAbsolute || request.target_reference ||
+        request.offset_reference || request.goal_frame_reference)
+      return Result<void>::Err(failed("motion_replacement_target_not_resolved"));
+    auto resolved = resolve_motion_target(request, nullptr, reference_resolver_);
+    if (!resolved.ok()) return Result<void>::Err(resolved.error());
+    request.motion = std::move(resolved.value());
+    RobotStateDTO start_state{source->trajectory.joint_names, start.value().positions_rad,
+                              start.value().velocities_rad_s};
+    RobotStateDTO suffix_seed{source->trajectory.joint_names, cut.value().positions_rad,
+                              std::vector<double>(source->trajectory.joint_names.size(), 0.0)};
+    auto suffix_state = controlled_state_for_binding(request, suffix_seed);
+    if (!suffix_state.ok()) return Result<void>::Err(suffix_state.error());
+    const auto elapsed =
+        motion_replacement_elapsed_ns(clock_.now(), session->preparation_started_ns);
+    if (!elapsed || *elapsed >= context.preparation_budget_ns || stop_token.stop_requested())
+      return Result<void>::Err(failed("motion_replacement_preparation_budget_expired"));
+    MovingReplacementInputDTO moving{
+        captured.goal,
+        captured.binding_epoch,
+        cursor,
+        std::move(prefix.value()),
+        divergence,
+        std::move(suffix_state.value()),
+        source->plan_request.base_frame,
+        source->plan_request.tcp_frame,
+        source->plan_request.speed_profile,
+        source->plan_request.per_resource_dynamics_limits,
+        static_cast<double>(context.preparation_budget_ns - *elapsed) / 1e9};
+    auto retained =
+        retain_current_scene_snapshot_lease_inventory(session->execution_id, request.move_id);
+    if (!retained.ok()) return Result<void>::Err(retained.error());
+    prepared->retained_scene = std::move(retained.value());
+    auto& inventory = prepared->retained_scene.mutable_inventory();
+    if (inventory.projection_binding.projection_revision.retained_bundle_id !=
+            request.binding.retained_bundle_id ||
+        inventory.projection_binding.projection_revision.graph_revision !=
+            request.binding.graph_revision)
+      return Result<void>::Err(failed("motion_replacement_projection_mismatch"));
+    if (auto admission = collision_validation_admission_error(); admission)
+      return Result<void>::Err(std::move(*admission));
+    auto grasp = install_resolved_contact_grasp_policy(request, inventory);
+    if (!grasp.ok()) return grasp;
+    std::stop_callback cancellation(stop_token, [this, session]() {
+      session->replacement_validation_cancellation->request_cancel("motion_replacement_cancelled");
+      planner_.request_cancel();
+    });
+    const auto start_ns = session->preparation_started_ns;
+    if (start_ns > std::numeric_limits<std::int64_t>::max() - context.preparation_budget_ns)
+      return Result<void>::Err(failed("motion_replacement_budget_unrepresentable"));
+    const auto deadline = scheduler_.schedule(
+        session->preparation_deadline_ns,
+        [this, session, cancellation = session->replacement_validation_cancellation]() {
+          std::lock_guard lock(session->mutex);
+          if (session->replacement_validation_cancellation != cancellation ||
+              session->preparation_completed)
+            return;
+          cancellation->request_cancel("motion_replacement_budget_expired");
+          planner_.request_cancel();
+        },
+        SchedulerPriority::Monitoring);
+    struct DeadlineGuard {
+      IScheduler& scheduler;
+      ScheduleHandle handle;
+      ~DeadlineGuard() {
+        if (handle != 0U) scheduler.cancel(handle);
+      }
+    } deadline_guard{scheduler_, deadline};
+    auto computed = compute_validated_motion_plan(
+        request, inventory, start_state, 0U, start_ns, context.preparation_budget_ns, stop_token,
+        session->replacement_validation_cancellation, session->execution_id, &moving);
+    if (!computed.ok()) return Result<void>::Err(computed.error());
+    const auto completion_elapsed = motion_replacement_elapsed_ns(clock_.now(), start_ns);
+    if (!completion_elapsed || *completion_elapsed >= context.preparation_budget_ns ||
+        stop_token.stop_requested())
+      return Result<void>::Err(failed("motion_replacement_preparation_budget_expired"));
+    resolve_motion_execution_timeout(request, *computed.value().planning.result.trajectory);
+    ExecuteWorkerPlanPhaseResult planning;
+    planning.plan_request = std::move(computed.value().planning.request);
+    planning.planning_result = std::move(computed.value().planning.result);
+    auto& trajectory = *planning.planning_result->trajectory;
+    auto& validation = computed.value().validation;
+    ExecuteWorkerValidationPhaseResult validated;
+    validated.validation_evidence = PreparedMotionValidationEvidenceDTO{
+        config_.validation_revision, validation.noncollision_result,
+        validation.collision_world_revision, validation.collision_policy_revision,
+        validation.collision_decision};
+    auto product =
+        make_and_prepare_motion_participant(request, trajectory, planning, validated, session);
+    if (!product.ok()) return Result<void>::Err(product.error());
+    auto projection =
+        build_runtime_collision_state_projection(trajectory, validation.collision_trajectory);
+    if (!projection.ok()) return Result<void>::Err(projection.error());
+    auto correlation = std::make_unique<ExecutionCorrelationTracker>();
+    correlation->set_from_request(request);
+    auto collision_curve =
+        std::make_shared<const TrajectoryDTO>(std::move(validation.collision_trajectory));
+    prepared->scene_snapshot_lease = std::move(validation.scene_snapshot_lease);
+    auto arm = RuntimeCollisionLookaheadSession::prepare_arm(
+        session->execution_id, 0U, collision_curve, request.contact_policy_id,
+        prepared->retained_scene.binding().projection_revision);
+    std::lock_guard lock(session->mutex);
+    if (session->cancel_requested || stop_token.stop_requested())
+      return Result<void>::Err(failed("motion_replacement_cancelled"));
+    session->participant = std::move(product.value());
+    session->replacement_execution = std::move(prepared);
+    session->replacement_correlation = std::move(correlation);
+    session->replacement_collision_trajectory = std::move(collision_curve);
+    session->replacement_projection = std::move(projection.value());
+    session->replacement_lookahead_arm = std::move(arm);
+    session->state = ResolvedPreparedMotionExecutionStateDTO::kPrepared;
+    return Result<void>::Ok();
+  };
+  auto outcome = [&]() -> Result<void> {
+    try {
+      return compute();
+    } catch (const std::exception& error) {
+      return Result<void>::Err(ErrorDTO{
+          kErrorPlanningFailed, "Replacement preparation raised", {{"exception", error.what()}}});
+    } catch (...) {
+      return Result<void>::Err(failed("motion_replacement_preparation_exception"));
+    }
+  }();
+  {
+    std::lock_guard lock(session->mutex);
+    session->preparation_completed = true;
+    if (!outcome.ok()) {
+      if (session->spring_cold_product) {
+        auto& cold = *session->spring_cold_product;
+        cold.state = cold.cancelled || stop_token.stop_requested()
+                         ? ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch
+                         : ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
+        cold.error = outcome.error();
+      } else {
+        session->state = session->cancel_requested
+                             ? ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch
+                             : ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
+        session->error = outcome.error();
+      }
+    }
+  }
+  if (!outcome.ok() && !session->spring_cold_product && session->backend_prepare_result &&
+      session->backend_prepare_result->state == PrepareParticipantResultStateDTO::kPrepared) {
+    // Keep the original preparation error. A later explicit cancellation or
+    // owner cleanup observes any retirement refusal and retains membership.
+    (void)execution_backend_.RetirePreparedExecution(session->execution_id);
+  }
+  session->changed.notify_all();
+  KernelEvent event;
+  event.type = KernelEventType::kParticipantPrepared;
+  event.execution_id = session->execution_id;
+  event.timestamp_ns = clock_.now();
+  if (!outcome.ok()) event.error = outcome.error();
+  event.details = {{"phase", "replacement_preparation"}};
+  ExecutionCorrelationTracker correlation;
+  correlation.set_from_request(session->authority.execution_request);
+  correlation.stamp_details(event.details);
+  emit_event(std::move(event));
+}
+
+Result<void> ExecutionKernel::check_motion_replacement_scene(
+    const PreparedMotionSession& session) const {
+  const auto* motion = session.participant
+                           ? std::get_if<PreparedMotionExecutionDTO>(&session.participant->payload)
+                           : nullptr;
+  if (!motion || !session.replacement_execution)
+    return Result<void>::Err(ErrorCode::kInvalidRequest);
+  const auto& next = *session.replacement_execution;
+  if (next.scene_snapshot_lease) {
+    const auto validation = current_scene_snapshot_lease_validation_context();
+    if (validation) {
+      const auto checked = validate_scene_snapshot_lease(*next.scene_snapshot_lease, *validation);
+      if (checked.accepted &&
+          !(checked.details.contains("accepted_live_world_revision_divergence") &&
+            next.scene_snapshot_lease->objects.empty()))
+        return Result<void>::Ok();
+    }
+  } else if (collision_world_revisions_equal(
+                 current_authoritative_collision_world_revision(),
+                 motion->validation_evidence.collision_world_revision)) {
+    return Result<void>::Ok();
+  }
+  return Result<void>::Err(ErrorDTO{kErrorSceneChangedDuringValidation,
+                                    "Replacement collision evidence is no longer current",
+                                    {{"reason", "motion_replacement_scene_stale"}}});
+}
+
+bool ExecutionKernel::service_motion_replacement(const std::stop_token stop_token,
+                                                 ActiveMotionExecution& current) {
+  std::shared_ptr<PreparedMotionSession> pending;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    pending = pending_prepared_motion_session_;
+  }
+  if (!pending) return false;
+  const auto& source = pending->authority.replacement->source;
+  bool notify_owner = false;
+  bool should_observe = false;
+  const auto notify = [&]() {
+    KernelEvent event;
+    event.type = KernelEventType::kParticipantPrepared;
+    event.execution_id = pending->execution_id;
+    event.timestamp_ns = clock_.now();
+    event.details = {{"phase", "replacement_commit_safe_point"}};
+    ExecutionCorrelationTracker correlation;
+    correlation.set_from_request(pending->authority.execution_request);
+    correlation.stamp_details(event.details);
+    emit_event(std::move(event));
+  };
+  {
+    std::lock_guard lock(pending->mutex);
+    if (pending->cancel_requested || stop_token.stop_requested() ||
+        source.execution_id != current.execution_id ||
+        addressed_stop_fence_execution_id_.load(std::memory_order_acquire) == current.execution_id)
+      return false;
+    if (pending->state == ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested &&
+        pending->dispatch_gate.load(std::memory_order_acquire) ==
+            PreparedMotionDispatchGate::kOpen) {
+      const auto elapsed =
+          motion_replacement_elapsed_ns(clock_.now(), pending->preparation_started_ns);
+      const auto scene = check_motion_replacement_scene(*pending);
+      if (!scene.ok() || !elapsed ||
+          *elapsed >= pending->authority.replacement->preparation_budget_ns) {
+        pending->state = ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
+        pending->error = !scene.ok()
+                             ? scene.error()
+                             : ErrorDTO{kErrorPlanningTimeout,
+                                        "Replacement preparation budget expired before send",
+                                        {}};
+        pending->replacement_observation = PreparedMotionReplacementObservationDTO{
+            PreparedMotionReplacementPhaseDTO::kNoEffect, {}, {}, {}, pending->error};
+        notify_owner = true;
+      } else {
+        std::lock_guard protection_lock(runtime_collision_protection_mutex_);
+        const auto* progress = execution_backend_.execution_progress_publication();
+        const auto hazard = progress
+                                ? progress->hazard_authority_claimed(source.execution_generation)
+                                : std::nullopt;
+        if (!runtime_collision_protection_.active ||
+            runtime_collision_protection_.execution_id != source.execution_id || !hazard ||
+            *hazard) {
+          pending->state = ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
+          pending->error = ErrorDTO{kErrorExecutionRejected,
+                                    "Source runtime protection already owns containment",
+                                    {{"reason", "motion_replacement_source_hazard_authority"}}};
+          pending->replacement_observation = PreparedMotionReplacementObservationDTO{
+              PreparedMotionReplacementPhaseDTO::kNoEffect, {}, {}, {}, pending->error};
+          notify_owner = true;
+        } else {
+          auto expected = PreparedMotionDispatchGate::kOpen;
+          if (!pending->dispatch_gate.compare_exchange_strong(
+                  expected, PreparedMotionDispatchGate::kCommitted, std::memory_order_acq_rel))
+            return false;
+          const auto& binding = pending->authority.execution_request.binding;
+          auto receipt = execution_backend_.DispatchReplacement(
+              source, pending->execution_id, *pending->participant,
+              ExecutionGoalKey{binding.controller_goal_id, binding.controller_goal_generation},
+              pending->preparation_deadline_ns);
+          if (receipt.command.dispatch == ExecutionPortDispatch::kNotDispatched) {
+            pending->replacement_observation = PreparedMotionReplacementObservationDTO{
+                PreparedMotionReplacementPhaseDTO::kNoEffect, {}, {}, {}, receipt.command.error};
+            pending->state = ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
+            pending->error = receipt.command.error.value_or(
+                ErrorDTO{kErrorExecutionRejected, "Replacement was not dispatched", {}});
+            notify_owner = true;
+          } else {
+            pending->replacement_observation = PreparedMotionReplacementObservationDTO{
+                PreparedMotionReplacementPhaseDTO::kPossiblySent,
+                {},
+                {},
+                {},
+                receipt.command.error};
+            if (receipt.submitted_at_ns &&
+                *receipt.submitted_at_ns >= pending->preparation_started_ns &&
+                *receipt.submitted_at_ns < pending->preparation_deadline_ns &&
+                *receipt.submitted_at_ns <= clock_.now()) {
+              pending->replacement_execution->exec_start_ns = *receipt.submitted_at_ns;
+              pending->replacement_execution->last_runtime_scale_sample_ns =
+                  *receipt.submitted_at_ns;
+            } else {
+              pending->error = ErrorDTO{
+                  kErrorInvariantViolation, "Replacement submission time is unavailable", {}};
+            }
+            if (receipt.handle) {
+              if (const auto invalid = prepared_execution_handle_field_error(
+                      *receipt.handle, *pending->participant, binding.controller_goal_id,
+                      binding.controller_goal_generation)) {
+                pending->error = ErrorDTO{kErrorInvariantViolation,
+                                          "Replacement handle crosses dispatch identity",
+                                          {{"reason", std::string(*invalid)}}};
+              } else {
+                pending->replacement_execution->execution_handle = std::move(*receipt.handle);
+                pending->backend_execution_generation =
+                    pending->replacement_execution->execution_handle.execution_generation;
+                pending->last_dispatched_participant = pending->participant;
+                pending->replacement_lookahead_arm->execution_generation =
+                    pending->backend_execution_generation;
+              }
+            } else {
+              pending->error = receipt.command.error.value_or(
+                  ErrorDTO{kErrorExecutionRejected, "Replacement send outcome is unresolved", {}});
+            }
+            notify_owner = pending->error.has_value();
+          }
+        }
+      }
+    }
+    should_observe = pending->dispatch_gate.load(std::memory_order_acquire) ==
+                         PreparedMotionDispatchGate::kCommitted &&
+                     pending->state == ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested;
+    if (notify_owner) {
+      notify_owner = !pending->replacement_failure_notified;
+      pending->replacement_failure_notified = true;
+    }
+  }
+  if (!should_observe) {
+    if (notify_owner) notify();
+    return false;
+  }
+  auto observed = execution_backend_.ObserveReplacement(source, pending->execution_id);
+  {
+    std::lock_guard lock(pending->mutex);
+    if (observed.ok())
+      pending->replacement_observation = std::move(observed.value());
+    else {
+      pending->error = observed.error();
+      pending->replacement_observation = PreparedMotionReplacementObservationDTO{
+          PreparedMotionReplacementPhaseDTO::kEffectUncertain, {}, {}, {}, observed.error()};
+    }
+    const auto& observation = *pending->replacement_observation;
+    if (observation.phase == PreparedMotionReplacementPhaseDTO::kReadyToCommit &&
+        pending->replacement_execution && pending->backend_execution_generation != 0U &&
+        !pending->error) {
+      // The ordinary worker cannot finalize its predecessor while this event
+      // is dispatched. Parent callbacks are synchronous and must never wait
+      // for this safe point while retaining addressed state.
+      pending->worker_parked = true;
+      notify_owner = true;
+    } else if (observation.phase == PreparedMotionReplacementPhaseDTO::kEffectUncertain ||
+               observation.phase == PreparedMotionReplacementPhaseDTO::kNoEffect) {
+      notify_owner = !pending->replacement_failure_notified;
+      pending->replacement_failure_notified = true;
+    }
+  }
+  if (notify_owner) notify();
+  std::unique_ptr<ActiveMotionExecution> retired;
+  bool adopted = false;
+  {
+    std::lock_guard lock(pending->mutex);
+    pending->worker_parked = false;
+    adopted = pending->state == ResolvedPreparedMotionExecutionStateDTO::kDispatched;
+    if (adopted) retired = std::move(pending->replacement_execution);
+  }
+  if (retired && retired->execution_progress_generation != 0U)
+    execution_backend_.retire_execution_progress_generation(retired->execution_progress_generation);
+  if (adopted) {
+    emit_event({KernelEventType::kExecuteStarted,
+                current.execution_id,
+                clock_.now(),
+                {},
+                {},
+                std::nullopt,
+                {{"reason", "motion_replacement_committed"}}});
+  }
+  return adopted;
+}
+
+Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
+    const std::uint64_t candidate_id, const PreparedMotionReplacementSourceDTO& source,
+    const PreparedMotionReplacementCommitDTO commit) {
+  const auto reject = [](const char* reason) {
+    return Result<bool>::Err(ErrorDTO{
+        kErrorExecutionRejected, "Replacement adoption was refused", {{"reason", reason}}});
+  };
+  if (!commit.owner_commit) return reject("motion_replacement_commit_missing");
+  std::lock_guard owner_lock(prepared_motion_session_mutex_);
+  auto pending = pending_prepared_motion_session_;
+  auto incumbent = active_prepared_motion_session_;
+  auto* current = active_motion_execution_;
+  if (!pending || !incumbent || !current || pending->execution_id != candidate_id ||
+      incumbent->execution_id != source.execution_id ||
+      current->execution_id != source.execution_id)
+    return reject("motion_replacement_source_stale");
+  std::scoped_lock session_lock(pending->mutex, incumbent->mutex);
+  if (!pending->worker_parked) return Result<bool>::Ok(false);
+  const auto& retained = pending->authority.replacement->source;
+  if (source.execution_id != retained.execution_id ||
+      source.execution_generation != retained.execution_generation ||
+      source.goal != retained.goal || source.binding_epoch != retained.binding_epoch ||
+      source.prepared_contract_digest != retained.prepared_contract_digest ||
+      pending->cancel_requested || !pending->replacement_execution ||
+      !pending->replacement_correlation || !pending->replacement_projection ||
+      !pending->replacement_lookahead_arm || pending->error || !pending->replacement_observation ||
+      pending->replacement_observation->phase !=
+          PreparedMotionReplacementPhaseDTO::kReadyToCommit ||
+      addressed_stop_fence_execution_id_.load(std::memory_order_acquire) == source.execution_id)
+    return reject("motion_replacement_adoption_proof_incomplete");
+  auto& next = *pending->replacement_execution;
+  const auto* motion = std::get_if<PreparedMotionExecutionDTO>(&pending->participant->payload);
+  if (!motion || !motion->plan_request.moving_replacement)
+    return reject("motion_replacement_prepared_context_missing");
+  const auto scene = check_motion_replacement_scene(*pending);
+  if (!scene.ok()) return Result<bool>::Err(scene.error());
+  std::lock_guard protection_lock(runtime_collision_protection_mutex_);
+  const auto status = sm_.status();
+  if (status.execution_id != source.execution_id || status.fact ||
+      status.state != ExecutionState::kExecuting || !runtime_collision_protection_.active ||
+      runtime_collision_protection_.execution_id != source.execution_id ||
+      !runtime_collision_query_session_.load(std::memory_order_acquire))
+    return reject("motion_replacement_runtime_protection_stale");
+  {
+    std::lock_guard projection_lock(runtime_collision_state_projection_mutex_);
+    const auto& replacement = *pending->replacement_projection;
+    if (!runtime_collision_state_projection_ ||
+        runtime_collision_state_projection_->source_joint_names != replacement.source_joint_names ||
+        runtime_collision_state_projection_->query_joint_names != replacement.query_joint_names ||
+        runtime_collision_state_projection_->source_to_query_indices !=
+            replacement.source_to_query_indices ||
+        runtime_collision_state_projection_->template_positions_rad.size() !=
+            replacement.template_positions_rad.size() ||
+        current->request.contact_policy_id != next.request.contact_policy_id)
+      return reject("motion_replacement_monitor_context_changed");
+    for (std::size_t index = 0U; index < replacement.template_positions_rad.size(); ++index) {
+      if (std::find(replacement.source_to_query_indices.begin(),
+                    replacement.source_to_query_indices.end(),
+                    index) == replacement.source_to_query_indices.end() &&
+          runtime_collision_state_projection_->template_positions_rad[index] !=
+              replacement.template_positions_rad[index])
+        return reject("motion_replacement_monitor_context_changed");
+    }
+  }
+  const auto* progress = execution_backend_.execution_progress_publication();
+  const auto hazard =
+      progress ? progress->hazard_authority_claimed(source.execution_generation) : std::nullopt;
+  if (!hazard || *hazard) return reject("motion_replacement_source_hazard_authority");
+  // All context copies and arm preparation happened before the CAS. The
+  // backend validates its exact goal/Stop/association proofs, then calls this
+  // immediate callback while holding its participant mutex.
+  // The preparation budget ended at actual Replace submission. Recognition
+  // and adoption retain the backend's existing effect-aware deadlines.
+  // Prepare timeout values before backend adoption / owner CAS.
+  next.exec_timeout_ns = static_cast<std::int64_t>(next.request.timeouts.execution_timeout_s * 1e9);
+  next.zero_speed_hold_timeout_ns =
+      next.request.timeouts.zero_speed_hold_timeout_s
+          ? static_cast<std::int64_t>(*next.request.timeouts.zero_speed_hold_timeout_s * 1e9)
+          : 0;
+  next.execution_progress_generation = pending->backend_execution_generation;
+  const auto adopted = execution_backend_.AdoptReplacement(source, candidate_id, commit);
+  if (!adopted.ok()) return Result<bool>::Err(adopted.error());
+  static_assert(std::is_nothrow_swappable_v<ActiveMotionExecution>);
+  std::swap(*current, next);
+  current->prepared_session = pending;
+  active_prepared_motion_session_ = pending;
+  pending_prepared_motion_session_.reset();
+  sm_.set_execution_id(candidate_id);
+  active_correlation_.swap_prepared(*pending->replacement_correlation);
+  // Reuse the continuous immediate session/schedule: no teardown, no new
+  // query engine and no contact-release re-baseline at handover.
+  runtime_collision_protection_.execution_id = candidate_id;
+  runtime_collision_protection_.generation = ++runtime_collision_protection_next_generation_;
+  current->runtime_collision_protection_generation = runtime_collision_protection_.generation;
+  if (auto lookahead = runtime_collision_lookahead_session_.load(std::memory_order_acquire))
+    lookahead->publish_prepared_arm(std::move(*pending->replacement_lookahead_arm));
+  pending->replacement_lookahead_arm.reset();
+  pending->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
+  pending->replacement_observation->phase = PreparedMotionReplacementPhaseDTO::kCommitted;
+  return Result<bool>::Ok(true);
+}
+
+Result<PreparedMotionReplacementSourceDTO> ExecutionKernel::CaptureMotionReplacementSource(
+    const std::uint64_t execution_id) const {
+  std::shared_ptr<PreparedMotionSession> session;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    session = active_prepared_motion_session_;
+  }
+  if (!session) {
+    return Result<PreparedMotionReplacementSourceDTO>::Err(ErrorCode::kMissingReference);
+  }
+  std::lock_guard lock(session->mutex);
+  const auto status = sm_.status();
+  if (session->execution_id != execution_id || status.execution_id != execution_id ||
+      status.state != ExecutionState::kExecuting || status.fact ||
+      session->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched ||
+      !session->last_dispatched_participant || session->backend_execution_generation == 0U ||
+      addressed_stop_fence_execution_id_.load(std::memory_order_acquire) == execution_id) {
+    return Result<PreparedMotionReplacementSourceDTO>::Err(
+        ErrorDTO{kErrorExecutionRejected,
+                 "Motion replacement source is no longer executing",
+                 {{"reason", "motion_replacement_source_stale"}}});
+  }
+  const auto& request = session->authority.execution_request;
+  const ExecutionGoalKey goal{request.binding.controller_goal_id,
+                              request.binding.controller_goal_generation};
+  auto captured = execution_backend_.CaptureReplacementSource(
+      execution_id, session->backend_execution_generation, goal,
+      session->last_dispatched_participant->prepared_contract_digest);
+  if (!captured.ok()) return captured;
+  const auto& source = captured.value();
+  if (source.execution_id != execution_id ||
+      source.execution_generation != session->backend_execution_generation || source.goal != goal ||
+      source.prepared_contract_digest !=
+          session->last_dispatched_participant->prepared_contract_digest ||
+      source.binding_epoch != source.controller_sample.binding_epoch || !source.progress.valid ||
+      source.progress.terminal ||
+      source.progress.execution_generation != source.execution_generation ||
+      source.progress.trajectory_time_ns < 0 ||
+      source.progress.source_timestamp_ns != source.controller_sample.source_stamp_ns ||
+      source.progress.received_timestamp_ns != source.controller_sample.local_receipt_stamp_ns)
+    return Result<PreparedMotionReplacementSourceDTO>::Err(
+        ErrorDTO{kErrorExecutionRejected,
+                 "Replacement source facts do not identify one sample",
+                 {{"reason", "motion_replacement_source_sample_mismatch"}}});
+  return captured;
 }
 
 Result<ResolvedPreparedMotionExecutionSnapshotDTO> ExecutionKernel::ObservePreparedMotion(
@@ -3835,6 +5211,8 @@ Result<ResolvedPreparedMotionExecutionSnapshotDTO> ExecutionKernel::ObservePrepa
   {
     std::lock_guard lock(prepared_motion_session_mutex_);
     session = active_prepared_motion_session_;
+    if (!session || session->execution_id != execution_id)
+      session = pending_prepared_motion_session_;
   }
   if (!session) {
     return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Err(
@@ -3857,7 +5235,8 @@ Result<ResolvedPreparedMotionExecutionSnapshotDTO> ExecutionKernel::ObservePrepa
                  {{"reason", "prepared_motion_dispatch_source_invalid"}}});
   if (session->dispatch_gate.load(std::memory_order_acquire) ==
           PreparedMotionDispatchGate::kCommitted &&
-      session->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched)
+      session->state != ResolvedPreparedMotionExecutionStateDTO::kDispatched &&
+      !session->authority.replacement)
     return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Err(
         ErrorDTO{kErrorInvariantViolation,
                  "A committed dispatch has not produced a verified motion source",
@@ -3879,11 +5258,20 @@ Result<ResolvedPreparedMotionExecutionSnapshotDTO> ExecutionKernel::ObservePrepa
                    "Backend returned an invalid original trajectory cursor",
                    {{"reason", "prepared_motion_cursor_invalid"}}});
   }
+  std::optional<ResolvedPreparedMotionSpringColdResultDTO> cold;
+  if (session->spring_cold_product) {
+    const auto& product = *session->spring_cold_product;
+    cold = ResolvedPreparedMotionSpringColdResultDTO{
+        product.reserved_execution_id,
+        product.cancelled ? ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch
+                          : product.state,
+        product.participant, product.error};
+  }
   return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Ok(
-      ResolvedPreparedMotionExecutionSnapshotDTO{session->execution_id, session->state,
-                                                 session->participant,
-                                                 session->backend_prepare_result, session->error,
-                                                 cursor, session->last_dispatched_participant});
+      ResolvedPreparedMotionExecutionSnapshotDTO{
+          session->execution_id, session->state, session->participant,
+          session->backend_prepare_result, session->error, cursor,
+          session->last_dispatched_participant, session->replacement_observation, std::move(cold)});
 }
 
 Result<void> ExecutionKernel::DispatchPreparedMotion(
@@ -3892,6 +5280,8 @@ Result<void> ExecutionKernel::DispatchPreparedMotion(
   {
     std::lock_guard lock(prepared_motion_session_mutex_);
     session = active_prepared_motion_session_;
+    if (!session || session->execution_id != execution_id)
+      session = pending_prepared_motion_session_;
   }
   if (!session) {
     return Result<void>::Err(ErrorDTO{kErrorMissingReference,
@@ -3925,11 +5315,45 @@ Result<void> ExecutionKernel::CancelPreparedMotion(const std::uint64_t execution
   {
     std::lock_guard lock(prepared_motion_session_mutex_);
     session = active_prepared_motion_session_;
+    if (!session || session->execution_id != execution_id)
+      session = pending_prepared_motion_session_;
   }
   if (!session) {
     return Result<void>::Err(ErrorDTO{kErrorMissingReference,
                                       "Prepared motion session is not resident",
                                       {{"reason", "prepared_motion_session_missing"}}});
+  }
+  if (session->authority.replacement) {
+    bool sent_refusal = false;
+    {
+      std::lock_guard lock(session->mutex);
+      if (session->execution_id != execution_id)
+        return Result<void>::Err(ErrorCode::kMissingReference);
+      const bool no_effect =
+          session->replacement_observation &&
+          session->replacement_observation->phase == PreparedMotionReplacementPhaseDTO::kNoEffect;
+      if (session->spring_cold_product) session->spring_cold_product->cancelled = true;
+      if (session->state == ResolvedPreparedMotionExecutionStateDTO::kDispatched ||
+          (session->dispatch_gate.load(std::memory_order_acquire) ==
+               PreparedMotionDispatchGate::kCommitted &&
+           !no_effect))
+        sent_refusal = true;
+      if (!sent_refusal) {
+        session->cancel_requested = true;
+        session->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+        auto open = PreparedMotionDispatchGate::kOpen;
+        (void)session->dispatch_gate.compare_exchange_strong(
+            open, PreparedMotionDispatchGate::kFencedBeforeDispatch, std::memory_order_acq_rel);
+      }
+    }
+    session->replacement_cancellation.request_stop();
+    session->changed.notify_all();
+    if (sent_refusal)
+      return Result<void>::Err(
+          ErrorDTO{kErrorExecutionRejected,
+                   "A possibly sent replacement requires the existing Stop owner",
+                   {}});
+    return Result<void>::Ok();
   }
   {
     std::lock_guard lock(session->mutex);
@@ -3938,7 +5362,9 @@ Result<void> ExecutionKernel::CancelPreparedMotion(const std::uint64_t execution
                                         "Prepared motion execution identity is stale",
                                         {{"reason", "prepared_motion_execution_id_mismatch"}}});
     }
-    if (session->state == ResolvedPreparedMotionExecutionStateDTO::kDispatched) {
+    if (session->state == ResolvedPreparedMotionExecutionStateDTO::kDispatched ||
+        session->dispatch_gate.load(std::memory_order_acquire) ==
+            PreparedMotionDispatchGate::kCommitted) {
       return Result<void>::Err(
           ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
                    "A dispatched participant requires the prepared Stop-stage path",
@@ -3955,6 +5381,134 @@ Result<void> ExecutionKernel::CancelPreparedMotion(const std::uint64_t execution
   request_active_planning_cancel();
   request_active_validation_cancel("prepared_motion_cancelled_pre_dispatch");
   return Result<void>::Ok();
+}
+
+Result<bool> ExecutionKernel::RetireCancelledPreparedMotion(const std::uint64_t candidate_id) {
+  std::unique_lock lifecycle_lock(lifecycle_mutex_);
+  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire))
+    return Result<bool>::Ok(false);
+  std::shared_ptr<PreparedMotionSession> pending;
+  std::shared_ptr<PreparedMotionSession> source;
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    pending = pending_prepared_motion_session_;
+    source = active_prepared_motion_session_;
+  }
+  // Replay acknowledges only this already completed old membership retirement;
+  // it cannot cancel, dispatch or retire the promoted identity.
+  for (const auto& resident : {pending, source}) {
+    if (!resident) continue;
+    std::lock_guard lock(resident->mutex);
+    if (resident->spring_promotion_receipt &&
+        resident->spring_promotion_receipt->abandoned_id == candidate_id &&
+        resident->spring_promotion_receipt->promoted_id == resident->execution_id)
+      return Result<bool>::Ok(true);
+  }
+  if (!pending || pending->execution_id != candidate_id)
+    return Result<bool>::Err(ErrorCode::kMissingReference);
+  std::optional<StopCertificateRefDTO> settled_certificate;
+  {
+    std::lock_guard lock(pending->mutex);
+    const bool no_effect =
+        pending->dispatch_gate.load(std::memory_order_acquire) ==
+            PreparedMotionDispatchGate::kFencedBeforeDispatch ||
+        (pending->replacement_observation &&
+         pending->replacement_observation->phase == PreparedMotionReplacementPhaseDTO::kNoEffect);
+    bool source_stop_settled = false;
+    if ((!no_effect || pending->spring_cold_product) && source && pending->authority.replacement &&
+        addressed_participant_stop_settlement_ && addressed_motion_stop_recovery_evidence_) {
+      std::lock_guard source_lock(source->mutex);
+      const auto& captured = pending->authority.replacement->source;
+      const auto& settlement = *addressed_participant_stop_settlement_;
+      const auto& evidence = *addressed_motion_stop_recovery_evidence_;
+      const auto status = sm_.status();
+      source_stop_settled =
+          source->execution_id == captured.execution_id &&
+          source->backend_execution_generation == captured.execution_generation &&
+          source->participant &&
+          source->participant->prepared_contract_digest == captured.prepared_contract_digest &&
+          settlement.execution_id == captured.execution_id &&
+          settlement.controller_goal_id == captured.goal.controller_goal_id &&
+          settlement.controller_goal_generation == captured.goal.controller_goal_generation &&
+          evidence.execution_id == captured.execution_id && evidence.backend_stop_confirmed &&
+          evidence.aggregate_stop_certificate == settlement.aggregate_stop_certificate &&
+          status.execution_id == captured.execution_id &&
+          recovery_execution_state_locked(status) == ExecutionState::kStopped && status.fact &&
+          status.fact->effect == ParticipantEffectKnowledge::kEffectSettled &&
+          pending->backend_prepare_result &&
+          pending->backend_prepare_result->state == PrepareParticipantResultStateDTO::kPrepared;
+      if (source_stop_settled) settled_certificate = settlement.aggregate_stop_certificate;
+    }
+    if ((!pending->cancel_requested || !no_effect) && !source_stop_settled)
+      return Result<bool>::Err(ErrorCode::kExecutionRejected);
+    if (pending->spring_cold_product && !pending->spring_cold_product->cancelled &&
+        !pending->cancel_requested) {
+      const auto& spring = *pending->spring_cold_product->authority.replacement->spring_return;
+      if (!settled_certificate || !spring.stage ||
+          settled_certificate->stop_id != spring.stage->stop_id ||
+          settled_certificate->stop_generation != spring.stage->stop_generation)
+        return Result<bool>::Err(ErrorCode::kExecutionRejected);
+    }
+    if (!pending->preparation_completed) return Result<bool>::Ok(false);
+    if (source_stop_settled && ((!worker_signals_.complete() && worker_thread_.joinable()) ||
+                                completion_publication_execution_id_.load(
+                                    std::memory_order_acquire) == source->execution_id))
+      return Result<bool>::Ok(false);
+  }
+  if (replacement_preparation_thread_.joinable()) {
+    if (replacement_preparation_thread_.get_id() == std::this_thread::get_id())
+      return Result<bool>::Ok(false);
+    lifecycle_worker_retirement_in_progress_.store(true, std::memory_order_release);
+    lifecycle_lock.unlock();
+    replacement_preparation_thread_.join();
+    lifecycle_lock.lock();
+    lifecycle_worker_retirement_in_progress_.store(false, std::memory_order_release);
+  }
+  if (pending->backend_prepare_result &&
+      pending->backend_prepare_result->state == PrepareParticipantResultStateDTO::kPrepared) {
+    // This also proves a sent candidate ended under the same scoped Stop;
+    // source settlement alone never certifies the candidate's effect.
+    const auto retired = execution_backend_.RetirePreparedExecution(candidate_id);
+    if (!retired.ok()) return Result<bool>::Err(retired.error());
+  }
+  std::lock_guard lock(prepared_motion_session_mutex_);
+  if (pending_prepared_motion_session_ != pending)
+    return Result<bool>::Err(ErrorCode::kStaleGeneration);
+  std::lock_guard session_lock(pending->mutex);
+  if (pending->spring_cold_product && !pending->spring_cold_product->cancelled &&
+      !pending->cancel_requested && settled_certificate &&
+      pending->spring_cold_product->state ==
+          ResolvedPreparedMotionExecutionStateDTO::kColdPrepared &&
+      pending->spring_cold_product->participant && pending->spring_cold_product->execution &&
+      !pending->spring_cold_product->error) {
+    auto cold = std::move(*pending->spring_cold_product);
+    pending->spring_cold_product.reset();
+    pending->spring_promotion_receipt.emplace(PreparedMotionSession::SpringPromotionReceipt{
+        candidate_id, cold.reserved_execution_id, std::move(*settled_certificate)});
+    pending->authority = std::move(cold.authority);
+    pending->execution_id = cold.reserved_execution_id;
+    pending->participant = std::move(cold.participant);
+    pending->replacement_execution = std::move(cold.execution);
+    pending->replacement_collision_trajectory = std::move(cold.collision_trajectory);
+    pending->state = ResolvedPreparedMotionExecutionStateDTO::kColdPrepared;
+    pending->backend_prepare_result.reset();
+    pending->backend_execution_generation = 0U;
+    pending->last_dispatched_participant.reset();
+    pending->replacement_observation.reset();
+    pending->replacement_correlation.reset();
+    pending->replacement_lookahead_arm.reset();
+    pending->replacement_projection.reset();
+    pending->error.reset();
+    pending->dispatch_requested = false;
+    pending->worker_parked = false;
+    pending->replacement_failure_notified = false;
+    pending->dispatch_gate.store(PreparedMotionDispatchGate::kOpen, std::memory_order_release);
+    return Result<bool>::Ok(true);
+  }
+  // Cancelled/failed data has no promotion authority. Its old physical debt
+  // was nevertheless retired above by the same exact backend proof.
+  pending_prepared_motion_session_.reset();
+  return Result<bool>::Ok(true);
 }
 
 Result<std::uint64_t> ExecutionKernel::PrepareCapabilityCommand(
@@ -3980,6 +5534,21 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     const ExecuteRequestDTO& request, std::shared_ptr<PreparedMotionSession> prepared_session) {
   EventDeferralScope event_scope(*this);
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  const bool cold_reuse = prepared_session && prepared_session->authority.replacement &&
+                         prepared_session->authority.replacement->spring_return;
+  std::shared_ptr<const PreparedOperationParticipantDTO> cold_product;
+  if (cold_reuse) {
+    std::lock_guard owner_lock(prepared_motion_session_mutex_);
+    std::lock_guard session_lock(prepared_session->mutex);
+    if (pending_prepared_motion_session_ != prepared_session ||
+        prepared_session->state != ResolvedPreparedMotionExecutionStateDTO::kColdPrepared ||
+        !prepared_session->spring_activation_certificate || prepared_session->cancel_requested ||
+        !prepared_session->participant || !prepared_session->replacement_execution)
+      return Result<uint64_t>::Err(ErrorDTO{kErrorExecutionRejected,
+          "Cold activation no longer owns its exact prepared product",
+          {{"reason", "spring_return_activation_stale"}}});
+    cold_product = prepared_session->participant;
+  }
   clear_runtime_collision_state_projection();
   if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire)) {
     return Result<uint64_t>::Err(ErrorDTO{kErrorExecutionRejected,
@@ -3991,7 +5560,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
   if (admission_status.state != ExecutionState::kIdle && !admission_status.fact.has_value()) {
     return Result<uint64_t>::Err(ErrorCode::kExecutionRejected);
   }
-  if (!retire_execute_worker(lifecycle_lock)) {
+  if (!retire_execute_worker(lifecycle_lock, cold_reuse)) {
     return Result<uint64_t>::Err(
         ErrorDTO{kErrorExecutionRejected,
                  "Execution cannot be started from the active execution worker",
@@ -4016,7 +5585,8 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                     {"participant_fact", to_string(fact->kind)}}});
     }
     // Motion-free retirement of the previous ended execution.
-    if (const auto retired = retire_prepared_motion_membership(); !retired.ok()) {
+    if (const auto retired = retire_prepared_motion_membership(
+            cold_reuse ? prepared_session.get() : nullptr); !retired.ok()) {
       return Result<uint64_t>::Err(retired.error());
     }
     sm_.retire();
@@ -4036,7 +5606,8 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                 ExecutionState::kIdle,
                 std::nullopt,
                 {{"reason", "ended_execution_retired_by_admission"}}});
-  } else if (const auto retired = retire_prepared_motion_membership(); !retired.ok()) {
+  } else if (const auto retired = retire_prepared_motion_membership(
+                 cold_reuse ? prepared_session.get() : nullptr); !retired.ok()) {
     return Result<uint64_t>::Err(retired.error());
   }
 
@@ -4067,14 +5638,15 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                    std::to_string(*request.timeouts.zero_speed_hold_timeout_s)}}});
   }
 
-  const uint64_t exec_id = next_execution_id_.load(std::memory_order_relaxed);
+  const uint64_t exec_id = cold_reuse ? prepared_session->execution_id
+                                    : next_execution_id_.load(std::memory_order_relaxed);
   if (exec_id == std::numeric_limits<std::uint64_t>::max()) {
     return Result<uint64_t>::Err(ErrorDTO{kErrorExecutionRejected,
                                           "Execution identity space is exhausted",
                                           {{"reason", "execution_id_exhausted"}}});
   }
   addressed_stop_fence_execution_id_.store(0U, std::memory_order_release);
-  next_execution_id_.store(exec_id + 1U, std::memory_order_relaxed);
+  if (!cold_reuse) next_execution_id_.store(exec_id + 1U, std::memory_order_relaxed);
   auto prev_state = sm_.status().state;
   sm_.set_execution_id(exec_id);
   set_active_request_correlation(request);
@@ -4150,8 +5722,20 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     return reject_admission(synchronized_scene.error());
   }
 
-  auto retained_scene_result =
-      retain_current_scene_snapshot_lease_inventory(exec_id, request.move_id);
+  auto retained_scene_result = [&]() -> Result<RetainedSceneSnapshotLease> {
+    if (!cold_reuse) return retain_current_scene_snapshot_lease_inventory(exec_id, request.move_id);
+    const auto current = current_scene_snapshot_lease_validation_context();
+    std::lock_guard lock(prepared_session->mutex);
+    const auto& staged = *prepared_session->replacement_execution;
+    if (!current || current->live_projection_revision != staged.retained_scene.binding().projection_revision ||
+        (staged.scene_snapshot_lease &&
+         !validate_scene_snapshot_lease(*staged.scene_snapshot_lease, *current).accepted))
+      return Result<RetainedSceneSnapshotLease>::Err(ErrorDTO{kErrorExecutionRejected,
+          "Spring successor projection or retained lease changed before activation",
+          {{"reason", "spring_return_projection_stale"}}});
+    return Result<RetainedSceneSnapshotLease>::Ok(
+        std::move(prepared_session->replacement_execution->retained_scene));
+  }();
   if (!retained_scene_result.ok()) {
     return reject_admission(std::move(retained_scene_result.error()));
   }
@@ -4170,15 +5754,15 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                  {{"reason", "planning_scene_synchronization_raced"}}});
   }
   ExecuteRequestDTO resolved_request(request);
-  auto contact_grasp_binding =
-      install_resolved_contact_grasp_policy(resolved_request, retained_scene.mutable_inventory());
+  auto contact_grasp_binding = cold_reuse ? Result<void>::Ok()
+      : install_resolved_contact_grasp_policy(resolved_request, retained_scene.mutable_inventory());
   if (!contact_grasp_binding.ok()) {
     return reject_admission(contact_grasp_binding.error());
   }
   set_active_request_correlation(resolved_request);
   std::optional<SceneSnapshotLease> scene_snapshot_lease;
-  scene_snapshot_lease =
-      build_scene_snapshot_lease(retained_scene.inventory(), resolved_request, exec_id);
+  scene_snapshot_lease = cold_reuse ? prepared_session->replacement_execution->scene_snapshot_lease
+      : build_scene_snapshot_lease(retained_scene.inventory(), resolved_request, exec_id);
 
   std::optional<RobotStateDTO> synced_state;
   auto observed_start = observed_state_.current_state(clock_.now());
@@ -4274,19 +5858,30 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                                      "Planning requires an authority-selected observed start state",
                                      {{"reason", "planning_start_state_unavailable"}}});
   }
-  auto dynamic_start_contacts = discover_dynamic_carried_start_contacts(
-      retained_scene.mutable_inventory(), *synced_state, exec_id);
-  if (!dynamic_start_contacts.ok()) {
-    return reject_admission(dynamic_start_contacts.error());
+  if (!cold_reuse) {
+    auto dynamic_start_contacts = discover_dynamic_carried_start_contacts(
+        retained_scene.mutable_inventory(), *synced_state, exec_id);
+    if (!dynamic_start_contacts.ok()) return reject_admission(dynamic_start_contacts.error());
+    resolved_request.dynamically_discovered_start_contact_count = dynamic_start_contacts.value();
   }
-  resolved_request.dynamically_discovered_start_contact_count = dynamic_start_contacts.value();
 
   PreparedExecutionStart prepared;
+  if (cold_reuse) {
+    const auto& motion = std::get<PreparedMotionExecutionDTO>(cold_product->payload);
+    const auto start = cached_trajectory_matches_current_start(
+        motion.trajectory, *synced_state, request.tolerances.joint_position_tol_rad);
+    const auto goal = cached_trajectory_matches_request_goal(kinematics_, motion.trajectory, resolved_request);
+    if (!start.compatible || !goal.compatible)
+      return reject_admission(ErrorDTO{kErrorStartStateMismatch,
+          "Spring successor no longer matches the settled start or admitted target",
+          {{"reason", "spring_return_start_or_target_changed"}}});
+    prepared.trajectory = motion.trajectory;
+  }
   const auto active_collision_world_revision = retained_scene.inventory().bundle.world->revision;
   const TrajectoryCacheRevisionEvidence active_cache_evidence{
       projection_binding.projection_revision, active_collision_world_revision};
   const auto cache_key = trajectory_cache_key(resolved_request);
-  if (resolved_request.cache_mode != CacheMode::kDisable) {
+  if (!cold_reuse && resolved_request.cache_mode != CacheMode::kDisable) {
     // Exact-revision entries are cache hits. A same-intent older-revision entry
     // is only a current-snapshot revalidation candidate; it carries no stale
     // proof and cannot dispatch until the ordinary validation gate restamps it.
@@ -4326,7 +5921,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     }
   }
 
-  const auto initial_state = (prepared.cache_hit || prepared.cache_revalidation_candidate)
+  const auto initial_state = (cold_reuse || prepared.cache_hit || prepared.cache_revalidation_candidate)
                                  ? ExecutionState::kValidating
                                  : ExecutionState::kPlanning;
   if (initial_state != ExecutionState::kPlanning) {
@@ -4408,13 +6003,15 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     }
     std::lock_guard active_lock(prepared_motion_session_mutex_);
     active_prepared_motion_session_ = prepared_session;
+    if (cold_reuse && pending_prepared_motion_session_ == prepared_session)
+      pending_prepared_motion_session_.reset();
   }
 
   auto worker_start_gate = std::make_shared<WorkerStartGate>();
   const auto worker_generation = ++execute_worker_generation_;
   worker_thread_ = std::jthread(
       [this, request_copy = std::move(resolved_request), exec_id,
-       cached_trajectory = (prepared.cache_hit || prepared.cache_revalidation_candidate)
+       cached_trajectory = (cold_reuse || prepared.cache_hit || prepared.cache_revalidation_candidate)
                                ? std::make_optional(std::move(prepared.trajectory))
                                : std::nullopt,
        cache_revalidation_candidate = prepared.cache_revalidation_candidate,
@@ -4461,9 +6058,25 @@ AddressedParticipantStopFenceDisposition ExecutionKernel::fence_addressed_partic
   revoke_runtime_collision_lookahead_clear_permits();
 
   std::shared_ptr<PreparedMotionSession> session;
+  std::shared_ptr<PreparedMotionSession> pending;
   {
     std::lock_guard lock(prepared_motion_session_mutex_);
     session = active_prepared_motion_session_;
+    pending = pending_prepared_motion_session_;
+  }
+  if (pending && pending->authority.replacement &&
+      pending->authority.replacement->source.execution_id == execution_id) {
+    auto open = PreparedMotionDispatchGate::kOpen;
+    if (pending->dispatch_gate.compare_exchange_strong(
+            open, PreparedMotionDispatchGate::kFencedBeforeDispatch, std::memory_order_acq_rel)) {
+      {
+        std::lock_guard pending_lock(pending->mutex);
+        pending->cancel_requested = true;
+        pending->state = ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch;
+      }
+      pending->replacement_cancellation.request_stop();
+      pending->changed.notify_all();
+    }
   }
   if (!session || session->execution_id != execution_id) {
     return AddressedParticipantStopFenceDisposition::kUnknown;
@@ -5052,6 +6665,10 @@ RecoveryAuthorityCapture ExecutionKernel::capture_recovery_authority_locked() {
   const auto status = sm_.status();
   capture.execution_id = status.execution_id;
   capture.execution_state = recovery_execution_state_locked(status);
+  if (status.fact) capture.terminal_effect = status.fact->effect;
+  capture.terminal_cleanup_complete =
+      (!worker_thread_.joinable() || worker_signals_.complete()) &&
+      completion_publication_execution_id_.load(std::memory_order_acquire) != status.execution_id;
   capture.operator_stop_owner_generation =
       operator_stop_owner_generation_for_execution(capture.execution_id);
   capture.stronger_authority_active =
@@ -5071,10 +6688,21 @@ RecoveryAuthorityCapture ExecutionKernel::capture_recovery_authority_locked() {
         fact_error.has_value() && is_classified_stop_intervention(fact_error->details);
   }
   if (capture.execution_state == ExecutionState::kFailed) {
+    const auto never_dispatched = failed_preparation_never_dispatched_locked();
+    capture.failed_preparation_never_dispatched = never_dispatched != nullptr;
+    if (status.fact.has_value()) {
+      capture.failed_execution_effect = status.fact->effect;
+    }
+    if (never_dispatched) {
+      std::lock_guard session_lock(never_dispatched->mutex);
+      capture.failed_validation_conclusive_collision =
+          never_dispatched->conclusive_collision_failure;
+    }
     capture.failed_validation_retryable =
         (fact_error.has_value() && is_retryable_failed_validation_error(*fact_error)) ||
-        failed_preparation_never_dispatched_locked() != nullptr;
+        capture.failed_preparation_never_dispatched;
     if (fact_error.has_value()) {
+      capture.failed_validation_code = fact_error->code;
       auto it = fact_error->details.find("reason");
       if (it != fact_error->details.end()) {
         capture.failed_validation_reason = it->second;
@@ -5113,6 +6741,7 @@ ExecutionState ExecutionKernel::recovery_execution_state_locked(
       return ExecutionState::kCompleted;
     case ParticipantExecutionFactKind::kCancelledBeforeDispatch:
     case ParticipantExecutionFactKind::kPreemptedByAddressedStop:
+    case ParticipantExecutionFactKind::kPreemptedByReplacement:
       return ExecutionState::kStopped;
     case ParticipantExecutionFactKind::kLocalFailure:
       return status.fact->effect == ParticipantEffectKnowledge::kEffectUncertain
@@ -5351,7 +6980,18 @@ KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action_impl(
       // The participant keeps no local fault latch any more; this action is
       // never offered by its assessment.
       return reject(reason_codes::kRecoveryActionNotAllowed);
+    case RecoveryAction::kCloseOperation:
     case RecoveryAction::kReplanFromStoppedState: {
+      if (request.action == RecoveryAction::kCloseOperation) {
+        if (!retire_execute_worker(lifecycle_lock, /*containment_already_certified=*/true))
+          return reject(reason_codes::kTerminalPublicationInProgress);
+        capture = capture_recovery_authority_locked();
+        assessment = publish_recovery_assessment_locked(capture, "close_operation_recheck");
+        const auto close_decision = evaluate_recovery_admission(request, capture, assessment);
+        if (!close_decision.admitted) return reject(close_decision.rejection_reason);
+        const auto retired = retire_prepared_motion_membership();
+        if (!retired.ok()) return reject("operation_close_cleanup_failed");
+      }
       // Motion-free local retirement ONLY: the participant returns to Idle;
       // no backend reset or motion command is issued on any accepted action.
       sm_.retire();
@@ -5372,11 +7012,12 @@ KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action_impl(
       emit_event({KernelEventType::kStateTransition,
                   prev_execution_id,
                   clock_.now(),
-                  ExecutionState::kStopped,
+                  capture.execution_state,
                   ExecutionState::kIdle,
                   std::nullopt,
-                  {{"reason", "stopped_replan_acknowledged"}}});
-      accepted_from_state = ExecutionState::kStopped;
+                  {{"reason", request.action == RecoveryAction::kCloseOperation
+                                  ? "operation_closed" : "stopped_replan_acknowledged"}}});
+      accepted_from_state = capture.execution_state;
       active_correlation_.clear_program_run_and_action_span();
       break;
     }
@@ -6123,7 +7764,8 @@ Result<std::size_t> ExecutionKernel::discover_dynamic_carried_start_contacts(
 
 Result<PlanRequestDTO> ExecutionKernel::make_plan_request(
     const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
-    std::uint32_t planning_attempt_index, const RobotStateDTO* start_state_override) {
+    std::uint32_t planning_attempt_index, const RobotStateDTO* start_state_override,
+    const MovingReplacementInputDTO* replacement) {
   const auto& projection_binding = projection_inventory.projection_binding;
   if (!projection_binding.valid()) {
     return Result<PlanRequestDTO>::Err(
@@ -6201,14 +7843,16 @@ Result<PlanRequestDTO> ExecutionKernel::make_plan_request(
       projection_inventory.bundle.world,
       projection_inventory.bundle.policy.has_value()
           ? std::make_shared<const CollisionPolicySnapshot>(*projection_inventory.bundle.policy)
-          : nullptr});
+          : nullptr,
+      replacement ? std::optional<MovingReplacementInputDTO>{*replacement} : std::nullopt});
 }
 
 Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_trajectory_with_evidence(
     const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
-    std::uint32_t planning_attempt_index, const RobotStateDTO* start_state_override) {
+    std::uint32_t planning_attempt_index, const RobotStateDTO* start_state_override,
+    const MovingReplacementInputDTO* replacement) {
   auto plan_request = make_plan_request(request, projection_inventory, planning_attempt_index,
-                                        start_state_override);
+                                        start_state_override, replacement);
   if (!plan_request.ok()) {
     return Result<PlanningSuccess>::Err(plan_request.error());
   }
@@ -6244,17 +7888,6 @@ Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_trajectory_with_e
   }
 
   return Result<PlanningSuccess>::Err(ErrorCode::kPlanningFailed);
-}
-
-Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
-    const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
-    std::uint32_t planning_attempt_index, const RobotStateDTO* start_state_override) {
-  auto planned = plan_trajectory_with_evidence(request, projection_inventory,
-                                               planning_attempt_index, start_state_override);
-  if (!planned.ok()) {
-    return Result<TrajectoryDTO>::Err(planned.error());
-  }
-  return Result<TrajectoryDTO>::Ok(std::move(*planned.value().result.trajectory));
 }
 
 Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_motion_continuation(
@@ -6307,7 +7940,14 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     const TrajectoryDTO& trajectory, const ExecuteRequestDTO& request,
     CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
     const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
-    const RobotStateDTO* start_state_override, const std::stop_token external_stop_token) {
+    const RobotStateDTO* start_state_override, const std::stop_token external_stop_token,
+    bool* conclusive_collision_failure,
+    std::shared_ptr<CollisionCancellationToken> validation_cancellation,
+    const std::optional<std::uint64_t> validation_execution_id,
+    const MovingReplacementInputDTO* replacement) {
+  if (conclusive_collision_failure != nullptr) {
+    *conclusive_collision_failure = false;
+  }
   // Start-state gate
   RobotStateDTO current_state;
   if (start_state_override != nullptr) {
@@ -6354,7 +7994,9 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
         sm_.status().state, collision_resources, validation_admission, runtime_protection));
   }
 
-  auto cancel = install_validation_cancel_token();
+  const bool registers_active_cancellation = !validation_cancellation;
+  auto cancel = validation_cancellation ? std::move(validation_cancellation)
+                                        : install_validation_cancel_token();
   std::stop_callback external_cancel(
       external_stop_token, [cancel]() { cancel->request_cancel("motion_preview_cancelled"); });
   if (external_stop_token.stop_requested()) {
@@ -6368,7 +8010,7 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
         kernel->clear_validation_cancel_token(token);
       }
     }
-  } cancel_guard{this, cancel};
+  } cancel_guard{registers_active_cancellation ? this : nullptr, cancel};
 
   // Full non-collision trajectory validation (including TCP speed limit per
   // spec 230 §3.3). The manyforge_collision pipeline is the only
@@ -6379,6 +8021,13 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
   opts.base_frame = compiled_frame_name(request.binding.base_frame);
   opts.max_tcp_linear_speed_mps = request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
   opts.run_collision_checks = false;
+  if (replacement) {
+    opts.retained_prefix = RetainedTrajectoryPrefixValidationOptionsDTO{
+        replacement->divergence_cursor_s - replacement->source_cursor_s,
+        replacement->source_speed_profile.max_tcp_linear_speed_mps.value_or(0.0),
+        compiled_frame_name(replacement->source_tcp_frame),
+        compiled_frame_name(replacement->source_base_frame)};
+  }
   auto val_result = trajectory_validator_.validate_non_collision(trajectory, opts, *cancel);
   if (!val_result.valid) {
     if (val_result.error.has_value()) {
@@ -6415,8 +8064,10 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
 
   std::optional<SceneSnapshotLease> effective_scene_snapshot_lease = scene_snapshot_lease;
   if (!effective_scene_snapshot_lease.has_value() && scene_snapshot_lease_inventory.bundle.world) {
-    effective_scene_snapshot_lease = build_scene_snapshot_lease(scene_snapshot_lease_inventory,
-                                                                request, sm_.status().execution_id);
+    const auto execution_id =
+        validation_execution_id ? *validation_execution_id : sm_.status().execution_id;
+    effective_scene_snapshot_lease =
+        build_scene_snapshot_lease(scene_snapshot_lease_inventory, request, execution_id);
   }
 
   auto run_authoritative_validation_once = [&]() -> Result<AuthoritativeValidationAttempt> {
@@ -6570,6 +8221,25 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
   if (config_.enable_collision_diagnostic_compare && collision_diagnostic_comparator_ != nullptr) {
     append_collision_compare_diagnostics(details, bundle, trajectory,
                                          *collision_diagnostic_comparator_);
+  }
+  if (conclusive_collision_failure != nullptr && !contact_policy_violation.has_value() &&
+      bundle.decision.action == CollisionDecisionAction::kReject &&
+      bundle.decision.first_failing_waypoint.has_value()) {
+    const auto failed_waypoint = std::find_if(
+        bundle.waypoint_records.begin(), bundle.waypoint_records.end(), [&](const auto& record) {
+          return record.waypoint_index == *bundle.decision.first_failing_waypoint;
+        });
+    if (failed_waypoint != bundle.waypoint_records.end()) {
+      const auto& result = failed_waypoint->result;
+      *conclusive_collision_failure =
+          result.engine_status == CollisionEngineStatus::kOk && result.in_collision &&
+          result.decision == CollisionDecisionResult::kFail &&
+          std::any_of(result.normalized_pairs_classified.begin(),
+                      result.normalized_pairs_classified.end(), [](const auto& pair) {
+                        return pair.classification ==
+                               CollisionPairClassification::kBlockingCollision;
+                      });
+    }
   }
   return Result<CollisionValidationSuccess>::Err(
       ErrorDTO{rejection_error_code,

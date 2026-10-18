@@ -21,18 +21,18 @@ namespace {
   throw CommandSchemaCodecError(std::move(message));
 }
 
-[[nodiscard]] const CanonicalValue& require_member(
-    const CanonicalValue& object, std::string_view name) {
-  const auto* member = object.find_object_member(name);
+[[nodiscard]] const CanonicalValue &require_member(const CanonicalValue &object,
+                                                   std::string_view name) {
+  const auto *member = object.find_object_member(name);
   if (member == nullptr) {
     fail("command schema normalized value is missing " + std::string(name));
   }
   return *member;
 }
 
-[[nodiscard]] const std::string& require_string(
-    const CanonicalValue& value, std::string_view name) {
-  const auto* text = std::get_if<std::string>(&value.storage());
+[[nodiscard]] const std::string &require_string(const CanonicalValue &value,
+                                                std::string_view name) {
+  const auto *text = std::get_if<std::string>(&value.storage());
   if (text == nullptr) {
     fail("command schema normalized field is not a string: " +
          std::string(name));
@@ -40,9 +40,9 @@ namespace {
   return *text;
 }
 
-[[nodiscard]] const CanonicalValue::Array& require_array(
-    const CanonicalValue& value, std::string_view name) {
-  const auto* array = std::get_if<CanonicalValue::Array>(&value.storage());
+[[nodiscard]] const CanonicalValue::Array &
+require_array(const CanonicalValue &value, std::string_view name) {
+  const auto *array = std::get_if<CanonicalValue::Array>(&value.storage());
   if (array == nullptr) {
     fail("command schema normalized field is not an array: " +
          std::string(name));
@@ -50,9 +50,9 @@ namespace {
   return *array;
 }
 
-[[nodiscard]] std::uint64_t require_positive_integer(
-    const CanonicalValue& value, std::string_view name) {
-  const auto* number = std::get_if<double>(&value.storage());
+[[nodiscard]] std::uint64_t
+require_positive_integer(const CanonicalValue &value, std::string_view name) {
+  const auto *number = std::get_if<double>(&value.storage());
   if (number == nullptr || !std::isfinite(*number) ||
       std::floor(*number) != *number || *number < 1.0 || *number > 4096.0) {
     fail("command schema normalized cardinality is outside [1, 4096]: " +
@@ -61,8 +61,8 @@ namespace {
   return static_cast<std::uint64_t>(*number);
 }
 
-[[nodiscard]] core::CoordinateKind parse_coordinate_kind(
-    std::string_view token) {
+[[nodiscard]] core::CoordinateKind
+parse_coordinate_kind(std::string_view token) {
   if (token == "angular") {
     return core::CoordinateKind::kAngular;
   }
@@ -72,38 +72,65 @@ namespace {
   fail("command schema coordinate kind is outside the closed enum");
 }
 
-[[nodiscard]] core::CommandCallerOptionValueKind parse_option_kind(
-    std::string_view token) {
+[[nodiscard]] core::CommandCallerOptionValueKind
+parse_option_kind(std::string_view token) {
   if (token == "nonnegative_duration_seconds") {
     return core::CommandCallerOptionValueKind::kNonnegativeDurationSeconds;
   }
   fail("command schema caller option kind is outside the closed enum");
 }
 
-[[nodiscard]] core::CommandSchemaDTO decode_normalized(
-    const CanonicalValue& normalized) {
+[[nodiscard]] core::CommandSchemaDTO
+decode_normalized(const CanonicalValue &normalized) {
   std::vector<core::CommandSchemaCompatibleCapabilityDTO> capabilities;
-  for (const auto& item : require_array(
-           require_member(normalized, "compatible_capabilities"),
-           "compatible_capabilities")) {
+  for (const auto &item :
+       require_array(require_member(normalized, "compatible_capabilities"),
+                     "compatible_capabilities")) {
     capabilities.push_back(core::CommandSchemaCompatibleCapabilityDTO{
-        core::CapabilityId(require_string(
-            require_member(item, "capability_id"), "capability_id")),
+        core::CapabilityId(require_string(require_member(item, "capability_id"),
+                                          "capability_id")),
         core::CapabilityDefinitionRevision(require_string(
             require_member(item, "capability_definition_revision"),
             "capability_definition_revision")),
     });
   }
 
-  const auto& command_value = require_member(normalized, "command_value");
+  const auto &api_version =
+      require_string(require_member(normalized, "api_version"), "api_version");
+  if (api_version == core::kIoSignalWriteCommandSchemaApiVersion) {
+    if (require_string(
+            require_member(require_member(normalized, "command_value"),
+                           "value_kind"),
+            "value_kind") != "io_signal_write") {
+      fail("output command schema value kind is outside the boolean family");
+    }
+    return {core::CommandSchemaId(
+                require_string(require_member(normalized, "command_schema_id"),
+                               "command_schema_id")),
+            core::CommandSchemaRevision(require_string(
+                require_member(normalized, "command_schema_revision"),
+                "command_schema_revision")),
+            std::move(capabilities),
+            core::IoSignalWriteCommandValueContractDTO{},
+            {},
+            {},
+            {},
+            std::nullopt,
+            std::nullopt,
+            {}};
+  }
+  if (api_version != core::kCommandSchemaApiVersion) {
+    fail("command schema API version is outside the closed family");
+  }
+  const auto &command_value = require_member(normalized, "command_value");
   if (require_string(require_member(command_value, "value_kind"),
                      "value_kind") != "gripper_position") {
     fail("command schema value kind is outside the qualified I6 family");
   }
   std::vector<core::CoordinateKind> position_kinds;
-  for (const auto& item : require_array(
-           require_member(command_value, "accepted_position_kinds"),
-           "accepted_position_kinds")) {
+  for (const auto &item :
+       require_array(require_member(command_value, "accepted_position_kinds"),
+                     "accepted_position_kinds")) {
     position_kinds.push_back(
         parse_coordinate_kind(require_string(item, "accepted_position_kind")));
   }
@@ -123,23 +150,23 @@ namespace {
   }
 
   std::vector<core::ResourceRoleId> resource_selectors;
-  for (const auto& item : require_array(
-           require_member(normalized, "resource_role_selectors"),
-           "resource_role_selectors")) {
+  for (const auto &item :
+       require_array(require_member(normalized, "resource_role_selectors"),
+                     "resource_role_selectors")) {
     resource_selectors.emplace_back(
         require_string(item, "resource_role_selector"));
   }
   std::vector<core::ChannelRoleId> channel_selectors;
-  for (const auto& item : require_array(
-           require_member(normalized, "channel_role_selectors"),
-           "channel_role_selectors")) {
+  for (const auto &item :
+       require_array(require_member(normalized, "channel_role_selectors"),
+                     "channel_role_selectors")) {
     channel_selectors.emplace_back(
         require_string(item, "channel_role_selector"));
   }
   std::vector<core::CommandCallerOptionDTO> options;
-  for (const auto& item : require_array(
+  for (const auto &item : require_array(
            require_member(normalized, "caller_options"), "caller_options")) {
-    const auto* required =
+    const auto *required =
         std::get_if<bool>(&require_member(item, "required").storage());
     if (required == nullptr) {
       fail("command schema caller option required field is not boolean");
@@ -147,16 +174,16 @@ namespace {
     options.push_back(core::CommandCallerOptionDTO{
         core::CommandOptionId(
             require_string(require_member(item, "option_id"), "option_id")),
-        parse_option_kind(require_string(require_member(item, "value_kind"),
-                                         "value_kind")),
+        parse_option_kind(
+            require_string(require_member(item, "value_kind"), "value_kind")),
         *required,
     });
   }
 
   std::vector<core::CommandStopEvidenceRequirement> stop_requirements;
-  for (const auto& item : require_array(
-           require_member(normalized, "stop_evidence_requirements"),
-           "stop_evidence_requirements")) {
+  for (const auto &item :
+       require_array(require_member(normalized, "stop_evidence_requirements"),
+                     "stop_evidence_requirements")) {
     if (require_string(item, "stop_evidence_requirement") !=
         "command_terminal") {
       fail("command schema Stop requirement is outside the closed enum");
@@ -173,12 +200,12 @@ namespace {
   }
 
   return core::CommandSchemaDTO{
-      core::CommandSchemaId(require_string(
-          require_member(normalized, "command_schema_id"),
-          "command_schema_id")),
-      core::CommandSchemaRevision(require_string(
-          require_member(normalized, "command_schema_revision"),
-          "command_schema_revision")),
+      core::CommandSchemaId(
+          require_string(require_member(normalized, "command_schema_id"),
+                         "command_schema_id")),
+      core::CommandSchemaRevision(
+          require_string(require_member(normalized, "command_schema_revision"),
+                         "command_schema_revision")),
       std::move(capabilities),
       core::GripperPositionCommandValueContractDTO{
           std::move(position_kinds), minimum, maximum,
@@ -193,19 +220,19 @@ namespace {
   };
 }
 
-}  // namespace
+} // namespace
 
 QualifiedCommandSchema resolve_and_qualify_command_schema(
-    const core::CommandSchemaCatalogRecordRefDTO& reference,
-    const core::ContentAddressedStoreKey& resolved_store_key,
+    const core::CommandSchemaCatalogRecordRefDTO &reference,
+    const core::ContentAddressedStoreKey &resolved_store_key,
     std::string_view stored_bytes) {
   if (stored_bytes.size() > kMaxArtifactEncodedBytes ||
       reference.content_addressed_store_key.empty() ||
       resolved_store_key.empty()) {
     fail("command-schema bytes or store key violate fixed bounds");
   }
-  const auto& registry = build_qualified_closed_schema_registry();
-  const auto* family = registry.find_qualified_catalog_schema(
+  const auto &registry = build_qualified_closed_schema_registry();
+  const auto *family = registry.find_qualified_catalog_schema(
       core::CatalogRecordKind::kCommandSchema, reference.schema_id,
       reference.schema_revision);
   if (family == nullptr || family->compiled_schema() == nullptr) {
@@ -225,7 +252,9 @@ QualifiedCommandSchema resolve_and_qualify_command_schema(
       *family->compiled_schema(), parse_strict_json_model_yaml(stored_bytes));
   const detail::ContentIdentitySpec identity_spec{
       detail::catalog_record_identity_domain("command_schema"),
-      std::string(core::kCommandSchemaApiVersion),
+      require_string(
+          require_member(normalized.normalized_root(), "api_version"),
+          "api_version"),
       "command_schema_revision",
   };
   if (!detail::verify_content_identity(normalized.normalized_root(),
@@ -237,11 +266,12 @@ QualifiedCommandSchema resolve_and_qualify_command_schema(
       decoded.command_schema_revision != reference.record_revision) {
     fail("command-schema typed ID/revision selector does not match referent");
   }
-  if (decoded != core::builtin_gripper_position_command_schema()) {
+  if (decoded != core::builtin_gripper_position_command_schema() &&
+      decoded != core::builtin_io_signal_write_command_schema()) {
     fail("command schema does not match the build-owned qualified I6 family");
   }
   return QualifiedCommandSchema(reference, std::move(decoded),
                                 normalized.normalized_root());
 }
 
-}  // namespace manyforge::deployment
+} // namespace manyforge::deployment

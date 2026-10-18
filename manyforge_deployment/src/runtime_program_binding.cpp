@@ -1,4 +1,6 @@
 #include <manyforge_deployment/runtime_program_binding.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_core/io_signal_descriptor.hpp>
 
 #include <algorithm>
 #include <iterator>
@@ -39,8 +41,8 @@ require_control_domain(const core::CellGraphDTO &graph,
         return candidate.control_domain_id == binding.control_domain_id;
       },
       "control domain");
-  if (domain.controller_topology_id != binding.controller_topology_id ||
-      domain.topology_revision != binding.topology_revision) {
+  if (domain.controller().controller_topology_id != binding.controller_topology_id ||
+      domain.controller().topology_revision != binding.topology_revision) {
     fail("runtime Program Binding control domain and binding topology differ");
   }
   return domain;
@@ -59,8 +61,8 @@ require_desired_route(const core::RetainedBundleDTO &bundle,
                    domain.control_domain_revision;
       },
       "desired control configuration");
-  if (configuration.controller_topology_id != domain.controller_topology_id ||
-      configuration.topology_revision != domain.topology_revision) {
+  if (configuration.controller_topology_id != domain.controller().controller_topology_id ||
+      configuration.topology_revision != domain.controller().topology_revision) {
     fail("runtime Program Binding desired configuration topology differs");
   }
   const auto &route = require_one(
@@ -220,6 +222,195 @@ RuntimeProgramTargetBinding resolve_runtime_program_target(
       std::move(provider_binding), binding_value.contact_grasp_bindings);
 }
 
+core::RuntimeParticipantBindingDTO build_runtime_io_output_binding_dto(
+    const RuntimeProgramTargetBinding &target,
+    const core::ResourceRoleId &resource_role,
+    const RetainedBundle &retained_bundle,
+    const core::RuntimeProviderDomainConfigurationReadbackDTO
+        &actual_provider) {
+  const auto &graph = retained_bundle.value().cell_graph;
+  const auto *domain = actual_provider.domain.provider();
+  const auto schema = core::builtin_io_signal_write_command_schema();
+  if (!verify_retained_bundle_identity(retained_bundle) ||
+      !actual_provider.locally_valid() || !domain || resource_role.empty() ||
+      target.control_binding() ||
+      target.capability().capability_id.value() != "io.gpio.set_output" ||
+      target.capability().command_schema !=
+          core::ProgramCommandSchemaRefDTO{schema.command_schema_id,
+                                           schema.command_schema_revision} ||
+      !target.capability_provider_binding() ||
+      target.retained_bundle_id() != retained_bundle.retained_bundle_id() ||
+      target.graph_revision() != graph.graph_revision ||
+      actual_provider.retained_bundle_id != target.retained_bundle_id() ||
+      actual_provider.graph_revision != target.graph_revision() ||
+      domain->provider.controllable_component_id !=
+          target.component().controllable_component_id)
+    fail("runtime output has no exact retained target/provider occurrence");
+
+  const auto &sealed_domain = require_one(
+      graph.control_domains,
+      [&](const auto &value) {
+        return value.control_domain_id ==
+                   actual_provider.domain.control_domain_id &&
+               value.control_domain_revision ==
+                   actual_provider.domain.control_domain_revision;
+      },
+      "output provider domain");
+  if (!sealed_domain.provider() ||
+      *sealed_domain.provider() != domain->provider)
+    fail("runtime output provider differs from its sealed domain");
+  const auto &provider = *target.capability_provider_binding();
+  const auto *provider_target =
+      std::get_if<core::ComponentTargetCapabilityProviderTargetDTO>(
+          &provider.target);
+  const auto &occurrence = actual_provider.provider_occurrence;
+  if (!provider_target ||
+      provider_target->controllable_component_id !=
+          target.component().controllable_component_id ||
+      provider_target->component_type_revision !=
+          target.component().component_type_revision ||
+      provider_target->command_target_id !=
+          target.target_role().command_target_id ||
+      provider.capability_id != target.capability().capability_id ||
+      provider.capability_definition_revision !=
+          target.capability().capability_definition_revision ||
+      provider.provider_instance_id != occurrence.provider_instance_id ||
+      provider.provider_manifest_id != occurrence.provider_manifest_id ||
+      provider.provider_manifest_revision !=
+          occurrence.provider_manifest_revision)
+    fail("runtime output capability belongs to another provider occurrence");
+
+  const auto catalog = ResolveRetainedIoSignalCatalog(graph);
+  if (!catalog.ok())
+    fail("runtime output signal catalog is not qualified: " +
+         catalog.error().message);
+  std::vector<std::string> member_names;
+  std::vector<core::ResourceId> output_resources;
+  for (const auto &member : catalog.value()) {
+    if (member.descriptor.signal_id.controllable_component_id !=
+            target.component().controllable_component_id ||
+        member.runtime_unit_id != occurrence.provider_runtime_unit_id ||
+        !std::binary_search(domain->provider.signal_names.begin(),
+                            domain->provider.signal_names.end(),
+                            member.descriptor.signal_id.name))
+      continue;
+    member_names.push_back(member.descriptor.signal_id.name);
+    if (member.descriptor.output_resource)
+      output_resources.push_back(*member.descriptor.output_resource);
+  }
+  std::sort(member_names.begin(), member_names.end());
+  std::sort(output_resources.begin(), output_resources.end());
+  output_resources.erase(
+      std::unique(output_resources.begin(), output_resources.end()),
+      output_resources.end());
+  if (member_names != domain->provider.signal_names ||
+      output_resources != domain->output_resources ||
+      std::find(target.component().runtime_unit_ids.begin(),
+                target.component().runtime_unit_ids.end(),
+                occurrence.provider_runtime_unit_id) ==
+          target.component().runtime_unit_ids.end())
+    fail("runtime output provider membership differs from the complete "
+         "retained catalog");
+  const auto &row = require_one(
+      catalog.value(),
+      [&](const auto &value) {
+        return value.descriptor.signal_id.controllable_component_id ==
+                   target.component().controllable_component_id &&
+               value.command_target_id ==
+                   target.target_role().command_target_id &&
+               value.resource_role_id == resource_role;
+      },
+      "output signal resource");
+  const auto digest = core::ComputeIoSignalDescriptorDigest(row.descriptor);
+  const auto &role = require_one(
+      target.target_role().signal_role_bindings,
+      [&](const auto &value) {
+        return value.resource_role_id == resource_role;
+      },
+      "output signal role");
+  if (row.descriptor.direction != core::IoSignalDirection::kOutput ||
+      row.descriptor.value_type != core::IoSignalValueType::kBoolean ||
+      !row.descriptor.output_resource ||
+      row.runtime_unit_id != occurrence.provider_runtime_unit_id ||
+      !digest.ok() || role.signal_descriptor_digest != digest.value() ||
+      role.signal_name != row.descriptor.signal_id.name ||
+      role.direction != row.descriptor.direction ||
+      role.value_type != row.descriptor.value_type ||
+      role.transition_capability != row.descriptor.transition_capability ||
+      !std::binary_search(domain->provider.signal_names.begin(),
+                          domain->provider.signal_names.end(),
+                          row.descriptor.signal_id.name) ||
+      !std::binary_search(domain->output_resources.begin(),
+                          domain->output_resources.end(),
+                          *row.descriptor.output_resource))
+    fail("runtime output role, descriptor or actual channel differs from its "
+         "seal");
+
+  core::IoOutputCompletionPolicyDTO policy(core::IoOutputImmediateDTO{});
+  if (row.provider.profile == "ros_set_bool" || row.provider.profile == "ur_set_io") {
+    const auto devices = ResolveRetainedIoProviderDevices(graph);
+    if (!devices.ok())
+      fail("runtime output device policy is not qualified: " +
+           devices.error().message);
+    const auto &device = require_one(
+        devices.value(),
+        [&](const auto &value) {
+          return value.runtime_unit_id == row.runtime_unit_id &&
+                 value.controllable_component_id ==
+                     row.descriptor.signal_id.controllable_component_id;
+        },
+        "output mechanism device policy");
+    if (!device.output_source_ack_timeout_ns ||
+        *device.output_source_ack_timeout_ns <= 0)
+      fail("runtime output mechanism has no retained source-acknowledgement "
+           "budget");
+    policy = core::IoOutputCompletionPolicyDTO(
+        core::IoOutputSourceAckBudgetDTO{*device.output_source_ack_timeout_ns});
+  } else if (row.provider.profile == "ros2_control_gpio") {
+    policy = core::IoOutputCompletionPolicyDTO(core::IoOutputSubmittedDTO{});
+  } else if (row.provider.profile != "mock_output") {
+    fail("runtime output mechanism is unsupported");
+  }
+
+  return core::RuntimeParticipantBindingDTO{
+      target.program_id(),
+      target.program_revision(),
+      target.program_binding_id(),
+      target.retained_bundle_id(),
+      target.graph_revision(),
+      target.component_role().component_role_id,
+      target.target_role().target_role_id,
+      target.component().controllable_component_id,
+      target.component().component_type_id,
+      target.component().component_type_revision,
+      target.target_role().command_target_id,
+      target.capability().capability_id,
+      target.capability().capability_definition_revision,
+      target.capability().command_schema,
+      {},
+      {},
+      {},
+      {},
+      {},
+      std::nullopt,
+      core::RuntimeCapabilityProviderPathDTO{
+          provider.capability_id, provider.capability_definition_revision,
+          provider.capability_provider_binding_id,
+          provider.capability_provider_binding_revision,
+          occurrence.provider_instance_id, occurrence.provider_manifest_id,
+          occurrence.provider_manifest_revision,
+          occurrence.provider_runtime_unit_id,
+          occurrence.provider_runtime_epoch},
+      {},
+      {{occurrence.provider_runtime_unit_id,
+        occurrence.provider_runtime_epoch}},
+      {},
+      core::RuntimeIoOutputBindingDTO{
+          resource_role, row.descriptor, digest.value(),
+          actual_provider.component_lifecycle_generation, occurrence,
+          domain->provider.signal_configuration_digest, std::move(policy)}};
+}
+
 core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
     const RuntimeProgramTargetBinding &target,
     const ActiveRuntimeParticipantFactsDTO &active_facts,
@@ -255,7 +446,8 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
         "provider runtime epoch");
     if (fact.provider_runtime_unit_id != runtime_unit_id ||
         fact.runtime_epoch.empty()) {
-      fail("runtime participant provider occurrence differs from its retained runtime unit");
+      fail("runtime participant provider occurrence differs from its retained "
+           "runtime unit");
     }
     return fact.runtime_epoch;
   };
@@ -465,6 +657,10 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
                        target.control_binding()->control_binding_id &&
                    provider_target.control_binding_revision ==
                        target.control_binding()->control_binding_revision;
+          } else if constexpr (std::is_same_v<Target, core::ComponentTargetCapabilityProviderTargetDTO>) {
+            // A non-coordinate observation provider is never a supporting
+            // planning/control path for physical operation dispatch.
+            return false;
           } else if constexpr (
               std::is_same_v<Target,
                              core::ControlDomainCapabilityProviderTargetDTO>) {

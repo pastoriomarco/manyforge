@@ -1075,3 +1075,60 @@ def test_preselected_session_report_is_shared_by_existing_consumers(tmp_path, mo
     report = root / "session-reports" / (previous + ".json")
     assert workbench._previous_session_report() == report
     assert workbench._previous_session_arguments() == ("--workbench-previous-session-reports-root", str(root / "session-reports"), "--workbench-previous-session-id", previous)
+
+
+@pytest.mark.parametrize("dependencies", [False, True])
+def test_ros_dependency_setups_precede_build_and_application_overlay_is_last(
+    tmp_path: Path, monkeypatch: Any, dependencies: bool
+) -> None:
+    # Import actual setup scripts with literal arguments, including shell
+    # metacharacters in a filename. The build/service owners are not started.
+    monkeypatch.setattr(dev_workbench.os, "environ", dict(os.environ))
+    monkeypatch.delenv("MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS", raising=False)
+    monkeypatch.delenv("MANYFORGE_SETUP_ORDER", raising=False)
+    build = tmp_path / "build"
+    monkeypatch.setattr(dev_workbench, "BUILD_ROOT", build)
+    monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "1")
+    if dependencies:
+        first = tmp_path / "first $literal.bash"
+        second = tmp_path / "second.bash"
+        first.write_text('export MANYFORGE_SETUP_ORDER="first"\nprintf "setup output"\n')
+        second.write_text('export MANYFORGE_SETUP_ORDER="${MANYFORGE_SETUP_ORDER}:second"\n')
+        monkeypatch.setenv("MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS", f"{first}:{second}")
+    seen = []
+
+    def run(command: tuple[str, ...], *, env: dict[str, str]) -> None:
+        seen.append((command, dict(env)))
+        assert env.get("MANYFORGE_SETUP_ORDER") == ("first:second" if dependencies else None)
+        runtime = build / "ros-integration"
+        runtime.mkdir(parents=True)
+        for name in ("manyforge_ros2_control_execution_host", "manyforge_roboplan_candidate_worker"):
+            target = runtime / name
+            target.write_text("fixture")
+            target.chmod(0o755)
+        overlay = build / "isaac/ros-overlay/install/setup.bash"
+        overlay.parent.mkdir(parents=True)
+        overlay.write_text('export MANYFORGE_SETUP_ORDER="${MANYFORGE_SETUP_ORDER:+${MANYFORGE_SETUP_ORDER}:}application"\n')
+
+    monkeypatch.setattr(dev_workbench, "_run", run)
+    dev_workbench._ensure_current_ros_backend()
+    assert len(seen) == 1
+    assert seen[0][0][0].endswith("scripts/ros/build-ros2-control-runtime.sh")
+    assert os.environ["MANYFORGE_SETUP_ORDER"] == (
+        "first:second:application" if dependencies else "application")
+
+
+@pytest.mark.parametrize("configured", ["missing", "relative", "failed"])
+def test_ros_dependency_setup_failure_prevents_build_with_exact_path(
+    tmp_path: Path, monkeypatch: Any, configured: str
+) -> None:
+    monkeypatch.setattr(dev_workbench.os, "environ", dict(os.environ))
+    setup = tmp_path / "configured.bash"
+    if configured == "failed":
+        setup.write_text("return 23\n")
+    selected = str(setup) if configured != "relative" else "relative.bash"
+    monkeypatch.setenv("MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS", selected)
+    monkeypatch.setattr(dev_workbench, "_run", lambda *_args, **_kwargs: pytest.fail("build started"))
+    with pytest.raises(dev_workbench.WorkbenchError) as raised:
+        dev_workbench._ensure_current_ros_backend()
+    assert selected in str(raised.value)

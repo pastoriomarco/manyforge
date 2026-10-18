@@ -1025,8 +1025,19 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     tmp_path: Path,
 ):
     client, state = _client(tmp_path)
+    # Apply captures only authored intent (model_source_capture requires its
+    # component inventory), so the Applied baseline is a canonical intent.
+    _replace_deployment_session(state, DeploymentDraftSession())
+    authored = {
+        "api_version": "manyforge.deployment_intent.v2",
+        "deployment_artifact_id": "cell_a",
+        "name": "Cell A",
+        "components": [],
+        "attachments": [],
+        "policies": {},
+    }
     source = tmp_path / "cell_a.deployment.yaml"
-    source.write_text(json.dumps(_document()), encoding="utf-8")
+    source.write_text(json.dumps(authored), encoding="utf-8")
 
     workspace = client.get("/api/deployment/workspace").json()
     response = client.post(
@@ -1038,7 +1049,8 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     assert workspace["draft"]["deploymentArtifactId"] == "cell_a"
     assert workspace["draft"]["differsFromSaved"] is False
     applied = deepcopy(workspace["draft"]["document"])
-    applied_revision = workspace["draft"]["deploymentRevision"]
+    # Manager assigns the prepared Deployment revision; intent has none.
+    applied_revision = _DIGEST
 
     response = client.post(
         "/api/deployment/draft/mutations",
@@ -1105,6 +1117,9 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     )
     assert response.status_code == 200, response.text
     assert response.json()["draft"]["document"]["name"] == applied["name"]
+    assert response.json()["managerApplied"]["activationOrder"]["componentIds"] == [
+        row["component_id"] for row in applied["components"]
+    ]
     assert (
         state.authoring_retained_state()["schema_version"]
         == "manyforge.composer_authoring_workspace.v2"

@@ -194,6 +194,15 @@ class FakeStore final : public ICCLCLifecycleTargetStore {
     incidents.insert_or_assign(record.incident.incident_id, stored);
     return Result<ComponentIncidentRecordDTO>::Ok(record);
   }
+  Result<bool> HasOpenIncident() override {
+    if (fail_open_query) return Result<bool>::Err(Unavailable());
+    return Result<bool>::Ok(observer_incident_open ||
+        std::any_of(incidents.begin(), incidents.end(),
+                    [](const auto& row) { return !row.second.incident.acknowledged; }));
+  }
+  bool fail_open_query{};
+  bool observer_incident_open{};
+
   Result<std::optional<ComponentIncidentRecordDTO>> LoadOpenComponentIncident(
       const ControllableComponentId& component) override {
     const auto* open = Open(component);
@@ -419,8 +428,9 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
     }
     std::vector<LifecycleFactDTO> facts{
         {LifecycleFactId("external.controller_configuration_ready"), Boolean(ready)},
-        {LifecycleFactId("external.fault_present"), Boolean(false)},
-        {LifecycleFactId("external.transport_ready"), Boolean(true)}};
+        {LifecycleFactId("external.controller_loaded"), Boolean(controller_loaded)},
+        {LifecycleFactId("external.fault_present"), Boolean(fault_present)},
+        {LifecycleFactId("external.transport_ready"), Boolean(transport_ready)}};
     if (cause) {
       facts.push_back({LifecycleFactId(std::string(kLifecycleBlockingCauseFactId)),
                        {LifecycleFactValueKindDTO::kToken, std::nullopt, std::nullopt,
@@ -432,8 +442,11 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
         {query.lifecycle_transaction_id, query.lifecycle_transaction_generation,
          query.controllable_component_id, query.control_domain_id, query.control_domain_revision,
          query.provider_instance_id, query.provider_manifest_id, query.provider_manifest_revision,
-         query.provider_runtime_unit_id, query.provider_runtime_epoch, observation_generation,
-         observation_generation, now, now, now + kSecond, observed, std::move(facts), diagnostic,
+         query.provider_runtime_unit_id,
+         observation_epoch.value_or(query.provider_runtime_epoch), observation_generation,
+         observation_generation, now - (stale_observation ? kSecond : 0),
+         now - (stale_observation ? kSecond : 0),
+         now + (stale_observation ? 0 : kSecond), observed, std::move(facts), diagnostic,
          diagnostic_snapshot});
   }
 
@@ -575,8 +588,13 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
   ComponentLifecycleStateDTO observed{ComponentLifecycleStateDTO::kDeclared};
   bool ready{};
   bool reachable{true};
+  bool controller_loaded{true};
+  bool fault_present{false};
+  bool transport_ready{true};
   std::optional<LifecycleBlockingCauseClassDTO> cause;
   std::uint64_t observation_generation{1U};
+  std::optional<RuntimeEpoch> observation_epoch;
+  bool stale_observation{};
   bool authoring_allowed{true};
   bool accepting{true};
   bool settling{};
@@ -681,11 +699,13 @@ class LifecycleTargetDriverTest : public ::testing::Test {
     const auto current = ports_.ReadCurrentComponent(kComponent).value();
     std::vector<ExpectedControlDomainRevisionDTO> domains;
     for (const auto& domain : current.domains) {
-      domains.push_back({domain.control_domain_id, domain.control_domain_revision,
-                         domain.controller_topology_id, domain.topology_revision,
-                         {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt,
-                          std::nullopt},
-                         domain.current_control_bindings});
+      domains.push_back(
+          {domain.control_domain_id,
+           domain.control_domain_revision,
+           domain.controller().controller_topology_id,
+           domain.controller().topology_revision,
+           {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt},
+           domain.controller().current_control_bindings});
     }
     ComponentLifecycleIntentDTO intent{
         {RequestId(request_id), RequestOwnerEpoch("cclc.owner.1"), "composer", std::nullopt},
@@ -714,7 +734,7 @@ class LifecycleTargetDriverTest : public ::testing::Test {
 TestLaunchDiagnosticSnapshot() {
   return std::make_shared<
       const content_identity::CanonicalValue>(content_identity::parse_canonical_json(
-      R"snapshot({"context":{"bundle_id":"bundle.1","component_id":"component.arm","generator_identity":null,"graph_revision":"graph.1","launch_identity":"sha256:0000000000000000000000000000000000000000000000000000000000000000","request_context":"Apply=apply.7","runtime_epoch":"epoch.1","runtime_unit_id":"robot_cell.ros2_control_execution"},"core_dump_link":null,"exit":{"core_dumped":false,"observed_utc":"2026-10-11T18:00:00Z","signal":11,"status":null},"generated":{"controllers_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222","robot_description_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},"output":{"dropped_forward_bytes":0,"dropped_forward_lines":0,"invalid_text_bytes":0,"line_count":1,"tail":"controller crashed\n","truncated":false},"readiness":{"arm_controller_active":null,"binding_epoch":null,"captured_utc":null,"controller_bound":null,"controller_loaded":null,"controller_manager_present":null,"controller_observed":null,"hardware_ready":null,"joint_sample_available":null,"known":null,"sample_age_ns":null},"settings":{"argv":["ros2","launch"],"arm_controller_name":"arm","controller_profile":"ur5","controllers_yaml":"arm: effective settings","frame_prefix":"","gripper_controller_name":null,"retained_configuration_json":"{}","runtime_namespace":"/robot"}})snapshot"));
+      R"snapshot({"context":{"controllable_component_id":"component.arm","generator_identity":null,"graph_revision":"graph.1","launch_identity":"sha256:0000000000000000000000000000000000000000000000000000000000000000","request_context":"Apply=apply.7","retained_bundle_id":"bundle.1","runtime_epoch":"epoch.1","runtime_unit_id":"robot_cell.ros2_control_execution"},"core_dump_link":null,"exit":{"core_dumped":false,"observed_utc":"2026-10-11T18:00:00Z","signal":11,"status":null},"generated":{"controllers_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222","robot_description_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},"launch_readiness":{"arm_controller_active":null,"binding_epoch":null,"captured_utc":null,"controller_bound":null,"controller_loaded":null,"controller_manager_present":null,"controller_observed":null,"hardware_ready":null,"joint_sample_available":null,"known":null,"sample_age_ns":null},"output":{"dropped_forward_bytes":0,"dropped_forward_lines":0,"invalid_text_bytes":0,"line_count":1,"tail":"controller crashed\n","truncated":false},"settings":{"argv":["ros2","launch"],"arm_controller_name":"arm","controller_profile":"ur5","controllers_yaml":"arm: effective settings","frame_prefix":"","gripper_controller_name":null,"retained_configuration_json":"{}","runtime_namespace":"/robot"}})snapshot"));
 }
 
 TEST_F(LifecycleTargetDriverTest, LateReadinessIsFollowedByPrepareThenEnableWithoutAnOperator) {
@@ -1101,7 +1121,9 @@ TEST_F(LifecycleTargetDriverTest, InterventionCauseIsRetainedUntilTheOperatorsRe
   auto progress = Progress();
   EXPECT_EQ(progress.phase, LifecycleProgressPhaseDTO::kBlocked);
   EXPECT_EQ(progress.blocking_cause_class, LifecycleBlockingCauseClassDTO::kProtectiveStop);
-  EXPECT_EQ(progress.blocking_reason, "intervention_required:protective_stop");
+  ASSERT_TRUE(progress.incident);
+  EXPECT_EQ(progress.incident->cause_class, LifecycleBlockingCauseClassDTO::kProtectiveStop);
+  EXPECT_EQ(ports_.containments.size(), 1U);
   EXPECT_EQ(store_.causes.size(), 1U);
 
   // Communication is lost: the retained class still blocks, not availability.
@@ -1129,14 +1151,14 @@ TEST_F(LifecycleTargetDriverTest, InterventionCauseIsRetainedUntilTheOperatorsRe
   EXPECT_EQ(Progress().blocking_cause_class, LifecycleBlockingCauseClassDTO::kProtectiveStop);
   EXPECT_TRUE(ports_.submitted.empty());
 
-  // The operator's Recover is accepted by CCLC; the journal clears the
-  // retained class in that acceptance commit and the target is unchanged
-  // (stand-in below). While that transaction settles, the adapter still
-  // reports the stop the Recover step is about to clear; it is not retained
-  // again.
+  // The existing operator incident Recover clears the retained class in
+  // its actual acceptance commit. While the subsequent step settles, the
+  // recovered cause is not retained again.
   ports_.cause = LifecycleBlockingCauseClassDTO::kProtectiveStop;
   ++ports_.observation_generation;
-  store_.causes.clear();
+  const auto recovered = Driver().RecoverIncident(OperatorRecover("operator.recover.startup"));
+  ASSERT_TRUE(recovered.ok() && recovered.value());
+  ASSERT_TRUE(recovered.value()->incident_recovery);
   ports_.settling = true;
   Driver().RunOnce();
   EXPECT_TRUE(store_.causes.empty());
@@ -1154,14 +1176,16 @@ TEST_F(LifecycleTargetDriverTest, InterventionCauseIsRetainedUntilTheOperatorsRe
   EXPECT_EQ(store_.targets.at(kComponent).target_generation, 1U);
 }
 
-TEST_F(LifecycleTargetDriverTest, InterventionCausePermitsOnlyARequestedDisable) {
+TEST_F(LifecycleTargetDriverTest, ExplicitInterventionStillContainsWhenDisableWasRequested) {
   Target(LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator);
   ports_.achieved = ComponentLifecycleStateDTO::kActive;
   ports_.observed = ComponentLifecycleStateDTO::kDisabled;
   ports_.cause = LifecycleBlockingCauseClassDTO::kEmergencyStop;
   Driver().RunOnce();
-  ASSERT_EQ(ports_.submitted.size(), 1U);
-  EXPECT_EQ(ports_.submitted.front().intent, ComponentLifecycleIntentKindDTO::kDisable);
+  ASSERT_TRUE(Progress().incident);
+  EXPECT_EQ(Progress().incident->cause_class, LifecycleBlockingCauseClassDTO::kEmergencyStop);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  EXPECT_TRUE(ports_.submitted.empty());
 }
 
 TEST_F(LifecycleTargetDriverTest, NothingIsSubmittedOrWrittenWhileNothingChanges) {
@@ -1178,14 +1202,21 @@ TEST_F(LifecycleTargetDriverTest, NothingIsSubmittedOrWrittenWhileNothingChanges
   EXPECT_TRUE(store_.targets.at(kComponent).reached);
   EXPECT_TRUE(ports_.submitted.empty());
 
-  // A blocked component writes its retained cause once, then nothing.
+  // The new intervention records one incident/containment and its cause;
+  // unchanged later observations do not rewrite any of those facts.
   ports_.achieved = ComponentLifecycleStateDTO::kDeclared;
   ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident);
+  const auto writes_after_fault = store_.writes;
   for (int pass = 0; pass < 10; ++pass) {
     clock_.advance(kSecond);
     Driver().RunOnce();
   }
-  EXPECT_EQ(store_.writes, 2);
+  EXPECT_EQ(store_.writes, writes_after_fault);
+  EXPECT_EQ(store_.causes.size(), 1U);
+  EXPECT_EQ(store_.incidents.size(), 1U);
+  EXPECT_EQ(ports_.containments.size(), 1U);
   EXPECT_TRUE(ports_.submitted.empty());
 }
 
@@ -1221,6 +1252,85 @@ class LifecycleIncidentTest : public LifecycleTargetDriverTest {
   }
 };
 
+TEST_F(LifecycleIncidentTest, OwnedEnableTransitionExplainsInactivityUntilItSettles) {
+  ReachTarget();
+  ports_.achieved = ComponentLifecycleStateDTO::kPrepared;
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 1U);
+  ASSERT_EQ(ports_.submitted.back().intent, ComponentLifecycleIntentKindDTO::kEnable);
+  ports_.statuses.begin()->second.acceptance.accepted_at_ns = clock_.now();
+  ports_.achieved = ports_.observed = ComponentLifecycleStateDTO::kDegraded;
+  ports_.ready = false;
+  ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
+  Driver().RunOnce();
+  EXPECT_TRUE(ports_.containments.empty());
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kTransitionInProgress);
+  ports_.BecomeReady();
+  ports_.cause.reset();
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  Driver().RunOnce();
+  EXPECT_TRUE(ports_.containments.empty());
+  ports_.achieved = ports_.observed = ComponentLifecycleStateDTO::kDegraded;
+  ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
+  Driver().RunOnce();
+  ASSERT_NE(store_.Open(kComponent), nullptr);
+  EXPECT_EQ(store_.Open(kComponent)->incident.cause_class, LifecycleBlockingCauseClassDTO::kProviderLost);
+}
+
+TEST_F(LifecycleIncidentTest, AcceptedTransitionDeadlineDoesNotHidePersistentInactivity) {
+  ReachTarget();
+  ports_.achieved = ComponentLifecycleStateDTO::kPrepared;
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 1U);
+  ports_.statuses.begin()->second.acceptance.accepted_at_ns = clock_.now();
+  ports_.achieved = ports_.observed = ComponentLifecycleStateDTO::kDegraded;
+  ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
+  Driver().RunOnce();
+  EXPECT_TRUE(ports_.containments.empty());
+  clock_.advance(30 * kSecond);  // This fixture's actual accepted timeout.
+  Driver().RunOnce();
+  ASSERT_NE(store_.Open(kComponent), nullptr);
+  EXPECT_EQ(store_.Open(kComponent)->incident.cause_class, LifecycleBlockingCauseClassDTO::kProviderLost);
+}
+
+TEST_F(LifecycleIncidentTest, OwnedDisableDoesNotHideTransportLoss) {
+  ReachTarget();
+  Target(LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator);
+  // This fixture's observed-only Disable plan admits its real Disabled readback.
+  ports_.observed = ComponentLifecycleStateDTO::kDisabled;
+  ports_.ready = false;
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 1U);
+  ASSERT_EQ(ports_.submitted.back().intent, ComponentLifecycleIntentKindDTO::kDisable);
+  ports_.statuses.begin()->second.acceptance.accepted_at_ns = clock_.now();
+  ports_.observed = ComponentLifecycleStateDTO::kDegraded;
+  ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
+  ports_.transport_ready = false;
+  Driver().RunOnce();
+  ASSERT_NE(store_.Open(kComponent), nullptr);
+  EXPECT_EQ(store_.Open(kComponent)->incident.cause_class, LifecycleBlockingCauseClassDTO::kProviderLost);
+}
+
+TEST_F(LifecycleIncidentTest, FirstPrepareAvailabilityDoesNotInventAPreviouslyReachedTarget) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.BecomeReady();  // This fixture's ordinary observation-only Prepare admission.
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 1U);
+  ASSERT_EQ(ports_.submitted.back().intent, ComponentLifecycleIntentKindDTO::kPrepare);
+  ASSERT_FALSE(store_.targets.at(kComponent).reached);
+  ports_.statuses.begin()->second.acceptance.accepted_at_ns = clock_.now();
+  ports_.observed = ComponentLifecycleStateDTO::kDegraded;
+  ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
+  ports_.controller_loaded = false;
+  ports_.transport_ready = false;
+  Driver().RunOnce();
+  EXPECT_TRUE(ports_.containments.empty());
+  EXPECT_EQ(store_.Open(kComponent), nullptr);
+  EXPECT_FALSE(store_.targets.at(kComponent).reached);
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kTransitionInProgress);
+}
+
 class ProgramResetPositionScopeTest : public LifecycleIncidentTest {
  protected:
   CCLCProgramResetPositionScopeRequest Request() {
@@ -1249,18 +1359,17 @@ class ProgramResetPositionScopeTest : public LifecycleIncidentTest {
         current.active_publication_receipt,
         kComponent,
         current.provider_occurrences.front(),
-        current.domains.front(),
-        [](const BrandLifecycleObservationDTO&, CCLCProgramResetPositionPhase) { return true; }};
+        current.domains.front()};
   }
   static Result<void> Complete(const CCLCProgramResetPositionAdvance& advance) {
-    // Repeated phase commits join positive switch ACK and target-published
+    // Repeated phase advances join positive switch ACK and target-published
     // callbacks without inventing another normal phase or waiting for pose.
     for (const auto phase : {CCLCProgramResetPositionPhase::kSwitchingToWriter,
                              CCLCProgramResetPositionPhase::kSettingState,
                              CCLCProgramResetPositionPhase::kSettingState,
                              CCLCProgramResetPositionPhase::kSwitchingToJtc,
                              CCLCProgramResetPositionPhase::kSwitchingToJtc}) {
-      auto result = advance(phase, {});
+      auto result = advance(phase, std::nullopt);
       if (!result.ok()) return result;
     }
     return Result<void>::Ok();
@@ -1273,6 +1382,7 @@ TEST_F(ProgramResetPositionScopeTest,
   const auto request = Request();
   const auto target = store_.targets.at(kComponent);
   const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
     EXPECT_TRUE(Driver().ReadReadinessFacts(kComponent).value().blocker.has_value());
     ports_.achieved = ComponentLifecycleStateDTO::kDegraded;
     ports_.observed = ComponentLifecycleStateDTO::kDegraded;
@@ -1283,115 +1393,182 @@ TEST_F(ProgramResetPositionScopeTest,
     EXPECT_TRUE(ports_.containments.empty());
     EXPECT_EQ(ports_.submit_count.load(), 0);
     EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kTransitionInProgress);
+    for (const auto phase : {CCLCProgramResetPositionPhase::kSettingState,
+                             CCLCProgramResetPositionPhase::kSwitchingToJtc}) {
+      EXPECT_TRUE(advance(phase, std::nullopt).ok());
+      Driver().RunOnce();
+      EXPECT_TRUE(ports_.containments.empty());
+    }
     ports_.achieved = ComponentLifecycleStateDTO::kActive;
     ports_.BecomeReady();
     ports_.cause.reset();
-    return Complete(advance);
+    return advance(CCLCProgramResetPositionPhase::kSwitchingToJtc, std::nullopt);
   });
   EXPECT_TRUE(result.ok());
   EXPECT_EQ(store_.targets.at(kComponent), target);
   EXPECT_FALSE(Driver().ReadReadinessFacts(kComponent).value().blocker.has_value());
 }
 
-TEST_F(ProgramResetPositionScopeTest, PhaseCommitAndFollowerObservationShareTheSameExclusion) {
-  ReachTarget();
-  auto request = Request();
-  auto observed_phase = CCLCProgramResetPositionPhase::kSwitchingToWriter;
-  request.expected_transition = [&](const auto&, const auto expected_phase) {
-    EXPECT_EQ(observed_phase, expected_phase);
-    return observed_phase == expected_phase;
-  };
-  std::mutex mutex;
-  std::condition_variable changed;
-  bool committed{};
-  const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
-    ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
-    std::thread pass([&] {
-      {
-        std::unique_lock lock(mutex);
-        changed.wait(lock, [&] { return committed; });
-      }
-      Driver().RunOnce();
-    });
-    const auto advanced = advance(CCLCProgramResetPositionPhase::kSettingState, [&] {
-      observed_phase = CCLCProgramResetPositionPhase::kSettingState;
-      {
-        std::lock_guard lock(mutex);
-        committed = true;
-      }
-      changed.notify_all();
-      return Result<void>::Ok();
-    });
-    // Keep a failed precondition from leaving the test worker waiting.
-    {
-      std::lock_guard lock(mutex);
-      committed = true;
-    }
-    changed.notify_all();
-    pass.join();
-    EXPECT_TRUE(advanced.ok());
-    EXPECT_TRUE(ports_.containments.empty());
-    return Result<void>::Err({"effect_cancelled", "test complete", {}});
-  });
-  EXPECT_FALSE(result.ok());
-}
-
-TEST_F(ProgramResetPositionScopeTest, PhaseCommitExceptionExpiresAllowanceAndClosesScope) {
+TEST_F(ProgramResetPositionScopeTest, StepDeadlineExpiresWhileEffectActionHasNotReturned) {
   ReachTarget();
   const auto request = Request();
   const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
-    const auto advanced =
-        advance(CCLCProgramResetPositionPhase::kSettingState,
-                []() -> Result<void> { throw std::runtime_error("local phase commit failed"); });
-    EXPECT_FALSE(advanced.ok());
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
+    ports_.achieved = ports_.observed = ComponentLifecycleStateDTO::kDegraded;
+    ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
+    Driver().RunOnce();
+    EXPECT_TRUE(ports_.containments.empty());
+    clock_.advance(kSecond);
+    Driver().RunOnce();  // Still inside the action: RAII cleanup has not run.
+    EXPECT_EQ(ports_.containments.size(), 1U);
+    const auto expired = advance(CCLCProgramResetPositionPhase::kSettingState, std::nullopt);
+    EXPECT_FALSE(expired.ok());
+    return expired;
+  });
+  EXPECT_FALSE(result.ok());
+  ASSERT_NE(store_.Open(kComponent), nullptr);
+  EXPECT_EQ(store_.Open(kComponent)->incident.cause_class, LifecycleBlockingCauseClassDTO::kProviderLost);
+}
+
+TEST_F(ProgramResetPositionScopeTest, UnarmedScopeDoesNotInventAControllerAbsenceWindow) {
+  ReachTarget();
+  const auto request = Request();
+  const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto&) {
+    ports_.achieved = ports_.observed = ComponentLifecycleStateDTO::kDegraded;
     ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
     Driver().RunOnce();
     EXPECT_EQ(ports_.containments.size(), 1U);
-    return advanced;
+    return Result<void>::Err({"effect_not_started", "no SDK deadline installed", {}});
   });
   EXPECT_FALSE(result.ok());
 }
 
-TEST_F(ProgramResetPositionScopeTest, AdapterCleanupRevokesExpectedFactWithoutAnotherNormalPhase) {
+TEST_F(ProgramResetPositionScopeTest, AlreadyElapsedStepDeadlineRefusesBeforeAnyTransition) {
   ReachTarget();
-  auto request = Request();
-  bool expected_fact_present = true;
-  request.expected_transition = [&](const auto&, auto) { return expected_fact_present; };
+  const auto request = Request();
   const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
-    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSettingState, {}).ok());
-    const auto revoked = advance(CCLCProgramResetPositionPhase::kSettingState, [&] {
-      expected_fact_present = false;  // Adapter-local containment clears its fact.
-      return Result<void>::Ok();
-    });
-    EXPECT_TRUE(revoked.ok());
+    const auto expired = advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now());
+    EXPECT_FALSE(expired.ok());
+    EXPECT_EQ(expired.error().details.at("reason"), "step_deadline_elapsed");
     ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
     Driver().RunOnce();
     EXPECT_EQ(ports_.containments.size(), 1U);
-    return Result<void>::Err({"effect_failed", "writer cleanup", {}});
+    return expired;
   });
   EXPECT_FALSE(result.ok());
+}
+
+TEST_F(ProgramResetPositionScopeTest, ControllerNeverReturnsFailsFinalReadinessAndLossRemainsVisible) {
+  ReachTarget();
+  const auto request = Request();
+  const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
+    ports_.achieved = ComponentLifecycleStateDTO::kDegraded;
+    ports_.observed = ComponentLifecycleStateDTO::kDegraded;
+    ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
+    const auto completed = Complete(advance);
+    EXPECT_TRUE(completed.ok());
+    Driver().RunOnce();
+    EXPECT_TRUE(ports_.containments.empty());
+    return completed;
+  });
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "position_reset_component_not_active");
+  Driver().RunOnce();
+  ASSERT_NE(store_.Open(kComponent), nullptr);
+  EXPECT_EQ(store_.Open(kComponent)->incident.cause_class,
+            LifecycleBlockingCauseClassDTO::kProviderLost);
 }
 
 TEST_F(ProgramResetPositionScopeTest, SettingStateCannotCompleteBeforeReturnToJtc) {
   ReachTarget();
   const auto request = Request();
   const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
-    return advance(CCLCProgramResetPositionPhase::kSettingState, {});
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
+    return advance(CCLCProgramResetPositionPhase::kSettingState, std::nullopt);
   });
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().details.at("reason"), "position_reset_activation_not_completed");
   EXPECT_FALSE(Driver().ReadReadinessFacts(kComponent).value().blocker.has_value());
 }
 
-TEST_F(ProgramResetPositionScopeTest, AvailabilityWithoutExactRawProofStillCreatesIncident) {
+TEST_F(ProgramResetPositionScopeTest, LostTransportDuringRequestedTransitionCreatesIncident) {
   ReachTarget();
-  auto request = Request();
-  request.expected_transition = [](const auto&, auto) { return false; };
-  const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto&) {
+  const auto request = Request();
+  const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
+    ports_.observed = ComponentLifecycleStateDTO::kDegraded;
+    ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
+    ports_.transport_ready = false;
+    Driver().RunOnce();
+    EXPECT_EQ(ports_.containments.size(), 1U);
+    return Result<void>::Err({"effect_failed", "transport lost", {}});
+  });
+  EXPECT_FALSE(result.ok());
+  ASSERT_NE(store_.Open(kComponent), nullptr);
+  EXPECT_EQ(store_.Open(kComponent)->incident.cause_class,
+            LifecycleBlockingCauseClassDTO::kProviderLost);
+}
+
+TEST_F(ProgramResetPositionScopeTest, UnloadedControllerIsNotExpectedInactivity) {
+  ReachTarget();
+  const auto request = Request();
+  const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
+    ports_.observed = ComponentLifecycleStateDTO::kDegraded;
+    ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
+    ports_.controller_loaded = false;
+    Driver().RunOnce();
+    EXPECT_EQ(ports_.containments.size(), 1U);
+    return Result<void>::Err({"effect_failed", "controller unloaded", {}});
+  });
+  EXPECT_FALSE(result.ok());
+  ASSERT_NE(store_.Open(kComponent), nullptr);
+  EXPECT_EQ(store_.Open(kComponent)->incident.cause_class, LifecycleBlockingCauseClassDTO::kProviderLost);
+}
+
+TEST_F(ProgramResetPositionScopeTest, HardwareErrorDuringRequestedTransitionStillContains) {
+  ReachTarget();
+  const auto request = Request();
+  const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
+    ports_.observed = ComponentLifecycleStateDTO::kFaulted;
+    ports_.cause = LifecycleBlockingCauseClassDTO::kUnknown;
+    Driver().RunOnce();
+    EXPECT_EQ(ports_.containments.size(), 1U);
+    return Result<void>::Err({"effect_failed", "hardware unavailable", {}});
+  });
+  EXPECT_FALSE(result.ok());
+  ASSERT_NE(store_.Open(kComponent), nullptr);
+  EXPECT_EQ(store_.Open(kComponent)->incident.cause_class, LifecycleBlockingCauseClassDTO::kUnknown);
+}
+
+TEST_F(ProgramResetPositionScopeTest, AggregateFaultedStateIsNotExplainedByControllerInactivity) {
+  ReachTarget();
+  const auto request = Request();
+  const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
+    ports_.achieved = ComponentLifecycleStateDTO::kFaulted;
+    ports_.observed = ComponentLifecycleStateDTO::kDegraded;
     ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
     Driver().RunOnce();
     EXPECT_EQ(ports_.containments.size(), 1U);
-    return Result<void>::Err({"effect_failed", "provider failed", {}});
+    return Result<void>::Err({"effect_failed", "component faulted", {}});
+  });
+  EXPECT_FALSE(result.ok());
+  ASSERT_NE(store_.Open(kComponent), nullptr);
+  EXPECT_EQ(store_.Open(kComponent)->incident.cause_class, LifecycleBlockingCauseClassDTO::kUnknown);
+}
+
+TEST_F(ProgramResetPositionScopeTest, UnreachableProviderDuringRequestedTransitionCreatesIncident) {
+  ReachTarget();
+  const auto request = Request();
+  const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
+    ports_.reachable = false;
+    Driver().RunOnce();
+    EXPECT_EQ(ports_.containments.size(), 1U);
+    return Result<void>::Err({"effect_failed", "provider unreachable", {}});
   });
   EXPECT_FALSE(result.ok());
   ASSERT_NE(store_.Open(kComponent), nullptr);
@@ -1402,20 +1579,14 @@ TEST_F(ProgramResetPositionScopeTest, AvailabilityWithoutExactRawProofStillCreat
 TEST_F(ProgramResetPositionScopeTest, FaultAndUnreachableProviderAreNeverExempted) {
   ReachTarget();
   auto request = Request();
-  unsigned qualifications{};
-  request.expected_transition = [&](const auto&, auto) {
-    ++qualifications;
-    return true;
-  };
   const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
     ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
     Driver().RunOnce();
-    EXPECT_EQ(qualifications, 0U);
     EXPECT_EQ(ports_.containments.size(), 1U);
-    EXPECT_FALSE(advance(CCLCProgramResetPositionPhase::kSettingState, {}).ok());
+    EXPECT_FALSE(advance(CCLCProgramResetPositionPhase::kSettingState, std::nullopt).ok());
     ports_.reachable = false;
     Driver().RunOnce();
-    EXPECT_EQ(qualifications, 0U);
     return Result<void>::Err({"effect_failed", "fault", {}});
   });
   EXPECT_FALSE(result.ok());
@@ -1427,9 +1598,10 @@ TEST_F(ProgramResetPositionScopeTest, TargetCancellationExpiresQualificationBefo
   const auto request = Request();
   unsigned effects{};
   const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
     static_cast<void>(store_.SetLifecycleTarget(kComponent, LifecycleTargetStateDTO::kDisabled,
                                                 LifecycleTargetOriginDTO::kOperator));
-    const auto phase = advance(CCLCProgramResetPositionPhase::kSettingState, {});
+    const auto phase = advance(CCLCProgramResetPositionPhase::kSettingState, std::nullopt);
     if (phase.ok()) ++effects;
     return phase;
   });
@@ -1442,7 +1614,8 @@ TEST_F(ProgramResetPositionScopeTest, OutOfOrderPhaseExpiresTheExpectedTransitio
   ReachTarget();
   const auto request = Request();
   const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
-    const auto phase = advance(CCLCProgramResetPositionPhase::kSwitchingToJtc, {});
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
+    const auto phase = advance(CCLCProgramResetPositionPhase::kSwitchingToJtc, std::nullopt);
     EXPECT_FALSE(phase.ok());
     ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
     Driver().RunOnce();
@@ -1459,7 +1632,10 @@ TEST_F(ProgramResetPositionScopeTest, TheSameProviderLossOfAnotherComponentRemai
                                               LifecycleTargetOriginDTO::kStartup));
   store_.targets.at(other).reached = true;
   const auto request = Request();
-  const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto&) {
+  const auto result = Driver().WithProgramResetPositionScope(request, [&](const auto& advance) {
+    EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
+    // The same fresh inactive-controller shape is scoped for only kComponent.
+    ports_.achieved = ports_.observed = ComponentLifecycleStateDTO::kDegraded;
     ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
     Driver().RunOnce();
     EXPECT_EQ(ports_.containments.size(), 1U);
@@ -1525,7 +1701,8 @@ TEST_F(ProgramResetPositionScopeTest, AlreadyRunningEnableFinishesBeforeScopeCan
   std::atomic<bool> action_called{};
   std::optional<Result<void>> scoped;
   std::thread reset([&] {
-    scoped = driver.WithProgramResetPositionScope(request, [&](const auto&) {
+    scoped = driver.WithProgramResetPositionScope(request, [&](const auto& advance) {
+      EXPECT_TRUE(advance(CCLCProgramResetPositionPhase::kSwitchingToWriter, clock_.now() + kSecond).ok());
       action_called = true;
       return Result<void>::Ok();
     });
@@ -2483,81 +2660,78 @@ TEST_F(LifecycleTargetDriverTest, ReadinessFactsKeepNoTargetCausesWithoutObserva
   EXPECT_TRUE(ports_.containments.empty());
 }
 
-TEST_F(LifecycleTargetDriverTest, ReadinessFactsIncludeUnrecordedCauseUntilActualRecoveryFencesIt) {
+TEST_F(LifecycleTargetDriverTest, ReadinessFactsIncludeStartupIncidentUntilActualRecoveryFencesIt) {
   Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
   ports_.BecomeReady();
   ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
   store_.fail_record_cause = true;
   Driver().RunOnce();
   ASSERT_TRUE(store_.causes.empty());
+  ASSERT_TRUE(Progress().incident);
+  EXPECT_EQ(ports_.containments.size(), 1U);
   const auto observations = ports_.observations;
   const auto writes = store_.writes;
   const auto retained_target = store_.targets;
-  auto blocked = Driver().ReadReadinessFacts(kComponent);
-  ASSERT_TRUE(blocked.ok()) << blocked.error().message;
+  const auto blocked = Driver().ReadReadinessFacts(kComponent);
+  ASSERT_TRUE(blocked.ok());
   ASSERT_TRUE(blocked.value().blocker);
-  EXPECT_EQ(blocked.value().blocker->code, "intervention_required");
+  EXPECT_EQ(blocked.value().blocker->code, "component_incident_open");
   EXPECT_EQ(blocked.value().facts.target, store_.targets.at(kComponent));
   EXPECT_EQ(ports_.observations, observations);
   EXPECT_EQ(store_.writes, writes);
   EXPECT_EQ(store_.targets, retained_target);
   EXPECT_TRUE(ports_.submitted.empty());
-  // Existing recovery changes the durable generation. Reading it does not
-  // retry the failed write or clear owner-private state.
-  store_.OrdinaryRecover(kComponent);
-  const auto recovered = Driver().ReadReadinessFacts(kComponent);
-  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
-  EXPECT_FALSE(recovered.value().blocker);
-  EXPECT_EQ(recovered.value().facts.recovery_generation, 1U);
+  const auto recovered = Driver().RecoverIncident(OperatorRecover("operator.recover.unrecorded"));
+  ASSERT_TRUE(recovered.ok() && recovered.value());
+  ASSERT_TRUE(recovered.value()->incident_recovery);
+  const auto writes_after_recovery = store_.writes;
+  const auto clear = Driver().ReadReadinessFacts(kComponent);
+  ASSERT_TRUE(clear.ok());
+  EXPECT_FALSE(clear.value().blocker);
+  EXPECT_EQ(clear.value().facts.recovery_generation, 1U);
   EXPECT_EQ(ports_.observations, observations);
-  EXPECT_EQ(store_.writes, writes);
-  EXPECT_EQ(store_.targets, retained_target);
+  EXPECT_EQ(store_.writes, writes_after_recovery);
 }
 
-TEST_F(LifecycleTargetDriverTest, UnrecordedStartupFaultBlocksUntilRecordedThenUntilRecover) {
+TEST_F(LifecycleTargetDriverTest, UnrecordedStartupFaultContainsBeforeCauseStorageAndNeedsIncidentRecover) {
   Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
   ports_.BecomeReady();
   ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
   store_.fail_record_cause = true;
   Driver().RunOnce();
-  auto progress = Progress();
-  EXPECT_EQ(progress.phase, LifecycleProgressPhaseDTO::kBlocked);
-  EXPECT_EQ(progress.blocking_cause_class, LifecycleBlockingCauseClassDTO::kFault);
-  ASSERT_TRUE(progress.blocking_reason.has_value());
-  EXPECT_EQ(progress.blocking_reason->rfind(
-                "intervention_cause_record_unavailable:component_lifecycle_journal_unavailable",
-                0U),
-            0U);
+  ASSERT_TRUE(Progress().incident);
+  const auto id = Progress().incident->incident_id;
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kBlocked);
+  EXPECT_EQ(Progress().blocking_cause_class, LifecycleBlockingCauseClassDTO::kFault);
+  EXPECT_EQ(ports_.containments.size(), 1U);
   EXPECT_TRUE(store_.causes.empty());
-
-  // Fresh normal status afterwards: the unrecorded fault still blocks; the
-  // component never progresses past it.
+  // Normal status neither clears the incident nor loses the unrecorded cause.
   ports_.cause.reset();
   for (int pass = 0; pass < 3; ++pass) {
     clock_.advance(kSecond);
     ++ports_.observation_generation;
     Driver().RunOnce();
-    EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kBlocked);
+    ASSERT_TRUE(Progress().incident);
+    EXPECT_EQ(Progress().incident->incident_id, id);
     EXPECT_EQ(Progress().blocking_cause_class, LifecycleBlockingCauseClassDTO::kFault);
   }
   EXPECT_TRUE(ports_.submitted.empty());
-
-  // The journal recovers: the retried record makes it durable, and it stays
-  // retained until the operator's Recover.
   store_.fail_record_cause = false;
   Driver().RunOnce();
   ASSERT_EQ(store_.causes.size(), 1U);
   EXPECT_EQ(store_.causes.begin()->second.cause_class, LifecycleBlockingCauseClassDTO::kFault);
-  EXPECT_EQ(Progress().blocking_reason, "intervention_required:fault");
+  EXPECT_EQ(Progress().incident->incident_id, id);
   for (int pass = 0; pass < 3; ++pass) {
     clock_.advance(kSecond);
     Driver().RunOnce();
   }
   EXPECT_EQ(store_.causes.size(), 1U);
-  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kBlocked);
+  EXPECT_EQ(store_.incidents.size(), 1U);
+  EXPECT_EQ(ports_.containments.size(), 1U);
   EXPECT_TRUE(ports_.submitted.empty());
-
-  store_.OrdinaryRecover(kComponent);
+  const auto recovered = Driver().RecoverIncident(OperatorRecover("operator.recover.startup-fault"));
+  ASSERT_TRUE(recovered.ok() && recovered.value());
+  ASSERT_TRUE(recovered.value()->incident_recovery);
   Driver().RunOnce();
   ASSERT_EQ(ports_.submitted.size(), 1U);
   EXPECT_EQ(ports_.submitted.front().intent, ComponentLifecycleIntentKindDTO::kPrepare);
@@ -2840,4 +3014,146 @@ TEST_F(LifecycleTargetDriverTest, WorkerWakesOnEventsAndFallsBackOnTheScheduler)
 }
 
 }  // namespace
+TEST(LifecycleIntervention129Test, EveryCurrentInterventionContainsBeforeEnableAndWhileDisabled) {
+  for (const auto cause : {LifecycleBlockingCauseClassDTO::kEmergencyStop,
+       LifecycleBlockingCauseClassDTO::kProtectiveStop, LifecycleBlockingCauseClassDTO::kSafeguardStop,
+       LifecycleBlockingCauseClassDTO::kFault, LifecycleBlockingCauseClassDTO::kConfiguration,
+       LifecycleBlockingCauseClassDTO::kUnknown, LifecycleBlockingCauseClassDTO::kCollision,
+       LifecycleBlockingCauseClassDTO::kExternalControl, LifecycleBlockingCauseClassDTO::kProviderLost}) {
+    for (const auto state : {ComponentLifecycleStateDTO::kDeclared,
+                            ComponentLifecycleStateDTO::kDisabled,
+                            ComponentLifecycleStateDTO::kUndeclared,
+                            ComponentLifecycleStateDTO::kDisabling}) {
+      SCOPED_TRACE(std::string(to_string(cause)) + ":" + std::string(to_string(state)));
+      FakeClock clock;
+      clock.set(100 * kSecond);
+      ManualScheduler scheduler;
+      FakeStore store;
+      FakePorts ports(clock);
+      static_cast<void>(store.SetLifecycleTarget(kComponent, LifecycleTargetStateDTO::kActive,
+                                                 LifecycleTargetOriginDTO::kStartup));
+      ports.achieved = state;
+      ports.observed = state;
+      ports.cause = cause;
+      CCLCLifecycleTargetDriver driver({}, store, ports, clock, scheduler);
+      driver.RunOnce();
+      const auto progress = driver.ReadTargetView(kComponent).value().progress;
+      ASSERT_TRUE(progress && progress->incident);
+      EXPECT_EQ(progress->incident->cause_class, cause);
+      EXPECT_EQ(ports.containments.size(), 1U);
+      EXPECT_TRUE(ports.submitted.empty());
+      EXPECT_FALSE(store.targets.at(kComponent).reached);
+    }
+  }
+}
+
+TEST_F(LifecycleIncidentTest, FreshFaultDuringPendingPrepareUsesTheSameIncidentOwner) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.BecomeReady();
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 1U);
+  ASSERT_EQ(ports_.submitted.front().intent, ComponentLifecycleIntentKindDTO::kPrepare);
+  ports_.settling = true;
+  ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
+  ++ports_.observation_generation;
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident);
+  EXPECT_EQ(Progress().incident->cause_class, LifecycleBlockingCauseClassDTO::kFault);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  EXPECT_EQ(ports_.submitted.size(), 1U);
+  EXPECT_TRUE(store_.causes.empty()); // existing settling semantics preserved
+}
+
+TEST_F(LifecycleIncidentTest, ForeignOrStaleStartupFaultDoesNotForgeCurrentIntervention) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
+  ports_.observation_epoch = RuntimeEpoch("foreign.epoch");
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident);
+  EXPECT_TRUE(ports_.containments.empty());
+  ports_.observation_epoch.reset();
+  ports_.stale_observation = true;
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident);
+  EXPECT_TRUE(ports_.containments.empty());
+  EXPECT_TRUE(store_.causes.empty());
+  ports_.stale_observation = false;
+  ++ports_.observation_generation;
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+}
+
+TEST_F(LifecycleIncidentTest, WholeComponentApplyExemptsStartupFaultOnlyUntilAdoption) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
+  store_.applying.insert(kComponent);
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident);
+  EXPECT_TRUE(ports_.containments.empty());
+  ASSERT_EQ(store_.causes.size(), 1U);
+  store_.applying.clear();
+  ++ports_.observation_generation;
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident);
+  EXPECT_EQ(Progress().incident->cause_class, LifecycleBlockingCauseClassDTO::kFault);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+}
+
+TEST_F(LifecycleTargetDriverTest, RequestedDisableWithOnlyAbsenceIsNotAnIntervention) {
+  Target(LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator);
+  ports_.achieved = ComponentLifecycleStateDTO::kDisabled;
+  ports_.reachable = false;
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident);
+  EXPECT_TRUE(ports_.containments.empty());
+  EXPECT_TRUE(ports_.submitted.empty());
+}
+
+TEST_F(LifecycleIncidentTest, RecoveryGuardIncludesRemovedAndUnrecordedIncidentsAndReadFailures) {
+  EXPECT_TRUE(Driver().CheckNoOpenIncidents().ok());
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.cause = LifecycleBlockingCauseClassDTO::kFault;
+  store_.fail_open_incident = true;
+  Driver().RunOnce();
+  EXPECT_TRUE(store_.incidents.empty());
+  const auto unrecorded = Driver().CheckNoOpenIncidents();
+  ASSERT_FALSE(unrecorded.ok());
+  EXPECT_EQ(unrecorded.error().code, "incident_open");
+  store_.fail_open_incident = false;
+  Driver().RunOnce();
+  ASSERT_EQ(store_.incidents.size(), 1U);
+  // Removed components remain in the existing journal. Current configured
+  // product membership is deliberately not the guard's inventory.
+  store_.targets.erase(kComponent);
+  EXPECT_FALSE(Driver().CheckNoOpenIncidents().ok());
+  const auto recovered = Driver().RecoverIncident(OperatorRecover("operator.recover.removed"));
+  ASSERT_TRUE(recovered.ok() && recovered.value());
+  EXPECT_TRUE(Driver().CheckNoOpenIncidents().ok());
+  store_.fail_open_query = true;
+  const auto unavailable = Driver().CheckNoOpenIncidents();
+  ASSERT_FALSE(unavailable.ok());
+  EXPECT_EQ(unavailable.error().code, "component_lifecycle_journal_unavailable");
+}
+
+TEST_F(LifecycleIncidentTest, ObserverIncidentBlocksTheGuardWithoutAComponentTargetOrRecovery) {
+  EXPECT_TRUE(Driver().CheckNoOpenIncidents().ok());
+  store_.observer_incident_open = true;
+  const auto blocked = Driver().CheckNoOpenIncidents();
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().code, "incident_open");
+  EXPECT_TRUE(store_.targets.empty());
+  EXPECT_TRUE(store_.causes.empty());
+  EXPECT_TRUE(store_.incidents.empty());
+  // A component Recover is not observer BringUp and cannot authorize a clear.
+  const auto component_recover = Driver().RecoverIncident(
+      OperatorRecover("operator.component-recover-is-not-observer-bringup"));
+  ASSERT_TRUE(component_recover.ok());
+  EXPECT_FALSE(component_recover.value());
+  EXPECT_TRUE(store_.observer_incident_open);
+  EXPECT_FALSE(Driver().CheckNoOpenIncidents().ok());
+  EXPECT_EQ(store_.writes, 0U);
+  EXPECT_EQ(ports_.observations, 0U);
+  EXPECT_TRUE(ports_.submitted.empty());
+}
 }  // namespace manyforge::core

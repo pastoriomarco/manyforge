@@ -99,6 +99,8 @@ struct ManagerApplyFenceExpectationDTO final {
   std::vector<manyforge::core::DomainActiveControlConfigurationDTO>
       expected_active_control_configurations;
   std::optional<manyforge::core::ConfigurationFenceScopeDTO> actual_scope{};
+  std::vector<manyforge::core::ProviderConfigurationFenceLineageDTO>
+      expected_provider_lineages{};
 };
 
 /// Bounded durable pre-effect coordinator for one named Apply fence.

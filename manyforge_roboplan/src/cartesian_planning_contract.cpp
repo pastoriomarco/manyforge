@@ -318,7 +318,7 @@ std::vector<double> merged_path_breakpoints(
   return breakpoints;
 }
 
-std::optional<core::ErrorDTO> validate_cartesian_trajectory_output(
+std::optional<core::ErrorDTO> validate_cartesian_trajectory_output_impl(
     const roboplan::JointTrajectory& trajectory,
     const std::vector<std::string>& expected_joint_names,
     const CartesianPlanningControl& control) {
@@ -397,6 +397,91 @@ double evaluate_polynomial(std::span<const double> coefficients,
     result = std::fma(result, value, *coefficient);
   }
   return result;
+}
+
+// Every primitive operation expands its rounded result by one representable
+// value on each side. Do not replace these with a final epsilon: cancellation
+// while constructing/splitting control points also needs an enclosure.
+struct PositionInterval {
+  double lower;
+  double upper;
+};
+
+PositionInterval outward_interval(double lower, double upper) {
+  return {std::nextafter(lower, -std::numeric_limits<double>::infinity()),
+          std::nextafter(upper, std::numeric_limits<double>::infinity())};
+}
+
+bool finite_interval(const PositionInterval& interval) {
+  return std::isfinite(interval.lower) && std::isfinite(interval.upper) &&
+         interval.lower <= interval.upper;
+}
+
+PositionInterval interval_add(PositionInterval lhs, PositionInterval rhs) {
+  if (rhs.lower == 0.0 && rhs.upper == 0.0) {
+    return lhs;
+  }
+  if (lhs.lower == 0.0 && lhs.upper == 0.0) {
+    return rhs;
+  }
+  return outward_interval(lhs.lower + rhs.lower, lhs.upper + rhs.upper);
+}
+
+PositionInterval interval_subtract(PositionInterval lhs,
+                                   PositionInterval rhs) {
+  if (rhs.lower == 0.0 && rhs.upper == 0.0) {
+    return lhs;
+  }
+  return outward_interval(lhs.lower - rhs.upper, lhs.upper - rhs.lower);
+}
+
+PositionInterval interval_multiply(PositionInterval lhs,
+                                   PositionInterval rhs) {
+  if (finite_interval(lhs) && finite_interval(rhs) &&
+      ((lhs.lower == 0.0 && lhs.upper == 0.0) ||
+       (rhs.lower == 0.0 && rhs.upper == 0.0))) {
+    return {0.0, 0.0};
+  }
+  const std::array products{lhs.lower * rhs.lower, lhs.lower * rhs.upper,
+                            lhs.upper * rhs.lower, lhs.upper * rhs.upper};
+  if (!std::all_of(products.begin(), products.end(),
+                   [](double value) { return std::isfinite(value); })) {
+    return {-std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity()};
+  }
+  return outward_interval(*std::min_element(products.begin(), products.end()),
+                          *std::max_element(products.begin(), products.end()));
+}
+
+PositionInterval interval_divide_positive(PositionInterval value,
+                                          double divisor) {
+  if (value.lower == 0.0 && value.upper == 0.0) {
+    return value;
+  }
+  return outward_interval(value.lower / divisor, value.upper / divisor);
+}
+
+using PositionControlPolygon = std::array<PositionInterval, 6>;
+
+std::pair<PositionControlPolygon, PositionControlPolygon>
+split_position_control_polygon(PositionControlPolygon polygon) {
+  PositionControlPolygon left;
+  PositionControlPolygon right;
+  left.front() = polygon.front();
+  right.back() = polygon.back();
+  for (std::size_t level = 1; level < polygon.size(); ++level) {
+    for (std::size_t index = 0; index < polygon.size() - level; ++index) {
+      // Divide before adding so a finite midpoint does not overflow merely
+      // because the sum of two finite positions would overflow.
+      polygon[index] = interval_add(
+          interval_divide_positive(polygon[index], 2.0),
+          interval_divide_positive(polygon[index + 1], 2.0));
+    }
+    left[level] = polygon.front();
+    right[polygon.size() - 1 - level] =
+        polygon[polygon.size() - 1 - level];
+  }
+  return {left, right};
 }
 
 template <std::size_t Capacity>
@@ -622,6 +707,123 @@ double maximum_normalized_joint_speed(
 }  // namespace
 
 namespace detail {
+
+core::Result<QuinticPositionBoundResult> check_quintic_position_bounds(
+    const QuinticPositionEndpoint& start,
+    const QuinticPositionEndpoint& end,
+    double duration_s,
+    double lower_limit,
+    double upper_limit,
+    double tolerance,
+    std::size_t max_interval_checks,
+    const CartesianPlanningControl& control) {
+  using Result = core::Result<QuinticPositionBoundResult>;
+  const auto failure = [](std::string reason) {
+    return Result::Err(core::ErrorDTO{
+        core::kErrorPlanningFailed,
+        "Quintic connector position bounds could not be qualified",
+        {{"reason", std::move(reason)},
+         {"failure_stage", "quintic_position_validation"}}});
+  };
+  const std::array inputs{start.position, start.velocity, start.acceleration,
+                          end.position, end.velocity, end.acceleration,
+                          lower_limit, upper_limit, tolerance};
+  if (!std::all_of(inputs.begin(), inputs.end(),
+                   [](double value) { return std::isfinite(value); }) ||
+      !finite_positive(duration_s) || lower_limit > upper_limit ||
+      tolerance < 0.0) {
+    return failure("quintic_position_bounds_input_invalid");
+  }
+  if (auto error = planning_control_error(control,
+                                          "quintic_position_validation")) {
+    return Result::Err(std::move(*error));
+  }
+
+  const auto exact = [](double value) { return PositionInterval{value, value}; };
+  // Bounds expansion also uses interval arithmetic. Acceptance uses the
+  // inward sides of these enclosures; rejection uses their outward sides.
+  // Caller tolerance is applied exactly once, without another epsilon.
+  const auto lower = interval_subtract(exact(lower_limit), exact(tolerance));
+  const auto upper = interval_add(exact(upper_limit), exact(tolerance));
+  const auto duration = exact(duration_s);
+  const auto duration_squared = interval_multiply(duration, duration);
+  const auto tangent_start = interval_divide_positive(
+      interval_multiply(duration, exact(start.velocity)), 5.0);
+  const auto tangent_end = interval_divide_positive(
+      interval_multiply(duration, exact(end.velocity)), 5.0);
+  const auto curvature_start = interval_divide_positive(
+      interval_multiply(duration_squared, exact(start.acceleration)), 20.0);
+  const auto curvature_end = interval_divide_positive(
+      interval_multiply(duration_squared, exact(end.acceleration)), 20.0);
+  const PositionControlPolygon polygon{
+      exact(start.position),
+      interval_add(exact(start.position), tangent_start),
+      interval_add(interval_add(exact(start.position),
+                                interval_multiply(exact(2.0), tangent_start)),
+                   curvature_start),
+      interval_add(interval_subtract(exact(end.position),
+                                     interval_multiply(exact(2.0), tangent_end)),
+                   curvature_end),
+      interval_subtract(exact(end.position), tangent_end),
+      exact(end.position)};
+  if (!finite_interval(lower) || !finite_interval(upper) ||
+      !finite_interval(duration_squared) ||
+      !std::all_of(polygon.begin(), polygon.end(), finite_interval)) {
+    return failure("quintic_position_bounds_arithmetic_overflow");
+  }
+
+  // Depth-first traversal retains only unvisited right siblings. Both work
+  // and scratch growth are bounded by the explicit caller budget; no full
+  // subdivision tree is materialized.
+  std::vector<PositionControlPolygon> pending{polygon};
+  std::size_t checks = 0;
+  while (!pending.empty()) {
+    if (checks == max_interval_checks) {
+      return Result::Ok(QuinticPositionBoundResult::kInconclusive);
+    }
+    if (checks % kPlanningControlCheckStride == 0) {
+      if (auto error = planning_control_error(
+              control, "quintic_position_validation")) {
+        return Result::Err(std::move(*error));
+      }
+    }
+    ++checks;
+    const auto current = pending.back();
+    pending.pop_back();
+    if (!std::all_of(current.begin(), current.end(), finite_interval)) {
+      return failure("quintic_position_bounds_arithmetic_overflow");
+    }
+    // A Bernstein endpoint encloses an actual curve point. A control point
+    // outside the limits alone is NOT evidence of a trajectory violation.
+    for (const auto endpoint : {current.front(), current.back()}) {
+      if (endpoint.upper < lower.lower || endpoint.lower > upper.upper) {
+        return Result::Ok(QuinticPositionBoundResult::kProvenViolation);
+      }
+    }
+    const bool within = std::all_of(
+        current.begin(), current.end(), [&](const PositionInterval& point) {
+          return point.lower >= lower.upper && point.upper <= upper.lower;
+        });
+    if (within) {
+      continue;
+    }
+    if (checks == max_interval_checks) {
+      return Result::Ok(QuinticPositionBoundResult::kInconclusive);
+    }
+    const auto [left, right] = split_position_control_polygon(current);
+    pending.push_back(right);
+    pending.push_back(left);
+  }
+  return Result::Ok(QuinticPositionBoundResult::kProvenWithin);
+}
+
+std::optional<core::ErrorDTO> validate_cartesian_trajectory_output(
+    const roboplan::JointTrajectory& trajectory,
+    const std::vector<std::string>& expected_joint_names,
+    const CartesianPlanningControl& control) {
+  return validate_cartesian_trajectory_output_impl(
+      trajectory, expected_joint_names, control);
+}
 
 std::optional<core::ErrorDTO>
 validate_and_normalize_cartesian_trajectory_output(

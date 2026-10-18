@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 namespace manyforge::core {
@@ -55,6 +56,14 @@ namespace {
   return std::tie(row.owner.operation_id, row.owner.participant_id);
 }
 
+[[nodiscard]] auto transfer_owner_key(const ResourceSlotOwnerTransferDTO& row) noexcept {
+  return std::tie(row.expected_owner.operation_id, row.expected_owner.participant_id);
+}
+
+[[nodiscard]] auto physical_owner_key(const ResourceSlotOwnerDTO& owner) noexcept {
+  return std::tie(owner.binding_identity, owner.controller_authority);
+}
+
 template <typename Value>
 [[nodiscard]] Result<Value> reject_value(std::string message, std::string reason,
                                          ErrorCode code = ErrorCode::kExecutionRejected) {
@@ -65,12 +74,13 @@ template <typename Value>
 }  // namespace
 
 bool ResourceSlotOwnerDTO::valid() const noexcept {
-  return !operation_id.empty() && operation_revision.nonzero() && !participant_id.empty() &&
-         !control_domain_id.empty() && !control_domain_revision.empty() &&
-         !control_binding_id.empty() && !control_binding_revision.empty() &&
-         !controller_topology_id.empty() && !topology_revision.empty() &&
-         !control_route_id.empty() && !active_control_configuration_id.empty() &&
-         active_control_configuration_generation.nonzero();
+  if (operation_id.empty() || !operation_revision.nonzero() || participant_id.empty() ||
+      !binding_identity.locally_valid()) return false;
+  if (binding_identity.provider()) return !controller_authority;
+  return controller_authority && !controller().controller_topology_id.empty() &&
+      !controller().topology_revision.empty() && !controller().control_route_id.empty() &&
+      !controller().active_control_configuration_id.empty() &&
+      controller().active_control_configuration_generation.nonzero();
 }
 
 ResourceSlotTable::ResourceSlotTable(
@@ -325,6 +335,123 @@ Result<void> ResourceSlotTable::transition_batch(
   }
   advance_generation_locked();
   return Result<void>::Ok();
+}
+
+Result<std::uint64_t> ResourceSlotTable::transfer_dispatched_owners(
+    const ResourceSlotTableSnapshotDTO& expected,
+    const std::vector<ResourceSlotOwnerTransferDTO>& transfers) {
+  return transfer_owners(expected, transfers, ResourceSlotOwnerTransferMode::kMoving);
+}
+
+Result<std::uint64_t> ResourceSlotTable::transfer_owners(
+    const ResourceSlotTableSnapshotDTO& expected,
+    const std::vector<ResourceSlotOwnerTransferDTO>& transfers,
+    const ResourceSlotOwnerTransferMode mode) {
+  using TransferResult = Result<std::uint64_t>;
+  const auto refuse = [](std::string message, std::string reason,
+                         ErrorCode code = ErrorCode::kExecutionRejected) {
+    return reject_value<std::uint64_t>(std::move(message), std::move(reason), code);
+  };
+  if (mode != ResourceSlotOwnerTransferMode::kMoving &&
+      mode != ResourceSlotOwnerTransferMode::kSettled)
+    return refuse("resource transfer mode is unsupported", "resource_transfer_mode_invalid",
+                  ErrorCode::kInvalidRequest);
+  const auto required_state = mode == ResourceSlotOwnerTransferMode::kMoving
+                                  ? ResourceSlotState::kDispatched
+                                  : ResourceSlotState::kTerminal;
+  const auto next_state = mode == ResourceSlotOwnerTransferMode::kMoving
+                              ? ResourceSlotState::kDispatched
+                              : ResourceSlotState::kReserved;
+  if (transfers.empty() || transfers.size() > kMaxKernelResourceSlots ||
+      !std::is_sorted(transfers.begin(), transfers.end(),
+                      [](const auto& left, const auto& right) {
+                        return transfer_owner_key(left) < transfer_owner_key(right);
+                      }) ||
+      std::adjacent_find(transfers.begin(), transfers.end(),
+                         [](const auto& left, const auto& right) {
+                           return transfer_owner_key(left) == transfer_owner_key(right);
+                         }) != transfers.end())
+    return refuse("resource transfer owners are not a bounded canonical set",
+                  "resource_transfer_not_canonical", ErrorCode::kInvalidRequest);
+
+  std::lock_guard lock(data_mutex_);
+  if (expected.operation_resource_generation != operation_resource_generation_)
+    return refuse("resource transfer names a stale operation-resource generation",
+                  "operation_resource_generation_stale");
+  if (expected.slots != slots_)
+    return refuse("resource transfer differs from its exact captured slots",
+                  "resource_transfer_snapshot_mismatch");
+  auto generation = require_generation_available_locked();
+  if (!generation.ok()) return TransferResult::Err(generation.error());
+
+  const auto& target = transfers.front().next_owner;
+  if (!target.valid())
+    return refuse("resource transfer target is invalid", "resource_transfer_target_invalid",
+                  ErrorCode::kInvalidRequest);
+  if (std::any_of(slots_.begin(), slots_.end(), [&](const auto& slot) {
+        return slot.owner && slot.owner->operation_id == target.operation_id;
+      }))
+    return refuse("resource transfer reuses a resident operation identity",
+                  "resource_transfer_identity_reused", ErrorCode::kInvalidRequest);
+
+  std::set<ResourceId> selected_resources;
+  std::set<OperationParticipantId> target_participants;
+  std::vector<std::pair<std::size_t, std::optional<ResourceSlotOwnerDTO>>> assignments;
+  assignments.reserve(slots_.size());
+  std::vector<std::size_t> indices;
+  std::size_t resource_count = 0U;
+  for (const auto& row : transfers) {
+    if (!row.expected_owner.valid() || !row.next_owner.valid() || row.resources.empty() ||
+        row.resources.size() > slots_.size() - resource_count ||
+        !std::is_sorted(row.resources.begin(), row.resources.end()) ||
+        std::adjacent_find(row.resources.begin(), row.resources.end()) != row.resources.end())
+      return refuse("resource transfer row or scope is invalid", "resource_transfer_row_invalid",
+                    ErrorCode::kInvalidRequest);
+    resource_count += row.resources.size();
+    if (row.next_owner.operation_id != target.operation_id ||
+        row.next_owner.operation_revision != target.operation_revision ||
+        !target_participants.insert(row.next_owner.participant_id).second)
+      return refuse("resource transfer targets disagree or repeat a participant",
+                    "resource_transfer_target_invalid", ErrorCode::kInvalidRequest);
+    if (physical_owner_key(row.expected_owner) != physical_owner_key(row.next_owner))
+      return refuse("resource transfer changes its physical binding or configuration",
+                    "resource_transfer_binding_mismatch", ErrorCode::kInvalidRequest);
+    auto validation = validate_resource_set_locked(row.resources, indices);
+    if (!validation.ok()) return TransferResult::Err(validation.error());
+    for (const auto index : indices) {
+      const auto& slot = slots_[index];
+      if (!selected_resources.insert(slot.resource_id).second)
+        return refuse("resource transfer scopes overlap", "resource_transfer_scope_overlap",
+                      ErrorCode::kInvalidRequest);
+      if (!slot.owner || *slot.owner != row.expected_owner)
+        return refuse("resource transfer owner does not match the slot", "resource_owner_mismatch");
+      if (slot.state != required_state)
+        return refuse(mode == ResourceSlotOwnerTransferMode::kMoving
+                          ? "only dispatched resources can transfer ownership"
+                          : "only terminal resources can transfer settled ownership",
+                      "resource_transfer_state_invalid", ErrorCode::kInvalidStateTransition);
+      // Copy every replacement before touching the live table. The commit
+      // below uses only noexcept swaps and one scalar generation advance.
+      assignments.emplace_back(index, std::optional<ResourceSlotOwnerDTO>(row.next_owner));
+    }
+    const auto owned_count =
+        static_cast<std::size_t>(std::count_if(slots_.begin(), slots_.end(), [&](const auto& slot) {
+          return slot.owner && slot.owner->operation_id == row.expected_owner.operation_id &&
+                 slot.owner->participant_id == row.expected_owner.participant_id;
+        }));
+    if (owned_count != indices.size())
+      return refuse("resource transfer omits part of an incumbent participant scope",
+                    "resource_transfer_scope_incomplete", ErrorCode::kInvalidRequest);
+  }
+
+  static_assert(std::is_nothrow_swappable_v<std::optional<ResourceSlotOwnerDTO>>);
+  auto result = TransferResult::Ok(operation_resource_generation_ + 1U);
+  for (auto& [index, replacement] : assignments) {
+    slots_[index].owner.swap(replacement);
+    slots_[index].state = next_state;
+  }
+  advance_generation_locked();
+  return result;
 }
 
 Result<ResourceSlotOwnerDTO> ResourceSlotTable::revise_owner(
@@ -880,16 +1007,20 @@ Result<void> ResourceSlotTable::reconfigure_runtime_inventory(
     if (!slot.owner.has_value()) {
       continue;
     }
+    // Provider slots have no controller configuration. Kernel validates their
+    // exact sealed occurrence before publication; occupied resource removal
+    // remains refused above, independent of domain kind.
+    if (slot.owner->binding_identity.provider()) continue;
     const auto configuration = std::lower_bound(
         active_control_configurations.begin(), active_control_configurations.end(),
-        slot.owner->control_domain_id,
+        slot.owner->binding_identity.control_domain_id,
         [](const auto& row, const ControlDomainId& id) { return row.control_domain_id < id; });
     if (configuration == active_control_configurations.end() ||
-        configuration->control_domain_id != slot.owner->control_domain_id ||
+        configuration->control_domain_id != slot.owner->binding_identity.control_domain_id ||
         configuration->active_control_configuration_id !=
-            slot.owner->active_control_configuration_id ||
+            slot.owner->controller().active_control_configuration_id ||
         configuration->active_control_configuration_generation !=
-            slot.owner->active_control_configuration_generation) {
+            slot.owner->controller().active_control_configuration_generation) {
       return reject("candidate runtime changes an occupied control configuration",
                     "runtime_active_control_configuration_changed");
     }

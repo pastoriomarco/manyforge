@@ -7,6 +7,8 @@
 #include <manyforge_core/stop_terminal_state.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/io_rule_state.hpp>
+#include <manyforge_core/types/io_rule_recovery.hpp>
 #include <manyforge_core/types/operation_runtime.hpp>
 #include <manyforge_core/types/prepared_operation_diagnostics.hpp>
 #include <optional>
@@ -189,6 +191,15 @@ class IOperationJournal {
       const StopFaultRecoveryResultDTO& recovery_result, const StopFaultLatchDTO& cleared_latch,
       const StopStatusDTO& resulting_stop_status) = 0;
 
+  /// Same durable recovery/replay owner, without fabricated Stop identities.
+  /// Exact retries of an immutable payload return the original sequence.
+  [[nodiscard]] virtual Result<std::uint64_t> RecordGlobalIoRuleCleared(
+      const IoGlobalRuleRecoveryRecordDTO&) {
+    return Result<std::uint64_t>::Err(
+        {"unsupported_capability", "Global rule recovery journal is not installed",
+         {{"reason", "io_global_rule_recovery_journal_unsupported"}}});
+  }
+
   /// The sole durable clean-owner marker. It succeeds only when no journaled
   /// operation, Stop projection, active latch/surveillance owner, or orphan
   /// remains unresolved.
@@ -204,6 +215,16 @@ class IOperationJournal {
       const RequestOwnerEpoch& owner_epoch, const OperationStateDTO& state,
       const RuntimeScaleStatusDTO* scale_status, const char* transition_reason,
       std::span<const PreparedMotionDiagnosticsDTO> prepared_motion_diagnostics = {}) = 0;
+
+  /// Forensic projection of an actual Kernel-owned global rule transition.
+  /// This never installs a rule or grants Stop/latch authority. The activation
+  /// owner preserves transition order and atomic baseline/sequence capture.
+  [[nodiscard]] virtual Result<std::uint64_t> RecordInterruptRuleStateChanged(
+      const IoRuleStateChangeDTO&) {
+    return Result<std::uint64_t>::Err({"unsupported_capability",
+                                       "Global rule-state journal projection is not installed",
+                                       {{"reason", "io_rule_state_journal_unsupported"}}});
+  }
 
   [[nodiscard]] virtual Result<std::uint64_t> RecordCellAdmissionClaimAcquired(
       const RequestOwnerEpoch&, const CellAdmissionClaimDTO&) {

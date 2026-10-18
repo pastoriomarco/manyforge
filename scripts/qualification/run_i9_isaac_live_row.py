@@ -905,12 +905,15 @@ def _lifecycle_expected_domains(
         domain_id = domain.get("control_domain_id")
         if not isinstance(domain_id, str) or not domain_id:
             raise LiveRowError("CCLC component snapshot has no domain identity")
+        if domain.get("kind") != "controller":
+            raise LiveRowError(f"CCLC domain {domain_id} is not a controller domain")
         bindings = _binding_rows(
             domain.get("current_control_bindings"),
             label=f"CCLC domain {domain_id}",
         )
         bindings_by_domain[domain_id] = bindings
         row = {
+            "kind": "controller",
             "control_domain_id": domain_id,
             "control_domain_revision": domain.get("control_domain_revision"),
             "controller_topology_id": domain.get("controller_topology_id"),
@@ -2005,7 +2008,7 @@ def _foundationpose_source_rows(
             observation.get("source") if isinstance(observation, dict) else None
         )
         if (
-            row.get("quality") == "good"
+            row.get("payload_quality") == "good"
             and row.get("fresh") is True
             and row.get("eligible") is True
             and isinstance(observation, dict)
@@ -2252,7 +2255,7 @@ def _collision_stop_history_exact(
         if (
             isinstance(journal, dict)
             and journal.get("api_version")
-            == "manyforge.stop_acceptance_projection.v2"
+            == "manyforge.stop_acceptance_projection.v8"
             and isinstance(intent, dict)
             and intent.get("intent_kind") == "ordinary_stop"
             and isinstance(value, dict)

@@ -68,6 +68,8 @@ enum class ParticipantExecutionFactKind : std::uint8_t {
   /// The addressed owner's Stop ended the dispatched execution; the owner
   /// holds the containment evidence and certificate.
   kPreemptedByAddressedStop,
+  /// Exact physical handover transferred this command to its recognized successor.
+  kPreemptedByReplacement,
 };
 
 /// What the participant knows about physical effects of its ended execution.
@@ -98,6 +100,7 @@ inline const char* to_string(ParticipantExecutionFactKind kind) {
     case kLocalFailure: return "local_failure";
     case kCancelledBeforeDispatch: return "cancelled_before_dispatch";
     case kPreemptedByAddressedStop: return "preempted_by_addressed_stop";
+    case kPreemptedByReplacement: return "preempted_by_replacement";
   }
   return "unknown";
 }

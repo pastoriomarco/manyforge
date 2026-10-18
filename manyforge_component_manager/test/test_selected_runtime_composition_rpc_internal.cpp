@@ -135,12 +135,11 @@ constexpr std::string_view kDigestThree =
       ActiveControlConfigurationId("configuration-1"),
       expected.control_domain_id,
       expected.control_domain_revision,
-      {{ControlBindingId("binding-1"),
-        ControlBindingRevision("binding-revision-1"),
+      {{ControlBindingId("binding-1"), ControlBindingRevision("binding-revision-1"),
         ControlRouteId("shared-route")}},
       ActivationSetId("activation-set-1"),
-      expected.controller_topology_id,
-      expected.topology_revision,
+      expected.controller().controller_topology_id,
+      expected.controller().topology_revision,
       request.runtime_unit_id,
       request.runtime_epoch,
       1U,
@@ -150,10 +149,10 @@ constexpr std::string_view kDigestThree =
   const ResolvedLifecycleControlDomainScopeDTO scope{
       expected.control_domain_id,
       expected.control_domain_revision,
-      expected.controller_topology_id,
-      expected.topology_revision,
+      expected.controller().controller_topology_id,
+      expected.controller().topology_revision,
       configuration,
-      expected.expected_control_bindings,
+      expected.controller().expected_control_bindings,
       {ResourceId("resource-1")}};
   const ResolvedLifecycleProviderOccurrenceDTO provider{
       scope.control_domain_id,
@@ -1792,7 +1791,7 @@ TEST(SelectedRuntimeCompositionRpcInternal,
   auto domains = SelectedRequest().intent.expected_control_domains;
   const ExpectedActiveControlConfigurationDTO absent_configuration{
       ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt};
-  domains.front().expected_active_control_configuration = absent_configuration;
+  domains.front().controller().expected_active_control_configuration = absent_configuration;
   return {ControllableComponentId("arm.1"), RequestOwnerEpoch("owner.current"),
           {std::nullopt, ComponentLifecycleGeneration(1U), 0U}, std::move(domains),
           LifecycleTargetStateDTO::kActive, ComponentLifecycleIntentKindDTO::kPrepare};
@@ -1866,8 +1865,14 @@ TEST(SelectedRuntimeCompositionRpcInternal,
         ApplyComponentQualifiedPredecessorDTO{ComponentLifecycleGeneration(1U), ContentDigest(std::string(kDigestOne))}};
     if (mutation == 8U) facts.candidate_expected_domains.clear();
     if (mutation == 9U) facts.candidate_expected_domains.push_back(facts.candidate_expected_domains.front());
-    if (mutation == 10U) facts.candidate_expected_domains.front().topology_revision = TopologyRevision("");
-    if (mutation == 11U) facts.candidate_expected_domains.front().expected_control_bindings.front().control_route_id = ControlRouteId("");
+    if (mutation == 10U)
+      facts.candidate_expected_domains.front().controller().topology_revision =
+          TopologyRevision("");
+    if (mutation == 11U)
+      facts.candidate_expected_domains.front()
+          .controller()
+          .expected_control_bindings.front()
+          .control_route_id = ControlRouteId("");
     if (mutation == 1U) foreign.planning_facts.reset();
     EXPECT_FALSE(foreign.valid());
     EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(foreign), std::invalid_argument);
@@ -1939,16 +1944,19 @@ TEST(SelectedRuntimeCompositionRpcInternal,
       {{ControllableComponentId("arm.1"), ProcessPresenceState::kUnknown}}, std::nullopt, facts};
   EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(too_many), std::invalid_argument);
   facts = PlanningFacts();
-  facts.candidate_expected_domains.front().expected_control_bindings.clear();
+  facts.candidate_expected_domains.front().controller().expected_control_bindings.clear();
   for (std::size_t index = 0U; index < kMaxLifecycleExpectedBindings; ++index) {
-    facts.candidate_expected_domains.front().expected_control_bindings.push_back({
-        ControlBindingId(std::to_string(index) + std::string(kMaxLifecycleIdentityBytes - 4U, 'b')),
-        ControlBindingRevision(std::string(kMaxLifecycleIdentityBytes, 'r')),
-        ControlRouteId(std::string(kMaxLifecycleIdentityBytes, 'q'))});
+    facts.candidate_expected_domains.front().controller().expected_control_bindings.push_back(
+        {ControlBindingId(std::to_string(index) +
+                          std::string(kMaxLifecycleIdentityBytes - 4U, 'b')),
+         ControlBindingRevision(std::string(kMaxLifecycleIdentityBytes, 'r')),
+         ControlRouteId(std::string(kMaxLifecycleIdentityBytes, 'q'))});
   }
-  std::sort(facts.candidate_expected_domains.front().expected_control_bindings.begin(),
-      facts.candidate_expected_domains.front().expected_control_bindings.end(),
-      [](const auto &lhs, const auto &rhs) { return lhs.control_binding_id < rhs.control_binding_id; });
+  std::sort(facts.candidate_expected_domains.front().controller().expected_control_bindings.begin(),
+            facts.candidate_expected_domains.front().controller().expected_control_bindings.end(),
+            [](const auto& lhs, const auto& rhs) {
+              return lhs.control_binding_id < rhs.control_binding_id;
+            });
   ASSERT_TRUE(facts.valid());
   const ManagerComponentBringUpInspectionResultDTO oversized{request,
       {{ControllableComponentId("arm.1"), ProcessPresenceState::kUnknown}}, std::nullopt, facts};
@@ -2521,6 +2529,84 @@ TEST(SelectedRuntimeCompositionRpcInternal, NoneOwnerProofAndPacketBoundsRemainS
   EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(inventory), std::invalid_argument);
   std::string oversized(kMaximumSelectedRuntimeCompositionRpcPacketBytes + 1U, 'x');
   EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(oversized), std::invalid_argument);
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal,
+     ProviderScopeUsesExplicitEnvelopeAndRejectsVersionAliases) {
+  auto request = Request();
+  const ProviderConfigurationFenceOccurrenceDTO occurrence{
+      ControllableComponentId("arm.1"),
+      ProviderInstanceId("provider.io"),
+      ContentDigest(std::string(kDigestOne)),
+      {}};
+  request.configuration_fence_scope = {
+      {occurrence.controllable_component_id},
+      {{ControlDomainId("arm.domain"), ControlDomainRevision("old"),
+        ControlDomainRevision("new"),
+        ProviderConfigurationFenceDomainDTO{occurrence, occurrence}}},
+      {},
+      {}};
+  ASSERT_TRUE(request.valid());
+  const auto packet = EncodeSelectedRuntimeCompositionRpcRequest(request);
+  EXPECT_EQ(packet.substr(0U, 8U), std::string("MFNSRC5\0", 8U));
+  EXPECT_TRUE(IsSelectedRuntimeCompositionRpcPacket(packet));
+  EXPECT_EQ(DecodeSelectedRuntimeCompositionRpcRequest(packet), request);
+  auto alias = packet;
+  alias[6] = '4';
+  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequest(alias),
+               std::invalid_argument);
+  const ManagerSelectedRuntimeCompositionResultDTO result{
+      request, ManagerSelectedRuntimeCompositionState::kPreparing, {}};
+  const auto reply = EncodeSelectedRuntimeCompositionRpcResponse(result);
+  EXPECT_EQ(reply.substr(0U, 8U), std::string("MFNSRC5\0", 8U));
+  EXPECT_EQ(std::get<ManagerSelectedRuntimeCompositionResultDTO>(
+                DecodeSelectedRuntimeCompositionRpcResponse(reply)),
+            result);
+  const auto legacy = EncodeSelectedRuntimeCompositionRpcRequest(Request());
+  EXPECT_EQ(legacy.substr(0U, 8U), std::string("MFNSRC4\0", 8U));
+  alias = legacy;
+  alias[6] = '5';
+  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequest(alias),
+               std::invalid_argument);
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal,
+     ProviderPlanningFactsRetainTrueDomainWithoutControllerIdentity) {
+  auto request = InspectionRequest();
+  request.planning_component_id = ControllableComponentId("arm.1");
+  auto facts = PlanningFacts();
+  const ProviderControlDomainDTO provider{
+      ControllableComponentId("arm.1"),
+      RuntimeUnitId("runtime.io"),
+      ProviderInstanceId("provider.io"),
+      ProviderManifestId("manyforge.provider.io_signals"),
+      ProviderManifestRevision(std::string(kDigestOne)),
+      ContentDigest(std::string(kDigestTwo)),
+      ContentDigest(std::string(kDigestThree)),
+      {"ready"},
+      30'000'000'000};
+  facts.candidate_expected_domains = {ExpectedControlDomainRevisionDTO{
+      ControlDomainId("io.domain"),
+      ControlDomainRevision(std::string(kDigestOne)),
+      ExpectedProviderDomainScopeDTO{
+          provider,
+          {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt,
+           std::nullopt}}}};
+  const ManagerComponentBringUpInspectionResultDTO result{
+      request,
+      {{ControllableComponentId("arm.1"), ProcessPresenceState::kAbsent}},
+      std::nullopt,
+      facts};
+  ASSERT_TRUE(result.valid());
+  const auto packet = EncodeSelectedRuntimeCompositionRpcResponse(result);
+  EXPECT_EQ(packet.substr(0U, 8U), std::string("MFNSRC5\0", 8U));
+  const auto decoded = DecodeSelectedRuntimeCompositionRpcResponse(packet);
+  EXPECT_EQ(std::get<ManagerComponentBringUpInspectionResultDTO>(decoded),
+            result);
+  auto alias = packet;
+  alias[6] = '4';
+  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(alias),
+               std::invalid_argument);
 }
 
 } // namespace

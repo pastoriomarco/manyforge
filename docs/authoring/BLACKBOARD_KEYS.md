@@ -137,7 +137,17 @@ then on.
   is not available while a run holds the values. `read` keys are not
   changed by the operator.
 
-## 7. Editing in Composer
+## 7. System keys
+
+The system writes two families of read-only keys: `node_outcome.<node>`
+(each motion node's last outcome, `none` until it ends in this Run) and
+`interrupt_state.<rule_id>` (each Deployment global rule's current state).
+Read them like any key; you never declare or write them, and no key,
+namespace or Program parameter may use the names `node_outcome` or
+`interrupt_state`. Their values are listed in
+[Interrupts](INTERRUPTS.md#6-system-keys-and-their-values).
+
+## 8. Editing in Composer
 
 | Change | How it is applied |
 | --- | --- |

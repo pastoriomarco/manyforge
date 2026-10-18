@@ -34,19 +34,26 @@ class SceneProjectionWorker;
 /// destroying either adapter. This holder contains no command or Stop policy.
 class Ros2TransportResources final {
 public:
- Ros2TransportResources(std::string node_name, std::string node_namespace,
-                        std::size_t executor_thread_count,
-                        std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
-                        std::string arm_group_id, core::IClock& clock);
- ~Ros2TransportResources();
- Ros2TransportResources(const Ros2TransportResources&) = delete;
- Ros2TransportResources& operator=(const Ros2TransportResources&) = delete;
+  /// Transport-only resources for adapters without a scene projection.
+  Ros2TransportResources(std::string node_name, std::string node_namespace,
+                         std::size_t executor_thread_count);
+  Ros2TransportResources(
+      std::string node_name, std::string node_namespace,
+      std::size_t executor_thread_count,
+      std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
+      std::string arm_group_id, core::IClock &clock);
+  ~Ros2TransportResources();
+  Ros2TransportResources(const Ros2TransportResources &) = delete;
+  Ros2TransportResources &operator=(const Ros2TransportResources &) = delete;
 
- rclcpp::Node::SharedPtr node() const noexcept { return node_; }
- detail::SceneProjectionWorker& projection_worker() const noexcept;
- bool started() const noexcept { return started_.load(std::memory_order_acquire); }
- void start();
- void quiesce() noexcept;
+  rclcpp::Node::SharedPtr node() const noexcept { return node_; }
+  /// Refuses transport-only holders, which own no scene projection worker.
+  detail::SceneProjectionWorker &projection_worker() const;
+  bool started() const noexcept {
+    return started_.load(std::memory_order_acquire);
+  }
+  void start();
+  void quiesce() noexcept;
 
 private:
   friend class JtcExecutionPortTestPeer;

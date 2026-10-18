@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import replace
 from threading import Event, Thread
@@ -16,10 +17,11 @@ from manyforge_behavior.assistant_program_port import (
     ProgramAssistantPort,
 )
 from manyforge_behavior.kernel_client import (
+    KernelOperationObservationUnavailableError,
     KernelClient,
     KernelOperationAdmissionRejectedError,
 )
-from manyforge_behavior.orchestration_ports import OwnerTaskState
+from manyforge_behavior.orchestration_ports import OwnerTaskSettlementPendingError, OwnerTaskState
 from manyforge_behavior.nodes.stop_policy import (
     OperatorMotionStopPolicy,
     OperatorMotionStopSnapshot,
@@ -31,6 +33,7 @@ from manyforge_behavior.orchestration_ports import (
     FrameTransformError,
     NodeAttemptIdentity,
     OwnerInvocationHeldError,
+    OwnerInvocationRefusedByPriorityError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
     OwnerTaskSettlementPendingError,
@@ -4402,6 +4405,99 @@ def test_node_preview_refuses_unbound_runs_and_non_motion_nodes() -> None:
     assert transport.submissions == []
 
 
+def _interrupt_inputs(node_id: str) -> OwnerNodeInputs:
+    """Resolved inputs of one interrupt move: the rule fields travel only in
+    the captured Program; the motion fields build the ordinary payload."""
+
+    parameters = {
+        key: value
+        for key, value in _absolute_inputs("motion.move_to_pose", [_BASE]).parameters.items()
+        if key not in {"target_mode", "target_reference", "offset_reference", "contact_policy_id"}
+    }
+    parameters.update(
+        stop_mode="soft_on_path",
+        priority=0,
+        interrupt_condition={"compare": {
+            "op": "==",
+            "operand": {"signal": {"target_role": "station", "resource_role": "edge"}},
+            "value": True,
+        }},
+        on_signal="success",
+    )
+    if node_id == "motion.probe_search":
+        parameters["contact_policy_id"] = "probe.contact"
+    return OwnerNodeInputs(parameters=parameters)
+
+
+@pytest.mark.parametrize("node_id", ["motion.move_until_signal", "motion.probe_search"])
+def test_interrupt_move_submits_the_ordinary_motion_with_its_node_context(node_id) -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("search")
+
+    started = port.operations.start(node_id, identity, _interrupt_inputs(node_id))
+
+    assert started.state is OwnerTaskState.ACTIVE
+    participant = transport.submissions[0]["participants"][0]
+    assert participant["required_capability_id"] == "execution.trajectory.execute"
+    # The Core lowers the rule from the captured node this scope names.
+    assert participant["execution_scope"] == {
+        "node_instance_id": "search",
+        "node_attempt_id": "attempt:search",
+    }
+    payload = participant["payload"]
+    # Public caller scopes stay empty; no rule field reaches the wire.
+    assert payload["motion_interrupt_scopes"] == []
+    assert payload["motion"]["kind"] == "pose_goal"
+    assert payload["target_mode"] == "absolute"
+    assert "goal_frame_reference" not in payload
+    for field in ("interrupt_condition", "stop_mode", "on_signal", "priority"):
+        assert field not in repr(payload)
+    if node_id == "motion.probe_search":
+        # The precision-contact policy is the Core's scene policy, no grasp.
+        assert payload["contact_policy_id"] == "probe.contact"
+        assert payload["runtime_object_bindings"] == []
+    else:
+        assert payload["contact_policy_id"] is None
+
+
+def test_probe_search_requires_its_contact_policy() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_interrupt_inputs("motion.probe_search").parameters)
+    parameters.pop("contact_policy_id")
+
+    with pytest.raises(ProductionPortError, match="contact_policy_id"):
+        port.operations.start(
+            "motion.probe_search", _identity("probe"), OwnerNodeInputs(parameters=parameters)
+        )
+    assert transport.submissions == []
+
+
+@pytest.mark.parametrize("node_id", ["motion.move_until_signal", "motion.probe_search"])
+def test_interrupt_move_preview_keeps_the_original_node_context(node_id) -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("search")
+    inputs = _interrupt_inputs(node_id)
+    port.operations.start(node_id, identity, inputs)
+    executed = transport.submissions[0]["participants"][0]
+    submissions_before = deepcopy(transport.submissions)
+
+    _, intent = port.motion_preview_intent(
+        identity, node_id, inputs.parameters, request_id="preview.search"
+    )
+
+    previewed = intent["participants"][0]
+    assert {**previewed["payload"], "move_id": None} == {**executed["payload"], "move_id": None}
+    assert previewed["action_span"] is None
+    assert previewed["execution_scope"] == executed["execution_scope"]
+    assert transport.submissions == submissions_before
+
+
 def test_idle_scene_restoration_reuses_the_exact_applied_program_convergence() -> None:
     transport = _SceneTransport()
     port = _scene_port(transport)
@@ -4548,7 +4644,7 @@ class _HeldPreparationTransport(_Transport):
             "terminal_error":None, "capability_id":"tool.gripper.command", "controllable_component_id":"tool.1",
             "command_target_id":"gripper.command", "resources":["gripper.resource"],
             "control_binding_id":"gripper.binding", "control_binding_revision":_DIGEST_E,
-            "controller_goal_id":"goal.1", "controller_goal_generation":1,
+            "command_id":"goal.1", "command_generation":1,
         }])
         return result
 
@@ -4709,3 +4805,295 @@ def test_idle_reset_scene_preparation_forwards_exact_claim_without_authoring_adm
     assert transport.forwarded
     assert all(row["program_reset_scene_authorization"] == authorization for row in transport.forwarded)
     assert all("expected_admission_generation" not in row for row in transport.forwarded)
+
+
+def _stopped_motion_for_recovery(*, lost_replies: int = 0):
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("motion-recovery-body")
+    started = port.operations.start("motion.move_to_pose", identity, _motion_inputs())
+    transport.operations[started.task_id].update(
+        {
+            "state": "stopped",
+            "operation_revision": 2,
+            "active_stop_id": "stop.1",
+            "active_stop_generation": 1,
+        }
+    )
+    transport.operation_recovery = lambda _operation_id: {
+        "ok": True,
+        "operation_revision": 2,
+        "participants": [{"operation_participant_id": "participant.arm"}],
+        "recovery_assessment": {
+            "recovery_class": "ordinary_operator_stop",
+            "assessment_revision": 3,
+            "control_command_epoch": "control.epoch.1",
+            "execution_id": "execution.1",
+            "latch_id": "",
+            "stop_certificate_id": "certificate.1",
+            "stop_owner_generation": 1,
+        },
+        "stop_generation": 1,
+        "stop_id": "stop.1",
+    }
+    bodies: list[dict[str, Any]] = []
+    revisions: list[int] = []
+    lost = [lost_replies]
+
+    def apply(_operation_id, revision, body):
+        bodies.append(deepcopy(dict(body)))
+        revisions.append(revision)
+        if lost[0] > 0:
+            lost[0] -= 1
+            raise RuntimeError("the reply was lost")
+        return {
+            "ok": True,
+            "result": {
+                "request_id": body["request_id"],
+                "action": body["action"],
+                "accepted": True,
+                "resulting_assessment": {"recovery_class": "recovered"},
+            },
+        }
+
+    transport.apply_operation_recovery = apply
+    return SimpleNamespace(
+        port=port,
+        identity=identity,
+        started=started,
+        bodies=bodies,
+        revisions=revisions,
+        transport=transport,
+    )
+
+
+def _moved_on(previous):
+    """The owner's observation after a Stop or a refreshed assessment."""
+
+    def observed(operation_id):
+        response = deepcopy(previous(operation_id))
+        response["recovery_assessment"]["assessment_revision"] = 4
+        response["recovery_assessment"]["control_command_epoch"] = "control.epoch.2"
+        return response
+
+    return observed
+
+
+def test_manual_recovery_request_sends_no_fresh_attempt_flag() -> None:
+    fixture = _stopped_motion_for_recovery()
+
+    result = fixture.port.operations.recover(
+        fixture.started.task_id,
+        fixture.identity,
+        action="replan_from_stopped_state",
+        request_id="operator.retry.1",
+        reason="operator Retry",
+    )
+
+    assert result["accepted"] is True
+    assert len(fixture.bodies) == 1
+    assert "fresh_motion_attempt" not in fixture.bodies[0]
+
+
+def test_close_operation_is_fenced_without_a_fresh_attempt_and_retires_the_task() -> None:
+    fixture = _stopped_motion_for_recovery()
+
+    closed = fixture.port.operations.close(
+        fixture.started.task_id, fixture.identity, request_id="program-close:1"
+    )
+
+    assert closed is True
+    (body,) = fixture.bodies
+    assert body["action"] == "close_operation"
+    assert body["expected_assessment_revision"] == 3
+    assert body["expected_stop_certificate_id"] == "certificate.1"
+    assert "fresh_motion_attempt" not in body
+    assert fixture.started.task_id not in fixture.port._tasks  # Nothing resident.
+    # Closing what is no longer retained is the already-closed outcome.
+    assert fixture.port.operations.close(
+        fixture.started.task_id, fixture.identity, request_id="program-close:1"
+    ) is True
+    assert len(fixture.bodies) == 1
+
+
+def test_an_unknown_close_replays_the_exact_original_request_body() -> None:
+    fixture = _stopped_motion_for_recovery(lost_replies=1)
+    with pytest.raises(OwnerTaskSettlementPendingError):
+        fixture.port.operations.close(
+            fixture.started.task_id, fixture.identity, request_id="program-close:2"
+        )
+    # The owner's assessment moves before the replay: a rebuilt request would
+    # carry these new fences under the same request identity.
+    fixture.transport.operation_recovery = _moved_on(fixture.transport.operation_recovery)
+
+    assert fixture.port.operations.close(
+        fixture.started.task_id, fixture.identity, request_id="program-close:2"
+    ) is True
+
+    assert len(fixture.bodies) == 2
+    assert json.dumps(fixture.bodies[1], sort_keys=True) == json.dumps(
+        fixture.bodies[0], sort_keys=True
+    )
+    assert fixture.revisions[1] == fixture.revisions[0]
+
+
+def test_an_unknown_close_cannot_be_replaced_by_another_request() -> None:
+    fixture = _stopped_motion_for_recovery(lost_replies=1)
+    with pytest.raises(OwnerTaskSettlementPendingError):
+        fixture.port.operations.close(
+            fixture.started.task_id, fixture.identity, request_id="program-close:3"
+        )
+    with pytest.raises(ProductionPortError, match="changed request"):
+        fixture.port.operations.close(
+            fixture.started.task_id, fixture.identity, request_id="program-close:other"
+        )
+
+
+def test_a_refused_close_keeps_the_operation_retained_for_reset() -> None:
+    fixture = _stopped_motion_for_recovery()
+
+    class _Refusal(RuntimeError):
+        code = "operation_recovery_stale"
+
+    def refuse_with_code(_operation_id, revision, body):
+        fixture.bodies.append(deepcopy(dict(body)))
+        raise _Refusal("operation closure is stale or not eligible")
+
+    fixture.transport.apply_operation_recovery = refuse_with_code
+    assert fixture.port.operations.close(
+        fixture.started.task_id, fixture.identity, request_id="program-close:4"
+    ) is False
+    assert fixture.started.task_id in fixture.port._tasks
+
+
+def test_a_transient_assessment_absence_is_not_a_failure_and_a_malformed_read_is_surfaced() -> None:
+    fixture = _stopped_motion_for_recovery()
+
+    def unreachable(_operation_id):
+        raise KernelOperationObservationUnavailableError("the owner is unreachable")
+
+    fixture.transport.operation_recovery = unreachable
+    transient = fixture.port.operations.observe(fixture.started.task_id)
+    assert transient.state is OwnerTaskState.INTERRUPTED
+    assert "recovery_assessment" not in transient.metadata
+    assert "recovery_assessment_failure" not in transient.metadata
+
+    fixture.transport.operation_recovery = lambda _operation_id: {"ok": True}
+    malformed = fixture.port.operations.observe(fixture.started.task_id)
+    assert malformed.state is OwnerTaskState.INTERRUPTED
+    assert "recovery_assessment" not in malformed.metadata
+    failure = malformed.metadata["recovery_assessment_failure"]
+    assert failure["reason_code"] == "owner_recovery_assessment_invalid"
+    assert "no owner projection" in failure["message"]
+
+
+def test_motion_participants_carry_no_automatic_retry_context() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+
+    port.operations.start("motion.move_to_pose", _identity("motion-no-context"), _motion_inputs())
+
+    participant = transport.submissions[-1]["participants"][0]
+    assert "automatic_retry_context" not in participant
+    assert "automatic_retry_context" not in participant["payload"]
+
+
+def test_a_logical_preemption_is_read_from_the_operation_state_exactly() -> None:
+    fixture = _stopped_motion_for_recovery()
+    successor = {"operation_id": "op.9", "node_instance_id": "other", "node_attempt_id": "a.9"}
+    fixture.transport.operations[fixture.started.task_id].update(
+        {"state": "executing", "preemption": {"kind": "preempted", "by": successor}}
+    )
+
+    observed = fixture.port.operations.observe(fixture.started.task_id)
+    assert observed.state is OwnerTaskState.ACTIVE  # Physically it still moves.
+    assert observed.metadata["preemption"] == {"kind": "preempted", "by": successor}
+
+    fixture.port.operations.release_preempted(fixture.started.task_id, fixture.identity)
+    assert fixture.started.task_id not in fixture.port._tasks
+
+    fixture = _stopped_motion_for_recovery()
+    fixture.transport.operations[fixture.started.task_id]["preemption"] = {
+        "kind": "won", "by": successor,
+    }
+    with pytest.raises(ProductionPortError, match="preemption fact is invalid"):
+        fixture.port.operations.observe(fixture.started.task_id)
+
+
+def test_a_newcomer_refused_by_priority_names_the_winner() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+
+    def refuse(body):
+        transport.submissions.append(deepcopy(body))
+        return {
+            "ok": False,
+            "error": {
+                "code": "refused_by_priority",
+                "message": "a higher-priority motion holds the robot",
+                "details": {
+                    "winner_operation_id": "op.1",
+                    "winner_node_instance_id": "winner",
+                    "winner_node_attempt_id": "a.1",
+                },
+            },
+        }
+
+    transport.submit = refuse
+    with pytest.raises(OwnerInvocationRefusedByPriorityError) as raised:
+        port.operations.start("motion.move_to_pose", _identity("motion-refused"), _motion_inputs())
+    assert raised.value.winner == {
+        "operation_id": "op.1",
+        "node_instance_id": "winner",
+        "node_attempt_id": "a.1",
+    }
+    assert port._tasks == {}
+
+
+def test_a_failed_operation_carries_its_own_failure_facts() -> None:
+    fixture = _stopped_motion_for_recovery()
+    operation = fixture.transport.operations[fixture.started.task_id]
+    operation.update(
+        {
+            "state": "failed",
+            "participants": [
+                {
+                    "state": "failed",
+                    "resources": ["robot.arm", "robot.arm.joints"],
+                    "terminal_error": {"code": "planning_failed", "message": "no path"},
+                    "terminal_fact": {"kind": "local_failure", "effect": "no_effect", "error": None},
+                }
+            ],
+        }
+    )
+    read = fixture.transport.read
+    fixture.transport.read = lambda operation_id: {**read(operation_id), "owner_epoch": "kernel.epoch.7"}
+
+    observed = fixture.port.operations.observe(fixture.started.task_id)
+
+    assert observed.metadata["operation_failure"] == {
+        "operation": {
+            "source_owner_epoch": "kernel.epoch.7",
+            "operation_id": fixture.started.task_id,
+            "operation_revision": 2,
+        },
+        "resource_ids": ["robot.arm", "robot.arm.joints"],
+        "failure": {"code": "planning_failed", "message": observed.message},
+        "terminal_facts": [{"kind": "local_failure", "effect": "no_effect"}],
+    }
+
+
+def test_an_observed_operation_carries_its_exact_state_and_residency() -> None:
+    fixture = _stopped_motion_for_recovery()
+    observed = fixture.port.operations.observe(fixture.started.task_id)
+    assert observed.metadata["operation_state"] == "stopped"
+    assert observed.metadata["resident"] is True
+
+    # An exact successful read showing the operation no longer resident:
+    # its retirement already completed (SX-1974).
+    fixture.transport.resident[observed.metadata["operation_id"]] = False
+    retired = fixture.port.operations.observe(fixture.started.task_id)
+    assert retired.metadata["resident"] is False

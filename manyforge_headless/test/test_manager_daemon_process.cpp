@@ -1,3 +1,4 @@
+#include "../src/program_runner_publisher_fault_internal.hpp"
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <signal.h>
@@ -119,6 +120,187 @@ TEST(ManagerCellAdmissionReadinessReducer,
       core::RequestOwnerEpoch("foreign-successor");
   EXPECT_FALSE(IsCurrentProgramRunnerOwner(
       after, core::RuntimeEpoch("runner-successor")));
+}
+
+TEST(ManagerCellAdmissionReadinessReducer,
+     RunnerContactLossRequiresPreviouslyQualifiedActiveRun) {
+  const core::RequestOwnerEpoch manager("manager.owner");
+  const core::RuntimeEpoch manager_runtime("manager.runtime");
+  const auto loss = [&](const std::optional<core::ProgramCycleStatusDTO> &cycle,
+                        std::string_view predicate =
+                            "program_runner_liveness_probe",
+                        std::string_view message = "contact failed") {
+    return MakeProgramRunnerContactLoss(cycle, manager, manager_runtime,
+                                        predicate, message);
+  };
+  EXPECT_FALSE(loss(std::nullopt));
+  EXPECT_FALSE(loss(IdleCycleStatus()));
+  auto cycle = IdleCycleStatus();
+  cycle.program_run_id = core::ProgramRunId("run");
+  cycle.cycle_claim_generation = core::CellAdmissionClaimGeneration(9U);
+  for (const auto state : {core::ProgramCycleStateDTO::kStarting,
+                           core::ProgramCycleStateDTO::kRunning,
+                           core::ProgramCycleStateDTO::kStopping}) {
+    cycle.state = state;
+    for (const auto predicate :
+         {"program_runner_liveness_probe", "program_runner_liveness_renewal",
+          "program_runner_reconciliation_renewal",
+          "program_runner_publication_fault"}) {
+      const auto fact = loss(cycle, predicate);
+      ASSERT_TRUE(fact);
+      EXPECT_EQ(fact->established_cycle, cycle);
+      EXPECT_EQ(fact->failure_predicate, predicate);
+    }
+  }
+  EXPECT_FALSE(loss(cycle, "required_native_receiver_observable"));
+  cycle.state = core::ProgramCycleStateDTO::kTerminalAwaitingReset;
+  cycle.terminal_or_settlement_reference =
+      core::ContentDigest("sha256:" + std::string(64U, 'a'));
+  EXPECT_FALSE(loss(cycle));
+  cycle.state = core::ProgramCycleStateDTO::kResetting;
+  EXPECT_FALSE(loss(cycle));
+  cycle.state = core::ProgramCycleStateDTO::kRunning;
+  cycle.terminal_or_settlement_reference.reset();
+  const auto bounded =
+      loss(cycle, "program_runner_liveness_probe", std::string(2048U, 'x'));
+  ASSERT_TRUE(bounded);
+  EXPECT_EQ(bounded->message.size(), 1024U);
+}
+
+TEST(ManagerProgramRunnerPublicationFault,
+     NullableTypedErrorIsClosedAndBounded) {
+  using content_identity::CanonicalValue;
+  const auto fault = [](std::string message =
+                            "final key write was not acknowledged") {
+    return CanonicalValue(CanonicalValue::Object{
+        {"code", CanonicalValue("program_bbkey_publication_failed")},
+        {"message", CanonicalValue(std::move(message))},
+        {"details", CanonicalValue(CanonicalValue::Object{})}});
+  };
+  EXPECT_FALSE(
+      detail::DecodeProgramRunnerPublisherFault(CanonicalValue(nullptr)));
+  const auto decoded = detail::DecodeProgramRunnerPublisherFault(fault());
+  ASSERT_TRUE(decoded);
+  EXPECT_EQ(decoded->code, "program_bbkey_publication_failed");
+  EXPECT_EQ(decoded->message, "final key write was not acknowledged");
+  EXPECT_TRUE(decoded->details.empty());
+  for (const auto &invalid :
+       {CanonicalValue(false),
+        CanonicalValue(CanonicalValue::Object{
+            {"code", CanonicalValue("program_bbkey_publication_failed")}}),
+        CanonicalValue(CanonicalValue::Object{
+            {"code", CanonicalValue("program_runner_liveness_probe")},
+            {"message", CanonicalValue("alive")},
+            {"details", CanonicalValue(CanonicalValue::Object{})}}),
+        CanonicalValue(CanonicalValue::Object{
+            {"code", CanonicalValue("program_bbkey_publication_failed")},
+            {"message", CanonicalValue("failed")},
+            {"details",
+             CanonicalValue(CanonicalValue::Object{
+                 {"failure_predicate", CanonicalValue("caller.asserted")}})}}),
+        fault(std::string(1025U, 'x')),
+        fault(std::string("bad") + static_cast<char>(0xff))}) {
+    EXPECT_THROW(
+        static_cast<void>(detail::DecodeProgramRunnerPublisherFault(invalid)),
+        std::invalid_argument);
+  }
+}
+
+TEST(ManagerProgramRunnerPublicationFault,
+     RawStateIsClosedBeforeDigestAndFaultClassification) {
+  EXPECT_EQ(detail::DecodeProgramRunnerManagerState("current"),
+            core::ManagerLivenessStateDTO::kCurrent);
+  EXPECT_EQ(detail::DecodeProgramRunnerManagerState("unreconciled"),
+            core::ManagerLivenessStateDTO::kUnreconciled);
+  for (const auto state : {"garbage", "expired", "", "Current"}) {
+    EXPECT_THROW(
+        static_cast<void>(detail::DecodeProgramRunnerManagerState(state)),
+        std::invalid_argument);
+  }
+}
+
+TEST(ManagerProgramRunnerPublicationFault,
+     CurrentFencedPublisherIsTypedWithoutInventingRunnerDeath) {
+  auto cycle = IdleCycleStatus();
+  cycle.state = core::ProgramCycleStateDTO::kRunning;
+  cycle.program_run_id = core::ProgramRunId("run");
+  cycle.cycle_claim_generation = core::CellAdmissionClaimGeneration(9U);
+  const auto fault =
+      content_identity::CanonicalValue(content_identity::CanonicalValue::Object{
+          {"code", content_identity::CanonicalValue(
+                       "program_bbkey_publication_failed")},
+          {"message", content_identity::CanonicalValue("key ACK missing")},
+          {"details", content_identity::CanonicalValue(
+                          content_identity::CanonicalValue::Object{})}});
+  const core::RuntimeEpoch receiver("runner-owner");
+  // Golden vector produced by the existing Python RFC8785 helper, not a
+  // locally invented framing or an assumed Manager process-death reference.
+  const std::optional<std::string> reference =
+      "sha256:dcf9f1d846eb19d655b0da3da50f978ca68913d08f206476e20787d68f13686b";
+  EXPECT_EQ(
+      content_identity::sha256_digest(content_identity::canonical_json(fault)),
+      *reference);
+  EXPECT_NO_THROW(detail::CheckProgramRunnerPublicationHealth(
+      content_identity::CanonicalValue(nullptr), cycle, receiver, false,
+      std::nullopt));
+  EXPECT_THROW(detail::CheckProgramRunnerPublicationHealth(
+                   fault, cycle, receiver, false, reference),
+               std::invalid_argument);
+  EXPECT_THROW(
+      detail::CheckProgramRunnerPublicationHealth(
+          fault, cycle, core::RuntimeEpoch("foreign-runner"), true, reference),
+      std::invalid_argument);
+  EXPECT_THROW(detail::CheckProgramRunnerPublicationHealth(
+                   fault, cycle, receiver, true, std::nullopt),
+               std::invalid_argument);
+  EXPECT_THROW(detail::CheckProgramRunnerPublicationHealth(
+                   fault, cycle, receiver, true,
+                   std::string("sha256:") + std::string(64U, 'a')),
+               std::invalid_argument);
+  try {
+    detail::CheckProgramRunnerPublicationHealth(fault, cycle, receiver, true,
+                                                reference);
+    FAIL() << "publisher failure did not stop normal renewal progression";
+  } catch (const detail::ProgramRunnerPublisherFault &error) {
+    EXPECT_EQ(error.cycle(), cycle);
+    EXPECT_EQ(std::string(error.what()),
+              "program_bbkey_publication_failed: key ACK missing");
+    const auto loss = MakeProgramRunnerContactLoss(
+        cycle, core::RequestOwnerEpoch("manager"),
+        core::RuntimeEpoch("manager.runtime"),
+        "program_runner_publication_fault", error.what());
+    ASSERT_TRUE(loss);
+    EXPECT_EQ(loss->established_cycle, cycle);
+    EXPECT_EQ(loss->failure_predicate, "program_runner_publication_fault");
+  }
+}
+
+TEST(ManagerProgramRunnerPublicationFault,
+     RetainedCauseRemainsTypedAtUtf8Boundary) {
+  std::string message;
+  for (std::size_t i = 0; i < 512U; ++i)
+    message += "é";
+  const auto retained = detail::ProgramRunnerPublisherFaultMessage(
+      {"program_bbkey_publication_failed", message, {}});
+  EXPECT_LE(retained.size(), 1024U);
+  EXPECT_TRUE(content_identity::is_utf8_nfc(retained));
+  EXPECT_TRUE(retained.starts_with("program_bbkey_publication_failed: "));
+  auto cycle = IdleCycleStatus();
+  cycle.state = core::ProgramCycleStateDTO::kRunning;
+  cycle.program_run_id = core::ProgramRunId("run");
+  cycle.cycle_claim_generation = core::CellAdmissionClaimGeneration(9U);
+  const auto loss = MakeProgramRunnerContactLoss(
+      cycle, core::RequestOwnerEpoch("manager"),
+      core::RuntimeEpoch("manager.runtime"), "program_runner_publication_fault",
+      retained);
+  ASSERT_TRUE(loss);
+  EXPECT_EQ(loss->failure_predicate, "program_runner_publication_fault");
+  EXPECT_EQ(loss->message, retained);
+  EXPECT_EQ(loss->established_cycle, cycle);
+  EXPECT_FALSE(MakeProgramRunnerContactLoss(
+      IdleCycleStatus(), core::RequestOwnerEpoch("manager"),
+      core::RuntimeEpoch("manager.runtime"), "program_runner_publication_fault",
+      retained));
 }
 
 TEST(ManagerCellAdmissionReadinessReducer,
@@ -1543,7 +1725,7 @@ std::string SceneRuntimeObserveRequest(
                          })},
        })},
       {"policy_id", CanonicalValue(std::string(policy_id))},
-      {"quality", CanonicalValue("good")},
+      {"payload_quality", CanonicalValue("good")},
       {"source_epoch", CanonicalValue(std::string(source_epoch))},
       {"source_id", CanonicalValue(std::string(source_id))},
       {"source_sequence", CanonicalValue(static_cast<double>(source_sequence))},
@@ -1587,7 +1769,7 @@ std::string SceneRuntimePoseObserveRequest(
                           {"entity", CanonicalValue("/box")}})},
        })},
       {"policy_id", CanonicalValue("before_planning")},
-      {"quality", CanonicalValue("good")},
+      {"payload_quality", CanonicalValue("good")},
       {"source_epoch", CanonicalValue(std::string(source_epoch))},
       {"source_id", CanonicalValue(std::string(source_id))},
       {"source_sequence", CanonicalValue(static_cast<double>(source_sequence))},
@@ -3665,6 +3847,38 @@ TEST(ManagerDaemonProcess,
       cclc_command("owner_identity", CanonicalValue(CanonicalValue::Object{})),
       "request_owner_epoch");
   ASSERT_FALSE(original_owner.empty());
+  // Events use the stable owner/journal even before a physical product exists.
+  const auto idle_identity = deployment::parse_strict_json_model_yaml(SendCommand(
+      directory.execution_socket_path(),
+      R"({"api_version":"manyforge.execution_command.v1","command":"identity"})")).root();
+  ASSERT_EQ(RequiredMember(idle_identity, "ok"), CanonicalValue(false));
+  const auto event_owner_epoch = RequiredText(
+      RequiredMember(RequiredMember(idle_identity, "error"), "details"), "owner_epoch");
+  const auto read_event_metadata = [&](const bool expected_ready, const bool stale_cursor = false) {
+    const auto response = deployment::parse_strict_json_model_yaml(SendCommand(
+        directory.execution_socket_path(), content_identity::canonical_json(
+            CanonicalValue(CanonicalValue::Object{
+                {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+                {"command", CanonicalValue("events")},
+                {"owner_epoch", CanonicalValue(stale_cursor ? "unregistered-event-owner" : event_owner_epoch)},
+                {"after_sequence", CanonicalValue(0.0)}, {"limit", CanonicalValue(1.0)}})))).root();
+    EXPECT_EQ(RequiredMember(response, "ok"), CanonicalValue(!stale_cursor))
+        << content_identity::canonical_json(response);
+    EXPECT_EQ(RequiredText(response, "owner_epoch"), event_owner_epoch);
+    EXPECT_EQ(RequiredMember(response, "execution_owner_ready"), CanonicalValue(expected_ready));
+    const auto& faults = RequiredMember(response, "runtime_faults");
+    EXPECT_EQ(faults.as_object().size(), 2U);
+    EXPECT_EQ(RequiredMember(faults, "operation_journal_write_fault"), CanonicalValue(nullptr));
+    EXPECT_EQ(RequiredMember(faults, "program_runner_loss"), CanonicalValue(nullptr));
+    if (stale_cursor) {
+      EXPECT_EQ(RequiredText(RequiredMember(response, "error"), "code"),
+                "operation_journal_owner_epoch_stale");
+    } else {
+      EXPECT_EQ(RequiredText(RequiredMember(response, "event_page"), "owner_epoch"), event_owner_epoch);
+    }
+  };
+  read_event_metadata(false);
+  read_event_metadata(false, true);  // Page error keeps actual-owner metadata.
   const auto request =
       ApplyRequest(directory, before->source_owner_epoch,
                    WaitForAuthoringAdmission(directory).admission_generation,
@@ -3700,6 +3914,8 @@ TEST(ManagerDaemonProcess,
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   ASSERT_TRUE(succeeded) << last;
+  read_event_metadata(true);  // Same stable owner and envelope after composition.
+  read_event_metadata(true, true);
   component_manager::SqliteManagerApplyJournal journal(
       directory.manager_root() /
           std::string(component_manager::kManagerApplyJournalFilename),
@@ -3796,10 +4012,17 @@ TEST(ManagerDaemonProcess,
   // Produce the same intrinsic manual OperationIntent as the existing native
   // process test. Every identity, binding, role, axis and goal comes from the
   // installed owner's actual status; no Program-node/route authority is minted.
-  const auto submit_current_joint_hold = [&](const std::string &request_id) {
-    const auto bytes = SendCommand(directory.execution_socket_path(),
+  const auto submit_current_joint_hold = [&](const std::string &request_id,
+                                             std::optional<CanonicalValue>
+                                                 automatic_retry_context =
+                                                     std::nullopt,
+                                             bool non_motion_capability =
+                                                 false) {
+    const auto bytes = SendCommand(
+        directory.execution_socket_path(),
         R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
-    const auto response = deployment::parse_strict_json_model_yaml(bytes).root();
+    const auto response =
+        deployment::parse_strict_json_model_yaml(bytes).root();
     if (RequiredMember(response, "ok") != CanonicalValue(true))
       throw std::runtime_error("Actual motion producer status unavailable: " + bytes);
     const auto &actual = RequiredMember(response, "status");
@@ -3811,7 +4034,8 @@ TEST(ManagerDaemonProcess,
     const auto target = std::find_if(targets.begin(), targets.end(), [&](const auto &row) {
       return RequiredText(row, "presentation") == "motion";
     });
-    if (target == targets.end()) throw std::runtime_error("Actual motion target is absent");
+    if (target == targets.end())
+      throw std::runtime_error("Actual motion target is absent");
     const auto &command = RequiredMember(*target, "command");
     const auto &manual = RequiredMember(command, "manual_control");
     const auto &observed_targets = RequiredMember(RequiredMember(actual, "control_state"), "observed_targets").as_array();
@@ -3820,7 +4044,8 @@ TEST(ManagerDaemonProcess,
           RequiredText(row, "command_target_id") == RequiredText(*target, "command_target_id") &&
           RequiredText(row, "operation_capability_id") == RequiredText(*target, "operation_capability_id");
     });
-    if (observed_row == observed_targets.end()) throw std::runtime_error("Actual motion observation is absent");
+    if (observed_row == observed_targets.end())
+      throw std::runtime_error("Actual motion observation is absent");
     const auto &observed = RequiredMember(*observed_row, "observed");
     if (!observed.is_object() || RequiredMember(observed, "complete") != CanonicalValue(true) ||
         RequiredText(observed, "source_epoch").empty() || RequiredMember(observed, "sequence").as_number() <= 0.0)
@@ -3853,30 +4078,46 @@ TEST(ManagerDaemonProcess,
         {"per_joint_dynamics_limits", CanonicalValue(CanonicalValue::Object{})},
         {"motion_interrupt_scopes", CanonicalValue(CanonicalValue::Array{})},
         {"runtime_object_bindings", CanonicalValue(CanonicalValue::Array{})}});
+    CanonicalValue::Object participant{
+        {"component_role_id", RequiredMember(command, "component_role_id")},
+        {"target_role_id", RequiredMember(command, "target_role_id")},
+        {"required_capability_id",
+         non_motion_capability
+             ? CanonicalValue("tool.gripper.command")
+             : RequiredMember(*target, "operation_capability_id")},
+        {"action_span", CanonicalValue(nullptr)},
+        {"payload", std::move(payload)}};
+    if (automatic_retry_context)
+      participant.emplace_back("automatic_retry_context",
+                               *automatic_retry_context);
     CanonicalValue operation(CanonicalValue::Object{
-        {"request_context", CanonicalValue(CanonicalValue::Object{
-            {"request_id", CanonicalValue(request_id)}, {"request_owner_epoch", RequiredMember(identity, "owner_epoch")},
-            {"source_label", CanonicalValue("manager_ros_apply_fixture")}, {"correlation_id", CanonicalValue(nullptr)}})},
+        {"request_context",
+         CanonicalValue(CanonicalValue::Object{
+             {"request_id", CanonicalValue(request_id)},
+             {"request_owner_epoch", RequiredMember(identity, "owner_epoch")},
+             {"source_label", CanonicalValue("manager_ros_apply_fixture")},
+             {"correlation_id", CanonicalValue(nullptr)}})},
         {"program_id", RequiredMember(manual, "program_id")},
         {"program_revision", RequiredMember(manual, "program_revision")},
         {"program_binding_id", RequiredMember(manual, "program_binding_id")},
         {"program_run_id", RequiredMember(manual, "program_run_id")},
         {"expected_graph_revision", RequiredMember(identity, "graph_revision")},
-        {"expected_retained_bundle_id", RequiredMember(identity, "retained_bundle_id")},
+        {"expected_retained_bundle_id",
+         RequiredMember(identity, "retained_bundle_id")},
         {"expected_scene_revision", RequiredMember(identity, "scene_revision")},
-        {"participants", CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-            {"component_role_id", RequiredMember(command, "component_role_id")},
-            {"target_role_id", RequiredMember(command, "target_role_id")},
-            {"required_capability_id", RequiredMember(*target, "operation_capability_id")},
-            {"action_span", CanonicalValue(nullptr)}, {"payload", std::move(payload)}})})},
+        {"participants", CanonicalValue(CanonicalValue::Array{
+                             CanonicalValue(std::move(participant))})},
         {"coordination_policy", CanonicalValue("independent")}});
-    const auto submitted_motion = SendCommand(directory.execution_socket_path(),
+    const auto submitted_motion = SendCommand(
+        directory.execution_socket_path(),
         content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue("manyforge.execution_command.v1")},
-            {"command", CanonicalValue("submit")}, {"operation", std::move(operation)},
+            {"command", CanonicalValue("submit")},
+            {"operation", std::move(operation)},
             {"attribution", CanonicalValue(CanonicalValue::Object{
-                {"assurance", CanonicalValue("unverified")}, {"principal_id", CanonicalValue(nullptr)},
-                {"transport", CanonicalValue("http")}})}})));
+                                {"assurance", CanonicalValue("unverified")},
+                                {"principal_id", CanonicalValue(nullptr)},
+                                {"transport", CanonicalValue("http")}})}})));
     return deployment::parse_strict_json_model_yaml(submitted_motion).root();
   };
 
@@ -3898,6 +4139,7 @@ TEST(ManagerDaemonProcess,
                             "active_control_configuration_generation")}});
       }
       expected_domains.emplace_back(CanonicalValue::Object{
+          {"kind", RequiredMember(domain, "kind")},
           {"control_domain_id", RequiredMember(domain, "control_domain_id")},
           {"control_domain_revision",
            RequiredMember(domain, "control_domain_revision")},
@@ -4134,11 +4376,56 @@ TEST(ManagerDaemonProcess,
   // Submit, rather than preview, consumes the real current route/readiness,
   // ordinary manual Cell claim and configured resource admission gate.
   static_cast<void>(WaitForAuthoringAdmission(directory));
-  const auto accepted_motion = submit_current_joint_hold("empty-ros-one-mock.active-motion");
+  const auto retry_context = [](CanonicalValue remaining) {
+    return CanonicalValue(
+        CanonicalValue::Object{{"remaining_retries", std::move(remaining)}});
+  };
+  // The abandoned retry-policy field is refused even when its old count
+  // would have been valid. Program policy is not a native operation input.
+  for (const auto remaining : {1.0, 10.0}) {
+    const auto refused = submit_current_joint_hold(
+        "retry-context-no-program-" + std::to_string(remaining),
+        retry_context(CanonicalValue(remaining)));
+    ASSERT_EQ(RequiredMember(refused, "ok"), CanonicalValue(false));
+    EXPECT_EQ(RequiredText(RequiredMember(refused, "error"), "code"),
+              "execution_command_invalid")
+        << content_identity::canonical_json(refused);
+  }
+  std::vector<CanonicalValue> malformed_retry_contexts;
+  for (const auto &remaining :
+       {CanonicalValue(0.0), CanonicalValue(11.0), CanonicalValue(1.5),
+        CanonicalValue(true), CanonicalValue("1"), CanonicalValue(nullptr)})
+    malformed_retry_contexts.push_back(retry_context(remaining));
+  malformed_retry_contexts.emplace_back(nullptr);
+  malformed_retry_contexts.emplace_back(CanonicalValue::Object{});
+  malformed_retry_contexts.emplace_back(
+      CanonicalValue::Object{{"remaining_retries", CanonicalValue(1.0)},
+                             {"unknown_field", CanonicalValue(false)}});
+  malformed_retry_contexts.emplace_back(
+      CanonicalValue::Object{{"unknown_field", CanonicalValue(1.0)}});
+  for (std::size_t index = 0; index < malformed_retry_contexts.size();
+       ++index) {
+    const auto refused = submit_current_joint_hold(
+        "malformed-retry-context-" + std::to_string(index),
+        malformed_retry_contexts[index]);
+    ASSERT_EQ(RequiredMember(refused, "ok"), CanonicalValue(false));
+    EXPECT_EQ(RequiredText(RequiredMember(refused, "error"), "code"),
+              "execution_command_invalid")
+        << content_identity::canonical_json(refused);
+  }
+  const auto non_motion_context = submit_current_joint_hold(
+      "retry-context-non-motion", retry_context(CanonicalValue(1.0)), true);
+  ASSERT_EQ(RequiredMember(non_motion_context, "ok"), CanonicalValue(false));
+  EXPECT_EQ(RequiredText(RequiredMember(non_motion_context, "error"), "code"),
+            "execution_command_invalid");
+  const auto accepted_motion =
+      submit_current_joint_hold("empty-ros-one-mock.active-motion");
   ASSERT_EQ(RequiredMember(accepted_motion, "ok"), CanonicalValue(true))
       << content_identity::canonical_json(accepted_motion);
-  const auto operation_id = RequiredText(RequiredMember(accepted_motion, "accepted"), "operation_id");
-  const auto motion_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  const auto operation_id =
+      RequiredText(RequiredMember(accepted_motion, "accepted"), "operation_id");
+  const auto motion_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
   CanonicalValue actual_motion(nullptr);
   while (std::chrono::steady_clock::now() < motion_deadline) {
     const auto bytes = SendCommand(directory.execution_socket_path(),
@@ -4159,16 +4446,500 @@ TEST(ManagerDaemonProcess,
   const auto &motion_participants = RequiredMember(actual_motion, "participants").as_array();
   ASSERT_EQ(motion_participants.size(), 1U);
   const auto &motion_participant = motion_participants.front();
+  EXPECT_EQ(actual_motion.find_object_member("motion_retry_candidate"), nullptr);
+  EXPECT_EQ(actual_motion.find_object_member("motion_retry_disposition"), nullptr);
+  EXPECT_EQ(motion_participant.find_object_member("automatic_retry_context"), nullptr);
+  EXPECT_EQ(motion_participant.find_object_member("execution_scope"), nullptr);
   EXPECT_EQ(RequiredText(motion_participant, "controllable_component_id"), component);
   EXPECT_EQ(RequiredText(motion_participant, "state"), "completed");
-  EXPECT_EQ(RequiredMember(motion_participant, "terminal_error"), CanonicalValue(nullptr));
-  const auto arm = std::find_if(candidate->value().cell_graph.control_bindings.begin(),
-      candidate->value().cell_graph.control_bindings.end(), [](const auto &binding) {
+  EXPECT_EQ(RequiredMember(motion_participant, "terminal_error"),
+            CanonicalValue(nullptr));
+  const auto arm = std::find_if(
+      candidate->value().cell_graph.control_bindings.begin(),
+      candidate->value().cell_graph.control_bindings.end(),
+      [](const auto &binding) {
         return binding.capability_id.value() == "execution.trajectory.execute";
       });
   ASSERT_NE(arm, candidate->value().cell_graph.control_bindings.end());
   EXPECT_EQ(RequiredText(motion_participant, "control_binding_id"), arm->control_binding_id.value());
   EXPECT_EQ(RequiredText(motion_participant, "control_domain_id"), arm->control_domain_id.value());
+
+  // These commands reach the actual private decoder and stable Kernel. This
+  // product has no sealed signals, so valid shapes refuse without registration
+  // or effects; malformed counter/condition shapes must stop at the decoder.
+  const CanonicalValue io_attribution(CanonicalValue::Object{
+      {"transport", CanonicalValue("internal")},
+      {"assurance", CanonicalValue("unverified")},
+      {"principal_id", CanonicalValue(nullptr)}});
+  const auto io_command = [&](const std::string &name, const std::string &field,
+                              CanonicalValue payload) {
+    return deployment::parse_strict_json_model_yaml(
+               SendCommand(
+                   directory.execution_socket_path(),
+                   content_identity::canonical_json(
+                       CanonicalValue(CanonicalValue::Object{
+                           {"api_version",
+                            CanonicalValue("manyforge.execution_command.v1")},
+                           {"command", CanonicalValue(name)},
+                           {"attribution", io_attribution},
+                           {field, std::move(payload)}}))))
+        .root();
+  };
+  // Explicit uncertainty acknowledgement is a Reset-only closed extension.
+  // The target is absent, so valid shapes reach Kernel validation without an
+  // output write or accepting any operator recovery proof.
+  CanonicalValue::Object reset_request{
+      {"request_context",
+       CanonicalValue(CanonicalValue::Object{
+           {"request_id", CanonicalValue("reset.output-ack.decoder")},
+           {"request_owner_epoch", CanonicalValue(event_owner_epoch)},
+           {"source_label", CanonicalValue("native-output-ack-test")},
+           {"correlation_id", CanonicalValue(nullptr)}})},
+      {"operation_id", CanonicalValue("operation.absent-output")},
+      {"expected_operation_revision", CanonicalValue(1.0)},
+      {"reason", CanonicalValue(nullptr)}};
+  const CanonicalValue acknowledgement(
+      CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+          {"operation_id", CanonicalValue("operation.absent-output")},
+          {"operation_revision", CanonicalValue(1.0)}})});
+  for (const bool explicit_ack : {false, true}) {
+    auto request = reset_request;
+    if (explicit_ack)
+      request.emplace_back("acknowledged_uncertain_outputs", acknowledgement);
+    const auto decoded =
+        io_command("reset", "request", CanonicalValue(request));
+    ASSERT_EQ(RequiredMember(decoded, "ok"), CanonicalValue(false));
+    EXPECT_NE(RequiredText(RequiredMember(decoded, "error"), "code"),
+              "execution_command_invalid");
+  }
+  for (const auto &invalid_ack :
+       {CanonicalValue(nullptr), CanonicalValue(true),
+        CanonicalValue(
+            CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                {"operation_id", CanonicalValue("operation.absent-output")},
+                {"operation_revision", CanonicalValue(0.0)}})}),
+        CanonicalValue(
+            CanonicalValue::Array{acknowledgement.as_array().front(),
+                                  acknowledgement.as_array().front()}),
+        CanonicalValue(CanonicalValue::Array{
+            CanonicalValue(CanonicalValue::Object{
+                {"operation_id", CanonicalValue("z")},
+                {"operation_revision", CanonicalValue(1.0)}}),
+            CanonicalValue(CanonicalValue::Object{
+                {"operation_id", CanonicalValue("a")},
+                {"operation_revision", CanonicalValue(1.0)}})}),
+        CanonicalValue(
+            CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                {"operation_id", CanonicalValue("operation.absent-output")},
+                {"operation_revision", CanonicalValue(1.0)},
+                {"unexpected", CanonicalValue(false)}})})}) {
+    auto malformed = reset_request;
+    malformed.emplace_back("acknowledged_uncertain_outputs", invalid_ack);
+    const auto refused =
+        io_command("reset", "request", CanonicalValue(malformed));
+    EXPECT_EQ(RequiredText(RequiredMember(refused, "error"), "code"),
+              "execution_command_invalid");
+  }
+  auto wrong_control = reset_request;
+  wrong_control.emplace_back("acknowledged_uncertain_outputs", acknowledgement);
+  const auto wrong_ack = io_command("acknowledge_completed", "request",
+                                    CanonicalValue(wrong_control));
+  EXPECT_EQ(RequiredText(RequiredMember(wrong_ack, "error"), "code"),
+            "execution_command_invalid");
+
+  CanonicalValue::Object io_token{
+      {"owner_epoch", CanonicalValue(event_owner_epoch)},
+      {"catalog_generation", CanonicalValue("18446744073709551615")},
+      {"registration_id", CanonicalValue("18446744073709551615")},
+      {"scope",
+       CanonicalValue(CanonicalValue::Object{
+           {"program_runner_owner_epoch", CanonicalValue("runner.io-wire")},
+           {"program_run_id", CanonicalValue("run.io-wire")},
+           {"node",
+            CanonicalValue(CanonicalValue::Object{
+                {"node_instance_id", CanonicalValue("io_wait")},
+                {"node_attempt_id", CanonicalValue("attempt.io-wire")}})}})}};
+  for (const auto &command : {"read_io_watch", "release_io_watch"}) {
+    const auto refused =
+        io_command(command, "registration", CanonicalValue(io_token));
+    ASSERT_EQ(RequiredMember(refused, "ok"), CanonicalValue(false));
+    EXPECT_EQ(
+        RequiredText(RequiredMember(RequiredMember(refused, "error"), "details"),
+                     "reason"),
+        "io_signal_service_unavailable")
+        << content_identity::canonical_json(refused);
+    for (const auto &bad :
+         {CanonicalValue(1.0), CanonicalValue("01"),
+          CanonicalValue("18446744073709551616"), CanonicalValue("0")}) {
+      auto malformed = io_token;
+      for (auto &[key, value] : malformed)
+        if (key == "registration_id")
+          value = bad;
+      const auto invalid = io_command(command, "registration",
+                                      CanonicalValue(std::move(malformed)));
+      EXPECT_EQ(RequiredText(RequiredMember(invalid, "error"), "code"),
+                "execution_command_invalid");
+    }
+  }
+  CanonicalValue::Object io_request{
+      {"schema_version", CanonicalValue("manyforge.io_watch_request.v1")},
+      {"owner_epoch", CanonicalValue(event_owner_epoch)},
+      {"program_binding_id", CanonicalValue("binding.io-wire")},
+      {"program_runner_owner_epoch", CanonicalValue("runner.io-wire")},
+      {"claim_generation", CanonicalValue(1.0)},
+      {"program_run_id", CanonicalValue("run.io-wire")},
+      {"node_instance_id", CanonicalValue("io_wait")},
+      {"node_attempt_id", CanonicalValue("attempt.io-wire")},
+      {"target_role_id", CanonicalValue("io_target")},
+      {"resource_role_id", CanonicalValue("ready_input")},
+      {"condition", CanonicalValue(CanonicalValue::Object{
+                        {"kind", CanonicalValue("level")},
+                        {"expected_value", CanonicalValue(false)}})}};
+  const auto unscoped_watch =
+      io_command("register_io_watch", "request", CanonicalValue(io_request));
+  EXPECT_EQ(RequiredText(RequiredMember(RequiredMember(unscoped_watch, "error"),
+                                        "details"),
+                         "reason"),
+            "io_watch_scope_stale");
+  CanonicalValue::Object io_scope_release{
+      {"schema_version", CanonicalValue("manyforge.io_watch_scope_release.v1")},
+      {"owner_epoch", CanonicalValue(event_owner_epoch)},
+      {"program_binding_id", CanonicalValue("binding.io-wire")},
+      {"program_runner_owner_epoch", CanonicalValue("runner.io-wire")},
+      {"claim_generation", CanonicalValue(1.0)},
+      {"program_run_id", CanonicalValue("run.io-wire")},
+      {"node_instance_id", CanonicalValue("io_wait")},
+      {"node_attempt_id", CanonicalValue("attempt.io-wire")}};
+  const auto stale_scope_release = io_command(
+      "release_io_watch", "scope_request", CanonicalValue(io_scope_release));
+  EXPECT_EQ(
+      RequiredText(RequiredMember(RequiredMember(stale_scope_release, "error"),
+                                  "details"),
+                   "reason"),
+      "io_watch_scope_stale");
+  const auto read_scope_refused = io_command("read_io_watch", "scope_request",
+                                             CanonicalValue(io_scope_release));
+  EXPECT_EQ(RequiredText(RequiredMember(read_scope_refused, "error"), "code"),
+            "execution_command_invalid");
+  io_scope_release.emplace_back("unexpected", CanonicalValue(false));
+  const auto malformed_scope = io_command("release_io_watch", "scope_request",
+                                          CanonicalValue(io_scope_release));
+  EXPECT_EQ(RequiredText(RequiredMember(malformed_scope, "error"), "code"),
+            "execution_command_invalid");
+
+  // Output value decoding conveys only a typed logical write. A stale owner
+  // proves this reaches Kernel validation without permitting a provider effect.
+  const auto submit_output_value = [&](CanonicalValue command_value,
+                                       std::optional<CanonicalValue>
+                                           caller_timeout = std::nullopt) {
+    CanonicalValue::Object payload{
+        {"kind", CanonicalValue("capability_command")},
+        {"command_schema_id", CanonicalValue("io-write-schema")},
+        {"command_schema_revision", CanonicalValue("io-write-schema-revision")},
+        {"command_value", std::move(command_value)},
+        {"caller_options", CanonicalValue(CanonicalValue::Array{})}};
+    if (caller_timeout)
+      payload.emplace_back("completion_timeout_s", *caller_timeout);
+    return io_command(
+        "submit", "operation",
+        CanonicalValue(CanonicalValue::Object{
+            {"request_context",
+             CanonicalValue(CanonicalValue::Object{
+                 {"request_id", CanonicalValue("io-write-wire")},
+                 {"request_owner_epoch", CanonicalValue("owner.output.stale")},
+                 {"source_label", CanonicalValue("io-write-wire")},
+                 {"correlation_id", CanonicalValue(nullptr)}})},
+            {"program_id", CanonicalValue("program.io-write-wire")},
+            {"program_revision", CanonicalValue("revision.io-write-wire")},
+            {"program_binding_id", CanonicalValue("binding.io-write-wire")},
+            {"program_run_id", CanonicalValue("run.io-write-wire")},
+            {"expected_graph_revision", CanonicalValue("graph.io-write-wire")},
+            {"expected_retained_bundle_id",
+             CanonicalValue("bundle.io-write-wire")},
+            {"expected_scene_revision", CanonicalValue(nullptr)},
+            {"participants",
+             CanonicalValue(
+                 CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                     {"component_role_id", CanonicalValue("io_device")},
+                     {"target_role_id", CanonicalValue("outputs")},
+                     {"required_capability_id",
+                      CanonicalValue("io.output.command")},
+                     {"action_span", CanonicalValue(nullptr)},
+                     {"payload", CanonicalValue(std::move(payload))}})})},
+            {"coordination_policy", CanonicalValue("independent")}}));
+  };
+  for (const bool value : {false, true}) {
+    const auto stale_output =
+        submit_output_value(CanonicalValue(CanonicalValue::Object{
+            {"kind", CanonicalValue("io_signal_write")},
+            {"resource_role_id", CanonicalValue("valve_enable")},
+            {"value", CanonicalValue(value)}}));
+    ASSERT_EQ(RequiredMember(stale_output, "ok"), CanonicalValue(false));
+    EXPECT_EQ(RequiredText(RequiredMember(stale_output, "error"), "code"),
+              "stale_request_owner_epoch")
+        << content_identity::canonical_json(stale_output);
+  }
+  for (const auto &value : {CanonicalValue(nullptr), CanonicalValue(0.0),
+                            CanonicalValue("false")}) {
+    const auto malformed_output =
+        submit_output_value(CanonicalValue(CanonicalValue::Object{
+            {"kind", CanonicalValue("io_signal_write")},
+            {"resource_role_id", CanonicalValue("valve_enable")},
+            {"value", value}}));
+    EXPECT_EQ(RequiredText(RequiredMember(malformed_output, "error"), "code"),
+              "execution_command_invalid");
+  }
+
+  for (const auto &timeout : {CanonicalValue(1.0), CanonicalValue(nullptr)}) {
+    const auto forbidden = submit_output_value(
+        CanonicalValue(CanonicalValue::Object{
+            {"kind", CanonicalValue("io_signal_write")},
+            {"resource_role_id", CanonicalValue("valve_enable")},
+            {"value", CanonicalValue(false)}}),
+        timeout);
+    EXPECT_EQ(RequiredText(RequiredMember(forbidden, "error"), "code"),
+              "execution_command_invalid");
+  }
+  const auto gripper = CanonicalValue(CanonicalValue::Object{
+      {"kind", CanonicalValue("gripper_position")},
+      {"position", CanonicalValue(CanonicalValue::Object{
+                       {"kind", CanonicalValue("angular_rad")},
+                       {"value_rad", CanonicalValue(0.1)}})},
+      {"max_effort", CanonicalValue(nullptr)}});
+  const auto gripper_without_timeout = submit_output_value(gripper);
+  EXPECT_EQ(
+      RequiredText(RequiredMember(gripper_without_timeout, "error"), "code"),
+      "execution_command_invalid");
+  const auto gripper_with_timeout =
+      submit_output_value(gripper, CanonicalValue(1.0));
+  EXPECT_EQ(RequiredText(RequiredMember(gripper_with_timeout, "error"), "code"),
+            "stale_request_owner_epoch");
+
+  for (auto &[key, value] : io_request)
+    if (key == "condition")
+      value = CanonicalValue(
+          CanonicalValue::Object{{"kind", CanonicalValue("rising_edge")},
+                                 {"expected_value", CanonicalValue(false)}});
+  const auto unsupported =
+      io_command("register_io_watch", "request", CanonicalValue(io_request));
+  EXPECT_EQ(RequiredText(RequiredMember(unsupported, "error"), "code"),
+            "io_watch_condition_unsupported");
+  io_request.emplace_back("unknown", CanonicalValue(false));
+  const auto malformed_watch =
+      io_command("register_io_watch", "request", CanonicalValue(io_request));
+  EXPECT_EQ(RequiredText(RequiredMember(malformed_watch, "error"), "code"),
+            "execution_command_invalid");
+
+  CanonicalValue::Object io_query{
+      {"schema_version", CanonicalValue("manyforge.target_observation_query.v1")},
+      {"owner_epoch", CanonicalValue(event_owner_epoch)},
+      {"program_binding_id", CanonicalValue("binding.io-wire")},
+      {"target_role_id", CanonicalValue("io_target")},
+      {"kind", CanonicalValue("io_signal")},
+      {"resource_role_id", CanonicalValue("ready_input")}};
+  const auto query_io = [&](CanonicalValue query) {
+    return deployment::parse_strict_json_model_yaml(
+               SendCommand(
+                   directory.execution_socket_path(),
+                   content_identity::canonical_json(
+                       CanonicalValue(CanonicalValue::Object{
+                           {"api_version",
+                            CanonicalValue("manyforge.execution_command.v1")},
+                           {"command", CanonicalValue("query_target")},
+                           {"query", std::move(query)}}))))
+        .root();
+  };
+  const auto missing_service = query_io(CanonicalValue(io_query));
+  EXPECT_EQ(RequiredText(RequiredMember(missing_service, "error"), "code"),
+            "io_signal_service_unavailable");
+  CanonicalValue::Object mock_set{
+      {"schema_version", CanonicalValue("manyforge.mock_io_input_request.v1")},
+      {"owner_epoch", CanonicalValue(event_owner_epoch)},
+      {"program_binding_id", CanonicalValue("binding.io-wire")},
+      {"target_role_id", CanonicalValue("io_target")},
+      {"resource_role_id", CanonicalValue("ready_input")},
+      {"expected_source_epoch", CanonicalValue("installation.io-wire")},
+      {"value", CanonicalValue(false)}};
+  const auto missing_mock =
+      io_command("set_mock_io_input", "request", CanonicalValue(mock_set));
+  EXPECT_EQ(RequiredText(RequiredMember(missing_mock, "error"), "code"),
+            "io_signal_service_unavailable");
+  for (auto &[key, value] : mock_set)
+    if (key == "value")
+      value = CanonicalValue("false");
+  const auto malformed_mock =
+      io_command("set_mock_io_input", "request", CanonicalValue(mock_set));
+  EXPECT_EQ(RequiredText(RequiredMember(malformed_mock, "error"), "code"),
+            "execution_command_invalid");
+  io_query.emplace_back("coordinate_role_id", CanonicalValue("fake_axis"));
+  const auto mixed_coordinate = query_io(CanonicalValue(std::move(io_query)));
+  EXPECT_EQ(RequiredText(RequiredMember(mixed_coordinate, "error"), "code"),
+            "execution_command_invalid");
+  // Exercise the recovery codec through the Manager-owned production host.
+  // The completed hold is resident, but cannot authorize a motion retry.
+  const auto read_recovery = [&] {
+    return deployment::parse_strict_json_model_yaml(
+               SendCommand(
+                   directory.execution_socket_path(),
+                   content_identity::canonical_json(
+                       CanonicalValue(CanonicalValue::Object{
+                           {"api_version",
+                            CanonicalValue("manyforge.execution_command.v1")},
+                           {"command",
+                            CanonicalValue("get_operation_recovery")},
+                           {"operation_id", CanonicalValue(operation_id)}}))))
+        .root();
+  };
+  const auto recovery = read_recovery();
+  ASSERT_EQ(RequiredMember(recovery, "ok"), CanonicalValue(true))
+      << content_identity::canonical_json(recovery);
+  const auto &assessment = RequiredMember(recovery, "recovery_assessment");
+  EXPECT_EQ(RequiredText(assessment, "schema_version"),
+            "manyforge.kernel_recovery_assessment.v1");
+  const auto &eligibility = RequiredMember(assessment, "retry_eligibility");
+  ASSERT_TRUE(eligibility.is_object());
+  EXPECT_EQ(eligibility.as_object().size(), 4U);
+  EXPECT_EQ(RequiredMember(eligibility, "eligible"), CanonicalValue(false));
+  EXPECT_EQ(RequiredText(eligibility, "cause"), "not_eligible");
+  EXPECT_FALSE(RequiredText(eligibility, "effect").empty());
+  EXPECT_FALSE(RequiredText(eligibility, "reason").empty());
+  CanonicalValue::Object recovery_request{
+      {"request_id", CanonicalValue("managed-recovery-wire")},
+      {"action", CanonicalValue("reset_cycle")},
+      {"principal_id", CanonicalValue("operator.recovery-wire-test")},
+      {"expected_assessment_revision",
+       RequiredMember(assessment, "assessment_revision")},
+      {"expected_control_command_epoch",
+       RequiredMember(assessment, "control_command_epoch")},
+      {"expected_execution_id", RequiredMember(assessment, "execution_id")},
+      {"expected_latch_id", RequiredMember(assessment, "latch_id")},
+      {"expected_stop_certificate_id",
+       RequiredMember(assessment, "stop_certificate_id")},
+      {"expected_stop_owner_generation",
+       RequiredMember(assessment, "stop_owner_generation")},
+      {"reason", CanonicalValue("wire validation only")}};
+  const auto apply_recovery = [&](CanonicalValue request_value,
+                                  const CanonicalValue &operation_revision) {
+    return deployment::parse_strict_json_model_yaml(
+               SendCommand(
+                   directory.execution_socket_path(),
+                   content_identity::canonical_json(
+                       CanonicalValue(CanonicalValue::Object{
+                           {"api_version",
+                            CanonicalValue("manyforge.execution_command.v1")},
+                           {"command",
+                            CanonicalValue("apply_operation_recovery")},
+                           {"expected_operation_revision", operation_revision},
+                           {"operation_id", CanonicalValue(operation_id)},
+                           {"request", std::move(request_value)}}))))
+        .root();
+  };
+
+  // Reset belongs to Program control and is always rejected by participant
+  // recovery. This checks the action-result encoder without changing state.
+  const auto refused_recovery_reset =
+      apply_recovery(CanonicalValue(recovery_request),
+                     RequiredMember(recovery, "operation_revision"));
+  ASSERT_EQ(RequiredMember(refused_recovery_reset, "ok"), CanonicalValue(true))
+      << content_identity::canonical_json(refused_recovery_reset);
+  const auto &refused_result = RequiredMember(refused_recovery_reset, "result");
+  EXPECT_EQ(RequiredMember(refused_result, "accepted"), CanonicalValue(false));
+  EXPECT_EQ(RequiredText(RequiredMember(RequiredMember(refused_result, "error"),
+                                        "details"),
+                         "reason"),
+            "action_not_allowed");
+  const auto &resulting_assessment =
+      RequiredMember(refused_result, "resulting_assessment");
+  EXPECT_EQ(RequiredText(resulting_assessment, "schema_version"),
+            "manyforge.kernel_recovery_assessment.v1");
+  EXPECT_EQ(RequiredMember(resulting_assessment, "retry_eligibility"),
+            eligibility);
+  auto explicit_default = recovery_request;
+  explicit_default.emplace_back("fresh_motion_attempt", CanonicalValue(false));
+  EXPECT_EQ(apply_recovery(CanonicalValue(std::move(explicit_default)),
+                           RequiredMember(recovery, "operation_revision")),
+            refused_recovery_reset);
+  auto changed_attempt = recovery_request;
+  changed_attempt.emplace_back("fresh_motion_attempt", CanonicalValue(true));
+  const auto conflicting_attempt =
+      apply_recovery(CanonicalValue(std::move(changed_attempt)),
+                     RequiredMember(recovery, "operation_revision"));
+  ASSERT_EQ(RequiredMember(conflicting_attempt, "ok"), CanonicalValue(false));
+  EXPECT_EQ(RequiredText(RequiredMember(conflicting_attempt, "error"), "code"),
+            "request_id_conflict");
+
+  // A stale operation fence proves valid shapes reached Core; it cannot
+  // execute recovery even if a future participant policy changes.
+  const CanonicalValue stale_revision(
+      RequiredMember(recovery, "operation_revision").as_number() + 1.0);
+  std::erase_if(recovery_request,
+                [](const auto &field) { return field.first == "request_id"; });
+  recovery_request.emplace_back("request_id",
+                                CanonicalValue("managed-recovery-stale-wire"));
+  for (const auto flag : {std::optional<bool>{}, std::optional<bool>{false},
+                          std::optional<bool>{true}}) {
+    auto request_value = recovery_request;
+    if (flag.has_value())
+      request_value.emplace_back("fresh_motion_attempt", CanonicalValue(*flag));
+    const auto refused = apply_recovery(
+        CanonicalValue(std::move(request_value)), stale_revision);
+    ASSERT_EQ(RequiredMember(refused, "ok"), CanonicalValue(false));
+    EXPECT_EQ(RequiredText(RequiredMember(refused, "error"), "code"),
+              "operation_recovery_stale")
+        << content_identity::canonical_json(refused);
+  }
+  auto final_failure_request = recovery_request;
+  std::erase_if(final_failure_request,
+                [](const auto &field) { return field.first == "action"; });
+  final_failure_request.emplace_back(
+      "action", CanonicalValue("report_final_motion_failure"));
+  const auto stale_final_failure = apply_recovery(
+      CanonicalValue(std::move(final_failure_request)), stale_revision);
+  ASSERT_EQ(RequiredMember(stale_final_failure, "ok"), CanonicalValue(false));
+  EXPECT_EQ(RequiredText(RequiredMember(stale_final_failure, "error"), "code"),
+            "execution_command_invalid")
+      << content_identity::canonical_json(stale_final_failure);
+  std::vector<CanonicalValue> malformed_requests;
+  for (const auto &flag :
+       {CanonicalValue(nullptr), CanonicalValue(0.0), CanonicalValue(1.0),
+        CanonicalValue("false"), CanonicalValue(CanonicalValue::Array{}),
+        CanonicalValue(CanonicalValue::Object{})}) {
+    auto request_value = recovery_request;
+    request_value.emplace_back("fresh_motion_attempt", flag);
+    malformed_requests.emplace_back(std::move(request_value));
+  }
+  auto unknown_field = recovery_request;
+  unknown_field.emplace_back("unknown_field", CanonicalValue(false));
+  malformed_requests.emplace_back(std::move(unknown_field));
+  auto extra_field = recovery_request;
+  extra_field.emplace_back("fresh_motion_attempt", CanonicalValue(false));
+  extra_field.emplace_back("unknown_field", CanonicalValue(false));
+  malformed_requests.emplace_back(std::move(extra_field));
+  auto missing_field = recovery_request;
+  std::erase_if(missing_field,
+                [](const auto &field) { return field.first == "reason"; });
+  missing_field.emplace_back("fresh_motion_attempt", CanonicalValue(true));
+  malformed_requests.emplace_back(std::move(missing_field));
+  auto replaced_field = recovery_request;
+  std::erase_if(replaced_field,
+                [](const auto &field) { return field.first == "reason"; });
+  replaced_field.emplace_back("unknown_field", CanonicalValue(false));
+  malformed_requests.emplace_back(std::move(replaced_field));
+  for (const auto &request_value : malformed_requests) {
+    const auto refused = apply_recovery(request_value, stale_revision);
+    ASSERT_EQ(RequiredMember(refused, "ok"), CanonicalValue(false));
+    EXPECT_EQ(RequiredText(RequiredMember(refused, "error"), "code"),
+              "execution_command_invalid")
+        << content_identity::canonical_json(refused);
+  }
+  const auto unchanged_recovery = read_recovery();
+  ASSERT_EQ(RequiredMember(unchanged_recovery, "ok"), CanonicalValue(true));
+  EXPECT_EQ(RequiredMember(unchanged_recovery, "operation_revision"),
+            RequiredMember(recovery, "operation_revision"));
+  EXPECT_EQ(
+      RequiredMember(RequiredMember(unchanged_recovery, "recovery_assessment"),
+                     "retry_eligibility"),
+      eligibility);
   const auto execution = WaitForExecutionReady(directory, candidate_id);
   EXPECT_FALSE(execution.owner_epoch.empty());
   const auto scene_after = scene_source.Read();

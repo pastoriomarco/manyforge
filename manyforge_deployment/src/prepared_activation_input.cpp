@@ -220,10 +220,89 @@ parse_artifacts(const CanonicalValue &value, const std::string_view label,
 
 } // namespace
 
-PreparedActivationOrigin parse_prepared_activation_origin(const CanonicalValue &value) {
+core::Result<PreparedActivationProgramOutcomeDTO>
+parse_prepared_activation_program_outcome(const CanonicalValue &prepared) {
+  using Reply = core::Result<PreparedActivationProgramOutcomeDTO>;
+  const auto missing = [](std::string_view field) {
+    return core::ErrorDTO{"headless_source_invalid",
+                          "headless source is missing field " +
+                              std::string(field),
+                          {}};
+  };
+  const auto string_value =
+      [&](const CanonicalValue &object,
+          std::string_view field) -> core::Result<std::string> {
+    const auto *value = object.find_object_member(field);
+    if (!value)
+      return core::Result<std::string>::Err(missing(field));
+    if (!value->is_string() || value->as_string().empty())
+      return core::Result<std::string>::Err({"headless_source_invalid",
+                                             "headless source field " +
+                                                 std::string(field) +
+                                                 " must be a non-empty string",
+                                             {}});
+    return core::Result<std::string>::Ok(value->as_string());
+  };
+  const auto invalid = [](std::string message) {
+    return Reply::Err(
+        {"program_applied_selection_invalid", std::move(message), {}});
+  };
+  const auto *outcome = prepared.find_object_member("program_outcome");
+  if (!outcome)
+    return Reply::Err(missing("program_outcome"));
+  const auto kind = string_value(*outcome, "kind");
+  if (!kind.ok())
+    return Reply::Err(kind.error());
+  if (kind.value() == "no_program") {
+    if (!outcome->is_object() || outcome->as_object().size() != 1U)
+      return invalid("inconsistent no_program outcome");
+    for (const auto field : {"program_id", "program_revision"}) {
+      const auto *value = prepared.find_object_member(field);
+      if (!value)
+        return Reply::Err(missing(field));
+      if (!value->is_null())
+        return invalid("inconsistent no_program outcome");
+    }
+    return Reply::Ok({});
+  }
+  if (kind.value() == "bound") {
+    const auto binding = string_value(*outcome, "program_binding_id");
+    if (!binding.ok())
+      return Reply::Err(binding.error());
+    return Reply::Ok({core::ProgramBindingId(binding.value()), std::nullopt});
+  }
+  if (kind.value() != "non_executable")
+    return invalid("active Program outcome kind is unsupported");
+  const auto *encoded = outcome->find_object_member("outcome");
+  if (!encoded)
+    return Reply::Err(missing("outcome"));
+  try {
+    auto decoded = DecodeProgramNonExecutableOutcome(canonical_json(*encoded));
+    const std::pair<std::string_view, std::string_view> fields[] = {
+        {"program_id", decoded.program_id.value()},
+        {"program_revision", decoded.program_revision.value()},
+        {"retained_bundle_id", decoded.retained_bundle_id.value()},
+        {"graph_revision", decoded.graph_revision.value()}};
+    for (const auto &[field, expected] : fields) {
+      const auto actual = string_value(prepared, field);
+      if (!actual.ok())
+        return Reply::Err(actual.error());
+      if (actual.value() != expected)
+        return invalid("active Program outcome differs from its preparation");
+    }
+    return Reply::Ok({std::nullopt, std::move(decoded)});
+  } catch (const ProgramBindingOutcomeError &error) {
+    return invalid(std::string("active Program outcome is invalid: ") +
+                   error.what());
+  }
+}
+
+PreparedActivationOrigin
+parse_prepared_activation_origin(const CanonicalValue &value) {
   const auto &kind = text(member(value, "kind"), "origin.kind");
   if (kind == "scenario") {
-    require_exact_fields(value, {"kind", "scenario_id", "source_document_digest"}, "origin");
+    require_exact_fields(
+        value, {"kind", "scenario_id", "source_document_digest"}, "origin");
     const auto &scenario = text(member(value, "scenario_id"), "origin.scenario_id");
     if (scenario.size() > 256U) fail("prepared activation origin scenario_id exceeds its bound");
     const auto &source = text(member(value, "source_document_digest"), "origin.source_document_digest");

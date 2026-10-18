@@ -8,6 +8,7 @@ truth, gripper state, or Stop semantics; those remain in the native owners.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -27,21 +28,31 @@ from manyforge_behavior.failure_details import (
     exception_failure_details,
 )
 from manyforge_behavior.kernel_client import (
+    EXECUTION_TRANSPORT_FAILURE_CODES,
     ActionSpan,
     ExecutionState,
     KernelClient,
+    KernelClientResponseError,
     KernelOperationAdmissionRejectedError,
     KernelOperationObservationUnavailableError,
     KernelOperationSettlementPendingError,
 )
+from manyforge_behavior.program import INTERRUPT_MOTION_NODE_IDS as _INTERRUPT_MOTION_NODE_IDS
+from manyforge_behavior.program import MOTION_NODE_IDS as _MOTION_NODE_IDS
 from manyforge_behavior.orchestration_ports import (
+    FAILED_EXECUTION_STATES as _FAILED_STATES,
+    INTERRUPTED_EXECUTION_STATES as _INTERRUPTED_STATES,
     PROGRAM_MOTION_STOP_RECOVERY_CLASSES,
+    recovery_outcome,
+    request_identity as _request_identity,
     FrameTransformError,
     FrameTransformResult,
+    MockSimulationRefusedError,
     NodeAttemptIdentity,
     OwnerInvocationResult,
     OwnerInvocationPendingError,
     OwnerInvocationHeldError,
+    OwnerInvocationRefusedByPriorityError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
     OwnerTaskSettlementPendingError,
@@ -52,6 +63,7 @@ from manyforge_behavior.orchestration_ports import (
     ProgramRunScopeState,
     describe_owner_failure,
 )
+from manyforge_behavior.recovery import OWNER_RECOVERY_ACTIONS
 from manyforge_behavior.scene_client import (
     SceneClient,
     SceneOutcomeUnknownError,
@@ -71,28 +83,6 @@ _ACTIVE_STATES: Final = frozenset(
         ExecutionState.STOPPING.value,
     }
 )
-_INTERRUPTED_STATES: Final = frozenset(
-    {
-        ExecutionState.STOPPED.value,
-        ExecutionState.INTERRUPTED.value,
-        ExecutionState.CANCELLED_PRE_DISPATCH.value,
-    }
-)
-_FAILED_STATES: Final = frozenset(
-    {
-        ExecutionState.FAILED.value,
-        ExecutionState.INTERVENTION_REQUIRED.value,
-    }
-)
-_MOTION_NODE_IDS: Final = frozenset(
-    {
-        "motion.move_to_joint_target",
-        "motion.move_to_pose",
-        "motion.follow_cartesian_path",
-    }
-)
-
-
 def _held_selection_revision(error: KernelOperationAdmissionRejectedError) -> int | None:
     if error.details.get("reason") not in {
         "program_run_stop_fence_active",
@@ -160,9 +150,106 @@ def _owner_failure_message(exc: BaseException) -> str:
     return describe_owner_failure(message, exception_failure_details(exc))[:1024]
 
 
-def _request_identity(prefix: str, *coordinates: str) -> str:
-    digest = sha256(b"\x00".join(value.encode("utf-8") for value in coordinates))
-    return f"{prefix}:{digest.hexdigest()}"
+_PREEMPTION_KINDS: Final = frozenset({"preempted", "superseded_unsent"})
+_SUCCESSOR_FIELDS: Final = ("operation_id", "node_instance_id", "node_attempt_id")
+
+
+def _preemption_fact(value: object) -> dict[str, Any]:
+    """The Kernel's logical preemption of this operation (DX-1168), exactly."""
+    by = value.get("by") if isinstance(value, Mapping) else None
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"kind", "by"}
+        or value["kind"] not in _PREEMPTION_KINDS
+        or not isinstance(by, Mapping)
+        or set(by) != set(_SUCCESSOR_FIELDS)
+        or any(not isinstance(by[key], str) or not by[key] for key in _SUCCESSOR_FIELDS)
+    ):
+        raise ProductionPortError("native operation preemption fact is invalid")
+    return {"kind": value["kind"], "by": {key: by[key] for key in _SUCCESSOR_FIELDS}}
+
+
+def _operation_failure_fact(
+    envelope: Mapping[str, Any],
+    operation: Mapping[str, Any],
+    reason_code: str,
+    message: str,
+) -> dict[str, Any] | None:
+    """The failed operation's own Kernel facts, for the operator-facing run
+    record (`operation_failures`); None when the facts are incomplete."""
+    epoch = envelope.get("owner_epoch")
+    revision = operation.get("operation_revision")
+    participants = operation.get("participants")
+    if (
+        not isinstance(epoch, str)
+        or not epoch
+        or type(revision) is not int
+        or revision < 1
+        or not isinstance(participants, list)
+    ):
+        return None
+    resources: set[str] = set()
+    facts: list[dict[str, str]] = []
+    for participant in participants:
+        if not isinstance(participant, Mapping):
+            return None
+        for resource in participant.get("resources") or ():
+            if isinstance(resource, str) and resource:
+                resources.add(resource)
+        fact = participant.get("terminal_fact")
+        if isinstance(fact, Mapping) and participant.get("state") != (
+            ExecutionState.COMPLETED.value
+        ):
+            kind, effect = fact.get("kind"), fact.get("effect")
+            if isinstance(kind, str) and kind and isinstance(effect, str) and effect:
+                facts.append({"kind": kind, "effect": effect})
+    if not resources:
+        return None
+    return {
+        "operation": {
+            "source_owner_epoch": epoch,
+            "operation_id": operation.get("operation_id"),
+            "operation_revision": revision,
+        },
+        "resource_ids": sorted(resources),
+        "failure": {"code": reason_code, "message": message[:4096]},
+        "terminal_facts": facts,
+    }
+
+
+def _participant_output_evidence(participant: Mapping[str, Any]) -> str | None:
+    """Strictly read one operation participant's binding identity and optional
+    correlated output evidence (SX-2119).
+
+    A provider participant has control_binding_id/revision BOTH null and a
+    real capability-provider binding id/revision; a controller participant
+    keeps its paired control binding. ``output_evidence`` is omitted when
+    absent; an explicit null or unknown spelling is invalid.
+    """
+
+    def text(name: str) -> bool:
+        value = participant.get(name)
+        return isinstance(value, str) and bool(value)
+
+    if "control_binding_id" in participant or "control_binding_revision" in participant:
+        control_id = participant.get("control_binding_id")
+        control_revision = participant.get("control_binding_revision")
+        if control_id is None and control_revision is None:
+            if not (
+                text("capability_provider_binding_id")
+                and text("capability_provider_binding_revision")
+            ):
+                raise ProductionPortError(
+                    "provider participant has no capability-provider binding identity"
+                )
+        elif not (text("control_binding_id") and text("control_binding_revision")):
+            raise ProductionPortError("participant control binding identity is not paired")
+    if "output_evidence" not in participant:
+        return None
+    evidence = participant["output_evidence"]
+    if not isinstance(evidence, str) or evidence not in OUTPUT_EVIDENCE_VALUES:
+        raise ProductionPortError("participant output evidence is invalid")
+    return evidence
 
 
 def _sequence(value: object, *, field: str, length: int | None = None) -> Sequence[Any]:
@@ -468,6 +555,45 @@ def _reference(
     raise ProductionPortError(f"{field} has an unsupported reference form")
 
 
+_IO_READ_NODE_IDS: Final = frozenset({"io.get_input", "io.check_input"})
+_IO_SIGNAL_NODE_IDS: Final = _IO_READ_NODE_IDS | {"io.wait_for_input"}
+_IO_OUTPUT_NODE_ID: Final = "io.set_output"
+_IO_OUTPUT_CAPABILITY: Final = "io.gpio.set_output"
+# Contract 53: the closed correlated-source facts a provider participant may
+# report. They describe the source's acceptance, never the physical effect.
+OUTPUT_EVIDENCE_VALUES: Final = frozenset(
+    {"not_submitted", "submitted", "source_accepted", "source_rejected", "acceptance_unknown"}
+)
+_MAX_IO_WATCHES: Final = 4_096
+
+
+class IoSignalRefusedError(ProductionPortError):
+    """An `io.*` node's signal reference cannot be served; ``code`` is the
+    stable refusal (spec 210 §5.2), raised at Run preparation where literal."""
+
+    def __init__(
+        self, code: str, message: str, *, target_role_id: str, resource_role_id: str
+    ) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.details = {
+            "reason": code,
+            "reference_type": "resource_role",
+            "reference_id": resource_role_id,
+            "target_role_id": target_role_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _SignalBinding:
+    resource_role_id: str
+    signal_name: str
+    value_type: str
+    direction: str
+    transition_capability: str
+    signal_descriptor_digest: str
+
+
 @dataclass(frozen=True, slots=True)
 class _TargetBinding:
     target_role_id: str
@@ -475,6 +601,168 @@ class _TargetBinding:
     controllable_component_id: str
     command_target_id: str
     capabilities: Mapping[str, Mapping[str, Any]]
+    # Resource roles bound to one boolean signal, and those bound more than
+    # once (signal and coordinate rows, or repeated signal rows).
+    signals: Mapping[str, _SignalBinding] = field(default_factory=dict)
+    ambiguous_signal_roles: frozenset[str] = frozenset()
+
+
+def _signal_role_bindings(
+    row: Mapping[str, Any],
+) -> tuple[dict[str, _SignalBinding], frozenset[str]]:
+    """One target row's optional `signal_role_bindings` (handshake01).
+
+    The rows arrive already decoded by the generated Program Binding transport
+    (`validate_program_binding`: closed fields, sorted unique roles, no
+    coordinate overlap). Values are checked where they are used (`_io_signal`)
+    so each refusal keeps its own reason; a role bound more than once is
+    reported ambiguous rather than resolved by row order.
+    """
+
+    signals: dict[str, _SignalBinding] = {}
+    repeated: set[str] = set()
+    for signal in row.get("signal_role_bindings", ()):
+        binding = _SignalBinding(**signal)
+        if binding.resource_role_id in signals:
+            repeated.add(binding.resource_role_id)
+        signals[binding.resource_role_id] = binding
+    coordinate_roles = {
+        resource["resource_role_id"] for resource in row.get("resource_role_bindings", ())
+    }
+    return signals, frozenset(repeated | (coordinate_roles & set(signals)))
+
+
+def _io_signal(
+    targets: Mapping[str, _TargetBinding],
+    target_role_id: str,
+    resource_role_id: str,
+    *,
+    output: bool = False,
+) -> _SignalBinding:
+    """The one boolean input (or, for ``output``, output) bound to this
+    target's resource role."""
+
+    def refuse(code: str, message: str) -> IoSignalRefusedError:
+        return IoSignalRefusedError(
+            code,
+            message,
+            target_role_id=target_role_id,
+            resource_role_id=resource_role_id,
+        )
+
+    target = targets.get(target_role_id)
+    if target is None or resource_role_id not in target.signals:
+        raise refuse(
+            "io_signal_unbound",
+            f"resource role {resource_role_id!r} of target role {target_role_id!r} "
+            "is not bound to a signal",
+        )
+    if resource_role_id in target.ambiguous_signal_roles:
+        raise refuse(
+            "io_signal_unbound",
+            f"resource role {resource_role_id!r} of target role {target_role_id!r} "
+            "is bound more than once",
+        )
+    signal = target.signals[resource_role_id]
+    if signal.value_type != "bool":
+        raise refuse(
+            "io_signal_type_mismatch",
+            f"signal {signal.signal_name!r} is {signal.value_type!r}, not bool",
+        )
+    if output:
+        if signal.direction != "output":
+            raise refuse(
+                "io_signal_direction_mismatch",
+                f"signal {signal.signal_name!r} is an {signal.direction!r}, not an output",
+            )
+        return signal
+    if signal.direction != "input":
+        # An output's reported state is read only through its separately
+        # declared readback input, which this binding does not carry yet.
+        raise refuse(
+            "io_signal_direction_mismatch",
+            f"signal {signal.signal_name!r} is an {signal.direction!r} without a "
+            "declared readback input",
+        )
+    if signal.transition_capability not in {"sampled_only", "captured"}:
+        raise refuse(
+            "io_signal_transition_unsupported",
+            f"signal {signal.signal_name!r} declares an unsupported transition "
+            f"capability {signal.transition_capability!r}",
+        )
+    return signal
+
+
+def _validate_io_signal_nodes(
+    program: Mapping[str, Any], targets: Mapping[str, _TargetBinding]
+) -> None:
+    """Refuse literal `io.*` signal references at Run preparation."""
+
+    pending = [program.get("tree")] if program.get("tree") is not None else []
+    while pending:
+        node = _mapping(pending.pop(), field="Program tree node")
+        pending.extend(node.get("children") or ())
+        if node.get("node_id") not in _IO_SIGNAL_NODE_IDS | {_IO_OUTPUT_NODE_ID}:
+            continue
+        parameters = node.get("parameters")
+        if not isinstance(parameters, Mapping):
+            continue
+        target_role_id = parameters.get("target_role")
+        resource_role_id = parameters.get("resource_role")
+        if isinstance(target_role_id, str) and isinstance(resource_role_id, str):
+            _io_signal(
+                targets,
+                target_role_id,
+                resource_role_id,
+                output=node["node_id"] == _IO_OUTPUT_NODE_ID,
+            )
+        if node["node_id"] == "io.wait_for_input":
+            _io_watch_edge(parameters, target_role_id, resource_role_id)
+
+
+def _io_watch_edge(
+    parameters: Mapping[str, Any], target_role_id: Any, resource_role_id: Any
+) -> None:
+    """This slice watches levels only; an edge is refused, never run."""
+
+    edge = parameters.get("edge", "level")
+    if edge != "level":
+        raise IoSignalRefusedError(
+            "io_watch_condition_unsupported",
+            f"wait_for_input edge {edge!r} is not supported; only level waits are",
+            target_role_id=str(target_role_id),
+            resource_role_id=str(resource_role_id),
+        )
+
+
+def _io_watch_condition(
+    parameters: Mapping[str, Any], target_role_id: Any, resource_role_id: Any
+) -> dict[str, Any]:
+    """The one level condition of a node attempt's resolved parameters."""
+
+    _io_watch_edge(parameters, target_role_id, resource_role_id)
+    expected = parameters.get("expected_value")
+    if type(expected) is not bool:
+        raise ProductionPortError("wait_for_input expected_value must be boolean")
+    return {"kind": "level", "expected_value": expected}
+
+
+def _io_owner_reason(error: BaseException, default: str) -> str:
+    """An owner refusal's stable `io_*` reason, else ``default``."""
+
+    details = getattr(error, "details", None)
+    reason = details.get("reason") if isinstance(details, Mapping) else None
+    code = getattr(error, "code", None)
+    for candidate in (reason, code):
+        if isinstance(candidate, str) and candidate.startswith("io_"):
+            return candidate
+    return default
+
+
+@dataclass(slots=True)
+class _IoWatch:
+    identity: NodeAttemptIdentity
+    registration: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,10 +849,25 @@ class _OperationTask:
     terminal: OwnerTaskSnapshot | None = None
     held_before_admission: bool = False
     unknown_admission: _UnknownOperationAdmission | None = None
+    unknown_close: _UnknownRecovery | None = None
     gripper_timing: tuple[str | None, float | None] | None = None
     submitted_intent: Mapping[str, Any] | None = None
     acceptance: Mapping[str, Any] | None = None
     held_preparation: _HeldPreparation | None = None
+    # Interrupt motion: per participant, the qualified Stop stage order read
+    # once at its terminal observation (SX-2211).
+    interrupt_stop_chain: Mapping[str, tuple[str, ...]] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _UnknownRecovery:
+    """One operation closure whose outcome is unknown: its exact request,
+    replayed byte-for-byte under the same request identity."""
+
+    request_id: str
+    revision: int
+    request: Mapping[str, Any]
+    assessment: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -669,7 +972,9 @@ def _motion_spec(
             "joint_names": joint_names,
             "positions_rad": positions,
         }
-    if node_id == "motion.move_to_pose":
+    if node_id == "motion.move_to_pose" or node_id in _INTERRUPT_MOTION_NODE_IDS:
+        # The interrupt moves are pose goals; their rule is the Core's,
+        # lowered from the captured node (never sent as caller scopes).
         return {
             "kind": "pose_goal",
             "goal": _pose3(parameters.get("goal"), field="goal"),
@@ -743,12 +1048,13 @@ def program_motion_participant(
         base_frame_role_id=base_frame_role_id,
         targets=targets,
     )
+    pose_goal = node_id == "motion.move_to_pose" or node_id in _INTERRUPT_MOTION_NODE_IDS
     goal_poses: Sequence[object] = (
         ()
         if node_id == "motion.move_to_joint_target"
         else (
             (parameters.get("goal"),)
-            if node_id == "motion.move_to_pose"
+            if pose_goal
             else _sequence(parameters.get("path"), field="path")
         )
     )
@@ -757,7 +1063,7 @@ def program_motion_participant(
         if not goal_poses
         else _goal_frame_reference(
             goal_poses,
-            field="goal" if node_id == "motion.move_to_pose" else "path",
+            field="goal" if pose_goal else "path",
             target_mode=target_mode,
             target_role_id=target_role_id,
             base_frame_role_id=base_frame_role_id,
@@ -776,11 +1082,15 @@ def program_motion_participant(
     contact_policy_id = parameters.get("contact_policy_id")
     contact_scene_resource_id = parameters.get("contact_scene_resource_id")
     runtime_object_bindings: list[dict[str, str]] = []
-    if (contact_policy_id is None) != (contact_scene_resource_id is None):
+    if node_id == "motion.probe_search":
+        # The search's precision-contact policy: the Core selects it from the
+        # retained scene policy; it names no grasped scene resource.
+        contact_policy_id = _text(contact_policy_id, field="contact_policy_id")
+    elif (contact_policy_id is None) != (contact_scene_resource_id is None):
         raise ProductionPortError(
             "contact policy and contact scene resource must be supplied together"
         )
-    if contact_policy_id is not None:
+    elif contact_policy_id is not None:
         policy_id = _text(contact_policy_id, field="contact_policy_id")
         scene_resource_id = _text(
             contact_scene_resource_id, field="contact_scene_resource_id"
@@ -847,21 +1157,31 @@ class NativeKernelProgramPort:
         kernel: KernelClient,
         *,
         current_owner_epoch: Callable[[], str] | None = None,
+        stop_terminal: Callable[..., Mapping[str, Any] | None] | None = None,
     ) -> None:
         if not isinstance(kernel, KernelClient):
             raise TypeError("kernel must be one bounded KernelClient")
         if current_owner_epoch is not None and not callable(current_owner_epoch):
             raise TypeError("current_owner_epoch must be callable")
+        if stop_terminal is not None and not callable(stop_terminal):
+            raise TypeError("stop_terminal must be callable")
         self._kernel = kernel
         self._current_owner_epoch = current_owner_epoch
+        # The Runner's existing events reader: the Stop terminal projection
+        # of exactly (stop_id, stop_generation), or None (SX-2215); with
+        # read_to_end=True it first reads the events to that record.
+        self._stop_terminal = stop_terminal
         self._contexts: dict[str, _BoundContext] = {}
         self._tasks: dict[str, _OperationTask] = {}
         self._scope_stops: dict[str, _ProgramScopeStop] = {}
+        self._io_watches: dict[str, _IoWatch] = {}
         self._lock = RLock()
         self.operations = _NativeKernelOperationTaskPort(self)
         self.controls = _NativeKernelControlTaskPort(self)
         self.queries = _NativeTargetQueryPort(self)
         self.scope = _NativeKernelProgramScopePort(self)
+        self.io_watches = _NativeIoWatchTaskPort(self)
+        self.mock_simulation = _NativeMockSimulationPort(self)
 
     @staticmethod
     def _validate_execution_group_policies(program: Mapping[str, Any]) -> None:
@@ -924,6 +1244,7 @@ class NativeKernelProgramPort:
                 capabilities[capability_id] = capability
             if target_role_id in targets:
                 raise ProductionPortError("Program Binding repeats a target role")
+            signals, ambiguous_signal_roles = _signal_role_bindings(row)
             targets[target_role_id] = _TargetBinding(
                 target_role_id,
                 component_role_id,
@@ -936,6 +1257,8 @@ class NativeKernelProgramPort:
                     field=f"target_role_bindings[{index}].command_target_id",
                 ),
                 capabilities,
+                signals,
+                ambiguous_signal_roles,
             )
         contact_grasps: dict[str, _ContactGraspBinding] = {}
         raw_contact_grasps = binding.get("contact_grasp_bindings", ())
@@ -961,6 +1284,7 @@ class NativeKernelProgramPort:
                 runtime_object_id,
             )
         NativeKernelProgramPort._validate_execution_group_policies(context.program)
+        _validate_io_signal_nodes(context.program, targets)
         return _BoundContext(
             context,
             targets,
@@ -987,6 +1311,15 @@ class NativeKernelProgramPort:
             self._contexts[context.program_run_id] = parsed
 
     def unbind(self, program_run_id: str) -> None:
+        # Run teardown releases every watch its nodes still hold.
+        self.io_watches.release_run(program_run_id)
+        # SX-2433: settle ENDs while the Run is still current. An END not yet
+        # OK-ACKed fails this unbind like an unresolved operation; the context
+        # stays bound and the next (finalizing) unbind resends it unchanged.
+        if self.mock_simulation.resend_unknown_ends(program_run_id):
+            raise ProductionPortError(
+                "cannot unbind a Program run with unconfirmed Mock simulation ends"
+            )
         with self._lock:
             stop = self._scope_stops.get(program_run_id)
             has_scope_stop = stop is not None
@@ -998,6 +1331,7 @@ class NativeKernelProgramPort:
                 )
             with self._lock:
                 self._contexts.pop(program_run_id, None)
+            self.mock_simulation.release_run(program_run_id)
             return
         tasks, local_tasks = self._run_operation_tasks(program_run_id)
         if any(task.terminal is None and not task.held_before_admission for task in local_tasks):
@@ -1031,6 +1365,7 @@ class NativeKernelProgramPort:
                     self._acknowledge_task(member_task_id, member.identity)
         with self._lock:
             self._contexts.pop(program_run_id, None)
+        self.mock_simulation.release_run(program_run_id)
 
     def _context(self, program_run_id: str) -> _BoundContext:
         with self._lock:
@@ -1038,6 +1373,34 @@ class NativeKernelProgramPort:
                 return self._contexts[program_run_id]
             except KeyError as exc:
                 raise ProductionPortError("Program-run client context is not bound") from exc
+
+    def _run_attribution(self, program_run_id: str) -> dict[str, Any]:
+        """The exact private Runner attribution of one Run: the captured
+        Kernel/Binding occurrence plus the current scope's claim."""
+
+        context = self._context(program_run_id)
+        scope = self.scope.execution_scope(program_run_id)
+        claim = scope.get("claim_generation")
+        if type(claim) is not int or claim < 1:
+            raise ProductionPortError("Program execution scope has no claim generation")
+        return {
+            "owner_epoch": context.request_owner_epoch,
+            "program_binding_id": context.capture.program_binding_id,
+            "program_runner_owner_epoch": _text(
+                scope.get("program_runner_owner_epoch"), field="scope runner epoch"
+            ),
+            "claim_generation": claim,
+            "program_run_id": program_run_id,
+        }
+
+    def _node_attribution(self, identity: NodeAttemptIdentity) -> dict[str, Any]:
+        """The Run attribution plus the exact node attempt."""
+
+        return {
+            **self._run_attribution(identity.program_run_id),
+            "node_instance_id": identity.node_instance_id,
+            "node_attempt_id": identity.node_attempt_id,
+        }
 
     def _require_scope_open(self, program_run_id: str) -> None:
         """Reject fresh local work after the Program owner accepted Stop.
@@ -1132,7 +1495,7 @@ class NativeKernelProgramPort:
 
         if not isinstance(identity, NodeAttemptIdentity):
             raise TypeError("motion preview requires one node-attempt identity")
-        if node_id not in _MOTION_NODE_IDS:
+        if node_id not in _MOTION_NODE_IDS and node_id not in _INTERRUPT_MOTION_NODE_IDS:
             raise ProgramMotionPreviewUnavailableError(
                 "node_motion_preview_unsupported",
                 f"node {node_id!r} has no native motion preview",
@@ -1178,21 +1541,27 @@ class NativeKernelProgramPort:
             raise ProgramMotionPreviewUnavailableError(
                 "execution_owner_unavailable", _owner_failure_message(error)
             ) from error
+        previewed: dict[str, Any] = {
+            "component_role_id": participant.target.component_role_id,
+            "target_role_id": participant.target.target_role_id,
+            "required_capability_id": "execution.trajectory.execute",
+            # Preview is not node work: no span.
+            "action_span": None,
+            "payload": dict(participant.payload),
+        }
+        if node_id in _INTERRUPT_MOTION_NODE_IDS:
+            # The original node context: the Core projects the captured
+            # node's rule into the preview exactly as at execution.
+            previewed["execution_scope"] = {
+                "node_instance_id": identity.node_instance_id,
+                "node_attempt_id": identity.node_attempt_id,
+            }
         intent = self._operation_intent(
             context,
             request_id=preview_request_id,
             owner_epoch=owner_epoch,
             scene_revision=scene_revision,
-            participants=[
-                {
-                    "component_role_id": participant.target.component_role_id,
-                    "target_role_id": participant.target.target_role_id,
-                    "required_capability_id": "execution.trajectory.execute",
-                    # Preview is not node work: no span or execution scope.
-                    "action_span": None,
-                    "payload": dict(participant.payload),
-                }
-            ],
+            participants=[previewed],
             coordination_policy="independent",
         )
         return participant, intent
@@ -1370,6 +1739,45 @@ class NativeKernelProgramPort:
             },
             (actuation, dwell),
         )
+
+    def _io_output_payload(
+        self, context: _BoundContext, parameters: Mapping[str, Any]
+    ) -> tuple[_TargetBinding, dict[str, Any]]:
+        """One typed boolean write under the bound target's sealed schema.
+
+        The schema identity is the Program Binding's sealed command_schema of
+        the target's io.gpio.set_output capability; it is never invented.
+        """
+        target_role_id = _text(parameters.get("target_role"), field="target_role")
+        resource_role_id = _text(parameters.get("resource_role"), field="resource_role")
+        target = self._target(context, target_role_id, _IO_OUTPUT_CAPABILITY)
+        _io_signal(context.targets, target_role_id, resource_role_id, output=True)
+        schema = target.capabilities[_IO_OUTPUT_CAPABILITY].get("command_schema")
+        if schema is None:
+            raise ProductionPortError(
+                f"target role {target_role_id!r} has no sealed output command schema"
+            )
+        schema = _mapping(schema, field="output command_schema")
+        value = parameters.get("value")
+        if type(value) is not bool:
+            raise ProductionPortError("io.set_output value must be a boolean")
+        return target, {
+            "kind": "capability_command",
+            "command_schema_id": _text(
+                schema.get("command_schema_id"), field="command_schema_id"
+            ),
+            "command_schema_revision": _text(
+                schema.get("command_schema_revision"), field="command_schema_revision"
+            ),
+            "command_value": {
+                "kind": "io_signal_write",
+                "resource_role_id": resource_role_id,
+                "value": value,
+            },
+            # Contract 65: no caller deadline; the Kernel resolves the sealed
+            # provider/device acknowledgement policy.
+            "caller_options": [],
+        }
 
     @staticmethod
     def _pick_synthesis(
@@ -1975,7 +2383,7 @@ class NativeKernelProgramPort:
             return self._start_pick_place_planning(node_id, identity, inputs)
         preset_owner_status: tuple[str, dict[str, Any]] | None = None
         gripper_timing = None
-        if node_id in _MOTION_NODE_IDS:
+        if node_id in _MOTION_NODE_IDS or node_id in _INTERRUPT_MOTION_NODE_IDS:
             context, target, payload = self._motion_payload(node_id, inputs.parameters, identity)
             capability_id = "execution.trajectory.execute"
         elif node_id == "gripper.command_position":
@@ -1986,6 +2394,10 @@ class NativeKernelProgramPort:
                 inputs.parameters, identity, expected_owner_epoch=preset_owner_status[0], capture_timing=True,
             )
             capability_id = "tool.gripper.command"
+        elif node_id == _IO_OUTPUT_NODE_ID:
+            context = self._context(identity.program_run_id)
+            target, payload = self._io_output_payload(context, inputs.parameters)
+            capability_id = _IO_OUTPUT_CAPABILITY
         else:
             raise ProductionPortError(f"Kernel operation port does not implement {node_id!r}")
         span = ActionSpan(
@@ -2026,6 +2438,14 @@ class NativeKernelProgramPort:
             revision = _held_selection_revision(error)
             if revision is not None:
                 raise OwnerInvocationHeldError(revision) from error
+            if error.code == "refused_by_priority":
+                raise OwnerInvocationRefusedByPriorityError(
+                    str(error),
+                    {
+                        key: str(error.details.get(f"winner_{key}", ""))
+                        for key in _SUCCESSOR_FIELDS
+                    },
+                ) from error
             raise
         except Exception as error:
             # The owner may already have accepted the deterministic request.
@@ -2179,12 +2599,42 @@ class NativeKernelProgramPort:
     def _recovery_assessment(
         self, operation: Mapping[str, Any], operation_id: str
     ) -> Mapping[str, Any] | None:
+        # Manual callers: any absence or read failure is no assessment.
+        assessment, _failure = self._recovery_assessment_read(operation, operation_id)
+        return assessment
+
+    def _recovery_assessment_read(
+        self, operation: Mapping[str, Any], operation_id: str
+    ) -> tuple[Mapping[str, Any] | None, Exception | None]:
+        """One exact read: (assessment, None) for the operation revision;
+        (None, None) for a transient absence (owner unreachable, or the
+        assessment has not caught up with the revision); (None, error) for a
+        malformed or unexpected read."""
+
         try:
             assessment = self._kernel.recovery_assessment(operation_id)
-        except Exception:
-            return None
+        except KernelOperationObservationUnavailableError:
+            return None, None
+        except Exception as error:
+            return None, error
         if assessment.get("operation_revision") != operation.get("operation_revision"):
-            return None
+            return None, None
+        return assessment, None
+
+    def _observed_recovery_assessment(
+        self,
+        operation: Mapping[str, Any],
+        operation_id: str,
+        metadata: dict[str, Any],
+    ) -> Mapping[str, Any] | None:
+        assessment, failure = self._recovery_assessment_read(operation, operation_id)
+        if failure is not None:
+            # Recorded for the automatic caller, which surfaces it; manual
+            # callers ignore it, as they ignore an absent assessment.
+            metadata["recovery_assessment_failure"] = {
+                "reason_code": "owner_recovery_assessment_invalid",
+                "message": (str(failure) or type(failure).__name__)[:1024],
+            }
         return assessment
 
     def _held_preparation_scope(
@@ -2284,6 +2734,139 @@ class NativeKernelProgramPort:
             raise OwnerTaskObservationUnavailableError("cancelled preparation is not yet proven held/no-effect") from error
         raise OwnerInvocationHeldError(scope["selection_revision"])
 
+    def _interrupt_stop_terminal(
+        self, operation: Mapping[str, Any]
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """The Stop terminal projection of the single Stop the operation's
+        escalated rule row names (exact Stop id and generation), read through
+        the existing events consumption, and whether it is still pending.
+
+        Only an escalated trip needs the containing stage. When the events
+        reader lacks the record, one existing ``read_stop`` (``stop_status``)
+        tells its ``terminal_projection`` (SX-2226): ``pending`` waits (the
+        node re-observes on its next tick), ``recorded`` reads the events to
+        the record after that observation, and ``failed``, a missing or an
+        unknown value stays unproven. The interrupt mapper still matches the
+        Stop certificate id/revision (distinct from the control binding),
+        participant and plan references and treats truncated details as
+        unproven."""
+
+        if self._stop_terminal is None:
+            return None, False
+        rows = [
+            row
+            for participant in operation.get("participants") or ()
+            if isinstance(participant, Mapping)
+            for row in participant.get("io_rule_outcomes") or ()
+            if isinstance(row, Mapping) and row.get("stop_id") is not None
+        ]
+        stops = {(row.get("stop_id"), row.get("stop_generation")) for row in rows}
+        if len(stops) != 1 or not any(
+            # Only this case maps by the containing stage (interrupt_outcome).
+            row.get("stop_result") == "succeeded_escalated"
+            and row.get("terminal_cause") in ("signal_trip", "failed")
+            and isinstance(row.get("evidence"), Mapping)
+            and row["evidence"].get("trip") is not None
+            for row in rows
+        ):
+            return None, False
+        ((stop_id, stop_generation),) = stops
+        if type(stop_id) is not str or not stop_id or type(stop_generation) is not int:
+            return None, False
+        terminal = self._stop_terminal(stop_id, stop_generation)
+        if terminal is None:
+            # SX-2222/2226: the record may follow the operation's terminal
+            # state; the existing read_stop tells whether it is recorded.
+            try:
+                status = self._kernel.stop_status(stop_id).get("stop_status")
+            except Exception:
+                return None, False
+            if not isinstance(status, Mapping) or status.get("stop_generation") != stop_generation:
+                return None, False
+            projection = status.get("terminal_projection")
+            if projection == "pending":
+                return None, True
+            if projection != "recorded":
+                return None, False
+            terminal = self._stop_terminal(stop_id, stop_generation, read_to_end=True)
+        return (deepcopy(dict(terminal)) if isinstance(terminal, Mapping) else None), False
+
+    def _interrupt_stop_chains(
+        self, task: _OperationTask, operation: Mapping[str, Any]
+    ) -> dict[str, tuple[str, ...]]:
+        """Per operation participant, the qualified Stop stage order of the
+        exact Targets motion row it used (``command.stop_response``,
+        SX-2211/2224): same component, command target and operation
+        capability, the participant's actual control binding id and revision,
+        and a Targets identity of the Run's Applied bundle and graph. A null
+        stop_response (with ``stop_response_error``), an unreadable reply or
+        any mismatch gives that participant no chain (its containing stage
+        stays unproven); another target's chain is never borrowed."""
+
+        try:
+            capture = self._context(task.identity.program_run_id).capture
+            envelope = self._kernel.targets()
+            owner = _mapping(envelope.get("identity"), field="targets identity")
+            if (
+                owner.get("retained_bundle_id") != capture.retained_bundle_id
+                or owner.get("graph_revision") != capture.graph_revision
+            ):
+                return {}
+            inventory = _mapping(envelope.get("targets"), field="execution targets")
+            if inventory.get("schema_version") != "manyforge.execution_targets.v3":
+                return {}
+            rows: dict[tuple[Any, Any, Any], list[Mapping[str, Any]]] = {}
+            for component in _sequence(inventory.get("components"), field="target components"):
+                component = _mapping(component, field="target component")
+                for row in _sequence(component.get("targets"), field="component targets"):
+                    row = _mapping(row, field="component target")
+                    key = (
+                        component.get("controllable_component_id"),
+                        row.get("command_target_id"),
+                        row.get("operation_capability_id"),
+                    )
+                    rows.setdefault(key, []).append(row)
+        except Exception:
+            return {}
+        chains: dict[str, tuple[str, ...]] = {}
+        for participant in operation.get("participants") or ():
+            if not isinstance(participant, Mapping) or type(participant.get("participant_id")) is not str:
+                continue
+            matches = rows.get((
+                participant.get("controllable_component_id"),
+                participant.get("command_target_id"),
+                participant.get("capability_id"),
+            ), [])
+            command = matches[0].get("command") if len(matches) == 1 else None
+            if (
+                matches and matches[0].get("presentation") != "motion"
+                or not isinstance(command, Mapping)
+                or command.get("stop_response_error") is not None
+            ):
+                continue
+            response = command.get("stop_response")
+            if (
+                not isinstance(response, Mapping)
+                or type(participant.get("control_binding_id")) is not str
+                or response.get("control_binding_id") != participant["control_binding_id"]
+                or response.get("control_binding_revision")
+                != participant.get("control_binding_revision")
+                or not isinstance(response.get("stages"), list)
+            ):
+                continue
+            stages = [
+                stage.get("stage_id") if isinstance(stage, Mapping) else None
+                for stage in response["stages"]
+            ]
+            if (
+                not stages
+                or any(type(stage) is not str or not stage for stage in stages)
+                or len(set(stages)) != len(stages)
+            ):
+                continue
+            chains[participant["participant_id"]] = tuple(stages)
+        return chains
+
     def _observation(self, task: _OperationTask) -> tuple[dict[str, Any], OwnerTaskSnapshot]:
         shared = task.operation
         if shared is None:
@@ -2310,8 +2893,35 @@ class NativeKernelProgramPort:
         metadata = {
             "operation_id": shared.operation_id,
             "operation_revision": operation.get("operation_revision"),
+            "operation_state": state,
             **self._gripper_metadata(task),
         }
+        evidence = [
+            _participant_output_evidence(_mapping(row, field="operation participant"))
+            for row in operation.get("participants") or ()
+        ]
+        if task.node_id == _IO_OUTPUT_NODE_ID and evidence and evidence[0] is not None:
+            metadata["output_evidence"] = evidence[0]
+        if task.node_id in _INTERRUPT_MOTION_NODE_IDS:
+            # The typed rule result the interrupt adapter maps (P5, I5).
+            metadata["interrupt_operation"] = {
+                "operation_id": shared.operation_id,
+                "participants": deepcopy(list(operation.get("participants") or ())),
+            }
+            if state not in _ACTIVE_STATES:
+                terminal, pending = self._interrupt_stop_terminal(metadata["interrupt_operation"])
+                if terminal is not None:
+                    metadata["interrupt_stop_terminal"] = terminal
+                if pending:
+                    metadata["interrupt_stop_terminal_pending"] = True
+                if task.interrupt_stop_chain is None:
+                    task.interrupt_stop_chain = self._interrupt_stop_chains(
+                        task, operation
+                    )
+                metadata["interrupt_stop_chain"] = dict(task.interrupt_stop_chain)
+        if type(envelope.get("resident")) is bool:
+            # A successful read with resident false: retirement completed.
+            metadata["resident"] = envelope["resident"]
         stop_id = operation.get("active_stop_id")
         stop_generation = operation.get("active_stop_generation")
         if (
@@ -2322,6 +2932,10 @@ class NativeKernelProgramPort:
         ):
             metadata["active_stop_id"] = stop_id
             metadata["active_stop_generation"] = stop_generation
+        if operation.get("preemption") is not None:
+            # Logical, at the newcomer's acceptance: the incumbent node ends
+            # now while the Kernel still owns its physical handover.
+            metadata["preemption"] = _preemption_fact(operation["preemption"])
         if state in _ACTIVE_STATES:
             snapshot = OwnerTaskSnapshot(
                 task_id=task.task_id,
@@ -2335,12 +2949,19 @@ class NativeKernelProgramPort:
                 metadata=metadata,
             )
         elif state in _INTERRUPTED_STATES:
-            assessment = self._recovery_assessment(operation, shared.operation_id)
+            assessment = self._observed_recovery_assessment(
+                operation, shared.operation_id, metadata
+            )
             if assessment is not None:
                 metadata["recovery_assessment"] = assessment
                 if assessment.get("recovery_class") in (PROGRAM_MOTION_STOP_RECOVERY_CLASSES):
                     metadata["authored_failure_policy"] = "pause_for_operator"
                     metadata["authored_failure_policy_parameter"] = "operator_stop_policy"
+            failure_fact = _operation_failure_fact(
+                envelope, operation, f"operation_{state}", "native operation was interrupted"
+            )
+            if failure_fact is not None:
+                metadata["operation_failure"] = failure_fact
             snapshot = OwnerTaskSnapshot(
                 task_id=task.task_id,
                 state=OwnerTaskState.INTERRUPTED,
@@ -2349,10 +2970,15 @@ class NativeKernelProgramPort:
                 message="native operation was interrupted",
             )
         elif state in _FAILED_STATES:
-            assessment = self._recovery_assessment(operation, shared.operation_id)
+            assessment = self._observed_recovery_assessment(
+                operation, shared.operation_id, metadata
+            )
             if assessment is not None:
                 metadata["recovery_assessment"] = assessment
             reason_code, message, details = self._terminal_error(operation)
+            failure_fact = _operation_failure_fact(envelope, operation, reason_code, message)
+            if failure_fact is not None:
+                metadata["operation_failure"] = failure_fact
             snapshot = OwnerTaskSnapshot(
                 task_id=task.task_id,
                 state=OwnerTaskState.FAILED,
@@ -2387,6 +3013,28 @@ class NativeKernelProgramPort:
         request_id: str,
         reason: str | None,
     ) -> Mapping[str, Any]:
+        revision, recovery_request, assessment = self._build_operation_recovery(
+            operation,
+            snapshot,
+            action=action,
+            request_id=request_id,
+            reason=reason,
+        )
+        return self._send_operation_recovery(
+            operation_id, revision, recovery_request, assessment
+        )
+
+    @staticmethod
+    def _build_operation_recovery(
+        operation: Mapping[str, Any],
+        snapshot: OwnerTaskSnapshot,
+        *,
+        action: str,
+        request_id: str,
+        reason: str | None,
+    ) -> tuple[int, dict[str, Any], Mapping[str, Any]]:
+        """The exact fenced request for one observed operation revision."""
+
         if snapshot.state not in {
             OwnerTaskState.FAILED,
             OwnerTaskState.INTERRUPTED,
@@ -2396,23 +3044,31 @@ class NativeKernelProgramPort:
         revision = operation.get("operation_revision")
         if not isinstance(assessment, Mapping) or type(revision) is not int:
             raise ProductionPortError("operation recovery identity is incomplete")
+        recovery_request = {
+            "request_id": request_id,
+            "action": action,
+            "principal_id": "program_runner",
+            "expected_assessment_revision": assessment.get("assessment_revision"),
+            "expected_control_command_epoch": assessment.get("control_command_epoch"),
+            "expected_execution_id": assessment.get("execution_id"),
+            "expected_latch_id": assessment.get("latch_id", ""),
+            "expected_stop_certificate_id": assessment.get("stop_certificate_id", ""),
+            "expected_stop_owner_generation": assessment.get("stop_owner_generation", 0),
+            "reason": reason or "",
+        }
+        return revision, recovery_request, assessment
+
+    def _send_operation_recovery(
+        self,
+        operation_id: str,
+        revision: int,
+        recovery_request: Mapping[str, Any],
+        assessment: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        request_id = recovery_request["request_id"]
+        action = recovery_request["action"]
         try:
-            result = self._kernel.recover(
-                operation_id,
-                revision,
-                {
-                    "request_id": request_id,
-                    "action": action,
-                    "principal_id": "program_runner",
-                    "expected_assessment_revision": assessment.get("assessment_revision"),
-                    "expected_control_command_epoch": assessment.get("control_command_epoch"),
-                    "expected_execution_id": assessment.get("execution_id"),
-                    "expected_latch_id": assessment.get("latch_id", ""),
-                    "expected_stop_certificate_id": assessment.get("stop_certificate_id", ""),
-                    "expected_stop_owner_generation": assessment.get("stop_owner_generation", 0),
-                    "reason": reason or "",
-                },
-            )
+            result = self._kernel.recover(operation_id, revision, dict(recovery_request))
         except Exception as error:
             code = getattr(error, "code", None)
             if code not in {
@@ -2450,6 +3106,84 @@ class NativeKernelProgramPort:
         # neither release a newer independent Stop nor reinterpret acceptance
         # through a fallible follow-up observation.
         return result
+
+    def _close_task(
+        self,
+        task_id: str,
+        identity: NodeAttemptIdentity,
+        *,
+        request_id: str,
+    ) -> bool:
+        """Close one settled terminal operation (`close_operation`, DX-1169).
+
+        True once the Kernel retired it (or nothing is retained any more);
+        False when refused, which leaves the operation retained for Reset.
+        An unknown outcome keeps the exact request on the task and raises
+        OwnerTaskSettlementPendingError: the same request is replayed later.
+        """
+        with self._lock:
+            task = self._tasks.get(task_id)
+        if task is None:
+            # Already retired by an accepted recovery, ACK or Reset.
+            return True
+        if task.identity != identity:
+            raise ProductionPortError("operation closure changed node attempt")
+        shared = task.operation
+        if shared is None:
+            raise ProductionPortError("unadmitted operation has no closure")
+        pending = task.unknown_close
+        if pending is None:
+            operation, snapshot = self._observation(task)
+            revision, recovery_request, assessment = self._build_operation_recovery(
+                operation,
+                snapshot,
+                action="close_operation",
+                request_id=request_id,
+                reason="Program node finished with a failure",
+            )
+        elif pending.request_id != request_id:
+            raise ProductionPortError("unknown operation closure changed request")
+        else:
+            revision, recovery_request, assessment = (
+                pending.revision,
+                pending.request,
+                pending.assessment,
+            )
+        try:
+            result = self._send_operation_recovery(
+                shared.operation_id, revision, recovery_request, assessment
+            )
+        except Exception as error:
+            result, outcome_error = None, error
+        else:
+            outcome_error = None
+        outcome = None if outcome_error is not None else recovery_outcome(result)
+        if outcome is None:
+            with self._lock:
+                task.unknown_close = _UnknownRecovery(
+                    request_id, revision, recovery_request, assessment
+                )
+            raise OwnerTaskSettlementPendingError(
+                "operation closure outcome is unknown"
+            ) from outcome_error
+        with self._lock:
+            task.unknown_close = None
+            if outcome:
+                for member_task_id in shared.member_task_ids:
+                    member = self._tasks.get(member_task_id)
+                    if member is not None and member.operation is shared:
+                        self._tasks.pop(member_task_id, None)
+        return outcome
+
+    def _release_preempted_task(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        """Forget a logically preempted task: the Kernel owns its handover."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            if task.identity != identity:
+                raise ProductionPortError("preempted task changed node attempt")
+            self._tasks.pop(task_id, None)
 
     def _recover_task(
         self,
@@ -3427,13 +4161,7 @@ class _NativeKernelControlTaskPort:
             raise ProductionPortError("the exact current recovery offer is unavailable")
         actions = assessment.get("allowed_actions")
         if (
-            action
-            not in {
-                "retry_motion_from_current_state",
-                "acknowledge_and_continue",
-                "retry_after_scene_repair",
-                "replan_from_stopped_state",
-            }
+            action not in OWNER_RECOVERY_ACTIONS
             or not isinstance(actions, list)
             or action not in actions
         ):
@@ -3645,9 +4373,88 @@ class _NativeTargetQueryPort:
                 details=details,
             ) from exc
 
+    def _read_io_input(
+        self, node_id: str, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerInvocationResult:
+        """Read one bound boolean input once; only `fresh` authorizes it."""
+
+        context = self._owner._context(identity.program_run_id)
+        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
+        resource_role_id = _text(
+            inputs.parameters.get("resource_role"), field="resource_role"
+        )
+        try:
+            _io_signal(context.targets, target_role_id, resource_role_id)
+        except IoSignalRefusedError as error:
+            return OwnerInvocationResult(
+                False, reason_code=error.code, message=str(error), details=error.details
+            )
+        query = {
+            "schema_version": "manyforge.target_observation_query.v1",
+            "owner_epoch": context.request_owner_epoch,
+            "program_binding_id": context.capture.program_binding_id,
+            "target_role_id": target_role_id,
+            "kind": "io_signal",
+            "resource_role_id": resource_role_id,
+        }
+        try:
+            response = self._owner._kernel.query_target(query)
+        except Exception as error:
+            reason = _io_owner_reason(error, "")
+            if not reason:
+                raise
+            details = exception_failure_details(error)
+            return OwnerInvocationResult(
+                False,
+                reason_code=reason,
+                message=_owner_failure_message(error),
+                details=details,
+            )
+        observation = _mapping(response.get("target_observation"), field="target_observation")
+        expected = {**query, "schema_version": "manyforge.target_observation.v1"}
+        if any(observation.get(key) != value for key, value in expected.items()):
+            raise ProductionPortError("native I/O observation crossed the captured query")
+        value = _mapping(observation.get("value"), field="I/O observation value")
+        metadata = {
+            key: value.get(key)
+            for key in ("signal_name", "quality", "source_id", "source_epoch", "source_sequence")
+        }
+        if value.get("quality") != "fresh" or type(value.get("value")) is not bool:
+            return OwnerInvocationResult(
+                False,
+                metadata=metadata,
+                reason_code="io_input_unavailable",
+                message=(
+                    f"input {resource_role_id!r} of target role {target_role_id!r} "
+                    f"is {value.get('quality')!r}; only a fresh value can be read"
+                ),
+                details={
+                    "reason": "io_input_unavailable",
+                    "reference_type": "resource_role",
+                    "reference_id": resource_role_id,
+                    "target_role_id": target_role_id,
+                },
+            )
+        if node_id == "io.get_input":
+            return OwnerInvocationResult(True, output=value["value"], metadata=metadata)
+        expected_value = inputs.parameters.get("expected_value")
+        if type(expected_value) is not bool:
+            raise ProductionPortError("check_input expected_value must be boolean")
+        matched = value["value"] is expected_value
+        return OwnerInvocationResult(
+            matched,
+            metadata=metadata,
+            reason_code=None if matched else "io_input_not_matched",
+            message="" if matched else (
+                f"input {resource_role_id!r} is {value['value']}, expected {expected_value}"
+            ),
+        )
+
     def invoke(
         self, node_id: str, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
     ) -> OwnerInvocationResult:
+        if node_id in _IO_READ_NODE_IDS:
+            return self._read_io_input(node_id, identity, inputs)
         if node_id not in {
             "model.get_frame_pose",
             "gripper.check_status",
@@ -3726,6 +4533,482 @@ class _NativeTargetQueryPort:
         )
 
 
+class _NativeIoWatchTaskPort:
+    """`io.wait_for_input` as a narrowed OwnerTaskPort over the command socket.
+
+    start registers one zero-claim level watch for the exact node attempt,
+    observe reads it, and cancel/acknowledge release that exact token. Run
+    teardown (`unbind`) releases what is left. A transport failure is never
+    teardown: the watch stays registered and is read again on a later tick.
+
+    A registration whose reply is unknown (transport failure, timeout or an
+    unusable reply: no token) ends the attempt, so the exact attempt's scope
+    is released then with `scope_request`. That release is sent once over the
+    existing transport; if it is unknown too, Run teardown releases the Run's
+    watches on the host. A host refusal registered nothing and sends nothing.
+    """
+
+    def __init__(self, owner: NativeKernelProgramPort) -> None:
+        self._owner = owner
+
+    def start(
+        self, node_id: str, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerTaskSnapshot:
+        if node_id != "io.wait_for_input":
+            raise ProductionPortError("I/O watch node is unsupported")
+        owner = self._owner
+        context = owner._context(identity.program_run_id)
+        owner._require_scope_open(identity.program_run_id)
+        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
+        resource_role_id = _text(
+            inputs.parameters.get("resource_role"), field="resource_role"
+        )
+        condition = _io_watch_condition(inputs.parameters, target_role_id, resource_role_id)
+        _io_signal(context.targets, target_role_id, resource_role_id)
+        attempt = owner._node_attribution(identity)
+        task_id = _request_identity(
+            "program-io-watch", identity.program_run_id, identity.node_attempt_id
+        )
+        with owner._lock:
+            if task_id in owner._io_watches:
+                raise ProductionPortError("node attempt already registered its I/O watch")
+            if len(owner._io_watches) >= _MAX_IO_WATCHES:
+                raise ProductionPortError("I/O watch retention is full")
+        try:
+            response = owner._kernel.register_io_watch(
+                {
+                    "schema_version": "manyforge.io_watch_request.v1",
+                    **attempt,
+                    "target_role_id": target_role_id,
+                    "resource_role_id": resource_role_id,
+                    "condition": condition,
+                }
+            )
+        except Exception as error:
+            if isinstance(error, KernelClientResponseError) or (
+                getattr(error, "code", None) in EXECUTION_TRANSPORT_FAILURE_CODES
+            ):
+                self._release_unknown_scope(attempt)
+            raise
+        with owner._lock:
+            owner._io_watches[task_id] = _IoWatch(
+                identity, deepcopy(dict(response["registration"]))
+            )
+        return self._snapshot(task_id, response["result"])
+
+    def _release_unknown_scope(self, attempt: Mapping[str, Any]) -> None:
+        try:
+            self._owner._kernel.release_io_watch_scope(
+                {"schema_version": "manyforge.io_watch_scope_release.v1", **attempt}
+            )
+        except Exception:
+            # Unknown again: no retry here; Run teardown releases the Run's
+            # watches on the host, and the original failure stays reported.
+            pass
+
+    def _watch(self, task_id: str) -> _IoWatch | None:
+        with self._owner._lock:
+            return self._owner._io_watches.get(task_id)
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        watch = self._watch(task_id)
+        if watch is None:
+            raise ProductionPortError("I/O watch is not registered")
+        try:
+            result = self._owner._kernel.read_io_watch(watch.registration)
+        except Exception as error:
+            if getattr(error, "code", None) in EXECUTION_TRANSPORT_FAILURE_CODES:
+                raise OwnerTaskObservationUnavailableError(
+                    "I/O watch is temporarily unavailable to read"
+                ) from error
+            raise
+        return self._snapshot(task_id, result)
+
+    @staticmethod
+    def _snapshot(task_id: str, result: Mapping[str, Any]) -> OwnerTaskSnapshot:
+        state = result.get("state")
+        if state == "released":
+            # Released by the host (owner/activation teardown) before a match;
+            # Core erased the watch, so the reply has no observation.
+            return OwnerTaskSnapshot(
+                task_id,
+                OwnerTaskState.FAILED,
+                metadata={"io_watch_state": state},
+                reason_code="io_watch_released",
+                message="the I/O watch was released by its owner before it matched",
+            )
+        observation = _mapping(result.get("observation"), field="I/O watch observation")
+        metadata = {
+            "io_watch_state": state,
+            "quality": observation.get("quality"),
+            "signal_name": observation.get("signal_name"),
+        }
+        if state == "pending":
+            return OwnerTaskSnapshot(task_id, OwnerTaskState.ACTIVE, metadata=metadata)
+        if state == "matched":
+            sample = _mapping(result.get("matched_sample"), field="matched sample")
+            metadata["matched_sample"] = {
+                key: sample.get(key) for key in ("source_id", "source_epoch", "source_sequence")
+            }
+            return OwnerTaskSnapshot(task_id, OwnerTaskState.SUCCEEDED, metadata=metadata)
+        raise ProductionPortError("I/O watch read has an unknown state")
+
+    def cancel(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        """Release the exact watch; idempotent, and absent means released."""
+
+        watch = self._watch(task_id)
+        if watch is None:
+            return
+        if watch.identity != identity:
+            raise ProductionPortError("I/O watch belongs to another node attempt")
+        self._owner._kernel.release_io_watch(watch.registration)
+        with self._owner._lock:
+            self._owner._io_watches.pop(task_id, None)
+
+    def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self.cancel(task_id, identity)
+
+    def release_run(self, program_run_id: str) -> None:
+        """Run teardown: release each remaining watch of this run.
+
+        A release the host cannot confirm now is dropped locally: the host
+        releases a retired run's watches itself (run-capture/owner teardown).
+        """
+
+        with self._owner._lock:
+            watches = [
+                (task_id, watch)
+                for task_id, watch in self._owner._io_watches.items()
+                if watch.identity.program_run_id == program_run_id
+            ]
+        for task_id, watch in watches:
+            try:
+                self._owner._kernel.release_io_watch(watch.registration)
+            except Exception:
+                pass
+            with self._owner._lock:
+                self._owner._io_watches.pop(task_id, None)
+
+
+_LOGGER = logging.getLogger(__name__)
+_MOCK_SIMULATION_OCCURRENCE: Final = (
+    "owner_epoch",
+    "program_binding_id",
+    "program_runner_owner_epoch",
+    "claim_generation",
+    "program_run_id",
+    "node_instance_id",
+    "node_attempt_id",
+    "node_start_index",
+)
+
+
+def _pause_fact(state: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "paused": state["paused"],
+        "run_revision": str(state["revision"]),
+        "held_node_instance_ids": list(state["held"]),
+    }
+
+
+def _mock_simulation_row(row: Any) -> dict[str, Any]:
+    """One authored row on the wire: an omitted change is an explicit null."""
+
+    row = _mapping(row, field="mock_simulation row")
+    signal = _mapping(row.get("signal"), field="mock_simulation signal")
+    change = row.get("change")
+    return {
+        "signal": {
+            "target_role": _text(signal.get("target_role"), field="target_role"),
+            "resource_role": _text(signal.get("resource_role"), field="resource_role"),
+        },
+        "start_value": row.get("start_value"),
+        "change": None if change is None else {
+            "after_ms": _mapping(change, field="mock_simulation change").get("after_ms"),
+            "value": change.get("value"),
+        },
+    }
+
+
+class _NativeMockSimulationPort:
+    """Decision 133: `start_mock_io_node_simulation` for one node attempt.
+
+    The request carries the attempt's existing io-watch attribution, the
+    Runner's node start index (decimal text) and the node's literal rows in
+    canonical selector order. The host retains each node start's result, so
+    the node resends the same request after an unknown reply. A typed host
+    ErrorResponse is a closed refusal (`MockSimulationRefusedError`).
+    """
+
+    def __init__(self, owner: NativeKernelProgramPort) -> None:
+        self._owner = owner
+        # Ends whose reply is unknown, resent unchanged before the next
+        # Mock call and at Run teardown; bounded (the host also cancels a
+        # retired Run's pending changes).
+        self._unknown_ends: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._refusal_logged: set[tuple[str, str, str]] = set()
+        # Per Run: the latest Halt state {revision, paused, request, settled};
+        # a START waits until it is answered.
+        self._run_pause: dict[str, dict[str, Any]] = {}
+        self._unconfirmed_pauses: dict[str, list[dict[str, Any]]] = {}
+
+    def request(
+        self,
+        identity: NodeAttemptIdentity,
+        node_start_index: int,
+        signals: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        if type(node_start_index) is not int or not 1 <= node_start_index <= 2**64 - 1:
+            raise ProductionPortError("node start index must be a positive uint64")
+        self._owner._require_scope_open(identity.program_run_id)
+        rows = sorted(
+            (_mock_simulation_row(row) for row in signals),
+            key=lambda row: (row["signal"]["target_role"], row["signal"]["resource_role"]),
+        )
+        return {
+            "schema_version": "manyforge.mock_io_node_start.v1",
+            **self._owner._node_attribution(identity),
+            "node_start_index": str(node_start_index),
+            "signals": rows,
+        }
+
+    def set_run_paused(
+        self,
+        program_run_id: str,
+        run_revision: int,
+        paused: bool,
+        held_node_instance_ids: Sequence[str] = (),
+    ) -> None:
+        """Decision 135 / SX-2411/2416: record the Run's Halt state at the
+        Runner's run_revision. Nothing is sent until the Run's first START
+        establishes its Mock context (then exactly once, the current state,
+        just before that START); afterwards each change is sent. Never
+        raises. An unanswered state (lost reply, or an explicit error, which
+        had no effect) is resent unchanged on the Run's ticks and before the
+        next START, never with a fresh revision; one superseded while
+        unanswered is reported unconfirmed."""
+
+        if type(run_revision) is not int or not 1 <= run_revision <= 2**64 - 1:
+            raise ProductionPortError("run_revision must be a positive uint64")
+        with self._owner._lock:
+            current = self._run_pause.get(program_run_id)
+            if current is not None and current["revision"] >= run_revision:
+                return
+            established = current is not None and current["established"]
+            # A state still being sent reports itself if it stays unanswered.
+            if established and current["outcome"] in {"unknown", "refused"}:
+                self._unconfirmed_pauses.setdefault(program_run_id, []).append(
+                    _pause_fact(current)
+                )
+            self._run_pause[program_run_id] = {
+                "revision": run_revision, "paused": paused,
+                "held": sorted(set(held_node_instance_ids)), "request": None,
+                "outcome": "unsent", "established": established,
+            }
+        if established:
+            self._settle_run_pause(program_run_id)
+
+    def _settle_run_pause(self, program_run_id: str) -> str:
+        """Send the Run's latest Halt state unless answered: its outcome,
+        `settled`, `unknown` (lost reply) or `refused` (explicit error).
+
+        The state is established and its request fixed under the lock, so a
+        Halt arriving during this send sees the established context and is
+        sent itself. Only the current state takes the reply's outcome; a
+        superseded one just returns it (reported if it was never answered).
+        """
+
+        attribution: dict[str, Any] | None = None
+        while True:
+            with self._owner._lock:
+                state = self._run_pause.get(program_run_id)
+                if state is None:
+                    raise MockSimulationRefusedError(
+                        "mock_run_pause_unknown",
+                        "the Run never supplied its Mock pause state",
+                        {"reason": "mock_run_pause_unknown"},
+                    )
+                if state["outcome"] == "settled":
+                    return "settled"
+                if state["request"] is None and attribution is not None:
+                    state["request"] = {
+                        "schema_version": "manyforge.mock_io_run_pause.v1",
+                        **attribution,
+                        "run_revision": str(state["revision"]),
+                        "paused": state["paused"],
+                        "held_node_instance_ids": list(state["held"]),
+                    }
+                if state["request"] is not None:
+                    state["established"] = True  # The first START needs it.
+                    request = state["request"]
+                    break
+            # The Run attribution reads the Kernel scope: never under the lock.
+            try:
+                attribution = self._owner._run_attribution(program_run_id)
+            except Exception:
+                with self._owner._lock:
+                    state["established"] = True
+                    if self._run_pause.get(program_run_id) is state:
+                        state["outcome"] = "unknown"
+                return "unknown"
+        try:
+            self._owner._kernel.set_mock_io_run_paused(request)
+            outcome = "settled"
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if isinstance(error, KernelClientResponseError) or not isinstance(code, str) or (
+                code in EXECUTION_TRANSPORT_FAILURE_CODES
+            ):
+                outcome = "unknown"
+            elif code == "mock_simulation_stale":
+                # The same revision with the other state: a Runner bug,
+                # logged and never retried.
+                _LOGGER.error(
+                    "Mock Run pause state refused as stale: run=%s revision=%s paused=%s",
+                    program_run_id, state["revision"], state["paused"],
+                )
+                with self._owner._lock:  # No accepted receipt: unconfirmed.
+                    self._unconfirmed_pauses.setdefault(program_run_id, []).append(
+                        _pause_fact(state)
+                    )
+                outcome = "settled"
+            else:
+                outcome = "refused"  # No effect: resent unchanged.
+        with self._owner._lock:
+            if self._run_pause.get(program_run_id) is state:
+                state["outcome"] = outcome
+            elif outcome != "settled":
+                self._unconfirmed_pauses.setdefault(program_run_id, []).append(
+                    _pause_fact(state)
+                )
+        return outcome
+
+    def resend_run_pause(
+        self, program_run_id: str
+    ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any] | None]:
+        """The Run's tick resend: (superseded states never answered, to
+        record now; the current state if still unanswered)."""
+
+        with self._owner._lock:
+            superseded = tuple(self._unconfirmed_pauses.pop(program_run_id, ()))
+            state = self._run_pause.get(program_run_id)
+        if (
+            state is None
+            or not state["established"]  # No START yet: no Mock call at all.
+            or self._settle_run_pause(program_run_id) == "settled"
+        ):
+            return superseded, None
+        return superseded, _pause_fact(state)
+
+    def start(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        if self.resend_unknown_ends(request["program_run_id"]):
+            # An older attempt's timer may still be live: the node waits and
+            # resends the same START once every END of the Run is answered.
+            raise ProductionPortError("the Run's Mock ends are not yet answered")
+        if self._settle_run_pause(request["program_run_id"]) == "unknown":
+            # Unknown: the node keeps waiting and resends the same START. An
+            # explicit pause error lets the host answer the START itself.
+            raise ProductionPortError("the Run's Mock pause state is not yet answered")
+        with self._owner._lock:
+            current = self._run_pause.get(request["program_run_id"])
+            if current is None or current["outcome"] not in {"settled", "refused"}:
+                # A superseded send's ACK cannot confirm a newer snapshot.
+                # Keep the same START/index until the actual current request
+                # is answered. The existing explicit-refusal path is unchanged.
+                raise ProductionPortError("the Run's Mock pause state is not yet answered")
+        try:
+            return self._owner._kernel.start_mock_io_node_simulation(request)
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if (
+                not isinstance(error, KernelClientResponseError)
+                and isinstance(code, str)
+                and code
+                and code not in EXECUTION_TRANSPORT_FAILURE_CODES
+            ):
+                details = getattr(error, "details", None)
+                raise MockSimulationRefusedError(
+                    code,
+                    str(error),
+                    details if isinstance(details, Mapping) else None,
+                ) from error
+            raise
+
+    @staticmethod
+    def end_request(start_request: Mapping[str, Any]) -> dict[str, Any]:
+        """Decision 135: the end of the attempt that sent ``start_request``."""
+
+        return {
+            "schema_version": "manyforge.mock_io_node_end.v1",
+            **{name: start_request[name] for name in _MOCK_SIMULATION_OCCURRENCE},
+        }
+
+    def end(self, start_request: Mapping[str, Any]) -> None:
+        request = self.end_request(start_request)
+        self.resend_unknown_ends(request["program_run_id"])
+        self._send_end(request)
+
+    def _send_end(self, request: dict[str, Any]) -> bool:
+        """Send one exact END; only its exact OK ACK settles it (True).
+
+        A lost reply and every refusal (SX-2427: no refusal proves the entry
+        absent) keep that END pending, resent unchanged; a refusal is logged
+        once per END at warning level. The Run reports an END still pending
+        when it ends, and its unbind fails until every END is OK-ACKed.
+        """
+
+        key = (
+            request["program_run_id"], request["node_instance_id"], request["node_start_index"]
+        )
+        try:
+            self._owner._kernel.end_mock_io_node_simulation(request)
+        except Exception as error:
+            code = getattr(error, "code", None)
+            refused = not isinstance(error, KernelClientResponseError) and isinstance(code, str) and (
+                code not in EXECUTION_TRANSPORT_FAILURE_CODES
+            )
+            with self._owner._lock:
+                if key not in self._unknown_ends and len(self._unknown_ends) >= _MAX_IO_WATCHES:
+                    raise ProductionPortError("Mock end retention is full") from error
+                self._unknown_ends[key] = request
+                warn = refused and key not in self._refusal_logged
+                if warn:
+                    self._refusal_logged.add(key)
+            if warn:
+                details = getattr(error, "details", None)
+                _LOGGER.warning(
+                    "Mock simulation END refused, kept pending: run=%s node=%s index=%s "
+                    "code=%s reason=%s",
+                    key[0], key[1], key[2], code,
+                    details.get("reason") if isinstance(details, Mapping) else None,
+                )
+            return False
+        with self._owner._lock:
+            self._unknown_ends.pop(key, None)
+            self._refusal_logged.discard(key)
+        return True
+
+    def resend_unknown_ends(self, program_run_id: str) -> tuple[dict[str, Any], ...]:
+        """Resend this Run's unanswered ENDs unchanged (the tree tick, each
+        Mock START/END and the Run's unbind call this); those still
+        unanswered afterwards."""
+
+        with self._owner._lock:
+            pending = [
+                request for key, request in self._unknown_ends.items()
+                if key[0] == program_run_id
+            ]
+        return tuple(request for request in pending if not self._send_end(request))
+
+    def release_run(self, program_run_id: str) -> None:
+        """The Run's unbind succeeded, so none of its ENDs is pending (an
+        unanswered END fails the unbind): forget its pause state."""
+
+        with self._owner._lock:
+            self._run_pause.pop(program_run_id, None)
+            self._unconfirmed_pauses.pop(program_run_id, None)
+
+
 class _NativeKernelOperationTaskPort:
     """Unambiguous OwnerTaskPort view over one native Program client."""
 
@@ -3765,6 +5048,12 @@ class _NativeKernelOperationTaskPort:
             request_id=request_id,
             reason=reason,
         )
+
+    def close(self, task_id: str, identity: NodeAttemptIdentity, *, request_id: str) -> bool:
+        return self._owner._close_task(task_id, identity, request_id=request_id)
+
+    def release_preempted(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self._owner._release_preempted_task(task_id, identity)
 
 
 class _NativeKernelProgramScopePort:

@@ -18,6 +18,7 @@
 #include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
+#include <manyforge_deployment/program_io_stop_response_validation.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
@@ -282,7 +283,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   throw std::logic_error("unknown assistant mode");
 }
 
-[[nodiscard]] deployment::CanonicalValue artifact_payload(
+[[nodiscard]] std::vector<deployment::PreparedActivationArtifact> artifact_rows(
     const std::vector<deployment::detail::PreparedActivationArtifact> &artifacts) {
   std::vector<deployment::PreparedActivationArtifact> rows;
   rows.reserve(artifacts.size());
@@ -290,7 +291,12 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
     rows.push_back({artifact.content_addressed_store_key,
                     artifact.content_digest, artifact.bytes});
   }
-  return deployment::prepared_activation_artifact_rows(std::move(rows));
+  return rows;
+}
+
+[[nodiscard]] deployment::CanonicalValue artifact_payload(
+    const std::vector<deployment::detail::PreparedActivationArtifact> &artifacts) {
+  return deployment::prepared_activation_artifact_rows(artifact_rows(artifacts));
 }
 
 [[nodiscard]] deployment::CanonicalValue prepare(const Options &options) {
@@ -453,6 +459,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
         *materialized.bundle, materialized.model_map, catalog_store);
   }
   const auto &binding = outcome.binding;
+  auto raw_artifact_rows = artifact_rows(materialized.raw_artifacts);
   // The complete assembled input is independently verified below, including
   // strict absence of identities and assignments for no_program.
   deployment::CanonicalValue program_outcome(nullptr);
@@ -475,12 +482,26 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       throw std::logic_error(
           "prepared Program binding failed independent in-memory reload");
     }
+    const auto stop_refs = deployment::required_program_io_stop_artifacts(
+        *program, *binding, *materialized.bundle);
+    if (!stop_refs.ok())
+      throw std::invalid_argument(stop_refs.error().details.at("reason"));
+    if (!stop_refs.value().empty()) {
+      if (!materialized.model_map)
+        throw std::invalid_argument("io_rule_stop_model_map_mismatch");
+      const auto valid = deployment::validate_program_io_stop_responses(
+          *program, *binding, *materialized.bundle, *materialized.model_map,
+          raw_artifact_rows);
+      if (!valid.ok())
+        throw std::invalid_argument(valid.error().details.at("reason"));
+    }
     program_binding_payload = binding->normalized_root();
-    program_outcome = deployment::CanonicalValue(deployment::CanonicalValue::Object{
-        {"kind", deployment::CanonicalValue("bound")},
-        {"program_binding_id",
-         deployment::CanonicalValue(binding->program_binding_id().value())},
-    });
+    program_outcome =
+        deployment::CanonicalValue(deployment::CanonicalValue::Object{
+            {"kind", deployment::CanonicalValue("bound")},
+            {"program_binding_id",
+             deployment::CanonicalValue(binding->program_binding_id().value())},
+        });
   } else {
     if (!outcome.non_executable.has_value()) {
       throw std::logic_error("prepared Program has no typed outcome");
@@ -507,7 +528,9 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
                                           : deployment::CanonicalValue(nullptr)},
            {"program_binding", std::move(program_binding_payload)},
            {"program_role_assignment", assignment_value},
-           {"raw_artifacts", artifact_payload(materialized.raw_artifacts)},
+           {"raw_artifacts",
+            deployment::prepared_activation_artifact_rows(
+                std::move(raw_artifact_rows))},
            {"retained_bundle", materialized.bundle->normalized_root()},
        })},
       {"assistant_mode",

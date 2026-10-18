@@ -8,7 +8,11 @@ import {
 } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type {
+  AutomaticRetryAuditEvent,
+  CycleRecoveryOffer,
   JsonValue,
+  ProgramInterventionStopScope,
+  RuntimeControlAuditEvent,
 } from '../types/api';
 import type { ExecutionObservationTransportStatus } from '../types/viewerObservation';
 import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
@@ -24,11 +28,13 @@ import {
 import { useComposerSettings } from '../hooks/useComposerSettings';
 import { MOTION_CONTROL_WIDTH_REM, type ComposerSettings } from '../state/composerSettings';
 import { OverlayPanel } from './OverlayPanel';
+import { NamespaceGroupOptions, useNamespaceGroups } from './common/NamespaceGroupOptions';
+import { groupByNamespace } from '../utils/blackboardNamespaces';
 import { incidentFacts } from '../state/componentLifecyclePresentation';
 import { PendingApplyNote, SettingsSubheading } from './SettingsScope';
 import { ProgramRunSetup, type AdmittedSpeedsView } from './ProgramRunSetup';
 import { api } from '../api/client';
-import { parseApiErrorDto } from '../api/parsers';
+import { isAutomaticRetryAuditEvent, parseApiErrorDto } from '../api/parsers';
 import {
   BlackboardValueEditor,
   blackboardValueDraft,
@@ -37,7 +43,17 @@ import {
   parseBlackboardValueDraft,
 } from './BlackboardValueEditor';
 import { PersistentKeyValuesSection } from './PersistentKeyValues';
+import { UncertainOutputConfirmation } from './UncertainOutputConfirmation';
+import { globalRuleLatchNotices, type GlobalRuleLatch } from '../state/globalRuleLatches';
+import { useGlobalRuleRecovery } from '../hooks/useGlobalRuleRecovery';
 import {
+  allUncertainOutputsApproved,
+  mergeUncertainOutputs,
+  programRunUncertainOutputs,
+  uncertainOutputs,
+} from '../utils/uncertainOutputs';
+import {
+  useBriefNotice,
   usePublishWorkbenchNotices,
   type WorkbenchNotice,
 } from '../state/workbenchNotices';
@@ -95,6 +111,195 @@ function nodeActivitySummary(statuses: Record<string, string>): string {
   return `${running} node${running === 1 ? '' : 's'} running · ${waiting} waiting`;
 }
 
+const AUTOMATIC_RETRY_CAUSE_LABELS: Readonly<Record<string, string>> = {
+  collision_stop_nominal: 'collision Stop',
+  planning_no_effect: 'planning failed',
+};
+
+/** The cause as words; an unnamed cause is humanised like any stable code. */
+function automaticRetryCauseLabel(cause: string): string {
+  return AUTOMATIC_RETRY_CAUSE_LABELS[cause] ?? humanizeReasonCode(cause);
+}
+
+/**
+ * The failed attempt, as its Kernel failure: "Collision Stop on move: <code> —
+ * <message>", or the cause alone when the owner has no Kernel failure. Shown in
+ * red before the retry line. Null for another event.
+ */
+export function automaticRetryFailureText(event: RuntimeControlAuditEvent): string | null {
+  if (!isAutomaticRetryAuditEvent(event)) return null;
+  const { nodeInstanceId, cause, failure } = event.facts;
+  const head = `${actionLabel(automaticRetryCauseLabel(cause))} on ${nodeInstanceId}`;
+  if (failure === null) return head;
+  const { title, message } = formatStructuredError(failure);
+  return `${head}: ${title} — ${message}`;
+}
+
+/** "Attempt 2 of 4 for move after collision Stop" (an automatic retry), or null for another event. */
+export function automaticRetryText(event: RuntimeControlAuditEvent): string | null {
+  if (!isAutomaticRetryAuditEvent(event)) return null;
+  const {
+    nodeInstanceId, attempt, maxAttempts, cause,
+  } = event.facts;
+  return `Attempt ${attempt} of ${maxAttempts} for ${nodeInstanceId} after ${automaticRetryCauseLabel(cause)}`;
+}
+
+/** The brief warning for one automatic retry: "Collision Stop on move — attempt 2 of 4". */
+function automaticRetryBriefNotice(
+  programRunId: string | null,
+  event: AutomaticRetryAuditEvent,
+): WorkbenchNotice {
+  const {
+    nodeInstanceId, attempt, maxAttempts, cause,
+  } = event.facts;
+  return {
+    id: `program.automatic-retry.${programRunId}.${event.eventRevision}`,
+    severity: 'warning',
+    domain: 'runtime',
+    title: `${actionLabel(automaticRetryCauseLabel(cause))} on ${nodeInstanceId} — attempt ${attempt} of ${maxAttempts}`,
+    message: 'Recorded in the runtime-control events.',
+  };
+}
+
+function newestAutomaticRetry(
+  audit: readonly RuntimeControlAuditEvent[],
+): AutomaticRetryAuditEvent | null {
+  return audit.findLast(isAutomaticRetryAuditEvent) ?? null;
+}
+
+const IO_SOURCE_UNAVAILABLE = 'program_node_io_source_unavailable';
+const IO_SOURCE_AVAILABLE = 'program_node_io_source_available';
+
+interface IoSourceTransition {
+  unavailable: boolean;
+  nodeInstanceId: string;
+  quality: string | null;
+}
+
+/** The facts of an io wait's source transition, or null for another event. */
+function ioSourceTransition(event: RuntimeControlAuditEvent): IoSourceTransition | null {
+  if (event.kind !== IO_SOURCE_UNAVAILABLE && event.kind !== IO_SOURCE_AVAILABLE) return null;
+  const facts = event.facts as Record<string, JsonValue>;
+  if (typeof facts.node_instance_id !== 'string') return null;
+  return {
+    unavailable: event.kind === IO_SOURCE_UNAVAILABLE,
+    nodeInstanceId: facts.node_instance_id,
+    quality: typeof facts.quality === 'string' ? facts.quality : null,
+  };
+}
+
+/**
+ * "Input source unavailable for wait_part (stale) — still waiting" /
+ * "Input source available again for wait_part", or null for another event.
+ */
+export function ioSourceAuditText(event: RuntimeControlAuditEvent): string | null {
+  const transition = ioSourceTransition(event);
+  if (transition === null) return null;
+  return transition.unavailable
+    ? `Input source unavailable for ${transition.nodeInstanceId}${transition.quality === null ? '' : ` (${transition.quality})`} — still waiting`
+    : `Input source available again for ${transition.nodeInstanceId}`;
+}
+
+/**
+ * The running io waits whose newest source transition is "unavailable": the
+ * Runner keeps such a node RUNNING and records the transition as an event.
+ */
+export function ioSourceUnavailableNodes(
+  audit: readonly RuntimeControlAuditEvent[],
+  nodeStatuses: Readonly<Record<string, string>>,
+): IoSourceTransition[] {
+  const newest = new Map<string, IoSourceTransition>();
+  for (const event of audit) {
+    const transition = ioSourceTransition(event);
+    if (transition !== null) newest.set(transition.nodeInstanceId, transition);
+  }
+  return [...newest.values()].filter((transition) => (
+    transition.unavailable && nodeStatuses[transition.nodeInstanceId] === 'running'
+  ));
+}
+
+function ioSourceUnavailableText(transition: IoSourceTransition): string {
+  return `Waiting on ${transition.nodeInstanceId}: input source unavailable${transition.quality === null ? '' : ` (${transition.quality})`}. The wait continues once the source is fresh again.`;
+}
+
+function newestIoSourceUnavailable(
+  audit: readonly RuntimeControlAuditEvent[],
+): RuntimeControlAuditEvent | null {
+  return audit.findLast((event) => ioSourceTransition(event)?.unavailable === true) ?? null;
+}
+
+function ioSourceBriefNotice(
+  programRunId: string | null,
+  event: RuntimeControlAuditEvent,
+): WorkbenchNotice {
+  const transition = ioSourceTransition(event) as IoSourceTransition;
+  return {
+    id: `program.io-source-unavailable.${programRunId}.${event.eventRevision}`,
+    severity: 'warning',
+    domain: 'runtime',
+    title: `Input source unavailable on ${transition.nodeInstanceId} — still waiting`,
+    message: 'Recorded in the runtime-control events.',
+  };
+}
+
+/**
+ * The brief warning for the newest event `newestOf` selects that the panel
+ * has not yet announced. The first loaded audit is history and announces
+ * nothing, so an event already in it never re-shows, even after a remount. A
+ * later revision, or the first such event of a new run, is new. `useBriefNotice`
+ * keys the notice by its run and revision, so an unchanged event never
+ * restarts its timer.
+ */
+function useBriefNewestAuditEvent<E extends RuntimeControlAuditEvent>(
+  programRunId: string | null,
+  audit: readonly RuntimeControlAuditEvent[] | null,
+  newestOf: (audit: readonly RuntimeControlAuditEvent[]) => E | null,
+  noticeOf: (programRunId: string | null, event: E) => WorkbenchNotice,
+): WorkbenchNotice | null {
+  const [baseline, setBaseline] = useState<{ runId: string | null; revision: number } | null>(null);
+  if (audit !== null && baseline === null) {
+    setBaseline({ runId: programRunId, revision: newestOf(audit)?.eventRevision ?? 0 });
+  }
+  const newest = audit === null ? null : newestOf(audit);
+  const fresh = newest !== null && baseline !== null
+    && (baseline.runId !== programRunId || newest.eventRevision > baseline.revision)
+    ? newest
+    : null;
+  return useBriefNotice(fresh === null ? null : noticeOf(programRunId, fresh));
+}
+
+/** The brief warning for a newly unavailable io wait source (see the retry notice). */
+export function useBriefIoSourceUnavailable(
+  programRunId: string | null,
+  audit: readonly RuntimeControlAuditEvent[] | null,
+): WorkbenchNotice | null {
+  return useBriefNewestAuditEvent(
+    programRunId,
+    audit,
+    newestIoSourceUnavailable,
+    ioSourceBriefNotice,
+  );
+}
+
+/**
+ * The brief warning for the newest automatic retry the panel has not yet
+ * announced. The first loaded audit is history and announces nothing, so a
+ * retry already in it never re-shows, even after a remount. A later revision,
+ * or the first retry of a new run, is new. `useBriefNotice` keys the notice by
+ * its run and revision, so an unchanged retry never restarts its timer.
+ */
+export function useBriefAutomaticRetry(
+  programRunId: string | null,
+  audit: readonly RuntimeControlAuditEvent[] | null,
+): WorkbenchNotice | null {
+  return useBriefNewestAuditEvent(
+    programRunId,
+    audit,
+    newestAutomaticRetry,
+    automaticRetryBriefNotice,
+  );
+}
+
 function actionLabel(value: string): string {
   const label = value.replace(/^recovery\./, '').replaceAll('_', ' ');
   return label.charAt(0).toUpperCase() + label.slice(1);
@@ -125,6 +330,7 @@ export function ProgramRuntimePanel({
     stageManualResult,
   } = controller;
   const [blackboardKey, setBlackboardKey] = useState('');
+  const keyNamespaces = useNamespaceGroups();
   const [blackboardDraft, setBlackboardDraft] = useState('');
   const [blackboardPoseIssue, setBlackboardPoseIssue] = useState<string | null>(null);
   const [blackboardError, setBlackboardError] = useState<string | null>(null);
@@ -134,6 +340,9 @@ export function ProgramRuntimePanel({
   const controls = state.controls?.runtimeControls ?? null;
   const recoveryOffer = state.controls?.recoveryOffer ?? null;
   const ordinaryMotionHeld = recoveryOffer?.recoveryClass === 'ordinary_operator_stop';
+  const ioSourceUnavailable = state.run === null || controls === null
+    ? []
+    : ioSourceUnavailableNodes(controls.audit, state.run.nodeStatuses);
   const runReason = state.run?.reason ? formatStructuredError(state.run.reason) : null;
   const declaredKeys = state.applied?.program.blackboard?.keys ?? [];
   // Operator writes follow the key's access and use its typed editor; a
@@ -338,6 +547,15 @@ export function ProgramRuntimePanel({
           </span>
         </div>
       )}
+      {ioSourceUnavailable.map((transition) => (
+        <p
+          key={transition.nodeInstanceId}
+          className="inline-message severity-warning"
+          role="status"
+        >
+          {ioSourceUnavailableText(transition)}
+        </p>
+      ))}
       {enabled && recoveryOffer !== null && (
         <section className="runtime-control-section" aria-labelledby="runtime-recovery-title">
           <div className="runtime-control-heading">
@@ -426,6 +644,7 @@ export function ProgramRuntimePanel({
             <select
               value={blackboardKey}
               onChange={(event) => {
+                if (keyNamespaces.handleToggle(event.currentTarget.value)) return;
                 const key = writableKeys.find((row) => row.key === event.currentTarget.value);
                 setBlackboardKey(event.currentTarget.value);
                 setBlackboardDraft(key === undefined
@@ -437,11 +656,17 @@ export function ProgramRuntimePanel({
               }}
             >
               <option value="">Choose a key</option>
-              {writableKeys.map((key) => (
-                <option key={key.key} value={key.key}>
-                  {key.key} · {key.type}
-                </option>
-              ))}
+              <NamespaceGroupOptions
+                groups={groupByNamespace(writableKeys, (key) => key.key)}
+                expanded={keyNamespaces.expanded}
+                current={blackboardKey}
+                valueOf={(key) => key.key}
+                option={(key) => (
+                  <option key={key.key} value={key.key}>
+                    {key.key} · {key.type}
+                  </option>
+                )}
+              />
             </select>
           </label>
           {selectedBlackboardKey !== null && (
@@ -526,11 +751,18 @@ export function ProgramRuntimePanel({
             <p>Earlier events are outside this recent window. Use Runtime / history for retained operational history.</p>
           )}
           <ol className="runtime-control-audit">
-            {controls.audit.map((event) => (
-              <li key={event.eventRevision}>
-                <code>{event.eventRevision}</code> {actionLabel(event.kind)}
-              </li>
-            ))}
+            {controls.audit.map((event) => {
+              const failure = automaticRetryFailureText(event);
+              return (
+                <li key={event.eventRevision}>
+                  {failure !== null && <p className="inline-message severity-error">{failure}</p>}
+                  <code>{event.eventRevision}</code>{' '}
+                  {ioSourceTransition(event)?.unavailable === true ? (
+                    <span className="inline-message severity-warning">{ioSourceAuditText(event)}</span>
+                  ) : automaticRetryText(event) ?? ioSourceAuditText(event) ?? actionLabel(event.kind)}
+                </li>
+              );
+            })}
           </ol>
         </details>
       )}
@@ -624,6 +856,8 @@ export function deriveTransportGuidance({
   motionActive,
   onOpenManualRecovery,
   onReviewProgramRecovery,
+  globalRuleLatches = [],
+  onClearGlobalRuleLatch,
 }: {
   enabled: boolean;
   program: ProgramRuntimeController;
@@ -632,6 +866,9 @@ export function deriveTransportGuidance({
   motionActive: boolean;
   onOpenManualRecovery?: (operation: ManualRecoveryOperation) => void;
   onReviewProgramRecovery: () => void;
+  /** Latched global rules (contracts 78/86) from the owner's recovery offers. */
+  globalRuleLatches?: readonly GlobalRuleLatch[];
+  onClearGlobalRuleLatch?: (latch: GlobalRuleLatch) => void;
 }): WorkbenchNotice[] {
   const notices: WorkbenchNotice[] = [];
   const phase = observationTransport?.phase;
@@ -705,8 +942,8 @@ export function deriveTransportGuidance({
       title: 'Cell recovery required',
       message: `${humanizeReasonCode(fault.reasonCode)} · ${
         fault.recoveryStatus.replaceAll('_', ' ')
-      }. Motion remains blocked.${robot.componentIncidents.map(({ componentId, incident }) =>
-        ` Incident on ${componentId}: ${incidentFacts(incident)}.`).join('')}`,
+      }. Motion remains blocked.${robot.componentIncidents.map(({ controllableComponentId, incident }) =>
+        ` Incident on ${controllableComponentId}: ${incidentFacts(incident)}.`).join('')}`,
       busy: robot.stopFaultRecoveryPending,
       actions: [{
         id: 'recover-cell',
@@ -719,6 +956,8 @@ export function deriveTransportGuidance({
       }],
     });
   }
+  // Contracts 78/86: latched global rules, a source-loss latch shown distinctly.
+  notices.push(...globalRuleLatchNotices(globalRuleLatches, onClearGlobalRuleLatch));
   if (facts.programRecovery) {
     notices.push({
       id: 'recovery.program',
@@ -970,6 +1209,26 @@ export function ProgramTransportControls({
   // confirmed like Halt: motion stops first, the question comes after.
   const [resetIntent, setResetIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
   const [resetSelection, setResetSelection] = useState(NO_RESET_OPTIONS);
+  // Contract 66: retained outputs with unknown acceptance are released only by
+  // targeted operation Resets that acknowledge each one explicitly.
+  // Manual operations and the held Program-run operations (recovery offers).
+  const resetUncertain = useMemo(
+    () => mergeUncertainOutputs(
+      uncertainOutputs(robot.currentStatus?.manualOperations),
+      programRunUncertainOutputs([
+        ...(program.state.controls?.recoveryHolds ?? []).map((hold) => hold.offer),
+        program.state.controls?.recoveryOffer,
+      ]),
+    ),
+    [robot.currentStatus?.manualOperations, program.state.controls],
+  );
+  const [approvedUncertain, setApprovedUncertain] = useState<ReadonlySet<string>>(() => new Set());
+  const [uncertainResetError, setUncertainResetError] = useState<string | null>(null);
+  const uncertainApproved = allUncertainOutputsApproved(resetUncertain, approvedUncertain);
+  // Continue fails the held node; it is confirmed when the backend asks.
+  const [continueIntent, setContinueIntent] = useState<
+    Pick<CycleRecoveryOffer, 'offerId' | 'offerRevision' | 'nodeInstanceId'> | null
+  >(null);
   // Installation settings (UA7W.11); they never add a confirmation to Stop.
   const preferences = useComposerSettings().settings.motionPanel;
   const detailsButton = useRef<HTMLButtonElement>(null);
@@ -1049,32 +1308,106 @@ export function ProgramTransportControls({
     ?? robot.state.status?.cellStopAction
     ?? null;
   const allMotionQuiesced = state.runnerAvailable && executionSelectionIsQuiescent(allGroup);
-  // Paused on a failed node: Retry retries it and resumes the motion the
-  // failure pause stopped (backend), so it replaces Run/Resume meanwhile.
-  const failureOffer = state.controls?.recoveryOffer ?? null;
-  // A disabled Retry still replaces Run/Resume: the pause must not be
-  // bypassed, and its reason (e.g. containment not confirmed) is shown.
-  const retryActions = failureOffer?.actions.filter(
-    (action) => RETRY_ACTION_IDS.includes(action.actionId),
-  ) ?? [];
-  const retryAction = retryActions.find((action) => action.enabled)
-    ?? retryActions[0]
-    ?? null;
-  const retryPending = retryAction !== null
-    && state.controlPending === `recovery:${retryAction.actionId}`;
-  // A motion-producing Retry is refused by operator-alarm attention on the
-  // held operation's exact resources; Composer disables it with the remedy.
-  const retryAlarmBlock = retryAction !== null && failureOffer !== null
-    && MOTION_PRODUCING_RECOVERY_ACTIONS.has(retryAction.actionId)
-    ? program.motionAttentionBlock(recoveryOfferResourceIds(failureOffer))
+  // Paused on failed nodes: each active hold has its own offer and owns its
+  // motion groups (a hold in no named group: every group no other hold
+  // names). A group's Retry (in place of Run/Resume) and Continue (in place
+  // of Stop) target the hold that owns it; the first hold in arrival order
+  // wins when two hold the same group. The focused offer when it is no
+  // hold (an operator Stop) keeps its Retry on every group, as it did before.
+  const recoveryHolds = state.controls?.recoveryHolds ?? [];
+  const focusedOffer = state.controls?.recoveryOffer ?? null;
+  const operatorOffer = focusedOffer !== null
+    && !recoveryHolds.some((hold) => hold.offer.offerId === focusedOffer.offerId)
+    ? focusedOffer
     : null;
-  const canRetry = enabled
-    && retryAction !== null
-    && retryAction.enabled
-    && retryAlarmBlock === null
+  const recoveryCommandAllowed = enabled
     && state.pending === null
     && state.controlPending === null
     && program.draftUnappliedReason === null;
+  const offerControls = (
+    offer: CycleRecoveryOffer,
+    interventionStopScope: ProgramInterventionStopScope,
+  ) => {
+    // A disabled Retry still replaces Run/Resume: the pause must not be
+    // bypassed, and its reason (e.g. containment not confirmed) is shown.
+    const retryActions = offer.actions.filter(
+      (action) => RETRY_ACTION_IDS.includes(action.actionId),
+    );
+    const retryAction = retryActions.find((action) => action.enabled)
+      ?? retryActions[0]
+      ?? null;
+    // A motion-producing Retry is refused by operator-alarm attention on the
+    // held operation's exact resources; Composer disables it with the remedy.
+    const retryAlarmBlock = retryAction !== null
+      && MOTION_PRODUCING_RECOVERY_ACTIONS.has(retryAction.actionId)
+      ? program.motionAttentionBlock(recoveryOfferResourceIds(offer))
+      : null;
+    const continueAction = offer.actions.find(
+      (action) => action.actionId === 'continue_with_failure',
+    ) ?? null;
+    return {
+      offer,
+      interventionStopScope,
+      retryAction,
+      retryAlarmBlock,
+      canRetry: recoveryCommandAllowed
+        && retryAction?.enabled === true
+        && retryAlarmBlock === null,
+      retryPending: retryAction !== null
+        && state.controlPending === `recovery:${offer.offerId}:${retryAction.actionId}`,
+      continueAction,
+      canContinue: recoveryCommandAllowed && continueAction?.enabled === true,
+      continuePending: state.controlPending === `recovery:${offer.offerId}:continue_with_failure`,
+    };
+  };
+  const holdsControls = recoveryHolds.map((hold) => ({
+    hold,
+    ...offerControls(hold.offer, hold.interventionStopScope),
+  }));
+  const operatorControls = operatorOffer === null
+    ? null
+    : offerControls(operatorOffer, 'all');
+  // A hold whose node is in no named group (['all']) owns every group that
+  // no other hold names (contract item 43).
+  const groupHold = (groupId: string) => holdsControls.find(
+    (controls) => controls.hold.motionGroupIds.includes(groupId),
+  ) ?? holdsControls.find(
+    (controls) => controls.hold.motionGroupIds.length === 1
+      && controls.hold.motionGroupIds[0] === 'all',
+  ) ?? null;
+  const heldNodeNames = recoveryHolds.map((hold) => hold.offer.nodeInstanceId).join(', ');
+  const retryTitle = (controls: ReturnType<typeof offerControls>): string => {
+    const { retryAction, offer } = controls;
+    if (retryAction === null) return '';
+    if (!retryAction.enabled) {
+      return retryAction.disabledReasonCode === 'failure_pause_containment_unconfirmed'
+        ? 'Retry waits until stopping the Program\'s other motion is confirmed.'
+        : `Retry is unavailable: ${(retryAction.disabledReasonCode ?? 'not allowed').replaceAll('_', ' ')}.`;
+    }
+    return program.draftUnappliedReason
+      ?? controls.retryAlarmBlock?.message
+      ?? (controls.interventionStopScope === 'own_groups'
+        ? `Retry ${offer.nodeInstanceId} and let its groups continue.`
+        : recoveryHolds.length > 1
+          ? `Retry ${offer.nodeInstanceId} and let the Program's motion continue, except groups other held nodes own.`
+          : `Retry ${offer.nodeInstanceId} and let all the Program's motion continue.`);
+  };
+  const continueTarget = continueIntent === null ? null : holdsControls.find((controls) => (
+    controls.offer.offerId === continueIntent.offerId
+    && controls.offer.offerRevision === continueIntent.offerRevision
+  )) ?? null;
+  const requestContinue = (controls: ReturnType<typeof offerControls>) => {
+    if (!controls.canContinue || controls.continueAction === null) return;
+    if (controls.continueAction.requiresConfirmation) {
+      setContinueIntent({
+        offerId: controls.offer.offerId,
+        offerRevision: controls.offer.offerRevision,
+        nodeInstanceId: controls.offer.nodeInstanceId,
+      });
+    } else {
+      program.applyRecoveryAction(controls.offer, 'continue_with_failure');
+    }
+  };
   const canProgramHalt = enabled
     && state.runnerAvailable
     && cycleState === 'running'
@@ -1113,7 +1446,7 @@ export function ProgramTransportControls({
   const continueLabel = continueStates.has('held') && continueStates.has('ready')
     ? 'Run or Resume'
     : continueStates.has('held') ? 'Resume' : 'Run';
-  // Idle, Reset only restores what its options select, so it always asks.
+  // Idle, Reset restores only what its options select (possibly nothing, contract 141), so it always asks.
   const idleReset = cycleState === 'idle_after_reset' && !executionActive;
   // A finished, stopped or failed run asks too when Reset confirmation is on,
   // so its options can be chosen in the same step.
@@ -1127,29 +1460,31 @@ export function ProgramTransportControls({
     reloadInitialScene: resetSelection.reloadInitialScene,
     resetRobotPosition: positionAvailable && resetSelection.resetRobotPosition,
   };
-  const resetNothingSelected = !resetSelectionApplied.reloadInitialScene
-    && !resetSelectionApplied.resetRobotPosition;
   const resetKept = resetKeptMessage(resetSelectionApplied);
+  // Uncertain outputs always ask: each needs its own acknowledgement.
+  const confirmReset = preferences.confirmReset || resetUncertain.length > 0;
   const requestProgramReset = async () => {
     if (!canReset) return;
+    setApprovedUncertain(new Set());
+    setUncertainResetError(null);
     setResetSelection(NO_RESET_OPTIONS);
     if (idleReset) {
       setResetIntent('confirm');
       return;
     }
     if (!executionActive) {
-      if (endedReset && preferences.confirmReset) setResetIntent('confirm');
+      if (endedReset && confirmReset) setResetIntent('confirm');
       else void program.reset();
       return;
     }
     if (!motionSettled) {
-      setResetIntent(preferences.confirmReset ? 'stopping' : 'automatic');
+      setResetIntent(confirmReset ? 'stopping' : 'automatic');
       if (programFullStopping) return;
       const accepted = await program.stopMotion(['all']);
       if (!accepted) setResetIntent(null);
       return;
     }
-    if (preferences.confirmReset) setResetIntent('confirm');
+    if (confirmReset) setResetIntent('confirm');
     else void program.reset();
   };
 
@@ -1220,6 +1555,20 @@ export function ProgramTransportControls({
     robot.selectMode(target.gripper ? 'gripper' : 'joint');
     onOpenRobotControls?.();
   };
+  const briefRetry = useBriefAutomaticRetry(
+    program.state.run?.capture.programRunId ?? null,
+    program.state.run === null ? null : program.state.controls?.runtimeControls?.audit ?? null,
+  );
+  usePublishWorkbenchNotices('program-retry', briefRetry === null ? [] : [briefRetry]);
+  const briefIoSource = useBriefIoSourceUnavailable(
+    program.state.run?.capture.programRunId ?? null,
+    program.state.run === null ? null : program.state.controls?.runtimeControls?.audit ?? null,
+  );
+  usePublishWorkbenchNotices('program-io-source', briefIoSource === null ? [] : [briefIoSource]);
+  const globalRuleRecovery = useGlobalRuleRecovery(
+    enabled,
+    robot.currentStatus?.ownerEpoch ?? null,
+  );
   usePublishWorkbenchNotices('transport', deriveTransportGuidance({
     enabled,
     program,
@@ -1228,6 +1577,8 @@ export function ProgramTransportControls({
     motionActive,
     onOpenManualRecovery: onOpenRobotControls === undefined ? undefined : openManualRecovery,
     onReviewProgramRecovery: () => setDetailsOpen(true),
+    globalRuleLatches: globalRuleRecovery.latches,
+    onClearGlobalRuleLatch: globalRuleRecovery.clear,
   }));
   // Keep the control panels at their established sizes. Only the center
   // guidance track is elastic; additional Motion groups widen the left panel
@@ -1301,6 +1652,18 @@ export function ProgramTransportControls({
               && state.controlPending === null
               && program.commandAllowed('program_motion_resume');
             const releaseLabel = group.state === 'ready' ? 'Run' : 'Resume';
+            // The hold that owns this group takes its Retry and Continue. A group
+            // no hold owns takes an operator Stop's Retry when it has one;
+            // otherwise a stopped or held group waits while any hold is active.
+            // A running group keeps its ordinary state.
+            const owner = groupHold(group.groupId);
+            const retryTarget = owner ?? operatorControls;
+            const retry = retryTarget?.retryAction ?? null;
+            const canRetryGroup = retryTarget?.canRetry === true;
+            const retryPending = retryTarget?.retryPending === true;
+            const waitsForHold = owner === null
+              && recoveryHolds.length > 0
+              && (group.state === 'held' || group.state === 'ready');
             const scale = program.groupRuntimeScales[group.groupId];
             const scaleAvailable = enabled
               && blockedReason === null
@@ -1338,43 +1701,50 @@ export function ProgramTransportControls({
                 <button
                   type="button"
                   className="transport-group-resume"
-                  disabled={retryAction !== null ? !canRetry : !canGroupRelease}
-                  title={retryAction !== null && failureOffer !== null
-                    ? retryAction.enabled
-                      ? program.draftUnappliedReason
-                        ?? retryAlarmBlock?.message
-                        ?? `Retry ${failureOffer.nodeInstanceId} and let all the Program's motion continue.`
-                      : retryAction.disabledReasonCode === 'failure_pause_containment_unconfirmed'
-                        ? 'Retry waits until stopping the Program\'s other motion is confirmed.'
-                        : `Retry is unavailable: ${(retryAction.disabledReasonCode ?? 'not allowed').replaceAll('_', ' ')}.`
-                    : canGroupRelease
-                      ? `${releaseLabel} ${group.groupId}: its stopped and not-yet-started motion continues.`
-                      : group.state === 'running'
-                        ? `${group.groupId} motion is running.`
-                        : program.draftUnappliedReason
-                          ?? releaseAlarmBlock?.message
-                          ?? group.resumeUnavailableReason?.replaceAll('_', ' ')
-                          ?? `${releaseLabel} is unavailable for this group.`}
+                  disabled={retry !== null ? !canRetryGroup : waitsForHold || !canGroupRelease}
+                  title={retry !== null && retryTarget !== null
+                    ? retryTitle(retryTarget)
+                    : waitsForHold
+                      ? `${group.groupId} waits for held node${recoveryHolds.length > 1 ? 's' : ''} ${heldNodeNames}: Retry or Continue ${recoveryHolds.length > 1 ? 'them' : 'it'} first.`
+                      : canGroupRelease
+                        ? `${releaseLabel} ${group.groupId}: its stopped and not-yet-started motion continues.`
+                        : group.state === 'running'
+                          ? `${group.groupId} motion is running.`
+                          : program.draftUnappliedReason
+                            ?? releaseAlarmBlock?.message
+                            ?? group.resumeUnavailableReason?.replaceAll('_', ' ')
+                            ?? `${releaseLabel} is unavailable for this group.`}
                   onClick={() => {
-                    if (retryAction !== null) {
-                      if (canRetry) program.applyRecoveryAction(retryAction.actionId);
-                    } else if (canGroupRelease) void program.resumeMotion([group.groupId]);
+                    if (retryTarget !== null && retry !== null) {
+                      if (canRetryGroup) program.applyRecoveryAction(retryTarget.offer, retry.actionId);
+                    } else if (!waitsForHold && canGroupRelease) void program.resumeMotion([group.groupId]);
                   }}
-                >{retryAction !== null ? (retryPending ? 'Retrying' : 'Retry')
+                >{retry !== null ? (retryPending ? 'Retrying' : 'Retry')
                   : releasePending ? (group.state === 'ready' ? 'Starting' : 'Resuming')
                     : group.state === 'running' ? 'Running' : releaseLabel}</button>
-                <button
-                  type="button"
-                  className="danger-button transport-group-stop"
-                  disabled={!canGroupStop}
-                  title={canGroupStop
-                    ? `Stop motion in ${group.groupId} without resetting the Program.`
-                    : group.state === 'held'
-                      ? 'This group is already stopped.'
-                      : 'Stop is unavailable for this group.'}
-                  onClick={() => { void program.stopMotion([group.groupId]); }}
-                >{stopPending || group.state === 'stopping' ? 'Stopping'
-                    : group.state === 'held' || group.state === 'ready' ? 'Stopped' : 'Stop'}</button>
+                {owner?.continueAction != null ? (
+                  <button
+                    type="button"
+                    className="danger-button transport-group-stop transport-group-continue"
+                    disabled={!owner.canContinue}
+                    title="Continuing fails the node"
+                    aria-label={`Continue ${group.groupId}: fail held node ${owner.offer.nodeInstanceId}`}
+                    onClick={() => requestContinue(owner)}
+                  >{owner.continuePending ? 'Continuing' : 'Continue'}</button>
+                ) : (
+                  <button
+                    type="button"
+                    className="danger-button transport-group-stop"
+                    disabled={!canGroupStop}
+                    title={canGroupStop
+                      ? `Stop motion in ${group.groupId} without resetting the Program.`
+                      : group.state === 'held'
+                        ? 'This group is already stopped.'
+                        : 'Stop is unavailable for this group.'}
+                    onClick={() => { void program.stopMotion([group.groupId]); }}
+                  >{stopPending || group.state === 'stopping' ? 'Stopping'
+                      : group.state === 'held' || group.state === 'ready' ? 'Stopped' : 'Stop'}</button>
+                )}
                 <label className="transport-group-scale" title={scaleAvailable
                   ? `Scale current and subsequent moves for ${group.groupId}.`
                     + (effectiveDiffers
@@ -1459,7 +1829,7 @@ export function ProgramTransportControls({
             onClick={() => { void requestProgramReset(); }}
           >{resetIntent === 'stopping' || resetIntent === 'automatic' ? 'Stopping'
             : cycleState === 'resetting' || state.pending === 'reset'
-              || state.controlPending === 'recovery:reset_cycle' ? 'Resetting' : 'Reset'}</button>
+              || state.controlPending?.endsWith(':reset_cycle') ? 'Resetting' : 'Reset'}</button>
           <div className="transport-unique-icons">
             <button
               ref={detailsButton}
@@ -1506,16 +1876,28 @@ export function ProgramTransportControls({
         onClose={() => program.cancelActivationExecute()}
       >
         <div className="dialog-copy transport-confirmation">
-          <p>These components are not active yet:</p>
-          <ul>{program.activationOffer?.components.filter((component) => component.lifecycleState !== 'active').map((component) => (
-            <li key={component.componentId}>{component.componentId} ({component.lifecycleState})</li>
-          ))}</ul>
+          <p>{program.activationPending ? 'Component activation status:' : 'These components are not active yet:'}</p>
+          <ul>{program.activationOffer?.components.filter((component) => program.activationPending || component.lifecycleState !== 'active').map((component) => {
+            const health = program.activationComponentHealth[component.controllableComponentId];
+            const current = health?.snapshot;
+            const matching = current !== null && current !== undefined
+              && current.controllableComponentId === component.controllableComponentId
+              && current.retainedBundleId === component.retainedBundleId
+              && current.graphRevision === component.graphRevision
+              && current.publicationGeneration === component.publicationGeneration
+              && current.activePublicPointerDigest === component.activePublicPointerDigest
+              && current.readiness.requestOwnerEpoch === component.readiness.requestOwnerEpoch;
+            const status = !program.activationPending ? component.lifecycleState
+              : matching ? current.lifecycleState : health?.error ?? 'Current component health has not been read.';
+            return <li key={component.controllableComponentId}>{component.controllableComponentId} ({status})</li>;
+          })}</ul>
           <p>
             Activate prepares and enables every configured component in Deployment order,
             then executes the Program once. Components this Program does not use are activated too;
             Execute can still be refused for another reason.
           </p>
-          {program.activationPending && <p role="status">{program.activationWaiting ? 'Waiting for current Execute readiness…' : 'Activating components…'}</p>}
+          {program.activationPending && <p role="status">{program.activationWaiting ? 'Waiting for current Execute readiness…'
+            : program.activationProgress ?? 'Activating components…'}</p>}
           <div className="dialog-actions">
             <button type="button" onClick={() => program.cancelActivationExecute()}>Cancel</button>
             <button type="button" className="transport-run" disabled={program.activationPending}
@@ -1543,9 +1925,9 @@ export function ProgramTransportControls({
             </p>
             {robot.componentIncidents.length > 0 && (
               <ul aria-label="Open component incidents">
-                {robot.componentIncidents.map(({ componentId, incident }) => (
+                {robot.componentIncidents.map(({ controllableComponentId, incident }) => (
                   <li key={incident.incidentId}>
-                    <strong>{componentId}</strong>: {incidentFacts(incident)}
+                    <strong>{controllableComponentId}</strong>: {incidentFacts(incident)}
                   </li>
                 ))}
               </ul>
@@ -1798,6 +2180,15 @@ export function ProgramTransportControls({
             </small>
           </fieldset>
           {resetKept !== null && <p>{resetKept}</p>}
+          <UncertainOutputConfirmation outputs={resetUncertain} approved={approvedUncertain}
+            onToggle={(key, approved) => setApprovedUncertain((current) => {
+              const next = new Set(current);
+              if (approved) next.add(key); else next.delete(key);
+              return next;
+            })} />
+          {uncertainResetError !== null && (
+            <p className="inline-message severity-error" role="alert">{uncertainResetError}</p>
+          )}
           {!idleReset && !endedReset && <p>
             {programFullStopped
               ? 'Cancel keeps the run halted; Execute resumes it.'
@@ -1808,11 +2199,22 @@ export function ProgramTransportControls({
             <button
               type="button"
               className="danger-button"
-              disabled={!canReset || !motionSettled || (idleReset && resetNothingSelected)}
-              title={idleReset && resetNothingSelected ? 'Select what to restore.' : undefined}
+              // An ended run, or no run at all, has no live motion selections
+              // (all groups are unavailable); the owner's Reset admission
+              // (canReset) is authoritative there.
+              // An idle Reset may restore nothing (contract 141).
+              disabled={!canReset || (!motionSettled && !endedReset && !idleReset) || !uncertainApproved}
+              title={!uncertainApproved ? 'Confirm each output with unknown acceptance first.' : undefined}
               onClick={() => {
-                setResetIntent(null);
-                void program.reset(resetSelectionApplied);
+                void (async () => {
+                  const failure = await robot.resetUncertainOutputs(resetUncertain);
+                  if (failure !== null) {
+                    setUncertainResetError(`${failure} The Program was not reset.`);
+                    return;
+                  }
+                  setResetIntent(null);
+                  void program.reset(resetSelectionApplied);
+                })();
               }}
             >Reset Program</button>
           </div>
@@ -1847,6 +2249,39 @@ export function ProgramTransportControls({
                 void program.fullStop();
               }}
             >Halt Program</button>
+          </div>
+        </div>
+      </OverlayPanel>
+      <OverlayPanel
+        open={continueIntent !== null}
+        title="Continue with a failed node?"
+        titleId="program-continue-confirmation-title"
+        kind="dialog"
+        compact
+        onClose={() => setContinueIntent(null)}
+      >
+        <div className="dialog-copy transport-confirmation">
+          <p>
+            Continuing fails the node <code>{continueIntent?.nodeInstanceId}</code>:
+            its held operation is closed, it returns FAILURE to the Program
+            tree, and the motion groups it holds resume.
+          </p>
+          {continueTarget === null || !continueTarget.canContinue ? (
+            <p role="status">Continue is no longer available for this hold.</p>
+          ) : null}
+          <div className="dialog-actions">
+            <button type="button" onClick={() => setContinueIntent(null)}>Cancel</button>
+            <button
+              type="button"
+              className="danger-button"
+              disabled={continueTarget === null || !continueTarget.canContinue}
+              onClick={() => {
+                setContinueIntent(null);
+                if (continueTarget !== null) {
+                  program.applyRecoveryAction(continueTarget.offer, 'continue_with_failure');
+                }
+              }}
+            >Continue</button>
           </div>
         </div>
       </OverlayPanel>

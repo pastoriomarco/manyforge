@@ -1,4 +1,5 @@
 #include "manyforge_deployment/cell_graph_codec.hpp"
+#include <manyforge_deployment/io_signal_catalog.hpp>
 
 #include <algorithm>
 #include <array>
@@ -418,9 +419,88 @@ template <typename StrongType>
                 parse_placement_pose(*root_pose, child_path(path, "root_pose_in_cell"))}};
 }
 
+[[nodiscard]] std::int64_t parse_positive_int64(const CanonicalValue &value,
+                                                std::string_view path);
+
 [[nodiscard]] ControlDomainDTO parse_control_domain(const CanonicalValue& value,
                                                     std::string_view path) {
   const auto& object = require_object(value, path);
+  if (const auto *kind = find_member(object, "kind")) {
+    if (require_string(*kind, child_path(path, "kind")) != "provider")
+      fail(path, "unknown control-domain kind");
+    require_exact_fields(object,
+                         {"control_domain_id", "control_domain_revision",
+                          "runtime_unit_ids",
+                          "control_coordinator_endpoint_role",
+                          "containment_granularity", "kind", "provider"},
+                         path);
+    const auto provider_path = child_path(path, "provider");
+    const auto &provider =
+        require_object(require_member(object, "provider", path), provider_path);
+    require_exact_fields(provider,
+                         {"controllable_component_id",
+                          "provider_runtime_unit_id", "provider_instance_id",
+                          "provider_manifest_id", "provider_manifest_revision",
+                          "lifecycle_plan_catalog_digest",
+                          "signal_configuration_digest", "signal_names",
+                          "lifecycle_command_timeout_ns"},
+                         provider_path);
+    std::vector<std::string> names;
+    for (const auto &item :
+         require_array(require_member(provider, "signal_names", provider_path),
+                       child_path(provider_path, "signal_names"))) {
+      names.push_back(
+          parse_identity<core::ResourceRoleId>(item, provider_path).value());
+    }
+    if (names.empty() || !std::is_sorted(names.begin(), names.end()) ||
+        std::adjacent_find(names.begin(), names.end()) != names.end())
+      fail(provider_path,
+           "provider signal membership must be a canonical nonempty set");
+    return ControlDomainDTO{
+        parse_identity<ControlDomainId>(
+            require_member(object, "control_domain_id", path), path),
+        parse_digest<ControlDomainRevision>(
+            require_member(object, "control_domain_revision", path), path),
+        parse_identity_set<RuntimeUnitId>(
+            require_member(object, "runtime_unit_ids", path), path),
+        parse_identity<EndpointRoleId>(
+            require_member(object, "control_coordinator_endpoint_role", path),
+            path),
+        parse_containment_granularity(
+            require_member(object, "containment_granularity", path), path),
+        core::ProviderControlDomainDTO{
+            parse_identity<ControllableComponentId>(
+                require_member(provider, "controllable_component_id",
+                               provider_path),
+                provider_path),
+            parse_identity<RuntimeUnitId>(
+                require_member(provider, "provider_runtime_unit_id",
+                               provider_path),
+                provider_path),
+            parse_identity<ProviderInstanceId>(
+                require_member(provider, "provider_instance_id", provider_path),
+                provider_path),
+            parse_identity<ProviderManifestId>(
+                require_member(provider, "provider_manifest_id", provider_path),
+                provider_path),
+            parse_digest<ProviderManifestRevision>(
+                require_member(provider, "provider_manifest_revision",
+                               provider_path),
+                provider_path),
+            parse_digest<core::ContentDigest>(
+                require_member(provider, "lifecycle_plan_catalog_digest",
+                               provider_path),
+                provider_path),
+            parse_digest<core::ContentDigest>(
+                require_member(provider, "signal_configuration_digest",
+                               provider_path),
+                provider_path),
+            std::move(names),
+            parse_positive_int64(
+                require_member(provider, "lifecycle_command_timeout_ns",
+                               provider_path),
+                child_path(provider_path, "lifecycle_command_timeout_ns"))}};
+  }
   require_exact_fields(object,
                        {"control_domain_id", "control_domain_revision", "runtime_unit_ids",
                         "control_coordinator_endpoint_role", "controller_topology_id",
@@ -885,16 +965,54 @@ template <typename StrongType>
 }
 
 [[nodiscard]] CanonicalValue control_domain_value(const ControlDomainDTO& record) {
+  if (const auto *provider = record.provider()) {
+    CanonicalValue::Array names;
+    for (const auto &name : provider->signal_names)
+      names.emplace_back(name);
+    return CanonicalValue(CanonicalValue::Object{
+        {"control_domain_id", identity_value(record.control_domain_id)},
+        {"control_domain_revision",
+         identity_value(record.control_domain_revision)},
+        {"runtime_unit_ids", identity_array(record.runtime_unit_ids)},
+        {"control_coordinator_endpoint_role",
+         identity_value(record.control_coordinator_endpoint_role)},
+        {"containment_granularity", CanonicalValue(std::string(core::to_string(
+                                        record.containment_granularity)))},
+        {"kind", CanonicalValue("provider")},
+        {"provider",
+         CanonicalValue(CanonicalValue::Object{
+             {"controllable_component_id",
+              identity_value(provider->controllable_component_id)},
+             {"provider_runtime_unit_id",
+              identity_value(provider->provider_runtime_unit_id)},
+             {"provider_instance_id",
+              identity_value(provider->provider_instance_id)},
+             {"provider_manifest_id",
+              identity_value(provider->provider_manifest_id)},
+             {"provider_manifest_revision",
+              identity_value(provider->provider_manifest_revision)},
+             {"lifecycle_plan_catalog_digest",
+              identity_value(provider->lifecycle_plan_catalog_digest)},
+             {"signal_configuration_digest",
+              identity_value(provider->signal_configuration_digest)},
+             {"signal_names", CanonicalValue(std::move(names))},
+             {"lifecycle_command_timeout_ns",
+              CanonicalValue(static_cast<double>(
+                  provider->lifecycle_command_timeout_ns))}})}});
+  }
   return CanonicalValue(CanonicalValue::Object{
       {"control_domain_id", identity_value(record.control_domain_id)},
-      {"control_domain_revision", identity_value(record.control_domain_revision)},
+      {"control_domain_revision",
+       identity_value(record.control_domain_revision)},
       {"runtime_unit_ids", identity_array(record.runtime_unit_ids)},
       {"control_coordinator_endpoint_role",
        identity_value(record.control_coordinator_endpoint_role)},
-      {"controller_topology_id", identity_value(record.controller_topology_id)},
-      {"topology_revision", identity_value(record.topology_revision)},
-      {"containment_granularity",
-       CanonicalValue(std::string(core::to_string(record.containment_granularity)))}});
+      {"controller_topology_id",
+       identity_value(record.controller().controller_topology_id)},
+      {"topology_revision",
+       identity_value(record.controller().topology_revision)},
+      {"containment_granularity", CanonicalValue(std::string(core::to_string(
+                                      record.containment_granularity)))}});
 }
 
 [[nodiscard]] CanonicalValue control_binding_value(const ControlBindingDTO& record) {
@@ -1241,6 +1359,31 @@ void validate_intrinsic(const CellGraphDTO& graph) {
     for (const auto& unit_id : domain.runtime_unit_ids) {
       require_reference(runtime_ids, unit_id.value(), "control_domains.runtime_unit_ids");
     }
+    if (const auto *provider = domain.provider()) {
+      if (!provider->locally_valid())
+        fail("control_domains.provider", "invalid provider-domain proof");
+      require_reference(component_ids,
+                        provider->controllable_component_id.value(),
+                        "control_domains.provider.controllable_component_id");
+      require_reference(runtime_ids, provider->provider_runtime_unit_id.value(),
+                        "control_domains.provider.provider_runtime_unit_id");
+      const auto component = std::find_if(
+          graph.controllable_components.begin(),
+          graph.controllable_components.end(), [&](const auto &value) {
+            return value.controllable_component_id ==
+                   provider->controllable_component_id;
+          });
+      if (std::find(domain.runtime_unit_ids.begin(),
+                    domain.runtime_unit_ids.end(),
+                    provider->provider_runtime_unit_id) ==
+              domain.runtime_unit_ids.end() ||
+          std::find(component->runtime_unit_ids.begin(),
+                    component->runtime_unit_ids.end(),
+                    provider->provider_runtime_unit_id) ==
+              component->runtime_unit_ids.end())
+        fail("control_domains.provider",
+             "provider runtime must belong to its actual component and domain");
+    }
   }
 
   std::map<std::string,
@@ -1254,6 +1397,9 @@ void validate_intrinsic(const CellGraphDTO& graph) {
     require_reference(runtime_ids, binding.provider_runtime_unit_id.value(),
                       "control_bindings.provider_runtime_unit_id");
     const ControlDomainDTO& domain = *domains.at(binding.control_domain_id.value());
+    if (domain.provider())
+      fail("control_bindings.control_domain_id",
+           "controller binding cannot target a provider-only domain");
     const auto component = std::find_if(
         graph.controllable_components.begin(),
         graph.controllable_components.end(), [&](const auto& candidate) {
@@ -1272,8 +1418,9 @@ void validate_intrinsic(const CellGraphDTO& graph) {
            "provider runtime must belong to both the binding component and "
            "control domain");
     }
-    if (binding.controller_topology_id != domain.controller_topology_id ||
-        binding.topology_revision != domain.topology_revision) {
+    if (binding.controller_topology_id !=
+            domain.controller().controller_topology_id ||
+        binding.topology_revision != domain.controller().topology_revision) {
       fail("control_bindings", "binding topology identity does not match its control domain");
     }
     const auto [selected_manifest, inserted] =
@@ -1437,6 +1584,11 @@ GraphIdentityReadyCellGraphCandidate prepare_cell_graph_identity(
   }
 
   CellGraphDTO graph = source_graph;
+  const auto materialized_io_devices =
+      MaterializeRetainedIoProviderDevices(graph);
+  if (!materialized_io_devices.ok())
+    fail("$.runtime_units",
+         materialized_io_devices.error().details.at("reason"));
   const auto& schema_registry = build_qualified_closed_schema_registry();
   detail::CumulativeNormalizedValueBudget normalized_configuration_budget;
   for (std::size_t index = 0U; index < graph.runtime_units.size(); ++index) {
@@ -1483,6 +1635,13 @@ GraphIdentityReadyCellGraphCandidate prepare_cell_graph_identity(
       fail(configuration_path, error.what());
     }
   }
+
+  const auto io_catalog = ResolveRetainedIoSignalCatalog(graph);
+  if (!io_catalog.ok())
+    fail("$.runtime_units", io_catalog.error().details.at("reason"));
+  const auto io_devices = ResolveRetainedIoProviderDevices(graph);
+  if (!io_devices.ok())
+    fail("$.runtime_units", io_devices.error().details.at("reason"));
 
   CanonicalValue normalized_root = graph_value(graph);
   try {

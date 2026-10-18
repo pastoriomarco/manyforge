@@ -164,6 +164,7 @@ private:
       {"expected_control_domains",
        CanonicalValue(
            CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+               {"kind", CanonicalValue("controller")},
                {"control_domain_id", CanonicalValue("domain.arm")},
                {"control_domain_revision", CanonicalValue("domain.revision.1")},
                {"controller_topology_id", CanonicalValue("topology.arm")},

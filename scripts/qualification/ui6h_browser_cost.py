@@ -112,7 +112,6 @@ runpy.run_module({module!r}, run_name='__main__')
         workbench.BUILD_ROOT = args.build_root
         workbench.MANAGER_BINARY = workbench.HEADLESS_BUILD / "manyforge_manager_daemon"
         # Locate the caller's already-built inputs, without changing owner wiring.
-        workbench._import_package = lambda: None
         workbench._ensure_current_backend = lambda: next(
             workbench.HEADLESS_BUILD.glob("manyforge_headless_py*.so")
         )

@@ -30,7 +30,10 @@ from manyforge_headless_api.models import (
     ComponentProcessStopBody,
     FullStopIntentRequest,
     HistorianReconcileRequest,
+    IoSignalReadRequest,
+    MockIoInputRequest,
     OperationControlRequest,
+    OperationResetRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
@@ -41,7 +44,7 @@ from manyforge_headless_api.models import (
     RouteSelectionRequest,
     SceneTransactionRequest,
     StopIntentRequest,
-    StopFaultRecoveryIntentRequest,
+    StopFaultRecoveryRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
     ProgramSelectionStartRequest,
@@ -839,6 +842,15 @@ def create_headless_router(
     def execution_control_state() -> dict[str, Any]:
         return _call(client.execution_control_state)
 
+    @router.post("/api/execution/io-signals/read")
+    def execution_read_io_signal(body: IoSignalReadRequest) -> dict[str, Any]:
+        return _call(lambda: client.read_io_signal(body.model_dump(mode="json")))
+
+    @router.post("/api/execution/io-signals/mock-input")
+    def execution_set_mock_io_input(body: MockIoInputRequest) -> dict[str, Any]:
+        # Simulation of a Mock source: no Draft fence, no motion admission.
+        return _call(lambda: client.set_mock_io_input(body.model_dump(mode="json")))
+
     @router.get("/api/control/state")
     def control_projection() -> dict[str, Any]:
         return _call(client.control_projection)
@@ -936,7 +948,7 @@ def create_headless_router(
     @router.post("/api/execution/operations/{operation_id}/reset")
     async def execution_reset(
         operation_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: OperationControlRequest,
+        body: OperationResetRequest,
     ) -> dict[str, Any]:
         require_matching_operation(operation_id, body.operation_id)
         return await control_call(
@@ -979,7 +991,7 @@ def create_headless_router(
 
     @router.post("/api/execution/stop-fault/recover")
     async def execution_recover_stop_fault(
-        body: StopFaultRecoveryIntentRequest,
+        body: StopFaultRecoveryRequest,
     ) -> dict[str, Any]:
         return await control_call(
             lambda: client.recover_stop_fault(

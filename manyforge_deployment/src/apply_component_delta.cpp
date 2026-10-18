@@ -174,6 +174,8 @@ Relations(const core::RetainedBundleDTO &bundle,
           if constexpr (std::is_same_v<Target,
                                        core::CellGlobalCapabilityProviderTargetDTO>) {
             return true;
+          } else if constexpr (std::is_same_v<Target, core::ComponentTargetCapabilityProviderTargetDTO>) {
+            return target.controllable_component_id == component.controllable_component_id;
           } else if constexpr (std::is_same_v<
                                    Target,
                                    core::TargetBindingCapabilityProviderTargetDTO>) {
@@ -305,8 +307,21 @@ RuntimeFamilies(const RetainedBundle &bundle,
   // Retained policy records are cell-wide catalog references; a change is an
   // explicit, reported dependency of every component rather than a hidden
   // cell-wide fallback.
-  families.emplace(kApplyComponentReasonRetainedPolicies,
-                   CanonicalValue(MemberArray(root, "retained_policy_records")));
+  // Preserve the historical family bytes when the optional budget is absent.
+  if (const auto budget = bundle.value().motion_takeover_preparation_budget_s;
+      budget.has_value()) {
+    families.emplace(
+        kApplyComponentReasonRetainedPolicies,
+        CanonicalValue(Object{
+            {"retained_policy_records",
+             CanonicalValue(MemberArray(root, "retained_policy_records"))},
+            {"motion_takeover_preparation_budget_s", CanonicalValue(*budget)},
+        }));
+  } else {
+    families.emplace(
+        kApplyComponentReasonRetainedPolicies,
+        CanonicalValue(MemberArray(root, "retained_policy_records")));
+  }
   return families;
 }
 

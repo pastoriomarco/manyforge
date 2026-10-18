@@ -1,4 +1,7 @@
+#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_deployment/cclc_runtime_composition.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
+#include <set>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -570,6 +573,208 @@ core::Result<std::optional<core::NativeApplyPlanDTO>>
 CCLCRuntimeComposition::LoadNativeApplyPlan(
     const core::NamedApplyPublicationTransactionDTO &apply) {
   return journal_.LoadNativeApplyPlan(apply);
+}
+
+core::Result<core::InstalledProviderCandidateFactsDTO>
+CCLCRuntimeComposition::ReadInstalledNativeApplyCandidateFacts(
+    const core::NativeApplyPlanDTO &expected_plan,
+    const RetainedBundle &actual_candidate,
+    const core::ICCLCLifecyclePlanCatalogSource &installed_catalogs,
+    const core::ControllableComponentId &component,
+    const std::vector<core::ResolvedLifecycleControlDomainScopeDTO> &domains,
+    const std::vector<core::ResolvedLifecycleProviderOccurrenceDTO> &providers,
+    const std::vector<core::BrandLifecyclePortRegistrationDTO> &ports) {
+  using Reply = core::Result<core::InstalledProviderCandidateFactsDTO>;
+  const auto refuse = [](const char *reason) {
+    return Reply::Err(
+        composition_error(reason, "Installed candidate facts do not match the "
+                                  "exact recorded NativeApply"));
+  };
+  try {
+    const auto owner = coordinator_.request_owner_epoch();
+    if (!coordinator_.accepting_new_requests())
+      return refuse("native_candidate_owner_unavailable");
+    const auto recorded = journal_.LoadNativeApplyPlan(expected_plan.apply);
+    if (!recorded.ok())
+      return Reply::Err(recorded.error());
+    if (!recorded.value() || *recorded.value() != expected_plan ||
+        expected_plan.component_bring_up || !expected_plan.apply.valid() ||
+        !verify_retained_bundle_identity(actual_candidate) ||
+        actual_candidate.value().cell_graph.cell_id != config_.cell_id ||
+        expected_plan.candidate_retained_bundle_id !=
+            actual_candidate.retained_bundle_id() ||
+        expected_plan.candidate_graph_revision !=
+            actual_candidate.value().cell_graph.graph_revision)
+      return refuse("native_candidate_plan_mismatch");
+    const auto planned = std::find_if(
+        expected_plan.components.begin(), expected_plan.components.end(),
+        [&](const auto &row) { return row.component_id == component; });
+    if (planned == expected_plan.components.end() ||
+        !planned->generation.nonzero() ||
+        std::count_if(expected_plan.components.begin(),
+                      expected_plan.components.end(), [&](const auto &row) {
+                        return row.component_id == component;
+                      }) != 1)
+      return refuse("native_candidate_component_missing");
+    const auto &graph = actual_candidate.value().cell_graph;
+    if (std::count_if(graph.controllable_components.begin(),
+                      graph.controllable_components.end(),
+                      [&](const auto &row) {
+                        return row.controllable_component_id == component;
+                      }) != 1)
+      return refuse("native_candidate_component_missing");
+    std::set<core::ControlDomainId> expected_domains;
+    for (const auto &binding : graph.control_bindings)
+      if (binding.controllable_component_id == component)
+        expected_domains.insert(binding.control_domain_id);
+    for (const auto &domain : graph.control_domains)
+      if (domain.provider() &&
+          domain.provider()->controllable_component_id == component)
+        expected_domains.insert(domain.control_domain_id);
+    if (expected_domains.empty() || expected_domains.size() != domains.size() ||
+        domains.size() != providers.size() || domains.size() != ports.size())
+      return refuse("native_candidate_membership_incomplete");
+    const auto io = ResolveRetainedIoSignalCatalog(graph);
+    if (!io.ok())
+      return Reply::Err(io.error());
+    auto expected_domain = expected_domains.begin();
+    for (std::size_t index = 0; index < domains.size();
+         ++index, ++expected_domain) {
+      const auto &scope = domains[index];
+      const auto &occurrence = providers[index];
+      if (!scope.locally_valid() || !occurrence.locally_valid() ||
+          scope.control_domain_id != *expected_domain ||
+          occurrence.control_domain_id != scope.control_domain_id ||
+          occurrence.control_domain_revision != scope.control_domain_revision ||
+          ports[index].provider_occurrence != occurrence || !ports[index].port)
+        return refuse("native_candidate_registration_mismatch");
+      const auto sealed = std::find_if(
+          graph.control_domains.begin(), graph.control_domains.end(),
+          [&](const auto &row) {
+            return row.control_domain_id == scope.control_domain_id;
+          });
+      if (sealed == graph.control_domains.end() ||
+          sealed->control_domain_revision != scope.control_domain_revision)
+        return refuse("native_candidate_domain_mismatch");
+      if (const auto *provider = sealed->provider()) {
+        std::vector<core::ResourceId> outputs;
+        for (const auto &row : io.value())
+          if (row.runtime_unit_id == provider->provider_runtime_unit_id &&
+              row.descriptor.signal_id.controllable_component_id == component &&
+              std::binary_search(provider->signal_names.begin(),
+                                 provider->signal_names.end(),
+                                 row.descriptor.signal_id.name) &&
+              row.descriptor.output_resource)
+            outputs.push_back(*row.descriptor.output_resource);
+        std::sort(outputs.begin(), outputs.end());
+        outputs.erase(std::unique(outputs.begin(), outputs.end()),
+                      outputs.end());
+        const core::ResolvedLifecycleControlDomainScopeDTO expected{
+            sealed->control_domain_id, sealed->control_domain_revision,
+            core::ResolvedProviderDomainScopeDTO{
+                *provider, occurrence.provider_runtime_epoch, std::nullopt,
+                std::move(outputs)}};
+        if (scope != expected ||
+            !core::ProviderDomainMatchesOccurrence(
+                sealed->control_domain_id, sealed->control_domain_revision,
+                *provider, occurrence.provider_runtime_epoch, occurrence))
+          return refuse("native_candidate_provider_mismatch");
+      } else {
+        if (scope.provider() ||
+            scope.controller().controller_topology_id !=
+                sealed->controller().controller_topology_id ||
+            scope.controller().topology_revision !=
+                sealed->controller().topology_revision)
+          return refuse("native_candidate_controller_mismatch");
+        std::set<core::ResourceId> resources;
+        std::size_t bindings = 0;
+        for (const auto &binding : graph.control_bindings) {
+          if (binding.control_domain_id != scope.control_domain_id)
+            continue;
+          ++bindings;
+          const auto selected = std::find_if(
+              scope.control_bindings().begin(), scope.control_bindings().end(),
+              [&](const auto &row) {
+                return row.control_binding_id == binding.control_binding_id;
+              });
+          if (selected == scope.control_bindings().end() ||
+              selected->control_binding_revision !=
+                  binding.control_binding_revision ||
+              std::find(binding.legal_control_route_ids.begin(),
+                        binding.legal_control_route_ids.end(),
+                        selected->control_route_id) ==
+                  binding.legal_control_route_ids.end() ||
+              binding.provider_instance_id != occurrence.provider_instance_id ||
+              binding.provider_manifest_id != occurrence.provider_manifest_id ||
+              binding.provider_manifest_revision !=
+                  occurrence.provider_manifest_revision ||
+              binding.provider_runtime_unit_id !=
+                  occurrence.provider_runtime_unit_id)
+            return refuse("native_candidate_controller_binding_mismatch");
+          for (const auto &resource : binding.resource_bindings)
+            resources.insert(resource.resource_id);
+        }
+        if (bindings != scope.control_bindings().size() ||
+            scope.resource_ids() != std::vector<core::ResourceId>(
+                                        resources.begin(), resources.end()))
+          return refuse("native_candidate_controller_membership_incomplete");
+        if (scope.controller().active_control_configuration) {
+          const auto route = std::find_if(
+              expected_plan.routes.begin(), expected_plan.routes.end(),
+              [&](const auto &row) {
+                return row.control_domain_id == scope.control_domain_id;
+              });
+          if (route == expected_plan.routes.end() ||
+              route->generation !=
+                  scope.controller()
+                      .active_control_configuration
+                      ->active_control_configuration_generation)
+            return refuse("native_candidate_controller_generation_mismatch");
+        }
+      }
+      const auto catalog = installed_catalogs.LoadExactLifecyclePlanCatalog(
+          occurrence.provider_manifest_id,
+          occurrence.provider_manifest_revision,
+          occurrence.lifecycle_plan_catalog_digest);
+      if (!catalog.ok())
+        return Reply::Err(catalog.error());
+      if (!core::VerifyBrandLifecyclePlanCatalog(catalog.value()).ok() ||
+          catalog.value().provider_manifest_id !=
+              occurrence.provider_manifest_id ||
+          catalog.value().provider_manifest_revision !=
+              occurrence.provider_manifest_revision ||
+          catalog.value().catalog_digest !=
+              occurrence.lifecycle_plan_catalog_digest)
+        return refuse("native_candidate_catalog_mismatch");
+    }
+    const auto current = journal_.LoadCurrentSnapshotFacts(
+        {component}, std::vector<core::ControlDomainId>(
+                         expected_domains.begin(), expected_domains.end()));
+    if (!current.ok())
+      return Reply::Err(current.error());
+    if (!current.value().locally_valid() ||
+        current.value().components.size() != 1U ||
+        current.value().components.front().controllable_component_id !=
+            component ||
+        (current.value().components.front().durable_generation &&
+         current.value().components.front().durable_generation->value() >
+             planned->generation.value()))
+      return refuse("native_candidate_generation_stale");
+    const auto after = journal_.LoadNativeApplyPlan(expected_plan.apply);
+    if (!after.ok())
+      return Reply::Err(after.error());
+    if (!after.value() || *after.value() != expected_plan ||
+        coordinator_.request_owner_epoch() != owner ||
+        !coordinator_.accepting_new_requests())
+      return refuse("native_candidate_plan_changed");
+    return Reply::Ok({expected_plan.candidate_retained_bundle_id,
+                      expected_plan.candidate_graph_revision, component,
+                      planned->generation, domains, providers,
+                      core::InstalledNativeApplyCandidateSourceDTO{
+                          owner, expected_plan.apply}});
+  } catch (...) {
+    return refuse("native_candidate_source_failed");
+  }
 }
 
 core::Result<void> CCLCRuntimeComposition::AdoptNativeApplyFacts(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -11,12 +12,14 @@ import pytest
 import rfc8785
 
 from manyforge_headless_api.execution import (
+    RETRY_ELIGIBILITY_REASONS,
     ExecutionCommandClient,
     ExecutionEventPump,
 )
 from manyforge_headless_api.models import (
     FullStopIntentRequest,
     OperationIntentRequest,
+    OperationRecoveryActionRequest,
     ProgramRunStopIntentRequest,
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
@@ -228,6 +231,9 @@ def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
         "admission_generation": 1,
         "api_version": "manyforge.execution_command_response.v1",
         "command": "events",
+        "owner_epoch": owner_epoch,
+        "execution_owner_ready": True,
+        "runtime_faults": {"operation_journal_write_fault": None, "program_runner_loss": None},
         "event_page": {
             "events": events,
             "has_more": False,
@@ -516,6 +522,33 @@ def test_execution_client_reads_one_exact_internal_stop_status(
         "command": "read_stop",
         "stop_id": "stop.1",
     }
+
+    # SX-2226: the additive terminal_projection string, one of three values.
+    status: dict[str, Any] = {
+        "request_id": "program-stop.1",
+        "schema_version": "manyforge.execution_stop_status.v1",
+        "state": "succeeded",
+        "stop_generation": 4,
+        "stop_id": "stop.1",
+    }
+    reply = {
+        "api_version": "manyforge.execution_command_response.v1",
+        "command": "read_stop",
+        "ok": True,
+        "stop_status": status,
+    }
+    monkeypatch.setattr(client, "_exchange_control", lambda command: copy.deepcopy(reply))
+    for projection in ("pending", "recorded", "failed"):
+        status["terminal_projection"] = projection
+        assert client.stop_status("stop.1")["stop_status"]["terminal_projection"] == projection
+    for invalid in ("not_applicable", None, 1, {"state": "recorded"}):
+        status["terminal_projection"] = invalid
+        with pytest.raises(HeadlessApiError):
+            client.stop_status("stop.1")
+    status.pop("terminal_projection")
+    status["extra"] = "x"
+    with pytest.raises(HeadlessApiError):
+        client.stop_status("stop.1")
 
     with pytest.raises(HeadlessApiError) as unavailable_publicly:
         ExecutionCommandClient(tmp_path).stop_status("stop.1")
@@ -1260,6 +1293,7 @@ class _RecordingCore:
     def __init__(self) -> None:
         self.ingested: list[dict[str, Any]] = []
         self.completed_calls: list[dict[str, Any]] = []
+        self.runtime_fault_snapshots: list[dict[str, Any]] = []
         self.completed = threading.Event()
         self.unknown = threading.Event()
         self.alarm_refreshes = 0
@@ -1279,6 +1313,10 @@ class _RecordingCore:
         self.completed_calls.append(kwargs)
         self.completed.set()
         return {"status": "complete"}
+
+    def observe_runtime_fault_conditions(self, **kwargs: Any) -> dict[str, Any]:
+        self.runtime_fault_snapshots.append(kwargs)
+        return {"status": "observed", "changed": False}
 
     def mark_operation_event_source_unknown(self, **_kwargs: Any) -> dict[str, Any]:
         self.unknown.set()
@@ -1312,6 +1350,8 @@ class _PagedExecution:
         assert limit == 1
         events = [] if after_sequence else [self.event]
         return {
+            "execution_owner_ready": True,
+            "runtime_faults": {"operation_journal_write_fault": None, "program_runner_loss": None},
             "operation_progress": self.progress,
             "admission_generation": self.admission_generation,
             "events": events,
@@ -1352,6 +1392,8 @@ class _StreamingExecution(_PagedExecution):
             events = available[:limit]
         next_sequence = events[-1]["sequence"] if events else after_sequence
         return {
+            "execution_owner_ready": True,
+            "runtime_faults": {"operation_journal_write_fault": None, "program_runner_loss": None},
             "operation_progress": self.progress,
             "admission_generation": self.admission_generation,
             "events": events,
@@ -1441,7 +1483,13 @@ class _IdleExecution:
         self, _owner_epoch: str, _after_sequence: int, *, limit: int = 16
     ) -> dict[str, Any]:
         self.events_calls += 1
-        raise AssertionError("idle owner must not be queried for events")
+        assert _owner_epoch == self.owner_epoch
+        return {
+            "owner_epoch": self.owner_epoch, "execution_owner_ready": False,
+            "runtime_faults": {"operation_journal_write_fault": None, "program_runner_loss": None},
+            "events": [], "has_more": False, "next_after_sequence": _after_sequence,
+            "operation_progress": [], "admission_generation": self.admission_generation,
+        }
 
     def stop_fault(self) -> dict[str, Any]:
         self.stop_fault_calls += 1
@@ -1473,9 +1521,12 @@ class _RetiringExecution(_PagedExecution):
     def events(
         self, owner_epoch: str, after_sequence: int, *, limit: int = 16
     ) -> dict[str, Any]:
-        if self.fail:
+        if self.retired:
+            self.fail = False
+        elif self.fail:
             self.retired = True
         page = super().events(owner_epoch, after_sequence, limit=limit)
+        page["execution_owner_ready"] = not self.retired
         if not after_sequence:
             self.fail = True
         return page
@@ -1672,7 +1723,7 @@ def test_event_pump_operation_semantic_cache_has_the_native_resident_bound(
     assert "execution_control_projection_capacity_invalid" in pump.last_error
 
 
-def test_event_pump_reconciles_typed_idle_owner_without_querying_events() -> None:
+def test_event_pump_reconciles_typed_idle_owner_through_stable_events() -> None:
     core = _RecordingCore()
     execution = _IdleExecution()
     wakes: list[None] = []
@@ -1690,7 +1741,7 @@ def test_event_pump_reconciles_typed_idle_owner_without_querying_events() -> Non
 
     assert pump.last_error is None
     assert execution.status_calls >= 1
-    assert execution.events_calls == 0
+    assert execution.events_calls >= 1
     assert execution.status_calls >= 4
     assert wakes == [None]
     assert core.completed_calls[0] == {
@@ -1715,7 +1766,7 @@ def test_event_pump_completes_idle_snapshot_with_active_stop_fault_offer() -> No
     pump.shutdown()
 
     assert pump.last_error is None
-    assert execution.events_calls == 0
+    assert execution.events_calls >= 1
     assert execution.stop_fault_calls >= 1
     assert core.completed_calls[0] == {
         "current_stop_fault_json": rfc8785.dumps(offer["latch"]).decode("utf-8"),
@@ -1769,7 +1820,7 @@ def test_event_pump_keeps_idle_source_open_when_stop_fault_read_fails(
 
     assert pump.last_error is not None
     assert expected_error in pump.last_error
-    assert execution.events_calls == 0
+    assert execution.events_calls >= 1
     assert execution.stop_fault_calls >= 1
     assert core.completed_calls == []
     assert not core.completed.is_set()
@@ -1799,7 +1850,7 @@ def test_event_pump_wakes_cold_state_when_idle_kernel_admission_advances() -> No
     pump.shutdown()
 
     assert len(wakes) == baseline + 1
-    assert execution.events_calls == 0
+    assert execution.events_calls >= 1
 
 
 def test_event_pump_reconciles_idle_after_owner_retirement_at_event_high_water() -> (
@@ -2031,7 +2082,8 @@ def _component_snapshot(component_id: str, cause: str) -> dict[str, Any]:
         "domains": [
             {
                 "control_domain_id": "domain.arm",
-                "current_resources": ["resource.arm"],
+                "kind": "controller",
+                "resources": ["resource.arm"],
                 "topology_revision": "topology.rev",
             }
         ],
@@ -2106,7 +2158,7 @@ def test_component_conditions_forward_only_condition_facts_at_a_bounded_cadence(
                 "domains": [
                     {
                         "control_domain_id": "domain.arm",
-                        "current_resources": ["resource.arm"],
+                        "resources": ["resource.arm"],
                     }
                 ],
                 "graph_revision": "graph.1",
@@ -2131,6 +2183,42 @@ def test_component_conditions_forward_only_condition_facts_at_a_bounded_cadence(
     pump._observe_component_lifecycle_conditions()  # noqa: SLF001
     assert len(core.observed) == 1
     assert cclc.calls == ["owner_identity", "arm", "gripper", "owner_identity"]
+
+
+def test_a_provider_domain_component_completes_the_lifecycle_observation() -> None:
+    # A model-free I/O provider domain carries the same common `resources`
+    # (its sealed logical outputs). Its component is read like a controller
+    # one, so the observation is complete rather than permanently
+    # `incomplete` (which left the runtime_health alarm domain unreconciled
+    # and closed admission).
+    core = _ComponentConditionCore(["arm", "station_io"])
+    cclc = _FakeCCLC()
+    provider = _component_snapshot("station_io", "none")
+    provider["domains"] = [
+        {
+            "active_control_configuration": None,
+            "control_domain_id": "domain.io",
+            "control_domain_revision": "rev.io",
+            "kind": "io_provider",
+            "provider": {},
+            "provider_runtime_epoch": "epoch.io",
+            "resources": ["resource.do0"],
+        }
+    ]
+    cclc.snapshots = {
+        "arm": _component_snapshot("arm", "none"),
+        "station_io": provider,
+    }
+    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
+    assert len(core.observed) == 1
+    observed = core.observed[0]
+    assert observed["unavailable_component_ids"] == []
+    rows = json.loads(observed["snapshots_json"])
+    assert [row["domains"] for row in rows] == [
+        [{"control_domain_id": "domain.arm", "resources": ["resource.arm"]}],
+        [{"control_domain_id": "domain.io", "resources": ["resource.do0"]}],
+    ]
+    assert core.observation_pending is False
 
 
 def test_component_conditions_need_no_cclc_without_components() -> None:
@@ -2550,3 +2638,609 @@ def test_cclc_incident_events_wait_quietly_for_an_unreachable_owner() -> None:
     assert cclc.reads == []
     assert core.recorded == []
     assert not pump._incident_events_failing  # noqa: SLF001
+
+
+def _recovery_response(retry_eligibility: object = "absent") -> dict[str, Any]:
+    assessment: dict[str, Any] = {
+        "schema_version": "manyforge.kernel_recovery_assessment.v1",
+        "assessment_revision": 2,
+        "control_command_epoch": 0,
+        "execution_id": 1,
+        "allowed_actions": ["retry_motion_from_current_state"],
+    }
+    if retry_eligibility != "absent":
+        assessment["retry_eligibility"] = retry_eligibility
+    return {
+        "api_version": "manyforge.execution_command_response.v1",
+        "command": "get_operation_recovery",
+        "ok": True,
+        "operation_revision": 3,
+        "participants": [{"operation_id": "operation.1"}],
+        "stop_id": None,
+        "stop_generation": None,
+        "recovery_assessment": assessment,
+    }
+
+
+def _retry_eligibility(**changes: object) -> dict[str, object]:
+    eligibility: dict[str, object] = {
+        "eligible": True,
+        "cause": "planning_no_effect",
+        "effect": "known_no_effect",
+        "reason": "none",
+    }
+    return {**eligibility, **changes}
+
+
+@pytest.mark.parametrize("cause", ["planning_no_effect", "collision_stop_nominal", "not_eligible"])
+@pytest.mark.parametrize("effect", ["known_no_effect", "effect_observed", "effect_uncertain"])
+def test_recovery_assessment_accepts_closed_retry_eligibility(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cause: str, effect: str
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    eligibility = _retry_eligibility(
+        eligible=cause != "not_eligible", cause=cause, effect=effect, reason="none"
+    )
+    response = _recovery_response(eligibility)
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    assert client.operation_recovery("operation.1")["recovery_assessment"][
+        "retry_eligibility"
+    ] == eligibility
+
+
+_RETRY_REASONS = tuple(sorted(RETRY_ELIGIBILITY_REASONS))
+
+
+@pytest.mark.parametrize("reason", _RETRY_REASONS)
+def test_recovery_assessment_accepts_every_frozen_retry_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reason: str
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    eligibility = _retry_eligibility(
+        eligible=reason == "none", cause="not_eligible", reason=reason
+    )
+    response = _recovery_response(eligibility)
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    assert client.operation_recovery("operation.1")["recovery_assessment"][
+        "retry_eligibility"
+    ] == eligibility
+
+
+def test_recovery_assessment_without_retry_eligibility_stays_valid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    response = _recovery_response()
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    assert "retry_eligibility" not in client.operation_recovery("operation.1")[
+        "recovery_assessment"
+    ]
+
+
+@pytest.mark.parametrize(
+    "eligibility",
+    [
+        None,
+        [],
+        "eligible",
+        _retry_eligibility(eligible=None),
+        _retry_eligibility(eligible=1),
+        _retry_eligibility(eligible="true"),
+        _retry_eligibility(cause=None),
+        _retry_eligibility(cause=["planning_no_effect"]),
+        _retry_eligibility(cause="planning_retry"),
+        _retry_eligibility(effect=None),
+        _retry_eligibility(effect={"effect": "effect_observed"}),
+        _retry_eligibility(effect="effect_unknown"),
+        _retry_eligibility(reason=None),
+        _retry_eligibility(reason=""),
+        _retry_eligibility(reason="NONE"),
+        _retry_eligibility(reason="blocked"),
+        _retry_eligibility(reason="stop_not_settled "),
+        _retry_eligibility(reason=3),
+        _retry_eligibility(reason=["none"]),
+        {k: v for k, v in _retry_eligibility().items() if k != "reason"},
+        {k: v for k, v in _retry_eligibility().items() if k != "eligible"},
+        {**_retry_eligibility(), "extra": None},
+    ],
+)
+def test_recovery_assessment_rejects_malformed_retry_eligibility(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, eligibility: object
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    response = _recovery_response(eligibility)
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    with pytest.raises(HeadlessApiError) as malformed:
+        client.operation_recovery("operation.1")
+    assert malformed.value.code == "execution_command_response_invalid"
+
+
+def test_recovery_action_request_is_serialized_with_the_native_ten_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    commands: list[dict[str, Any]] = []
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        commands.append(command)
+        request = command["request"]
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "apply_operation_recovery",
+            "ok": True,
+            "result": {
+                "request_id": request["request_id"],
+                "action": request["action"],
+                "accepted": True,
+                "resulting_assessment": {},
+            },
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    client.apply_operation_recovery(
+        "operation.1",
+        3,
+        OperationRecoveryActionRequest.model_validate(
+            {
+                "request_id": "recovery.1",
+                "action": "retry_motion_from_current_state",
+                "expected_assessment_revision": 2,
+                "expected_control_command_epoch": 0,
+                "expected_execution_id": 1,
+            }
+        ),
+    )
+    # The native decoder requires exactly these fields.
+    assert set(commands[0]["request"]) == {
+        "request_id",
+        "action",
+        "principal_id",
+        "expected_assessment_revision",
+        "expected_control_command_epoch",
+        "expected_execution_id",
+        "expected_latch_id",
+        "expected_stop_certificate_id",
+        "expected_stop_owner_generation",
+        "reason",
+    }
+
+
+def test_recovery_assessment_reason_union_is_the_frozen_eighteen() -> None:
+    assert len(RETRY_ELIGIBILITY_REASONS) == 18
+    assert "none" in RETRY_ELIGIBILITY_REASONS
+
+
+def test_operation_events_pass_retry_fact_payloads_through_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Native ingest owns the event-level wire shapes; Python only forwards them.
+    owner_epoch = "execution.epoch.1"
+    event = copy.deepcopy(_event(owner_epoch, 1))
+    event["payload"]["api_version"] = "manyforge.operation_journal_record.v4"
+    event["payload"]["operation_state"]["motion_retry_candidate"] = "not_a_candidate"
+    client = ExecutionCommandClient(tmp_path)
+    response = _page(owner_epoch, [event])
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    page = client.events(owner_epoch, 0)
+    assert page["events"][0] == event
+
+def test_stable_event_readiness_tracks_active_idle_active_same_kernel() -> None:
+    class ModeExecution(_PagedExecution):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ready = True
+            self.identities = 0
+
+        def identity(self) -> dict[str, Any]:
+            self.identities += 1
+            if self.ready:
+                return super().identity()
+            return {
+                "ok": False,
+                "error": {"code": "execution_owner_not_ready", "message": "No product",
+                          "details": {"owner_epoch": self.owner_epoch}},
+            }
+
+        def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
+            page = super().events(owner_epoch, after_sequence, limit=limit)
+            page["execution_owner_ready"] = self.ready
+            return page
+
+    core = _RecordingCore()
+    execution = ModeExecution()
+    wakes: list[bool] = []
+    changed = threading.Event()
+    pump = ExecutionEventPump(core, execution, poll_seconds=0.01, page_limit=1)  # type: ignore[arg-type]
+    def observe() -> None:
+        wakes.append(execution.ready)
+        changed.set()
+
+    pump.set_change_observer(observe)
+    pump.start()
+    try:
+        assert changed.wait(timeout=1.0)
+        changed.clear()
+        execution.ready = False
+        assert changed.wait(timeout=1.0)
+        for _ in range(100):
+            if execution.identities >= 2:
+                break
+            threading.Event().wait(0.01)
+        assert execution.identities >= 2
+        changed.clear()
+        execution.ready = True
+        assert changed.wait(timeout=1.0)
+    finally:
+        pump.shutdown()
+    assert pump.last_error is None
+    assert wakes == [True, False, True]
+    assert len(core.ingested) == 1  # The same journal cursor survives mode changes.
+    assert all(call["source_owner_epoch"] == execution.owner_epoch
+               for call in core.completed_calls)
+
+
+@pytest.mark.parametrize("malformed_kind", [None, {}], ids=["typed_error", "type_error"])
+def test_page_parse_errors_keep_runtime_fault_context_for_pump(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, malformed_kind: Any
+) -> None:
+    epoch = "kernel.1"
+    fault = {
+        "request_owner_epoch": epoch, "write_kind": "state_observed",
+        "error": {"code": "io_error", "message": "Journal failed", "details": {}},
+        "operation_id": None, "operation_revision": None, "request_id": None,
+        "program_run_id": None, "execution_scope": None,
+    }
+    response = _page(epoch, [_event(epoch, 1)])
+    response["runtime_faults"]["operation_journal_write_fault"] = fault
+    response["event_page"]["events"][0]["record_kind"] = malformed_kind
+    client = ExecutionCommandClient(tmp_path)
+    monkeypatch.setattr(client, "_exchange", lambda _request: response)
+    expected_error = HeadlessApiError if malformed_kind is None else TypeError
+    with pytest.raises(expected_error) as failed:
+        client.events(epoch, 0, limit=1)
+    snapshot = failed.value.runtime_fault_snapshot
+    assert snapshot["owner_epoch"] == epoch
+    assert snapshot["runtime_faults"]["operation_journal_write_fault"] == fault
+
+    class FailedExecution(_PagedExecution):
+        def __init__(self) -> None:
+            super().__init__()
+            self.owner_epoch = epoch
+
+        def events(self, _owner_epoch: str, _after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
+            raise failed.value
+
+    core = _RecordingCore()
+    pump = ExecutionEventPump(core, FailedExecution(), poll_seconds=0.01, page_limit=1)  # type: ignore[arg-type]
+    pump.start()
+    assert core.unknown.wait(timeout=1.0)
+    pump.shutdown()
+    assert core.runtime_fault_snapshots
+    assert json.loads(core.runtime_fault_snapshots[0]["current_runtime_faults_json"])[
+        "operation_journal_write_fault"
+    ] == fault
+    assert core.completed_calls == []
+    assert pump.last_error is not None  # Fault delivery does not turn page failure into Good.
+
+
+def test_execution_client_projects_global_rule_recovery_offers_and_variant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from manyforge_headless_api.models import GlobalIoRuleRecoveryIntentRequest
+
+    client = ExecutionCommandClient(tmp_path)
+    selector = {
+        "context": {
+            "owner_epoch": "kernel.epoch.1",
+            "catalog_generation": "4",
+            "active_publication_generation": 2,
+            "bundle": "bundle.1",
+            "graph": "graph.1",
+        },
+        "rule_id": "door_open",
+        "expected_rule_registration_id": "9",
+    }
+    offer = {
+        "selector": selector,
+        "current_condition": None,
+        "post_latch_disposition": "await_operator_ack",
+        "latch_cause": "source_loss",
+    }
+    offers: list[Any] = [offer]
+    commands: list[dict[str, Any]] = []
+    result: dict[str, Any] = {}
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        commands.append(command)
+        if command["command"] == "get_stop_fault":
+            return {
+                "api_version": "manyforge.execution_command_response.v1",
+                "command": "get_stop_fault",
+                "ok": True,
+                "stop_fault": None,
+                "global_rule_recovery_offers": offers,
+            }
+        return {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": "recover_stop_fault",
+            "ok": True,
+            "result": result,
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    monkeypatch.setattr(client, "_exchange_control", exchange)
+    assert client.stop_fault()["global_rule_recovery_offers"] == [offer]
+    for patch in (
+        {"current_condition": 0},
+        {"latch_cause": "unknown"},
+        {"post_latch_disposition": "auto_clear"},
+        {"selector": {**selector, "expected_rule_registration_id": 9}},
+        # SX-2216: Core emits only a positive registration nonce.
+        {"selector": {**selector, "expected_rule_registration_id": "0"}},
+        {"selector": {**selector, "context": {**selector["context"], "catalog_generation": "04"}}},
+        {"extra": True},
+    ):
+        offers[:] = [{**offer, **patch}]
+        with pytest.raises(HeadlessApiError):
+            client.stop_fault()
+
+    request = GlobalIoRuleRecoveryIntentRequest.model_validate(
+        {
+            "kind": "global_io_rule",
+            "request_context": {
+                "request_id": "request.rule-recovery.1",
+                "request_owner_epoch": "execution.epoch.1",
+                "source_label": "operator_ui",
+                "correlation_id": None,
+            },
+            "selector": selector,
+            "reason": None,
+        }
+    )
+    result.update(
+        request_id="request.rule-recovery.1",
+        replay_status="accepted_new",
+        accepted=True,
+        context=selector["context"],
+        rule={"rule_id": "door_open", "state": "clear", "triggering_acquisition": None},
+        error=None,
+    )
+    assert client.recover_stop_fault(request)["result"]["accepted"] is True
+    # The variant keeps its explicit null reason; Stop bytes are untouched.
+    assert commands[-1]["request"] == request.model_dump(mode="json")
+    assert commands[-1]["request"]["reason"] is None
+    result["rule"] = {**result["rule"], "rule_id": "other"}
+    with pytest.raises(HeadlessApiError):
+        client.recover_stop_fault(request)
+    result.update(accepted=False, rule=None, error="global_rule_condition_true")
+    assert client.recover_stop_fault(request)["result"]["accepted"] is False
+    # SX-2216: the result proves the exact requested selector context.
+    result.update(
+        accepted=True,
+        rule={"rule_id": "door_open", "state": "clear", "triggering_acquisition": None},
+        error=None,
+    )
+    for field, value in (
+        ("owner_epoch", "kernel.epoch.2"),
+        ("catalog_generation", "5"),
+        ("active_publication_generation", 3),
+        ("bundle", "bundle.2"),
+        ("graph", "graph.2"),
+    ):
+        result["context"] = {**selector["context"], field: value}
+        with pytest.raises(HeadlessApiError):
+            client.recover_stop_fault(request)
+    # A replay of a historical request keeps its original context even after
+    # the current Applied context (the offers) moved on.
+    offers[:] = [{**offer, "selector": {
+        **selector, "context": {**selector["context"], "active_publication_generation": 3}}}]
+    assert client.stop_fault()["global_rule_recovery_offers"] == offers
+    result.update(context=selector["context"], replay_status="replayed_exact")
+    assert client.recover_stop_fault(request)["result"]["replay_status"] == "replayed_exact"
+    with pytest.raises(ValueError):
+        GlobalIoRuleRecoveryIntentRequest.model_validate({
+            **request.model_dump(mode="json"),
+            "selector": {**selector, "expected_rule_registration_id": "0"},
+        })
+
+
+def _rule_state_event(owner_epoch: str, sequence: int, state: str) -> dict[str, Any]:
+    payload = {
+        "owner_epoch": owner_epoch,
+        "catalog_generation": "1",
+        "active_publication_generation": 1,
+        "retained_bundle_id": "bundle.1",
+        "graph_revision": "graph.1",
+        "rule_id": "door",
+        "state": state,
+        "triggering_acquisition": None,
+    }
+    return {
+        "effect_pending": False,
+        "occurred_at_ns": 100 + sequence,
+        "occurred_at_wall": f"2026-08-07T10:00:01.00000000{sequence}Z",
+        "operation_id": None,
+        "operation_revision": None,
+        "owner_epoch": owner_epoch,
+        "payload": payload,
+        "payload_digest": f"sha256:{hashlib.sha256(rfc8785.dumps(payload)).hexdigest()}",
+        "record_kind": "interrupt_rule_state_changed",
+        "request_id": None,
+        "sequence": sequence,
+    }
+
+
+def _rule_catalog(owner_epoch: str) -> dict[str, Any]:
+    return {
+        "owner_epoch": owner_epoch,
+        "catalog_generation": "1",
+        "active_publication_generation": 1,
+        "bundle": "bundle.1",
+        "graph": "graph.1",
+        "rule_ids": ["door"],
+        "referenced_program_blackboard_keys": [],
+    }
+
+
+def _rule_baseline(owner_epoch: str, through: int) -> dict[str, Any]:
+    return {"status": "ready", "snapshot": {
+        "owner_epoch": owner_epoch,
+        "catalog_generation": "1",
+        "active_publication_generation": 1,
+        "retained_bundle_id": "bundle.1",
+        "graph_revision": "graph.1",
+        "through_sequence": through,
+        "states": [{"rule_id": "door", "state": "clear", "triggering_acquisition": None}],
+    }}
+
+
+def test_execution_client_passes_global_rule_wire_and_null_identity_state_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    owner_epoch = "execution-host.epoch.rules"
+    row = _rule_state_event(owner_epoch, 1, "tripped")
+    response = _page(owner_epoch, [row])
+    response["interrupt_rule_catalog"] = _rule_catalog(owner_epoch)
+    response["interrupt_rule_state_baseline"] = {"status": "projection_pending"}
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    page = client.events(owner_epoch, 0)
+    assert page["events"][0]["record_kind"] == "interrupt_rule_state_changed"
+    assert page["interrupt_rule_catalog"] == response["interrupt_rule_catalog"]
+    assert page["interrupt_rule_state_baseline"] == {"status": "projection_pending"}
+
+    row["operation_id"] = "operation.1"
+    with pytest.raises(HeadlessApiError):
+        client.events(owner_epoch, 0)
+
+
+class _RuleStreamingExecution(_StreamingExecution):
+    def __init__(self) -> None:
+        super().__init__()
+        self.baseline_through = 0
+
+    def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
+        page = super().events(owner_epoch, after_sequence, limit=limit)
+        page["interrupt_rule_catalog"] = _rule_catalog(owner_epoch)
+        page["interrupt_rule_state_baseline"] = _rule_baseline(owner_epoch, self.baseline_through)
+        return page
+
+
+def test_event_pump_projects_global_rules_and_forwards_rule_rows_to_the_historian() -> None:
+    core = _RecordingCore()
+    execution = _RuleStreamingExecution()
+    epoch = execution.owner_epoch
+    execution.append(_event(epoch, 1))
+    execution.append(_rule_state_event(epoch, 2, "tripped"))
+    published: list[list[dict[str, Any]] | None] = []
+    pump = ExecutionEventPump(core, execution, poll_seconds=0.01)  # type: ignore[arg-type]
+    pump.set_global_rules_observer(published.append)
+    pump.start()
+    for _ in range(200):
+        if core.completed_calls and published:
+            break
+        threading.Event().wait(0.01)
+    execution.append(_rule_state_event(epoch, 3, "latched"))
+    for _ in range(200):
+        if published and published[-1] == [{"rule_id": "door", "state": "latched", "keys": []}]:
+            break
+        threading.Event().wait(0.01)
+    pump.shutdown()
+
+    # Rule rows reach the historian unchanged; snapshots cover them.
+    assert [row["source_sequence"] for row in core.ingested] == [1, 2, 3]
+    tripped = _rule_state_event(epoch, 2, "tripped")
+    assert core.ingested[1] == {
+        "source_owner_epoch": epoch,
+        "source_sequence": 2,
+        "record_kind": "interrupt_rule_state_changed",
+        "request_id": None,
+        "operation_id": None,
+        "operation_revision": None,
+        "occurred_at_ns": tripped["occurred_at_ns"],
+        "occurred_at_wall": tripped["occurred_at_wall"],
+        "effect_pending": False,
+        "payload_json": rfc8785.dumps(tripped["payload"]).decode("utf-8"),
+        "payload_digest": tripped["payload_digest"],
+    }
+    assert set(json.loads(core.ingested[1]["payload_json"])) == {
+        "owner_epoch", "catalog_generation", "active_publication_generation",
+        "retained_bundle_id", "graph_revision", "rule_id", "state",
+        "triggering_acquisition",
+    }
+    assert core.completed_calls[0]["through_source_sequence"] == 2
+    assert core.completed_calls[-1]["through_source_sequence"] == 3
+    assert published[0] == [{"rule_id": "door", "state": "tripped", "keys": []}]
+    assert published[-1] == [{"rule_id": "door", "state": "latched", "keys": []}]
+    assert len(published) == 2
+
+
+def test_event_pump_keeps_the_historian_feed_when_the_rule_wire_is_malformed(caplog) -> None:
+    core = _RecordingCore()
+    execution = _RuleStreamingExecution()
+    execution.append(_event(execution.owner_epoch, 1))
+    execution.append(_rule_state_event(execution.owner_epoch, 2, "exploded"))
+    published: list[list[dict[str, Any]] | None] = []
+    pump = ExecutionEventPump(core, execution, poll_seconds=0.01)  # type: ignore[arg-type]
+    pump.set_global_rules_observer(published.append)
+    # Capture on the module logger itself: suite-wide logging configuration
+    # (propagation or levels set by other tests) must not hide the warning.
+    module_logger = logging.getLogger("manyforge_headless_api.execution")
+    previous_level = module_logger.level
+    module_logger.addHandler(caplog.handler)
+    module_logger.setLevel(logging.WARNING)
+    try:
+        pump.start()
+        for _ in range(200):
+            if core.completed_calls and published:
+                break
+            threading.Event().wait(0.01)
+        pump.shutdown()
+    finally:
+        module_logger.removeHandler(caplog.handler)
+        module_logger.setLevel(previous_level)
+
+    # The historian still receives the row; only the GUI fold is unreadable.
+    assert [row["source_sequence"] for row in core.ingested] == [1, 2]
+    # The lost row is not covered by the cut (through 0): pending, not clear.
+    assert published == [[{"rule_id": "door", "state": "pending", "keys": []}]]
+    assert pump.last_error is None
+    assert "global rule status is unreadable" in caplog.text
+
+
+class _RefusingRuleRowCore(_RecordingCore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.refusals = 0
+
+    def ingest_operation_event(self, **kwargs: Any) -> dict[str, Any]:
+        if kwargs["record_kind"] == "interrupt_rule_state_changed":
+            self.refusals += 1
+            raise HeadlessApiError("operation_event_invalid", "historian refused the row")
+        return super().ingest_operation_event(**kwargs)
+
+
+def test_event_pump_surfaces_a_refused_rule_row_like_any_refused_row() -> None:
+    core = _RefusingRuleRowCore()
+    execution = _RuleStreamingExecution()
+    execution.append(_event(execution.owner_epoch, 1))
+    execution.append(_rule_state_event(execution.owner_epoch, 2, "tripped"))
+    published: list[list[dict[str, Any]] | None] = []
+    pump = ExecutionEventPump(core, execution, poll_seconds=0.01)  # type: ignore[arg-type]
+    pump.set_global_rules_observer(published.append)
+    pump.start()
+    for _ in range(200):
+        if core.refusals >= 2 and core.unknown.is_set():
+            break
+        threading.Event().wait(0.01)
+    pump.shutdown()
+
+    # The shared refusal path: source quality unknown, error recorded, no
+    # snapshot past the refused row, and the row is retried, not skipped.
+    assert core.unknown.is_set()
+    assert pump.last_error is not None
+    assert "historian refused the row" in str(pump.last_error)
+    assert core.refusals >= 2
+    assert [row["source_sequence"] for row in core.ingested][:1] == [1]
+    assert not core.completed_calls
+    assert published and published[-1] is None

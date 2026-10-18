@@ -62,21 +62,30 @@ public:
   execution_table() const noexcept {
     return execution_table_;
   }
+  [[nodiscard]] const std::vector<core::ProgramBlackboardKeyDeclarationDTO> &
+  blackboard_key_declarations() const noexcept {
+    return blackboard_key_declarations_;
+  }
 
 private:
   ProgramBindingContract(core::ProgramBindingContractDTO value,
                          CanonicalValue normalized_program_root,
                          std::string canonical_program_bytes,
-                         core::ProgramExecutionTableDTO execution_table)
+                         core::ProgramExecutionTableDTO execution_table,
+                         std::vector<core::ProgramBlackboardKeyDeclarationDTO>
+                             blackboard_key_declarations)
       : value_(std::move(value)),
         normalized_program_root_(std::move(normalized_program_root)),
         canonical_program_bytes_(std::move(canonical_program_bytes)),
-        execution_table_(std::move(execution_table)) {}
+        execution_table_(std::move(execution_table)),
+        blackboard_key_declarations_(std::move(blackboard_key_declarations)) {}
 
   core::ProgramBindingContractDTO value_;
   CanonicalValue normalized_program_root_;
   std::string canonical_program_bytes_;
   core::ProgramExecutionTableDTO execution_table_;
+  std::vector<core::ProgramBlackboardKeyDeclarationDTO>
+      blackboard_key_declarations_;
 
   friend class detail::ProgramBindingContractConstructionAuthority;
 };

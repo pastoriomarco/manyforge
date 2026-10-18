@@ -118,6 +118,7 @@ class BoundedStopStageAttemptExecutor::Impl final {
       slot.request = std::move(request);
       slot.infrastructure_failure = false;
       slot.result.reset();
+      slot.spring_return_point.reset();
       slot.state = State::kQueued;
       const StopStageAttemptHandle handle{static_cast<std::uint32_t>(index), slot.generation};
       slot.changed.notify_one();
@@ -162,6 +163,16 @@ class BoundedStopStageAttemptExecutor::Impl final {
             std::optional<ParticipantStopStageResultDTO>(std::move(*slot->result))};
   }
 
+  [[nodiscard]] std::shared_ptr<const SpringBackReturnPointDTO> ReadSpringReturnPoint(
+      const StopStageAttemptHandle handle) noexcept {
+    auto* slot = Resolve(handle);
+    if (slot == nullptr) return {};
+    std::lock_guard lock(slot->mutex);
+    if (slot->generation != handle.generation || slot->state == State::kFree ||
+        slot->cancellation.stop_requested()) return {};
+    return slot->spring_return_point;
+  }
+
   [[nodiscard]] StopStageAttemptReleaseStatus Release(
       const StopStageAttemptHandle handle) noexcept {
     auto* slot = Resolve(handle);
@@ -180,6 +191,7 @@ class BoundedStopStageAttemptExecutor::Impl final {
         }
         slot->request = {};
         slot->result.reset();
+        slot->spring_return_point.reset();
         slot->cancellation = std::move(fresh_cancellation);
         slot->infrastructure_failure = false;
         slot->state = State::kFree;
@@ -232,6 +244,7 @@ class BoundedStopStageAttemptExecutor::Impl final {
     StopStageAttemptRequest request;
     std::stop_source cancellation;
     std::optional<ParticipantStopStageResultDTO> result;
+    std::shared_ptr<const SpringBackReturnPointDTO> spring_return_point;
     bool infrastructure_failure{};
     std::jthread worker;
   };
@@ -239,6 +252,40 @@ class BoundedStopStageAttemptExecutor::Impl final {
   [[nodiscard]] Slot* Resolve(const StopStageAttemptHandle handle) noexcept {
     return handle.locally_valid() && handle.slot < capacity_ ? slots_[handle.slot].get() : nullptr;
   }
+
+  [[nodiscard]] bool PublishSpringReturnPoint(
+      Slot& slot, const StopStageAttemptHandle handle,
+      const SpringBackReturnPointDTO& point) noexcept {
+    try {
+      auto immutable = std::make_shared<const SpringBackReturnPointDTO>(point);
+      {
+        std::lock_guard lock(slot.mutex);
+        if (slot.generation != handle.generation || slot.state != State::kRunning ||
+            !slot.request.force_spring_return || slot.cancellation.stop_requested() ||
+            slot.spring_return_point) return false;
+        slot.spring_return_point = std::move(immutable);
+      }
+      receiver_.StageAttemptCompleted(handle);
+      return true;
+    } catch (...) {
+      // Progress is optional. Containment continues on the same stage lane.
+      return false;
+    }
+  }
+
+  class SpringObserver final : public IStopStageSpringReturnObserver {
+   public:
+    SpringObserver(Impl& owner, Slot& slot, StopStageAttemptHandle handle)
+        : owner_(owner), slot_(slot), handle_(handle) {}
+    [[nodiscard]] bool SpringReturnPointReady(
+        const SpringBackReturnPointDTO& point) noexcept override {
+      return owner_.PublishSpringReturnPoint(slot_, handle_, point);
+    }
+   private:
+    Impl& owner_;
+    Slot& slot_;
+    StopStageAttemptHandle handle_;
+  };
 
   [[nodiscard]] bool Drained() noexcept {
     if (active_calls_.load(std::memory_order_acquire) != 0U) {
@@ -284,8 +331,14 @@ class BoundedStopStageAttemptExecutor::Impl final {
       std::optional<ParticipantStopStageResultDTO> result;
       bool infrastructure_failure = false;
       try {
-        result.emplace(
-            request.port->TranslateStopStage(*request.stage, *request.budget, cancellation));
+        if (request.force_spring_return) {
+          SpringObserver observer(*this, slot, {slot_index, slot.generation});
+          result.emplace(request.port->TranslateStopStageForTakeover(
+              *request.stage, *request.budget, cancellation, observer));
+        } else {
+          result.emplace(
+              request.port->TranslateStopStage(*request.stage, *request.budget, cancellation));
+        }
       } catch (...) {
         infrastructure_failure = true;
       }
@@ -351,6 +404,12 @@ bool BoundedStopStageAttemptExecutor::RequestCancel(const StopStageAttemptHandle
 StopStageAttemptTakeResult BoundedStopStageAttemptExecutor::TryTake(
     const StopStageAttemptHandle handle) noexcept {
   return impl_->TryTake(handle);
+}
+
+std::shared_ptr<const SpringBackReturnPointDTO>
+BoundedStopStageAttemptExecutor::ReadSpringReturnPoint(
+    const StopStageAttemptHandle handle) noexcept {
+  return impl_->ReadSpringReturnPoint(handle);
 }
 
 StopStageAttemptReleaseStatus BoundedStopStageAttemptExecutor::Release(

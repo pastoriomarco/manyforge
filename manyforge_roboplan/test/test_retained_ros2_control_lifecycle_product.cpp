@@ -1,3 +1,5 @@
+#include "../src/io_provider_lifecycle_product.hpp"
+#include "io_retained_fixture.hpp"
 #include "retained_lifecycle_product_fixture.hpp"
 
 #include <gtest/gtest.h>
@@ -111,7 +113,7 @@ void check_owned_process_health(bool with_pure_projection) {
   }
   const deployment::FilesystemVerifiedRetainedProviderManifestSource manifests(
       root.path());
-  auto product = RetainedRos2ControlLifecycleProduct::Create(
+  auto product = RetainedHostLifecycleProduct::Create(
       fixture.bundle, manifests, {binding}, {handle}, clock, 1000);
   ASSERT_TRUE(product.ok()) << product.error().message;
   ASSERT_EQ(product.value()->brand_ports().size(), 1U);
@@ -171,6 +173,92 @@ TEST(RetainedRos2ControlLifecycleProductTest,
   if (::testing::Test::HasFatalFailure())
     return;
   check_owned_process_health(false);
+}
+
+TEST(RetainedRos2ControlLifecycleProductTest,
+     GenuineProviderOnlyProductRequiresRealResourcesAndPinsActualDriver) {
+  product_test::PackageRoot root;
+  const auto fixture =
+      deployment::test::materialize_boolean_io_retained_fixture(root.path());
+  const auto &domain =
+      fixture.bundle->value().cell_graph.control_domains.front();
+  ASSERT_NE(domain.provider(), nullptr);
+  const auto &provider = *domain.provider();
+  deployment::FilesystemVerifiedRetainedProviderManifestSource manifests(
+      root.path());
+  const auto manifest = manifests.get_verified(
+      {fixture.bundle->retained_bundle_id(), provider.provider_manifest_id,
+       provider.provider_manifest_revision});
+  ASSERT_TRUE(manifest);
+  auto clock = std::make_shared<core::FakeClock>();
+  const core::RuntimeEpoch epoch("actual.host.epoch");
+  core::ResolvedLifecycleControlDomainScopeDTO scope{
+      domain.control_domain_id, domain.control_domain_revision,
+      core::ResolvedProviderDomainScopeDTO{provider, epoch, std::nullopt, {}}};
+  core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
+      domain.control_domain_id,
+      domain.control_domain_revision,
+      provider.provider_instance_id,
+      provider.provider_manifest_id,
+      provider.provider_manifest_revision,
+      provider.provider_runtime_unit_id,
+      epoch,
+      provider.lifecycle_plan_catalog_digest};
+  auto made = host_detail::IoProviderDriverRecord::Create(
+      scope, occurrence, manifest->value(), clock, 1000);
+  ASSERT_TRUE(made.ok());
+  auto driver = std::move(made.value());
+  EXPECT_FALSE(RetainedHostLifecycleProduct::Create(
+                   fixture.bundle, manifests, {}, {}, *clock, 1000, {driver})
+                   .ok());
+  const auto rows = deployment::ResolveRetainedIoSignalCatalog(
+      fixture.bundle->value().cell_graph);
+  ASSERT_TRUE(rows.ok());
+  ASSERT_EQ(rows.value().size(), 1U);
+  class Ingress final : public core::IIoSignalIngress {
+  public:
+    bool TryEnqueue(const core::IoSourceAcquisitionDTO &) noexcept override {
+      ++frames;
+      return true;
+    }
+    void
+    NotifyLoss(const core::IoIngressLossNotificationDTO &) noexcept override {}
+    unsigned frames{};
+  };
+  const auto ingress = std::make_shared<Ingress>();
+  {
+    auto lock = driver->AcquireDelivery();
+    ASSERT_TRUE(driver
+                    ->InstallResourcesLocked(
+                        {{rows.value(),
+                          {},
+                          ingress,
+                          core::IoSourceIncarnation("actual.apply")}},
+                        {}, {})
+                    .ok());
+  }
+  auto product = RetainedHostLifecycleProduct::Create(
+      fixture.bundle, manifests, {}, {}, *clock, 1000, {driver});
+  ASSERT_TRUE(product.ok()) << product.error().message;
+  ASSERT_EQ(product.value()->brand_ports().size(), 1U);
+  EXPECT_EQ(product.value()->brand_ports().front().provider_occurrence,
+            occurrence);
+  EXPECT_EQ(product.value()->brand_ports().front().port,
+            driver->brand_registration().port);
+  const std::weak_ptr<host_detail::IoProviderDriverRecord> actual_driver =
+      driver;
+  {
+    core::FixedCCLCPortRegistry registry(product.value()->brand_ports(), {});
+    product.value().reset();
+    driver.reset();
+    ASSERT_FALSE(actual_driver.expired());
+    const auto health = registry.ReadExactLifecycleHealth(occurrence, 0);
+    ASSERT_TRUE(health.ok());
+    EXPECT_EQ(health.value().observed_state,
+              core::ComponentLifecycleStateDTO::kDeclared);
+    EXPECT_EQ(ingress->frames, 0U);
+  }
+  EXPECT_TRUE(actual_driver.expired());
 }
 
 } // namespace

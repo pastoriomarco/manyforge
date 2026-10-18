@@ -792,7 +792,13 @@ class SqliteActiveBundlePublicationStore::Impl final {
     }
   }
 
+  // Non-owning read-only view, matching the Apply journal's existing reader.
+  Impl(sqlite3 *borrowed_database, const core::CellId &cell_id)
+      : cell_id_(cell_id), database_(borrowed_database), borrowed_(true) {}
+
   ~Impl() {
+    if (borrowed_)
+      return;
     try {
       Close();
     } catch (...) {
@@ -1487,11 +1493,62 @@ class SqliteActiveBundlePublicationStore::Impl final {
   sqlite3* database_{};
   mutable std::mutex mutex_;
   bool closed_{};
+  bool borrowed_{};
   /// Last complete integrity verification and the change identity it held
   /// under. Guarded by `mutex_`; discarded before every re-verification.
   mutable std::optional<VerifiedIntegrity> verified_;
   mutable std::uint64_t complete_verifications_{};
 };
+
+Result<ActiveBundlePublicationReceiptDTO>
+ReadActiveBundlePublicationReadOnly(const std::filesystem::path &database_path,
+                                    const core::CellId &cell_id) {
+  using Reply = Result<ActiveBundlePublicationReceiptDTO>;
+  const auto rejected = [] {
+    return Reply::Err(
+        {"active_bundle_publication_unavailable",
+         "The current active publication cannot be verified read-only",
+         {{"reason", "active_bundle_publication_read_invalid"}}});
+  };
+  sqlite3 *raw = nullptr;
+  try {
+    ValidateBoundedIdentity(cell_id.value(), "cell_id");
+    const auto path = ValidateDatabasePath(database_path);
+    PreflightPublicationStore(path, cell_id);
+    if (sqlite3_open_v2(path.string().c_str(), &raw,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
+                            SQLITE_OPEN_NOFOLLOW,
+                        nullptr) != SQLITE_OK) {
+      if (raw)
+        sqlite3_close(raw);
+      raw = nullptr;
+      return rejected();
+    }
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(raw,
+                                                                sqlite3_close);
+    raw = nullptr;
+    Check(database.get(),
+          sqlite3_busy_timeout(database.get(), kBusyTimeoutMilliseconds),
+          "configure read-only publication timeout");
+    Exec(database.get(), "PRAGMA query_only=ON");
+    Transaction snapshot(database.get(), "BEGIN");
+    ValidatePublicationStoreIdentityAndSchema(database.get(), cell_id);
+    SqliteActiveBundlePublicationStore::Impl view(database.get(), cell_id);
+    const auto integrity = view.VerifyIntegrityLocked();
+    if (!integrity.current_generation.nonzero())
+      return rejected();
+    const auto receipt = view.ReceiptByGenerationLocked(
+        static_cast<std::int64_t>(integrity.current_generation.value()));
+    if (!receipt)
+      return rejected();
+    snapshot.Commit();
+    return Reply::Ok(receipt->receipt);
+  } catch (const std::exception &) {
+    if (raw)
+      sqlite3_close(raw);
+    return rejected();
+  }
+}
 
 SqliteActiveBundlePublicationStore::SqliteActiveBundlePublicationStore(
     std::filesystem::path database_path,

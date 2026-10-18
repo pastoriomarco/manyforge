@@ -9,12 +9,92 @@ import type {
   ProgramTreeNode,
   ProgramValueSource,
 } from '../types/api';
+import {
+  groupByNamespace,
+  NODE_OUTCOME_NAMESPACE,
+  NODE_OUTCOME_VALUES,
+  INTERRUPT_NODE_OUTCOME_VALUES,
+  INTERRUPT_STATE_NAMESPACE,
+  INTERRUPT_STATE_VALUES,
+} from './blackboardNamespaces';
 import { hasSourcesWithin } from './valuePaths';
 
-const FORBIDDEN_DYNAMIC_PARAMETERS = new Set([
+/**
+ * Motion nodes that retry automatically, and the parameters that tune it. The
+ * parameters are literal-only (contract item 12). Mirrors the backend's
+ * AUTOMATIC_RETRY_NODE_IDS and AUTOMATIC_RETRY_LITERAL_PARAMETERS.
+ */
+export const AUTOMATIC_RETRY = {
+  nodeIds: ['motion.move_to_joint_target', 'motion.move_to_pose', 'motion.follow_cartesian_path'],
+  parameterIds: ['automatic_retries', 'automatic_retry_delay_s'],
+} as const;
+
+/** The two motion nodes with a per-node interrupt rule (contract 63). */
+export const INTERRUPT_MOTION_NODE_IDS = ['motion.move_until_signal', 'motion.probe_search'] as const;
+
+/**
+ * The keys a Draft's nodes may read: its declared keys plus the system-owned
+ * outcome key `node_outcome.<instance_id>` of every motion node (the plain
+ * motion nodes and the two interrupt nodes; contract items 42, 46(f)) and the
+ * read-only `interrupt_state.<rule_id>` key of every known global rule
+ * (contracts 63, 64). All are declared by the Program validator, never
+ * authored.
+ */
+export function programBlackboardKeys(
+  program: Pick<ProgramAuthoringDocument, 'blackboard' | 'forest'>,
+  globalRuleIds: readonly string[] = [],
+): BlackboardKeyDeclaration[] {
+  const keys = [...(program.blackboard?.keys ?? [])];
+  const motion: readonly string[] = AUTOMATIC_RETRY.nodeIds;
+  const interrupt: readonly string[] = INTERRUPT_MOTION_NODE_IDS;
+  const pending = [...(program.forest ?? [])];
+  for (let node = pending.pop(); node !== undefined; node = pending.pop()) {
+    if (motion.includes(node.node_id) || interrupt.includes(node.node_id)) {
+      const values = interrupt.includes(node.node_id)
+        ? INTERRUPT_NODE_OUTCOME_VALUES : NODE_OUTCOME_VALUES;
+      keys.push({
+        key: `${NODE_OUTCOME_NAMESPACE}.${node.instance_id}`,
+        type: 'string',
+        access: 'read',
+        persistence: 'run',
+        description: `Last outcome of motion node ${node.instance_id}: ${values.join(' | ')}`,
+      });
+    }
+    pending.push(...node.children);
+  }
+  for (const ruleId of new Set(globalRuleIds)) {
+    keys.push({
+      key: `${INTERRUPT_STATE_NAMESPACE}.${ruleId}`,
+      type: 'string',
+      access: 'read',
+      persistence: 'persistent',
+      description: `Current state of global interrupt rule ${ruleId}: ${INTERRUPT_STATE_VALUES.join(' | ')}`,
+    });
+  }
+  return keys.sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0));
+}
+
+const RELATIVE_RETRY_REASON = 'Not retried automatically: relative to the robot\'s own position.';
+
+// Literal-only parameters: no value-source binding is offered (contract items 12, 33).
+const FORBIDDEN_DYNAMIC_PARAMETERS = new Set<string>([
+  ...AUTOMATIC_RETRY.parameterIds,
+  'preemption_priority',
+  'preempted_result',
   'contact_policy_id',
   'model_endpoint_alias',
   'prompt_template_id',
+  // Interrupt rule fields of the two interrupt motion nodes (schema04 §2).
+  'interrupt_condition',
+  'stop_mode',
+  'activation_mode',
+  'on_signal',
+  'on_no_signal',
+  'priority',
+  'stop_entry_stage_id',
+  'success_through_stage_id',
+  // Node Mock simulation rows are literal-only (contract 133).
+  'mock_simulation',
 ]);
 
 export interface FlatProgramNode {
@@ -253,6 +333,10 @@ function jsonRecord(value: JsonValue | undefined): Record<string, JsonValue> | n
     : null;
 }
 
+function jsonArray(value: JsonValue | undefined): JsonValue[] {
+  return Array.isArray(value) ? value : [];
+}
+
 function compatibleBlackboardKeys(
   entry: CatalogEntry,
   parameterId: string,
@@ -283,6 +367,7 @@ export function programSemanticChoices(
   entry: CatalogEntry,
   parameterId: string,
   program: ProgramAuthoringDocument,
+  globalRuleIds: readonly string[] = [],
 ): ProgramSemanticChoice[] {
   const semanticType = schema['x-manyforge-semantic-type'];
   const choices: ProgramSemanticChoice[] = [];
@@ -295,12 +380,11 @@ export function programSemanticChoices(
       });
     }
   } else if (semanticType === 'blackboard_key') {
-    for (const key of compatibleBlackboardKeys(
-      entry,
-      parameterId,
-      program.blackboard?.keys ?? [],
-    )) {
-      choices.push({ value: key.key, label: key.key, group: key.type });
+    const compatible = compatibleBlackboardKeys(entry, parameterId, programBlackboardKeys(program, globalRuleIds));
+    for (const group of groupByNamespace(compatible, (key) => key.key)) {
+      for (const key of group.items) {
+        choices.push({ value: key.key, label: key.key, group: group.label });
+      }
     }
   } else if (semanticType === 'scene_resource') {
     for (const resource of program.scene ?? []) {
@@ -344,6 +428,8 @@ export function programSemanticChoices(
       }
     }
   }
+  // Keys keep their namespace order: root first, node outcomes last.
+  if (semanticType === 'blackboard_key') return choices;
   const unique = new Map(choices.map((choice) => [choice.value, choice]));
   return [...unique.values()].sort((left, right) =>
     (left.group ?? '').localeCompare(right.group ?? '')
@@ -634,6 +720,81 @@ export function collectBlackboardUsages(
       ),
     ]),
   );
+}
+
+/**
+ * Every Draft reference that keeps each component role, one label per use. A
+ * role with no label is free to remove. Counts what the backend validator
+ * counts: node parameters of the component_role semantic type, target roles,
+ * scene component frames, and contact policy component_model_body selectors.
+ */
+export function collectComponentRoleUsages(
+  program: ProgramAuthoringDocument,
+  catalogEntries: CatalogEntry[],
+): Map<string, string[]> {
+  const usages = new Map<string, Set<string>>();
+  const add = (role: JsonValue | undefined, label: string) => {
+    if (typeof role !== 'string') return;
+    usages.set(role, (usages.get(role) ?? new Set<string>()).add(label));
+  };
+  const catalog = new Map(catalogEntries.map((entry) => [entry.id, entry]));
+  for (const { node } of flattenProgramForest(program.forest)) {
+    const entry = catalog.get(node.node_id);
+    for (const field of entry?.parameters ?? []) {
+      if (field.schema['x-manyforge-semantic-type'] === 'component_role') {
+        add(node.parameters[field.id], `node ${node.instance_id}`);
+      }
+    }
+  }
+  for (const [targetId, target] of Object.entries(program.target_roles)) {
+    add(jsonRecord(target)?.component_role, `target role ${targetId}`);
+  }
+  for (const resource of program.scene ?? []) {
+    const frame = resource.pose.frame_ref;
+    if (frame.kind === 'component_frame') {
+      add(frame.component_role, `scene frame ${resource.scene_resource_id}`);
+    }
+  }
+  for (const policy of program.contact_policies ?? []) {
+    const record = jsonRecord(policy);
+    const policyId = typeof record?.policy_id === 'string' ? record.policy_id : 'unnamed';
+    const label = `contact policy ${policyId}`;
+    for (const zone of jsonArray(record?.zones)) {
+      for (const pair of jsonArray(jsonRecord(zone)?.body_pairs)) {
+        for (const side of ['body_a', 'body_b']) {
+          const body = jsonRecord(jsonRecord(pair)?.[side]);
+          if (body?.kind === 'component_model_body') {
+            add(body.component_role_id, label);
+          }
+        }
+      }
+    }
+  }
+  return new Map([...usages].map(([role, labels]) => [role, [...labels]]));
+}
+
+/** The title of a Remove button guarded by its usages: the usages it would break, or the plain action when free. */
+export function removeGuardTitle(usages: readonly string[], freeTitle: string): string {
+  return usages.length > 0 ? usages.join(', ') : freeTitle;
+}
+
+/**
+ * Why a motion node's automatic-retry field is locked, or null (contract items
+ * 7 and 13). A literal relative joint move is never retried; a relative pose or
+ * path is not retried unless it names a target_reference, literal or bound. A
+ * bound target_mode is resolved per attempt by the runner, so nothing locks.
+ */
+export function automaticRetryLockReason(
+  nodeId: string,
+  node: Pick<ProgramTreeNode, 'parameters' | 'value_sources'>,
+  parameterId: string,
+): string | null {
+  if (!(AUTOMATIC_RETRY.parameterIds as readonly string[]).includes(parameterId)) return null;
+  if (!(AUTOMATIC_RETRY.nodeIds as readonly string[]).includes(nodeId)) return null;
+  if (node.value_sources?.target_mode !== undefined) return null;
+  if (node.parameters.target_mode !== 'relative') return null;
+  const hasReference = (node.parameters.target_reference ?? node.value_sources?.target_reference ?? null) !== null;
+  return nodeId === 'motion.move_to_joint_target' || !hasReference ? RELATIVE_RETRY_REASON : null;
 }
 
 /** Group the backend's per-formula names by the declaration each one reads. */

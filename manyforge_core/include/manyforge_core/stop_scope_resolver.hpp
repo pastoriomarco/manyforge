@@ -45,6 +45,10 @@ struct StopScopeComponentSnapshotDTO final {
   ControllableComponentId controllable_component_id;
   ComponentLifecycleGeneration component_lifecycle_generation;
   std::vector<ResourceId> resources;
+  /// Exact subset of resources derived from sealed logical output bindings.
+  /// Those channels may be referenced by several component aliases; physical
+  /// resource membership retains its original unique-component invariant.
+  std::vector<ResourceId> logical_output_resources{};
 
   friend bool operator==(const StopScopeComponentSnapshotDTO&,
                          const StopScopeComponentSnapshotDTO&) = default;
@@ -168,5 +172,10 @@ struct StopAcceptedPredecessorInput final {
     StopScopeResolutionDTO resolution,
     std::vector<StopAffectedOperationRevisionDTO> newly_affected_operation_revisions,
     std::int64_t accepted_at_ns, std::span<const StopAcceptedPredecessorInput> predecessors);
+
+/// Reuse the resolver's canonical diagnostic ordering after owner-local alias
+/// resolution adds stale caller metadata. This grants no scope authority.
+void canonicalize_stop_scope_stale_diagnostics(
+    std::vector<StopScopeStaleDiagnosticDTO>& diagnostics);
 
 }  // namespace manyforge::core

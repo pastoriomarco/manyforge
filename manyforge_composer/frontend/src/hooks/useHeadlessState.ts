@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
 import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
+import { motionWaitRefusalMessage } from '../state/motionWaitRefusal';
 import { operatorAlarmRefusalMessage } from '../state/operatorAlarmRefusal';
 import { structuredErrorText } from '../state/structuredError';
 import { verifiedNoPhysicalComponents } from '../state/viewerModelReadiness';
 import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
+import { parseGlobalRuleStatus, type GlobalRuleStatus } from '../utils/globalRuleStatus';
 import {
   parseApiErrorDto,
   parseKnownProgramRunOutcome,
@@ -438,7 +440,7 @@ function poseSourceViewerKey(value: unknown): unknown {
   // (``isFreshGood``), so their flips publish.
   return [
     source.object_id, source.policy_id, source.source_id, source.source_epoch,
-    source.quality, source.fresh, source.eligible, source.buffered,
+    source.payload_quality, source.fresh, source.eligible, source.buffered,
     payload?.kind ?? null, values,
   ];
 }
@@ -477,7 +479,7 @@ export function sceneRuntimeViewerKey(
  * Delivery diagnostics that never change what the shell shows as status,
  * command enablement or freshness class (spec 450: receiver times, transport
  * sequence counters and computed ages do not trigger shell publication).
- * Pose-source freshness (``fresh``/``quality``) is not among them.
+ * Pose-source freshness (``fresh``/``payload_quality``) is not among them.
  */
 const SHELL_DIAGNOSTIC_FIELDS = new Set([
   'receiverAgeNs',
@@ -704,10 +706,22 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private operationProgress: readonly OperationProgressSample[] = EMPTY_OPERATION_PROGRESS;
   private readonly operationProgressListeners = new Set<Listener>();
   readonly getOperationProgress = () => this.operationProgress;
+  // Global rule states share the progress listeners (both are event-pump facts).
+  private globalRules: readonly GlobalRuleStatus[] | null = null;
+  readonly getGlobalRules = () => this.globalRules;
+  /**
+   * Whether the retained rule rows are live: the control transport is
+   * connected and confirmed with no transport error (not delayed/stale or
+   * failing), and the owner is semantically current. Otherwise the rows are
+   * last known only.
+   */
+  private globalRulesCurrent = false;
+  readonly getGlobalRulesCurrent = () => this.globalRulesCurrent;
   readonly subscribeOperationProgress = (listener: Listener) => {
     this.operationProgressListeners.add(listener);
     return () => this.operationProgressListeners.delete(listener);
   };
+  readonly subscribeGlobalRules = this.subscribeOperationProgress;
   private readonly viewerListeners = new Set<Listener>();
   private readonly executionObservationListeners = new Set<Listener>();
   private readonly observationTransportListeners = new Set<Listener>();
@@ -880,6 +894,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             }
             throw new Error(
               operatorAlarmRefusalMessage(error?.code, error?.details)
+                || motionWaitRefusalMessage(error?.code, error?.details)
                 || error?.message || error?.code
                 || `Execution command rejected (HTTP ${response.status}).`,
             );
@@ -919,7 +934,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             const ownerDetails = ownerError?.details !== null
               && typeof ownerError?.details === 'object' && !Array.isArray(ownerError.details)
               ? ownerError.details as Record<string, unknown> : null;
-            const alarmRefusal = operatorAlarmRefusalMessage(value.code as string, ownerDetails);
+            const alarmRefusal = operatorAlarmRefusalMessage(value.code as string, ownerDetails)
+              ?? motionWaitRefusalMessage(value.code as string, ownerDetails);
             throw new Error(alarmRefusal ?? `${value.code}: ${typeof detail?.message === 'string'
               ? detail.message : value.code}`);
           }
@@ -1216,6 +1232,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
 
   private clearControlSession(reason: string): void {
     this.operationProgress = EMPTY_OPERATION_PROGRESS;
+    this.globalRules = null;
     for (const listener of this.operationProgressListeners) listener();
     this.controlSessionId = null;
     this.controlReceiverIncarnation = null;
@@ -1591,7 +1608,11 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       const progress = progressPresent
         ? parseOperationProgress(shellRecord.operation_progress) : null;
       delete shellRecord.operation_progress;
-      const progressOnly = kind === 'delta' && progressPresent
+      const globalRulesPresent = 'global_rules' in shellRecord;
+      const globalRules = globalRulesPresent
+        ? parseGlobalRuleStatus(shellRecord.global_rules) : null;
+      delete shellRecord.global_rules;
+      const progressOnly = kind === 'delta' && (progressPresent || globalRulesPresent)
         && Object.keys(shellRecord).every((name) => name === 'complete');
       let candidate: ComposerHeadlessState;
       let candidateExecutionTargetsWire = this.executionTargetsWire;
@@ -1743,8 +1764,11 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         || record.event_class === 'critical'
         || !sameShellPublication(this.latest, candidate));
       this.latest = candidate;
-      if (progress !== null || kind === 'snapshot') {
-        this.operationProgress = progress ?? EMPTY_OPERATION_PROGRESS;
+      if (progressPresent || globalRulesPresent || kind === 'snapshot') {
+        if (progressPresent || kind === 'snapshot') {
+          this.operationProgress = progress ?? EMPTY_OPERATION_PROGRESS;
+        }
+        if (globalRulesPresent || kind === 'snapshot') this.globalRules = globalRules;
         for (const listener of this.operationProgressListeners) listener();
       }
       if (canonicalPositiveU64(record.state_sequence)) {
@@ -2095,6 +2119,17 @@ export class HeadlessStateSource implements ExecutionObservationReader {
 
   private refreshControlCondition(): void {
     this.refreshObservationDemand();
+    // The same facts that gate commands (confirmed heartbeat, no transport
+    // error) plus the server-reported semantic status; not the brief local
+    // projection mismatch, so live rows do not flicker on a revision in flight.
+    const rulesCurrent = this.controlTransportStatus === 'connected'
+      && this.controlSemanticStatus === 'current'
+      && this.controlHeartbeatConfirmed
+      && this.controlTransportError === null;
+    if (rulesCurrent !== this.globalRulesCurrent) {
+      this.globalRulesCurrent = rulesCurrent;
+      for (const listener of this.operationProgressListeners) listener();
+    }
     let error = this.enabled ? this.controlTransportError : null;
     const semantic = this.semanticCondition();
     if (this.enabled && error === null && semantic.status === 'synchronizing') {

@@ -2632,19 +2632,17 @@ make_applicability_inputs(
     }
     desired_configurations.emplace_back(CanonicalValue::Object{
         {"control_domain_id", CanonicalValue(domain.control_domain_id.value())},
-        {"control_domain_revision",
-         CanonicalValue(domain.control_domain_revision.value())},
+        {"control_domain_revision", CanonicalValue(domain.control_domain_revision.value())},
         {"controller_topology_id",
-         CanonicalValue(domain.controller_topology_id.value())},
-        {"topology_revision", CanonicalValue(domain.topology_revision.value())},
+         CanonicalValue(domain.controller().controller_topology_id.value())},
+        {"topology_revision", CanonicalValue(domain.controller().topology_revision.value())},
         {"activation_set_id",
-         CanonicalValue(domain.controller_topology_id.value() ==
-                                "lite6_gripper_direct_topology"
-                            ? "gripper_direct"
-                        : domain.controller_topology_id.value() ==
-                                "lite6_arm_direct_topology"
-                            ? "arm_direct"
-                            : "arm_chain")},
+         CanonicalValue(
+             domain.controller().controller_topology_id.value() == "lite6_gripper_direct_topology"
+                 ? "gripper_direct"
+             : domain.controller().controller_topology_id.value() == "lite6_arm_direct_topology"
+                 ? "arm_direct"
+                 : "arm_chain")},
         {"binding_routes", CanonicalValue(std::move(binding_routes))},
     });
   }
@@ -2988,7 +2986,8 @@ make_lite6_controllable_retention_fixture(
     std::string_view ros_gripper_actuation_kind = "pneumatic",
     std::optional<double> ros_gripper_dwell_s = std::nullopt,
     std::string_view ros_gripper_output_mode = "commanded",
-    void (*component_input_mapper)(CanonicalValue::Object &) = nullptr) {
+    void (*component_input_mapper)(CanonicalValue::Object &) = nullptr,
+    const CanonicalValue *interrupt_policy_configuration = nullptr) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (component_input_mapper != nullptr &&
       (!gripper_only || !ros2_control_execution || structural_override == nullptr ||
@@ -3224,6 +3223,35 @@ make_lite6_controllable_retention_fixture(
                                     inputs.normalized_external_resources());
     deployment_members.emplace_back("site_overlay_ref",
                                     *inputs.normalized_site_overlay_ref());
+  }
+  if (interrupt_policy_configuration != nullptr) {
+    for (auto &[name, value] : deployment_members) {
+      if (name != "policies")
+        continue;
+      auto policies = value.as_object();
+      for (auto &[field, selected] : policies) {
+        if (field == "interrupt_sources" || field == "interrupt_policies" ||
+            field == "interrupt_config") {
+          const auto *replacement =
+              interrupt_policy_configuration->find_object_member(field);
+          if (replacement == nullptr)
+            throw std::logic_error("fixture interrupt carrier missing field");
+          selected = *replacement;
+        }
+      }
+      if (const auto *rules =
+              interrupt_policy_configuration->find_object_member(
+                  "interrupt_rules")) {
+        const auto existing = std::find_if(
+            policies.begin(), policies.end(),
+            [](const auto &field) { return field.first == "interrupt_rules"; });
+        if (existing == policies.end())
+          policies.emplace_back("interrupt_rules", *rules);
+        else
+          existing->second = *rules;
+      }
+      value = CanonicalValue(std::move(policies));
+    }
   }
   const CanonicalValue deployment_value(std::move(deployment_members));
   std::vector<QualifiedRuntimeProfile> runtime_profiles;

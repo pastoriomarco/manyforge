@@ -779,8 +779,15 @@ void AppendOptionalRevision(std::vector<std::string> &tokens,
   }
 }
 
-std::string
-EncodeDomains(const std::vector<ConfigurationFenceDomainScopeDTO> &domains) {
+std::string EncodeDomains(const ConfigurationFenceScopeDTO &scope) {
+  if (std::any_of(
+          scope.domains.begin(), scope.domains.end(), [](const auto &domain) {
+            return std::holds_alternative<
+                core::ProviderConfigurationFenceDomainDTO>(domain.payload);
+          }))
+    return "MF-PROVIDER-FENCE-DOMAINS-V1:" +
+           core::detail::EncodeConfigurationFenceScopeRecord(scope);
+  const auto &domains = scope.domains;
   std::vector<std::string> tokens;
   tokens.reserve(domains.size() * 5U);
   for (const auto &domain : domains) {
@@ -840,6 +847,34 @@ std::string EncodeActiveConfigurations(
   return EncodeTokens(tokens);
 }
 
+std::string EncodeExpectedConfigurations(
+    const std::vector<DomainActiveControlConfigurationDTO> &configurations,
+    const std::vector<core::ProviderConfigurationFenceLineageDTO> &lineages) {
+  if (lineages.empty())
+    return EncodeActiveConfigurations(configurations);
+  if (lineages.size() > kMaximumManagerApplyFenceDomains)
+    throw ManagerApplyJournalLimitError(
+        "provider lineage count exceeds the qualified bound");
+  std::vector<std::string> tokens;
+  tokens.reserve(lineages.size() * 3U);
+  for (const auto &lineage : lineages) {
+    if (!lineage.valid())
+      throw std::invalid_argument("provider lineage is invalid");
+    ValidateBoundedIdentity(lineage.control_domain_id.value(),
+                            "provider_lineage_domain");
+    ValidateBoundedIdentity(lineage.provider_runtime_epoch.value(),
+                            "provider_lineage_epoch");
+    tokens.push_back(lineage.control_domain_id.value());
+    tokens.push_back(lineage.provider_runtime_epoch.value());
+    tokens.push_back(std::to_string(
+        CheckedSigned(lineage.component_lifecycle_generation.value(),
+                      "provider_lineage_generation")));
+  }
+  return "MF-PROVIDER-CONFIGURATION-LINEAGES-V1:" +
+         EncodeTokens({EncodeActiveConfigurations(configurations),
+                       EncodeTokens(tokens)});
+}
+
 template <typename Revision>
 [[nodiscard]] std::optional<Revision> DecodeOptionalRevision(
     const std::vector<std::string> &tokens, const std::size_t presence_index,
@@ -864,6 +899,24 @@ ConfigurationFenceScopeDTO DecodeScope(const std::string &components_encoding,
                                        const std::string &domains_encoding,
                                        const std::string &bindings_encoding,
                                        const std::string &resources_encoding) {
+  constexpr std::string_view provider_prefix = "MF-PROVIDER-FENCE-DOMAINS-V1:";
+  if (domains_encoding.starts_with(provider_prefix)) {
+    auto scope = core::detail::DecodeConfigurationFenceScopeRecord(
+        std::string_view(domains_encoding).substr(provider_prefix.size()));
+    if (scope.controllable_component_ids.size() >
+            kMaximumManagerApplyFenceComponents ||
+        scope.domains.size() > kMaximumManagerApplyFenceDomains ||
+        scope.bindings.size() > kMaximumManagerApplyFenceBindings ||
+        scope.resources.size() > kMaximumManagerApplyFenceResources ||
+        EncodeDomains(scope) != domains_encoding ||
+        EncodeComponents(scope.controllable_component_ids) !=
+            components_encoding ||
+        EncodeBindings(scope.bindings) != bindings_encoding ||
+        EncodeResources(scope.resources) != resources_encoding)
+      throw ManagerApplyJournalIntegrityError(
+          "stored provider fence scope is inconsistent");
+    return scope;
+  }
   const auto component_tokens = DecodeTokens(
       components_encoding, kMaximumManagerApplyFenceComponents, "components");
   const auto domain_tokens = DecodeTokens(
@@ -950,6 +1003,42 @@ DecodeActiveConfigurations(const std::string &encoding) {
         ActiveControlConfigurationId(tokens[index + 1U]),
         ActiveControlConfigurationGeneration(generation),
     });
+  }
+  return result;
+}
+
+struct DecodedExpectedConfigurations final {
+  std::vector<DomainActiveControlConfigurationDTO> configurations;
+  std::vector<core::ProviderConfigurationFenceLineageDTO> lineages;
+};
+DecodedExpectedConfigurations
+DecodeExpectedConfigurations(const std::string &encoding) {
+  constexpr std::string_view prefix = "MF-PROVIDER-CONFIGURATION-LINEAGES-V1:";
+  if (!encoding.starts_with(prefix))
+    return {DecodeActiveConfigurations(encoding), {}};
+  const auto fields = DecodeTokens(encoding.substr(prefix.size()), 2U,
+                                   "provider configuration facts");
+  if (fields.size() != 2U)
+    throw ManagerApplyJournalIntegrityError(
+        "provider configuration facts are malformed");
+  DecodedExpectedConfigurations result{DecodeActiveConfigurations(fields[0]),
+                                       {}};
+  const auto tokens = DecodeTokens(
+      fields[1], kMaximumManagerApplyFenceDomains * 3U, "provider lineages");
+  if (tokens.empty() || tokens.size() % 3U != 0U)
+    throw ManagerApplyJournalIntegrityError(
+        "provider lineage tuple cardinality is invalid");
+  for (std::size_t i = 0U; i < tokens.size(); i += 3U) {
+    const auto generation =
+        ParseCanonicalUnsigned(tokens[i + 2U], "provider lineage generation");
+    if (generation == 0U ||
+        generation > static_cast<std::uint64_t>(
+                         std::numeric_limits<std::int64_t>::max()))
+      throw ManagerApplyJournalIntegrityError(
+          "provider lineage generation is invalid");
+    result.lineages.push_back({ControlDomainId(tokens[i]),
+                               RuntimeEpoch(tokens[i + 1U]),
+                               core::ComponentLifecycleGeneration(generation)});
   }
   return result;
 }
@@ -1063,7 +1152,7 @@ std::string EncodeFenceReconciliationEvidence(
       evidence.configuration_fence_id.value(),
       std::to_string(fence_generation),
       EncodeComponents(evidence.reconciled_scope.controllable_component_ids),
-      EncodeDomains(evidence.reconciled_scope.domains),
+      EncodeDomains(evidence.reconciled_scope),
       EncodeBindings(evidence.reconciled_scope.bindings),
       EncodeResources(evidence.reconciled_scope.resources),
       std::to_string(operation_generation),
@@ -1413,7 +1502,8 @@ bool SameFenceIntent(const ApplyConfigurationFenceIntentDTO &lhs,
          lhs.expected_fence_generation == rhs.expected_fence_generation &&
          lhs.expected_active_control_configurations ==
              rhs.expected_active_control_configurations &&
-         lhs.reason == rhs.reason;
+         lhs.reason == rhs.reason &&
+         lhs.expected_provider_lineages == rhs.expected_provider_lineages;
 }
 
 struct EncodedAffectedScope final {
@@ -1449,7 +1539,7 @@ EncodeAffectedScope(const ContentDigest &intent_digest,
       CheckedSigned(affected_scope.apply_generation.value(),
                     "apply_generation"),
       EncodeComponents(affected_scope.scope.controllable_component_ids),
-      EncodeDomains(affected_scope.scope.domains),
+      EncodeDomains(affected_scope.scope),
       EncodeBindings(affected_scope.scope.bindings),
       EncodeResources(affected_scope.scope.resources),
       std::string(core::to_string(affected_scope.busy_disposition)),
@@ -1540,10 +1630,12 @@ EncodeFenceAttempt(const ContentDigest &intent_digest,
       CheckedNonnegativeSigned(intent.expected_fence_generation.value(),
                                "expected_fence_generation"),
       EncodeComponents(intent.scope.controllable_component_ids),
-      EncodeDomains(intent.scope.domains),
+      EncodeDomains(intent.scope),
       EncodeBindings(intent.scope.bindings),
       EncodeResources(intent.scope.resources),
-      EncodeActiveConfigurations(intent.expected_active_control_configurations),
+      EncodeExpectedConfigurations(
+          intent.expected_active_control_configurations,
+          intent.expected_provider_lineages),
       {},
   };
   std::string record;
@@ -1623,7 +1715,7 @@ EncodeFenceAcceptance(const ApplyId &apply_id,
       CheckedSigned(accepted.configuration_fence_generation.value(),
                     "configuration_fence_generation"),
       EncodeComponents(accepted.captured_scope.controllable_component_ids),
-      EncodeDomains(accepted.captured_scope.domains),
+      EncodeDomains(accepted.captured_scope),
       EncodeBindings(accepted.captured_scope.bindings),
       EncodeResources(accepted.captured_scope.resources),
       std::string(core::to_string(accepted.replay_status)),
@@ -3853,6 +3945,8 @@ public:
           "stored Apply-fence attempt is structurally invalid");
     }
     try {
+      const auto configuration_facts =
+          DecodeExpectedConfigurations(active_configurations);
       ApplyConfigurationFenceIntentDTO intent{
           PublicRequestContextDTO{
               RequestId(request_id),
@@ -3871,8 +3965,9 @@ public:
           static_cast<std::uint64_t>(operation_generation),
           ConfigurationFenceGeneration(
               static_cast<std::uint64_t>(fence_generation)),
-          DecodeActiveConfigurations(active_configurations),
+          configuration_facts.configurations,
           reason,
+          configuration_facts.lineages,
       };
       const ContentDigest parent_digest(intent_digest);
       const ContentDigest scope_digest(affected_scope_digest);
@@ -6729,6 +6824,55 @@ core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
   } catch (const std::exception &) {
     sqlite3_close(database);
     return rejected("manager_apply_journal_read_failed");
+  }
+}
+
+core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusReadOnly(
+    const std::filesystem::path &database_path, const CellId &cell_id,
+    const core::NamedApplyPublicationTransactionDTO &apply) {
+  using Reply = core::Result<PersistedManagerApplyStatus>;
+  const auto rejected = [] {
+    return Reply::Err({"manager_apply_read_unavailable",
+                       "The exact retained Apply cannot be verified read-only",
+                       {{"reason", "manager_apply_read_invalid"}}});
+  };
+  if (!apply.valid())
+    return rejected();
+  sqlite3 *raw = nullptr;
+  try {
+    PreflightApplyJournal(database_path, cell_id);
+    if (sqlite3_open_v2(database_path.string().c_str(), &raw,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
+                            SQLITE_OPEN_NOFOLLOW,
+                        nullptr) != SQLITE_OK) {
+      if (raw)
+        sqlite3_close(raw);
+      raw = nullptr;
+      return rejected();
+    }
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(raw,
+                                                                sqlite3_close);
+    raw = nullptr;
+    Check(database.get(),
+          sqlite3_busy_timeout(database.get(), kBusyTimeoutMilliseconds),
+          "configure read-only Apply timeout");
+    Exec(database.get(), "PRAGMA query_only=ON");
+    Transaction snapshot(database.get(), "BEGIN");
+    ValidateApplyJournalIdentityAndSchema(database.get(), cell_id,
+                                          database_path);
+    SqliteManagerApplyJournal::Impl view(database.get(), cell_id);
+    static_cast<void>(view.VerifyIntegrityLocked());
+    auto status = view.StatusLocked(
+        apply.apply_id,
+        CheckedSigned(apply.apply_generation.value(), "apply_generation"));
+    if (!status)
+      return rejected();
+    snapshot.Commit();
+    return Reply::Ok(std::move(*status));
+  } catch (const std::exception &) {
+    if (raw)
+      sqlite3_close(raw);
+    return rejected();
   }
 }
 

@@ -32,6 +32,8 @@ import {
   parseManagerStatusProjection,
   parseMotionPreviewResponse,
   parseManualControlAvailability,
+  parseGlobalRuleRecoveryOffers,
+  parseGlobalRuleRecoveryResult,
   parseStopFaultRecoveryOffer,
   parseStopFaultRecoveryResult,
   parseNodeEnvironmentResponse,
@@ -55,6 +57,15 @@ import {
   parseProgramNodeCorrectionPreview,
   parseProgramRunAdmittedSpeeds,
 } from './parsers';
+import {
+  ioSignalReadBody,
+  mockIoInputBody,
+  parseIoSignalResponse,
+  parseMockIoInputReceipt,
+  type IoSignalReading,
+  type MockIoInputReceipt,
+  type IoSignalSelector,
+} from './parsers/ioSignals';
 import {
   parseComposerSettingsSnapshot,
   type ComposerSettings,
@@ -130,6 +141,8 @@ import type {
   ExecutionIdentity,
   MotionPreviewReceipt,
   ManualControlAvailability,
+  GlobalRuleRecoveryOffer,
+  GlobalRuleRecoveryResult,
   StopFaultRecoveryOffer,
   RuntimeScaleControlSelector,
   RuntimeScaleControlStatus,
@@ -592,7 +605,7 @@ function requireExactCloseIncidentRecovery(
     && result.incidentRecovery === null && result.transactionId === null && result.requestId === null && result.status === null) return;
   if (request.intent !== 'recover' || request.reason !== 'cell closed by operator'
     || result.incidentRecovery?.incidentId !== expected.expected_incident_id
-    || result.incidentRecovery.componentId !== request.controllable_component_id
+    || result.incidentRecovery.controllableComponentId !== request.controllable_component_id
     || result.incidentRecovery.closureReason !== 'cell_closed_by_operator'
     || result.transactionId !== null || result.status !== null) {
     throw new Error('Close incident recovery was not acknowledged for the exact incident.');
@@ -668,9 +681,9 @@ export const api = {
       return requestJson('/api/cclc/targets/settlement', (value) => parseLifecycleOwnerSettlement(value, sent),
         signal, { method: 'POST', body: JSON.stringify({ scope: sent }) });
     },
-    componentProcessStopOffer: (componentId: string): Promise<import('../types/cclc').ComponentProcessStopOffer> => requestJson(
-      `/api/cclc/components/${encodeURIComponent(componentId)}/process/stop-offer`,
-      (value) => parseComponentProcessStopOffer(value, componentId),
+    componentProcessStopOffer: (controllableComponentId: string): Promise<import('../types/cclc').ComponentProcessStopOffer> => requestJson(
+      `/api/cclc/components/${encodeURIComponent(controllableComponentId)}/process/stop-offer`,
+      (value) => parseComponentProcessStopOffer(value, controllableComponentId),
     ),
     stopComponentProcess: (request: ComponentProcessStopRequest): Promise<ComponentProcessStopResult> => {
       const captured = structuredClone(request);
@@ -696,13 +709,13 @@ export const api = {
       signal,
     ),
     component: (
-      componentId: string,
+      controllableComponentId: string,
       signal?: AbortSignal,
     ): Promise<CCLCComponentSnapshot> => requestJson(
-      `/api/cclc/components/${encodeURIComponent(componentId)}`,
+      `/api/cclc/components/${encodeURIComponent(controllableComponentId)}`,
       (value) => {
         const snapshot = parseCCLCComponentSnapshot(value);
-        if (snapshot.componentId !== componentId) {
+        if (snapshot.controllableComponentId !== controllableComponentId) {
           throw new Error('component snapshot does not match its request');
         }
         return snapshot;
@@ -710,13 +723,13 @@ export const api = {
       signal,
     ),
     routeTemplates: (
-      componentId: string,
+      controllableComponentId: string,
       signal?: AbortSignal,
     ): Promise<CCLCRouteTemplateSet> => requestJson(
-      `/api/cclc/components/${encodeURIComponent(componentId)}/route-templates`,
+      `/api/cclc/components/${encodeURIComponent(controllableComponentId)}/route-templates`,
       (value) => {
         const templates = parseCCLCRouteTemplateSet(value);
-        if (templates.componentId !== componentId) {
+        if (templates.controllableComponentId !== controllableComponentId) {
           throw new Error('route templates do not match their request');
         }
         return templates;
@@ -738,7 +751,7 @@ export const api = {
         }
         if (
           result.incidentRecovery !== null
-          && result.incidentRecovery.componentId !== request.controllable_component_id
+          && result.incidentRecovery.controllableComponentId !== request.controllable_component_id
         ) {
           throw new Error('incident recovery does not match its request');
         }
@@ -764,7 +777,7 @@ export const api = {
           throw new Error('lifecycle request result does not match its request');
         }
         if (result.incidentRecovery !== null
-          && result.incidentRecovery.componentId !== request.controllable_component_id) {
+          && result.incidentRecovery.controllableComponentId !== request.controllable_component_id) {
           throw new Error('incident recovery does not match its request');
         }
         requireExactCloseIncidentRecovery(request, result);
@@ -1410,6 +1423,26 @@ export const api = {
     ),
   },
   execution: {
+    /** Read one bound boolean signal (`query_target` kind `io_signal`); no effect. */
+    readIoSignal: (selector: IoSignalSelector, signal?: AbortSignal): Promise<IoSignalReading> =>
+      requestJson(
+        '/api/execution/io-signals/read',
+        (value) => parseIoSignalResponse(value, 'query_target', selector),
+        signal,
+        { method: 'POST', body: JSON.stringify(ioSignalReadBody(selector)) },
+      ),
+    /** Set one installed Mock input to an explicit value (simulation only). */
+    setMockIoInput: (
+      selector: IoSignalSelector,
+      expectedSourceEpoch: string,
+      value: boolean,
+      signal?: AbortSignal,
+    ): Promise<MockIoInputReceipt> => requestJson(
+      '/api/execution/io-signals/mock-input',
+      (response) => parseMockIoInputReceipt(response, selector, value),
+      signal,
+      { method: 'POST', body: JSON.stringify(mockIoInputBody(selector, expectedSourceEpoch, value)) },
+    ),
     /** Each robot's latest owner-admitted TCP speed in one Program run (history evidence). */
     admittedSpeeds: (programRunId: string, signal?: AbortSignal): Promise<ProgramRunAdmittedSpeeds> =>
       requestJson(
@@ -1473,6 +1506,42 @@ export const api = {
                 row.activeControlConfigurationGeneration,
             })),
             reason: 'operator requested cell recovery',
+          }),
+        },
+      );
+    },
+    /** Latched global rules' recovery offers from the same stop-fault read (SX-2206). */
+    globalRuleRecoveryOffers: (signal?: AbortSignal): Promise<GlobalRuleRecoveryOffer[]> =>
+      requestJson('/api/execution/stop-fault', parseGlobalRuleRecoveryOffers, signal),
+    /**
+     * Clear one latched global rule with the offer's exact selector. One send
+     * per operator action: an unknown outcome is reported, never replayed.
+     */
+    clearGlobalRuleLatch: (
+      ownerEpoch: string,
+      requestId: string,
+      offer: GlobalRuleRecoveryOffer,
+      signal?: AbortSignal,
+    ): Promise<GlobalRuleRecoveryResult> => {
+      // The sent selector, snapshotted: its reply must echo exactly its rule
+      // and context (SX-2216).
+      const selector = { ...offer.selector, context: { ...offer.selector.context } };
+      return requestJson(
+        '/api/execution/stop-fault/recover',
+        (value) => parseGlobalRuleRecoveryResult(value, requestId, selector),
+        signal,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            kind: 'global_io_rule',
+            request_context: {
+              request_id: requestId,
+              request_owner_epoch: ownerEpoch,
+              source_label: 'composer_ui',
+              correlation_id: null,
+            },
+            selector,
+            reason: 'operator cleared global rule latch',
           }),
         },
       );

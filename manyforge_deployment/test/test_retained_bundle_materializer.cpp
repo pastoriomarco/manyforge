@@ -24,6 +24,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -231,9 +232,36 @@ array_member(const CanonicalValue &value, std::string_view name) {
 }
 
 [[nodiscard]] RetentionQualifiedDeployment
-qualify_empty(std::string_view cell_id) {
+qualify_empty(std::string_view cell_id,
+              std::optional<double> takeover_budget_s = std::nullopt) {
+  auto root = parse_strict_json_model_yaml(deployment_document(cell_id))
+                  .root()
+                  .as_object();
+  if (takeover_budget_s.has_value()) {
+    root.emplace_back(
+        "policies",
+        CanonicalValue(CanonicalValue::Object{
+            {"retained_policy_records",
+             CanonicalValue(CanonicalValue::Array{})},
+            {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
+            {"commissioned_stop_interfaces",
+             CanonicalValue(CanonicalValue::Array{})},
+            {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
+            {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
+            {"interrupt_config",
+             CanonicalValue(CanonicalValue::Object{
+                 {"queue_depth", CanonicalValue(8.0)},
+                 {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
+                 {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
+                 {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
+             })},
+            {"motion_takeover_preparation_budget_s",
+             CanonicalValue(*takeover_budget_s)},
+        }));
+  }
   const auto deployment = compute_deployment_artifact_revision(
-      parse_strict_json_model_yaml(deployment_document(cell_id)),
+      parse_strict_json_model_yaml(
+          canonical_json(CanonicalValue(std::move(root)))),
       std::span<const QualifiedRuntimeProfile>{});
   const auto composition = compose_cell_occurrences(
       deployment.graph(), std::span<const SourceVerifiedModelAsset>{},
@@ -249,8 +277,9 @@ qualify_empty(std::string_view cell_id) {
 }
 
 [[nodiscard]] std::shared_ptr<const RetainedBundle>
-materialize_empty(std::string_view cell_id, IRawArtifactStore &store) {
-  const auto qualified = qualify_empty(cell_id);
+materialize_empty(std::string_view cell_id, IRawArtifactStore &store,
+                  std::optional<double> takeover_budget_s = std::nullopt) {
+  const auto qualified = qualify_empty(cell_id, takeover_budget_s);
   const detail::RejectingCompilerInputArtifactSource input_source;
   detail::RejectingCatalogArtifactStore catalog_store;
   return detail::RetainedBundleMaterializer::materialize(
@@ -3662,6 +3691,54 @@ TEST(RetainedBundleMaterializer,
       EXPECT_NE(first_artifacts[index].content_digest,
                 second_artifacts[index].content_digest);
     }
+  }
+}
+
+TEST(RetainedBundleMaterializer,
+     MovingTakeoverBudgetIsOptionalRetainedAndBoundByTheBundleIdentity) {
+  test::InMemoryRawArtifactStoreFixture store;
+  const auto ordinary = materialize_empty("i3_budget_cell", store);
+  EXPECT_FALSE(
+      ordinary->value().motion_takeover_preparation_budget_s.has_value());
+  EXPECT_EQ(ordinary->normalized_root().find_object_member(
+                "motion_takeover_preparation_budget_s"),
+            nullptr);
+  const auto moving = materialize_empty("i3_budget_cell", store, 3.5);
+  EXPECT_EQ(moving->value().motion_takeover_preparation_budget_s,
+            std::optional<double>(3.5));
+  EXPECT_NE(moving->retained_bundle_id(), ordinary->retained_bundle_id());
+  const auto reloaded =
+      detail::RetainedBundleReloadAuthority::reload(moving->canonical_bytes());
+  EXPECT_EQ(reloaded->value(), moving->value());
+  EXPECT_TRUE(verify_retained_bundle_identity(*reloaded));
+
+  const auto tampered = replace_root_member(
+      moving->normalized_root(), "motion_takeover_preparation_budget_s",
+      CanonicalValue(7.0));
+  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+                   canonical_json(tampered))),
+               RetainedBundleError);
+  const auto resealed = detail::RetainedBundleReloadAuthority::reload(
+      canonical_json(reidentify_retained_bundle(tampered)));
+  EXPECT_EQ(resealed->value().motion_takeover_preparation_budget_s,
+            std::optional<double>(7.0));
+  EXPECT_NE(resealed->retained_bundle_id(), moving->retained_bundle_id());
+}
+
+TEST(RetainedBundleMaterializer,
+     MovingTakeoverBudgetRejectsInvalidPresentValuesEvenWithFreshIdentity) {
+  test::InMemoryRawArtifactStoreFixture store;
+  const auto moving = materialize_empty("i3_budget_invalid_cell", store, 3.5);
+  for (const auto &invalid : std::vector<CanonicalValue>{
+           CanonicalValue(nullptr), CanonicalValue(false),
+           CanonicalValue("3.5"), CanonicalValue(0.0), CanonicalValue(-1.0)}) {
+    const auto changed = reidentify_retained_bundle(
+        replace_root_member(moving->normalized_root(),
+                            "motion_takeover_preparation_budget_s", invalid));
+    EXPECT_THROW(
+        static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+            canonical_json(changed))),
+        RetainedBundleError);
   }
 }
 

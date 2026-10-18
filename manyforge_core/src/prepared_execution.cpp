@@ -71,26 +71,27 @@ template <typename Available, typename Selected, typename Matches>
 
 [[nodiscard]] bool participant_identity_shape(
     const PreparedOperationParticipantDTO& participant) noexcept {
-  return digest(participant.prepared_contract_digest) && identity(participant.operation_id) &&
+  return participant.provider() == nullptr && participant.binding_identity.controller() != nullptr &&
+         digest(participant.prepared_contract_digest) && identity(participant.operation_id) &&
          counter(participant.operation_revision) && identity(participant.participant_id) &&
          identity(participant.controllable_component_id) &&
          identity(participant.command_target_id) && identity(participant.capability_id) &&
-         identity(participant.control_domain_id) && identity(participant.control_domain_revision) &&
-         identity(participant.control_binding_id) &&
-         identity(participant.control_binding_revision) &&
-         identity(participant.active_control_configuration_id) &&
-         counter(participant.active_control_configuration_generation) &&
+         identity(participant.binding_identity.control_domain_id) && identity(participant.binding_identity.control_domain_revision) &&
+         identity(participant.binding_identity.controller()->control_binding_id) &&
+         identity(participant.binding_identity.controller()->control_binding_revision) &&
+         identity(participant.controller().active_control_configuration_id) &&
+         counter(participant.controller().active_control_configuration_generation) &&
          capability_provider_pair_valid(
-             participant.capability_provider
-                 ? std::optional(participant.capability_provider->capability_provider_binding_id)
+             participant.controller().capability_provider
+                 ? std::optional(participant.controller().capability_provider->capability_provider_binding_id)
                  : std::nullopt,
-             participant.capability_provider
+             participant.controller().capability_provider
                  ? std::optional(
-                       participant.capability_provider->capability_provider_binding_revision)
+                       participant.controller().capability_provider->capability_provider_binding_revision)
                  : std::nullopt) &&
-         identity(participant.controller_topology_id) && identity(participant.topology_revision) &&
-         identity(participant.control_route_id) &&
-         identity(participant.control_provider.runtime_epoch) &&
+         identity(participant.controller().controller_topology_id) && identity(participant.controller().topology_revision) &&
+         identity(participant.controller().control_route_id) &&
+         identity(participant.controller().control_provider.runtime_epoch) &&
          canonical_resources(participant.resources);
 }
 
@@ -123,13 +124,14 @@ template <typename Available, typename Selected, typename Matches>
 [[nodiscard]] bool prepare_identity_matches(
     const PrepareParticipantResultDTO& result,
     const PreparedOperationParticipantDTO& participant) noexcept {
+  if (participant.provider() || !participant.binding_identity.controller()) return false;
   const auto expected_provider_id =
-      participant.capability_provider
-          ? std::optional(participant.capability_provider->capability_provider_binding_id)
+      participant.controller().capability_provider
+          ? std::optional(participant.controller().capability_provider->capability_provider_binding_id)
           : std::nullopt;
   const auto expected_provider_revision =
-      participant.capability_provider
-          ? std::optional(participant.capability_provider->capability_provider_binding_revision)
+      participant.controller().capability_provider
+          ? std::optional(participant.controller().capability_provider->capability_provider_binding_revision)
           : std::nullopt;
   return result.operation_id == participant.operation_id &&
          result.operation_revision == participant.operation_revision &&
@@ -137,19 +139,19 @@ template <typename Available, typename Selected, typename Matches>
          result.controllable_component_id == participant.controllable_component_id &&
          result.command_target_id == participant.command_target_id &&
          result.capability_id == participant.capability_id &&
-         result.control_domain_id == participant.control_domain_id &&
-         result.control_domain_revision == participant.control_domain_revision &&
-         result.control_binding_id == participant.control_binding_id &&
-         result.control_binding_revision == participant.control_binding_revision &&
-         result.active_control_configuration_id == participant.active_control_configuration_id &&
+         result.control_domain_id == participant.binding_identity.control_domain_id &&
+         result.control_domain_revision == participant.binding_identity.control_domain_revision &&
+         result.control_binding_id == participant.binding_identity.controller()->control_binding_id &&
+         result.control_binding_revision == participant.binding_identity.controller()->control_binding_revision &&
+         result.active_control_configuration_id == participant.controller().active_control_configuration_id &&
          result.active_control_configuration_generation ==
-             participant.active_control_configuration_generation &&
+             participant.controller().active_control_configuration_generation &&
          result.capability_provider_binding_id == expected_provider_id &&
          result.capability_provider_binding_revision == expected_provider_revision &&
-         result.controller_topology_id == participant.controller_topology_id &&
-         result.topology_revision == participant.topology_revision &&
-         result.control_route_id == participant.control_route_id &&
-         result.provider_runtime_epoch == participant.control_provider.runtime_epoch &&
+         result.controller_topology_id == participant.controller().controller_topology_id &&
+         result.topology_revision == participant.controller().topology_revision &&
+         result.control_route_id == participant.controller().control_route_id &&
+         result.provider_runtime_epoch == participant.controller().control_provider.runtime_epoch &&
          result.payload_kind == prepared_participant_payload_kind(participant);
 }
 
@@ -157,25 +159,26 @@ template <typename Available, typename Selected, typename Matches>
     const ExecutionBackendStatusDTO& status, const PreparedOperationParticipantDTO& participant,
     const ControllerGoalId& controller_goal_id,
     ControllerGoalGeneration controller_goal_generation) noexcept {
+  if (participant.provider() || !participant.binding_identity.controller()) return false;
   return status.operation_id == participant.operation_id &&
          status.operation_revision == participant.operation_revision &&
          status.participant_id == participant.participant_id &&
          status.controllable_component_id == participant.controllable_component_id &&
          status.command_target_id == participant.command_target_id &&
          status.capability_id == participant.capability_id &&
-         status.control_domain_id == participant.control_domain_id &&
-         status.control_domain_revision == participant.control_domain_revision &&
-         status.control_binding_id == participant.control_binding_id &&
-         status.control_binding_revision == participant.control_binding_revision &&
-         status.controller_topology_id == participant.controller_topology_id &&
-         status.topology_revision == participant.topology_revision &&
-         status.control_route_id == participant.control_route_id &&
-         status.active_control_configuration_id == participant.active_control_configuration_id &&
+         status.control_domain_id == participant.binding_identity.control_domain_id &&
+         status.control_domain_revision == participant.binding_identity.control_domain_revision &&
+         status.control_binding_id == participant.binding_identity.controller()->control_binding_id &&
+         status.control_binding_revision == participant.binding_identity.controller()->control_binding_revision &&
+         status.controller_topology_id == participant.controller().controller_topology_id &&
+         status.topology_revision == participant.controller().topology_revision &&
+         status.control_route_id == participant.controller().control_route_id &&
+         status.active_control_configuration_id == participant.controller().active_control_configuration_id &&
          status.active_control_configuration_generation ==
-             participant.active_control_configuration_generation &&
+             participant.controller().active_control_configuration_generation &&
          status.controller_goal_id == controller_goal_id &&
          status.controller_goal_generation == controller_goal_generation &&
-         status.provider_runtime_epoch == participant.control_provider.runtime_epoch &&
+         status.provider_runtime_epoch == participant.controller().control_provider.runtime_epoch &&
          status.resources == participant.resources;
 }
 
@@ -187,7 +190,7 @@ template <typename Available, typename Selected, typename Matches>
 
 [[nodiscard]] bool stop_plan_matches_participant(
     const PreparedOperationParticipantDTO& participant) noexcept {
-  const auto& stop_plan = participant.ordinary_stop_plan;
+  const auto& stop_plan = participant.controller().ordinary_stop_plan;
   const bool ordinary_plan =
       stop_plan.participant_stop_profile_purpose ==
           ParticipantStopProfilePurposeDTO::kOrdinary &&
@@ -256,42 +259,42 @@ std::optional<std::string_view> prepared_participant_backend_binding_field_error
     return "prepared_participant_backend_model_bindings_mismatch";
   if (participant.frame_bindings != binding.frame_bindings)
     return "prepared_participant_backend_frame_bindings_mismatch";
-  if (participant.control_domain_id != path.control_domain_id)
+  if (participant.binding_identity.control_domain_id != path.control_domain_id)
     return "prepared_participant_backend_control_domain_id_mismatch";
-  if (participant.control_domain_revision != path.control_domain_revision)
+  if (participant.binding_identity.control_domain_revision != path.control_domain_revision)
     return "prepared_participant_backend_control_domain_revision_mismatch";
-  if (participant.control_binding_id != path.control_binding_id)
+  if (participant.binding_identity.controller()->control_binding_id != path.control_binding_id)
     return "prepared_participant_backend_control_binding_id_mismatch";
-  if (participant.control_binding_revision != path.control_binding_revision)
+  if (participant.binding_identity.controller()->control_binding_revision != path.control_binding_revision)
     return "prepared_participant_backend_control_binding_revision_mismatch";
-  if (participant.control_interface_contract_id != path.control_interface_contract_id)
+  if (participant.controller().control_interface_contract_id != path.control_interface_contract_id)
     return "prepared_participant_backend_interface_contract_id_mismatch";
-  if (participant.control_interface_revision != path.control_interface_revision)
+  if (participant.controller().control_interface_revision != path.control_interface_revision)
     return "prepared_participant_backend_interface_revision_mismatch";
-  if (participant.controller_topology_id != path.controller_topology_id)
+  if (participant.controller().controller_topology_id != path.controller_topology_id)
     return "prepared_participant_backend_controller_topology_id_mismatch";
-  if (participant.topology_revision != path.topology_revision)
+  if (participant.controller().topology_revision != path.topology_revision)
     return "prepared_participant_backend_topology_revision_mismatch";
-  if (participant.control_route_id != path.control_route_id)
+  if (participant.controller().control_route_id != path.control_route_id)
     return "prepared_participant_backend_control_route_id_mismatch";
-  if (participant.activation_set_id != path.activation_set_id)
+  if (participant.controller().activation_set_id != path.activation_set_id)
     return "prepared_participant_backend_activation_set_id_mismatch";
-  if (participant.control_provider != provider(path))
+  if (participant.controller().control_provider != provider(path))
     return "prepared_participant_backend_control_provider_mismatch";
-  if (participant.capability_provider != expected_capability_provider)
+  if (participant.controller().capability_provider != expected_capability_provider)
     return "prepared_participant_backend_capability_provider_mismatch";
   if (participant.resources != binding_resources(binding))
     return "prepared_participant_backend_resources_mismatch";
-  if (participant.active_control_configuration_id != path.active_control_configuration_id)
+  if (participant.controller().active_control_configuration_id != path.active_control_configuration_id)
     return "prepared_participant_backend_active_configuration_id_mismatch";
-  if (participant.active_control_configuration_generation !=
+  if (participant.controller().active_control_configuration_generation !=
       path.active_control_configuration_generation)
     return "prepared_participant_backend_active_configuration_generation_mismatch";
   if (participant.runtime_unit_epochs != binding.runtime_unit_epochs)
     return "prepared_participant_backend_runtime_unit_epochs_mismatch";
-  if (participant.stop_evidence_policy_id != path.stop_evidence_policy_id)
+  if (participant.controller().stop_evidence_policy_id != path.stop_evidence_policy_id)
     return "prepared_participant_backend_stop_evidence_policy_id_mismatch";
-  if (participant.stop_evidence_policy_revision != path.stop_evidence_policy_revision)
+  if (participant.controller().stop_evidence_policy_revision != path.stop_evidence_policy_revision)
     return "prepared_participant_backend_stop_evidence_policy_revision_mismatch";
   if (!stop_plan_matches_participant(participant)) {
     return "prepared_participant_backend_stop_plan_mismatch";
@@ -344,29 +347,29 @@ prepared_participant_backend_physical_binding_field_error(
                    available.compiled_frame_name == selected.compiled_frame_name;
           }))
     return "prepared_participant_backend_frame_bindings_mismatch";
-  if (participant.control_domain_id != path.control_domain_id)
+  if (participant.binding_identity.control_domain_id != path.control_domain_id)
     return "prepared_participant_backend_control_domain_id_mismatch";
-  if (participant.control_domain_revision != path.control_domain_revision)
+  if (participant.binding_identity.control_domain_revision != path.control_domain_revision)
     return "prepared_participant_backend_control_domain_revision_mismatch";
-  if (participant.control_binding_id != path.control_binding_id)
+  if (participant.binding_identity.controller()->control_binding_id != path.control_binding_id)
     return "prepared_participant_backend_control_binding_id_mismatch";
-  if (participant.control_binding_revision != path.control_binding_revision)
+  if (participant.binding_identity.controller()->control_binding_revision != path.control_binding_revision)
     return "prepared_participant_backend_control_binding_revision_mismatch";
-  if (participant.control_interface_contract_id != path.control_interface_contract_id)
+  if (participant.controller().control_interface_contract_id != path.control_interface_contract_id)
     return "prepared_participant_backend_interface_contract_id_mismatch";
-  if (participant.control_interface_revision != path.control_interface_revision)
+  if (participant.controller().control_interface_revision != path.control_interface_revision)
     return "prepared_participant_backend_interface_revision_mismatch";
-  if (participant.controller_topology_id != path.controller_topology_id)
+  if (participant.controller().controller_topology_id != path.controller_topology_id)
     return "prepared_participant_backend_controller_topology_id_mismatch";
-  if (participant.topology_revision != path.topology_revision)
+  if (participant.controller().topology_revision != path.topology_revision)
     return "prepared_participant_backend_topology_revision_mismatch";
-  if (participant.control_route_id != path.control_route_id)
+  if (participant.controller().control_route_id != path.control_route_id)
     return "prepared_participant_backend_control_route_id_mismatch";
-  if (participant.activation_set_id != path.activation_set_id)
+  if (participant.controller().activation_set_id != path.activation_set_id)
     return "prepared_participant_backend_activation_set_id_mismatch";
-  if (participant.control_provider != provider(path))
+  if (participant.controller().control_provider != provider(path))
     return "prepared_participant_backend_control_provider_mismatch";
-  if (participant.capability_provider != expected_capability_provider)
+  if (participant.controller().capability_provider != expected_capability_provider)
     return "prepared_participant_backend_capability_provider_mismatch";
   if (!unambiguous_subset(
           binding.resources, participant.resources,
@@ -374,16 +377,16 @@ prepared_participant_backend_physical_binding_field_error(
             return available.resource_id == selected;
           }))
     return "prepared_participant_backend_resources_mismatch";
-  if (participant.active_control_configuration_id != path.active_control_configuration_id)
+  if (participant.controller().active_control_configuration_id != path.active_control_configuration_id)
     return "prepared_participant_backend_active_configuration_id_mismatch";
-  if (participant.active_control_configuration_generation !=
+  if (participant.controller().active_control_configuration_generation !=
       path.active_control_configuration_generation)
     return "prepared_participant_backend_active_configuration_generation_mismatch";
   if (participant.runtime_unit_epochs != binding.runtime_unit_epochs)
     return "prepared_participant_backend_runtime_unit_epochs_mismatch";
-  if (participant.stop_evidence_policy_id != path.stop_evidence_policy_id)
+  if (participant.controller().stop_evidence_policy_id != path.stop_evidence_policy_id)
     return "prepared_participant_backend_stop_evidence_policy_id_mismatch";
-  if (participant.stop_evidence_policy_revision != path.stop_evidence_policy_revision)
+  if (participant.controller().stop_evidence_policy_revision != path.stop_evidence_policy_revision)
     return "prepared_participant_backend_stop_evidence_policy_revision_mismatch";
   if (!stop_plan_matches_participant(participant))
     return "prepared_participant_backend_stop_plan_mismatch";
@@ -419,13 +422,15 @@ std::optional<std::string_view> prepare_participant_result_field_error(
 Result<PrepareParticipantResultDTO> MakePrepareParticipantResult(
     const PreparedOperationParticipantDTO& participant, PrepareParticipantResultStateDTO state,
     std::optional<ErrorDTO> error) {
+  if (participant.provider() || !participant.binding_identity.controller())
+    return Result<PrepareParticipantResultDTO>::Err(invalid_projection("prepared_controller_authority_required"));
   const auto provider_id =
-      participant.capability_provider
-          ? std::optional(participant.capability_provider->capability_provider_binding_id)
+      participant.controller().capability_provider
+          ? std::optional(participant.controller().capability_provider->capability_provider_binding_id)
           : std::nullopt;
   const auto provider_revision =
-      participant.capability_provider
-          ? std::optional(participant.capability_provider->capability_provider_binding_revision)
+      participant.controller().capability_provider
+          ? std::optional(participant.controller().capability_provider->capability_provider_binding_revision)
           : std::nullopt;
   PrepareParticipantResultDTO result{participant.operation_id,
                                      participant.operation_revision,
@@ -433,18 +438,18 @@ Result<PrepareParticipantResultDTO> MakePrepareParticipantResult(
                                      participant.controllable_component_id,
                                      participant.command_target_id,
                                      participant.capability_id,
-                                     participant.control_domain_id,
-                                     participant.control_domain_revision,
-                                     participant.control_binding_id,
-                                     participant.control_binding_revision,
-                                     participant.active_control_configuration_id,
-                                     participant.active_control_configuration_generation,
+                                     participant.binding_identity.control_domain_id,
+                                     participant.binding_identity.control_domain_revision,
+                                     participant.binding_identity.controller()->control_binding_id,
+                                     participant.binding_identity.controller()->control_binding_revision,
+                                     participant.controller().active_control_configuration_id,
+                                     participant.controller().active_control_configuration_generation,
                                      provider_id,
                                      provider_revision,
-                                     participant.controller_topology_id,
-                                     participant.topology_revision,
-                                     participant.control_route_id,
-                                     participant.control_provider.runtime_epoch,
+                                     participant.controller().controller_topology_id,
+                                     participant.controller().topology_revision,
+                                     participant.controller().control_route_id,
+                                     participant.controller().control_provider.runtime_epoch,
                                      prepared_participant_payload_kind(participant),
                                      state,
                                      state == PrepareParticipantResultStateDTO::kPrepared
@@ -518,24 +523,26 @@ Result<ExecutionBackendStatusDTO> MakeExecutionBackendStatus(
     ControllerGoalGeneration controller_goal_generation, ExecutionBackendStateDTO state,
     double accepted_trajectory_time_s, double progress, std::uint64_t source_sequence,
     std::int64_t receiver_local_receipt_timestamp_ns, std::optional<ErrorDTO> error) {
+  if (participant.provider() || !participant.binding_identity.controller())
+    return Result<ExecutionBackendStatusDTO>::Err(invalid_projection("prepared_controller_authority_required"));
   ExecutionBackendStatusDTO status{participant.operation_id,
                                    participant.operation_revision,
                                    participant.participant_id,
                                    participant.controllable_component_id,
                                    participant.command_target_id,
                                    participant.capability_id,
-                                   participant.control_domain_id,
-                                   participant.control_domain_revision,
-                                   participant.control_binding_id,
-                                   participant.control_binding_revision,
-                                   participant.controller_topology_id,
-                                   participant.topology_revision,
-                                   participant.control_route_id,
-                                   participant.active_control_configuration_id,
-                                   participant.active_control_configuration_generation,
+                                   participant.binding_identity.control_domain_id,
+                                   participant.binding_identity.control_domain_revision,
+                                   participant.binding_identity.controller()->control_binding_id,
+                                   participant.binding_identity.controller()->control_binding_revision,
+                                   participant.controller().controller_topology_id,
+                                   participant.controller().topology_revision,
+                                   participant.controller().control_route_id,
+                                   participant.controller().active_control_configuration_id,
+                                   participant.controller().active_control_configuration_generation,
                                    controller_goal_id,
                                    controller_goal_generation,
-                                   participant.control_provider.runtime_epoch,
+                                   participant.controller().control_provider.runtime_epoch,
                                    participant.resources,
                                    state,
                                    accepted_trajectory_time_s,

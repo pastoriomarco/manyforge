@@ -717,6 +717,41 @@ TEST(JtcExecutionPort, ImmediateQuiescenceAfterStartCannotLoseExecutorCancellati
   }
 }
 
+TEST(Ros2TransportResources, TransportOnlyRunsCallbacksWithoutSceneProjection) {
+  Ros2TransportResources resources("generic_io_transport_test",
+                                   "/generic_io_test", 2);
+  EXPECT_EQ(std::string(resources.node()->get_namespace()), "/generic_io_test");
+  EXPECT_THROW(resources.projection_worker(), std::logic_error);
+  auto received = std::make_shared<std::promise<void>>();
+  auto completed = received->get_future();
+  auto notified = std::make_shared<std::atomic<bool>>(false);
+  const auto timer =
+      resources.node()->create_wall_timer(1ms, [received, notified] {
+        if (!notified->exchange(true))
+          received->set_value();
+      });
+  resources.start();
+  EXPECT_EQ(completed.wait_for(3s), std::future_status::ready);
+  EXPECT_TRUE(JtcExecutionPortTestPeer::executor_is_spinning(resources));
+  resources.quiesce();
+  EXPECT_FALSE(JtcExecutionPortTestPeer::executor_is_spinning(resources));
+  EXPECT_FALSE(
+      resources.node()->get_node_base_interface()->get_context()->is_valid());
+  EXPECT_THROW(resources.start(), std::logic_error);
+  resources.quiesce();
+}
+
+TEST(Ros2TransportResources, TransportOnlyCanQuiesceBeforeStart) {
+  Ros2TransportResources resources("generic_io_unstarted_transport_test", "",
+                                   2);
+  EXPECT_FALSE(resources.started());
+  resources.quiesce();
+  EXPECT_FALSE(
+      resources.node()->get_node_base_interface()->get_context()->is_valid());
+  EXPECT_THROW(resources.start(), std::logic_error);
+  resources.quiesce();
+}
+
 TEST(JtcExecutionPort, ShutdownAfterContextStoppedNeedsNoNotificationOrCommands) {
   Rig rig;
   const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);

@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread
+from types import MappingProxyType, SimpleNamespace
 import time
 from typing import Any
 
@@ -101,7 +102,11 @@ def test_owner_captures_values_before_later_writes_without_changing_status_wire(
     assert snapshot.state is ProgramRunState.SUCCEEDED
     run.value_store.write("recorded_value", False)
     record = owner.take_diagnostic(run_id)
-    assert record["blackboard"] == {"recorded_value": True}
+    # The motion node's system-owned outcome key is captured like any key.
+    assert record["blackboard"] == {
+        "node_outcome.move_to_pick": "completed",
+        "recorded_value": True,
+    }
     assert record["program_binding_id"] == admission.program_binding_id
     assert not {"runtime_overrides", "omitted_override_count"} & set(record)
     assert "blackboard" not in snapshot.to_dict()
@@ -114,6 +119,20 @@ def _plain(value: Any) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return [_plain(nested) for nested in value]
     return value
+
+
+# A settled, not-eligible assessment for the failed motion attempts these fakes
+# model. Without one the owner adapter waits for an assessment to settle.
+_SETTLED_FAILURE_METADATA: Mapping[str, Any] = MappingProxyType(
+    {
+        "recovery_assessment": {
+            "status": "action_required",
+            "execution_state": "Failed",
+            "allowed_actions": [],
+            "recovery_class": "failed_validation",
+        }
+    }
+)
 
 
 class _TaskPort:
@@ -138,6 +157,11 @@ class _TaskPort:
         return OwnerTaskSnapshot(
             task_id=f"task-{self.starts}",
             state=self._initial_state,
+            metadata=(
+                _SETTLED_FAILURE_METADATA
+                if self._initial_state is OwnerTaskState.FAILED
+                else {}
+            ),
             reason_code=(
                 "owner_failed" if self._initial_state is OwnerTaskState.FAILED else None
             ),
@@ -190,6 +214,7 @@ class _PolicyTaskPort(_TaskPort):
             task_id=f"task-{self.starts}",
             state=OwnerTaskState.FAILED,
             metadata={
+                **_SETTLED_FAILURE_METADATA,
                 "authored_failure_policy": "pause_for_operator",
                 "authored_failure_policy_parameter": ("no_feasible_plan_policy"),
             },
@@ -219,6 +244,8 @@ class _OperatorStopTaskPort(_TaskPort):
                 "recovery_assessment": {
                     "allowed_actions": ["replan_from_stopped_state"],
                     "recovery_class": self.recovery_class,
+                    "status": "action_required",
+                    "execution_state": "Stopped",
                     "stop_id": "stop.1",
                     "stop_generation": 1,
                 },
@@ -1311,6 +1338,7 @@ class _ObservationBoundFailureTaskPort(_PolicyTaskPort):
             "allowed_actions": ["retry_after_scene_repair", "reset_cycle"],
             "observed_state_valid_until_ns": self.deadline_ns,
             "recovery_class": "failed_validation",
+            "execution_state": "Failed",
             "retry_admissible": True,
             "status": "retry_ready",
         }
@@ -3795,7 +3823,9 @@ def test_program_run_snapshot_is_a_closed_serializable_owner_projection() -> Non
         "message",
         "details",
         "origin",
+        "operation_failures",
     }
+    assert value["operation_failures"] == []
     assert value["schema_version"] == "manyforge.program_run_status.v3"
     assert value["details"] is None and value["origin"] is None
     assert value["node_status_revision"] == 1
@@ -4466,3 +4496,591 @@ def test_program_owner_retires_held_preparation_before_exact_selected_release(cl
         with pytest.raises(ProgramRunOwnerError): owner.resume_motion(run_id,**args)
         assert scope.release_requests == 0 and scope.held
         assert task.starts == 1
+
+
+class _MotionRetryTaskPort(_TaskPort):
+    """A motion attempt fails with an eligible planning cause; it can be closed."""
+
+    def __init__(self, events: list[str], holder: dict[str, Any]) -> None:
+        super().__init__(events, OwnerTaskState.FAILED)
+        self._holder = holder
+        self.closes: list[str] = []
+        self.recoveries: list[str] = []
+        self._assessment = {
+            "allowed_actions": ["retry_after_scene_repair"],
+            "recovery_class": "planning_failed",
+            "status": "retry_ready",
+            "execution_state": "Failed",
+            "eligible_close": True,
+            "retry_eligibility": {
+                "eligible": True,
+                "cause": "planning_no_effect",
+                "effect": "known_no_effect",
+                "reason": None,
+            },
+        }
+
+    def start(self, _node_id, _identity, _inputs) -> OwnerTaskSnapshot:
+        self.starts += 1
+        return self.observe(f"task-{self.starts}")
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        return OwnerTaskSnapshot(
+            task_id=task_id,
+            state=OwnerTaskState.FAILED,
+            metadata={"recovery_assessment": self._assessment, "operation_id": task_id},
+            reason_code="planning_failed",
+            message="no feasible path",
+        )
+
+    def close(self, task_id, _identity, *, request_id) -> bool:
+        self.closes.append(task_id)
+        return True
+
+    def recover(self, _task_id, _identity, *, action, request_id, reason):
+        self.recoveries.append(action)
+        return {"request_id": request_id, "action": action, "accepted": True, "error": None}
+
+
+def test_run_stopped_during_an_automatic_retry_wait_leaves_nothing_resident() -> None:
+    clock = [0.0]
+    holder: dict[str, Any] = {}
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED,
+        task_factory=lambda events: _MotionRetryTaskPort(events, holder),
+        program_clock_source=lambda: clock[0],
+    )
+    run_id = owner.start(admission).capture.program_run_id
+
+    waiting = owner.advance_once(run_id)
+
+    assert waiting.state is ProgramRunState.RUNNING  # The wait keeps the node running.
+    assert task.closes == ["task-1"]  # Closed before the wait.
+    retried = owner.take_node_history_events(run_id)
+    assert len(retried) == 1
+    assert retried[0]["attempt"] == 2
+    assert retried[0]["max_attempts"] == 4
+    assert retried[0]["cause"] == "planning_no_effect"
+    assert owner.take_node_history_events(run_id) == ()
+
+    stopped = owner.stop(run_id)
+
+    # No run-end backstop: nothing was resident, nothing is reported.
+    assert task.closes == ["task-1"] and task.recoveries == []
+    assert task.cancels == 0
+    assert stopped.state is ProgramRunState.STOPPED
+
+
+# --- R5: per-node failure holds, Stop scope, Continue, operation failures ---
+
+_OPERATION_FACT = {
+    "operation": {"source_owner_epoch": "kernel.epoch.1", "operation_id": "op", "operation_revision": 2},
+    "resource_ids": ["arm.joints"],
+    "failure": {"code": "no_feasible_candidate", "message": "No pick candidate is feasible"},
+    "terminal_facts": [{"kind": "local_failure", "effect": "no_effect"}],
+}
+
+
+class _HeldFailureTaskPort(_PolicyTaskPort):
+    """Every attempt fails into an authored pause, with its operation facts;
+    the operation can be closed."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events, OwnerTaskState.FAILED)
+        self.closes: list[tuple[str, str]] = []
+
+    def start(self, node_id, identity, inputs) -> OwnerTaskSnapshot:
+        started = super().start(node_id, identity, inputs)
+        return replace(
+            started, metadata={**started.metadata, "operation_failure": _OPERATION_FACT}
+        )
+
+    def close(self, task_id, _identity, *, request_id) -> bool:
+        self.closes.append((task_id, request_id))
+        return True
+
+
+def _two_group_holds(
+    scope_value: str | None,
+    *,
+    success_policy: str = "all",
+    layout: Sequence[tuple[str, list[str] | None]] = (
+        ("arm_move", ["arm"]),
+        ("tool_move", ["tools"]),
+    ),
+):
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED,
+        task_factory=_HeldFailureTaskPort,
+        interventions=interventions,
+    )
+    document = admission.program.to_dict()
+    move = document["tree"]["children"][0]
+    policy = {"allow_intervention": True, "max_retries": 0}
+    if scope_value is not None:
+        policy["intervention_stop_scope"] = scope_value
+    children = []
+    for instance_id, groups in layout:
+        child = deepcopy(move)
+        child["instance_id"] = instance_id
+        if groups is not None:
+            child["execution_groups"] = groups
+        child["recovery_policy"] = dict(policy)
+        children.append(child)
+    document["tree"] = {
+        "node_id": "parallel",
+        "instance_id": "parallel",
+        "parameters": {"success_policy": success_policy},
+        "children": children,
+    }
+    document["execution_groups"] = {
+        group: {"execution_policy": "independent"}
+        for _node, groups in layout
+        for group in groups or ()
+    }
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+    program = Program.from_dict(document, admission.environment.catalog)
+    rows = [row.to_dict() for row in program_node_policies(program)]
+    admission = _admission_for_program(admission, program, rows)
+    run_id = owner.start(admission).capture.program_run_id
+    paused = owner.advance_once(run_id)
+    return owner, task, scope, interventions, run_id, paused
+
+
+def _hold(interventions, run_id, node_instance_id):
+    return next(
+        hold
+        for hold in interventions.read_holds(run_id)
+        if hold.identity.node_instance_id == node_instance_id
+    )
+
+
+def test_every_held_node_is_its_own_hold_with_its_operation_failure_row() -> None:
+    owner, _task, scope, interventions, run_id, paused = _two_group_holds(None)
+
+    assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
+    assert [hold.identity.node_instance_id for hold in interventions.read_holds(run_id)] == [
+        "arm_move",
+        "tool_move",
+    ]
+    assert owner.failure_holds(run_id) == interventions.read_holds(run_id)
+    assert owner.hold_motion_groups(run_id, "arm_move") == (("arm",), "all")
+    # Default scope all: the pause stops every group, once.
+    assert scope.last_selection_stop["group_ids"] == ["all"]
+    rows = paused.to_dict()["operation_failures"]
+    assert [(row["node_instance_id"], row["recovery_class"]) for row in rows] == [
+        ("arm_move", "failed_validation"),
+        ("tool_move", "failed_validation"),
+    ]
+    arm = _hold(interventions, run_id, "arm_move")
+    assert rows[0]["node_attempt_id"] == arm.identity.node_attempt_id
+    # The revision that published the hold (the pause Stop moves it on).
+    assert 1 < rows[0]["operator_facing_run_revision"] <= paused.run_revision
+    assert rows[1]["operator_facing_run_revision"] == rows[0]["operator_facing_run_revision"]
+    assert {key: rows[0][key] for key in _OPERATION_FACT} == _OPERATION_FACT
+    owner.stop(run_id)
+
+
+def test_retry_of_one_hold_releases_every_group_not_owned_by_another_hold() -> None:
+    owner, task, scope, interventions, run_id, _paused = _two_group_holds(None)
+    arm = _hold(interventions, run_id, "arm_move")
+    released: list[frozenset[str]] = []
+    run = owner._entry(run_id).run
+    original = run.note_operator_release
+    run.note_operator_release = lambda nodes: (released.append(nodes), original(nodes))
+
+    owner.retry_failure_pause(
+        run_id,
+        node_attempt_id=arm.identity.node_attempt_id,
+        action=None,
+        request_id="retry.arm",
+        reason=None,
+    )
+    assert scope.last_selection_release["group_ids"] == ["arm"]  # tools stays held
+    assert released and "tool_move" not in released[0]
+
+    resumed = owner.resolve_intervention(
+        run_id, node_attempt_id=arm.identity.node_attempt_id, action="retry"
+    )
+    # The other hold stays: still intervention_required, but the tree ticks.
+    assert resumed.state is ProgramRunState.INTERVENTION_REQUIRED
+    assert resumed.reason_code == "no_feasible_candidate"
+    assert [row["node_instance_id"] for row in resumed.to_dict()["operation_failures"]] == [
+        "tool_move"
+    ]
+    starts = task.starts
+    owner.advance_once(run_id)  # Consumes arm's Retry decision.
+    owner.advance_once(run_id)  # Its fresh attempt starts while tool_move stays held.
+    assert task.starts == starts + 1
+    owner.stop(run_id)
+
+
+def test_own_groups_scope_stops_and_releases_only_the_held_nodes_groups() -> None:
+    owner, _task, scope, interventions, run_id, _paused = _two_group_holds("own_groups")
+
+    assert scope.last_selection_stop["group_ids"] == ["arm", "tools"]
+    assert owner.hold_motion_groups(run_id, "tool_move") == (("tools",), "own_groups")
+    tool = _hold(interventions, run_id, "tool_move")
+    owner.retry_failure_pause(
+        run_id,
+        node_attempt_id=tool.identity.node_attempt_id,
+        action=None,
+        request_id="retry.tool",
+        reason=None,
+    )
+    assert scope.last_selection_release["group_ids"] == ["tools"]
+    owner.stop(run_id)
+
+
+def _release_for(held: str, others: Sequence[str], *, scope: str = "all"):
+    """`_failure_hold_release` over named groups arm/tools/spare; `free` is
+    the node in no named group (contract item 43)."""
+    groups = {"arm_move": ("arm",), "tool_move": ("tools",), "free_move": ("all",)}
+    policy = SimpleNamespace(recovery_policy={"intervention_stop_scope": scope})
+    run = SimpleNamespace(
+        node_motion_groups=groups.__getitem__,
+        execution_selections={"all": (), "arm": (), "spare": (), "tools": ()},
+        capture=SimpleNamespace(node_policy_by_instance_id={held: policy}),
+    )
+    hold = lambda node: SimpleNamespace(  # noqa: E731
+        identity=SimpleNamespace(node_instance_id=node)
+    )
+    return ProgramRunOwner._failure_hold_release(
+        SimpleNamespace(_hold_stop_scope=ProgramRunOwner._hold_stop_scope),
+        run,
+        hold(held),
+        [hold(held), *(hold(node) for node in others)],
+    )
+
+
+@pytest.mark.parametrize("scope", ["all", "own_groups"])
+def test_a_hold_in_no_named_group_releases_every_group_no_other_hold_owns(scope) -> None:
+    assert _release_for("free_move", [], scope=scope) == "all"
+    assert _release_for("free_move", ["arm_move"], scope=scope) == ["spare", "tools"]
+    assert _release_for("free_move", ["arm_move", "tool_move"], scope=scope) == ["spare"]
+    # While it is active, another hold releases only its own groups.
+    assert _release_for("arm_move", ["free_move"]) == ["arm"]
+    assert _release_for("arm_move", ["tool_move"]) == ["arm", "spare"]
+    assert _release_for("arm_move", []) == "all"
+
+
+@pytest.mark.parametrize("operation", ["retry", "continue"])
+def test_a_hold_in_no_named_group_releases_only_its_own_node(operation) -> None:
+    owner, _task, scope, interventions, run_id, _paused = _two_group_holds(
+        None, layout=(("arm_move", ["arm"]), ("free_move", None))
+    )
+    assert owner.hold_motion_groups(run_id, "free_move") == (("all",), "all")
+    releases = scope.release_requests
+    free = _hold(interventions, run_id, "free_move")
+    if operation == "retry":
+        owner.retry_failure_pause(
+            run_id,
+            node_attempt_id=free.identity.node_attempt_id,
+            action=None,
+            request_id="retry.free",
+            reason=None,
+        )
+    else:
+        owner.continue_failure_pause(
+            run_id,
+            node_attempt_id=free.identity.node_attempt_id,
+            request_id="continue.free",
+            reason=None,
+        )
+    # arm_move's hold owns arm (the only named group): free_move releases
+    # itself by node_instance_id (SX-2020), never another hold's group.
+    assert scope.release_requests == releases + 1
+    assert scope.last_selection_release["group_ids"] == []
+    assert scope.last_selection_release["node_instance_id"] == "free_move"
+    owner.stop(run_id)
+
+
+def test_a_named_group_hold_never_sends_a_node_release() -> None:
+    owner, _task, scope, interventions, run_id, _paused = _two_group_holds(
+        None, layout=(("arm_move", ["arm"]), ("free_move", None))
+    )
+    arm = _hold(interventions, run_id, "arm_move")
+    owner.retry_failure_pause(
+        run_id,
+        node_attempt_id=arm.identity.node_attempt_id,
+        action=None,
+        request_id="retry.arm",
+        reason=None,
+    )
+    assert scope.last_selection_release["group_ids"] == ["arm"]
+    assert "node_instance_id" not in scope.last_selection_release
+    owner.stop(run_id)
+
+
+def test_continue_closes_the_held_operation_and_the_node_fails_to_the_tree() -> None:
+    owner, task, scope, interventions, run_id, _paused = _two_group_holds(
+        None, success_policy="one"
+    )
+    arm = _hold(interventions, run_id, "arm_move")
+
+    owner.continue_failure_pause(
+        run_id,
+        node_attempt_id=arm.identity.node_attempt_id,
+        request_id="continue.arm",
+        reason=None,
+    )
+    assert task.closes == [(arm.owner_task_id, "continue.arm")]
+    assert scope.last_selection_release["group_ids"] == ["arm"]
+    owner.resolve_intervention(
+        run_id, node_attempt_id=arm.identity.node_attempt_id, action="manual_failure"
+    )
+    starts = task.starts
+    ticked = owner.advance_once(run_id)
+    assert ticked.node_statuses["arm_move"] == "failure"
+    assert task.starts == starts  # FAILURE to the tree, no new attempt.
+    assert ticked.state is ProgramRunState.INTERVENTION_REQUIRED  # tool_move held
+    owner.stop(run_id)
+
+
+def test_continue_refused_when_the_held_operation_cannot_close() -> None:
+    owner, task, scope, interventions, run_id, _paused = _two_group_holds(None)
+    arm = _hold(interventions, run_id, "arm_move")
+    task.close = lambda *_args, **_kwargs: False
+    releases = scope.release_requests
+
+    with pytest.raises(ProgramRunOwnerError, match="not eligible to close"):
+        owner.continue_failure_pause(
+            run_id,
+            node_attempt_id=arm.identity.node_attempt_id,
+            request_id="continue.refused",
+            reason=None,
+        )
+    assert scope.release_requests == releases
+    owner.stop(run_id)
+
+
+class _FailedFactTaskPort(_TaskPort):
+    def start(self, node_id, identity, inputs) -> OwnerTaskSnapshot:
+        started = super().start(node_id, identity, inputs)
+        return replace(
+            started, metadata={**started.metadata, "operation_failure": _OPERATION_FACT}
+        )
+
+
+def test_a_failed_run_keeps_its_operation_failure_row_until_reset() -> None:
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED,
+        task_factory=lambda events: _FailedFactTaskPort(events, OwnerTaskState.FAILED),
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    failed = owner.advance_once(run_id)
+
+    assert failed.state is ProgramRunState.FAILED
+    (row,) = failed.to_dict()["operation_failures"]
+    assert row["node_instance_id"] == "move_to_pick"
+    assert row["failure"] == _OPERATION_FACT["failure"]
+    assert row["operator_facing_run_revision"] <= failed.run_revision
+
+
+def test_a_run_without_operation_failures_publishes_an_empty_list() -> None:
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    # Always present: a missing key would be unknown provenance.
+    assert owner.advance_once(run_id).to_dict()["operation_failures"] == []
+
+
+class _MockRunRecorder:
+    """Decision 135: the Run-wide Mock pause notifications the owner sends."""
+
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.events = events
+
+    def set_run_paused(self, program_run_id, run_revision, paused, held=()) -> None:
+        self.calls.append(("pause", program_run_id, run_revision, paused, tuple(held)))
+        if self.events is not None:
+            self.events.append(f"mock_snapshot:{run_revision}:{paused}:{','.join(held)}")
+
+    def end(self, start_request) -> None:  # pragma: no cover - no Mock nodes here
+        self.calls.append(("end", start_request))
+
+    def resend_unknown_ends(self, program_run_id):
+        return ()
+
+    def resend_run_pause(self, program_run_id):
+        return (), None
+
+
+def test_mock_run_pause_follows_run_start_halt_and_resume_but_not_teardown():
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    mock = _MockRunRecorder()
+    owner._ports = replace(owner._ports, mock_simulation=mock)
+    scope.ready = True
+    scope.node_count = 3
+    started = owner.start(admission)
+    run_id = started.capture.program_run_id
+    # Recorded (the port sends it only before the first Mock START), with the
+    # actual mask: never-started (Ready) nodes are held.
+    initial_mask = owner._entry(run_id).run.mock_held_nodes()
+    assert mock.calls == [("pause", run_id, started.run_revision, False, initial_mask)]
+    owner.advance_once(run_id)
+    owner.full_stop(run_id)
+    assert mock.calls[-1][2:] and mock.calls[-1][3] is True
+    halt_revision = mock.calls[-1][2]
+    assert halt_revision > started.run_revision
+    assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
+    resumed = owner.resume_full_stop(run_id, request_id="execute-after-halt")
+    assert mock.calls[-1][:4] == ("pause", run_id, resumed.run_revision, False)
+    assert resumed.run_revision > halt_revision
+    count = len(mock.calls)
+    owner.stop(run_id)  # Teardown ends nodes (END), never a pause state.
+    assert len(mock.calls) == count
+
+
+def test_a_run_without_a_mock_port_runs_through_halt_resume_and_stop():
+    """SX-2416: no Mock nodes, no Mock port, no I/O service: no Mock call."""
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    assert owner._ports.mock_simulation is None
+    scope.ready = True
+    scope.node_count = 3
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    owner.full_stop(run_id)
+    assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
+    resumed = owner.resume_full_stop(run_id, request_id="execute-after-halt")
+    assert resumed.state is ProgramRunState.RUNNING
+    owner.advance_once(run_id)
+    owner.stop(run_id)
+
+
+def test_an_unconfirmed_mock_end_holds_the_run_short_of_terminal_until_unbind_succeeds():
+    """SX-2433/2434: the native unbind fails while a Mock END is unanswered.
+    The Run stays FINALIZING (not terminal: no terminal record, readiness or
+    claim release can follow), and the finalizing tick re-enters unbind."""
+    from manyforge_behavior.production_ports import ProductionPortError
+
+    class _PendingEndContext(_ContextPort):
+        pending_ends = 2  # Unbind attempts that still find an unanswered END.
+
+        def unbind(self, program_run_id: str) -> None:
+            super().unbind(program_run_id)
+            if self.pending_ends:
+                self.pending_ends -= 1
+                raise ProductionPortError(
+                    "cannot unbind a Program run with unconfirmed Mock simulation ends"
+                )
+
+    events: list[str] = []
+    context_port = _PendingEndContext(events)
+    owner, admission, _task, _scope, _fixture_events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED,
+        context_port=context_port,
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    for _ in range(2):
+        held = owner.advance_once(run_id)
+        assert held.state is ProgramRunState.FINALIZING
+        assert held.reason_code == "program_run_cleanup_failed"
+        assert "unconfirmed Mock simulation ends" in held.message
+    completed = owner.advance_once(run_id)
+    assert completed.state is ProgramRunState.SUCCEEDED
+    assert context_port.unbound == [run_id] * 3
+
+
+
+def _mock_owner(initial_task_state=OwnerTaskState.ACTIVE):
+    owner, admission, task, scope, events = _fixture(initial_task_state=initial_task_state)
+    mock = _MockRunRecorder(events)
+    owner._ports = replace(owner._ports, mock_simulation=mock)
+    scope.ready = True
+    scope.node_count = 3
+    run_id = owner.start(admission).capture.program_run_id
+    run = owner._entry(run_id).run
+    mask = {"value": ()}
+    run.mock_held_nodes = lambda: mask["value"]
+    return owner, run_id, run, mock, mask, events
+
+
+def test_a_changed_held_mask_takes_a_new_revision_before_the_ticks_starts():
+    owner, run_id, run, mock, mask, events = _mock_owner()
+    before = owner.read(run_id).run_revision
+    selection = run.operator_stop_scope().selection_revision
+    mask["value"] = ("move_to_pick",)  # E.g. a Faulted settlement: no new
+    starts_before = sum(event == "leaf_start" for event in events)  # selection revision.
+    events.append("tick")
+    after = owner.advance_once(run_id)
+    snapshot_revision = mock.calls[-1][2]
+    assert mock.calls[-1] == ("pause", run_id, snapshot_revision, False, ("move_to_pick",))
+    assert before < snapshot_revision <= after.run_revision
+    assert run.operator_stop_scope().selection_revision == selection
+    tick = events[events.index("tick"):]
+    snapshot_at = tick.index(f"mock_snapshot:{snapshot_revision}:False:move_to_pick")
+    assert all(event != "leaf_start" for event in tick[:snapshot_at])
+    assert sum(event == "leaf_start" for event in events) >= starts_before
+    count = len(mock.calls)
+    owner.advance_once(run_id)  # Same mask: no new revision, nothing sent.
+    assert len(mock.calls) == count
+
+
+def test_a_released_mask_shrinks_with_a_higher_revision():
+    owner, run_id, _run, mock, mask, _events = _mock_owner()
+    mask["value"] = ("move_to_pick", "remove_table")
+    owner.advance_once(run_id)
+    held_revision = mock.calls[-1][2]
+    mask["value"] = ("remove_table",)  # A selected release / Retry published.
+    owner.advance_once(run_id)
+    assert mock.calls[-1][3:] == (False, ("remove_table",))
+    assert mock.calls[-1][2] > held_revision
+
+
+def test_halt_and_a_held_node_are_both_carried():
+    owner, run_id, _run, mock, mask, _events = _mock_owner()
+    mask["value"] = ("move_to_pick",)
+    owner.advance_once(run_id)
+    owner.full_stop(run_id)
+    assert mock.calls[-1][3:] == (True, ("move_to_pick",))  # Both causes.
+    assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
+    resumed = owner.resume_full_stop(run_id, request_id="execute-after-halt")
+    # Clearing the Halt keeps the hold.
+    assert mock.calls[-1] == ("pause", run_id, resumed.run_revision, False, ("move_to_pick",))
+    mask["value"] = ()
+    owner.advance_once(run_id)
+    assert mock.calls[-1][3:] == (False, ())
+    revisions = [call[2] for call in mock.calls]
+    assert revisions == sorted(set(revisions))  # One ordering: strictly increasing.
+
+
+def test_a_mask_change_during_a_halt_keeps_the_mock_paused():
+    """A Halt landing while a tick derives a changed mask: the mask-only
+    snapshot stays paused; the resume then carries paused=false and it."""
+    owner, run_id, run, mock, mask, _events = _mock_owner()
+
+    def halt_meanwhile():
+        entry = owner._entry(run_id)
+        if entry.state is ProgramRunState.RUNNING and mask["value"]:
+            entry.state = ProgramRunState.FULL_STOPPING  # A concurrent Halt.
+        return mask["value"]
+
+    run.mock_held_nodes = halt_meanwhile
+    mask["value"] = ("move_to_pick",)  # E.g. a failed Stop's Faulted settlement.
+    owner.advance_once(run_id)
+    assert mock.calls[-1][3:] == (True, ("move_to_pick",))
+    # The selection Stop and release paths re-check RUNNING under the same
+    # lock, so they never publish during a Halt; the helper covers them too.
+    entry = owner._entry(run_id)
+    for state, paused in ((ProgramRunState.FULL_STOPPED, True),
+                          (ProgramRunState.FULL_STOPPING, True),
+                          (ProgramRunState.RUNNING, False)):
+        entry.state = state
+        assert owner._mock_paused(entry) is paused
+    entry.state = ProgramRunState.FULL_STOPPING
+    assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
+    resumed = owner.resume_full_stop(run_id, request_id="execute-after-halt")
+    assert mock.calls[-1] == ("pause", run_id, resumed.run_revision, False, ("move_to_pick",))

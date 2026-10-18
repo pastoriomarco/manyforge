@@ -1714,7 +1714,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
         # existing scoped invalidation/authorization and retirement contract.
         assert admission["effect_pending"] is True and control["effect_pending"] is True
         identity_fields = (
-            "participant_id", "controller_goal_id", "controller_goal_generation",
+            "participant_id", "command_id", "command_generation",
             "controllable_component_id", "command_target_id", "capability_id",
             "control_domain_id", "control_domain_revision", "control_binding_id",
             "control_binding_revision", "capability_provider_binding_id",
@@ -1959,3 +1959,153 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
         except BaseException:
             keep_failure_evidence(owner_root)
             raise
+
+
+def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
+    tmp_path: Path,
+) -> None:
+    from manyforge_behavior.catalog import NodeCatalog
+    from manyforge_composer.backend.authoring_forest import empty_authoring
+    from manyforge_composer.backend.scenario_artifacts import (
+        build_scenario_document,
+        save_scenario_artifact,
+    )
+
+    # Use the normal Scenario writer and activation preparer. The latter owns
+    # retention of the real empty model map; this test supplies no sealed DTO.
+    authoring = empty_authoring(NodeCatalog(NODE_CATALOG))
+    authoring.update({
+        "program_id": "logical_process_program",
+        "name": "Logical process Program",
+        "forest": [{"node_id": "timer", "instance_id": "logical.wait",
+                    "parameters": {"duration_s": 0.05}, "children": []}],
+    })
+    scenario_id = "logical_process_scenario"
+    scenario = tmp_path / "logical.scenario"
+    save_scenario_artifact(
+        build_scenario_document(
+            scenario_id=scenario_id, name="Logical process Scenario", description="",
+            program_draft=authoring,
+            deployment_draft={
+                "api_version": "manyforge.deployment_intent.v2",
+                "deployment_artifact_id": "logical_process_deployment",
+                "name": "Logical process Deployment",
+                "attachments": [], "components": [], "policies": {},
+            },
+            program_role_assignment={"component_roles": [], "target_roles": []},
+            manyforge_version="0.1.0", last_known_status="ready",
+        ),
+        str(scenario), allowed_roots=[str(tmp_path)], overwrite=False,
+    )
+    stack_root = tmp_path / "stack"
+    stack_root.mkdir()
+    metadata = json.loads(_required_path("MANYFORGE_MANAGER_APPLY_METADATA").read_text("utf-8"))
+    stack = ProcessStack(
+        stack_root, package_root=_required_path("MANYFORGE_MANAGER_APPLY_PACKAGE_ROOT"),
+        cell_id=metadata["cell_id"], enable_program_runner=True,
+        composer_fs_roots=(tmp_path,), freshness_milliseconds=120_000,
+    )
+    try:
+        stack.prepare_native_manager_fixture()
+        stack.start_manager()
+        stack.start_program_runner()
+        stack.start_api()
+        stack.wait_manager_source()
+        stack.wait_program_runner()
+        stack.wait_authoring_admission(expected_allowed=True)
+        stack.start_composer()
+        stack.wait_composer()
+        with (
+            _composer_snapshot_stream(stack, client_id="logical-process") as snapshots,
+            HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
+            HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
+        ):
+            for attempt in range(8):
+                draft = composer.request("GET", "/api/program/draft")
+                snapshot = _matching_composer_snapshot(snapshots, draft)
+                deployment = composer.request("GET", "/api/deployment/workspace")
+                try:
+                    loaded = composer.request("POST", "/api/scenario-documents/load", body={
+                        **_composer_fence(snapshot, request_id=f"logical.load.{attempt}"),
+                        "deploymentDraftId": deployment["draft"]["id"],
+                        "expectedDeploymentDraftRevision": deployment["draft"]["revision"],
+                        "path": str(scenario), "confirmDiscard": False,
+                    })
+                    break
+                except HeadlessClientError as error:
+                    if error.code not in {"authoring_not_ready", "stale_generation"} or attempt == 7:
+                        raise
+            assert loaded["status"] == "accepted", loaded
+            activation = loaded["activation"]
+            deadline = time.monotonic() + 30.0
+            while True:
+                status = headless.manager_apply_status(
+                    activation["apply_id"], activation["apply_generation"]
+                )
+                if status["state"] != "pending":
+                    assert status["state"] == "succeeded" and status["ok"] is True, status
+                    break
+                assert time.monotonic() < deadline, status
+                time.sleep(0.01)
+            # Wait only for the exact successful public selection. No failed
+            # Apply or unrelated owner error becomes a retry or a fake success.
+            while True:
+                try:
+                    applied = composer.program_applied()
+                    if applied["scenario_id"] == scenario_id:
+                        break
+                except HeadlessClientError as error:
+                    if error.code not in {"program_applied_selection_not_active",
+                                          "program_applied_selection_not_found"}:
+                        raise
+                assert time.monotonic() < deadline, status
+                time.sleep(0.01)
+            assert applied["program_id"] == authoring["program_id"], applied
+            assert applied["program_binding_id"] == status["prepared_activation"]["program_binding_id"]
+            assert applied["retained_bundle_id"] == status["candidate_projection_revision"]["retained_bundle_id"]
+            selected = headless.program_applied_status()
+            assert selected["executable"] is True and selected["non_executable"] is None, selected
+            assert selected["program_id"] == applied["program_id"], selected
+            assert selected["program_binding_id"] == applied["program_binding_id"], selected
+            assert selected["program"] is None, selected
+            assert applied["program"]["component_roles"] == {}, applied
+            assert applied["program"]["target_roles"] == {}, applied
+            graph = headless.manager_graph()["cell_graph"]
+            for field in ("controllable_components", "control_domains", "control_bindings", "model_instances"):
+                assert graph[field] == [], graph
+            binding = applied["program_binding"]
+            assert binding["program_binding_id"] == applied["program_binding_id"], binding
+            assert binding["program_revision"] == applied["program_revision"], binding
+            assert binding["component_role_bindings"] == [], binding
+            assert binding["target_role_bindings"] == [], binding
+            stack.wait_authoring_admission(expected_allowed=True)
+            draft = composer.request("GET", "/api/program/draft")["program"]
+            started = headless.program_run_start({
+                "request_id": "logical.run", "request_owner_epoch": "logical.process.epoch",
+                "source_label": "logical_process_test", "correlation_id": "logical.run",
+                "scenario_id": scenario_id,
+                "source_document_digest": applied["source_document_digest"],
+                "expected_applied_record_digest": applied["source"]["record_digest"],
+                "draft_program_revision": draft["program_revision"],
+            })
+            capture = started["capture"]
+            assert capture["program_id"] == applied["program_id"], started
+            assert capture["program_revision"] == applied["program_revision"], started
+            assert capture["program_binding_id"] == applied["program_binding_id"], started
+            deadline = time.monotonic() + 10.0
+            while True:
+                terminal = headless.program_run(capture["program_run_id"])
+                if terminal["state"] in {"succeeded", "failed", "stopped"}:
+                    assert terminal["state"] == "succeeded", terminal
+                    break
+                assert time.monotonic() < deadline, terminal
+                time.sleep(0.01)
+            assert terminal["capture"] == capture, terminal
+            assert not list(stack.root.rglob("controller-launch-artifacts")), stack.root
+            assert not list(stack.root.rglob("controller_launch_artifacts.json")), stack.root
+    except BaseException:
+        stack.log.flush()
+        keep_failure_evidence(tmp_path)
+        raise
+    finally:
+        stack.close()

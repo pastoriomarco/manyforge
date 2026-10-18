@@ -1256,7 +1256,7 @@
         "record_kind": "command_schema",
         "record_revision": "sha256:4808a6bec7d020cb66df2082325e1838471a2604deaddfd1afe31dae427140e9",
         "schema_id": "manyforge.command_schema.v1",
-        "schema_revision": "sha256:dd305be4c7071d4b5fcf31c031d80b7adb8d3a29562629a189b167922b1f29da"
+        "schema_revision": "sha256:fdce9bb1facd259bde85f502197fd534dc05346a030605a55aa951d9e88c73dd"
       },
       {
         "content_addressed_store_key": "catalog/maintained/component_type/lite6_lite_gripper.fixed_scale.component/9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
@@ -1349,11 +1349,11 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/1633c7226de6d49382aed9868d2bc5285a7b2dbf294455b137f0f52caf4f31eb",
-        "content_digest": "sha256:5f07324b2c8eb913caa79211461ae186278e68e6c1dde767744738225ed875a5",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/bf0592ebc9797dd4c6c8aeb8cd1ff067ffd50349fc7c15eb9b7d08072db8cefc",
+        "content_digest": "sha256:7b356bcb3d27338baf524a6d0f4bd1f93f4825adffb7a8f76684615a0b51443b",
         "record_id": "manyforge.ros2_control_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:1633c7226de6d49382aed9868d2bc5285a7b2dbf294455b137f0f52caf4f31eb",
+        "record_revision": "sha256:bf0592ebc9797dd4c6c8aeb8cd1ff067ffd50349fc7c15eb9b7d08072db8cefc",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1401,7 +1401,7 @@
     ]
   },
   "deployment_artifact_id": "ur5e_lite6_wall",
-  "deployment_revision": "sha256:c3b526e5cacd013256a9283d661fd027e21268a2d52f47d851846abe035432fd",
+  "deployment_revision": "sha256:0c766428f1c834d27b42551f5b9c4df67be8793f4cbb2e90b34d5a36996f2a37",
   "description": "Minimal offline mock UR5e and Lite6 qualification cell derived from the simple ManyMove dual-robot wall layout. The robots plan independently; both are owned by one cell execution Kernel and remain independently planned.",
   "desired_control_configurations": [
     {
@@ -3010,7 +3010,7 @@
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
-        "runtime_profile_revision": "sha256:1633c7226de6d49382aed9868d2bc5285a7b2dbf294455b137f0f52caf4f31eb",
+        "runtime_profile_revision": "sha256:bf0592ebc9797dd4c6c8aeb8cd1ff067ffd50349fc7c15eb9b7d08072db8cefc",
         "runtime_unit_id": "robot_cell.ros2_control_execution"
       }
     ]

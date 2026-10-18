@@ -15,7 +15,7 @@ namespace manyforge::core {
 inline constexpr std::string_view kCapabilityDefinitionApiVersion =
     "manyforge.capability_definition.v1";
 inline constexpr std::string_view kBuiltinCapabilityDefinitionRegistryDigest =
-    "sha256:ae8aae9ef416f40457225858d8d56829dce5c512cb842b803393bfaa24741e22";
+    "sha256:f16fbfaf20185c184fee1ed014592eb443f2c5f5144de84eaae685504c0d38f9";
 
 enum class CapabilityScope : std::uint8_t {
   kCellGlobal = 0,
@@ -258,16 +258,16 @@ inline constexpr std::array<CapabilityDefinitionDescriptor, 67>
          CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
         {"io.gpio.set_output",
-         "sha256:3bd1b9ac4b80f7d64f5c6b1efd91814d30bddef871ada5c2cdf02b4f6138d032",
-         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kControlBinding,
+         "sha256:b7f9e3ae6ed12dd59fd78193db902c6ad09528372ad0f5e2423f936833cb49f8",
+         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
         {"io.gpio.get_input",
-         "sha256:c64176f47388ca0a6a56ec67ca5f44211d90cb1dc400abef1bb7e2b3bccf8965",
-         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kControlBinding,
+         "sha256:abe7c9eed8b4b76ada84aa770ae3111691dfdd07001f4abd68a38bed56ed3d84",
+         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
         {"io.gpio.wait_for_input",
-         "sha256:cb0a3e15d5ca0433aaeb3d8531b200986d3867451460ef549670cc14b3823398",
-         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kControlBinding,
+         "sha256:f5520f864f38d6f658039b8a338da9ef1fec014d70e9e354c5e40935717b4747",
+         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
         {"tool.gripper.command",
          "sha256:a24b841e7c0323815a3576869d5819340bc6a98f1c2ffd5b47131e26698e9392",
@@ -419,8 +419,8 @@ static_assert(capability_scope_count(CapabilityScope::kTargetBinding) == 31U);
 static_assert(capability_scope_count(CapabilityScope::kCellGlobal) == 28U);
 static_assert(capability_scope_count(CapabilityScope::kControlDomain) == 8U);
 static_assert(capability_provider_binding_kind_count(
-                  CapabilityProviderBindingKind::kCapabilityProviderBinding) == 47U);
+                  CapabilityProviderBindingKind::kCapabilityProviderBinding) == 50U);
 static_assert(
-    capability_provider_binding_kind_count(CapabilityProviderBindingKind::kControlBinding) == 20U);
+    capability_provider_binding_kind_count(CapabilityProviderBindingKind::kControlBinding) == 17U);
 
 }  // namespace manyforge::core

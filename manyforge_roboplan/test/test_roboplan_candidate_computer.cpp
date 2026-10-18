@@ -6,8 +6,10 @@
 #include <filesystem>
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
+#include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_roboplan/detail/cartesian_trajectory_contract.hpp>
 #include <manyforge_roboplan/roboplan_candidate_computer.hpp>
+#include <manyforge_roboplan/roboplan_planner_options.hpp>
 #include <memory>
 #include <optional>
 #include <roboplan/core/scene.hpp>
@@ -147,6 +149,294 @@ struct CandidateFixture final {
   return ResolvedJointGoalDTO{fixture.binding.resources,
                               fixture.binding.compiled_joint_names,
                               values(fixture.goal)};
+}
+
+// A small fixed prefix around a collision-free captured start, with moving
+// P/V/A. It represents the Kernel's already retained source; no old
+// certificates are transmitted or reused when the new candidate is measured.
+[[nodiscard]] RoboPlanCandidateRequestDTO
+moving_request(CandidateFixture &fixture) {
+  const Eigen::VectorXd direction = (fixture.goal - fixture.start).normalized();
+  fixture.goal = fixture.start + 0.02 * direction;
+  auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+  const Eigen::VectorXd velocity = 0.001 * direction;
+  const Eigen::VectorXd acceleration = 0.0001 * direction;
+  constexpr double divergence = 0.125;
+  auto prefix_point = [&](double time) {
+    return TrajectoryWaypointDTO{time,
+                                 values(fixture.start + time * velocity +
+                                        0.5 * time * time * acceleration),
+                                 values(velocity + time * acceleration),
+                                 values(acceleration)};
+  };
+  TrajectoryDTO prefix{fixture.binding.resources,
+                       fixture.binding.compiled_joint_names,
+                       {prefix_point(0.0), prefix_point(divergence / 2.0),
+                        prefix_point(divergence)}};
+  input.start_state.velocities = std::vector<CoordinateVelocityDTO>{};
+  for (double value : values(velocity))
+    input.start_state.velocities->push_back(AngularVelocityDTO{value});
+  auto seed = controlled_state(
+      fixture.binding, fixture.start + divergence * velocity +
+                           0.5 * divergence * divergence * acceleration);
+  input.moving_replacement = MovingReplacementInputDTO{
+      ExecutionGoalKey{ControllerGoalId("source-moving"),
+                       ControllerGoalGeneration(11U)},
+      ExecutionBindingEpoch(7U),
+      1.0,
+      std::move(prefix),
+      1.0 + divergence,
+      std::move(seed),
+      input.base_frame,
+      input.tcp_frame,
+      input.speed_profile,
+      input.dynamics_limits,
+      30.0};
+  return input;
+}
+
+TEST(
+    RoboPlanCandidateComputerTest,
+    MovingCandidatePreservesPrefixAndEntersAMovingSuffixWithoutGlobalRetiming) {
+  auto fixture = make_fixture();
+  auto input = moving_request(fixture);
+  const ResolvedFrameDTO source_tcp = ResolvedComponentModelFrameDTO{
+      fixture.binding.controllable_component_id,
+      fixture.binding.model_instance_id, FrameRoleId("source-tcp"),
+      "wrist_3_link", fixture.binding.model_revision};
+  ASSERT_TRUE(fixture.scene->getFrameId("wrist_3_link"));
+  fixture.binding.permitted_frames.push_back(source_tcp);
+  input.moving_replacement->source_tcp_frame = source_tcp;
+  for (std::size_t index = 0; index < fixture.binding.resources.size(); ++index)
+    input.dynamics_limits.push_back(
+        {fixture.binding.resources[index],
+         fixture.binding.compiled_joint_names[index],
+         JointDynamicsLimitDTO{std::nullopt, std::nullopt, 10.0}});
+  input.moving_replacement->source_per_resource_dynamics_limits =
+      input.dynamics_limits;
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+
+  const auto result = computer.compute(input);
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto &curve = result.value();
+  const auto &prefix = input.moving_replacement->source_prefix_trajectory;
+  ASSERT_GT(curve.waypoints.size(), prefix.waypoints.size());
+  for (std::size_t index = 0; index < prefix.waypoints.size(); ++index) {
+    EXPECT_EQ(curve.waypoints[index].time_from_start_s,
+              prefix.waypoints[index].time_from_start_s);
+    EXPECT_EQ(curve.waypoints[index].positions_rad,
+              prefix.waypoints[index].positions_rad);
+    EXPECT_EQ(curve.waypoints[index].velocities_rad_s,
+              prefix.waypoints[index].velocities_rad_s);
+    EXPECT_EQ(curve.waypoints[index].accelerations_rad_s2,
+              prefix.waypoints[index].accelerations_rad_s2);
+  }
+  const auto &entry = curve.waypoints[prefix.waypoints.size()];
+  EXPECT_TRUE(std::any_of(entry.velocities_rad_s.begin(),
+                          entry.velocities_rad_s.end(),
+                          [](double value) { return value != 0.0; }));
+  EXPECT_GT(entry.time_from_start_s, prefix.waypoints.back().time_from_start_s);
+  EXPECT_EQ(curve.waypoints.back().positions_rad, values(fixture.goal));
+  for (const double velocity : curve.waypoints.back().velocities_rad_s)
+    EXPECT_EQ(velocity, 0.0);
+  for (const double acceleration : curve.waypoints.back().accelerations_rad_s2)
+    EXPECT_EQ(acceleration, 0.0);
+  ASSERT_TRUE(curve.runtime_scale_bounds);
+  EXPECT_GT(curve.runtime_scale_bounds->max_rate_per_s, 0.0);
+  EXPECT_GT(curve.runtime_scale_bounds->max_rate_change_per_s2, 0.0);
+  EXPECT_GE(curve.runtime_scale_bounds->max_stop_path_rate, 1.0);
+  EXPECT_FALSE(curve.runtime_scale_bounds->nominal_time_multiplier);
+  EXPECT_FALSE(curve.cartesian_fidelity_metrics);
+  EXPECT_TRUE(curve.cartesian_waypoint_times_s.empty());
+  EXPECT_EQ(input.start_state.velocities->size(),
+            fixture.binding.resources.size());
+  EXPECT_FALSE(
+      input.moving_replacement->source_prefix_trajectory.runtime_scale_bounds);
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     MovingPoseGoalKeepsItsAuthoredPoseAfterTheInteriorJoin) {
+  auto fixture = make_fixture();
+  auto input = moving_request(fixture);
+  const auto target =
+      fixture.scene->forwardKinematics(fixture.goal, "tool0", "base");
+  input.motion = PoseGoalDTO{pose(target)};
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto result = computer.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto &final = result.value().waypoints.back().positions_rad;
+  const Eigen::VectorXd positions =
+      Eigen::Map<const Eigen::VectorXd>(final.data(), final.size());
+  const auto reached = fixture.scene->forwardKinematics(
+      fixture.scene->toFullJointPositions("arm", positions), "tool0", "base");
+  EXPECT_LE((reached.block<3, 1>(0, 3) - target.block<3, 1>(0, 3)).norm(),
+            input.tolerances.translation_tol_m);
+  EXPECT_LE(Eigen::AngleAxisd(reached.block<3, 3>(0, 0).transpose() *
+                              target.block<3, 3>(0, 0))
+                .angle(),
+            input.tolerances.rotation_tol_rad);
+  EXPECT_FALSE(result.value().cartesian_fidelity_metrics);
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     MovingPreparationAllowsAnActuallyRestingSource) {
+  auto fixture = make_fixture();
+  auto input = moving_request(fixture);
+  input.start_state.velocities.reset();
+  input.moving_replacement->suffix_start_state = input.start_state;
+  for (auto &point :
+       input.moving_replacement->source_prefix_trajectory.waypoints) {
+    point.positions_rad = values(fixture.start);
+    point.velocities_rad_s.assign(fixture.binding.resources.size(), 0.0);
+    point.accelerations_rad_s2.assign(fixture.binding.resources.size(), 0.0);
+  }
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto result = computer.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().waypoints.back().positions_rad,
+            values(fixture.goal));
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     ZeroVelocityWithNonzeroAccelerationCannotSelectARestSuffixEntry) {
+  auto fixture = make_fixture();
+  auto input = moving_request(fixture);
+  input.start_state.velocities = std::vector<CoordinateVelocityDTO>(
+      fixture.binding.resources.size(), AngularVelocityDTO{0.0});
+  input.moving_replacement->suffix_start_state = input.start_state;
+  input.motion = ResolvedJointGoalDTO{fixture.binding.resources,
+                                      fixture.binding.compiled_joint_names,
+                                      values(fixture.start)};
+  for (auto &point :
+       input.moving_replacement->source_prefix_trajectory.waypoints) {
+    point.positions_rad = values(fixture.start);
+    point.velocities_rad_s.assign(fixture.binding.resources.size(), 0.0);
+  }
+  ASSERT_TRUE(std::any_of(
+      input.moving_replacement->source_prefix_trajectory.waypoints.back()
+          .accelerations_rad_s2.begin(),
+      input.moving_replacement->source_prefix_trajectory.waypoints.back()
+          .accelerations_rad_s2.end(),
+      [](double value) { return value != 0.0; }));
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto result = computer.compute(input);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"),
+            "native_moving_connector_unqualified");
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     MovingSourcePositionOvershootCannotBeHiddenBySuffixCertificates) {
+  auto fixture = make_fixture();
+  auto input = moving_request(fixture);
+  const auto positions = fixture.scene->getPositionLimitVectors("arm", false);
+  ASSERT_TRUE(positions);
+  input.moving_replacement->source_prefix_trajectory.waypoints[1]
+      .positions_rad[0] = positions->second[0] + 1.0;
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto result = computer.compute(input);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"),
+            "native_moving_position_bounds_unqualified");
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     MovingPartialJointGoalRetainsOriginalCapturedUnselectedTargets) {
+  auto fixture = make_fixture();
+  auto input = moving_request(fixture);
+  const auto index = fixture.binding.resources.size() - 1U;
+  input.motion =
+      ResolvedJointGoalDTO{{fixture.binding.resources[index]},
+                           {fixture.binding.compiled_joint_names[index]},
+                           {fixture.goal[static_cast<Eigen::Index>(index)]}};
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+
+  const auto result = computer.compute(input);
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  auto expected = values(fixture.start);
+  expected[index] = fixture.goal[static_cast<Eigen::Index>(index)];
+  EXPECT_EQ(result.value().waypoints.back().positions_rad, expected);
+  const auto seed =
+      angular_position_projection(input.moving_replacement->suffix_start_state);
+  ASSERT_TRUE(seed.ok());
+  EXPECT_NE(seed.value(), values(fixture.start));
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     MovingIncomingLimitViolationCannotBeRepairedByDurationSearch) {
+  auto fixture = make_fixture();
+  auto input = moving_request(fixture);
+  for (std::size_t index = 0; index < fixture.binding.resources.size(); ++index)
+    input.dynamics_limits.push_back(
+        {fixture.binding.resources[index],
+         fixture.binding.compiled_joint_names[index],
+         JointDynamicsLimitDTO{0.00001, std::nullopt, std::nullopt}});
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto result = computer.compute(input);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"),
+            "native_moving_incoming_limits_violated");
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     MovingSourceIdentitySeedAndDerivedEvidenceMutationsAreRefused) {
+  auto fixture = make_fixture();
+  const auto input = moving_request(fixture);
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  auto changed = input;
+  changed.moving_replacement->source_binding_epoch = ExecutionBindingEpoch(0U);
+  EXPECT_FALSE(computer.compute(changed).ok());
+  changed = input;
+  changed.moving_replacement->source_prefix_trajectory.runtime_scale_bounds =
+      TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0, 1.0};
+  EXPECT_FALSE(computer.compute(changed).ok());
+  changed = input;
+  changed.moving_replacement->suffix_start_state.positions[0] =
+      AngularPositionDTO{0.0};
+  EXPECT_FALSE(computer.compute(changed).ok());
+  changed = input;
+  changed.moving_replacement->source_prefix_trajectory.waypoints[1]
+      .accelerations_rad_s2.clear();
+  EXPECT_FALSE(computer.compute(changed).ok());
+}
+
+TEST(
+    RoboPlanCandidateComputerTest,
+    MovingCartesianDeclaresTheUnqualifiedBlendConstraintWithoutFabricatingEvidence) {
+  auto fixture = make_fixture();
+  auto input = moving_request(fixture);
+  input.motion = CartesianPathDTO{};
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto result = computer.compute(input);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"),
+            "native_moving_cartesian_blend_proof_unavailable");
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     MovingPreparationHonorsCancellationAndItsSingleWholeDeadline) {
+  auto fixture = make_fixture();
+  const auto input = moving_request(fixture);
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto cancelled = computer.compute(input, {[] { return true; }, {}});
+  ASSERT_FALSE(cancelled.ok());
+  EXPECT_EQ(cancelled.error().details.at("reason"),
+            "planning_cancelled_by_interrupt");
+  const auto expired = computer.compute(input, {{}, [] { return true; }});
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().details.at("reason"), "planning_timeout");
 }
 
 TEST(RoboPlanCandidateComputerTest,
@@ -599,6 +889,61 @@ TEST(RoboPlanCandidateComputerTest,
   ASSERT_FALSE(cancelled_result.ok());
   EXPECT_EQ(cancelled_result.error().details.at("reason"),
             "planning_cancelled_by_interrupt");
+}
+
+// Core supplies the stationary successor's already-clamped PlanRequest timeout;
+// smooth compute additionally deducts time spent checking its moving prefix.
+// These are the actual solver-option constructors used by compute, not a test
+// planner. The Core request assertion and source clamp prove which cap arrives.
+TEST(RoboPlanCandidateComputerTest,
+     ProductionSolverOptionsPreserveTheBoundedTakeoverPlanningTimeout) {
+  for (const double capped_timeout : {0.1, 0.2, 0.5}) {
+    SCOPED_TRACE(capped_timeout);
+    for (const auto profile :
+         {PlanningProfileDTO::kFirstFeasible, PlanningProfileDTO::kBalanced,
+          PlanningProfileDTO::kQualityBounded}) {
+      SCOPED_TRACE(static_cast<int>(profile));
+      const auto options = planning_profile_rrt_options(
+          production_rrt_options("arm", capped_timeout), profile);
+      EXPECT_DOUBLE_EQ(options.max_planning_time, capped_timeout);
+    }
+  }
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     RealMovingAndStationarySuccessorCandidatesRefuseAnExpiredSourceClock) {
+  for (const bool moving : {true, false}) {
+    SCOPED_TRACE(moving ? "smooth moving replacement"
+                        : "stationary spring successor shape");
+    auto fixture = make_fixture();
+    auto input =
+        moving ? moving_request(fixture)
+               : request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+    // Full B belongs to this successor. A stationary candidate receives its
+    // min(P, residual B) from Core; it has no moving-prefix budget field.
+    constexpr Duration preparation_budget = 500'000'000;
+    if (input.moving_replacement)
+      input.moving_replacement->remaining_preparation_budget_s = 0.5;
+    RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                       {0x1234U, 65'536U, 0.01});
+    for (const double capped_timeout : {0.1, 0.2, 0.5}) {
+      SCOPED_TRACE(capped_timeout);
+      input.planning_timeout_s = capped_timeout;
+      FakeClock source_clock;
+      // Exact boundary from the caller's real clock contract, no wall-clock test.
+      source_clock.set(preparation_budget);
+      std::size_t deadline_checks{};
+      const auto deadline_expired = [&] {
+        ++deadline_checks;
+        return source_clock.now() >= preparation_budget;
+      };
+      const RoboPlanCandidateControl control{{}, deadline_expired};
+      const auto expired = computer.compute(input, control);
+      ASSERT_FALSE(expired.ok());
+      EXPECT_EQ(expired.error().details.at("reason"), "planning_timeout");
+      EXPECT_GT(deadline_checks, 0U);
+    }
+  }
 }
 
 } // namespace

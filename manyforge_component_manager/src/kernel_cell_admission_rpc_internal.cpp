@@ -89,6 +89,7 @@ public:
     pos_ += n;
     return v;
   }
+  bool HasRemaining() const { return pos_ < in_.size(); }
   void Finish() const {
     if (pos_ != in_.size())
       Fail("trailing packet fields");
@@ -249,25 +250,54 @@ core::CellAdmissionClaimReleaseDTO Release(Reader &r) {
           {Enum<core::CellAdmissionSettlementKindDTO>(r, 5U),
            S<core::ContentDigest>(r)}};
 }
+void ProgramCycle(Writer &w, const core::ProgramCycleStatusDTO &x) {
+  S(w, x.program_runner_owner_epoch);
+  w.U64(x.cycle_generation);
+  Enum(w, x.state);
+  Opt(w, x.program_run_id, [](Writer &w, const auto &v) { S(w, v); });
+  Opt(w, x.cycle_claim_generation, [](Writer &w, const auto &v) { G(w, v); });
+  Opt(w, x.terminal_or_settlement_reference,
+      [](Writer &w, const auto &v) { S(w, v); });
+  Opt(w, x.accepted_reset, [](Writer &w, const auto &reset) {
+    S(w, reset.request_owner_epoch);
+    S(w, reset.request_id);
+    S(w, reset.request_payload_digest);
+    w.Bool(reset.reload_initial_scene);
+    w.Bool(reset.reset_robot_position);
+    Opt(w, reset.reset_claim_generation,
+        [](Writer &w, const auto &generation) { G(w, generation); });
+  });
+}
+
+core::ProgramCycleStatusDTO ProgramCycle(Reader &r) {
+  return core::ProgramCycleStatusDTO{
+      S<core::RequestOwnerEpoch>(r),
+      r.U64(),
+      Enum<core::ProgramCycleStateDTO>(r, 8U),
+      Opt<core::ProgramRunId>(
+          r, [](Reader &r) { return S<core::ProgramRunId>(r); }),
+      Opt<core::CellAdmissionClaimGeneration>(
+          r,
+          [](Reader &r) { return G<core::CellAdmissionClaimGeneration>(r); }),
+      Opt<core::ContentDigest>(
+          r, [](Reader &r) { return S<core::ContentDigest>(r); }),
+      Opt<core::AcceptedProgramResetDTO>(r, [](Reader &r) {
+        return core::AcceptedProgramResetDTO{
+            S<core::RequestOwnerEpoch>(r),
+            S<core::RequestId>(r),
+            S<core::ContentDigest>(r),
+            r.Bool(),
+            r.Bool(),
+            Opt<core::CellAdmissionClaimGeneration>(r, [](Reader &r) {
+              return G<core::CellAdmissionClaimGeneration>(r);
+            })};
+      })};
+}
+
 void Readiness(Writer &w, const core::CellAdmissionReadinessSnapshotDTO &x) {
   w.Bool(x.program_cycle_status_current);
-  Opt(w, x.program_cycle_status, [](Writer &w, const auto &v) {
-    S(w, v.program_runner_owner_epoch);
-    w.U64(v.cycle_generation);
-    Enum(w, v.state);
-    Opt(w, v.program_run_id, [](Writer &w, const auto &v) { S(w, v); });
-    Opt(w, v.cycle_claim_generation, [](Writer &w, const auto &v) { G(w, v); });
-    Opt(w, v.terminal_or_settlement_reference,
-        [](Writer &w, const auto &v) { S(w, v); });
-    Opt(w, v.accepted_reset, [](Writer& w, const auto& reset) {
-      S(w, reset.request_owner_epoch);
-      S(w, reset.request_id);
-      S(w, reset.request_payload_digest);
-      w.Bool(reset.reload_initial_scene);
-      w.Bool(reset.reset_robot_position);
-      Opt(w, reset.reset_claim_generation, [](Writer& w, const auto& generation) { G(w, generation); });
-    });
-  });
+  Opt(w, x.program_cycle_status,
+      [](Writer &w, const auto &v) { ProgramCycle(w, v); });
   w.Bool(x.required_component_status_current);
   w.U64(x.required_component_total);
   w.U64(x.required_component_current_compatible_ready_converged);
@@ -276,32 +306,24 @@ void Readiness(Writer &w, const core::CellAdmissionReadinessSnapshotDTO &x) {
   w.U64(x.blocking_fault_count);
   w.U64(x.unresolved_owner_count);
   w.U64(x.unsettled_effect_count);
+  if (x.program_runner_loss) {
+    const auto &loss = *x.program_runner_loss;
+    if (!core::ValidateProgramRunnerContactLoss(loss).ok())
+      Fail("invalid Program Runner contact loss");
+    w.Bool(true);
+    S(w, loss.manager_owner_epoch);
+    S(w, loss.manager_runtime_epoch);
+    ProgramCycle(w, loss.established_cycle);
+    w.String(loss.failure_predicate);
+    w.String(loss.message);
+  }
 }
 
 core::CellAdmissionReadinessSnapshotDTO Readiness(Reader &r) {
   core::CellAdmissionReadinessSnapshotDTO x;
   x.program_cycle_status_current = r.Bool();
-  x.program_cycle_status = Opt<core::ProgramCycleStatusDTO>(r, [](Reader &r) {
-    return core::ProgramCycleStatusDTO{
-        S<core::RequestOwnerEpoch>(r),
-        r.U64(),
-        Enum<core::ProgramCycleStateDTO>(r, 8U),
-        Opt<core::ProgramRunId>(
-            r, [](Reader &r) { return S<core::ProgramRunId>(r); }),
-        Opt<core::CellAdmissionClaimGeneration>(
-            r,
-            [](Reader &r) { return G<core::CellAdmissionClaimGeneration>(r); }),
-        Opt<core::ContentDigest>(
-            r, [](Reader &r) { return S<core::ContentDigest>(r); }),
-        Opt<core::AcceptedProgramResetDTO>(r, [](Reader& r) {
-          return core::AcceptedProgramResetDTO{
-              S<core::RequestOwnerEpoch>(r), S<core::RequestId>(r),
-              S<core::ContentDigest>(r), r.Bool(), r.Bool(),
-              Opt<core::CellAdmissionClaimGeneration>(r, [](Reader& r) {
-                return G<core::CellAdmissionClaimGeneration>(r);
-              })};
-        })};
-  });
+  x.program_cycle_status = Opt<core::ProgramCycleStatusDTO>(
+      r, [](Reader &r) { return ProgramCycle(r); });
   x.required_component_status_current = r.Bool();
   x.required_component_total = r.U32();
   x.required_component_current_compatible_ready_converged = r.U32();
@@ -310,6 +332,16 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(Reader &r) {
   x.blocking_fault_count = r.U32();
   x.unresolved_owner_count = r.U32();
   x.unsettled_effect_count = r.U32();
+  if (r.HasRemaining()) {
+    if (!r.Bool())
+      Fail("Program Runner loss extension must be present or omitted");
+    core::ProgramRunnerContactLossDTO loss{
+        S<core::RequestOwnerEpoch>(r), S<core::RuntimeEpoch>(r),
+        ProgramCycle(r), r.String(), r.String()};
+    if (!core::ValidateProgramRunnerContactLoss(loss).ok())
+      Fail("invalid Program Runner contact loss");
+    x.program_runner_loss = std::move(loss);
+  }
   if (x.required_component_current_compatible_ready_converged >
       x.required_component_total) {
     Fail("readiness count exceeds total");
@@ -469,7 +501,9 @@ bool IsKernelCellAdmissionRpcPacket(std::string_view b) noexcept {
 
 KernelCellAdmissionRpcResponse
 DispatchKernelCellAdmissionRpc(core::IKernelCellAdmissionPort &kernel,
-                               const KernelCellAdmissionRpcPacket &request) {
+                               const KernelCellAdmissionRpcPacket &request,
+                               std::shared_ptr<core::IIoSignalService>* actual_retired_service) {
+  if (actual_retired_service) actual_retired_service->reset();
   const auto adopt = [](const auto &result) -> KernelCellAdmissionRpcResponse {
     return result.ok() ? KernelCellAdmissionRpcResponse{result.value()}
                        : KernelCellAdmissionRpcResponse{result.error()};
@@ -481,7 +515,8 @@ DispatchKernelCellAdmissionRpc(core::IKernelCellAdmissionPort &kernel,
   }
   if (request.command == "cell_admission_update_readiness")
     return adopt(kernel.UpdateCellAdmissionReadiness(
-        std::get<core::CellAdmissionReadinessSnapshotDTO>(request.request)));
+        std::get<core::CellAdmissionReadinessSnapshotDTO>(request.request),
+        actual_retired_service));
   if (request.command == "cell_admission_publish_liveness") {
     const auto published = kernel.Publish(
         std::get<core::ManagerLivenessObservationDTO>(request.request));

@@ -260,6 +260,52 @@ template <typename Value, typename Less>
 // These joins establish durable data consistency only. The original live
 // private offer and independently qualified retained bundle own effect entry;
 // replay/owner replacement must remain observation and reconciliation only.
+[[nodiscard]] bool fence_matches_expected_provider(
+    const ConfigurationFenceDomainScopeDTO& fence,
+    const ExpectedControlDomainRevisionDTO& expected) noexcept {
+  const auto* payload = std::get_if<ProviderConfigurationFenceDomainDTO>(&fence.payload);
+  const auto* expected_provider = expected.provider();
+  const auto* proof =
+      payload && payload->candidate_provider ? &*payload->candidate_provider : nullptr;
+  if (static_cast<bool>(proof) != static_cast<bool>(expected_provider)) return false;
+  return !proof ||
+         (proof->controllable_component_id ==
+              expected_provider->provider.controllable_component_id &&
+          proof->provider_instance_id == expected_provider->provider.provider_instance_id &&
+          proof->signal_configuration_digest ==
+              expected_provider->provider.signal_configuration_digest);
+}
+
+[[nodiscard]] bool fence_matches_current_provider(
+    const ConfigurationFenceDomainScopeDTO& fence,
+    const ResolvedLifecycleControlDomainScopeDTO& current, bool candidate) noexcept {
+  const auto* payload = std::get_if<ProviderConfigurationFenceDomainDTO>(&fence.payload);
+  const auto* proof =
+      payload ? (candidate ? &payload->candidate_provider : &payload->predecessor_provider)
+              : nullptr;
+  const auto* provider = current.provider();
+  if (static_cast<bool>(proof && proof->has_value()) != static_cast<bool>(provider)) return false;
+  return !provider ||
+         ((*proof)->controllable_component_id == provider->provider.controllable_component_id &&
+          (*proof)->provider_instance_id == provider->provider.provider_instance_id &&
+          (*proof)->signal_configuration_digest == provider->provider.signal_configuration_digest &&
+          (*proof)->output_resources == provider->output_resources);
+}
+
+[[nodiscard]] bool fence_provider_within_parent(
+    const ConfigurationFenceDomainScopeDTO& child,
+    const ConfigurationFenceDomainScopeDTO& parent) noexcept {
+  const auto* child_payload = std::get_if<ProviderConfigurationFenceDomainDTO>(&child.payload);
+  const auto* parent_payload = std::get_if<ProviderConfigurationFenceDomainDTO>(&parent.payload);
+  const std::optional<ProviderConfigurationFenceOccurrenceDTO> absent;
+  return (!child.predecessor_control_domain_revision ||
+          (child_payload ? child_payload->predecessor_provider : absent) ==
+              (parent_payload ? parent_payload->predecessor_provider : absent)) &&
+         (!child.candidate_control_domain_revision ||
+          (child_payload ? child_payload->candidate_provider : absent) ==
+              (parent_payload ? parent_payload->candidate_provider : absent));
+}
+
 [[nodiscard]] bool selected_status_evidence_valid(const ComponentLifecycleStatusDTO& status) {
   const auto& evidence = *status.selected_bring_up;
   const auto& claim = evidence.selected_claim;
@@ -285,13 +331,18 @@ template <typename Value, typename Less>
       !ValidateCellAdmissionRecoveryReceiptQuery({intent, claim, std::nullopt}).ok() ||
       intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
       intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
-      intent.owner_epoch != request.request_owner_epoch || intent.request_id != request.request_id ||
+      intent.owner_epoch != request.request_owner_epoch ||
+      intent.request_id != request.request_id ||
       intent.owner_transaction_id != accepted.lifecycle_transaction_id.value() ||
       intent.owner_transaction_id !=
-          "selected-lifecycle." + std::to_string(accepted.lifecycle_transaction_generation.value()) ||
+          "selected-lifecycle." +
+              std::to_string(accepted.lifecycle_transaction_generation.value()) ||
       intent.request_payload_digest != evidence.offer_digest ||
-      intent.expected_admission_generation != status.accepted_intent.expected_admission_generation ||
-      intent.scope.resources.empty() || intent.scope.configurations.empty() ||
+      intent.expected_admission_generation !=
+          status.accepted_intent.expected_admission_generation ||
+      (std::any_of(scope.domains.begin(), scope.domains.end(),
+                   [](const auto& domain) { return domain.has_controller_side(); }) &&
+       (intent.scope.resources.empty() || intent.scope.configurations.empty())) ||
       intent.program_cycle_evidence || intent.program_node_evidence ||
       !intent.intervention_evidence ||
       intent.intervention_evidence->parent_program_cycle_claim_generation ||
@@ -299,13 +350,13 @@ template <typename Value, typename Less>
       !bounded_identity(evidence.accepted_fence.configuration_fence_id) ||
       scope.controllable_component_ids !=
           std::vector<ControllableComponentId>{status.accepted_intent.controllable_component_id} ||
-      scope.resources != intent.scope.resources ||
-      scope.domains.size() != status.domains.size() ||
+      scope.resources != intent.scope.resources || scope.domains.size() != status.domains.size() ||
       scope.domains.size() > kMaxLifecycleDisableDomainUnion ||
       scope.bindings.size() > kMaxLifecycleStatusBindingUnion ||
       scope.resources.size() > kMaximumCellAdmissionScopeEntries ||
       evidence.successor_occurrence.domains.size() !=
-          status.accepted_intent.expected_control_domains.size()) return false;
+          status.accepted_intent.expected_control_domains.size())
+    return false;
 
   std::vector<ControlDomainId> candidate_domains;
   for (const auto& domain : status.accepted_intent.expected_control_domains)
@@ -333,8 +384,10 @@ template <typename Value, typename Less>
       const auto& expected = status.accepted_intent.expected_control_domains[candidate_index++];
       if (expected.control_domain_id != fenced.control_domain_id ||
           expected.control_domain_revision != *fenced.candidate_control_domain_revision ||
-          !domain.expected_domain || *domain.expected_domain != expected) return false;
-      for (const auto& binding : expected.expected_control_bindings) {
+          !fence_matches_expected_provider(fenced, expected) || !domain.expected_domain ||
+          *domain.expected_domain != expected)
+        return false;
+      for (const auto& binding : expected.control_bindings()) {
         const auto [entry, inserted] = candidate_bindings.emplace(
             binding.control_binding_id, binding.control_binding_revision);
         if (!inserted && entry->second != binding.control_binding_revision) return false;
@@ -352,7 +405,10 @@ template <typename Value, typename Less>
     const bool candidate = !accepted_phase &&
                            fenced.candidate_control_domain_revision == current.control_domain_revision;
     if (!predecessor && !candidate) return false;
-    for (const auto& binding : current.current_control_bindings) {
+    if (!((predecessor && fence_matches_current_provider(fenced, current, false)) ||
+          (candidate && fence_matches_current_provider(fenced, current, true))))
+      return false;
+    for (const auto& binding : current.control_bindings()) {
       const auto entry = std::lower_bound(scope.bindings.begin(), scope.bindings.end(),
           binding.control_binding_id, [](const auto& row, const auto& id) {
             return row.control_binding_id < id;
@@ -363,7 +419,7 @@ template <typename Value, typename Less>
             (candidate && entry->candidate_control_binding_revision ==
                               binding.control_binding_revision))) return false;
     }
-    for (const auto& resource : current.current_resources)
+    for (const auto& resource : current.resource_ids())
       if (!std::binary_search(scope.resources.begin(), scope.resources.end(), resource)) return false;
 
     // Configurations in the selected claim are the adopted predecessor facts.
@@ -375,11 +431,12 @@ template <typename Value, typename Less>
           [](const auto& row, const auto& id) { return row.control_domain_id < id; });
       const bool claimed = configured != intent.scope.configurations.end() &&
                            configured->control_domain_id == domain.control_domain_id;
-      if (claimed != current.active_control_configuration.has_value()) return false;
-      if (claimed && (configured->active_configuration_id !=
-                         current.active_control_configuration->active_control_configuration_id ||
-                     configured->active_configuration_generation !=
-                         current.active_control_configuration->active_control_configuration_generation))
+      const auto active = current.configuration_identity();
+      if (claimed != active.has_value()) return false;
+      if (claimed &&
+          (configured->active_configuration_id != active->active_control_configuration_id ||
+           configured->active_configuration_generation !=
+               active->active_control_configuration_generation))
         return false;
     }
   }
@@ -462,12 +519,16 @@ template <typename Value, typename Less>
         fenced.control_domain_id, [](const auto& row, const auto& id) {
           return row.control_domain_id < id;
         });
-    if (fenced.control_domain_id != domain.control_domain_id || parent == parent_scope.domains.end() ||
+    if (fenced.control_domain_id != domain.control_domain_id ||
+        parent == parent_scope.domains.end() ||
         parent->control_domain_id != fenced.control_domain_id ||
-        (fenced.predecessor_control_domain_revision && fenced.predecessor_control_domain_revision !=
-                                                     parent->predecessor_control_domain_revision) ||
-        (fenced.candidate_control_domain_revision && fenced.candidate_control_domain_revision !=
-                                                   parent->candidate_control_domain_revision)) return false;
+        (fenced.predecessor_control_domain_revision &&
+         fenced.predecessor_control_domain_revision !=
+             parent->predecessor_control_domain_revision) ||
+        (fenced.candidate_control_domain_revision &&
+         fenced.candidate_control_domain_revision != parent->candidate_control_domain_revision) ||
+        !fence_provider_within_parent(fenced, *parent))
+      return false;
     if (fenced.predecessor_control_domain_revision) predecessor_domains.push_back(fenced.control_domain_id);
     if (fenced.candidate_control_domain_revision) {
       candidate_domains.push_back(fenced.control_domain_id);
@@ -475,8 +536,10 @@ template <typename Value, typename Less>
       const auto& expected = intent.expected_control_domains[candidate_index++];
       if (expected.control_domain_id != fenced.control_domain_id ||
           expected.control_domain_revision != *fenced.candidate_control_domain_revision ||
-          !domain.expected_domain || *domain.expected_domain != expected) return false;
-      for (const auto& binding : expected.expected_control_bindings) {
+          !fence_matches_expected_provider(fenced, expected) || !domain.expected_domain ||
+          *domain.expected_domain != expected)
+        return false;
+      for (const auto& binding : expected.control_bindings()) {
         const auto [entry, inserted] = candidate_bindings.emplace(
             binding.control_binding_id, binding.control_binding_revision);
         if (!inserted && entry->second != binding.control_binding_revision) return false;
@@ -490,7 +553,10 @@ template <typename Value, typename Less>
     const bool candidate = !accepted_phase &&
                           fenced.candidate_control_domain_revision == current.control_domain_revision;
     if (!predecessor && !candidate) return false;
-    for (const auto& binding : current.current_control_bindings) {
+    if (!((predecessor && fence_matches_current_provider(fenced, current, false)) ||
+          (candidate && fence_matches_current_provider(fenced, current, true))))
+      return false;
+    for (const auto& binding : current.control_bindings()) {
       const auto entry = std::lower_bound(scope.bindings.begin(), scope.bindings.end(),
           binding.control_binding_id, [](const auto& row, const auto& id) {
             return row.control_binding_id < id;
@@ -501,17 +567,18 @@ template <typename Value, typename Less>
             (candidate && entry->candidate_control_binding_revision ==
                               binding.control_binding_revision))) return false;
     }
-    for (const auto& resource : current.current_resources)
+    for (const auto& resource : current.resource_ids())
       if (!std::binary_search(scope.resources.begin(), scope.resources.end(), resource)) return false;
     if (accepted_phase && domain.expected_domain &&
         fenced.predecessor_control_domain_revision == fenced.candidate_control_domain_revision) {
-      const auto& expected = domain.expected_domain->expected_active_control_configuration;
+      const auto& expected = domain.expected_domain->expected_configuration();
       const bool present = expected.presence == ExpectedActiveControlConfigurationPresenceDTO::kPresent;
-      if (present != current.active_control_configuration.has_value()) return false;
-      if (present && (expected.active_control_configuration_id !=
-                         current.active_control_configuration->active_control_configuration_id ||
-                     expected.active_control_configuration_generation !=
-                         current.active_control_configuration->active_control_configuration_generation))
+      const auto active = current.configuration_identity();
+      if (present != active.has_value()) return false;
+      if (present &&
+          (expected.active_control_configuration_id != active->active_control_configuration_id ||
+           expected.active_control_configuration_generation !=
+               active->active_control_configuration_generation))
         return false;
     }
   }
@@ -914,8 +981,15 @@ bool ExpectedControlBindingRevisionDTO::locally_valid() const noexcept {
 }
 
 bool ExpectedControlDomainRevisionDTO::locally_valid() const noexcept {
-  if (!bounded_identity(control_domain_id) || !bounded_identity(control_domain_revision) ||
-      !bounded_identity(controller_topology_id) || !bounded_identity(topology_revision) ||
+  if (payload.valueless_by_exception() || !bounded_identity(control_domain_id) ||
+      !bounded_identity(control_domain_revision))
+    return false;
+  if (const auto* value = provider())
+    return value->provider.locally_valid() &&
+           value->expected_active_control_configuration.locally_valid();
+  const auto& [controller_topology_id, topology_revision, expected_active_control_configuration,
+               expected_control_bindings] = controller();
+  if (!bounded_identity(controller_topology_id) || !bounded_identity(topology_revision) ||
       !expected_active_control_configuration.locally_valid() || expected_control_bindings.empty() ||
       expected_control_bindings.size() > kMaxLifecycleExpectedBindings) {
     return false;
@@ -994,10 +1068,10 @@ bool ComponentLifecycleIntentDTO::locally_valid() const noexcept {
   std::size_t binding_count = 0U;
   for (const auto& domain : expected_control_domains) {
     if (!domain.locally_valid() ||
-        binding_count > kMaxLifecycleExpectedBindings - domain.expected_control_bindings.size()) {
+        binding_count > kMaxLifecycleExpectedBindings - domain.control_bindings().size()) {
       return false;
     }
-    binding_count += domain.expected_control_bindings.size();
+    binding_count += domain.control_bindings().size();
   }
   return true;
 }
@@ -1189,8 +1263,29 @@ bool LifecycleReconciliationEvidenceDTO::locally_valid() const noexcept {
 }
 
 bool ResolvedLifecycleControlDomainScopeDTO::locally_valid() const noexcept {
-  if (!bounded_identity(control_domain_id) || !bounded_identity(control_domain_revision) ||
-      !bounded_identity(controller_topology_id) || !bounded_identity(topology_revision) ||
+  if (payload.valueless_by_exception() || !bounded_identity(control_domain_id) ||
+      !bounded_identity(control_domain_revision))
+    return false;
+  if (const auto* value = provider()) {
+    if (!value->provider.locally_valid() || !bounded_identity(value->provider_runtime_epoch))
+      return false;
+    if (value->output_resources.size() > kMaxLifecycleCurrentResources ||
+        !std::is_sorted(value->output_resources.begin(), value->output_resources.end()) ||
+        std::adjacent_find(value->output_resources.begin(), value->output_resources.end()) !=
+            value->output_resources.end() ||
+        std::any_of(value->output_resources.begin(), value->output_resources.end(),
+                    [](const auto& id) { return !bounded_identity(id); }))
+      return false;
+    if (!value->active_control_configuration) return true;
+    const auto& configuration = *value->active_control_configuration;
+    return configuration.locally_valid() &&
+           configuration.source_runtime_unit_id == value->provider.provider_runtime_unit_id &&
+           configuration.source_runtime_epoch == value->provider_runtime_epoch &&
+           configuration.signal_configuration_digest == value->provider.signal_configuration_digest;
+  }
+  const auto& [controller_topology_id, topology_revision, active_control_configuration,
+               current_control_bindings, current_resources] = controller();
+  if (!bounded_identity(controller_topology_id) || !bounded_identity(topology_revision) ||
       current_control_bindings.empty() ||
       current_control_bindings.size() > kMaxLifecycleResolvedBindings ||
       current_resources.empty() || current_resources.size() > kMaxLifecycleCurrentResources) {
@@ -1236,12 +1331,11 @@ bool ResolvedLifecycleControlDomainScopeDTO::locally_valid() const noexcept {
   return true;
 }
 
-bool ResolvedLifecycleProviderOccurrenceDTO::locally_valid() const noexcept {
-  return bounded_identity(control_domain_id) && bounded_identity(control_domain_revision) &&
-         bounded_identity(provider_instance_id) && bounded_identity(provider_manifest_id) &&
-         bounded_identity(provider_manifest_revision) &&
-         bounded_identity(provider_runtime_unit_id) && bounded_identity(provider_runtime_epoch) &&
-         bounded_identity(lifecycle_plan_catalog_digest);
+bool ProviderDomainActiveConfigurationDTO::locally_valid() const noexcept {
+  return bounded_identity(active_control_configuration_id) &&
+         active_control_configuration_generation.nonzero() &&
+         bounded_identity(source_runtime_unit_id) && bounded_identity(source_runtime_epoch) &&
+         source_sequence != 0U && IsExactLowercaseSha256Digest(signal_configuration_digest.value());
 }
 
 bool SelectedControllerOccurrenceDTO::locally_valid() const noexcept {
@@ -1318,12 +1412,38 @@ bool ComponentLifecycleCurrentSnapshotDTO::locally_valid() const noexcept {
     if (!domain.locally_valid() || !provider.locally_valid() ||
         domain.control_domain_id != provider.control_domain_id ||
         domain.control_domain_revision != provider.control_domain_revision ||
-        binding_count > kMaxLifecycleResolvedBindings - domain.current_control_bindings.size() ||
-        resource_count > kMaxLifecycleCurrentResources - domain.current_resources.size()) {
+        binding_count > kMaxLifecycleResolvedBindings - domain.control_bindings().size() ||
+        resource_count > kMaxLifecycleCurrentResources - domain.resource_ids().size()) {
       return false;
     }
-    binding_count += domain.current_control_bindings.size();
-    resource_count += domain.current_resources.size();
+    if (const auto* driver = domain.provider();
+        driver && (driver->provider.controllable_component_id != controllable_component_id ||
+                   !ProviderDomainMatchesOccurrence(
+                       domain.control_domain_id, domain.control_domain_revision, driver->provider,
+                       driver->provider_runtime_epoch, provider)))
+      return false;
+    binding_count += domain.control_bindings().size();
+    resource_count += domain.resource_ids().size();
+  }
+  return true;
+}
+
+bool ExpectedDomainProofMatchesResolvedScope(
+    const ExpectedControlDomainRevisionDTO& expected,
+    const ResolvedLifecycleControlDomainScopeDTO& current) noexcept {
+  if (!expected.locally_valid() || !current.locally_valid() ||
+      expected.control_domain_id != current.control_domain_id ||
+      expected.control_domain_revision != current.control_domain_revision ||
+      expected.payload.index() != current.payload.index()) {
+    return false;
+  }
+  if (const auto* provider = expected.provider()) {
+    if (provider->provider != current.provider()->provider) return false;
+  } else if (expected.controller().controller_topology_id !=
+                 current.controller().controller_topology_id ||
+             expected.controller().topology_revision != current.controller().topology_revision ||
+             expected.control_bindings() != current.control_bindings()) {
+    return false;
   }
   return true;
 }
@@ -1331,23 +1451,17 @@ bool ComponentLifecycleCurrentSnapshotDTO::locally_valid() const noexcept {
 bool ExpectedDomainMatchesResolvedScope(
     const ExpectedControlDomainRevisionDTO& expected,
     const ResolvedLifecycleControlDomainScopeDTO& current) noexcept {
-  if (!expected.locally_valid() || !current.locally_valid() ||
-      expected.control_domain_id != current.control_domain_id ||
-      expected.control_domain_revision != current.control_domain_revision ||
-      expected.controller_topology_id != current.controller_topology_id ||
-      expected.topology_revision != current.topology_revision ||
-      expected.expected_control_bindings != current.current_control_bindings) {
-    return false;
-  }
-  const auto& expected_configuration = expected.expected_active_control_configuration;
+  if (!ExpectedDomainProofMatchesResolvedScope(expected, current)) return false;
+  const auto& expected_configuration = expected.expected_configuration();
+  const auto actual = current.configuration_identity();
   if (expected_configuration.presence == ExpectedActiveControlConfigurationPresenceDTO::kAbsent) {
-    return !current.active_control_configuration.has_value();
+    return !actual.has_value();
   }
-  return current.active_control_configuration.has_value() &&
+  return actual.has_value() &&
          *expected_configuration.active_control_configuration_id ==
-             current.active_control_configuration->active_control_configuration_id &&
+             actual->active_control_configuration_id &&
          *expected_configuration.active_control_configuration_generation ==
-             current.active_control_configuration->active_control_configuration_generation;
+             actual->active_control_configuration_generation;
 }
 
 bool ComponentLifecycleDomainStatusDTO::locally_valid() const noexcept {
@@ -1370,6 +1484,13 @@ bool ComponentLifecycleDomainStatusDTO::locally_valid() const noexcept {
       !known(action_state) || !known(effect) ||
       primitive_attempts.size() > kMaxLifecycleAttemptsPerDomain || !error_valid(error)) {
     return false;
+  }
+  if (current_scope && current_scope->provider()) {
+    const auto& driver = *current_scope->provider();
+    if (!ProviderDomainMatchesOccurrence(control_domain_id, current_scope->control_domain_revision,
+                                         driver.provider, driver.provider_runtime_epoch,
+                                         *resolved_provider_occurrence))
+      return false;
   }
   std::set<LifecyclePrimitiveAttemptId> attempts;
   bool any_possible_effect = false;
@@ -1517,12 +1638,14 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
     }
     if (domain.current_scope.has_value()) {
       ++current_domain_count;
-      current_binding_count += domain.current_scope->current_control_bindings.size();
+      current_binding_count += domain.current_scope->control_bindings().size();
       if (current_binding_count > kMaxLifecycleResolvedBindings) {
         return false;
       }
-      if (domain.current_scope->active_control_configuration.has_value()) {
-        const auto& configuration = *domain.current_scope->active_control_configuration;
+      if (!domain.current_scope->provider() &&
+          domain.current_scope->controller().active_control_configuration.has_value()) {
+        const auto& configuration =
+            *domain.current_scope->controller().active_control_configuration;
         if (kinematic_projection_count >
             kMaxLifecycleKinematicSourceProjections -
                 configuration.kinematic_resource_source_projections.size()) {
@@ -1540,7 +1663,7 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
       }
     }
     if (domain.expected_domain.has_value()) {
-      expected_binding_count += domain.expected_domain->expected_control_bindings.size();
+      expected_binding_count += domain.expected_domain->control_bindings().size();
       if (expected_binding_count > kMaxLifecycleExpectedBindings) {
         return false;
       }

@@ -15,7 +15,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kCCLCJournalSchemaId = "manyforge.internal.cclc.journal.v5";
-inline constexpr std::int64_t kCCLCJournalSchemaVersion = 19;
+inline constexpr std::int64_t kCCLCJournalSchemaVersion = 20;
 inline constexpr std::int64_t kCCLCJournalSqliteApplicationId = 0x4D464C4A;
 inline constexpr std::string_view kCCLCJournalFilename = "cclc-journal.sqlite3";
 inline constexpr std::size_t kDefaultCCLCExactResultHistory = 128U;
@@ -254,6 +254,9 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
   [[nodiscard]] Result<std::optional<ComponentLifecycleStatusDTO>> LoadRetainedLifecycleStatus(
       const LifecycleTransactionId& lifecycle_transaction_id) override;
 
+  [[nodiscard]] Result<std::vector<ComponentLifecycleStatusDTO>>
+  LoadRetainedComponentLifecycleHistory(const ControllableComponentId&) override;
+
   [[nodiscard]] Result<ComponentLifecycleCurrentFactReadbackDTO> LoadCurrentComponentLifecycleFact(
       const ControllableComponentId& controllable_component_id) override;
 
@@ -401,6 +404,7 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
       const ComponentIncidentRecordDTO& record, std::uint64_t recovery_generation) override;
   [[nodiscard]] Result<std::optional<ComponentIncidentRecordDTO>> LoadOpenComponentIncident(
       const ControllableComponentId& component) override;
+  [[nodiscard]] Result<bool> HasOpenIncident() override;
   [[nodiscard]] Result<bool> RecordComponentIncidentContainment(
       const std::string& incident_id, ComponentIncidentContainmentStateDTO state,
       const std::string& record_json, std::int64_t occurred_at_ns) override;

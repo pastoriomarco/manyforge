@@ -22,6 +22,7 @@ class ExecutionWorkerSignals {
   void mark_complete();
   void abandon();
   bool wait_for_completion(std::int64_t timeout_ns);
+  [[nodiscard]] bool complete() const;
 
   void notify();
 

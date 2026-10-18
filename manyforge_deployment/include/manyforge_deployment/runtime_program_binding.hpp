@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/types/runtime_domain_configuration.hpp>
 #include <manyforge_core/types/program_binding.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -203,5 +204,14 @@ build_runtime_participant_binding_dto(
     const RuntimeProgramTargetBinding &target,
     const ActiveRuntimeParticipantFactsDTO &active_facts,
     std::span<const RuntimeProgramTargetBinding> supporting_capabilities = {});
+
+/// Resolve a genuine output channel from the sealed target/resource and the
+/// installed provider's actual lifecycle occurrence. Closed metadata permits
+/// construction only; Kernel command admission still requires enabled proof.
+[[nodiscard]] core::RuntimeParticipantBindingDTO
+build_runtime_io_output_binding_dto(
+    const RuntimeProgramTargetBinding& target, const core::ResourceRoleId& resource_role,
+    const RetainedBundle& retained_bundle,
+    const core::RuntimeProviderDomainConfigurationReadbackDTO& actual_provider);
 
 } // namespace manyforge::deployment

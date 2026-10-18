@@ -1,6 +1,7 @@
 #include <manyforge_deployment/component_lifecycle_current_snapshot_source.hpp>
 
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 
 #include <algorithm>
 #include <set>
@@ -74,8 +75,9 @@ resolved_bindings(
   if (graph_bindings.empty() ||
       desired.control_domain_id != domain.control_domain_id ||
       desired.control_domain_revision != domain.control_domain_revision ||
-      desired.controller_topology_id != domain.controller_topology_id ||
-      desired.topology_revision != domain.topology_revision) {
+      desired.controller_topology_id !=
+          domain.controller().controller_topology_id ||
+      desired.topology_revision != domain.controller().topology_revision) {
     return fail<std::vector<core::ExpectedControlBindingRevisionDTO>>(
         "retained_domain_configuration_incomplete",
         "retained desired control configuration does not close its domain");
@@ -87,8 +89,9 @@ resolved_bindings(
     if (!current->locally_valid() ||
         current->control_domain_id != domain.control_domain_id ||
         current->control_domain_revision != domain.control_domain_revision ||
-        current->controller_topology_id != domain.controller_topology_id ||
-        current->topology_revision != domain.topology_revision ||
+        current->controller_topology_id !=
+            domain.controller().controller_topology_id ||
+        current->topology_revision != domain.controller().topology_revision ||
         current->binding_routes.size() != graph_bindings.size()) {
       return fail<std::vector<core::ExpectedControlBindingRevisionDTO>>(
           "current_active_configuration_mismatch",
@@ -253,6 +256,12 @@ VerifiedComponentLifecycleCurrentSnapshotSource::ReadCurrentComponentSnapshot(
       component_bindings.push_back(&binding);
     }
   }
+  for (const auto &domain : graph.control_domains) {
+    if (const auto *provider = domain.provider();
+        provider &&
+        provider->controllable_component_id == controllable_component_id)
+      domain_ids.push_back(domain.control_domain_id);
+  }
   std::sort(domain_ids.begin(), domain_ids.end());
   domain_ids.erase(std::unique(domain_ids.begin(), domain_ids.end()),
                    domain_ids.end());
@@ -315,56 +324,12 @@ VerifiedComponentLifecycleCurrentSnapshotSource::ReadCurrentComponentSnapshot(
     const auto *desired = unique_by(
         retained_bundle_.value().desired_control_configurations, domain_id,
         [](const auto &value) { return value.control_domain_id; });
-    if (graph_domain == nullptr || desired == nullptr) {
+    if (graph_domain == nullptr ||
+        (!graph_domain->provider() && desired == nullptr)) {
       return fail<core::ComponentLifecycleCurrentSnapshotDTO>(
           "retained_domain_not_found_or_ambiguous",
           "component domain has no unique retained domain and desired "
           "configuration");
-    }
-
-    std::vector<const core::ControlBindingDTO *> graph_bindings;
-    std::set<core::ResourceId> resources;
-    for (const auto &binding : graph.control_bindings) {
-      if (binding.control_domain_id != domain_id) {
-        continue;
-      }
-      if (binding.controller_topology_id !=
-              graph_domain->controller_topology_id ||
-          binding.topology_revision != graph_domain->topology_revision) {
-        return fail<core::ComponentLifecycleCurrentSnapshotDTO>(
-            "retained_binding_topology_mismatch",
-            "control binding does not match its retained domain topology");
-      }
-      graph_bindings.push_back(&binding);
-      for (const auto &resource : binding.resource_bindings) {
-        resources.insert(resource.resource_id);
-      }
-    }
-    const auto bindings =
-        resolved_bindings(*graph_domain, *desired, graph_bindings,
-                          domain_fact.current_active_control_configuration);
-    if (!bindings.ok() || resources.empty()) {
-      if (!bindings.ok()) {
-        return core::Result<core::ComponentLifecycleCurrentSnapshotDTO>::Err(
-            bindings.error());
-      }
-      return fail<core::ComponentLifecycleCurrentSnapshotDTO>(
-          "retained_domain_resources_missing",
-          "component domain has no complete retained resource scope");
-    }
-
-    core::ResolvedLifecycleControlDomainScopeDTO scope{
-        graph_domain->control_domain_id,
-        graph_domain->control_domain_revision,
-        graph_domain->controller_topology_id,
-        graph_domain->topology_revision,
-        domain_fact.current_active_control_configuration,
-        bindings.value(),
-        std::vector<core::ResourceId>(resources.begin(), resources.end())};
-    if (!scope.locally_valid()) {
-      return fail<core::ComponentLifecycleCurrentSnapshotDTO>(
-          "resolved_domain_scope_invalid",
-          "resolved current domain scope is not one closed canonical value");
     }
 
     const auto occurrence = std::lower_bound(
@@ -373,6 +338,100 @@ VerifiedComponentLifecycleCurrentSnapshotSource::ReadCurrentComponentSnapshot(
           return candidate.control_domain_id < requested;
         });
     if (occurrence == provider_occurrences_.end() ||
+        occurrence->control_domain_id != domain_id)
+      return fail<core::ComponentLifecycleCurrentSnapshotDTO>(
+          "lifecycle_provider_occurrence_mismatch",
+          "domain has no actual provider occurrence");
+
+    const auto build_scope =
+        [&]() -> core::Result<core::ResolvedLifecycleControlDomainScopeDTO> {
+      if (const auto *driver = graph_domain->provider()) {
+        if (driver->controllable_component_id != controllable_component_id ||
+            domain_fact.current_active_control_configuration ||
+            !core::ProviderDomainMatchesOccurrence(
+                domain_id, graph_domain->control_domain_revision, *driver,
+                occurrence->provider_runtime_epoch, *occurrence))
+          return fail<core::ResolvedLifecycleControlDomainScopeDTO>(
+              "provider_domain_fact_mismatch",
+              "provider domain does not match its actual occurrence");
+        const auto catalog = ResolveRetainedIoSignalCatalog(graph);
+        if (!catalog.ok())
+          return core::Result<core::ResolvedLifecycleControlDomainScopeDTO>::
+              Err(catalog.error());
+        std::vector<core::ResourceId> outputs;
+        for (const auto &row : catalog.value()) {
+          if (row.runtime_unit_id == driver->provider_runtime_unit_id &&
+              row.descriptor.signal_id.controllable_component_id ==
+                  driver->controllable_component_id &&
+              std::binary_search(driver->signal_names.begin(),
+                                 driver->signal_names.end(),
+                                 row.descriptor.signal_id.name) &&
+              row.descriptor.output_resource)
+            outputs.push_back(*row.descriptor.output_resource);
+        }
+        std::sort(outputs.begin(), outputs.end());
+        outputs.erase(std::unique(outputs.begin(), outputs.end()),
+                      outputs.end());
+        return core::Result<core::ResolvedLifecycleControlDomainScopeDTO>::Ok(
+            {domain_id, graph_domain->control_domain_revision,
+             core::ResolvedProviderDomainScopeDTO{
+                 *driver, occurrence->provider_runtime_epoch, std::nullopt,
+                 std::move(outputs)}});
+      }
+
+      std::vector<const core::ControlBindingDTO *> graph_bindings;
+      std::set<core::ResourceId> resources;
+      for (const auto &binding : graph.control_bindings) {
+        if (binding.control_domain_id != domain_id) {
+          continue;
+        }
+        if (binding.controller_topology_id !=
+                graph_domain->controller().controller_topology_id ||
+            binding.topology_revision !=
+                graph_domain->controller().topology_revision) {
+          return fail<core::ResolvedLifecycleControlDomainScopeDTO>(
+              "retained_binding_topology_mismatch",
+              "control binding does not match its retained domain topology");
+        }
+        graph_bindings.push_back(&binding);
+        for (const auto &resource : binding.resource_bindings) {
+          resources.insert(resource.resource_id);
+        }
+      }
+      const auto bindings =
+          resolved_bindings(*graph_domain, *desired, graph_bindings,
+                            domain_fact.current_active_control_configuration);
+      if (!bindings.ok() || resources.empty()) {
+        if (!bindings.ok()) {
+          return core::Result<core::ResolvedLifecycleControlDomainScopeDTO>::
+              Err(bindings.error());
+        }
+        return fail<core::ResolvedLifecycleControlDomainScopeDTO>(
+            "retained_domain_resources_missing",
+            "component domain has no complete retained resource scope");
+      }
+
+      core::ResolvedLifecycleControlDomainScopeDTO scope{
+          graph_domain->control_domain_id,
+          graph_domain->control_domain_revision,
+          graph_domain->controller().controller_topology_id,
+          graph_domain->controller().topology_revision,
+          domain_fact.current_active_control_configuration,
+          bindings.value(),
+          std::vector<core::ResourceId>(resources.begin(), resources.end())};
+      if (!scope.locally_valid()) {
+        return fail<core::ResolvedLifecycleControlDomainScopeDTO>(
+            "resolved_domain_scope_invalid",
+            "resolved current domain scope is not one closed canonical value");
+      }
+      return core::Result<core::ResolvedLifecycleControlDomainScopeDTO>::Ok(
+          std::move(scope));
+    };
+    auto built = build_scope();
+    if (!built.ok())
+      return core::Result<core::ComponentLifecycleCurrentSnapshotDTO>::Err(
+          built.error());
+    if (occurrence == provider_occurrences_.end() ||
         occurrence->control_domain_id != domain_id ||
         occurrence->control_domain_revision !=
             graph_domain->control_domain_revision ||
@@ -380,8 +439,9 @@ VerifiedComponentLifecycleCurrentSnapshotSource::ReadCurrentComponentSnapshot(
                   occurrence->provider_runtime_unit_id) ||
         !contains(component->runtime_unit_ids,
                   occurrence->provider_runtime_unit_id) ||
-        !provider_matches_component_binding(
-            *occurrence, controllable_component_id, component_bindings)) {
+        (!graph_domain->provider() &&
+         !provider_matches_component_binding(
+             *occurrence, controllable_component_id, component_bindings))) {
       return fail<core::ComponentLifecycleCurrentSnapshotDTO>(
           "lifecycle_provider_occurrence_mismatch",
           "component domain has no exact current retained lifecycle provider "
@@ -409,7 +469,7 @@ VerifiedComponentLifecycleCurrentSnapshotSource::ReadCurrentComponentSnapshot(
           "lifecycle_catalog_readback_mismatch",
           "lifecycle catalog source returned a non-exact provider occurrence");
     }
-    domains.push_back(std::move(scope));
+    domains.push_back(std::move(built.value()));
     providers.push_back(*occurrence);
   }
 

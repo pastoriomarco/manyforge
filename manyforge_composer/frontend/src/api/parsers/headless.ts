@@ -14,7 +14,12 @@ import type {
   OperatorAlarmRecord,
   OperatorAlarmSnapshot,
 } from '../../types/headless';
-import type { StopFaultRecoveryOffer } from '../../types/robotControl';
+import type {
+  GlobalRuleRecoveryOffer,
+  GlobalRuleRecoveryResult,
+  GlobalRuleRecoverySelector,
+  StopFaultRecoveryOffer,
+} from '../../types/robotControl';
 import {
   StructuralContractError,
   allowedKeysAt,
@@ -25,6 +30,7 @@ import {
   exactKeysAt,
   fail,
   integerAt,
+  nullablePositiveUint64TextAt,
   monotonicNanosecondsAt,
   nullableNumberAt,
   nullableStringAt,
@@ -561,9 +567,10 @@ export function parseStopFaultRecoveryOffer(
   value: unknown,
 ): StopFaultRecoveryOffer | null {
   const envelope = objectAt(value, 'stopFaultResponse');
-  exactKeysAt(
+  allowedKeysAt(
     envelope,
     ['api_version', 'command', 'ok', 'stop_fault'],
+    ['global_rule_recovery_offers'],
     'stopFaultResponse',
   );
   if (
@@ -711,6 +718,146 @@ export function parseStopFaultRecoveryOffer(
     stopCertificate: certificate,
     configurationExpectations: expectations,
     recoveryUnavailableReason,
+  };
+}
+
+function parseGlobalRuleContext(
+  value: unknown,
+  path: string,
+): GlobalRuleRecoverySelector['context'] {
+  const context = objectAt(value, path);
+  exactKeysAt(context, [
+    'active_publication_generation', 'bundle', 'catalog_generation', 'graph', 'owner_epoch',
+  ], path);
+  return {
+    owner_epoch: stringAt(context.owner_epoch, `${path}.owner_epoch`),
+    catalog_generation: nullablePositiveUint64TextAt(
+      stringAt(context.catalog_generation, `${path}.catalog_generation`),
+      `${path}.catalog_generation`,
+    )!,
+    active_publication_generation: positiveIntegerAt(
+      context.active_publication_generation,
+      `${path}.active_publication_generation`,
+    ),
+    bundle: stringAt(context.bundle, `${path}.bundle`),
+    graph: stringAt(context.graph, `${path}.graph`),
+  };
+}
+
+function parseGlobalRuleRecoverySelector(
+  value: unknown,
+  path: string,
+): GlobalRuleRecoverySelector {
+  const selector = objectAt(value, path);
+  exactKeysAt(selector, ['context', 'expected_rule_registration_id', 'rule_id'], path);
+  return {
+    context: parseGlobalRuleContext(selector.context, `${path}.context`),
+    rule_id: stringAt(selector.rule_id, `${path}.rule_id`),
+    // Canonical positive uint64 text: Core emits and accepts only >= 1.
+    expected_rule_registration_id: nullablePositiveUint64TextAt(
+      stringAt(selector.expected_rule_registration_id, `${path}.expected_rule_registration_id`),
+      `${path}.expected_rule_registration_id`,
+    )!,
+  };
+}
+
+/**
+ * Parse the latched global rules' recovery offers of the same get_stop_fault
+ * reply (SX-2206). An owner that does not project them yet offers none.
+ */
+export function parseGlobalRuleRecoveryOffers(value: unknown): GlobalRuleRecoveryOffer[] {
+  parseStopFaultRecoveryOffer(value);
+  const envelope = objectAt(value, 'stopFaultResponse');
+  if (envelope.global_rule_recovery_offers === undefined) return [];
+  return arrayAt(
+    envelope.global_rule_recovery_offers,
+    'stopFaultResponse.global_rule_recovery_offers',
+  ).map((item, index) => {
+    const path = `stopFaultResponse.global_rule_recovery_offers[${index}]`;
+    const offer = objectAt(item, path);
+    exactKeysAt(offer, [
+      'current_condition', 'latch_cause', 'post_latch_disposition', 'selector',
+    ], path);
+    const currentCondition = offer.current_condition === null
+      ? null : booleanAt(offer.current_condition, `${path}.current_condition`);
+    const disposition = stringAt(offer.post_latch_disposition, `${path}.post_latch_disposition`);
+    if (disposition !== 'auto_clear_on_signal_release' && disposition !== 'await_operator_ack') {
+      return fail(`${path}.post_latch_disposition`, 'a supported post-latch disposition');
+    }
+    const cause = stringAt(offer.latch_cause, `${path}.latch_cause`);
+    if (cause !== 'condition' && cause !== 'source_loss') {
+      return fail(`${path}.latch_cause`, 'a supported latch cause');
+    }
+    return {
+      selector: parseGlobalRuleRecoverySelector(offer.selector, `${path}.selector`),
+      currentCondition,
+      postLatchDisposition: disposition,
+      latchCause: cause,
+    };
+  });
+}
+
+/**
+ * Parse the owner result of one `global_io_rule` recover_stop_fault request.
+ * It must echo the exact requested selector's rule and context (SX-2216),
+ * the request's own context also for a replay after the Applied one moved.
+ */
+export function parseGlobalRuleRecoveryResult(
+  value: unknown,
+  expectedRequestId: string,
+  expectedSelector: GlobalRuleRecoverySelector,
+): GlobalRuleRecoveryResult {
+  const expectedRuleId = expectedSelector.rule_id;
+  const envelope = objectAt(value, 'globalRuleRecoveryResponse');
+  exactKeysAt(envelope, ['api_version', 'command', 'ok', 'result'], 'globalRuleRecoveryResponse');
+  if (
+    stringAt(envelope.api_version, 'globalRuleRecoveryResponse.api_version')
+      !== 'manyforge.execution_command_response.v1'
+    || booleanAt(envelope.ok, 'globalRuleRecoveryResponse.ok') !== true
+    || stringAt(envelope.command, 'globalRuleRecoveryResponse.command') !== 'recover_stop_fault'
+  ) {
+    return fail('globalRuleRecoveryResponse', 'a successful global-rule recovery response');
+  }
+  const path = 'globalRuleRecoveryResponse.result';
+  const result = objectAt(envelope.result, path);
+  exactKeysAt(result, [
+    'accepted', 'context', 'error', 'replay_status', 'request_id', 'rule',
+  ], path);
+  if (stringAt(result.request_id, `${path}.request_id`) !== expectedRequestId) {
+    return fail(`${path}.request_id`, `the request ID ${expectedRequestId}`);
+  }
+  const context = parseGlobalRuleContext(result.context, `${path}.context`);
+  const expected = expectedSelector.context;
+  if (
+    context.owner_epoch !== expected.owner_epoch
+    || context.catalog_generation !== expected.catalog_generation
+    || context.active_publication_generation !== expected.active_publication_generation
+    || context.bundle !== expected.bundle
+    || context.graph !== expected.graph
+  ) {
+    return fail(`${path}.context`, 'the requested selector context');
+  }
+  const accepted = booleanAt(result.accepted, `${path}.accepted`);
+  let ruleState: GlobalRuleRecoveryResult['ruleState'] = null;
+  if (result.rule !== null || accepted) {
+    const rule = objectAt(result.rule, `${path}.rule`);
+    exactKeysAt(rule, ['rule_id', 'state', 'triggering_acquisition'], `${path}.rule`);
+    if (stringAt(rule.rule_id, `${path}.rule.rule_id`) !== expectedRuleId) {
+      return fail(`${path}.rule.rule_id`, `the rule ${expectedRuleId}`);
+    }
+    const state = stringAt(rule.state, `${path}.rule.state`);
+    if (state !== 'clear' && state !== 'tripped' && state !== 'latched') {
+      return fail(`${path}.rule.state`, 'a supported rule state');
+    }
+    ruleState = state;
+  }
+  return {
+    accepted,
+    replayStatus: nullableStringAt(result.replay_status, `${path}.replay_status`),
+    ruleState,
+    // The owner's refusal detail is shown verbatim; a structured one as JSON.
+    error: result.error === null || typeof result.error === 'string'
+      ? result.error : JSON.stringify(result.error),
   };
 }
 

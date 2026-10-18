@@ -2,6 +2,7 @@
 
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/io_motion_rule.hpp>
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/speed_profile.hpp>
@@ -83,10 +84,12 @@ class RuntimeParticipantPolicySelection final {
 [[nodiscard]] Result<SpeedProfileDTO> apply_deployment_motion_speed_limit(
     double deployment_maximum_tcp_linear_speed_mps, SpeedProfileDTO requested);
 
-/// No motion-interrupt policy is admitted until a per-robot mechanism is
-/// designed: any requested move-scoped interrupt is refused with reason
-/// `motion_interrupt_policy_not_admitted`. No source lookup or arming occurs.
+/// Nonempty scopes require exact immutable bindings from the existing sealed
+/// participant policy catalog; the default preserves explicit refusal when no
+/// binding has been installed. Fresh-source arming remains a dispatch check.
 [[nodiscard]] Result<void> validate_motion_interrupt_scope_admission(
-    std::span<const MotionInterruptScopeDTO> scopes);
+    std::span<const MotionInterruptScopeDTO> scopes,
+    std::span<const IoMotionRulePolicyBindingDTO> policies = {},
+    const RuntimeParticipantBindingDTO* participant = nullptr);
 
 }  // namespace manyforge::core

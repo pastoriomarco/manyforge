@@ -1,3 +1,4 @@
+#include "program_runner_publisher_fault_internal.hpp"
 #include "manyforge_headless/cell_admission_readiness_reducer.hpp"
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 #include "manyforge_headless/manager_package_generation.hpp"
@@ -60,6 +61,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <string_view>
 #include <system_error>
 #include <thread>
@@ -554,7 +556,7 @@ struct ManagerCommand final {
   std::optional<std::string> pose_object_id{};
   std::optional<std::string> pose_policy_id{};
   std::optional<std::uint64_t> pose_lifetime_ns{};
-  std::optional<PoseSourceQuality> pose_quality{};
+  std::optional<PoseSourceQuality> pose_payload_quality{};
   std::optional<bool> pose_eligible{};
   std::optional<CanonicalValue> pose_payload{};
   std::vector<PoseObserverBinding> pose_observer_bindings{};
@@ -1076,7 +1078,7 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
           {"runtime_policy_revision",
            CanonicalValue(std::string(kProgramRunnerLivenessPolicyRevision))},
       }));
-  RequireExactObjectSize(response, 23U, "Program Runner heartbeat ack");
+  RequireExactObjectSize(response, 24U, "Program Runner heartbeat ack");
   const auto local_age = RequiredNonnegativeUnsigned(
       RequiredMember(response, "local_heartbeat_age_ns"),
       "Program Runner local heartbeat age");
@@ -1119,12 +1121,11 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
               RequiredUnsigned(
                   RequiredMember(response, "last_accepted_heartbeat_sequence"),
                   "Program Runner heartbeat sequence") == sequence &&
-              (current || (!reconciliation_digest.has_value() &&
-                           state == "unreconciled" && fenced)) &&
               (!fault_reference.has_value() ||
                (fault_reference->starts_with("sha256:") &&
                 fault_reference->size() == 71U)),
           "Program Runner liveness acknowledgement is not exact");
+  const auto parsed_state = detail::DecodeProgramRunnerManagerState(state);
   core::ManagerLivenessObservationDTO observation{
       {required_set.cell_id, receiver.runtime_unit_id, receiver.runtime_epoch,
        required_set.manager_runtime_unit_id, required_set.manager_runtime_epoch,
@@ -1133,9 +1134,7 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
        core::RuntimePolicyRevision(
            std::string(kProgramRunnerLivenessPolicyRevision)),
        sequence, receiver_status_sequence, static_cast<std::int64_t>(local_age),
-       current ? core::ManagerLivenessStateDTO::kCurrent
-               : core::ManagerLivenessStateDTO::kUnreconciled,
-       fenced,
+       parsed_state, fenced,
        fault_reference.has_value() ? std::optional<core::ContentDigest>(
                                          core::ContentDigest(*fault_reference))
                                    : std::nullopt},
@@ -1144,8 +1143,15 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
       core::ContentDigest(RequiredString(response, "receiver_status_digest"))};
   Require(core::ValidateManagerLivenessObservation(observation).ok(),
           "Program Runner liveness observation is malformed");
-  return {std::move(observation), RequiredProgramCycleStatus(RequiredMember(
-                                      response, "program_cycle_status"))};
+  const auto cycle = RequiredProgramCycleStatus(
+      RequiredMember(response, "program_cycle_status"));
+  detail::CheckProgramRunnerPublicationHealth(
+      RequiredMember(response, "publisher_fault"), cycle,
+      receiver.runtime_epoch, fenced, fault_reference);
+  Require(current || (!reconciliation_digest.has_value() &&
+                      state == "unreconciled" && fenced),
+          "Program Runner liveness acknowledgement is not exact");
+  return {std::move(observation), cycle};
 }
 
 std::uint64_t RequiredUnsigned(const CanonicalValue &value,
@@ -1532,10 +1538,10 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
         RequiredUnsigned(RequiredMember(root, "lifetime_ns"), "lifetime_ns");
     Require(*result.pose_lifetime_ns <= kMaximumPoseObservationLifetimeNs,
             "lifetime_ns exceeds the scene-runtime observation bound");
-    const auto quality = RequiredString(root, "quality");
+    const auto quality = RequiredString(root, "payload_quality");
     Require(quality == "good" || quality == "unknown",
-            "quality must be good or unknown");
-    result.pose_quality = quality == "good" ? PoseSourceQuality::kGood
+            "payload_quality must be good or unknown");
+    result.pose_payload_quality = quality == "good" ? PoseSourceQuality::kGood
                                             : PoseSourceQuality::kUnknown;
     result.pose_eligible = RequiredBool(root, "eligible");
     const auto &payload = RequiredMember(root, "payload");
@@ -2959,6 +2965,9 @@ public:
             [this] { RequireCurrentPackageGeneration(); },
             [this](const component_manager::ManagerApplyIntentDTO &) {
               TryPublishApplyTransition();
+            },
+            [this](const auto &intent, const auto attempt) {
+              return PrepareSuccessfulApplySettlement(intent, attempt);
             }),
         scene_runtime_owner_([] { return HostMonotonicNs(); },
                              [] { return RandomToken("scene-init-"); }),
@@ -3055,6 +3064,11 @@ private:
     component_manager::ManagerActiveRuntimeConvergenceResult runtime;
     std::shared_ptr<const deployment::RetainedBundle> active_bundle;
     std::uint32_t unsettled_effect_count{};
+  };
+
+  struct SuccessfulManagerRenewal final {
+    NativeManagerLivenessSnapshot snapshot;
+    std::uint64_t started_at_ns;
   };
 
   struct PoseObserverSession final {
@@ -4109,6 +4123,7 @@ private:
   }
 
   [[nodiscard]] bool ClosePlannedMaintenanceAdmission() noexcept {
+    std::lock_guard attempt_lock(manager_liveness_attempt_mutex_);
     if (!last_submitted_readiness_.has_value()) {
       return false;
     }
@@ -4129,27 +4144,44 @@ private:
           updated.error().message);
     }
     last_submitted_readiness_ = snapshot;
+    if (snapshot.program_cycle_status_current && snapshot.program_cycle_status)
+      established_program_cycle_status_ = snapshot.program_cycle_status;
+  }
+
+  void RetainRunnerContactFailure(const std::string_view predicate,
+                                  const std::string_view message) noexcept {
+    try {
+      if (program_runner_contact_loss_ || !established_program_cycle_status_)
+        return;
+      program_runner_contact_loss_ = MakeProgramRunnerContactLoss(
+          established_program_cycle_status_,
+          core::RequestOwnerEpoch(manager_owner_epoch_), manager_runtime_epoch_,
+          predicate, message);
+    } catch (...) {
+      // Failure reporting cannot terminate the existing renewal lane.
+    }
   }
 
   void SubmitFailClosedReadiness(
       const std::optional<core::ProgramCycleStatusDTO> &status =
           std::nullopt) noexcept {
-    const auto current =
-        status.has_value()
-            ? status
-            : (last_submitted_readiness_.has_value()
-                   ? last_submitted_readiness_->program_cycle_status
-                   : std::nullopt);
-    if (!current.has_value()) {
-      return;
-    }
-    auto closed = last_submitted_readiness_.value_or(
-        core::CellAdmissionReadinessSnapshotDTO{});
-    closed.program_cycle_status_current = false;
-    closed.program_cycle_status = *current;
-    closed.required_component_status_current = false;
-    closed.deployment_status_current = false;
     try {
+      const auto current =
+          status.has_value()
+              ? status
+              : (last_submitted_readiness_.has_value()
+                     ? last_submitted_readiness_->program_cycle_status
+                     : std::nullopt);
+      if (!current.has_value()) {
+        return;
+      }
+      auto closed = last_submitted_readiness_.value_or(
+          core::CellAdmissionReadinessSnapshotDTO{});
+      closed.program_cycle_status_current = false;
+      closed.program_cycle_status = *current;
+      closed.required_component_status_current = false;
+      closed.deployment_status_current = false;
+      closed.program_runner_loss = program_runner_contact_loss_;
       SubmitCellAdmissionReadiness(closed);
     } catch (...) {
       // Kernel readiness remains unavailable. Independent Runner presence
@@ -4273,9 +4305,11 @@ private:
   /// `deployment_status_current=false` before returning. No interval was found in
   /// which the Kernel stays open after required-owner evidence has expired, so no
   /// additional progress lease, watchdog or second Stop owner is added here.
-  void TryRenewNativeManagerLiveness(
+  bool TryRenewNativeManagerLiveness(
       const NativeManagerLivenessSnapshot &snapshot, const bool forced_closed,
       const std::uint64_t readiness_barrier, const bool allow_native) noexcept {
+    const auto started_at = ElapsedNs();
+    bool required_owners_published = false;
     const auto &runtime = snapshot.runtime;
     const auto &active_bundle = *snapshot.active_bundle;
     std::optional<core::ProgramCycleStatusDTO> probed_cycle_status;
@@ -4413,7 +4447,7 @@ private:
       if (!allow_native ||
           !manager_liveness_retry_gate_.attempt_allowed(ElapsedNs())) {
         SubmitFailClosedReadiness(probed_cycle_status);
-        return;
+        return required_owners_published;
       }
       // A replacement Runner still reports its predecessor's durable cycle
       // until the reconciliation renewal below succeeds. Keep admission
@@ -4568,6 +4602,11 @@ private:
             "Kernel rejected Program Runner liveness observation: " +
             published_runner.error().message);
       }
+      // C1: the native rows and this actual Runner row now make the exact
+      // successor renewal available to the existing Kernel owner guard.
+      // Subsequent readiness reduction/publication is not a settlement gate.
+      required_owners_published = true;
+      successful_manager_renewal_ = SuccessfulManagerRenewal{snapshot, started_at};
       track_failure("cell_admission_readiness_reduction", "cell");
       const auto readiness = BuildCellAdmissionReadiness(
           runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
@@ -4591,19 +4630,21 @@ private:
       manager_liveness_retry_gate_.RecordSuccess();
       manager_liveness_last_warning_.reset();
     } catch (const component_manager::ManagerLivenessRuntimeTransition &) {
+      successful_manager_renewal_.reset();
       // Runtime replacement is already fenced by Apply. No native heartbeat
       // was sent, so this is ordinary convergence rather than an uncertain
       // renewal. Keep readiness closed until the next exact snapshot arrives.
       SubmitFailClosedReadiness(probed_cycle_status);
       manager_liveness_retry_gate_.RecordSuccess();
     } catch (const component_manager::ManagerLivenessPublicationSuperseded &) {
+      successful_manager_renewal_.reset();
       SubmitFailClosedReadiness(probed_cycle_status);
       {
         std::lock_guard lock(manager_liveness_lane_mutex_);
         if (!manager_liveness_snapshot_.has_value() ||
             !SameNativeManagerLivenessIdentity(snapshot,
                                                *manager_liveness_snapshot_)) {
-          return;
+          return required_owners_published;
         }
         manager_liveness_superseded_publication_ =
             snapshot.runtime.plan.active_publication;
@@ -4612,31 +4653,126 @@ private:
       // the complete batch.  Preserve fail-closed readiness, but do not spend
       // the lease-expiry retry budget on this expected publication race.
       manager_liveness_retry_gate_.RecordSuccess();
+    } catch (const detail::ProgramRunnerPublisherFault &error) {
+      successful_manager_renewal_.reset();
+      // A responding Runner is present. Its independent publisher has failed;
+      // reuse required-owner containment without manufacturing process death.
+      track_failure("program_runner_publication_fault",
+                    "cell-role:program_runner");
+      const auto &cycle = error.cycle();
+      if (established_program_cycle_status_ &&
+          cycle.program_runner_owner_epoch ==
+              established_program_cycle_status_->program_runner_owner_epoch &&
+          cycle.program_run_id ==
+              established_program_cycle_status_->program_run_id &&
+          cycle.cycle_claim_generation ==
+              established_program_cycle_status_->cycle_claim_generation) {
+        RetainRunnerContactFailure(failure_predicate, error.what());
+      }
+      SubmitFailClosedReadiness(probed_cycle_status);
+      record_attempt_failure();
+      warn_failure(error.what());
     } catch (const std::exception &error) {
+      if (failure_predicate == "program_runner_liveness_probe" ||
+          failure_predicate == "program_runner_liveness_renewal" ||
+          failure_predicate == "program_runner_reconciliation_renewal")
+        RetainRunnerContactFailure(failure_predicate, error.what());
       SubmitFailClosedReadiness(probed_cycle_status);
       {
         std::lock_guard lock(manager_liveness_lane_mutex_);
         if (manager_liveness_snapshot_.has_value() &&
             !SameNativeManagerLivenessIdentity(snapshot,
                                                *manager_liveness_snapshot_)) {
-          return;
+          return required_owners_published;
         }
       }
       record_attempt_failure();
       warn_failure(error.what());
     } catch (...) {
+      if (failure_predicate == "program_runner_liveness_probe" ||
+          failure_predicate == "program_runner_liveness_renewal" ||
+          failure_predicate == "program_runner_reconciliation_renewal")
+        RetainRunnerContactFailure(failure_predicate, "Program Runner contact failed");
       SubmitFailClosedReadiness(probed_cycle_status);
       {
         std::lock_guard lock(manager_liveness_lane_mutex_);
         if (manager_liveness_snapshot_.has_value() &&
             !SameNativeManagerLivenessIdentity(snapshot,
                                                *manager_liveness_snapshot_)) {
-          return;
+          return required_owners_published;
         }
       }
       record_attempt_failure();
       warn_failure("unknown exception");
     }
+    return required_owners_published;
+  }
+
+  bool SuccessfulRenewalIsCurrent(
+      const NativeManagerLivenessSnapshot &snapshot) const {
+    if (!successful_manager_renewal_ || program_runner_contact_loss_ ||
+        !SameNativeManagerLivenessIdentity(successful_manager_renewal_->snapshot, snapshot))
+      return false;
+    const auto now = ElapsedNs();
+    const auto started = successful_manager_renewal_->started_at_ns;
+    // Conservative reuse of the real lease: every receipt follows attempt
+    // start. The final Kernel guard remains the authority for actual health.
+    return now >= started && now - started < static_cast<std::uint64_t>(
+        deployment::execution_runtime_contract::manager_liveness_policy().expiry_timeout_ns);
+  }
+
+  bool RenewCurrentNativeManagerLiveness(
+      const component_manager::ManagerApplyIntentDTO *expected = nullptr,
+      const bool reuse_only = false) {
+    std::lock_guard attempt_lock(manager_liveness_attempt_mutex_);
+    const auto [snapshot, superseded, forced_closed, barrier] = [&] {
+      std::lock_guard lock(manager_liveness_lane_mutex_);
+      return std::tuple{manager_liveness_snapshot_, manager_liveness_superseded_publication_,
+                        manager_liveness_force_closed_, manager_liveness_readiness_barrier_};
+    }();
+    if (!snapshot) {
+      if (!reuse_only) SubmitFailClosedReadiness();
+      return false;
+    }
+    const auto &publication = snapshot->runtime.plan.active_publication;
+    if (expected &&
+        (publication.request.transaction_ref != core::ActiveBundlePublicationTransactionRefDTO{
+             core::NamedApplyPublicationTransactionDTO{expected->apply_id, expected->apply_generation}} ||
+         publication.request.candidate_retained_bundle_id != expected->candidate_retained_bundle_id ||
+         publication.request.candidate_graph_revision != expected->candidate_graph_revision))
+      return false;
+    if (expected && SuccessfulRenewalIsCurrent(*snapshot)) return true;
+    if (reuse_only) return false;
+    if (!manager_liveness_attempted_publication_ ||
+        *manager_liveness_attempted_publication_ != publication) {
+      // C2: the SAME publication-boundary reset covers heartbeat and initial
+      // settlement, before the existing retry gate can skip a native attempt.
+      manager_liveness_retry_gate_.RecordSuccess();
+      manager_liveness_attempted_publication_ = publication;
+    }
+    const bool allow_native = !superseded || publication != *superseded;
+    const bool published = TryRenewNativeManagerLiveness(*snapshot, forced_closed,
+                                                        barrier, allow_native);
+    return published && !program_runner_contact_loss_;
+  }
+
+  bool PrepareSuccessfulApplySettlement(
+      const component_manager::ManagerApplyIntentDTO &intent,
+      const component_manager::ManagerApplySettlementAttempt attempt) {
+    if (config_.program_runner_liveness_socket.empty()) return true;
+    if (RenewCurrentNativeManagerLiveness(&intent, true)) return true;
+    if (attempt == component_manager::ManagerApplySettlementAttempt::kOrdinaryHeartbeat)
+      return false;  // No second attempt: use only this ordinary heartbeat.
+    try {
+      // I/O stays outside renewal serialization and all host/Core locks.
+      static_cast<void>(ObserveRuntimeAndPublish());
+      return RenewCurrentNativeManagerLiveness(&intent);
+    } catch (const std::exception &error) {
+      std::cerr << "Manager Apply successor observation remains pending: " << error.what() << '\n';
+    } catch (...) {
+      std::cerr << "Manager Apply successor observation remains pending after an unknown error\n";
+    }
+    return false;
   }
 
   void StartNativeManagerLivenessLane() {
@@ -4667,43 +4803,39 @@ private:
 
   void RunNativeManagerLivenessLane() noexcept {
     const auto heartbeat_period = std::chrono::nanoseconds(
-        deployment::execution_runtime_contract::manager_liveness_policy()
-            .heartbeat_period_ns);
+        deployment::execution_runtime_contract::manager_liveness_policy().heartbeat_period_ns);
     std::unique_lock lock(manager_liveness_lane_mutex_);
+    bool ordinary_heartbeat = true;
+    auto next_heartbeat = std::chrono::steady_clock::now() + heartbeat_period;
     while (!manager_liveness_lane_stop_) {
-      const auto next_heartbeat =
-          std::chrono::steady_clock::now() + heartbeat_period;
-      const auto snapshot = manager_liveness_snapshot_;
-      const auto superseded_publication =
-          manager_liveness_superseded_publication_;
-      const auto forced_closed = manager_liveness_force_closed_;
-      const auto readiness_barrier = manager_liveness_readiness_barrier_;
+      if (ordinary_heartbeat)
+        next_heartbeat = std::chrono::steady_clock::now() + heartbeat_period;
       const auto wake_generation = manager_liveness_wake_generation_;
       lock.unlock();
-      if (snapshot.has_value()) {
-        const auto allow_native = !superseded_publication.has_value() ||
-                                  snapshot->runtime.plan.active_publication !=
-                                      *superseded_publication;
-        if (!manager_liveness_attempted_publication_.has_value() ||
-            *manager_liveness_attempted_publication_ !=
-                snapshot->runtime.plan.active_publication) {
-          // A durable successor is independent work.  Never carry a
-          // predecessor batch's retry delay across the publication boundary.
-          manager_liveness_retry_gate_.RecordSuccess();
-          manager_liveness_attempted_publication_ =
-              snapshot->runtime.plan.active_publication;
+      static_cast<void>(RenewCurrentNativeManagerLiveness());
+      // Only tag the actual pending Apply with this ordinary heartbeat.
+      // The existing progress owner performs release RPCs; this independent
+      // lease lane never waits behind that owner's operation or transport.
+      try {
+        if (ordinary_heartbeat) {
+          if (const auto pending = named_apply_.PendingSettlementForHeartbeat())
+            RequestApplySettlementProgress(*pending);
         }
-        TryRenewNativeManagerLiveness(*snapshot, forced_closed,
-                                      readiness_barrier, allow_native);
-      } else {
-        SubmitFailClosedReadiness();
+      } catch (const std::exception &error) {
+        std::cerr << "Manager Apply heartbeat settlement stopped fail-closed: "
+                  << error.what() << '\n';
+      } catch (...) {
+        std::cerr << "Manager Apply heartbeat settlement stopped fail-closed after an unknown error\n";
       }
       lock.lock();
-      static_cast<void>(manager_liveness_lane_condition_.wait_until(
+      const bool woken = manager_liveness_lane_condition_.wait_until(
           lock, next_heartbeat, [&] {
             return manager_liveness_lane_stop_ ||
                    manager_liveness_wake_generation_ != wake_generation;
-          }));
+          });
+      // Keep this SAME ordinary deadline through extra publication/control
+      // wakes: they may renew leases, but cannot starve the timed retry.
+      ordinary_heartbeat = !woken;
     }
   }
 
@@ -4923,6 +5055,7 @@ private:
       std::lock_guard lock(apply_progress_lane_mutex_);
       apply_progress_lane_stop_ = false;
       apply_progress_requested_ = true;
+      apply_settlement_retry_requested_.reset();
       apply_progress_faulted_ = false;
     }
     apply_progress_lane_ = std::thread([this] { RunApplyProgressLane(); });
@@ -4951,24 +5084,44 @@ private:
     apply_progress_lane_condition_.notify_one();
   }
 
+  void RequestApplySettlementProgress(
+      const core::NamedApplyPublicationTransactionDTO &expected) {
+    {
+      std::lock_guard lock(apply_progress_lane_mutex_);
+      if (apply_progress_lane_stop_ || apply_progress_faulted_) return;
+      // One coalesced scheduling reference, never a replacement journal fact.
+      apply_settlement_retry_requested_ = expected;
+    }
+    apply_progress_lane_condition_.notify_one();
+  }
+
   void RunApplyProgressLane() noexcept {
     std::unique_lock lock(apply_progress_lane_mutex_);
     while (!apply_progress_lane_stop_) {
       apply_progress_lane_condition_.wait(lock, [&] {
-        return apply_progress_lane_stop_ || apply_progress_requested_;
+        return apply_progress_lane_stop_ || apply_progress_requested_ ||
+               apply_settlement_retry_requested_.has_value();
       });
       if (apply_progress_lane_stop_) {
         break;
       }
+      const bool progress_requested = apply_progress_requested_;
+      const auto settlement_requested = std::move(apply_settlement_retry_requested_);
       apply_progress_requested_ = false;
+      apply_settlement_retry_requested_.reset();
       lock.unlock();
 
       bool pending = false;
       try {
-        const auto result = named_apply_.RecoverIncompleteApply();
-        pending = result.has_value() &&
-                  result->state ==
-                      component_manager::ManagerNamedApplyResultState::kPending;
+        if (settlement_requested)
+          static_cast<void>(named_apply_.RetryPendingSettlementOnHeartbeat(*settlement_requested));
+        if (progress_requested) {
+          const auto result = named_apply_.RecoverIncompleteApply();
+          pending = result.has_value() &&
+                    result->state ==
+                        component_manager::ManagerNamedApplyResultState::kPending &&
+                    !result->settlement_pending;
+        }
       } catch (const std::exception &error) {
         std::cerr << "Manager daemon Apply progression stopped fail-closed: "
                   << error.what() << '\n';
@@ -5046,7 +5199,7 @@ private:
                                                 std::nullopt, std::nullopt});
         };
     if (!observation.eligible ||
-        observation.quality != PoseSourceQuality::kGood || !acceptance.fresh) {
+        observation.payload_quality != PoseSourceQuality::kGood || !acceptance.fresh) {
       return no_application(SceneRuntimePoseApplicationStatus::kNotRequested);
     }
     if (observation.key.policy_id == "before_planning") {
@@ -5235,7 +5388,7 @@ private:
                          });
         if (observation == owner.pose_sources.end() || !observation->fresh ||
             observation->buffered || !observation->observation.eligible ||
-            observation->observation.quality != PoseSourceQuality::kGood ||
+            observation->observation.payload_quality != PoseSourceQuality::kGood ||
             observation->observation.source_epoch !=
                 session->second.source_epoch ||
             observation->observation.source_epoch_order !=
@@ -5307,7 +5460,7 @@ private:
         }
         if (!observed->fresh || observed->buffered ||
             !observed->observation.eligible ||
-            observed->observation.quality != PoseSourceQuality::kGood) {
+            observed->observation.payload_quality != PoseSourceQuality::kGood) {
           return failure(
               "scene_runtime_pose_observation_stale",
               "before-planning pose source has no fresh eligible observation",
@@ -5865,7 +6018,8 @@ private:
               {}, std::move(original_prepare_acknowledgement));
           TrySendResponse(client.get(), ApplyResponse(command, result));
           if (result.state ==
-              component_manager::ManagerNamedApplyResultState::kPending) {
+                  component_manager::ManagerNamedApplyResultState::kPending &&
+              !result.settlement_pending) {
             TrySubmitFailClosedReadiness();
             RequestApplyProgress();
             return false;
@@ -6130,7 +6284,7 @@ private:
                     command.pose_object_id.has_value() &&
                     command.pose_policy_id.has_value() &&
                     command.pose_lifetime_ns.has_value() &&
-                    command.pose_quality.has_value() &&
+                    command.pose_payload_quality.has_value() &&
                     command.pose_eligible.has_value() &&
                     command.pose_payload.has_value(),
                 "decoded scene-runtime observation is incomplete");
@@ -6175,7 +6329,7 @@ private:
             declared->policy_id != *command.pose_policy_id ||
             (*command.pose_eligible && !declared->eligible) ||
             (*command.pose_eligible &&
-             *command.pose_quality != PoseSourceQuality::kGood)) {
+             *command.pose_payload_quality != PoseSourceQuality::kGood)) {
           source_lock.unlock();
           TrySendResponse(
               client.get(),
@@ -6200,7 +6354,7 @@ private:
               exact_record.requested_lifetime_ns == *command.pose_lifetime_ns &&
               exact_record.observation.source_epoch ==
                   *command.pose_source_epoch &&
-              exact_record.observation.quality == *command.pose_quality &&
+              exact_record.observation.payload_quality == *command.pose_payload_quality &&
               exact_record.observation.eligible == *command.pose_eligible &&
               exact_record.observation.payload == *command.pose_payload;
           if (!exact) {
@@ -6232,7 +6386,7 @@ private:
               *command.pose_source_sequence,
               observed_at,
               observed_at + static_cast<std::int64_t>(*command.pose_lifetime_ns),
-              *command.pose_quality,
+              *command.pose_payload_quality,
               *command.pose_eligible,
               *command.pose_payload,
           };
@@ -6432,6 +6586,10 @@ private:
   std::string manager_owner_id_;
   std::string scene_owner_id_;
   std::string scene_runtime_owner_id_;
+  // All heartbeat sequence/retry/readiness fields are serialized by this
+  // same attempt mutex. Never take it while holding lane_mutex_.
+  std::mutex manager_liveness_attempt_mutex_;
+  std::optional<SuccessfulManagerRenewal> successful_manager_renewal_;
   std::mutex manager_liveness_lane_mutex_;
   std::condition_variable manager_liveness_lane_condition_;
   std::optional<NativeManagerLivenessSnapshot> manager_liveness_snapshot_;
@@ -6443,7 +6601,7 @@ private:
   std::uint64_t manager_heartbeat_sequence_{};
   component_manager::detail::ManagerLivenessRetryGate
       manager_liveness_retry_gate_;
-  // Log-only, accessed exclusively by RunNativeManagerLivenessLane.
+  // Log-only, accessed under manager_liveness_attempt_mutex_.
   std::optional<std::string> manager_liveness_last_warning_;
   std::optional<core::ActiveBundlePublicationReceiptDTO>
       manager_liveness_attempted_publication_;
@@ -6451,10 +6609,15 @@ private:
       manager_liveness_superseded_publication_;
   std::optional<core::CellAdmissionReadinessSnapshotDTO>
       last_submitted_readiness_;
+  // Alarm evidence only, serialized with the existing renewal attempt. It does not
+  // alter readiness selection, retry budgets, lease expiry or containment.
+  std::optional<core::ProgramCycleStatusDTO> established_program_cycle_status_;
+  std::optional<core::ProgramRunnerContactLossDTO> program_runner_contact_loss_;
   std::mutex apply_progress_lane_mutex_;
   std::condition_variable apply_progress_lane_condition_;
   bool apply_progress_lane_stop_{};
   bool apply_progress_requested_{};
+  std::optional<core::NamedApplyPublicationTransactionDTO> apply_settlement_retry_requested_;
   bool apply_progress_faulted_{};
   std::thread apply_progress_lane_;
   std::map<std::string, PoseObserverSession> pose_observer_sessions_;

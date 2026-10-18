@@ -180,8 +180,11 @@ namespace {
 }
 
 [[nodiscard]] Result<void> validate_command_intent(const CapabilityCommandIntentDTO& command) {
+  const auto* output = std::get_if<IoSignalWriteCommandValueDTO>(&command.command_value);
   if (command.command_schema_id.empty() || command.command_schema_revision.empty() ||
-      !std::isfinite(command.completion_timeout_s) || command.completion_timeout_s <= 0.0 ||
+      (output == nullptr &&
+       (!command.completion_timeout_s || !std::isfinite(*command.completion_timeout_s) ||
+        *command.completion_timeout_s <= 0.0)) ||
       command.caller_options.size() > kMaxOperationCommandOptions) {
     return invalid("capability command envelope is malformed", "capability_command_invalid");
   }
@@ -192,6 +195,16 @@ namespace {
       return invalid("capability command option is malformed or duplicated",
                      "capability_command_option_invalid");
     }
+  }
+  if (output != nullptr) {
+    if (command.completion_timeout_s) {
+      return invalid("output command timing is resolved from its sealed mechanism",
+                     "io_signal_output_timeout_forbidden");
+    }
+    if (output->resource_role_id.empty()) {
+      return invalid("output command must name one resource role", "io_signal_output_role_invalid");
+    }
+    return Result<void>::Ok();
   }
   const auto& value = std::get<GripperPositionCommandValueDTO>(command.command_value);
   const auto position_kind = coordinate_kind(value.position);

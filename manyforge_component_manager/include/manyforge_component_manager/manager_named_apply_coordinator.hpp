@@ -73,6 +73,8 @@ struct ManagerNamedApplyRequestDTO final {
                          const ManagerNamedApplyRequestDTO &) = default;
 };
 
+enum class ManagerApplySettlementAttempt { kInitial, kOrdinaryHeartbeat };
+
 enum class ManagerNamedApplyResultState {
   kPending,
   kSucceeded,
@@ -86,6 +88,9 @@ struct ManagerNamedApplyResult final {
   ManagerNamedApplyResultState state;
   bool request_replayed;
   std::optional<ManagerApplyTerminalOutcomeDTO> terminal_outcome;
+  // A durable successful Apply can still retain its original parent claim.
+  // Only the ordinary heartbeat retries this settlement, not Apply progression.
+  bool settlement_pending{false};
 };
 
 /// Single-progression-owner composition of the I4 named-Apply phase owners.
@@ -125,6 +130,11 @@ public:
   using ApplyIdFactory = std::function<manyforge::core::ApplyId()>;
   using ApplyProgressObserver =
       std::function<void(const ManagerApplyIntentDTO &)>;
+  /// Prepare actual successor required-owner renewal before successful parent
+  /// release. Heartbeat retries may only reuse that heartbeat's current proof.
+  /// This callback never authorizes release; the exact Kernel guards still run.
+  using SuccessfulSettlementPreparation = std::function<bool(
+      const ManagerApplyIntentDTO &, ManagerApplySettlementAttempt)>;
 
   ManagerNamedApplyCoordinator(
       SqliteManagerApplyJournal &apply_journal,
@@ -150,7 +160,8 @@ public:
       ApplyIdFactory apply_id_factory,
       InitialSceneSource initial_scene_source,
       RuntimePreStartGuard pre_start_guard = {},
-      ApplyProgressObserver apply_progress_observer = {});
+      ApplyProgressObserver apply_progress_observer = {},
+      SuccessfulSettlementPreparation successful_settlement_preparation = {});
 
   /// Validate and durably accept one exact request without advancing any
   /// runtime effect. Exact replay returns terminal evidence when it already
@@ -168,6 +179,16 @@ public:
   /// process's captured original claim and inputs. Recovery never reconstructs
   /// live delegation from retained observations.
   [[nodiscard]] std::optional<ManagerNamedApplyResult> RecoverIncompleteApply();
+
+  /// Nonblocking metadata read by the ordinary heartbeat. An earlier beat
+  /// cannot schedule a later Apply's settlement; this is only a scheduling tag.
+  [[nodiscard]] std::optional<manyforge::core::NamedApplyPublicationTransactionDTO>
+  PendingSettlementForHeartbeat();
+  /// The existing Apply progress lane consumes this exact heartbeat tag. It
+  /// reuses the journal/claim replay protocol without repeating Apply effects.
+  [[nodiscard]] std::optional<ManagerNamedApplyResult>
+  RetryPendingSettlementOnHeartbeat(
+      const manyforge::core::NamedApplyPublicationTransactionDTO &expected);
 
   ManagerNamedApplyCoordinator(const ManagerNamedApplyCoordinator &) = delete;
   ManagerNamedApplyCoordinator &
@@ -221,6 +242,12 @@ private:
   [[nodiscard]] ManagerNamedApplyResult FinishOriginalConfigurationPublication(
       const PersistedManagerApplyIntent &intent, bool request_replayed);
   [[nodiscard]] manyforge::core::ApplyId MintApplyId();
+  [[nodiscard]] bool SettleSuccessfulAdmission(
+      const PersistedManagerApplyIntent &intent,
+      const PersistedManagerApplyTerminalOutcome &terminal,
+      ManagerApplySettlementAttempt attempt);
+  [[nodiscard]] ManagerNamedApplyResult PendingSettlementResult(
+      const ManagerApplyIntentDTO &intent, bool replayed) const;
 
   SqliteManagerApplyJournal &apply_journal_;
   IManagerActiveRuntimePlanSource &active_plan_source_;
@@ -239,6 +266,7 @@ private:
   ApplyIdFactory apply_id_factory_;
   InitialSceneSource initial_scene_source_;
   ApplyProgressObserver apply_progress_observer_;
+  SuccessfulSettlementPreparation successful_settlement_preparation_;
   ManagerApplyFenceCoordinator fence_coordinator_;
   ManagerPlannedMaintenanceCoordinator &planned_maintenance_;
   ManagerActiveRuntimeCoordinator active_runtime_coordinator_;
@@ -248,6 +276,10 @@ private:
   ManagerSelectedBundleTransitionCoordinator selected_bundle_coordinator_;
   ManagerApplyFenceReleaseCoordinator fence_release_coordinator_;
   std::optional<CapturedApplyInputs> captured_apply_inputs_;
+  // Scheduling reference only. Intent, terminal and exact parent remain owned
+  // by the existing journal/capture; no duplicate settlement result is cached.
+  std::optional<manyforge::core::NamedApplyPublicationTransactionDTO>
+      pending_settlement_;
   std::mutex operation_mutex_;
 };
 

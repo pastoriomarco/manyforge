@@ -305,6 +305,14 @@ class HeadlessCorePort(Protocol):
         **kwargs: Any,
     ) -> dict[str, Any]: ...
 
+    def observe_runtime_fault_conditions(
+        self, **kwargs: Any
+    ) -> dict[str, Any]: ...
+
+    def observe_program_failure_condition(
+        self, condition_json: str
+    ) -> dict[str, Any]: ...
+
     def mark_operation_event_source_unknown(
         self,
         **kwargs: Any,
@@ -902,6 +910,24 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("complete_operation_event_snapshot", **kwargs),
             method="complete_operation_event_snapshot",
+        )
+
+    def observe_runtime_fault_conditions(
+        self, **kwargs: Any
+    ) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("observe_runtime_fault_conditions", **kwargs),
+            method="observe_runtime_fault_conditions",
+        )
+
+    def observe_program_failure_condition(
+        self, condition_json: str
+    ) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke(
+                "observe_program_failure_condition", condition_json=condition_json
+            ),
+            method="observe_program_failure_condition",
         )
 
     def mark_operation_event_source_unknown(

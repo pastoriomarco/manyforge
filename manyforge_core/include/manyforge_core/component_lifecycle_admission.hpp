@@ -26,6 +26,9 @@ struct SelectedComponentBringUpOfferDTO final {
   std::vector<RuntimeParticipantBindingDTO> candidate_participants;
   ConfigurationFenceAdmissionSnapshotDTO fence_admission;
   ContentDigest original_request_payload_digest;
+  /// Exact sealed non-coordinate domain closure; no engine registration is
+  /// invented for a genuine input-only provider.
+  std::vector<ResolvedLifecycleControlDomainScopeDTO> candidate_provider_domains{};
 
   friend bool operator==(const SelectedComponentBringUpOfferDTO&,
                          const SelectedComponentBringUpOfferDTO&) = default;
@@ -47,6 +50,7 @@ struct ApplyBringUpAdmissionComponentDTO final {
   std::optional<ComponentLifecycleCurrentSnapshotDTO> predecessor;
   std::vector<RuntimeParticipantBindingDTO> candidate_participants;
   std::optional<ApplyBringUpAdmissionRecoveryDTO> recovery;
+  std::vector<ResolvedLifecycleControlDomainScopeDTO> candidate_provider_domains{};
 };
 
 struct ApplyBringUpAdmissionOfferDTO final {

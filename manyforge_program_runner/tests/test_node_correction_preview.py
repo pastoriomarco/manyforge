@@ -132,6 +132,12 @@ class _FailingMotionPort:
             task_id=f"task-{self.starts}",
             state=OwnerTaskState.FAILED,
             metadata={
+                # A settled, not-eligible assessment, as the Kernel reports a failure.
+                "recovery_assessment": {
+                    "status": "action_required",
+                    "execution_state": "Failed",
+                    "allowed_actions": [],
+                },
                 "authored_failure_policy": "pause_for_operator",
                 "authored_failure_policy_parameter": "no_feasible_plan_policy",
             },
@@ -148,7 +154,7 @@ class _FailingMotionPort:
     def acknowledge(self, _task_id: str, _identity: NodeAttemptIdentity) -> None:
         raise AssertionError("a failed attempt is never acknowledged")
 
-    def recover(self, *_args: Any, **_kwargs: Any) -> Mapping[str, Any]:
+    def recover(self, *_args: Any, **kwargs: Any) -> Mapping[str, Any]:
         self.recoveries += 1
         raise AssertionError("preview must not recover or retry")
 

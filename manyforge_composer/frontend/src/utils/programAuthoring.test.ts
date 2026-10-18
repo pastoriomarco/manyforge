@@ -10,12 +10,14 @@ import type {
 import {
   collectProgramBindingCandidates,
   collectProgramParameterUsages,
+  collectComponentRoleUsages,
   deriveProgramMotionConfiguration,
   nextProgramInstanceId,
   programDiagnosticNodeId,
   programSemanticChoices,
   programSemanticExpectedAccess,
   programSemanticExpectedType,
+  removeGuardTitle,
   resolveProgramParameterLiteralValue,
 } from './programAuthoring';
 
@@ -193,6 +195,68 @@ describe('Program parameter binding continuity', () => {
     expect(nextProgramInstanceId('motion.move', ['motion.move', 'motion.move_2'])).toBe(
       'motion.move_3',
     );
+  });
+
+  it('reports every Draft reference that keeps a component role', () => {
+    const grip: CatalogEntry = {
+      ...entry,
+      id: 'grip',
+      parameters: [parameter('component_id', 'string', 'component_role')],
+    };
+    const program: ProgramAuthoringDocument = {
+      api_version: 'manyforge.program.v2',
+      program_id: 'role_usage',
+      program_profile: 'composable-cell-v1',
+      name: 'Role usage',
+      catalog: {
+        api_version: 'manyforge.node_catalog.v2',
+        content_version: '2.4.0',
+      },
+      component_roles: { robot: {}, tool: {}, spare: {} },
+      target_roles: { arm: { component_role: 'robot', required_capabilities: [] } },
+      scene: [{
+        scene_resource_id: 'table',
+        shape: { type: 'box', box_dimensions_m: [1, 1, 0.1] },
+        pose: {
+          frame_ref: {
+            kind: 'component_frame',
+            component_role: 'tool',
+            model_role: 'tool_model',
+            frame_role: 'tcp',
+          },
+          position_m: [0, 0, 0],
+          orientation: { xyzw: [0, 0, 0, 1] },
+        },
+      }],
+      schema_version: 'manyforge.composer_authoring_forest.v1',
+      forest: [
+        tree({ node_id: 'grip', parameters: { component_id: 'robot' } }),
+        tree({ node_id: 'grip', instance_id: 'n2', parameters: { component_id: 'robot' } }),
+      ],
+      positions: {},
+      contact_policies: [{
+        api_version: 'manyforge.contact_policy.v1',
+        policy_id: 'grasp',
+        mode: 'contact_grasp',
+        zones: [{
+          zone_id: 'pad',
+          body_pairs: [{
+            body_a: { kind: 'component_model_body', component_role_id: 'spare', collision_body_role_id: 'pad' },
+            body_b: { kind: 'runtime_object', runtime_object_id: 'cube' },
+          }],
+        }],
+      }],
+    };
+
+    const usages = collectComponentRoleUsages(program, [grip]);
+    expect(usages.get('robot')).toEqual(['node n1', 'node n2', 'target role arm']);
+    expect(usages.get('tool')).toEqual(['scene frame table']);
+    // A contact policy still naming the role keeps it.
+    expect(usages.get('spare')).toEqual(['contact policy grasp']);
+    expect(usages.get('free')).toBeUndefined();
+    expect(removeGuardTitle(usages.get('robot') ?? [], 'Remove component role'))
+      .toBe('node n1, node n2, target role arm');
+    expect(removeGuardTitle([], 'Remove component role')).toBe('Remove component role');
   });
 
   it('projects backend diagnostic paths onto retained node identities', () => {

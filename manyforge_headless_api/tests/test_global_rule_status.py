@@ -1,0 +1,171 @@
+"""Headless GUI projection of the Kernel's global rule states (contract 64)."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from manyforge_headless_api.global_rule_status import (
+    GlobalRuleStatusModel,
+    InterruptStateWireError,
+)
+
+_OWNER = "kernel-1"
+_CONTEXT = {
+    "owner_epoch": _OWNER,
+    "catalog_generation": "4",
+    "active_publication_generation": 3,
+    "retained_bundle_id": "bundle-1",
+    "graph_revision": "graph-1",
+}
+
+
+def _catalog(rule_ids: list[str], **extra: Any) -> dict[str, Any]:
+    return {
+        "owner_epoch": _OWNER,
+        "catalog_generation": _CONTEXT["catalog_generation"],
+        "active_publication_generation": 3,
+        "bundle": "bundle-1",
+        "graph": "graph-1",
+        "rule_ids": rule_ids,
+        "referenced_program_blackboard_keys": [],
+        **extra,
+    }
+
+
+def _ready(states: dict[str, str], through: int, **context: Any) -> dict[str, Any]:
+    return {
+        "status": "ready",
+        "snapshot": {
+            **_CONTEXT,
+            **context,
+            "through_sequence": through,
+            "states": [
+                {"rule_id": rule_id, "state": state, "triggering_acquisition": None}
+                for rule_id, state in sorted(states.items())
+            ],
+        },
+    }
+
+
+def _row(sequence: int, rule_id: str, state: str, **context: Any) -> dict[str, Any]:
+    return {
+        "sequence": sequence,
+        "record_kind": "interrupt_rule_state_changed",
+        "payload": {
+            **_CONTEXT,
+            **context,
+            "rule_id": rule_id,
+            "state": state,
+            "triggering_acquisition": None,
+        },
+    }
+
+
+def _states(model: GlobalRuleStatusModel) -> dict[str, str] | None:
+    rows = model.rows()
+    return None if rows is None else {row["rule_id"]: row["state"] for row in rows}
+
+
+def test_unknown_catalog_is_unknown_and_verified_empty_is_no_rules() -> None:
+    model = GlobalRuleStatusModel()
+    assert model.rows() is None
+    model.observe(_OWNER, None, None, [])
+    assert model.rows() is None
+    model.observe(
+        _OWNER,
+        {"status": "verified_empty", "owner_epoch": _OWNER,
+         "active_publication_generation": 3, "bundle": "b", "graph": "g"},
+        None,
+        [],
+    )
+    assert model.rows() == []
+
+
+def test_ready_baseline_then_later_rows_overlay_and_earlier_rows_do_not() -> None:
+    model = GlobalRuleStatusModel()
+    model.observe(
+        _OWNER, _catalog(["door", "light"]), _ready({"door": "clear", "light": "clear"}, 10),
+        [_row(9, "door", "latched"), _row(11, "light", "tripped")],
+    )
+    assert model.rows() == [
+        {"rule_id": "door", "state": "clear", "keys": []},
+        {"rule_id": "light", "state": "tripped", "keys": []},
+    ]
+    # Pending keeps the qualified cut and keeps following its rows.
+    model.observe(
+        _OWNER, _catalog(["door", "light"]), {"status": "projection_pending"},
+        [_row(12, "door", "latched")],
+    )
+    assert _states(model) == {"door": "latched", "light": "tripped"}
+    # A newer ready cut supersedes rows at or before its boundary.
+    model.observe(_OWNER, _catalog(["door", "light"]), _ready({"door": "clear", "light": "clear"}, 12), [])
+    assert _states(model) == {"door": "clear", "light": "clear"}
+
+
+def test_rows_read_before_the_baseline_still_count_after_it() -> None:
+    model = GlobalRuleStatusModel()
+    model.observe(_OWNER, _catalog(["door"]), {"status": "projection_pending"}, [_row(5, "door", "tripped")])
+    assert _states(model) == {"door": "pending"}
+    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "clear"}, 4), [])
+    assert _states(model) == {"door": "tripped"}
+
+
+def test_baseline_without_a_proving_catalog_or_null_is_pending() -> None:
+    model = GlobalRuleStatusModel()
+    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "latched"}, 1, catalog_generation="5"), [])
+    assert _states(model) == {"door": "pending"}
+    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "latched"}, 1), [])
+    assert _states(model) == {"door": "latched"}
+    model.observe(_OWNER, _catalog(["door"]), None, [])
+    assert _states(model) == {"door": "pending"}
+    # Pending without a qualified cut stays pending.
+    model.observe(_OWNER, _catalog(["door"]), {"status": "projection_pending"}, [])
+    assert _states(model) == {"door": "pending"}
+
+
+def test_waiting_for_program_rules_name_their_keys() -> None:
+    model = GlobalRuleStatusModel()
+    model.observe(
+        _OWNER,
+        {"status": "waiting_for_program", "owner_epoch": _OWNER,
+         "active_publication_generation": 3, "bundle": "b", "graph": "g",
+         "rule_ids": ["mixed", "other"],
+         "waiting_for_program": [{"rule_id": "mixed", "keys": ["part_ready"]},
+                                 {"rule_id": "other", "keys": ["a", "b"]}]},
+        None,
+        [],
+    )
+    assert model.rows() == [
+        {"rule_id": "mixed", "state": "waiting_for_program", "keys": ["part_ready"]},
+        {"rule_id": "other", "state": "waiting_for_program", "keys": ["a", "b"]},
+    ]
+    # The per-rule annotation of an installed catalog wins over its state.
+    model.observe(
+        _OWNER,
+        _catalog(["mixed", "signal"], waiting_for_program=[{"rule_id": "mixed", "keys": ["k"]}]),
+        _ready({"mixed": "clear", "signal": "tripped"}, 2),
+        [],
+    )
+    assert _states(model) == {"mixed": "waiting_for_program", "signal": "tripped"}
+
+
+def test_malformed_wire_is_unknown_and_needs_a_cut_after_the_lost_rows() -> None:
+    model = GlobalRuleStatusModel()
+    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "clear"}, 1), [])
+    bad = _row(7, "door", "exploded")
+    with pytest.raises(InterruptStateWireError):
+        model.observe(_OWNER, _catalog(["door"]), _ready({"door": "clear"}, 1), [bad])
+    assert model.rows() is None
+    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "clear"}, 6), [])
+    assert _states(model) == {"door": "pending"}
+    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "latched"}, 7), [])
+    assert _states(model) == {"door": "latched"}
+
+
+def test_another_owner_is_a_wire_error() -> None:
+    model = GlobalRuleStatusModel()
+    with pytest.raises(InterruptStateWireError):
+        model.observe("kernel-2", _catalog(["door"]), None, [])
+    assert model.rows() is None

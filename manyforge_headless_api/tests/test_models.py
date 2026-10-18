@@ -11,6 +11,7 @@ from manyforge_behavior.failure_details import FAILURE_DETAIL_KEYS
 from manyforge_headless_api.models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
+    CapabilityCommandParticipantRequest,
     ManagerApplyPreparedActivation,
     ManagerApplyRequest,
     ManagerApplyStatus,
@@ -23,6 +24,7 @@ from manyforge_headless_api.models import (
     OperationControlRequest,
     OperationIntentRequest,
     OperationParticipantRequest,
+    OperationRecoveryActionRequest,
     ProgramNodeAdmissionEvidenceRequest,
     ProgramDiagnosticRequest,
     ProgramSelectionStopRequest,
@@ -1672,3 +1674,155 @@ def test_idle_reset_scene_authorization_is_a_closed_union_with_the_existing_run_
                       {**authorization, "reset_claim": {**authorization["reset_claim"], "reload_initial_scene": True}}):
         with pytest.raises(ValidationError):
             SceneTransactionRequest.model_validate({**body, "program_reset_scene_authorization": malformed})
+
+
+def _recovery_action(**changes: object) -> dict[str, object]:
+    body = {
+        "request_id": "recovery.1",
+        "action": "retry_motion_from_current_state",
+        "expected_assessment_revision": 2,
+        "expected_control_command_epoch": 0,
+        "expected_execution_id": 1,
+    }
+    return {**body, **changes}
+
+
+def test_recovery_action_accepts_close_operation() -> None:
+    parsed = OperationRecoveryActionRequest.model_validate(
+        _recovery_action(action="close_operation")
+    )
+    assert parsed.action == "close_operation"
+    for unknown in ("report_final_motion_failure", "Close_operation"):
+        with pytest.raises(ValidationError):
+            OperationRecoveryActionRequest.model_validate(_recovery_action(action=unknown))
+
+
+def test_runtime_control_audit_rows_pass_through_the_cycle_frame_unchanged():
+    from manyforge_headless_api.program_cycle import ProgramCycleFrameDTO
+
+    audit = [
+        {
+            "event_revision": 7,
+            "kind": "program_node_automatic_retry",
+            "node_instance_id": "move.1",
+            "attempt": 2,
+            "max_attempts": 4,
+            "cause": "planning_no_effect",
+            "delay_s": 1.0,
+        }
+    ]
+    frame = {
+        "program_runner_owner_epoch": "runner.1",
+        "cycle_generation": 1,
+        "state": "running",
+        "program_run_id": "run.1",
+        "cycle_claim_generation": 1,
+        "terminal_or_settlement_reference": None,
+        "execution_control_revision": 1,
+        "causal_correlation_id": None,
+        "causal_session_id": None,
+        "causal_client_sequence": None,
+        "current_command_kind": None,
+        "failure": None,
+        "reset_phase": None,
+        "reset_options": None,
+        "reset_robot_position": {"available": False, "reason": "unsupported"},
+        "allowed_commands": [],
+        "run_revision": 1,
+        "node_status_revision": 1,
+        "runtime_control_revision": 3,
+        "recovery_offer": None,
+        "run": {
+            "owner_epoch": "runner.1",
+            "capture": {"program_run_id": "run.1"},
+            "run_revision": 1,
+            "node_status_revision": 1,
+            "state": "running",
+        },
+        "runtime_controls": {
+            "program_run_id": "run.1",
+            "owner_epoch": "runner.1",
+            "run_revision": 1,
+            "runtime_controls": {
+                "schema_version": "manyforge.program_runtime_controls.v3",
+                "program_run_id": "run.1",
+                "runtime_control_revision": 3,
+                "recovery_fences": {},
+                "retry_counts": {"move.1": 1},
+                "audit": audit,
+            },
+        },
+    }
+    parsed = ProgramCycleFrameDTO.model_validate(frame)
+    assert parsed.runtime_controls["runtime_controls"]["audit"] == audit
+
+
+def _output_payload(value: object = True, **extra: object) -> dict[str, object]:
+    payload = {
+        **_tool_payload(),
+        "command_schema_id": "cell.valve.io_signal_write",
+        "command_value": {
+            "kind": "io_signal_write", "resource_role_id": "valve", "value": value, **extra,
+        },
+    }
+    # Contract 65: an output write carries no caller deadline.
+    payload.pop("completion_timeout_s")
+    return payload
+
+
+def test_output_write_omits_the_caller_deadline_and_gripper_keeps_it() -> None:
+    participant = {
+        "component_role_id": "io_module", "target_role_id": "cell_io",
+        "required_capability_id": "io.gpio.set_output", "action_span": None,
+    }
+    parsed = OperationParticipantRequest.model_validate({**participant, "payload": _output_payload()})
+    assert "completion_timeout_s" not in parsed.model_dump(mode="json")["payload"]
+    with pytest.raises(ValidationError, match="provider policy owns it"):
+        OperationParticipantRequest.model_validate(
+            {**participant, "payload": {**_output_payload(), "completion_timeout_s": 30.0}}
+        )
+    gripper = _tool_payload()
+    assert CapabilityCommandParticipantRequest.model_validate(gripper).model_dump(
+        mode="json"
+    )["completion_timeout_s"] == gripper["completion_timeout_s"]
+    gripper.pop("completion_timeout_s")
+    with pytest.raises(ValidationError, match="completion_timeout_s is required"):
+        CapabilityCommandParticipantRequest.model_validate(gripper)
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_boolean_output_write_is_one_typed_command_value(value: bool) -> None:
+    participant = OperationParticipantRequest.model_validate({
+        "component_role_id": "io_module", "target_role_id": "cell_io",
+        "required_capability_id": "io.gpio.set_output", "action_span": None,
+        "payload": _output_payload(value),
+    })
+    assert participant.model_dump(mode="json")["payload"]["command_value"] == {
+        "kind": "io_signal_write", "resource_role_id": "valve", "value": value,
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _output_payload(None),
+        _output_payload(0),
+        _output_payload("true"),
+        _output_payload(True, readback_signal_id="di_0"),
+        {**_output_payload(), "command_value": {"kind": "io_signal_write", "value": True}},
+    ],
+)
+def test_boolean_output_write_refuses_coercion_and_extra_authority(payload) -> None:
+    with pytest.raises(ValidationError):
+        OperationParticipantRequest.model_validate({
+            "component_role_id": "io_module", "target_role_id": "cell_io",
+            "required_capability_id": "io.gpio.set_output", "action_span": None,
+            "payload": payload,
+        })
+
+
+def test_pick_tool_phase_stays_a_gripper_command() -> None:
+    body = _pick_request()
+    body["tool_operation"]["participants"][0]["payload"] = _output_payload()
+    with pytest.raises(ValidationError, match="gripper capability command"):
+        PickSequencePlanningRequest.model_validate(body)

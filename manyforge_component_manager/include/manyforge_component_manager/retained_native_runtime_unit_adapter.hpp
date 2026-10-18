@@ -148,7 +148,8 @@ public:
   GetAuthoringAdmission() const override;
   [[nodiscard]] manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
   UpdateCellAdmissionReadiness(
-      const manyforge::core::CellAdmissionReadinessSnapshotDTO &snapshot)
+      const manyforge::core::CellAdmissionReadinessSnapshotDTO &snapshot,
+      std::shared_ptr<manyforge::core::IIoSignalService>* actual_retired_service = nullptr)
       override;
   [[nodiscard]] manyforge::core::Result<void> Publish(
       const manyforge::core::ManagerLivenessObservationDTO &observation)

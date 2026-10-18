@@ -1056,13 +1056,11 @@ NativeParentReadFixture WriteNativeParent(
             if (binding.control_domain_id == expected.control_domain_id) {
               if (first_binding == nullptr)
                 first_binding = &binding;
-              const auto route =
-                  std::find_if(expected.expected_control_bindings.begin(),
-                               expected.expected_control_bindings.end(),
-                               [&](const auto &value) {
-                                 return value.control_binding_id ==
-                                        binding.control_binding_id;
-                               });
+              const auto route = std::find_if(
+                  expected.controller().expected_control_bindings.begin(),
+                  expected.controller().expected_control_bindings.end(), [&](const auto& value) {
+                    return value.control_binding_id == binding.control_binding_id;
+                  });
               bindings.push_back({binding.control_binding_id,
                                   binding.control_binding_revision,
                                   route->control_route_id});
@@ -1072,8 +1070,8 @@ NativeParentReadFixture WriteNativeParent(
           scope = core::ResolvedLifecycleControlDomainScopeDTO{
               expected.control_domain_id,
               expected.control_domain_revision,
-              expected.controller_topology_id,
-              expected.topology_revision,
+              expected.controller().controller_topology_id,
+              expected.controller().topology_revision,
               std::nullopt,
               bindings,
               {resources.begin(), resources.end()}};
@@ -1227,6 +1225,49 @@ TEST(ManagerApplyJournalIntegrity,
                ManagerApplyJournalConflictError);
   EXPECT_EQ(ReadFileBytes(cell_path), cell_before);
   ExpectNoSqliteSidecars(cell_path);
+}
+
+TEST(ManagerApplyJournalReadOnly,
+     NeverCreatesAndPreservesExactRecordDatabaseAndWal) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "read-only.sqlite3";
+  const auto intent = Intent();
+  const core::NamedApplyPublicationTransactionDTO apply{
+      intent.apply_id, intent.apply_generation};
+  EXPECT_FALSE(
+      ReadManagerApplyStatusReadOnly(path, intent.cell_id, apply).ok());
+  EXPECT_FALSE(std::filesystem::exists(path));
+  ExpectNoSqliteSidecars(path);
+  SqliteManagerApplyJournal owner(path, intent.cell_id);
+  const auto accepted = owner.EnsureIntent(intent);
+  const auto wal = std::filesystem::path(path.string() + "-wal");
+  ASSERT_TRUE(std::filesystem::exists(wal));
+  const auto database_before = ReadFileBytes(path);
+  const auto wal_before = ReadFileBytes(wal);
+  const auto actual =
+      ReadManagerApplyStatusReadOnly(path, intent.cell_id, apply);
+  ASSERT_TRUE(actual.ok()) << actual.error().message;
+  EXPECT_EQ(actual.value().intent, accepted.record);
+  EXPECT_FALSE(
+      ReadManagerApplyStatusReadOnly(path, CellId("another-cell"), apply).ok());
+  EXPECT_FALSE(ReadManagerApplyStatusReadOnly(
+                   path, intent.cell_id, {apply.apply_id, ApplyGeneration(2U)})
+                   .ok());
+  EXPECT_EQ(ReadFileBytes(path), database_before);
+  EXPECT_EQ(ReadFileBytes(wal), wal_before);
+  ExecSql(
+      path,
+      "DROP TRIGGER manager_apply_intents_no_update;"
+      "UPDATE manager_apply_intents SET source_label='tampered';"
+      "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
+      "manager_apply_intents "
+      "BEGIN SELECT RAISE(ABORT, 'manager_apply_intents is immutable'); END;");
+  const auto corrupt_database = ReadFileBytes(path);
+  const auto corrupt_wal = ReadFileBytes(wal);
+  EXPECT_FALSE(
+      ReadManagerApplyStatusReadOnly(path, intent.cell_id, apply).ok());
+  EXPECT_EQ(ReadFileBytes(path), corrupt_database);
+  EXPECT_EQ(ReadFileBytes(wal), corrupt_wal);
 }
 
 TEST(ManagerApplyJournalIntegrity, RejectsPreUa4JournalVersion) {
@@ -4614,6 +4655,57 @@ TEST(ManagerApplyJournal, InitializingPurposeSurvivesJournalReopen) {
   EXPECT_EQ(stored->intent.scene_initialization,
             ManagerSceneInitialization::kInitialize);
   EXPECT_FALSE(reopened.EnsureIntent(intent).inserted);
+}
+
+TEST(ManagerApplyJournal,
+     ProviderFenceProofSurvivesDurableScopeAndAttemptReopen) {
+  TemporaryDirectory directory;
+  const auto database = directory.path() / "provider-fence.sqlite3";
+  auto fence = FenceIntent();
+  const core::ProviderConfigurationFenceOccurrenceDTO occurrence{
+      ControllableComponentId("robot-1"),
+      core::ProviderInstanceId("provider.io"),
+      ContentDigest(std::string(kDigestOne)),
+      {ResourceId("io.output")}};
+  fence.scope = {
+      {occurrence.controllable_component_id},
+      {{ControlDomainId("io.domain"), ControlDomainRevision("old"),
+        ControlDomainRevision("new"),
+        core::ProviderConfigurationFenceDomainDTO{occurrence, occurrence}}},
+      {},
+      occurrence.output_resources};
+  fence.expected_active_control_configurations.clear();
+  fence.expected_provider_lineages = {
+      {ControlDomainId("io.domain"),
+       core::RuntimeEpoch("actual.provider.epoch"),
+       core::ComponentLifecycleGeneration(7U)}};
+  ASSERT_TRUE(fence.valid());
+  {
+    SqliteManagerApplyJournal journal(database, CellId("cell-1"));
+    const auto intent = journal.EnsureIntent(Intent()).record;
+    const auto affected =
+        journal.EnsureAffectedScope(intent.intent_digest, AffectedScope(fence))
+            .record;
+    const auto attempt =
+        journal
+            .EnsureFenceAttempt(intent.intent_digest,
+                                affected.affected_scope_digest, fence)
+            .record;
+    EXPECT_EQ(attempt.fence_intent.scope, fence.scope);
+  }
+  SqliteManagerApplyJournal reopened(database, CellId("cell-1"));
+  const auto scope =
+      reopened.ReadAffectedScope(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(scope);
+  EXPECT_EQ(scope->affected_scope.scope, fence.scope);
+  const auto attempt =
+      reopened.ReadFenceAttempt(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(attempt);
+  EXPECT_EQ(attempt->fence_intent.scope, fence.scope);
+  EXPECT_EQ(attempt->fence_intent.expected_provider_lineages,
+            fence.expected_provider_lineages);
+  EXPECT_TRUE(
+      attempt->fence_intent.expected_active_control_configurations.empty());
 }
 
 } // namespace manyforge::component_manager

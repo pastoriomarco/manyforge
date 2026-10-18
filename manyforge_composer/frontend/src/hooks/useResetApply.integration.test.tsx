@@ -125,13 +125,17 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
     ? null
     : heldOffer({
       actions: [{
-        actionId: 'retry_motion_from_current_state', labelKey: 'retry',
+        actionId: 'retry_motion_from_current_state',
         requiresConfirmation: false, performsBackendReset: false,
         enabled: hold !== 'containment_unconfirmed',
         disabledReasonCode: hold === 'containment_unconfirmed'
           ? 'failure_pause_containment_unconfirmed' : null,
       }, {
-        actionId: 'reset_cycle', labelKey: 'reset',
+        actionId: 'continue_with_failure',
+        requiresConfirmation: true, performsBackendReset: false,
+        enabled: true, disabledReasonCode: null,
+      }, {
+        actionId: 'reset_cycle',
         requiresConfirmation: true, performsBackendReset: true,
         enabled: true, disabledReasonCode: null,
       }],
@@ -160,7 +164,6 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
     resetRobotPosition: { available: false, reason: 'unsupported' },
     allowedCommands: ['program_reset', 'program_motion_resume', 'program_resume_full_stop']
       .map((commandKind) => ({ commandKind, semanticTarget: {}, allowed: true, disabledReason: null })),
-    recoveryOffer: offer,
     run,
     runtimeControls: {
       ownerEpoch: 'runner.epoch.1',
@@ -168,6 +171,9 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
       runRevision: 4,
       runtimeControls: { runtimeControlRevision: 1 },
       recoveryOffer: offer,
+      recoveryHolds: offer === null ? [] : [{
+        motionGroupIds: ['all'], interventionStopScope: 'all', offer,
+      }],
       executionSelections: {
         selectionRevision: 1,
         motionHeld: groupState === 'held',
@@ -188,7 +194,7 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
 function idleCycle(correlationId: string | null): Partial<ProgramCycleStatus> {
   return {
     state: 'idle_after_reset', cycleGeneration: 8, programRunId: null,
-    causalCorrelationId: correlationId, allowedCommands: [], recoveryOffer: null,
+    causalCorrelationId: correlationId, allowedCommands: [],
     run: null, runtimeControls: null,
   };
 }
@@ -527,8 +533,9 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
     expect(runtime.commandAllowed('program_motion_resume')).toBe(false);
     expect(runtime.commandDisabledReason('program_motion_resume')).toBe(runtime.draftUnappliedReason);
     expect(runtime.commandAllowed('program_reset')).toBe(true);
+    const currentOffer = () => hooks!.runtime.state.controls!.recoveryHolds[0].offer;
     await act(async () => {
-      runtime.applyRecoveryAction('retry_motion_from_current_state');
+      runtime.applyRecoveryAction(currentOffer(), 'retry_motion_from_current_state');
       await runtime.resumeMotion('all');
     });
     expect(transport.sendExecutionCommand).not.toHaveBeenCalled();
@@ -538,12 +545,76 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
     await flush();
     expect(hooks!.runtime.draftUnappliedReason).toBeNull();
     expect(hooks!.runtime.commandAllowed('program_motion_resume')).toBe(true);
-    await act(async () => { hooks!.runtime.applyRecoveryAction('retry_motion_from_current_state'); });
+    await act(async () => {
+      hooks!.runtime.applyRecoveryAction(currentOffer(), 'retry_motion_from_current_state');
+    });
     expect(transport.sendExecutionCommand).toHaveBeenCalledExactlyOnceWith(
       'execution_recovery',
       expect.objectContaining({ action_id: 'retry_motion_from_current_state' }),
       expect.any(String),
     );
+  });
+
+  it('sends Continue for the exact hold offer, and nothing for a stale revision', async () => {
+    await mount({ ...HELD, draftRevision: 4, programRevision: digest('a') });
+    const offer = hooks!.runtime.state.controls!.recoveryHolds[0].offer;
+    await act(async () => {
+      hooks!.runtime.applyRecoveryAction(
+        { offerId: offer.offerId, offerRevision: offer.offerRevision + 1 }, 'continue_with_failure',
+      );
+    });
+    expect(transport.sendExecutionCommand).not.toHaveBeenCalled();
+    await act(async () => { hooks!.runtime.applyRecoveryAction(offer, 'continue_with_failure'); });
+    expect(transport.sendExecutionCommand).toHaveBeenCalledExactlyOnceWith(
+      'execution_recovery',
+      expect.objectContaining({
+        offer_id: offer.offerId,
+        offer_revision: offer.offerRevision,
+        action_id: 'continue_with_failure',
+      }),
+      expect.any(String),
+    );
+    expect(hooks!.runtime.state.controlPending)
+      .toBe(`recovery:${offer.offerId}:continue_with_failure`);
+  });
+
+  it('sends an operator Stop Retry for its focused offer, which no hold owns', async () => {
+    const base = heldCycle('failure_pause', {});
+    const stop = heldOffer({
+      offerId: digest('5'),
+      offerRevision: 2,
+      recoveryClass: 'ordinary_operator_stop',
+      actions: [{
+        actionId: 'retry_motion_from_current_state',
+        requiresConfirmation: false, performsBackendReset: false,
+        enabled: true, disabledReasonCode: null,
+      }],
+    });
+    await mount({
+      ...HELD,
+      draftRevision: 4,
+      programRevision: digest('a'),
+      cycle: { runtimeControls: { ...base.runtimeControls!, recoveryOffer: stop, recoveryHolds: [] } },
+    });
+    expect(hooks!.runtime.state.controls!.recoveryHolds).toEqual([]);
+    await act(async () => {
+      hooks!.runtime.applyRecoveryAction(
+        { offerId: stop.offerId, offerRevision: stop.offerRevision + 1 }, 'retry_motion_from_current_state',
+      );
+    });
+    expect(transport.sendExecutionCommand).not.toHaveBeenCalled();
+    await act(async () => { hooks!.runtime.applyRecoveryAction(stop, 'retry_motion_from_current_state'); });
+    expect(transport.sendExecutionCommand).toHaveBeenCalledExactlyOnceWith(
+      'execution_recovery',
+      expect.objectContaining({
+        offer_id: stop.offerId,
+        offer_revision: stop.offerRevision,
+        action_id: 'retry_motion_from_current_state',
+      }),
+      expect.any(String),
+    );
+    expect(hooks!.runtime.state.controlPending)
+      .toBe(`recovery:${stop.offerId}:retry_motion_from_current_state`);
   });
 
   it('refuse Run of a run Executed but never Run until the Draft is Applied', async () => {

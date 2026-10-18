@@ -84,14 +84,38 @@ std::string Redigest(std::string source) {
   return source;
 }
 
+TEST(OperatorAlarmCatalog,
+     ProgramFailureHasDistinctProgramAuthorityAndExactMotionScope) {
+  const auto catalog = OperatorAlarmCatalog::Load(PackagedCatalog());
+  const auto *definition = catalog.Find("manyforge.program.operation_failure");
+  ASSERT_NE(definition, nullptr);
+  EXPECT_EQ(definition->priority, "high");
+  EXPECT_TRUE(definition->acknowledgement_required);
+  EXPECT_TRUE(definition->requires_motion_attention);
+  EXPECT_EQ(definition->set_authority,
+            "manyforge.program_runner.failure_condition");
+  EXPECT_EQ(definition->clear_authority, definition->set_authority);
+  EXPECT_NE(definition->set_authority,
+            catalog.Find("manyforge.motion.execution_fault")->set_authority);
+}
 TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   const auto catalog = OperatorAlarmCatalog::Load(PackagedCatalog());
   EXPECT_EQ(catalog.schema_version(), "manyforge.operator_alarm_catalog.v1");
-  EXPECT_EQ(catalog.catalog_version(), "2.4.0");
+  EXPECT_EQ(catalog.catalog_version(), "2.6.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "e435a7ba1057ce8aa77eb324ae26d217a2dcde03641298e8484bbe8d21385727");
-  ASSERT_EQ(catalog.definitions().size(), 9U);
+            "eb5d5bdf48e06d8637a9f0d29eff24949f6fa7ff8ac10365375986b42d2616c8");
+  ASSERT_EQ(catalog.definitions().size(), 12U);
+  for (const auto name : {"manyforge.runtime.program_runner_loss",
+                          "manyforge.runtime.operation_journal_write_fault"}) {
+    const auto* fault = catalog.Find(name);
+    ASSERT_NE(fault, nullptr);
+    EXPECT_EQ(fault->priority, "high");
+    EXPECT_TRUE(fault->acknowledgement_required);
+    EXPECT_TRUE(fault->requires_motion_attention);
+    EXPECT_EQ(fault->adapter_id, "manyforge.alarm_adapter.runtime_fault_condition");
+    EXPECT_EQ(fault->max_evidence_refs, 1U);
+  }
   const auto *collision = catalog.Find("manyforge.motion.runtime_collision");
   ASSERT_NE(collision, nullptr);
   EXPECT_EQ(collision->priority, "critical");
@@ -123,7 +147,7 @@ TEST(OperatorAlarmCatalog,
   const auto parsed = deployment::parse_strict_json_model_yaml(source);
   const auto canonical_json = content_identity::canonical_json(parsed.root());
   EXPECT_EQ(OperatorAlarmCatalog::Decode(canonical_json).definitions().size(),
-            9U);
+            12U);
 
   auto tampered = source;
   const auto title = tampered.find("Runtime collision stop");

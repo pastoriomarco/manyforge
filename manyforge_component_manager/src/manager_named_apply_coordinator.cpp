@@ -139,6 +139,7 @@ LoadBundle(const deployment::IVerifiedRetainedBundleSource &source,
         fence.expected_fence_generation,
         fence.expected_active_control_configurations,
         fence.scope,
+        fence.expected_provider_lineages,
     };
   }
 
@@ -296,6 +297,7 @@ LoadBundle(const deployment::IVerifiedRetainedBundleSource &source,
       snapshot.configuration_fence_generation,
       snapshot.active_control_configurations,
       scope,
+      snapshot.provider_lineages,
   };
 }
 
@@ -418,12 +420,14 @@ DirectAdmissionIntent(
   return acquired.value();
 }
 
-void ReleaseAdmission(
+bool ReleaseAdmission(
     const PersistedManagerApplyIntent &durable,
     const PersistedManagerApplyTerminalOutcome &terminal,
     core::IKernelCellAdmissionPort &cell_admission,
     const std::optional<core::ContentDigest> &bring_up_plan_digest = {},
-    const std::optional<core::CellAdmissionClaimDTO> &original_parent_claim = {}) {
+    const std::optional<core::CellAdmissionClaimDTO> &original_parent_claim = {},
+    const ManagerNamedApplyCoordinator::SuccessfulSettlementPreparation &prepare = {},
+    const ManagerApplySettlementAttempt attempt = ManagerApplySettlementAttempt::kInitial) {
   const auto intent = durable.intent.parent_authoring_claim.has_value()
                           ? durable.intent.parent_authoring_claim->intent
                           : DirectAdmissionIntent(durable, bring_up_plan_digest);
@@ -441,13 +445,16 @@ void ReleaseAdmission(
   }
   if (receipt.value().status ==
       core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact) {
-    return;
+    return true;
   }
   Require(receipt.value().status ==
                   core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
               receipt.value().matched_claim.has_value(),
           "terminal Manager Apply has no exact held admission claim");
   const auto &claim = *receipt.value().matched_claim;
+  if (terminal.terminal_outcome.succeeded() && prepare &&
+      !prepare(durable.intent, attempt))
+    return false;
   const auto settlement_kind = durable.intent.parent_authoring_claim.has_value()
                                    ? core::CellAdmissionSettlementKindDTO::kOwnerCommit
                                    : core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled;
@@ -470,6 +477,7 @@ void ReleaseAdmission(
               ? std::string{}
               : " [" + reason->second + "]"));
   }
+  return true;
 }
 
 } // namespace
@@ -602,7 +610,8 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     RuntimeObservationReducer::Clock clock_ns, ApplyIdFactory apply_id_factory,
     InitialSceneSource initial_scene_source,
     RuntimePreStartGuard pre_start_guard,
-    ApplyProgressObserver apply_progress_observer)
+    ApplyProgressObserver apply_progress_observer,
+    SuccessfulSettlementPreparation successful_settlement_preparation)
     : apply_journal_(apply_journal), active_plan_source_(active_plan_source),
       retained_bundle_source_(retained_bundle_source),
       artifact_source_(artifact_source), publication_reader_(publication_store),
@@ -613,6 +622,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
       apply_id_factory_(std::move(apply_id_factory)),
       initial_scene_source_(std::move(initial_scene_source)),
       apply_progress_observer_(std::move(apply_progress_observer)),
+      successful_settlement_preparation_(std::move(successful_settlement_preparation)),
       fence_coordinator_(apply_journal_, kernel_fence_, manager_runtime_epoch_),
       planned_maintenance_(planned_maintenance),
       active_runtime_coordinator_(active_plan_source, process_port,
@@ -636,6 +646,71 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
   Require(static_cast<bool>(apply_id_factory_), "Apply ID factory is required");
   Require(static_cast<bool>(initial_scene_source_),
           "Apply initial-Scene source is required");
+}
+
+ManagerNamedApplyResult ManagerNamedApplyCoordinator::PendingSettlementResult(
+    const ManagerApplyIntentDTO &intent, const bool replayed) const {
+  return {intent.apply_id, intent.apply_generation,
+          ManagerNamedApplyResultState::kPending, replayed, std::nullopt, true};
+}
+
+bool ManagerNamedApplyCoordinator::SettleSuccessfulAdmission(
+    const PersistedManagerApplyIntent &durable,
+    const PersistedManagerApplyTerminalOutcome &terminal,
+    const ManagerApplySettlementAttempt attempt) {
+  const auto &intent = durable.intent;
+  const bool linked = HasOriginalBringUpCapture(intent);
+  const auto plan_digest = linked
+      ? std::optional(captured_apply_inputs_->bring_up_plan->plan_digest) : std::nullopt;
+  const auto original_claim = linked
+      ? captured_apply_inputs_->original_parent_claim : std::nullopt;
+  const bool settled = ReleaseAdmission(durable, terminal, cell_admission_,
+      plan_digest, original_claim, successful_settlement_preparation_, attempt);
+  if (!settled) {
+    pending_settlement_ = core::NamedApplyPublicationTransactionDTO{
+        intent.apply_id, intent.apply_generation};
+    return false;
+  }
+  pending_settlement_.reset();
+  return true;
+}
+
+std::optional<core::NamedApplyPublicationTransactionDTO>
+ManagerNamedApplyCoordinator::PendingSettlementForHeartbeat() {
+  std::unique_lock lock(operation_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) return std::nullopt;
+  return pending_settlement_;
+}
+
+std::optional<ManagerNamedApplyResult>
+ManagerNamedApplyCoordinator::RetryPendingSettlementOnHeartbeat(
+    const core::NamedApplyPublicationTransactionDTO &expected) {
+  // The independent heartbeat may not wait behind active Apply/Scene effects.
+  // Keep the same pending reference for its next ordinary cadence instead.
+  std::unique_lock lock(operation_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) return std::nullopt;
+  if (!pending_settlement_ || *pending_settlement_ != expected) return std::nullopt;
+  const auto reference = *pending_settlement_;
+  try {
+    const auto durable = apply_journal_.ReadIntent(reference.apply_id, reference.apply_generation);
+    const auto terminal = apply_journal_.ReadTerminalOutcome(reference.apply_id, reference.apply_generation);
+    Require(durable && terminal && terminal->terminal_outcome.succeeded(),
+            "pending Apply settlement lost its exact successful journal record");
+    if (!SettleSuccessfulAdmission(*durable, *terminal,
+                                  ManagerApplySettlementAttempt::kOrdinaryHeartbeat))
+      return PendingSettlementResult(durable->intent, true);
+    if (captured_apply_inputs_ && captured_apply_inputs_->apply_id == reference.apply_id &&
+        captured_apply_inputs_->apply_generation == reference.apply_generation)
+      captured_apply_inputs_.reset();
+    return ManagerNamedApplyResult{reference.apply_id, reference.apply_generation,
+        ManagerNamedApplyResultState::kSucceeded, true, terminal->terminal_outcome};
+  } catch (...) {
+    // Source/read/validation errors and uncertain release are not permission
+    // to retry. Leave actual claim/terminal evidence for the old diagnosis path;
+    // only a known preparation-false result retains this scheduling reference.
+    pending_settlement_.reset();
+    throw;
+  }
 }
 
 core::ApplyId ManagerNamedApplyCoordinator::MintApplyId() {
@@ -979,7 +1054,8 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalConfiguratio
     const auto released = fence_release_coordinator_.ReleaseOrRecover(intent.apply_id, intent.apply_generation);
     const auto terminal = apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation);
     Require(terminal.has_value(), "configuration release lacks its actual terminal evidence");
-    ReleaseAdmission(durable, *terminal, cell_admission_);
+    if (!SettleSuccessfulAdmission(durable, *terminal, ManagerApplySettlementAttempt::kInitial))
+      return PendingSettlementResult(intent, request_replayed);
     return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kSucceeded,
         request_replayed, released.durable_terminal_outcome.record.terminal_outcome};
   } catch (const std::exception &error) {
@@ -1155,8 +1231,8 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalBringUpPubli
     const auto released = fence_release_coordinator_.ReleaseOrRecover(intent.apply_id, intent.apply_generation);
     const auto terminal = apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation);
     Require(terminal.has_value(), "configured parent fence release lacks actual terminal proof");
-    ReleaseAdmission(durable, *terminal, cell_admission_, captured_apply_inputs_->bring_up_plan->plan_digest,
-                     captured_apply_inputs_->original_parent_claim);
+    if (!SettleSuccessfulAdmission(durable, *terminal, ManagerApplySettlementAttempt::kInitial))
+      return PendingSettlementResult(intent, request_replayed);
     return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kSucceeded,
             request_replayed, released.durable_terminal_outcome.record.terminal_outcome};
   } catch (const std::exception &error) {
@@ -1211,6 +1287,9 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
       existing.has_value()) {
     Require(MatchesRequest(existing->intent, request),
             "public request identity is already bound to another Apply");
+    if (pending_settlement_ == core::NamedApplyPublicationTransactionDTO{
+            existing->intent.apply_id, existing->intent.apply_generation})
+      return PendingSettlementResult(existing->intent, true);
     if (const auto observation = ObserveBringUpParent(existing->intent, true);
         observation.has_value())
       return *observation;
@@ -1224,6 +1303,9 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
             terminal.has_value() ? std::optional(terminal->terminal_outcome)
                                  : std::nullopt};
   }
+
+  if (pending_settlement_)
+    throw ManagerNamedApplyBusyError("another successful Apply retains its original admission claim");
 
   const auto candidate =
       LoadBundle(retained_bundle_source_, request.candidate_retained_bundle_id,
@@ -1410,6 +1492,9 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   if (const auto terminal = apply_journal_.ReadTerminalOutcome(
           intent.apply_id, intent.apply_generation);
       terminal.has_value()) {
+    if (pending_settlement_ == core::NamedApplyPublicationTransactionDTO{
+            intent.apply_id, intent.apply_generation})
+      return PendingSettlementResult(intent, request_replayed);
     return {intent.apply_id, intent.apply_generation,
             ResultStateFromTerminal(terminal->terminal_outcome),
             request_replayed, terminal->terminal_outcome};
@@ -1878,7 +1963,8 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
       intent.apply_id, intent.apply_generation);
   Require(terminal.has_value(),
           "Manager Apply release completed without terminal evidence");
-  ReleaseAdmission(durable_intent, *terminal, cell_admission_, plan_digest, original_claim);
+  if (!SettleSuccessfulAdmission(durable_intent, *terminal, ManagerApplySettlementAttempt::kInitial))
+    return PendingSettlementResult(intent, request_replayed);
   return {intent.apply_id, intent.apply_generation,
           ManagerNamedApplyResultState::kSucceeded, request_replayed,
           release->durable_terminal_outcome.record.terminal_outcome};
@@ -1887,6 +1973,10 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
 std::optional<ManagerNamedApplyResult>
 ManagerNamedApplyCoordinator::RecoverIncompleteApply() {
   std::lock_guard lock(operation_mutex_);
+  if (pending_settlement_)
+    return ManagerNamedApplyResult{
+        pending_settlement_->apply_id, pending_settlement_->apply_generation,
+        ManagerNamedApplyResultState::kPending, true, std::nullopt, true};
   const auto inventory = apply_journal_.ReadStatusInventory();
   const PersistedManagerApplyStatus *pending = nullptr;
   for (const auto &status : inventory) {

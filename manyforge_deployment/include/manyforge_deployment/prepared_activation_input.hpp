@@ -8,6 +8,7 @@
 #include <vector>
 #include <variant>
 
+#include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
@@ -44,6 +45,16 @@ using PreparedActivationOrigin =
 [[nodiscard]] CanonicalValue prepared_activation_origin_value(const PreparedActivationOrigin &origin);
 [[nodiscard]] core::ContentDigest sealed_canonical_empty_capture_digest(
     const PreparedSealedCanonicalEmptyOrigin &origin);
+
+/// Pure projection of the Program outcome in an immutable Apply receipt.
+/// This grants no Applied/currentness authority. Existing Headless ingress
+/// error codes are retained so both consumers share the same interpretation.
+struct PreparedActivationProgramOutcomeDTO final {
+  std::optional<core::ProgramBindingId> program_binding_id;
+  std::optional<ProgramNonExecutableOutcomeDTO> non_executable;
+};
+[[nodiscard]] core::Result<PreparedActivationProgramOutcomeDTO>
+parse_prepared_activation_program_outcome(const CanonicalValue &prepared);
 
 class PreparedActivationInputError final : public std::invalid_argument {
 public:

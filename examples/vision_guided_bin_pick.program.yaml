@@ -102,7 +102,7 @@ blackboard:
       owner: program
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.5.0
+  content_version: 2.7.0
 compatibility:
   assistant: required
   lanes:
@@ -149,7 +149,7 @@ description: Vision-guided pick-and-place Program. A bounded model request selec
 name: vision_guided_bin_pick
 program_id: vision_guided_bin_pick
 program_profile: composable-cell-v1
-program_revision: sha256:9f4e4e9f6782553155085785c72ef033f9a8ed1905417f312cd74e58228536b5
+program_revision: sha256:cb83fcd4969ce3f7927d7e0f4f8e26ae8c3fcfdbd9d8c4462737238b093d9058
 scene:
   - pose:
       frame_ref:

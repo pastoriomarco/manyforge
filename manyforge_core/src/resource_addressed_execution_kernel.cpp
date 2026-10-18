@@ -2,11 +2,73 @@
 
 namespace manyforge::core {
 
+std::string bounded_operation_journal_diagnostic_text(std::string_view value,
+                                                      std::size_t maximum_bytes) {
+  if (content_identity::is_utf8_nfc(value)) {
+    auto size = std::min(value.size(), maximum_bytes);
+    while (size < value.size() && size > 0U &&
+           (static_cast<unsigned char>(value[size]) & 0xc0U) == 0x80U)
+      --size;
+    return std::string(value.substr(0U, size));
+  }
+  // Match the existing launch-output policy for otherwise unrepresentable
+  // bytes. A marker identifies the representation; never split an escape.
+  constexpr std::string_view marker = "escaped bytes: ";
+  constexpr char hex[] = "0123456789abcdef";
+  std::string result(marker.substr(0U, maximum_bytes));
+  for (const auto character : value) {
+    const auto byte = static_cast<unsigned char>(character);
+    const std::size_t needed = byte >= 0x80U ? 4U : character == '\\' ? 2U : 1U;
+    if (needed > maximum_bytes - result.size()) break;
+    if (byte >= 0x80U) {
+      result += "\\x";
+      result += hex[byte >> 4U];
+      result += hex[byte & 0x0fU];
+    } else if (character == '\\') {
+      result += "\\\\";
+    } else {
+      result += character;
+    }
+  }
+  return result;
+}
+
+std::optional<OperationJournalWriteFaultDTO>
+ResourceAddressedExecutionKernel::get_operation_journal_write_fault() const {
+  std::lock_guard state_lock(state_mutex_);
+  return operation_journal_write_fault_;
+}
+
+void ResourceAddressedExecutionKernel::retain_operation_journal_write_fault_locked(
+    std::string_view write_kind, const ErrorDTO& failure, const OperationStateDTO* state,
+    std::optional<RequestId> request_id) {
+  motion_admission_closed_ = true;
+  if (operation_journal_write_fault_) return;
+  OperationJournalWriteFaultDTO fact{
+      config_.request_owner_epoch,
+      bounded_operation_journal_diagnostic_text(write_kind, 64U),
+      ErrorDTO{bounded_operation_journal_diagnostic_text(failure.code, 256U),
+               bounded_operation_journal_diagnostic_text(failure.message, 1024U), {}},
+      std::nullopt, std::nullopt, std::move(request_id), std::nullopt, std::nullopt};
+  if (state) {
+    fact.operation_id = state->operation_id;
+    fact.operation_revision = state->operation_revision;
+    fact.program_run_id = state->program_run_id;
+    if (state->participants.size() == 1U)
+      fact.execution_scope = state->participants.front().execution_scope;
+  }
+  operation_journal_write_fault_ = std::move(fact);
+}
+
 void ResourceAddressedExecutionKernel::stamp_operation_capture_locked(ActiveOperation& operation,
                                                                       OperationStateDTO& state) {
   if (operation.last_capture_order == static_cast<std::uint64_t>(INT64_MAX)) {
     motion_admission_closed_ = true;
     throw std::overflow_error("operation journal capture order exhausted");
+  }
+  for (auto& participant : state.participants) {
+    if (participant.terminal_fact && !terminal(participant.state))
+      participant.terminal_fact.reset();
   }
   state.journal_capture_order = ++operation.last_capture_order;
 }
@@ -14,7 +76,8 @@ void ResourceAddressedExecutionKernel::stamp_operation_capture_locked(ActiveOper
 Result<bool> ResourceAddressedExecutionKernel::record_operation_state_locked(
     std::unique_lock<std::mutex>& state_lock, OperationStateDTO& state,
     const RuntimeScaleStatusDTO* scale, const char* reason,
-    std::span<const PreparedMotionDiagnosticsDTO> diagnostics) {
+    std::span<const PreparedMotionDiagnosticsDTO> diagnostics,
+    std::optional<RequestId> request_id) {
   auto* operation = find_active_operation_locked(state.operation_id);
   if (operation == nullptr || !operation->ordinary_commit_in_flight)
     return reject<bool>("operation capture has no ordinary commit guard",
@@ -33,7 +96,11 @@ Result<bool> ResourceAddressedExecutionKernel::record_operation_state_locked(
                                          diagnostics);
   });
   state_lock.lock();
-  if (!written.ok()) return Result<bool>::Err(written.error());
+  if (!written.ok()) {
+    retain_operation_journal_write_fault_locked(reason, written.error(), &state,
+                                               std::move(request_id));
+    return Result<bool>::Err(written.error());
+  }
   operation = find_active_operation_locked(state.operation_id);
   if (operation == nullptr || operation->commit_mutex != identity ||
       operation->state.operation_revision != prior.operation_revision ||
@@ -81,8 +148,9 @@ std::vector<OperationId> ResourceAddressedExecutionKernel::durable_operation_ret
   std::vector<OperationId> retained;
   retained.reserve(active_operations_.size() + historical_operations_.size());
   for (const auto& [operation_id, operation] : active_operations_) {
-    (void)operation;
     retained.push_back(operation_id);
+    for (const auto* slot : {&operation->pending_motion_takeover, &operation->next_motion_takeover})
+      if (!slot->empty()) retained.push_back(slot->key());
   }
   if (manual_operation_claim_.has_value()) {
     retained.emplace_back(manual_operation_claim_->intent.owner_transaction_id);
@@ -137,16 +205,26 @@ bool ResourceAddressedExecutionKernel::evict_oldest_historical_operation_locked(
   return true;
 }
 
+std::size_t ResourceAddressedExecutionKernel::resident_operation_count_locked() const noexcept {
+  auto count = active_operations_.size();
+  for (const auto& [id, operation] : active_operations_) {
+    static_cast<void>(id);
+    count += !operation->pending_motion_takeover.empty();
+    count += !operation->next_motion_takeover.empty();
+  }
+  return count;
+}
+
 bool ResourceAddressedExecutionKernel::make_operation_admission_capacity_locked() {
   const auto protected_operation_ids = durable_operation_retention_ids_locked();
   while (!historical_operations_.empty() &&
-         active_operations_.size() + historical_operations_.size() >=
+         resident_operation_count_locked() + historical_operations_.size() >=
              config_.request_replay_capacity) {
     if (!evict_oldest_historical_operation_locked(protected_operation_ids)) {
       return false;
     }
   }
-  return active_operations_.size() + historical_operations_.size() <
+  return resident_operation_count_locked() + historical_operations_.size() <
          config_.request_replay_capacity;
 }
 
@@ -157,7 +235,7 @@ void ResourceAddressedExecutionKernel::retain_historical_operation_locked(Operat
   // are therefore never selected for this compaction.
   const auto protected_operation_ids = durable_operation_retention_ids_locked();
   while (!historical_operations_.empty() &&
-         active_operations_.size() + historical_operations_.size() >
+         resident_operation_count_locked() + historical_operations_.size() >
              config_.request_replay_capacity) {
     if (!evict_oldest_historical_operation_locked(protected_operation_ids)) {
       break;
@@ -256,6 +334,7 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   stop_fault_recovery_replay_ledger_.reserve(config_.request_replay_capacity);
   operation_recovery_replay_ledger_.reserve(config_.request_replay_capacity);
   program_run_stop_fences_.reserve(config_.request_replay_capacity);
+  global_io_rule_projection_queue_.reserve(config_.request_replay_capacity);
   stop_terminal_history_.reserve(kMaximumResidentStopTerminalRecords);
   for (std::size_t index = 0U; index < stop_transactions_.size(); ++index) {
     stop_transactions_[index] = std::make_unique<StopTransaction>();
@@ -357,7 +436,12 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
       [this] {
         std::lock_guard state_lock(state_mutex_);
         return is_active_stop_fault_latch(active_stop_fault_latch_);
-      }, config_.cell_admission_program_reset_status_source);
+      },
+      config_.cell_admission_program_reset_status_source,
+      [this](std::shared_ptr<IIoSignalService>* affected_service) {
+        std::lock_guard state_lock(state_mutex_);
+        return retire_program_blackboard_source_locked(affected_service);
+      });
   refresh_execution_claims();  // construction is single-threaded
   if (recovery.value().recovered_stops.size() > kMaximumResidentStopTerminalRecords) {
     throw std::runtime_error("recovered Stop terminal history exceeds its fixed bound");
@@ -524,6 +608,13 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
   }
   engine_subscriptions_.clear();
   engine_event_ingress_->Drain();
+  {
+    std::lock_guard state_lock(state_mutex_);
+    if (program_cycle_claim_run_)
+      retire_program_io_watches_locked(program_cycle_claim_run_->program_run_id);
+    retire_all_io_rules_locked();
+    static_cast<void>(retire_program_blackboard_source_locked());
+  }
 
   std::vector<ScheduleHandle> surveillance_handles;
   if (config_.stop_surveillance.has_value()) {

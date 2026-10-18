@@ -7,7 +7,9 @@
 #include <iterator>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
+#include <manyforge_core/io_rule_stop_response.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
+#include <manyforge_core/prepared_planning_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_core/types/prepared_execution.hpp>
 
@@ -80,7 +82,7 @@ namespace {
     supporting_providers.push_back(RuntimeCapabilityProviderPathDTO{
         CapabilityId("planning.motion.joint_goal"), CapabilityDefinitionRevision(Digest('3')),
         CapabilityProviderBindingId(Digest('4')), CapabilityProviderBindingRevision(Digest('5')),
-        ProviderInstanceId("planner.1"), ProviderManifestId(Digest('6')),
+        ProviderInstanceId("planner.1"), ProviderManifestId("planner.manifest"),
         ProviderManifestRevision(Digest('7')), RuntimeUnitId("planner.runtime"),
         RuntimeEpoch("planner.epoch")});
   }
@@ -242,8 +244,8 @@ struct SealedInputs final {
           {},
           {},
           2.0,
-          schema.completion_rule,
-          schema.confirmation_rule,
+          *schema.completion_rule,
+          *schema.confirmation_rule,
           schema.stop_evidence_requirements};
 }
 
@@ -444,6 +446,45 @@ struct SealedInputs final {
           3.0};
 }
 
+[[nodiscard]] PreparedMotionExecutionDTO MovingPayload(const SealedInputs& inputs) {
+  auto payload = MotionPayload(inputs);
+  auto& trajectory = payload.trajectory;
+  trajectory.waypoints.front().velocities_rad_s = {0.1, -0.1};
+  trajectory.waypoints.front().accelerations_rad_s2 = {0.02, 0.0};
+  trajectory.waypoints.insert(trajectory.waypoints.begin() + 1,
+                              TrajectoryWaypointDTO{0.25, {0.05, -0.05}, {0.1, -0.1}, {0.0, 0.0}});
+  trajectory.runtime_scale_bounds = TrajectoryRuntimeScaleBoundsDTO{2.0, 8.0};
+  payload.start_state.velocities =
+      std::vector<CoordinateVelocityDTO>{AngularVelocityDTO{0.1}, AngularVelocityDTO{-0.1}};
+  payload.plan_request.start_state = payload.start_state;
+  auto suffix = payload.start_state;
+  suffix.positions = {AngularPositionDTO{0.05}, AngularPositionDTO{-0.05}};
+  suffix.velocities =
+      std::vector<CoordinateVelocityDTO>{AngularVelocityDTO{0.0}, AngularVelocityDTO{0.0}};
+  auto prefix = trajectory;
+  prefix.waypoints.pop_back();
+  prefix.runtime_scale_bounds.reset();
+  payload.plan_request.moving_replacement =
+      MovingReplacementInputDTO{{ControllerGoalId("old.goal"), ControllerGoalGeneration(2U)},
+                                ExecutionBindingEpoch(3U),
+                                2.0,
+                                std::move(prefix),
+                                2.25,
+                                std::move(suffix),
+                                payload.plan_request.base_frame,
+                                payload.plan_request.tcp_frame,
+                                SpeedProfileDTO{1.0, 1.0, 0.8},
+                                {},
+                                1.0};
+  payload.planning_evidence.planning_result.trajectory = trajectory;
+  auto& validated = payload.validation_evidence.noncollision_result;
+  validated.trajectory_metrics->peak_tcp_linear_speed_mps = 0.7;
+  validated.moving_replacement = MovingReplacementValidationEvidenceDTO{
+      TrajectoryValidationMetricsDTO{0.25, {0.3, 0.3}, {0.0, 0.0}, 0.7},
+      TrajectoryValidationMetricsDTO{0.75, {0.5, 0.5}, {0.0, 0.0}, 0.1}};
+  return payload;
+}
+
 TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
   const auto base = BasePlan();
   auto command_inputs = Inputs(base, true);
@@ -539,7 +580,7 @@ TEST(PreparedOperationParticipantCodecTest, RejectsSelfAttestedClaimsAndDigestFo
       inputs.readiness, DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(made.ok());
   auto forged = made.value();
-  forged.claimed_command_interfaces.front().interface_name = "velocity";
+  forged.controller().claimed_command_interfaces.front().interface_name = "velocity";
   EXPECT_FALSE(VerifyPreparedOperationParticipant(forged, inputs.binding, inputs.readiness,
                                                   DefaultLimits(),
                                                   MotionInterruptNodeCategory::kGeneric)
@@ -570,7 +611,7 @@ TEST(PreparedOperationParticipantCodecTest, BackendBindingRejectsCrossedParticip
       "prepared_participant_backend_shape_invalid");
 
   auto crossed = made.value();
-  crossed.control_route_id = ControlRouteId("route.other");
+  crossed.controller().control_route_id = ControlRouteId("route.other");
   EXPECT_EQ(prepared_participant_backend_binding_field_error(
                 crossed, inputs.binding, PreparedParticipantPayloadKindDTO::kMotionExecution),
             "prepared_participant_backend_control_route_id_mismatch");
@@ -605,46 +646,367 @@ TEST(PreparedOperationParticipantCodecTest,
           .has_value());
 
   auto crossed = made.value();
-  crossed.control_route_id = ControlRouteId("route.other");
+  crossed.controller().control_route_id = ControlRouteId("route.other");
   EXPECT_EQ(prepared_participant_backend_physical_binding_field_error(
                 crossed, physical.value(), PreparedParticipantPayloadKindDTO::kMotionExecution),
             "prepared_participant_backend_control_route_id_mismatch");
 }
 
 TEST(PreparedOperationParticipantCodecTest,
-     MotionRefusesInterruptScopesAndRequiresDeploymentMaximum) {
+     MotionRefusesUnqualifiedScopesAndRequiresDeploymentMaximum) {
   const auto base = BasePlan();
   auto inputs = Inputs(base, false);
   const auto candidate = Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs));
 
   auto interrupted = candidate;
   std::get<PreparedMotionExecutionDTO>(interrupted.payload)
-      .interrupt_scopes.push_back(PreparedMotionInterruptScopeDTO{
-          MotionInterruptScopeId("scope.1"), InterruptPolicyId("interrupt.contact"),
-          MotionInterruptActivationMode::kRequireInactiveAtArm, std::nullopt, std::nullopt, true,
-          MotionInterruptStopProfileDTO{}, MotionInterruptNodeCategory::kGeneric, {},
-          candidate.ordinary_stop_plan});
+      .interrupt_scopes.push_back(
+          PreparedMotionInterruptScopeDTO{MotionInterruptScopeId("scope.1"),
+                                          InterruptPolicyId("interrupt.contact"),
+                                          MotionInterruptActivationMode::kRequireInactiveAtArm,
+                                          std::nullopt,
+                                          true,
+                                          MotionInterruptStopProfileDTO{},
+                                          MotionInterruptNodeCategory::kGeneric,
+                                          {},
+                                          candidate.controller().ordinary_stop_plan});
   auto interrupted_result =
       MakePreparedOperationParticipant(std::move(interrupted), inputs.binding, inputs.readiness,
                                        DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_FALSE(interrupted_result.ok());
-  EXPECT_EQ(interrupted_result.error().details.at("reason"),
-            "motion_interrupt_policy_not_admitted");
+  EXPECT_EQ(interrupted_result.error().details.at("reason"), "motion_interrupt_scope_invalid");
 
   auto weaker = candidate;
   std::get<PreparedMotionExecutionDTO>(weaker.payload)
       .plan_request.speed_profile.max_tcp_linear_speed_mps = 0.75;
-  auto weaker_result = MakePreparedOperationParticipant(
-      std::move(weaker), inputs.binding, inputs.readiness, DefaultLimits(),
-      MotionInterruptNodeCategory::kGeneric);
+  auto weaker_result =
+      MakePreparedOperationParticipant(std::move(weaker), inputs.binding, inputs.readiness,
+                                       DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_FALSE(weaker_result.ok());
   EXPECT_EQ(weaker_result.error().details.at("reason"), "motion_payload_join_invalid");
   auto unexpectedly_lower = candidate;
   std::get<PreparedMotionExecutionDTO>(unexpectedly_lower.payload)
       .plan_request.speed_profile.max_tcp_linear_speed_mps = 0.25;
-  EXPECT_FALSE(MakePreparedOperationParticipant(
-      std::move(unexpectedly_lower), inputs.binding, inputs.readiness, DefaultLimits(), MotionInterruptNodeCategory::kGeneric).ok());
+  EXPECT_FALSE(MakePreparedOperationParticipant(std::move(unexpectedly_lower), inputs.binding,
+                                                inputs.readiness, DefaultLimits(),
+                                                MotionInterruptNodeCategory::kGeneric)
+                   .ok());
+}
+
+TEST(PreparedOperationParticipantCodecTest,
+     MotionScopeRoundTripJoinsExactPreparedStopAndRejectsCrossedOwners) {
+  const auto inputs = Inputs(BasePlan(), false);
+  auto candidate = Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs));
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "search.nominal";
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  profile.jerk_limits_enabled = false;
+  profile.deceleration_time_s = 1.0;
+  profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{2.0}},
+                                        {"joint_2", AngularAccelerationDTO{2.0}}};
+  PreparedParticipantStopPlanContextDTO context{
+      candidate.operation_id,
+      candidate.operation_revision,
+      candidate.participant_id,
+      candidate.program_id,
+      candidate.program_revision,
+      candidate.program_binding_id,
+      candidate.program_run_id,
+      profile,
+      ParticipantStopProfilePurposeDTO::kMotionInterruptScope,
+      std::string("search.scope"),
+      MotionInterruptNodeCategory::kGeneric};
+  auto stop =
+      MakePreparedParticipantStopPlan(inputs.readiness.value().resolved_stop_base_plan, context,
+                                      inputs.binding.value().resources, DefaultLimits());
+  ASSERT_TRUE(stop.ok()) << stop.error().message;
+  std::get<PreparedMotionExecutionDTO>(candidate.payload)
+      .interrupt_scopes.push_back({MotionInterruptScopeId("search.scope"),
+                                   InterruptPolicyId("search.policy"),
+                                   MotionInterruptActivationMode::kFreshEdgeAfterArm,
+                                   std::nullopt,
+                                   true,
+                                   profile,
+                                   MotionInterruptNodeCategory::kGeneric,
+                                   {},
+                                   stop.value()});
+  const auto made =
+      MakePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness, DefaultLimits(),
+                                       MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  const auto encoded =
+      EncodePreparedOperationParticipant(made.value(), inputs.binding, inputs.readiness,
+                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(encoded.ok());
+  EXPECT_EQ(encoded.value().find("result_binding_key"), std::string::npos);
+  const auto decoded =
+      DecodePreparedOperationParticipant(encoded.value(), inputs.binding, inputs.readiness,
+                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  const auto& scope =
+      std::get<PreparedMotionExecutionDTO>(decoded.value().payload).interrupt_scopes.front();
+  EXPECT_EQ(scope.stop_plan, stop.value());
+  EXPECT_EQ(scope.activation_mode, MotionInterruptActivationMode::kFreshEdgeAfterArm);
+  auto crossed_context = context;
+  crossed_context.operation_id = OperationId("other.operation");
+  const auto crossed_stop = MakePreparedParticipantStopPlan(
+      inputs.readiness.value().resolved_stop_base_plan, crossed_context,
+      inputs.binding.value().resources, DefaultLimits());
+  ASSERT_TRUE(crossed_stop.ok());
+  auto crossed = candidate;
+  std::get<PreparedMotionExecutionDTO>(crossed.payload).interrupt_scopes.front().stop_plan =
+      crossed_stop.value();
+  EXPECT_FALSE(MakePreparedOperationParticipant(crossed, inputs.binding, inputs.readiness,
+                                                DefaultLimits(),
+                                                MotionInterruptNodeCategory::kGeneric)
+                   .ok());
+  auto mismatched_profile = candidate;
+  std::get<PreparedMotionExecutionDTO>(mismatched_profile.payload)
+      .interrupt_scopes.front()
+      .stop_profile->profile_id = "unbound.profile";
+  EXPECT_FALSE(MakePreparedOperationParticipant(mismatched_profile, inputs.binding,
+                                                inputs.readiness, DefaultLimits(),
+                                                MotionInterruptNodeCategory::kGeneric)
+                   .ok());
+}
+
+TEST(PreparedOperationParticipantCodecTest,
+     FaultScopeRoundTripUsesOrdinaryPlanWithoutDesiredProfileAndRejectsCrossedAction) {
+  const auto inputs = Inputs(BasePlan(), false);
+  auto candidate = Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs));
+  auto prepared =
+      MakePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness, DefaultLimits(),
+                                       MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  candidate = prepared.value();
+  auto& scopes = std::get<PreparedMotionExecutionDTO>(candidate.payload).interrupt_scopes;
+  scopes.push_back({MotionInterruptScopeId("fault.scope"),
+                    InterruptPolicyId("fault.policy"),
+                    MotionInterruptActivationMode::kRequireInactiveAtArm,
+                    std::nullopt,
+                    true,
+                    std::nullopt,
+                    MotionInterruptNodeCategory::kGeneric,
+                    {},
+                    candidate.controller().ordinary_stop_plan,
+                    InterruptPreemptionAction::kPreemptTrajectory});
+  const auto sealed =
+      MakePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness, DefaultLimits(),
+                                       MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(sealed.ok()) << sealed.error().message;
+  candidate = sealed.value();
+  const auto bytes =
+      EncodePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness,
+                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(bytes.ok()) << bytes.error().message;
+  EXPECT_NE(bytes.value().find("\"preemption_action\":\"preempt_trajectory\""), std::string::npos);
+  const auto decoded =
+      DecodePreparedOperationParticipant(bytes.value(), inputs.binding, inputs.readiness,
+                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  const auto& scope =
+      std::get<PreparedMotionExecutionDTO>(decoded.value().payload).interrupt_scopes.front();
+  EXPECT_FALSE(scope.stop_profile);
+  EXPECT_EQ(scope.preemption_action, InterruptPreemptionAction::kPreemptTrajectory);
+  EXPECT_EQ(scope.stop_plan, candidate.controller().ordinary_stop_plan);
+  auto crossed = candidate;
+  std::get<PreparedMotionExecutionDTO>(crossed.payload).interrupt_scopes.front().preemption_action =
+      InterruptPreemptionAction::kCompleteMoveOnSignal;
+  EXPECT_FALSE(MakePreparedOperationParticipant(crossed, inputs.binding, inputs.readiness,
+                                                DefaultLimits(),
+                                                MotionInterruptNodeCategory::kGeneric)
+                   .ok());
+  crossed = candidate;
+  std::get<PreparedMotionExecutionDTO>(crossed.payload)
+      .interrupt_scopes.front()
+      .stop_plan.operation_id = OperationId("other.operation");
+  EXPECT_FALSE(MakePreparedOperationParticipant(crossed, inputs.binding, inputs.readiness,
+                                                DefaultLimits(),
+                                                MotionInterruptNodeCategory::kGeneric)
+                   .ok());
+}
+
+TEST(PreparedOperationParticipantCodecTest, MovingPrefixKeepsItsCapAndExactPreparedResultIdentity) {
+  const auto inputs = Inputs(BasePlan(), false);
+  const auto payload = MovingPayload(inputs);
+  auto made = MakePreparedOperationParticipant(Candidate(inputs.binding, inputs.readiness, payload),
+                                               inputs.binding, inputs.readiness, DefaultLimits(),
+                                               MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(made.ok()) << made.error().details.at("reason");
+  const auto bytes =
+      EncodePreparedOperationParticipant(made.value(), inputs.binding, inputs.readiness,
+                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(bytes.ok()) << bytes.error().details.at("reason");
+  const auto decoded =
+      DecodePreparedOperationParticipant(bytes.value(), inputs.binding, inputs.readiness,
+                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().details.at("reason");
+  const auto& restored = std::get<PreparedMotionExecutionDTO>(decoded.value().payload);
+  ASSERT_TRUE(restored.plan_request.moving_replacement);
+  ASSERT_TRUE(restored.validation_evidence.noncollision_result.moving_replacement);
+  const auto* context = &*restored.plan_request.moving_replacement;
+  EXPECT_EQ(
+      EncodePreparedTrajectory(restored.trajectory, context).value(),
+      EncodePreparedTrajectory(*restored.planning_evidence.planning_result.trajectory, context)
+          .value());
+  EXPECT_DOUBLE_EQ(*restored.validation_evidence.noncollision_result.trajectory_metrics
+                        ->peak_tcp_linear_speed_mps,
+                   0.7);
+  EXPECT_DOUBLE_EQ(*restored.plan_request.speed_profile.max_tcp_linear_speed_mps, 0.5);
+  EXPECT_EQ(
+      EncodePreparedOperationParticipant(decoded.value(), inputs.binding, inputs.readiness,
+                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric)
+          .value(),
+      bytes.value());
+}
+
+TEST(PreparedOperationParticipantCodecTest,
+     MovingContextMetricsAndPlanningCannotBeCrossedOrOmitted) {
+  const auto inputs = Inputs(BasePlan(), false);
+  for (int mutation = 0; mutation < 10; ++mutation) {
+    SCOPED_TRACE(mutation);
+    auto payload = MovingPayload(inputs);
+    auto& result = payload.validation_evidence.noncollision_result;
+    if (mutation == 0) result.moving_replacement.reset();
+    if (mutation == 1) payload.plan_request.moving_replacement.reset();
+    if (mutation == 2) result.moving_replacement->unchanged_prefix.trajectory_duration_s += 0.1;
+    if (mutation == 3) result.moving_replacement->changed_future.peak_tcp_linear_speed_mps = 0.6;
+    if (mutation == 4) result.moving_replacement->unchanged_prefix.peak_tcp_linear_speed_mps = 0.9;
+    if (mutation == 5) result.trajectory_metrics->peak_abs_joint_velocity_rad_s[0] += 0.1;
+    if (mutation == 6)
+      result.moving_replacement->unchanged_prefix.peak_abs_joint_acceleration_rad_s2.clear();
+    if (mutation == 7)
+      payload.planning_evidence.planning_result.trajectory->waypoints.back().positions_rad[0] +=
+          0.01;
+    if (mutation == 8) payload.trajectory.waypoints.front().time_from_start_s = -0.1;
+    if (mutation == 9) payload.trajectory.waypoints.front().accelerations_rad_s2[0] += 0.01;
+    const auto made = MakePreparedOperationParticipant(
+        Candidate(inputs.binding, inputs.readiness, std::move(payload)), inputs.binding,
+        inputs.readiness, DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+    EXPECT_FALSE(made.ok());
+  }
 }
 
 }  // namespace
+TEST(PreparedOperationParticipantCodecTest,
+     RuleStopEntryResolvesOriginalSuffixAndRejectsCrossedOrMissingFloor) {
+  const auto inputs = Inputs(BasePlan(), false);
+  auto made = MakePreparedOperationParticipant(
+      Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs)), inputs.binding,
+      inputs.readiness, DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(made.ok());
+  const auto& plan = made.value().controller().ordinary_stop_plan;
+  const auto first = ResolvePreparedIoRuleStopEntry(plan, {});
+  ASSERT_TRUE(first.ok());
+  EXPECT_EQ(first.value().stage_index, 0U);
+  const auto& floor = plan.stage_commands.back().resolved_stage;
+  ASSERT_EQ(floor.stage_kind, StopEscalationStageKind::kSoftwareHard);
+  const auto chosen = ResolvePreparedIoRuleStopEntry(plan, floor.stop_escalation_stage_id);
+  ASSERT_TRUE(chosen.ok());
+  EXPECT_EQ(chosen.value().stage_index, floor.stage_index);
+  auto crossed = chosen.value();
+  crossed.resolved_stop_base_plan_id = ResolvedStopBasePlanId("other.base.plan");
+  EXPECT_FALSE(VerifyPreparedIoRuleStopEntry(plan, crossed).ok());
+  crossed = chosen.value();
+  crossed.stage_index = 0U;
+  EXPECT_FALSE(VerifyPreparedIoRuleStopEntry(plan, crossed).ok());
+  EXPECT_FALSE(ResolvePreparedIoRuleStopEntry(plan, StopEscalationStageId("missing")).ok());
+  auto no_floor = plan;
+  no_floor.stage_commands.pop_back();
+  EXPECT_FALSE(ResolvePreparedIoRuleStopEntry(no_floor, {}).ok());
+  auto noncontiguous = plan;
+  noncontiguous.stage_commands.back().resolved_stage.stage_index += 1U;
+  EXPECT_FALSE(ResolvePreparedIoRuleStopEntry(noncontiguous, {}).ok());
+}
+
+TEST(PreparedOperationParticipantCodecTest,
+     RuleNominalModeRefusesCrossModeWithoutDisablingQualifiedSubstitution) {
+  const auto base = BasePlan();
+  MotionInterruptStopProfileDTO profile;
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  EXPECT_TRUE(ValidateIoRuleNominalStopMode(base, profile).ok());
+  profile.recoverable_substitution_mode = MotionInterruptStopMode::kSpringBackHold;
+  EXPECT_TRUE(ValidateIoRuleNominalStopMode(base, profile).ok());
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  EXPECT_FALSE(ValidateIoRuleNominalStopMode(base, profile).ok());
+  profile.stop_mode = MotionInterruptStopMode::kHardDeceleration;
+  EXPECT_FALSE(ValidateIoRuleNominalStopMode(base, profile).ok());
+}
+
+TEST(PreparedOperationParticipantCodecTest,
+     RulePreparedEntryRoundTripSealsTupleAndFallbackWithoutRenumberingChain) {
+  const auto inputs = Inputs(BasePlan(), false);
+  auto candidate = Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs));
+  auto made =
+      MakePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness, DefaultLimits(),
+                                       MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(made.ok());
+  candidate = made.value();
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "entry.nominal";
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  profile.jerk_limits_enabled = false;
+  profile.deceleration_time_s = 1.0;
+  profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{2.0}},
+                                        {"joint_2", AngularAccelerationDTO{2.0}}};
+  PreparedParticipantStopPlanContextDTO context{
+      candidate.operation_id,
+      candidate.operation_revision,
+      candidate.participant_id,
+      candidate.program_id,
+      candidate.program_revision,
+      candidate.program_binding_id,
+      candidate.program_run_id,
+      profile,
+      ParticipantStopProfilePurposeDTO::kMotionInterruptScope,
+      std::string("entry.scope"),
+      MotionInterruptNodeCategory::kGeneric};
+  const auto plan =
+      MakePreparedParticipantStopPlan(inputs.readiness.value().resolved_stop_base_plan, context,
+                                      inputs.binding.value().resources, DefaultLimits());
+  ASSERT_TRUE(plan.ok());
+  const auto entry = ResolvePreparedIoRuleStopEntry(
+      plan.value(), plan.value().stage_commands.back().resolved_stage.stop_escalation_stage_id);
+  ASSERT_TRUE(entry.ok());
+  std::get<PreparedMotionExecutionDTO>(candidate.payload)
+      .interrupt_scopes.push_back({MotionInterruptScopeId("entry.scope"),
+                                   InterruptPolicyId("entry.policy"),
+                                   MotionInterruptActivationMode::kRequireInactiveAtArm,
+                                   {},
+                                   true,
+                                   profile,
+                                   MotionInterruptNodeCategory::kGeneric,
+                                   {},
+                                   plan.value(),
+                                   InterruptPreemptionAction::kCompleteMoveOnSignal,
+                                   entry.value(),
+                                   entry.value()});
+  const auto sealed =
+      MakePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness, DefaultLimits(),
+                                       MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(sealed.ok()) << sealed.error().message;
+  candidate = sealed.value();
+  const auto bytes =
+      EncodePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness,
+                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(bytes.ok()) << bytes.error().message;
+  const auto decoded =
+      DecodePreparedOperationParticipant(bytes.value(), inputs.binding, inputs.readiness,
+                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  const auto& scope =
+      std::get<PreparedMotionExecutionDTO>(decoded.value().payload).interrupt_scopes.front();
+  EXPECT_EQ(scope.stop_entry, entry.value());
+  EXPECT_EQ(scope.success_through, entry.value());
+  EXPECT_EQ(scope.stop_plan.stage_commands, plan.value().stage_commands);
+  auto invalid = candidate;
+  std::get<PreparedMotionExecutionDTO>(invalid.payload)
+      .interrupt_scopes.front()
+      .stop_entry->stage_index = 0U;
+  EXPECT_FALSE(EncodePreparedOperationParticipant(invalid, inputs.binding, inputs.readiness,
+                                                  DefaultLimits(),
+                                                  MotionInterruptNodeCategory::kGeneric)
+                   .ok());
+}
+
 }  // namespace manyforge::core

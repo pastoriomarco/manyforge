@@ -6,6 +6,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "provider_domain_value_internal.hpp"
+
 namespace manyforge::core {
 namespace {
 
@@ -173,27 +175,29 @@ template <typename StrongCounter>
 }
 
 [[nodiscard]] CanonicalValue domain_value(const ResolvedLifecycleControlDomainScopeDTO& value) {
+  if (value.provider()) return detail::ResolvedProviderDomainValue(value, false);
   CanonicalValue::Array bindings;
-  bindings.reserve(value.current_control_bindings.size());
-  for (const auto& binding : value.current_control_bindings) {
+  bindings.reserve(value.control_bindings().size());
+  for (const auto& binding : value.control_bindings()) {
     bindings.emplace_back(current_binding_value(binding));
   }
   CanonicalValue::Array resources;
-  resources.reserve(value.current_resources.size());
-  for (const auto& resource : value.current_resources) {
+  resources.reserve(value.physical_resources().size());
+  for (const auto& resource : value.physical_resources()) {
     resources.emplace_back(identity(resource));
   }
   CanonicalValue::Object members{
       {"control_domain_id", identity(value.control_domain_id)},
       {"control_domain_revision", identity(value.control_domain_revision)},
-      {"controller_topology_id", identity(value.controller_topology_id)},
+      {"controller_topology_id", identity(value.controller().controller_topology_id)},
       {"current_control_bindings", CanonicalValue(std::move(bindings))},
       {"current_resources", CanonicalValue(std::move(resources))},
-      {"topology_revision", identity(value.topology_revision)},
+      {"topology_revision", identity(value.controller().topology_revision)},
   };
-  if (value.active_control_configuration.has_value()) {
-    members.emplace_back("active_control_configuration",
-                         active_configuration_value(*value.active_control_configuration));
+  if (value.controller().active_control_configuration.has_value()) {
+    members.emplace_back(
+        "active_control_configuration",
+        active_configuration_value(*value.controller().active_control_configuration));
   }
   return CanonicalValue(std::move(members));
 }

@@ -217,6 +217,161 @@ TEST(RuntimeScalePreparation, RejectsMalformedAndUnrepresentableBudgets) {
   EXPECT_FALSE(prepare_runtime_scaling(derivatives, limits, 0.99, kBounds).has_value());
 }
 
+TEST(RuntimeScalePreparation, OrdinaryDilationAndMarginArithmeticRetainTheirExactResults) {
+  const std::array derivatives{TrajectoryDerivativeBounds{2.0, 1.0, 0.0}};
+  const std::array limits{TrajectoryDerivativeLimits{1.0, 1.0, std::nullopt}};
+  const auto ordinary = prepare_runtime_scaling(derivatives, limits, 0.2, kBounds);
+  ASSERT_TRUE(ordinary);
+  EXPECT_DOUBLE_EQ(ordinary->trajectory_time_multiplier, 2.0);
+  EXPECT_DOUBLE_EQ(ordinary->scale_bounds.max_rate_per_s, 0.75 * (1.0 - 1e-12));
+  EXPECT_DOUBLE_EQ(ordinary->scale_bounds.max_rate_change_per_s2, 16.0 * (1.0 - 1e-12));
+  const std::array jerk_derivatives{TrajectoryDerivativeBounds{1.0, 1.0, 1.0}};
+  const std::array jerk_limits{TrajectoryDerivativeLimits{1.0, 1.0, 1.0}};
+  const std::array envelopes{TrajectoryDynamicsEnvelope{jerk_derivatives, jerk_limits, 4.0}};
+  const auto tcp_floor = prepare_runtime_scaling(envelopes, 0.2, kBounds);
+  ASSERT_TRUE(tcp_floor);
+  EXPECT_DOUBLE_EQ(tcp_floor->trajectory_time_multiplier, 4.0);
+  EXPECT_DOUBLE_EQ(tcp_floor->scale_bounds.max_rate_per_s, 2.625 * (1.0 - 1e-12));
+  EXPECT_DOUBLE_EQ(tcp_floor->scale_bounds.max_rate_change_per_s2, 1.96875 * (1.0 - 1e-12));
+}
+
+TEST(FixedRuntimeScalePreparation, QualifiesTheActualCurveWithoutRequiringNominalHeadroom) {
+  const std::array derivatives{TrajectoryDerivativeBounds{0.5, 0.9, 1e12}};
+  const std::array limits{TrajectoryDerivativeLimits{1.0, 1.0, std::nullopt}};
+  const std::array pieces{TrajectoryDynamicsEnvelope{derivatives, limits}};
+  const auto fixed = prepare_fixed_runtime_scaling(pieces, kBounds);
+  ASSERT_TRUE(fixed);
+  const auto ordinary = prepare_runtime_scaling(pieces, 0.2, kBounds);
+  ASSERT_TRUE(ordinary);
+  EXPECT_GT(ordinary->trajectory_time_multiplier, 1.0);
+  EXPECT_NEAR(fixed->max_rate_per_s, 0.2 * (1.0 - 1e-12), 1e-15);
+  EXPECT_DOUBLE_EQ(fixed->max_rate_change_per_s2, 16.0 * (1.0 - 1e-12));
+  EXPECT_LE(derivatives[0].acceleration + derivatives[0].velocity * fixed->max_rate_per_s,
+            limits[0].acceleration);
+}
+
+TEST(FixedRuntimeScalePreparation, TakesOneGlobalMinimumAcrossAllPieceDimensions) {
+  const std::array derivatives{TrajectoryDerivativeBounds{0.25, 0.5, 2.0},
+                               TrajectoryDerivativeBounds{1.0, 0.25, 6.0},
+                               TrajectoryDerivativeBounds{0.0, 0.0, 0.0}};
+  const std::array limits{TrajectoryDerivativeLimits{1.0, 1.0, 4.0},
+                          TrajectoryDerivativeLimits{2.0, 1.0, 8.0},
+                          TrajectoryDerivativeLimits{1.0, 1.0, 1.0}};
+  const auto dimensions = std::span(derivatives);
+  const auto ceilings = std::span(limits);
+  std::array pieces{TrajectoryDynamicsEnvelope{dimensions.first(1), ceilings.first(1)},
+                    TrajectoryDynamicsEnvelope{dimensions.subspan(1), ceilings.subspan(1)}};
+  const auto together = prepare_fixed_runtime_scaling(pieces, kBounds);
+  const std::array flattened{TrajectoryDynamicsEnvelope{derivatives, limits}};
+  const auto flat = prepare_fixed_runtime_scaling(flattened, kBounds);
+  ASSERT_TRUE(together && flat);
+  EXPECT_DOUBLE_EQ(together->max_rate_per_s, (2.0 / 3.0) * (1.0 - 1e-12));
+  EXPECT_DOUBLE_EQ(together->max_rate_change_per_s2, 1.0 * (1.0 - 1e-12));
+  EXPECT_DOUBLE_EQ(together->max_rate_per_s, flat->max_rate_per_s);
+  EXPECT_DOUBLE_EQ(together->max_rate_change_per_s2, flat->max_rate_change_per_s2);
+  std::swap(pieces[0], pieces[1]);
+  const auto reordered = prepare_fixed_runtime_scaling(pieces, kBounds);
+  ASSERT_TRUE(reordered);
+  EXPECT_DOUBLE_EQ(reordered->max_rate_per_s, together->max_rate_per_s);
+  EXPECT_DOUBLE_EQ(reordered->max_rate_change_per_s2, together->max_rate_change_per_s2);
+  for (std::size_t index = 0; index < derivatives.size(); ++index) {
+    const auto& d = derivatives[index];
+    EXPECT_LE(d.acceleration + d.velocity * together->max_rate_per_s, limits[index].acceleration);
+    EXPECT_LE(d.jerk + 3.0 * d.acceleration * together->max_rate_per_s +
+                  d.velocity * together->max_rate_change_per_s2,
+              *limits[index].jerk);
+  }
+}
+
+TEST(FixedRuntimeScalePreparation, RefusesActualLimitViolationsWithoutAnEpsilon) {
+  std::array derivatives{TrajectoryDerivativeBounds{1.0, 0.25, 0.5}};
+  const std::array limits{TrajectoryDerivativeLimits{1.0, 1.0, 1.0}};
+  const std::array pieces{TrajectoryDynamicsEnvelope{derivatives, limits}};
+  ASSERT_TRUE(prepare_fixed_runtime_scaling(pieces, kBounds));
+  for (const auto dimension : {0, 1, 2}) {
+    derivatives[0] = {0.25, 0.25, 0.25};
+    const auto above = std::nextafter(1.0, std::numeric_limits<double>::infinity());
+    if (dimension == 0) derivatives[0].velocity = above;
+    if (dimension == 1) derivatives[0].acceleration = above;
+    if (dimension == 2) derivatives[0].jerk = above;
+    EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));
+  }
+  derivatives[0] = {1.0, 1.0, 0.0};
+  EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));  // No positive acceleration margin.
+  derivatives[0] = {0.25, 0.25, 1.0};
+  EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));  // No positive jerk margin.
+}
+
+TEST(FixedRuntimeScalePreparation, RefusesAnyRequiredTcpDilationAndMalformedPieces) {
+  const std::array derivatives{TrajectoryDerivativeBounds{0.1, 0.1, 0.1}};
+  const std::array limits{TrajectoryDerivativeLimits{1.0, 1.0, std::nullopt}};
+  std::array pieces{TrajectoryDynamicsEnvelope{derivatives, limits}};
+  for (const auto floor :
+       {0.5, std::nextafter(1.0, 2.0), 2.0, std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::quiet_NaN()}) {
+    pieces[0].minimum_time_multiplier = floor;
+    EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));
+  }
+  pieces[0].minimum_time_multiplier = 1.0;
+  EXPECT_TRUE(prepare_fixed_runtime_scaling(pieces, kBounds));
+  EXPECT_FALSE(prepare_fixed_runtime_scaling({}, kBounds));
+  pieces[0].limits = {};
+  EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));
+  pieces[0] = {};
+  EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));
+}
+
+TEST(FixedRuntimeScalePreparation, RejectsNonfiniteNegativeOrInvalidLimitsAndCeilings) {
+  std::array derivatives{TrajectoryDerivativeBounds{0.1, 0.1, 0.1}};
+  std::array limits{TrajectoryDerivativeLimits{1.0, 1.0, 1.0}};
+  const std::array pieces{TrajectoryDynamicsEnvelope{derivatives, limits}};
+  for (const auto invalid :
+       {-1.0, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+    derivatives[0] = {invalid, 0.1, 0.1};
+    EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));
+    derivatives[0] = {0.1, invalid, 0.1};
+    EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));
+    derivatives[0] = {0.1, 0.1, invalid};
+    EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));
+  }
+  derivatives[0] = {0.1, 0.1, 0.1};
+  for (const auto invalid : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                             std::numeric_limits<double>::quiet_NaN()}) {
+    limits[0] = {invalid, 1.0, 1.0};
+    EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));
+    limits[0] = {1.0, invalid, 1.0};
+    EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));
+    limits[0] = {1.0, 1.0, invalid};
+    EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));
+    limits[0] = {1.0, 1.0, 1.0};
+    EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, {invalid, 16.0}));
+    EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, {4.0, invalid}));
+  }
+}
+
+TEST(FixedRuntimeScalePreparation, RoundsInsideCeilingsAndRequiresRepresentablePositiveBounds) {
+  std::array derivatives{TrajectoryDerivativeBounds{0.0, 0.0, 0.0}};
+  std::array limits{TrajectoryDerivativeLimits{1.0, 1.0, 1.0}};
+  const std::array pieces{TrajectoryDynamicsEnvelope{derivatives, limits}};
+  const auto stationary = prepare_fixed_runtime_scaling(pieces, kBounds);
+  ASSERT_TRUE(stationary);
+  EXPECT_DOUBLE_EQ(stationary->max_rate_per_s, 4.0 * (1.0 - 1e-12));
+  EXPECT_DOUBLE_EQ(stationary->max_rate_change_per_s2, 16.0 * (1.0 - 1e-12));
+  EXPECT_LT(stationary->max_rate_per_s, 4.0);
+  EXPECT_LT(stationary->max_rate_change_per_s2, 16.0);
+  derivatives[0] = {0.5, 0.25, std::nextafter(1.0, 0.0)};
+  const auto tight = prepare_fixed_runtime_scaling(pieces, kBounds);
+  ASSERT_TRUE(tight);
+  EXPECT_GT(tight->max_rate_per_s, 0.0);
+  EXPECT_GT(tight->max_rate_change_per_s2, 0.0);
+  EXPECT_LE(derivatives[0].jerk + 3.0 * derivatives[0].acceleration * tight->max_rate_per_s +
+                derivatives[0].velocity * tight->max_rate_change_per_s2,
+            1.0);
+  derivatives[0] = {std::numeric_limits<double>::max(), 1.0, 0.0};
+  limits[0] = {std::numeric_limits<double>::max(), std::nextafter(1.0, 2.0), std::nullopt};
+  EXPECT_FALSE(prepare_fixed_runtime_scaling(pieces, kBounds));
+}
+
 TEST(RuntimeScaleGovernor, ConstantScaleIntegratesExactlyIncludingZeroHold) {
   for (double scale : {0.0, 0.25, 1.0}) {
     RuntimeScaleGovernor governor(scale, kBounds);

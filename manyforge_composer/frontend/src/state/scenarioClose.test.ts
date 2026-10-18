@@ -29,7 +29,7 @@ const cclcOwnerEpoch = `sha256:${'8'.repeat(64)}`;
 const source = { available: true, freshness: 'fresh', sourceOwnerEpoch: managerOwnerEpoch, sourceOwnerId: 'manager.cell' };
 const projection = (value: ManagerActiveProjection, metadata = source) => ({ source: metadata, status: { managerReady: true, active: value } });
 const scope = { request_owner_epoch: cclcOwnerEpoch, publication_generation: 2, active_public_pointer_digest: 'pointer' };
-const component = { componentId: 'arm', retainedBundleId: active.retainedBundleId, graphRevision: active.graphRevision,
+const component = { controllableComponentId: 'arm', retainedBundleId: active.retainedBundleId, graphRevision: active.graphRevision,
   publicationGeneration: 2, lifecycleGeneration: 3, lifecycleState: 'active', readiness: { requestOwnerEpoch: cclcOwnerEpoch },
   lifecycleProgress: null, domains: [] };
 const processScope = { predecessor_projection_revision: { retained_bundle_id: active.retainedBundleId,
@@ -115,7 +115,7 @@ function noneCloseFixture() {
   apiMock.cclc.targetRetirementOffer.mockResolvedValue({ scope: ownerScope, targets: [] });
   apiMock.cclc.retireTargets.mockResolvedValue({ replay_status: 'accepted_new', scope: ownerScope, retired_targets: [] });
   apiMock.cclc.ownerSettlement.mockResolvedValue({ scope: ownerScope, settled: true });
-  apiMock.cclc.component.mockResolvedValue({ ...component, componentId: 'gripper', activePublicPointerDigest: pointer });
+  apiMock.cclc.component.mockResolvedValue({ ...component, controllableComponentId: 'gripper', activePublicPointerDigest: pointer });
   apiMock.cclc.componentProcessStopOffer.mockImplementation(async () => parseComponentProcessStopOffer(offer, 'gripper'));
   return { request: { ...inputs(), expected: predecessor }, offer, successor };
 }
@@ -360,7 +360,7 @@ function standaloneFixture(state: ProgramCycleStatus['state'] = 'idle_after_rese
     runRevision: null, nodeStatusRevision: null, runtimeControlRevision: null, executionControlRevision: 1,
     causalCorrelationId: null, causalSessionId: null, causalClientSequence: null, currentCommandKind: null,
     failure: null, resetPhase: null, resetOptions: null,
-    resetRobotPosition: { available: false, reason: 'unsupported' }, allowedCommands: [], recoveryOffer: null, run: null, runtimeControls: null };
+    resetRobotPosition: { available: false, reason: 'unsupported' }, allowedCommands: [], run: null, runtimeControls: null };
   function sceneView(revision: number, attached = carried): LogicalSceneProjection {
     const attachmentRevision = 'sha256:' + 'a'.repeat(64);
     const pose = { position_m: { x: 4, y: 5, z: 6 }, orientation_xyzw: [0, 0, 0, 1] as [number, number, number, number] };
@@ -823,7 +823,7 @@ function heldCloseFixture() {
   const run: NonNullable<ProgramCycleStatus['run']> = {
     schemaVersion: 'manyforge.program_run_status.v3', ownerId: 'program.runner', ownerEpoch: runner,
     runRevision: 41, state: 'intervention_required', treeStatus: 'running', nodeStatusRevision: 13,
-    nodeStatuses: { left: 'held', right: 'held', control_flow: 'running' }, activeOperationCount: null,
+    nodeStatuses: { left: 'held', right: 'held', control_flow: 'running' }, activeOperationCount: null, operationFailures: [],
     reason: null, message: 'Motion held after ordinary Stop', capture: {
       programRunId: 'run.1', appliedRecordDigest: 'applied.digest', scenarioId: 'scenario.current',
       sourceDocumentDigest: 'source.digest', programId: 'program.current', programRevision: 'program.revision',
@@ -834,10 +834,10 @@ function heldCloseFixture() {
   };
   const runtimeControls: NonNullable<ProgramCycleStatus['runtimeControls']> = {
     schemaVersion: 'manyforge.program_runtime_control_projection.v9', ownerId: run.ownerId, ownerEpoch: runner,
-    programRunId: 'run.1', runRevision: run.runRevision, recoveryOffer: null,
+    programRunId: 'run.1', runRevision: run.runRevision, recoveryOffer: null, recoveryHolds: [],
     runtimeControls: { schemaVersion: 'manyforge.program_runtime_controls.v3', programRunId: 'run.1',
       runtimeControlRevision: 5, recoveryFences: { programGeneration: 1, deploymentGeneration: 1,
-        sceneAdmissionEpoch: 1, poseSourceApplyGeneration: 1 }, retryCounts: {}, audit: [] },
+        sceneAdmissionEpoch: 1, poseSourceApplyGeneration: 1 }, audit: [] },
     executionSelections: { selectionRevision: 7, motionHeld: true, groups: [{ groupId: 'all',
       nodeCount: 3, heldNodeCount: 2, state: 'mixed', stopAllowed: true, startAllowed: true,
       startUnavailableReason: null, resumeAllowed: true, resumeUnavailableReason: null,

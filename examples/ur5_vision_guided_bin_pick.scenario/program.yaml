@@ -191,7 +191,7 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.5.0"
+    "content_version": "2.7.0"
   },
   "compatibility": {
     "assistant": "required",

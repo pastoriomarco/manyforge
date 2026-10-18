@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:97a61aed742ff302a7ccf3c68eedb6b9c5e80516ef145a131db5f27b51538a60",
     "deployment.yaml": "sha256:f0db16d229b43f91bae78a6cb5cf09066a5dcf9c95dae7c0770aac3c9042102e",
-    "program.yaml": "sha256:154cbab2ab28b576f40ff1f47a9d33c23b230aea4a8750dfe790c2ceaa5c1a12"
+    "program.yaml": "sha256:2bbb2a928693984099677b318882f682ec93048dd3ea40438f0cec7cb3f08704"
   },
   "name": "ur5_roboplan_local_semantic_shape_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:5d7b63352a38719cc25562e248edd872465029032b3249574223072efa32a40b",
+    "checked_content_digest": "sha256:3395d813c4d3069c0c47a854d73193c4dfd80e0342e115aa83862688bf1c0abc",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

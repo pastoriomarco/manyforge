@@ -1,8 +1,50 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import {
+  IoSignalConfigurationSection,
+  IoSignalInputFields,
+  IoSignalOutputFields,
+} from './IoSignalConfigurationSection';
+import {
+  IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S,
+  IO_DEVICE_PROVISIONAL_OUTPUT_ACK_TIMEOUT_S,
+  ioDeviceComponentValue,
+  ioDeviceHasAcknowledgedOutput,
+  ioDeviceHasGpioOutput,
+  ioProviderDeviceTimeout,
+  ioProviderDeviceValue,
+  isIoProviderComponent,
+  lifecycleTimeoutProblem,
+  newIoDeviceDraft,
+  outputAckTimeoutProblem,
+  validateIoDeviceDraft,
+  withIoDirection,
+  type IoDeviceDraft,
+  type IoSignalInputDraft,
+  type IoSignalOutputDraft,
+} from '../utils/ioSignalConfiguration';
 import type { StructuralResourceState } from '../state/structuralResource';
+import {
+  canonicalScope,
+  globalRuleScopeGroups,
+  globalRuleScopeKind,
+  interruptKeyInitialProblem,
+  GLOBAL_RULE_KEY_UNDECLARED,
+  globalRuleChoices,
+  globalRuleKeyNotes,
+  GLOBAL_RULE_STATE_OPERAND_UNSUPPORTED,
+  globalRuleProblem,
+  commonStopStages,
+  globalRulesOf,
+  newGlobalRule,
+  type TargetStopChain,
+} from '../utils/interruptAuthoring';
+import { DraftTextInput } from './common/DraftInputs';
+import { InterruptConditionEditor } from './InterruptConditionEditor';
+import { StopStagePicker } from './StopStagePicker';
 import type {
+  BlackboardKeyDeclaration,
   DeploymentControlledStopProfile,
   JsonValue,
   SourceModelProjection,
@@ -17,7 +59,16 @@ interface DeploymentFocusedEditorProps {
   sourceModel: StructuralResourceState<SourceModelProjection>;
   motionDescriptors: ManualControlMotionDescriptor[];
   gripperDescriptors: ManualControlGripperDescriptor[];
+  /** Keys a global rule may read: the Program Draft's declared and system keys; null without a Program. */
+  programKeys?: readonly BlackboardKeyDeclaration[] | null;
+  /** Published motion targets' qualified Stop chains (SX-2167). */
+  stopChains?: readonly TargetStopChain[];
+  /** The Applied Program's execution group ids; null when no Program is applied (contract 73). */
+  executionGroupIds?: readonly string[] | null;
 }
+
+const NO_PROGRAM_KEYS: readonly BlackboardKeyDeclaration[] = [];
+const NO_STOP_CHAINS: readonly TargetStopChain[] = [];
 
 interface RuntimeConfiguration {
   index: number;
@@ -26,6 +77,8 @@ interface RuntimeConfiguration {
   configurationPath: Array<string | number>;
   intentTargetSettings: Record<string, JsonValue> | null;
   framePrefix: string | null;
+  /** A model-free I/O device (runtime_kind io_provider): I/O sections only. */
+  ioProvider: boolean;
 }
 
 interface MotionTargetLimit {
@@ -106,6 +159,7 @@ function runtimeConfigurations(
         framePrefix: configuration.runtime_kind === 'ros2_control'
           ? (typeof component?.frame_prefix === 'string' ? component.frame_prefix : '')
           : null,
+        ioProvider: isIoProviderComponent(component ?? undefined),
       }];
     });
   }
@@ -124,6 +178,7 @@ function runtimeConfigurations(
         configurationPath: ['graph', 'runtime_units', index, 'configuration'],
         intentTargetSettings: null,
         framePrefix: null,
+        ioProvider: false,
       }]
       : [];
   });
@@ -1633,11 +1688,24 @@ export function DeploymentFocusedEditor({
   sourceModel,
   motionDescriptors,
   gripperDescriptors,
+  programKeys = NO_PROGRAM_KEYS,
+  stopChains = NO_STOP_CHAINS,
+  executionGroupIds = null,
 }: DeploymentFocusedEditorProps) {
   const document = controller.workspace?.draft.document ?? null;
   const runtimes = useMemo(() => runtimeConfigurations(document), [document]);
-  const limits = useMemo(() => motionTargetLimits(runtimes), [runtimes]);
+  // I/O devices have no model, motion, gripper, frame or Stop inputs.
+  const motionRuntimes = useMemo(() => runtimes.filter((runtime) => !runtime.ioProvider), [runtimes]);
+  const limits = useMemo(() => motionTargetLimits(motionRuntimes), [motionRuntimes]);
   const controlledStop = useMemo(() => controlledStopTargets(document), [document]);
+  const ioRuntimes = useMemo(() => runtimes.map((runtime) => ({
+    index: runtime.index,
+    runtimeUnitId: runtime.runtimeUnitId,
+    configuration: runtime.configuration,
+    configurationPath: runtime.configurationPath,
+    intentComponent: runtime.intentTargetSettings !== null,
+    ioProvider: runtime.ioProvider,
+  })), [runtimes]);
   if (document === null) {
     return <div className="panel-state">Open a Deployment artifact to edit its Draft.</div>;
   }
@@ -1655,11 +1723,457 @@ export function DeploymentFocusedEditor({
         sourceModel={sourceModel}
         motionDescriptors={motionDescriptors}
         limits={limits}
-        runtimes={runtimes}
+        runtimes={motionRuntimes}
       />
-      <NativeRuntimeSection controller={controller} runtimes={runtimes} />
+      <NativeRuntimeSection controller={controller} runtimes={motionRuntimes} />
       <ControlledStopSection controller={controller} targets={controlledStop} />
-      <GripperSection controller={controller} descriptors={gripperDescriptors} runtimes={runtimes} />
+      <GripperSection controller={controller} descriptors={gripperDescriptors} runtimes={motionRuntimes} />
+      {document.api_version === 'manyforge.deployment_intent.v2' && (
+        <IoDeviceSection controller={controller} document={document} />
+      )}
+      <IoSignalConfigurationSection controller={controller} runtimes={ioRuntimes} />
+      {document.api_version === 'manyforge.deployment_intent.v2' && (
+        <GlobalInterruptRulesSection controller={controller} document={document} programKeys={programKeys}
+          stopChains={stopChains} executionGroupIds={executionGroupIds} />
+      )}
     </section>
+  );
+}
+
+interface IoDeviceRow {
+  index: number;
+  componentId: string;
+  runtimeConfiguration: Record<string, JsonValue> | null;
+}
+
+/**
+ * Model-free I/O device components (io_device_v0 / runtime_kind io_provider):
+ * add one (a single `components` append), edit its lifecycle command time
+ * limit, or remove it. Its signals are edited in the I/O signals section. An
+ * I/O device is not drawn in the 3D scene.
+ */
+function IoDeviceSection({ controller, document }: {
+  controller: DeploymentWorkspaceController;
+  document: Record<string, JsonValue>;
+}) {
+  const components = Array.isArray(document.components) ? document.components : [];
+  const componentIds = components.flatMap((value) => {
+    const id = objectValue(value)?.component_id;
+    return typeof id === 'string' ? [id] : [];
+  });
+  const devices: IoDeviceRow[] = components.flatMap((value, index) => {
+    const component = objectValue(value);
+    const componentId = component?.component_id;
+    return isIoProviderComponent(value) && typeof componentId === 'string' ? [{
+      index,
+      componentId,
+      runtimeConfiguration: objectValue(objectValue(component?.configuration)?.runtime_configuration),
+    }] : [];
+  });
+  const [draft, setDraft] = useState<IoDeviceDraft | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const disabled = !controller.mutationAvailable || controller.busy;
+  const update = (next: IoDeviceDraft) => {
+    setDraft(next);
+    setError(null);
+  };
+  const create = async () => {
+    if (draft === null) return;
+    const problem = validateIoDeviceDraft(draft, componentIds);
+    if (problem !== null) {
+      setError(problem);
+      return;
+    }
+    const result = await controller.mutate(['components'], 'append', ioDeviceComponentValue(draft));
+    if (result === null) setError('The Deployment owner rejected this I/O device.');
+    else setDraft(null);
+  };
+  const signal = draft?.signal ?? null;
+  return (
+    <details className="dcard" open={devices.length > 0 || draft !== null}>
+      <summary>I/O devices</summary>
+      <div className="deployment-focused-body">
+        {devices.length === 0 && draft === null && <p className="muted">No I/O device is declared.</p>}
+        {devices.map((device) => (
+          <IoDeviceEditor key={device.componentId} controller={controller} device={device} disabled={disabled} />
+        ))}
+        {draft === null ? (
+          <div className="button-row">
+            <button type="button" disabled={disabled}
+              onClick={() => update(newIoDeviceDraft(componentIds))}>Add I/O device</button>
+          </div>
+        ) : (
+          <fieldset className="deployment-gripper-editor">
+            <legend>New I/O device</legend>
+            <div className="deployment-focused-form-grid">
+              <label className="deployment-focused-field">
+                <span>Component id</span>
+                <input aria-label="I/O device component id" value={draft.componentId} disabled={disabled}
+                  onChange={(event) => update({
+                    ...draft,
+                    componentId: event.target.value,
+                    signal: { ...draft.signal, draft: { ...draft.signal.draft, componentId: event.target.value } } as IoDeviceDraft['signal'],
+                  })} />
+              </label>
+              <label className="deployment-focused-field">
+                <span>Lifecycle command time limit</span>
+                <span className="deployment-number-with-unit">
+                  <input aria-label="I/O device lifecycle command time limit" inputMode="decimal"
+                    value={draft.lifecycleTimeoutS} disabled={disabled}
+                    title={`Enable/Disable of this device's driver must finish within this time (above 0, at most ${IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S} s).`}
+                    onChange={(event) => update({ ...draft, lifecycleTimeoutS: event.target.value })} />
+                  <small>s</small>
+                </span>
+              </label>
+            </div>
+            <p className="field-help">First signal (an I/O device needs at least one). Leave Resource role blank to use the signal name, and Source blank to use {draft.componentId}_source.</p>
+            {signal?.kind === 'input' ? (
+              <IoSignalInputFields index={0} draft={signal.draft} disabled={disabled} ioProvider
+                onChange={(patch: Partial<IoSignalInputDraft>) => update({ ...draft, signal: { kind: 'input', draft: { ...signal.draft, ...patch } } })}
+                onDirection={(direction) => update({ ...draft, signal: withIoDirection(signal, direction) as IoDeviceDraft['signal'] })} />
+            ) : signal?.kind === 'output' ? (
+              <IoSignalOutputFields index={0} draft={signal.draft} disabled={disabled} ioProvider
+                onChange={(patch: Partial<IoSignalOutputDraft>) => update({ ...draft, signal: { kind: 'output', draft: { ...signal.draft, ...patch } } })}
+                onDirection={(direction) => update({ ...draft, signal: withIoDirection(signal, direction) as IoDeviceDraft['signal'] })} />
+            ) : null}
+            {error !== null && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
+            <div className="button-row">
+              <button type="button" className="primary-action" disabled={disabled}
+                onClick={() => { void create(); }}>Create I/O device</button>
+              <button type="button" disabled={controller.busy}
+                onClick={() => { setDraft(null); setError(null); }}>Cancel</button>
+            </div>
+          </fieldset>
+        )}
+        <p className="field-help">An I/O device is a model-free component whose connection to its I/O (subscription or service client) is its own control domain: own Enable/Disable, time limit and re-sync recovery. Sources: Mock, generic ROS Bool / SetBool, Universal Robots io_states / set_io and ros2_control GPIO. I/O physically on a robot is declared here too: it shares the robot's driver without owning it, and the robot's Enable/Disable does not touch it. It has no model, pose, frames or Stop settings and is not drawn in the 3D scene.</p>
+      </div>
+    </details>
+  );
+}
+
+function IoDeviceEditor({ controller, device, disabled }: {
+  controller: DeploymentWorkspaceController;
+  device: IoDeviceRow;
+  disabled: boolean;
+}) {
+  const current = ioProviderDeviceTimeout(device.runtimeConfiguration, device.componentId);
+  const rosOutputs = ioDeviceHasAcknowledgedOutput(device.runtimeConfiguration);
+  const gpioOutputs = ioDeviceHasGpioOutput(device.runtimeConfiguration);
+  const shownAck = current.outputAckTimeoutS ?? IO_DEVICE_PROVISIONAL_OUTPUT_ACK_TIMEOUT_S;
+  const [text, setText] = useState(String(current.timeoutS));
+  const [ackText, setAckText] = useState(String(shownAck));
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setText(String(current.timeoutS));
+    setError(null);
+  }, [current.timeoutS]);
+  useEffect(() => {
+    setAckText(String(shownAck));
+    setError(null);
+  }, [shownAck]);
+  // Writes the device's one row; the acknowledgement timeout is kept only
+  // while the device has ROS SetBool / UR set_io outputs (contracts 68, 82).
+  const commitRow = async (timeoutS: number, ackS: number | null) => {
+    const result = await controller.mutate(
+      ['components', device.index, 'configuration', 'runtime_configuration', 'io_provider_devices'],
+      'set',
+      [ioProviderDeviceValue(device.componentId, timeoutS, rosOutputs && ackS !== null ? ackS : undefined)],
+    );
+    setError(result === null ? 'The Deployment owner rejected this setting.' : null);
+  };
+  const commit = async () => {
+    const problem = lifecycleTimeoutProblem(text);
+    if (problem !== null) {
+      setError(problem);
+      return;
+    }
+    const value = Number(text.trim());
+    if (current.exact && current.authored && value === current.timeoutS) return;
+    await commitRow(value, current.outputAckTimeoutS);
+  };
+  const commitAck = async () => {
+    const problem = outputAckTimeoutProblem(ackText);
+    if (problem !== null) {
+      setError(problem);
+      return;
+    }
+    const value = Number(ackText.trim());
+    if (current.exact && current.outputAckTimeoutS === value) return;
+    if (current.outputAckTimeoutS === null && value === IO_DEVICE_PROVISIONAL_OUTPUT_ACK_TIMEOUT_S) return;
+    await commitRow(current.timeoutS, value);
+  };
+  return (
+    <section className="deployment-runtime-unit">
+      <header><strong>{device.componentId}</strong><small>I/O device</small></header>
+      {device.runtimeConfiguration === null ? (
+        <p className="muted">This I/O device has no runtime configuration; its time limit cannot be edited here.</p>
+      ) : (
+        <div className="deployment-focused-form-grid">
+          <label className={`deployment-focused-field${error !== null ? ' invalid' : ''}`}>
+            <span>Lifecycle command time limit</span>
+            <span className="deployment-number-with-unit">
+              <input aria-label={`${device.componentId} lifecycle command time limit`} inputMode="decimal"
+                value={text} disabled={disabled}
+                onChange={(event) => { setText(event.target.value); setError(null); }}
+                onBlur={() => { void commit(); }}
+                onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} />
+              <small>s</small>
+            </span>
+          </label>
+          {rosOutputs && (
+            <label className="deployment-focused-field">
+              <span>Output acknowledgement timeout</span>
+              <span className="deployment-number-with-unit">
+                <input aria-label={`${device.componentId} output acknowledgement timeout`} inputMode="decimal"
+                  value={ackText} disabled={disabled}
+                  title="How long a ROS SetBool or UR set_io output write waits for the service's acceptance. Without it in time the write's effect is unknown and the output stays blocked until the device is re-synced."
+                  onChange={(event) => { setAckText(event.target.value); setError(null); }}
+                  onBlur={() => { void commitAck(); }}
+                  onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} />
+                <small>s</small>
+              </span>
+            </label>
+          )}
+        </div>
+      )}
+      {!current.authored && device.runtimeConfiguration !== null && (
+        <p className="field-help">Not authored: the default {current.timeoutS} s applies.</p>
+      )}
+      {rosOutputs && current.outputAckTimeoutS === null && device.runtimeConfiguration !== null && (
+        <p className="field-help">Output acknowledgement: provisional {IO_DEVICE_PROVISIONAL_OUTPUT_ACK_TIMEOUT_S} s (to be measured on the live lanes); Mock outputs are immediate.</p>
+      )}
+      {gpioOutputs && device.runtimeConfiguration !== null && (
+        <p className="field-help">ros2_control GPIO outputs are submitted only: the gpio command controller gives no acknowledgement, so they have no acknowledgement timeout.</p>
+      )}
+      {error !== null && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
+      <div className="button-row">
+        <button type="button" disabled={disabled}
+          onClick={() => { void controller.mutate(['components', device.index], 'remove'); }}>Remove I/O device</button>
+      </div>
+    </section>
+  );
+}
+
+const LATCH_RELEASE_HELP = 'A latch with no operation to Reset is cleared by the operator once its condition no longer holds (default), or automatically when the condition clears. A Program Reset never clears it.';
+const IDLE_BEHAVIOUR_HELP = 'Default: latches while a Program Run is in flight and the robot is still; ignored when no Run exists. Moving motion is always stopped.';
+
+/**
+ * Global (Deployment) interrupt rules, `policies.interrupt_rules` (schema04
+ * §3): each with its condition, scope, priority, idle behaviour and Stop
+ * entry stage. A rule stops, latches and publishes the read-only key
+ * `interrupt_state.<rule_id>`. The whole list is committed per change.
+ */
+export function GlobalInterruptRulesSection({
+  controller, document, programKeys, stopChains = NO_STOP_CHAINS, executionGroupIds = null,
+}: {
+  controller: DeploymentWorkspaceController;
+  document: Record<string, JsonValue>;
+  /** Null when there is no Program: its user-key operands then wait for one (contract 106). */
+  programKeys: readonly BlackboardKeyDeclaration[] | null;
+  /** A global rule's entry stage must be qualified by every published robot chain. */
+  stopChains?: readonly TargetStopChain[];
+  /** The Applied Program's execution group ids; null when no Program is applied. */
+  executionGroupIds?: readonly string[] | null;
+}) {
+  const rows = globalRulesOf(document);
+  const stopStages = useMemo(() => commonStopStages(stopChains), [stopChains]);
+  // Operands of a new rule; each rule's own list adds the keys it reads that no Program declares.
+  const choices = useMemo(
+    () => globalRuleChoices(document, programKeys, undefined),
+    [document, programKeys],
+  );
+  const [error, setError] = useState<string | null>(null);
+  const disabled = !controller.mutationAvailable || controller.busy;
+  if (rows === null) {
+    return (
+      <details className="dcard">
+        <summary>Global interrupt rules</summary>
+        <p className="deployment-field-error inline-message severity-error">policies.interrupt_rules is not a list; it is kept unchanged and cannot be edited here.</p>
+      </details>
+    );
+  }
+  const ids = rows.map((row) => objectValue(row)?.rule_id);
+  const commit = async (next: JsonValue[], index: number | null) => {
+    if (index !== null) {
+      const others = next.flatMap((row, at) => {
+        const id = objectValue(row)?.rule_id;
+        return at !== index && typeof id === 'string' ? [id] : [];
+      });
+      const problem = globalRuleProblem(next[index], others,
+        globalRuleChoices(document, programKeys, objectValue(next[index])?.condition));
+      if (problem !== null) {
+        setError(problem);
+        return;
+      }
+    }
+    const result = next.length === 0
+      ? await controller.mutate(['policies', 'interrupt_rules'], 'remove')
+      : await controller.mutate(['policies', 'interrupt_rules'], 'set', next);
+    setError(result === null ? 'The Deployment owner rejected this rule change.' : null);
+  };
+  const update = (index: number, patch: Record<string, JsonValue | undefined>) => {
+    const current = objectValue(rows[index]) ?? {};
+    const merged: Record<string, JsonValue> = { ...current };
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === undefined) delete merged[key];
+      else merged[key] = value;
+    }
+    void commit(rows.map((row, at) => (at === index ? merged : row)), index);
+  };
+  return (
+    <details className="dcard" open={rows.length > 0}>
+      <summary>Global interrupt rules</summary>
+      <div className="deployment-focused-body">
+        <p className="field-help">A global rule stops the motion in its scope when its condition holds, latches, and publishes the read-only key <code>interrupt_state.&lt;rule id&gt;</code> (clear, tripped or latched), always current. Program nodes react to a rule only through that key.</p>
+        {rows.length === 0 && <p className="muted">No global interrupt rule is declared.</p>}
+        {rows.map((row, index) => {
+          const rule = objectValue(row) ?? {};
+          const scopeKind = globalRuleScopeKind(rule.scope);
+          const groups = globalRuleScopeGroups(rule.scope);
+          // Applied groups first, then any stored id the Applied Program lacks (T2 refuses it at Apply).
+          const groupChoices = [...new Set([...(executionGroupIds ?? []), ...groups])].sort();
+          const groupsAvailable = executionGroupIds !== null && executionGroupIds.length > 0;
+          const ruleId = typeof rule.rule_id === 'string' ? rule.rule_id : `rule ${index + 1}`;
+          const ruleChoices = globalRuleChoices(document, programKeys, rule.condition);
+          const keyNotes = globalRuleKeyNotes(rule.condition, programKeys);
+          return (
+            <fieldset className="deployment-gripper-editor" key={`${index}:${ruleId}`} aria-label={`Global rule ${ruleId}`}>
+              <legend>{ruleId}</legend>
+              <div className="deployment-focused-form-grid">
+                <label className="deployment-focused-field">
+                  <span>Rule id</span>
+                  <DraftTextInput aria-label={`${ruleId} rule id`} value={typeof rule.rule_id === 'string' ? rule.rule_id : ''}
+                    disabled={disabled}
+                    validate={(text) => (/^[a-z][a-z0-9_.-]*$/.test(text.trim()) ? null : 'Use a portable lower-case id.')}
+                    onCommit={(text) => update(index, { rule_id: text.trim() })} />
+                </label>
+                <label className="deployment-focused-field">
+                  <span>Priority (0–100)</span>
+                  <DraftTextInput aria-label={`${ruleId} priority`} inputMode="numeric"
+                    value={typeof rule.priority === 'number' ? rule.priority : 0} disabled={disabled}
+                    validate={(text) => (/^\d+$/.test(text.trim()) && Number(text) <= 100 ? null : 'Priority is an integer from 0 to 100.')}
+                    onCommit={(text) => update(index, { priority: Number(text.trim()) })} />
+                </label>
+                <label className="deployment-focused-field">
+                  <span>Scope</span>
+                  <select aria-label={`${ruleId} scope`} value={scopeKind ?? ''} disabled={disabled}
+                    onChange={(event) => {
+                      const kind = event.target.value;
+                      if (kind === 'execution_groups') {
+                        const initial = groups.length > 0 ? groups : groupChoices.slice(0, 1);
+                        if (initial.length > 0) update(index, { scope: canonicalScope(initial) as JsonValue });
+                      } else if (kind === 'all_motion' || kind === 'everything') {
+                        update(index, { scope: kind });
+                      }
+                    }}>
+                    {scopeKind === null && <option value="">Unrecognized scope (kept)</option>}
+                    <option value="all_motion">All motion</option>
+                    <option value="execution_groups" disabled={!groupsAvailable && scopeKind !== 'execution_groups'}>
+                      Execution groups{groupsAvailable ? '' : ' (apply a Program first)'}
+                    </option>
+                    <option value="everything">Everything (Full Stop)</option>
+                  </select>
+                </label>
+                {scopeKind === 'execution_groups' && (
+                  <fieldset className="deployment-focused-field" aria-label={`${ruleId} execution groups`}>
+                    <legend>Execution groups (Applied Program)</legend>
+                    {groupChoices.map((group) => {
+                      const selected = groups.includes(group);
+                      const known = executionGroupIds?.includes(group) ?? false;
+                      return (
+                        <label key={group}>
+                          <input type="checkbox" aria-label={`${ruleId} group ${group}`} checked={selected}
+                            disabled={disabled || (selected && groups.length === 1)}
+                            onChange={() => update(index, {
+                              scope: canonicalScope(selected
+                                ? groups.filter((item) => item !== group) : [...groups, group]) as JsonValue,
+                            })} />
+                          {' '}{group}{known ? '' : ' (not in the Applied Program)'}
+                        </label>
+                      );
+                    })}
+                  </fieldset>
+                )}
+                <label className="deployment-focused-field" title={IDLE_BEHAVIOUR_HELP}>
+                  <span>When nothing moves</span>
+                  <select aria-label={`${ruleId} idle behaviour`} value={typeof rule.idle_behaviour === 'string' ? rule.idle_behaviour : ''}
+                    disabled={disabled}
+                    onChange={(event) => update(index, {
+                      idle_behaviour: event.target.value === '' ? undefined : event.target.value,
+                    })}>
+                    <option value="">Default (latch during a Run, else ignore)</option>
+                    <option value="latch">Latch</option>
+                    <option value="ignore">Ignore (records one info row)</option>
+                  </select>
+                </label>
+                <label className="deployment-focused-field" title={LATCH_RELEASE_HELP}>
+                  <span>Latch release</span>
+                  <select aria-label={`${ruleId} latch release`}
+                    value={rule.latch_release === 'auto_on_clear' ? 'auto_on_clear' : ''}
+                    disabled={disabled}
+                    onChange={(event) => update(index, {
+                      latch_release: event.target.value === '' ? undefined : event.target.value,
+                    })}>
+                    <option value="">Operator clears (default)</option>
+                    <option value="auto_on_clear">Auto-clear when the condition clears</option>
+                  </select>
+                </label>
+              </div>
+              <div className="deployment-focused-field">
+                <span>Condition</span>
+                <InterruptConditionEditor label={`${ruleId} condition`} value={rule.condition} choices={ruleChoices}
+                  disabled={disabled} onCommit={(condition) => update(index, { condition })} />
+                {keyNotes.waiting.length > 0 && (
+                  <p className="field-help" aria-label={`${ruleId} key waiting`}>
+                    Waiting for a Program that declares {keyNotes.waiting.join(', ')}: the whole rule is inactive until then.
+                  </p>
+                )}
+                {keyNotes.mixed && (
+                  <p className="field-help" aria-label={`${ruleId} mixed operands`}>
+                    This rule reads signals and keys, so it doesn&apos;t act while no Program is applied; use a separate signal-only rule if it must always act.
+                  </p>
+                )}
+                {keyNotes.undeclared.length > 0 && (
+                  <p className="deployment-field-error inline-message severity-error" aria-label={`${ruleId} key undeclared`}>
+                    {GLOBAL_RULE_KEY_UNDECLARED}: the Program does not declare {keyNotes.undeclared.join(', ')}; Apply is refused until it does.
+                  </p>
+                )}
+                {keyNotes.stateOperands.length > 0 && (
+                  <p className="deployment-field-error inline-message severity-error" aria-label={`${ruleId} state operand`}>
+                    {GLOBAL_RULE_STATE_OPERAND_UNSUPPORTED}: a global rule cannot read {keyNotes.stateOperands.join(', ')}; read rule states in the Program instead.
+                  </p>
+                )}
+                {(() => {
+                  const problem = interruptKeyInitialProblem(rule.condition, programKeys ?? []);
+                  return problem === null ? null : (
+                    <p className="deployment-field-error inline-message severity-error" aria-label={`${ruleId} key initial`}>{problem}</p>
+                  );
+                })()}
+              </div>
+              <div className="deployment-focused-field">
+                <span>Stop entry stage</span>
+                <StopStagePicker label={`${ruleId} stop entry stage`}
+                  value={typeof rule.stop_entry_stage_id === 'string' ? rule.stop_entry_stage_id : undefined}
+                  stages={stopStages} omittedLabel="First stage (default)" disabled={disabled}
+                  onChange={(next) => update(index, { stop_entry_stage_id: next })} />
+              </div>
+              <div className="button-row">
+                <button type="button" disabled={disabled}
+                  onClick={() => { void commit(rows.filter((_, at) => at !== index), null); }}>Remove rule</button>
+              </div>
+            </fieldset>
+          );
+        })}
+        {error !== null && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
+        <div className="button-row">
+          <button type="button" disabled={disabled || choices.length === 0}
+            title={choices.length === 0 ? 'Declare an input signal or a Program key first.' : undefined}
+            onClick={() => {
+              const rule = newGlobalRule(ids.filter((id): id is string => typeof id === 'string'), choices[0]);
+              void commit([...rows, rule as unknown as JsonValue], rows.length);
+            }}>Add global rule</button>
+        </div>
+      </div>
+    </details>
   );
 }

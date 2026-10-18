@@ -11,6 +11,9 @@
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/program_binding_compiler.hpp"
 #include "posix_durability_internal.hpp"
+#include <manyforge_deployment/global_io_rule_qualification.hpp>
+#include <manyforge_deployment/program_io_condition_compiler.hpp>
+#include <manyforge_deployment/program_io_stop_response_validation.hpp>
 
 namespace manyforge::deployment {
 namespace {
@@ -19,6 +22,20 @@ namespace posix = detail::posix_durability;
 
 [[noreturn]] void fail(const std::string &message) {
   throw PreparedActivationInputError(message);
+}
+
+[[noreturn]] void fail_global_rule_qualification(const core::ErrorDTO &error) {
+  std::string message = error.details.at("reason");
+  // Preserve the existing refusal code and exception type. Contract106 key
+  // and114 group diagnostics retain their actual names in visible text.
+  const bool named_group =
+      (message == "global_interrupt_group_unbound" ||
+       message == "global_interrupt_program_binding_missing") &&
+      error.details.contains("rule_id") && error.details.contains("group_id");
+  const bool named_key = message == "global_rule_key_undeclared" &&
+      error.details.contains("rule_id") && error.details.contains("key");
+  if (named_group || named_key) message += " (" + error.message + ")";
+  fail(message);
 }
 
 [[nodiscard]] std::exception_ptr make_error(std::string_view message) {
@@ -230,11 +247,75 @@ PreparedActivationInput assemble_prepared_activation(
   }
   const RecordingCatalogSource recording(catalog);
   const auto outcome = compile_program_binding_outcome(
-      program, parse_program_role_assignment(role_assignment), bundle, model_map,
-      recording);
+      program, parse_program_role_assignment(role_assignment), bundle,
+      model_map, recording);
+  // Global scopes/conditions are resolved against this exact prospective
+  // Program binding, or without a Program for signal-only activation rules.
+  const auto globals = compile_retained_io_policies(
+      outcome.binding ? &program : nullptr, outcome.binding.get(), bundle);
+  if (!globals.ok())
+    fail_global_rule_qualification(globals.error());
+  const auto global_refs =
+      required_global_io_stop_artifacts(globals.value(), bundle);
+  if (!global_refs.ok())
+    fail(global_refs.error().details.at("reason"));
+  for (const auto &ref : global_refs.value()) {
+    const auto bytes = raw_artifacts.get_verified(
+        ref.content_addressed_store_key, ref.content_digest, ref.byte_size);
+    if (!bytes)
+      fail("io_rule_stop_product_missing");
+    const auto existing =
+        std::find_if(raw_artifacts_to_embed.begin(),
+                     raw_artifacts_to_embed.end(), [&](const auto &row) {
+                       return row.content_addressed_store_key ==
+                              ref.content_addressed_store_key;
+                     });
+    if (existing == raw_artifacts_to_embed.end())
+      raw_artifacts_to_embed.push_back(
+          {ref.content_addressed_store_key, ref.content_digest, *bytes});
+    else if (existing->content_digest != ref.content_digest ||
+             existing->bytes != *bytes)
+      fail("io_rule_stop_product_ambiguous");
+  }
+  const auto global_entries = validate_global_io_stop_entries(
+      globals.value(), bundle, model_map ? &*model_map : nullptr,
+      raw_artifacts_to_embed);
+  if (!global_entries.ok())
+    fail(global_entries.error().details.at("reason"));
   CanonicalValue program_outcome(nullptr);
   CanonicalValue program_binding(nullptr);
   if (outcome.binding != nullptr) {
+    const auto refs =
+        required_program_io_stop_artifacts(program, *outcome.binding, bundle);
+    if (!refs.ok())
+      fail(refs.error().details.at("reason"));
+    for (const auto &ref : refs.value()) {
+      const auto bytes = raw_artifacts.get_verified(
+          ref.content_addressed_store_key, ref.content_digest, ref.byte_size);
+      if (!bytes)
+        fail("io_rule_stop_product_missing");
+      const auto existing =
+          std::find_if(raw_artifacts_to_embed.begin(),
+                       raw_artifacts_to_embed.end(), [&](const auto &row) {
+                         return row.content_addressed_store_key ==
+                                ref.content_addressed_store_key;
+                       });
+      if (existing == raw_artifacts_to_embed.end())
+        raw_artifacts_to_embed.push_back(
+            {ref.content_addressed_store_key, ref.content_digest, *bytes});
+      else if (existing->content_digest != ref.content_digest ||
+               existing->bytes != *bytes)
+        fail("io_rule_stop_product_ambiguous");
+    }
+    if (!refs.value().empty()) {
+      if (!model_map)
+        fail("io_rule_stop_model_map_mismatch");
+      const auto valid = validate_program_io_stop_responses(
+          program, *outcome.binding, bundle, *model_map,
+          raw_artifacts_to_embed);
+      if (!valid.ok())
+        fail(valid.error().details.at("reason"));
+    }
     program_binding = outcome.binding->normalized_root();
     program_outcome = CanonicalValue(CanonicalValue::Object{
         {"kind", CanonicalValue("bound")},
@@ -244,9 +325,10 @@ PreparedActivationInput assemble_prepared_activation(
   } else {
     program_outcome = CanonicalValue(CanonicalValue::Object{
         {"kind", CanonicalValue("non_executable")},
-        {"outcome", parse_strict_json_model_yaml(EncodeProgramNonExecutableOutcome(
-                        *outcome.non_executable))
-                        .root()},
+        {"outcome",
+         parse_strict_json_model_yaml(
+             EncodeProgramNonExecutableOutcome(*outcome.non_executable))
+             .root()},
     });
   }
   CanonicalValue::Object identity{
@@ -432,7 +514,19 @@ recompile_prepared_program_outcome(const PreparedActivationInput &prepared) {
   const auto &closure = prepared.closure();
   // The structural verifier proved exact absence of artifacts, identities,
   // and assignments. There is no Program to compile or Scene to project.
-  if (closure.program == nullptr) return {};
+  if (closure.program == nullptr) {
+    const auto globals = compile_retained_io_policies(nullptr, nullptr,
+                                                      *closure.retained_bundle);
+    if (!globals.ok())
+      fail_global_rule_qualification(globals.error());
+    const auto entries = validate_global_io_stop_entries(
+        globals.value(), *closure.retained_bundle,
+        closure.retained_model_map ? &*closure.retained_model_map : nullptr,
+        closure.raw_artifacts);
+    if (!entries.ok())
+      fail(entries.error().details.at("reason"));
+    return {};
+  }
   const PreparedPayloadCatalogSource catalog(closure.catalog_artifacts);
   ProgramBindingOutcome recompiled;
   try {
@@ -443,12 +537,46 @@ recompile_prepared_program_outcome(const PreparedActivationInput &prepared) {
     fail(std::string("prepared Program outcome does not recompile: ") +
          error.what());
   }
-  const bool bound_matches =
-      prepared.program_binding_id().has_value() && recompiled.binding != nullptr &&
-      closure.program_binding != nullptr &&
-      recompiled.binding->program_binding_id() == *prepared.program_binding_id() &&
-      closure.program_binding->program_binding_id() ==
-          *prepared.program_binding_id();
+  const auto globals = compile_retained_io_policies(
+      recompiled.binding ? closure.program.get() : nullptr,
+      recompiled.binding.get(), *closure.retained_bundle);
+  if (!globals.ok())
+    fail_global_rule_qualification(globals.error());
+  const auto global_entries = validate_global_io_stop_entries(
+      globals.value(), *closure.retained_bundle,
+      closure.retained_model_map ? &*closure.retained_model_map : nullptr,
+      closure.raw_artifacts);
+  if (!global_entries.ok())
+    fail(global_entries.error().details.at("reason"));
+  if (recompiled.binding) {
+    // The preparer, durable readback and actual Apply share capture's exact
+    // condition compiler. A failed check never becomes an empty projection.
+    const auto conditions = compile_program_io_conditions(
+        *closure.program, *recompiled.binding, *closure.retained_bundle);
+    if (!conditions.ok())
+      fail(conditions.error().details.at("reason") + ": " +
+           conditions.error().message);
+    const auto refs = required_program_io_stop_artifacts(
+        *closure.program, *recompiled.binding, *closure.retained_bundle);
+    if (!refs.ok())
+      fail(refs.error().details.at("reason"));
+    if (!refs.value().empty()) {
+      if (!closure.retained_model_map)
+        fail("io_rule_stop_model_map_mismatch");
+      const auto valid = validate_program_io_stop_responses(
+          *closure.program, *recompiled.binding, *closure.retained_bundle,
+          *closure.retained_model_map, closure.raw_artifacts);
+      if (!valid.ok())
+        fail(valid.error().details.at("reason"));
+    }
+  }
+  const bool bound_matches = prepared.program_binding_id().has_value() &&
+                             recompiled.binding != nullptr &&
+                             closure.program_binding != nullptr &&
+                             recompiled.binding->program_binding_id() ==
+                                 *prepared.program_binding_id() &&
+                             closure.program_binding->program_binding_id() ==
+                                 *prepared.program_binding_id();
   const bool unbound_matches =
       prepared.program_outcome().has_value() &&
       recompiled.non_executable.has_value() &&

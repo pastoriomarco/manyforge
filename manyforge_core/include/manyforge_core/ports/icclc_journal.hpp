@@ -583,6 +583,14 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
   [[nodiscard]] virtual Result<std::optional<ComponentLifecycleStatusDTO>>
   LoadRetainedLifecycleStatus(const LifecycleTransactionId& lifecycle_transaction_id) = 0;
 
+  /// Read-only retained completed history for the exact component. Missing or
+  /// compacted rows are not recovery proof. Uses the existing terminal bound.
+  [[nodiscard]] virtual Result<std::vector<ComponentLifecycleStatusDTO>>
+  LoadRetainedComponentLifecycleHistory(const ControllableComponentId&) {
+    return Result<std::vector<ComponentLifecycleStatusDTO>>::Err(
+        {"component_lifecycle_history_unavailable", "CCLC retained history is unavailable", {}});
+  }
+
   /// Returns one coherent watermark/state readback. This point query performs
   /// no admission, generation minting, observation, or external effect.
   [[nodiscard]] virtual Result<ComponentLifecycleCurrentFactReadbackDTO>

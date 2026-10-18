@@ -53,6 +53,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace manyforge::core {
@@ -252,6 +253,15 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   Result<void> DispatchPreparedMotion(std::uint64_t execution_id,
                                       const ContentDigest& prepared_contract_digest) override;
   Result<void> CancelPreparedMotion(std::uint64_t execution_id) override;
+  Result<bool> RetireCancelledPreparedMotion(std::uint64_t candidate_id) override;
+  Result<PreparedMotionReplacementSourceDTO> CaptureMotionReplacementSource(
+      std::uint64_t execution_id) const override;
+  Result<bool> CommitPreparedMotionReplacement(std::uint64_t candidate_id,
+                                               const PreparedMotionReplacementSourceDTO& source,
+                                               PreparedMotionReplacementCommitDTO commit) override;
+  Result<bool> PrepareColdMotionAfterStop(std::uint64_t candidate_id,
+                                          const StopCertificateDTO& certificate) override;
+
   Result<std::uint64_t> PrepareCapabilityCommand(
       ResolvedPreparedCapabilityCommandExecutionRequestDTO request) override;
   Result<ResolvedPreparedCapabilityCommandSnapshotDTO> ObservePreparedCapabilityCommand(
@@ -420,34 +430,48 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
  private:
   struct PreparedMotionSession;
+  struct ActiveMotionExecution;
   [[nodiscard]] std::shared_ptr<PreparedMotionSession> failed_preparation_never_dispatched_locked();
   [[nodiscard]] bool failed_preparation_settled_locked();
   [[nodiscard]] std::optional<ErrorDTO>
   collision_resource_replacement_refusal_locked();
   /// Motion-free retirement of the prepared membership through the backend's
   /// RetirePreparedExecution; never moves the robot or resets the backend.
-  [[nodiscard]] Result<void> retire_prepared_motion_membership();
+  [[nodiscard]] Result<void> retire_prepared_motion_membership(
+      const PreparedMotionSession* preserve_pending = nullptr);
   /// Recovery classification input derived from the participant facts and
   /// the addressed Stop evidence. Recovery moves to the addressed Kernel next.
   [[nodiscard]] ExecutionState recovery_execution_state_locked(const ExecutionStatus& status) const;
   struct PlanningSuccess;
+  struct ValidatedMotionPlan;
   struct ExecuteWorkerPlanPhaseResult;
   struct ExecuteWorkerValidationPhaseResult;
 
   Result<std::uint64_t> execute_impl(const ExecuteRequestDTO& request,
                                      std::shared_ptr<PreparedMotionSession> prepared_session);
+  Result<std::uint64_t> prepare_motion_replacement(std::shared_ptr<PreparedMotionSession> session);
+  Result<std::uint64_t> prepare_spring_motion_attachment(
+      ResolvedPreparedMotionExecutionRequestDTO request);
+  Result<void> launch_motion_replacement_preparation(
+      const std::shared_ptr<PreparedMotionSession>& session);
+  void compute_motion_replacement(std::stop_token stop_token,
+                                  std::shared_ptr<PreparedMotionSession> session);
+  Result<void> compute_spring_motion_replacement(
+      std::stop_token stop_token, const std::shared_ptr<PreparedMotionSession>& session);
+  Result<void> qualify_spring_motion_replacement(
+      ResolvedPreparedMotionExecutionRequestDTO& candidate, const PreparedMotionSession& source);
+  bool service_motion_replacement(std::stop_token stop_token, ActiveMotionExecution& current);
+  Result<void> check_motion_replacement_scene(const PreparedMotionSession& session) const;
+
   Result<PlanRequestDTO> make_plan_request(const ExecuteRequestDTO& request,
                                            const CollisionWorldLeaseInventory& projection_inventory,
                                            std::uint32_t planning_attempt_index,
-                                           const RobotStateDTO* start_state_override = nullptr);
+                                           const RobotStateDTO* start_state_override = nullptr,
+                                           const MovingReplacementInputDTO* replacement = nullptr);
   Result<PlanningSuccess> plan_trajectory_with_evidence(
       const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
-      std::uint32_t planning_attempt_index = 0,
-      const RobotStateDTO* start_state_override = nullptr);
-  Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request,
-                                        const CollisionWorldLeaseInventory& projection_inventory,
-                                        std::uint32_t planning_attempt_index = 0,
-                                        const RobotStateDTO* start_state_override = nullptr);
+      std::uint32_t planning_attempt_index = 0, const RobotStateDTO* start_state_override = nullptr,
+      const MovingReplacementInputDTO* replacement = nullptr);
   Result<PlanningSuccess> plan_motion_continuation(
       ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
       const detail::MotionResumeIntent& continuation);
@@ -495,8 +519,22 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       const TrajectoryDTO& trajectory, const ExecuteRequestDTO& request,
       CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
       const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
-      const RobotStateDTO* start_state_override = nullptr,
-      std::stop_token external_stop_token = {});
+      const RobotStateDTO* start_state_override = nullptr, std::stop_token external_stop_token = {},
+      bool* conclusive_collision_failure = nullptr,
+      std::shared_ptr<CollisionCancellationToken> validation_cancellation = {},
+      std::optional<std::uint64_t> validation_execution_id = std::nullopt,
+      const MovingReplacementInputDTO* replacement = nullptr);
+
+  /// Shared computation only. The caller owns planner serialization, the
+  /// deadline/cancellation registration, projection lifetime and admission.
+  /// Explicit validation ownership never replaces an incumbent's token.
+  Result<ValidatedMotionPlan> compute_validated_motion_plan(
+      const ExecuteRequestDTO& request, CollisionWorldLeaseInventory& projection_inventory,
+      const RobotStateDTO& start_state, std::uint32_t planning_attempt_index,
+      std::int64_t planning_start_ns, std::int64_t planning_timeout_ns, std::stop_token stop_token,
+      std::shared_ptr<CollisionCancellationToken> validation_cancellation = {},
+      std::optional<std::uint64_t> validation_execution_id = std::nullopt,
+      const MovingReplacementInputDTO* replacement = nullptr);
 
   /// Async execution worker function.
   void async_execute_worker(std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,
@@ -505,6 +543,15 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                             RetainedSceneSnapshotLease retained_scene,
                             std::optional<SceneSnapshotLease> scene_snapshot_lease,
                             std::shared_ptr<PreparedMotionSession> prepared_session = {});
+
+  /// Build immutable authority/evidence only; no backend Prepare, session,
+  /// lifecycle, snapshot or monitoring mutation belongs in this computation.
+  static Result<std::shared_ptr<const PreparedOperationParticipantDTO>>
+  assemble_prepared_motion_participant(
+      const ResolvedPreparedMotionExecutionRequestDTO& authority,
+      const ExecuteRequestDTO& request, const TrajectoryDTO& trajectory,
+      const PlanRequestDTO& plan_request, const PlanResultDTO& planning_result,
+      const PreparedMotionValidationEvidenceDTO& validation_evidence);
 
   Result<std::shared_ptr<const PreparedOperationParticipantDTO>>
   make_and_prepare_motion_participant(
@@ -602,6 +649,25 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // once (first record wins); a recorded error is the exact cause handed to
   // the prepared-motion owner when the worker exits before dispatch.
   struct ActiveMotionExecution {
+    explicit ActiveMotionExecution(ExecuteRequestDTO supplied) : request(std::move(supplied)) {}
+
+    // One worker's current context. Replacement adopts these existing values
+    // only at that worker's safe point, never by starting another presenter.
+    ExecuteRequestDTO request;
+    std::uint64_t execution_id{};
+    RetainedSceneSnapshotLease retained_scene;
+    std::optional<SceneSnapshotLease> scene_snapshot_lease;
+    std::shared_ptr<PreparedMotionSession> prepared_session;
+    ExecutionHandle execution_handle;
+    std::int64_t exec_start_ns{};
+    std::int64_t exec_timeout_ns{};
+    ExecutionSnapshot latest_backend_snapshot;
+    std::int64_t last_runtime_scale_sample_ns{};
+    double runtime_scaled_execution_ns{};
+    std::int64_t zero_speed_hold_timeout_ns{};
+    bool zero_speed_holding{};
+    std::int64_t zero_speed_hold_started_ns{};
+    bool zero_speed_hold_stop_requested{};
     bool terminal_recorded = false;
     std::optional<ErrorDTO> terminal_error;
     std::uint64_t runtime_collision_protection_generation = 0;
@@ -859,6 +925,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   mutable std::mutex prepared_motion_session_mutex_;
   std::shared_ptr<PreparedMotionSession> active_prepared_motion_session_;
+  std::shared_ptr<PreparedMotionSession> pending_prepared_motion_session_;
+  ActiveMotionExecution* active_motion_execution_{};  // same mutex; existing worker's stack
+  std::jthread replacement_preparation_thread_;  // computation only; never a physical presenter
 
   // Declared last so its destructor runs first after the kernel destructor body.
   // The destructor body already stops/drains it explicitly; this member order is

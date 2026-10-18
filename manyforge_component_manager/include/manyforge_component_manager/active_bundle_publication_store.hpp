@@ -115,8 +115,17 @@ class SqliteActiveBundlePublicationStore final
   void Close();
 
  private:
+  friend manyforge::core::Result<manyforge::core::ActiveBundlePublicationReceiptDTO>
+  ReadActiveBundlePublicationReadOnly(const std::filesystem::path &,
+                                    const manyforge::core::CellId &);
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+/// Observation-only current head from an existing store. No initialization,
+/// schema migration, write connection, checkpoint or publication permission.
+[[nodiscard]] manyforge::core::Result<manyforge::core::ActiveBundlePublicationReceiptDTO>
+ReadActiveBundlePublicationReadOnly(const std::filesystem::path &database_path,
+                                  const manyforge::core::CellId &cell_id);
 
 }  // namespace manyforge::component_manager

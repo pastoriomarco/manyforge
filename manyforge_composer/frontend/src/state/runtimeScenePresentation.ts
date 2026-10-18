@@ -618,7 +618,7 @@ export function attachedScenePresentation(
 
 type GoodObservationSource = Extract<
   SceneRuntimePoseSource,
-  { quality: 'good' }
+  { payload_quality: 'good' }
 >;
 type JointObservationSource = GoodObservationSource & {
   payload: Extract<
@@ -634,7 +634,7 @@ type PoseObservationSource = GoodObservationSource & {
 };
 
 function isFreshGood(source: SceneRuntimePoseSource): source is GoodObservationSource {
-  return source.quality === 'good' && source.fresh;
+  return source.payload_quality === 'good' && source.fresh;
 }
 
 function isJointObservation(
@@ -817,9 +817,9 @@ export function runtimeScenePresentation(
       total: sources.length,
       freshGood: fresh.length,
       staleGood: sources.filter(
-        (source) => source.quality === 'good' && !source.fresh,
+        (source) => source.payload_quality === 'good' && !source.fresh,
       ).length,
-      unknown: sources.filter((source) => source.quality === 'unknown').length,
+      unknown: sources.filter((source) => source.payload_quality === 'unknown').length,
       buffered: sources.filter((source) => source.buffered).length,
       warnings,
     },

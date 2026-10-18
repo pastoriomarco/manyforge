@@ -122,7 +122,7 @@ def base_observations(live: ModuleType, scenario):
                     "payload": {
                         "journal_payload": {
                             "api_version": (
-                                "manyforge.stop_acceptance_projection.v2"
+                                "manyforge.stop_acceptance_projection.v8"
                             ),
                             "intent": {
                                 "intent_kind": "ordinary_stop",
@@ -151,7 +151,7 @@ def base_observations(live: ModuleType, scenario):
                 "source_id": "foundationpose_trocar",
                 "object_id": "graspable",
                 "policy_id": "before_planning",
-                "quality": "good",
+                "payload_quality": "good",
                 "fresh": True,
                 "eligible": True,
                 "source_epoch": "pose.epoch.1",
@@ -1139,7 +1139,8 @@ def test_cclc_startup_uses_fresh_owner_templates_and_full_binding_sets(
                         "controller_topology_id": f"topology.{domain_id}",
                         "topology_revision": f"topology-revision.{domain_id}",
                         "current_control_bindings": bindings,
-                        "current_resources": [],
+                        "kind": "controller",
+                        "resources": [],
                     }
                     for domain_id, bindings in sorted(self.bindings.items())
                 ],

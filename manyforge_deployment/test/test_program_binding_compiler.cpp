@@ -23,6 +23,7 @@
 #include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -32,6 +33,8 @@
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
+#include "io_retained_fixture.hpp"
+#include "program_binding_internal.hpp"
 #include "../../manyforge_roboplan/src/retained_ros2_control_lifecycle_plans_internal.hpp"
 
 namespace {
@@ -173,7 +176,8 @@ make_ros_motion_context(const std::filesystem::path &root) {
 
 [[nodiscard]] CanonicalValue
 make_program_root(const RetainedBundle &bundle,
-                  bool include_node_policy = false) {
+                  bool include_node_policy = false,
+                  bool own_group_intervention = false) {
   CanonicalValue::Object tree{
       {"node_id", CanonicalValue("sequence")},
       {"instance_id", CanonicalValue("root")},
@@ -181,12 +185,15 @@ make_program_root(const RetainedBundle &bundle,
       {"children", CanonicalValue(CanonicalValue::Array{})},
   };
   if (include_node_policy) {
-    tree.emplace_back(
-        "recovery_policy",
-        CanonicalValue(CanonicalValue::Object{
-            {"allow_intervention", CanonicalValue(true)},
-            {"max_retries", CanonicalValue(1.0)},
-        }));
+    CanonicalValue::Object recovery{
+        {"allow_intervention", CanonicalValue(true)},
+        {"max_retries", CanonicalValue(1.0)},
+    };
+    if (own_group_intervention) {
+      recovery.emplace_back("intervention_stop_scope",
+                            CanonicalValue("own_groups"));
+    }
+    tree.emplace_back("recovery_policy", CanonicalValue(std::move(recovery)));
     tree.emplace_back("operator_stop_policy", CanonicalValue("hold"));
   }
   return CanonicalValue(CanonicalValue::Object{
@@ -344,12 +351,14 @@ make_aggregate_program_root(const RetainedBundle &bundle) {
   return CanonicalValue(std::move(root));
 }
 
-[[nodiscard]] std::string make_program_bytes(const RetainedBundle &bundle,
-                                             bool aggregate_gripper = false,
-                                             bool include_node_policy = false) {
+[[nodiscard]] std::string
+make_program_bytes(const RetainedBundle &bundle, bool aggregate_gripper = false,
+                   bool include_node_policy = false,
+                   bool own_group_intervention = false) {
   CanonicalValue root = aggregate_gripper
                             ? make_aggregate_program_root(bundle)
-                            : make_program_root(bundle, include_node_policy);
+                            : make_program_root(bundle, include_node_policy,
+                                                own_group_intervention);
   const std::string revision =
       compute_content_identity(root, ContentIdentitySpec{
                                          .identity_domain = "program-revision",
@@ -486,7 +495,7 @@ TEST(ProgramBindingCompilerTest,
   ScopedTrustedRoot root;
   const BindingCompilerContext context = make_context(root.path());
   const auto contract = verify_program_binding_contract(
-      make_program_bytes(*context.bundle, false, true), *context.bundle);
+      make_program_bytes(*context.bundle, false, true, true), *context.bundle);
   FilesystemCatalogArtifactStore catalog_store(root.path());
   const auto binding =
       compile_program_binding(*contract, valid_assignment(), *context.bundle,
@@ -495,6 +504,10 @@ TEST(ProgramBindingCompilerTest,
   ASSERT_EQ(contract->value().node_policies.size(), 1U);
   ASSERT_NE(binding, nullptr);
   EXPECT_EQ(binding->value().node_policies, contract->value().node_policies);
+  EXPECT_EQ(binding->value()
+                .node_policies.front()
+                .recovery_policy.intervention_stop_scope,
+            manyforge::core::ProgramInterventionStopScope::kOwnGroups);
 
   ScopedTrustedRoot direct_root;
   const BindingCompilerContext direct_context =
@@ -1486,6 +1499,231 @@ TEST(ProgramBindingCompilerTest,
                RuntimeProgramBindingResolutionError);
 }
 
+std::string output_binding_program(
+    const RetainedBundle &bundle, bool mixed = false,
+    std::string_view output_role = "lamp",
+    std::string_view output_capability = "io.gpio.set_output") {
+  auto root = make_program_root(bundle);
+  root =
+      with_member(root, "component_roles",
+                  CanonicalValue(CanonicalValue::Object{
+                      {"device", CanonicalValue(CanonicalValue::Object{})}}));
+  CanonicalValue::Array capabilities;
+  for (const auto &id :
+       mixed ? std::vector<std::string>{"io.gpio.get_input",
+                                        std::string(output_capability)}
+             : std::vector<std::string>{std::string(output_capability)})
+    capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id", CanonicalValue(id)},
+        {"parameters", CanonicalValue(CanonicalValue::Object{})},
+        {"disposition", CanonicalValue("required")}});
+  CanonicalValue::Array roles{CanonicalValue(std::string(output_role))};
+  if (mixed && output_role != "ready")
+    roles.emplace_back("ready");
+  root = with_member(
+      root, "target_roles",
+      CanonicalValue(CanonicalValue::Object{
+          {"signals",
+           CanonicalValue(CanonicalValue::Object{
+               {"component_role", CanonicalValue("device")},
+               {"required_capabilities",
+                CanonicalValue(std::move(capabilities))},
+               {"required_frame_roles",
+                CanonicalValue(CanonicalValue::Array{})},
+               {"required_resource_roles", CanonicalValue(std::move(roles))},
+               {"required_collision_body_roles",
+                CanonicalValue(CanonicalValue::Array{})},
+               {"required_model_roles",
+                CanonicalValue(CanonicalValue::Array{})}})}}));
+  CanonicalValue::Array children;
+  if (mixed)
+    children.emplace_back(CanonicalValue::Object{
+        {"node_id", CanonicalValue("io.check_input")},
+        {"instance_id", CanonicalValue("check")},
+        {"parameters", CanonicalValue(CanonicalValue::Object{
+                           {"target_role", CanonicalValue("signals")},
+                           {"resource_role", CanonicalValue("ready")},
+                           {"expected_value", CanonicalValue(true)}})},
+        {"children", CanonicalValue(CanonicalValue::Array{})}});
+  children.emplace_back(CanonicalValue::Object{
+      {"node_id", CanonicalValue("io.set_output")},
+      {"instance_id", CanonicalValue("write")},
+      {"parameters",
+       CanonicalValue(CanonicalValue::Object{
+           {"target_role", CanonicalValue("signals")},
+           {"resource_role", CanonicalValue(std::string(output_role))},
+           {"value", CanonicalValue(true)}})},
+      {"children", CanonicalValue(CanonicalValue::Array{})}});
+  root =
+      with_member(root, "tree",
+                  CanonicalValue(CanonicalValue::Object{
+                      {"node_id", CanonicalValue("sequence")},
+                      {"instance_id", CanonicalValue("root")},
+                      {"parameters", CanonicalValue(CanonicalValue::Object{})},
+                      {"children", CanonicalValue(std::move(children))}}));
+  root = manyforge::deployment::normalize_program_authoring(root);
+  root = with_member(
+      root, "program_revision",
+      CanonicalValue(compute_content_identity(
+          root, ContentIdentitySpec{"program-revision", "manyforge.program.v2",
+                                    "program_revision"})));
+  return canonical_json(root);
+}
+
+TEST(ProgramBindingCompilerTest,
+     ModelFreeOutputAndMixedSignalsCompileAndReload) {
+  for (const bool mixed : {false, true}) {
+    ScopedTrustedRoot root;
+    const auto fixture =
+        manyforge::deployment::test::materialize_boolean_io_retained_fixture(
+            root.path(), mixed, true);
+    const auto &bundle = *fixture.bundle;
+    FilesystemVerifiedRetainedModelMapSource maps(root.path());
+    const auto map = maps.get_verified(
+        {bundle.retained_bundle_id(),
+         bundle.value().compiled_products.symbol_role_maps.front().product_id});
+    ASSERT_TRUE(map);
+    FilesystemCatalogArtifactStore catalog(root.path());
+    const auto program = verify_program_binding_contract(
+        output_binding_program(bundle, mixed), bundle);
+    const ProgramRoleAssignmentDTO assignment{
+        {{ComponentRoleId("device"),
+          manyforge::core::ControllableComponentId("device.io")}},
+        {{TargetRoleId("signals"), manyforge::core::CommandTargetId("gpio")}}};
+    const auto binding =
+        compile_program_binding(*program, assignment, bundle, *map, catalog);
+    ASSERT_NE(binding, nullptr);
+    const auto &target = binding->value().target_role_bindings.front();
+    EXPECT_TRUE(target.resource_role_bindings.empty());
+    ASSERT_EQ(target.signal_role_bindings.size(), mixed ? 2U : 1U);
+    const auto output =
+        std::find_if(target.signal_role_bindings.begin(),
+                     target.signal_role_bindings.end(), [](const auto &role) {
+                       return role.resource_role_id.value() == "lamp";
+                     });
+    ASSERT_NE(output, target.signal_role_bindings.end());
+    EXPECT_EQ(output->direction, manyforge::core::IoSignalDirection::kOutput);
+    const auto capability =
+        std::find_if(target.capability_bindings.begin(),
+                     target.capability_bindings.end(), [](const auto &row) {
+                       return row.capability_id.value() == "io.gpio.set_output";
+                     });
+    ASSERT_NE(capability, target.capability_bindings.end());
+    EXPECT_TRUE(capability->capability_provider_binding);
+    EXPECT_FALSE(capability->control_binding);
+    ASSERT_TRUE(capability->command_schema);
+    EXPECT_EQ(capability->command_schema->command_schema_id.value(),
+              manyforge::core::kIoSignalWriteCommandSchemaId);
+    EXPECT_EQ(reload_verified_program_binding(binding->canonical_bytes(),
+                                              bundle, *map)
+                  ->value(),
+              binding->value());
+    auto forged = binding->value();
+    for (auto &row : forged.target_role_bindings.front().capability_bindings)
+      if (row.capability_id.value() == "io.gpio.set_output")
+        row.command_schema->command_schema_revision =
+            manyforge::core::CommandSchemaRevision(std::string(kZeroDigest));
+    const auto resealed = manyforge::deployment::detail::
+        ProgramBindingConstructionAuthority::seal(forged);
+    EXPECT_THROW(static_cast<void>(reload_verified_program_binding(
+                     resealed->canonical_bytes(), bundle, *map)),
+                 manyforge::deployment::ProgramBindingError);
+    const auto direct =
+        compile_direct_control_program_binding_inventory(bundle, *map, catalog);
+    ASSERT_EQ(direct.io.size(), 1U);
+    EXPECT_TRUE(direct.motion.empty());
+    EXPECT_TRUE(direct.gripper.empty());
+    const auto &direct_target =
+        direct.io.front()->value().target_role_bindings.front();
+    EXPECT_EQ(direct_target.signal_role_bindings.size(), mixed ? 2U : 1U);
+    EXPECT_EQ(direct_target.capability_bindings.size(), mixed ? 2U : 1U);
+    EXPECT_TRUE(direct_target.resource_role_bindings.empty());
+    EXPECT_EQ(reload_verified_program_binding(
+                  direct.io.front()->canonical_bytes(), bundle, *map)
+                  ->value(),
+              direct.io.front()->value());
+  }
+}
+
+TEST(ProgramBindingCompilerTest,
+     OutputRefusesInputRoleAndWrongRequiredCapability) {
+  ScopedTrustedRoot root;
+  const auto fixture =
+      manyforge::deployment::test::materialize_boolean_io_retained_fixture(
+          root.path(), true, true);
+  const auto &bundle = *fixture.bundle;
+  FilesystemVerifiedRetainedModelMapSource maps(root.path());
+  const auto map = maps.get_verified(
+      {bundle.retained_bundle_id(),
+       bundle.value().compiled_products.symbol_role_maps.front().product_id});
+  ASSERT_TRUE(map);
+  FilesystemCatalogArtifactStore catalog(root.path());
+  const ProgramRoleAssignmentDTO assignment{
+      {{ComponentRoleId("device"),
+        manyforge::core::ControllableComponentId("device.io")}},
+      {{TargetRoleId("signals"), manyforge::core::CommandTargetId("gpio")}}};
+  const auto wrong_direction = verify_program_binding_contract(
+      output_binding_program(bundle, false, "ready"), bundle);
+  EXPECT_THROW(static_cast<void>(compile_program_binding(
+                   *wrong_direction, assignment, bundle, *map, catalog)),
+               ProgramBindingCompilerError);
+  EXPECT_THROW(
+      static_cast<void>(verify_program_binding_contract(
+          output_binding_program(bundle, false, "lamp", "io.gpio.get_input"),
+          bundle)),
+      manyforge::deployment::ProgramContractError);
+}
+
+class MissingOutputSchemaSource final
+    : public manyforge::deployment::ICatalogArtifactSource {
+public:
+  explicit MissingOutputSchemaSource(
+      const manyforge::deployment::ICatalogArtifactSource &source)
+      : source_(source) {}
+  std::optional<std::string> get_verified(
+      const manyforge::core::ContentAddressedStoreKey &key,
+      const manyforge::core::ContentDigest &digest,
+      std::optional<std::uint64_t> size = std::nullopt) const override {
+    auto bytes = source_.get_verified(key, digest, size);
+    if (bytes && bytes->find("manyforge.io_signal_write_command_schema.v1") !=
+                     std::string::npos)
+      return std::nullopt;
+    return bytes;
+  }
+
+private:
+  const manyforge::deployment::ICatalogArtifactSource &source_;
+};
+
+TEST(ProgramBindingCompilerTest,
+     OutputRequiresActualVerifiedCommandSchemaArtifact) {
+  ScopedTrustedRoot root;
+  const auto fixture =
+      manyforge::deployment::test::materialize_boolean_io_retained_fixture(
+          root.path(), false, true);
+  const auto &bundle = *fixture.bundle;
+  FilesystemVerifiedRetainedModelMapSource maps(root.path());
+  const auto map = maps.get_verified(
+      {bundle.retained_bundle_id(),
+       bundle.value().compiled_products.symbol_role_maps.front().product_id});
+  ASSERT_TRUE(map);
+  FilesystemCatalogArtifactStore catalog(root.path());
+  MissingOutputSchemaSource missing(catalog);
+  const auto program =
+      verify_program_binding_contract(output_binding_program(bundle), bundle);
+  const ProgramRoleAssignmentDTO assignment{
+      {{ComponentRoleId("device"),
+        manyforge::core::ControllableComponentId("device.io")}},
+      {{TargetRoleId("signals"), manyforge::core::CommandTargetId("gpio")}}};
+  EXPECT_THROW(static_cast<void>(compile_program_binding(
+                   *program, assignment, bundle, *map, missing)),
+               ProgramBindingCompilerError);
+  EXPECT_THROW(
+      static_cast<void>(compile_direct_control_program_binding_inventory(
+          bundle, *map, missing)),
+      ProgramBindingCompilerError);
+}
+
 } // namespace
 
 TEST(ProgramBindingCompilerTest, PreparedOriginIsClosedAndScenarioAccessIsChecked) {
@@ -1559,3 +1797,163 @@ TEST(ProgramBindingCompilerTest, SealedEmptyReadbackRequiresTheActualAdmission) 
   EXPECT_THROW(static_cast<void>(d::parse_prepared_activation_origin(CanonicalValue(mixed_origin))),
                d::PreparedActivationInputError);
 }
+
+namespace {
+
+std::string io_binding_program(const RetainedBundle &bundle,
+                               std::string_view edge = "level") {
+  auto root = make_program_root(bundle);
+  root =
+      with_member(root, "component_roles",
+                  CanonicalValue(CanonicalValue::Object{
+                      {"device", CanonicalValue(CanonicalValue::Object{})}}));
+  CanonicalValue::Array capabilities;
+  for (const auto *id : {"io.gpio.get_input", "io.gpio.wait_for_input"}) {
+    capabilities.emplace_back(CanonicalValue::Object{
+        {"capability_id", CanonicalValue(id)},
+        {"parameters", CanonicalValue(CanonicalValue::Object{})},
+        {"disposition", CanonicalValue("required")}});
+  }
+  root = with_member(
+      root, "target_roles",
+      CanonicalValue(CanonicalValue::Object{
+          {"inputs",
+           CanonicalValue(CanonicalValue::Object{
+               {"component_role", CanonicalValue("device")},
+               {"required_capabilities",
+                CanonicalValue(std::move(capabilities))},
+               {"required_frame_roles",
+                CanonicalValue(CanonicalValue::Array{})},
+               {"required_resource_roles",
+                CanonicalValue(CanonicalValue::Array{CanonicalValue("ready")})},
+               {"required_collision_body_roles",
+                CanonicalValue(CanonicalValue::Array{})},
+               {"required_model_roles",
+                CanonicalValue(CanonicalValue::Array{})}})}}));
+  CanonicalValue::Array children;
+  for (const bool wait : {false, true}) {
+    CanonicalValue::Object parameters{
+        {"target_role", CanonicalValue("inputs")},
+        {"resource_role", CanonicalValue("ready")},
+        {"expected_value", CanonicalValue(true)}};
+    if (wait)
+      parameters.emplace_back("edge", CanonicalValue(std::string(edge)));
+    children.emplace_back(CanonicalValue::Object{
+        {"node_id",
+         CanonicalValue(wait ? "io.wait_for_input" : "io.check_input")},
+        {"instance_id", CanonicalValue(wait ? "wait" : "check")},
+        {"parameters", CanonicalValue(std::move(parameters))},
+        {"children", CanonicalValue(CanonicalValue::Array{})}});
+  }
+  root =
+      with_member(root, "tree",
+                  CanonicalValue(CanonicalValue::Object{
+                      {"node_id", CanonicalValue("sequence")},
+                      {"instance_id", CanonicalValue("root")},
+                      {"parameters", CanonicalValue(CanonicalValue::Object{})},
+                      {"children", CanonicalValue(std::move(children))}}));
+  root = with_member(
+      root, "program_revision",
+      CanonicalValue(compute_content_identity(
+          root, ContentIdentitySpec{"program-revision", "manyforge.program.v2",
+                                    "program_revision"})));
+  return canonical_json(root);
+}
+
+TEST(ProgramBindingCompilerTest,
+     ModelFreeBooleanIoCompilesAndReloadsExactSignalBindings) {
+  ScopedTrustedRoot root;
+  const auto fixture =
+      manyforge::deployment::test::materialize_boolean_io_retained_fixture(
+          root.path());
+  ASSERT_NE(fixture.bundle, nullptr);
+  const auto &bundle = *fixture.bundle;
+  EXPECT_TRUE(bundle.value().cell_graph.model_instances.empty());
+  EXPECT_TRUE(bundle.value().cell_graph.control_bindings.empty());
+  ASSERT_EQ(bundle.value().cell_graph.control_domains.size(), 1U);
+  EXPECT_NE(bundle.value().cell_graph.control_domains.front().provider(),
+            nullptr);
+  EXPECT_TRUE(bundle.value().compiled_products.control_domain_products.empty());
+  ASSERT_EQ(bundle.value().compiled_products.symbol_role_maps.size(), 1U);
+  FilesystemVerifiedRetainedModelMapSource maps(root.path());
+  const auto map = maps.get_verified(
+      {bundle.retained_bundle_id(),
+       bundle.value().compiled_products.symbol_role_maps.front().product_id});
+  ASSERT_TRUE(map);
+  const auto *target_map =
+      map->find_target(manyforge::core::ControllableComponentId("device.io"),
+                       manyforge::core::CommandTargetId("gpio"));
+  ASSERT_NE(target_map, nullptr);
+  EXPECT_TRUE(target_map->model_groups.empty());
+  EXPECT_TRUE(target_map->frames.empty());
+  EXPECT_TRUE(target_map->collision_bodies.empty());
+  const auto installed =
+      manyforge::deployment::ResolveRetainedIoSignalCatalog(bundle.value().cell_graph);
+  ASSERT_TRUE(installed.ok());
+  ASSERT_EQ(installed.value().size(), 1U);
+  EXPECT_EQ(installed.value().front().provider.initial_value, false);
+  EXPECT_EQ(installed.value().front().provider.ingress_depth, 64U);
+  const auto program =
+      verify_program_binding_contract(io_binding_program(bundle), bundle);
+  const ProgramRoleAssignmentDTO assignment{
+      {{ComponentRoleId("device"),
+        manyforge::core::ControllableComponentId("device.io")}},
+      {{TargetRoleId("inputs"), manyforge::core::CommandTargetId("gpio")}}};
+  FilesystemCatalogArtifactStore catalog(root.path());
+  const auto binding =
+      compile_program_binding(*program, assignment, bundle, *map, catalog);
+  ASSERT_NE(binding, nullptr);
+  const auto direct =
+      compile_direct_control_program_binding_inventory(bundle, *map, catalog);
+  EXPECT_TRUE(direct.motion.empty());
+  EXPECT_TRUE(direct.gripper.empty());
+  ASSERT_EQ(direct.io.size(), 1U);
+  EXPECT_EQ(direct.io.front()->value().program_id.value(),
+            manyforge::deployment::kDirectControlIoProgramId);
+  ASSERT_EQ(direct.io.front()->value().target_role_bindings.size(), 1U);
+  EXPECT_TRUE(direct.io.front()
+                  ->value()
+                  .target_role_bindings.front()
+                  .resource_role_bindings.empty());
+  EXPECT_EQ(direct.io.front()
+                ->value()
+                .target_role_bindings.front()
+                .signal_role_bindings.size(),
+            1U);
+  EXPECT_EQ(reload_verified_program_binding(
+                direct.io.front()->canonical_bytes(), bundle, *map)
+                ->value(),
+            direct.io.front()->value());
+  ASSERT_EQ(binding->value().target_role_bindings.size(), 1U);
+  const auto &target = binding->value().target_role_bindings.front();
+  EXPECT_TRUE(target.resource_role_bindings.empty());
+  ASSERT_EQ(target.signal_role_bindings.size(), 1U);
+  EXPECT_EQ(target.signal_role_bindings.front().resource_role_id.value(),
+            "ready");
+  EXPECT_EQ(target.signal_role_bindings.front().signal_name, "ready");
+  ASSERT_EQ(target.capability_bindings.size(), 2U);
+  EXPECT_TRUE(target.capability_bindings.front().capability_provider_binding);
+  EXPECT_FALSE(target.capability_bindings.front().control_binding);
+  const auto reopened = manyforge::deployment::reload_verified_program_binding(
+      binding->canonical_bytes(), bundle, *map);
+  EXPECT_EQ(reopened->value(), binding->value());
+  auto forged = binding->value();
+  forged.target_role_bindings.front()
+      .signal_role_bindings.front()
+      .signal_descriptor_digest =
+      manyforge::core::ContentDigest(std::string(kZeroDigest));
+  const auto resealed =
+      manyforge::deployment::detail::ProgramBindingConstructionAuthority::seal(
+          forged);
+  EXPECT_THROW(
+      static_cast<void>(manyforge::deployment::reload_verified_program_binding(
+          resealed->canonical_bytes(), bundle, *map)),
+      manyforge::deployment::ProgramBindingError);
+  const auto edge_program = verify_program_binding_contract(
+      io_binding_program(bundle, "rising"), bundle);
+  EXPECT_THROW(static_cast<void>(compile_program_binding(
+                   *edge_program, assignment, bundle, *map, catalog)),
+               ProgramBindingCompilerError);
+}
+
+} // namespace

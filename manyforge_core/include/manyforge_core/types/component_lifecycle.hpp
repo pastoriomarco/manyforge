@@ -11,12 +11,15 @@
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/lifecycle_provider_occurrence.hpp>
 #include <manyforge_core/types/stop_certificate.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace manyforge::core {
@@ -213,13 +216,64 @@ struct ExpectedControlBindingRevisionDTO final {
                          const ExpectedControlBindingRevisionDTO&) = default;
 };
 
-struct ExpectedControlDomainRevisionDTO final {
-  ControlDomainId control_domain_id;
-  ControlDomainRevision control_domain_revision;
+struct ExpectedControllerDomainScopeDTO final {
   ControllerTopologyId controller_topology_id;
   TopologyRevision topology_revision;
   ExpectedActiveControlConfigurationDTO expected_active_control_configuration;
   std::vector<ExpectedControlBindingRevisionDTO> expected_control_bindings;
+  friend bool operator==(const ExpectedControllerDomainScopeDTO&,
+                         const ExpectedControllerDomainScopeDTO&) = default;
+};
+
+struct ExpectedProviderDomainScopeDTO final {
+  ProviderControlDomainDTO provider;
+  ExpectedActiveControlConfigurationDTO expected_active_control_configuration;
+  friend bool operator==(const ExpectedProviderDomainScopeDTO&,
+                         const ExpectedProviderDomainScopeDTO&) = default;
+};
+
+struct ExpectedControlDomainRevisionDTO final {
+  ControlDomainId control_domain_id;
+  ControlDomainRevision control_domain_revision;
+  std::variant<ExpectedControllerDomainScopeDTO, ExpectedProviderDomainScopeDTO> payload;
+
+  ExpectedControlDomainRevisionDTO(ControlDomainId id, ControlDomainRevision revision,
+                                   ControllerTopologyId topology,
+                                   TopologyRevision topology_revision,
+                                   ExpectedActiveControlConfigurationDTO configuration,
+                                   std::vector<ExpectedControlBindingRevisionDTO> bindings)
+      : control_domain_id(std::move(id)),
+        control_domain_revision(std::move(revision)),
+        payload(ExpectedControllerDomainScopeDTO{std::move(topology), std::move(topology_revision),
+                                                 std::move(configuration), std::move(bindings)}) {}
+  ExpectedControlDomainRevisionDTO(ControlDomainId id, ControlDomainRevision revision,
+                                   ExpectedProviderDomainScopeDTO provider)
+      : control_domain_id(std::move(id)),
+        control_domain_revision(std::move(revision)),
+        payload(std::move(provider)) {}
+
+  [[nodiscard]] ExpectedControllerDomainScopeDTO& controller() {
+    return std::get<ExpectedControllerDomainScopeDTO>(payload);
+  }
+  [[nodiscard]] const ExpectedControllerDomainScopeDTO& controller() const {
+    return std::get<ExpectedControllerDomainScopeDTO>(payload);
+  }
+  [[nodiscard]] const ExpectedProviderDomainScopeDTO* provider() const noexcept {
+    return std::get_if<ExpectedProviderDomainScopeDTO>(&payload);
+  }
+  [[nodiscard]] const std::vector<ExpectedControlBindingRevisionDTO>& control_bindings()
+      const noexcept {
+    static const std::vector<ExpectedControlBindingRevisionDTO> none;
+    if (const auto* physical = std::get_if<ExpectedControllerDomainScopeDTO>(&payload))
+      return physical->expected_control_bindings;
+    return none;
+  }
+  [[nodiscard]] const ExpectedActiveControlConfigurationDTO& expected_configuration()
+      const noexcept {
+    if (const auto* physical = std::get_if<ExpectedControllerDomainScopeDTO>(&payload))
+      return physical->expected_active_control_configuration;
+    return std::get<ExpectedProviderDomainScopeDTO>(payload).expected_active_control_configuration;
+  }
 
   [[nodiscard]] bool locally_valid() const noexcept;
 
@@ -381,12 +435,19 @@ struct LifecyclePrimitiveTransitionDTO final {
                          const LifecyclePrimitiveTransitionDTO&) = default;
 };
 
+struct DeviceConfiguredLifecycleLimitDTO final {
+  friend bool operator==(DeviceConfiguredLifecycleLimitDTO,
+                         DeviceConfiguredLifecycleLimitDTO) = default;
+};
+
+using LifecyclePlanTimeoutPolicyDTO = std::variant<std::int64_t, DeviceConfiguredLifecycleLimitDTO>;
+
 struct LifecycleIntentPlanDTO final {
   ComponentLifecycleIntentKindDTO intent;
   ComponentLifecycleStateDTO requested_state;
   std::optional<LifecyclePredicateDTO> recover_target_eligibility;
   LifecyclePredicateDTO requested_postcondition;
-  std::int64_t timeout_duration_ns;
+  LifecyclePlanTimeoutPolicyDTO timeout_policy;
   std::vector<LifecyclePrimitiveTransitionDTO> transitions;
 
   [[nodiscard]] bool locally_valid() const noexcept;
@@ -520,35 +581,109 @@ struct LifecycleReconciliationEvidenceDTO final {
                          const LifecycleReconciliationEvidenceDTO&) = default;
 };
 
-struct ResolvedLifecycleControlDomainScopeDTO final {
-  ControlDomainId control_domain_id;
-  ControlDomainRevision control_domain_revision;
+struct ProviderDomainActiveConfigurationDTO final {
+  ActiveControlConfigurationId active_control_configuration_id;
+  ActiveControlConfigurationGeneration active_control_configuration_generation;
+  RuntimeUnitId source_runtime_unit_id;
+  RuntimeEpoch source_runtime_epoch;
+  std::uint64_t source_sequence;
+  ContentDigest signal_configuration_digest;
+  [[nodiscard]] bool locally_valid() const noexcept;
+  friend bool operator==(const ProviderDomainActiveConfigurationDTO&,
+                         const ProviderDomainActiveConfigurationDTO&) = default;
+};
+
+struct LifecycleDomainConfigurationIdentityDTO final {
+  ActiveControlConfigurationId active_control_configuration_id;
+  ActiveControlConfigurationGeneration active_control_configuration_generation;
+  friend bool operator==(const LifecycleDomainConfigurationIdentityDTO&,
+                         const LifecycleDomainConfigurationIdentityDTO&) = default;
+};
+
+struct ResolvedControllerDomainScopeDTO final {
   ControllerTopologyId controller_topology_id;
   TopologyRevision topology_revision;
   std::optional<ActiveControlConfigurationDTO> active_control_configuration;
   std::vector<ExpectedControlBindingRevisionDTO> current_control_bindings;
   std::vector<ResourceId> current_resources;
+  friend bool operator==(const ResolvedControllerDomainScopeDTO&,
+                         const ResolvedControllerDomainScopeDTO&) = default;
+};
+
+struct ResolvedProviderDomainScopeDTO final {
+  ProviderControlDomainDTO provider;
+  RuntimeEpoch provider_runtime_epoch;
+  std::optional<ProviderDomainActiveConfigurationDTO> active_control_configuration;
+  /// Genuine non-coordinate output channels; input-only providers have none.
+  std::vector<ResourceId> output_resources{};
+  friend bool operator==(const ResolvedProviderDomainScopeDTO&,
+                         const ResolvedProviderDomainScopeDTO&) = default;
+};
+
+struct ResolvedLifecycleControlDomainScopeDTO final {
+  ControlDomainId control_domain_id;
+  ControlDomainRevision control_domain_revision;
+  std::variant<ResolvedControllerDomainScopeDTO, ResolvedProviderDomainScopeDTO> payload;
+
+  ResolvedLifecycleControlDomainScopeDTO(ControlDomainId id, ControlDomainRevision revision,
+                                         ControllerTopologyId topology,
+                                         TopologyRevision topology_revision,
+                                         std::optional<ActiveControlConfigurationDTO> configuration,
+                                         std::vector<ExpectedControlBindingRevisionDTO> bindings,
+                                         std::vector<ResourceId> resources)
+      : control_domain_id(std::move(id)),
+        control_domain_revision(std::move(revision)),
+        payload(ResolvedControllerDomainScopeDTO{std::move(topology), std::move(topology_revision),
+                                                 std::move(configuration), std::move(bindings),
+                                                 std::move(resources)}) {}
+  ResolvedLifecycleControlDomainScopeDTO(ControlDomainId id, ControlDomainRevision revision,
+                                         ResolvedProviderDomainScopeDTO provider)
+      : control_domain_id(std::move(id)),
+        control_domain_revision(std::move(revision)),
+        payload(std::move(provider)) {}
+
+  [[nodiscard]] ResolvedControllerDomainScopeDTO& controller() {
+    return std::get<ResolvedControllerDomainScopeDTO>(payload);
+  }
+  [[nodiscard]] const ResolvedControllerDomainScopeDTO& controller() const {
+    return std::get<ResolvedControllerDomainScopeDTO>(payload);
+  }
+  [[nodiscard]] const ResolvedProviderDomainScopeDTO* provider() const noexcept {
+    return std::get_if<ResolvedProviderDomainScopeDTO>(&payload);
+  }
+  [[nodiscard]] const std::vector<ExpectedControlBindingRevisionDTO>& control_bindings()
+      const noexcept {
+    static const std::vector<ExpectedControlBindingRevisionDTO> none;
+    if (const auto* physical = std::get_if<ResolvedControllerDomainScopeDTO>(&payload))
+      return physical->current_control_bindings;
+    return none;
+  }
+  [[nodiscard]] const std::vector<ResourceId>& physical_resources() const noexcept {
+    static const std::vector<ResourceId> none;
+    if (const auto* physical = std::get_if<ResolvedControllerDomainScopeDTO>(&payload))
+      return physical->current_resources;
+    return none;
+  }
+  [[nodiscard]] const std::vector<ResourceId>& resource_ids() const noexcept {
+    if (const auto* driver = provider()) return driver->output_resources;
+    return controller().current_resources;
+  }
+  [[nodiscard]] std::optional<LifecycleDomainConfigurationIdentityDTO> configuration_identity()
+      const {
+    return std::visit(
+        [](const auto& scope) -> std::optional<LifecycleDomainConfigurationIdentityDTO> {
+          if (!scope.active_control_configuration) return std::nullopt;
+          return LifecycleDomainConfigurationIdentityDTO{
+              scope.active_control_configuration->active_control_configuration_id,
+              scope.active_control_configuration->active_control_configuration_generation};
+        },
+        payload);
+  }
 
   [[nodiscard]] bool locally_valid() const noexcept;
 
   friend bool operator==(const ResolvedLifecycleControlDomainScopeDTO&,
                          const ResolvedLifecycleControlDomainScopeDTO&) = default;
-};
-
-struct ResolvedLifecycleProviderOccurrenceDTO final {
-  ControlDomainId control_domain_id;
-  ControlDomainRevision control_domain_revision;
-  ProviderInstanceId provider_instance_id;
-  ProviderManifestId provider_manifest_id;
-  ProviderManifestRevision provider_manifest_revision;
-  RuntimeUnitId provider_runtime_unit_id;
-  RuntimeEpoch provider_runtime_epoch;
-  ContentDigest lifecycle_plan_catalog_digest;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const ResolvedLifecycleProviderOccurrenceDTO&,
-                         const ResolvedLifecycleProviderOccurrenceDTO&) = default;
 };
 
 struct ComponentLifecycleCurrentSnapshotDTO final {
@@ -706,6 +841,12 @@ struct ComponentLifecycleStatusDTO final {
 };
 
 [[nodiscard]] bool ExpectedDomainMatchesResolvedScope(
+    const ExpectedControlDomainRevisionDTO& expected,
+    const ResolvedLifecycleControlDomainScopeDTO& current) noexcept;
+
+/// Same sealed domain/provider proof without claiming configuration presence.
+/// Apply uses this while an actual installation may add its configuration.
+[[nodiscard]] bool ExpectedDomainProofMatchesResolvedScope(
     const ExpectedControlDomainRevisionDTO& expected,
     const ResolvedLifecycleControlDomainScopeDTO& current) noexcept;
 

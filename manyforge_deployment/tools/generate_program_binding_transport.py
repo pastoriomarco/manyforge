@@ -50,19 +50,21 @@ EXPECTED_SCALARS = {
 }
 EXPECTED_ENUMS = {
     "operator_stop_policy": ["inherit", "hold", "continue"],
+    "intervention_stop_scope": ["all", "own_groups"],
 }
 EXPECTED_RECORDS = {
     "binding": ["api_version", "program_binding_id", "program_id", "program_revision", "retained_bundle_id", "graph_revision", "node_environment", "component_role_bindings", "target_role_bindings", "node_policies", "contact_grasp_bindings", "provenance"],
     "node_environment": ["catalog_id", "content_version", "catalog_digest", "environment_digest"],
     "component": ["component_role_id", "controllable_component_id", "component_type_id", "component_type_revision", "model_role_bindings"],
     "model": ["model_role_id", "model_instance_id", "model_revision"],
-    "target": ["target_role_id", "component_role_id", "controllable_component_id", "command_target_id", "frame_role_bindings", "resource_role_bindings", "collision_body_role_bindings", "capability_bindings"],
+    "target": ["target_role_id", "component_role_id", "controllable_component_id", "command_target_id", "frame_role_bindings", "resource_role_bindings", "collision_body_role_bindings", "capability_bindings", "signal_role_bindings"],
     "frame": ["frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name"],
     "resource": ["resource_role_id", "resource_ids", "compiled_resource_names"],
+    "signal": ["resource_role_id", "signal_name", "value_type", "direction", "transition_capability", "signal_descriptor_digest"],
     "collision": ["collision_body_role_id", "model_instance_id", "model_revision", "compiled_collision_body_names"],
     "capability": ["capability_id", "capability_definition_revision", "control_binding", "capability_provider_binding", "command_schema"],
     "node_policy": ["instance_id", "recovery_policy", "operator_stop_policy"],
-    "recovery_policy": ["allow_intervention", "max_retries"],
+    "recovery_policy": ["allow_intervention", "max_retries", "intervention_stop_scope"],
     "control": ["control_binding_id", "control_binding_revision"],
     "provider": ["capability_provider_binding_id", "capability_provider_binding_revision"],
     "command_schema": ["command_schema_id", "command_schema_revision"],
@@ -70,6 +72,10 @@ EXPECTED_RECORDS = {
     "contact_body": ["component_role_id", "target_role_id", "controllable_component_id", "command_target_id", "model_role_id", "collision_body_role_id", "model_instance_id", "model_revision", "collision_body_ids"],
     "provenance": ["binding_compiler_contract_digest", "role_assignment_digest", "source_records", "resolved_output_records"],
     "provenance_record": ["record_kind", "record_id", "revision"],
+}
+EXPECTED_OPTIONAL_RECORD_FIELDS = {
+    "target": ["signal_role_bindings"],
+    "recovery_policy": ["intervention_stop_scope"],
 }
 EXPECTED_KINDS = [
     "model_asset", "runtime_profile", "component_type",
@@ -99,6 +105,7 @@ TYPE_NAMES = {
     "target": "ProgramTargetRoleBinding",
     "frame": "ProgramFrameRoleBinding",
     "resource": "ProgramResourceRoleBinding",
+    "signal": "ProgramSignalRoleBinding",
     "collision": "ProgramCollisionBodyRoleBinding",
     "capability": "ProgramCapabilityBinding",
     "node_policy": "ProgramNodePolicy",
@@ -120,6 +127,10 @@ FIELD_TYPES = {
     ("binding", "contact_grasp_bindings"): "ProgramContactGraspBinding[]",
     ("binding", "provenance"): "ProgramBindingProvenance",
     ("component", "model_role_bindings"): "ProgramModelRoleBinding[]",
+    ("target", "signal_role_bindings"): "ProgramSignalRoleBinding[]",
+    ("signal", "value_type"): "'bool'",
+    ("signal", "direction"): "'input' | 'output'",
+    ("signal", "transition_capability"): "'sampled_only' | 'captured'",
     ("target", "frame_role_bindings"): "ProgramFrameRoleBinding[]",
     ("target", "resource_role_bindings"): "ProgramResourceRoleBinding[]",
     ("target", "collision_body_role_bindings"): "ProgramCollisionBodyRoleBinding[]",
@@ -134,6 +145,7 @@ FIELD_TYPES = {
     ("node_policy", "operator_stop_policy"): "ProgramOperatorStopPolicy",
     ("recovery_policy", "allow_intervention"): "boolean",
     ("recovery_policy", "max_retries"): "number",
+    ("recovery_policy", "intervention_stop_scope"): "ProgramInterventionStopScope",
     ("contact", "allowed_body_bindings"): "ProgramContactGraspBodyBinding[]",
     ("contact", "max_penetration_m"): "number",
     ("contact", "terminal_window_start_fraction"): "number",
@@ -152,7 +164,7 @@ def load_and_validate(path: Path) -> dict[str, Any]:
         raise ValueError(f"invalid descriptor JSON: {error}") from error
     expected_root = {
         "api_version", "binding_api_version", "limits", "scalars", "enums", "records",
-        "catalog_record_kinds", "formulas", "invariants",
+        "catalog_record_kinds", "formulas", "invariants", "optional_record_fields",
     }
     if not isinstance(value, dict) or set(value) != expected_root:
         raise ValueError("descriptor root is not the closed v1 record")
@@ -165,6 +177,7 @@ def load_and_validate(path: Path) -> dict[str, Any]:
         ("scalars", EXPECTED_SCALARS),
         ("enums", EXPECTED_ENUMS),
         ("records", EXPECTED_RECORDS),
+        ("optional_record_fields", EXPECTED_OPTIONAL_RECORD_FIELDS),
         ("catalog_record_kinds", EXPECTED_KINDS),
         ("formulas", EXPECTED_FORMULAS),
         ("invariants", EXPECTED_INVARIANTS),
@@ -207,8 +220,13 @@ def _py_constants(descriptor: dict[str, Any]) -> str:
         lines.append(f'    "{name}": ({entries}),')
     lines.extend([
         "}",
+        "_OPTIONAL_FIELDS = " + repr({
+            name: tuple(fields) for name, fields in descriptor["optional_record_fields"].items()
+        }),
         "_STOP_POLICIES = frozenset(" +
         repr(tuple(descriptor["enums"]["operator_stop_policy"])) + ")",
+        "_INTERVENTION_STOP_SCOPES = frozenset(" +
+        repr(tuple(descriptor["enums"]["intervention_stop_scope"])) + ")",
         '_PROGRAM_ID = re.compile(r"^[a-z][a-z0-9_.-]*\\Z")',
         f'_COLLISION_BODY_ID = "{descriptor["formulas"]["collision_body_id"]}"',
     ])
@@ -237,8 +255,11 @@ def _ts_constants(descriptor: dict[str, Any]) -> str:
         lines.append(f"  {name}: [{', '.join(repr(field) for field in fields)}],")
     lines.extend([
         "} as const;",
+        "const OPTIONAL_FIELDS = " + repr(descriptor["optional_record_fields"]) + " as const;",
         "const STOP_POLICIES = new Set(" +
         repr(descriptor["enums"]["operator_stop_policy"]) + ");",
+        "const INTERVENTION_STOP_SCOPES = new Set(" +
+        repr(descriptor["enums"]["intervention_stop_scope"]) + ");",
         f"const COLLISION_BODY_ID = {descriptor['formulas']['collision_body_id']!r};",
         f'const MAX_ROWS = {descriptor["limits"]["nested_rows"]};',
         f'const ROLE_MAX_ROWS = {descriptor["limits"]["role_rows"]};',
@@ -258,13 +279,16 @@ def _type_interfaces(descriptor: dict[str, Any]) -> str:
         f"export type CatalogRecordKind = {kinds};",
         "export type ProgramOperatorStopPolicy = " +
         " | ".join(repr(value) for value in descriptor["enums"]["operator_stop_policy"]) + ";",
+        "export type ProgramInterventionStopScope = " +
+        " | ".join(repr(value) for value in descriptor["enums"]["intervention_stop_scope"]) + ";",
     ]
     api_version = descriptor["binding_api_version"]
     for record_name, fields in descriptor["records"].items():
         sections.append(f"export interface {TYPE_NAMES[record_name]} {{")
         for field in fields:
             field_type = FIELD_TYPES.get((record_name, field), "string")
-            sections.append(f"  {field}: {field_type.format(api_version=api_version)};")
+            optional = "?" if field in descriptor["optional_record_fields"].get(record_name, ()) else ""
+            sections.append(f"  {field}{optional}: {field_type.format(api_version=api_version)};")
         sections.append("}")
     return "\n".join(sections)
 

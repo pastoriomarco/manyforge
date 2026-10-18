@@ -19,6 +19,44 @@ bool within_scale_roundoff(double scale) noexcept {
 bool positive(double value) noexcept {
   return std::isfinite(value) && value > 0.0;
 }
+
+std::optional<RuntimeScaleBounds> derive_scale_bounds(
+    std::span<const TrajectoryDynamicsEnvelope> participants, double dilation,
+    RuntimeScaleBounds bounds) noexcept {
+  for (const auto& participant : participants) {
+    const auto derivatives = participant.derivatives;
+    const auto limits = participant.limits;
+    for (std::size_t index = 0U; index < derivatives.size(); ++index) {
+      const auto& source = derivatives[index];
+      const auto& limit = limits[index];
+      const double velocity = source.velocity / dilation;
+      const double acceleration = source.acceleration / dilation / dilation;
+      const double jerk = source.jerk / dilation / dilation / dilation;
+      if (velocity > 0.0) {
+        bounds.max_rate_per_s =
+            std::min(bounds.max_rate_per_s, (limit.acceleration - acceleration) / velocity);
+      }
+      if (limit.jerk.has_value()) {
+        const double margin = *limit.jerk - jerk;
+        if (!(margin > 0.0)) return std::nullopt;
+        if (acceleration > 0.0) {
+          bounds.max_rate_per_s = std::min(bounds.max_rate_per_s, margin / acceleration / 6.0);
+        }
+        if (velocity > 0.0) {
+          bounds.max_rate_change_per_s2 =
+              std::min(bounds.max_rate_change_per_s2, margin / velocity / 2.0);
+        }
+      }
+    }
+  }
+  // Keep arithmetic rounding away from a bound shared by two jerk terms.
+  bounds.max_rate_per_s *= 1.0 - 1e-12;
+  bounds.max_rate_change_per_s2 *= 1.0 - 1e-12;
+  if (!positive(bounds.max_rate_per_s) || !positive(bounds.max_rate_change_per_s2)) {
+    return std::nullopt;
+  }
+  return bounds;
+}
 }  // namespace
 
 std::optional<RuntimeScalePreparation> prepare_runtime_scaling(
@@ -70,41 +108,36 @@ std::optional<RuntimeScalePreparation> prepare_runtime_scaling(
   }
   const double dilation = prepared.trajectory_time_multiplier;
   if (!positive(dilation)) return std::nullopt;
-  for (const auto& participant : participants) {
-    const auto derivatives = participant.derivatives;
-    const auto limits = participant.limits;
-    for (std::size_t index = 0U; index < derivatives.size(); ++index) {
-      const auto& source = derivatives[index];
-      const auto& limit = limits[index];
-      const double velocity = source.velocity / dilation;
-      const double acceleration = source.acceleration / dilation / dilation;
-      const double jerk = source.jerk / dilation / dilation / dilation;
-      if (velocity > 0.0) {
-        prepared.scale_bounds.max_rate_per_s = std::min(
-            prepared.scale_bounds.max_rate_per_s, (limit.acceleration - acceleration) / velocity);
-      }
-      if (limit.jerk.has_value()) {
-        const double margin = *limit.jerk - jerk;
-        if (!(margin > 0.0)) return std::nullopt;
-        if (acceleration > 0.0) {
-          prepared.scale_bounds.max_rate_per_s =
-              std::min(prepared.scale_bounds.max_rate_per_s, margin / acceleration / 6.0);
-        }
-        if (velocity > 0.0) {
-          prepared.scale_bounds.max_rate_change_per_s2 =
-              std::min(prepared.scale_bounds.max_rate_change_per_s2, margin / velocity / 2.0);
-        }
-      }
+  const auto bounds = derive_scale_bounds(participants, dilation, prepared.scale_bounds);
+  if (!bounds) return std::nullopt;
+  prepared.scale_bounds = *bounds;
+  return prepared;
+}
+
+std::optional<RuntimeScaleBounds> prepare_fixed_runtime_scaling(
+    std::span<const TrajectoryDynamicsEnvelope> pieces,
+    RuntimeScaleBounds software_ceiling) noexcept {
+  if (pieces.empty() || !positive(software_ceiling.max_rate_per_s) ||
+      !positive(software_ceiling.max_rate_change_per_s2))
+    return std::nullopt;
+  for (const auto& piece : pieces) {
+    if (piece.derivatives.empty() || piece.derivatives.size() != piece.limits.size() ||
+        piece.minimum_time_multiplier != 1.0)
+      return std::nullopt;
+    for (std::size_t index = 0U; index < piece.derivatives.size(); ++index) {
+      const auto& d = piece.derivatives[index];
+      const auto& limit = piece.limits[index];
+      if (!std::isfinite(d.velocity) || d.velocity < 0.0 || !std::isfinite(d.acceleration) ||
+          d.acceleration < 0.0 || !std::isfinite(d.jerk) || d.jerk < 0.0 ||
+          !positive(limit.velocity) || !positive(limit.acceleration) ||
+          (limit.jerk && !positive(*limit.jerk)) || d.velocity > limit.velocity ||
+          d.acceleration > limit.acceleration || (limit.jerk && d.jerk > *limit.jerk))
+        return std::nullopt;
     }
   }
-  // Keep arithmetic rounding away from a bound shared by two jerk terms.
-  prepared.scale_bounds.max_rate_per_s *= 1.0 - 1e-12;
-  prepared.scale_bounds.max_rate_change_per_s2 *= 1.0 - 1e-12;
-  if (!positive(prepared.scale_bounds.max_rate_per_s) ||
-      !positive(prepared.scale_bounds.max_rate_change_per_s2)) {
-    return std::nullopt;
-  }
-  return prepared;
+  // Fixed timing has no nominal headroom/dilation pass: qualify actual limits,
+  // then share the existing governor margins at exactly unit dilation.
+  return derive_scale_bounds(pieces, 1.0, software_ceiling);
 }
 
 RuntimeScaleGovernor::RuntimeScaleGovernor(double initial_scale, RuntimeScaleBounds bounds)

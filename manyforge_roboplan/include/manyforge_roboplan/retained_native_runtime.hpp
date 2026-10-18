@@ -136,9 +136,10 @@ using RetainedRuntimeParticipantResolverFactory =
     std::function<RetainedRuntimeParticipantResolver(
         std::vector<core::RuntimeParticipantBinding>)>;
 
-/// Adapt a cell-wide Program-binding resolver to exact physical Kernel
-/// registrations. This shares the native runtime's ambiguity and physical-owner
-/// validation without requiring the motion runtime to own the cell resolver.
+/// Adapt a cell-wide Program-binding resolver to exact composed Kernel owners.
+/// Physical representatives retain the native Stop-owner validation. Logical
+/// outputs retain their actual channel engine and sealed provider binding;
+/// neither requires the motion runtime to own the stable cell resolver.
 [[nodiscard]] core::RuntimeParticipantAdmissionResolver
 make_retained_cell_kernel_participant_resolver(
     RetainedRuntimeParticipantResolver binding_resolver,
@@ -447,6 +448,11 @@ struct RetainedNativeRuntime final
       participant_registrations;
   core::RuntimeParticipantAdmissionResolver participant_resolver;
   RetainedRuntimeParticipantResolverFactory participant_resolver_factory;
+  /// Adopt the pre-staged factory only after exact stable-cell product commit.
+  /// Caller retains the existing product-install exclusion across publication
+  /// and adoption; no Core lock is held when taking the route mutex here.
+  void AdoptVerifiedParticipantResolverFactory(
+      RetainedRuntimeParticipantResolverFactory &&factory);
   /// Set once by composition; staging never changes lifecycle/controller state.
   RetainedRobotMeasuredSourcePreparer prepare_measured_sources;
   /// The stable Kernel stores a non-owning pointer to this source. A retained
@@ -520,6 +526,15 @@ struct RetainedNativeRuntime final
   [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
   PublishComponentCommandReadiness(
       const core::ComponentCommandReadinessPublicationDTO &publication) override;
+
+  /// Consume actual provider-domain proof before the unchanged whole-component
+  /// publication, including every physical participant reseal.
+  [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
+  PublishComponentCommandReadiness(
+      const core::ComponentCommandReadinessPublicationDTO &publication,
+      const core::ComponentLifecycleCurrentSnapshotDTO &actual_snapshot,
+      const std::vector<core::BrandLifecycleObservationDTO>
+          &actual_observations) override;
 
   [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
   PublishComponentCommandReadiness(

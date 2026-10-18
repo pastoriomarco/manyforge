@@ -1141,6 +1141,7 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
         "message": "",
         "details": None,
         "origin": None,
+        "operation_failures": [],
     }
 
 
@@ -4703,3 +4704,119 @@ def test_replacing_headless_loses_scene_attempt_memory_for_initializing_apply():
     replacement = _status_reading_service(core, _CommittingManager("succeeded"), runner)
     replacement.notify_committed_apply()
     assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 2
+
+
+def test_operation_reset_carries_only_explicit_uncertain_output_acknowledgements() -> None:
+    """Contract 66: a targeted Reset lists only its own unknown outputs."""
+
+    from manyforge_headless_api.models import OperationResetRequest
+
+    execution = FakeExecution()
+    app = create_app(
+        service=_service(
+            FakeCore(),
+            FakeManager(),
+            execution,
+            program_runner=FakeProgramRunner(active=False),
+        )
+    )
+    body = {
+        "request_context": {
+            "request_id": "request.control.ack",
+            "request_owner_epoch": "execution.epoch.1",
+            "source_label": "operator_ui",
+            "correlation_id": None,
+        },
+        "operation_id": "operation-1",
+        "expected_operation_revision": 3,
+        "reason": None,
+    }
+    acknowledged = [
+        {"operation_id": "operation-1", "operation_revision": 2},
+        {"operation_id": "operation-1", "operation_revision": 3},
+    ]
+    with TestClient(app) as client:
+        plain = client.post("/api/execution/operations/operation-1/reset", json=body)
+        acked = client.post(
+            "/api/execution/operations/operation-1/reset",
+            json={**body, "acknowledged_uncertain_outputs": acknowledged},
+        )
+        foreign = client.post(
+            "/api/execution/operations/operation-1/reset",
+            json={
+                **body,
+                "acknowledged_uncertain_outputs": [
+                    {"operation_id": "operation-2", "operation_revision": 1}
+                ],
+            },
+        )
+        unsorted = client.post(
+            "/api/execution/operations/operation-1/reset",
+            json={**body, "acknowledged_uncertain_outputs": acknowledged[::-1]},
+        )
+        empty = client.post(
+            "/api/execution/operations/operation-1/reset",
+            json={**body, "acknowledged_uncertain_outputs": []},
+        )
+
+    assert plain.status_code == 200
+    assert acked.status_code == 200
+    assert foreign.status_code == 422
+    assert unsorted.status_code == 422
+    assert empty.status_code == 422
+    sent = [request for kind, request in execution.requests if kind == "reset"]
+    assert len(sent) == 2
+    # An ordinary Reset keeps its exact wire shape (no null field).
+    assert "acknowledged_uncertain_outputs" not in sent[0].model_dump(mode="json")
+    assert sent[1].model_dump(mode="json")["acknowledged_uncertain_outputs"] == acknowledged
+    assert isinstance(sent[1], OperationResetRequest)
+
+
+def test_stop_fault_recovery_route_dispatches_the_global_io_rule_variant() -> None:
+    from manyforge_headless_api.models import GlobalIoRuleRecoveryIntentRequest
+
+    execution = FakeExecution()
+    app = create_app(
+        service=_service(
+            FakeCore(),
+            FakeManager(),
+            execution,
+            program_runner=FakeProgramRunner(active=False),
+        )
+    )
+    recovery = {
+        "kind": "global_io_rule",
+        "request_context": {
+            "request_id": "request.rule-recovery.1",
+            "request_owner_epoch": "execution.epoch.1",
+            "source_label": "operator_ui",
+            "correlation_id": None,
+        },
+        "selector": {
+            "context": {
+                "owner_epoch": "kernel.epoch.1",
+                "catalog_generation": "4",
+                "active_publication_generation": 2,
+                "bundle": "bundle.1",
+                "graph": "graph.1",
+            },
+            "rule_id": "door_open",
+            "expected_rule_registration_id": "9",
+        },
+        "reason": None,
+    }
+    with TestClient(app) as client:
+        recovered = client.post("/api/execution/stop-fault/recover", json=recovery)
+        stale_kind = client.post(
+            "/api/execution/stop-fault/recover",
+            json={**recovery, "expected_latch_id": "stop-fault.1"},
+        )
+    assert recovered.status_code == 200, recovered.text
+    assert stale_kind.status_code == 422
+    [(kind, request)] = execution.requests
+    assert kind == "recover_stop_fault"
+    assert isinstance(request, GlobalIoRuleRecoveryIntentRequest)
+    dumped = request.model_dump(mode="json")
+    assert dumped["selector"] == recovery["selector"]
+    assert dumped["reason"] is None
+    assert dumped["request_context"]["request_id"] == "request.rule-recovery.1"

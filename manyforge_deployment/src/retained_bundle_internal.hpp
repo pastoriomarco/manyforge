@@ -173,6 +173,10 @@ class RetainedBundleMaterializer final {
   /// independently reloaded before the first raw-CAS effect. The resulting
   /// semantic bundle is durably inserted and independently reconstructed
   /// before it is returned.
+  ///
+  /// `retain_empty_model_map` makes a model-free candidate carry the empty
+  /// composed-model symbol/role map, so a zero-component Program can bind
+  /// against it. The sealed canonical-empty package never sets it.
   [[nodiscard]] static std::shared_ptr<const RetainedBundle>
   materialize_store_and_reload_production(
       const RetentionQualifiedDeployment& qualified,
@@ -182,7 +186,8 @@ class RetainedBundleMaterializer final {
           structural_model_preparations,
       ICatalogArtifactStore& catalog_artifact_store,
       IRawArtifactStore& artifact_store,
-      IRetainedBundleRepository& bundle_repository);
+      IRetainedBundleRepository& bundle_repository,
+      bool retain_empty_model_map = false);
 
   /// Private, explicitly non-authoritative fixture path retained only for the
   /// bounded mechanical tests that preceded C1.0.

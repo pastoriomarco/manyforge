@@ -621,6 +621,10 @@ public:
 
 private:
   friend manyforge::core::Result<PersistedManagerApplyStatus>
+  ReadManagerApplyStatusReadOnly(
+      const std::filesystem::path &, const manyforge::core::CellId &,
+      const manyforge::core::NamedApplyPublicationTransactionDTO &);
+  friend manyforge::core::Result<PersistedManagerApplyStatus>
   ReadNativeApplyParentStatusReadOnly(
       const std::filesystem::path &, const manyforge::core::CellId &,
       const manyforge::core::NativeApplyPlanDTO &,
@@ -680,6 +684,15 @@ ValidateFreshManagerApplySuccessReadOnly(
     const manyforge::core::CellId &cell_id,
     const manyforge::core::CellAdmissionClaimDTO &fresh_claim,
     const manyforge::core::CellAdmissionClaimReleaseDTO &release);
+
+/// Observation-only exact record from an existing journal, including terminal
+/// records with no live claim. It grants no Apply/effect/currentness
+/// permission.
+[[nodiscard]] manyforge::core::Result<PersistedManagerApplyStatus>
+ReadManagerApplyStatusReadOnly(
+    const std::filesystem::path &database_path,
+    const manyforge::core::CellId &cell_id,
+    const manyforge::core::NamedApplyPublicationTransactionDTO &apply);
 
 /// Read one exact sealed parent and its existing phase records without opening
 /// a mutable journal owner. These retained values are observation-only: the

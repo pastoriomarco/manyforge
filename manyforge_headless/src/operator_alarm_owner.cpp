@@ -1073,6 +1073,18 @@ AlarmLifecycleOwner::Snapshot(const std::optional<std::size_t> limit,
   };
 }
 
+std::optional<AlarmPointState>
+AlarmLifecycleOwner::ConditionPoint(const std::string_view definition_id,
+                                    const AlarmSubject &subject) const {
+  const auto *definition = catalog_.Find(definition_id);
+  Require(definition != nullptr, "operator_alarm_definition_unknown",
+          "condition lookup names an unknown definition");
+  const auto condition_id =
+      CanonicalAlarmConditionId(catalog_, *definition, subject);
+  std::lock_guard lock(mutex_);
+  const auto found = points_.find(condition_id);
+  return found == points_.end() ? std::nullopt : std::optional(found->second);
+}
 std::vector<OperatorAlarmRecord> AlarmLifecycleOwner::TerminalRecords(
     const std::optional<std::size_t> limit) const {
   if (limit.has_value()) {

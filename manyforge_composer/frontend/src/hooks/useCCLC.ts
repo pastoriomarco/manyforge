@@ -2,13 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { api, ApiError } from '../api/client';
 import type {
+  CCLCExpectedActiveConfiguration,
   CCLCComponentSnapshot,
   CCLCOwnerIdentity,
   CCLCLifecycleIntent,
   CCLCLifecycleRequestBody,
   CCLCRequestContext,
   CCLCRouteRequestBody,
-  CCLCRouteTemplate,
+  CCLCRouteTemplateWire,
   CCLCRouteTemplateSet,
   CCLCTransactionStatus,
 } from '../types/cclc';
@@ -34,7 +35,7 @@ export interface ActivationSequenceObservation {
 }
 
 export interface CCLCController {
-  componentId: string;
+  controllableComponentId: string;
   snapshot: CCLCComponentSnapshot | null;
   routeTemplates: CCLCRouteTemplateSet | null;
   transaction: CCLCTransactionStatus | null;
@@ -43,7 +44,7 @@ export interface CCLCController {
   busy: boolean;
   readUnavailableReason: string | null;
   error: string | null;
-  setComponentId: (value: string) => void;
+  setControllableComponentId: (value: string) => void;
   refresh: () => Promise<void>;
   reconcileTransaction: () => Promise<void>;
   dismissError: () => void;
@@ -55,8 +56,8 @@ export interface CCLCController {
   activationProgress: string | null;
   componentHealth: Record<string, { snapshot: CCLCComponentSnapshot | null; error: string | null }>;
   activationUnresolved: boolean;
-  activationRefusal: { componentId: string; transactionId: string; error: NonNullable<CCLCTransactionStatus['error']> } | null;
-  submitRoute: (template: CCLCRouteTemplate) => Promise<void>;
+  activationRefusal: { controllableComponentId: string; transactionId: string; error: NonNullable<CCLCTransactionStatus['error']> } | null;
+  submitRoute: (template: CCLCRouteTemplateWire) => Promise<void>;
 }
 
 export function browserRequestIdentity(prefix: string): string {
@@ -127,34 +128,56 @@ export function lifecycleRequestFromSnapshot(
 ): CCLCLifecycleRequestBody {
   return {
     request_context: context,
-    controllable_component_id: snapshot.componentId,
+    controllable_component_id: snapshot.controllableComponentId,
     intent,
     expected_graph_revision: snapshot.graphRevision,
     expected_component_lifecycle_generation: snapshot.lifecycleGeneration,
     expected_admission_generation: admissionGeneration,
-    expected_control_domains: snapshot.domains.map((domain) => ({
-      control_domain_id: domain.controlDomainId,
-      control_domain_revision: domain.controlDomainRevision,
-      controller_topology_id: domain.controllerTopologyId,
-      topology_revision: domain.topologyRevision,
-      expected_active_control_configuration: domain.activeConfiguration === null
-        ? {
-          presence: 'absent',
-          active_control_configuration_id: null,
-          active_control_configuration_generation: null,
+    expected_control_domains: snapshot.domains.map((domain) => {
+      const expected_active_control_configuration: CCLCExpectedActiveConfiguration =
+        domain.activeConfiguration === null
+          ? {
+            presence: 'absent',
+            active_control_configuration_id: null,
+            active_control_configuration_generation: null,
+          }
+          : {
+            presence: 'present',
+            active_control_configuration_id: domain.activeConfiguration.id,
+            active_control_configuration_generation:
+              domain.activeConfiguration.generation,
+          };
+      // Every expected domain carries its required kind; neither variant
+      // carries the response `resources`.
+      switch (domain.kind) {
+        case 'io_provider':
+          return {
+            kind: 'io_provider' as const,
+            control_domain_id: domain.controlDomainId,
+            control_domain_revision: domain.controlDomainRevision,
+            provider: domain.provider,
+            expected_active_control_configuration,
+          };
+        case 'controller':
+          return {
+            kind: 'controller' as const,
+            control_domain_id: domain.controlDomainId,
+            control_domain_revision: domain.controlDomainRevision,
+            controller_topology_id: domain.controllerTopologyId,
+            topology_revision: domain.topologyRevision,
+            expected_active_control_configuration,
+            expected_control_bindings: domain.currentControlBindings.map((binding) => ({
+              control_binding_id: binding.controlBindingId,
+              control_binding_revision: binding.controlBindingRevision,
+              control_route_id: binding.controlRouteId,
+            })),
+          };
+        default: {
+          const unknown: never = domain;
+          throw new Error(`unknown CCLC domain kind: ${String((unknown as { kind: unknown }).kind)}`);
         }
-        : {
-          presence: 'present',
-          active_control_configuration_id: domain.activeConfiguration.id,
-          active_control_configuration_generation:
-            domain.activeConfiguration.generation,
-        },
-      expected_control_bindings: domain.currentControlBindings.map((binding) => ({
-        control_binding_id: binding.controlBindingId,
-        control_binding_revision: binding.controlBindingRevision,
-        control_route_id: binding.controlRouteId,
-      })),
-    })),
+      }
+    }),
     reason: 'operator-confirmed Composer request',
     confirmed: true,
   };
@@ -162,7 +185,7 @@ export function lifecycleRequestFromSnapshot(
 
 export function routeRequestFromTemplate(
   templates: CCLCRouteTemplateSet,
-  template: CCLCRouteTemplate,
+  template: CCLCRouteTemplateWire,
   context: CCLCRequestContext,
   admissionGeneration: number,
 ): CCLCRouteRequestBody {
@@ -193,7 +216,7 @@ export async function activateThroughOrdinaryLifecycle(
   const check = async () => {
     const current = await read();
     if (current.ownerEpoch !== initial.ownerEpoch
-      || current.snapshot.componentId !== initial.snapshot.componentId
+      || current.snapshot.controllableComponentId !== initial.snapshot.controllableComponentId
       || current.snapshot.retainedBundleId !== initial.snapshot.retainedBundleId
       || current.snapshot.graphRevision !== initial.snapshot.graphRevision) {
       throw new Error('Activation stopped: owner or applied configuration changed.');
@@ -226,7 +249,7 @@ export async function activateThroughOrdinaryLifecycle(
 
 export async function activateOrderedComponents(
   componentIds: readonly string[],
-  activate: (componentId: string) => Promise<void>,
+  activate: (controllableComponentId: string) => Promise<void>,
 ): Promise<void> {
   for (const id of componentIds) await activate(id);
 }
@@ -267,7 +290,7 @@ export function useCCLC(
   admissionGeneration: number | null,
   configuredComponentIds?: readonly string[],
 ): CCLCController {
-  const [componentId, setComponentIdValue] = useState('');
+  const [controllableComponentId, setComponentIdValue] = useState('');
   const [snapshot, setSnapshot] = useState<CCLCComponentSnapshot | null>(null);
   const [routeTemplates, setRouteTemplates] = useState<CCLCRouteTemplateSet | null>(null);
   const [transaction, setTransaction] = useState<CCLCTransactionStatus | null>(null);
@@ -287,9 +310,9 @@ export function useCCLC(
   const activationAbort = useRef<AbortController | null>(null);
   const passiveAbort = useRef<AbortController | null>(null);
   const admissionRef = useRef(admissionGeneration);
-  const selectedRef = useRef(componentId);
-  selectedRef.current = componentId;
-  const configuredKey = JSON.stringify(configuredComponentIds ?? (componentId ? [componentId] : []));
+  const selectedRef = useRef(controllableComponentId);
+  selectedRef.current = controllableComponentId;
+  const configuredKey = JSON.stringify(configuredComponentIds ?? (controllableComponentId ? [controllableComponentId] : []));
   const [healthComponentKey, setHealthComponentKey] = useState(configuredKey);
   if (healthComponentKey !== configuredKey) {
     setHealthComponentKey(configuredKey);
@@ -303,7 +326,7 @@ export function useCCLC(
   admissionRef.current = admissionGeneration;
   useEffect(() => () => activationAbort.current?.abort(new Error('Activation stopped: client disconnected.')), [enabled]);
 
-  const setComponentId = useCallback((value: string) => {
+  const setControllableComponentId = useCallback((value: string) => {
     activationAbort.current?.abort(new Error('Activation stopped: selected component changed.'));
     setComponentIdValue(value);
     setSnapshot(null);
@@ -317,7 +340,7 @@ export function useCCLC(
     observeComponentReadChanges = false,
   ) => {
     if (!enabled) throw new Error('CCLC client is unavailable');
-    const identity = (addressedComponent ?? componentId).trim();
+    const identity = (addressedComponent ?? controllableComponentId).trim();
     if (!identity) throw new Error('Enter a component identity first');
     const marker = {};
     currentReads.current.set(identity, marker);
@@ -341,10 +364,10 @@ export function useCCLC(
       ]);
       signal?.throwIfAborted();
       const ownerEpoch = cclcRequestOwnerEpoch(owner, nextSnapshot, execution);
-      if (nextSnapshot.componentId !== identity) throw new Error('CCLC component identity does not match its request');
+      if (nextSnapshot.controllableComponentId !== identity) throw new Error('CCLC component identity does not match its request');
       validate?.(nextSnapshot, ownerEpoch, execution.ownerEpoch);
       let nextTemplates: CCLCRouteTemplateSet = {
-        componentId: nextSnapshot.componentId,
+        controllableComponentId: nextSnapshot.controllableComponentId,
         retainedBundleId: nextSnapshot.retainedBundleId,
         graphRevision: nextSnapshot.graphRevision,
         templates: [],
@@ -352,7 +375,7 @@ export function useCCLC(
       if (publishSelected && lifecycleSupportsRouteSelection(nextSnapshot.lifecycleState)) {
         nextTemplates = await api.cclc.routeTemplates(identity, signal);
         if (
-          nextSnapshot.componentId !== nextTemplates.componentId
+          nextSnapshot.controllableComponentId !== nextTemplates.controllableComponentId
           || nextSnapshot.retainedBundleId !== nextTemplates.retainedBundleId
           || nextSnapshot.graphRevision !== nextTemplates.graphRevision
         ) {
@@ -383,7 +406,7 @@ export function useCCLC(
     } finally {
       if (currentReads.current.get(identity) === marker) currentReads.current.delete(identity);
     }
-  }, [componentId, enabled]);
+  }, [controllableComponentId, enabled]);
 
   const refresh = useCallback(async () => {
     if (activationAbort.current !== null) return;
@@ -506,14 +529,14 @@ export function useCCLC(
       const owner = await api.cclc.owner(abort.signal);
       abort.signal.throwIfAborted();
       const capturedConfigured = configuredRef.current;
-      const ids = order === null ? [componentId] : order.componentIds;
+      const ids = order === null ? [controllableComponentId] : order.componentIds;
       let executionOwnerEpoch: string | null = null;
       let publication: { generation: number; pointerDigest: string } | null = null;
       const finalReads: Array<() => Promise<{ snapshot: CCLCComponentSnapshot }>> = [];
       await activateOrderedComponents(ids, async (id) => {
-        let binding: { componentId: string; retainedBundleId: string; graphRevision: string; ownerEpoch: string;
+        let binding: { controllableComponentId: string; retainedBundleId: string; graphRevision: string; ownerEpoch: string;
           publicationGeneration: number; activePublicPointerDigest: string } | null = !sequence && snapshot !== null
-          ? { componentId: snapshot.componentId, retainedBundleId: snapshot.retainedBundleId,
+          ? { controllableComponentId: snapshot.controllableComponentId, retainedBundleId: snapshot.retainedBundleId,
             graphRevision: snapshot.graphRevision, ownerEpoch: snapshot.readiness.requestOwnerEpoch,
             publicationGeneration: snapshot.publicationGeneration, activePublicPointerDigest: snapshot.activePublicPointerDigest } : null;
         const verify = async () => {
@@ -544,14 +567,14 @@ export function useCCLC(
                   throw new Error('Activation stopped: owner or component identity changed.');
                 }
                 const identity = {
-                  componentId: next.componentId,
+                  controllableComponentId: next.controllableComponentId,
                   retainedBundleId: next.retainedBundleId,
                   graphRevision: next.graphRevision,
                   ownerEpoch,
                   publicationGeneration: next.publicationGeneration,
                   activePublicPointerDigest: next.activePublicPointerDigest,
                 };
-                if (binding !== null && (identity.componentId !== binding.componentId
+                if (binding !== null && (identity.controllableComponentId !== binding.controllableComponentId
                   || identity.retainedBundleId !== binding.retainedBundleId
                   || identity.graphRevision !== binding.graphRevision
                   || identity.ownerEpoch !== binding.ownerEpoch
@@ -611,7 +634,7 @@ export function useCCLC(
               && status.terminalResult === 'failed_known_no_effect' && !status.reconciliationRequired
               && status.error?.code === 'component_lifecycle_transition_missing'
               && status.error.details.reason === 'no_transition_satisfied') {
-              refusal = { componentId: request.controllable_component_id,
+              refusal = { controllableComponentId: request.controllable_component_id,
                 transactionId: status.transactionId, error: status.error };
               setActivationRefusal(refusal);
             }
@@ -661,9 +684,9 @@ export function useCCLC(
       busyRef.current = false;
       setBusy(false);
     }
-  }, [busy, componentId, pendingTransaction, readCurrent, snapshot, transaction]);
+  }, [busy, controllableComponentId, pendingTransaction, readCurrent, snapshot, transaction]);
 
-  const submitRoute = useCallback(async (template: CCLCRouteTemplate) => {
+  const submitRoute = useCallback(async (template: CCLCRouteTemplateWire) => {
     if (activationAbort.current !== null) return;
     busyRef.current = true;
     setBusy(true);
@@ -830,7 +853,7 @@ export function useCCLC(
   }, [busy, enabled, pendingTransaction, readCurrent, transaction?.terminalResult]);
 
   return {
-    componentId,
+    controllableComponentId,
     snapshot,
     routeTemplates,
     transaction,
@@ -839,7 +862,7 @@ export function useCCLC(
     busy,
     readUnavailableReason,
     error,
-    setComponentId,
+    setControllableComponentId,
     refresh,
     reconcileTransaction,
     dismissError: () => setError(null),

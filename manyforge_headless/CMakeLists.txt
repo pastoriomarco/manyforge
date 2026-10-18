@@ -175,6 +175,14 @@ if(NOT TARGET manyforge::component_manager OR NOT TARGET manyforge::scene)
     "manyforge_headless could not resolve its source-owner dependencies")
 endif()
 
+# Deployment may have been added before Scene materialized the existing Core
+# target. Its standalone codec branch must resolve provider-domain validation
+# through that same Core implementation once the Headless graph supplies it.
+if(TARGET manyforge_deployment_runtime_contract_codec)
+  target_link_libraries(manyforge_deployment_runtime_contract_codec PUBLIC
+    manyforge_core)
+endif()
+
 add_library(manyforge_headless_owner_publication
   src/owner_publication.cpp
   src/scene_runtime_pose_projector.cpp)
@@ -788,7 +796,12 @@ if(BUILD_TESTING)
     manyforge_headless_test_canonical_empty_package
     manyforge_headless_test_assistant_package
     manyforge_headless_test_alarm_registry_package)
+  target_include_directories(test_headless_api_core PRIVATE
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
   target_compile_definitions(test_headless_api_core PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_HEADLESS_TEST_LITE6_SOURCE_ROOT}"
     MANYFORGE_HEADLESS_TEST_ALARM_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/resources/operator-alarm-catalog.v1.yaml"
     MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_PACKAGE_ROOT}"
     MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_BUNDLE_IDS_FILE="${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_BUNDLE_IDS_FILE}"
@@ -797,7 +810,10 @@ if(BUILD_TESTING)
     MANYFORGE_HEADLESS_TEST_NODE_CATALOG="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_catalog.yaml"
     MANYFORGE_HEADLESS_TEST_NODE_ENVIRONMENT_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_behavior/resources/node_environment_manifest.yaml")
   target_link_libraries(test_headless_api_core PRIVATE
+    manyforge_preparation_support
     manyforge_event_historian
+    manyforge::core_sqlite_operation_journal
+    manyforge::core_sqlite_cclc_journal
     manyforge::deployment
     manyforge::deployment_admission
     GTest::gtest_main)

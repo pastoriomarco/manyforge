@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <manyforge_core/types/action_span.hpp>
 #include <manyforge_core/types/command_schema.hpp>
+#include <manyforge_core/types/io_output_command_value.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
@@ -38,7 +40,8 @@ struct GripperPositionCommandValueDTO final {
                          const GripperPositionCommandValueDTO&) = default;
 };
 
-using CapabilityCommandValueDTO = std::variant<GripperPositionCommandValueDTO>;
+using CapabilityCommandValueDTO =
+    std::variant<GripperPositionCommandValueDTO, IoSignalWriteCommandValueDTO>;
 
 struct CommandDurationOptionDTO final {
   CommandOptionId option_id;
@@ -51,7 +54,9 @@ struct CapabilityCommandIntentDTO final {
   CommandSchemaId command_schema_id;
   CommandSchemaRevision command_schema_revision;
   CapabilityCommandValueDTO command_value;
-  double completion_timeout_s{};
+  /// Required for the existing gripper command. Generic output commands omit
+  /// it: their mechanism's policy is resolved from the sealed provider.
+  std::optional<double> completion_timeout_s;
   std::vector<CommandDurationOptionDTO> caller_options;
   friend bool operator==(const CapabilityCommandIntentDTO&,
                          const CapabilityCommandIntentDTO&) = default;

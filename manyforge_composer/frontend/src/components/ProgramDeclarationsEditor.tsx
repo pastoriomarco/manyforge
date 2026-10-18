@@ -25,12 +25,15 @@ import {
   collectProgramParameterUsages,
   flattenProgramForest,
   formulaUsageLabel,
+  removeGuardTitle,
   type FormulaUsage,
   type ProgramMotionDefaultRole,
 } from '../utils/programAuthoring';
 import { requestOpenSettings } from '../state/settingsNavigation';
 import { canonicalFrames, frameKey, frameLabel, programFrameChoices } from '../utils/programFrames';
 import { valuePathParameter } from '../utils/valuePaths';
+import { INTERRUPT_KEY_INITIAL_REQUIRED } from '../utils/interruptAuthoring';
+import { reservedNameProblem } from '../utils/blackboardNamespaces';
 import type { ProgramDeclarationSelection } from './ProgramDeclarationsNavigator';
 import { buildProgramParameterMutation, typeValuesTransition } from './ProgramPropertyEditor';
 import { FormulaEditor } from './property/FormulaEditor';
@@ -78,13 +81,11 @@ interface ProgramDeclarationsEditorProps {
   motionDefaults?: ReadonlyMap<string, ProgramMotionDefaultRole>;
   /** The declared robots and Scene objects a pose key's `allowed_frames` name. */
   frameProgram?: Pick<ProgramDocument, 'target_roles' | 'scene'>;
+  /** Keys read by a node or global interrupt rule: each must declare `initial:` (contract 87). */
+  interruptKeyUses?: ReadonlySet<string>;
 }
 
-function usageTitle(bindings: string[], formulas: FormulaUsage[]): string {
-  return bindings.length + formulas.length > 0
-    ? [...bindings, ...formulas.map(formulaUsageLabel)].join(', ')
-    : 'Remove declaration';
-}
+const NO_INTERRUPT_KEY_USES: ReadonlySet<string> = new Set();
 
 function FormulaUsages({
   usages,
@@ -178,6 +179,8 @@ export function buildBlackboardKeyDeclaration(form: BlackboardKeyForm): Blackboa
   const initial = parseInitialValue(form.type, form.initialText);
   const key = form.key.trim();
   if (!key) throw new Error('Blackboard key is required.');
+  const reserved = reservedNameProblem(key, 'A blackboard key');
+  if (reserved !== null) throw new Error(reserved);
   if (form.expression !== null) {
     if (initial !== undefined) throw new Error('Formula: a computed key has no initial value.');
     if (form.persistence === 'persistent') throw new Error('Formula: a persistent key cannot be computed.');
@@ -297,6 +300,7 @@ export function ProgramDeclarationsEditor({
   diagnostics = [],
   motionDefaults = new Map(),
   frameProgram,
+  interruptKeyUses = NO_INTERRUPT_KEY_USES,
 }: ProgramDeclarationsEditorProps) {
   const cardLayout = useCardPanelLayout();
   const parameterUsages = useMemo(() => collectProgramParameterUsages(roots), [roots]);
@@ -415,6 +419,8 @@ export function ProgramDeclarationsEditor({
       if (!parameterId.trim()) {
         return { message: 'Parameter ID is required.', target: 'program-parameter-id' };
       }
+      const reserved = reservedNameProblem(parameterId, 'A parameter ID');
+      if (reserved !== null) return { message: reserved, target: 'program-parameter-id' };
       return null;
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : 'Parameter is invalid.';
@@ -426,9 +432,11 @@ export function ProgramDeclarationsEditor({
       };
     }
   };
-  const namespaceIssue = () => namespaceId.trim()
-    ? null
-    : { message: 'Namespace ID is required.', target: 'program-namespace-id' };
+  const namespaceIssue = () => {
+    if (!namespaceId.trim()) return { message: 'Namespace ID is required.', target: 'program-namespace-id' };
+    const reserved = reservedNameProblem(namespaceId, 'A namespace ID');
+    return reserved === null ? null : { message: reserved, target: 'program-namespace-id' };
+  };
   const keyIssue = (): { message: string; target: string } | null => {
     if (fields.some((field) => !field.field.trim() || !field.type.trim())) {
       return {
@@ -442,6 +450,8 @@ export function ProgramDeclarationsEditor({
     if (!keyName.trim()) {
       return { message: 'Blackboard key is required.', target: 'program-key-name' };
     }
+    const reserved = reservedNameProblem(keyName, 'A blackboard key');
+    if (reserved !== null) return { message: reserved, target: 'program-key-name' };
     try {
       parseInitialValue(keyType, keyInitialText);
     } catch (caught) {
@@ -531,6 +541,8 @@ export function ProgramDeclarationsEditor({
           : {}),
       };
       if (!declaration.parameter_id) throw new Error('Parameter ID is required.');
+      const reserved = reservedNameProblem(declaration.parameter_id, 'A parameter ID');
+      if (reserved !== null) throw new Error(reserved);
       void Promise.resolve(onMutate('program_draft_upsert_parameters', {
         parameters: [declaration] as unknown as JsonValue,
       })).then((response) => {
@@ -556,8 +568,9 @@ export function ProgramDeclarationsEditor({
   const saveNamespace = (clearAfterSave = true) => {
     if (!clearAfterSave && selectedNamespace && !namespaceDirty) return;
     const id = namespaceId.trim();
-    if (!id) {
-      reportError('Namespace ID is required.', 'program-namespace-id');
+    const issue = namespaceIssue();
+    if (issue) {
+      reportError(issue.message, issue.target);
       return;
     }
     const declaration: BlackboardNamespaceDeclaration = {
@@ -827,10 +840,10 @@ export function ProgramDeclarationsEditor({
                     type="button"
                     className="text-button"
                     disabled={busy || usages.length + formulas.length > 0}
-                    title={usageTitle(
-                      usages.map((usage) => `${usage.nodeLabel}.${usage.fieldName}`),
-                      formulas,
-                    )}
+                    title={removeGuardTitle([
+                      ...usages.map((usage) => `${usage.nodeLabel}.${usage.fieldName}`),
+                      ...formulas.map(formulaUsageLabel),
+                    ], 'Remove declaration')}
                     onClick={() => onMutate('program_draft_remove_parameters', {
                       parameter_ids: [parameter.parameter_id],
                     })}
@@ -1072,10 +1085,10 @@ export function ProgramDeclarationsEditor({
                     type="button"
                     className="text-button"
                     disabled={busy || usages.length + formulas.length > 0}
-                    title={usageTitle(
-                      usages.map((usage) => `${usage.nodeLabel}.${usage.fieldName}`),
-                      formulas,
-                    )}
+                    title={removeGuardTitle([
+                      ...usages.map((usage) => `${usage.nodeLabel}.${usage.fieldName}`),
+                      ...formulas.map(formulaUsageLabel),
+                    ], 'Remove declaration')}
                     onClick={() => onMutate('blackboard_draft_remove_keys', {
                       keys: [key.key],
                     })}
@@ -1129,6 +1142,11 @@ export function ProgramDeclarationsEditor({
                   )}
                 </select>
               </label>
+            )}
+            {interruptKeyUses.has(keyName.trim()) && keyInitialText === null && (
+              <p className="program-form-error inline-message severity-error" aria-label="Key initial required">
+                {INTERRUPT_KEY_INITIAL_REQUIRED}: an interrupt condition reads this key, so it must declare an initial value.
+              </p>
             )}
             {keyExpression !== null && (
               <label>

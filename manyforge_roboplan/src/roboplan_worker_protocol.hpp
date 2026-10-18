@@ -10,7 +10,7 @@
 namespace manyforge::roboplan_backend::worker_protocol {
 
 inline constexpr std::uint32_t kFrameMagic = 0x4d465750U;  // MFWP
-inline constexpr std::uint16_t kProtocolVersion = 9U;
+inline constexpr std::uint16_t kProtocolVersion = 10U;
 inline constexpr int kProtocolDescriptor = 3;
 /// Worker-reserved duplicate of the approved scene-asset root directory.
 inline constexpr int kSceneAssetRootDescriptor = 9;

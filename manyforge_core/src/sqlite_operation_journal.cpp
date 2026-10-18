@@ -1,3 +1,4 @@
+#include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <sqlite3.h>
 
 #include <algorithm>
@@ -25,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -159,15 +161,15 @@ CREATE TABLE operation_participants (
   operation_id TEXT NOT NULL,
   participant_index INTEGER NOT NULL,
   participant_id TEXT NOT NULL,
-  controller_goal_id TEXT NOT NULL,
-  controller_goal_generation INTEGER NOT NULL,
+  command_id TEXT NOT NULL,
+  command_generation INTEGER NOT NULL,
   controllable_component_id TEXT NOT NULL,
   command_target_id TEXT NOT NULL,
   capability_id TEXT NOT NULL,
   control_domain_id TEXT NOT NULL,
   control_domain_revision TEXT NOT NULL,
-  control_binding_id TEXT NOT NULL,
-  control_binding_revision TEXT NOT NULL,
+  control_binding_id TEXT,
+  control_binding_revision TEXT,
   capability_provider_binding_id TEXT,
   capability_provider_binding_revision TEXT,
   payload_kind TEXT NOT NULL,
@@ -177,6 +179,10 @@ CREATE TABLE operation_participants (
   terminal_error_message TEXT,
   execution_node_instance_id TEXT,
   execution_node_attempt_id TEXT,
+  CHECK ((control_binding_id IS NULL) = (control_binding_revision IS NULL)),
+  CHECK ((capability_provider_binding_id IS NULL) =
+         (capability_provider_binding_revision IS NULL)),
+  CHECK (control_binding_id IS NOT NULL OR capability_provider_binding_id IS NOT NULL),
   PRIMARY KEY(operation_id, participant_index),
   FOREIGN KEY(operation_id) REFERENCES operation_snapshots(operation_id)
     ON DELETE CASCADE
@@ -593,6 +599,82 @@ template <typename StrongId>
   });
 }
 
+[[nodiscard]] CanonicalValue ParticipantFactValue(const ParticipantExecutionFact& fact) {
+  Require(std::string_view(to_string(fact.kind)) != "unknown" &&
+              std::string_view(to_string(fact.effect)) != "unknown",
+          "operation_journal_record_invalid", "participant terminal fact enum is invalid");
+  return CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue(to_string(fact.kind))},
+                                               {"effect", CanonicalValue(to_string(fact.effect))},
+                                               {"error", ErrorValue(fact.error)}});
+}
+
+[[nodiscard]] ParticipantExecutionFact ParticipantFactFromValue(const CanonicalValue& value) {
+  const auto* kind = value.find_object_member("kind");
+  const auto* effect = value.find_object_member("effect");
+  const auto* failure = value.find_object_member("error");
+  Require(value.is_object() && value.as_object().size() == 3U && kind && effect && failure &&
+              kind->is_string() && effect->is_string(),
+          "operation_journal_corrupt", "participant terminal fact shape is invalid");
+  std::optional<ParticipantExecutionFactKind> parsed_kind;
+  for (const auto candidate : {ParticipantExecutionFactKind::kComputedCompletion,
+                               ParticipantExecutionFactKind::kLocalFailure,
+                               ParticipantExecutionFactKind::kCancelledBeforeDispatch,
+                               ParticipantExecutionFactKind::kPreemptedByAddressedStop,
+                               ParticipantExecutionFactKind::kPreemptedByReplacement})
+    if (kind->as_string() == to_string(candidate)) parsed_kind = candidate;
+  std::optional<ParticipantEffectKnowledge> parsed_effect;
+  for (const auto candidate :
+       {ParticipantEffectKnowledge::kNoEffect, ParticipantEffectKnowledge::kEffectSettled,
+        ParticipantEffectKnowledge::kEffectUncertain})
+    if (effect->as_string() == to_string(candidate)) parsed_effect = candidate;
+  Require(parsed_kind && parsed_effect, "operation_journal_corrupt",
+          "participant terminal fact enum is invalid");
+  std::optional<ErrorDTO> error;
+  if (!failure->is_null()) {
+    const auto* code = failure->find_object_member("code");
+    const auto* message = failure->find_object_member("message");
+    const auto* details = failure->find_object_member("details");
+    Require(failure->is_object() && failure->as_object().size() == 3U && code && message &&
+                details && code->is_string() && message->is_string() && details->is_object(),
+            "operation_journal_corrupt", "participant terminal fact error is invalid");
+    error = ErrorDTO{code->as_string(), message->as_string(), {}};
+    for (const auto& [key, detail] : details->as_object()) {
+      Require(detail.is_string(), "operation_journal_corrupt",
+              "participant terminal fact error detail is invalid");
+      error->details.emplace(key, detail.as_string());
+    }
+  }
+  return {*parsed_kind, *parsed_effect, std::move(error)};
+}
+
+[[nodiscard]] CanonicalValue PreemptionValue(const OperationPreemptionDTO& value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"kind", CanonicalValue(std::string(to_string(value.kind)))},
+      {"by", CanonicalValue(CanonicalValue::Object{
+          {"operation_id", CanonicalValue(value.by.operation_id.value())},
+          {"node_instance_id", CanonicalValue(value.by.node_instance_id.value())},
+          {"node_attempt_id", CanonicalValue(value.by.node_attempt_id)}})}});
+}
+
+[[nodiscard]] OperationPreemptionDTO PreemptionFromValue(const CanonicalValue& value) {
+  const auto* kind = value.find_object_member("kind");
+  const auto* by = value.find_object_member("by");
+  Require(value.is_object() && value.as_object().size() == 2U && kind && kind->is_string() &&
+              by && by->is_object() && by->as_object().size() == 3U,
+          "operation_journal_corrupt", "operation preemption shape is invalid");
+  const auto* operation = by->find_object_member("operation_id");
+  const auto* node = by->find_object_member("node_instance_id");
+  const auto* attempt = by->find_object_member("node_attempt_id");
+  Require(operation && operation->is_string() && node && node->is_string() &&
+              attempt && attempt->is_string() &&
+              (kind->as_string() == "preempted" || kind->as_string() == "superseded_unsent"),
+          "operation_journal_corrupt", "operation preemption identity is invalid");
+  return {kind->as_string() == "preempted" ? OperationPreemptionKind::kPreempted
+                                         : OperationPreemptionKind::kSupersededUnsent,
+          {OperationId(operation->as_string()), ProgramNodeInstanceId(node->as_string()),
+           attempt->as_string()}};
+}
+
 [[nodiscard]] CanonicalValue RequestContextValue(const PublicRequestContextDTO& context) {
   return CanonicalValue(CanonicalValue::Object{
       {"correlation_id", OptionalText(context.correlation_id)},
@@ -995,11 +1077,20 @@ template <typename StrongId>
 [[nodiscard]] CanonicalValue CapabilityPayloadValue(const CapabilityCommandIntentDTO& command) {
   CanonicalValue command_value = std::visit(
       [](const auto& value) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"kind", CanonicalValue("gripper_position")},
-            {"max_effort", CoordinateEffortValue(value.max_effort)},
-            {"position", CoordinatePositionValue(value.position)},
-        });
+        using Value = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Value, IoSignalWriteCommandValueDTO>) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("io_signal_write")},
+              {"resource_role_id", CanonicalValue(value.resource_role_id.value())},
+              {"value", CanonicalValue(value.value)},
+          });
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("gripper_position")},
+              {"max_effort", CoordinateEffortValue(value.max_effort)},
+              {"position", CoordinatePositionValue(value.position)},
+          });
+        }
       },
       command.command_value);
   CanonicalValue::Array options;
@@ -1010,14 +1101,21 @@ template <typename StrongId>
         {"value_s", CanonicalValue(option.value_s)},
     });
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object result{
       {"caller_options", CanonicalValue(std::move(options))},
       {"command_schema_id", CanonicalValue(command.command_schema_id.value())},
       {"command_schema_revision", CanonicalValue(command.command_schema_revision.value())},
       {"command_value", std::move(command_value)},
-      {"completion_timeout_s", CanonicalValue(command.completion_timeout_s)},
       {"kind", CanonicalValue("capability_command")},
-  });
+  };
+  const bool output = std::holds_alternative<IoSignalWriteCommandValueDTO>(command.command_value);
+  Require(
+      output ? !command.completion_timeout_s.has_value() : command.completion_timeout_s.has_value(),
+      "operation_journal_record_invalid",
+      "capability command completion policy has the wrong authority");
+  if (!output)
+    result.emplace_back("completion_timeout_s", CanonicalValue(*command.completion_timeout_s));
+  return CanonicalValue(std::move(result));
 }
 
 [[nodiscard]] CanonicalValue SceneRevisionValue(const std::optional<SceneRevision>& scene) {
@@ -1110,6 +1208,14 @@ void AddExecutionScope(CanonicalValue::Object& row,
   });
 }
 
+[[nodiscard]] IoOutputEvidence OutputEvidenceFromName(std::string_view value) {
+  for (const auto evidence : {IoOutputEvidence::kNotSubmitted, IoOutputEvidence::kSubmitted,
+                              IoOutputEvidence::kSourceAccepted, IoOutputEvidence::kSourceRejected,
+                              IoOutputEvidence::kAcceptanceUnknown})
+    if (to_string(evidence) == value) return evidence;
+  throw std::invalid_argument("unknown I/O output evidence");
+}
+
 [[nodiscard]] CanonicalValue OperationStateValue(const OperationStateDTO& state) {
   Require(!has_program_execution_scope(state) || state.journal_capture_order > 0U,
           "operation_journal_record_invalid",
@@ -1117,22 +1223,31 @@ void AddExecutionScope(CanonicalValue::Object& row,
   CanonicalValue::Array participants;
   participants.reserve(state.participants.size());
   for (const auto& participant : state.participants) {
+    const auto* controller = participant.binding_identity.controller();
+    const auto* provider = participant.binding_identity.capability_provider();
     CanonicalValue::Object row{
         {"capability_id", CanonicalValue(participant.capability_id.value())},
         {"capability_provider_binding_id",
-         OptionalIdentity(participant.capability_provider_binding_id)},
+         provider ? CanonicalValue(provider->capability_provider_binding_id.value())
+                  : CanonicalValue(nullptr)},
         {"capability_provider_binding_revision",
-         OptionalIdentity(participant.capability_provider_binding_revision)},
+         provider ? CanonicalValue(provider->capability_provider_binding_revision.value())
+                  : CanonicalValue(nullptr)},
         {"command_target_id", CanonicalValue(participant.command_target_id.value())},
-        {"control_binding_id", CanonicalValue(participant.control_binding_id.value())},
-        {"control_binding_revision", CanonicalValue(participant.control_binding_revision.value())},
-        {"control_domain_id", CanonicalValue(participant.control_domain_id.value())},
-        {"control_domain_revision", CanonicalValue(participant.control_domain_revision.value())},
+        {"control_binding_id", controller ? CanonicalValue(controller->control_binding_id.value())
+                                          : CanonicalValue(nullptr)},
+        {"control_binding_revision",
+         controller ? CanonicalValue(controller->control_binding_revision.value())
+                    : CanonicalValue(nullptr)},
+        {"control_domain_id",
+         CanonicalValue(participant.binding_identity.control_domain_id.value())},
+        {"control_domain_revision",
+         CanonicalValue(participant.binding_identity.control_domain_revision.value())},
         {"controllable_component_id",
          CanonicalValue(participant.controllable_component_id.value())},
-        {"controller_goal_generation",
-         Number(participant.controller_goal_generation.value(), "controller goal generation")},
-        {"controller_goal_id", CanonicalValue(participant.controller_goal_id.value())},
+        {"command_generation",
+         Number(participant.command_generation.value(), "command generation")},
+        {"command_id", CanonicalValue(participant.command_id.value())},
         {"participant_id", CanonicalValue(participant.participant_id.value())},
         {"payload_kind", CanonicalValue(std::string(PayloadKindName(participant.payload_kind)))},
         {"progress", CanonicalValue(participant.progress)},
@@ -1141,6 +1256,20 @@ void AddExecutionScope(CanonicalValue::Object& row,
         {"terminal_error", ErrorValue(participant.terminal_error)},
     };
     AddExecutionScope(row, participant.execution_scope);
+    if (participant.terminal_fact)
+      row.emplace_back("terminal_fact", ParticipantFactValue(*participant.terminal_fact));
+    if (!participant.io_rule_outcomes.empty()) {
+      const auto qualified = ValidateIoRuleOutcomeParticipant(
+          state.operation_id, state.operation_revision, participant);
+      Require(qualified.ok(), "operation_journal_record_invalid",
+              "I/O rule registration relabels its containing participant");
+      const auto encoded = EncodeIoRuleOutcomes(participant.io_rule_outcomes);
+      Require(encoded.ok(), "operation_journal_record_invalid", "I/O rule evidence is invalid");
+      row.emplace_back("io_rule_outcomes", content_identity::parse_canonical_json(encoded.value()));
+    }
+    if (participant.output_evidence)
+      row.emplace_back("output_evidence",
+                       CanonicalValue(std::string(to_string(*participant.output_evidence))));
     participants.emplace_back(std::move(row));
   }
   CanonicalValue::Object result{
@@ -1163,6 +1292,7 @@ void AddExecutionScope(CanonicalValue::Object& row,
       {"state", CanonicalValue(std::string(OperationStateName(state.state)))},
       {"updated_at_ns", Timestamp(state.updated_at_ns, "operation update timestamp")},
   };
+  if (state.preemption) result.emplace_back("preemption", PreemptionValue(*state.preemption));
   // Preserve legacy payload bytes on read/migration. Fresh Kernel captures
   // carry this private ordering fact; it is not part of public control DTOs.
   if (state.journal_capture_order != 0U) {
@@ -1309,6 +1439,22 @@ void AddExecutionScope(CanonicalValue::Object& row,
       {"request_context", RequestContextValue(request.request_context)},
   };
   AddExecutionScope(row, request.execution_scope);
+  if (request.acknowledged_uncertain_outputs) {
+    CanonicalValue::Array acknowledged;
+    std::optional<OperationId> previous;
+    for (const auto& operation : *request.acknowledged_uncertain_outputs) {
+      Require(!operation.operation_id.empty() && operation.operation_revision.nonzero() &&
+                  (!previous || *previous < operation.operation_id),
+              "operation_journal_record_invalid",
+              "uncertain output acknowledgements must have unique sorted operation IDs");
+      previous = operation.operation_id;
+      acknowledged.emplace_back(CanonicalValue::Object{
+          {"operation_id", CanonicalValue(operation.operation_id.value())},
+          {"operation_revision",
+           Number(operation.operation_revision.value(), "acknowledged operation revision")}});
+    }
+    row.emplace_back("acknowledged_uncertain_outputs", CanonicalValue(std::move(acknowledged)));
+  }
   return CanonicalValue(std::move(row));
 }
 
@@ -1622,14 +1768,11 @@ void AddExecutionScope(CanonicalValue::Object& row,
     const EmergencyStopAcceptanceRecordDTO& acceptance,
     const EmergencyStopProjectedIntentDTO& intent, const StopAcceptedDTO& accepted,
     const EmergencyStopAffectedStateSnapshotDTO& affected_state) {
-  const bool scoped = std::any_of(affected_state.operations.begin(),
-                                  affected_state.operations.end(), has_program_execution_scope);
   return CanonicalValue(CanonicalValue::Object{
       {"acceptance", EmergencyStopAcceptanceRecordValue(acceptance)},
       {"accepted", StopAcceptedValue(accepted)},
       {"affected_state", EmergencyStopAffectedStateValue(affected_state)},
-      {"api_version", CanonicalValue(scoped ? "manyforge.stop_acceptance_projection.v3"
-                                            : "manyforge.stop_acceptance_projection.v2")},
+      {"api_version", CanonicalValue("manyforge.stop_acceptance_projection.v8")},
       {"intent", ProjectedStopIntentValue(intent)},
       {"record_kind", CanonicalValue("stop_acceptance_projected")},
   });
@@ -1728,12 +1871,8 @@ void AddExecutionScope(CanonicalValue::Object& row,
                                          const OperationStateDTO& state,
                                          const RuntimeScaleStatusDTO* scale_status,
                                          bool effect_pending) {
-  const bool scoped = has_program_execution_scope(state);
   return CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue(scoped ? "manyforge.operation_journal_record.v3"
-                                     : state.journal_capture_order == 0U
-                                         ? "manyforge.operation_journal_record.v1"
-                                         : "manyforge.operation_journal_record.v2")},
+      {"api_version", CanonicalValue("manyforge.operation_journal_record.v8")},
       {"effect_pending", CanonicalValue(effect_pending)},
       {"intent", intent},
       {"operation_state", OperationStateValue(state)},
@@ -1753,27 +1892,52 @@ void AddExecutionScope(CanonicalValue::Object& row,
       (state.active_stop_id.has_value() != state.active_stop_generation.has_value())) {
     return false;
   }
+  if (state.preemption) {
+    const auto& fact = *state.preemption;
+    if (to_string(fact.kind).empty() || !has_program_execution_scope(state) ||
+        state.journal_capture_order == 0U || fact.by.operation_id.empty() ||
+        fact.by.operation_id == state.operation_id || fact.by.operation_id.value().size() > 2048U ||
+        fact.by.operation_id.value().find('\0') != std::string::npos ||
+        !valid_program_node_execution_scope({fact.by.node_instance_id, fact.by.node_attempt_id}))
+      return false;
+  }
   for (const auto& participant : state.participants) {
+    if (participant.terminal_fact &&
+        participant.terminal_fact->kind == ParticipantExecutionFactKind::kPreemptedByReplacement &&
+        (!state.preemption || state.preemption->kind != OperationPreemptionKind::kPreempted ||
+         participant.state != OperationStateKind::kStopped ||
+         participant.terminal_fact->effect != ParticipantEffectKnowledge::kEffectSettled ||
+         participant.terminal_fact->error))
+      return false;
+    if (participant.terminal_fact &&
+        (!IsTerminal(participant.state) ||
+         std::string_view(to_string(participant.terminal_fact->kind)) == "unknown" ||
+         std::string_view(to_string(participant.terminal_fact->effect)) == "unknown"))
+      return false;
     if (participant.execution_scope.has_value() &&
         !valid_program_node_execution_scope(*participant.execution_scope)) {
       return false;
     }
-    if (participant.participant_id.empty() || participant.controller_goal_id.empty() ||
-        !participant.controller_goal_generation.nonzero() ||
+    if (participant.participant_id.empty() || participant.command_id.empty() ||
+        !participant.command_generation.nonzero() ||
         participant.controllable_component_id.empty() || participant.command_target_id.empty() ||
-        participant.capability_id.empty() || participant.control_domain_id.empty() ||
-        participant.control_domain_revision.empty() || participant.control_binding_id.empty() ||
-        participant.control_binding_revision.empty() || !std::isfinite(participant.progress) ||
-        participant.progress < 0.0 || participant.progress > 1.0 || participant.resources.empty() ||
+        participant.capability_id.empty() || !participant.binding_identity.locally_valid() ||
+        (participant.output_evidence &&
+         (to_string(*participant.output_evidence).empty() ||
+          participant.payload_kind != OperationParticipantPayloadKind::kCapabilityCommand)) ||
+        (participant.binding_identity.provider() &&
+         participant.payload_kind != OperationParticipantPayloadKind::kCapabilityCommand) ||
+        !std::isfinite(participant.progress) || participant.progress < 0.0 ||
+        participant.progress > 1.0 || participant.resources.empty() ||
         participant.resources.size() > kMaxKernelResourceSlots ||
         std::any_of(participant.resources.begin(), participant.resources.end(),
                     [](const auto& resource) { return resource.empty(); })) {
       return false;
     }
+    if (!ValidateIoRuleOutcomeParticipant(state.operation_id, state.operation_revision, participant).ok())
+      return false;
     const std::set<ResourceId> unique(participant.resources.begin(), participant.resources.end());
-    if (unique.size() != participant.resources.size() ||
-        participant.capability_provider_binding_id.has_value() !=
-            participant.capability_provider_binding_revision.has_value()) {
+    if (unique.size() != participant.resources.size()) {
       return false;
     }
   }
@@ -2090,8 +2254,22 @@ template <typename T>
   return static_cast<std::uint64_t>(value);
 }
 
-void ValidateSnapshotCapture(sqlite3* database, const OperationId& operation_id,
-                             std::uint64_t order, const OperationStateDTO* successor = nullptr) {
+[[nodiscard]] std::optional<OperationPreemptionDTO> CapturedPreemption(
+    sqlite3* database, const std::string& captured_state) {
+  Statement field(database,
+                  "SELECT json_type(?,'$.preemption'),json_extract(?,'$.preemption')");
+  field.Bind(1, captured_state);
+  field.Bind(2, captured_state);
+  Require(field.Step(), "operation_journal_corrupt", "preemption capture is missing");
+  if (field.IsNull(0)) return std::nullopt;
+  Require(field.Text(0) == "object" && !field.IsNull(1), "operation_journal_corrupt",
+          "preemption capture is invalid");
+  return PreemptionFromValue(content_identity::parse_canonical_json(field.Text(1)));
+}
+
+std::string ValidateSnapshotCapture(sqlite3* database, const OperationId& operation_id,
+                                    std::uint64_t order,
+                                    const OperationStateDTO* successor = nullptr) {
   Statement record(database,
                    "SELECT payload_json,payload_digest FROM journal_records WHERE sequence="
                    "(SELECT snapshot_sequence FROM operation_snapshots WHERE operation_id=?)");
@@ -2119,6 +2297,19 @@ void ValidateSnapshotCapture(sqlite3* database, const OperationId& operation_id,
           "operation has no committed capture");
   const auto state = captured.Text(0);
   Require(!captured.Step(), "operation_journal_corrupt", "operation capture is ambiguous");
+  Statement capture_version(database, "SELECT json_extract(?,'$.api_version')");
+  capture_version.Bind(1, bytes);
+  Require(capture_version.Step() &&
+              (capture_version.Text(0) == "manyforge.operation_journal_record.v8" ||
+               capture_version.Text(0) == "manyforge.stop_acceptance_projection.v8") &&
+              !capture_version.Step(),
+          "operation_journal_corrupt", "operation capture has an unsupported command identity format");
+  if (const auto captured = CapturedPreemption(database, state)) {
+    Require(successor == nullptr || successor->preemption == captured,
+            "operation_journal_record_invalid", "operation preemption changed after acceptance");
+  }
+
+
   Statement shape(
       database,
       "SELECT json_extract(?,'$.journal_capture_order'), "
@@ -2176,6 +2367,7 @@ void ValidateSnapshotCapture(sqlite3* database, const OperationId& operation_id,
     }
     ++index;
   }
+  return state;
 }
 
 [[nodiscard]] OperationStateDTO LoadOperationState(sqlite3* database,
@@ -2228,8 +2420,8 @@ void ValidateSnapshotCapture(sqlite3* database, const OperationId& operation_id,
           "operation snapshot identity is not unique");
 
   Statement participants(database,
-                         "SELECT participant_index,participant_id,controller_goal_id,"
-                         "controller_goal_generation,controllable_component_id,command_target_id,"
+                         "SELECT participant_index,participant_id,command_id,"
+                         "command_generation,controllable_component_id,command_target_id,"
                          "capability_id,control_domain_id,control_domain_revision,"
                          "control_binding_id,control_binding_revision,"
                          "capability_provider_binding_id,capability_provider_binding_revision,"
@@ -2257,6 +2449,22 @@ void ValidateSnapshotCapture(sqlite3* database, const OperationId& operation_id,
     const bool has_provider_revision = !participants.IsNull(12);
     Require(has_provider_id == has_provider_revision, "operation_journal_corrupt",
             "operation participant has an incomplete provider binding");
+    Require(participants.IsNull(9) == participants.IsNull(10), "operation_journal_corrupt",
+            "operation participant has an incomplete controller binding");
+    Require(!participants.IsNull(9) || has_provider_id, "operation_journal_corrupt",
+            "operation participant has no binding authority");
+    std::optional<CapabilityProviderBindingIdentityDTO> provider;
+    if (has_provider_id)
+      provider = CapabilityProviderBindingIdentityDTO{
+          CapabilityProviderBindingId(participants.Text(11)),
+          CapabilityProviderBindingRevision(participants.Text(12))};
+    ParticipantBindingIdentityDTO binding_identity{
+        ControlDomainId(participants.Text(7)), ControlDomainRevision(participants.Text(8)),
+        participants.IsNull(9) ? decltype(ParticipantBindingIdentityDTO::binding)(*provider)
+                               : decltype(ParticipantBindingIdentityDTO::binding)(
+                                     ControllerParticipantBindingIdentityDTO{
+                                         ControlBindingId(participants.Text(9)),
+                                         ControlBindingRevision(participants.Text(10)), provider})};
     const bool has_error_code = !participants.IsNull(16);
     const bool has_error_message = !participants.IsNull(17);
     Require(has_error_code == has_error_message, "operation_journal_corrupt",
@@ -2297,20 +2505,11 @@ void ValidateSnapshotCapture(sqlite3* database, const OperationId& operation_id,
         OperationParticipantId(participants.Text(1)),
         ControllerGoalId(participants.Text(2)),
         ControllerGoalGeneration(
-            PositiveIdentifier(participants.Integer(3), "controller goal generation")),
+            PositiveIdentifier(participants.Integer(3), "command generation")),
         ControllableComponentId(participants.Text(4)),
         CommandTargetId(participants.Text(5)),
         CapabilityId(participants.Text(6)),
-        ControlDomainId(participants.Text(7)),
-        ControlDomainRevision(participants.Text(8)),
-        ControlBindingId(participants.Text(9)),
-        ControlBindingRevision(participants.Text(10)),
-        has_provider_id ? std::optional<CapabilityProviderBindingId>(
-                              CapabilityProviderBindingId(participants.Text(11)))
-                        : std::nullopt,
-        has_provider_revision ? std::optional<CapabilityProviderBindingRevision>(
-                                    CapabilityProviderBindingRevision(participants.Text(12)))
-                              : std::nullopt,
+        std::move(binding_identity),
         *payload_kind,
         *participant_state,
         participants.Real(15),
@@ -2320,8 +2519,73 @@ void ValidateSnapshotCapture(sqlite3* database, const OperationId& operation_id,
     });
     ++expected_index;
   }
+  const auto capture = ValidateSnapshotCapture(database, operation_id, state.journal_capture_order);
+  state.preemption = CapturedPreemption(database, capture);
+  Statement facts(
+      database,
+      "SELECT json_type(value,'$.terminal_fact'),json_extract(value,'$.terminal_fact'),"
+      "json_extract(value,'$.participant_id'),json_extract(value,'$.command_id'),"
+      "json_extract(value,'$.command_generation'),json_extract(value,'$.control_binding_id'"
+      "),"
+      "json_extract(value,'$.control_binding_revision'),json_extract(value,'$.control_domain_id'),"
+      "json_extract(value,'$.control_domain_revision'),json_extract(value,'$.capability_provider_"
+      "binding_id'),"
+      "json_extract(value,'$.capability_provider_binding_revision'),json_type(value,'$.output_"
+      "evidence'),"
+      "json_extract(value,'$.output_evidence'),json_type(value,'$.control_binding_id'),"
+      "json_type(value,'$.control_binding_revision'),"
+      "json_type(value,'$.io_rule_outcomes'),json_extract(value,'$.io_rule_outcomes') "
+      "FROM json_each(?,'$.participants') ORDER BY CAST(key AS INTEGER)");
+  facts.Bind(1, capture);
+  std::size_t fact_index = 0U;
+  while (facts.Step()) {
+    Require(fact_index < state.participants.size(), "operation_journal_corrupt",
+            "participant fact capture count mismatch");
+    auto& participant = state.participants[fact_index];
+    const auto* controller = participant.binding_identity.controller();
+    const auto* provider = participant.binding_identity.capability_provider();
+    Require(facts.Text(2) == participant.participant_id.value() &&
+                facts.Text(3) == participant.command_id.value() &&
+                facts.Integer(4) ==
+                    static_cast<std::int64_t>(participant.command_generation.value()) &&
+                facts.IsNull(5) == (controller == nullptr) &&
+                facts.IsNull(6) == (controller == nullptr) &&
+                (controller || (facts.Text(13) == "null" && facts.Text(14) == "null")) &&
+                (!controller || (facts.Text(5) == controller->control_binding_id.value() &&
+                                 facts.Text(6) == controller->control_binding_revision.value())) &&
+                facts.Text(7) == participant.binding_identity.control_domain_id.value() &&
+                facts.Text(8) == participant.binding_identity.control_domain_revision.value() &&
+                facts.IsNull(9) == (provider == nullptr) &&
+                facts.IsNull(10) == (provider == nullptr) &&
+                (!provider ||
+                 (facts.Text(9) == provider->capability_provider_binding_id.value() &&
+                  facts.Text(10) == provider->capability_provider_binding_revision.value())),
+            "operation_journal_corrupt", "participant capture identity mismatch");
+    if (!facts.IsNull(0)) {
+      Require(facts.Text(0) == "object" && !facts.IsNull(1), "operation_journal_corrupt",
+              "participant fact capture shape mismatch");
+      participant.terminal_fact =
+          ParticipantFactFromValue(content_identity::parse_canonical_json(facts.Text(1)));
+    }
+    if (!facts.IsNull(11)) {
+      Require(facts.Text(11) == "text" && !facts.IsNull(12), "operation_journal_corrupt",
+              "participant output evidence shape mismatch");
+      participant.output_evidence = OutputEvidenceFromName(facts.Text(12));
+    }
+    if (!facts.IsNull(15)) {
+      Require(facts.Text(15) == "array" && !facts.IsNull(16), "operation_journal_corrupt",
+              "participant rule outcome shape mismatch");
+      auto decoded = DecodeIoRuleOutcomes(facts.Text(16));
+      Require(decoded.ok(), "operation_journal_corrupt", "participant rule evidence is invalid");
+      participant.io_rule_outcomes = std::move(decoded.value());
+      Require(ValidateIoRuleOutcomeParticipant(state.operation_id, state.operation_revision,
+                  participant).ok(), "operation_journal_corrupt", "participant rule evidence relabels identity");
+    }
+    ++fact_index;
+  }
+  Require(fact_index == state.participants.size(), "operation_journal_corrupt",
+          "participant fact capture count mismatch");
   RequireState(state);
-  ValidateSnapshotCapture(database, operation_id, state.journal_capture_order);
   return state;
 }
 
@@ -2421,8 +2685,8 @@ void StoreOperationSnapshot(sqlite3* database, const RequestOwnerEpoch& owner_ep
     Statement insert_participant(
         database,
         "INSERT INTO operation_participants("
-        "operation_id,participant_index,participant_id,controller_goal_id,"
-        "controller_goal_generation,controllable_component_id,command_target_id,"
+        "operation_id,participant_index,participant_id,command_id,"
+        "command_generation,controllable_component_id,command_target_id,"
         "capability_id,control_domain_id,control_domain_revision,control_binding_id,"
         "control_binding_revision,capability_provider_binding_id,"
         "capability_provider_binding_revision,payload_kind,state,progress,"
@@ -2432,19 +2696,24 @@ void StoreOperationSnapshot(sqlite3* database, const RequestOwnerEpoch& owner_ep
     insert_participant.Bind(1, state.operation_id.value());
     insert_participant.Bind(2, static_cast<std::int64_t>(index));
     insert_participant.Bind(3, participant.participant_id.value());
-    insert_participant.Bind(4, participant.controller_goal_id.value());
+    insert_participant.Bind(4, participant.command_id.value());
     insert_participant.Bind(
-        5, static_cast<std::int64_t>(participant.controller_goal_generation.value()));
+        5, static_cast<std::int64_t>(participant.command_generation.value()));
     insert_participant.Bind(6, participant.controllable_component_id.value());
     insert_participant.Bind(7, participant.command_target_id.value());
     insert_participant.Bind(8, participant.capability_id.value());
-    insert_participant.Bind(9, participant.control_domain_id.value());
-    insert_participant.Bind(10, participant.control_domain_revision.value());
-    insert_participant.Bind(11, participant.control_binding_id.value());
-    insert_participant.Bind(12, participant.control_binding_revision.value());
-    if (participant.capability_provider_binding_id.has_value()) {
-      insert_participant.Bind(13, participant.capability_provider_binding_id->value());
-      insert_participant.Bind(14, participant.capability_provider_binding_revision->value());
+    insert_participant.Bind(9, participant.binding_identity.control_domain_id.value());
+    insert_participant.Bind(10, participant.binding_identity.control_domain_revision.value());
+    if (const auto* controller = participant.binding_identity.controller()) {
+      insert_participant.Bind(11, controller->control_binding_id.value());
+      insert_participant.Bind(12, controller->control_binding_revision.value());
+    } else {
+      insert_participant.BindNull(11);
+      insert_participant.BindNull(12);
+    }
+    if (const auto* provider = participant.binding_identity.capability_provider()) {
+      insert_participant.Bind(13, provider->capability_provider_binding_id.value());
+      insert_participant.Bind(14, provider->capability_provider_binding_revision.value());
     } else {
       insert_participant.BindNull(13);
       insert_participant.BindNull(14);
@@ -2893,6 +3162,8 @@ class SqliteOperationJournal::Impl final {
   std::uint64_t RecordCellAdmissionGenerationAdvanced(const RequestOwnerEpoch& owner_epoch,
                                                       AdmissionGeneration prior_generation,
                                                       AdmissionGeneration resulting_generation);
+  std::uint64_t RecordInterruptRuleStateChanged(const IoRuleStateChangeDTO& change);
+  std::uint64_t RecordGlobalIoRuleCleared(const IoGlobalRuleRecoveryRecordDTO& record);
 
   OperationJournalEventPageDTO ReadEvents(const RequestOwnerEpoch& owner_epoch,
                                           std::uint64_t after_sequence, std::size_t limit,
@@ -3062,12 +3333,11 @@ class SqliteOperationJournal::Impl final {
       Require(!metadata.Step(), "operation_journal_corrupt",
               "operation journal metadata insert returned an unexpected row");
     }
-    // Q51/Q53: the per-robot Stop timing changed the journal format; journals
-    // of an earlier format (only this unreleased branch wrote them) are
-    // refused, never converted.
+    // Contract130: common command identities changed the unreleased format.
+    // Earlier journals are refused without converting their retained evidence.
     Require(ScalarInteger(database_, "PRAGMA user_version") >= kOperationJournalSchemaVersion,
             "operation_journal_format_unsupported",
-            "operation journal predates the per-robot Stop timing format and is not converted");
+            "operation journal predates the common command identity format and is not converted");
     Require(SchemaObjectNames(database_) == ExpectedSchemaObjects(),
             "operation_journal_storage_foreign", "operation journal contains an unexpected schema");
     Require(
@@ -3629,7 +3899,7 @@ OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
                         "('operation_accepted','control_accepted','stop_acceptance_projected',"
                         "'stop_terminal_projected','stop_fault_cleared',"
                         "'runtime_scale_accepted','operation_prepared',"
-                        "'state_observed',"
+                        "'state_observed','interrupt_rule_state_changed',"
                         "'host_replaced') "
                         "ORDER BY sequence LIMIT ?"
                       : "SELECT sequence,record_kind,request_id,operation_id,"
@@ -4118,13 +4388,13 @@ std::uint64_t SqliteOperationJournal::Impl::RecordOperationAccepted(
           "operation_journal_record_invalid",
           "operation acceptance does not match its durable intent or state");
   for (std::size_t index = 0; index < accepted.participant_assignments.size(); ++index) {
-    Require(
-        accepted.participant_assignments[index].input_index == index &&
-            accepted.participant_assignments[index].participant_id ==
-                state.participants[index].participant_id &&
-            intent.participants[index].execution_scope == state.participants[index].execution_scope,
-        "operation_journal_record_invalid",
-        "operation acceptance participant assignment is inconsistent");
+    Require(accepted.participant_assignments[index].input_index == index &&
+                accepted.participant_assignments[index].participant_id ==
+                    state.participants[index].participant_id &&
+                intent.participants[index].execution_scope ==
+                    state.participants[index].execution_scope,
+            "operation_journal_record_invalid",
+            "operation acceptance participant assignment is inconsistent");
   }
   return Append(owner_epoch, "operation_accepted", intent.request_context.request_id,
                 RecordValue("operation_accepted", owner_epoch, OperationIntentValue(intent),
@@ -5429,6 +5699,154 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionGenerationAdvance
   return resulting_generation.value();
 }
 
+std::uint64_t SqliteOperationJournal::Impl::RecordGlobalIoRuleCleared(
+    const IoGlobalRuleRecoveryRecordDTO& record) {
+  const auto encoded = EncodeIoGlobalRuleRecoveryRecord(record);
+  Require(encoded.ok(), "operation_journal_record_invalid",
+          "global rule recovery authorization is invalid");
+  const auto& payload = encoded.value();
+  Require(payload.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
+          "global rule recovery authorization exceeds the fixed payload bound");
+  const auto digest = content_identity::sha256_digest(payload);
+  const auto& request = record.intent.request_context;
+  const auto lock = LockOrdinaryWriter();
+  RequireOpen();
+  const auto occurred_at_wall = wall_time_text_();
+  ValidateWallTimeText(occurred_at_wall);
+  Transaction transaction(database_);
+  if (critical_section_observer_) critical_section_observer_("ordinary_write");
+  Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
+  active.Bind(1, request.request_owner_epoch.value());
+  Require(active.Step() && active.Integer(0) == 1 && !active.Step(),
+          "operation_journal_owner_epoch_stale", "global rule recovery owner is not active");
+  // Use the existing cross-kind owner/request uniqueness boundary. A replay
+  // returns the original durable sequence; a changed evaluation, nonce or
+  // payload cannot be substituted after an uncertain commit.
+  Statement existing(database_,
+                     "SELECT sequence,record_kind,payload_json,payload_digest "
+                     "FROM journal_records WHERE owner_epoch=? AND request_id=? "
+                     "AND record_kind<>'stop_acceptance_projected'");
+  existing.Bind(1, request.request_owner_epoch.value());
+  existing.Bind(2, request.request_id.value());
+  if (existing.Step()) {
+    const auto sequence = PositiveIdentifier(existing.Integer(0), "operation journal sequence");
+    const auto kind = existing.Text(1);
+    const auto prior = existing.Text(2);
+    const auto prior_digest = existing.Text(3);
+    Require(!existing.Step(), "operation_journal_corrupt", "global recovery request is duplicated");
+    Require(content_identity::sha256_digest(prior) == prior_digest, "operation_journal_corrupt",
+            "global recovery request digest is corrupt");
+    Require(
+        kind == "global_io_rule_recovery_authorized" && prior == payload && prior_digest == digest,
+        "request_id_conflict", "global recovery request conflicts with retained durable truth");
+    transaction.Commit();
+    return sequence;
+  }
+  Statement insert(database_,
+                   "INSERT INTO journal_records(owner_epoch,record_kind,request_id,"
+                   "operation_id,operation_revision,occurred_at_ns,occurred_at_wall,"
+                   "effect_pending,payload_json,payload_digest) "
+                   "VALUES(?,'global_io_rule_recovery_authorized',?,NULL,NULL,?,?,0,?,?)");
+  insert.Bind(1, request.request_owner_epoch.value());
+  insert.Bind(2, request.request_id.value());
+  insert.Bind(3, record.inactive_observation.evaluated_at_ns);
+  insert.Bind(4, occurred_at_wall);
+  insert.Bind(5, payload);
+  insert.Bind(6, digest);
+  Require(!insert.Step(), "operation_journal_corrupt", "global recovery insert returned a row");
+  const auto sequence =
+      PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
+  // Reuse existing retained history. The Core recovery owner serializes any
+  // unresolved immutable record before another authorization is prepared;
+  // completed, retired selectors never become fresh requests after eviction.
+  Statement compact(
+      database_,
+      "DELETE FROM journal_records WHERE owner_epoch=? "
+      "AND record_kind='global_io_rule_recovery_authorized' "
+      "AND sequence NOT IN (SELECT sequence FROM journal_records WHERE owner_epoch=? "
+      "AND record_kind='global_io_rule_recovery_authorized' ORDER BY sequence DESC LIMIT ?)");
+  compact.Bind(1, request.request_owner_epoch.value());
+  compact.Bind(2, request.request_owner_epoch.value());
+  compact.Bind(3, static_cast<std::int64_t>(history_capacity_));
+  Require(!compact.Step(), "operation_journal_corrupt",
+          "global recovery compaction returned a row");
+  transaction.Commit();
+  return sequence;
+}
+
+std::uint64_t SqliteOperationJournal::Impl::RecordInterruptRuleStateChanged(
+    const IoRuleStateChangeDTO& change) {
+  Require(!io_rule_state_field_error(change.context, change.rule) && change.occurred_at_ns >= 0,
+          "operation_journal_record_invalid", "global rule-state projection is invalid");
+  const auto& context = change.context;
+  CanonicalValue acquisition(nullptr);
+  if (change.rule.triggering_acquisition) {
+    const auto& actual = *change.rule.triggering_acquisition;
+    const auto& cursor = actual.source_cursor;
+    acquisition = CanonicalValue(CanonicalValue::Object{
+        {"source_id", CanonicalValue(actual.source_id.value())},
+        {"source_epoch", CanonicalValue(actual.incarnation.value())},
+        {"source_sequence", CanonicalValue(std::to_string(actual.source_sequence))},
+        {"source_cursor",
+         CanonicalValue(CanonicalValue::Object{
+             {"owner_epoch", CanonicalValue(cursor.owner_epoch.value())},
+             {"catalog_generation", CanonicalValue(std::to_string(cursor.catalog_generation))},
+             {"source_id", CanonicalValue(cursor.source_id.value())},
+             {"record_sequence", CanonicalValue(std::to_string(cursor.record_sequence))}})}});
+  }
+  const auto payload = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"owner_epoch", CanonicalValue(context.owner_epoch.value())},
+      {"catalog_generation", CanonicalValue(std::to_string(context.catalog_generation))},
+      {"active_publication_generation",
+       CanonicalValue(static_cast<double>(context.active_publication_generation.value()))},
+      {"retained_bundle_id", CanonicalValue(context.retained_bundle_id.value())},
+      {"graph_revision", CanonicalValue(context.graph_revision.value())},
+      {"rule_id", CanonicalValue(change.rule.rule_id.value())},
+      {"state", CanonicalValue(std::string(io_global_rule_state_token(change.rule.state)))},
+      {"triggering_acquisition", std::move(acquisition)}}));
+  Require(payload.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
+          "global rule-state projection exceeds the fixed payload bound");
+  const auto digest = content_identity::sha256_digest(payload);
+  const auto lock = LockOrdinaryWriter();
+  RequireOpen();
+  const auto occurred_at_wall = wall_time_text_();
+  ValidateWallTimeText(occurred_at_wall);
+  Transaction transaction(database_);
+  if (critical_section_observer_) critical_section_observer_("ordinary_write");
+  Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
+  active.Bind(1, context.owner_epoch.value());
+  Require(active.Step() && active.Integer(0) == 1 && !active.Step(),
+          "operation_journal_owner_epoch_stale", "global rule-state owner is not active");
+  Statement insert(
+      database_,
+      "INSERT INTO journal_records(owner_epoch,record_kind,request_id,operation_id,"
+      "operation_revision,occurred_at_ns,occurred_at_wall,effect_pending,payload_json,"
+      "payload_digest) VALUES(?,'interrupt_rule_state_changed',NULL,NULL,NULL,?,?,0,?,?)");
+  insert.Bind(1, context.owner_epoch.value());
+  insert.Bind(2, change.occurred_at_ns);
+  insert.Bind(3, occurred_at_wall);
+  insert.Bind(4, payload);
+  insert.Bind(5, digest);
+  Require(!insert.Step(), "operation_journal_corrupt", "global rule-state insert returned a row");
+  const auto sequence =
+      PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
+  // Reuse this journal's existing retained-history bound. Current truth comes
+  // from the atomic Kernel baseline, never from assuming old rows still exist.
+  Statement compact(
+      database_,
+      "DELETE FROM journal_records WHERE owner_epoch=? AND "
+      "record_kind='interrupt_rule_state_changed' "
+      "AND sequence NOT IN (SELECT sequence FROM journal_records WHERE owner_epoch=? "
+      "AND record_kind='interrupt_rule_state_changed' ORDER BY sequence DESC LIMIT ?)");
+  compact.Bind(1, context.owner_epoch.value());
+  compact.Bind(2, context.owner_epoch.value());
+  compact.Bind(3, static_cast<std::int64_t>(history_capacity_));
+  Require(!compact.Step(), "operation_journal_corrupt",
+          "global rule-state compaction returned a row");
+  transaction.Commit();
+  return sequence;
+}
+
 SqliteOperationJournal::SqliteOperationJournal(
     std::filesystem::path database_path, CellId cell_id, std::size_t history_capacity,
     std::function<std::string()> wall_time_text,
@@ -5584,6 +6002,16 @@ Result<std::uint64_t> SqliteOperationJournal::RecordCellAdmissionGenerationAdvan
     return impl_->RecordCellAdmissionGenerationAdvanced(owner_epoch, prior_generation,
                                                         resulting_generation);
   });
+}
+
+Result<std::uint64_t> SqliteOperationJournal::RecordGlobalIoRuleCleared(
+    const IoGlobalRuleRecoveryRecordDTO& record) {
+  return AsResult<std::uint64_t>([&] { return impl_->RecordGlobalIoRuleCleared(record); });
+}
+
+Result<std::uint64_t> SqliteOperationJournal::RecordInterruptRuleStateChanged(
+    const IoRuleStateChangeDTO& change) {
+  return AsResult<std::uint64_t>([&] { return impl_->RecordInterruptRuleStateChanged(change); });
 }
 
 Result<OperationJournalEventPageDTO> SqliteOperationJournal::ReadEvents(

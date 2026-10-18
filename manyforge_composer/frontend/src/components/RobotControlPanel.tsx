@@ -35,6 +35,12 @@ import { OperationProgress } from './OperationProgress';
 import { GizmoSteps, StepSelect, useGizmoSettings } from './common/GizmoControls';
 import type { GizmoController } from './common/GizmoControls';
 import { ANGULAR_STEP_OPTIONS } from '../utils/gizmo';
+import {
+  allUncertainOutputsApproved,
+  uncertainOutputKey,
+  uncertainOutputs,
+} from '../utils/uncertainOutputs';
+import { UncertainOutputConfirmation } from './UncertainOutputConfirmation';
 
 const RAD_TO_DEG = 180 / Math.PI;
 const DEG_TO_RAD = Math.PI / 180;
@@ -372,7 +378,7 @@ export function RobotControlPanelView({
     gripper?.programBindingId, status?.sceneRevision.scene_id,
     status?.sceneRevision.revision_id, status?.sceneRevision.content_hash,
     status?.retainedBundleId, status?.graphRevision, programActive,
-    state.selectedComponentId, state.selectedMotionTargetId, state.selectedGripperTargetId,
+    state.selectedControllableComponentId, state.selectedMotionTargetId, state.selectedGripperTargetId,
     state.mode, inputRebase].join('\u0000');
   const inputContext = useMemo(() => ({ resetKey: inputResetKey, reportPending }), [inputResetKey, reportPending]);
   const operationActive = robotControlHasActiveOperation(state);
@@ -396,15 +402,36 @@ export function RobotControlPanelView({
     if (canStop) stopButton.current?.focus();
   }, [canStop]);
   const recoveryRequired = manualOperationRequiresRecovery(state.operation);
+  // Contract 66: an output with unknown acceptance is released only by a
+  // targeted Reset that acknowledges it explicitly.
+  const operationUncertainOutputs = useMemo(
+    () => uncertainOutputs(state.operation === null ? [] : [state.operation]),
+    [state.operation],
+  );
+  const [approvedUncertain, setApprovedUncertain] = useState<ReadonlySet<string>>(() => new Set());
+  const uncertainApproved = allUncertainOutputsApproved(operationUncertainOutputs, approvedUncertain);
   const resetOperationControl = (
-    <button
-      type="button"
-      disabled={!enabled || controller.currentStatus == null || state.operation?.resident !== true
-        || !operationStateIsTerminal(state.operation.state) || controlPending !== null}
-      aria-label="Reset operation"
-      title="Release this exact terminal direct operation after the owner has certified containment."
-      onClick={() => { void reset(); }}
-    >{controlPending === 'reset' ? 'Sending Reset' : 'Reset operation'}</button>
+    <>
+      <UncertainOutputConfirmation outputs={operationUncertainOutputs} approved={approvedUncertain}
+        disabled={controlPending !== null}
+        onToggle={(key, approved) => setApprovedUncertain((current) => {
+          const next = new Set(current);
+          if (approved) next.add(key); else next.delete(key);
+          return next;
+        })} />
+      <button
+        type="button"
+        disabled={!enabled || controller.currentStatus == null || state.operation?.resident !== true
+          || !operationStateIsTerminal(state.operation.state) || controlPending !== null || !uncertainApproved}
+        aria-label="Reset operation"
+        title={uncertainApproved
+          ? 'Release this exact terminal direct operation after the owner has certified containment.'
+          : 'Confirm each output with unknown acceptance first.'}
+        onClick={() => {
+          void reset(operationUncertainOutputs.filter((output) => approvedUncertain.has(uncertainOutputKey(output))));
+        }}
+      >{controlPending === 'reset' ? 'Sending Reset' : 'Reset operation'}</button>
+    </>
   );
   const presentedPose = robotControlHasLocalDraft(state) || observedMotion === null
     ? state.draftPose : observedMotion.currentTcpPose;
@@ -735,12 +762,12 @@ export function RobotControlPanelView({
                   <span>Robot</span>
                   <select
                     aria-label="Robot target"
-                    value={`${state.selectedComponentId ?? ''}\u0000${state.selectedMotionTargetId ?? ''}`}
+                    value={`${state.selectedControllableComponentId ?? ''}\u0000${state.selectedMotionTargetId ?? ''}`}
                     disabled={state.phase === 'approving'}
                     onChange={(event) => {
-                      const [componentId, motionTargetId] = event.currentTarget.value.split('\u0000');
-                      if (componentId !== undefined && motionTargetId !== undefined) {
-                        controller.selectRobot(componentId, motionTargetId);
+                      const [controllableComponentId, motionTargetId] = event.currentTarget.value.split('\u0000');
+                      if (controllableComponentId !== undefined && motionTargetId !== undefined) {
+                        controller.selectRobot(controllableComponentId, motionTargetId);
                       }
                     }}
                   >

@@ -1078,7 +1078,7 @@ def test_composer_program_routes_forward_when_draft_matches_applied(
         "scenario_id": "cell-pick",
         "source_document_digest": digest_a,
         "expected_applied_record_digest": "sha256:" + "b" * 64,
-        "expected_admission_generation": 7,
+        # Q128: Run carries no admission generation; the server uses its current one.
     }
     stop = {
         "request_id": "request.program.2",
@@ -2202,6 +2202,7 @@ def test_lifecycle_request_result_proxy_preserves_exact_request_without_submit(r
         "expected_component_lifecycle_generation": 4,
         "expected_admission_generation": 7,
         "expected_control_domains": [{
+            "kind": "controller",
             "control_domain_id": "domain.arm", "control_domain_revision": "domain.1",
             "controller_topology_id": "topology.arm", "topology_revision": "topology.1",
             "expected_active_control_configuration": {
@@ -2489,3 +2490,89 @@ def test_close_runtime_detach_still_rejects_native_authoring_fences(headless_cli
         response = composer.post("/api/scene/transactions", json=body)
         assert response.status_code == 422, response.text
         assert not [request for request in requests if request["path"] == "/api/scene/transactions"]
+
+
+def test_composer_forwards_the_targeted_reset_acknowledgement_unchanged(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+    control = {
+        "request_context": {
+            "request_id": "request.control.ack",
+            "request_owner_epoch": "execution.epoch.1",
+            "source_label": "composer_ui",
+            "correlation_id": None,
+        },
+        "operation_id": "operation-1",
+        "expected_operation_revision": 3,
+        "reason": None,
+        "acknowledged_uncertain_outputs": [
+            {"operation_id": "operation-1", "operation_revision": 3}
+        ],
+    }
+    with _composer(client) as composer:
+        accepted = composer.post(
+            "/api/execution/operations/operation-1/reset", json=control
+        )
+        refused = composer.post(
+            "/api/execution/operations/operation-1/reset",
+            json={
+                **control,
+                "acknowledged_uncertain_outputs": [
+                    {"operation_id": "operation-9", "operation_revision": 1}
+                ],
+            },
+        )
+    assert accepted.status_code == 200
+    assert refused.status_code == 422
+    forwarded = [
+        item
+        for item in requests
+        if item["path"] == "/api/execution/operations/operation-1/reset"
+    ]
+    assert [item["body"] for item in forwarded] == [control]
+
+
+def test_global_io_rule_recovery_variant_is_proxied_unchanged(headless_client) -> None:
+    client, requests, _node_environment = headless_client
+    selector = {
+        "context": {
+            "owner_epoch": "kernel.epoch.1",
+            "catalog_generation": "4",
+            "active_publication_generation": 2,
+            "bundle": "sha256:" + "1" * 64,
+            "graph": "sha256:" + "2" * 64,
+        },
+        "rule_id": "door_open",
+        "expected_rule_registration_id": "18446744073709551615",
+    }
+    recovery = {
+        "kind": "global_io_rule",
+        "request_context": {
+            "request_id": "request.rule-recovery.1",
+            "request_owner_epoch": "execution.epoch.1",
+            "source_label": "composer_ui",
+            "correlation_id": None,
+        },
+        "selector": selector,
+        "reason": None,
+    }
+    with _composer(client) as composer:
+        accepted = composer.post("/api/execution/stop-fault/recover", json=recovery)
+        unknown = composer.post(
+            "/api/execution/stop-fault/recover", json={**recovery, "kind": "other"}
+        )
+        numeric = composer.post(
+            "/api/execution/stop-fault/recover",
+            json={
+                **recovery,
+                "selector": {**selector, "expected_rule_registration_id": 7},
+            },
+        )
+    assert accepted.status_code == 200, accepted.text
+    assert unknown.status_code == 422
+    assert numeric.status_code == 422
+    forwarded = [
+        item for item in requests if item["path"] == "/api/execution/stop-fault/recover"
+    ]
+    assert [item["body"] for item in forwarded] == [recovery]

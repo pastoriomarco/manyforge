@@ -638,6 +638,26 @@ ComputeCellAdmissionRecoveryFootprint(
   return Result<CellAdmissionRecoveryFootprintDTO>::Ok(result);
 }
 
+Result<void> ValidateProgramRunnerContactLoss(const ProgramRunnerContactLossDTO& loss) {
+  const auto& cycle = loss.established_cycle;
+  const bool active = cycle.state == ProgramCycleStateDTO::kStarting ||
+                      cycle.state == ProgramCycleStateDTO::kRunning ||
+                      cycle.state == ProgramCycleStateDTO::kStopping;
+  if (!BoundedIdentity(loss.manager_owner_epoch.value()) ||
+      !BoundedIdentity(loss.manager_runtime_epoch.value()) ||
+      !ValidateProgramCycleStatus(cycle).ok() || !active || !cycle.program_run_id ||
+      !cycle.cycle_claim_generation || cycle.accepted_reset ||
+      cycle.terminal_or_settlement_reference ||
+      (loss.failure_predicate != "program_runner_liveness_probe" &&
+       loss.failure_predicate != "program_runner_liveness_renewal" &&
+       loss.failure_predicate != "program_runner_reconciliation_renewal" &&
+       loss.failure_predicate != "program_runner_publication_fault") ||
+      loss.message.size() > 1024U || !content_identity::is_utf8_nfc(loss.message)) {
+    return Invalid<void>("program_runner_contact_loss_invalid");
+  }
+  return Result<void>::Ok();
+}
+
 Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
   if (!BoundedIdentity(status.program_runner_owner_epoch.value()) ||
       status.cycle_generation == 0U || status.cycle_generation > kMaximumSafeCounter ||

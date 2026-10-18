@@ -429,6 +429,14 @@ public:
     Publish();
   }
 
+  /// Publish a real transitional controller-manager activity sample.
+  void SetControllerActivity(bool controller_active, bool writer_active) {
+    active_ = controller_active;
+    writer_active_ = writer_active;
+    if (jtc_ != nullptr) jtc_->SetActive(controller_active);
+    Publish();
+  }
+
   void SetHardwareActive(bool active) {
     hardware_active_ = active;
     Publish();

@@ -19,6 +19,11 @@ namespace core = manyforge::core;
 // Version 4 carries the per-component delta and receipts (H1a-IF.1).
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'S',
                                               'R', 'C', '4', 0};
+constexpr auto kProviderMagic = [] {
+  auto value = kMagic;
+  value[6] = '5';
+  return value;
+}();
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
 constexpr std::uint8_t kRequestTag = 1U;
 constexpr std::uint8_t kPreparingTag = 2U;
@@ -55,12 +60,17 @@ constexpr std::string_view kObserverRetirementMagic = "MFNSRC4-OBSERVER-RETIREME
 
 class Writer final {
 public:
-  explicit Writer(const std::uint8_t tag) {
+  explicit Writer(const std::uint8_t tag, bool provider_format = false)
+      : provider_format_(provider_format) {
     bytes_.reserve(1024U);
-    for (const auto byte : kMagic) {
+    for (const auto byte : provider_format_ ? kProviderMagic : kMagic) {
       Byte(byte);
     }
     Byte(tag);
+  }
+
+  [[nodiscard]] bool ProviderFormat() const noexcept {
+    return provider_format_;
   }
 
   void Byte(const std::uint8_t value) {
@@ -101,6 +111,7 @@ private:
     }
   }
 
+  bool provider_format_;
   std::string bytes_;
 };
 
@@ -111,11 +122,20 @@ public:
         bytes_.size() > kMaximumSelectedRuntimeCompositionRpcPacketBytes) {
       Fail("packet is empty, incomplete, or oversized");
     }
-    for (const auto expected : kMagic) {
-      if (Byte() != expected) {
-        Fail("packet magic or version differs");
-      }
-    }
+    const auto magic = bytes_.substr(0U, kMagic.size());
+    provider_format_ =
+        magic ==
+        std::string_view(reinterpret_cast<const char *>(kProviderMagic.data()),
+                         kProviderMagic.size());
+    if (!provider_format_ &&
+        magic != std::string_view(reinterpret_cast<const char *>(kMagic.data()),
+                                  kMagic.size()))
+      Fail("packet magic or version differs");
+    offset_ = kMagic.size();
+  }
+
+  [[nodiscard]] bool ProviderFormat() const noexcept {
+    return provider_format_;
   }
 
   [[nodiscard]] std::uint8_t Byte() {
@@ -162,7 +182,9 @@ public:
     return static_cast<std::uint8_t>(bytes_[offset_]);
   }
 
-  void Finish() const {
+  void Finish(bool provider_scope = false) const {
+    if (provider_scope != provider_format_)
+      Fail("packet version differs from scope kind");
     if (offset_ != bytes_.size()) {
       Fail("packet has trailing fields");
     }
@@ -175,6 +197,7 @@ private:
     }
   }
 
+  bool provider_format_{};
   std::string_view bytes_;
   std::size_t offset_{};
 };
@@ -257,7 +280,22 @@ ReadProjectionRevision(Reader &reader) {
            ReadStrong<core::ContentDigest>(reader)}};
 }
 
+[[nodiscard]] bool
+UsesProviderDomains(const core::ConfigurationFenceScopeDTO &scope) {
+  return std::any_of(
+      scope.domains.begin(), scope.domains.end(), [](const auto &domain) {
+        return std::holds_alternative<
+            core::ProviderConfigurationFenceDomainDTO>(domain.payload);
+      });
+}
+
 void WriteScope(Writer &writer, const core::ConfigurationFenceScopeDTO &scope) {
+  if (writer.ProviderFormat()) {
+    writer.String(core::detail::EncodeConfigurationFenceScopeRecord(scope));
+    return;
+  }
+  if (UsesProviderDomains(scope))
+    Fail("provider scope requires the provider packet version");
   WriteVector(
       writer, scope.controllable_component_ids,
       [](Writer &output, const auto &value) { WriteStrong(output, value); });
@@ -277,6 +315,8 @@ void WriteScope(Writer &writer, const core::ConfigurationFenceScopeDTO &scope) {
 }
 
 [[nodiscard]] core::ConfigurationFenceScopeDTO ReadScope(Reader &reader) {
+  if (reader.ProviderFormat())
+    return core::detail::DecodeConfigurationFenceScopeRecord(reader.String());
   return {
       ReadVector<core::ControllableComponentId>(
           reader,
@@ -561,24 +601,36 @@ void ReadInspectionPlanningRequestTail(Reader &reader,
 }
 
 void WritePlanningDomain(Writer &writer, const core::ExpectedControlDomainRevisionDTO &domain) {
+  if (writer.ProviderFormat()) {
+    writer.String(
+        core::detail::EncodeExpectedControlDomainRevisionRecord(domain));
+    return;
+  }
+  if (domain.provider())
+    Fail("provider planning domain requires the provider packet version");
   WriteStrong(writer, domain.control_domain_id);
   WriteStrong(writer, domain.control_domain_revision);
-  WriteStrong(writer, domain.controller_topology_id);
-  WriteStrong(writer, domain.topology_revision);
-  const auto &configuration = domain.expected_active_control_configuration;
+  WriteStrong(writer, domain.controller().controller_topology_id);
+  WriteStrong(writer, domain.controller().topology_revision);
+  const auto &configuration =
+      domain.controller().expected_active_control_configuration;
   writer.Byte(static_cast<std::uint8_t>(configuration.presence));
   WriteOptionalStrong(writer, configuration.active_control_configuration_id);
   writer.Boolean(configuration.active_control_configuration_generation.has_value());
   if (configuration.active_control_configuration_generation)
     WriteGeneration(writer, *configuration.active_control_configuration_generation);
-  WriteVector(writer, domain.expected_control_bindings, [](Writer &output, const auto &binding) {
-    WriteStrong(output, binding.control_binding_id);
-    WriteStrong(output, binding.control_binding_revision);
-    WriteStrong(output, binding.control_route_id);
-  });
+  WriteVector(writer, domain.controller().expected_control_bindings,
+              [](Writer &output, const auto &binding) {
+                WriteStrong(output, binding.control_binding_id);
+                WriteStrong(output, binding.control_binding_revision);
+                WriteStrong(output, binding.control_route_id);
+              });
 }
 
 [[nodiscard]] core::ExpectedControlDomainRevisionDTO ReadPlanningDomain(Reader &reader) {
+  if (reader.ProviderFormat())
+    return core::detail::DecodeExpectedControlDomainRevisionRecord(
+        reader.String());
   auto domain = ReadStrong<core::ControlDomainId>(reader);
   auto revision = ReadStrong<core::ControlDomainRevision>(reader);
   auto topology = ReadStrong<core::ControllerTopologyId>(reader);
@@ -598,6 +650,15 @@ void WritePlanningDomain(Writer &writer, const core::ExpectedControlDomainRevisi
   });
   return {std::move(domain), std::move(revision), std::move(topology), std::move(topology_revision),
           configuration, std::move(bindings)};
+}
+
+[[nodiscard]] bool
+UsesProviderPlanning(const ManagerComponentBringUpInspectionResultDTO &result) {
+  return result.planning_facts &&
+         std::any_of(
+             result.planning_facts->candidate_expected_domains.begin(),
+             result.planning_facts->candidate_expected_domains.end(),
+             [](const auto &domain) { return domain.provider() != nullptr; });
 }
 
 void WriteInspectionPlanningResultTail(Writer &writer,
@@ -909,15 +970,15 @@ void WriteError(Writer &writer, const core::ErrorDTO &error) {
 
 bool IsSelectedRuntimeCompositionRpcPacket(
     const std::string_view bytes) noexcept {
-  if (bytes.size() <= kMagic.size()) {
+  if (bytes.size() <= kMagic.size())
     return false;
-  }
-  for (std::size_t index = 0U; index < kMagic.size(); ++index) {
-    if (static_cast<std::uint8_t>(bytes[index]) != kMagic[index]) {
-      return false;
-    }
-  }
-  return true;
+  const auto magic = bytes.substr(0U, kMagic.size());
+  return magic ==
+             std::string_view(reinterpret_cast<const char *>(kMagic.data()),
+                              kMagic.size()) ||
+         magic == std::string_view(
+                      reinterpret_cast<const char *>(kProviderMagic.data()),
+                      kProviderMagic.size());
 }
 
 std::string EncodeSelectedRuntimeCompositionRpcRequest(
@@ -925,7 +986,8 @@ std::string EncodeSelectedRuntimeCompositionRpcRequest(
   if (!request.valid()) {
     Fail("cannot encode an invalid request");
   }
-  Writer writer(kRequestTag);
+  Writer writer(kRequestTag,
+                UsesProviderDomains(request.configuration_fence_scope));
   WriteRequest(writer, request);
   WriteObserverLaunchFacts(writer, request.isaac_pose_observer_launch_facts);
   return std::move(writer).Finish();
@@ -939,7 +1001,7 @@ DecodeSelectedRuntimeCompositionRpcRequest(const std::string_view bytes) {
   }
   auto request = ReadRequest(reader);
   request.isaac_pose_observer_launch_facts = ReadObserverLaunchFacts(reader);
-  reader.Finish();
+  reader.Finish(UsesProviderDomains(request.configuration_fence_scope));
   if (!request.valid()) {
     Fail("decoded request is invalid");
   }
@@ -1050,7 +1112,17 @@ DecodeSelectedRuntimeCompositionRpcRequestVariant(
     }
     Fail("packet is not a request");
   }();
-  reader.Finish();
+  const bool provider_scope = std::visit(
+      [](const auto &value) {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<
+                          T, ManagerSelectedRuntimeCompositionRequestDTO>)
+          return UsesProviderDomains(value.configuration_fence_scope);
+        else
+          return false;
+      },
+      request);
+  reader.Finish(provider_scope);
   if (!std::visit([](const auto &value) { return value.valid(); }, request)) {
     Fail("decoded request is invalid");
   }
@@ -1070,7 +1142,8 @@ std::string EncodeSelectedRuntimeCompositionRpcResponse(
           Writer writer(
               value.state == ManagerSelectedRuntimeCompositionState::kPreparing
                   ? kPreparingTag
-                  : kInstalledTag);
+                  : kInstalledTag,
+              UsesProviderDomains(value.request.configuration_fence_scope));
           WriteRequest(writer, value.request);
           WriteReceipts(writer, value.component_receipts);
           WriteObserverLaunchFacts(writer, value.request.isaac_pose_observer_launch_facts);
@@ -1104,7 +1177,7 @@ std::string EncodeSelectedRuntimeCompositionRpcResponse(
           if (!value.valid()) {
             Fail("cannot encode an invalid component inspection result");
           }
-          Writer writer(kInspectionResultTag);
+          Writer writer(kInspectionResultTag, UsesProviderPlanning(value));
           WriteInspectionRequest(writer, value.request);
           WriteProcessObservations(writer, value.configured_components);
           if (value.cell_observer)
@@ -1215,7 +1288,7 @@ DecodeSelectedRuntimeCompositionRpcResponse(const std::string_view bytes) {
         std::move(request), std::move(observations), ReadCellObserverTail(reader)};
     ReadInspectionPlanningResultTail(reader, result);
     ReadInspectionNoneOwnersTail(reader, result.configured_components);
-    reader.Finish();
+    reader.Finish(UsesProviderPlanning(result));
     if (!result.valid()) {
       Fail("decoded component inspection result is invalid");
     }
@@ -1233,7 +1306,7 @@ DecodeSelectedRuntimeCompositionRpcResponse(const std::string_view bytes) {
           ? ManagerSelectedRuntimeCompositionState::kPreparing
           : ManagerSelectedRuntimeCompositionState::kInstalled,
       std::move(receipts), ReadObserverRetirementTail(reader)};
-  reader.Finish();
+  reader.Finish(UsesProviderDomains(result.request.configuration_fence_scope));
   if (!result.valid()) {
     Fail("decoded result is invalid");
   }

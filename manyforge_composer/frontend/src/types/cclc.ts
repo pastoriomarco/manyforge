@@ -26,14 +26,46 @@ export interface CCLCControlBinding {
   controlRouteId: string;
 }
 
-export interface CCLCComponentDomain {
+/** Existing Core provider-domain proof, kept verbatim (wire casing) so a request can echo it. */
+export interface CCLCProviderControlDomainWire {
+  controllable_component_id: string;
+  provider_runtime_unit_id: string;
+  provider_instance_id: string;
+  provider_manifest_id: string;
+  provider_manifest_revision: string;
+  lifecycle_plan_catalog_digest: string;
+  signal_configuration_digest: string;
+  signal_names: string[];
+  lifecycle_command_timeout_ns: number;
+}
+
+/** Members every response domain carries; `kind` gives `resources` its meaning. */
+interface CCLCComponentDomainBase {
+  kind: 'controller' | 'io_provider';
   controlDomainId: string;
   controlDomainRevision: string;
+  /**
+   * Core resource_ids(): controller = resources of the current control binding;
+   * io_provider = sealed logical outputs (empty for input-only providers).
+   */
+  resources: string[];
+  activeConfiguration: CCLCActiveConfigurationRef | null;
+}
+
+/** Model-free I/O provider domain: no topology, bindings or physical resources. */
+export interface CCLCProviderComponentDomain extends CCLCComponentDomainBase {
+  kind: 'io_provider';
+  provider: CCLCProviderControlDomainWire;
+  providerRuntimeEpoch: string;
+}
+
+export type CCLCComponentDomain = CCLCControllerComponentDomain | CCLCProviderComponentDomain;
+
+export interface CCLCControllerComponentDomain extends CCLCComponentDomainBase {
+  kind: 'controller';
   controllerTopologyId: string;
   topologyRevision: string;
-  activeConfiguration: CCLCActiveConfigurationRef | null;
   currentControlBindings: CCLCControlBinding[];
-  currentResources: string[];
 }
 
 export interface CCLCProviderOccurrence {
@@ -84,7 +116,7 @@ export type CCLCIncidentCauseClass = Exclude<CCLCBlockingCauseClass, 'none' | 'a
 export type CCLCUnsigned64 = number | string;
 
 /** Stored evidence retains its wire field names for faithful readback. */
-export interface CCLCIncidentDiagnosticSnapshot {
+export interface CCLCIncidentDiagnosticSnapshotWire {
   exit: {
     status: number | null;
     signal: number | null;
@@ -92,16 +124,17 @@ export interface CCLCIncidentDiagnosticSnapshot {
     observed_utc: string;
   };
   context: {
-    component_id: string | null;
+    controllable_component_id: string | null;
     request_context: string | null;
     runtime_unit_id: string | null;
     runtime_epoch: string | null;
-    bundle_id: string | null;
+    retained_bundle_id: string | null;
     graph_revision: string | null;
     generator_identity: string | null;
     launch_identity: string | null;
   };
-  readiness: {
+  /** ros2_control launch facts (null for an I/O provider); not the CCLC readiness verdict. */
+  launch_readiness: {
     known: boolean | null;
     controller_manager_present: boolean | null;
     controller_observed: boolean | null;
@@ -142,7 +175,7 @@ export interface CCLCIncidentDiagnosticSnapshot {
 
 export interface CCLCIncidentDiagnostic {
   error: NonNullable<CCLCTransactionStatus['error']>;
-  snapshot: CCLCIncidentDiagnosticSnapshot | null;
+  snapshot: CCLCIncidentDiagnosticSnapshotWire | null;
 }
 
 /**
@@ -172,7 +205,7 @@ export interface CCLCLifecycleProgress {
 }
 
 export interface CCLCComponentSnapshot {
-  componentId: string;
+  controllableComponentId: string;
   lifecycleGeneration: number;
   lifecycleState: CCLCLifecycleState;
   retainedBundleId: string;
@@ -195,7 +228,8 @@ export type CCLCLifecycleFactValue =
   | { kind: 'integer'; integerValue: number }
   | { kind: 'token'; tokenValue: string };
 
-export interface CCLCReadinessDomain {
+/** One readiness row per provider occurrence (not per control domain). */
+export interface CCLCReadinessProviderOccurrence {
   providerOccurrence: CCLCProviderOccurrence & { controlDomainRevision: string };
   /** Build-selected presentation fact; absent means not stated. */
   hasActivationStep?: boolean;
@@ -216,7 +250,8 @@ export interface CCLCComponentReadiness {
   requestedState: 'prepared' | 'active' | null;
   ready: boolean;
   error: CCLCTransactionStatus['error'];
-  domains: CCLCReadinessDomain[];
+  /** Wire `readiness.domains`: one row per provider occurrence. */
+  providerOccurrences: CCLCReadinessProviderOccurrence[];
   measuredState: {
     required: boolean | null;
     available: boolean | null;
@@ -251,17 +286,17 @@ export interface CCLCComponentExpectation {
   expected_component_lifecycle_state: 'prepared' | 'active' | 'disabled';
 }
 
-export interface CCLCRouteTemplate {
+export interface CCLCRouteTemplateWire {
   desired_configuration: CCLCDesiredConfiguration;
   expected_active_control_configuration: CCLCExpectedActiveConfiguration;
   component_expectations: CCLCComponentExpectation[];
 }
 
 export interface CCLCRouteTemplateSet {
-  componentId: string;
+  controllableComponentId: string;
   retainedBundleId: string;
   graphRevision: string;
-  templates: CCLCRouteTemplate[];
+  templates: CCLCRouteTemplateWire[];
 }
 
 export interface CCLCRequestContext {
@@ -279,6 +314,7 @@ export interface CCLCLifecycleRequestBody {
   expected_component_lifecycle_generation: number;
   expected_admission_generation: number;
   expected_control_domains: Array<{
+    kind: 'controller';
     control_domain_id: string;
     control_domain_revision: string;
     controller_topology_id: string;
@@ -289,6 +325,12 @@ export interface CCLCLifecycleRequestBody {
       control_binding_revision: string;
       control_route_id: string;
     }>;
+  } | {
+    kind: 'io_provider';
+    control_domain_id: string;
+    control_domain_revision: string;
+    provider: CCLCProviderControlDomainWire;
+    expected_active_control_configuration: CCLCExpectedActiveConfiguration;
   }>;
   reason: string;
   /** Close acknowledges exactly this open incident; ordinary Recover is unchanged. */
@@ -347,7 +389,7 @@ export interface CCLCAdmission {
 /** The operator's accepted acknowledgement of one open component incident. */
 export interface CCLCIncidentRecovery {
   incidentId: string;
-  componentId: string;
+  controllableComponentId: string;
   causeClass: CCLCIncidentCauseClass;
   acknowledgedBy: string;
   acknowledgedAtNs: Nanoseconds;

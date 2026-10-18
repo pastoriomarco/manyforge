@@ -123,12 +123,15 @@ parse_runtime_kind(const CanonicalValue &configuration,
                            std::string(label) + ".runtime_kind");
   if (value == "ros2_control")
     return ActivationRuntimeKind::kRos2Control;
+  if (value == "io_provider")
+    return ActivationRuntimeKind::kIoProvider;
   fail(std::string(label) + ".runtime_kind is unsupported: " + value);
 }
 
 [[nodiscard]] std::string_view
-runtime_kind_text(ActivationRuntimeKind) noexcept {
-  return "ros2_control";
+runtime_kind_text(ActivationRuntimeKind kind) noexcept {
+  return kind == ActivationRuntimeKind::kIoProvider ? "io_provider"
+                                                    : "ros2_control";
 }
 
 } // namespace
@@ -206,7 +209,11 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
     const bool has_native = row.find_object_member("native_runtime") != nullptr;
     const bool has_ros =
         row.find_object_member("ros2_control_runtime") != nullptr;
-    if (has_native == has_ros) {
+    const bool has_io =
+        row.find_object_member("io_provider_runtime") != nullptr;
+    if (static_cast<unsigned>(has_native) + static_cast<unsigned>(has_ros) +
+            static_cast<unsigned>(has_io) !=
+        1U) {
       fail(label + " must select exactly one runtime kind");
     }
     if (has_native) {
@@ -217,7 +224,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
                      label);
       static_cast<void>(object(member(row, "native_runtime", label),
                                label + ".native_runtime"));
-    } else {
+    } else if (has_ros) {
       require_fields(row,
                      {"acceptance_obligations", "model_family_id",
                       "ros2_control_runtime", "runtime_restoration_profile_id",
@@ -225,6 +232,26 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
                      label);
       static_cast<void>(object(member(row, "ros2_control_runtime", label),
                                label + ".ros2_control_runtime"));
+    }
+    if (has_io) {
+      require_fields(row,
+                     {"acceptance_obligations", "io_provider_runtime",
+                      "runtime_restoration_profile_id", "source_fields",
+                      "stop_profiles"},
+                     label);
+      if (!object(member(row, "io_provider_runtime", label),
+                  label + ".io_provider_runtime")
+               .empty() ||
+          !object(member(row, "source_fields", label), label + ".source_fields")
+               .empty() ||
+          !object(member(row, "stop_profiles", label), label + ".stop_profiles")
+               .empty() ||
+          !array(member(row, "acceptance_obligations", label),
+                 label + ".acceptance_obligations")
+               .empty() ||
+          text(member(row, "runtime_restoration_profile_id", label), label) !=
+              "io_device_v0")
+        fail(label + " is not the exact model-free I/O profile");
     }
     static_cast<void>(
         object(member(row, "source_fields", label), label + ".source_fields"));
@@ -235,9 +262,11 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
     const auto &profile_id =
         text(member(row, "runtime_restoration_profile_id", label),
              label + ".runtime_restoration_profile_id");
-    const auto &family_id =
-        text(member(row, "model_family_id", label), label + ".model_family_id");
-    if (!families.contains(family_id)) {
+    const std::string family_id =
+        has_io ? std::string{}
+               : text(member(row, "model_family_id", label),
+                      label + ".model_family_id");
+    if (!has_io && !families.contains(family_id)) {
       fail(label + " selects unknown model family " + family_id);
     }
     if (!profiles
@@ -262,12 +291,31 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
     const auto authored_kind = parse_runtime_kind(
         component.configuration,
         "component " + component.component_id + ".configuration");
-    if (authored_kind != ActivationRuntimeKind::kRos2Control) {
+    const auto selected_kind =
+        found->second.value.find_object_member("io_provider_runtime")
+            ? ActivationRuntimeKind::kIoProvider
+            : ActivationRuntimeKind::kRos2Control;
+    if (authored_kind != selected_kind) {
       fail("component " + component.component_id + " selects " +
            std::string(runtime_kind_text(authored_kind)) +
            " runtime configuration for " +
-           std::string(runtime_kind_text(ActivationRuntimeKind::kRos2Control)) +
-           " profile " + component.component_profile_id);
+           std::string(runtime_kind_text(selected_kind)) + " profile " +
+           component.component_profile_id);
+    }
+    if (selected_kind == ActivationRuntimeKind::kIoProvider) {
+      if (component.model_source || component.root_pose_in_cell ||
+          !component.frame_prefix.empty())
+        fail("model-free I/O profile carries physical model fields");
+      result.push_back(
+          ActivationComponentProfile{component.component_id,
+                                     component.component_profile_id,
+                                     {},
+                                     {},
+                                     {},
+                                     selected_kind,
+                                     CanonicalValue(nullptr),
+                                     found->second.value});
+      continue;
     }
     const auto family = families.find(found->second.model_family_id);
     if (family == families.end()) {

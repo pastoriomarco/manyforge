@@ -122,6 +122,16 @@ struct RecoveryAuthorityCapture {
   /// prepared execution proven never dispatched (no physical effect).
   bool failed_validation_retryable = false;
   std::string failed_validation_reason;
+  /// Exact immutable failure facts, distinct from broader manual recovery.
+  std::string failed_validation_code;
+  ParticipantEffectKnowledge failed_execution_effect{ParticipantEffectKnowledge::kEffectUncertain};
+  bool failed_preparation_never_dispatched{false};
+  /// Set only by the authoritative typed collision decision before it is
+  /// converted into an ErrorDTO; validation_collision alone is insufficient.
+  bool failed_validation_conclusive_collision{false};
+  ParticipantEffectKnowledge terminal_effect{ParticipantEffectKnowledge::kEffectUncertain};
+  /// The terminal publisher and all subordinate worker borrows have finished.
+  bool terminal_cleanup_complete{false};
   /// Observation evidence; absent until RT-8C wires the dedicated
   /// publication (never lifecycle ExecutionSnapshot).
   std::optional<ObservedStateEvidenceDTO> observed_state;
@@ -168,6 +178,10 @@ class ObservedReadinessTracker {
   std::int64_t continuous_safe_since_ns_ = -1;
   std::uint32_t consecutive_safe_samples_ = 0;
 };
+
+/// Pure planning-failure classification shared by original failure evidence
+/// and recovery assessment. Callers supply their exact captured facts.
+MotionRetryEligibilityDTO planning_retry_eligibility(const RecoveryAuthorityCapture& capture);
 
 /// Pure construction of the assessment from one coherent capture. Performs
 /// no locking, no I/O, no backend/planner/engine calls.

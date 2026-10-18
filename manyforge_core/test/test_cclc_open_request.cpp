@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
@@ -39,6 +40,7 @@ constexpr std::int64_t kMaximumClockNs = std::numeric_limits<std::int64_t>::max(
       {"expected_admission_generation", CanonicalValue(7.0)},
       {"expected_control_domains",
        CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+           {"kind", CanonicalValue("controller")},
            {"control_domain_id", CanonicalValue("domain.arm")},
            {"control_domain_revision", CanonicalValue("domain.revision.1")},
            {"controller_topology_id", CanonicalValue("topology.arm")},
@@ -1011,5 +1013,191 @@ TEST(CCLCOpenRequest, ProgramLifecyclePointReadRejectsCorruptSnapshotAndOpenPayl
   EXPECT_EQ(port.legacy_component_reads, 1U);
   EXPECT_EQ(port.grouped_reads, 0U);
 }
+
+TEST(CCLCOpenRequest, ProviderSnapshotUsesTypedScopeAndExactSafeNumericFields) {
+  TargetViewPort port;
+  port.mutate_snapshot = [](ComponentLifecycleCurrentSnapshotDTO &value) {
+    const auto occurrence = value.provider_occurrences.front();
+    const ProviderControlDomainDTO provider{
+        value.controllable_component_id,
+        occurrence.provider_runtime_unit_id,
+        occurrence.provider_instance_id,
+        occurrence.provider_manifest_id,
+        occurrence.provider_manifest_revision,
+        occurrence.lifecycle_plan_catalog_digest,
+        ContentDigest(Sha('1')),
+        {"ready"},
+        30'000'000'000LL};
+    value.domains = {
+        {occurrence.control_domain_id, occurrence.control_domain_revision,
+         ResolvedProviderDomainScopeDTO{
+             provider,
+             occurrence.provider_runtime_epoch,
+             ProviderDomainActiveConfigurationDTO{
+                 ActiveControlConfigurationId("provider.configuration"),
+                 ActiveControlConfigurationGeneration(9'007'199'254'740'991ULL),
+                 occurrence.provider_runtime_unit_id,
+                 occurrence.provider_runtime_epoch, 9'007'199'254'740'991ULL,
+                 provider.signal_configuration_digest},
+             {}}}};
+    const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(value);
+    if (!digest.ok())
+      throw std::logic_error(digest.error().message);
+    value.snapshot_digest = digest.value();
+  };
+  const auto result = ExecuteCanonicalCCLCOpenRequest(
+      Request(
+          "component_lifecycle_snapshot",
+          CanonicalValue(CanonicalValue::Object{
+              {"controllable_component_id", CanonicalValue("component.arm")}})),
+      port, {});
+  ASSERT_TRUE(result.ok());
+  const auto response = content_identity::parse_canonical_json(result.value());
+  ASSERT_TRUE(Member(response, "ok").as_bool()) << result.value();
+  const auto &domain =
+      Member(Member(response, "result"), "domains").as_array().front();
+  EXPECT_EQ(Member(domain, "kind").as_string(), "io_provider");
+  EXPECT_EQ(domain.find_object_member("controller_topology_id"), nullptr);
+  EXPECT_EQ(Member(Member(domain, "provider"), "lifecycle_command_timeout_ns")
+                .as_number(),
+            30'000'000'000.0);
+  const auto &configuration = Member(domain, "active_control_configuration");
+  EXPECT_EQ(Member(configuration, "active_control_configuration_generation")
+                .as_number(),
+            9'007'199'254'740'991.0);
+  EXPECT_EQ(Member(configuration, "source_sequence").as_number(),
+            9'007'199'254'740'991.0);
+  EXPECT_EQ(port.grouped_reads, 0U);
+}
+// Fixed pre-wire-cutover identities: these snapshots retain their canonical
+// identity keys while both public read commands use the common resources field.
+TEST(CCLCOpenRequest, DomainResourcesAreCommonAndDoNotChangeSnapshotIdentity) {
+  for (const bool provider : {false, true}) {
+    for (const bool has_output : {false, true}) {
+      if (!provider && !has_output) continue;
+      SCOPED_TRACE(provider);
+      SCOPED_TRACE(has_output);
+      auto snapshot = VerifiedSnapshot();
+      if (provider) {
+        const auto occurrence = snapshot.provider_occurrences.front();
+        const ProviderControlDomainDTO proof{
+            snapshot.controllable_component_id, occurrence.provider_runtime_unit_id,
+            occurrence.provider_instance_id, occurrence.provider_manifest_id,
+            occurrence.provider_manifest_revision, occurrence.lifecycle_plan_catalog_digest,
+            ContentDigest(Sha('1')), {"ready"}, 30'000'000'000LL};
+        snapshot.domains = {{occurrence.control_domain_id, occurrence.control_domain_revision,
+                            ResolvedProviderDomainScopeDTO{
+                                proof, occurrence.provider_runtime_epoch, std::nullopt,
+                                has_output ? std::vector<ResourceId>{ResourceId("resource.arm")}
+                                           : std::vector<ResourceId>{}}}};
+      }
+      const std::string expected_digest = !provider
+          ? "sha256:9b17871d075ae1b5dfd78a210160d8bed4781a76d331e56251c10485dac57f16"
+          : has_output
+              ? "sha256:6b9e58230f9fc6bd78dbc48dbeebd918fe8134171f118743cf3c164d904f1950"
+              : "sha256:84a356db1fc9cd458e1a652b25cba171f912e0286ffb841201c85ebf47a8ca27";
+      const auto digest = ComputeComponentLifecycleCurrentSnapshotDigest(snapshot);
+      ASSERT_TRUE(digest.ok()) << digest.error().message;
+      ASSERT_EQ(digest.value().value(), expected_digest);
+      snapshot.snapshot_digest = digest.value();
+      TargetViewPort port;
+      port.mutate_snapshot = [&](auto& value) { value = snapshot; };
+      port.mutate_read = [&](auto& value) {
+        value.snapshot = snapshot;
+        value.readiness = UnavailableReadiness(snapshot);
+      };
+      for (const std::string command : {"component_lifecycle_snapshot", "component_snapshot"}) {
+        const auto encoded = ExecuteCanonicalCCLCOpenRequest(
+            Request(command, CanonicalValue(CanonicalValue::Object{
+                {"controllable_component_id", CanonicalValue("component.arm")}})), port, {});
+        ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+        const auto response = content_identity::parse_canonical_json(encoded.value());
+        ASSERT_TRUE(Member(response, "ok").as_bool()) << encoded.value();
+        const auto& value = Member(response, "result");
+        const auto& domain = Member(value, "domains").as_array().front();
+        EXPECT_EQ(Member(domain, "kind").as_string(), provider ? "io_provider" : "controller");
+        EXPECT_EQ(domain.find_object_member("current_resources"), nullptr);
+        EXPECT_EQ(domain.find_object_member("output_resources"), nullptr);
+        const auto& resources = Member(domain, "resources").as_array();
+        EXPECT_EQ(resources.size(), has_output ? 1U : 0U);
+        if (has_output) EXPECT_EQ(resources.front().as_string(), "resource.arm");
+        EXPECT_EQ(Member(value, "snapshot_digest").as_string(), expected_digest);
+      }
+      EXPECT_TRUE(VerifyComponentLifecycleCurrentSnapshot(snapshot).ok());
+    }
+  }
+}
+
+TEST(CCLCOpenRequest, ExpectedDomainsRequireExplicitKindWithoutResourceEcho) {
+  // The provider request echoes only the existing expected-scope fields from
+  // a real typed snapshot. Resources/runtime epoch remain response facts.
+  TargetViewPort snapshot_port;
+  snapshot_port.mutate_snapshot = [](auto& snapshot) {
+    const auto occurrence = snapshot.provider_occurrences.front();
+    const ProviderControlDomainDTO proof{
+        snapshot.controllable_component_id, occurrence.provider_runtime_unit_id,
+        occurrence.provider_instance_id, occurrence.provider_manifest_id,
+        occurrence.provider_manifest_revision, occurrence.lifecycle_plan_catalog_digest,
+        ContentDigest(Sha('1')), {"ready"}, 30'000'000'000LL};
+    snapshot.domains = {{occurrence.control_domain_id, occurrence.control_domain_revision,
+                        ResolvedProviderDomainScopeDTO{
+                            proof, occurrence.provider_runtime_epoch, std::nullopt, {}}}};
+    snapshot.snapshot_digest = ComputeComponentLifecycleCurrentSnapshotDigest(snapshot).value();
+  };
+  const auto encoded_snapshot = ExecuteCanonicalCCLCOpenRequest(
+      Request("component_lifecycle_snapshot", CanonicalValue(CanonicalValue::Object{
+          {"controllable_component_id", CanonicalValue("component.arm")}})), snapshot_port, {});
+  ASSERT_TRUE(encoded_snapshot.ok());
+  const auto response = content_identity::parse_canonical_json(encoded_snapshot.value());
+  ASSERT_TRUE(Member(response, "ok").as_bool()) << encoded_snapshot.value();
+  const auto& actual = Member(Member(response, "result"), "domains").as_array().front();
+  const CanonicalValue provider_expected(CanonicalValue::Object{
+      {"kind", Member(actual, "kind")},
+      {"control_domain_id", Member(actual, "control_domain_id")},
+      {"control_domain_revision", Member(actual, "control_domain_revision")},
+      {"provider", Member(actual, "provider")},
+      {"expected_active_control_configuration",
+       CanonicalValue(CanonicalValue::Object{{"presence", CanonicalValue("absent")}})}});
+  const auto controller_expected = Member(LifecycleIntentValue(), "expected_control_domains").as_array().front();
+  const auto request_for = [](const CanonicalValue& domain) {
+    auto fields = LifecycleIntentValue().as_object();
+    for (auto& [name, value] : fields)
+      if (name == "expected_control_domains")
+        value = CanonicalValue(CanonicalValue::Array{domain});
+    return Request("lifecycle_submit", CanonicalValue(std::move(fields)));
+  };
+  for (const auto& expected : {controller_expected, provider_expected}) {
+    FakeOpenPort port;
+    const auto accepted = ExecuteCanonicalCCLCOpenRequest(request_for(expected), port, {});
+    ASSERT_TRUE(accepted.ok());
+    EXPECT_TRUE(Member(content_identity::parse_canonical_json(accepted.value()), "ok").as_bool());
+    ASSERT_TRUE(port.lifecycle_intent.has_value());
+    EXPECT_EQ(port.lifecycle_intent->expected_control_domains.front().provider() != nullptr,
+              Member(expected, "kind").as_string() == "io_provider");
+    // Missing/old/unknown kinds and response-only resource fields are hard
+    // refusals before the existing lifecycle port is called.
+    for (const unsigned variant : {0U, 1U, 2U, 3U, 4U, 5U}) {
+      auto fields = expected.as_object();
+      if (variant == 0U) {
+        std::erase_if(fields, [](const auto& field) { return field.first == "kind"; });
+      } else if (variant <= 2U) {
+        for (auto& [name, value] : fields)
+          if (name == "kind") value = CanonicalValue(variant == 1U ? "provider" : "unknown");
+      } else {
+        fields.emplace_back(variant == 3U ? "resources" : variant == 4U ? "current_resources" : "output_resources",
+                            CanonicalValue(CanonicalValue::Array{}));
+      }
+      port.lifecycle_intent.reset();
+      const auto rejected = ExecuteCanonicalCCLCOpenRequest(
+          request_for(CanonicalValue(std::move(fields))), port, {});
+      ASSERT_TRUE(rejected.ok());
+      const auto refusal = content_identity::parse_canonical_json(rejected.value());
+      EXPECT_FALSE(Member(refusal, "ok").as_bool());
+      EXPECT_EQ(Member(Member(refusal, "error"), "code").as_string(), "cclc_open_request_invalid");
+      EXPECT_FALSE(port.lifecycle_intent.has_value());
+    }
+  }
+}
+
 }  // namespace
 }  // namespace manyforge::core

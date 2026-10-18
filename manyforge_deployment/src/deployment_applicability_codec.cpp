@@ -9,7 +9,10 @@
 #include <limits>
 #include <manyforge_core/types/interrupt.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/program_contract.hpp>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -384,6 +387,22 @@ parse_provider_target(CapabilityScope scope, const CanonicalValue &value,
         require_member(object, "cell_id", path), child_path(path, "cell_id"))};
 
   case CapabilityScope::kTargetBinding:
+    if (object.size() == 3U) {
+      require_exact_fields(object,
+                           {"controllable_component_id",
+                            "component_type_revision", "command_target_id"},
+                           path);
+      return core::ComponentTargetCapabilityProviderTargetDTO{
+          parse_portable_id<ControllableComponentId>(
+              require_member(object, "controllable_component_id", path),
+              child_path(path, "controllable_component_id")),
+          parse_digest<ComponentTypeRevision>(
+              require_member(object, "component_type_revision", path),
+              child_path(path, "component_type_revision")),
+          parse_portable_id<CommandTargetId>(
+              require_member(object, "command_target_id", path),
+              child_path(path, "command_target_id"))};
+    }
     require_exact_fields(object,
                          {"controllable_component_id",
                           "component_type_revision", "command_target_id",
@@ -408,6 +427,20 @@ parse_provider_target(CapabilityScope scope, const CanonicalValue &value,
     };
 
   case CapabilityScope::kControlDomain:
+    if (const auto *domain_kind = find_member(object, "domain_kind")) {
+      require_exact_fields(
+          object,
+          {"control_domain_id", "control_domain_revision", "domain_kind"},
+          path);
+      if (require_string(*domain_kind, path) != "provider")
+        fail(path, "unknown control-domain target kind");
+      return ControlDomainCapabilityProviderTargetDTO{
+          parse_portable_id<ControlDomainId>(
+              require_member(object, "control_domain_id", path), path),
+          parse_digest<ControlDomainRevision>(
+              require_member(object, "control_domain_revision", path), path),
+          core::ProviderControlDomainCapabilityTargetDTO{}};
+    }
     require_exact_fields(object,
                          {"control_domain_id", "control_domain_revision",
                           "controller_topology_id", "topology_revision"},
@@ -952,6 +985,17 @@ encode_provider_target(CapabilityScope scope,
     });
   }
   case CapabilityScope::kTargetBinding: {
+    if (const auto *direct =
+            std::get_if<core::ComponentTargetCapabilityProviderTargetDTO>(
+                &target)) {
+      return CanonicalValue(CanonicalValue::Object{
+          {"controllable_component_id",
+           CanonicalValue(direct->controllable_component_id.value())},
+          {"component_type_revision",
+           CanonicalValue(direct->component_type_revision.value())},
+          {"command_target_id",
+           CanonicalValue(direct->command_target_id.value())}});
+    }
     const auto *value =
         std::get_if<TargetBindingCapabilityProviderTargetDTO>(&target);
     if (value == nullptr) {
@@ -977,13 +1021,21 @@ encode_provider_target(CapabilityScope scope,
       fail("capability_provider_bindings.target",
            "scope and target alternative disagree");
     }
+    if (value->provider())
+      return CanonicalValue(CanonicalValue::Object{
+          {"control_domain_id",
+           CanonicalValue(value->control_domain_id.value())},
+          {"control_domain_revision",
+           CanonicalValue(value->control_domain_revision.value())},
+          {"domain_kind", CanonicalValue("provider")}});
     return CanonicalValue(CanonicalValue::Object{
         {"control_domain_id", CanonicalValue(value->control_domain_id.value())},
         {"control_domain_revision",
          CanonicalValue(value->control_domain_revision.value())},
         {"controller_topology_id",
-         CanonicalValue(value->controller_topology_id.value())},
-        {"topology_revision", CanonicalValue(value->topology_revision.value())},
+         CanonicalValue(value->controller().controller_topology_id.value())},
+        {"topology_revision",
+         CanonicalValue(value->controller().topology_revision.value())},
     });
   }
   }
@@ -1404,7 +1456,9 @@ encode_external_resources(const std::vector<ExternalResourceDTO> &values) {
     const std::vector<core::CatalogRecordRefDTO> &retained_policy_records,
     const CanonicalValue &interrupt_sources,
     const CanonicalValue &interrupt_policies,
-    const CanonicalValue &interrupt_config) {
+    const CanonicalValue &interrupt_config,
+    const std::optional<double> motion_takeover_preparation_budget_s,
+    const CanonicalValue *interrupt_rules = nullptr) {
   CanonicalValue::Object result{
       {"retained_policy_records",
        encode_retained_policy_records(retained_policy_records)},
@@ -1416,6 +1470,13 @@ encode_external_resources(const std::vector<ExternalResourceDTO> &values) {
       {"interrupt_policies", interrupt_policies},
       {"interrupt_config", interrupt_config},
   };
+  // Empty/absent global tables preserve the original empty-policy identity.
+  if (interrupt_rules && !interrupt_rules->as_array().empty())
+    result.emplace_back("interrupt_rules", *interrupt_rules);
+  if (motion_takeover_preparation_budget_s.has_value()) {
+    result.emplace_back("motion_takeover_preparation_budget_s",
+                        CanonicalValue(*motion_takeover_preparation_budget_s));
+  }
   return CanonicalValue(std::move(result));
 }
 
@@ -1993,6 +2054,162 @@ require_interrupt_source(const std::vector<ParsedInterruptSource> &sources,
   return *source;
 }
 
+void validate_interrupt_condition(const CanonicalValue &condition,
+                                  std::string_view path, std::size_t depth,
+                                  std::size_t &nodes) {
+  if (depth > 8U || ++nodes > 64U)
+    fail(path, "interrupt condition exceeds authored tree bounds");
+  const auto &record = require_object(condition, path);
+  if (record.size() != 1U)
+    fail(path, "condition requires exactly one operator");
+  if (const auto *comparison = find_member(record, "compare")) {
+    const auto &fields = require_object(*comparison, path);
+    require_exact_fields(fields, {"operand", "op", "value"}, path);
+    const auto &operand = require_member(fields, "operand", path);
+    const auto &selector = require_object(operand, path);
+    if (selector.size() != 1U)
+      fail(path, "operand requires exactly one selector");
+    bool signal_operand = false;
+    if (const auto *key = find_member(selector, "key")) {
+      (void)require_portable_token_string(*key, path);
+    } else {
+      signal_operand = true;
+      const auto &signal =
+          require_object(require_member(selector, "signal", path), path);
+      require_exact_fields(signal, {"controllable_component_id", "signal_name"},
+                           path);
+      (void)require_portable_token_string(
+          require_member(signal, "controllable_component_id", path), path);
+      const auto &name =
+          require_string(require_member(signal, "signal_name", path), path);
+      if (name.empty() || name.size() > 256U ||
+          name.find('\0') != std::string::npos)
+        fail(path, "invalid condition signal name");
+    }
+    const auto &op = require_string(require_member(fields, "op", path), path);
+    if (op != "==" && op != "!=" && op != "<" && op != "<=" && op != ">" &&
+        op != ">=")
+      fail(path, "unknown condition comparison operator");
+    const auto &literal = require_member(fields, "value", path);
+    if (!literal.is_bool() && !literal.is_string() && !literal.is_number())
+      fail(path, "condition value requires a scalar literal");
+    if (literal.is_number() &&
+        std::trunc(literal.as_number()) == literal.as_number() &&
+        std::fabs(literal.as_number()) > 9007199254740991.0)
+      fail(path, "condition integer literal exceeds safe range");
+    if ((signal_operand && !literal.is_bool()) ||
+        (!literal.is_number() && op != "==" && op != "!="))
+      fail(path, "condition comparison types are incompatible");
+    return;
+  }
+  if (const auto *child = find_member(record, "not")) {
+    validate_interrupt_condition(*child, path, depth + 1U, nodes);
+    return;
+  }
+  const auto *children = find_member(record, "all");
+  if (children == nullptr)
+    children = &require_member(record, "any", path);
+  const auto &array = require_array(*children, path);
+  if (array.empty() || array.size() > 64U - nodes)
+    fail(path, "invalid interrupt condition child count");
+  for (const auto &child : array)
+    validate_interrupt_condition(child, path, depth + 1U, nodes);
+}
+
+// Global rules have their own closed authored carrier. This normalization
+// checks syntax only; Applied Program group/key and retained signal proof use
+// the existing checked condition/compiler boundary before actual Apply.
+[[nodiscard]] CanonicalValue
+parse_interrupt_rules(const CanonicalValue::Object &policies) {
+  const auto *value = find_member(policies, "interrupt_rules");
+  if (!value)
+    return CanonicalValue(CanonicalValue::Array{});
+  const auto &rules = require_array(*value, "$.policies.interrupt_rules");
+  if (rules.size() > core::kMaxDeploymentApplicabilityRows)
+    fail("$.policies.interrupt_rules",
+         "global rule count exceeds deployment bound");
+  std::map<std::string, CanonicalValue> ordered;
+  for (std::size_t index = 0; index < rules.size(); ++index) {
+    const auto path = index_path("$.policies.interrupt_rules", index);
+    const auto &rule = require_object(rules[index], path);
+    require_closed_fields(
+        rule, {"rule_id", "condition", "scope"},
+        {"priority", "idle_behaviour", "stop_entry_stage_id", "latch_release"},
+        path);
+    const auto id = require_portable_token_string(
+        require_member(rule, "rule_id", path), path);
+    const auto &condition = require_member(rule, "condition", path);
+    std::size_t nodes = 0;
+    validate_interrupt_condition(condition, child_path(path, "condition"), 1U,
+                                 nodes);
+    const auto &scope = require_member(rule, "scope", path);
+    CanonicalValue normalized_scope = scope;
+    if (scope.is_string()) {
+      if (scope.as_string() != "all_motion" &&
+          scope.as_string() != "everything")
+        fail(
+            path,
+            "global scope requires all_motion, execution_groups or everything");
+    } else {
+      const auto &selector = require_object(scope, child_path(path, "scope"));
+      require_exact_fields(selector, {"execution_groups"}, path);
+      const auto &groups = require_array(
+          require_member(selector, "execution_groups", path), path);
+      if (groups.empty() || groups.size() > core::kMaxProgramExecutionGroups)
+        fail(path, "global execution_groups must be nonempty and bounded");
+      std::set<std::string> names;
+      for (const auto &group : groups) {
+        const auto &name = require_string(group, path);
+        if (!core::valid_program_execution_group(name) ||
+            !names.insert(name).second)
+          fail(path, "global execution group is invalid or duplicated");
+      }
+      CanonicalValue::Array normalized_groups;
+      for (const auto &name : names)
+        normalized_groups.emplace_back(name);
+      normalized_scope = CanonicalValue(CanonicalValue::Object{
+          {"execution_groups", CanonicalValue(std::move(normalized_groups))}});
+    }
+    double priority = 0;
+    if (const auto *authored = find_member(rule, "priority")) {
+      priority = require_finite_number(*authored, path);
+      if (priority < 0 || priority > 100 || std::trunc(priority) != priority)
+        fail(path, "global priority must be an integer in 0..100");
+    }
+    CanonicalValue::Object normalized{{"rule_id", CanonicalValue(id)},
+                                      {"condition", condition},
+                                      {"scope", std::move(normalized_scope)},
+                                      {"priority", CanonicalValue(priority)}};
+    std::string latch_release = "operator";
+    if (const auto *authored = find_member(rule, "latch_release")) {
+      latch_release =
+          require_string(*authored, child_path(path, "latch_release"));
+      if (latch_release != "operator" && latch_release != "auto_on_clear")
+        fail(child_path(path, "latch_release"),
+             "global latch_release requires operator or auto_on_clear");
+    }
+    normalized.emplace_back("latch_release", CanonicalValue(latch_release));
+    if (const auto *idle = find_member(rule, "idle_behaviour")) {
+      const auto &token = require_string(*idle, path);
+      if (token != "latch" && token != "ignore")
+        fail(path, "invalid global idle_behaviour");
+      normalized.emplace_back("idle_behaviour", *idle);
+    }
+    if (const auto *entry = find_member(rule, "stop_entry_stage_id")) {
+      (void)require_portable_token_string(*entry, path);
+      normalized.emplace_back("stop_entry_stage_id", *entry);
+    }
+    if (!ordered.emplace(id, CanonicalValue(std::move(normalized))).second)
+      fail(path, "duplicate global rule_id");
+  }
+  CanonicalValue::Array normalized;
+  for (auto &[id, rule] : ordered) {
+    (void)id;
+    normalized.push_back(std::move(rule));
+  }
+  return CanonicalValue(std::move(normalized));
+}
+
 [[nodiscard]] CanonicalValue parse_interrupt_policies(
     const CanonicalValue::Object &policies,
     const std::vector<ParsedInterruptSource> &parsed_sources) {
@@ -2010,28 +2227,37 @@ require_interrupt_source(const std::vector<ParsedInterruptSource> &sources,
     const auto &policy = require_object(rows[index], path);
     require_closed_fields(
         policy,
-        {"policy_id", "source_id", "controllable_component_ids",
-         "command_target_ids", "control_domain_ids", "control_binding_ids",
-         "resource_ids", "affected_phases", "preemption_action",
-         "post_latch_disposition", "scope_kind"},
-        {"priority", "maskable", "maskable_by", "stop_scope", "scope_expiry",
+        {"policy_id", "controllable_component_ids", "command_target_ids",
+         "control_domain_ids", "control_binding_ids", "resource_ids",
+         "affected_phases", "preemption_action", "post_latch_disposition",
+         "scope_kind"},
+        {"source_id", "condition", "idle_behaviour", "priority", "maskable",
+         "maskable_by", "stop_scope", "scope_expiry",
          "allowed_activation_modes", "allowed_stop_modes", "stop_profile",
-         "description"},
+         "description", "stop_entry_stage_id", "fallback_outcome"},
         path);
     ParsedInterruptPolicy parsed;
     parsed.policy_id =
         require_portable_token_string(require_member(policy, "policy_id", path),
                                       child_path(path, "policy_id"));
-    parsed.source_id =
-        require_portable_token_string(require_member(policy, "source_id", path),
-                                      child_path(path, "source_id"));
-    const auto &source = require_interrupt_source(
-        parsed_sources, parsed.source_id, child_path(path, "source_id"));
-
+    const auto *source_value = find_member(policy, "source_id");
+    const auto *condition = find_member(policy, "condition");
+    const ParsedInterruptSource *source = nullptr;
     CanonicalValue::Object normalized{
-        {"policy_id", CanonicalValue(parsed.policy_id)},
-        {"source_id", CanonicalValue(parsed.source_id)},
-    };
+        {"policy_id", CanonicalValue(parsed.policy_id)}};
+    if (source_value != nullptr) {
+      parsed.source_id = require_portable_token_string(
+          *source_value, child_path(path, "source_id"));
+      source = &require_interrupt_source(parsed_sources, parsed.source_id,
+                                         child_path(path, "source_id"));
+      normalized.emplace_back("source_id", CanonicalValue(parsed.source_id));
+    }
+    if (condition != nullptr) {
+      std::size_t nodes = 0U;
+      validate_interrupt_condition(*condition, child_path(path, "condition"),
+                                   1U, nodes);
+      normalized.emplace_back("condition", *condition);
+    }
     std::vector<std::string> values;
     bool has_required_scope = false;
     for (const std::string_view field :
@@ -2055,6 +2281,19 @@ require_interrupt_source(const std::vector<ParsedInterruptSource> &sources,
                        child_path(path, "scope_kind"));
     if (parsed.scope_kind != "static" && parsed.scope_kind != "operation") {
       fail(child_path(path, "scope_kind"), "value is outside the closed enum");
+    }
+    if ((parsed.scope_kind == "static" &&
+         ((source_value == nullptr) == (condition == nullptr))) ||
+        (parsed.scope_kind == "operation" && condition != nullptr))
+      fail(path, "static policy requires one source_id or condition; operation "
+                 "condition comes from node");
+    if (const auto *idle = find_member(policy, "idle_behaviour")) {
+      const auto &token =
+          require_string(*idle, child_path(path, "idle_behaviour"));
+      if (parsed.scope_kind != "static" ||
+          (token != "latch" && token != "ignore"))
+        fail(path, "idle_behaviour is latch|ignore on static policies only");
+      normalized.emplace_back("idle_behaviour", *idle);
     }
     normalized.emplace_back(
         "affected_phases",
@@ -2087,11 +2326,32 @@ require_interrupt_source(const std::vector<ParsedInterruptSource> &sources,
       fail(child_path(path, "post_latch_disposition"),
            "value is outside the closed enum");
     }
-    parsed.effective_priority = source.priority;
+    if (const auto *entry = find_member(policy, "stop_entry_stage_id")) {
+      normalized.emplace_back(
+          "stop_entry_stage_id",
+          CanonicalValue(require_portable_token_string(
+              *entry, child_path(path, "stop_entry_stage_id"))));
+    }
+    if (const auto *fallback = find_member(policy, "fallback_outcome")) {
+      const auto &value =
+          require_string(*fallback, child_path(path, "fallback_outcome"));
+      if ((value != "fail_node" && value != "count_as_success") ||
+          (value == "count_as_success" &&
+           (parsed.scope_kind != "operation" ||
+            parsed.preemption_action != "complete_move_on_signal")))
+        fail(child_path(path, "fallback_outcome"),
+             "count_as_success requires an operation desired-trip rule");
+      normalized.emplace_back("fallback_outcome", *fallback);
+    }
     if (const auto *priority = find_member(policy, "priority");
         priority != nullptr) {
       parsed.effective_priority = static_cast<int>(require_integer_in_range(
-          *priority, 0U, 1000U, child_path(path, "priority")));
+          *priority, 0U, source == nullptr ? 100U : 1000U,
+          child_path(path, "priority")));
+    } else if (source != nullptr) {
+      parsed.effective_priority = source->priority;
+    } else {
+      parsed.effective_priority = 0; // Contract 59: source-less default only.
     }
     if (const auto *maskable = find_member(policy, "maskable");
         maskable != nullptr) {
@@ -2152,7 +2412,8 @@ require_interrupt_source(const std::vector<ParsedInterruptSource> &sources,
               *allowed_stop_modes, child_path(path, "allowed_stop_modes"),
               {"spring_back_hold", "soft_on_path", "hard_deceleration"}, values,
               true));
-      if (source.source_class != "fast_execution_relevant" ||
+      if ((source != nullptr &&
+           source->source_class != "fast_execution_relevant") ||
           parsed.post_latch_disposition != "auto_clear_after_motion_outcome") {
         fail(path, "complete_move_on_signal requires a fast source and "
                    "auto_clear_after_motion_outcome");
@@ -2245,7 +2506,8 @@ require_interrupt_source(const std::vector<ParsedInterruptSource> &sources,
          right_index < parsed_policies.size(); ++right_index) {
       const auto &left = parsed_policies[left_index];
       const auto &right = parsed_policies[right_index];
-      if (left.source_id != right.source_id) {
+      if (left.source_id.empty() || right.source_id.empty() ||
+          left.source_id != right.source_id) {
         continue;
       }
       const bool shares_phase =
@@ -2355,15 +2617,27 @@ decode_deployment_applicability_inputs_candidate(
   std::vector<StopStageParametersDTO> stop_stage_parameters;
   std::vector<CommissionedStopInterfaceDTO> commissioned_stop_interfaces;
   std::vector<core::CatalogRecordRefDTO> retained_policy_records;
+  std::optional<double> motion_takeover_preparation_budget_s;
   std::optional<CanonicalValue> normalized_policies;
   const CanonicalValue *policies_value = find_member(root, "policies");
   if (policies_value != nullptr) {
     const auto &policies = require_object(*policies_value, "$.policies");
-    require_closed_fields(policies,
-                          {"retained_policy_records", "stop_stage_parameters",
-                           "commissioned_stop_interfaces", "interrupt_sources",
-                           "interrupt_policies", "interrupt_config"},
-                          {}, "$.policies");
+    require_closed_fields(
+        policies,
+        {"retained_policy_records", "stop_stage_parameters",
+         "commissioned_stop_interfaces", "interrupt_sources",
+         "interrupt_policies", "interrupt_config"},
+        {"motion_takeover_preparation_budget_s", "interrupt_rules"},
+        "$.policies");
+    if (const auto *budget =
+            find_member(policies, "motion_takeover_preparation_budget_s")) {
+      constexpr auto path = "$.policies.motion_takeover_preparation_budget_s";
+      const auto seconds = require_finite_number(*budget, path);
+      if (seconds <= 0.0) {
+        fail(path, "expected positive seconds");
+      }
+      motion_takeover_preparation_budget_s = seconds;
+    }
     retained_policy_records = parse_retained_policy_records(policies);
     const CanonicalValue interrupt_config = validate_interrupt_config(policies);
     std::vector<ParsedInterruptSource> parsed_interrupt_sources;
@@ -2371,6 +2645,7 @@ decode_deployment_applicability_inputs_candidate(
         parse_interrupt_sources(policies, providers, parsed_interrupt_sources);
     CanonicalValue normalized_interrupt_policies =
         parse_interrupt_policies(policies, parsed_interrupt_sources);
+    const auto normalized_interrupt_rules = parse_interrupt_rules(policies);
 
     const auto &parameter_values = require_array(
         require_member(policies, "stop_stage_parameters", "$.policies"),
@@ -2408,7 +2683,8 @@ decode_deployment_applicability_inputs_candidate(
     normalized_policies = encode_supported_policies(
         stop_stage_parameters, commissioned_stop_interfaces,
         retained_policy_records, normalized_interrupt_sources,
-        normalized_interrupt_policies, interrupt_config);
+        normalized_interrupt_policies, interrupt_config,
+        motion_takeover_preparation_budget_s, &normalized_interrupt_rules);
   }
 
   std::optional<SiteOverlayRefDTO> site_overlay_ref;
@@ -2438,6 +2714,7 @@ decode_deployment_applicability_inputs_candidate(
       std::move(stop_stage_parameters),
       std::move(commissioned_stop_interfaces),
       std::move(retained_policy_records),
+      motion_takeover_preparation_budget_s,
   };
   CanonicalValue normalized_desired =
       encode_desired_configurations(value.desired_control_configurations);
@@ -2497,7 +2774,9 @@ compute_capability_provider_binding_revisions(
         value.retained_policy_records,
         require_normalized_policy_member("interrupt_sources"),
         require_normalized_policy_member("interrupt_policies"),
-        require_normalized_policy_member("interrupt_config"));
+        require_normalized_policy_member("interrupt_config"),
+        value.motion_takeover_preparation_budget_s,
+        candidate.normalized_policies()->find_object_member("interrupt_rules"));
   }
 
   return RevisionVerifiedDeploymentApplicabilityInputs(

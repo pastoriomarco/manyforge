@@ -11,6 +11,14 @@
 
 namespace manyforge::core {
 
+/// TCP constraint for the unchanged closed prefix of a moving replacement.
+struct RetainedTrajectoryPrefixValidationOptionsDTO final {
+  double end_time_s{};
+  double max_tcp_linear_speed_mps{};
+  std::string tcp_frame;
+  std::string base_frame;
+};
+
 /// Validation options for trajectory validation (spec §3.8)
 struct ValidationOptionsDTO {
   double max_tcp_linear_speed_mps = 0.0;  // > 0: effective TCP speed limit to enforce (ADR-0015)
@@ -20,6 +28,7 @@ struct ValidationOptionsDTO {
   // (for example TCP-speed checks). Collision authority is then expected to
   // live in the normalized CollisionValidationCoordinator path.
   bool run_collision_checks = true;
+  std::optional<RetainedTrajectoryPrefixValidationOptionsDTO> retained_prefix{};
 };
 
 /// Compact measurements made while validating the exact accepted trajectory.
@@ -53,6 +62,15 @@ struct TrajectoryValidationMetricsDTO final {
                          const TrajectoryValidationMetricsDTO&) = default;
 };
 
+/// Piece diagnostics from the same whole-curve validator traversal.
+struct MovingReplacementValidationEvidenceDTO final {
+  TrajectoryValidationMetricsDTO unchanged_prefix;
+  TrajectoryValidationMetricsDTO changed_future;
+
+  friend bool operator==(const MovingReplacementValidationEvidenceDTO&,
+                         const MovingReplacementValidationEvidenceDTO&) = default;
+};
+
 /// Validation result (spec §3.8)
 struct ValidationResultDTO {
   ValidationResultDTO() = default;
@@ -68,6 +86,7 @@ struct ValidationResultDTO {
   /// Present on successful trajectory validation.  This is evidence about the
   /// exact accepted trajectory, not a second policy or execution authority.
   std::optional<TrajectoryValidationMetricsDTO> trajectory_metrics;
+  std::optional<MovingReplacementValidationEvidenceDTO> moving_replacement{};
 };
 
 /// Collision check request (spec §3.8)

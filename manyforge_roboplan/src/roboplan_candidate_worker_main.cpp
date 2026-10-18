@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -442,7 +443,30 @@ int run_worker(int descriptor) {
       case MessageType::kPlan: {
         auto candidate =
             worker_protocol::decode_candidate_request(request.payload);
-        auto result = computer.compute(candidate);
+        RoboPlanCandidateControl control;
+        if (candidate.moving_replacement) {
+          const double remaining =
+              candidate.moving_replacement->remaining_preparation_budget_s;
+          if (!std::isfinite(remaining) || remaining <= 0.0 ||
+              remaining > std::chrono::duration<double>(std::chrono::hours(24))
+                              .count()) {
+            fail("moving replacement preparation budget is invalid");
+          }
+          const auto deadline =
+              std::chrono::steady_clock::now() +
+              std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                  std::chrono::duration<double>(remaining));
+          control.deadline_expired = [deadline] {
+            return std::chrono::steady_clock::now() >= deadline;
+          };
+        }
+        auto result = computer.compute(candidate, control);
+        if (control.deadline_expired && control.deadline_expired()) {
+          result = core::Result<core::TrajectoryDTO>::Err(
+              core::ErrorDTO{"planning_timeout",
+                             "Moving replacement preparation timed out",
+                             {{"reason", "planning_timeout"}}});
+        }
         send_frame(descriptor, MessageType::kPlanResult,
                    worker_protocol::encode_trajectory_result(result));
         break;

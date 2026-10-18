@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <manyforge_core/execution_sample_association.hpp>
 #include <manyforge_core/execution_stop_support.hpp>
@@ -217,6 +218,7 @@ struct ParticipantStopStageHelper::Run {
   std::optional<Duration> recognition_delay_ns;
   /// Q59: stale controller state seen while waiting; it is the stage failure.
   std::optional<ErrorDTO> stale_state_error;
+  IStopStageSpringReturnObserver* spring_observer{};
 };
 
 ParticipantStopStageHelper::ParticipantStopStageHelper(IExecutionPort& port, const IClock& clock,
@@ -264,15 +266,119 @@ void ParticipantStopStageHelper::Record(SentGoal goal) {
   sent_.push_back(std::move(goal));
 }
 
+bool ParticipantStopStageHelper::ReserveReplacement(const ExecutionGoalKey& source) {
+  std::lock_guard lock(mutex_);
+  if (!goal_ || goal_->key != source || sent_.size() != 1U || sent_.front().key != source ||
+      sent_.front().moving_replacement)
+    return false;
+  sent_.reserve(kExecutionGoalRecordCapacity);
+  return true;
+}
+
+void ParticipantStopStageHelper::RecordReplacement(
+    ExecutionGoalKey key, TrajectoryDTO trajectory,
+    std::shared_ptr<ExecutionSampleAssociation> association) noexcept {
+  std::lock_guard lock(mutex_);
+  sent_.push_back(
+      SentGoal{std::move(key), std::move(trajectory), std::nullopt, std::move(association), true});
+}
+
+void ParticipantStopStageHelper::RetireSettledReplacement(const ExecutionGoalKey& key) noexcept {
+  std::lock_guard lock(mutex_);
+  const auto found = std::find_if(sent_.begin(), sent_.end(), [&](const auto& goal) {
+    return goal.moving_replacement && goal.key == key;
+  });
+  if (found != sent_.end()) sent_.erase(found);
+}
+
+bool ParticipantStopStageHelper::HasPendingReplacement() const {
+  std::lock_guard lock(mutex_);
+  return std::any_of(sent_.begin(), sent_.end(),
+                     [](const auto& goal) { return goal.moving_replacement; });
+}
+
+bool ParticipantStopStageHelper::CanCompleteNaturally(const ExecutionGoalKey& source) const {
+  std::lock_guard lock(mutex_);
+  const bool pending = std::any_of(sent_.begin(), sent_.end(),
+                                   [](const auto& goal) { return goal.moving_replacement; });
+  if (!pending) return true;
+  const auto original = std::find_if(sent_.begin(), sent_.end(),
+                                     [&](const auto& goal) { return goal.key == source; });
+  if (original == sent_.end()) return false;
+  const auto predecessor = port_.ReadGoal(source);
+  if (!predecessor) return false;
+  for (auto newer = std::next(original); newer != sent_.end(); ++newer) {
+    auto observed = port_.ReadGoal(newer->key);
+    if (!observed) observed = newer->terminal_observation;
+    // Rejection proves the newer command was prevented. Missing/unknown or a
+    // cancel result alone is not settlement proof for the original shortcut.
+    if (!observed || observed->key != newer->key ||
+        observed->binding_epoch != predecessor->binding_epoch ||
+        observed->binding_epoch != port_.ReadReadiness().binding_epoch ||
+        observed->phase != ExecutionGoalPhase::kTerminal ||
+        observed->result != ExecutionGoalResult::kRejected)
+      return false;
+  }
+  return true;
+}
+
+bool ParticipantStopStageHelper::CancelGoals(const std::vector<SentGoal>& goals) {
+  bool sent = false;
+  for (const auto& goal : goals) {
+    try {
+      sent |= port_.Cancel(goal.key).dispatch != ExecutionPortDispatch::kNotDispatched;
+    } catch (...) {
+      // A thrown send is uncertain; still request the other retained key.
+      sent = true;
+    }
+  }
+  return sent;
+}
+
+bool ParticipantStopStageHelper::CancelLiveGoals() {
+  return CancelGoals(LiveGoals());
+}
+
+void ParticipantStopStageHelper::AdoptReplacement(
+    std::optional<StopStageDispatchedGoalDTO>& goal) noexcept {
+  static_assert(std::is_nothrow_swappable_v<StopStageDispatchedGoalDTO>);
+  static_assert(std::is_nothrow_move_assignable_v<SentGoal>);
+  std::lock_guard lock(mutex_);
+  goal_.swap(goal);
+  // The caller just proved this exact predecessor superseded by the own-
+  // recognized successor. No unresolved record is removed here.
+  sent_.erase(sent_.begin(), std::prev(sent_.end()));
+  sent_.front().moving_replacement = false;
+}
+
 std::vector<ParticipantStopStageHelper::SentGoal> ParticipantStopStageHelper::LiveGoals() const {
   std::vector<SentGoal> sent;
   {
     std::lock_guard lock(mutex_);
     sent = sent_;
   }
+  const bool pending = std::any_of(sent.begin(), sent.end(),
+                                   [](const auto& goal) { return goal.moving_replacement; });
   std::vector<SentGoal> live;
   for (auto it = sent.rbegin(); it != sent.rend(); ++it) {
-    if (!terminal(port_.ReadGoal(it->key))) live.push_back(*it);
+    auto observed = port_.ReadGoal(it->key);
+    if (pending) {
+      if (observed && observed->key == it->key &&
+          observed->binding_epoch == port_.ReadReadiness().binding_epoch &&
+          observed->phase == ExecutionGoalPhase::kTerminal) {
+        std::lock_guard lock(mutex_);
+        const auto retained = std::find_if(sent_.begin(), sent_.end(),
+                                           [&](const auto& goal) { return goal.key == it->key; });
+        if (retained != sent_.end()) retained->terminal_observation = observed;
+      } else if (!observed && it->terminal_observation) {
+        observed = it->terminal_observation;
+      }
+    }
+    if (!terminal(observed) ||
+        (pending && (!observed || !observed->result ||
+                     observed->binding_epoch != port_.ReadReadiness().binding_epoch ||
+                     observed->result == ExecutionGoalResult::kEndedUnknown)))
+      live.push_back(*it);
   }
   return live;
 }
@@ -305,6 +411,18 @@ std::optional<double> ParticipantStopStageHelper::OriginalPathCursor(
 ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStage(
     const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
     std::stop_token cancellation) {
+  return TranslateStopStageImpl(stage, budget, cancellation, nullptr);
+}
+
+ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStageForTakeover(
+    const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+    std::stop_token cancellation, IStopStageSpringReturnObserver& observer) {
+  return TranslateStopStageImpl(stage, budget, cancellation, &observer);
+}
+
+ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStageImpl(
+    const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+    std::stop_token cancellation, IStopStageSpringReturnObserver* observer) {
   const auto started = clock_.now();
   if (cancellation.stop_requested()) return superseded_result(stage);
   const auto refuse = [&](std::string reason, std::string message) {
@@ -406,6 +524,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStage(
           std::nullopt,
           std::nullopt,
           std::nullopt};
+  run.spring_observer = observer;
   // Q42: the lane's hard stop is the controlled hard stop (level 3) with the
   // cancel (level 4) as its floor; a controller-goal cancel is level 4 itself.
   if (!controlled) return RunHardStage(run, software_hard);
@@ -667,7 +786,23 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
   if (!projected.ok()) {
     return Fail(run, stage_error(projected.error(), "controlled_stop_projection_invalid"));
   }
-  const auto& profile = projected.value();
+  auto profile = std::move(projected.value());
+  const bool force_spring =
+      run.spring_observer &&
+      (profile.stop_mode == MotionInterruptStopMode::kSpringBackHold ||
+       (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath &&
+        profile.recoverable_substitution_mode == MotionInterruptStopMode::kSpringBackHold));
+  const bool spring_substitution =
+      force_spring && profile.stop_mode == MotionInterruptStopMode::kSoftOnPath;
+  if (spring_substitution) {
+    profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+    profile.recoverable_substitution_mode.reset();
+  }
+
+  if (HasPendingReplacement() && !CanCompleteNaturally(run.goal.key))
+    return Fail(run,
+                stage_error("pending_replacement_has_no_controlled_source",
+                            "The pending replacement leaves no qualified source or goal slot"));
 
   // §4.2 step 1 (Q17/Q38): speed publication stops; the factor is frozen.
   const double frozen = freeze_speed_factor_();
@@ -774,9 +909,32 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
   auto spring_profile = profile;
   spring_profile.deceleration_time_s = motion_interrupt_deceleration_time_or_default(profile);
 
+  if (force_spring) {
+    auto forward = spring_profile;
+    forward.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+    forward.deceleration_time_s = 0.5 * *spring_profile.deceleration_time_s;
+    forward.recoverable_substitution_mode.reset();
+    auto resolved =
+        resolve_soft_on_path_stop_initial_state(run.goal.trajectory, forward, initial, planner);
+    if (!resolved.ok())
+      return Fail(run, stage_error(resolved.error(), "spring_back_initial_state_invalid"));
+    const SpringBackReturnPointDTO point{run.goal.key, trip->binding_epoch, *trip,
+                                         std::move(resolved.value())};
+    // Notification cannot alter physical containment or select another stage.
+    static_cast<void>(run.spring_observer->SpringReturnPointReady(point));
+  }
+
   auto outcome = ControlledStopResultDTO{};
   outcome.accepted = true;
   outcome.executed_stop_mode = profile.stop_mode;
+  if (spring_substitution) {
+    outcome.fallback_reason = "takeover_spring_return";
+    put(outcome.diagnostics, "requested_stop_mode", interrupt_structured_string("soft_on_path"));
+    put(outcome.diagnostics, "recoverable_substitution_reason",
+        interrupt_structured_string("takeover_spring_return"));
+    put(outcome.diagnostics, "recoverable_substitution_pair",
+        interrupt_structured_string("soft_on_path->spring_back_hold"));
+  }
   outcome.stop_command_source = MotionInterruptStopCommandSource::kFjtPreemptPathRamp;
   Result<SoftOnPathStopPlanDTO> planned =
       profile.stop_mode == MotionInterruptStopMode::kSoftOnPath
@@ -1019,6 +1177,9 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
 
 ParticipantStopStageResultDTO ParticipantStopStageHelper::RunNaturalCompletion(
     Run& run, const TimePoint stop_deadline, std::string basis) {
+  if (!CanCompleteNaturally(run.goal.key))
+    return Fail(run, stage_error("pending_replacement_not_settled",
+                                 "A newer possibly sent motion still requires containment"));
   ControlledStopResultDTO outcome;
   outcome.accepted = true;
   outcome.completed_by_natural_completion = true;
@@ -1034,7 +1195,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunNaturalCompletion(
   std::optional<ExecutionGoalObservationDTO> goal;
   const bool ended = Await(run, stop_deadline, [&] {
     goal = port_.ReadGoal(run.goal.key);
-    return terminal(goal);
+    return terminal(goal) && CanCompleteNaturally(run.goal.key);
   });
   if (run.cancellation.stop_requested()) {
     return Fail(run, stage_error("stop_stage_cancelled_after_dispatch",
@@ -1145,6 +1306,10 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunHardStage(
 std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryControlledHardStop(
     Run& run, const SentGoal& live, const ExecutionControllerSampleDTO& sample,
     const double factor, std::string& fallback_reason) {
+  if (HasPendingReplacement() && LiveGoals().size() >= kExecutionGoalRecordCapacity) {
+    fallback_reason = "pending_replacement_goal_capacity";
+    return std::nullopt;
+  }
   const auto goal = port_.ReadGoal(live.key);
   if (!goal.has_value() || !usable_sample(sample, run.lane.joint_names.size(), goal->binding_epoch) ||
       !live.association->Observe(sample, goal)) {
@@ -1306,7 +1471,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunCancel(Run& run) {
   // controller holds; the floor observes that hold.
   if (live.empty()) return RunEndedGoalHold(run);
   // The newest sample before the cancel orders every counted sample.
-  const auto baseline = port_.ReadSample();
+  auto baseline = port_.ReadSample();
   // SX-218 (Q50): the switch baseline is only a sample that the association
   // of a cancelled goal attributes to that goal. A sample before any such
   // goal's first anchor (e.g. the controller's pre-goal hold) is no
@@ -1323,16 +1488,21 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunCancel(Run& run) {
     }
   }
   // Q35: always cancel, also at factor 0; every goal that may still run.
+  const bool pending_replacement = HasPendingReplacement();
   bool any_sent = false;
-  for (const auto& goal : live) {
-    any_sent |= port_.Cancel(goal.key).dispatch != ExecutionPortDispatch::kNotDispatched;
+  if (pending_replacement) {
+    any_sent = CancelGoals(live);
+  } else {
+    for (const auto& goal : live)
+      any_sent |= port_.Cancel(goal.key).dispatch != ExecutionPortDispatch::kNotDispatched;
   }
   if (live.empty() || !any_sent) {
     return Fail(run, stage_error("hard_stop_cancel_not_dispatched",
                                  "The controller cancel was not dispatched"));
   }
   run.dispatched = true;
-  const auto newest = live.front().key;
+  auto newest = live.front().key;
+  std::array<bool, kExecutionGoalRecordCapacity> restoration_attempted{};
   run.finish_goal = newest;
   // Q5/Q35 finish with Q50 ordering. Every counted sample is received after
   // this cancel was sent and is newer (controller source stamp, same epoch)
@@ -1348,9 +1518,48 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunCancel(Run& run) {
   std::string basis;
   bool completed_naturally = false;
   const bool finished = Await(run, run.terminal_deadline, [&] {
-    const auto goal = port_.ReadGoal(newest);
+    auto goal = port_.ReadGoal(newest);
+    // A pending successor can reject after its cancel was latched. The old
+    // key may then be current again; its first cancel could have been stale.
+    // Retry each retained predecessor once, inside the original deadline.
+    if (pending_replacement && newest == live.front().key && goal &&
+        goal->phase == ExecutionGoalPhase::kTerminal &&
+        goal->result == ExecutionGoalResult::kRejected) {
+      const auto readiness = port_.ReadReadiness();
+      for (std::size_t index = 1U; index < live.size() && index < restoration_attempted.size();
+           ++index) {
+        if (restoration_attempted[index]) continue;
+        const auto predecessor = port_.ReadGoal(live[index].key);
+        if (!predecessor || predecessor->phase == ExecutionGoalPhase::kTerminal ||
+            predecessor->binding_epoch != readiness.binding_epoch || !readiness.controller_active ||
+            !readiness.controller_bound || !readiness.hardware_active)
+          continue;
+        restoration_attempted[index] = true;
+        auto fresh_baseline = port_.ReadSample();
+        std::optional<ExecutionControllerSampleDTO> fresh_switch_baseline;
+        if (fresh_baseline && live[index].association &&
+            live[index].association->Observe(*fresh_baseline, predecessor))
+          fresh_switch_baseline = fresh_baseline;
+        bool possibly_sent = true;
+        try {
+          possibly_sent =
+              port_.Cancel(live[index].key).dispatch != ExecutionPortDispatch::kNotDispatched;
+        } catch (...) {
+          // Keep uncertainty and let only this key's actual evidence finish.
+        }
+        if (!possibly_sent) continue;
+        newest = live[index].key;
+        run.finish_goal = newest;
+        baseline = std::move(fresh_baseline);
+        switch_baseline = std::move(fresh_switch_baseline);
+        switched_source.reset();
+        goal = port_.ReadGoal(newest);
+        break;
+      }
+    }
     if (goal.has_value() && goal->phase == ExecutionGoalPhase::kTerminal &&
-        goal->result == ExecutionGoalResult::kSucceeded) {
+        goal->result == ExecutionGoalResult::kSucceeded &&
+        (!pending_replacement || LiveGoals().empty())) {
       completed_naturally = true;
       return true;
     }
@@ -1377,6 +1586,12 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunCancel(Run& run) {
       basis = "factor_zero_cancel_acknowledged";
     } else {
       return false;
+    }
+    if (pending_replacement) {
+      const auto unresolved = LiveGoals();
+      if (std::any_of(unresolved.begin(), unresolved.end(),
+                      [&](const auto& retained) { return retained.key != newest; }))
+        return false;
     }
     finish_receipt = sample->local_receipt_stamp_ns;
     return true;

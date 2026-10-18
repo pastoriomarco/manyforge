@@ -1,0 +1,328 @@
+{
+  "api_version": "manyforge.program.v2",
+  "blackboard": {
+    "keys": [
+      {
+        "access": "read_write",
+        "initial": {
+          "frame_ref": {
+            "frame_role": "base",
+            "kind": "target_frame",
+            "target_role": "arm"
+          },
+          "orientation": {
+            "rpy_deg": [
+              180.0,
+              0.0,
+              0.0
+            ]
+          },
+          "position_m": [
+            1.5,
+            0.0,
+            0.2
+          ]
+        },
+        "key": "trial.goal",
+        "persistence": "run",
+        "type": "stored_pose"
+      }
+    ],
+    "namespaces": [
+      {
+        "namespace_id": "trial",
+        "owner": "program"
+      }
+    ]
+  },
+  "catalog": {
+    "api_version": "manyforge.node_catalog.v2",
+    "content_version": "2.7.0"
+  },
+  "compatibility": {
+    "assistant": "forbidden",
+    "lanes": [
+      "manyforge-only"
+    ],
+    "requires": [],
+    "tags": [
+      "lite6",
+      "r5-live-trial"
+    ]
+  },
+  "component_roles": {
+    "robot": {
+      "required_component_type_tags": [
+        "articulated-arm"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ]
+    }
+  },
+  "description": "R5 trial (a): automatic motion retry after a planning (IK) failure. The goal key starts unreachable; after 1.5 s a parallel branch writes a reachable goal, and a later automatic attempt (automatic_retries 3, delay 1.0 s) re-reads it and succeeds.",
+  "forest": [
+    {
+      "children": [
+        {
+          "children": [],
+          "instance_id": "start_rest",
+          "node_id": "motion.move_to_joint_target",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": [
+              {
+                "joint_name": "joint1",
+                "position_rad": 0.0
+              },
+              {
+                "joint_name": "joint2",
+                "position_rad": -0.785
+              },
+              {
+                "joint_name": "joint3",
+                "position_rad": 0.785
+              },
+              {
+                "joint_name": "joint4",
+                "position_rad": 0.0
+              },
+              {
+                "joint_name": "joint5",
+                "position_rad": 1.57
+              },
+              {
+                "joint_name": "joint6",
+                "position_rad": 0.0
+              }
+            ],
+            "planning_timeout_s": 5.0,
+            "target_role": "arm",
+            "tcp_frame_role": "tcp",
+            "velocity_scale": 0.4
+          }
+        },
+        {
+          "children": [
+            {
+              "children": [],
+              "instance_id": "retry_move",
+              "node_id": "motion.move_to_pose",
+              "parameters": {
+                "automatic_retries": 3,
+                "automatic_retry_delay_s": 1.0,
+                "base_frame_role": "base",
+                "execution_timeout_s": 30.0,
+                "planning_timeout_s": 1.0,
+                "target_role": "arm",
+                "tcp_frame_role": "tcp",
+                "velocity_scale": 0.4
+              },
+              "value_sources": {
+                "goal": {
+                  "kind": "blackboard_key",
+                  "reference": "trial.goal"
+                }
+              }
+            },
+            {
+              "children": [
+                {
+                  "children": [],
+                  "instance_id": "wait_before_fix",
+                  "node_id": "timer",
+                  "parameters": {
+                    "duration_s": 1.5
+                  }
+                },
+                {
+                  "children": [],
+                  "instance_id": "make_goal_reachable",
+                  "node_id": "logic.set_value",
+                  "parameters": {
+                    "key": "trial.goal",
+                    "value": {
+                      "frame_ref": {
+                        "frame_role": "base",
+                        "kind": "target_frame",
+                        "target_role": "arm"
+                      },
+                      "orientation": {
+                        "rpy_deg": [
+                          180.0,
+                          0.0,
+                          0.0
+                        ]
+                      },
+                      "position_m": [
+                        0.16,
+                        0.08,
+                        0.2
+                      ]
+                    }
+                  }
+                }
+              ],
+              "instance_id": "fix_goal_later",
+              "node_id": "sequence",
+              "parameters": {}
+            }
+          ],
+          "instance_id": "retry_window",
+          "node_id": "parallel",
+          "parameters": {
+            "success_policy": "all"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "retry_move_completed",
+          "node_id": "logic.check_value",
+          "parameters": {
+            "key": "node_outcome.retry_move",
+            "value": "completed"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "end_rest",
+          "node_id": "motion.move_to_joint_target",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": [
+              {
+                "joint_name": "joint1",
+                "position_rad": 0.0
+              },
+              {
+                "joint_name": "joint2",
+                "position_rad": -0.785
+              },
+              {
+                "joint_name": "joint3",
+                "position_rad": 0.785
+              },
+              {
+                "joint_name": "joint4",
+                "position_rad": 0.0
+              },
+              {
+                "joint_name": "joint5",
+                "position_rad": 1.57
+              },
+              {
+                "joint_name": "joint6",
+                "position_rad": 0.0
+              }
+            ],
+            "planning_timeout_s": 5.0,
+            "target_role": "arm",
+            "tcp_frame_role": "tcp",
+            "velocity_scale": 0.4
+          }
+        }
+      ],
+      "instance_id": "trial_a",
+      "node_id": "sequence",
+      "parameters": {}
+    }
+  ],
+  "name": "r5_trial_a_retry",
+  "parameters": [],
+  "positions": {},
+  "program_id": "r5_trial_a_retry",
+  "program_profile": "composable-cell-v1",
+  "scene": [
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "position_m": [
+          0.0,
+          0.0,
+          -0.051
+        ]
+      },
+      "scene_resource_id": "ground",
+      "shape": {
+        "box_dimensions_m": [
+          1.0,
+          1.0,
+          0.1
+        ],
+        "type": "box"
+      }
+    }
+  ],
+  "schema_version": "manyforge.composer_authoring_forest.v1",
+  "target_roles": {
+    "arm": {
+      "component_role": "robot",
+      "required_capabilities": [
+        {
+          "capability_id": "execution.feedback.phase_events",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "execution.trajectory.execute",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.joint_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.pose_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.profile.balanced",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.trajectory.time_parameterized",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "state.observed.current",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "validation.trajectory.non_collision",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [
+        "arm_collision"
+      ],
+      "required_frame_roles": [
+        "base",
+        "tcp"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ],
+      "required_resource_roles": [
+        "arm_joints"
+      ]
+    }
+  }
+}

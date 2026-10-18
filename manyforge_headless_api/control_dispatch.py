@@ -12,7 +12,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
+
+from manyforge_behavior.failure_details import output_may_have_acted
 
 from .control_protocol import (
     ExecutionCommandRequestDTO,
@@ -25,6 +27,7 @@ from .models import (
     FullStopIntentRequest,
     ManualResultStageRequest,
     OperationControlRequest,
+    OperationResetRequest,
     OperationIntentRequest,
     ProgramCycleResetRequest,
     ProgramFullStopResetRequest,
@@ -37,13 +40,14 @@ from .models import (
     ProgramManualHandoverRequest,
     RuntimeScaleControlRequest,
     RuntimeBlackboardWriteRequest,
-    StopFaultRecoveryIntentRequest,
+    StopFaultRecoveryRequest,
     StopIntentRequest,
 )
 from .native import HeadlessApiError
 from .service import HeadlessService, TrustedAttribution
 
 
+_STOP_FAULT_RECOVERY_ADAPTER: TypeAdapter = TypeAdapter(StopFaultRecoveryRequest)
 _NATIVE_EXECUTION_COMMANDS = frozenset(
     {
         "operation_start",
@@ -129,7 +133,56 @@ class HeadlessExecutionControlDispatch:
         ]
         # The projection is native-owned. A concurrent retirement/revision
         # change still rejects in the command's exact Kernel check.
-        return None if len(matches) == 1 else "manual_operation_scope_stale"
+        if len(matches) == 1:
+            return None
+        if not matches and self._held_program_uncertain_output(request, cycle):
+            return None
+        return "manual_operation_scope_stale"
+
+    def _held_program_uncertain_output(
+        self, request: ExecutionCommandRequestDTO, cycle: Mapping[str, Any]
+    ) -> bool:
+        """Contract 66 (SX-2169): the operator's targeted Reset of a retained
+        Program-owned output whose write ended acceptance-unknown, which it
+        acknowledges explicitly. Proven only from the exact current operation
+        projection: same id and revision, resident, owned by the current
+        cycle's Program run, and its participant's output_evidence. No other
+        held Program operation passes this gate."""
+
+        payload = request.payload
+        operation_id = payload.get("operation_id")
+        revision = payload.get("expected_operation_revision")
+        run_id = cycle.get("program_run_id")
+        acknowledged = payload.get("acknowledged_uncertain_outputs")
+        if (
+            request.command_envelope.command_kind != "operation_reset"
+            or not isinstance(operation_id, str)
+            or not operation_id
+            or type(revision) is not int
+            or not isinstance(run_id, str)
+            or not run_id
+            or not isinstance(acknowledged, list)
+            or {"operation_id": operation_id, "operation_revision": revision}
+            not in acknowledged
+        ):
+            return False
+        try:
+            response = self._service.execution_read(operation_id)
+        except Exception:
+            return False
+        operation = response.get("operation") if isinstance(response, Mapping) else None
+        participants = operation.get("participants") if isinstance(operation, Mapping) else None
+        return (
+            response.get("ok") is True
+            and response.get("resident") is True
+            and operation.get("operation_id") == operation_id
+            and operation.get("operation_revision") == revision
+            and operation.get("program_run_id") == run_id
+            and isinstance(participants, list)
+            and len(participants) == 1
+            and isinstance(participants[0], Mapping)
+            and output_may_have_acted(participants[0].get("output_evidence"))
+        )
 
     def _standalone_execution_projection(self) -> tuple[str, int, dict[str, Any]]:
         response = self._service.execution_identity()
@@ -473,9 +526,11 @@ class HeadlessExecutionControlDispatch:
                 "operation_reset",
                 "operation_acknowledge_completed",
             }:
-                model = OperationControlRequest.model_validate(
-                    {**payload, "request_context": context}
-                )
+                model = (
+                    OperationResetRequest
+                    if kind == "operation_reset"
+                    else OperationControlRequest
+                ).model_validate({**payload, "request_context": context})
                 if kind == "operation_reset":
                     result = self._service.execution_reset(model, attribution)
                 else:
@@ -502,7 +557,7 @@ class HeadlessExecutionControlDispatch:
                 )
             elif kind == "stop_recovery":
                 result = self._service.execution_recover_stop_fault(
-                    StopFaultRecoveryIntentRequest.model_validate(
+                    _STOP_FAULT_RECOVERY_ADAPTER.validate_python(
                         {**payload, "request_context": context}
                     )
                 )

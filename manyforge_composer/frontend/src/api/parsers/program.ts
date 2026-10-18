@@ -362,18 +362,28 @@ function parseProgramNodeRecoveryPolicy(
   path: string,
 ): ProgramNodeRecoveryPolicy {
   const record = objectAt(value, path);
-  exactKeysAt(record, ['allow_intervention', 'max_retries'], path);
+  allowedKeysAt(record, ['allow_intervention', 'max_retries'], ['intervention_stop_scope'], path);
   const maxRetries = integerAt(record.max_retries, `${path}.max_retries`);
   if (maxRetries < 0 || maxRetries > 255) {
     return fail(`${path}.max_retries`, 'an integer in 0..255 (0 is Unlimited)');
   }
-  return {
+  const policy: ProgramNodeRecoveryPolicy = {
     allow_intervention: booleanAt(
       record.allow_intervention,
       `${path}.allow_intervention`,
     ),
     max_retries: maxRetries,
   };
+  if (record.intervention_stop_scope !== undefined) {
+    if (record.intervention_stop_scope === 'all') {
+      return fail(`${path}.intervention_stop_scope`, 'omitted (all is the canonical default)');
+    }
+    if (record.intervention_stop_scope !== 'own_groups') {
+      return fail(`${path}.intervention_stop_scope`, 'all or own_groups');
+    }
+    policy.intervention_stop_scope = 'own_groups';
+  }
+  return policy;
 }
 
 function parseProgramTreeNode(

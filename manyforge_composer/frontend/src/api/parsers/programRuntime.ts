@@ -19,9 +19,12 @@ import type {
   CycleRecoveryAction,
   CycleRecoveryActionId,
   CycleRecoveryOffer,
+  ProgramRecoveryHold,
   ProgramRuntimeControlProjection,
   ProgramRuntimeControlsSnapshot,
   RuntimeControlAuditEvent,
+  AutomaticRetryAuditEvent,
+  AutomaticRetryAuditFacts,
 } from '../../types/api';
 import type { RuntimeScaleControlAccepted, RuntimeScaleControlStatus, ProgramRunAdmittedSpeeds } from '../../types/robotControl';
 import type { JsonObject } from './shared';
@@ -176,12 +179,6 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
         ),
       };
     }),
-    recoveryOffer: record.recovery_offer === null
-      ? null
-      : parseCycleRecoveryOffer(
-        record.recovery_offer,
-        'programCycleStatus.recovery_offer',
-      ),
     run: record.run === null ? null : parseProgramRunStatus(record.run),
     runtimeControls: record.runtime_controls === null
       ? null
@@ -478,6 +475,63 @@ export function parseKnownProgramRunOutcome(payload: unknown, status: number): S
   return { code, message, details: parsed, origin: null };
 }
 
+function programOperationFailuresAt(value: unknown, path: string): ProgramRunStatus['operationFailures'] {
+  // Match the owner/Headless provenance contract, including UTF-8 byte bounds.
+  const textAt = (value: unknown, path: string, maximumBytes: number, empty = false): string => {
+    const text = stringAt(value, path);
+    if ((!empty && text.length === 0) || utf8Length(text) > maximumBytes
+      || text.normalize('NFC') !== text) {
+      return fail(path, `NFC text within ${maximumBytes} UTF-8 bytes${empty ? '' : ', nonempty'}`);
+    }
+    return text;
+  };
+  const before = (left: string, right: string): boolean => {
+    // The producer sorts Unicode code points (Python), not UTF-16 code units.
+    const a = Array.from(left); const b = Array.from(right);
+    for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+      const difference = a[index].codePointAt(0)! - b[index].codePointAt(0)!;
+      if (difference !== 0) return difference < 0;
+    }
+    return a.length < b.length;
+  };
+  return boundedArrayAt(value, path, 4096).map((value, index) => {
+    const key = `${path}[${index}]`;
+    const row = objectAt(value, key);
+    exactKeysAt(row, ['node_instance_id', 'node_attempt_id', 'operator_facing_run_revision',
+      'operation', 'resource_ids', 'failure', 'recovery_class', 'terminal_facts'], key);
+    const operation = objectAt(row.operation, `${key}.operation`);
+    exactKeysAt(operation, ['source_owner_epoch', 'operation_id', 'operation_revision'], `${key}.operation`);
+    const failure = objectAt(row.failure, `${key}.failure`);
+    exactKeysAt(failure, ['code', 'message'], `${key}.failure`);
+    const resourceIds = boundedArrayAt(row.resource_ids, `${key}.resource_ids`, 4096)
+      .map((value, index) => textAt(value, `${key}.resource_ids[${index}]`, 1024));
+    if (resourceIds.length === 0 || resourceIds.some((value, index) => index > 0 && !before(resourceIds[index - 1], value))) {
+      return fail(`${key}.resource_ids`, 'nonempty sorted unique resource IDs');
+    }
+    const terminalFacts = boundedArrayAt(row.terminal_facts, `${key}.terminal_facts`, 4096)
+      .map((value, index) => {
+        const factPath = `${key}.terminal_facts[${index}]`;
+        const fact = objectAt(value, factPath);
+        exactKeysAt(fact, ['kind', 'effect'], factPath);
+        return { kind: textAt(fact.kind, `${factPath}.kind`, 128),
+          effect: textAt(fact.effect, `${factPath}.effect`, 128) };
+      });
+    return {
+      nodeInstanceId: textAt(row.node_instance_id, `${key}.node_instance_id`, 128),
+      nodeAttemptId: textAt(row.node_attempt_id, `${key}.node_attempt_id`, 512),
+      operatorFacingRunRevision: positiveIntegerAt(row.operator_facing_run_revision, `${key}.operator_facing_run_revision`),
+      operation: { sourceOwnerEpoch: textAt(operation.source_owner_epoch, `${key}.operation.source_owner_epoch`, 2048),
+        operationId: textAt(operation.operation_id, `${key}.operation.operation_id`, 2048),
+        operationRevision: positiveIntegerAt(operation.operation_revision, `${key}.operation.operation_revision`) },
+      resourceIds,
+      failure: { code: textAt(failure.code, `${key}.failure.code`, 256),
+        message: textAt(failure.message, `${key}.failure.message`, 4096, true) },
+      recoveryClass: textAt(row.recovery_class, `${key}.recovery_class`, 128),
+      terminalFacts,
+    };
+  });
+}
+
 export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
   const path = 'programRun';
   const record = objectAt(value, path);
@@ -485,6 +539,7 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     record,
     [
       'active_operation_count',
+      'operation_failures',
       'capture',
       'details',
       'message',
@@ -670,6 +725,7 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     ),
     nodeStatuses,
     activeOperationCount,
+    operationFailures: programOperationFailuresAt(record.operation_failures, `${path}.operation_failures`),
     reason: reasonCode === null
       ? null
       : { code: reasonCode, message, ...failureContext },
@@ -683,11 +739,51 @@ const RECOVERY_ACTION_IDS = new Set<CycleRecoveryActionId>([
   'retry_after_scene_repair',
   'replan_from_stopped_state',
   'retry_runtime_step',
+  'continue_with_failure',
   'reset_cycle',
 ]);
 
 function nullablePositiveIntegerAt(value: unknown, path: string): number | null {
   return value === null ? null : positiveIntegerAt(value, path);
+}
+
+/** The one event kind whose facts are parsed into typed fields. */
+export function isAutomaticRetryAuditEvent(
+  event: RuntimeControlAuditEvent,
+): event is AutomaticRetryAuditEvent {
+  return event.kind === 'program_node_automatic_retry';
+}
+
+function parseAutomaticRetryAuditFacts(
+  record: JsonObject,
+  path: string,
+): AutomaticRetryAuditFacts {
+  const attempt = positiveIntegerAt(record.attempt, `${path}.attempt`);
+  const maxAttempts = positiveIntegerAt(record.max_attempts, `${path}.max_attempts`);
+  if (attempt < 2 || attempt > maxAttempts) {
+    return fail(path, 'attempt from 2 through max_attempts');
+  }
+  const delayS = numberAt(record.delay_s, `${path}.delay_s`);
+  if (delayS < 0) return fail(`${path}.delay_s`, 'a non-negative number');
+  const code = record.code === undefined || record.code === null
+    ? null
+    : nonEmptyStringAt(record.code, `${path}.code`);
+  const message = record.message === undefined || record.message === null
+    ? null
+    : nonEmptyStringAt(record.message, `${path}.message`);
+  if ((code === null) !== (message === null)) {
+    return fail(path, 'a Kernel failure with both code and message, or neither');
+  }
+  return {
+    nodeInstanceId: nonEmptyStringAt(record.node_instance_id, `${path}.node_instance_id`),
+    attempt,
+    maxAttempts,
+    cause: nonEmptyStringAt(record.cause, `${path}.cause`),
+    delayS,
+    failure: code === null || message === null
+      ? null
+      : { code, message, details: null, origin: null },
+  };
 }
 
 function parseRuntimeControlAuditEvent(
@@ -700,6 +796,13 @@ function parseRuntimeControlAuditEvent(
     `${path}.event_revision`,
   );
   const kind = stringAt(record.kind, `${path}.kind`);
+  if (kind === 'program_node_automatic_retry') {
+    return {
+      eventRevision,
+      kind,
+      facts: parseAutomaticRetryAuditFacts(record, path),
+    };
+  }
   return {
     eventRevision,
     kind,
@@ -730,19 +833,8 @@ export function parseProgramRuntimeControlsSnapshot(
     'program_generation', 'deployment_generation', 'scene_admission_epoch',
     'pose_source_apply_generation',
   ], `${path}.recovery_fences`);
-  const retryRecord = objectAt(record.retry_counts, `${path}.retry_counts`);
-  const retryCounts = Object.fromEntries(Object.entries(retryRecord).map(
-    ([nodeInstanceId, count]) => [
-      stringAt(nodeInstanceId, `${path}.retry_counts key`),
-      integerAt(count, `${path}.retry_counts.${nodeInstanceId}`),
-    ],
-  ));
-  // Accumulated counts are independent of the finite authored limit: an
-  // Unlimited (0) node may exceed 255 explicit retries.
-  if (Object.keys(retryCounts).length > 100_000
-      || Object.values(retryCounts).some((count) => count < 1)) {
-    return fail(`${path}.retry_counts`, 'at most 100000 Program nodes with positive exact retry counts');
-  }
+  // retry_counts stays on the wire (exact key) but has no Composer reader.
+  objectAt(record.retry_counts, `${path}.retry_counts`);
   const revision = positiveIntegerAt(
     record.runtime_control_revision,
     `${path}.runtime_control_revision`,
@@ -780,7 +872,6 @@ export function parseProgramRuntimeControlsSnapshot(
         `${path}.recovery_fences.pose_source_apply_generation`,
       ),
     },
-    retryCounts,
     audit,
   };
 }
@@ -791,7 +882,7 @@ function parseCycleRecoveryAction(
 ): CycleRecoveryAction {
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'action_id', 'label_key', 'requires_confirmation',
+    'action_id', 'requires_confirmation',
     'performs_backend_reset', 'enabled', 'disabled_reason_code',
   ], path);
   const actionId = stringAt(
@@ -811,7 +902,6 @@ function parseCycleRecoveryAction(
   }
   return {
     actionId,
-    labelKey: stringAt(record.label_key, `${path}.label_key`),
     requiresConfirmation: booleanAt(
       record.requires_confirmation,
       `${path}.requires_confirmation`,
@@ -839,7 +929,7 @@ function parseCycleRecoveryOffer(
     'program_generation', 'deployment_generation', 'scene_admission_epoch',
     'pose_source_apply_generation', 'latch_id', 'stop_id', 'stop_generation',
     'stop_certificate_id', 'stop_certificate_revision', 'status',
-    'recovery_class', 'actions', 'primary_action', 'reason_code', 'message',
+    'recovery_class', 'actions', 'reason_code', 'message',
     'details', 'origin', 'evidence_refs', 'manual_result', 'policy',
     'retries_used',
   ], path);
@@ -862,18 +952,6 @@ function parseCycleRecoveryOffer(
     ));
   if (new Set(actions.map((action) => action.actionId)).size !== actions.length) {
     return fail(`${path}.actions`, 'unique recovery action identities');
-  }
-  const primaryActionValue = nullableStringAt(
-    record.primary_action,
-    `${path}.primary_action`,
-  );
-  const primaryAction = primaryActionValue as CycleRecoveryActionId | null;
-  if (
-    (primaryAction !== null && !RECOVERY_ACTION_IDS.has(primaryAction))
-    || (primaryAction !== null
-      && !actions.some((action) => action.actionId === primaryAction && action.enabled))
-  ) {
-    return fail(`${path}.primary_action`, 'an enabled offered recovery action');
   }
   const manualResult = objectAt(record.manual_result, `${path}.manual_result`);
   exactKeysAt(
@@ -978,7 +1056,6 @@ function parseCycleRecoveryOffer(
       enabled: manualResultEnabled,
       disabledReasonCode: manualResultDisabledReasonCode,
     },
-    primaryAction,
     reason: {
       code: stringAt(record.reason_code, `${path}.reason_code`),
       message: failureMessageAt(record.message, `${path}.message`),
@@ -1077,6 +1154,25 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
   return { selectionRevision, motionHeld, groups };
 }
 
+function parseProgramRecoveryHold(value: unknown, path: string): ProgramRecoveryHold {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['motion_group_ids', 'intervention_stop_scope', 'offer'], path);
+  const motionGroupIds = boundedArrayAt(record.motion_group_ids, `${path}.motion_group_ids`, 4097)
+    .map((item, index) => nonEmptyStringAt(item, `${path}.motion_group_ids[${index}]`));
+  if (motionGroupIds.length === 0 || new Set(motionGroupIds).size !== motionGroupIds.length) {
+    return fail(`${path}.motion_group_ids`, 'at least one unique motion group ID');
+  }
+  const scope = stringAt(record.intervention_stop_scope, `${path}.intervention_stop_scope`);
+  if (scope !== 'all' && scope !== 'own_groups') {
+    return fail(`${path}.intervention_stop_scope`, 'all or own_groups');
+  }
+  return {
+    motionGroupIds,
+    interventionStopScope: scope,
+    offer: parseCycleRecoveryOffer(record.offer, `${path}.offer`),
+  };
+}
+
 export function parseProgramRuntimeControlProjection(
   value: unknown,
 ): ProgramRuntimeControlProjection {
@@ -1084,7 +1180,7 @@ export function parseProgramRuntimeControlProjection(
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'schema_version', 'owner_id', 'owner_epoch', 'program_run_id',
-    'run_revision', 'runtime_controls', 'recovery_offer',
+    'run_revision', 'runtime_controls', 'recovery_offer', 'recovery_offers',
     'execution_selections',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
@@ -1102,11 +1198,20 @@ export function parseProgramRuntimeControlProjection(
   const recoveryOffer = record.recovery_offer === null
     ? null
     : parseCycleRecoveryOffer(record.recovery_offer, `${path}.recovery_offer`);
+  const recoveryHolds = boundedArrayAt(record.recovery_offers, `${path}.recovery_offers`, 4096)
+    .map((item, index) => parseProgramRecoveryHold(item, `${path}.recovery_offers[${index}]`));
   if (
     runtimeControls.programRunId !== programRunId
     || (recoveryOffer !== null && recoveryOffer.programRunId !== programRunId)
+    || recoveryHolds.some((hold) => hold.offer.programRunId !== programRunId)
   ) {
     return fail(path, 'one exact Program-run identity');
+  }
+  if (
+    new Set(recoveryHolds.map((hold) => hold.offer.offerId)).size !== recoveryHolds.length
+    || new Set(recoveryHolds.map((hold) => hold.offer.nodeInstanceId)).size !== recoveryHolds.length
+  ) {
+    return fail(`${path}.recovery_offers`, 'one offer per held node');
   }
   return {
     schemaVersion,
@@ -1116,6 +1221,7 @@ export function parseProgramRuntimeControlProjection(
     runRevision: positiveIntegerAt(record.run_revision, `${path}.run_revision`),
     runtimeControls,
     recoveryOffer,
+    recoveryHolds,
     executionSelections: parseExecutionSelectionControls(record.execution_selections, `${path}.execution_selections`),
   };
 }

@@ -11,6 +11,12 @@
 
 namespace manyforge::deployment::detail {
 
+/// Check a parsed map against the exact retained physical bindings and sealed
+/// direct IO target witnesses. Non-coordinate targets cannot gain geometry.
+/// Internal pure validation seam shared by every retained map reader.
+void require_symbol_role_map_matches_retained_bundle(
+    const CanonicalValue &map, const core::RetainedBundleDTO &bundle);
+
 /// Reconstruct one sealed model map directly from the exact retained bundle
 /// and artifact bytes already held by an activation preparation operation.
 /// This is the in-memory counterpart of the filesystem reader; it performs

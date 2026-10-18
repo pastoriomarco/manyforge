@@ -411,9 +411,9 @@ class BoundedOperationControlExecutor::Impl final {
           }
           case OperationControlKind::kReset: {
             if (request->payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
-              auto value =
-                  request->engine->reset_gripper(request->command_target, request->subordinate_id,
-                                                 request->subordinate_generation);
+              auto value = request->engine->reset_capability_command(
+                  request->command_target, request->subordinate_id, request->subordinate_generation,
+                  request->output_reset_authority);
               result.accepted = value.ok();
               if (!value.ok()) {
                 result.error = value.error();

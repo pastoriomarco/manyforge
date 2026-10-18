@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace manyforge::core {
@@ -140,27 +141,81 @@ struct ApplyComponentBringUpReferenceDTO final {
   ApplyFenceOwnerDTO owner;
   ContentDigest plan_digest;
 
-  [[nodiscard]] bool valid() const noexcept {
-    return owner.valid() && !plan_digest.empty();
-  }
+  [[nodiscard]] bool valid() const noexcept { return owner.valid() && !plan_digest.empty(); }
 
   friend bool operator==(const ApplyComponentBringUpReferenceDTO&,
                          const ApplyComponentBringUpReferenceDTO&) = default;
+};
+
+struct ControllerConfigurationFenceDomainDTO final {
+  friend bool operator==(const ControllerConfigurationFenceDomainDTO&,
+                         const ControllerConfigurationFenceDomainDTO&) = default;
+};
+
+struct ProviderConfigurationFenceOccurrenceDTO final {
+  ControllableComponentId controllable_component_id;
+  ProviderInstanceId provider_instance_id;
+  ContentDigest signal_configuration_digest;
+  std::vector<ResourceId> output_resources{};
+  [[nodiscard]] bool valid() const noexcept {
+    return !controllable_component_id.empty() && !provider_instance_id.empty() &&
+           !signal_configuration_digest.empty() &&
+           std::is_sorted(output_resources.begin(), output_resources.end()) &&
+           std::adjacent_find(output_resources.begin(), output_resources.end()) ==
+               output_resources.end() &&
+           std::none_of(output_resources.begin(), output_resources.end(),
+                        [](const auto& id) { return id.empty(); });
+  }
+  friend bool operator==(const ProviderConfigurationFenceOccurrenceDTO&,
+                         const ProviderConfigurationFenceOccurrenceDTO&) = default;
+};
+
+struct ProviderConfigurationFenceDomainDTO final {
+  std::optional<ProviderConfigurationFenceOccurrenceDTO> predecessor_provider;
+  std::optional<ProviderConfigurationFenceOccurrenceDTO> candidate_provider;
+  friend bool operator==(const ProviderConfigurationFenceDomainDTO&,
+                         const ProviderConfigurationFenceDomainDTO&) = default;
 };
 
 struct ConfigurationFenceDomainScopeDTO final {
   ControlDomainId control_domain_id;
   std::optional<ControlDomainRevision> predecessor_control_domain_revision;
   std::optional<ControlDomainRevision> candidate_control_domain_revision;
+  std::variant<ControllerConfigurationFenceDomainDTO, ProviderConfigurationFenceDomainDTO> payload{
+      ControllerConfigurationFenceDomainDTO{}};
 
   [[nodiscard]] bool valid() const noexcept {
-    return !control_domain_id.empty() &&
-           (predecessor_control_domain_revision.has_value() ||
-            candidate_control_domain_revision.has_value()) &&
-           (!predecessor_control_domain_revision.has_value() ||
-            !predecessor_control_domain_revision->empty()) &&
-           (!candidate_control_domain_revision.has_value() ||
-            !candidate_control_domain_revision->empty());
+    const bool common = !control_domain_id.empty() &&
+                        (predecessor_control_domain_revision.has_value() ||
+                         candidate_control_domain_revision.has_value()) &&
+                        (!predecessor_control_domain_revision.has_value() ||
+                         !predecessor_control_domain_revision->empty()) &&
+                        (!candidate_control_domain_revision.has_value() ||
+                         !candidate_control_domain_revision->empty());
+    if (!common || payload.valueless_by_exception()) return false;
+    if (const auto* provider = std::get_if<ProviderConfigurationFenceDomainDTO>(&payload))
+      return (provider->predecessor_provider || provider->candidate_provider) &&
+             (!provider->predecessor_provider ||
+              (predecessor_control_domain_revision && provider->predecessor_provider->valid())) &&
+             (!provider->candidate_provider ||
+              (candidate_control_domain_revision && provider->candidate_provider->valid()));
+    return true;
+  }
+
+  [[nodiscard]] bool has_controller_side() const noexcept {
+    const auto* provider = std::get_if<ProviderConfigurationFenceDomainDTO>(&payload);
+    return !provider || (predecessor_control_domain_revision && !provider->predecessor_provider) ||
+           (candidate_control_domain_revision && !provider->candidate_provider);
+  }
+  [[nodiscard]] bool has_controller_predecessor() const noexcept {
+    if (!predecessor_control_domain_revision) return false;
+    const auto* provider = std::get_if<ProviderConfigurationFenceDomainDTO>(&payload);
+    return !provider || !provider->predecessor_provider;
+  }
+  [[nodiscard]] bool has_controller_candidate() const noexcept {
+    if (!candidate_control_domain_revision) return false;
+    const auto* provider = std::get_if<ProviderConfigurationFenceDomainDTO>(&payload);
+    return !provider || !provider->candidate_provider;
   }
 
   friend bool operator==(const ConfigurationFenceDomainScopeDTO&,
@@ -191,7 +246,9 @@ struct ConfigurationFenceBindingScopeDTO final {
 /// The collections are canonical, sorted, unique, and bounded by the
 /// qualified deployment. They are deliberately not partitioned by component:
 /// one domain or resource may span components and must be fenced atomically.
-/// Either every collection is empty or every collection is nonempty. The
+/// Controller contributions retain their nonempty physical collections.
+/// Provider contributions carry exact typed component/provider proof and do
+/// not invent controller bindings or physical resources. The
 /// deployment-owned pure derivation proves the binding/resource overlap
 /// closure; this value layer validates only the closed canonical shape.
 struct ConfigurationFenceScopeDTO final {
@@ -206,8 +263,12 @@ struct ConfigurationFenceScopeDTO final {
     if (all_empty) {
       return true;
     }
-    if (controllable_component_ids.empty() || domains.empty() || bindings.empty() ||
-        resources.empty()) {
+    const bool controller = std::any_of(domains.begin(), domains.end(), [](const auto& domain) {
+      return domain.has_controller_side();
+    });
+    if (controllable_component_ids.empty() || domains.empty() ||
+        (controller && (bindings.empty() || resources.empty())) ||
+        (!controller && !bindings.empty())) {
       return false;
     }
 
@@ -253,6 +314,34 @@ struct ConfigurationFenceScopeDTO final {
     for (const auto& domain : domains) {
       if (!domain.valid()) {
         return false;
+      }
+      if (const auto* provider =
+              std::get_if<ProviderConfigurationFenceDomainDTO>(&domain.payload)) {
+        for (const auto* occurrence :
+             {&provider->predecessor_provider, &provider->candidate_provider}) {
+          if (*occurrence && !std::binary_search(controllable_component_ids.begin(),
+                                                 controllable_component_ids.end(),
+                                                 (*occurrence)->controllable_component_id))
+            return false;
+          if (*occurrence && !std::includes(resources.begin(), resources.end(),
+                                            (*occurrence)->output_resources.begin(),
+                                            (*occurrence)->output_resources.end()))
+            return false;
+        }
+      }
+    }
+    if (!controller) {
+      for (const auto& resource : resources) {
+        const bool owned = std::any_of(domains.begin(), domains.end(), [&](const auto& domain) {
+          const auto* provider = std::get_if<ProviderConfigurationFenceDomainDTO>(&domain.payload);
+          if (!provider) return false;
+          const auto contains = [&](const auto& occurrence) {
+            return occurrence && std::binary_search(occurrence->output_resources.begin(),
+                                                    occurrence->output_resources.end(), resource);
+          };
+          return contains(provider->predecessor_provider) || contains(provider->candidate_provider);
+        });
+        if (!owned) return false;
       }
     }
     for (const auto& binding : bindings) {
@@ -304,6 +393,21 @@ struct DomainActiveControlConfigurationDTO final {
                          const DomainActiveControlConfigurationDTO&) = default;
 };
 
+/// Captured actual predecessor driver lineage. This is durable observation
+/// carried by the existing admission receipt, never a new claim or grant.
+struct ProviderConfigurationFenceLineageDTO final {
+  ControlDomainId control_domain_id;
+  RuntimeEpoch provider_runtime_epoch;
+  ComponentLifecycleGeneration component_lifecycle_generation;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return !control_domain_id.empty() && !provider_runtime_epoch.empty() &&
+           component_lifecycle_generation.nonzero();
+  }
+  friend bool operator==(const ProviderConfigurationFenceLineageDTO&,
+                         const ProviderConfigurationFenceLineageDTO&) = default;
+};
+
 /// Apply-specific projection of the generic configuration-fence intent.
 ///
 /// The generic `ConfigurationFenceIntentDTO` name remains reserved for spec
@@ -320,6 +424,7 @@ struct ApplyConfigurationFenceIntentDTO final {
   ConfigurationFenceGeneration expected_fence_generation;
   std::vector<DomainActiveControlConfigurationDTO> expected_active_control_configurations;
   std::string reason;
+  std::vector<ProviderConfigurationFenceLineageDTO> expected_provider_lineages{};
 
   [[nodiscard]] bool valid() const noexcept {
     if (owner_request_context.request_id.empty() ||
@@ -331,7 +436,7 @@ struct ApplyConfigurationFenceIntentDTO final {
             static_cast<std::size_t>(
                 std::count_if(scope.domains.begin(), scope.domains.end(),
                               [](const ConfigurationFenceDomainScopeDTO& domain) {
-                                return domain.predecessor_control_domain_revision.has_value();
+                                return domain.has_controller_predecessor();
                               }))) {
       return false;
     }
@@ -353,7 +458,7 @@ struct ApplyConfigurationFenceIntentDTO final {
 
     std::size_t configuration_index = 0U;
     for (const auto& domain : scope.domains) {
-      if (!domain.predecessor_control_domain_revision.has_value()) {
+      if (!domain.has_controller_predecessor()) {
         continue;
       }
       const auto& configuration = expected_active_control_configurations[configuration_index++];
@@ -361,7 +466,15 @@ struct ApplyConfigurationFenceIntentDTO final {
         return false;
       }
     }
-    return true;
+    std::size_t provider_index = 0U;
+    for (const auto& domain : scope.domains) {
+      if (!domain.predecessor_control_domain_revision || domain.has_controller_predecessor())
+        continue;
+      if (provider_index >= expected_provider_lineages.size()) return false;
+      const auto& lineage = expected_provider_lineages[provider_index++];
+      if (!lineage.valid() || lineage.control_domain_id != domain.control_domain_id) return false;
+    }
+    return provider_index == expected_provider_lineages.size();
   }
 
   friend bool operator==(const ApplyConfigurationFenceIntentDTO&,
@@ -462,6 +575,7 @@ struct ConfigurationFenceAdmissionSnapshotDTO final {
   std::uint64_t affected_queued_operation_count;
   std::uint64_t affected_active_operation_count;
   ContentDigest result_digest;
+  std::vector<ProviderConfigurationFenceLineageDTO> provider_lineages{};
 
   [[nodiscard]] bool presence_valid() const noexcept {
     if (!echoed_query.valid() || !execution_host_epoch.valid() ||
@@ -473,8 +587,15 @@ struct ConfigurationFenceAdmissionSnapshotDTO final {
     }
 
     std::size_t configuration_index = 0U;
+    std::size_t provider_index = 0U;
     for (const auto& domain : echoed_query.affected_scope.domains) {
       if (!domain.predecessor_control_domain_revision.has_value()) {
+        continue;
+      }
+      if (!domain.has_controller_predecessor()) {
+        if (provider_index >= provider_lineages.size()) return false;
+        const auto& lineage = provider_lineages[provider_index++];
+        if (!lineage.valid() || lineage.control_domain_id != domain.control_domain_id) return false;
         continue;
       }
       if (configuration_index >= active_control_configurations.size()) {
@@ -485,7 +606,8 @@ struct ConfigurationFenceAdmissionSnapshotDTO final {
         return false;
       }
     }
-    return configuration_index == active_control_configurations.size();
+    return configuration_index == active_control_configurations.size() &&
+           provider_index == provider_lineages.size();
   }
 
   [[nodiscard]] bool matches(const ConfigurationFenceAdmissionQueryDTO& query) const noexcept {
@@ -531,7 +653,7 @@ struct ConfigurationFenceReconciliationEvidenceDTO final {
 
     std::size_t configuration_index = 0U;
     for (const auto& domain : reconciled_scope.domains) {
-      if (!domain.candidate_control_domain_revision.has_value()) {
+      if (!domain.has_controller_candidate()) {
         continue;
       }
       if (configuration_index >= active_control_configurations.size()) {
@@ -616,16 +738,13 @@ struct ApplyComponentBringUpAuthorityDTO final {
            intent.claim_kind == CellAdmissionClaimKindDTO::kManagerApply &&
            intent.owner_role == CellAdmissionOwnerRoleDTO::kManager &&
            intent.owner_transaction_id == parent.owner.apply_id.value() &&
-           intent.request_payload_digest == parent.plan_digest &&
-           !intent.owner_epoch.empty() && !intent.request_id.empty() &&
-           intent.expected_admission_generation.nonzero() &&
+           intent.request_payload_digest == parent.plan_digest && !intent.owner_epoch.empty() &&
+           !intent.request_id.empty() && intent.expected_admission_generation.nonzero() &&
            intent.scope.resources.empty() && intent.scope.configurations.empty() &&
            !intent.program_cycle_evidence.has_value() &&
-           !intent.intervention_evidence.has_value() &&
-           !intent.program_node_evidence.has_value() &&
+           !intent.intervention_evidence.has_value() && !intent.program_node_evidence.has_value() &&
            parent_claim.claim_generation.nonzero() &&
-           parent_claim.acquired_admission_generation.nonzero() &&
-           parent_claim.accepted_at_ns >= 0;
+           parent_claim.acquired_admission_generation.nonzero() && parent_claim.accepted_at_ns >= 0;
   }
 
   friend bool operator==(const ApplyComponentBringUpAuthorityDTO&,
@@ -998,7 +1117,7 @@ struct SelectedBringUpConfigurationFenceReconciliationEvidenceDTO final {
 
     std::size_t configuration_index = 0U;
     for (const auto& domain : reconciled_scope.domains) {
-      if (!domain.candidate_control_domain_revision.has_value()) {
+      if (!domain.has_controller_candidate()) {
         continue;
       }
       if (configuration_index >= active_control_configurations.size()) {

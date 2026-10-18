@@ -44,7 +44,7 @@ inline constexpr std::string_view
 inline constexpr std::string_view
     kRos2ControlExecutionRuntimeConfigurationSchemaRevision =
         "sha256:"
-        "20f76c1fa9f103c6f008029505639a45ec6f9166305156b31d43056235544483";
+        "34fbeab889c274ca724eb992e7bcc4305229e8bcce484b0857c4ca5e9d35e379";
 inline constexpr std::string_view kRos2ControlExecutionRuntimeRoleId =
     ros2_control_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view

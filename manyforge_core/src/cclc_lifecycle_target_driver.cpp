@@ -132,7 +132,6 @@ struct DomainObservation final {
   /// The fresh intervention class must be retained durably (the caller
   /// records it, see RetainCause), observed at `observed_at_ns`.
   bool retain{};
-  bool planned_reset_transition{};
   std::int64_t observed_at_ns{};
 };
 
@@ -575,6 +574,10 @@ bool CCLCLifecycleTargetDriver::MatchesProgramResetPositionScope(
 
 Result<void> CCLCLifecycleTargetDriver::ValidateProgramResetPositionScope(
     ICCLCLifecycleTargetDriverPorts& ports, const ProgramResetPositionScope& scope) {
+  if (scope.step_deadline_ns && clock_.now() >= *scope.step_deadline_ns)
+    return Result<void>::Err(driver_error("program_reset_position_scope_stale",
+                                          "the current position Reset step deadline elapsed",
+                                          "step_deadline_elapsed"));
   const auto facts = store_.LoadLifecycleTargetFacts(scope.request.component);
   if (!facts.ok()) return Result<void>::Err(facts.error());
   const auto current = ports.ReadCurrentComponent(scope.request.component);
@@ -601,11 +604,11 @@ Result<void> CCLCLifecycleTargetDriver::WithProgramResetPositionScope(
       request.request_owner_epoch.empty() || request.request_id.empty() ||
       request.request_payload_digest.empty() || request.component.empty() ||
       !request.provider.locally_valid() || !request.domain.locally_valid() ||
-      !request.domain.active_control_configuration ||
-      request.domain.active_control_configuration->state !=
+      request.domain.provider() || !request.domain.controller().active_control_configuration ||
+      request.domain.controller().active_control_configuration->state !=
           ActiveControlConfigurationStateDTO::kReconciled ||
       request.provider.control_domain_id != request.domain.control_domain_id ||
-      !request.expected_transition || !action)
+      !action)
     return refused("scope_request_invalid");
   std::shared_ptr<ProgramResetPositionScope> scope;
   {
@@ -664,7 +667,7 @@ Result<void> CCLCLifecycleTargetDriver::WithProgramResetPositionScope(
     }
   } close_scope{*this, scope};
   const auto advance = [this, scope, refused](const CCLCProgramResetPositionPhase phase,
-                                              const std::function<Result<void>()>& phase_commit) {
+                                              const std::optional<TimePoint> step_deadline_ns) {
     std::lock_guard run_lock(run_mutex_);
     if (program_reset_position_scope_ != scope || !scope->valid)
       return refused("scope_closed_or_expired");
@@ -685,17 +688,11 @@ Result<void> CCLCLifecycleTargetDriver::WithProgramResetPositionScope(
       scope->valid = false;
       return validated;
     }
-    if (phase_commit) {
-      try {
-        validated = phase_commit();
-      } catch (...) {
-        validated = refused("phase_commit_exception");
-      }
-      if (!validated.ok()) {
-        scope->valid = false;
-        return validated;
-      }
+    if (step_deadline_ns && *step_deadline_ns <= clock_.now()) {
+      scope->valid = false;
+      return refused("step_deadline_elapsed");
     }
+    if (step_deadline_ns) scope->step_deadline_ns = step_deadline_ns;
     scope->phase = phase;
     Wake();
     return Result<void>::Ok();
@@ -871,19 +868,6 @@ CCLCLifecycleTargetDriver::ObserveAllDomains(
         ports, target.controllable_component_id, occurrence, target.target_generation,
         stored == retained.end() ? LifecycleBlockingCauseClassDTO::kNone : stored->second,
         target.recovered_cause, record_causes, clock_);
-    const auto& scope = program_reset_position_scope_;
-    if (scope && MatchesProgramResetPositionScope(*scope, target, current) &&
-        occurrence == scope->request.provider && observed.observation &&
-        observed.reported == LifecycleBlockingCauseClassDTO::kAvailability &&
-        observed.cause == LifecycleBlockingCauseClassDTO::kAvailability) {
-      // The adapter qualifies the SAME raw sample; no Core controller names,
-      // cause rewriting, stale observations or broad availability allowance.
-      try {
-        observed.planned_reset_transition =
-            scope->request.expected_transition(*observed.observation, scope->phase);
-      } catch (...) {
-      }
-    }
     if (observed.retain) {
       RetainCause(state, target.controllable_component_id, occurrence.control_domain_id,
                   observed.cause, observed.observed_at_ns);
@@ -1094,6 +1078,33 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
   auto intervention = LifecycleBlockingCauseClassDTO::kNone;
   bool intervention_fresh = false;
   bool lost = false;
+  bool requested_controller_absence = false;
+  const auto matches_target = [&](const ComponentLifecycleTargetExpectationDTO& expected) {
+    return expected.controllable_component_id == target.controllable_component_id &&
+           expected.target_generation == target.target_generation;
+  };
+  bool lifecycle_owned = false;
+  bool lifecycle_transition = false;
+  if (state.in_flight && matches_target(state.in_flight->expected_target)) {
+    // Reuse the accepted transaction's own bound; an uncertain request or an
+    // unreadable/expired status cannot create an unlimited absence window.
+    try {
+      const auto status = ports.LoadLifecycleStatus(state.in_flight->lifecycle_transaction_id);
+      if (status.ok() && status.value()) {
+        const auto& value = *status.value();
+        const auto& accepted = value.acceptance;
+        lifecycle_owned =
+            accepted.lifecycle_transaction_id == state.in_flight->lifecycle_transaction_id &&
+            value.accepted_intent.controllable_component_id == target.controllable_component_id &&
+            value.accepted_intent.intent == state.in_flight->intent;
+        lifecycle_transition = lifecycle_owned && !value.terminal_result &&
+            accepted.accepted_at_ns >= 0 && accepted.timeout_duration_ns > 0 &&
+            accepted.accepted_at_ns <= std::numeric_limits<std::int64_t>::max() - accepted.timeout_duration_ns &&
+            clock_.now() < accepted.accepted_at_ns + accepted.timeout_duration_ns;
+      }
+    } catch (...) {
+    }
+  }
   std::vector<std::string> codes;
   std::optional<ControlDomainId> trigger;
   std::optional<ErrorDTO> diagnostic;
@@ -1114,8 +1125,31 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
                            : std::vector<std::string>{};
       continue;
     }
+    const bool reset_transition = program_reset_position_scope_ &&
+        MatchesProgramResetPositionScope(*program_reset_position_scope_, target, current) &&
+        program_reset_position_scope_->step_deadline_ns &&
+        clock_.now() < *program_reset_position_scope_->step_deadline_ns &&
+        condition.control_domain_id == program_reset_position_scope_->request.domain.control_domain_id;
+    const auto boolean_fact = [&](std::string_view id, bool expected) {
+      return fresh && std::any_of(observed.observation->facts.begin(),
+                                 observed.observation->facts.end(), [&](const auto& fact) {
+        return fact.lifecycle_fact_id.value() == id &&
+               fact.value.kind == LifecycleFactValueKindDTO::kBoolean &&
+               fact.value.boolean_value == expected;
+      });
+    };
+    // 142: the existing transition owner explains controller inactivity, not
+    // transport loss, unloaded hardware or an independently reported fault.
+    const bool expected_inactivity = (reset_transition || lifecycle_transition) && fresh &&
+        observed.reported == LifecycleBlockingCauseClassDTO::kAvailability &&
+        observed.cause == LifecycleBlockingCauseClassDTO::kAvailability &&
+        observed.observation->observed_state == ComponentLifecycleStateDTO::kDegraded &&
+        boolean_fact("external.controller_loaded", true) &&
+        boolean_fact("external.transport_ready", true) &&
+        boolean_fact("external.fault_present", false);
+    requested_controller_absence = requested_controller_absence || expected_inactivity;
     if (!fresh || (observed.reported == LifecycleBlockingCauseClassDTO::kAvailability &&
-                   !observed.planned_reset_transition)) {
+                   !expected_inactivity)) {
       if (!lost && !trigger) trigger = condition.control_domain_id;
       lost = true;
       continue;
@@ -1135,7 +1169,11 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
   // (`kAny`), which a component retained unchanged across an Apply or an
   // in-session owner replacement keeps, never this driver's own history. A
   // freshly reported intervention class counts in every detecting mode.
-  const bool any_mode = open.has_value() || detection == IncidentDetection::kAny;
+  // Disable intentionally suppresses absence by default. Its accepted
+  // transition still detects real loss after this same durable target had
+  // previously reached readiness; first-Prepare availability stays waiting.
+  const bool any_mode = open.has_value() || detection == IncidentDetection::kAny ||
+                        (lifecycle_owned && target.reached);
   auto cause = intervention != LifecycleBlockingCauseClassDTO::kNone &&
                        (intervention_fresh || any_mode)
                    ? intervention
@@ -1143,8 +1181,10 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
                                   : LifecycleBlockingCauseClassDTO::kNone;
   bool loss = cause == LifecycleBlockingCauseClassDTO::kProviderLost;
   // A verified loss the observations do not explain is still an incident.
-  if (cause == LifecycleBlockingCauseClassDTO::kNone && detection == IncidentDetection::kAny &&
-      unexplained != LifecycleBlockingCauseClassDTO::kNone) {
+  if (cause == LifecycleBlockingCauseClassDTO::kNone && any_mode &&
+      unexplained != LifecycleBlockingCauseClassDTO::kNone &&
+      (!requested_controller_absence ||
+       current.component_lifecycle_state != ComponentLifecycleStateDTO::kDegraded)) {
     cause = unexplained;
     loss = true;
   }
@@ -1155,7 +1195,6 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
   // component the Apply retains unchanged keeps its reached status and the
   // incident rules. Only the Apply facts end this, never time or status.
   const bool replaced = cause != LifecycleBlockingCauseClassDTO::kNone &&
-                        (open.has_value() || detection != IncidentDetection::kNone) &&
                         ApplyReplacesComponent(target.controllable_component_id);
   if (replaced) cause = LifecycleBlockingCauseClassDTO::kNone;
 
@@ -1227,7 +1266,7 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
             std::string("apply_replacement_in_progress"), now_ns);
     return true;
   }
-  if (detection == IncidentDetection::kNone || cause == LifecycleBlockingCauseClassDTO::kNone) {
+  if (cause == LifecycleBlockingCauseClassDTO::kNone) {
     return false;
   }
 
@@ -1298,7 +1337,8 @@ bool CCLCLifecycleTargetDriver::FollowInFlight(ICCLCLifecycleTargetDriverPorts& 
   }
   if (!state.in_flight) return false;
   const auto& in_flight = *state.in_flight;
-  // Not observed while open: the last known class stays presented.
+  // Fresh interventions were checked before following the transaction;
+  // ordinary in-flight progress keeps the last known class presented.
   const auto known_cause =
       state.progress ? state.progress->blocking_cause_class : LifecycleBlockingCauseClassDTO::kNone;
   const auto status = ports.LoadLifecycleStatus(in_flight.lifecycle_transaction_id);
@@ -1484,6 +1524,30 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
     }
   }
 
+  // An unsettled lifecycle request still owns its exact transaction, but
+  // cannot hide a current intervention until its terminal response arrives.
+  // Do not retain classes while that request settles; its normal postcondition
+  // and Recover suppression remain the existing owner's responsibility.
+  if ((state.in_flight || state.pending_intent) && actual_target) {
+    const auto pending_current = ports.ReadCurrentComponent(component);
+    if (pending_current.ok()) {
+      auto pending_target = *actual_target;
+      if (reached_observed) pending_target.reached = true;
+      const auto pending_detection =
+          pending_target.requested_state == LifecycleTargetStateDTO::kDisabled
+              ? IncidentDetection::kNone
+          : pending_target.reached ? IncidentDetection::kAny
+          : pending_target.recovered_cause ? IncidentDetection::kNewCause
+                                            : IncidentDetection::kNone;
+      const auto pending_conditions = ObserveAllDomains(
+          ports, pending_target, state, pending_current.value(), retained, false);
+      if (EvaluateIncident(ports, pending_target, state, pending_current.value(),
+                           pending_conditions, facts.value().open_incident,
+                           pending_detection, std::nullopt, now_ns)) {
+        return true;
+      }
+    }
+  }
   if (FollowInFlight(ports, actual_target, state, now_ns)) return true;
   if (retired) {
     if (state.unrecorded_incident) {
@@ -1580,13 +1644,11 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   if (program_reset_position_scope_ &&
       program_reset_position_scope_->request.component == component) {
     auto& scope = *program_reset_position_scope_;
-    if (!MatchesProgramResetPositionScope(scope, target, current)) scope.valid = false;
+    if (!MatchesProgramResetPositionScope(scope, target, current) ||
+        (scope.step_deadline_ns && clock_.now() >= *scope.step_deadline_ns)) scope.valid = false;
     const auto conditions = ObserveAllDomains(ports, target, state, current, retained, !settling);
-    const bool planned = std::any_of(
-        conditions.begin(), conditions.end(),
-        [](const auto& condition) { return condition.observed.planned_reset_transition; });
     const auto unexplained = achieved == ComponentLifecycleStateDTO::kFaulted ||
-                                     (achieved == ComponentLifecycleStateDTO::kDegraded && !planned)
+                                     achieved == ComponentLifecycleStateDTO::kDegraded
                                  ? LifecycleBlockingCauseClassDTO::kUnknown
                                  : LifecycleBlockingCauseClassDTO::kNone;
     if (EvaluateIncident(ports, target, state, current, conditions, std::nullopt, detection, next,
@@ -1600,6 +1662,20 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
         now_ns);
     return true;
   }
+  // A fresh intervention from the exact current occurrence is catastrophic
+  // in every lifecycle state (129). Availability still needs the durable
+  // reached marker. Reuse this one observation pass for plan eligibility too;
+  // a missing plan catalog cannot hide an explicitly reported intervention.
+  const auto conditions =
+      ObserveAllDomains(ports, target, state, current, retained, !settling);
+  const bool verified_loss = achieved == ComponentLifecycleStateDTO::kDegraded ||
+                             achieved == ComponentLifecycleStateDTO::kFaulted;
+  if (EvaluateIncident(ports, target, state, current, conditions, std::nullopt,
+                       detection, next, now_ns,
+                       verified_loss ? LifecycleBlockingCauseClassDTO::kUnknown
+                                     : LifecycleBlockingCauseClassDTO::kNone)) {
+    return true;
+  }
   if (!next) {
     state.failed_basis.reset();
     state.failure_reason.reset();
@@ -1607,11 +1683,6 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
     // safety stop, fault or lost controller after it became ready stays
     // visible in its progress (spec 530 lifecycle blocking causes). Nothing
     // is submitted; an unchanged class writes nothing.
-    const auto conditions = ObserveAllDomains(ports, target, state, current, retained, !settling);
-    if (EvaluateIncident(ports, target, state, current, conditions, std::nullopt, detection,
-                         std::nullopt, now_ns)) {
-      return true;
-    }
     auto cause = current.provider_occurrences.empty() ? retained_worst
                                                       : LifecycleBlockingCauseClassDTO::kNone;
     bool all_fresh_without_cause = !conditions.empty();
@@ -1667,8 +1738,8 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   auto cause = LifecycleBlockingCauseClassDTO::kNone;
   bool all_fresh = true;
   std::optional<std::string> unavailable_reason;
-  std::vector<DomainCondition> conditions;
-  for (const auto& occurrence : current.provider_occurrences) {
+  for (std::size_t index = 0U; index < current.provider_occurrences.size(); ++index) {
+    const auto& occurrence = current.provider_occurrences[index];
     auto catalog = ports.LoadLifecyclePlanCatalog(occurrence);
     if (!catalog.ok()) {
       Publish(state, LifecycleProgressPhaseDTO::kBlocked, *next,
@@ -1677,15 +1748,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
       return true;
     }
     catalogs.push_back(std::move(catalog.value()));
-    const auto stored = retained.find(occurrence.control_domain_id);
-    auto observed = ObserveDomain(
-        ports, component, occurrence, target.target_generation,
-        stored == retained.end() ? LifecycleBlockingCauseClassDTO::kNone : stored->second,
-        target.recovered_cause, !settling, clock_);
-    if (observed.retain) {
-      RetainCause(state, component, occurrence.control_domain_id, observed.cause,
-                  observed.observed_at_ns);
-    }
+    const auto& observed = conditions[index].observed;
     basis.observation_generations.push_back(observed.generation);
     if (!observed.observation) {
       all_fresh = false;
@@ -1693,23 +1756,11 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
     }
     cause = Worst(cause, observed.cause);
     observations.push_back(observed.observation);
-    conditions.push_back({occurrence.control_domain_id, std::move(observed)});
-  }
-  // A component that reached its target and that CCLC verified as degraded
-  // or faulted, or a new intervention class while recovering, is an incident.
-  const bool verified_loss = achieved == ComponentLifecycleStateDTO::kDegraded ||
-                             achieved == ComponentLifecycleStateDTO::kFaulted;
-  if ((detection == IncidentDetection::kNewCause ||
-       (detection == IncidentDetection::kAny && verified_loss)) &&
-      EvaluateIncident(ports, target, state, current, conditions, std::nullopt,
-                       verified_loss ? detection : IncidentDetection::kNewCause, next, now_ns,
-                       LifecycleBlockingCauseClassDTO::kUnknown)) {
-    return true;
   }
 
-  // An intervention-requiring class blocks every step except moving toward
-  // a requested Disable; ManyForge never clears it itself. One held only in
-  // memory (its record failed) blocks the same way and says so.
+  // A retained class without a fresh report still blocks ordinary progress
+  // until Recover. Fresh interventions already went through the incident
+  // path above, including when Disable is the requested target.
   if (lifecycle_cause_requires_intervention(cause) &&
       *next != ComponentLifecycleIntentKindDTO::kDisable) {
     Publish(state, LifecycleProgressPhaseDTO::kBlocked, *next, cause,
@@ -1794,14 +1845,21 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   for (const auto& domain : current.domains) {
     ExpectedActiveControlConfigurationDTO configuration{
         ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt};
-    if (domain.active_control_configuration) {
+    if (const auto active = domain.configuration_identity()) {
       configuration = {ExpectedActiveControlConfigurationPresenceDTO::kPresent,
-                       domain.active_control_configuration->active_control_configuration_id,
-                       domain.active_control_configuration->active_control_configuration_generation};
+                       active->active_control_configuration_id,
+                       active->active_control_configuration_generation};
+    }
+    if (const auto* provider = domain.provider()) {
+      expected_domains.emplace_back(
+          domain.control_domain_id, domain.control_domain_revision,
+          ExpectedProviderDomainScopeDTO{provider->provider, configuration});
+      continue;
     }
     expected_domains.push_back({domain.control_domain_id, domain.control_domain_revision,
-                                domain.controller_topology_id, domain.topology_revision,
-                                configuration, domain.current_control_bindings});
+                                domain.controller().controller_topology_id,
+                                domain.controller().topology_revision, configuration,
+                                domain.control_bindings()});
   }
   ComponentLifecycleIntentDTO intent{
       {LifecycleTargetRequestId(component, target.target_generation, state.step, *next,
@@ -1825,6 +1883,34 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
     state.progress->blocking_cause_class = cause;
   }
   return true;
+}
+
+Result<void> CCLCLifecycleTargetDriver::CheckNoOpenIncidents() {
+  // A pass evaluates local state copies before publishing components_. Keep
+  // that existing owner transition coherent with the durable all-row query.
+  // The Kernel calls this without its State mutex; no Kernel/admission lock
+  // is held over the journal read or an in-progress containment call.
+  std::lock_guard run_lock(run_mutex_);
+  const auto open = store_.HasOpenIncident();
+  if (!open.ok()) return Result<void>::Err(open.error());
+  if (open.value())
+    return Result<void>::Err(driver_error("incident_open",
+        "A component or cell-observer incident remains open", "incident_open"));
+  std::vector<std::pair<ControllableComponentId, std::uint64_t>> unrecorded;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    for (const auto& [component, state] : components_)
+      if (state.unrecorded_incident)
+        unrecorded.emplace_back(component, state.unrecorded_incident_generation);
+  }
+  for (const auto& [component, generation] : unrecorded) {
+    const auto facts = store_.LoadLifecycleTargetFacts(component);
+    if (!facts.ok()) return Result<void>::Err(facts.error());
+    if (facts.value().recovery_generation == generation)
+      return Result<void>::Err(driver_error("incident_open",
+          "A component incident is not yet durably recorded", "incident_open"));
+  }
+  return Result<void>::Ok();
 }
 
 Result<ComponentLifecycleReadinessTargetFactsDTO>

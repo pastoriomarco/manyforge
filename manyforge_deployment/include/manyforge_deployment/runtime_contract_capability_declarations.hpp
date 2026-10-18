@@ -48,6 +48,14 @@ inline constexpr std::array<std::string_view, 20U> kExecutionServices{{
     "validation.trajectory.non_collision",
 }};
 
+// Actual ROS host signal service/typed output surface. Keep this separate
+// from generic execution declarations; another runtime needs its own provider.
+inline constexpr std::array<std::string_view, 3U> kIoSignalServices{{
+    "io.gpio.get_input",
+    "io.gpio.set_output",
+    "io.gpio.wait_for_input",
+}};
+
 inline constexpr std::array<std::string_view, 5U> kComponentLifecycleServices{{
     "component.lifecycle.disable",
     "component.lifecycle.enable",

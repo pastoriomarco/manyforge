@@ -15,8 +15,9 @@ namespace manyforge::core {
 /// automatically. `kAvailability` means status or feedback is unreachable or
 /// stale before the component first reaches its target; fresh status that is
 /// simply not ready yet is `kNone`. Every other class requires intervention:
-/// CCLC retains it until the operator's Recover, and after the component
-/// first reached its target it is also an incident (maintainer, 2026-10-08).
+/// CCLC retains it until the operator's Recover. A fresh intervention from
+/// the current occurrence is an incident in every lifecycle state, except
+/// during an unadopted whole-component Apply replacement (maintainer129).
 enum class LifecycleBlockingCauseClassDTO : std::uint8_t {
   kNone = 0,
   kAvailability,

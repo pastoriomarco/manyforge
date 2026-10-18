@@ -20,6 +20,7 @@ import time
 import threading
 from typing import Any, Callable, Iterable
 
+import rfc8785
 from watchfiles import awatch
 from websockets.asyncio.client import connect as connect_websocket
 from websockets.exceptions import ConnectionClosed
@@ -39,6 +40,7 @@ from .program_cycle import (
     PROGRAM_CONTROL_STATE_SCHEMA,
     ProgramCycleFrameDTO,
     program_cycle_control_key,
+    program_operation_failures,
 )
 from .service import HeadlessService
 
@@ -47,6 +49,15 @@ _MAXIMUM_ACTIVE_CLIENT_INCIDENTS = CONTROL_MAXIMUM_CLIENTS * 8
 _SOURCE_RETRY_INITIAL_SECONDS = 0.05
 _SOURCE_RETRY_MAX_SECONDS = 1.0
 _LOGGER = logging.getLogger(__name__)
+_PROGRAM_FAILURE_CONDITION_SCHEMA = "manyforge.program_failure_condition.v1"
+# Run states holding an unresolved failure: held for it, ended failed, or
+# stopped with it. Only the Run's own resolution clears the condition.
+_ORDINARY_FAILURE_EFFECTS = frozenset({"no_effect", "effect_settled"})
+# These keep their own native alarms (runtime collision, Stop fault) or are
+# no failure at all (an operator Stop).
+_NATIVE_ALARM_RECOVERY_CLASSES = frozenset(
+    {"runtime_collision", "stop_fault_intervention", "ordinary_operator_stop"}
+)
 
 
 async def _drained_owner_read(
@@ -282,6 +293,62 @@ def _source_file_observation(path: Path) -> tuple[str | None, int | None]:
     return read_control_source_file_hint(str(path)) or (None, None)
 
 
+def program_failure_origins(cycle: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Ordinary operation failures the accepted Run currently holds, by origin.
+
+    The Runner publishes one row per active failure hold (and one for a failed
+    tree's tip), drops it when that hold is released and keeps the rest on a
+    stopped or failed Run until Reset; row presence alone is the hold. The
+    row's selected cause decides: its recovery class must not keep its own
+    native alarm, and no participant's terminal fact may show an uncertain
+    or still-active effect. The facts are every participant's raw fact
+    (SX-1985), so a co-participant that succeeded or failed differently
+    never suppresses the alarm. A pure logic failure carries no operation
+    row and never activates the alarm.
+    """
+
+    run = cycle.get("run")
+    if not isinstance(run, dict):
+        return {}
+    origins: dict[str, dict[str, Any]] = {}
+    for row in program_operation_failures(run):
+        facts = row["terminal_facts"]
+        if (
+            row["recovery_class"] in _NATIVE_ALARM_RECOVERY_CLASSES
+            or not facts
+            or any(fact["effect"] not in _ORDINARY_FAILURE_EFFECTS for fact in facts)
+        ):
+            continue
+        origin = {
+            "program_runner_owner_epoch": cycle["program_runner_owner_epoch"],
+            "program_run_id": cycle["program_run_id"],
+            "occurrence": {
+                "node_instance_id": row["node_instance_id"],
+                "node_attempt_id": row["node_attempt_id"],
+                "operator_facing_run_revision": row["operator_facing_run_revision"],
+            },
+            "operation": dict(row["operation"]),
+            "resource_ids": list(row["resource_ids"]),
+            "failure": dict(row["failure"]),
+        }
+        key = json.dumps(
+            [origin[name] for name in (
+                "program_runner_owner_epoch", "program_run_id", "occurrence", "operation"
+            )],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        origins.setdefault(key, origin)
+    return origins
+
+
+@dataclass(slots=True)
+class _ProgramFailureOccurrence:
+    origin: dict[str, Any]
+    activation_control_revision: int
+    run_revision: int
+
+
 def build_control_projection(
     cycle: dict[str, Any], ingress: ExecutionControlIngress
 ) -> ExecutionControlProjectionDTO:
@@ -334,6 +401,7 @@ class HeadlessControlStateSource:
         cold_freshness_paths: Iterable[Path] = (),
         cold_freshness_budget_ns: int | None = None,
         incident_recorder: Callable[..., dict[str, Any]] | None = None,
+        program_failure_observer: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         self._service = service
         self._ingress = ingress
@@ -403,32 +471,51 @@ class HeadlessControlStateSource:
         self._source_incidents: dict[str, tuple[int, int]] = {}
         self._incident_recording_failed = False
         self._semantic_reason: str | None = None
-        self._operation_progress: list[dict[str, Any]] = []
+        # Event-pump facts carried beside the shell: operation progress and
+        # the global rule states (None: unknown).
+        self._pump_facts: dict[str, Any] = {
+            "operation_progress": [], "global_rules": None,
+        }
         self._progress_lock = threading.Lock()
-        self._pending_progress: list[dict[str, Any]] | None = None
+        self._pending_pump_facts: dict[str, Any] = {}
+        # Application-lifetime demand for the Program feed alone, so the
+        # Program-failure condition follows the Run without a browser.
+        self._program_demand = False
+        self._program_failure_observer = program_failure_observer
+        self._program_failure_epoch: str | None = None
+        self._program_failure_control_revision: int | None = None
+        self._program_failures: dict[str, _ProgramFailureOccurrence] = {}
+        self._program_failures_resend = False
+        self._program_failure_observer_failed = False
 
     def notify_operation_progress(self, rows: list[dict[str, Any]]) -> None:
+        self._notify_pump_fact("operation_progress", rows)
+
+    def notify_global_rules(self, rows: list[dict[str, Any]] | None) -> None:
+        self._notify_pump_fact("global_rules", rows)
+
+    def _notify_pump_fact(self, name: str, value: Any) -> None:
         # Keep one latest value even before the first browser subscribes.
         with self._progress_lock:
-            scheduled = self._pending_progress is not None
-            self._pending_progress = rows
+            scheduled = bool(self._pending_pump_facts)
+            self._pending_pump_facts[name] = value
         loop = self._loop
         if loop is not None and not loop.is_closed():
             if not scheduled:
-                loop.call_soon_threadsafe(self._drain_operation_progress)
+                loop.call_soon_threadsafe(self._drain_pump_facts)
 
-    def _drain_operation_progress(self) -> None:
+    def _drain_pump_facts(self) -> None:
         with self._progress_lock:
-            rows, self._pending_progress = self._pending_progress, None
-        if rows is not None:
-            self._accept_operation_progress(rows)
-
-    def _accept_operation_progress(self, rows: list[dict[str, Any]]) -> None:
-        if rows == self._operation_progress:
+            facts, self._pending_pump_facts = self._pending_pump_facts, {}
+        changed = {
+            name: value for name, value in facts.items()
+            if value != self._pump_facts[name]
+        }
+        if not changed:
             return
-        self._operation_progress = rows
-        # Reuse already-captured owner facts. Progress never rebuilds the cold
-        # projection or grants new command authority.
+        self._pump_facts = {**self._pump_facts, **changed}
+        # Reuse already-captured owner facts. Pump facts never rebuild the
+        # cold projection or grant new command authority.
         self._publish("cold")
 
     @property
@@ -624,6 +711,8 @@ class HeadlessControlStateSource:
 
     def _invalidate_source(self, source: str) -> None:
         if source == "program":
+            if self._program_source_current:
+                self._report_program_failures_unknown()
             self._program_source_current = False
         elif source == "file_watch":
             self._watch_source_current = False
@@ -691,6 +780,32 @@ class HeadlessControlStateSource:
     def relative_monotonic_ns(self, now_ns: int) -> int:
         return max(0, now_ns - self._diagnostic_origin_ns)
 
+    def _program_demanded(self) -> bool:
+        return bool(self._subscriptions) or self._program_demand
+
+    def _start_program_reader(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._program_wake = asyncio.Event()
+        self._program_wake.set()
+        self._runner_task = loop.create_task(self._run_program_source())
+
+    async def start_program_demand(self) -> None:
+        """Keep the one Program reader running for the application lifetime.
+
+        This is internal demand on the same reader, not a client: it assembles
+        no cold projection and publishes no frame. ``close`` releases it.
+        """
+
+        loop = asyncio.get_running_loop()
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("control state source is closed")
+            if self._loop is not None and self._loop is not loop:
+                raise RuntimeError("control state source crossed event loops")
+            self._loop = loop
+            self._program_demand = True
+            if self._runner_task is None or self._runner_task.done():
+                self._start_program_reader(loop)
+
     async def subscribe(self) -> ControlStateSubscription:
         loop = asyncio.get_running_loop()
         async with self._lifecycle_lock:
@@ -701,14 +816,15 @@ class HeadlessControlStateSource:
             if len(self._subscriptions) >= CONTROL_MAXIMUM_CLIENTS:
                 raise RuntimeError("control state client limit reached")
             self._loop = loop
-            self._drain_operation_progress()
+            self._drain_pump_facts()
             subscription = ControlStateSubscription(asyncio.Event())
             self._subscriptions.add(subscription)
             if len(self._subscriptions) == 1:
                 self._cold_wake = asyncio.Event()
-                self._program_wake = asyncio.Event()
-                self._program_wake.set()
-                self._runner_task = loop.create_task(self._run_program_source())
+                # A reader that ended unexpectedly restarts with a new client,
+                # as it did before internal Program demand existed.
+                if self._runner_task is None or self._runner_task.done():
+                    self._start_program_reader(loop)
                 self._cold_task = loop.create_task(self._run_cold_assembler())
                 if self._watch_roots:
                     self._watch_task = loop.create_task(self._run_file_wakes())
@@ -724,37 +840,48 @@ class HeadlessControlStateSource:
             subscription.frame = None
             subscription.wake.set()
             self._subscriptions.discard(subscription)
-            if self._subscriptions:
-                return
-            tasks = tuple(
-                task
-                for task in (self._runner_task, self._cold_task, self._watch_task)
-                if task is not None
+            await self._release_demand_locked()
+
+    async def _release_demand_locked(self) -> None:
+        if self._subscriptions:
+            return
+        # Internal Program demand keeps only the Program reader and its
+        # current cycle; client-only cold state is always released.
+        tasks = tuple(
+            task
+            for task in (
+                None if self._program_demand else self._runner_task,
+                self._cold_task,
+                self._watch_task,
             )
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            self._runner_task = None
-            self._cold_task = None
-            self._watch_task = None
-            if self._cold_expiry_handle is not None:
-                self._cold_expiry_handle.cancel()
-                self._cold_expiry_handle = None
-            self._cycle = None
-            self._facts = None
-            self._shell = None
-            self._shell_key = None
-            self._cold_wake = None
-            self._program_wake = None
-            self._watch_keys.clear()
-            self._watch_modified.clear()
-            self._watch_fresh.clear()
-            self._program_source_current = False
-            self._watch_source_current = True
-            self._semantic_reason = None
-            self._loop = None
+            if task is not None
+        )
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._cold_task = None
+        self._watch_task = None
+        if self._cold_expiry_handle is not None:
+            self._cold_expiry_handle.cancel()
+            self._cold_expiry_handle = None
+        self._facts = None
+        self._shell = None
+        self._shell_key = None
+        self._cold_wake = None
+        self._watch_keys.clear()
+        self._watch_modified.clear()
+        self._watch_fresh.clear()
+        self._watch_source_current = True
+        self._semantic_reason = None
+        if self._program_demand:
+            return
+        self._runner_task = None
+        self._cycle = None
+        self._program_wake = None
+        self._program_source_current = False
+        self._loop = None
 
     def notify_cold(self) -> None:
         loop = self._loop
@@ -802,6 +929,9 @@ class HeadlessControlStateSource:
         subscriptions = tuple(self._subscriptions)
         for subscription in subscriptions:
             await self.unsubscribe(subscription)
+        async with self._lifecycle_lock:
+            self._program_demand = False
+            await self._release_demand_locked()
 
     def take(self, subscription: ControlStateSubscription) -> ControlStateFrame | None:
         frame = subscription.frame
@@ -900,7 +1030,7 @@ class HeadlessControlStateSource:
             generation=self._generation,
             event_class=event_class,
             control=build_control_projection(self._cycle, self._ingress),
-            shell={**self._shell, "operation_progress": self._operation_progress},
+            shell={**self._shell, **self._pump_facts},
         )
 
     def _publish(self, event_class: str) -> None:
@@ -945,6 +1075,7 @@ class HeadlessControlStateSource:
         self._program_source_current = True
         self._source_transition("program", failed=False)
         self._cycle = cycle
+        self._observe_program_failures(cycle)
         if self._facts is None:
             self.notify_cold()
         else:
@@ -978,12 +1109,109 @@ class HeadlessControlStateSource:
             # group hold/Resume and node progress do not change the cycle claim.
             self.notify_cold()
 
+    def _observe_program_failures(self, cycle: dict[str, Any]) -> None:
+        """Report the accepted Run's ordinary operation-failure conditions.
+
+        Active follows the Run's failure row. Clear comes only under a later
+        accepted control revision: the row is gone from the same Run (that
+        hold was released by Retry, Continue or a manual result, whatever
+        other holds remain), a completed Reset, or the same owner showing
+        another Run id (a new Run started). A missing run or an owner
+        replacement never clears; the native source registration makes a
+        replaced owner's conditions unknown.
+        """
+
+        if self._program_failure_observer is None:
+            return
+        epoch = cycle["program_runner_owner_epoch"]
+        control = cycle["execution_control_revision"]
+        if epoch != self._program_failure_epoch:
+            self._program_failures.clear()
+            self._program_failure_epoch = epoch
+        self._program_failure_control_revision = control
+        run_id = cycle.get("program_run_id")
+        run_revision = cycle.get("run_revision")
+        run = cycle.get("run")
+        current = program_failure_origins(cycle)
+        resend, self._program_failures_resend = self._program_failures_resend, False
+        for key, occurrence in tuple(self._program_failures.items()):
+            if occurrence.origin["program_run_id"] == run_id and run_revision is not None:
+                occurrence.run_revision = run_revision
+            if key in current:
+                continue
+            resolved = control > occurrence.activation_control_revision and (
+                cycle["state"] == "idle_after_reset"
+                or (run_id == occurrence.origin["program_run_id"] and isinstance(run, dict))
+                # The same owner started another Run: the earlier Run (and
+                # so its failure) no longer exists, even without an observed
+                # idle_after_reset in between.
+                or (
+                    isinstance(run_id, str)
+                    and run_id != occurrence.origin["program_run_id"]
+                )
+            )
+            if resolved:
+                if self._send_program_failure(occurrence, "clear", control):
+                    del self._program_failures[key]
+            elif resend:
+                self._send_program_failure(occurrence, "active", control)
+        for key, origin in current.items():
+            occurrence = self._program_failures.get(key)
+            if occurrence is None:
+                occurrence = _ProgramFailureOccurrence(origin, control, run_revision)
+                self._program_failures[key] = occurrence
+            elif not resend:
+                continue
+            self._send_program_failure(occurrence, "active", control)
+
+    def _report_program_failures_unknown(self) -> None:
+        control = self._program_failure_control_revision
+        if self._program_failure_observer is None or control is None:
+            return
+        # The next accepted cycle restates every retained occurrence.
+        self._program_failures_resend = True
+        for occurrence in tuple(self._program_failures.values()):
+            self._send_program_failure(occurrence, "unknown", control)
+
+    def _send_program_failure(
+        self, occurrence: _ProgramFailureOccurrence, state: str, control: int
+    ) -> bool:
+        observer = self._program_failure_observer
+        assert observer is not None
+        origin = occurrence.origin
+        condition = {
+            "schema_version": _PROGRAM_FAILURE_CONDITION_SCHEMA,
+            "program_runner_owner_epoch": origin["program_runner_owner_epoch"],
+            "execution_control_revision": control,
+            "program_run_id": origin["program_run_id"],
+            "run_revision": occurrence.run_revision,
+            "state": state,
+            "occurrence": origin["occurrence"],
+            "operation": origin["operation"],
+            "resource_ids": origin["resource_ids"],
+            "failure": origin["failure"],
+        }
+        try:
+            observer(rfc8785.dumps(condition).decode("utf-8"))
+        except Exception:
+            # The alarm path must never stop the Program reader. Restate the
+            # retained conditions on the next accepted cycle instead.
+            self._program_failures_resend = True
+            if not self._program_failure_observer_failed:
+                _LOGGER.exception("Program failure condition observation failed")
+            self._program_failure_observer_failed = True
+            return False
+        if self._program_failure_observer_failed:
+            _LOGGER.info("Program failure condition observation recovered")
+        self._program_failure_observer_failed = False
+        return True
+
     async def _run_program_source(self) -> None:
         if self._runner_url is None:
             assert self._program_wake is not None
             wake = self._program_wake
             retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
-            while self._subscriptions and not self._closed:
+            while self._program_demanded() and not self._closed:
                 await wake.wait()
                 wake.clear()
                 if await self._read_current_cycle("critical"):
@@ -994,7 +1222,7 @@ class HeadlessControlStateSource:
                     wake.set()
             return
         retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
-        while self._subscriptions and not self._closed:
+        while self._program_demanded() and not self._closed:
             try:
                 async with connect_websocket(
                     self._runner_url,

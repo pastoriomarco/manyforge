@@ -1,8 +1,8 @@
 # Generated extension composition; edit extension entries in their package descriptor.
 api_version: manyforge.node_catalog.v2
-content_version: 2.5.0
+content_version: 2.7.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:946dcdf51bfdae12e2ff6effed9e1ab3e9c437360ac7c600bf91cd25e6675eb3
+catalog_digest: sha256:76cf8c7efdf959a132e9c33802c4c683cb3afddaf229cf06bb09605d609fdf36
 schema_types:
   coordinate_position:
     type: object
@@ -560,6 +560,41 @@ schema_types:
         length: 3
         allowed_when:
           type: mesh
+  mock_signal_simulation:
+    type: object
+    additional_properties: false
+    required:
+    - signal
+    - start_value
+    properties:
+      signal:
+        type: object
+        additional_properties: false
+        required:
+        - target_role
+        - resource_role
+        properties:
+          target_role:
+            type: string
+            semantic_type: target_role
+          resource_role:
+            type: string
+            semantic_type: resource_role
+      start_value:
+        type: bool
+      change:
+        type: object
+        additional_properties: false
+        required:
+        - after_ms
+        - value
+        properties:
+          after_ms:
+            type: int
+            constraints:
+              min_inclusive: 0
+          value:
+            type: bool
 entries:
 - id: sequence
   name: Sequence
@@ -908,6 +943,38 @@ entries:
       values:
       - default
       - disable
+  - id: automatic_retries
+    required: false
+    default: 3
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 0
+        max_inclusive: 10
+  - id: automatic_retry_delay_s
+    required: false
+    default: 1.0
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+        max_inclusive: 60.0
+  - id: preemption_priority
+    required: false
+    default: 0
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 0
+        max_inclusive: 100
+  - id: preempted_result
+    required: false
+    default: failure
+    schema:
+      type: enum
+      values:
+      - success
+      - failure
   required_capabilities:
   - capability_id: planning.motion.joint_goal
     scope: target_binding
@@ -1098,6 +1165,38 @@ entries:
     schema:
       type: string
       semantic_type: scene_resource
+  - id: automatic_retries
+    required: false
+    default: 3
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 0
+        max_inclusive: 10
+  - id: automatic_retry_delay_s
+    required: false
+    default: 1.0
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+        max_inclusive: 60.0
+  - id: preemption_priority
+    required: false
+    default: 0
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 0
+        max_inclusive: 100
+  - id: preempted_result
+    required: false
+    default: failure
+    schema:
+      type: enum
+      values:
+      - success
+      - failure
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
@@ -1338,6 +1437,38 @@ entries:
     schema:
       type: string
       semantic_type: scene_resource
+  - id: automatic_retries
+    required: false
+    default: 3
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 0
+        max_inclusive: 10
+  - id: automatic_retry_delay_s
+    required: false
+    default: 1.0
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+        max_inclusive: 60.0
+  - id: preemption_priority
+    required: false
+    default: 0
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 0
+        max_inclusive: 100
+  - id: preempted_result
+    required: false
+    default: failure
+    schema:
+      type: enum
+      values:
+      - success
+      - failure
   required_capabilities:
   - capability_id: planning.motion.cartesian_path
     scope: target_binding
@@ -1411,6 +1542,18 @@ entries:
     schema:
       type: string
       semantic_type: target_role
+  - id: base_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+      semantic_scope_parameter: target_role
+  - id: tcp_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: goal
     required: true
     schema_ref: '#/schema_types/stored_pose'
@@ -1429,10 +1572,65 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
-  - id: interrupt_policy_id
-    required: true
+  - id: velocity_scale
+    required: false
+    default: 1.0
     schema:
-      type: string
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 1.0
+  - id: acceleration_scale
+    required: false
+    default: 1.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 1.0
+  - id: joint_position_tol_rad
+    required: false
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: translation_tol_m
+    required: false
+    default: 0.005
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: rotation_tol_rad
+    required: false
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: planning_timeout_s
+    required: false
+    default: 2.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: execution_timeout_s
+    required: false
+    default: 10.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: cache_mode
+    required: false
+    default: default
+    schema:
+      type: enum
+      values:
+      - default
+      - disable
   - id: stop_mode
     required: true
     schema:
@@ -1450,6 +1648,46 @@ entries:
       - require_inactive_at_arm
       - fresh_edge_after_arm
       - trip_if_already_active
+  - id: interrupt_condition
+    required: true
+    schema:
+      type: interrupt_condition
+  - id: on_signal
+    required: false
+    schema:
+      type: enum
+      values:
+      - success
+      - failure
+  - id: on_no_signal
+    required: false
+    schema:
+      type: enum
+      values:
+      - success
+      - failure
+  - id: priority
+    required: false
+    default: 0
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 0
+        max_inclusive: 100
+  - id: stop_entry_stage_id
+    required: false
+    schema:
+      type: string
+  - id: success_through_stage_id
+    required: false
+    schema:
+      type: string
+  - id: mock_simulation
+    required: false
+    schema:
+      type: array
+      items:
+        schema_ref: '#/schema_types/mock_signal_simulation'
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
@@ -1526,6 +1764,18 @@ entries:
     schema:
       type: string
       semantic_type: target_role
+  - id: base_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+      semantic_scope_parameter: target_role
+  - id: tcp_frame_role
+    required: true
+    schema:
+      type: string
+      semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: goal
     required: true
     schema_ref: '#/schema_types/stored_pose'
@@ -1544,10 +1794,65 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
-  - id: interrupt_policy_id
-    required: true
+  - id: velocity_scale
+    required: false
+    default: 1.0
     schema:
-      type: string
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 1.0
+  - id: acceleration_scale
+    required: false
+    default: 1.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+        max_inclusive: 1.0
+  - id: joint_position_tol_rad
+    required: false
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: translation_tol_m
+    required: false
+    default: 0.005
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: rotation_tol_rad
+    required: false
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: planning_timeout_s
+    required: false
+    default: 2.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: execution_timeout_s
+    required: false
+    default: 10.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: cache_mode
+    required: false
+    default: default
+    schema:
+      type: enum
+      values:
+      - default
+      - disable
   - id: contact_policy_id
     required: true
     schema:
@@ -1560,6 +1865,46 @@ entries:
       - spring_back_hold
       - soft_on_path
       - hard_deceleration
+  - id: interrupt_condition
+    required: true
+    schema:
+      type: interrupt_condition
+  - id: on_signal
+    required: false
+    schema:
+      type: enum
+      values:
+      - success
+      - failure
+  - id: on_no_signal
+    required: false
+    schema:
+      type: enum
+      values:
+      - success
+      - failure
+  - id: priority
+    required: false
+    default: 0
+    schema:
+      type: int
+      constraints:
+        min_inclusive: 0
+        max_inclusive: 100
+  - id: stop_entry_stage_id
+    required: false
+    schema:
+      type: string
+  - id: success_through_stage_id
+    required: false
+    schema:
+      type: string
+  - id: mock_simulation
+    required: false
+    schema:
+      type: array
+      items:
+        schema_ref: '#/schema_types/mock_signal_simulation'
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
@@ -2277,6 +2622,12 @@ entries:
     schema:
       type: string
       semantic_type: blackboard_key
+  - id: mock_simulation
+    required: false
+    schema:
+      type: array
+      items:
+        schema_ref: '#/schema_types/mock_signal_simulation'
   required_capabilities:
   - capability_id: io.gpio.get_input
     scope: target_binding
@@ -2327,6 +2678,12 @@ entries:
     required: true
     schema:
       type: bool
+  - id: mock_simulation
+    required: false
+    schema:
+      type: array
+      items:
+        schema_ref: '#/schema_types/mock_signal_simulation'
   required_capabilities:
   - capability_id: io.gpio.get_input
     scope: target_binding
@@ -2346,7 +2703,10 @@ entries:
 - id: io.wait_for_input
   name: Wait for input
   category: io
-  description: Wait for one semantic input resource to reach a value.
+  description: Wait for one semantic input resource to reach a value. While the source
+    is stale or unavailable the wait stays pending and visibly unavailable. Without
+    timeout_s it waits indefinitely; with it, the wait fails once that much Program
+    time has passed, which stands still while the Program is halted.
   stability: stable
   tags:
   - io
@@ -2380,6 +2740,19 @@ entries:
       - level
       - rising
       - falling
+  - id: timeout_s
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.01
+        max_inclusive: 3600.0
+  - id: mock_simulation
+    required: false
+    schema:
+      type: array
+      items:
+        schema_ref: '#/schema_types/mock_signal_simulation'
   required_capabilities:
   - capability_id: io.gpio.wait_for_input
     scope: target_binding

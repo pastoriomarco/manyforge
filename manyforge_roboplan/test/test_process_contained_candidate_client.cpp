@@ -279,6 +279,32 @@ config(const std::filesystem::path &worker) {
       256U * 1024U * 1024U, false, std::nullopt, std::nullopt, {}};
 }
 
+[[nodiscard]] RoboPlanCandidateRequestDTO
+moving_request(const ProcessFixture &fixture, double remaining_budget_s) {
+  auto input = request(fixture);
+  const auto width = fixture.binding.resources.size();
+  input.moving_replacement = MovingReplacementInputDTO{
+      ExecutionGoalKey{ControllerGoalId("source-goal"),
+                       ControllerGoalGeneration(2U)},
+      ExecutionBindingEpoch(1U),
+      1.0,
+      TrajectoryDTO{
+          fixture.binding.resources,
+          fixture.binding.compiled_joint_names,
+          {{0.0, values(fixture.start), std::vector<double>(width, 0.1),
+            std::vector<double>(width, 0.0)},
+           {0.2, values(fixture.start), std::vector<double>(width, 0.1),
+            std::vector<double>(width, 0.0)}}},
+      1.2,
+      state(fixture),
+      fixture.binding.permitted_frames[0],
+      fixture.binding.permitted_frames[1],
+      input.speed_profile,
+      input.dynamics_limits,
+      remaining_budget_s};
+  return input;
+}
+
 [[nodiscard]] Pose3DTO identity_pose(double x_m = 0.0) {
   return {{x_m, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
 }
@@ -1091,6 +1117,123 @@ TEST(ProcessContainedCandidateClientTest,
   ASSERT_TRUE(recovered.ok()) << recovered.error().message;
   EXPECT_EQ(recovered.value().waypoints.back().positions_rad,
             values(fixture.goal));
+  std::filesystem::remove(marker, ignored);
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     PreviousProtocolVersionIsRejectedDuringInitialization) {
+  auto fixture = make_fixture();
+  fixture.model.native_scene_name = "old-protocol";
+  try {
+    ProcessContainedRoboPlanCandidateClient client(
+        fixture.model, fixture.binding,
+        RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+        config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH));
+    FAIL() << "The eager worker initialization accepted the old protocol";
+  } catch (const std::runtime_error &failure) {
+    EXPECT_STREQ(failure.what(),
+                 "worker response has an invalid magic or version");
+  }
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     MovingTransactionUsesWholeBudgetInsteadOfSuffixPlanningCap) {
+  auto fixture = make_fixture();
+  const auto marker =
+      std::filesystem::temp_directory_path() /
+      ("manyforge-worker-moving-budget-" + std::to_string(::getpid()));
+  // An existing marker selects the fake worker's immediate-response branch.
+  {
+    std::ofstream existing(marker);
+    ASSERT_TRUE(existing.good());
+  }
+  fixture.model.native_scene_name = marker.string();
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH));
+  auto input = moving_request(fixture, 3.0);
+  input.planning_timeout_s = 0.000001;
+  const auto result = client.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().waypoints.back().positions_rad,
+            values(fixture.goal));
+  std::error_code ignored;
+  std::filesystem::remove(marker, ignored);
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     InvalidMovingBudgetsFailBeforeStartingWorker) {
+  auto fixture = make_fixture();
+  auto process_config = config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH);
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      std::move(process_config));
+  for (const double budget :
+       {0.0, -1.0, std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::max()}) {
+    const auto result = client.compute(moving_request(fixture, budget));
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"),
+              "native_planner_worker_protocol_failure");
+  }
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     MovingWholeBudgetExpiresWithoutTransportGrace) {
+  auto fixture = make_fixture();
+  const auto marker =
+      std::filesystem::temp_directory_path() /
+      ("manyforge-worker-moving-timeout-" + std::to_string(::getpid()));
+  std::error_code ignored;
+  std::filesystem::remove(marker, ignored);
+  fixture.model.native_scene_name = marker.string();
+  auto process_config = config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH);
+  process_config.request_transport_grace = 5s;
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      std::move(process_config));
+  auto input = moving_request(fixture, 0.025);
+  input.planning_timeout_s = 3.0;
+  auto result =
+      std::async(std::launch::async, [&] { return client.compute(input); });
+  const auto ready = result.wait_for(2s);
+  if (ready != std::future_status::ready) {
+    client.request_cancel();
+  }
+  ASSERT_EQ(ready, std::future_status::ready);
+  const auto expired = result.get();
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().details.at("reason"), "planning_timeout");
+  std::filesystem::remove(marker, ignored);
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     MovingPrefixKeepsExistingFourMiBRequestBound) {
+  auto fixture = make_fixture();
+  const auto marker =
+      std::filesystem::temp_directory_path() /
+      ("manyforge-worker-moving-oversize-" + std::to_string(::getpid()));
+  {
+    std::ofstream existing(marker);
+    ASSERT_TRUE(existing.good());
+  }
+  fixture.model.native_scene_name = marker.string();
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH));
+  auto input = moving_request(fixture, 3.0);
+  input.moving_replacement->source_prefix_trajectory.joint_names[0] =
+      std::string(4U * 1024U * 1024U, 'x');
+  const auto result = client.compute(input);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"),
+            "native_planner_worker_protocol_failure");
+  std::error_code ignored;
   std::filesystem::remove(marker, ignored);
 }
 

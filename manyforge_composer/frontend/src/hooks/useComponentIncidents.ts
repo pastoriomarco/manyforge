@@ -14,7 +14,7 @@ const OBSERVATION_INTERVAL_MS = 2000;
 
 /** One open component incident, exactly as the CCLC snapshot issued it. */
 export interface OpenComponentIncident {
-  componentId: string;
+  controllableComponentId: string;
   incident: CCLCComponentIncident;
 }
 
@@ -39,7 +39,7 @@ async function readIncidentSnapshots(
   }
   const [owner, ...snapshots] = await Promise.all([
     api.cclc.owner(signal),
-    ...componentIds.map((componentId) => api.cclc.component(componentId, signal)),
+    ...componentIds.map((controllableComponentId) => api.cclc.component(controllableComponentId, signal)),
   ]);
   const open = snapshots.filter((snapshot) => snapshot.lifecycleProgress?.incident != null);
   let ownerEpoch: string | null = null;
@@ -55,7 +55,7 @@ export async function readOpenComponentIncidents(
 ): Promise<OpenComponentIncident[]> {
   const { snapshots } = await readIncidentSnapshots(componentIds, signal);
   return snapshots.map((snapshot) => ({
-    componentId: snapshot.componentId,
+    controllableComponentId: snapshot.controllableComponentId,
     incident: snapshot.lifecycleProgress!.incident!,
   }));
 }
@@ -93,7 +93,7 @@ export async function acknowledgeComponentIncidents(
     );
     if (result.incidentRecovery === null && result.transactionId === null) {
       throw new Error(
-        `Acknowledgement of the ${snapshot.componentId} incident was ${result.replayStatus}.`,
+        `Acknowledgement of the ${snapshot.controllableComponentId} incident was ${result.replayStatus}.`,
       );
     }
   }

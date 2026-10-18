@@ -8,7 +8,9 @@
 
 namespace manyforge::core {
 
+class IIoSignalService;
 struct ActiveControlConfigurationDTO;
+struct ComponentLifecycleIntentDTO;
 struct SelectedComponentBringUpOfferDTO;
 struct CCLCLifecycleTargetRetirementIntentDTO;
 struct CCLCLifecycleTargetRetirementResultDTO;
@@ -49,8 +51,13 @@ class IKernelCellAdmissionPort {
         {"cell_close_prerequisites_unavailable", "the Kernel Close admission join is unavailable", {}});
   }
   [[nodiscard]] virtual AuthoringAdmissionDTO GetAuthoringAdmission() const = 0;
+  /// Process-local notification only: the affected service is pinned when
+  /// genuine BB teardown mutates it, even if a later update fails. Callers
+  /// queue processing only after this call unwinds; the pin is not completion
+  /// proof and is never serialized over the admission protocol.
   [[nodiscard]] virtual Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
-      const CellAdmissionReadinessSnapshotDTO& snapshot) = 0;
+      const CellAdmissionReadinessSnapshotDTO& snapshot,
+      std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr) = 0;
   [[nodiscard]] virtual Result<void> Publish(const ManagerLivenessObservationDTO& observation) {
     static_cast<void>(observation);
     return Result<void>::Err(ErrorDTO{"cell_admission_liveness_publication_unsupported",
@@ -82,6 +89,13 @@ class IKernelCellAdmissionPort {
   }
   [[nodiscard]] virtual Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent) = 0;
+  /// Existing CCLC owner only: exact local Disable/Prepare/Enable while its
+  /// own retained nonmoving output remains acceptance_unknown. Kernel must
+  /// qualify the actual resident owner; no transport exposes this exception.
+  [[nodiscard]] virtual Result<CellAdmissionClaimDTO> AcquireIoOutputRecoveryLifecycleClaim(
+      const CellAdmissionClaimIntentDTO& intent, const ComponentLifecycleIntentDTO&) {
+    return AcquireCellAdmissionClaim(intent);
+  }
   /// Process-local replacement recovery; ordinary transport does not expose
   /// this authority. Kernel must verify its exact adopted predecessor.
   [[nodiscard]] virtual Result<CellAdmissionClaimDTO> AcquireRouteRecoveryCellAdmissionClaim(

@@ -126,7 +126,7 @@ def _error_status(error: Mapping[str, Any]) -> str:
 
 
 def _component(
-    component_id: str,
+    tile_id: str,
     label: str,
     status: str,
     detail: str,
@@ -141,7 +141,7 @@ def _component(
     contributor_ids: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     return {
-        "id": component_id,
+        "id": tile_id,
         "label": label,
         "status": status,
         "detail": detail,
@@ -199,9 +199,9 @@ def _scope_status(
     contributors: tuple[str, ...],
 ) -> str:
     statuses = [
-        str(components_by_id[component_id]["status"])
-        for component_id in contributors
-        if component_id in components_by_id
+        str(components_by_id[tile_id]["status"])
+        for tile_id in contributors
+        if tile_id in components_by_id
     ]
     if not statuses:
         return _OFFLINE
@@ -864,17 +864,41 @@ def build_component_overview(
         "applied_program", "execution_owner", "execution_target",
         "planner_collision", "stop_capability",
     }
+    absent_empty_owner = (
+        all(
+            error.get("code") == "execution_owner_not_ready"
+            for error in (identity_error, targets_error, control_error)
+        )
+        and not identity
+    )
+    # A warm logical Apply retains a real native owner. Its current, mutually
+    # matching empty projections prove absence of equipment just as the cold
+    # absent-owner case does; a missing or faulted projection cannot do so.
+    current_empty_owner = (
+        not identity_error and not targets_error and not control_error
+        and execution_status == _HEALTHY
+        and identity.get("cell_id") == manager_payload.get("cell_id")
+        and isinstance(identity.get("owner_epoch"), str)
+        and bool(identity["owner_epoch"])
+        and type(identity.get("active_publication_generation")) is int
+        and identity.get("active_publication_generation")
+        == _mapping(active.get("publication")).get("publication_generation")
+        and execution_targets_response.get("identity") == identity
+        and execution_control_response.get("identity") == identity
+        and targets.get("components") == []
+        and control_state.get("observed_targets") == []
+        and control_state.get("manual_operations") == []
+        and control_state.get("runtime_scale_control", False) is None
+        and cell_stop_action.get("available") is True
+        and cell_stop_action.get("fault", False) is None
+    )
     quiet_empty = (
         _current_empty_physical_graph(runtime, manager_section, manager_payload)
         and not applied_program
         and applied_error.get("code") in {
             "program_applied_selection_not_found", "program_not_selected"
         }
-        and all(
-            error.get("code") == "execution_owner_not_ready"
-            for error in (identity_error, targets_error, control_error)
-        )
-        and not identity
+        and (absent_empty_owner or current_empty_owner)
         and not commandable_rows
         and not capability_ids
         and all(
@@ -928,12 +952,12 @@ def build_component_overview(
         ),
     )
     scope_components: list[dict[str, Any]] = []
-    for component_id, label, contributors in scopes:
-        empty_scope = quiet_empty and component_id in {"plan_preview", "execute_control"}
+    for tile_id, label, contributors in scopes:
+        empty_scope = quiet_empty and tile_id in {"plan_preview", "execute_control"}
         status = _OFFLINE if empty_scope else _scope_status(components_by_id, contributors)
         scope_components.append(
             _component(
-                component_id,
+                tile_id,
                 label,
                 status,
                 (
@@ -947,7 +971,7 @@ def build_component_overview(
                 required_for=(label,),
                 reason_code=(
                     empty_reason if empty_scope else
-                    None if status == _HEALTHY else f"{component_id}_unavailable"
+                    None if status == _HEALTHY else f"{tile_id}_unavailable"
                 ),
                 scope="functional_scope",
                 contributor_ids=contributors,
@@ -1002,7 +1026,7 @@ def build_component_overview(
         "profile_label": profile_label,
         "authority_label": "owner-issued scoped facts",
         "user_message": messages[readiness],
-        "capabilities": [label for _component_id, label, _contributors in scopes],
+        "capabilities": [label for _tile_id, label, _contributors in scopes],
         "components": [*scope_components, *components],
         "maintenance_operation": maintenance_operation,
         "basis": {

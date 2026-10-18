@@ -3,6 +3,7 @@
 #include <manyforge_core/ports/icclc_component_command_readiness_port.hpp>
 #include <manyforge_roboplan/retained_native_cell_runtime.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <exception>
 #include <functional>
@@ -178,6 +179,24 @@ class RetainedNativeCellCommandReadinessPort final
   }
 
   [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
+  PublishComponentCommandReadiness(
+      const core::ComponentCommandReadinessPublicationDTO& publication,
+      const core::ComponentLifecycleCurrentSnapshotDTO& actual_snapshot,
+      const std::vector<core::BrandLifecycleObservationDTO>& actual_observations) override {
+    const bool provider = std::any_of(actual_snapshot.domains.begin(), actual_snapshot.domains.end(),
+                                     [](const auto& domain) { return domain.provider() != nullptr; });
+    if (provider) {
+      const auto installed = cell_.addressed_kernel().publish_runtime_provider_configuration(
+          publication, actual_snapshot, actual_observations);
+      if (!installed.ok())
+        return core::Result<core::ComponentCommandReadinessDTO>::Err(installed.error());
+    }
+    // The same Kernel still owns complete component permission. Publishing
+    // actual driver facts above does not itself open command admission.
+    return PublishComponentCommandReadiness(publication);
+  }
+
+  [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
   ReadComponentCommandReadiness(
       const core::ControllableComponentId& controllable_component_id)
       const override {
@@ -204,19 +223,23 @@ class RetainedNativeCellCommandReadinessPort final
       return !lhs.participant_policy.has_value() ||
              lhs.participant_policy->value() == rhs.participant_policy->value();
     };
-    return lhs.binding.value() == rhs.binding.value() &&
-           same_readiness() &&
-           lhs.retained_default_stop_limits == rhs.retained_default_stop_limits &&
+    return lhs.binding.value() == rhs.binding.value() && same_readiness() &&
+           lhs.retained_default_stop_limits ==
+               rhs.retained_default_stop_limits &&
            lhs.stop_node_category == rhs.stop_node_category &&
            lhs.engine == rhs.engine &&
-           lhs.stop_execution_port == rhs.stop_execution_port && same_policy() &&
+           lhs.stop_execution_port == rhs.stop_execution_port &&
+           same_policy() &&
            lhs.prepared_motion_engine == rhs.prepared_motion_engine &&
-           lhs.default_operator_stop_profile == rhs.default_operator_stop_profile &&
+           lhs.default_operator_stop_profile ==
+               rhs.default_operator_stop_profile &&
            lhs.default_fault_stop_profile == rhs.default_fault_stop_profile &&
            lhs.deployment_maximum_tcp_linear_speed_mps ==
                rhs.deployment_maximum_tcp_linear_speed_mps &&
            lhs.intrinsic_direct_control == rhs.intrinsic_direct_control &&
-           lhs.direct_control_joint_limits == rhs.direct_control_joint_limits;
+           lhs.direct_control_joint_limits == rhs.direct_control_joint_limits &&
+           lhs.motion_takeover_preparation_budget_s ==
+               rhs.motion_takeover_preparation_budget_s;
   }
 
   [[nodiscard]] static core::Result<void> validate_generation_only_reseal(
@@ -246,6 +269,16 @@ class RetainedNativeCellCommandReadinessPort final
           return core::Result<void>::Err(resealed.error());
         }
         expected.stop_readiness = std::move(resealed.value());
+      }
+      if (expected.binding.value().controllable_component_id ==
+              publication.controllable_component_id && expected.binding.value().io_output_binding &&
+          expected.binding.value().io_output_binding->component_lifecycle_generation !=
+              publication.component_lifecycle_generation) {
+        auto value = expected.binding.value();
+        value.io_output_binding->component_lifecycle_generation = publication.component_lifecycle_generation;
+        auto resealed = core::verify_runtime_participant_binding(std::move(value));
+        if (!resealed.ok()) return core::Result<void>::Err(resealed.error());
+        expected.binding = std::move(resealed.value());
       }
       if (!same_registration(expected, candidate[index])) {
         return core::Result<void>::Err(core::ErrorDTO{

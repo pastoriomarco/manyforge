@@ -18,6 +18,9 @@ void require_exact_applicability_projection(
   if (deployment.value() != compiled.value()) {
     fail("applicability value tables");
   }
+  if (deployment.normalized_policies() != compiled.normalized_policies()) {
+    fail("complete normalized policies");
+  }
   if (deployment.normalized_desired_control_configurations() !=
       compiled.normalized_desired_control_configurations()) {
     fail("desired_control_configurations");

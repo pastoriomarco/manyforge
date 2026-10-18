@@ -3,10 +3,11 @@
 ManyForge selects exact RoboPlan 0.7.0 as the foundation for the current
 planner dependency closure. The selection does not give RoboPlan scene,
 validation, collision, cancellation, dispatch, or product authority; those
-remain behind focused ManyForge adapters. RoboPlan 0.6.0 is retained only as
-operator-directed restoration evidence until the 0.7 closure completes final
-UA7 qualification. There is no runtime selector or automatic fallback between
-the two generations.
+remain behind focused ManyForge adapters. The current pin is RoboPlan 0.7.0,
+commit `099dfa5ccd80b191eb3d6da9f4795f808a63913f` (`ROBOPLAN_PINNED_REF` in
+`scripts/setup-docker.sh`). The 0.6 dossiers under `upstream/` are kept only
+as historical evidence; no 0.6 build can be selected, and there is no runtime
+selector or automatic fallback between RoboPlan generations.
 
 `scripts/setup-docker.sh` materializes the complete source closure below into
 `.docker/`. Both production Dockerfiles verify canonical source contents,

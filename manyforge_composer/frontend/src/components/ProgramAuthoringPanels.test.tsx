@@ -35,6 +35,7 @@ import {
 import { ProgramTreeCanvas } from './ProgramTreeCanvas';
 import { ProgramWorkspace } from './ProgramWorkspace';
 import { ProgramSchemaValueEditor } from './property/ProgramSchemaValueEditor';
+import { catalogParameterSourceable } from '../utils/programAuthoring';
 
 const sequence: CatalogEntry = {
   id: 'sequence',
@@ -481,6 +482,173 @@ describe('Program authoring panels', () => {
       .toContain('Catalog-invalid value:');
   });
 
+  it('disables automatic retry fields by contract item 7, with the reason', () => {
+    // Fixture entries declare the retry parameters ahead of the catalog 2.6.0 bump.
+    const retryParameters: CatalogEntry['parameters'] = [
+      { id: 'target_mode', required: false, hasDefault: true, default: 'absolute',
+        schema: { type: 'string', enum: ['absolute', 'relative'] }, schemaHash: 'sha256:mode' },
+      { id: 'automatic_retries', required: false, hasDefault: true, default: 3,
+        schema: { type: 'integer', minimum: 0, maximum: 10 }, schemaHash: 'sha256:retries' },
+      { id: 'automatic_retry_delay_s', required: false, hasDefault: true, default: 1,
+        schema: { type: 'number', minimum: 0, maximum: 60 }, schemaHash: 'sha256:delay' },
+    ];
+    const reason = 'Not retried automatically: relative to the robot&#x27;s own position.';
+    const render = (
+      nodeId: string,
+      parameters: ProgramTreeNode['parameters'],
+      valueSources?: ProgramTreeNode['value_sources'],
+    ) => {
+      const node: ProgramTreeNode = {
+        node_id: nodeId, instance_id: 'move', children: [],
+        parameters: { automatic_retries: 3, automatic_retry_delay_s: 1, ...parameters },
+        ...(valueSources === undefined ? {} : { value_sources: valueSources }),
+      };
+      return renderToStaticMarkup(<ProgramPropertyEditor
+        roots={[node]} selectedId="move"
+        catalogEntries={[{ ...timer, id: nodeId, parameters: retryParameters }]}
+        program={authoringProgram([node], [])}
+        busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
+      />);
+    };
+    // Each retry field's own input, up to the next property.
+    const retryInputs = (markup: string) => ['automatic_retries', 'automatic_retry_delay_s'].map((id) => {
+      const start = markup.indexOf(`id="property-move-${id}"`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const end = markup.indexOf('class="program-property', start + 1);
+      return markup.slice(start, end < 0 ? undefined : end);
+    });
+    const expectDisabled = (markup: string) => {
+      expect(markup.split(reason).length - 1).toBe(2);
+      for (const field of retryInputs(markup)) expect(field).toMatch(/<input[^>]*disabled=""/);
+    };
+    const expectEnabled = (markup: string) => {
+      expect(markup).not.toContain(reason);
+      for (const field of retryInputs(markup)) expect(field).not.toMatch(/disabled=""/);
+    };
+    const reference = { frame_ref: { kind: 'cell_frame' }, position_m: [0, 0, 0] };
+
+    // Relative joint move: never retried.
+    expectDisabled(render('motion.move_to_joint_target', { target_mode: 'relative' }));
+    expectEnabled(render('motion.move_to_joint_target', { target_mode: 'absolute' }));
+    // Relative pose without a target_reference: offset from the robot's own pose.
+    expectDisabled(render('motion.move_to_pose', { target_mode: 'relative' }));
+    // Relative pose with a target_reference: retried, so enabled.
+    expectEnabled(render('motion.move_to_pose', { target_mode: 'relative', target_reference: reference }));
+    expectEnabled(render('motion.move_to_pose', { target_mode: 'absolute' }));
+    // Paths follow the same rule as poses.
+    expectDisabled(render('motion.follow_cartesian_path', { target_mode: 'relative' }));
+    expectEnabled(render('motion.follow_cartesian_path', { target_mode: 'relative', target_reference: reference }));
+    expectEnabled(render('motion.follow_cartesian_path', { target_mode: 'absolute' }));
+    // Other motion nodes never show the retry reason, even in relative mode.
+    expect(render('motion.move_until_signal', { target_mode: 'relative' })).not.toContain(reason);
+  });
+
+  it('offers no value-source binding for the automatic retry fields', () => {
+    const entry: CatalogEntry = { ...timer, id: 'motion.move_to_joint_target', parameters: [
+      { id: 'target_mode', required: false, hasDefault: true, default: 'absolute',
+        schema: { type: 'string', enum: ['absolute', 'relative'] }, schemaHash: 'sha256:mode' },
+      { id: 'planning_timeout_s', required: false, hasDefault: true, default: 5,
+        schema: { type: 'number', minimum: 0 }, schemaHash: 'sha256:timeout' },
+      { id: 'automatic_retries', required: false, hasDefault: true, default: 3,
+        schema: { type: 'integer', minimum: 0, maximum: 10 }, schemaHash: 'sha256:retries' },
+      { id: 'automatic_retry_delay_s', required: false, hasDefault: true, default: 1,
+        schema: { type: 'number', minimum: 0, maximum: 60 }, schemaHash: 'sha256:delay' },
+    ] };
+    // The same gate that decides the binding menu: literal-only for both retry ids.
+    expect(catalogParameterSourceable(entry, 'automatic_retries')).toBe(false);
+    expect(catalogParameterSourceable(entry, 'automatic_retry_delay_s')).toBe(false);
+    expect(catalogParameterSourceable(entry, 'planning_timeout_s')).toBe(true);
+    const node: ProgramTreeNode = {
+      node_id: entry.id, instance_id: 'move', children: [],
+      parameters: { target_mode: 'absolute', planning_timeout_s: 5, automatic_retries: 3, automatic_retry_delay_s: 1 },
+    };
+    const markup = renderToStaticMarkup(<ProgramPropertyEditor
+      roots={[node]} selectedId="move" catalogEntries={[entry]}
+      program={authoringProgram([node], [])}
+      busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
+    />);
+    // A sourceable number carries the binding wrapper; the retry fields do not.
+    const fieldOf = (id: string) => {
+      const start = markup.indexOf(`id="property-move-${id}"`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const end = markup.indexOf('class="program-property', start + 1);
+      return markup.slice(start, end < 0 ? undefined : end);
+    };
+    expect(fieldOf('planning_timeout_s')).toContain('program-value-field');
+    expect(fieldOf('automatic_retries')).not.toContain('program-value-');
+    expect(fieldOf('automatic_retry_delay_s')).not.toContain('program-value-');
+  });
+
+  it('renders the preemption fields as literal-only catalog controls', () => {
+    const entry: CatalogEntry = { ...timer, id: 'motion.move_to_joint_target', parameters: [
+      { id: 'planning_timeout_s', required: false, hasDefault: true, default: 5,
+        schema: { type: 'number', minimum: 0 }, schemaHash: 'sha256:timeout' },
+      { id: 'preemption_priority', required: false, hasDefault: true, default: 0,
+        schema: { type: 'integer', minimum: 0, maximum: 100 }, schemaHash: 'sha256:priority' },
+      { id: 'preempted_result', required: false, hasDefault: true, default: 'failure',
+        schema: { type: 'string', enum: ['success', 'failure'] }, schemaHash: 'sha256:result' },
+    ] };
+    expect(catalogParameterSourceable(entry, 'preemption_priority')).toBe(false);
+    expect(catalogParameterSourceable(entry, 'preempted_result')).toBe(false);
+    expect(catalogParameterSourceable(entry, 'planning_timeout_s')).toBe(true);
+    const node: ProgramTreeNode = {
+      node_id: entry.id, instance_id: 'move', children: [],
+      parameters: { planning_timeout_s: 5, preemption_priority: 40, preempted_result: 'success' },
+    };
+    const markup = renderToStaticMarkup(<ProgramPropertyEditor
+      roots={[node]} selectedId="move" catalogEntries={[entry]}
+      program={authoringProgram([node], [])}
+      busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
+    />);
+    const fieldOf = (id: string) => {
+      const start = markup.indexOf(`id="property-move-${id}"`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const end = markup.indexOf('class="program-property', start + 1);
+      return markup.slice(start, end < 0 ? undefined : end);
+    };
+    expect(fieldOf('planning_timeout_s')).toContain('program-value-field');
+    expect(fieldOf('preemption_priority')).not.toContain('program-value-');
+    expect(fieldOf('preemption_priority')).toMatch(/<input[^>]*value="40"/);
+    expect(fieldOf('preempted_result')).not.toContain('program-value-');
+    expect(fieldOf('preempted_result')).toMatch(/<option value="&quot;success&quot;" selected="">success<\/option>/);
+  });
+
+  it('keeps the retry fields enabled when target_mode comes from a value source', () => {
+    const sourced = { target_mode: { kind: 'blackboard_key', reference: 'motion_mode' } } as const;
+    const retryFields = (markup: string) => ['automatic_retries', 'automatic_retry_delay_s'].map((id) => {
+      const start = markup.indexOf(`id="property-move-${id}"`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const end = markup.indexOf('class="program-property', start + 1);
+      return markup.slice(start, end < 0 ? undefined : end);
+    });
+    const render = (nodeId: string, parameters: ProgramTreeNode['parameters']) => {
+      const node: ProgramTreeNode = {
+        node_id: nodeId, instance_id: 'move', children: [],
+        parameters: { automatic_retries: 3, automatic_retry_delay_s: 1, ...parameters },
+        value_sources: sourced,
+      };
+      return renderToStaticMarkup(<ProgramPropertyEditor
+        roots={[node]} selectedId="move"
+        catalogEntries={[{ ...timer, id: nodeId, parameters: [
+          { id: 'target_mode', required: false, hasDefault: true, default: 'absolute',
+            schema: { type: 'string', enum: ['absolute', 'relative'] }, schemaHash: 'sha256:mode' },
+          { id: 'automatic_retries', required: false, hasDefault: true, default: 3,
+            schema: { type: 'integer', minimum: 0, maximum: 10 }, schemaHash: 'sha256:retries' },
+          { id: 'automatic_retry_delay_s', required: false, hasDefault: true, default: 1,
+            schema: { type: 'number', minimum: 0, maximum: 60 }, schemaHash: 'sha256:delay' },
+        ] }]}
+        program={authoringProgram([node], [])}
+        busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
+      />);
+    };
+    // A bound target_mode is resolved per attempt: no literal check, fields stay enabled.
+    for (const nodeId of ['motion.move_to_joint_target', 'motion.move_to_pose', 'motion.follow_cartesian_path']) {
+      const markup = render(nodeId, {});
+      expect(markup, nodeId).not.toContain('Not retried automatically');
+      for (const field of retryFields(markup)) expect(field, nodeId).not.toMatch(/disabled=""/);
+    }
+  });
+
   it('offers the current robot pose or joints for a move goal', () => {
     const poseEntry: CatalogEntry = { ...timer, id: 'motion.move_to_pose', parameters: [
       { id: 'target_role', required: true, schema: { type: 'string' },
@@ -554,6 +722,135 @@ describe('Program authoring panels', () => {
       expect(markup).not.toContain('exceeds Deployment');
       expect(JSON.stringify(node)).toBe(before);
       if (referenced) expect(markup).toContain('value="param.speed"');
+    }
+  });
+
+  it('authors io input nodes from the bound input signals, with timeout and level-only edge', () => {
+    const parsed = parseProgramBindingTransport(nativeBindingFixture, 'binding');
+    const digest = `sha256:${'a'.repeat(64)}`;
+    const binding = { ...parsed, target_role_bindings: parsed.target_role_bindings.map((row) => (
+      row.target_role_id === 'arm' ? { ...row, signal_role_bindings: [
+        { resource_role_id: 'part_present', signal_name: 'DI0', value_type: 'bool' as const,
+          direction: 'input' as const, transition_capability: 'sampled_only' as const,
+          signal_descriptor_digest: digest },
+        { resource_role_id: 'lamp', signal_name: 'DO1', value_type: 'bool' as const,
+          direction: 'output' as const, transition_capability: 'sampled_only' as const,
+          signal_descriptor_digest: digest },
+      ] } : row)) };
+    const deployment = { binding } as unknown as DeploymentWorkspaceResponse;
+    const wait: CatalogEntry = { ...timer, id: 'io.wait_for_input', parameters: [
+      { id: 'target_role', required: true,
+        schema: { type: 'string', 'x-manyforge-semantic-type': 'target_role' },
+        schemaHash: 'sha256:t', hasDefault: false },
+      { id: 'resource_role', required: true,
+        schema: { type: 'string', 'x-manyforge-semantic-type': 'resource_role' },
+        schemaHash: 'sha256:r', hasDefault: false },
+      { id: 'edge', required: false, schema: { enum: ['level', 'rising', 'falling'], default: 'level' },
+        schemaHash: 'sha256:e', hasDefault: true, default: 'level' },
+      { id: 'timeout_s', required: false,
+        schema: { type: 'number', minimum: 0.01, maximum: 3600 },
+        schemaHash: 'sha256:s', hasDefault: false },
+    ] };
+    const node: ProgramTreeNode = {
+      node_id: 'io.wait_for_input', instance_id: 'wait_part', children: [],
+      parameters: { target_role: 'arm', resource_role: 'part_present' },
+    };
+    const program = { ...authoringProgram([node]), target_roles: {
+      arm: { required_resource_roles: ['part_present', 'lamp', 'tray_pose'] },
+    } };
+    const render = (workspace: DeploymentWorkspaceResponse | null) => renderToStaticMarkup(
+      <ProgramPropertyEditor roots={[node]} selectedId="wait_part" catalogEntries={[wait]}
+        deploymentWorkspace={workspace} program={program}
+        busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
+    );
+    const bound = render(deployment);
+    expect(bound).toContain('part_present · DI0 (input)');
+    expect(bound).toContain('arm input signals');
+    expect(bound).not.toContain('DO1');
+    expect(bound).not.toContain('>lamp<');
+    expect(bound).not.toContain('tray_pose');
+    expect(bound).toMatch(/<option[^>]*disabled=""[^>]*>rising \(not supported yet\)</);
+    expect(bound).toMatch(/<option[^>]*disabled=""[^>]*>falling \(not supported yet\)</);
+    expect(bound).not.toMatch(/disabled=""[^>]*>level</);
+    expect(bound).toContain('Edge waits are not supported yet; only level waits run.');
+    expect(bound).toContain('placeholder="Wait forever"');
+    expect(bound).toContain('Empty waits forever. Otherwise the wait fails after 0.01–3600 s');
+    // Without binding info the ordinary resource-role picker applies.
+    const unbound = render(null);
+    expect(unbound).toContain('>tray_pose<');
+    expect(unbound).not.toContain('(input)');
+  });
+
+  it('authors io.set_output from the bound output signals with a literal or key value', () => {
+    const parsed = parseProgramBindingTransport(nativeBindingFixture, 'binding');
+    const digest = `sha256:${'a'.repeat(64)}`;
+    const binding = { ...parsed, target_role_bindings: parsed.target_role_bindings.map((row) => (
+      row.target_role_id === 'arm' ? { ...row, signal_role_bindings: [
+        { resource_role_id: 'part_present', signal_name: 'DI0', value_type: 'bool' as const,
+          direction: 'input' as const, transition_capability: 'sampled_only' as const,
+          signal_descriptor_digest: digest },
+        { resource_role_id: 'lamp', signal_name: 'DO1', value_type: 'bool' as const,
+          direction: 'output' as const, transition_capability: 'sampled_only' as const,
+          signal_descriptor_digest: digest },
+      ] } : row)) };
+    const setOutput: CatalogEntry = { ...timer, id: 'io.set_output', parameters: [
+      { id: 'target_role', required: true,
+        schema: { type: 'string', 'x-manyforge-semantic-type': 'target_role' },
+        schemaHash: 'sha256:t', hasDefault: false },
+      { id: 'resource_role', required: true,
+        schema: { type: 'string', 'x-manyforge-semantic-type': 'resource_role' },
+        schemaHash: 'sha256:r', hasDefault: false },
+      { id: 'value', required: true, schema: { type: 'boolean' }, schemaHash: 'sha256:v', hasDefault: false },
+    ] };
+    const node: ProgramTreeNode = {
+      node_id: 'io.set_output', instance_id: 'lamp_on', children: [],
+      parameters: { target_role: 'arm', resource_role: 'lamp', value: true },
+    };
+    const program = { ...authoringProgram([node]), target_roles: {
+      arm: { required_resource_roles: ['part_present', 'lamp'] },
+    } };
+    const markup = renderToStaticMarkup(
+      <ProgramPropertyEditor roots={[node]} selectedId="lamp_on" catalogEntries={[setOutput]}
+        deploymentWorkspace={{ binding } as unknown as DeploymentWorkspaceResponse} program={program}
+        busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
+    );
+    expect(markup).toContain('lamp · DO1 (output)');
+    expect(markup).toContain('arm output signals');
+    expect(markup).not.toContain('DI0');
+    // The value may be a literal or bound to a key ("Use key").
+    expect(catalogParameterSourceable(setOutput, 'value')).toBe(true);
+  });
+
+  it('edits the interrupt node rule: structured condition, stage labels after Apply, literal-only fields', () => {
+    const until: CatalogEntry = { ...timer, id: 'motion.move_until_signal', parameters: [
+      { id: 'target_role', required: true,
+        schema: { type: 'string', 'x-manyforge-semantic-type': 'target_role' },
+        schemaHash: 'sha256:t', hasDefault: false },
+      { id: 'interrupt_condition', required: true, schema: { type: 'object', 'x-manyforge-condition-grammar': 'interrupt_condition' },
+        schemaHash: 'sha256:c', hasDefault: false },
+      { id: 'priority', required: false, schema: { type: 'integer', minimum: 0, maximum: 100, default: 0 },
+        schemaHash: 'sha256:p', hasDefault: true, default: 0 },
+      { id: 'stop_entry_stage_id', required: false, schema: { type: 'string' }, schemaHash: 'sha256:s', hasDefault: false },
+      { id: 'success_through_stage_id', required: false, schema: { type: 'string' }, schemaHash: 'sha256:u', hasDefault: false },
+    ] };
+    const node: ProgramTreeNode = {
+      node_id: 'motion.move_until_signal', instance_id: 'seek', children: [],
+      parameters: { target_role: 'arm', interrupt_condition: {
+        compare: { operand: { key: 'node_outcome.seek' }, op: '==', value: 'completed' } } },
+    };
+    const program = { ...authoringProgram([node]), target_roles: { arm: {} } };
+    const markup = renderToStaticMarkup(
+      <ProgramPropertyEditor roots={[node]} selectedId="seek" catalogEntries={[until]}
+        program={program} busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
+    );
+    expect(markup).toContain('aria-label="condition operand"');
+    expect(markup).toContain('seek (node outcome)');
+    expect(markup).toContain('>signal_trip<');
+    expect(markup).toContain('Controller goal cancel');
+    expect(markup).toContain('available after Apply');
+    expect(markup).toContain('containment at a later stage fails the node');
+    for (const id of ['interrupt_condition', 'priority', 'stop_entry_stage_id', 'success_through_stage_id']) {
+      expect(catalogParameterSourceable(until, id)).toBe(false);
     }
   });
 
@@ -1007,6 +1304,8 @@ describe('Program authoring panels', () => {
       refresh: vi.fn(),
       dismissError: vi.fn(),
       activationOffer: null,
+      activationComponentHealth: {},
+      activationProgress: null,
       activationPending: false,
       activationWaiting: false,
       confirmActivationExecute: vi.fn(async () => {}),
@@ -1202,6 +1501,8 @@ describe('Program authoring panels', () => {
       refresh: vi.fn(),
       dismissError: vi.fn(),
       activationOffer: null,
+      activationComponentHealth: {},
+      activationProgress: null,
       activationPending: false,
       activationWaiting: false,
       confirmActivationExecute: vi.fn(async () => {}),

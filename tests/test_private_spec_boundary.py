@@ -15,9 +15,6 @@ _ALLOWLIST_FILES = (
     "docs/operations/ORIN_STACK_SETUP.md",
     "scripts/dev-agent-session-start.sh",
     "scripts/regen-public-contracts.py",
-    "scripts/qualification/runtime_collision_schedule_baseline.md",
-    "scripts/qualification/step18_offline_proof.md",
-    "scripts/run-step18-loaded-kernel-qualification.sh",
 )
 _RUNTIME_DIRECTORIES = (
     "docs/operations",

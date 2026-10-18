@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
+  ProgramInterventionStopScope,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
   ProgramTreeNode,
 } from '../types/api';
 
 const DEFAULT_OPERATOR_STOP_POLICY: ProgramOperatorStopPolicy = 'inherit';
+const DEFAULT_INTERVENTION_STOP_SCOPE: ProgramInterventionStopScope = 'all';
 /** Largest finite retry limit; 0 on the wire means Unlimited. */
 export const MAX_RETRY_LIMIT = 255;
 
@@ -16,6 +18,8 @@ export interface ProgramPolicyForm {
   retry_limit_mode: 'unlimited' | 'limited';
   /** The finite limit while limited; NaN while the field is empty. */
   retry_limit: number;
+  /** Written only while intervention is allowed; the default `all` is omitted. */
+  intervention_stop_scope: ProgramInterventionStopScope;
   operator_stop_policy: ProgramOperatorStopPolicy;
   execution_group_mode: 'inherit' | 'all' | 'named';
   execution_group_names: string;
@@ -31,6 +35,8 @@ export function effectiveProgramPolicy(node: ProgramTreeNode): ProgramPolicyForm
     allow_intervention: node.recovery_policy?.allow_intervention ?? false,
     retry_limit_mode: maxRetries === 0 ? 'unlimited' : 'limited',
     retry_limit: maxRetries === 0 ? 1 : maxRetries,
+    intervention_stop_scope: node.recovery_policy?.intervention_stop_scope
+      ?? DEFAULT_INTERVENTION_STOP_SCOPE,
     operator_stop_policy: node.operator_stop_policy ?? DEFAULT_OPERATOR_STOP_POLICY,
     execution_group_mode: Array.isArray(node.execution_groups)
       ? 'named' : node.execution_groups ?? 'inherit',
@@ -41,10 +47,14 @@ export function effectiveProgramPolicy(node: ProgramTreeNode): ProgramPolicyForm
 
 /** The authored two-field policy the form describes. */
 export function programRecoveryPolicy(form: ProgramPolicyForm): ProgramNodeRecoveryPolicy {
-  return {
+  const policy: ProgramNodeRecoveryPolicy = {
     allow_intervention: form.allow_intervention,
     max_retries: form.retry_limit_mode === 'unlimited' ? 0 : form.retry_limit,
   };
+  if (form.allow_intervention && form.intervention_stop_scope === 'own_groups') {
+    policy.intervention_stop_scope = 'own_groups';
+  }
+  return policy;
 }
 
 /** "Unlimited" or "N retries": the authored zero is never shown as 0. */
@@ -233,6 +243,34 @@ export function ProgramPolicyEditor({
           API) may correct it and Retry. Otherwise the failure ends the run. The
           same rule applies to every caller.
         </p>
+        {form.allow_intervention && (
+          <>
+            <label className="program-policy-field" htmlFor={fieldId(id, 'intervention_stop_scope')}>
+              Groups that stop
+              <select
+                id={fieldId(id, 'intervention_stop_scope')}
+                value={form.intervention_stop_scope}
+                disabled={busy}
+                onChange={(event) => {
+                  const next: ProgramPolicyForm = {
+                    ...form,
+                    intervention_stop_scope: event.target.value as ProgramInterventionStopScope,
+                  };
+                  setForm(next);
+                  commit(next);
+                }}
+              >
+                {selectOptions([
+                  ['all', 'All groups'],
+                  ['own_groups', "Only this node's groups"],
+                ])}
+              </select>
+            </label>
+            <p className="program-policy-help">
+              Which motion groups stop while the run waits for the operator.
+            </p>
+          </>
+        )}
         <label className="program-policy-field" htmlFor={fieldId(id, 'retry_limit_mode')}>
           Retry limit
           <select

@@ -27,7 +27,9 @@ from .models import (
     ActivationPreparationRequest,
     CanonicalEmptyActivationPreparationRequest,
     HistorianReconcileRequest,
+    IoSignalReadRequest,
     ManagerApplyRequest,
+    MockIoInputRequest,
     ManagerDeploymentCandidatePreviewRequest,
     AuthoringMutationContext,
     AuthoringMutationRecoveryRequest,
@@ -59,6 +61,7 @@ from .models import (
     SceneTransactionRequest,
     SkillExpansionRequest,
     StopIntentRequest,
+    GlobalIoRuleRecoveryIntentRequest,
     StopFaultRecoveryIntentRequest,
     validate_failure_details_and_origin,
 )
@@ -67,6 +70,7 @@ from .component_overview import ComponentOverviewFacts
 from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
 from .apply_follower import CommittedApplyFollower
 from .program_runner_client import ProgramRunnerClientError, ProgramRunnerPort
+from .program_cycle import program_operation_failures
 from .program_binding_transport import ProgramBindingTransportError
 from .program_binding_projection import (
     validate_applied_program_selection,
@@ -502,6 +506,14 @@ class HeadlessService:
     def execution_observation(self) -> dict[str, Any]:
         return self._execution().observation()
 
+    def execution_read_io_signal(self, request: IoSignalReadRequest) -> dict[str, Any]:
+        """One effect-free `query_target(kind=io_signal)` read."""
+        return self._execution().query_target(request.target_query())
+
+    def execution_set_mock_io_input(self, request: MockIoInputRequest) -> dict[str, Any]:
+        """Set one installed Mock input; the host refuses every other source."""
+        return self._execution().set_mock_io_input(request)
+
     def open_execution_observation_session(self) -> Any:
         return self._execution().open_observation_session()
 
@@ -628,7 +640,7 @@ class HeadlessService:
 
     def execution_recover_stop_fault(
         self,
-        request: StopFaultRecoveryIntentRequest,
+        request: StopFaultRecoveryIntentRequest | GlobalIoRuleRecoveryIntentRequest,
     ) -> dict[str, Any]:
         return self._execution().recover_stop_fault(request)
 
@@ -1393,7 +1405,8 @@ class HeadlessService:
         except (rfc8785.CanonicalizationError, TypeError, ValueError):
             calculated_policy_digest = None
         if (
-            set(projection) != expected_fields
+            # `operation_failures` is always present (empty when none).
+            set(projection) != expected_fields | {"operation_failures"}
             or projection.get("schema_version") != PROGRAM_RUN_STATUS_VERSION
             or not _bounded_text(owner_id, maximum_bytes=512)
             or not _bounded_text(owner_epoch, maximum_bytes=512)
@@ -1457,6 +1470,7 @@ class HeadlessService:
             )
             if state == "succeeded" and projection["origin"] is not None:
                 raise ValueError("a succeeded run carries no failure origin")
+            program_operation_failures(projection)
         except ValueError as exc:
             raise HeadlessApiError(
                 "program_runner_response_invalid",

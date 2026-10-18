@@ -270,8 +270,23 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
+  py::class_<ExpectedProviderDomainScopeDTO>(module, "ExpectedProviderDomainScopeDTO",
+                                             py::is_final())
+      .def(py::init<ProviderControlDomainDTO, ExpectedActiveControlConfigurationDTO>(),
+           py::arg("provider"), py::arg("expected_active_control_configuration"))
+      .def_readonly("provider", &ExpectedProviderDomainScopeDTO::provider)
+      .def_readonly("expected_active_control_configuration",
+                    &ExpectedProviderDomainScopeDTO::expected_active_control_configuration)
+      .def(py::self == py::self);
+
   py::class_<ExpectedControlDomainRevisionDTO>(module, "ExpectedControlDomainRevisionDTO",
                                                py::is_final())
+      .def(py::init<ControlDomainId, ControlDomainRevision, ExpectedProviderDomainScopeDTO>(),
+           py::arg("control_domain_id"), py::arg("control_domain_revision"), py::arg("provider"))
+      .def_property_readonly(
+          "provider",
+          [](const ExpectedControlDomainRevisionDTO& value) { return value.provider(); },
+          py::return_value_policy::reference_internal)
       .def(py::init<ControlDomainId, ControlDomainRevision, ControllerTopologyId, TopologyRevision,
                     ExpectedActiveControlConfigurationDTO,
                     std::vector<ExpectedControlBindingRevisionDTO>>(),
@@ -281,15 +296,30 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def_readonly("control_domain_id", &ExpectedControlDomainRevisionDTO::control_domain_id)
       .def_readonly("control_domain_revision",
                     &ExpectedControlDomainRevisionDTO::control_domain_revision)
-      .def_readonly("controller_topology_id",
-                    &ExpectedControlDomainRevisionDTO::controller_topology_id)
-      .def_readonly("topology_revision", &ExpectedControlDomainRevisionDTO::topology_revision)
-      .def_readonly("expected_active_control_configuration",
-                    &ExpectedControlDomainRevisionDTO::expected_active_control_configuration)
-      .def_property_readonly("expected_control_bindings",
-                             [](const ExpectedControlDomainRevisionDTO& value) {
-                               return immutable_snapshot(value.expected_control_bindings);
-                             })
+      .def_property_readonly(
+          "controller_topology_id",
+          [](const ExpectedControlDomainRevisionDTO& value) -> const ControllerTopologyId& {
+            return value.controller().controller_topology_id;
+          },
+          py::return_value_policy::reference_internal)
+      .def_property_readonly(
+          "topology_revision",
+          [](const ExpectedControlDomainRevisionDTO& value) -> const TopologyRevision& {
+            return value.controller().topology_revision;
+          },
+          py::return_value_policy::reference_internal)
+      .def_property_readonly(
+          "expected_active_control_configuration",
+          [](const ExpectedControlDomainRevisionDTO& value)
+              -> const ExpectedActiveControlConfigurationDTO& {
+            return value.controller().expected_active_control_configuration;
+          },
+          py::return_value_policy::reference_internal)
+      .def_property_readonly(
+          "expected_control_bindings",
+          [](const ExpectedControlDomainRevisionDTO& value) {
+            return immutable_snapshot(value.controller().expected_control_bindings);
+          })
       .def("locally_valid", &ExpectedControlDomainRevisionDTO::locally_valid)
       .def(py::self == py::self)
       .def(py::self != py::self);
@@ -429,6 +459,12 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
+  py::class_<DeviceConfiguredLifecycleLimitDTO>(module, "DeviceConfiguredLifecycleLimitDTO",
+                                                py::is_final())
+      .def(py::init<>())
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
   py::class_<LifecycleIntentPlanDTO>(module, "LifecycleIntentPlanDTO", py::is_final())
       .def(py::init<ComponentLifecycleIntentKindDTO, ComponentLifecycleStateDTO,
                     std::optional<LifecyclePredicateDTO>, LifecyclePredicateDTO, std::int64_t,
@@ -436,12 +472,21 @@ void register_component_lifecycle_bindings(py::module_& module) {
            py::arg("intent"), py::arg("requested_state"), py::arg("recover_target_eligibility"),
            py::arg("requested_postcondition"), py::arg("timeout_duration_ns"),
            py::arg("transitions"))
+      .def(py::init<ComponentLifecycleIntentKindDTO, ComponentLifecycleStateDTO,
+                    std::optional<LifecyclePredicateDTO>, LifecyclePredicateDTO,
+                    LifecyclePlanTimeoutPolicyDTO, std::vector<LifecyclePrimitiveTransitionDTO>>(),
+           py::arg("intent"), py::arg("requested_state"), py::arg("recover_target_eligibility"),
+           py::arg("requested_postcondition"), py::arg("timeout_policy"), py::arg("transitions"))
       .def_readonly("intent", &LifecycleIntentPlanDTO::intent)
       .def_readonly("requested_state", &LifecycleIntentPlanDTO::requested_state)
       .def_readonly("recover_target_eligibility",
                     &LifecycleIntentPlanDTO::recover_target_eligibility)
       .def_readonly("requested_postcondition", &LifecycleIntentPlanDTO::requested_postcondition)
-      .def_readonly("timeout_duration_ns", &LifecycleIntentPlanDTO::timeout_duration_ns)
+      .def_property_readonly("timeout_duration_ns",
+                             [](const LifecycleIntentPlanDTO& value) {
+                               return std::get<std::int64_t>(value.timeout_policy);
+                             })
+      .def_readonly("timeout_policy", &LifecycleIntentPlanDTO::timeout_policy)
       .def_property_readonly(
           "transitions",
           [](const LifecycleIntentPlanDTO& value) { return immutable_snapshot(value.transitions); })
@@ -688,8 +733,54 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
+  py::class_<ProviderDomainActiveConfigurationDTO>(module, "ProviderDomainActiveConfigurationDTO",
+                                                   py::is_final())
+      .def(py::init<ActiveControlConfigurationId, ActiveControlConfigurationGeneration,
+                    RuntimeUnitId, RuntimeEpoch, std::uint64_t, ContentDigest>(),
+           py::arg("active_control_configuration_id"),
+           py::arg("active_control_configuration_generation"), py::arg("source_runtime_unit_id"),
+           py::arg("source_runtime_epoch"), py::arg("source_sequence"),
+           py::arg("signal_configuration_digest"))
+      .def_readonly("active_control_configuration_id",
+                    &ProviderDomainActiveConfigurationDTO::active_control_configuration_id)
+      .def_readonly("active_control_configuration_generation",
+                    &ProviderDomainActiveConfigurationDTO::active_control_configuration_generation)
+      .def_readonly("source_runtime_unit_id",
+                    &ProviderDomainActiveConfigurationDTO::source_runtime_unit_id)
+      .def_readonly("source_runtime_epoch",
+                    &ProviderDomainActiveConfigurationDTO::source_runtime_epoch)
+      .def_readonly("source_sequence", &ProviderDomainActiveConfigurationDTO::source_sequence)
+      .def_readonly("signal_configuration_digest",
+                    &ProviderDomainActiveConfigurationDTO::signal_configuration_digest)
+      .def("locally_valid", &ProviderDomainActiveConfigurationDTO::locally_valid)
+      .def(py::self == py::self);
+
+  py::class_<ResolvedProviderDomainScopeDTO>(module, "ResolvedProviderDomainScopeDTO",
+                                             py::is_final())
+      .def(py::init<ProviderControlDomainDTO, RuntimeEpoch,
+                    std::optional<ProviderDomainActiveConfigurationDTO>, std::vector<ResourceId>>(),
+           py::arg("provider"), py::arg("provider_runtime_epoch"),
+           py::arg("active_control_configuration") = std::nullopt,
+           py::arg("output_resources") = std::vector<ResourceId>{})
+      .def_readonly("provider", &ResolvedProviderDomainScopeDTO::provider)
+      .def_readonly("provider_runtime_epoch",
+                    &ResolvedProviderDomainScopeDTO::provider_runtime_epoch)
+      .def_readonly("active_control_configuration",
+                    &ResolvedProviderDomainScopeDTO::active_control_configuration)
+      .def_property_readonly("output_resources",
+                             [](const ResolvedProviderDomainScopeDTO& value) {
+                               return immutable_snapshot(value.output_resources);
+                             })
+      .def(py::self == py::self);
+
   py::class_<ResolvedLifecycleControlDomainScopeDTO>(
       module, "ResolvedLifecycleControlDomainScopeDTO", py::is_final())
+      .def(py::init<ControlDomainId, ControlDomainRevision, ResolvedProviderDomainScopeDTO>(),
+           py::arg("control_domain_id"), py::arg("control_domain_revision"), py::arg("provider"))
+      .def_property_readonly(
+          "provider",
+          [](const ResolvedLifecycleControlDomainScopeDTO& value) { return value.provider(); },
+          py::return_value_policy::reference_internal)
       .def(py::init<ControlDomainId, ControlDomainRevision, ControllerTopologyId, TopologyRevision,
                     std::optional<ActiveControlConfigurationDTO>,
                     std::vector<ExpectedControlBindingRevisionDTO>, std::vector<ResourceId>>(),
@@ -700,18 +791,33 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def_readonly("control_domain_id", &ResolvedLifecycleControlDomainScopeDTO::control_domain_id)
       .def_readonly("control_domain_revision",
                     &ResolvedLifecycleControlDomainScopeDTO::control_domain_revision)
-      .def_readonly("controller_topology_id",
-                    &ResolvedLifecycleControlDomainScopeDTO::controller_topology_id)
-      .def_readonly("topology_revision", &ResolvedLifecycleControlDomainScopeDTO::topology_revision)
-      .def_readonly("active_control_configuration",
-                    &ResolvedLifecycleControlDomainScopeDTO::active_control_configuration)
-      .def_property_readonly("current_control_bindings",
-                             [](const ResolvedLifecycleControlDomainScopeDTO& value) {
-                               return immutable_snapshot(value.current_control_bindings);
-                             })
+      .def_property_readonly(
+          "controller_topology_id",
+          [](const ResolvedLifecycleControlDomainScopeDTO& value) -> const ControllerTopologyId& {
+            return value.controller().controller_topology_id;
+          },
+          py::return_value_policy::reference_internal)
+      .def_property_readonly(
+          "topology_revision",
+          [](const ResolvedLifecycleControlDomainScopeDTO& value) -> const TopologyRevision& {
+            return value.controller().topology_revision;
+          },
+          py::return_value_policy::reference_internal)
+      .def_property_readonly(
+          "active_control_configuration",
+          [](const ResolvedLifecycleControlDomainScopeDTO& value)
+              -> const std::optional<ActiveControlConfigurationDTO>& {
+            return value.controller().active_control_configuration;
+          },
+          py::return_value_policy::reference_internal)
+      .def_property_readonly(
+          "current_control_bindings",
+          [](const ResolvedLifecycleControlDomainScopeDTO& value) {
+            return immutable_snapshot(value.controller().current_control_bindings);
+          })
       .def_property_readonly("current_resources",
                              [](const ResolvedLifecycleControlDomainScopeDTO& value) {
-                               return immutable_snapshot(value.current_resources);
+                               return immutable_snapshot(value.controller().current_resources);
                              })
       .def("locally_valid", &ResolvedLifecycleControlDomainScopeDTO::locally_valid)
       .def(py::self == py::self)
@@ -775,8 +881,49 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
+  py::class_<ProviderConfigurationFenceOccurrenceDTO>(
+      module, "ProviderConfigurationFenceOccurrenceDTO", py::is_final())
+      .def(py::init<ControllableComponentId, ProviderInstanceId, ContentDigest,
+                    std::vector<ResourceId>>(),
+           py::arg("controllable_component_id"), py::arg("provider_instance_id"),
+           py::arg("signal_configuration_digest"),
+           py::arg("output_resources") = std::vector<ResourceId>{})
+      .def_readonly("controllable_component_id",
+                    &ProviderConfigurationFenceOccurrenceDTO::controllable_component_id)
+      .def_readonly("provider_instance_id",
+                    &ProviderConfigurationFenceOccurrenceDTO::provider_instance_id)
+      .def_readonly("signal_configuration_digest",
+                    &ProviderConfigurationFenceOccurrenceDTO::signal_configuration_digest)
+      .def_property_readonly("output_resources",
+                             [](const ProviderConfigurationFenceOccurrenceDTO& value) {
+                               return immutable_snapshot(value.output_resources);
+                             })
+      .def("valid", &ProviderConfigurationFenceOccurrenceDTO::valid)
+      .def(py::self == py::self);
+
+  py::class_<ProviderConfigurationFenceDomainDTO>(module, "ProviderConfigurationFenceDomainDTO",
+                                                  py::is_final())
+      .def(py::init<std::optional<ProviderConfigurationFenceOccurrenceDTO>,
+                    std::optional<ProviderConfigurationFenceOccurrenceDTO>>(),
+           py::arg("predecessor_provider") = std::nullopt,
+           py::arg("candidate_provider") = std::nullopt)
+      .def_readonly("predecessor_provider",
+                    &ProviderConfigurationFenceDomainDTO::predecessor_provider)
+      .def_readonly("candidate_provider", &ProviderConfigurationFenceDomainDTO::candidate_provider)
+      .def(py::self == py::self);
+
   py::class_<ConfigurationFenceDomainScopeDTO>(module, "ConfigurationFenceDomainScopeDTO",
                                                py::is_final())
+      .def(py::init<ControlDomainId, std::optional<ControlDomainRevision>,
+                    std::optional<ControlDomainRevision>, ProviderConfigurationFenceDomainDTO>(),
+           py::arg("control_domain_id"), py::arg("predecessor_control_domain_revision"),
+           py::arg("candidate_control_domain_revision"), py::arg("provider"))
+      .def_property_readonly(
+          "provider",
+          [](const ConfigurationFenceDomainScopeDTO& value) {
+            return std::get_if<ProviderConfigurationFenceDomainDTO>(&value.payload);
+          },
+          py::return_value_policy::reference_internal)
       .def(py::init<ControlDomainId, std::optional<ControlDomainRevision>,
                     std::optional<ControlDomainRevision>>(),
            py::arg("control_domain_id"),

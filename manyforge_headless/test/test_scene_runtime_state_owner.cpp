@@ -358,6 +358,11 @@ TEST(SceneRuntimeStateOwner,
   EXPECT_THROW(
       owner.CompleteReplay(altered_batch, altered_batch.observations.size()),
       SceneRuntimeStateConflictError);
+  altered_batch = failed_batch;
+  altered_batch.observations.front().payload_quality = PoseSourceQuality::kUnknown;
+  EXPECT_THROW(
+      owner.CompleteReplay(altered_batch, altered_batch.observations.size()),
+      SceneRuntimeStateConflictError);
   EXPECT_EQ(owner.Snapshot().state, SceneInitializationState::kReplaying);
   owner.FailReplay(failed_batch, "backend apply failed");
   EXPECT_EQ(owner.Snapshot().state, SceneInitializationState::kFailed);
@@ -458,12 +463,14 @@ TEST(SceneRuntimeStateOwner, EmitsOneClosedCanonicalProjection) {
 
   const auto bytes = content_identity::canonical_json(
       SceneRuntimeStateValue(owner.Snapshot()));
-  EXPECT_NE(bytes.find("\"api_version\":\"manyforge.scene_runtime_state.v1\""),
+  EXPECT_NE(bytes.find("\"api_version\":\"manyforge.scene_runtime_state.v2\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"state\":\"closed\""), std::string::npos);
   EXPECT_NE(bytes.find("\"initialization_token\":\"token-1\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"buffered\":true"), std::string::npos);
+  EXPECT_NE(bytes.find("\"payload_quality\":\"good\""), std::string::npos);
+  EXPECT_EQ(bytes.find("\"quality\""), std::string::npos);
 }
 
 } // namespace

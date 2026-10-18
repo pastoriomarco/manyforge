@@ -1,5 +1,12 @@
 #include <gtest/gtest.h>
 
+#include "../../manyforge_deployment/test/maintained_interrupt_program_fixture.hpp"
+#include "managed_kernel_apply_fence_owner.hpp"
+#include "product_backed_runtime_participant_resolver.hpp"
+#include <manyforge_core/io_rule_stop_response.hpp>
+#include <manyforge_core/io_signal_subsystem.hpp>
+#include <manyforge_core/types/program_io_condition.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -405,6 +412,174 @@ make_runtime_context(
           provider_epoch};
 }
 
+[[nodiscard]] RuntimeContext make_captured_runtime_context(
+    const deployment::test::MaintainedInterruptProgramFixture &fixture) {
+  const auto target = deployment::resolve_runtime_program_target(
+      *fixture.binding, core::TargetRoleId("arm"),
+      core::CapabilityId("execution.trajectory.execute"), *fixture.bundle,
+      fixture.model_map);
+  if (!target.control_binding() || !target.control_domain() ||
+      !target.desired_route())
+    throw std::logic_error("maintained interrupt target has no physical route");
+  const auto &control = *target.control_binding();
+  const auto &graph = fixture.bundle->value().cell_graph;
+  const auto &component = require_one(
+      graph.controllable_components, control.controllable_component_id,
+      [](const auto &value) { return value.controllable_component_id; },
+      "component");
+  const auto &domain = require_one(
+      graph.control_domains, control.control_domain_id,
+      [](const auto &value) { return value.control_domain_id; }, "domain");
+  const auto &binding = require_one(
+      graph.control_bindings, control.control_binding_id,
+      [](const auto &value) { return value.control_binding_id; }, "binding");
+  const auto &desired = require_one(
+      fixture.bundle->value().desired_control_configurations,
+      control.control_domain_id,
+      [](const auto &value) { return value.control_domain_id; },
+      "desired configuration");
+  const core::RuntimeEpoch provider_epoch("provider.epoch.native-cclc.1");
+  std::set<core::RuntimeUnitId> units(component.runtime_unit_ids.begin(),
+                                      component.runtime_unit_ids.end());
+  units.insert(domain.runtime_unit_ids.begin(), domain.runtime_unit_ids.end());
+  units.insert(control.provider_runtime_unit_id);
+  std::vector<deployment::RuntimeProviderEpochFactDTO> providers{
+      {control.provider_instance_id, control.provider_runtime_unit_id,
+       provider_epoch}};
+  std::vector<deployment::RuntimeProgramTargetBinding> supporting;
+  for (const auto *capability :
+       {"planning.motion.pose_goal", "planning.profile.balanced",
+        "planning.trajectory.time_parameterized",
+        "validation.trajectory.non_collision"}) {
+    auto selected = deployment::resolve_runtime_program_target(
+        *fixture.binding, core::TargetRoleId("arm"),
+        core::CapabilityId(capability), *fixture.bundle, fixture.model_map);
+    if (!selected.capability_provider_binding() || selected.control_binding())
+      throw std::logic_error(
+          "maintained motion support is not provider-backed");
+    const auto &provider = *selected.capability_provider_binding();
+    std::set<core::RuntimeUnitId> provider_units;
+    for (const auto &endpoint : provider.endpoint_bindings)
+      if (endpoint.source_kind ==
+          core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+        const auto *unit =
+            std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+        if (!unit)
+          throw std::logic_error("maintained provider endpoint type differs");
+        provider_units.insert(*unit);
+      }
+    if (provider_units.size() != 1U)
+      throw std::logic_error(
+          "maintained motion support has no sole runtime owner");
+    const auto &unit = *provider_units.begin();
+    units.insert(unit);
+    const auto same =
+        std::find_if(providers.begin(), providers.end(), [&](const auto &row) {
+          return row.provider_instance_id == provider.provider_instance_id;
+        });
+    if (same == providers.end())
+      providers.push_back(
+          {provider.provider_instance_id, unit,
+           core::RuntimeEpoch("capture.fixture.provider." +
+                              provider.provider_instance_id.value())});
+    else if (same->provider_runtime_unit_id != unit)
+      throw std::logic_error(
+          "maintained provider aliases disagree on runtime owner");
+    supporting.push_back(std::move(selected));
+  }
+  std::vector<core::RuntimeUnitEpochBindingDTO> epochs;
+  for (const auto &unit : units)
+    epochs.push_back(
+        {unit, core::RuntimeEpoch("capture.fixture." + unit.value())});
+  auto prototype = core::verify_runtime_participant_binding(
+      deployment::build_runtime_participant_binding_dto(
+          target,
+          {*target.desired_route(),
+           core::ActiveControlConfigurationId("capture.fixture.configuration"),
+           core::ActiveControlConfigurationGeneration(1U), std::move(epochs),
+           std::move(providers)},
+          supporting));
+  if (!prototype.ok())
+    throw std::logic_error(prototype.error().message);
+  return {std::move(prototype.value()),
+          &component,
+          &domain,
+          &binding,
+          &desired,
+          provider_epoch};
+}
+
+[[nodiscard]] std::vector<core::RuntimeParticipantBinding>
+make_captured_physical_representatives(
+    const deployment::test::MaintainedInterruptProgramFixture &fixture,
+    const core::RuntimeParticipantBinding &motion) {
+  deployment::FilesystemCatalogArtifactStore catalogs(fixture.package_root);
+  const auto inventory =
+      deployment::compile_direct_control_program_binding_inventory(
+          *fixture.bundle, fixture.model_map, catalogs);
+  std::vector<std::shared_ptr<const deployment::ProgramBinding>> direct =
+      inventory.motion;
+  direct.insert(direct.end(), inventory.gripper.begin(),
+                inventory.gripper.end());
+  std::vector<core::RuntimeParticipantBinding> result{motion};
+  const auto &primary = *motion.value().control_path;
+  for (const auto &program : direct)
+    for (const auto &target : program->value().target_role_bindings)
+      for (const auto &capability : target.capability_bindings) {
+        if (!capability.control_binding ||
+            capability.control_binding->control_binding_id ==
+                primary.control_binding_id)
+          continue;
+        const auto selected = deployment::resolve_runtime_program_target(
+            *program, target.target_role_id, capability.capability_id,
+            *fixture.bundle, fixture.model_map);
+        if (!selected.control_binding() || !selected.desired_route())
+          throw std::logic_error(
+              "maintained desired binding has no physical target");
+        const auto &control = *selected.control_binding();
+        auto sealed = core::verify_runtime_participant_binding(
+            deployment::build_runtime_participant_binding_dto(
+                selected,
+                {*selected.desired_route(),
+                 core::ActiveControlConfigurationId(
+                     "capture.fixture." + control.control_domain_id.value()),
+                 core::ActiveControlConfigurationGeneration(1U),
+                 motion.value().runtime_unit_epochs,
+                 {{control.provider_instance_id,
+                   control.provider_runtime_unit_id,
+                   primary.provider_runtime_epoch}}}));
+        if (!sealed.ok())
+          throw std::logic_error(sealed.error().message);
+        result.push_back(std::move(sealed.value()));
+      }
+  std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) {
+    return a.value().control_path->control_binding_id <
+           b.value().control_path->control_binding_id;
+  });
+  if (result.size() !=
+      fixture.bundle->value().cell_graph.control_bindings.size())
+    throw std::logic_error(
+        "maintained physical representatives do not cover the sealed graph");
+  for (const auto &desired :
+       fixture.bundle->value().desired_control_configurations)
+    for (const auto &route : desired.binding_routes) {
+      const auto &actual = require_one(
+          result, route.control_binding_id,
+          [](const auto &row) {
+            return row.value().control_path->control_binding_id;
+          },
+          "desired physical representative");
+      const auto &path = *actual.value().control_path;
+      if (path.control_binding_revision != route.control_binding_revision ||
+          path.control_domain_id != desired.control_domain_id ||
+          path.control_domain_revision != desired.control_domain_revision ||
+          path.control_route_id != route.control_route_id)
+        throw std::logic_error(
+            "maintained physical representative differs from its sealed route");
+    }
+  return result;
+}
+
 [[nodiscard]] core::RuntimeRouteConfigurationReadbackDTO
 make_retained_plan_readback(const RuntimeContext &runtime) {
   const auto &desired = *runtime.desired;
@@ -429,7 +604,8 @@ TEST(RetainedNativeCCLCRuntime,
   const deployment::FilesystemCanonicalEmptyRetainedBundleSource empty_source(
       std::filesystem::path(MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE_ROOT));
   const auto empty = empty_source.load_verified();
-  auto port = MakeVerifiedEmptyCellRoutePublicationOwner(empty.retained_bundle());
+  auto port =
+      MakeVerifiedNoControllerRoutePublicationOwner(empty.retained_bundle());
   ASSERT_TRUE(port.ok()) << port.error().message;
 
   const auto populated = load_fixture_bundle(MANYFORGE_CCLC_READINESS_FIXTURE_ROOT);
@@ -442,7 +618,101 @@ TEST(RetainedNativeCCLCRuntime,
   const auto publish = port.value()->PublishAndReadBackRouteConfiguration(physical, {});
   ASSERT_FALSE(publish.ok());
   EXPECT_EQ(publish.error().code, "empty_cell_physical_route_unavailable");
-  EXPECT_FALSE(MakeVerifiedEmptyCellRoutePublicationOwner(*populated).ok());
+  EXPECT_FALSE(MakeVerifiedNoControllerRoutePublicationOwner(*populated).ok());
+}
+
+TEST(RetainedNativeCCLCRuntime,
+     ProviderDriverReceivesExactIntentAndChecksGenerationAtMutation) {
+  const core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
+      core::ControlDomainId("domain.io"),
+      core::ControlDomainRevision("domain.io.revision"),
+      core::ProviderInstanceId("driver.io"),
+      core::ProviderManifestId("manyforge.provider.io_signals"),
+      core::ProviderManifestRevision(Sha('1')),
+      core::RuntimeUnitId("host.io"),
+      core::RuntimeEpoch("host.epoch"),
+      core::ContentDigest(Sha('2'))};
+  const core::ControllableComponentId component("device.io");
+  core::FakeClock clock;
+  clock.set(100);
+  std::mutex driver_mutex;
+  std::uint64_t generation = 7U;
+  auto state = core::ComponentLifecycleStateDTO::kPrepared;
+  std::optional<core::BrandLifecyclePrimitiveIntentDTO> actual_intent;
+  unsigned calls = 0U;
+  const auto port =
+      RetainedExternallyManagedBrandLifecyclePort::CreateForProviderDomain(
+          component, occurrence,
+          [&](const auto &, core::TimePoint) {
+            std::lock_guard lock(driver_mutex);
+            return core::Result<RetainedExternallyManagedDomainSnapshot>::Ok(
+                {generation,
+                 state,
+                 false,
+                 {{core::LifecycleFactId("io.driver.enabled"),
+                   {core::LifecycleFactValueKindDTO::kBoolean,
+                    state == core::ComponentLifecycleStateDTO::kActive,
+                    std::nullopt, std::nullopt}}},
+                 std::nullopt});
+          },
+          clock, 1'000,
+          [&](const core::BrandLifecyclePrimitiveIntentDTO &intent,
+              std::stop_token) {
+            std::lock_guard lock(driver_mutex);
+            ++calls;
+            actual_intent = intent;
+            if (intent.expected_observation_generation != generation)
+              return RetainedExternallyManagedPrimitiveOutcome{
+                  core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched,
+                  core::LifecyclePrimitiveEffectDTO::kNone, std::nullopt,
+                  core::ErrorDTO{"driver_generation_stale",
+                                 "actual driver changed before mutation",
+                                 {}}};
+            ++generation;
+            state = core::ComponentLifecycleStateDTO::kActive;
+            return RetainedExternallyManagedPrimitiveOutcome{
+                core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown,
+                core::LifecyclePrimitiveEffectDTO::kObserved,
+                core::LifecyclePrimitiveKnownResultDTO::kSucceeded,
+                std::nullopt};
+          });
+  ASSERT_TRUE(port.ok()) << port.error().message;
+  const core::BrandLifecyclePrimitiveIntentDTO intent{
+      core::LifecycleTransactionId("actual.lifecycle"),
+      core::LifecycleTransactionGeneration(3U),
+      component,
+      occurrence.control_domain_id,
+      occurrence.control_domain_revision,
+      occurrence.provider_instance_id,
+      occurrence.provider_manifest_id,
+      occurrence.provider_manifest_revision,
+      occurrence.provider_runtime_unit_id,
+      occurrence.provider_runtime_epoch,
+      core::LifecyclePrimitiveId("io.provider.enable"),
+      core::LifecyclePrimitiveAttemptId("attempt.1"),
+      7U,
+      500};
+  const auto sent = port.value()->Dispatch(intent, {});
+  EXPECT_EQ(sent.dispatch_state,
+            core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown);
+  ASSERT_TRUE(actual_intent);
+  EXPECT_EQ(*actual_intent, intent);
+  EXPECT_EQ(generation, 8U);
+  EXPECT_EQ(port.value()->Dispatch(intent, {}).dispatch_state,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(generation, 8U);
+  EXPECT_EQ(calls, 2U);
+  auto foreign = intent;
+  foreign.controllable_component_id =
+      core::ControllableComponentId("foreign.component");
+  EXPECT_EQ(port.value()->Dispatch(foreign, {}).dispatch_state,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  std::stop_source cancellation;
+  cancellation.request_stop();
+  EXPECT_EQ(
+      port.value()->Dispatch(intent, cancellation.get_token()).dispatch_state,
+      core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(calls, 2U);
 }
 
 TEST(RetainedNativeApplyPlanning, RetainedRouteIsExactCurrentFactBeforeAnyEffects) {
@@ -800,7 +1070,9 @@ public:
   }
   [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
   UpdateCellAdmissionReadiness(
-      const core::CellAdmissionReadinessSnapshotDTO &) override {
+      const core::CellAdmissionReadinessSnapshotDTO &,
+      std::shared_ptr<core::IIoSignalService>* actual_retired_service = nullptr) override {
+    if (actual_retired_service) actual_retired_service->reset();
     return core::Result<core::AuthoringAdmissionDTO>::Ok(
         GetAuthoringAdmission());
   }
@@ -1035,9 +1307,13 @@ class AdmissionEngine final
       public core::IResolvedPreparedParticipantExecutionEngine,
       public core::IControlDomainExecutionPort {
 public:
+  explicit AdmissionEngine(bool rule_fixture = false)
+      : rule_fixture_(rule_fixture) {}
+
   [[nodiscard]] core::Result<std::uint64_t>
   execute(const core::ExecuteRequestDTO &) {
     ++execute_count_;
+    std::lock_guard lock(status_mutex_);
     status_.state = core::ExecutionState::kPlanning;
     status_.execution_id = 1U;
     return core::Result<std::uint64_t>::Ok(1U);
@@ -1189,7 +1465,79 @@ public:
     return Unsupported<void>();
   }
   [[nodiscard]] core::ExecutionStatus get_status() const override {
+    std::lock_guard lock(status_mutex_);
     return status_;
+  }
+
+  void MarkExecuting() {
+    core::ExecutionState before;
+    {
+      std::lock_guard lock(status_mutex_);
+      before = status_.state;
+      status_.state = core::ExecutionState::kExecuting;
+    }
+    const core::KernelEvent event{
+        core::KernelEventType::kStateTransition, 1U, 0, before,
+        core::ExecutionState::kExecuting,        {}, {}};
+    for (const auto &[id, callback] : callbacks_) {
+      (void)id;
+      callback(event);
+    }
+  }
+
+  [[nodiscard]] core::AddressedParticipantStopFenceDisposition
+  fence_addressed_participant_stop(
+      std::uint64_t execution_id) noexcept override {
+    return rule_fixture_ && execution_id == 1U
+               ? core::AddressedParticipantStopFenceDisposition::
+                     kDispatchCommitted
+               : core::AddressedParticipantStopFenceDisposition::kUnknown;
+  }
+
+  [[nodiscard]] core::Result<core::AddressedParticipantStopSettlementDTO>
+  settle_addressed_participant_stop(
+      const core::AddressedParticipantStopSettlementRequestDTO &request)
+      override {
+    if (!rule_fixture_)
+      return core::IResolvedParticipantExecutionEngine::
+          settle_addressed_participant_stop(request);
+    const auto &stage = request.containment.request;
+    const auto &certificate = request.aggregate_stop_certificate;
+    if (request.execution_id != 1U || !certificate.locally_valid() ||
+        request.effect_prevented_before_dispatch ||
+        request.containment.attempt_disposition !=
+            core::StopStageAttemptDispositionDTO::kDispatched ||
+        request.containment.outcome !=
+            core::ParticipantStopStageOutcomeDTO::kSucceeded ||
+        stage.stop_id != certificate.stop_id ||
+        stage.stop_generation != certificate.stop_generation)
+      return core::Result<core::AddressedParticipantStopSettlementDTO>::Err(
+          {"fixture_stop_identity_mismatch",
+           "exact fixture Stop settlement differs",
+           {}});
+    {
+      std::lock_guard lock(status_mutex_);
+      status_.state = core::ExecutionState::kStopped;
+    }
+    core::KernelRecoveryAssessmentDTO recovery;
+    recovery.assessment_revision = 1U;
+    recovery.control_command_epoch = 1U;
+    recovery.execution_id = 1U;
+    recovery.execution_state = core::ExecutionState::kStopped;
+    recovery.recovery_class = core::RecoveryClass::kOrdinaryOperatorStop;
+    recovery.status = core::RecoveryAssessmentStatus::kRetryReady;
+    recovery.retry_admissible = true;
+    recovery.stop_certificate_id = certificate.stop_certificate_id.value();
+    recovery.stop_certificate_revision =
+        certificate.stop_certificate_revision.value();
+    recovery.stop_owner_generation = certificate.stop_generation.value();
+    recovery.backend_stop_confirmed = true;
+    recovery.allowed_actions = {core::RecoveryAction::kReplanFromStoppedState,
+                                core::RecoveryAction::kResetCycle};
+    return core::Result<core::AddressedParticipantStopSettlementDTO>::Ok(
+        {request.execution_id, certificate, stage.operation_id,
+         stage.participant_id, stage.controller_goal_id,
+         stage.controller_goal_generation, recovery});
   }
   [[nodiscard]] core::SubscriptionHandle
   subscribe_events(core::EventCallback callback) override {
@@ -1201,10 +1549,43 @@ public:
     callbacks_.erase(handle.id);
   }
   [[nodiscard]] core::ParticipantStopStageResultDTO
-  TranslateStopStage(const core::ResolvedParticipantStopStageDTO &,
+  TranslateStopStage(const core::ResolvedParticipantStopStageDTO &stage,
                      const core::RemainingStopBudgetDTO &,
                      std::stop_token) override {
-    throw std::logic_error("test did not request Stop-stage translation");
+    if (!rule_fixture_)
+      throw std::logic_error("test did not request Stop-stage translation");
+    // The existing engine is the sole simulated effect/evidence boundary.
+    // Every returned identity and evidence requirement is the actual prepared
+    // stage handed to it by the Kernel; no product or plan is manufactured.
+    const auto &command =
+        stage.participant_stop_plan.stage_commands.at(stage.stage_index);
+    std::vector<core::StopEvidenceItemDTO> evidence;
+    for (const auto &item : command.resolved_stage.evidence_requirements)
+      evidence.push_back(
+          {item.requirement.evidence_item_id, item.requirement.evidence_kind,
+           core::StopEvidenceItemStateDTO::kSatisfied, item.resolved_source,
+           item.resolved_source.runtime_target.provider_runtime_epoch, 1U, 0,
+           core::JsonValueDTO{core::JsonObjectDTO{
+               {"completed_by_natural_completion", core::JsonValueDTO{false}}}},
+           std::nullopt});
+    std::optional<core::MotionControlledStopMode> mode;
+    if (command.resolved_stage.containment_command.command_kind ==
+        core::StopContainmentCommandKind::kMotionControlledStop)
+      mode = stage.participant_stop_plan.participant_stop_profile->stop_mode ==
+                     core::MotionInterruptStopMode::kSpringBackHold
+                 ? core::MotionControlledStopMode::kSpringBackHold
+                 : core::MotionControlledStopMode::kSoftOnPath;
+    return {stage,
+            core::StopStageAttemptDispositionDTO::kDispatched,
+            core::ParticipantStopStageOutcomeDTO::kSucceeded,
+            mode,
+            std::nullopt,
+            1U,
+            stage.provider_runtime_epoch,
+            1U,
+            0,
+            std::move(evidence),
+            std::nullopt};
   }
 
   [[nodiscard]] std::size_t execute_count() const noexcept {
@@ -1327,13 +1708,31 @@ private:
     decision.collision_world_revision = world;
 
     std::vector<PreparedMotionInterruptScopeDTO> scopes;
-    scopes.reserve(request.motion_interrupt_scopes.size());
     for (const auto &scope : request.motion_interrupt_scopes) {
-      if (!scope.stop_profile) {
-        return core::Result<core::PreparedOperationParticipantDTO>::Err(
-            {"stop_profile_missing",
-             "test prepared scope has no Stop profile",
-             {}});
+      const auto action = std::find_if(
+          authority.interrupt_scope_actions.begin(),
+          authority.interrupt_scope_actions.end(), [&](const auto &value) {
+            return value.scope_id.value() == scope.scope_id;
+          });
+      const bool desired = action != authority.interrupt_scope_actions.end() &&
+                           action->preemption_action ==
+                               InterruptPreemptionAction::kCompleteMoveOnSignal;
+      const bool fault = action != authority.interrupt_scope_actions.end() &&
+                         action->preemption_action ==
+                             InterruptPreemptionAction::kPreemptTrajectory;
+      if ((!desired && !fault) || desired != scope.stop_profile.has_value() ||
+          (fault && !authority.ordinary_stop_plan)) {
+        return Result<PreparedOperationParticipantDTO>::Err(
+            ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                     "fake prepared scope has no Stop profile",
+                     {{"reason", "stop_profile_missing"}}});
+      }
+      if (desired) {
+        const auto mode = ValidateIoRuleNominalStopMode(
+            authority.stop_readiness.value().resolved_stop_base_plan,
+            *scope.stop_profile);
+        if (!mode.ok())
+          return Result<PreparedOperationParticipantDTO>::Err(mode.error());
       }
       PreparedParticipantStopPlanContextDTO context{
           request.binding.operation_id,
@@ -1347,20 +1746,31 @@ private:
           ParticipantStopProfilePurposeDTO::kMotionInterruptScope,
           scope.scope_id,
           scope.node_category};
-      auto stop = MakePreparedParticipantStopPlan(
-          authority.stop_readiness.value().resolved_stop_base_plan,
-          std::move(context), binding.resources,
-          authority.retained_default_stop_limits);
+      auto stop =
+          fault ? Result<PreparedParticipantStopPlanDTO>::Ok(
+                      *authority.ordinary_stop_plan)
+                : MakePreparedParticipantStopPlan(
+                      authority.stop_readiness.value().resolved_stop_base_plan,
+                      std::move(context), binding.resources,
+                      authority.retained_default_stop_limits);
       if (!stop.ok()) {
-        return core::Result<core::PreparedOperationParticipantDTO>::Err(
-            stop.error());
+        return Result<PreparedOperationParticipantDTO>::Err(stop.error());
       }
-      scopes.push_back({MotionInterruptScopeId(scope.scope_id),
-                        InterruptPolicyId(scope.policy_id),
-                        scope.activation_mode, scope.arm_timeout_ns,
-                        scope.result_binding_key, scope.required,
-                        *scope.stop_profile, scope.node_category,
-                        scope.metadata, std::move(stop.value())});
+      const auto entry = ResolvePreparedIoRuleStopEntry(
+          stop.value(), action->stop_entry_stage_id);
+      if (!entry.ok())
+        return Result<PreparedOperationParticipantDTO>::Err(entry.error());
+      const auto success_through = ResolvePreparedIoRuleSuccessThrough(
+          stop.value(), entry.value(), action->success_through_stage_id);
+      if (!success_through.ok())
+        return Result<PreparedOperationParticipantDTO>::Err(
+            success_through.error());
+      scopes.push_back(
+          {MotionInterruptScopeId(scope.scope_id),
+           InterruptPolicyId(scope.policy_id), scope.activation_mode,
+           scope.arm_timeout_ns, scope.required, scope.stop_profile,
+           scope.node_category, scope.metadata, std::move(stop.value()),
+           action->preemption_action, entry.value(), success_through.value()});
     }
     std::sort(scopes.begin(), scopes.end(),
               [](const auto &left, const auto &right) {
@@ -1462,6 +1872,8 @@ private:
   }
 
   std::size_t execute_count_{};
+  bool rule_fixture_{};
+  mutable std::mutex status_mutex_;
   std::uint64_t next_subscription_id_{1U};
   core::ExecutionStatus status_{};
   std::map<std::uint64_t, core::EventCallback> callbacks_;
@@ -1477,15 +1889,28 @@ public:
   PublicationOwner(
       core::RuntimeParticipantBinding binding,
       std::filesystem::path journal_path, core::CellId cell_id,
-      core::FakeClock &clock)
+      core::FakeClock &clock,
+      const deployment::test::MaintainedInterruptProgramFixture *captured_fixture = nullptr,
+      std::vector<core::RuntimeParticipantBinding> physical_bindings = {})
       : binding_(std::move(binding)), journal_path_(std::move(journal_path)),
-        cell_id_(std::move(cell_id)), clock_(clock) {}
+        cell_id_(std::move(cell_id)), clock_(clock),
+        engine_(captured_fixture != nullptr),
+        captured_fixture_(captured_fixture),
+        physical_bindings_(std::move(physical_bindings)) {}
 
   [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
   ReadCurrentPhysicalParticipants(
-      const core::ActiveControlConfigurationDTO &) const override {
+      const core::ActiveControlConfigurationDTO &configuration) const override {
+    if (!captured_fixture_)
+      return core::Result<std::vector<core::RuntimeParticipantBinding>>::Ok(
+          {binding_});
+    std::vector<core::RuntimeParticipantBinding> selected;
+    for (const auto &binding : physical_bindings_)
+      if (binding.value().control_path->control_domain_id ==
+          configuration.control_domain_id)
+        selected.push_back(binding);
     return core::Result<std::vector<core::RuntimeParticipantBinding>>::Ok(
-        {binding_});
+        std::move(selected));
   }
 
   [[nodiscard]] core::Result<core::RuntimeRouteConfigurationReadbackDTO>
@@ -1493,7 +1918,23 @@ public:
       const core::ActiveControlConfigurationDTO &configuration,
       std::vector<deployment::VerifiedRouteReadinessParticipant> participants)
       override {
-    if (participants.size() != 1U ||
+    if (captured_fixture_) {
+      const auto primary = std::find_if(
+          participants.begin(), participants.end(), [&](const auto &row) {
+            return row.participant_binding.value().control_path &&
+                   row.participant_binding.value()
+                           .control_path->control_binding_id ==
+                       binding_.value().control_path->control_binding_id;
+          });
+      if (primary == participants.end())
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            {"invalid_fixture",
+             "captured motion route has no exact primary participant",
+             {}});
+      std::rotate(participants.begin(), primary, std::next(primary));
+    }
+    if (participants.empty() ||
+        (!captured_fixture_ && participants.size() != 1U) ||
         participants.front().participant_binding.value().control_path ==
             std::nullopt) {
       return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
@@ -1554,23 +1995,63 @@ public:
         .default_operator_stop_profile = std::move(operator_profile.value()),
         .default_fault_stop_profile = std::move(fault_profile),
         .deployment_maximum_tcp_linear_speed_mps = 0.15};
+    std::vector<core::RuntimeParticipantExecutionRegistration> registrations{
+        registration};
+    if (captured_fixture_)
+      for (auto other = std::next(participants.begin());
+           other != participants.end(); ++other) {
+        auto alias = registration;
+        alias.binding = other->participant_binding;
+        alias.stop_readiness = other->stop_readiness;
+        alias.participant_policy =
+            core::select_runtime_participant_policy(alias.binding);
+        registrations.push_back(std::move(alias));
+      }
     if (kernel_ == nullptr) {
       journal_ = std::make_unique<core::SqliteOperationJournal>(journal_path_,
                                                                 cell_id_);
+      if (captured_fixture_) {
+        resolver_ = std::make_shared<ProductBackedRuntimeParticipantResolver>(
+            captured_fixture_->package_root, captured_fixture_->bundle,
+            captured_fixture_->model_map,
+            [&] {
+              std::vector<core::RuntimeParticipantBinding> bindings;
+              for (const auto &row : registrations)
+                bindings.push_back(row.binding);
+              return bindings;
+            }(),
+            std::vector<core::ProgramBindingId>{},
+            captured_fixture_->program_artifact_root);
+        resolver_callback_ = make_retained_cell_kernel_participant_resolver(
+            [source = resolver_](const auto &operation, std::size_t index) {
+              return source->ResolveExecutionParticipant(operation, index);
+            },
+            registrations);
+      }
+      core::ResourceAddressedExecutionKernelConfig config{
+          core::RequestOwnerEpoch("kernel.native.readiness.1"),
+          cell_id_,
+          64U,
+          resolver_callback_,
+          captured_fixture_ ? &admission_gate_ : nullptr,
+          participants.front().participant_binding.value().graph_revision};
+      if (captured_fixture_)
+        config.manager_liveness_required_set =
+            core::ManagerLivenessRequiredSetDTO{
+                cell_id_,
+                captured_fixture_->bundle->retained_bundle_id(),
+                core::ComputeRequiredRuntimeSetDigest({}),
+                core::RuntimeUnitId("capture.fixture.manager"),
+                core::RuntimeEpoch("capture.fixture.manager.epoch"),
+                core::RequestOwnerEpoch("capture.fixture.manager.owner"),
+                {}};
       kernel_ = std::make_unique<core::ResourceAddressedExecutionKernel>(
-          std::vector<core::RuntimeParticipantExecutionRegistration>{
-              registration},
-          clock_, scheduler_, *journal_,
-          core::ResourceAddressedExecutionKernelConfig{
-              core::RequestOwnerEpoch("kernel.native.readiness.1"),
-              cell_id_,
-              64U,
-              {},
-              nullptr,
-              participants.front().participant_binding.value().graph_revision});
+          registrations, clock_, scheduler_, *journal_, std::move(config));
+      if (captured_fixture_)
+        admission_gate_.BindResourceTable(kernel_->resource_admission_table());
     }
     auto published = kernel_->publish_runtime_route_configuration(
-        configuration, {std::move(registration)}, {});
+        configuration, std::move(registrations), resolver_callback_);
     if (!published.ok()) {
       return published;
     }
@@ -1617,6 +2098,15 @@ public:
     return engine_.execute_count();
   }
 
+  [[nodiscard]] const ProductBackedRuntimeParticipantResolver &
+  resolver() const {
+    if (!resolver_)
+      throw std::logic_error("captured fixture resolver is absent");
+    return *resolver_;
+  }
+
+  void MarkExecuting() { engine_.MarkExecuting(); }
+
   [[nodiscard]] std::shared_ptr<const core::PreparedOperationParticipantDTO>
   prepared_participant() const noexcept {
     return engine_.prepared_participant();
@@ -1630,9 +2120,14 @@ private:
   core::ManualScheduler scheduler_;
   mutable std::mutex mutex_;
   std::vector<deployment::VerifiedRouteReadinessParticipant> participants_;
+  ManagedKernelAdmissionGate admission_gate_;
   AdmissionEngine engine_;
   std::unique_ptr<core::SqliteOperationJournal> journal_;
   std::unique_ptr<core::ResourceAddressedExecutionKernel> kernel_;
+  const deployment::test::MaintainedInterruptProgramFixture *captured_fixture_{};
+  std::shared_ptr<ProductBackedRuntimeParticipantResolver> resolver_;
+  core::RuntimeParticipantAdmissionResolver resolver_callback_;
+  std::vector<core::RuntimeParticipantBinding> physical_bindings_;
 };
 
 [[nodiscard]] core::ExpectedControlDomainRevisionDTO
@@ -1649,8 +2144,8 @@ expected_domain(const RuntimeContext &runtime) {
             });
   return {runtime.domain->control_domain_id,
           runtime.domain->control_domain_revision,
-          runtime.domain->controller_topology_id,
-          runtime.domain->topology_revision,
+          runtime.domain->controller().controller_topology_id,
+          runtime.domain->controller().topology_revision,
           {core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
            std::nullopt, std::nullopt},
           std::move(bindings)};
@@ -1804,9 +2299,19 @@ private:
 };
 
 enum class ReadinessCase {
-  kPublication, kFailedRestart, kRepeatedReconciliation,
-  kMeasuredCapture, kMeasuredFailedStage, kMeasuredRace,
-  kMeasuredUnavailable, kMeasuredNilRace, kConstructionOnce, kConstructionThrows
+  kPublication,
+  kCapturedNode,
+  kFailedRestart,
+  kRepeatedReconciliation,
+  kMeasuredCapture,
+  kMeasuredFailedStage,
+  kMeasuredRace,
+  kMeasuredUnavailable,
+  kMeasuredNilRace,
+  kConstructionOnce,
+  kConstructionThrows,
+  kBeforeStartRefused,
+  kBeforeStartThrows
 };
 
 // Exercise the actual runtime source-association seam against this fixture's
@@ -1981,16 +2486,242 @@ void CheckMeasuredSourceProtocol(
   owner.reset();
 }
 
+void CheckCapturedNodeExecution(
+    const deployment::test::MaintainedInterruptProgramFixture &fixture,
+    PublicationOwner &owner,
+    const deployment::VerifiedRouteReadinessParticipant &physical,
+    const core::ActiveBundlePublicationReceiptDTO &publication,
+    core::FakeClock &clock) {
+  auto &kernel = owner.kernel();
+  const core::RequestOwnerEpoch kernel_owner("kernel.native.readiness.1");
+  const core::RequestOwnerEpoch runner("capture.fixture.runner");
+  const core::ProgramRunId run("run.native.readiness.1");
+  core::CellAdmissionReadinessSnapshotDTO readiness{
+      true,
+      core::ProgramCycleStatusDTO{
+          runner, 1U, core::ProgramCycleStateDTO::kIdleAfterReset, {}, {}, {}},
+      true,
+      1U,
+      1U,
+      true,
+      true,
+      0U,
+      0U,
+      0U};
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(readiness).ok());
+  const auto &identity = fixture.binding->value();
+  const core::CellAdmissionClaimIntentDTO claim_intent{
+      core::CellAdmissionClaimKindDTO::kProgramCycle,
+      core::CellAdmissionOwnerRoleDTO::kProgramRunner,
+      runner,
+      run.value(),
+      core::RequestId("capture.fixture.cycle"),
+      core::ContentDigest(identity.program_revision.value()),
+      kernel.GetAuthoringAdmission().admission_generation,
+      {},
+      core::ProgramCycleAdmissionEvidenceDTO{identity.program_revision,
+                                             identity.program_revision},
+      {}};
+  const auto claim = kernel.AcquireCellAdmissionClaim(claim_intent);
+  ASSERT_TRUE(claim.ok()) << claim.error().message;
+  const core::ProgramRunExecutionCaptureDTO capture_request{
+      kernel_owner,
+      runner,
+      claim.value().claim_generation,
+      run,
+      identity.program_id,
+      identity.program_revision,
+      identity.program_binding_id,
+      identity.retained_bundle_id,
+      identity.graph_revision,
+      {}};
+  const auto capture = owner.resolver().ResolveProgramCapture(capture_request);
+  ASSERT_TRUE(capture.ok()) << capture.error().message;
+  ASSERT_NE(capture.value().io_conditions, nullptr);
+  ASSERT_EQ(capture.value().io_conditions->program_node_conditions.size(), 1U);
+  const auto &node =
+      capture.value().io_conditions->program_node_conditions.front();
+  auto made = core::IoSignalSubsystem::Create(
+      {kernel_owner, 1U, {}}, {1U, 1U, 16U, 8U, 512U, 1024U}, clock);
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  auto service =
+      std::shared_ptr<core::IoSignalSubsystem>(std::move(made.value()));
+  ASSERT_TRUE(kernel
+                  .InstallProgramIoSignalService(service,
+                                                 identity.retained_bundle_id,
+                                                 identity.graph_revision)
+                  .ok());
+
+  ASSERT_TRUE(kernel.register_program_run_capture(capture.value()).ok());
+  const auto held = kernel.get_program_execution_scope(run);
+  ASSERT_TRUE(held.ok());
+  const core::ProgramExecutionSelectionRequestDTO start{
+      {core::RequestId("capture.fixture.start"), kernel_owner, "test", {}},
+      runner,
+      claim.value().claim_generation,
+      run,
+      {"all"},
+      {}};
+  const auto started =
+      kernel.start_program_selection(start, held.value().selection_revision);
+  ASSERT_TRUE(started.ok()) << started.error().message;
+  readiness.program_cycle_status =
+      core::ProgramCycleStatusDTO{runner,
+                                  2U,
+                                  core::ProgramCycleStateDTO::kRunning,
+                                  run,
+                                  claim.value().claim_generation,
+                                  {}};
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(readiness).ok());
+
+  // The fixture supplies the trusted host context boundary using only its
+  // actual sealed products and compiled union. This is not a Manager Apply
+  // success/process test and does not fabricate a terminal Apply receipt.
+  const core::AppliedProgramBlackboardContextDTO context{
+      kernel_owner,
+      publication.publication_generation,
+      identity.program_id,
+      identity.program_revision,
+      identity.program_binding_id,
+      identity.retained_bundle_id,
+      identity.graph_revision,
+      capture.value().binding,
+      capture.value().blackboard_key_declarations,
+      capture.value().io_conditions,
+      capture.value().io_conditions->referenced_program_blackboard_keys,
+      1024U};
+  ASSERT_TRUE(
+      kernel.InstallAppliedProgramBlackboardContext(context, service).ok());
+  core::IoProgramBlackboardPublicationDTO frame{
+      {kernel_owner, runner, 2U, claim.value().claim_generation, run,
+       identity.program_binding_id, publication.publication_generation},
+      core::IoBlackboardPublicationKind::kBaseline,
+      1U,
+      0U,
+      {{"ready", core::IoConditionValueKind::kBoolean,
+        core::IoConditionValueDTO(false)}},
+      clock.now()};
+  ASSERT_TRUE(kernel.PublishProgramBlackboard(frame).ok());
+
+  auto intent = motion_operation(physical.participant_binding);
+  auto &motion = std::get<core::MotionParticipantIntentDTO>(
+      intent.participants.front().payload);
+  motion.motion = core::PoseGoalDTO{{{0.1, 0.1, 0.1}, {0.0, 0.0, 0.0, 1.0}}};
+  motion.motion_interrupt_scopes.clear();
+  intent.participants.front().execution_scope =
+      core::ProgramNodeExecutionScopeDTO{core::ProgramNodeInstanceId("move"),
+                                         "move.attempt.1"};
+  const auto submitted_intent = intent;
+  const auto accepted = kernel.execute(intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(intent, submitted_intent);
+  EXPECT_TRUE(std::get<core::MotionParticipantIntentDTO>(
+                  intent.participants.front().payload)
+                  .motion_interrupt_scopes.empty());
+  const auto prepared = owner.prepared_participant();
+  ASSERT_NE(prepared, nullptr);
+  const auto *motion_product =
+      std::get_if<core::PreparedMotionExecutionDTO>(&prepared->payload);
+  ASSERT_NE(motion_product, nullptr);
+  ASSERT_EQ(motion_product->interrupt_scopes.size(), 1U);
+  const auto &scope = motion_product->interrupt_scopes.front();
+  EXPECT_EQ(scope.interrupt_policy_id, node.policy_id);
+  EXPECT_EQ(scope.preemption_action,
+            core::InterruptPreemptionAction::kCompleteMoveOnSignal);
+  ASSERT_TRUE(scope.stop_entry);
+  ASSERT_TRUE(scope.success_through);
+  EXPECT_EQ(*scope.stop_entry, *scope.success_through);
+  EXPECT_EQ(scope.stop_plan.resolved_stop_base_plan_id,
+            physical.stop_readiness.value()
+                .resolved_stop_base_plan.resolved_stop_base_plan_id);
+  owner.MarkExecuting();
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto armed = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(armed.ok());
+  ASSERT_EQ(armed.value().participants.front().io_rule_outcomes.size(), 1U);
+  const auto &registration =
+      armed.value().participants.front().io_rule_outcomes.front().registration;
+  const auto observed = service->ReadRuleEvidence(registration);
+  ASSERT_TRUE(observed.ok());
+  EXPECT_EQ(observed.value().state, core::IoRuleRegistrationState::kArmed);
+  EXPECT_FALSE(observed.value().trip);
+  const auto &membership =
+      std::get<core::IoOperationRuleScopeDTO>(registration.scope);
+  EXPECT_EQ(membership.prepared_contract_digest,
+            prepared->prepared_contract_digest);
+  EXPECT_EQ(membership.controller_goal_id,
+            armed.value().participants.front().command_id);
+
+  frame.kind = core::IoBlackboardPublicationKind::kUpdate;
+  frame.message_sequence = 2U;
+  frame.previous_sequence = 1U;
+  frame.values.front().value = core::IoConditionValueDTO(true);
+  ASSERT_TRUE(kernel.PublishProgramBlackboard(frame).ok());
+  ASSERT_TRUE(kernel.ProcessIoRuleEvidence().ok());
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  bool terminal = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    const auto state =
+        kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(state.ok());
+    const auto &outcomes = state.value().participants.front().io_rule_outcomes;
+    if (outcomes.size() == 1U && outcomes.front().stop_certificate_id) {
+      terminal = true;
+      break;
+    }
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(terminal)
+      << "captured node trip did not produce a containing Stop outcome";
+  const auto ended = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(ended.ok());
+  EXPECT_EQ(ended.value().state, core::OperationStateKind::kStopped);
+  ASSERT_EQ(ended.value().participants.front().io_rule_outcomes.size(), 1U);
+  const auto &outcome =
+      ended.value().participants.front().io_rule_outcomes.front();
+  EXPECT_EQ(outcome.terminal_cause,
+            core::MotionExecutionTerminalCause::kSignalTrip);
+  ASSERT_TRUE(outcome.evidence.trip);
+  ASSERT_TRUE(outcome.evidence.trip->blackboard);
+  EXPECT_EQ(outcome.evidence.trip->blackboard->message_sequence, 2U);
+  EXPECT_EQ(outcome.evidence.trip->blackboard->scope, frame.scope);
+  ASSERT_TRUE(outcome.stop_id);
+  const auto stop = kernel.get_stop_status(*outcome.stop_id);
+  ASSERT_TRUE(stop.ok());
+  ASSERT_TRUE(stop.value().stop_certificate);
+  const auto certificate = kernel.get_stop_certificate(
+      stop.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok());
+  EXPECT_EQ(certificate.value().result,
+            core::StopCertificateResultDTO::kSucceededNominal);
+  EXPECT_EQ(owner.execute_count(), 1U);
+  EXPECT_EQ(service->ReadRuleEvidence(registration).value().state,
+            core::IoRuleRegistrationState::kRetired);
+}
+
 void CheckRetainedProductReadiness(ReadinessCase test_case) {
+  ScopedTrustedRoot state;
+  std::optional<deployment::test::MaintainedInterruptProgramFixture> captured_fixture;
+  if (test_case == ReadinessCase::kCapturedNode)
+    captured_fixture = deployment::test::LoadMaintainedInterruptProgram(
+        MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT, state.path());
   const std::filesystem::path fixture_root =
       MANYFORGE_CCLC_READINESS_FIXTURE_ROOT;
-  auto bundle = load_fixture_bundle(fixture_root);
-  auto runtime = make_runtime_context(*bundle);
+  auto bundle = captured_fixture ? captured_fixture->bundle
+                                 : load_fixture_bundle(fixture_root);
+  auto runtime = captured_fixture
+                     ? make_captured_runtime_context(*captured_fixture)
+                     : make_runtime_context(*bundle);
+  const auto physical_bindings = captured_fixture
+                                     ? make_captured_physical_representatives(
+                                           *captured_fixture, runtime.binding)
+                                     : std::vector{runtime.binding};
   const auto catalog = make_prepare_catalog(*runtime.control_binding);
   FixedCatalogSource catalogs(catalog);
   auto brand_port = std::make_shared<PreparingBrandPort>();
 
-  ScopedTrustedRoot state;
   const auto manager_root = state.path() / "manager";
   const auto state_root = state.path() / "state";
   const auto plan_root = state.path() / "plans";
@@ -2036,16 +2767,65 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
       runtime.control_binding->provider_runtime_unit_id,
       runtime.provider_epoch,
       catalog.catalog_digest};
+  std::map<core::ControlDomainId, std::shared_ptr<PreparingBrandPort>>
+      domain_ports{{occurrence.control_domain_id, brand_port}};
+  std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports{
+      {occurrence, brand_port}};
+  std::vector<core::ExpectedControlDomainRevisionDTO> expected_domains{
+      expected_domain(runtime)};
+  if (captured_fixture)
+    for (const auto &desired : bundle->value().desired_control_configurations) {
+      if (desired.control_domain_id == occurrence.control_domain_id)
+        continue;
+      const auto physical =
+          std::find_if(physical_bindings.begin(), physical_bindings.end(),
+                       [&](const auto &row) {
+                         return row.value().control_path->control_domain_id ==
+                                desired.control_domain_id;
+                       });
+      if (physical == physical_bindings.end())
+        throw std::logic_error(
+            "maintained controller domain has no actual representative");
+      const auto &path = *physical->value().control_path;
+      auto port = std::make_shared<PreparingBrandPort>();
+      domain_ports.emplace(desired.control_domain_id, port);
+      brand_ports.push_back(
+          {{desired.control_domain_id, desired.control_domain_revision,
+            path.provider_instance_id, path.provider_manifest_id,
+            path.provider_manifest_revision, path.provider_runtime_unit_id,
+            path.provider_runtime_epoch, catalog.catalog_digest},
+           port});
+      std::vector<core::ExpectedControlBindingRevisionDTO> bindings;
+      for (const auto &route : desired.binding_routes)
+        bindings.push_back({route.control_binding_id,
+                            route.control_binding_revision,
+                            route.control_route_id});
+      expected_domains.push_back(
+          {desired.control_domain_id,
+           desired.control_domain_revision,
+           desired.controller_topology_id,
+           desired.topology_revision,
+           {core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
+            {},
+            {}},
+           std::move(bindings)});
+    }
+  std::sort(expected_domains.begin(), expected_domains.end(),
+            [](const auto &a, const auto &b) {
+              return a.control_domain_id < b.control_domain_id;
+            });
   KernelPorts kernel_ports;
   kernel_ports.set_active(bundle->retained_bundle_id(),
                           bundle->value().cell_graph.graph_revision);
   const deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(
-      fixture_root / "retained-package");
+      captured_fixture ? captured_fixture->package_root
+                       : fixture_root / "retained-package");
   core::FakeClock clock;
   clock.set(1'000);
   PublicationOwner publication_owner(
       runtime.binding, state.path() / "operation-journal.sqlite3",
-      bundle->value().cell_graph.cell_id, clock);
+      bundle->value().cell_graph.cell_id, clock,
+      captured_fixture ? &*captured_fixture : nullptr, physical_bindings);
   core::ManualScheduler scheduler;
 
   std::function<core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
@@ -2060,18 +2840,21 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
 
   // Sample the fake provider's actual lifecycle result, independently of the
   // retained graph. Unchanged reads keep the same source generation.
-  const RetainedExternallyManagedDomainSnapshotSource controller_snapshot_source =
-      [brand_port, domain_id = occurrence.control_domain_id](
-          const core::ControlDomainId& domain, core::TimePoint now)
-          -> core::Result<RetainedExternallyManagedDomainSnapshot> {
-        if (domain != domain_id || now < 0) {
-          return core::Result<RetainedExternallyManagedDomainSnapshot>::Err(
-              {"controller_snapshot_unavailable", "read does not address the selected source",
-               {{"reason", "domain_or_clock_invalid"}}});
-        }
-        return core::Result<RetainedExternallyManagedDomainSnapshot>::Ok(
-            brand_port->controller_snapshot());
-      };
+  const RetainedExternallyManagedDomainSnapshotSource
+      controller_snapshot_source =
+          [domain_ports](const core::ControlDomainId &domain,
+                         core::TimePoint now)
+      -> core::Result<RetainedExternallyManagedDomainSnapshot> {
+    const auto port = domain_ports.find(domain);
+    if (port == domain_ports.end() || now < 0) {
+      return core::Result<RetainedExternallyManagedDomainSnapshot>::Err(
+          {"controller_snapshot_unavailable",
+           "read does not address the selected source",
+           {{"reason", "domain_or_clock_invalid"}}});
+    }
+    return core::Result<RetainedExternallyManagedDomainSnapshot>::Ok(
+        port->second->controller_snapshot());
+  };
   const auto initial_snapshot = brand_port->controller_snapshot();
   EXPECT_EQ(initial_snapshot.component_state, core::ComponentLifecycleStateDTO::kDeclared);
   EXPECT_FALSE(initial_snapshot.exact_controller_configuration_active);
@@ -2079,9 +2862,9 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
 
   auto composition = CreateRetainedNativeCCLCRuntime(
       config, bundle, publication_store, publication.value(), artifacts,
-      catalogs, {{occurrence, brand_port}}, {runtime.binding}, kernel_ports,
-      kernel_ports, publication_owner, clock, scheduler, std::move(current_configuration),
-      controller_snapshot_source);
+      catalogs, std::move(brand_ports), physical_bindings, kernel_ports,
+      kernel_ports, publication_owner, clock, scheduler,
+      std::move(current_configuration), controller_snapshot_source);
   ASSERT_TRUE(composition.ok()) << composition.error().message;
   ASSERT_TRUE(composition.value()->Start().ok());
   const auto current_request_owner =
@@ -2094,7 +2877,7 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
       core::ComponentLifecycleIntentKindDTO::kPrepare,
       bundle->value().cell_graph.graph_revision,
       core::ComponentLifecycleGeneration(1U),
-      {expected_domain(runtime)},
+      expected_domains,
       std::nullopt,
       {core::RequestTransportDTO::kInternal,
        core::RequestAssuranceDTO::kUnverified, std::nullopt}};
@@ -2150,6 +2933,13 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
   EXPECT_EQ(active_snapshot.component_state, core::ComponentLifecycleStateDTO::kActive);
   EXPECT_TRUE(active_snapshot.exact_controller_configuration_active);
   EXPECT_EQ(active_snapshot.source_generation, prepared_snapshot.source_generation + 1U);
+  if (captured_fixture)
+    for (const auto &[domain, port] : domain_ports) {
+      (void)domain;
+      EXPECT_EQ(port->dispatch_count(), 2U);
+      EXPECT_EQ(port->controller_snapshot().component_state,
+                core::ComponentLifecycleStateDTO::kActive);
+    }
 
   core::RouteSelectionIntentDTO route{
       {core::RequestId("route.native.readiness"), current_request_owner, "test",
@@ -2188,7 +2978,8 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
             core::ActiveControlConfigurationStateDTO::kReconciled);
 
   const auto published = publication_owner.participants();
-  ASSERT_EQ(published.size(), 1U);
+  ASSERT_EQ(published.size(),
+            captured_fixture ? runtime.desired->binding_routes.size() : 1U);
   EXPECT_EQ(published.front().stop_readiness.value().controllable_component_id,
             runtime.component->controllable_component_id);
   EXPECT_EQ(published.front()
@@ -2205,14 +2996,16 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
            .substr(7U) +
        ".json")));
 
-  // Route selection installed route and Stop readiness only: it never
-  // enables the component, even though CCLC recorded it Active.
-  const auto route_only =
-      publication_owner.kernel().execute(motion_operation(runtime.binding));
-  ASSERT_FALSE(route_only.ok());
-  EXPECT_EQ(route_only.error().details.at("reason"),
-            "component_command_not_eligible");
-  EXPECT_EQ(publication_owner.execute_count(), 0U);
+  if (!captured_fixture) {
+    // Route selection installed route and Stop readiness only: it never
+    // enables the component, even though CCLC recorded it Active.
+    const auto route_only =
+        publication_owner.kernel().execute(motion_operation(runtime.binding));
+    ASSERT_FALSE(route_only.ok());
+    EXPECT_EQ(route_only.error().details.at("reason"),
+              "component_command_not_eligible");
+    EXPECT_EQ(publication_owner.execute_count(), 0U);
+  }
 
   if (measured_case) {
     const auto snapshot = composition.value()->ReadCurrentComponentSnapshot(
@@ -2223,7 +3016,8 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
     return;
   }
 
-  if (test_case != ReadinessCase::kPublication) {
+  if (test_case != ReadinessCase::kPublication &&
+      test_case != ReadinessCase::kCapturedNode) {
     // Close and reopen the real durable CCLC owner while retaining the route
     // and engine. Inject only the readiness port result, not recovery logic.
     composition.value().reset();
@@ -2261,23 +3055,62 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
         }};
       };
     }
+    unsigned before_start_calls = 0;
+    const auto before_start =
+        [&](const deployment::CCLCRuntimeComposition &actual)
+        -> core::Result<void> {
+      ++before_start_calls;
+      EXPECT_FALSE(actual.coordinator().accepting_new_requests());
+      EXPECT_THROW((void)actual.open_request_socket_path(), std::logic_error);
+      const auto snapshot = actual.ReadCurrentComponentSnapshot(
+          runtime.component->controllable_component_id);
+      EXPECT_TRUE(snapshot.ok());
+      if (!snapshot.ok())
+        return core::Result<void>::Err(snapshot.error());
+      EXPECT_EQ(snapshot.value().active_publication_receipt,
+                publication.value());
+      EXPECT_EQ(
+          snapshot.value().component_lifecycle_generation,
+          enabled_status.value()->acceptance.component_lifecycle_generation);
+      EXPECT_GT(snapshot.value().component_lifecycle_generation.value(), 1U);
+      if (test_case == ReadinessCase::kBeforeStartRefused)
+        return core::Result<void>::Err({"injected_before_start_failure",
+                                        "participant construction refused",
+                                        {}});
+      if (test_case == ReadinessCase::kBeforeStartThrows)
+        throw std::runtime_error("participant construction exception");
+      return core::Result<void>::Ok();
+    };
     std::function<core::Result<void>()> reconcile;
     auto recovered = CreateRecoveredRetainedNativeCellCCLCRuntime(
         config, bundle, publication_store, publication.value(), artifacts,
         catalogs, {{occurrence, brand_port}}, {runtime.binding}, kernel_ports,
-        kernel_ports, publication_owner, readiness,
-        publication_owner.kernel(), clock, scheduler,
+        kernel_ports, publication_owner, readiness, publication_owner.kernel(),
+        clock, scheduler,
         [](const core::ActiveControlConfigurationDTO &) {
           ADD_FAILURE() << "Exact installed route must not be republished";
           return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
               {"unexpected_adoption", "route should already be current", {}});
-        }, [] { return core::Result<void>::Ok(); }, reconcile,
-        controller_snapshot_source);
+        },
+        [] { return core::Result<void>::Ok(); }, reconcile,
+        controller_snapshot_source, before_start);
     EXPECT_EQ(readiness.publications, 1U);
     EXPECT_EQ(brand_port->dispatch_count(), 2U);
-    if (test_case == ReadinessCase::kFailedRestart) {
+    EXPECT_EQ(before_start_calls,
+              test_case == ReadinessCase::kFailedRestart ? 0U : 1U);
+    if (test_case == ReadinessCase::kFailedRestart ||
+        test_case == ReadinessCase::kBeforeStartRefused ||
+        test_case == ReadinessCase::kBeforeStartThrows) {
       ASSERT_FALSE(recovered.ok());
-      EXPECT_EQ(recovered.error().code, "injected_readiness_failure");
+      if (test_case == ReadinessCase::kBeforeStartThrows) {
+        EXPECT_EQ(recovered.error().details.at("reason"),
+                  "native_cell_before_start_failed");
+      } else {
+        EXPECT_EQ(recovered.error().code,
+                  test_case == ReadinessCase::kFailedRestart
+                      ? "injected_readiness_failure"
+                      : "injected_before_start_failure");
+      }
       EXPECT_FALSE(reconcile);
       EXPECT_FALSE(publication_owner.kernel().GetAuthoringAdmission().authoring_allowed);
       EXPECT_EQ(publication_owner.kernel().GetAuthoringAdmission().admission_generation,
@@ -2367,6 +3200,12 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
   ASSERT_TRUE(publication_owner.kernel().SetRouteRecoveryPending(false).ok());
   ASSERT_TRUE(published_readiness.ok()) << published_readiness.error().message;
 
+  if (captured_fixture) {
+    CheckCapturedNodeExecution(*captured_fixture, publication_owner,
+                               published.front(), publication.value(), clock);
+    return;
+  }
+
   const auto accepted =
       publication_owner.kernel().execute(motion_operation(runtime.binding));
   ASSERT_TRUE(accepted.ok())
@@ -2375,23 +3214,30 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
   EXPECT_EQ(publication_owner.execute_count(), 1U);
   const auto prepared = publication_owner.prepared_participant();
   ASSERT_NE(prepared, nullptr);
-  EXPECT_EQ(prepared->stop_evidence_policy_id.value(),
+  EXPECT_EQ(prepared->controller().stop_evidence_policy_id.value(),
             "lite6_motion_controlled_stop");
   EXPECT_EQ(prepared->resources.size(), 6U);
   ExpectExactControlledStopPlan(
-      prepared->ordinary_stop_plan, runtime.binding.value().resources,
+      prepared->controller().ordinary_stop_plan,
+      runtime.binding.value().resources,
       core::ParticipantStopProfilePurposeDTO::kOperator,
-      "operator_soft_on_path", core::MotionInterruptStopMode::kSoftOnPath,
-      true, core::MotionInterruptStopMode::kSpringBackHold);
-  ASSERT_TRUE(prepared->fault_stop_plan.has_value());
+      "operator_soft_on_path", core::MotionInterruptStopMode::kSoftOnPath, true,
+      core::MotionInterruptStopMode::kSpringBackHold);
+  ASSERT_TRUE(prepared->controller().fault_stop_plan.has_value());
   ExpectExactControlledStopPlan(
-      *prepared->fault_stop_plan, runtime.binding.value().resources,
+      *prepared->controller().fault_stop_plan,
+      runtime.binding.value().resources,
       core::ParticipantStopProfilePurposeDTO::kFault, "fault_spring_back_hold",
       core::MotionInterruptStopMode::kSpringBackHold, false, std::nullopt);
 }
 
 TEST(RetainedNativeCCLCRuntime, RetainedProductPublishesRepositoryReadBackReadiness) {
   CheckRetainedProductReadiness(ReadinessCase::kPublication);
+}
+
+TEST(RetainedNativeCCLCRuntime,
+     MaintainedCapturedNodeArmsItsOwnQualifiedInterrupt) {
+  CheckRetainedProductReadiness(ReadinessCase::kCapturedNode);
 }
 
 TEST(RetainedNativeCCLCRuntime, FailedRestartReadinessKeepsAdmissionAndCommandsClosed) {
@@ -2524,6 +3370,15 @@ TEST(RetainedNativeMeasuredSourceProtocol, UnavailableInitialAndSuccessorRetireO
 }
 TEST(RetainedNativeMeasuredSourceProtocol, NullStageStillRefusesConcurrentAssociationChange) {
   CheckRetainedProductReadiness(ReadinessCase::kMeasuredNilRace);
+}
+
+TEST(RetainedNativeCCLCReadinessConstruction,
+     BeforeStartRefusalKeepsAdmissionClosed) {
+  CheckRetainedProductReadiness(ReadinessCase::kBeforeStartRefused);
+}
+TEST(RetainedNativeCCLCReadinessConstruction,
+     BeforeStartExceptionKeepsAdmissionClosed) {
+  CheckRetainedProductReadiness(ReadinessCase::kBeforeStartThrows);
 }
 
 TEST(RetainedNativeCCLCReadinessConstruction, RunsOnceAfterRecoveryAndNeverFromPureReads) {

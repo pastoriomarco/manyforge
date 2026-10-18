@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Final
 
+from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.canonical_artifact import (
     StrictArtifactError,
     canonical_json_bytes,
@@ -52,7 +53,7 @@ ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:20f76c1fa9f103c6f008029505639a45ec6f9166305156b31d43056235544483"
+    "sha256:34fbeab889c274ca724eb992e7bcc4305229e8bcce484b0857c4ca5e9d35e379"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -74,6 +75,21 @@ LIFECYCLE_INTENTS: Final = ("disable", "enable", "observe", "prepare", "recover"
 ROS2_CONTROL_PROVIDER_ID: Final = "manyforge.provider.ros2_control"
 
 CAPABILITIES: Final = {
+    "io.gpio.set_output": (
+        "sha256:b7f9e3ae6ed12dd59fd78193db902c6ad09528372ad0f5e2423f936833cb49f8",
+        "target_binding",
+        "capability_provider_binding",
+    ),
+    "io.gpio.get_input": (
+        "sha256:abe7c9eed8b4b76ada84aa770ae3111691dfdd07001f4abd68a38bed56ed3d84",
+        "target_binding",
+        "capability_provider_binding",
+    ),
+    "io.gpio.wait_for_input": (
+        "sha256:f5520f864f38d6f658039b8a338da9ef1fec014d70e9e354c5e40935717b4747",
+        "target_binding",
+        "capability_provider_binding",
+    ),
     "assistant.bridge.request": (
         "sha256:221f74e397dcae43f8122e30f78cd1e11923b755abf51e70085bc30257f3def9",
         "cell_global",
@@ -1227,6 +1243,75 @@ def lifecycle_product(
     return manifest, {**catalog_content, "catalog_digest": catalog_digest}
 
 
+def io_provider_lifecycle_plans() -> list[dict[str, Any]]:
+    """Exact projection of Core MakeIoProviderLifecyclePlans, without a budget.
+
+    The typed policy binds the sealed per-device limit at admission. Changing
+    a device limit never changes this reusable catalog's semantic anchor.
+    """
+    boolean = lifecycle_boolean
+    resources = "io.driver.resources_ready"
+    enabled = "io.driver.enabled"
+    fault = "io.driver.fault_present"
+    transport = "io.driver.transport_ready"
+    prepared = lifecycle_predicate(
+        ["prepared", "active"],
+        {resources: boolean(True), fault: boolean(False), transport: boolean(True)},
+    )
+    active = lifecycle_predicate(
+        ["active"],
+        {resources: boolean(True), enabled: boolean(True), fault: boolean(False), transport: boolean(True)},
+    )
+    disabled = lifecycle_predicate(
+        ["disabled"],
+        {resources: boolean(True), enabled: boolean(False), fault: boolean(False)},
+    )
+    definitions = (
+        ("prepare", "prepared", prepared, lifecycle_predicate(
+            ["declared", "disabled"], {fault: boolean(False), transport: boolean(True)})),
+        ("enable", "active", active, lifecycle_predicate(
+            ["prepared"], {resources: boolean(True), enabled: boolean(False), fault: boolean(False), transport: boolean(True)})),
+        ("disable", "disabled", disabled, lifecycle_predicate(
+            ["prepared", "active", "degraded"], {resources: boolean(True)})),
+        ("recover", "prepared", prepared, lifecycle_predicate(
+            ["degraded", "faulted"], {transport: boolean(True)})),
+    )
+    plans = []
+    for intent, requested, postcondition, eligibility in definitions:
+        plan = {
+            "intent": intent,
+            "requested_state": requested,
+            "requested_postcondition": postcondition,
+            "timeout_policy": {"kind": "device_configured_limit"},
+            "transitions": [lifecycle_transition(
+                "io.provider." + intent, eligibility, postcondition)],
+        }
+        if intent == "recover":
+            plan["recover_target_eligibility"] = lifecycle_predicate(
+                ["prepared", "active", "degraded", "faulted"], {transport: boolean(True)})
+        plans.append(plan)
+    return plans
+
+
+def io_signal_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
+    manifest, catalog = lifecycle_product(
+        "manyforge.provider.io_signals", io_provider_lifecycle_plans())
+    manifest["offered_capabilities"].extend(
+        {**capability_selector(capability_id),
+         "required_endpoint_role_ids": ["io_signal_service"]}
+        for capability_id in ("io.gpio.get_input", "io.gpio.wait_for_input", "io.gpio.set_output")
+    )
+    manifest["offered_capabilities"].sort(key=lambda row: row["capability_id"])
+    manifest = revisioned_document(
+        manifest, domain="catalog-record-revision/provider_manifest",
+        api_version="manyforge.provider_manifest.v1", revision_field="provider_manifest_revision")
+    catalog["provider_manifest_revision"] = manifest["provider_manifest_revision"]
+    catalog = revisioned_document(
+        catalog, domain="brand-lifecycle-plan-catalog",
+        api_version=LIFECYCLE_CATALOG_API_VERSION, revision_field="catalog_digest")
+    return manifest, catalog
+
+
 def lite6_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
     return lifecycle_product(LITE6_LIFECYCLE_PROVIDER_ID, lite6_lifecycle_plans())
 
@@ -1953,7 +2038,9 @@ def catalog_sources(
         native_gripper_capabilities,
         include_motion_controlled_stop=False,
     )
+    io_signal_manifest, _io_signal_catalog = io_signal_lifecycle_product()
     manifests = {
+        "io_signals": io_signal_manifest,
         "planning": provider_manifest(
             "manyforge.provider.native_planning",
             planner_capabilities,
@@ -2114,6 +2201,27 @@ def catalog_sources(
             schema_id="manyforge.command_schema.v1",
             schema_revision=schemas["command_schema"],
             payload=command_payload,
+        ),
+    )
+
+    # Real output commands use their own qualified record; preserve the
+    # existing gripper source and reference rather than inventing a schema
+    # revision or embedding command metadata in the provider offer.
+    io_command_path = (
+        root / "manyforge_deployment/resources/catalog/io.signal_write_boolean.v1.yaml"
+    )
+    io_command = read_yaml(io_command_path, "I/O signal write command schema")
+    io_command_payload = io_command_path.read_bytes()
+    sources["command_schema:io_signal_write"] = (
+        io_command_path,
+        io_command_payload,
+        catalog_reference(
+            kind="command_schema",
+            record_id=io_command["command_schema_id"],
+            record_revision=io_command["command_schema_revision"],
+            schema_id="manyforge.command_schema.v1",
+            schema_revision=schemas["command_schema"],
+            payload=io_command_payload,
         ),
     )
 
@@ -3069,10 +3177,14 @@ def sealed_deployment_bytes(
     return source.read_bytes()
 
 
-def _program_draft(program: dict[str, Any]) -> dict[str, Any]:
+def _program_draft(program: dict[str, Any], catalog: NodeCatalog) -> dict[str, Any]:
     result = copy.deepcopy(program)
     tree = result.pop("tree")
     result.pop("program_revision")
+    result["catalog"] = {
+        "api_version": catalog.api_version,
+        "content_version": catalog.content_version,
+    }
     return {
         "schema_version": "manyforge.composer_authoring_forest.v1",
         **result,
@@ -3275,6 +3387,7 @@ def _scenario_project_outputs(
     name: str,
     description: str,
     program: dict[str, Any],
+    catalog: NodeCatalog,
     deployment_intent: dict[str, Any],
     assignment: dict[str, Any],
     manyforge_version: str,
@@ -3286,7 +3399,7 @@ def _scenario_project_outputs(
                 raise GenerationError(
                     "maintained Scenario gripper configuration has a foreign component"
                 )
-    program_draft = _program_draft(program)
+    program_draft = _program_draft(program, catalog)
     role_assignment = _role_assignment(assignment)
     content = {
         "program_draft": program_draft,
@@ -3371,6 +3484,7 @@ def scenario_documents(
     sealed: dict[str, dict[str, Any]],
 ) -> list[tuple[Path, bytes, str]]:
     version = (root / "VERSION").read_text(encoding="utf-8").strip()
+    catalog = NodeCatalog(root / "manyforge_behavior/resources/node_catalog.yaml")
     outputs: list[tuple[Path, bytes, str]] = []
     families = {
         row["model_family_id"]: row for row in description["model_families"]
@@ -3405,6 +3519,7 @@ def scenario_documents(
                     name=deployment["name"],
                     description=deployment["description"],
                     program=program,
+                    catalog=catalog,
                     deployment_intent=intent,
                     assignment=assignment,
                     manyforge_version=version,
@@ -3500,7 +3615,8 @@ def generate(args: argparse.Namespace) -> None:
     outputs.extend(lifecycle_outputs)
     for key, (path, payload, unused_ref) in source_rows.items():
         del unused_ref
-        if key.startswith("model:") or key == "command_schema":
+        if (key.startswith("model:") or key == "command_schema" or
+                key.startswith("command_schema:")):
             continue
         outputs.append((path, payload, "maintained catalog source"))
 

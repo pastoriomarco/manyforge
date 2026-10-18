@@ -58,6 +58,13 @@ using RetainedExternallyManagedPrimitiveDispatcher =
         const core::ControlDomainId &, const core::LifecyclePrimitiveId &,
         std::stop_token)>;
 
+/// The real driver owner receives the entire immutable CCLC intent so it can
+/// check expected_observation_generation under its own mutation lock. This
+/// callback does not transfer CCLC transaction/deadline ownership.
+using RetainedProviderDomainPrimitiveDispatcher =
+    std::function<RetainedExternallyManagedPrimitiveOutcome(
+        const core::BrandLifecyclePrimitiveIntentDTO &, std::stop_token)>;
+
 /// Brand lifecycle adapter for an externally managed product.
 ///
 /// Observe normalizes the selected product snapshot into CCLC truth. Without a
@@ -75,6 +82,15 @@ public:
          RetainedExternallyManagedDomainSnapshotSource snapshot_source,
          core::IClock &clock, core::Duration observation_freshness_ns,
          RetainedExternallyManagedPrimitiveDispatcher dispatcher = {});
+
+  [[nodiscard]] static core::Result<
+      std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort>>
+  CreateForProviderDomain(
+      core::ControllableComponentId component,
+      core::ResolvedLifecycleProviderOccurrenceDTO provider_occurrence,
+      RetainedExternallyManagedDomainSnapshotSource snapshot_source,
+      core::IClock &clock, core::Duration observation_freshness_ns,
+      RetainedProviderDomainPrimitiveDispatcher dispatcher);
 
   [[nodiscard]] core::Result<core::BrandLifecycleObservationDTO>
   Observe(const core::BrandLifecycleObservationQueryDTO &query) override;

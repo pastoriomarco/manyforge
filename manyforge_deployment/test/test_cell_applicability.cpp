@@ -1844,31 +1844,21 @@ struct InputOptions final {
     }
     desired.emplace_back(CanonicalValue::Object{
         {"control_domain_id",
-         CanonicalValue(
-             options.desired_selection_case ==
-                     DesiredSelectionCase::kWrongDomain
-                 ? "wrong_domain"
-                 : graph.control_domains.front()
-                       .control_domain_id.value())},
+         CanonicalValue(options.desired_selection_case == DesiredSelectionCase::kWrongDomain
+                            ? "wrong_domain"
+                            : graph.control_domains.front().control_domain_id.value())},
         {"control_domain_revision",
-         CanonicalValue(graph.control_domains.front()
-                            .control_domain_revision.value())},
+         CanonicalValue(graph.control_domains.front().control_domain_revision.value())},
         {"controller_topology_id",
-         CanonicalValue(
-             options.desired_selection_case ==
-                     DesiredSelectionCase::kWrongTopology
-                 ? "wrong_topology"
-                 : graph.control_domains.front()
-                       .controller_topology_id.value())},
+         CanonicalValue(options.desired_selection_case == DesiredSelectionCase::kWrongTopology
+                            ? "wrong_topology"
+                            : graph.control_domains.front().controller_topology_id.value())},
         {"topology_revision",
-         CanonicalValue(
-             graph.control_domains.front().topology_revision.value())},
-        {"activation_set_id",
-         CanonicalValue(
-             options.desired_selection_case ==
-                     DesiredSelectionCase::kUnknownActivationSet
-                 ? "set_unknown"
-                 : "set_a")},
+         CanonicalValue(graph.control_domains.front().controller().topology_revision.value())},
+        {"activation_set_id", CanonicalValue(options.desired_selection_case ==
+                                                     DesiredSelectionCase::kUnknownActivationSet
+                                                 ? "set_unknown"
+                                                 : "set_a")},
         {"binding_routes", CanonicalValue(std::move(binding_routes))},
     });
     if (options.duplicate_desired) {
@@ -1901,17 +1891,13 @@ struct InputOptions final {
           const auto& domain = graph.control_domains.front();
           return CanonicalValue(CanonicalValue::Object{
               {"control_domain_id",
-               CanonicalValue(
-                   options.provider_target_case ==
-                           ProviderTargetCase::kWrongTarget
-                       ? "wrong_domain"
-                       : domain.control_domain_id.value())},
-              {"control_domain_revision",
-               CanonicalValue(domain.control_domain_revision.value())},
+               CanonicalValue(options.provider_target_case == ProviderTargetCase::kWrongTarget
+                                  ? "wrong_domain"
+                                  : domain.control_domain_id.value())},
+              {"control_domain_revision", CanonicalValue(domain.control_domain_revision.value())},
               {"controller_topology_id",
-               CanonicalValue(domain.controller_topology_id.value())},
-              {"topology_revision",
-               CanonicalValue(domain.topology_revision.value())},
+               CanonicalValue(domain.controller().controller_topology_id.value())},
+              {"topology_revision", CanonicalValue(domain.controller().topology_revision.value())},
           });
         }
         case core::CapabilityScope::kTargetBinding:

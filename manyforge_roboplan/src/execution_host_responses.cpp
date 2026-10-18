@@ -1,13 +1,16 @@
+#include <manyforge_core/io_rule_outcome_codec.hpp>
 #include "execution_host_responses.hpp"
 #include "execution_host_posix.hpp"
+#include "cell_admission_command_codec.hpp"
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 #include <manyforge_roboplan/controller_launch_process.hpp>
 #endif
-#include <manyforge_deployment/artifact_codec.hpp>
 #include <iostream>
+#include <manyforge_deployment/artifact_codec.hpp>
 #include <mutex>
+#include <stdexcept>
 #include <type_traits>
 
 namespace manyforge::roboplan_backend::host_detail {
@@ -829,6 +832,10 @@ ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
 
 [[nodiscard]] CanonicalValue
 StopStatusSummaryValue(const core::StopStatusDTO &value) {
+  const auto terminal_projection = StopProjectionStateName(value.terminal_projection.state);
+  Require(terminal_projection == "pending" || terminal_projection == "recorded" ||
+              terminal_projection == "failed",
+          "Stop terminal projection status is invalid");
   return CanonicalValue(CanonicalValue::Object{
       {"request_id", CanonicalValue(value.accepted.request_id.value())},
       {"schema_version", CanonicalValue("manyforge.execution_stop_status.v1")},
@@ -836,6 +843,7 @@ StopStatusSummaryValue(const core::StopStatusDTO &value) {
       {"stop_generation", CanonicalValue(static_cast<double>(
                               value.accepted.stop_generation.value()))},
       {"stop_id", CanonicalValue(value.accepted.stop_id.value())},
+      {"terminal_projection", CanonicalValue(std::string(terminal_projection))},
   });
 }
 
@@ -934,6 +942,78 @@ StopFaultOfferValue(const core::StopFaultRecoveryOfferDTO &offer) {
            ? CanonicalValue(*offer.recovery_unavailable_reason)
            : CanonicalValue(nullptr)},
   });
+}
+
+namespace {
+CanonicalValue GlobalRuleContextValue(const core::IoRuleStateContextDTO &context) {
+  Require(!core::io_rule_state_context_field_error(context),
+          "global rule context is invalid");
+  return CanonicalValue(CanonicalValue::Object{
+      {"owner_epoch", CanonicalValue(context.owner_epoch.value())},
+      {"catalog_generation", CanonicalValue(std::to_string(context.catalog_generation))},
+      {"active_publication_generation", CanonicalValue(static_cast<double>(
+          context.active_publication_generation.value()))},
+      {"bundle", CanonicalValue(context.retained_bundle_id.value())},
+      {"graph", CanonicalValue(context.graph_revision.value())}});
+}
+CanonicalValue GlobalRuleStateValue(const core::IoRuleStateContextDTO &context,
+                                    const core::IoRuleStateDTO &row) {
+  Require(!core::io_rule_state_field_error(context, row),
+          "global rule state is invalid");
+  CanonicalValue acquisition(nullptr);
+  if (row.triggering_acquisition) {
+    const auto &a = *row.triggering_acquisition;
+    acquisition = CanonicalValue(CanonicalValue::Object{
+        {"source_id", CanonicalValue(a.source_id.value())},
+        {"source_epoch", CanonicalValue(a.incarnation.value())},
+        {"source_sequence", CanonicalValue(std::to_string(a.source_sequence))},
+        {"source_cursor", IoSourceCursorValue(a.source_cursor)}});
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"rule_id", CanonicalValue(row.rule_id.value())},
+      {"state", CanonicalValue(std::string(core::io_global_rule_state_token(row.state)))},
+      {"triggering_acquisition", std::move(acquisition)}});
+}
+} // namespace
+
+CanonicalValue GlobalIoRuleRecoveryOfferValue(
+    const core::IoGlobalRuleRecoveryOfferDTO &offer) {
+  const auto &selector = offer.selector;
+  Require(!selector.rule_id.empty() &&
+              selector.rule_id.value().find('\0') == std::string::npos &&
+              selector.expected_rule_registration_id > 0U,
+          "global rule recovery selector is invalid");
+  const bool loss = offer.latch_cause == core::IoGlobalRuleLatchCauseDTO::kSourceLoss;
+  Require(loss || offer.latch_cause == core::IoGlobalRuleLatchCauseDTO::kCondition,
+          "global rule latch cause is invalid");
+  const bool automatic = offer.post_latch_disposition ==
+                         core::InterruptPostLatchDisposition::kAutoClearOnSignalRelease;
+  Require((automatic || offer.post_latch_disposition ==
+                            core::InterruptPostLatchDisposition::kAwaitOperatorAck) &&
+              (!loss || !automatic),
+          "global source loss has no operator recovery disposition");
+  return CanonicalValue(CanonicalValue::Object{
+      {"selector", CanonicalValue(CanonicalValue::Object{
+          {"context", GlobalRuleContextValue(selector.context)},
+          {"rule_id", CanonicalValue(selector.rule_id.value())},
+          {"expected_rule_registration_id", CanonicalValue(
+              std::to_string(selector.expected_rule_registration_id))}})},
+      {"current_condition", offer.current_condition
+          ? CanonicalValue(*offer.current_condition) : CanonicalValue(nullptr)},
+      {"post_latch_disposition", CanonicalValue(automatic
+          ? "auto_clear_on_signal_release" : "await_operator_ack")},
+      {"latch_cause", CanonicalValue(loss ? "source_loss" : "condition")}});
+}
+
+CanonicalValue GlobalIoRuleRecoveryResultValue(
+    const core::IoGlobalRuleRecoveryResultDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"request_id", CanonicalValue(value.request_id.value())},
+      {"replay_status", CanonicalValue(std::string(core::to_string(value.replay_status)))},
+      {"accepted", CanonicalValue(value.accepted)},
+      {"context", GlobalRuleContextValue(value.context)},
+      {"rule", GlobalRuleStateValue(value.context, value.rule)},
+      {"error", value.error ? ErrorValue(*value.error) : CanonicalValue(nullptr)}});
 }
 
 [[nodiscard]] CanonicalValue
@@ -1891,7 +1971,19 @@ RecoveryAssessmentValue(const core::KernelRecoveryAssessmentDTO &value) {
       {"reason_code", CanonicalValue(value.reason_code)},
       {"recovery_class", CanonicalValue(std::string(
                              core::recovery_class_name(value.recovery_class)))},
+      {"eligible_close", CanonicalValue(value.eligible_close)},
       {"retry_admissible", CanonicalValue(value.retry_admissible)},
+      {"retry_eligibility",
+       CanonicalValue(CanonicalValue::Object{
+           {"cause", CanonicalValue(std::string(core::motion_retry_cause_name(
+                         value.retry_eligibility.cause)))},
+           {"effect", CanonicalValue(std::string(core::motion_retry_effect_name(
+                          value.retry_eligibility.effect)))},
+           {"eligible", CanonicalValue(value.retry_eligibility.eligible)},
+           {"reason", CanonicalValue(std::string(
+                          core::motion_retry_ineligibility_reason_name(
+                              value.retry_eligibility.reason)))},
+       })},
       {"schema_version", CanonicalValue(value.schema_version)},
       {"source_id", CanonicalValue(value.source_id)},
       {"status", CanonicalValue(std::string(
@@ -1919,10 +2011,14 @@ RecoveryAssessmentValue(const core::KernelRecoveryAssessmentDTO &value) {
     }
     participants.emplace_back(CanonicalValue::Object{
         {"active_control_configuration_generation",
-         CanonicalValue(static_cast<double>(
-             value.active_control_configuration_generation.value()))},
+         value.active_control_configuration_generation
+             ? CanonicalValue(static_cast<double>(
+                   value.active_control_configuration_generation->value()))
+             : CanonicalValue(nullptr)},
         {"active_control_configuration_id",
-         CanonicalValue(value.active_control_configuration_id.value())},
+         value.active_control_configuration_id
+             ? CanonicalValue(value.active_control_configuration_id->value())
+             : CanonicalValue(nullptr)},
         {"capability_id", CanonicalValue(value.capability_id.value())},
         {"capability_provider_binding_id",
          value.capability_provider_binding_id.has_value()
@@ -1932,9 +2028,14 @@ RecoveryAssessmentValue(const core::KernelRecoveryAssessmentDTO &value) {
         {"controllable_component_id",
          CanonicalValue(value.controllable_component_id.value())},
         {"control_binding_id",
-         CanonicalValue(value.control_binding_id.value())},
+         value.control_binding_id
+             ? CanonicalValue(value.control_binding_id->value())
+             : CanonicalValue(nullptr)},
         {"control_domain_id", CanonicalValue(value.control_domain_id.value())},
-        {"control_route_id", CanonicalValue(value.control_route_id.value())},
+        {"control_route_id",
+         value.control_route_id
+             ? CanonicalValue(value.control_route_id->value())
+             : CanonicalValue(nullptr)},
         {"operation_participant_id",
          CanonicalValue(value.operation_participant_id.value())},
         {"resource_ids", CanonicalValue(std::move(resources))},
@@ -2145,35 +2246,46 @@ OperationStateValue(const core::OperationStateDTO &value) {
     for (const auto &resource : participant.resources) {
       resources.emplace_back(resource.value());
     }
-    participants.emplace_back(CanonicalValue::Object{
+    const auto *controller = participant.binding_identity.controller();
+    const auto *provider = participant.binding_identity.capability_provider();
+    if (participant.output_evidence)
+      Require(!core::to_string(*participant.output_evidence).empty() &&
+                  participant.payload_kind ==
+                      core::OperationParticipantPayloadKind::kCapabilityCommand,
+              "I/O output evidence is invalid");
+    CanonicalValue::Object participant_value{
         {"capability_id", CanonicalValue(participant.capability_id.value())},
         {"capability_provider_binding_id",
-         participant.capability_provider_binding_id.has_value()
-             ? CanonicalValue(
-                   participant.capability_provider_binding_id->value())
+         provider != nullptr
+             ? CanonicalValue(provider->capability_provider_binding_id.value())
              : CanonicalValue(nullptr)},
         {"capability_provider_binding_revision",
-         participant.capability_provider_binding_revision.has_value()
+         provider != nullptr
              ? CanonicalValue(
-                   participant.capability_provider_binding_revision->value())
+                   provider->capability_provider_binding_revision.value())
              : CanonicalValue(nullptr)},
         {"command_target_id",
          CanonicalValue(participant.command_target_id.value())},
         {"controllable_component_id",
          CanonicalValue(participant.controllable_component_id.value())},
         {"control_binding_id",
-         CanonicalValue(participant.control_binding_id.value())},
+         controller ? CanonicalValue(controller->control_binding_id.value())
+                    : CanonicalValue(nullptr)},
         {"control_binding_revision",
-         CanonicalValue(participant.control_binding_revision.value())},
+         controller
+             ? CanonicalValue(controller->control_binding_revision.value())
+             : CanonicalValue(nullptr)},
         {"control_domain_id",
-         CanonicalValue(participant.control_domain_id.value())},
+         CanonicalValue(
+             participant.binding_identity.control_domain_id.value())},
         {"control_domain_revision",
-         CanonicalValue(participant.control_domain_revision.value())},
-        {"controller_goal_generation",
+         CanonicalValue(
+             participant.binding_identity.control_domain_revision.value())},
+        {"command_generation",
          CanonicalValue(static_cast<double>(
-             participant.controller_goal_generation.value()))},
-        {"controller_goal_id",
-         CanonicalValue(participant.controller_goal_id.value())},
+             participant.command_generation.value()))},
+        {"command_id",
+         CanonicalValue(participant.command_id.value())},
         {"participant_id", CanonicalValue(participant.participant_id.value())},
         {"payload_kind",
          CanonicalValue(participant.payload_kind ==
@@ -2186,9 +2298,43 @@ OperationStateValue(const core::OperationStateDTO &value) {
         {"terminal_error", participant.terminal_error.has_value()
                                ? ErrorValue(*participant.terminal_error)
                                : CanonicalValue(nullptr)},
-    });
+    };
+    if (participant.terminal_fact) {
+      const auto &fact = *participant.terminal_fact;
+      participant_value.emplace_back(
+          "terminal_fact",
+          CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue(core::to_string(fact.kind))},
+              {"effect", CanonicalValue(core::to_string(fact.effect))},
+              {"error", fact.error ? ErrorValue(*fact.error)
+                                   : CanonicalValue(nullptr)}}));
+    }
+    if (participant.execution_scope) {
+      participant_value.emplace_back(
+          "execution_scope",
+          CanonicalValue(CanonicalValue::Object{
+              {"node_instance_id",
+               CanonicalValue(
+                   participant.execution_scope->node_instance_id.value())},
+              {"node_attempt_id",
+               CanonicalValue(participant.execution_scope->node_attempt_id)}}));
+    }
+    if (!participant.io_rule_outcomes.empty()) {
+      const auto qualified = core::ValidateIoRuleOutcomeParticipant(
+          value.operation_id, value.operation_revision, participant);
+      Require(qualified.ok(), "I/O rule outcome relabels its containing participant");
+      const auto encoded = core::EncodeIoRuleOutcomes(participant.io_rule_outcomes);
+      Require(encoded.ok(), "I/O rule outcome evidence is invalid");
+      participant_value.emplace_back("io_rule_outcomes",
+          content_identity::parse_canonical_json(encoded.value()));
+    }
+    if (participant.output_evidence)
+      participant_value.emplace_back("output_evidence",
+                                     CanonicalValue(std::string(core::to_string(
+                                         *participant.output_evidence))));
+    participants.emplace_back(std::move(participant_value));
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object operation_value{
       {"active_stop_generation",
        value.active_stop_generation.has_value()
            ? CanonicalValue(
@@ -2216,6 +2362,51 @@ OperationStateValue(const core::OperationStateDTO &value) {
       {"state", CanonicalValue(std::string(StateName(value.state)))},
       {"updated_at_ns", manyforge::content_identity::nonnegative_int64_value(
                             value.updated_at_ns)},
+  };
+  if (value.preemption) {
+    const auto& fact = *value.preemption;
+    operation_value.emplace_back("preemption", CanonicalValue(CanonicalValue::Object{
+        {"kind", CanonicalValue(std::string(core::to_string(fact.kind)))},
+        {"by", CanonicalValue(CanonicalValue::Object{
+            {"operation_id", CanonicalValue(fact.by.operation_id.value())},
+            {"node_instance_id", CanonicalValue(fact.by.node_instance_id.value())},
+            {"node_attempt_id", CanonicalValue(fact.by.node_attempt_id)}})}}));
+  }
+  return CanonicalValue(std::move(operation_value));
+}
+
+[[nodiscard]] CanonicalValue RuntimeFaultsValue(
+    const core::ResourceAddressedExecutionKernel &owner) {
+  const auto journal_fault = owner.get_operation_journal_write_fault();
+  const auto runner_loss = owner.get_program_runner_loss();
+  CanonicalValue journal_value(nullptr);
+  if (journal_fault) {
+    const auto &fault = *journal_fault;
+    journal_value = CanonicalValue(CanonicalValue::Object{
+        {"request_owner_epoch", CanonicalValue(fault.request_owner_epoch.value())},
+        {"write_kind", CanonicalValue(fault.write_kind)},
+        {"error", ErrorValue(fault.error)},
+        {"operation_id", fault.operation_id
+             ? CanonicalValue(fault.operation_id->value()) : CanonicalValue(nullptr)},
+        {"operation_revision", fault.operation_revision
+             ? CanonicalValue(static_cast<double>(fault.operation_revision->value()))
+             : CanonicalValue(nullptr)},
+        {"request_id", fault.request_id
+             ? CanonicalValue(fault.request_id->value()) : CanonicalValue(nullptr)},
+        {"program_run_id", fault.program_run_id
+             ? CanonicalValue(fault.program_run_id->value()) : CanonicalValue(nullptr)},
+        {"execution_scope", fault.execution_scope
+             ? CanonicalValue(CanonicalValue::Object{
+                   {"node_instance_id", CanonicalValue(fault.execution_scope->node_instance_id.value())},
+                   {"node_attempt_id", CanonicalValue(fault.execution_scope->node_attempt_id)}})
+             : CanonicalValue(nullptr)},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"operation_journal_write_fault", std::move(journal_value)},
+      {"program_runner_loss", runner_loss
+           ? detail::ProgramRunnerLossValue(*runner_loss, owner.request_owner_epoch())
+           : CanonicalValue(nullptr)},
   });
 }
 
@@ -2303,4 +2494,275 @@ CoordinatePositionValue(const core::CoordinatePositionDTO &position) {
        CanonicalValue(std::get<core::LinearPositionDTO>(position).value_m)},
   });
 }
+namespace {
+
+std::string_view IoQuality(core::IoSignalAvailability value) {
+  switch (value) {
+    case core::IoSignalAvailability::kMissing: return "missing";
+    case core::IoSignalAvailability::kFresh: return "fresh";
+    case core::IoSignalAvailability::kStale: return "stale";
+    case core::IoSignalAvailability::kInvalid: return "invalid";
+    case core::IoSignalAvailability::kUnavailable: return "unavailable";
+  }
+  Fail("I/O signal availability is invalid");
+}
+
+CanonicalValue IoMatchedSampleValue(const core::IoSignalSampleDTO& sample) {
+  const auto& publication = sample.publication;
+  Require(publication.validity == core::IoSampleValidity::kValid &&
+              publication.value.has_value(), "I/O watch matched sample is invalid");
+  return CanonicalValue(CanonicalValue::Object{
+      {"controllable_component_id", CanonicalValue(publication.signal_id.controllable_component_id.value())},
+      {"signal_name", CanonicalValue(publication.signal_id.name)},
+      {"source_id", CanonicalValue(publication.source_id.value())},
+      {"source_epoch", CanonicalValue(publication.incarnation.value())},
+      {"source_sequence", CanonicalValue(std::to_string(publication.source_sequence))},
+      {"value", CanonicalValue(*publication.value)},
+      {"received_at_ns", content_identity::nonnegative_int64_value(sample.received_at_ns)}});
+}
+
+}  // namespace
+
+CanonicalValue IoSourceCursorValue(const core::IoSourceCursorDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"owner_epoch", CanonicalValue(value.owner_epoch.value())},
+      {"catalog_generation",
+       CanonicalValue(std::to_string(value.catalog_generation))},
+      {"source_id", CanonicalValue(value.source_id.value())},
+      {"record_sequence",
+       CanonicalValue(std::to_string(value.record_sequence))}});
+}
+CanonicalValue IoSignalObservationValue(const core::IoSignalObservationDTO& value) {
+  const auto& sample = value.latest_sample;
+  const auto error = value.source_error.has_value()
+      ? value.source_error : sample ? sample->publication.error : std::nullopt;
+  CanonicalValue liveness(nullptr);
+  if (value.descriptor.liveness) {
+    const auto mode = *value.descriptor.liveness;
+    const char *name = nullptr;
+    switch (mode) {
+    case core::IoSignalLivenessMode::kInProcess:
+      name = "in_process";
+      break;
+    case core::IoSignalLivenessMode::kPeriodic:
+      name = "periodic";
+      break;
+    case core::IoSignalLivenessMode::kChangeOnly:
+      name = "change_only";
+      break;
+    default:
+      throw std::invalid_argument("Invalid I/O liveness descriptor");
+    }
+    liveness = CanonicalValue(CanonicalValue::Object{
+        {"mode", CanonicalValue(name)},
+        {"warning", mode == core::IoSignalLivenessMode::kChangeOnly
+                        ? CanonicalValue("liveness_unproven")
+                        : CanonicalValue(nullptr)}});
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"liveness", std::move(liveness)},
+      {"signal_name", CanonicalValue(value.descriptor.signal_id.name)},
+      {"value_type", CanonicalValue("bool")},
+      {"value", sample && sample->publication.value.has_value()
+                    ? CanonicalValue(*sample->publication.value)
+                    : CanonicalValue(nullptr)},
+      {"quality", CanonicalValue(std::string(IoQuality(value.availability)))},
+      {"source_id", CanonicalValue(value.descriptor.source_id.value())},
+      {"source_epoch",
+       value.installed_incarnation
+           ? CanonicalValue(value.installed_incarnation->value())
+           : CanonicalValue(nullptr)},
+      {"source_sequence", sample ? CanonicalValue(std::to_string(
+                                       sample->publication.source_sequence))
+                                 : CanonicalValue(nullptr)},
+      {"receipt_age_ns",
+       sample && value.evaluated_at_ns >= sample->received_at_ns
+           ? content_identity::nonnegative_int64_value(value.evaluated_at_ns -
+                                                       sample->received_at_ns)
+           : CanonicalValue(nullptr)},
+      {"continuity_loss_generation",
+       CanonicalValue(std::to_string(value.continuity_loss_generation))},
+      {"error", error ? ErrorValue(*error) : CanonicalValue(nullptr)}});
+}
+
+CanonicalValue IoWatchRegistrationValue(const core::IoWatchRegistrationDTO& value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"owner_epoch", CanonicalValue(value.owner_epoch.value())},
+      {"catalog_generation", CanonicalValue(std::to_string(value.catalog_generation))},
+      {"registration_id", CanonicalValue(std::to_string(value.registration_id))},
+      {"scope", CanonicalValue(CanonicalValue::Object{
+          {"program_runner_owner_epoch", CanonicalValue(value.scope.program_runner_owner_epoch.value())},
+          {"program_run_id", CanonicalValue(value.scope.program_run_id.value())},
+          {"node", CanonicalValue(CanonicalValue::Object{
+              {"node_instance_id", CanonicalValue(value.scope.node.node_instance_id.value())},
+              {"node_attempt_id", CanonicalValue(value.scope.node.node_attempt_id)}})}})}});
+}
+
+CanonicalValue IoWatchResultValue(const core::IoWatchResultDTO& value) {
+  const auto state = [&]() -> std::string_view {
+    switch (value.state) {
+      case core::IoWatchState::kPending: return "pending";
+      case core::IoWatchState::kMatched: return "matched";
+      case core::IoWatchState::kReleased: return "released";
+    }
+    Fail("I/O watch state is invalid");
+  }();
+  return CanonicalValue(CanonicalValue::Object{
+      {"state", CanonicalValue(std::string(state))},
+      {"observation", value.observation ? IoSignalObservationValue(*value.observation)
+                                        : CanonicalValue(nullptr)},
+      {"matched_sample", value.matched_sample ? IoMatchedSampleValue(*value.matched_sample)
+                                              : CanonicalValue(nullptr)}});
+}
+
+CanonicalValue::Object InterruptRuleEventMetadataFields(
+    const std::optional<core::IoRuleStateProjectionDTO> &actual,
+    const core::RequestOwnerEpoch &owner_epoch) {
+  if (!actual) return {{"interrupt_rule_catalog", CanonicalValue(nullptr)},
+                       {"interrupt_rule_state_baseline", CanonicalValue(nullptr)}};
+  const auto applied_fields = [&](const core::IoRuleAppliedContextDTO &context,
+                                  std::string_view status) {
+    const auto identity = [](const auto &id) {
+      return !id.empty() && id.value().find('\0') == std::string::npos;
+    };
+    Require(identity(context.owner_epoch) && context.owner_epoch == owner_epoch &&
+                identity(context.retained_bundle_id) &&
+                identity(context.graph_revision) &&
+                context.active_publication_generation.nonzero() &&
+                context.active_publication_generation.value() <=
+                    9'007'199'254'740'991ULL,
+            "rule metadata has no exact successful Applied context");
+    return CanonicalValue::Object{
+        {"status", CanonicalValue(std::string(status))},
+        {"owner_epoch", CanonicalValue(context.owner_epoch.value())},
+        {"active_publication_generation",
+         CanonicalValue(static_cast<double>(
+             context.active_publication_generation.value()))},
+        {"bundle", CanonicalValue(context.retained_bundle_id.value())},
+        {"graph", CanonicalValue(context.graph_revision.value())}};
+  };
+  const auto rule_fields = [](const auto &rules, bool waiting_only) {
+    CanonicalValue::Array ids;
+    CanonicalValue::Array waiting;
+    std::optional<core::InterruptPolicyId> previous;
+    for (const auto &rule : rules) {
+      Require(!rule.policy_id.empty() &&
+                  rule.policy_id.value().find('\0') == std::string::npos &&
+                  (!previous || *previous < rule.policy_id),
+              "rule catalog IDs are not canonical");
+      ids.emplace_back(rule.policy_id.value());
+      previous = rule.policy_id;
+      Require(!waiting_only ||
+                  (!rule.waiting_for_program_keys.empty() &&
+                   rule.required_signal_sources.empty()),
+              "no-service waiting rule has an actual signal dependency");
+      if (rule.waiting_for_program_keys.empty())
+        continue;
+      Require(!rule.condition, "waiting rule has a checked condition");
+      CanonicalValue::Array keys;
+      std::string previous_key;
+      for (const auto &key : rule.waiting_for_program_keys) {
+        Require(!key.empty() && key.find('\0') == std::string::npos &&
+                    previous_key < key,
+                "waiting rule keys are not canonical");
+        keys.emplace_back(key);
+        previous_key = key;
+      }
+      waiting.emplace_back(CanonicalValue::Object{
+          {"rule_id", CanonicalValue(rule.policy_id.value())},
+          {"keys", CanonicalValue(std::move(keys))}});
+    }
+    CanonicalValue::Object fields{
+        {"rule_ids", CanonicalValue(std::move(ids))}};
+    if (!waiting.empty())
+      fields.emplace_back("waiting_for_program", CanonicalValue(std::move(waiting)));
+    return fields;
+  };
+  if (actual->waiting_for_program) {
+    const auto &waiting = *actual->waiting_for_program;
+    Require(actual->status == core::IoRuleStateProjectionStatusDTO::kPending &&
+                !actual->catalog && !actual->baseline &&
+                !actual->verified_empty && !waiting.rules.empty(),
+            "waiting rule projection has an incompatible state snapshot");
+    auto fields = applied_fields(waiting.context, "waiting_for_program");
+    for (auto &field : rule_fields(waiting.rules, true))
+      fields.push_back(std::move(field));
+    return {{"interrupt_rule_catalog", CanonicalValue(std::move(fields))},
+            {"interrupt_rule_state_baseline",
+             CanonicalValue(CanonicalValue::Object{
+                 {"status", CanonicalValue("projection_pending")}})}};
+  }
+  if (actual->verified_empty) {
+    const auto &context = *actual->verified_empty;
+    Require((actual->status == core::IoRuleStateProjectionStatusDTO::kReady ||
+             actual->status == core::IoRuleStateProjectionStatusDTO::kPending) &&
+                !actual->catalog && !actual->baseline,
+            "verified-empty rule projection has no exact successful Applied "
+            "context");
+    return {{"interrupt_rule_catalog",
+             CanonicalValue(applied_fields(context, "verified_empty"))},
+            {"interrupt_rule_state_baseline",
+             actual->status == core::IoRuleStateProjectionStatusDTO::kPending
+                 ? CanonicalValue(CanonicalValue::Object{
+                       {"status", CanonicalValue("projection_pending")}})
+                 : CanonicalValue(nullptr)}};
+  }
+  Require(actual->catalog != nullptr, "rule projection has no actual catalog");
+  const auto &catalog = *actual->catalog;
+  const auto &context = catalog.context;
+  Require(!core::io_rule_state_context_field_error(context) && context.owner_epoch == owner_epoch,
+          "rule catalog context differs from the actual event owner");
+  auto rules = rule_fields(catalog.rules, false);
+  const bool waiting = std::any_of(
+      catalog.rules.begin(), catalog.rules.end(),
+      [](const auto &rule) { return !rule.waiting_for_program_keys.empty(); });
+  Require(!waiting ||
+              (!catalog.program_binding_id &&
+               actual->status == core::IoRuleStateProjectionStatusDTO::kPending),
+          "waiting rules have an Applied Program or a fabricated ready cut");
+  CanonicalValue::Array keys;
+  std::string previous_key;
+  for (const auto &key : catalog.referenced_program_blackboard_keys) {
+    Require(!key.empty() && key.find('\0') == std::string::npos && previous_key < key,
+            "rule catalog key union is not canonical");
+    keys.emplace_back(key);
+    previous_key = key;
+  }
+  auto catalog_fields = GlobalRuleContextValue(context).as_object();
+  for (auto &field : rules)
+    catalog_fields.push_back(std::move(field));
+  catalog_fields.emplace_back("referenced_program_blackboard_keys", CanonicalValue(std::move(keys)));
+  CanonicalValue metadata(std::move(catalog_fields));
+  CanonicalValue baseline(nullptr);
+  if (actual->status == core::IoRuleStateProjectionStatusDTO::kPending) {
+    Require(!actual->baseline, "pending rule projection has a ready baseline");
+    baseline = CanonicalValue(CanonicalValue::Object{{"status", CanonicalValue("projection_pending")}});
+  } else {
+    Require(actual->status == core::IoRuleStateProjectionStatusDTO::kReady && actual->baseline &&
+                actual->baseline->context == context &&
+                !core::io_rule_state_baseline_field_error(*actual->baseline),
+            "ready rule baseline has no exact same-catalog cut");
+    const auto &snapshot = *actual->baseline;
+    Require(snapshot.states.size() == catalog.rules.size(), "rule baseline omits actual catalog rows");
+    CanonicalValue::Array states;
+    for (std::size_t index = 0; index < snapshot.states.size(); ++index) {
+      const auto &row = snapshot.states[index];
+      Require(row.rule_id == catalog.rules[index].policy_id, "rule baseline relabels catalog membership");
+      states.emplace_back(GlobalRuleStateValue(context, row));
+    }
+    baseline = CanonicalValue(CanonicalValue::Object{
+        {"status", CanonicalValue("ready")},
+        {"snapshot", CanonicalValue(CanonicalValue::Object{
+            {"owner_epoch", CanonicalValue(context.owner_epoch.value())},
+            {"catalog_generation", CanonicalValue(std::to_string(context.catalog_generation))},
+            {"active_publication_generation", CanonicalValue(static_cast<double>(context.active_publication_generation.value()))},
+            {"retained_bundle_id", CanonicalValue(context.retained_bundle_id.value())},
+            {"graph_revision", CanonicalValue(context.graph_revision.value())},
+            {"through_sequence", CanonicalValue(static_cast<double>(snapshot.through_sequence))},
+            {"states", CanonicalValue(std::move(states))}})}});
+  }
+  return {{"interrupt_rule_catalog", std::move(metadata)},
+          {"interrupt_rule_state_baseline", std::move(baseline)}};
+}
+
 } // namespace manyforge::roboplan_backend::host_detail

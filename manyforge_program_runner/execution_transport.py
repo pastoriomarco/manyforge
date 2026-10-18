@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 from pathlib import Path
+import re
 from typing import Annotated, Any, Literal, TypeVar
+import unicodedata
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
@@ -30,6 +33,7 @@ from manyforge_headless_api.models import (
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
     TargetObservationQuery,
+    IoWatchResult,
     SHA256_PATTERN,
     SceneRevisionRequest,
 )
@@ -152,6 +156,302 @@ class _ProgramPlace(PlaceSequencePlanningRequest):
     retreat_operation: _ProgramOperation
 
 
+class _IoWatchCondition(StrictRequest):
+    # Edge and compound conditions are refused before this boundary.
+    kind: Literal["level"]
+    expected_value: bool
+
+
+class _IoWatchRequest(StrictRequest):
+    """`manyforge.io_watch_request.v1`: one node attempt's level watch."""
+
+    schema_version: Literal["manyforge.io_watch_request.v1"]
+    owner_epoch: _Identity
+    program_binding_id: _Digest
+    program_runner_owner_epoch: _Identity
+    claim_generation: _Revision
+    program_run_id: _Identity
+    node_instance_id: Annotated[str, Field(min_length=1, max_length=128)]
+    node_attempt_id: Annotated[str, Field(min_length=1, max_length=512)]
+    target_role_id: _Identity
+    resource_role_id: _Identity
+    condition: _IoWatchCondition
+
+
+class _IoWatchNode(StrictRequest):
+    node_instance_id: Annotated[str, Field(min_length=1, max_length=128)]
+    node_attempt_id: Annotated[str, Field(min_length=1, max_length=512)]
+
+
+class _IoWatchScope(StrictRequest):
+    program_runner_owner_epoch: _Identity
+    program_run_id: _Identity
+    node: _IoWatchNode
+
+
+class _IoWatchScopeRelease(StrictRequest):
+    """`manyforge.io_watch_scope_release.v1`: release (and fence) one exact
+    node attempt's watch when its registration reply was never known."""
+
+    schema_version: Literal["manyforge.io_watch_scope_release.v1"]
+    owner_epoch: _Identity
+    program_binding_id: _Digest
+    program_runner_owner_epoch: _Identity
+    claim_generation: _Revision
+    program_run_id: _Identity
+    node_instance_id: Annotated[str, Field(min_length=1, max_length=128)]
+    node_attempt_id: Annotated[str, Field(min_length=1, max_length=512)]
+
+
+class _IoWatchRegistration(StrictRequest):
+    """The exact Core registration token; read/release send it unchanged."""
+
+    owner_epoch: _Identity
+    catalog_generation: _Identity
+    registration_id: _Identity
+    scope: _IoWatchScope
+
+
+_UnsignedDecimal = Annotated[str, Field(pattern=r"^(0|[1-9][0-9]{0,19})$")]
+
+
+# Decision 133 (interface freeze01): `start_mock_io_node_simulation`.
+_MOCK_SIMULATION_COMMAND: Literal["start_mock_io_node_simulation"] = (
+    "start_mock_io_node_simulation"
+)
+_PositiveDecimal = Annotated[str, Field(pattern=r"^[1-9][0-9]{0,19}$")]
+
+
+class _MockSimulationSignal(StrictRequest):
+    target_role: _Identity
+    resource_role: _Identity
+
+
+class _MockSimulationChange(StrictRequest):
+    after_ms: Annotated[int, Field(ge=0, le=2**64 - 1)]
+    value: bool
+
+
+class _MockSimulationRow(StrictRequest):
+    signal: _MockSimulationSignal
+    start_value: bool
+    # Required and explicit: an authoring omission is normalized to null.
+    change: _MockSimulationChange | None
+
+
+class _MockSimulationReceipt(StrictRequest):
+    signal: _MockSimulationSignal
+    status: Literal["applied", "inactive"]
+
+
+def _selectors(rows) -> list[tuple[str, str]]:
+    return [(row.signal.target_role, row.signal.resource_role) for row in rows]
+
+
+class _MockSimulationOccurrence(StrictRequest):
+    owner_epoch: _Identity
+    program_binding_id: _Digest
+    program_runner_owner_epoch: _Identity
+    claim_generation: _Revision
+    program_run_id: _Identity
+    node_instance_id: Annotated[str, Field(min_length=1, max_length=128)]
+    node_attempt_id: Annotated[str, Field(min_length=1, max_length=512)]
+    # Positive full-width uint64, canonical decimal text (no 53-bit limit).
+    node_start_index: _PositiveDecimal
+
+    @field_validator("node_start_index")
+    @classmethod
+    def full_width_index(cls, value: str) -> str:
+        if int(value) > 2**64 - 1:
+            raise ValueError("node_start_index exceeds uint64")
+        return value
+
+    def occurrence(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name) for name in _MockSimulationOccurrence.model_fields
+        }
+
+
+class _MockSimulationEnd(_MockSimulationOccurrence):
+    """`manyforge.mock_io_node_end.v1` (decision 135): the start's exact
+    occurrence; its still-pending change is cancelled."""
+
+    schema_version: Literal["manyforge.mock_io_node_end.v1"]
+
+
+class _MockSimulationEndAck(_MockSimulationOccurrence):
+    api_version: Literal[EXECUTION_RESPONSE_VERSION]
+    command: Literal["end_mock_io_node_simulation"]
+    ok: Literal[True]
+
+
+class _MockRunPauseOccurrence(StrictRequest):
+    owner_epoch: _Identity
+    program_binding_id: _Digest
+    program_runner_owner_epoch: _Identity
+    claim_generation: _Revision
+    program_run_id: _Identity
+    # The Runner's existing run_revision: positive full uint64 decimal text.
+    run_revision: _PositiveDecimal
+    paused: bool
+    # Decision 138 (snapshot138 interface01): nodes whose nearest Hold
+    # wrapper is wholly held, sorted unique; mandatory, possibly empty.
+    held_node_instance_ids: list[Annotated[str, Field(min_length=1, max_length=128)]]
+
+    @field_validator("run_revision")
+    @classmethod
+    def full_width_revision(cls, value: str) -> str:
+        if int(value) > 2**64 - 1:
+            raise ValueError("run_revision exceeds uint64")
+        return value
+
+    @field_validator("held_node_instance_ids")
+    @classmethod
+    def canonical_mask(cls, value: list[str]) -> list[str]:
+        if value != sorted(set(value)):
+            raise ValueError("held_node_instance_ids is not sorted and unique")
+        return value
+
+    def occurrence(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in _MockRunPauseOccurrence.model_fields}
+
+
+class _MockRunPause(_MockRunPauseOccurrence):
+    """`manyforge.mock_io_run_pause.v1` (SX-2411, decision 138): the Run's
+    Halt state and held-node mask under one run_revision."""
+
+    schema_version: Literal["manyforge.mock_io_run_pause.v1"]
+
+
+class _MockRunPauseAck(_MockRunPauseOccurrence):
+    api_version: Literal[EXECUTION_RESPONSE_VERSION]
+    command: Literal["set_mock_io_run_paused"]
+    ok: Literal[True]
+
+
+class _MockSimulationRequest(_MockSimulationOccurrence):
+    """`manyforge.mock_io_node_start.v1`: one node start's literal rows."""
+
+    schema_version: Literal["manyforge.mock_io_node_start.v1"]
+    signals: Annotated[list[_MockSimulationRow], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def canonical_rows(self):
+        selectors = _selectors(self.signals)
+        if selectors != sorted(set(selectors)):
+            raise ValueError("Mock simulation rows are not unique and canonically sorted")
+        return self
+
+
+class _MockSimulationAck(_MockSimulationOccurrence):
+    """The exact flat 14-field success reply; no wrapper."""
+
+    api_version: Literal[EXECUTION_RESPONSE_VERSION]
+    command: Literal["start_mock_io_node_simulation"]
+    ok: Literal[True]
+    status: Literal["accepted"]
+    # The original host monotonic receipt: nonnegative int64 decimal text.
+    started_at_ns: _UnsignedDecimal
+    signals: list[_MockSimulationReceipt]
+
+    @model_validator(mode="after")
+    def bounded_anchor(self):
+        selectors = _selectors(self.signals)
+        if int(self.started_at_ns) > 2**63 - 1 or selectors != sorted(set(selectors)):
+            raise ValueError("Mock simulation acknowledgement is not canonical")
+        return self
+
+
+class _ProgramBlackboardValue(StrictRequest):
+    name: Annotated[str, Field(min_length=1, max_length=256)]
+    value_type: Literal["bool", "int64", "float64", "string"]
+    value: bool | str | float | None
+
+    @model_validator(mode="after")
+    def typed_value(self):
+        value = self.value
+        if value is None:
+            valid = True  # The key is actually unset.
+        elif self.value_type == "bool":
+            valid = type(value) is bool
+        elif self.value_type == "int64":
+            valid = (
+                isinstance(value, str)
+                and re.fullmatch(r"0|-?[1-9][0-9]{0,18}", value) is not None
+                and -(2**63) <= int(value) <= 2**63 - 1
+            )
+        elif self.value_type == "float64":
+            valid = type(value) is float and math.isfinite(value)
+        else:
+            valid = isinstance(value, str) and unicodedata.normalize("NFC", value) == value
+        if not valid:
+            raise ValueError("BB key value does not match its value type")
+        return self
+
+
+class _ProgramBlackboardPublication(StrictRequest):
+    """`manyforge.program_bbkey_publication.v1`: one ordered BB key frame."""
+
+    schema_version: Literal["manyforge.program_bbkey_publication.v1"]
+    owner_epoch: _Identity
+    program_runner_owner_epoch: _Identity
+    # Both null for the cell-level source between Runs.
+    claim_generation: _Revision | None
+    program_run_id: _Identity | None
+    program_binding_id: _Digest
+    # bb-wire-shapes03: the host's existing Applied publication counter.
+    active_publication_generation: _Revision
+    cycle_generation: _Revision
+    kind: Literal["baseline", "update"]
+    message_sequence: _UnsignedDecimal
+    previous_sequence: _UnsignedDecimal
+    values: list[_ProgramBlackboardValue]
+
+    @model_validator(mode="after")
+    def ordered_frame(self):
+        sequence = int(self.message_sequence)
+        names = [row.name for row in self.values]
+        if (
+            not 1 <= sequence <= 2**64 - 1
+            or int(self.previous_sequence) != sequence - 1
+            or (self.kind == "baseline") != (sequence == 1)
+            or names != sorted(set(names))
+            or not names
+            or (self.claim_generation is None) != (self.program_run_id is None)
+        ):
+            raise ValueError("BB key publication frame is not ordered and canonical")
+        return self
+
+
+class _ProgramBlackboardPublicationAck(StrictRequest):
+    """The actual Core admission reply (bb-wire-shapes03), closed.
+
+    `accepted`: this frame was admitted (no ACK for enqueue). `superseded`:
+    the frame's occurrence was retired by an authoritative Reset/new Run/
+    Apply replacement; `accepted_sequence` is null and the occurrence fields
+    describe the installed replacement. Mismatches stay ErrorDTOs.
+    """
+
+    api_version: Literal[EXECUTION_RESPONSE_VERSION]
+    command: Literal["publish_program_bbkeys"]
+    ok: Literal[True]
+    status: Literal["accepted", "superseded"]
+    owner_epoch: _Identity
+    program_binding_id: _Digest
+    active_publication_generation: _Revision
+    cycle_generation: _Revision
+    # Null between Runs.
+    program_run_id: _Identity | None
+    source_epoch: _Identity
+    accepted_sequence: _UnsignedDecimal | None
+
+    @model_validator(mode="after")
+    def sequence_matches_status(self):
+        if (self.status == "accepted") != (self.accepted_sequence is not None):
+            raise ValueError("BB publication reply sequence does not match its status")
+        return self
+
+
 class ProgramRunnerExecutionTransport(ExecutionCommandClient):
     """Validate Program mappings over the existing private owner client."""
 
@@ -260,6 +560,249 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
 
     def query_target(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return super().query_target(self._request(TargetObservationQuery, body))
+
+    def _io_watch_result(self, response: Mapping[str, Any], command: str) -> dict[str, Any]:
+        if response.get("command") != command:
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                f"{command} response does not name its command",
+            )
+        try:
+            return IoWatchResult.model_validate(response.get("result")).model_dump(mode="json")
+        except ValidationError as error:
+            raise HeadlessApiError(
+                "execution_command_response_invalid", f"{command} result is invalid"
+            ) from error
+
+    def register_io_watch(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Register one zero-claim level watch for one exact node attempt."""
+
+        request = self._request(_IoWatchRequest, body)
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "register_io_watch",
+                "attribution": self._request_attribution(None),
+                "request": request.model_dump(mode="json"),
+            }
+        )
+        result = self._io_watch_result(response, "register_io_watch")
+        try:
+            registration = _IoWatchRegistration.model_validate(response.get("registration"))
+        except ValidationError as error:
+            raise HeadlessApiError(
+                "execution_command_response_invalid", "I/O watch registration is invalid"
+            ) from error
+        scope = registration.scope
+        if (
+            registration.owner_epoch != request.owner_epoch
+            or scope.program_runner_owner_epoch != request.program_runner_owner_epoch
+            or scope.program_run_id != request.program_run_id
+            or scope.node.node_instance_id != request.node_instance_id
+            or scope.node.node_attempt_id != request.node_attempt_id
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "I/O watch registration does not identify its node attempt",
+            )
+        return {"registration": registration.model_dump(mode="json"), "result": result}
+
+    def _io_watch_registration(self, registration: Mapping[str, Any]) -> dict[str, Any]:
+        return self._request(_IoWatchRegistration, registration).model_dump(mode="json")
+
+    def read_io_watch(self, registration: Mapping[str, Any]) -> dict[str, Any]:
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "read_io_watch",
+                "attribution": self._request_attribution(None),
+                "registration": self._io_watch_registration(registration),
+            }
+        )
+        return self._io_watch_result(response, "read_io_watch")
+
+    def release_io_watch(self, registration: Mapping[str, Any]) -> None:
+        """Exact-token idempotent release; a released token stays released."""
+
+        self._release_io_watch(
+            {"registration": self._io_watch_registration(registration)}
+        )
+
+    def release_io_watch_scope(self, scope_request: Mapping[str, Any]) -> None:
+        """Tokenless release of one exact node attempt's watch scope.
+
+        The same command with `scope_request` instead of `registration`; the
+        host ACKs only after fencing the attempt and releasing any watch it
+        holds, with no result.
+        """
+
+        self._release_io_watch(
+            {
+                "scope_request": self._request(
+                    _IoWatchScopeRelease, scope_request
+                ).model_dump(mode="json")
+            }
+        )
+
+    def _release_io_watch(self, selector: dict[str, Any]) -> None:
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "release_io_watch",
+                "attribution": self._request_attribution(None),
+                **selector,
+            }
+        )
+        if response.get("command") != "release_io_watch":
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "release_io_watch response does not name its command",
+            )
+
+    def start_mock_io_node_simulation(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Start one node attempt's Mock simulation; only the exact accepted
+        reply for this same occurrence and these same rows ACKs it.
+
+        A host ErrorResponse keeps its code and details. Resending the same
+        request is answered with the host's retained original result.
+        """
+
+        request = self._request(_MockSimulationRequest, body)
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": _MOCK_SIMULATION_COMMAND,
+                "attribution": self._request_attribution(None),
+                "request": request.model_dump(mode="json"),
+            }
+        )
+        if response.get("ok") is False:
+            self._raise_error_response(response)
+        try:
+            ack = _MockSimulationAck.model_validate(response)
+        except ValidationError as error:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "Mock simulation acknowledgement is invalid",
+            ) from error
+        if ack.occurrence() != request.occurrence() or _selectors(ack.signals) != _selectors(
+            request.signals
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "Mock simulation acknowledgement does not answer this node start",
+            )
+        return ack.model_dump(mode="json")
+
+    def _mock_exchange(
+        self,
+        command: str,
+        request_model: type[_Request],
+        ack_model: type[_Request],
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """One closed Mock lifetime command whose success echoes exactly the
+        request's occurrence; a host ErrorResponse keeps its code."""
+
+        request = self._request(request_model, body)
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": command,
+                "attribution": self._request_attribution(None),
+                "request": request.model_dump(mode="json"),
+            }
+        )
+        if response.get("ok") is False:
+            self._raise_error_response(response)
+        try:
+            ack = ack_model.model_validate(response)
+        except ValidationError as error:
+            raise HeadlessApiError(
+                "execution_command_response_invalid", f"{command} reply is invalid"
+            ) from error
+        if ack.occurrence() != request.occurrence():
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                f"{command} reply does not answer this request",
+            )
+        return ack.model_dump(mode="json")
+
+    def end_mock_io_node_simulation(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Decision 135: end one node attempt's Mock simulation (idempotent)."""
+
+        return self._mock_exchange(
+            "end_mock_io_node_simulation", _MockSimulationEnd, _MockSimulationEndAck, body
+        )
+
+    def set_mock_io_run_paused(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Decision 135 / SX-2411: the Run's Halt state for Mock timers."""
+
+        return self._mock_exchange(
+            "set_mock_io_run_paused", _MockRunPause, _MockRunPauseAck, body
+        )
+
+    def publish_program_bbkeys(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Send one ordered BB key frame; only the exact success reply ACKs it."""
+
+        request = self._request(_ProgramBlackboardPublication, body)
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "publish_program_bbkeys",
+                "attribution": self._request_attribution(None),
+                "request": request.model_dump(mode="json"),
+            }
+        )
+        if response.get("ok") is False:
+            # The owner's ErrorDTO keeps its code (e.g. bb_source_not_ready).
+            self._raise_error_response(response)
+        try:
+            ack = _ProgramBlackboardPublicationAck.model_validate(response)
+        except ValidationError as error:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "BB key publication reply is invalid",
+            ) from error
+        same_occurrence = (
+            ack.owner_epoch == request.owner_epoch
+            and ack.program_binding_id == request.program_binding_id
+            and ack.active_publication_generation == request.active_publication_generation
+            and ack.cycle_generation == request.cycle_generation
+            and ack.program_run_id == request.program_run_id
+        )
+        if (
+            not same_occurrence or ack.accepted_sequence != request.message_sequence
+        ) if ack.status == "accepted" else same_occurrence:
+            # A supersession must name a different (replacement) occurrence.
+            raise HeadlessApiError(
+                "execution_command_response_identity_mismatch",
+                "BB key publication reply does not answer this frame",
+            )
+        return ack.model_dump(mode="json")
+
+    def read_interrupt_rule_state_events(
+        self, owner_epoch: str, after_sequence: int
+    ) -> dict[str, Any]:
+        """One page of the existing ``events`` command, returned whole for the
+        global-rule state mirror (contract 64): its outer
+        ``interrupt_rule_state_baseline`` and its sparse
+        ``interrupt_rule_state_changed`` rows, read strictly by the mirror."""
+
+        if type(after_sequence) is not int or not 0 <= after_sequence <= 9_007_199_254_740_991:
+            raise ValueError("operation event query exceeds its fixed bounds")
+        response = self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "after_sequence": after_sequence,
+                "command": "events",
+                "limit": 16,
+                "owner_epoch": owner_epoch,
+            }
+        )
+        if response.get("ok") is not True:
+            self._raise_error_response(response)
+        return response
 
     def read_program_execution_scope(self, program_run_id: str) -> dict[str, Any]:
         return self._exchange(

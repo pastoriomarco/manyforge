@@ -58,6 +58,19 @@ struct TrajectoryDynamicsEnvelope {
     std::span<const TrajectoryDerivativeLimits> limits, double headroom_fraction,
     RuntimeScaleBounds software_ceiling) noexcept;
 
+// Qualify an already timed fixed curve without dilation or a new nominal
+// headroom requirement. Every piece's actual V/A/enabled J must fit its own
+// resolved limits. minimum_time_multiplier must equal one: a required TCP
+// slowdown cannot be ignored. Uses the same governor-margin calculation and
+// conservative bounds rounding as ordinary preparation at unit dilation,
+// taking one global R/B minimum across pieces and the software ceilings.
+// Refuses malformed facts or nonpositive/unrepresentable bounds. No epsilon
+// admits an actual limit violation. This derives no Stop-rate certificate and
+// grants no planning, dispatch, lifecycle, clock or monitoring authority.
+[[nodiscard]] std::optional<RuntimeScaleBounds> prepare_fixed_runtime_scaling(
+    std::span<const TrajectoryDynamicsEnvelope> pieces,
+    RuntimeScaleBounds software_ceiling) noexcept;
+
 // A second-order time-law governor: scale and scale rate are continuous even
 // when the target changes during a ramp. Three analytic phases suffice; no
 // queue, allocation, clock read, owner call or integration substep is needed.

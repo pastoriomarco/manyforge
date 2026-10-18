@@ -4,7 +4,7 @@ import type {
   CCLCComponentSnapshot,
   CCLCIncidentCauseClass,
   CCLCLifecycleTargetOrigin,
-  CCLCReadinessDomain,
+  CCLCReadinessProviderOccurrence,
   CCLCTransactionStatus,
 } from '../types/cclc';
 
@@ -170,7 +170,7 @@ function verdict(
         'Motion is unavailable while the lifecycle owner reconciles the outcome from actual observation.',
     };
   }
-  if (achieved === 'faulted' || snapshot.readiness.domains.some((domain) => domain.health?.observedState === 'faulted')) {
+  if (achieved === 'faulted' || snapshot.readiness.providerOccurrences.some((domain) => domain.health?.observedState === 'faulted')) {
     return { message: 'Fault — intervention required', tone: 'intervention', consequence: INTERVENTION_CONSEQUENCE };
   }
   if (
@@ -237,7 +237,7 @@ export function componentLifecyclePresentation(
 }
 
 /** Read-only wording of the selected domain; raw health/classification is retained. */
-export function componentReadinessDomainPresentation(domain: CCLCReadinessDomain) {
+export function componentReadinessOccurrencePresentation(domain: CCLCReadinessProviderOccurrence) {
   const facts = domain.health?.facts ?? [];
   if (domain.hasActivationStep !== false) {
     return { state: domain.health?.observedState ?? 'health unavailable', facts };

@@ -268,5 +268,117 @@ TEST(BoundedStopStageAttemptExecutorTest,
   EXPECT_THROW(BoundedStopStageAttemptExecutor(16U, 1U, receiver), std::invalid_argument);
 }
 
+class SpringPointPort final : public IControlDomainExecutionPort {
+ public:
+  ParticipantStopStageResultDTO TranslateStopStage(
+      const ResolvedParticipantStopStageDTO& request, const RemainingStopBudgetDTO&,
+      std::stop_token) override {
+    return completed(request);
+  }
+  ParticipantStopStageResultDTO TranslateStopStageForTakeover(
+      const ResolvedParticipantStopStageDTO& request, const RemainingStopBudgetDTO&,
+      std::stop_token cancellation, IStopStageSpringReturnObserver& observer) override {
+    SpringBackReturnPointDTO point;
+    point.source_goal = {ControllerGoalId("source.goal"), ControllerGoalGeneration(7U)};
+    point.binding_epoch = ExecutionBindingEpoch(11U);
+    point.trip.source_stamp_ns = 100;
+    point.initial.command_path_time_s = 2.5;
+    point.initial.path_time_rate = 0.4;
+    point.initial.runtime_velocity_scale_at_trip = 0.4;
+    point.initial.joint_names = {"joint"};
+    point.initial.spring_back_return_point = {0.0, {1.0}, {0.0}, {0.0}};
+    const bool first = observer.SpringReturnPointReady(point);
+    point.initial.spring_back_return_point.positions_rad.front() = 99.0;
+    const bool duplicate = observer.SpringReturnPointReady(point);
+    {
+      std::unique_lock lock(mutex_);
+      first_accepted_ = first;
+      duplicate_accepted_ = duplicate;
+      entered_ = true;
+      changed_.notify_all();
+      while (!cancellation.stop_requested()) changed_.wait_for(lock, 1ms);
+    }
+    return completed(request);
+  }
+  [[nodiscard]] bool WaitEntered() {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, 1s, [&] { return entered_; });
+  }
+  [[nodiscard]] bool FirstAccepted() {
+    std::lock_guard lock(mutex_);
+    return first_accepted_;
+  }
+  [[nodiscard]] bool DuplicateAccepted() {
+    std::lock_guard lock(mutex_);
+    return duplicate_accepted_;
+  }
+ private:
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool entered_{};
+  bool first_accepted_{};
+  bool duplicate_accepted_{};
+};
+
+TEST(BoundedStopStageAttemptExecutorTest,
+     SpringPointIsImmutableProgressBeforeCompletionAndCannotCrossLaneGeneration) {
+  SpringPointPort port;
+  CompletionReceiver receiver;
+  BoundedStopStageAttemptExecutor executor(8U, 1U, receiver);
+  const auto started = executor.TryStart({&port, stage("spring"), budget(), true});
+  ASSERT_TRUE(started.handle);
+  EXPECT_TRUE(port.WaitEntered());
+  EXPECT_TRUE(port.FirstAccepted());
+  EXPECT_FALSE(port.DuplicateAccepted());
+  const auto point = executor.ReadSpringReturnPoint(*started.handle);
+  EXPECT_TRUE(point);
+  if (point) {
+    EXPECT_EQ(point->source_goal.controller_goal_id, ControllerGoalId("source.goal"));
+    EXPECT_EQ(point->source_goal.controller_goal_generation, ControllerGoalGeneration(7U));
+    EXPECT_EQ(point->binding_epoch, ExecutionBindingEpoch(11U));
+    EXPECT_EQ(point->initial.command_path_time_s, 2.5);
+    EXPECT_EQ(point->initial.spring_back_return_point.positions_rad,
+              std::vector<double>{1.0});
+    EXPECT_EQ(executor.ReadSpringReturnPoint(*started.handle), point);
+  }
+  EXPECT_EQ(receiver.Count(*started.handle), 1U);
+  EXPECT_EQ(executor.TryTake(*started.handle).status, StopStageAttemptTakeStatus::kPending);
+  EXPECT_TRUE(executor.RequestCancel(*started.handle));
+  EXPECT_FALSE(executor.ReadSpringReturnPoint(*started.handle));
+  EXPECT_EQ(WaitForResult(executor, *started.handle).status,
+            StopStageAttemptTakeStatus::kCompleted);
+  EXPECT_EQ(executor.Release(*started.handle), StopStageAttemptReleaseStatus::kReleased);
+  EXPECT_FALSE(executor.ReadSpringReturnPoint(*started.handle));
+
+  IsolatedPort ordinary;
+  const auto next = executor.TryStart({&ordinary, stage("ordinary"), budget()});
+  ASSERT_TRUE(next.handle);
+  EXPECT_EQ(next.handle->slot, started.handle->slot);
+  EXPECT_GT(next.handle->generation, started.handle->generation);
+  EXPECT_FALSE(executor.ReadSpringReturnPoint(*started.handle));
+  EXPECT_FALSE(executor.ReadSpringReturnPoint(*next.handle));
+  EXPECT_EQ(WaitForResult(executor, *next.handle).status,
+            StopStageAttemptTakeStatus::kCompleted);
+  EXPECT_EQ(executor.Release(*next.handle), StopStageAttemptReleaseStatus::kReleased);
+  executor.CloseIngress();
+  EXPECT_TRUE(executor.DrainFor(1s));
+}
+
+TEST(BoundedStopStageAttemptExecutorTest,
+     TakeoverWithoutProgressSupportKeepsOrdinaryContainmentWithoutInventingAnAnchor) {
+  IsolatedPort port;
+  CompletionReceiver receiver;
+  BoundedStopStageAttemptExecutor executor(8U, 1U, receiver);
+  const auto started = executor.TryStart({&port, stage("ordinary"), budget(), true});
+  ASSERT_TRUE(started.handle);
+  const auto result = WaitForResult(executor, *started.handle);
+  EXPECT_EQ(result.status, StopStageAttemptTakeStatus::kCompleted);
+  EXPECT_TRUE(result.result);
+  EXPECT_FALSE(executor.ReadSpringReturnPoint(*started.handle));
+  EXPECT_EQ(executor.Release(*started.handle), StopStageAttemptReleaseStatus::kReleased);
+  executor.CloseIngress();
+  EXPECT_TRUE(executor.DrainFor(1s));
+}
+
 }  // namespace
 }  // namespace manyforge::core

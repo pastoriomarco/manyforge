@@ -692,15 +692,16 @@ using SymbolIndex = std::map<SymbolKey, std::string>;
 }  // namespace
 
 std::string emit_composed_model_symbol_role_map(
-    const CompilerQualifiedCellIr& compiler_ir) {
+    const CompilerQualifiedCellIr& compiler_ir,
+    const bool allow_empty_model_map) {
   const CanonicalValue projection = map_projection(compiler_ir);
   const std::string bytes = canonical_json(projection);
   if (bytes.size() > kMaxComposedModelSymbolRoleMapBytes) {
     fail_retained_bundle(
         "composed model symbol/role map exceeds its retained artifact bound");
   }
-  const CanonicalValue parsed =
-      parse_and_verify_composed_model_symbol_role_map(bytes);
+  const CanonicalValue parsed = parse_and_verify_composed_model_symbol_role_map(
+      bytes, allow_empty_model_map);
   if (parsed != projection) {
     throw std::logic_error(
         "composed model symbol/role map verifier changed compiler output");
@@ -710,9 +711,10 @@ std::string emit_composed_model_symbol_role_map(
 
 void require_composed_model_symbol_role_map_matches(
     std::string_view canonical_bytes,
-    const CompilerQualifiedCellIr& compiler_ir) {
-  const CanonicalValue parsed =
-      parse_and_verify_composed_model_symbol_role_map(canonical_bytes);
+    const CompilerQualifiedCellIr& compiler_ir,
+    const bool allow_empty_model_map) {
+  const CanonicalValue parsed = parse_and_verify_composed_model_symbol_role_map(
+      canonical_bytes, allow_empty_model_map);
   const CanonicalValue expected = map_projection(compiler_ir);
   if (parsed != expected) {
     fail_retained_bundle(

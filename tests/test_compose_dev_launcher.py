@@ -365,6 +365,7 @@ esac
         ROS_DOMAIN_ID="17",
         RMW_IMPLEMENTATION="rmw_fastrtps_cpp",
         MANYFORGE_ROS2_CONTROL_BUILD_TESTING="ON",
+        MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS="/qualified/first.bash:/qualified/second.bash",
         MANYFORGE_DEV_IMAGE="current-ros-image",
         MANYFORGE_DEV_CONTAINER_NAME=container_name,
     )
@@ -396,7 +397,7 @@ esac
         (" " + " ".join(selection) if selection else "")
     )
     for name in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "ROS_STATIC_PEERS",
-                 "MANYFORGE_ROS2_CONTROL_BUILD_TESTING"):
+                 "MANYFORGE_ROS2_CONTROL_BUILD_TESTING", "MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS"):
         assert f"--env {name}" in command
     assert f"--user {os.getuid()}:{os.getgid()}" in command
     assert "--env HOME=/runner/home" in command

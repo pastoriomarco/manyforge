@@ -157,6 +157,11 @@ HistorianPageValue(const HistorianPage &page);
 /// parse and discard large nested records.
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 HistorianSummaryPageValue(const HistorianPage &page);
+/// Bounded display text from an operation snapshot's original participant
+/// errors. The producer stores it as message; retained older events are
+/// unchanged.
+[[nodiscard]] std::string OperationFailureHistoryMessage(
+    const manyforge::content_identity::CanonicalValue &operation_state);
 /// Compact projection of an already validated original. Storage binds its
 /// exact bytes to the original digest; list reads never decode full payloads.
 [[nodiscard]] manyforge::content_identity::CanonicalValue HistorianSummaryEventValue(

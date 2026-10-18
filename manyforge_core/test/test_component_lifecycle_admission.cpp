@@ -44,20 +44,21 @@ constexpr std::int64_t kAcceptedAtNs = 100;
 
 [[nodiscard]] ActiveControlConfigurationDTO ActiveConfiguration(
     const ExpectedControlDomainRevisionDTO& expected) {
-  const auto& binding = expected.expected_control_bindings.front();
+  const auto& binding = expected.controller().expected_control_bindings.front();
   return {
-      *expected.expected_active_control_configuration.active_control_configuration_id,
+      *expected.controller().expected_active_control_configuration.active_control_configuration_id,
       expected.control_domain_id,
       expected.control_domain_revision,
       {{binding.control_binding_id, binding.control_binding_revision, binding.control_route_id}},
       ActivationSetId("activation.1"),
-      expected.controller_topology_id,
-      expected.topology_revision,
+      expected.controller().controller_topology_id,
+      expected.controller().topology_revision,
       RuntimeUnitId("runtime.1"),
       RuntimeEpoch("runtime-epoch.1"),
       1U,
       {},
-      *expected.expected_active_control_configuration.active_control_configuration_generation,
+      *expected.controller()
+           .expected_active_control_configuration.active_control_configuration_generation,
       ActiveControlConfigurationStateDTO::kReconciled};
 }
 
@@ -65,10 +66,10 @@ constexpr std::int64_t kAcceptedAtNs = 100;
     const ExpectedControlDomainRevisionDTO& expected) {
   return {expected.control_domain_id,
           expected.control_domain_revision,
-          expected.controller_topology_id,
-          expected.topology_revision,
+          expected.controller().controller_topology_id,
+          expected.controller().topology_revision,
           ActiveConfiguration(expected),
-          expected.expected_control_bindings,
+          expected.controller().expected_control_bindings,
           {ResourceId("resource-" + expected.control_domain_id.value())}};
 }
 
@@ -176,21 +177,48 @@ void SealSnapshot(ComponentLifecycleCurrentSnapshotDTO& snapshot) {
   snapshot.snapshot_digest = digest.value();
 }
 
+[[nodiscard]] std::pair<ExpectedControlDomainRevisionDTO, BrandLifecyclePlanCatalogDTO>
+ConfigureProviderDomain(ComponentLifecycleCurrentSnapshotDTO& snapshot, std::size_t index,
+                        Duration limit, std::vector<LifecycleIntentPlanDTO> plans) {
+  auto& occurrence = snapshot.provider_occurrences[index];
+  auto catalog = Catalog(occurrence, std::move(plans));
+  const auto id = snapshot.domains[index].control_domain_id;
+  const auto revision = snapshot.domains[index].control_domain_revision;
+  ProviderControlDomainDTO provider{snapshot.controllable_component_id,
+                                    occurrence.provider_runtime_unit_id,
+                                    occurrence.provider_instance_id,
+                                    occurrence.provider_manifest_id,
+                                    occurrence.provider_manifest_revision,
+                                    occurrence.lifecycle_plan_catalog_digest,
+                                    ContentDigest(Sha('a')),
+                                    {"ready"},
+                                    limit};
+  snapshot.domains[index] = {id, revision,
+                             ResolvedProviderDomainScopeDTO{
+                                 provider, occurrence.provider_runtime_epoch, std::nullopt, {}}};
+  ExpectedControlDomainRevisionDTO expected{
+      id, revision,
+      ExpectedProviderDomainScopeDTO{
+          provider,
+          {ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt}}};
+  return {std::move(expected), std::move(catalog)};
+}
+
 [[nodiscard]] ApplyAdmissionFixture ApplyFixture(bool recovery = false, bool changed = false) {
   auto first = ExpectedDomain("a");
   if (!recovery || changed) {
-    first.expected_active_control_configuration = {
+    first.controller().expected_active_control_configuration = {
         ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt};
   }
   if (changed) {
     first.control_domain_revision = ControlDomainRevision("candidate-domain-a");
-    first.expected_control_bindings.front().control_binding_revision =
+    first.controller().expected_control_bindings.front().control_binding_revision =
         ControlBindingRevision("candidate-binding-a");
   }
   std::vector<ExpectedControlDomainRevisionDTO> expected{first};
   if (changed) {
     auto added = ExpectedDomain("b");
-    added.expected_active_control_configuration = {
+    added.controller().expected_active_control_configuration = {
         ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt};
     expected.push_back(added);
   }
@@ -202,13 +230,13 @@ void SealSnapshot(ComponentLifecycleCurrentSnapshotDTO& snapshot) {
     candidate_domains.push_back(
         {domain.control_domain_id,
          domain.control_domain_revision,
-         domain.controller_topology_id,
-         domain.topology_revision,
-         domain.expected_active_control_configuration.presence ==
+         domain.controller().controller_topology_id,
+         domain.controller().topology_revision,
+         domain.controller().expected_active_control_configuration.presence ==
                  ExpectedActiveControlConfigurationPresenceDTO::kPresent
              ? std::optional(ActiveConfiguration(domain))
              : std::nullopt,
-         domain.expected_control_bindings,
+         domain.controller().expected_control_bindings,
          {ResourceId("candidate-resource-" + domain.control_domain_id.value())}});
     candidate_providers.push_back(Provider(candidate_domains.back(), index == 0U ? "c" : "d"));
     catalogs.push_back(
@@ -262,7 +290,7 @@ void SealSnapshot(ComponentLifecycleCurrentSnapshotDTO& snapshot) {
       (successor ? domain->second.candidate_control_domain_revision
                  : domain->second.predecessor_control_domain_revision) =
           value.control_domain_revision;
-      for (const auto& binding : value.current_control_bindings) {
+      for (const auto& binding : value.controller().current_control_bindings) {
         auto entry = bindings
                          .try_emplace(binding.control_binding_id,
                                       ConfigurationFenceBindingScopeDTO{binding.control_binding_id,
@@ -272,8 +300,8 @@ void SealSnapshot(ComponentLifecycleCurrentSnapshotDTO& snapshot) {
                    : entry->second.predecessor_control_binding_revision) =
             binding.control_binding_revision;
       }
-      scope.resources.insert(scope.resources.end(), value.current_resources.begin(),
-                             value.current_resources.end());
+      scope.resources.insert(scope.resources.end(), value.controller().current_resources.begin(),
+                             value.controller().current_resources.end());
     }
   };
   if (predecessor) collect(predecessor->domains, false);
@@ -388,6 +416,110 @@ TEST(ComponentLifecycleAdmission, PreparesExactFixedTargetFromCurrentProviderCat
   EXPECT_TRUE(prepared.value().initial_status.locally_valid());
 }
 
+TEST(ComponentLifecycleAdmission, ConfiguredDeviceLimitsUseExactScopeWithoutChangingCatalog) {
+  auto plan = FixedPlan(ComponentLifecycleIntentKindDTO::kPrepare,
+                        ComponentLifecycleStateDTO::kPrepared, 1);
+  plan.timeout_policy = DeviceConfiguredLifecycleLimitDTO{};
+  std::optional<ContentDigest> digest;
+  for (const Duration limit : {7'000LL, 11'000LL}) {
+    auto snapshot = Snapshot({ExpectedDomain("a")});
+    auto [expected, catalog] = ConfigureProviderDomain(snapshot, 0U, limit, {plan});
+    SealSnapshot(snapshot);
+    const auto intent = Intent(ComponentLifecycleIntentKindDTO::kPrepare, {expected});
+    const auto prepared =
+        PrepareComponentLifecycleAdmission(intent, Candidate(snapshot, {catalog}));
+    ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+    EXPECT_EQ(prepared.value().acceptance.timeout_duration_ns, limit);
+    EXPECT_EQ(prepared.value().initial_status.remaining_duration_ns, limit);
+    if (digest) {
+      EXPECT_EQ(*digest, catalog.catalog_digest);
+    }
+    digest = catalog.catalog_digest;
+
+    auto changed = *snapshot.domains[0].provider();
+    ++changed.provider.lifecycle_command_timeout_ns;
+    snapshot.domains[0].payload = changed;
+    SealSnapshot(snapshot);
+    EXPECT_FALSE(PrepareComponentLifecycleAdmission(intent, Candidate(snapshot, {catalog})).ok());
+  }
+}
+
+TEST(ComponentLifecycleAdmission, ConfiguredPolicyRequiresValidActualProviderLimit) {
+  auto plan = FixedPlan(ComponentLifecycleIntentKindDTO::kPrepare,
+                        ComponentLifecycleStateDTO::kPrepared, 1);
+  plan.timeout_policy = DeviceConfiguredLifecycleLimitDTO{};
+  const auto physical_expected = ExpectedDomain("a");
+  auto physical = Snapshot({physical_expected});
+  const auto catalog = Catalog(physical.provider_occurrences[0], {plan});
+  EXPECT_FALSE(PrepareComponentLifecycleAdmission(
+                   Intent(ComponentLifecycleIntentKindDTO::kPrepare, {physical_expected}),
+                   Candidate(physical, {catalog}))
+                   .ok());
+  for (const Duration invalid : {0LL, -1LL, kMaxLifecycleTransactionTimeoutNs + 1LL}) {
+    auto snapshot = Snapshot({physical_expected});
+    auto [expected, provider_catalog] = ConfigureProviderDomain(snapshot, 0U, invalid, {plan});
+    EXPECT_FALSE(PrepareComponentLifecycleAdmission(
+                     Intent(ComponentLifecycleIntentKindDTO::kPrepare, {expected}),
+                     Candidate(snapshot, {provider_catalog}))
+                     .ok());
+  }
+}
+
+TEST(ComponentLifecycleAdmission, MixedFixedAndConfiguredRecoverKeepsMinimumBudget) {
+  const auto physical_expected = ExpectedDomain("a");
+  auto snapshot =
+      Snapshot({physical_expected, ExpectedDomain("b")}, ComponentLifecycleStateDTO::kFaulted);
+  const auto physical_catalog =
+      Catalog(snapshot.provider_occurrences[0],
+              {RecoverPlan(ComponentLifecycleStateDTO::kPrepared, 4'000),
+               RecoverPlan(ComponentLifecycleStateDTO::kDisabled, 6'000)});
+  auto configured = RecoverPlan(ComponentLifecycleStateDTO::kPrepared, 1);
+  configured.timeout_policy = DeviceConfiguredLifecycleLimitDTO{};
+  auto [provider_expected, provider_catalog] =
+      ConfigureProviderDomain(snapshot, 1U, 9'000, {configured});
+  SealSnapshot(snapshot);
+  const auto prepared = PrepareComponentLifecycleAdmission(
+      Intent(ComponentLifecycleIntentKindDTO::kRecover, {physical_expected, provider_expected}),
+      Candidate(snapshot, {physical_catalog, provider_catalog}));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  EXPECT_EQ(prepared.value().acceptance.timeout_duration_ns, 4'000);
+}
+
+TEST(ComponentLifecycleAdmission, TypedProviderFenceAndExpectationRecordsAreClosed) {
+  auto snapshot = Snapshot({ExpectedDomain("a")});
+  auto [expected, catalog] =
+      ConfigureProviderDomain(snapshot, 0U, 7'000,
+                              {FixedPlan(ComponentLifecycleIntentKindDTO::kPrepare,
+                                         ComponentLifecycleStateDTO::kPrepared, 5'000)});
+  const auto expected_bytes = detail::EncodeExpectedControlDomainRevisionRecord(expected);
+  EXPECT_EQ(detail::DecodeExpectedControlDomainRevisionRecord(expected_bytes), expected);
+  EXPECT_THROW((void)detail::DecodeExpectedControlDomainRevisionRecord(expected_bytes + "x"),
+               std::invalid_argument);
+  const auto& provider = snapshot.domains[0].provider()->provider;
+  const ProviderConfigurationFenceOccurrenceDTO proof{provider.controllable_component_id,
+                                                      provider.provider_instance_id,
+                                                      provider.signal_configuration_digest,
+                                                      {}};
+  ConfigurationFenceScopeDTO scope{
+      {snapshot.controllable_component_id},
+      {{snapshot.domains[0].control_domain_id, snapshot.domains[0].control_domain_revision,
+        snapshot.domains[0].control_domain_revision,
+        ProviderConfigurationFenceDomainDTO{proof, proof}}},
+      {},
+      {}};
+  ASSERT_TRUE(scope.valid());
+  const auto bytes = detail::EncodeConfigurationFenceScopeRecord(scope);
+  EXPECT_EQ(detail::DecodeConfigurationFenceScopeRecord(bytes), scope);
+  EXPECT_THROW((void)detail::DecodeConfigurationFenceScopeRecord(bytes + "x"),
+               std::invalid_argument);
+  auto invalid = scope;
+  auto& typed = std::get<ProviderConfigurationFenceDomainDTO>(invalid.domains[0].payload);
+  typed.candidate_provider->controllable_component_id =
+      ControllableComponentId("foreign.component");
+  EXPECT_FALSE(invalid.valid());
+  EXPECT_THROW((void)detail::EncodeConfigurationFenceScopeRecord(invalid), std::invalid_argument);
+}
+
 TEST(ComponentLifecycleAdmission, RecoverUsesMinimumAcrossEveryCandidateWithoutSelectingTarget) {
   const auto first = ExpectedDomain("a");
   const auto second = ExpectedDomain("b");
@@ -422,7 +554,7 @@ TEST(ComponentLifecycleAdmission, RejectsStaleSnapshotAndWrongCatalogBeforeReser
                                     ComponentLifecycleStateDTO::kActive, 5'000)});
 
   auto forged_content = catalog;
-  forged_content.plans.front().timeout_duration_ns += 1;
+  std::get<std::int64_t>(forged_content.plans.front().timeout_policy) += 1;
   auto prepared = PrepareComponentLifecycleAdmission(
       Intent(ComponentLifecycleIntentKindDTO::kEnable, {expected}),
       Candidate(snapshot, {forged_content}));
@@ -571,7 +703,7 @@ TEST(ApplyComponentBringUpAdmission, InitialPrepareEnableDisableDoNotInventCurre
     const auto plan = std::find_if(catalog.plans.begin(), catalog.plans.end(),
                                    [&](const auto& entry) { return entry.intent == kind; });
     ASSERT_NE(plan, catalog.plans.end());
-    EXPECT_EQ(value.acceptance.timeout_duration_ns, plan->timeout_duration_ns);
+    EXPECT_EQ(value.acceptance.timeout_duration_ns, std::get<std::int64_t>(plan->timeout_policy));
     EXPECT_EQ(value.initial_status.requested_state.state, plan->requested_state);
     EXPECT_EQ(plan->requested_postcondition, StatePredicate(plan->requested_state));
     if (kind == ComponentLifecycleIntentKindDTO::kDisable) {
@@ -796,12 +928,14 @@ TEST(ApplyComponentBringUpAdmission, RejectsForeignSnapshotProviderCatalogAndPhy
       ControlDomainRevision("foreign.revision");
   refused(fixture, "component_lifecycle_configuration_stale");
   fixture = ApplyFixture();
-  fixture.candidate.lifecycle_plan_catalogs.front().plans.front().timeout_duration_ns += 1;
+  std::get<std::int64_t>(
+      fixture.candidate.lifecycle_plan_catalogs.front().plans.front().timeout_policy) += 1;
   refused(fixture, "component_lifecycle_catalog_mismatch");
   fixture = ApplyFixture();
-  fixture.candidate_domains.front().current_resources.push_back(ResourceId("unfenced.resource"));
-  std::sort(fixture.candidate_domains.front().current_resources.begin(),
-            fixture.candidate_domains.front().current_resources.end());
+  fixture.candidate_domains.front().controller().current_resources.push_back(
+      ResourceId("unfenced.resource"));
+  std::sort(fixture.candidate_domains.front().controller().current_resources.begin(),
+            fixture.candidate_domains.front().controller().current_resources.end());
   refused(fixture, "component_lifecycle_configuration_stale");
   fixture = ApplyFixture(true, true);
   fixture.evidence.recovery->predecessor_snapshot_digest = ContentDigest(Sha('0'));
@@ -872,6 +1006,92 @@ TEST(ApplyComponentBringUpAdmission, RejectsUnsupportedProgramAndOverflowingAdmi
   const auto overflow = PrepareApply(fixture);
   ASSERT_FALSE(overflow.ok());
   EXPECT_EQ(overflow.error().details.at("reason"), "deadline_overflow");
+}
+
+TEST(ComponentLifecycleAdmission, ProviderFenceLineageCoversOnlyExactPredecessorSides) {
+  auto snapshot = Snapshot({ExpectedDomain("a")});
+  auto configured =
+      ConfigureProviderDomain(snapshot, 0U, 30'000'000'000LL,
+                              {FixedPlan(ComponentLifecycleIntentKindDTO::kPrepare,
+                                         ComponentLifecycleStateDTO::kPrepared, 5'000)});
+  (void)configured;
+  const auto& domain = snapshot.domains.front();
+  const auto& provider = *domain.provider();
+  const ProviderConfigurationFenceOccurrenceDTO proof{snapshot.controllable_component_id,
+                                                      provider.provider.provider_instance_id,
+                                                      provider.provider.signal_configuration_digest,
+                                                      {}};
+  const ConfigurationFenceScopeDTO scope{
+      {snapshot.controllable_component_id},
+      {{domain.control_domain_id, domain.control_domain_revision, domain.control_domain_revision,
+        ProviderConfigurationFenceDomainDTO{proof, proof}}},
+      {},
+      {}};
+  const auto& revision = snapshot.active_publication_receipt.request.candidate_projection_revision;
+  const ProviderConfigurationFenceLineageDTO actual{domain.control_domain_id,
+                                                    provider.provider_runtime_epoch,
+                                                    snapshot.component_lifecycle_generation};
+  ConfigurationFenceAdmissionSnapshotDTO admission{
+      {scope, RuntimeEpoch("manager.actual")},
+      {provider.provider.provider_runtime_unit_id, RuntimeEpoch("host.successor"),
+       RequestOwnerEpoch("host.actual"), ContentDigest("ledger.actual"),
+       snapshot.active_publication_receipt.publication_generation},
+      revision,
+      snapshot.active_publication_receipt.durable_public_pointer_content_digest,
+      1U,
+      ConfigurationFenceGeneration(1U),
+      {},
+      0U,
+      0U,
+      ContentDigest("digest.actual"),
+      {actual}};
+  ApplyConfigurationFenceIntentDTO intent{
+      {RequestId("request.actual"), RequestOwnerEpoch("owner.actual"),
+       "manager", std::nullopt},
+      {ApplyId("apply.actual"), ApplyGeneration(1U)},
+      scope,
+      ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+      revision.retained_bundle_id,
+      revision.graph_revision,
+      1U,
+      ConfigurationFenceGeneration(1U),
+      {},
+      "actual Apply",
+      {actual}};
+  EXPECT_TRUE(admission.presence_valid());
+  EXPECT_TRUE(intent.valid());
+  // This is captured predecessor lineage, never a new driver's Active proof.
+  EXPECT_NE(actual.provider_runtime_epoch, admission.execution_host_epoch.runtime_epoch);
+  auto missing = admission;
+  missing.provider_lineages.clear();
+  EXPECT_FALSE(missing.presence_valid());
+  auto missing_intent = intent;
+  missing_intent.expected_provider_lineages.clear();
+  EXPECT_FALSE(missing_intent.valid());
+  auto duplicate = admission;
+  duplicate.provider_lineages.push_back(actual);
+  EXPECT_FALSE(duplicate.presence_valid());
+  auto foreign = intent;
+  foreign.expected_provider_lineages.front().control_domain_id = ControlDomainId("foreign.domain");
+  EXPECT_FALSE(foreign.valid());
+  auto candidate_only = admission;
+  auto& fenced = candidate_only.echoed_query.affected_scope.domains.front();
+  fenced.predecessor_control_domain_revision.reset();
+  std::get<ProviderConfigurationFenceDomainDTO>(fenced.payload).predecessor_provider.reset();
+  EXPECT_FALSE(candidate_only.presence_valid());  // Unused predecessor receipt is forbidden.
+  candidate_only.provider_lineages.clear();
+  EXPECT_TRUE(candidate_only.presence_valid());
+  auto physical = intent;
+  physical.scope.domains.front().payload = ControllerConfigurationFenceDomainDTO{};
+  physical.scope.bindings.push_back(
+      {ControlBindingId("binding"), ControlBindingRevision("old"), ControlBindingRevision("next")});
+  physical.scope.resources.push_back(ResourceId("physical.resource"));
+  physical.expected_active_control_configurations.push_back(
+      {domain.control_domain_id, ActiveControlConfigurationId("actual.configuration"),
+       ActiveControlConfigurationGeneration(1U)});
+  EXPECT_FALSE(physical.valid());  // Provider receipt cannot masquerade as controller proof.
+  physical.expected_provider_lineages.clear();
+  EXPECT_TRUE(physical.valid());
 }
 
 }  // namespace

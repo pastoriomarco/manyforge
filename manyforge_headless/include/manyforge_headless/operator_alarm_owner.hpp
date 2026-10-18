@@ -431,6 +431,9 @@ public:
       std::optional<std::size_t> limit = std::nullopt,
       const std::set<AlarmLifecycleState> &states = {},
       AlarmSnapshotOrdering ordering = AlarmSnapshotOrdering::kDefault) const;
+  /// Read one existing condition point under the owner lock; no new state is created.
+  [[nodiscard]] std::optional<AlarmPointState>
+  ConditionPoint(std::string_view definition_id, const AlarmSubject &subject) const;
   [[nodiscard]] std::vector<OperatorAlarmRecord>
   TerminalRecords(std::optional<std::size_t> limit = std::nullopt) const;
   /// The latest published motion-attention projection. The owner rebuilds

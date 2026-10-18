@@ -1,4 +1,7 @@
+#include <manyforge_core/io_rule_stop_response.hpp>
 #include "manyforge_deployment/cell_applicability.hpp"
+#include <manyforge_deployment/io_provider_domain.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -464,8 +467,15 @@ struct QualifiedIndexes final {
         retained_policy);
   }
   for (const auto &domain : graph.control_domains) {
-    result.required_topologies.insert(
-        pair_key(domain.controller_topology_id, domain.topology_revision));
+    if (const auto *provider = domain.provider()) {
+      result.required_manifests.insert(
+          pair_key(provider->provider_manifest_id,
+                   provider->provider_manifest_revision));
+    } else {
+      result.required_topologies.insert(
+          pair_key(domain.controller().controller_topology_id,
+                   domain.controller().topology_revision));
+    }
   }
   for (const auto &binding : graph.control_bindings) {
     result.required_capability_definitions.insert(pair_key(
@@ -1234,8 +1244,10 @@ qualify_binding_contexts(const CompositionQualifiedCellIr &composition,
 
   for (const auto &binding : graph.control_bindings) {
     const auto &domain = require_domain(graph, binding.control_domain_id);
-    if (binding.controller_topology_id != domain.controller_topology_id ||
-        binding.topology_revision != domain.topology_revision) {
+    if (domain.provider() ||
+        binding.controller_topology_id !=
+            domain.controller().controller_topology_id ||
+        binding.topology_revision != domain.controller().topology_revision) {
       fail("control binding topology pair differs from its control domain");
     }
 
@@ -1499,25 +1511,33 @@ void qualify_desired_configurations(
            "control-domain ID");
     }
   }
-  if (desired_by_domain.size() != graph.control_domains.size()) {
+  const auto controller_domains = static_cast<std::size_t>(std::count_if(
+      graph.control_domains.begin(), graph.control_domains.end(),
+      [](const auto &domain) { return domain.provider() == nullptr; }));
+  if (desired_by_domain.size() != controller_domains) {
     fail("desired-control-configuration coverage is not exact");
   }
 
   for (const auto &domain : graph.control_domains) {
+    if (domain.provider()) {
+      if (desired_by_domain.contains(domain.control_domain_id))
+        fail("provider domain cannot select a controller configuration");
+      continue;
+    }
     const auto found = desired_by_domain.find(domain.control_domain_id);
     if (found == desired_by_domain.end()) {
       fail("control domain has no desired configuration");
     }
     const auto &desired = *found->second;
     if (desired.control_domain_revision != domain.control_domain_revision ||
-        desired.controller_topology_id != domain.controller_topology_id ||
-        desired.topology_revision != domain.topology_revision) {
+        desired.controller_topology_id != domain.controller().controller_topology_id ||
+        desired.topology_revision != domain.controller().topology_revision) {
       fail("desired configuration selects a stale domain or topology "
            "revision");
     }
     const auto &topology = indexes.topologies
-                               .at(pair_key(domain.controller_topology_id,
-                                            domain.topology_revision))
+                               .at(pair_key(domain.controller().controller_topology_id,
+                                            domain.controller().topology_revision))
                                ->value();
     (void)require_activation_set(topology, desired.activation_set_id);
 
@@ -1892,14 +1912,47 @@ void qualify_capability_provider_target(
     }
     const auto &domain = require_domain(graph, target->control_domain_id);
     if (domain.control_domain_revision != target->control_domain_revision ||
-        domain.controller_topology_id != target->controller_topology_id ||
-        domain.topology_revision != target->topology_revision) {
-      fail("control-domain capability-provider target is stale or selects "
-           "the wrong topology");
+        target->provider() != (domain.provider() != nullptr))
+      fail("control-domain capability-provider target is stale or has the "
+           "wrong kind");
+    if (const auto *provider = domain.provider()) {
+      if (binding.provider_instance_id != provider->provider_instance_id ||
+          binding.provider_manifest_id != provider->provider_manifest_id ||
+          binding.provider_manifest_revision !=
+              provider->provider_manifest_revision)
+        fail("provider-domain capability does not name its actual provider "
+             "occurrence");
+    } else if (domain.controller().controller_topology_id !=
+                   target->controller().controller_topology_id ||
+               domain.controller().topology_revision !=
+                   target->controller().topology_revision) {
+      fail("control-domain capability-provider target selects the wrong "
+           "topology");
     }
     break;
   }
   case core::CapabilityScope::kTargetBinding: {
+    if (const auto* direct = std::get_if<core::ComponentTargetCapabilityProviderTargetDTO>(&binding.target)) {
+      const auto& component = require_component(graph, direct->controllable_component_id);
+      if (component.component_type_revision != direct->component_type_revision)
+        fail("direct provider target has a stale component-type revision");
+      const auto& target_type = require_type_target(composition, component, direct->command_target_id);
+      require_target_capability(target_type, binding.capability_id, binding.capability_definition_revision);
+      const auto catalog = ResolveRetainedIoSignalCatalog(graph);
+      if (!catalog.ok()) fail(catalog.error().details.at("reason"));
+      if (target_type.resource_roles.empty()) fail("direct provider target declares no non-coordinate resource roles");
+      for (const auto& role : target_type.resource_roles) {
+        const auto* local = std::get_if<core::ComponentTypeLocalResourceRoleDTO>(&role);
+        if (!local || local->coordinate_kind || std::none_of(catalog.value().begin(), catalog.value().end(), [&](const auto& signal) {
+              return signal.descriptor.signal_id.controllable_component_id == direct->controllable_component_id &&
+                     signal.command_target_id == direct->command_target_id && signal.resource_role_id == local->resource_role_id;
+            }))
+          fail("direct provider target resource is not an exact sealed non-coordinate signal role");
+      }
+      const auto bound = ValidateNonCoordinateProviderTarget(graph, binding);
+      if (!bound.ok()) fail(bound.error().details.at("reason"));
+      break;
+    }
     const auto *target =
         std::get_if<core::TargetBindingCapabilityProviderTargetDTO>(
             &binding.target);
@@ -1945,6 +1998,11 @@ capability_coverage_key(const core::CapabilityProviderBindingDTO &binding) {
                           core::CellGlobalCapabilityProviderTargetDTO>) {
           result.emplace_back("cell_global");
           result.push_back(target.cell_id.value());
+        } else if constexpr (std::is_same_v<Target, core::ComponentTargetCapabilityProviderTargetDTO>) {
+          result.emplace_back("component_target");
+          result.push_back(target.controllable_component_id.value());
+          result.push_back(target.component_type_revision.value());
+          result.push_back(target.command_target_id.value());
         } else if constexpr (
             std::is_same_v<Target,
                            core::TargetBindingCapabilityProviderTargetDTO>) {
@@ -1958,8 +2016,13 @@ capability_coverage_key(const core::CapabilityProviderBindingDTO &binding) {
           result.emplace_back("control_domain");
           result.push_back(target.control_domain_id.value());
           result.push_back(target.control_domain_revision.value());
-          result.push_back(target.controller_topology_id.value());
-          result.push_back(target.topology_revision.value());
+          if (target.provider()) {
+            result.emplace_back("provider");
+          } else {
+            result.push_back(
+                target.controller().controller_topology_id.value());
+            result.push_back(target.controller().topology_revision.value());
+          }
         }
       },
       binding.target);
@@ -2037,6 +2100,11 @@ void qualify_complete_capability_coverage(
                       declared.capability_definition_revision ||
                   candidate.scope != core::CapabilityScope::kTargetBinding) {
                 return false;
+              }
+              if (const auto* direct = std::get_if<core::ComponentTargetCapabilityProviderTargetDTO>(&candidate.target)) {
+                return direct->controllable_component_id == component.controllable_component_id &&
+                       direct->component_type_revision == component.component_type_revision &&
+                       direct->command_target_id == target.command_target_id;
               }
               const auto *target_binding =
                   std::get_if<core::TargetBindingCapabilityProviderTargetDTO>(
@@ -3096,6 +3164,42 @@ qualify_stop_applicability(
   return result;
 }
 
+// Program group membership is qualified later against the actual sealed
+// Applied Program. Unrestricted motion scopes can qualify entries here.
+void qualify_interrupt_stop_entries(
+    const std::optional<CanonicalValue> &normalized_policies,
+    const std::vector<BindingContext> &bindings) {
+  if (!normalized_policies)
+    return;
+  const auto *rules =
+      normalized_policies->find_object_member("interrupt_rules");
+  if (!rules)
+    return;
+  for (const auto &rule : rules->as_array()) {
+    const auto *entry = rule.find_object_member("stop_entry_stage_id");
+    if (!entry || !rule.find_object_member("scope")->is_string())
+      continue;
+    bool matched = false;
+    for (const auto &context : bindings) {
+      if (context.binding->capability_id.value() !=
+          "execution.trajectory.execute")
+        continue;
+      matched = true;
+      std::vector<core::IoRuleStopEntryRowDTO> rows;
+      for (const auto &stage : context.stop_policy->value().escalation_stages)
+        rows.push_back({stage.stop_escalation_stage_id, stage.stage_kind,
+                        stage.containment_command.command_kind,
+                        qualify_stop_action_class(stage)});
+      const auto selected = core::ResolveIoRuleStopEntryIndex(
+          rows, core::StopEscalationStageId(entry->as_string()));
+      if (!selected.ok())
+        fail(selected.error().details.at("reason"));
+    }
+    if (!matched)
+      fail("io_rule_stop_entry_target_unqualified");
+  }
+}
+
 } // namespace
 
 ApplicabilityQualifiedCellIr qualify_cell_applicability(
@@ -3114,6 +3218,14 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
         commissioning_evidence_refs,
     const QualifiedSelectedSiteOverlay &selected_site_overlay,
     std::span<const QualifiedContactPolicy> contact_policies) {
+  if (const auto &configuration = deployment_inputs.normalized_policies();
+      configuration) {
+    for (const std::string_view name :
+         {"interrupt_sources", "interrupt_policies"})
+      if (const auto *rows = configuration->find_object_member(name);
+          rows && !rows->as_array().empty())
+        fail("legacy_interrupt_policy_runtime_unsupported");
+  }
   const QualifiedAssistantSettings assistant_settings =
       qualify_assistant_settings(deployment_inputs.assistant_settings(),
                                  deployment_inputs.value().external_resources);
@@ -3125,6 +3237,12 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
   const auto selected_overlay = qualify_selected_overlay(
       deployment_inputs.value(), selected_site_overlay);
   qualify_provider_instances(composition.graph(), deployment_inputs.value());
+  const auto provider_domains = ValidateIoProviderDomains(
+      composition.graph(),
+      deployment_inputs.value().capability_provider_bindings, runtime_profiles,
+      provider_manifests);
+  if (!provider_domains.ok())
+    fail(provider_domains.error().details.at("reason"));
 
   auto bindings = qualify_binding_contexts(composition, indexes);
   auto stop_dependencies =
@@ -3157,6 +3275,7 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
       composition.graph().cell_id, bindings, controllers_and_routes.routes,
       controllers_and_routes.controllers, deployment_inputs.value(),
       stop_dependencies, names, logical_rows);
+  qualify_interrupt_stop_entries(deployment_inputs.normalized_policies(), bindings);
 
   std::vector<LogicalBindingInterfaceTemplate> binding_interfaces;
   binding_interfaces.reserve(bindings.size());

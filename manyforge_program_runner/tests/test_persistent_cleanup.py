@@ -446,6 +446,40 @@ def test_a_reconciliation_that_may_not_be_durable_suppresses_values_until_settle
     assert pallet == 9
 
 
+@pytest.mark.usefixtures("_no_scene")
+def test_a_storage_fault_first_seen_after_the_claim_is_a_started_run_that_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    headless, _first = _store_pallet_nine(tmp_path)
+    headless.apply(_PALLET)
+    runtime, host = _runtime(tmp_path, headless, "late_fault")
+    register = runtime._persistent_keys  # noqa: SLF001
+    admission = runtime._admission  # noqa: SLF001
+    acquire = admission.acquire
+
+    def acquire_then_fail_storage(intent: dict[str, Any]) -> dict[str, Any]:
+        claim = acquire(intent)
+        # Storage reconciled before the claim, then fails once it is held.
+        monkeypatch.setattr(
+            register,
+            "reconcile",
+            lambda *_args: (_ for _ in ()).throw(
+                persistent_keys.PersistentKeyRegisterError("read-only file system")
+            ),
+        )
+        return claim
+
+    monkeypatch.setattr(admission, "acquire", acquire_then_fail_storage)
+    try:
+        with pytest.raises(ProgramRunnerError) as failed:
+            _start(runtime, headless)
+        assert failed.value.code == "program_run_started_then_failed"
+        assert failed.value.details["cause_code"] == "persistent_key_storage_unavailable"
+        assert host.stores == []
+    finally:
+        runtime.shutdown()
+
+
 def test_another_register_version_refuses_the_runner_by_name(tmp_path: Path) -> None:
     path = tmp_path / "persistent-keys.json"
     path.write_text('{"schema_version": "manyforge.persistent_key_register.v1"}')

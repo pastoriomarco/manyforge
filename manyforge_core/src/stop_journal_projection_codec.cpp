@@ -1,3 +1,4 @@
+#include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -378,19 +379,50 @@ template <typename T, typename Decode>
       i64(f[11], "accepted time")};
 }
 
+[[nodiscard]] V certificate_ref_value(const StopCertificateRefDTO& value);
+[[nodiscard]] StopCertificateRefDTO certificate_ref_from(const V& value);
+
+[[nodiscard]] V terminal_fact_value(const ParticipantExecutionFact& fact) {
+  if (static_cast<unsigned>(fact.kind) > 4U || static_cast<unsigned>(fact.effect) > 2U)
+    bad("participant terminal fact enum is invalid");
+  return arr({enc(fact.kind), enc(fact.effect), opt(fact.error, error_value)});
+}
+[[nodiscard]] ParticipantExecutionFact terminal_fact_from(const V& value) {
+  const auto& fields = exact(value, 3U, "participant terminal fact");
+  return {den<ParticipantExecutionFactKind>(fields[0], 4U, "participant fact kind"),
+          den<ParticipantEffectKnowledge>(fields[1], 2U, "participant effect knowledge"),
+          dopt<ErrorDTO>(fields[2], error_from)};
+}
+
 [[nodiscard]] V participant_state_value(const OperationParticipantStateDTO& value) {
+  if (value.terminal_fact &&
+      (value.state != OperationStateKind::kCompleted &&
+       value.state != OperationStateKind::kStopped && value.state != OperationStateKind::kFailed &&
+       value.state != OperationStateKind::kInterrupted &&
+       value.state != OperationStateKind::kInterventionRequired &&
+       value.state != OperationStateKind::kCancelledPreDispatch))
+    bad("participant terminal fact has no matching terminal row");
+  if (!value.binding_identity.locally_valid() ||
+      (value.binding_identity.provider() &&
+       value.payload_kind != OperationParticipantPayloadKind::kCapabilityCommand) ||
+      (value.output_evidence &&
+       (to_string(*value.output_evidence).empty() ||
+        value.payload_kind != OperationParticipantPayloadKind::kCapabilityCommand)))
+    bad("participant binding identity or output evidence is invalid");
+  const auto* controller = value.binding_identity.controller();
+  const auto* provider = value.binding_identity.capability_provider();
   A fields{enc(value.participant_id),
-           enc(value.controller_goal_id),
-           enc(value.controller_goal_generation),
+           enc(value.command_id),
+           enc(value.command_generation),
            enc(value.controllable_component_id),
            enc(value.command_target_id),
            enc(value.capability_id),
-           enc(value.control_domain_id),
-           enc(value.control_domain_revision),
-           enc(value.control_binding_id),
-           enc(value.control_binding_revision),
-           opt(value.capability_provider_binding_id, id_value),
-           opt(value.capability_provider_binding_revision, id_value),
+           enc(value.binding_identity.control_domain_id),
+           enc(value.binding_identity.control_domain_revision),
+           controller ? enc(controller->control_binding_id) : V(nullptr),
+           controller ? enc(controller->control_binding_revision) : V(nullptr),
+           provider ? enc(provider->capability_provider_binding_id) : V(nullptr),
+           provider ? enc(provider->capability_provider_binding_revision) : V(nullptr),
            enc(value.payload_kind),
            enc(value.state),
            V(value.progress),
@@ -403,40 +435,62 @@ template <typename T, typename Decode>
     fields.push_back(arr(
         {enc(value.execution_scope->node_instance_id), V(value.execution_scope->node_attempt_id)}));
   }
+  if (value.terminal_fact) {
+    if (!value.execution_scope) fields.emplace_back(nullptr);
+    fields.push_back(terminal_fact_value(*value.terminal_fact));
+  }
+  if (value.output_evidence) {
+    while (fields.size() < 19U) fields.emplace_back(nullptr);
+    fields.push_back(enc(*value.output_evidence));
+  }
+  if (!value.io_rule_outcomes.empty()) {
+    const auto encoded = EncodeIoRuleOutcomes(value.io_rule_outcomes);
+    if (!encoded.ok()) bad(encoded.error().details.at("reason"));
+    while (fields.size() < 20U) fields.emplace_back(nullptr);
+    fields.push_back(content_identity::parse_canonical_json(encoded.value()));
+  }
   return V(std::move(fields));
 }
 
 [[nodiscard]] OperationParticipantStateDTO participant_state_from(const V& value) {
-  if (!value.is_array() || (value.as_array().size() != 17U && value.as_array().size() != 18U)) {
+  if (!value.is_array() || (value.as_array().size() != 17U && value.as_array().size() != 18U &&
+                            value.as_array().size() != 19U && value.as_array().size() != 20U &&
+                            value.as_array().size() != 21U)) {
     bad("operation participant state has an unsupported shape");
   }
   const auto& f = value.as_array();
   std::optional<ProgramNodeExecutionScopeDTO> scope;
-  if (f.size() == 18U) {
+  if (f.size() >= 18U && !f[17].is_null()) {
     const auto& origin = exact(f[17], 2U, "operation participant scope");
     scope = ProgramNodeExecutionScopeDTO{did<ProgramNodeInstanceId>(origin[0], "node instance ID"),
                                          str(origin[1], "node attempt ID")};
     if (!valid_program_node_execution_scope(*scope)) bad("operation participant scope is invalid");
   }
-  return OperationParticipantStateDTO{
+  if (f[8].is_null() != f[9].is_null() || f[10].is_null() != f[11].is_null() ||
+      (f[8].is_null() && f[10].is_null()))
+    bad("participant binding identity is incomplete");
+  std::optional<CapabilityProviderBindingIdentityDTO> provider;
+  if (!f[10].is_null())
+    provider = CapabilityProviderBindingIdentityDTO{
+        did<CapabilityProviderBindingId>(f[10], "provider binding ID"),
+        did<CapabilityProviderBindingRevision>(f[11], "provider binding revision")};
+  ParticipantBindingIdentityDTO identity{
+      did<ControlDomainId>(f[6], "control domain ID"),
+      did<ControlDomainRevision>(f[7], "control domain revision"),
+      f[8].is_null()
+          ? decltype(ParticipantBindingIdentityDTO::binding)(*provider)
+          : decltype(ParticipantBindingIdentityDTO::binding)(
+                ControllerParticipantBindingIdentityDTO{
+                    did<ControlBindingId>(f[8], "control binding ID"),
+                    did<ControlBindingRevision>(f[9], "control binding revision"), provider})};
+  auto result = OperationParticipantStateDTO{
       did<OperationParticipantId>(f[0], "participant ID"),
-      did<ControllerGoalId>(f[1], "controller goal ID"),
-      did<ControllerGoalGeneration>(f[2], "controller goal generation"),
+      did<ControllerGoalId>(f[1], "command ID"),
+      did<ControllerGoalGeneration>(f[2], "command generation"),
       did<ControllableComponentId>(f[3], "component ID"),
       did<CommandTargetId>(f[4], "command target ID"),
       did<CapabilityId>(f[5], "capability ID"),
-      did<ControlDomainId>(f[6], "control domain ID"),
-      did<ControlDomainRevision>(f[7], "control domain revision"),
-      did<ControlBindingId>(f[8], "control binding ID"),
-      did<ControlBindingRevision>(f[9], "control binding revision"),
-      dopt<CapabilityProviderBindingId>(
-          f[10],
-          [](const V& v) { return did<CapabilityProviderBindingId>(v, "provider binding ID"); }),
-      dopt<CapabilityProviderBindingRevision>(f[11],
-                                              [](const V& v) {
-                                                return did<CapabilityProviderBindingRevision>(
-                                                    v, "provider binding revision");
-                                              }),
+      std::move(identity),
       den<OperationParticipantPayloadKind>(f[12], 1U, "participant payload kind"),
       den<OperationStateKind>(f[13], 14U, "operation state"),
       number(f[14], "progress"),
@@ -444,11 +498,57 @@ template <typename T, typename Decode>
           f[15], [](const V& v) { return did<ResourceId>(v, "resource ID"); }, "resources"),
       dopt<ErrorDTO>(f[16], error_from),
       std::move(scope)};
+  if (f.size() == 18U && f[17].is_null()) bad("empty participant scope extension");
+  if (f.size() >= 19U && !f[18].is_null()) result.terminal_fact = terminal_fact_from(f[18]);
+  if (f.size() == 19U && f[18].is_null()) bad("empty participant fact extension");
+  if (f.size() >= 20U && !f[19].is_null())
+    result.output_evidence = den<IoOutputEvidence>(f[19], 4U, "output evidence");
+  if (f.size() == 20U && f[19].is_null()) bad("empty output evidence extension");
+  if (f.size() == 21U) {
+    const auto decoded = DecodeIoRuleOutcomes(content_identity::canonical_json(f[20]));
+    if (!decoded.ok()) bad(decoded.error().details.at("reason"));
+    result.io_rule_outcomes = std::move(decoded.value());
+  }
+  (void)participant_state_value(result);
+  return result;
+}
+
+[[nodiscard]] V preemption_value(const OperationPreemptionDTO& value) {
+  if (to_string(value.kind).empty() || value.by.operation_id.empty() ||
+      value.by.operation_id.value().size() > 2048U ||
+      value.by.operation_id.value().find('\0') != std::string::npos ||
+      !valid_program_node_execution_scope({value.by.node_instance_id, value.by.node_attempt_id}))
+    bad("operation preemption identity is invalid");
+  return arr({enc(value.kind), enc(value.by.operation_id), enc(value.by.node_instance_id),
+              V(value.by.node_attempt_id)});
+}
+
+[[nodiscard]] OperationPreemptionDTO preemption_from(const V& value) {
+  const auto& f = exact(value, 4U, "operation preemption");
+  auto result = OperationPreemptionDTO{
+      den<OperationPreemptionKind>(f[0], 1U, "preemption kind"),
+      {did<OperationId>(f[1], "preempting operation ID"),
+       did<ProgramNodeInstanceId>(f[2], "preempting node ID"),
+       str(f[3], "preempting node attempt ID")}};
+  (void)preemption_value(result);
+  return result;
 }
 
 [[nodiscard]] V operation_state_value(const OperationStateDTO& value) {
   if (has_program_execution_scope(value) && value.journal_capture_order == 0U) {
     bad("captured Program work requires an ordered Stop snapshot");
+  }
+  for (const auto& participant : value.participants) {
+    const auto qualified = ValidateIoRuleOutcomeParticipant(
+        value.operation_id, value.operation_revision, participant);
+    if (!qualified.ok()) bad(qualified.error().details.at("reason"));
+    if (participant.terminal_fact &&
+        participant.terminal_fact->kind == ParticipantExecutionFactKind::kPreemptedByReplacement &&
+        (!value.preemption || value.preemption->kind != OperationPreemptionKind::kPreempted ||
+         participant.state != OperationStateKind::kStopped ||
+         participant.terminal_fact->effect != ParticipantEffectKnowledge::kEffectSettled ||
+         participant.terminal_fact->error))
+      bad("replacement settlement requires exact logical preemption and settled effects");
   }
   V::Array fields{enc(value.operation_id),
                   enc(value.operation_revision),
@@ -467,21 +567,28 @@ template <typename T, typename Decode>
     }
     fields.emplace_back(std::to_string(value.journal_capture_order));
   }
+  if (value.preemption) {
+    if (!has_program_execution_scope(value) || value.journal_capture_order == 0U ||
+        value.preemption->by.operation_id == value.operation_id)
+      bad("operation preemption requires a distinct captured Program successor");
+    fields.emplace_back(preemption_value(*value.preemption));
+  }
   return V(std::move(fields));
 }
 
 [[nodiscard]] OperationStateDTO operation_state_from(const V& value) {
-  if (!value.is_array() || (value.as_array().size() != 11U && value.as_array().size() != 12U)) {
+  if (!value.is_array() || (value.as_array().size() != 11U &&
+                            value.as_array().size() != 12U && value.as_array().size() != 13U)) {
     bad("operation state has an unsupported shape");
   }
   const auto& f = value.as_array();
   std::uint64_t capture_order{};
-  if (f.size() == 12U) {
+  if (f.size() >= 12U) {
     if (!f[11].is_string()) bad("operation journal capture order must be decimal text");
     capture_order = static_cast<std::uint64_t>(content_identity::parse_nonnegative_int64(f[11]));
     if (capture_order == 0U) bad("new operation capture order must be positive");
   }
-  return OperationStateDTO{
+  auto result = OperationStateDTO{
       did<OperationId>(f[0], "operation ID"),
       did<OperationRevision>(f[1], "operation revision"),
       did<ProgramBindingId>(f[2], "program binding ID"),
@@ -496,6 +603,9 @@ template <typename T, typename Decode>
       dopt<RuntimeScaleGeneration>(
           f[10], [](const V& v) { return did<RuntimeScaleGeneration>(v, "scale generation"); }),
       capture_order};
+  if (f.size() == 13U) result.preemption = preemption_from(f[12]);
+  (void)operation_state_value(result);
+  return result;
 }
 
 [[nodiscard]] V affected_value(const EmergencyStopAffectedStateSnapshotDTO& value) {
@@ -1864,6 +1974,23 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V acceptance_root(const StopJournalAcceptanceProjectionDTO& value) {
+  const bool provider_extension = std::any_of(
+      value.affected_state.operations.begin(), value.affected_state.operations.end(),
+      [](const auto& operation) {
+        return std::any_of(
+            operation.participants.begin(), operation.participants.end(),
+            [](const auto& row) { return row.binding_identity.provider() || row.output_evidence || !row.io_rule_outcomes.empty(); });
+      });
+  const bool preemption = std::any_of(
+      value.affected_state.operations.begin(), value.affected_state.operations.end(),
+      [](const auto& operation) { return operation.preemption.has_value(); });
+  const bool facts = std::any_of(
+      value.affected_state.operations.begin(), value.affected_state.operations.end(),
+      [](const auto& operation) {
+        return std::any_of(
+            operation.participants.begin(), operation.participants.end(),
+            [](const auto& participant) { return participant.terminal_fact.has_value(); });
+      });
   const bool scoped =
       std::any_of(value.affected_state.operations.begin(), value.affected_state.operations.end(),
                   has_program_execution_scope);
@@ -1872,9 +1999,12 @@ template <typename T, typename Decode>
                   [](const auto& row) { return row.journal_capture_order != 0U; });
   // Q51/Q53: the per-robot Stop timing changed every shape; earlier versions
   // (v1-v3) are refused, never converted.
-  return arr({V(scoped    ? "manyforge.internal.stop-journal-acceptance-projection.v6"
-                : ordered ? "manyforge.internal.stop-journal-acceptance-projection.v5"
-                          : "manyforge.internal.stop-journal-acceptance-projection.v4"),
+  return arr({V(provider_extension ? "manyforge.internal.stop-journal-acceptance-projection.v10"
+                : preemption       ? "manyforge.internal.stop-journal-acceptance-projection.v9"
+                : facts            ? "manyforge.internal.stop-journal-acceptance-projection.v8"
+                : scoped           ? "manyforge.internal.stop-journal-acceptance-projection.v6"
+                : ordered          ? "manyforge.internal.stop-journal-acceptance-projection.v5"
+                                   : "manyforge.internal.stop-journal-acceptance-projection.v4"),
               accepted_value(value.accepted), affected_value(value.affected_state)});
 }
 
@@ -1883,7 +2013,10 @@ template <typename T, typename Decode>
   const auto version = str(f[0], "acceptance API version");
   if (version != "manyforge.internal.stop-journal-acceptance-projection.v4" &&
       version != "manyforge.internal.stop-journal-acceptance-projection.v5" &&
-      version != "manyforge.internal.stop-journal-acceptance-projection.v6") {
+      version != "manyforge.internal.stop-journal-acceptance-projection.v6" &&
+      version != "manyforge.internal.stop-journal-acceptance-projection.v8" &&
+      version != "manyforge.internal.stop-journal-acceptance-projection.v9" &&
+      version != "manyforge.internal.stop-journal-acceptance-projection.v10") {
     bad("Stop journal acceptance projection API version is unsupported");
   }
   auto result = StopJournalAcceptanceProjectionDTO{accepted_from(f[1]), affected_from(f[2])};

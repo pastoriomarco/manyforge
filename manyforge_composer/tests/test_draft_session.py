@@ -1004,6 +1004,8 @@ def test_new_draft_is_fresh_empty_authoring_and_clears_saved_identity() -> None:
     assert authoring["program_id"].startswith("program-")
     assert len(authoring["program_id"]) == len("program-") + 32
     assert authoring["forest"] == []
+    assert authoring["component_roles"] == {}
+    assert authoring["target_roles"] == {}
     assert {
         row["parameter_id"]: row["default"] for row in authoring["parameters"]
     } == {
@@ -1233,6 +1235,30 @@ def test_node_policy_zero_retries_is_unlimited_and_not_implicit_intervention() -
         "program"
     ]["tree"]["children"][0]
     assert node["recovery_policy"] == {"allow_intervention": False, "max_retries": 255}
+
+
+def test_node_policy_intervention_stop_scope_is_optional_and_omits_default() -> None:
+    session = ComposerDraftSession(_program())
+    arguments = _node_policy_arguments(session)
+    arguments["recovery_policy"] = {
+        "allow_intervention": True,
+        "max_retries": 2,
+        "intervention_stop_scope": "own_groups",
+    }
+    node = _mutate(session, "program_draft_update_node_policies", arguments).snapshot[
+        "program"
+    ]["tree"]["children"][0]
+    assert node["recovery_policy"]["intervention_stop_scope"] == "own_groups"
+
+    arguments["recovery_policy"]["intervention_stop_scope"] = "all"
+    node = _mutate(session, "program_draft_update_node_policies", arguments).snapshot[
+        "program"
+    ]["tree"]["children"][0]
+    assert node["recovery_policy"] == {"allow_intervention": True, "max_retries": 2}
+
+    arguments["recovery_policy"]["intervention_stop_scope"] = "branch"
+    with pytest.raises(DraftSessionError):
+        _mutate(session, "program_draft_update_node_policies", arguments)
 
 
 def test_node_policy_instance_id_uses_the_128_byte_portable_bound() -> None:

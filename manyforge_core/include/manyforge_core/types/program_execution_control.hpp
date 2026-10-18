@@ -15,6 +15,8 @@ struct ProgramExecutionSelectionRequestDTO final {
   // One bounded selection union, resolved atomically by the captured owner.
   std::vector<std::string> group_ids;
   RequestAttributionDTO attribution;
+  // Individual hold release only; mutually exclusive with nonempty group_ids.
+  std::optional<ProgramNodeInstanceId> node_instance_id{};
   friend bool operator==(const ProgramExecutionSelectionRequestDTO&,
                          const ProgramExecutionSelectionRequestDTO&) = default;
 };

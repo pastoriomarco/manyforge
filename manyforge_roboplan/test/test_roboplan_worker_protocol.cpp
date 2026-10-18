@@ -214,6 +214,77 @@ TEST(RoboPlanWorkerProtocolTest,
 }
 
 TEST(RoboPlanWorkerProtocolTest,
+     MovingReplacementRoundTripsWithoutChangingOrdinaryPayloadPrefix) {
+  auto input = candidate_request();
+  const auto ordinary_bytes = encode_candidate_request(input);
+  EXPECT_FALSE(decode_candidate_request(ordinary_bytes).moving_replacement);
+  auto suffix_seed = state();
+  suffix_seed.positions = {AngularPositionDTO{0.8}, LinearPositionDTO{0.03}};
+  suffix_seed.velocities.reset();
+  input.moving_replacement = MovingReplacementInputDTO{
+      ExecutionGoalKey{ControllerGoalId("source-goal-a"),
+                       ControllerGoalGeneration(17U)},
+      ExecutionBindingEpoch(23U),
+      2.75,
+      TrajectoryDTO{binding().resources,
+                    binding().compiled_joint_names,
+                    {{0.0, {0.25, 0.012}, {0.5, 0.02}, {0.2, -0.03}},
+                     {0.375, {0.45, 0.02}, {0.4, 0.015}, {-0.1, 0.02}}}},
+      3.125,
+      suffix_seed,
+      ResolvedCellFrameDTO{CellId("cell-a"), "source-base"},
+      ResolvedComponentModelFrameDTO{
+          binding().controllable_component_id, binding().model_instance_id,
+          FrameRoleId("source-tcp"), "source-tcp", binding().model_revision},
+      SpeedProfileDTO{0.9, 0.8, 0.25},
+      {ResolvedResourceDynamicsLimitDTO{binding().resources[0],
+                                        binding().compiled_joint_names[0],
+                                        JointDynamicsLimitDTO{2.0, 3.0, 4.0}}},
+      1.75};
+
+  const auto moving_bytes = encode_candidate_request(input);
+  EXPECT_EQ(moving_bytes.substr(0U, ordinary_bytes.size()), ordinary_bytes);
+  const auto decoded = decode_candidate_request(moving_bytes);
+  ASSERT_TRUE(decoded.moving_replacement);
+  const auto &actual = *decoded.moving_replacement;
+  const auto &expected = *input.moving_replacement;
+  EXPECT_EQ(actual.source_goal, expected.source_goal);
+  EXPECT_EQ(actual.source_binding_epoch, expected.source_binding_epoch);
+  EXPECT_DOUBLE_EQ(actual.source_cursor_s, expected.source_cursor_s);
+  EXPECT_EQ(encode_trajectory_result(
+                Result<TrajectoryDTO>::Ok(actual.source_prefix_trajectory)),
+            encode_trajectory_result(
+                Result<TrajectoryDTO>::Ok(expected.source_prefix_trajectory)));
+  EXPECT_DOUBLE_EQ(actual.divergence_cursor_s, expected.divergence_cursor_s);
+  EXPECT_EQ(actual.suffix_start_state, expected.suffix_start_state);
+  EXPECT_EQ(decoded.start_state, input.start_state);
+  EXPECT_NE(actual.suffix_start_state, decoded.start_state);
+  EXPECT_EQ(actual.source_base_frame, expected.source_base_frame);
+  EXPECT_EQ(actual.source_tcp_frame, expected.source_tcp_frame);
+  EXPECT_EQ(actual.source_speed_profile, expected.source_speed_profile);
+  EXPECT_EQ(actual.source_per_resource_dynamics_limits,
+            expected.source_per_resource_dynamics_limits);
+  EXPECT_DOUBLE_EQ(actual.remaining_preparation_budget_s,
+                   expected.remaining_preparation_budget_s);
+  EXPECT_EQ(encode_candidate_request(decoded), moving_bytes);
+  input.moving_replacement.reset();
+  EXPECT_EQ(encode_candidate_request(input), ordinary_bytes);
+
+  auto malformed = moving_bytes;
+  malformed[ordinary_bytes.size()] = static_cast<char>(2);
+  EXPECT_THROW(static_cast<void>(decode_candidate_request(malformed)),
+               std::invalid_argument);
+  malformed = moving_bytes;
+  malformed.pop_back();
+  EXPECT_THROW(static_cast<void>(decode_candidate_request(malformed)),
+               std::invalid_argument);
+  malformed = moving_bytes;
+  malformed.push_back('\0');
+  EXPECT_THROW(static_cast<void>(decode_candidate_request(malformed)),
+               std::invalid_argument);
+}
+
+TEST(RoboPlanWorkerProtocolTest,
      ResultPayloadsPreservePortableSuccessAndClosedErrors) {
   TrajectoryDTO trajectory{
       binding().resources,

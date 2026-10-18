@@ -13,7 +13,9 @@ import rfc8785
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Discriminator,
     Field,
+    Tag,
     WithJsonSchema,
     field_validator,
     field_serializer,
@@ -160,21 +162,28 @@ class TargetObservationQuery(StrictRequest):
 
     `frame_transform` names no target: it expresses `pose`, given in
     `source_frame`, in `target_frame` through the cell frame resolver.
+    `io_signal` reads the boolean signal bound to the target's
+    `resource_role_id` (Program Binding `signal_role_bindings`).
     """
 
     schema_version: Literal["manyforge.target_observation_query.v1"]
     owner_epoch: str
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     target_role_id: str | None = None
-    kind: Literal["frame_pose", "gripper_status", "frame_transform"]
+    kind: Literal["frame_pose", "gripper_status", "frame_transform", "io_signal"]
     frame_role_id: str | None = None
+    resource_role_id: str | None = None
     relative_to_frame_role_id: str | None = None
     pose: Pose3Request | None = None
     source_frame: FrameReferenceRequest | None = None
     target_frame: FrameReferenceRequest | None = None
 
     @field_validator(
-        "owner_epoch", "target_role_id", "frame_role_id", "relative_to_frame_role_id"
+        "owner_epoch",
+        "target_role_id",
+        "frame_role_id",
+        "relative_to_frame_role_id",
+        "resource_role_id",
     )
     @classmethod
     def validate_identity(cls, value: str | None, info) -> str | None:
@@ -204,6 +213,8 @@ class TargetObservationQuery(StrictRequest):
             raise ValueError("only a frame-pose query names a frame role")
         if not frame_query and self.relative_to_frame_role_id is not None:
             raise ValueError("only a frame-pose query names a relative frame role")
+        if (self.kind == "io_signal") != (self.resource_role_id is not None):
+            raise ValueError("only an I/O signal query names a resource role")
         return self
 
 
@@ -992,6 +1003,7 @@ class CycleRecoveryActionRequest(ExecutionControlAttributionRequest):
         "replan_from_stopped_state",
         "retry_runtime_step",
         "reset_cycle",
+        "continue_with_failure",
     ]
     reason: str | None = None
 
@@ -2216,6 +2228,238 @@ class GripperFeedbackObservation(GripperCommandObservation):
     grasp_confirmed: bool | None
 
 
+_MAXIMUM_UINT64 = 18_446_744_073_709_551_615
+
+
+def _uint64_text(value: Any, *, label: str, minimum: int) -> str:
+    """One full-width I/O counter as canonical decimal text."""
+
+    if (
+        not isinstance(value, str)
+        or not value.isascii()
+        or not value.isdigit()
+        or str(int(value)) != value
+        or not minimum <= int(value) <= _MAXIMUM_UINT64
+    ):
+        raise ValueError(f"{label} must be canonical uint64 decimal text")
+    return value
+
+
+class IoSignalLiveness(StrictRequest):
+    """An input's declared liveness from its canonical descriptor (SX-2194).
+
+    `liveness_unproven` is the warning exactly of a change-only source.
+    """
+
+    mode: Literal["in_process", "periodic", "change_only"]
+    warning: Literal["liveness_unproven"] | None
+
+    @model_validator(mode="after")
+    def warning_matches_mode(self) -> "IoSignalLiveness":
+        if (self.warning is not None) != (self.mode == "change_only"):
+            raise ValueError("only a change-only input carries liveness_unproven")
+        return self
+
+
+class IoSignalObservation(StrictRequest):
+    """The `value` of one `io_signal` target observation (receiver clock).
+
+    Only `fresh` authorizes a read; any other quality keeps the last reported
+    value for diagnosis and never means `false`. `liveness` is null for an
+    output.
+    """
+
+    liveness: IoSignalLiveness | None
+    signal_name: str
+    value_type: Literal["bool"]
+    value: bool | None
+    quality: Literal["missing", "fresh", "stale", "invalid", "unavailable"]
+    source_id: str | None
+    source_epoch: str | None
+    source_sequence: str | None
+    receipt_age_ns: int | str | None
+    continuity_loss_generation: str
+    error: dict[str, Any] | None
+
+    @field_validator("signal_name", "source_id", "source_epoch")
+    @classmethod
+    def bounded_identity(cls, value: str | None, info) -> str | None:
+        # `source_epoch` is the opaque source incarnation (spec 260 §2.3).
+        if value is None:
+            return None
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=256)
+
+    @field_validator("source_sequence")
+    @classmethod
+    def counter(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _uint64_text(value, label=info.field_name, minimum=1)
+
+    @field_validator("continuity_loss_generation")
+    @classmethod
+    def loss_generation(cls, value: str) -> str:
+        return _uint64_text(value, label="continuity_loss_generation", minimum=0)
+
+    @field_validator("receipt_age_ns")
+    @classmethod
+    def receipt_age(cls, value: int | str | None) -> int | str | None:
+        if value is not None:
+            nonnegative_int64(value)
+        return value
+
+    @model_validator(mode="after")
+    def fresh_is_complete(self) -> "IoSignalObservation":
+        if self.quality == "fresh" and (
+            self.value is None
+            or self.source_epoch is None
+            or self.source_sequence is None
+            or self.receipt_age_ns is None
+        ):
+            raise ValueError("a fresh I/O observation carries its value and sample")
+        return self
+
+
+class IoSourceCursor(StrictRequest):
+    """The existing source cursor of one published I/O record.
+
+    Counters are canonical decimal text; `record_sequence` never resets on
+    source replacement, so a published record has one of at least 1.
+    """
+
+    owner_epoch: str
+    catalog_generation: str
+    source_id: str
+    record_sequence: str
+
+    @field_validator("owner_epoch", "source_id")
+    @classmethod
+    def bounded_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+    @field_validator("catalog_generation")
+    @classmethod
+    def generation(cls, value: str) -> str:
+        return _uint64_text(value, label="catalog_generation", minimum=1)
+
+    @field_validator("record_sequence")
+    @classmethod
+    def sequence(cls, value: str) -> str:
+        return _uint64_text(value, label="record_sequence", minimum=1)
+
+
+class MockIoPublicationError(BaseModel):
+    """The model accepted the value but ingress failed to publish it."""
+
+    model_config = ConfigDict(extra="allow", strict=True, frozen=True)
+
+    code: Annotated[str, Field(min_length=1)]
+    message: str
+
+
+class IoSignalReadRequest(StrictRequest):
+    """One effect-free GUI read of one bound boolean signal.
+
+    Exactly the `io_signal` kind of `manyforge.target_observation_query.v1`:
+    the host resolves it through the current Program Binding and installed
+    descriptor before reading.
+    """
+
+    schema_version: Literal["manyforge.target_observation_query.v1"]
+    owner_epoch: str
+    program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    target_role_id: str
+    kind: Literal["io_signal"]
+    resource_role_id: str
+
+    @field_validator("owner_epoch", "target_role_id", "resource_role_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+    def target_query(self) -> TargetObservationQuery:
+        return TargetObservationQuery.model_validate(self.model_dump(mode="json"))
+
+
+class MockIoInputRequest(StrictRequest):
+    """Set one installed Mock input (simulation, never a hardware command).
+
+    `expected_source_epoch` is the installed `source_epoch` of the read this
+    action is based on; it fences a stale click after Apply or restart. The
+    requested value is explicit, never an implicit inversion.
+    """
+
+    schema_version: Literal["manyforge.mock_io_input_request.v1"]
+    owner_epoch: str
+    program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    target_role_id: str
+    resource_role_id: str
+    expected_source_epoch: str
+    value: bool
+
+    @field_validator("owner_epoch", "target_role_id", "resource_role_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+    @field_validator("expected_source_epoch")
+    @classmethod
+    def source_epoch(cls, value: str) -> str:
+        return _bounded_nfc(value, label="expected_source_epoch", maximum_bytes=256)
+
+
+class IoWatchMatchedSample(StrictRequest):
+    """The matched sample's signal identity is `{controllable_component_id, signal_name}`."""
+
+    controllable_component_id: str
+    signal_name: str
+    source_id: str
+    source_epoch: str
+    source_sequence: str
+    value: bool
+    received_at_ns: int | str
+
+    @field_validator("controllable_component_id", "signal_name", "source_id", "source_epoch")
+    @classmethod
+    def bounded_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=256)
+
+    @field_validator("source_sequence")
+    @classmethod
+    def counter(cls, value: str, info) -> str:
+        return _uint64_text(value, label=info.field_name, minimum=1)
+
+    @field_validator("received_at_ns")
+    @classmethod
+    def received_at(cls, value: int | str) -> int | str:
+        nonnegative_int64(value)
+        return value
+
+
+class IoWatchResult(StrictRequest):
+    """One current ReadWatch result; `released` and `matched` are final.
+
+    Core erases a released watch, so `released` carries neither an
+    observation nor a matched sample; pending/matched carry the observation.
+    """
+
+    state: Literal["pending", "matched", "released"]
+    observation: IoSignalObservation | None
+    matched_sample: IoWatchMatchedSample | None
+
+    @model_validator(mode="after")
+    def matched_carries_sample(self) -> "IoWatchResult":
+        if self.state == "released":
+            if self.observation is not None or self.matched_sample is not None:
+                raise ValueError("a released watch carries no observation or sample")
+            return self
+        if self.observation is None:
+            raise ValueError("a pending or matched watch carries its observation")
+        if (self.state == "matched") != (self.matched_sample is not None):
+            raise ValueError("a matched watch carries its sample; a pending one none")
+        return self
+
+
 class AngularEffortRequest(StrictRequest):
     kind: Literal["angular_newton_meter"]
     value_nm: Annotated[float, Field(ge=0, allow_inf_nan=False)]
@@ -2248,6 +2492,29 @@ class GripperPositionCommandValueRequest(StrictRequest):
         return self
 
 
+class IoSignalWriteCommandValueRequest(StrictRequest):
+    """One typed boolean output write (contract 53); no provider/readback data."""
+
+    kind: Literal["io_signal_write"]
+    resource_role_id: str
+    value: bool
+
+    @field_validator("resource_role_id")
+    @classmethod
+    def validate_resource_role_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="resource_role_id",
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+CapabilityCommandValueRequest = Annotated[
+    GripperPositionCommandValueRequest | IoSignalWriteCommandValueRequest,
+    Field(discriminator="kind"),
+]
+
+
 class CommandDurationOptionRequest(StrictRequest):
     option_id: str
     value_s: Annotated[float, Field(ge=0, allow_inf_nan=False)]
@@ -2266,9 +2533,30 @@ class CapabilityCommandParticipantRequest(StrictRequest):
     kind: Literal["capability_command"]
     command_schema_id: str
     command_schema_revision: str
-    command_value: GripperPositionCommandValueRequest
-    completion_timeout_s: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    command_value: CapabilityCommandValueRequest
+    # Gripper commands carry the caller's positive deadline. An
+    # io_signal_write omits it: the Kernel resolves the sealed provider/device
+    # acknowledgement policy (contract 65).
+    completion_timeout_s: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = None
     caller_options: Annotated[list[CommandDurationOptionRequest], Field(max_length=64)]
+
+    @model_serializer(mode="wrap")
+    def serialize_omitted_timeout(self, handler):
+        payload = handler(self)
+        if payload.get("completion_timeout_s") is None:
+            payload.pop("completion_timeout_s", None)
+        return payload
+
+    @model_validator(mode="after")
+    def require_timeout_owner(self) -> "CapabilityCommandParticipantRequest":
+        io_write = isinstance(self.command_value, IoSignalWriteCommandValueRequest)
+        if io_write and self.completion_timeout_s is not None:
+            raise ValueError(
+                "io_signal_write omits completion_timeout_s; the provider policy owns it"
+            )
+        if not io_write and self.completion_timeout_s is None:
+            raise ValueError("completion_timeout_s is required for this command")
+        return self
 
     @field_validator("command_schema_id", "command_schema_revision")
     @classmethod
@@ -2843,8 +3131,10 @@ def _validate_pick_place_operations(
         raise ValueError("pick/place descend must be a motion operation")
     if not isinstance(
         tool.participants[0].payload, CapabilityCommandParticipantRequest
+    ) or not isinstance(
+        tool.participants[0].payload.command_value, GripperPositionCommandValueRequest
     ):
-        raise ValueError("pick/place tool phase must be a capability command")
+        raise ValueError("pick/place tool phase must be a gripper capability command")
     if not isinstance(retreat.participants[0].payload, MotionParticipantRequest):
         raise ValueError("pick/place retreat must be a motion operation")
     motion_participants = (
@@ -2999,6 +3289,60 @@ class OperationControlRequest(StrictRequest):
         return _bounded_nfc(value, label="reason", maximum_bytes=MAX_REASON_BYTES)
 
 
+class UncertainOutputAcknowledgementRequest(StrictRequest):
+    """One retained acceptance_unknown output the operator acknowledged."""
+
+    operation_id: str
+    operation_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_operation_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value, label="operation_id", maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+
+class OperationResetRequest(OperationControlRequest):
+    """Targeted operation Reset (contract 66).
+
+    ``acknowledged_uncertain_outputs`` lists only this operation's own retained
+    acceptance_unknown output(s) the operator explicitly acknowledged ("a write
+    already queued in the remote device may still act"); sorted and unique.
+    Omitted when absent, so an ordinary Reset keeps its exact wire bytes. The
+    owner refuses a Reset that would release an unlisted unknown output.
+    """
+
+    acknowledged_uncertain_outputs: (
+        Annotated[
+            list[UncertainOutputAcknowledgementRequest],
+            Field(min_length=1, max_length=64),
+        ]
+        | None
+    ) = None
+
+    @model_validator(mode="after")
+    def validate_acknowledged_outputs(self) -> "OperationResetRequest":
+        rows = self.acknowledged_uncertain_outputs
+        if rows is None:
+            return self
+        keys = [(row.operation_id, row.operation_revision) for row in rows]
+        if any(row.operation_id != self.operation_id for row in rows):
+            raise ValueError(
+                "acknowledged_uncertain_outputs must name only this operation"
+            )
+        if keys != sorted(set(keys)):
+            raise ValueError("acknowledged_uncertain_outputs must be sorted and unique")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_omitted_acknowledgement(self, handler):
+        payload = handler(self)
+        if payload.get("acknowledged_uncertain_outputs") is None:
+            payload.pop("acknowledged_uncertain_outputs", None)
+        return payload
+
+
 class OperationRecoveryActionRequest(StrictRequest):
     """Private Program-Runner request to one exact native operation owner."""
 
@@ -3009,6 +3353,7 @@ class OperationRecoveryActionRequest(StrictRequest):
         "retry_after_scene_repair",
         "replan_from_stopped_state",
         "reset_cycle",
+        "close_operation",
     ]
     principal_id: str = ""
     expected_assessment_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
@@ -3308,6 +3653,92 @@ class StopFaultRecoveryIntentRequest(StrictRequest):
         return self
 
 
+class GlobalIoRuleRecoveryContext(StrictRequest):
+    """The exact global-rule catalog context of one recovery offer (SX-2206)."""
+
+    owner_epoch: str
+    catalog_generation: str
+    active_publication_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
+    bundle: str
+    graph: str
+
+    @field_validator("owner_epoch", "bundle", "graph")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value, label=info.field_name, maximum_bytes=MAX_STOP_IDENTITY_BYTES
+        )
+
+    @field_validator("catalog_generation")
+    @classmethod
+    def validate_generation(cls, value: str) -> str:
+        return _uint64_text(value, label="catalog_generation", minimum=1)
+
+
+class GlobalIoRuleRecoverySelector(StrictRequest):
+    """The offer's selector, sent back unchanged by the recovery command."""
+
+    context: GlobalIoRuleRecoveryContext
+    rule_id: str
+    expected_rule_registration_id: str
+
+    @field_validator("rule_id")
+    @classmethod
+    def validate_rule_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value, label="rule_id", maximum_bytes=MAX_STOP_IDENTITY_BYTES
+        )
+
+    @field_validator("expected_rule_registration_id")
+    @classmethod
+    def validate_registration(cls, value: str) -> str:
+        return _uint64_text(
+            value, label="expected_rule_registration_id", minimum=1
+        )
+
+
+class GlobalIoRuleRecoveryIntentRequest(StrictRequest):
+    """The additive `global_io_rule` variant of recover_stop_fault (SX-2206)."""
+
+    kind: Literal["global_io_rule"]
+    request_context: CallerAttributionRequest
+    selector: GlobalIoRuleRecoverySelector
+    reason: str | None = None
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(value, label="reason", maximum_bytes=MAX_STOP_REASON_BYTES)
+
+    @model_validator(mode="after")
+    def validate_context(self) -> GlobalIoRuleRecoveryIntentRequest:
+        for label in ("request_id", "request_owner_epoch"):
+            _bounded_nfc(
+                getattr(self.request_context, label),
+                label=label,
+                maximum_bytes=MAX_STOP_IDENTITY_BYTES,
+            )
+        return self
+
+
+def _stop_fault_recovery_kind(value: Any) -> str:
+    kind = value.get("kind") if isinstance(value, dict) else getattr(value, "kind", None)
+    # The original Stop/certificate request carries no `kind`; any present
+    # discriminator selects the closed global-rule variant (and must match it).
+    return "stop_fault" if kind is None else "global_io_rule"
+
+
+StopFaultRecoveryRequest = Annotated[
+    Annotated[StopFaultRecoveryIntentRequest, Tag("stop_fault")]
+    | Annotated[GlobalIoRuleRecoveryIntentRequest, Tag("global_io_rule")],
+    Discriminator(_stop_fault_recovery_kind),
+]
+
+
 class RuntimeScaleControlTargetRequest(StrictRequest):
     component_role_id: str
     target_role_id: str
@@ -3457,6 +3888,9 @@ class CCLCControlBindingRequest(StrictRequest):
 
 
 class CCLCExpectedControlDomainRequest(StrictRequest):
+    """Expected controller domain; `kind` is required (no kindless legacy shape)."""
+
+    kind: Literal["controller"]
     control_domain_id: str
     control_domain_revision: str
     controller_topology_id: str
@@ -3492,6 +3926,54 @@ class CCLCExpectedControlDomainRequest(StrictRequest):
                 "expected_control_bindings must be strictly ordered by binding ID"
             )
         return self
+
+
+class CCLCProviderControlDomainRequest(StrictRequest):
+    """Existing Core provider-domain proof, echoed verbatim from the component snapshot."""
+
+    controllable_component_id: str
+    provider_runtime_unit_id: str
+    provider_instance_id: str
+    provider_manifest_id: str
+    provider_manifest_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    lifecycle_plan_catalog_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    signal_configuration_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    signal_names: Annotated[list[str], Field(min_length=1, max_length=4_096)]
+    lifecycle_command_timeout_ns: Annotated[int, Field(ge=1, le=3_600_000_000_000)]
+
+    @field_validator(
+        "controllable_component_id",
+        "provider_runtime_unit_id",
+        "provider_instance_id",
+        "provider_manifest_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
+
+    @field_validator("signal_names")
+    @classmethod
+    def validate_signal_names(cls, value: list[str]) -> list[str]:
+        if any(not name or len(name.encode("utf-8")) > 128 for name in value) or any(
+            left >= right for left, right in zip(value, value[1:])
+        ):
+            raise ValueError("signal_names must be canonical bounded non-empty names")
+        return value
+
+
+class CCLCExpectedProviderDomainRequest(StrictRequest):
+    """Existing Core expected provider domain: no topology, bindings or routes."""
+
+    kind: Literal["io_provider"]
+    control_domain_id: str
+    control_domain_revision: str
+    provider: CCLCProviderControlDomainRequest
+    expected_active_control_configuration: CCLCExpectedActiveConfigurationRequest
+
+    @field_validator("control_domain_id", "control_domain_revision")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
 
 
 class CloseIncidentRecoveryRequest(StrictRequest):
@@ -3601,8 +4083,13 @@ class ComponentLifecycleRequest(StrictRequest):
     expected_component_lifecycle_generation: Annotated[
         int, Field(ge=1, le=9_007_199_254_740_991)
     ]
+    # Discriminated on the required `kind` value; a kindless row or the
+    # superseded `kind: "provider"` is refused.
     expected_control_domains: Annotated[
-        list[CCLCExpectedControlDomainRequest],
+        list[Annotated[
+            CCLCExpectedControlDomainRequest | CCLCExpectedProviderDomainRequest,
+            Field(discriminator="kind"),
+        ]],
         Field(min_length=1, max_length=256),
     ]
     reason: str | None = None
@@ -3648,6 +4135,7 @@ class ComponentLifecycleRequest(StrictRequest):
             sum(
                 len(item.expected_control_bindings)
                 for item in self.expected_control_domains
+                if isinstance(item, CCLCExpectedControlDomainRequest)
             )
             > 4_096
         ):

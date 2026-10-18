@@ -6,6 +6,7 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import { useManagerApplyStatus } from '../hooks/useManagerApplyStatus';
 import type { ControlTransportStatus } from '../hooks/useHeadlessState';
 import type {
+  BlackboardKeyDeclaration,
   ManagerDiffProjection,
   ManagerGraphProjection,
   ManagerStatusProjection,
@@ -23,6 +24,7 @@ import { ComponentOverview } from './ComponentOverview';
 import type { RuntimeStatusView } from './runtimeStatus';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type { SourceModelProjection } from '../types/api';
+import type { TargetStopChain } from '../utils/interruptAuthoring';
 import type {
   ManualControlGripperDescriptor,
   ManualControlMotionDescriptor,
@@ -52,7 +54,13 @@ interface DeploymentCompositionPanelProps {
   componentOverview: ComponentOverviewInput;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   motionDescriptors: ManualControlMotionDescriptor[];
+  /** Published motion targets' qualified Stop chains (SX-2167). */
+  stopChains?: TargetStopChain[];
   gripperDescriptors: ManualControlGripperDescriptor[];
+  /** Keys a global interrupt rule may read (the Program Draft's keys). */
+  programKeys?: readonly BlackboardKeyDeclaration[] | null;
+  /** The Applied Program's execution group ids; null when no Program is applied. */
+  executionGroupIds?: readonly string[] | null;
   /** The workbench's single observation of the advertised maintenance
    * operation; this panel observes only an inventory-selected operation. */
   maintenanceStatus: ReturnType<typeof useManagerApplyStatus>;
@@ -97,7 +105,10 @@ export function DeploymentCompositionPanel({
   componentOverview,
   sourceModel,
   motionDescriptors,
+  stopChains,
   gripperDescriptors,
+  programKeys,
+  executionGroupIds = null,
   maintenanceStatus: advertisedStatus,
 }: DeploymentCompositionPanelProps) {
   const refreshDeploymentWorkspace = deploymentController.refresh;
@@ -241,7 +252,10 @@ export function DeploymentCompositionPanel({
             controller={deploymentController}
             sourceModel={sourceModel}
             motionDescriptors={motionDescriptors}
+            stopChains={stopChains}
             gripperDescriptors={gripperDescriptors}
+            programKeys={programKeys}
+            executionGroupIds={executionGroupIds}
           />
           <details className="dcard">
             <summary>Advanced compiled Deployment artifact</summary>

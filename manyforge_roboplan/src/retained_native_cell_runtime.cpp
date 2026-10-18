@@ -10,6 +10,18 @@
 namespace manyforge::roboplan_backend {
 namespace {
 
+// This is logical registration shape only. Actual CCLC/provider currentness
+// remains the Kernel's independent command-admission proof.
+bool IsLogicalOutputRegistration(
+    const core::RuntimeParticipantExecutionRegistration &registration) {
+  const auto &binding = registration.binding.value();
+  return registration.engine != nullptr && binding.io_output_binding &&
+         binding.io_output_binding->signal.output_resource &&
+         binding.resources.empty() && !binding.control_path &&
+         !registration.stop_readiness &&
+         registration.stop_execution_port == nullptr;
+}
+
 void ValidateRegistrations(
     const std::vector<core::RuntimeParticipantExecutionRegistration>
         &registrations,
@@ -21,9 +33,11 @@ void ValidateRegistrations(
   for (std::size_t index = 0U; index < registrations.size(); ++index) {
     const auto &registration = registrations[index];
     if (registration.engine == nullptr ||
-        registration.binding.value().resources.empty()) {
+        (registration.binding.value().io_output_binding
+             ? !IsLogicalOutputRegistration(registration)
+             : registration.binding.value().resources.empty())) {
       throw std::invalid_argument(
-          "native cell registration has no engine or physical resources");
+          "native cell registration has no engine or exact command resources");
     }
     for (std::size_t previous = 0U; previous < index; ++previous) {
       if (registrations[previous].binding.value() ==
@@ -35,7 +49,7 @@ void ValidateRegistrations(
   }
 }
 
-}  // namespace
+} // namespace
 
 core::Result<void> RetainedNativeCellRuntime::ValidateStopSourceCoverage(
     const std::vector<RetainedStopSurveillanceSourceInput> &sources,
@@ -63,11 +77,12 @@ core::Result<void> RetainedNativeCellRuntime::ValidateStopSourceCoverage(
   if (sources.empty() &&
       empty_source_mode ==
           RetainedStopSurveillanceEmptySourceMode::kManagedCellBootstrapEmpty) {
-    if (registrations.empty()) {
+    if (std::all_of(registrations.begin(), registrations.end(),
+                    IsLogicalOutputRegistration)) {
       return core::Result<void>::Ok();
     }
     return fail("native_cell_stop_sources_missing",
-                "native cell with participants requires Stop sources");
+                "native cell with physical participants requires Stop sources");
   }
   const auto valid = RetainedStopSurveillanceOwner::ValidateSources(sources);
   if (!valid.ok()) {
@@ -408,7 +423,12 @@ core::Result<void> RetainedNativeCellRuntime::reconfigure_runtime_component_set(
     const core::ConfigurationFenceId &apply_fence_id,
     const core::ConfigurationFenceScopeDTO &scope,
     const std::vector<core::ControllableComponentId> &retained_components,
-    std::function<core::Result<void>()> commit_publication) {
+    std::function<core::Result<void>()> commit_publication,
+    std::span<const core::ResolvedLifecycleControlDomainScopeDTO>
+        retained_provider_domains,
+    std::span<const core::ResolvedLifecycleProviderOccurrenceDTO>
+        retained_provider_occurrences,
+    const core::CellAdmissionClaimDTO *actual_parent_claim) {
   try {
     ValidateRegistrations(registrations, participant_resolver);
   } catch (const std::exception &exception) {
@@ -438,7 +458,8 @@ core::Result<void> RetainedNativeCellRuntime::reconfigure_runtime_component_set(
       registrations, participant_resolver,
       std::move(candidate_retained_bundle_id),
       std::move(candidate_graph_revision), apply_fence_id, scope,
-      retained_components, std::move(publish));
+      retained_components, std::move(publish), retained_provider_domains,
+      retained_provider_occurrences, actual_parent_claim);
   if (!result.ok()) {
     return result;
   }

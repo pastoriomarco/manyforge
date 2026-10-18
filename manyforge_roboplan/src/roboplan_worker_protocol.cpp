@@ -175,6 +175,10 @@ class Decoder final {
     }
   }
 
+  [[nodiscard]] bool at_end() const noexcept {
+    return offset_ == bytes_.size();
+  }
+
  private:
   void require(std::size_t size) const {
     if (size > bytes_.size() - offset_) {
@@ -824,6 +828,26 @@ std::string encode_candidate_request(
   encoder.floating(value.planning_timeout_s);
   encoder.u32(value.planning_attempt_index);
   encoder.optional(value.action_span, write_action_span);
+  // Omit the complete extension when absent, preserving ordinary payloads.
+  if (value.moving_replacement) {
+    encoder.boolean(true);
+    const auto &moving = *value.moving_replacement;
+    write_strong(encoder, moving.source_goal.controller_goal_id);
+    encoder.u64(moving.source_goal.controller_goal_generation.value());
+    encoder.u64(moving.source_binding_epoch.value());
+    encoder.floating(moving.source_cursor_s);
+    write_trajectory(encoder, moving.source_prefix_trajectory);
+    encoder.floating(moving.divergence_cursor_s);
+    write_controlled_state(encoder, moving.suffix_start_state);
+    write_frame(encoder, moving.source_base_frame);
+    write_frame(encoder, moving.source_tcp_frame);
+    encoder.floating(moving.source_speed_profile.velocity_scale);
+    encoder.floating(moving.source_speed_profile.acceleration_scale);
+    write_optional_double(encoder,
+                          moving.source_speed_profile.max_tcp_linear_speed_mps);
+    write_dynamics(encoder, moving.source_per_resource_dynamics_limits);
+    encoder.floating(moving.remaining_preparation_budget_s);
+  }
   return std::move(encoder).finish();
 }
 
@@ -857,6 +881,25 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
   value.planning_attempt_index = decoder.u32();
   value.action_span =
       decoder.optional<core::ActionSpanDTO>(read_action_span);
+  if (!decoder.at_end()) {
+    if (!decoder.boolean()) {
+      fail("absent moving-replacement extension must be omitted");
+    }
+    value.moving_replacement = core::MovingReplacementInputDTO{
+        core::ExecutionGoalKey{read_strong<core::ControllerGoalId>(decoder),
+                               core::ControllerGoalGeneration(decoder.u64())},
+        core::ExecutionBindingEpoch(decoder.u64()),
+        decoder.floating(),
+        read_trajectory(decoder),
+        decoder.floating(),
+        read_controlled_state(decoder),
+        read_frame(decoder),
+        read_frame(decoder),
+        core::SpeedProfileDTO{decoder.floating(), decoder.floating(),
+                              read_optional_double(decoder)},
+        read_dynamics(decoder),
+        decoder.floating()};
+  }
   decoder.require_end();
   return value;
 }

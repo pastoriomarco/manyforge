@@ -10,6 +10,7 @@ import {
 
 import { api } from '../../api/client';
 import type { CatalogJsonSchema, ExpressionValueType, ProgramValueSource } from '../../types/api';
+import { groupByNamespace } from '../../utils/blackboardNamespaces';
 import { sameValueSource, type ValueSourceMenuModel } from '../../utils/valueSourceMenu';
 import type { CanvasMenuEntry } from '../CanvasContextMenu';
 import { formatPreviewValue } from './FormulaEditor';
@@ -65,6 +66,17 @@ export function valueSourceMenuEntries(
       onSelect: () => actions.use(choice.source),
     };
   });
+  // Keys are grouped by namespace, one submenu each (closed until opened).
+  const keyGroups = groupByNamespace(
+    model.keyChoices,
+    (choice) => ('reference' in choice.source ? choice.source.reference : ''),
+  );
+  const keyItems = keyGroups.length === 1
+    ? choices(model.keyChoices)
+    : keyGroups.map((group) => ({
+      label: `${group.label} (${group.items.length})`,
+      items: choices(group.items),
+    }));
   const entries: CanvasMenuEntry[] = [
     {
       label: 'Type values',
@@ -76,7 +88,7 @@ export function valueSourceMenuEntries(
       label: 'Use key…',
       disabled: unavailable,
       title: model.unavailable ?? (model.keyChoices.length === 0 ? 'No readable key of this type is declared.' : undefined),
-      items: choices(model.keyChoices),
+      items: keyItems,
     },
     {
       label: 'Use parameter…',

@@ -428,7 +428,41 @@ void register_cell_graph_bindings(py::module_& module) {
           },
           py::is_operator());
 
+  py::class_<ProviderControlDomainDTO>(module, "ProviderControlDomainDTO", py::is_final())
+      .def(py::init<ControllableComponentId, RuntimeUnitId, ProviderInstanceId, ProviderManifestId,
+                    ProviderManifestRevision, ContentDigest, ContentDigest,
+                    std::vector<std::string>, Duration>(),
+           py::arg("controllable_component_id"), py::arg("provider_runtime_unit_id"),
+           py::arg("provider_instance_id"), py::arg("provider_manifest_id"),
+           py::arg("provider_manifest_revision"), py::arg("lifecycle_plan_catalog_digest"),
+           py::arg("signal_configuration_digest"), py::arg("signal_names"),
+           py::arg("lifecycle_command_timeout_ns"))
+      .def_readonly("controllable_component_id",
+                    &ProviderControlDomainDTO::controllable_component_id)
+      .def_readonly("provider_runtime_unit_id", &ProviderControlDomainDTO::provider_runtime_unit_id)
+      .def_readonly("provider_instance_id", &ProviderControlDomainDTO::provider_instance_id)
+      .def_readonly("provider_manifest_id", &ProviderControlDomainDTO::provider_manifest_id)
+      .def_readonly("provider_manifest_revision",
+                    &ProviderControlDomainDTO::provider_manifest_revision)
+      .def_readonly("lifecycle_plan_catalog_digest",
+                    &ProviderControlDomainDTO::lifecycle_plan_catalog_digest)
+      .def_readonly("signal_configuration_digest",
+                    &ProviderControlDomainDTO::signal_configuration_digest)
+      .def_readonly("signal_names", &ProviderControlDomainDTO::signal_names)
+      .def_readonly("lifecycle_command_timeout_ns",
+                    &ProviderControlDomainDTO::lifecycle_command_timeout_ns)
+      .def("locally_valid", &ProviderControlDomainDTO::locally_valid)
+      .def(py::self == py::self);
+
   py::class_<ControlDomainDTO>(module, "ControlDomainDTO", py::is_final())
+      .def(py::init<ControlDomainId, ControlDomainRevision, std::vector<RuntimeUnitId>,
+                    EndpointRoleId, ContainmentGranularity, ProviderControlDomainDTO>(),
+           py::arg("control_domain_id"), py::arg("control_domain_revision"),
+           py::arg("runtime_unit_ids"), py::arg("control_coordinator_endpoint_role"),
+           py::arg("containment_granularity"), py::arg("provider"))
+      .def_property_readonly(
+          "provider", [](const ControlDomainDTO& value) { return value.provider(); },
+          py::return_value_policy::reference_internal)
       .def(
           py::init(
               [](ControlDomainId control_domain_id, ControlDomainRevision control_domain_revision,
@@ -452,8 +486,18 @@ void register_cell_graph_bindings(py::module_& module) {
       .def_readonly("runtime_unit_ids", &ControlDomainDTO::runtime_unit_ids)
       .def_readonly("control_coordinator_endpoint_role",
                     &ControlDomainDTO::control_coordinator_endpoint_role)
-      .def_readonly("controller_topology_id", &ControlDomainDTO::controller_topology_id)
-      .def_readonly("topology_revision", &ControlDomainDTO::topology_revision)
+      .def_property_readonly(
+          "controller_topology_id",
+          [](const ControlDomainDTO& value) -> const ControllerTopologyId& {
+            return value.controller().controller_topology_id;
+          },
+          py::return_value_policy::reference_internal)
+      .def_property_readonly(
+          "topology_revision",
+          [](const ControlDomainDTO& value) -> const TopologyRevision& {
+            return value.controller().topology_revision;
+          },
+          py::return_value_policy::reference_internal)
       .def_readonly("containment_granularity", &ControlDomainDTO::containment_granularity)
       .def(
           "__eq__",

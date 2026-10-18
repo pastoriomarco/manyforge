@@ -143,7 +143,72 @@ std::vector<double> get_numbers(const CanonicalValue& value) {
   return result;
 }
 
-void validate_trajectory(const TrajectoryDTO& value) {
+void validate_trajectory(const TrajectoryDTO& value,
+                         const MovingReplacementInputDTO* replacement = nullptr);
+
+void validate_replacement_input(const MovingReplacementInputDTO& input) {
+  const auto& prefix = input.source_prefix_trajectory;
+  validate_trajectory(prefix);
+  const auto safe_counter = [](auto value) {
+    return value.nonzero() && value.value() <= 9'007'199'254'740'991ULL;
+  };
+  const auto positive = [](double value) { return std::isfinite(value) && value > 0.0; };
+  const double seam = input.divergence_cursor_s - input.source_cursor_s;
+  if (input.source_goal.controller_goal_id.empty() ||
+      !safe_counter(input.source_goal.controller_goal_generation) ||
+      !safe_counter(input.source_binding_epoch) || !std::isfinite(input.source_cursor_s) ||
+      input.source_cursor_s < 0.0 || !std::isfinite(input.divergence_cursor_s) || !positive(seam) ||
+      prefix.waypoints.front().time_from_start_s != 0.0 ||
+      prefix.waypoints.back().time_from_start_s != seam || prefix.runtime_scale_bounds ||
+      !prefix.cartesian_waypoint_times_s.empty() || prefix.cartesian_fidelity_metrics ||
+      !positive(input.remaining_preparation_budget_s) ||
+      !positive(input.source_speed_profile.velocity_scale) ||
+      !positive(input.source_speed_profile.acceleration_scale) ||
+      !input.source_speed_profile.max_tcp_linear_speed_mps ||
+      !positive(*input.source_speed_profile.max_tcp_linear_speed_mps) ||
+      compiled_frame_name(input.source_base_frame).empty() ||
+      compiled_frame_name(input.source_tcp_frame).empty() ||
+      !validate_controlled_state(input.suffix_start_state).ok() ||
+      input.suffix_start_state.resources != prefix.resources ||
+      input.suffix_start_state.joint_names != prefix.joint_names) {
+    fail("moving_replacement_input_invalid");
+  }
+  for (const auto& point : prefix.waypoints) {
+    if (point.velocities_rad_s.size() != prefix.resources.size() ||
+        point.accelerations_rad_s2.size() != prefix.resources.size())
+      fail("moving_replacement_prefix_pva_required");
+  }
+  std::set<ResourceId> limited;
+  for (const auto& row : input.source_per_resource_dynamics_limits) {
+    const auto found = std::find(prefix.resources.begin(), prefix.resources.end(), row.resource_id);
+    if (found == prefix.resources.end() || !limited.insert(row.resource_id).second ||
+        row.compiled_joint_name != prefix.joint_names[found - prefix.resources.begin()] ||
+        (row.limit.max_velocity_rad_s && !positive(*row.limit.max_velocity_rad_s)) ||
+        (row.limit.max_acceleration_rad_s2 && !positive(*row.limit.max_acceleration_rad_s2)) ||
+        (row.limit.max_jerk_rad_s3 && !positive(*row.limit.max_jerk_rad_s3)))
+      fail("moving_replacement_source_limits_invalid");
+  }
+}
+
+void validate_replacement_prefix(const TrajectoryDTO& value,
+                                 const MovingReplacementInputDTO& replacement) {
+  validate_replacement_input(replacement);
+  const auto& prefix = replacement.source_prefix_trajectory;
+  if (value.resources != prefix.resources || value.joint_names != prefix.joint_names ||
+      value.waypoints.size() <= prefix.waypoints.size())
+    fail("moving_replacement_source_prefix_mismatch");
+  for (std::size_t index = 0; index < prefix.waypoints.size(); ++index) {
+    const auto& source = prefix.waypoints[index];
+    const auto& actual = value.waypoints[index];
+    if (actual.time_from_start_s != source.time_from_start_s ||
+        actual.positions_rad != source.positions_rad ||
+        actual.velocities_rad_s != source.velocities_rad_s ||
+        actual.accelerations_rad_s2 != source.accelerations_rad_s2)
+      fail("moving_replacement_source_prefix_mismatch");
+  }
+}
+
+void validate_trajectory(const TrajectoryDTO& value, const MovingReplacementInputDTO* replacement) {
   const auto width = value.resources.size();
   if (width == 0U || width > kMaxCoordinates || value.joint_names.size() != width ||
       value.waypoints.size() < 2U || value.waypoints.size() > kMaxWaypoints ||
@@ -206,13 +271,18 @@ void validate_trajectory(const TrajectoryDTO& value) {
              std::all_of(waypoint.accelerations_rad_s2.begin(), waypoint.accelerations_rad_s2.end(),
                          zero);
     };
-    if (!rest(value.waypoints.front()) || !rest(value.waypoints.back())) {
+    if ((!replacement && !rest(value.waypoints.front())) || !rest(value.waypoints.back())) {
       fail("trajectory_runtime_scale_rest_boundary_required");
     }
   }
+  if (replacement) {
+    if (!value.runtime_scale_bounds) fail("moving_replacement_runtime_bounds_required");
+    validate_replacement_prefix(value, *replacement);
+  }
 }
-CanonicalValue trajectory_value(const TrajectoryDTO& value) {
-  validate_trajectory(value);
+CanonicalValue trajectory_value(const TrajectoryDTO& value,
+                                const MovingReplacementInputDTO* replacement = nullptr) {
+  validate_trajectory(value, replacement);
   CanonicalValue::Array waypoints;
   waypoints.reserve(value.waypoints.size());
   for (const auto& waypoint : value.waypoints) {
@@ -247,7 +317,8 @@ CanonicalValue trajectory_value(const TrajectoryDTO& value) {
   }
   return CanonicalValue(std::move(result));
 }
-TrajectoryDTO get_trajectory(const CanonicalValue& value) {
+TrajectoryDTO get_trajectory(const CanonicalValue& value,
+                             const MovingReplacementInputDTO* replacement = nullptr) {
   const auto* scale = value.find_object_member("runtime_scale_bounds");
   const auto* milestones = value.find_object_member("cartesian_waypoint_times_s");
   const auto* fidelity = value.find_object_member("cartesian_fidelity_metrics");
@@ -317,21 +388,25 @@ TrajectoryDTO get_trajectory(const CanonicalValue& value) {
     if (result.cartesian_waypoint_times_s.empty()) fail("trajectory_cartesian_milestones_invalid");
   }
   if (fidelity) result.cartesian_fidelity_metrics = get_cartesian_fidelity(*fidelity);
-  validate_trajectory(result);
+  validate_trajectory(result, replacement);
   return result;
 }
 }  // namespace
 
-Result<std::string> EncodePreparedTrajectory(const TrajectoryDTO& value) {
+Result<std::string> EncodePreparedTrajectory(const TrajectoryDTO& value,
+                                             const MovingReplacementInputDTO* replacement) {
   try {
-    return Result<std::string>::Ok(content_identity::canonical_json(trajectory_value(value)));
+    return Result<std::string>::Ok(
+        content_identity::canonical_json(trajectory_value(value, replacement)));
   } catch (const std::exception& error) {
     return rejected<std::string>(error.what());
   }
 }
-Result<TrajectoryDTO> DecodePreparedTrajectory(std::string_view bytes) {
+Result<TrajectoryDTO> DecodePreparedTrajectory(std::string_view bytes,
+                                               const MovingReplacementInputDTO* replacement) {
   try {
-    return Result<TrajectoryDTO>::Ok(get_trajectory(content_identity::parse_canonical_json(bytes)));
+    return Result<TrajectoryDTO>::Ok(
+        get_trajectory(content_identity::parse_canonical_json(bytes), replacement));
   } catch (const std::exception& error) {
     return rejected<TrajectoryDTO>(error.what());
   }
@@ -379,12 +454,13 @@ ProjectionRevisionDTO get_projection(const CanonicalValue& value) {
   if (!result.valid()) fail("projection_revision_invalid");
   return result;
 }
-CanonicalValue plan_result_value(const PlanResultDTO& value) {
+CanonicalValue plan_result_value(const PlanResultDTO& value,
+                                 const MovingReplacementInputDTO* replacement) {
   if (value.trajectory.has_value() == value.error.has_value()) fail("plan_result_xor_invalid");
   CanonicalValue::Object fields;
   fields.reserve(value.trajectory.has_value() ? 2U : 1U);
   if (value.trajectory.has_value()) {
-    fields.emplace_back("trajectory", trajectory_value(*value.trajectory));
+    fields.emplace_back("trajectory", trajectory_value(*value.trajectory, replacement));
     fields.emplace_back("projection_revision", projection_value(value.projection_revision));
   } else {
     if (value.projection_revision.valid()) fail("failed_plan_projection_forbidden");
@@ -392,11 +468,12 @@ CanonicalValue plan_result_value(const PlanResultDTO& value) {
   }
   return CanonicalValue(std::move(fields));
 }
-PlanResultDTO get_plan_result(const CanonicalValue& value) {
+PlanResultDTO get_plan_result(const CanonicalValue& value,
+                              const MovingReplacementInputDTO* replacement) {
   const bool success = value.find_object_member("trajectory") != nullptr;
   if (success) {
     exact(value, {"trajectory", "projection_revision"});
-    return PlanResultDTO{get_trajectory(member(value, "trajectory")), std::nullopt,
+    return PlanResultDTO{get_trajectory(member(value, "trajectory"), replacement), std::nullopt,
                          get_projection(member(value, "projection_revision"))};
   }
   exact(value, {"error"});
@@ -404,17 +481,20 @@ PlanResultDTO get_plan_result(const CanonicalValue& value) {
 }
 }  // namespace
 
-Result<std::string> EncodePreparedPlanResult(const PlanResultDTO& value) {
+Result<std::string> EncodePreparedPlanResult(const PlanResultDTO& value,
+                                             const MovingReplacementInputDTO* replacement) {
   try {
-    return Result<std::string>::Ok(content_identity::canonical_json(plan_result_value(value)));
+    return Result<std::string>::Ok(
+        content_identity::canonical_json(plan_result_value(value, replacement)));
   } catch (const std::exception& error) {
     return rejected<std::string>(error.what());
   }
 }
-Result<PlanResultDTO> DecodePreparedPlanResult(std::string_view bytes) {
+Result<PlanResultDTO> DecodePreparedPlanResult(std::string_view bytes,
+                                               const MovingReplacementInputDTO* replacement) {
   try {
     return Result<PlanResultDTO>::Ok(
-        get_plan_result(content_identity::parse_canonical_json(bytes)));
+        get_plan_result(content_identity::parse_canonical_json(bytes), replacement));
   } catch (const std::exception& error) {
     return rejected<PlanResultDTO>(error.what());
   }
@@ -729,7 +809,130 @@ PlannerCapabilityBindingDTO get_planner(const CanonicalValue& v) {
       RuntimeUnitId(text(member(v, "provider_runtime_unit_id"))),
       RuntimeEpoch(text(member(v, "provider_runtime_epoch")))};
 }
+CanonicalValue dynamics_value(const PerResourceDynamicsLimitsDTO& values) {
+  CanonicalValue::Array dynamics;
+  for (const auto& d : values) {
+    CanonicalValue::Object limit;
+    if (d.limit.max_velocity_rad_s)
+      limit.emplace_back("max_velocity_rad_s", CanonicalValue(*d.limit.max_velocity_rad_s));
+    if (d.limit.max_acceleration_rad_s2)
+      limit.emplace_back("max_acceleration_rad_s2",
+                         CanonicalValue(*d.limit.max_acceleration_rad_s2));
+    if (d.limit.max_jerk_rad_s3)
+      limit.emplace_back("max_jerk_rad_s3", CanonicalValue(*d.limit.max_jerk_rad_s3));
+    dynamics.emplace_back(
+        CanonicalValue::Object{{"resource_id", CanonicalValue(d.resource_id.value())},
+                               {"compiled_joint_name", CanonicalValue(d.compiled_joint_name)},
+                               {"limit", CanonicalValue(std::move(limit))}});
+  }
+  return CanonicalValue(std::move(dynamics));
+}
+CanonicalValue speed_value(const SpeedProfileDTO& value) {
+  CanonicalValue::Object speed{{"velocity_scale", CanonicalValue(value.velocity_scale)},
+                               {"acceleration_scale", CanonicalValue(value.acceleration_scale)}};
+  if (value.max_tcp_linear_speed_mps)
+    speed.emplace_back("max_tcp_linear_speed_mps", CanonicalValue(*value.max_tcp_linear_speed_mps));
+  return CanonicalValue(std::move(speed));
+}
+SpeedProfileDTO get_speed(const CanonicalValue& s) {
+  const bool hm = s.find_object_member("max_tcp_linear_speed_mps") != nullptr;
+  exact(s, hm ? std::initializer_list<std::string_view>{"velocity_scale", "acceleration_scale",
+                                                        "max_tcp_linear_speed_mps"}
+              : std::initializer_list<std::string_view>{"velocity_scale", "acceleration_scale"});
+  return {number(member(s, "velocity_scale")), number(member(s, "acceleration_scale")),
+          hm ? std::optional<double>(number(member(s, "max_tcp_linear_speed_mps"))) : std::nullopt};
+}
+PerResourceDynamicsLimitsDTO get_dynamics(const CanonicalValue& rows, bool closed = false) {
+  if (closed && !rows.is_array()) fail("array_required");
+  PerResourceDynamicsLimitsDTO result;
+  for (const auto& d : rows.as_array()) {
+    exact(d, {"resource_id", "compiled_joint_name", "limit"});
+    JointDynamicsLimitDTO l;
+    const auto& z = member(d, "limit");
+    if (const auto* x = z.find_object_member("max_velocity_rad_s"))
+      l.max_velocity_rad_s = number(*x);
+    if (const auto* x = z.find_object_member("max_acceleration_rad_s2"))
+      l.max_acceleration_rad_s2 = number(*x);
+    if (const auto* x = z.find_object_member("max_jerk_rad_s3")) l.max_jerk_rad_s3 = number(*x);
+    if (closed &&
+        object(z).size() != static_cast<std::size_t>(l.max_velocity_rad_s.has_value()) +
+                                static_cast<std::size_t>(l.max_acceleration_rad_s2.has_value()) +
+                                static_cast<std::size_t>(l.max_jerk_rad_s3.has_value()))
+      fail("unknown_or_missing_member");
+    result.push_back(
+        {ResourceId(text(member(d, "resource_id"))), text(member(d, "compiled_joint_name")), l});
+  }
+  return result;
+}
+
+void validate_replacement_request(const PlanRequestDTO& r) {
+  if (!r.moving_replacement) return;
+  const auto& m = *r.moving_replacement;
+  validate_replacement_input(m);
+  auto suffix_binding = m.suffix_start_state;
+  suffix_binding.positions = r.start_state.positions;
+  suffix_binding.velocities = r.start_state.velocities;
+  const auto& prefix = m.source_prefix_trajectory;
+  const auto positions = angular_position_projection(r.start_state);
+  if (!validate_controlled_state(r.start_state).ok() || suffix_binding != r.start_state ||
+      prefix.resources != r.resources ||
+      prefix.joint_names != r.model_group_binding.compiled_joint_names || !positions.ok() ||
+      positions.value() != prefix.waypoints.front().positions_rad || !r.start_state.velocities ||
+      r.start_state.velocities->size() != prefix.resources.size())
+    fail("moving_replacement_start_authority_mismatch");
+  for (std::size_t j = 0; j < prefix.resources.size(); ++j) {
+    const auto* v = std::get_if<AngularVelocityDTO>(&(*r.start_state.velocities)[j]);
+    if (!v || v->value_rad_s != prefix.waypoints.front().velocities_rad_s[j])
+      fail("moving_replacement_start_authority_mismatch");
+  }
+}
+CanonicalValue replacement_value(const MovingReplacementInputDTO& m) {
+  validate_replacement_input(m);
+  return CanonicalValue(CanonicalValue::Object{
+      {"source_goal",
+       CanonicalValue(CanonicalValue::Object{
+           {"controller_goal_id", CanonicalValue(m.source_goal.controller_goal_id.value())},
+           {"controller_goal_generation",
+            CanonicalValue(
+                static_cast<double>(m.source_goal.controller_goal_generation.value()))}})},
+      {"source_binding_epoch", CanonicalValue(static_cast<double>(m.source_binding_epoch.value()))},
+      {"source_cursor_s", CanonicalValue(m.source_cursor_s)},
+      {"source_prefix_trajectory", trajectory_value(m.source_prefix_trajectory)},
+      {"divergence_cursor_s", CanonicalValue(m.divergence_cursor_s)},
+      {"suffix_start_state", state_value(m.suffix_start_state)},
+      {"source_base_frame", frame_value(m.source_base_frame)},
+      {"source_tcp_frame", frame_value(m.source_tcp_frame)},
+      {"source_speed_profile", speed_value(m.source_speed_profile)},
+      {"source_per_resource_dynamics_limits",
+       dynamics_value(m.source_per_resource_dynamics_limits)},
+      {"remaining_preparation_budget_s", CanonicalValue(m.remaining_preparation_budget_s)}});
+}
+MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
+  exact(v, {"source_goal", "source_binding_epoch", "source_cursor_s", "source_prefix_trajectory",
+            "divergence_cursor_s", "suffix_start_state", "source_base_frame", "source_tcp_frame",
+            "source_speed_profile", "source_per_resource_dynamics_limits",
+            "remaining_preparation_budget_s"});
+  const auto& goal = member(v, "source_goal");
+  exact(goal, {"controller_goal_id", "controller_goal_generation"});
+  MovingReplacementInputDTO result{
+      {ControllerGoalId(text(member(goal, "controller_goal_id"))),
+       ControllerGoalGeneration(safe_unsigned(member(goal, "controller_goal_generation"), true))},
+      ExecutionBindingEpoch(safe_unsigned(member(v, "source_binding_epoch"), true)),
+      number(member(v, "source_cursor_s")),
+      get_trajectory(member(v, "source_prefix_trajectory")),
+      number(member(v, "divergence_cursor_s")),
+      get_state(member(v, "suffix_start_state")),
+      get_frame(member(v, "source_base_frame")),
+      get_frame(member(v, "source_tcp_frame")),
+      get_speed(member(v, "source_speed_profile")),
+      get_dynamics(member(v, "source_per_resource_dynamics_limits"), true),
+      number(member(v, "remaining_preparation_budget_s"))};
+  validate_replacement_input(result);
+  return result;
+}
+
 CanonicalValue plan_request_value(const PlanRequestDTO& r) {
+  validate_replacement_request(r);
   if (r.retained_collision_world || r.retained_collision_policy)
     fail("private_collision_handles_must_be_null");
   if (!r.active_control_configuration_generation.nonzero() ||
@@ -747,27 +950,6 @@ CanonicalValue plan_request_value(const PlanRequestDTO& r) {
     units.emplace_back(
         CanonicalValue::Object{{"runtime_unit_id", CanonicalValue(u.runtime_unit_id.value())},
                                {"runtime_epoch", CanonicalValue(u.runtime_epoch.value())}});
-  CanonicalValue::Array dynamics;
-  for (const auto& d : r.per_resource_dynamics_limits) {
-    CanonicalValue::Object limit;
-    if (d.limit.max_velocity_rad_s)
-      limit.emplace_back("max_velocity_rad_s", CanonicalValue(*d.limit.max_velocity_rad_s));
-    if (d.limit.max_acceleration_rad_s2)
-      limit.emplace_back("max_acceleration_rad_s2",
-                         CanonicalValue(*d.limit.max_acceleration_rad_s2));
-    if (d.limit.max_jerk_rad_s3)
-      limit.emplace_back("max_jerk_rad_s3", CanonicalValue(*d.limit.max_jerk_rad_s3));
-    dynamics.emplace_back(
-        CanonicalValue::Object{{"resource_id", CanonicalValue(d.resource_id.value())},
-                               {"compiled_joint_name", CanonicalValue(d.compiled_joint_name)},
-                               {"limit", CanonicalValue(std::move(limit))}});
-  }
-  CanonicalValue::Object speed{
-      {"velocity_scale", CanonicalValue(r.speed_profile.velocity_scale)},
-      {"acceleration_scale", CanonicalValue(r.speed_profile.acceleration_scale)}};
-  if (r.speed_profile.max_tcp_linear_speed_mps)
-    speed.emplace_back("max_tcp_linear_speed_mps",
-                       CanonicalValue(*r.speed_profile.max_tcp_linear_speed_mps));
   CanonicalValue::Object f{
       {"operation_id", CanonicalValue(r.operation_id.value())},
       {"participant_id", CanonicalValue(r.participant_id.value())},
@@ -821,9 +1003,9 @@ CanonicalValue plan_request_value(const PlanRequestDTO& r) {
            {"joint_position_tol_rad", CanonicalValue(r.tolerances.joint_position_tol_rad)},
            {"translation_tol_m", CanonicalValue(r.tolerances.translation_tol_m)},
            {"rotation_tol_rad", CanonicalValue(r.tolerances.rotation_tol_rad)}})},
-      {"speed_profile", CanonicalValue(std::move(speed))},
+      {"speed_profile", speed_value(r.speed_profile)},
       {"planning_profile", CanonicalValue(planning_profile(r.planning_profile))},
-      {"per_resource_dynamics_limits", CanonicalValue(std::move(dynamics))},
+      {"per_resource_dynamics_limits", dynamics_value(r.per_resource_dynamics_limits)},
       {"planning_timeout_s", CanonicalValue(r.planning_timeout_s)},
       {"planning_attempt_index", CanonicalValue(static_cast<double>(r.planning_attempt_index))},
       {"projection_binding",
@@ -845,12 +1027,15 @@ CanonicalValue plan_request_value(const PlanRequestDTO& r) {
             {"parent_node_attempt_id", CanonicalValue(r.action_span->parent_node_attempt_id)}}));
   if (r.contact_policy_id)
     f.emplace_back("contact_policy_id", CanonicalValue(*r.contact_policy_id));
+  if (r.moving_replacement)
+    f.emplace_back("moving_replacement", replacement_value(*r.moving_replacement));
   return CanonicalValue(std::move(f));
 }
 PlanRequestDTO get_plan_request(const CanonicalValue& v) {
   const bool ha = v.find_object_member("action_span") != nullptr;
   const bool hc = v.find_object_member("contact_policy_id") != nullptr;
-  if (object(v).size() != 47U + (ha ? 1U : 0U) + (hc ? 1U : 0U))
+  const bool hm = v.find_object_member("moving_replacement") != nullptr;
+  if (object(v).size() != 47U + (ha ? 1U : 0U) + (hc ? 1U : 0U) + (hm ? 1U : 0U))
     fail("plan_request_member_count_invalid");
   PlanRequestDTO r{
       OperationId(text(member(v, "operation_id"))),
@@ -975,27 +1160,9 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
   exact(t, {"joint_position_tol_rad", "translation_tol_m", "rotation_tol_rad"});
   r.tolerances = {number(member(t, "joint_position_tol_rad")),
                   number(member(t, "translation_tol_m")), number(member(t, "rotation_tol_rad"))};
-  const auto& s = member(v, "speed_profile");
-  const bool hm = s.find_object_member("max_tcp_linear_speed_mps") != nullptr;
-  exact(s, hm ? std::initializer_list<std::string_view>{"velocity_scale", "acceleration_scale",
-                                                        "max_tcp_linear_speed_mps"}
-              : std::initializer_list<std::string_view>{"velocity_scale", "acceleration_scale"});
-  r.speed_profile = {
-      number(member(s, "velocity_scale")), number(member(s, "acceleration_scale")),
-      hm ? std::optional<double>(number(member(s, "max_tcp_linear_speed_mps"))) : std::nullopt};
+  r.speed_profile = get_speed(member(v, "speed_profile"));
   r.planning_profile = get_planning_profile(text(member(v, "planning_profile")));
-  for (const auto& d : member(v, "per_resource_dynamics_limits").as_array()) {
-    exact(d, {"resource_id", "compiled_joint_name", "limit"});
-    JointDynamicsLimitDTO l;
-    const auto& z = member(d, "limit");
-    if (const auto* x = z.find_object_member("max_velocity_rad_s"))
-      l.max_velocity_rad_s = number(*x);
-    if (const auto* x = z.find_object_member("max_acceleration_rad_s2"))
-      l.max_acceleration_rad_s2 = number(*x);
-    if (const auto* x = z.find_object_member("max_jerk_rad_s3")) l.max_jerk_rad_s3 = number(*x);
-    r.per_resource_dynamics_limits.push_back(
-        {ResourceId(text(member(d, "resource_id"))), text(member(d, "compiled_joint_name")), l});
-  }
+  r.per_resource_dynamics_limits = get_dynamics(member(v, "per_resource_dynamics_limits"));
   r.planning_timeout_s = number(member(v, "planning_timeout_s"));
   const auto attempt = safe_unsigned(member(v, "planning_attempt_index"));
   if (attempt > std::numeric_limits<std::uint32_t>::max()) fail("planning_attempt_index_invalid");
@@ -1022,6 +1189,8 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
                                   text(member(a, "node_attempt_id")),
                                   text(member(a, "parent_node_attempt_id"))};
   }
+  if (hm) r.moving_replacement = get_replacement(member(v, "moving_replacement"));
+  validate_replacement_request(r);
   return r;
 }
 }  // namespace

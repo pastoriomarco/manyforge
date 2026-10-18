@@ -61,12 +61,48 @@ struct TargetBindingCapabilityProviderTargetDTO final {
                          const TargetBindingCapabilityProviderTargetDTO&) = default;
 };
 
+/// Direct non-coordinate target. Qualified against the exact declared local
+/// resource roles and their sealed provider ownership, without a control path.
+struct ComponentTargetCapabilityProviderTargetDTO final {
+  ControllableComponentId controllable_component_id;
+  ComponentTypeRevision component_type_revision;
+  CommandTargetId command_target_id;
+
+  friend bool operator==(const ComponentTargetCapabilityProviderTargetDTO&,
+                         const ComponentTargetCapabilityProviderTargetDTO&) = default;
+};
+
 /// Complete `control_domain` applicability target.
+struct ProviderControlDomainCapabilityTargetDTO final {
+  friend bool operator==(const ProviderControlDomainCapabilityTargetDTO&,
+                         const ProviderControlDomainCapabilityTargetDTO&) = default;
+};
+
 struct ControlDomainCapabilityProviderTargetDTO final {
   ControlDomainId control_domain_id;
   ControlDomainRevision control_domain_revision;
-  ControllerTopologyId controller_topology_id;
-  TopologyRevision topology_revision;
+  std::variant<ControllerControlDomainDTO, ProviderControlDomainCapabilityTargetDTO> payload;
+
+  ControlDomainCapabilityProviderTargetDTO(ControlDomainId id, ControlDomainRevision revision,
+                                           ControllerTopologyId topology,
+                                           TopologyRevision topology_revision)
+      : control_domain_id(std::move(id)),
+        control_domain_revision(std::move(revision)),
+        payload(ControllerControlDomainDTO{std::move(topology), std::move(topology_revision)}) {}
+  ControlDomainCapabilityProviderTargetDTO(ControlDomainId id, ControlDomainRevision revision,
+                                           ProviderControlDomainCapabilityTargetDTO provider)
+      : control_domain_id(std::move(id)),
+        control_domain_revision(std::move(revision)),
+        payload(provider) {}
+  [[nodiscard]] ControllerControlDomainDTO& controller() {
+    return std::get<ControllerControlDomainDTO>(payload);
+  }
+  [[nodiscard]] const ControllerControlDomainDTO& controller() const {
+    return std::get<ControllerControlDomainDTO>(payload);
+  }
+  [[nodiscard]] bool provider() const noexcept {
+    return std::holds_alternative<ProviderControlDomainCapabilityTargetDTO>(payload);
+  }
 
   friend bool operator==(const ControlDomainCapabilityProviderTargetDTO&,
                          const ControlDomainCapabilityProviderTargetDTO&) = default;
@@ -74,7 +110,8 @@ struct ControlDomainCapabilityProviderTargetDTO final {
 
 using CapabilityProviderTargetDTO =
     std::variant<CellGlobalCapabilityProviderTargetDTO, TargetBindingCapabilityProviderTargetDTO,
-                 ControlDomainCapabilityProviderTargetDTO>;
+                 ControlDomainCapabilityProviderTargetDTO,
+                 ComponentTargetCapabilityProviderTargetDTO>;
 
 enum class CapabilityEndpointSourceKind : std::uint8_t {
   kRuntimeUnit = 0,
@@ -243,6 +280,9 @@ struct DeploymentApplicabilityInputsDTO final {
   /// preserves the strong ID/revision pair; only contact and Stop-evidence
   /// alternatives are legal at this boundary.
   std::vector<CatalogRecordRefDTO> retained_policy_records;
+  /// Whole smooth-takeover preparation budget in seconds. Absence is retained
+  /// until a measured deployment default is selected; it is not a Stop budget.
+  std::optional<double> motion_takeover_preparation_budget_s{};
 
   friend bool operator==(const DeploymentApplicabilityInputsDTO&,
                          const DeploymentApplicabilityInputsDTO&) = default;

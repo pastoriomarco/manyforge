@@ -16,13 +16,13 @@ const FIELDS = {
   node_environment: ['catalog_id', 'content_version', 'catalog_digest', 'environment_digest'],
   component: ['component_role_id', 'controllable_component_id', 'component_type_id', 'component_type_revision', 'model_role_bindings'],
   model: ['model_role_id', 'model_instance_id', 'model_revision'],
-  target: ['target_role_id', 'component_role_id', 'controllable_component_id', 'command_target_id', 'frame_role_bindings', 'resource_role_bindings', 'collision_body_role_bindings', 'capability_bindings'],
+  target: ['target_role_id', 'component_role_id', 'controllable_component_id', 'command_target_id', 'frame_role_bindings', 'resource_role_bindings', 'collision_body_role_bindings', 'capability_bindings', 'signal_role_bindings'],
   frame: ['frame_role_id', 'model_instance_id', 'model_revision', 'compiled_frame_name'],
   resource: ['resource_role_id', 'resource_ids', 'compiled_resource_names'],
   collision: ['collision_body_role_id', 'model_instance_id', 'model_revision', 'compiled_collision_body_names'],
   capability: ['capability_id', 'capability_definition_revision', 'control_binding', 'capability_provider_binding', 'command_schema'],
   node_policy: ['instance_id', 'recovery_policy', 'operator_stop_policy'],
-  recovery_policy: ['allow_intervention', 'max_retries'],
+  recovery_policy: ['allow_intervention', 'max_retries', 'intervention_stop_scope'],
   control: ['control_binding_id', 'control_binding_revision'],
   provider: ['capability_provider_binding_id', 'capability_provider_binding_revision'],
   command_schema: ['command_schema_id', 'command_schema_revision'],
@@ -30,8 +30,11 @@ const FIELDS = {
   contact_body: ['component_role_id', 'target_role_id', 'controllable_component_id', 'command_target_id', 'model_role_id', 'collision_body_role_id', 'model_instance_id', 'model_revision', 'collision_body_ids'],
   provenance: ['binding_compiler_contract_digest', 'role_assignment_digest', 'source_records', 'resolved_output_records'],
   provenance_record: ['record_kind', 'record_id', 'revision'],
+  signal: ['resource_role_id', 'signal_name', 'value_type', 'direction', 'transition_capability', 'signal_descriptor_digest'],
 } as const;
+const OPTIONAL_FIELDS = {'recovery_policy': ['intervention_stop_scope'], 'target': ['signal_role_bindings']} as const;
 const STOP_POLICIES = new Set(['inherit', 'hold', 'continue']);
+const INTERVENTION_STOP_SCOPES = new Set(['all', 'own_groups']);
 const COLLISION_BODY_ID = 'component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}';
 const MAX_ROWS = 4096;
 const ROLE_MAX_ROWS = 4096;
@@ -47,12 +50,14 @@ export class ProgramBindingTransportError extends Error {}
 const bad = (path: string, expected: string): never => {
   throw new ProgramBindingTransportError(`${path}: ${expected}`);
 };
-const record = (value: unknown, keys: readonly string[], path: string): Row => {
+const record = (
+  value: unknown, keys: readonly string[], path: string, optional: readonly string[] = [],
+): Row => {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) bad(path, 'closed record');
   const row = value as Row;
-  const actual = Object.keys(row).sort();
-  const wanted = [...keys].sort();
-  if (actual.length !== wanted.length || actual.some((key, i) => key !== wanted[i])) bad(path, 'closed record');
+  const actual = Object.keys(row);
+  if (actual.some((key) => !keys.includes(key))
+      || keys.some((key) => !optional.includes(key) && !actual.includes(key))) bad(path, 'closed record');
   return row;
 };
 const array = (value: unknown, path: string, minimum = 0, maximum = MAX_ROWS): unknown[] => {
@@ -114,7 +119,7 @@ const nodePolicy = (value: unknown, path: string): Row => {
   const row = record(value, FIELDS.node_policy, path);
   policyId(row.instance_id, `${path}.instance_id`);
   const recovery = record(row.recovery_policy, FIELDS.recovery_policy,
-    `${path}.recovery_policy`);
+    `${path}.recovery_policy`, OPTIONAL_FIELDS.recovery_policy);
   if (typeof recovery.allow_intervention !== 'boolean') {
     bad(`${path}.recovery_policy.allow_intervention`, 'boolean');
   }
@@ -123,10 +128,16 @@ const nodePolicy = (value: unknown, path: string): Row => {
       || retries < 0 || retries > RETRY_MAX) {
     bad(`${path}.recovery_policy.max_retries`, 'bounded integer');
   }
+  const scope = Object.hasOwn(recovery, 'intervention_stop_scope')
+    ? recovery.intervention_stop_scope : 'all';
+  if (typeof scope !== 'string' || !INTERVENTION_STOP_SCOPES.has(scope)) {
+    bad(`${path}.recovery_policy.intervention_stop_scope`, 'closed enum');
+  }
   if (!STOP_POLICIES.has(row.operator_stop_policy as string)) {
     bad(`${path}.operator_stop_policy`, 'closed enum');
   }
   if (recovery.allow_intervention === false && retries === 0
+      && scope === 'all'
       && row.operator_stop_policy === 'inherit') {
     bad(path, 'default node-policy rows must be omitted');
   }
@@ -149,7 +160,7 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
   digest(env.catalog_digest, `${path}.node_environment.catalog_digest`);
   digest(env.environment_digest, `${path}.node_environment.environment_digest`);
 
-  const components = array(root.component_role_bindings, `${path}.component_role_bindings`, 1, ROLE_MAX_ROWS).map(
+  const components = array(root.component_role_bindings, `${path}.component_role_bindings`, 0, ROLE_MAX_ROWS).map(
     (item, i) => {
       const cp = `${path}.component_role_bindings[${i}]`;
       const component = record(item, FIELDS.component, cp);
@@ -177,7 +188,7 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
   const targets = array(root.target_role_bindings, `${path}.target_role_bindings`, 0, ROLE_MAX_ROWS).map(
     (item, i) => {
       const tp = `${path}.target_role_bindings[${i}]`;
-      const target = record(item, FIELDS.target, tp);
+      const target = record(item, FIELDS.target, tp, OPTIONAL_FIELDS.target);
       ['target_role_id', 'component_role_id', 'controllable_component_id', 'command_target_id'].forEach(
         (field) => identity(target[field], `${tp}.${field}`),
       );
@@ -201,6 +212,21 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
         return resource;
       });
       sorted(resources, (row) => row.resource_role_id as string, `${tp}.resource_role_bindings`);
+      if ('signal_role_bindings' in target) {
+        const coordinateRoles = new Set(resources.map((row) => row.resource_role_id));
+        const signals = array(target.signal_role_bindings, `${tp}.signal_role_bindings`, 1).map((item2, j) => {
+          const sp = `${tp}.signal_role_bindings[${j}]`;
+          const signal = record(item2, FIELDS.signal, sp);
+          identity(signal.resource_role_id, `${sp}.resource_role_id`);
+          identity(signal.signal_name, `${sp}.signal_name`);
+          digest(signal.signal_descriptor_digest, `${sp}.signal_descriptor_digest`);
+          if (signal.value_type !== 'bool' || !['input', 'output'].includes(signal.direction as string)
+              || !['sampled_only', 'captured'].includes(signal.transition_capability as string)) bad(sp, 'invalid signal declaration');
+          if (coordinateRoles.has(signal.resource_role_id)) bad(sp, 'resource role cannot resolve to both coordinate and signal');
+          return signal;
+        });
+        sorted(signals, (row) => row.resource_role_id as string, `${tp}.signal_role_bindings`);
+      }
       const collisions = array(target.collision_body_role_bindings, `${tp}.collision_body_role_bindings`).map((item2, j) => {
         const cp = `${tp}.collision_body_role_bindings[${j}]`;
         const collision = record(item2, FIELDS.collision, cp);

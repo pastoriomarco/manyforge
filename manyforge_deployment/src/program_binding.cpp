@@ -22,6 +22,8 @@
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "program_binding_internal.hpp"
+#include <manyforge_core/io_signal_descriptor.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 
 namespace manyforge::deployment {
 namespace {
@@ -101,6 +103,28 @@ void require_exact_fields(const CanonicalValue::Object& object,
   }
 }
 
+void require_fields(const CanonicalValue::Object &object,
+                    std::initializer_list<std::string_view> required,
+                    std::initializer_list<std::string_view> optional,
+                    std::string_view path) {
+  for (const auto name : required)
+    (void)require_member(object, name, path);
+  for (const auto &[name, unused] : object) {
+    (void)unused;
+    if (std::find(required.begin(), required.end(), name) == required.end() &&
+        std::find(optional.begin(), optional.end(), name) == optional.end())
+      fail(std::string(path) + ": unknown field '" + name + "'");
+  }
+}
+
+const CanonicalValue *find_member(const CanonicalValue::Object &object,
+                                  std::string_view name) {
+  const auto found =
+      std::find_if(object.begin(), object.end(),
+                   [&](const auto &row) { return row.first == name; });
+  return found == object.end() ? nullptr : &found->second;
+}
+
 [[nodiscard]] std::string child_path(std::string_view parent,
                                      std::string_view child) {
   return std::string(parent) + "." + std::string(child);
@@ -165,6 +189,9 @@ void validate_node_policy(const core::ProgramNodePolicyDTO& policy,
   if (policy.recovery_policy.max_retries > core::kMaxProgramRecoveryRetries) {
     fail(std::string(path) + ": recovery retry budget is out of range");
   }
+  if (core::to_string(policy.recovery_policy.intervention_stop_scope).empty()) {
+    fail(std::string(path) + ": invalid intervention Stop scope");
+  }
   if (policy.operator_stop_policy != core::ProgramOperatorStopPolicy::kInherit &&
       policy.operator_stop_policy != core::ProgramOperatorStopPolicy::kHold &&
       policy.operator_stop_policy != core::ProgramOperatorStopPolicy::kContinue) {
@@ -209,8 +236,28 @@ void validate_node_policy(const core::ProgramNodePolicyDTO& policy,
   const auto recovery_path = child_path(path, "recovery_policy");
   const auto& recovery = require_object(
       require_member(root, "recovery_policy", path), recovery_path);
-  require_exact_fields(recovery, {"allow_intervention", "max_retries"},
-                       recovery_path);
+  const auto scope =
+      std::find_if(recovery.begin(), recovery.end(), [](const auto &field) {
+        return field.first == "intervention_stop_scope";
+      });
+  auto stop_scope = core::ProgramInterventionStopScope::kAll;
+  if (scope == recovery.end()) {
+    require_exact_fields(recovery, {"allow_intervention", "max_retries"},
+                         recovery_path);
+  } else {
+    require_exact_fields(
+        recovery,
+        {"allow_intervention", "max_retries", "intervention_stop_scope"},
+        recovery_path);
+    const auto scope_path =
+        child_path(recovery_path, "intervention_stop_scope");
+    const auto &spelling = require_string(scope->second, scope_path);
+    if (spelling == "own_groups") {
+      stop_scope = core::ProgramInterventionStopScope::kOwnGroups;
+    } else if (spelling != "all") {
+      fail(scope_path + ": expected all or own_groups");
+    }
+  }
   const auto& allow =
       require_member(recovery, "allow_intervention", recovery_path);
   if (!allow.is_bool()) {
@@ -225,7 +272,8 @@ void validate_node_policy(const core::ProgramNodePolicyDTO& policy,
           allow.as_bool(),
           parse_policy_retries(
               require_member(recovery, "max_retries", recovery_path),
-              child_path(recovery_path, "max_retries"))},
+              child_path(recovery_path, "max_retries")),
+          stop_scope},
       parse_operator_stop_policy(
           require_member(root, "operator_stop_policy", path),
           child_path(path, "operator_stop_policy"))};
@@ -308,8 +356,7 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
   require_digest(value.node_environment.environment_digest.value(),
                  "program_binding.node_environment.environment_digest");
 
-  if (value.component_role_bindings.empty() ||
-      value.component_role_bindings.size() > core::kMaxProgramRoleBindings ||
+  if (value.component_role_bindings.size() > core::kMaxProgramRoleBindings ||
       value.target_role_bindings.size() > core::kMaxProgramRoleBindings) {
     fail("program binding role tables violate fixed bounds");
   }
@@ -355,6 +402,8 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
     if (target.frame_role_bindings.size() >
             core::kMaxProgramNestedRoleBindings ||
         target.resource_role_bindings.size() >
+            core::kMaxProgramNestedRoleBindings ||
+        target.signal_role_bindings.size() >
             core::kMaxProgramNestedRoleBindings ||
         target.collision_body_role_bindings.size() >
             core::kMaxProgramNestedRoleBindings ||
@@ -405,6 +454,33 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
     sort_unique(target.resource_role_bindings,
                 [](const auto& item) { return item.resource_role_id; },
                 "resource_role_bindings");
+
+    for (const auto &signal : target.signal_role_bindings) {
+      require_identity(signal.resource_role_id.value(),
+                       "signal_role_bindings.resource_role_id");
+      require_identity(signal.signal_name, "signal_role_bindings.signal_name");
+      require_digest(signal.signal_descriptor_digest.value(),
+                     "signal_role_bindings.signal_descriptor_digest");
+      if (signal.value_type != core::IoSignalValueType::kBoolean ||
+          (signal.direction != core::IoSignalDirection::kInput &&
+           signal.direction != core::IoSignalDirection::kOutput) ||
+          (signal.transition_capability !=
+               core::IoTransitionCapability::kSampledOnly &&
+           signal.transition_capability !=
+               core::IoTransitionCapability::kCaptured))
+        fail("signal role binding has an unsupported value contract");
+      if (std::any_of(
+              target.resource_role_bindings.begin(),
+              target.resource_role_bindings.end(), [&](const auto &resource) {
+                return resource.resource_role_id == signal.resource_role_id;
+              }))
+        fail("resource role resolves through both coordinate and signal "
+             "bindings");
+    }
+    sort_unique(
+        target.signal_role_bindings,
+        [](const auto &item) { return item.resource_role_id; },
+        "signal_role_bindings");
 
     for (const auto& collision : target.collision_body_role_bindings) {
       require_identity(collision.collision_body_role_id.value(),
@@ -655,18 +731,24 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
 
 [[nodiscard]] CanonicalValue node_policy_projection(
     const core::ProgramNodePolicyDTO& policy) {
+  CanonicalValue::Object recovery{
+      {"allow_intervention",
+       CanonicalValue(policy.recovery_policy.allow_intervention)},
+      {"max_retries",
+       CanonicalValue(static_cast<double>(policy.recovery_policy.max_retries))},
+  };
+  if (policy.recovery_policy.intervention_stop_scope !=
+      core::ProgramInterventionStopScope::kAll) {
+    recovery.emplace_back(
+        "intervention_stop_scope",
+        CanonicalValue(std::string(
+            core::to_string(policy.recovery_policy.intervention_stop_scope))));
+  }
   return CanonicalValue(CanonicalValue::Object{
       {"instance_id", CanonicalValue(policy.instance_id.value())},
-      {"operator_stop_policy",
-       CanonicalValue(std::string(
-           core::to_string(policy.operator_stop_policy)))},
-      {"recovery_policy",
-       CanonicalValue(CanonicalValue::Object{
-           {"allow_intervention",
-            CanonicalValue(policy.recovery_policy.allow_intervention)},
-           {"max_retries", CanonicalValue(static_cast<double>(
-                               policy.recovery_policy.max_retries))},
-       })},
+      {"operator_stop_policy", CanonicalValue(std::string(core::to_string(
+                                   policy.operator_stop_policy)))},
+      {"recovery_policy", CanonicalValue(std::move(recovery))},
   });
 }
 
@@ -861,8 +943,7 @@ template <typename StrongType>
   const auto& component_values = require_array(
       require_member(root, "component_role_bindings", "program_binding"),
       "program_binding.component_role_bindings");
-  if (component_values.empty() ||
-      component_values.size() > core::kMaxProgramRoleBindings) {
+  if (component_values.size() > core::kMaxProgramRoleBindings) {
     fail("program_binding.component_role_bindings: violates fixed bounds");
   }
   std::vector<core::ProgramComponentRoleBindingDTO> components;
@@ -934,13 +1015,12 @@ template <typename StrongType>
     const std::string path =
         index_path("program_binding.target_role_bindings", index);
     const auto& target = require_object(target_values[index], path);
-    require_exact_fields(
-        target,
-        {"target_role_id", "component_role_id", "controllable_component_id",
-         "command_target_id", "frame_role_bindings",
-         "resource_role_bindings", "collision_body_role_bindings",
-         "capability_bindings"},
-        path);
+    require_fields(target,
+                   {"target_role_id", "component_role_id",
+                    "controllable_component_id", "command_target_id",
+                    "frame_role_bindings", "resource_role_bindings",
+                    "collision_body_role_bindings", "capability_bindings"},
+                   {"signal_role_bindings"}, path);
 
     std::vector<core::ProgramFrameRoleBindingDTO> frames;
     const std::string frames_path = child_path(path, "frame_role_bindings");
@@ -1150,6 +1230,43 @@ template <typename StrongType>
       });
     }
 
+    std::vector<core::ProgramSignalRoleBindingDTO> signals;
+    if (const auto *supplied = find_member(target, "signal_role_bindings")) {
+      const auto &rows =
+          require_array(*supplied, child_path(path, "signal_role_bindings"));
+      if (rows.empty() || rows.size() > core::kMaxProgramNestedRoleBindings)
+        fail(path + ".signal_role_bindings: omit an empty table or respect its "
+                    "fixed bound");
+      for (const auto &value : rows) {
+        const auto &row = require_object(value, "signal_role_bindings[]");
+        require_exact_fields(row,
+                             {"resource_role_id", "signal_name", "value_type",
+                              "direction", "transition_capability",
+                              "signal_descriptor_digest"},
+                             "signal_role_bindings[]");
+        const auto &type =
+            require_string(require_member(row, "value_type", path), path);
+        const auto &direction =
+            require_string(require_member(row, "direction", path), path);
+        const auto &transition = require_string(
+            require_member(row, "transition_capability", path), path);
+        if (type != "bool" || (direction != "input" && direction != "output") ||
+            (transition != "sampled_only" && transition != "captured"))
+          fail(path + ": unsupported signal role binding contract");
+        signals.push_back(
+            {parse_identity<core::ResourceRoleId>(
+                 require_member(row, "resource_role_id", path), path),
+             require_string(require_member(row, "signal_name", path), path),
+             core::IoSignalValueType::kBoolean,
+             direction == "input" ? core::IoSignalDirection::kInput
+                                  : core::IoSignalDirection::kOutput,
+             transition == "sampled_only"
+                 ? core::IoTransitionCapability::kSampledOnly
+                 : core::IoTransitionCapability::kCaptured,
+             parse_digest<core::ContentDigest>(
+                 require_member(row, "signal_descriptor_digest", path), path)});
+      }
+    }
     targets.push_back(core::ProgramTargetRoleBindingDTO{
         parse_identity<core::TargetRoleId>(
             require_member(target, "target_role_id", path),
@@ -1163,8 +1280,11 @@ template <typename StrongType>
         parse_identity<core::CommandTargetId>(
             require_member(target, "command_target_id", path),
             child_path(path, "command_target_id")),
-        std::move(frames), std::move(resources), std::move(collision_bodies),
+        std::move(frames),
+        std::move(resources),
+        std::move(collision_bodies),
         std::move(capabilities),
+        std::move(signals),
     });
   }
 
@@ -1441,6 +1561,10 @@ void verify_provider_target(
                           Target, core::CellGlobalCapabilityProviderTargetDTO>) {
           return provider.scope == core::CapabilityScope::kCellGlobal &&
                  provider_target.cell_id == graph.cell_id;
+        } else if constexpr (std::is_same_v<Target, core::ComponentTargetCapabilityProviderTargetDTO>) {
+          return provider_target.controllable_component_id == target.controllable_component_id &&
+                 provider_target.command_target_id == target.command_target_id &&
+                 ValidateNonCoordinateProviderTarget(graph, provider).ok();
         } else if constexpr (std::is_same_v<
                                  Target,
                                  core::TargetBindingCapabilityProviderTargetDTO>) {
@@ -1476,13 +1600,30 @@ void verify_provider_target(
                 return candidate.control_domain_id ==
                        provider_target.control_domain_id;
               });
+          if (domain && provider_target.provider()) {
+            const auto* driver = domain->provider();
+            const auto configured = ResolveRetainedIoSignalCatalog(graph);
+            return driver && configured.ok() &&
+                provider.scope == core::CapabilityScope::kControlDomain &&
+                provider_target.control_domain_revision == domain->control_domain_revision &&
+                driver->controllable_component_id == target.controllable_component_id &&
+                driver->provider_instance_id == provider.provider_instance_id &&
+                driver->provider_manifest_id == provider.provider_manifest_id &&
+                driver->provider_manifest_revision == provider.provider_manifest_revision &&
+                std::any_of(configured.value().begin(), configured.value().end(), [&](const auto& row) {
+                  return row.runtime_unit_id == driver->provider_runtime_unit_id &&
+                         row.descriptor.signal_id.controllable_component_id == target.controllable_component_id &&
+                         row.command_target_id == target.command_target_id;
+                });
+          }
           return provider.scope == core::CapabilityScope::kControlDomain &&
                  target_uses_domain && domain != nullptr &&
+                 !domain->provider() && !provider_target.provider() &&
                  provider_target.control_domain_revision ==
                      domain->control_domain_revision &&
-                 provider_target.controller_topology_id ==
-                     domain->controller_topology_id &&
-                 provider_target.topology_revision == domain->topology_revision;
+                 provider_target.controller().controller_topology_id ==
+                     domain->controller().controller_topology_id &&
+                 provider_target.controller().topology_revision == domain->controller().topology_revision;
         }
       },
       provider.target);
@@ -1506,6 +1647,9 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
   if (!verify_retained_bundle_identity(retained_bundle)) {
     fail("selected retained bundle no longer passes its intrinsic identity proof");
   }
+  const auto io_catalog = ResolveRetainedIoSignalCatalog(graph);
+  if (!io_catalog.ok())
+    fail(io_catalog.error().details.at("reason"));
 
   for (const auto& component_binding : binding.component_role_bindings) {
     const auto* component =
@@ -1568,6 +1712,28 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
           resolved->compiled_frame_name != frame_binding.compiled_frame_name) {
         fail("frame-role binding differs from the retained model map");
       }
+    }
+
+    for (const auto &signal : target_binding.signal_role_bindings) {
+      const auto resolved = std::find_if(
+          io_catalog.value().begin(), io_catalog.value().end(),
+          [&](const auto &row) {
+            return row.descriptor.signal_id.controllable_component_id ==
+                       target_binding.controllable_component_id &&
+                   row.command_target_id == target_binding.command_target_id &&
+                   row.resource_role_id == signal.resource_role_id;
+          });
+      if (resolved == io_catalog.value().end())
+        fail("io_signal_unbound: no exact retained signal role");
+      const auto digest =
+          core::ComputeIoSignalDescriptorDigest(resolved->descriptor);
+      if (!digest.ok() || digest.value() != signal.signal_descriptor_digest ||
+          resolved->descriptor.signal_id.name != signal.signal_name ||
+          resolved->descriptor.value_type != signal.value_type ||
+          resolved->descriptor.direction != signal.direction ||
+          resolved->descriptor.transition_capability !=
+              signal.transition_capability)
+        fail("signal role binding differs from the exact retained descriptor");
     }
 
     for (const auto& resource_binding : target_binding.resource_role_bindings) {
@@ -1686,7 +1852,8 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
       }
       const bool is_gripper_position_command =
           capability.capability_id.value() == "tool.gripper.command";
-      if (is_gripper_position_command != capability.command_schema.has_value()) {
+      const bool is_io_output = capability.capability_id.value() == "io.gpio.set_output";
+      if ((is_gripper_position_command || is_io_output) != capability.command_schema.has_value()) {
         fail("capability command-schema presence differs from the qualified "
              "command family");
       }
@@ -1696,6 +1863,12 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
            capability.command_schema->command_schema_revision.value() !=
                core::kGripperPositionCommandSchemaRevision)) {
         fail("gripper capability selects another command-schema family");
+      }
+      if (is_io_output &&
+          (capability.command_schema->command_schema_id.value() != core::kIoSignalWriteCommandSchemaId ||
+           capability.command_schema->command_schema_revision.value() !=
+               core::kIoSignalWriteCommandSchemaRevision)) {
+        fail("output capability selects another command-schema family");
       }
     }
   }
@@ -1795,20 +1968,42 @@ CanonicalValue program_binding_projection(
            optional_command_schema_projection(capability.command_schema)},
       });
     }
-    targets.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object target_projection{
         {"target_role_id", CanonicalValue(target.target_role_id.value())},
-        {"component_role_id",
-         CanonicalValue(target.component_role_id.value())},
+        {"component_role_id", CanonicalValue(target.component_role_id.value())},
         {"controllable_component_id",
          CanonicalValue(target.controllable_component_id.value())},
-        {"command_target_id",
-         CanonicalValue(target.command_target_id.value())},
+        {"command_target_id", CanonicalValue(target.command_target_id.value())},
         {"frame_role_bindings", CanonicalValue(std::move(frames))},
         {"resource_role_bindings", CanonicalValue(std::move(resources))},
         {"collision_body_role_bindings",
          CanonicalValue(std::move(collision_bodies))},
         {"capability_bindings", CanonicalValue(std::move(capabilities))},
-    });
+    };
+    if (!target.signal_role_bindings.empty()) {
+      CanonicalValue::Array signals;
+      for (const auto &signal : target.signal_role_bindings) {
+        signals.emplace_back(CanonicalValue::Object{
+            {"resource_role_id",
+             CanonicalValue(signal.resource_role_id.value())},
+            {"signal_name", CanonicalValue(signal.signal_name)},
+            {"value_type", CanonicalValue("bool")},
+            {"direction",
+             CanonicalValue(signal.direction == core::IoSignalDirection::kInput
+                                ? "input"
+                                : "output")},
+            {"transition_capability",
+             CanonicalValue(signal.transition_capability ==
+                                    core::IoTransitionCapability::kSampledOnly
+                                ? "sampled_only"
+                                : "captured")},
+            {"signal_descriptor_digest",
+             CanonicalValue(signal.signal_descriptor_digest.value())}});
+      }
+      target_projection.emplace_back("signal_role_bindings",
+                                     CanonicalValue(std::move(signals)));
+    }
+    targets.emplace_back(std::move(target_projection));
   }
 
   CanonicalValue::Array node_policies;

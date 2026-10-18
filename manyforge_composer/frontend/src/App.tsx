@@ -30,6 +30,7 @@ import { useAuthoringWorkspace } from './hooks/useAuthoringWorkspace';
 import { useDeploymentWorkspace } from './hooks/useDeploymentWorkspace';
 import { useManagerApplyStatus } from './hooks/useManagerApplyStatus';
 import { activationFailureNotice } from './state/activationNotices';
+import { isMotionWaitRefusal } from './state/motionWaitRefusal';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace, type ScenarioReplacementIdentity } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
@@ -49,7 +50,8 @@ import {
   viewerModelRefreshKey,
 } from './state/nodeEnvironmentRefresh';
 import { useStructuralResource } from './state/structuralResource';
-import { deriveProgramMotionConfiguration } from './utils/programAuthoring';
+import { deriveProgramMotionConfiguration, programBlackboardKeys } from './utils/programAuthoring';
+import { globalRuleIds } from './utils/interruptAuthoring';
 import {
   useOperationalErrorMirror,
   useOperationalErrors,
@@ -78,6 +80,7 @@ import {
   useTransitionScope,
   useViewerConditionHold,
   noticesOfSeverity,
+  useBriefNotice,
   usePublishedWorkbenchNotices,
   type ViewerIncidentKind,
   type WorkbenchNotice,
@@ -94,7 +97,6 @@ function isNotFound(error: unknown): boolean {
 }
 
 const INSPECTOR_SECTION_MIN_HEIGHT = 140;
-const BRIEF_NOTICE_MS = 8_000;
 
 const NO_MOTION_TARGETS: readonly DirectControlMotionStatus[] = [];
 
@@ -111,22 +113,6 @@ const PROGRAM_ACTION_LABELS: Partial<Record<ProgramWorkspaceActionName, string>>
   save_as: 'Saving Program as',
   save_scenario_document: 'Saving Scenario',
 };
-
-/**
- * Presents one completed-operation message briefly, then removes it from
- * presentation. The backend keeps the durable record; nothing is stored here.
- */
-function useBriefNotice(notice: WorkbenchNotice | null): WorkbenchNotice | null {
-  const [visible, setVisible] = useState<string | null>(null);
-  const key = notice === null ? null : `${notice.id}\n${notice.message}`;
-  useEffect(() => {
-    setVisible(key);
-    if (key === null) return undefined;
-    const timer = window.setTimeout(() => setVisible(null), BRIEF_NOTICE_MS);
-    return () => window.clearTimeout(timer);
-  }, [key]);
-  return notice !== null && visible === key ? notice : null;
-}
 
 /** Report browser-only viewer errors once on activation and once on resolution. */
 function useViewerIncidentReporting(
@@ -188,7 +174,7 @@ export default function App() {
     readOnlyReason: string | null;
   }>({ active: false, title: 'Program inspector', readOnlyReason: null });
   const [viewerInspectorPanel, setViewerInspectorPanel] = useState<
-    'tools' | 'robot' | 'object' | null
+    'tools' | 'robot' | 'object' | 'io' | null
   >(null);
   const [inspectorHeight, setInspectorHeight] = useState(() => (
     typeof window === 'undefined' ? 720 : Math.max(320, window.innerHeight - 52)
@@ -341,13 +327,21 @@ export default function App() {
   );
   // Draft / Saved / Applied of both documents, shown in every workspace.
   const programStates = programDocumentStates(programController.state.workspace);
+  // Keys a global interrupt rule may read: the Program Draft's declared and
+  // system keys (schema04 §3; T2 resolves them against the Applied Program).
+  const programDraftAuthoring = programController.state.workspace?.draft.authoring ?? null;
+  const deploymentDraftDocument = deploymentController.workspace?.draft.document ?? null;
+  // Null without a Program Draft: a rule's user keys then wait for one (contract 106).
+  const globalRuleProgramKeys = useMemo(() => (programDraftAuthoring === null ? null
+    : programBlackboardKeys(programDraftAuthoring, globalRuleIds(deploymentDraftDocument))),
+  [deploymentDraftDocument, programDraftAuthoring]);
   const deploymentStates = deploymentDocumentStates(deploymentController.workspace);
   const configuredComponentIds = useMemo(() => (
     deploymentController.workspace?.managerApplied.activationOrder?.componentIds ?? []
   ), [deploymentController.workspace?.managerApplied.activationOrder]);
   const cclc = useCCLC(headlessEnabled,
     headlessSnapshot?.authoringAdmission.admissionGeneration ?? null, configuredComponentIds);
-  const { componentId: cclcComponentId, setComponentId: selectCCLCComponent, refresh: refreshCCLC } = cclc;
+  const { controllableComponentId: cclcComponentId, setControllableComponentId: selectCCLCComponent, refresh: refreshCCLC } = cclc;
   useOperationalErrorMirror({
     source: 'composer.cclc',
     title: 'Component lifecycle or route command failed',
@@ -371,6 +365,9 @@ export default function App() {
   );
   // Manual motion uses Applied defaults; Draft changes wait for Apply.
   const appliedProgram = programRuntime.state.applied;
+  // A global rule's execution_groups scope names the Applied Program's groups (contract 73).
+  const appliedExecutionGroupIds = useMemo(() => (appliedProgram === null || appliedProgram === undefined ? null
+    : Object.keys(appliedProgram.program.execution_groups ?? {}).sort()), [appliedProgram]);
   const programCartesianDefaults = useMemo(() => {
     if (catalog.status !== 'ready') return null;
     const defaults = (program: Parameters<typeof deriveProgramMotionConfiguration>[0]) => {
@@ -421,15 +418,9 @@ export default function App() {
   useOperationalErrorMirror({
     source: 'composer.program_runtime',
     title: 'Program Run, Stop, or Reset failed',
-    message: programRuntime.state.error,
+    // A motion-admission wait (contract 75) is an amber notice, not an error.
+    message: isMotionWaitRefusal(programRuntime.state.error) ? null : programRuntime.state.error,
     onDismiss: programRuntime.dismissError,
-  });
-  useOperationalErrorMirror({
-    source: 'composer.full_cell_stop',
-    title: 'Cell Full Stop command failed',
-    message: robotControl.fullStopError,
-    onDismiss: robotControl.dismissFullStopError,
-    attentionPolicy: 'acknowledgement_required',
   });
   useOperationalErrorMirror({
     source: 'composer.runtime_scale',
@@ -438,6 +429,7 @@ export default function App() {
     onDismiss: robotControl.dismissRuntimeScaleError,
   });
   const robotOperationalError = robotControl.state.error !== null
+    && !isMotionWaitRefusal(robotControl.state.error)
     && !robotControl.state.error.startsWith('The authored ')
     && !robotControl.state.error.startsWith('The stored ')
     ? robotControl.state.error
@@ -750,8 +742,26 @@ export default function App() {
         message: reason,
       });
     }
+    for (const [id, message, dismiss] of [
+      ['program', programRuntime.state.error, programRuntime.dismissError],
+      ['robot', robotControl.state.error, robotControl.dismissError],
+    ] as const) {
+      if (message === null || !isMotionWaitRefusal(message)) continue;
+      notices.push({
+        id: `motion.wait.${id}`,
+        severity: 'warning',
+        domain: 'runtime',
+        title: 'Motion waiting',
+        message,
+        actions: [{ id: 'dismiss', label: 'Dismiss', run: dismiss }],
+      });
+    }
     return notices;
   }, [
+    programRuntime.state.error,
+    programRuntime.dismissError,
+    robotControl.state.error,
+    robotControl.dismissError,
     authoringCause,
     authoringWorkspace.unavailableReason,
     controlNotices.length,
@@ -1170,6 +1180,7 @@ export default function App() {
               motionDescriptors={robotControl.motionTargets.map(
                 (target) => target.targetDescriptor,
               )}
+              stopChains={robotControl.motionTargets}
               onRetryCatalog={retryCatalog}
               onRetryEnvironment={retryNodeEnvironment}
               onInvalidEditChange={setProgramInvalidEdit}
@@ -1204,9 +1215,12 @@ export default function App() {
                 motionDescriptors={robotControl.motionTargets.map(
                   (target) => target.targetDescriptor,
                 )}
+                stopChains={robotControl.motionTargets}
                 gripperDescriptors={robotControl.gripperTargets.map(
                   (target) => target.targetDescriptor,
                 )}
+                programKeys={globalRuleProgramKeys}
+                executionGroupIds={appliedExecutionGroupIds}
                 maintenanceStatus={activation}
                 componentOverview={{
                   request: componentOverviewRequest,

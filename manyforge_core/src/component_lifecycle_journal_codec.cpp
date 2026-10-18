@@ -342,20 +342,61 @@ void PutExpectedBinding(Writer& writer, const ExpectedControlBindingRevisionDTO&
                                            reader.Identity<ControlRouteId>()};
 }
 
+void PutProviderDomain(Writer& writer, const ProviderControlDomainDTO& value) {
+  writer.Identity(value.controllable_component_id);
+  writer.Identity(value.provider_runtime_unit_id);
+  writer.Identity(value.provider_instance_id);
+  writer.Identity(value.provider_manifest_id);
+  writer.Identity(value.provider_manifest_revision);
+  writer.Identity(value.lifecycle_plan_catalog_digest);
+  writer.Identity(value.signal_configuration_digest);
+  writer.Vector(value.signal_names, [&](const auto& name) { writer.String(name); });
+  writer.I64(value.lifecycle_command_timeout_ns);
+}
+
+[[nodiscard]] ProviderControlDomainDTO GetProviderDomain(Reader& reader) {
+  return {reader.Identity<ControllableComponentId>(),
+          reader.Identity<RuntimeUnitId>(),
+          reader.Identity<ProviderInstanceId>(),
+          reader.Identity<ProviderManifestId>(),
+          reader.Identity<ProviderManifestRevision>(),
+          reader.Identity<ContentDigest>(),
+          reader.Identity<ContentDigest>(),
+          reader.Vector<std::string>([&]() { return reader.String(); }),
+          reader.I64()};
+}
+
 void PutExpectedDomain(Writer& writer, const ExpectedControlDomainRevisionDTO& value) {
   writer.Identity(value.control_domain_id);
   writer.Identity(value.control_domain_revision);
-  writer.Identity(value.controller_topology_id);
-  writer.Identity(value.topology_revision);
-  PutExpectedActiveConfiguration(writer, value.expected_active_control_configuration);
-  writer.Vector(value.expected_control_bindings,
+  if (const auto* provider = value.provider()) {
+    // The empty discriminator was never a valid controller topology identity.
+    // Controller records therefore retain every original byte unchanged.
+    writer.String({});
+    PutProviderDomain(writer, provider->provider);
+    PutExpectedActiveConfiguration(writer, provider->expected_active_control_configuration);
+    return;
+  }
+  writer.Identity(value.controller().controller_topology_id);
+  writer.Identity(value.controller().topology_revision);
+  PutExpectedActiveConfiguration(writer, value.expected_configuration());
+  writer.Vector(value.control_bindings(),
                 [&](const auto& item) { PutExpectedBinding(writer, item); });
 }
 
 [[nodiscard]] ExpectedControlDomainRevisionDTO GetExpectedDomain(Reader& reader) {
-  return ExpectedControlDomainRevisionDTO{reader.Identity<ControlDomainId>(),
-                                          reader.Identity<ControlDomainRevision>(),
-                                          reader.Identity<ControllerTopologyId>(),
+  auto id = reader.Identity<ControlDomainId>();
+  auto revision = reader.Identity<ControlDomainRevision>();
+  auto topology = reader.String();
+  if (topology.empty()) {
+    auto provider = GetProviderDomain(reader);
+    auto configuration = GetExpectedActiveConfiguration(reader);
+    return {std::move(id), std::move(revision),
+            ExpectedProviderDomainScopeDTO{std::move(provider), std::move(configuration)}};
+  }
+  return ExpectedControlDomainRevisionDTO{std::move(id),
+                                          std::move(revision),
+                                          ControllerTopologyId(std::move(topology)),
                                           reader.Identity<TopologyRevision>(),
                                           GetExpectedActiveConfiguration(reader),
                                           reader.Vector<ExpectedControlBindingRevisionDTO>(
@@ -520,21 +561,57 @@ void PutActiveConfiguration(Writer& writer, const ActiveControlConfigurationDTO&
 void PutResolvedScope(Writer& writer, const ResolvedLifecycleControlDomainScopeDTO& value) {
   writer.Identity(value.control_domain_id);
   writer.Identity(value.control_domain_revision);
-  writer.Identity(value.controller_topology_id);
-  writer.Identity(value.topology_revision);
+  if (const auto* provider = value.provider()) {
+    writer.String({});
+    PutProviderDomain(writer, provider->provider);
+    writer.Identity(provider->provider_runtime_epoch);
+    writer.Optional<ProviderDomainActiveConfigurationDTO>(
+        provider->active_control_configuration, [&](const auto& active) {
+          writer.Identity(active.active_control_configuration_id);
+          writer.Counter(active.active_control_configuration_generation);
+          writer.Identity(active.source_runtime_unit_id);
+          writer.Identity(active.source_runtime_epoch);
+          writer.U64(active.source_sequence);
+          writer.Identity(active.signal_configuration_digest);
+        });
+    writer.Vector(provider->output_resources, [&](const auto& id) { writer.Identity(id); });
+    return;
+  }
+  writer.Identity(value.controller().controller_topology_id);
+  writer.Identity(value.controller().topology_revision);
   writer.Optional<ActiveControlConfigurationDTO>(
-      value.active_control_configuration,
+      value.controller().active_control_configuration,
       [&](const auto& item) { PutActiveConfiguration(writer, item); });
-  writer.Vector(value.current_control_bindings,
+  writer.Vector(value.control_bindings(),
                 [&](const auto& item) { PutExpectedBinding(writer, item); });
-  writer.Vector(value.current_resources, [&](const auto& item) { writer.Identity(item); });
+  writer.Vector(value.physical_resources(), [&](const auto& item) { writer.Identity(item); });
 }
 
 [[nodiscard]] ResolvedLifecycleControlDomainScopeDTO GetResolvedScope(Reader& reader) {
+  auto id = reader.Identity<ControlDomainId>();
+  auto revision = reader.Identity<ControlDomainRevision>();
+  auto topology = reader.String();
+  if (topology.empty()) {
+    auto provider = GetProviderDomain(reader);
+    auto epoch = reader.Identity<RuntimeEpoch>();
+    auto active = reader.Optional<ProviderDomainActiveConfigurationDTO>([&]() {
+      return ProviderDomainActiveConfigurationDTO{
+          reader.Identity<ActiveControlConfigurationId>(),
+          reader.Counter<ActiveControlConfigurationGeneration>(),
+          reader.Identity<RuntimeUnitId>(),
+          reader.Identity<RuntimeEpoch>(),
+          reader.U64(),
+          reader.Identity<ContentDigest>()};
+    });
+    auto resources = reader.Vector<ResourceId>([&]() { return reader.Identity<ResourceId>(); });
+    return {std::move(id), std::move(revision),
+            ResolvedProviderDomainScopeDTO{std::move(provider), std::move(epoch), std::move(active),
+                                           std::move(resources)}};
+  }
   return ResolvedLifecycleControlDomainScopeDTO{
-      reader.Identity<ControlDomainId>(),
-      reader.Identity<ControlDomainRevision>(),
-      reader.Identity<ControllerTopologyId>(),
+      std::move(id),
+      std::move(revision),
+      ControllerTopologyId(std::move(topology)),
       reader.Identity<TopologyRevision>(),
       reader.Optional<ActiveControlConfigurationDTO>(
           [&]() { return GetActiveConfiguration(reader); }),
@@ -669,15 +746,61 @@ void PutReconciliation(Writer& writer, const LifecycleReconciliationEvidenceDTO&
                                             reader.I64()};
 }
 
+void PutProviderFenceOccurrence(Writer& writer,
+                                const ProviderConfigurationFenceOccurrenceDTO& value) {
+  writer.Identity(value.controllable_component_id);
+  writer.Identity(value.provider_instance_id);
+  writer.Identity(value.signal_configuration_digest);
+  writer.Vector(value.output_resources, [&](const auto& id) { writer.Identity(id); });
+}
+
+[[nodiscard]] ProviderConfigurationFenceOccurrenceDTO GetProviderFenceOccurrence(Reader& reader) {
+  return {reader.Identity<ControllableComponentId>(), reader.Identity<ProviderInstanceId>(),
+          reader.Identity<ContentDigest>(),
+          reader.Vector<ResourceId>([&]() { return reader.Identity<ResourceId>(); })};
+}
+
+void PutFenceDomain(Writer& writer, const ConfigurationFenceDomainScopeDTO& domain) {
+  const auto* provider = std::get_if<ProviderConfigurationFenceDomainDTO>(&domain.payload);
+  if (provider) writer.String({});  // Reserved: an empty domain ID was never valid.
+  writer.Identity(domain.control_domain_id);
+  writer.Optional<ControlDomainRevision>(domain.predecessor_control_domain_revision,
+                                         [&](const auto& item) { writer.Identity(item); });
+  writer.Optional<ControlDomainRevision>(domain.candidate_control_domain_revision,
+                                         [&](const auto& item) { writer.Identity(item); });
+  if (provider) {
+    writer.Optional<ProviderConfigurationFenceOccurrenceDTO>(
+        provider->predecessor_provider,
+        [&](const auto& item) { PutProviderFenceOccurrence(writer, item); });
+    writer.Optional<ProviderConfigurationFenceOccurrenceDTO>(
+        provider->candidate_provider,
+        [&](const auto& item) { PutProviderFenceOccurrence(writer, item); });
+  }
+}
+
+[[nodiscard]] ConfigurationFenceDomainScopeDTO GetFenceDomain(Reader& reader) {
+  auto id = reader.String();
+  const bool provider = id.empty();
+  if (provider) id = reader.String();
+  auto predecessor = reader.Optional<ControlDomainRevision>(
+      [&]() { return reader.Identity<ControlDomainRevision>(); });
+  auto candidate = reader.Optional<ControlDomainRevision>(
+      [&]() { return reader.Identity<ControlDomainRevision>(); });
+  ConfigurationFenceDomainScopeDTO result{ControlDomainId(std::move(id)), std::move(predecessor),
+                                          std::move(candidate)};
+  if (provider) {
+    auto before = reader.Optional<ProviderConfigurationFenceOccurrenceDTO>(
+        [&]() { return GetProviderFenceOccurrence(reader); });
+    auto after = reader.Optional<ProviderConfigurationFenceOccurrenceDTO>(
+        [&]() { return GetProviderFenceOccurrence(reader); });
+    result.payload = ProviderConfigurationFenceDomainDTO{std::move(before), std::move(after)};
+  }
+  return result;
+}
+
 void PutFenceScope(Writer& writer, const ConfigurationFenceScopeDTO& value) {
   writer.Vector(value.controllable_component_ids, [&](const auto& item) { writer.Identity(item); });
-  writer.Vector(value.domains, [&](const auto& domain) {
-    writer.Identity(domain.control_domain_id);
-    writer.Optional<ControlDomainRevision>(domain.predecessor_control_domain_revision,
-                                           [&](const auto& item) { writer.Identity(item); });
-    writer.Optional<ControlDomainRevision>(domain.candidate_control_domain_revision,
-                                           [&](const auto& item) { writer.Identity(item); });
-  });
+  writer.Vector(value.domains, [&](const auto& domain) { PutFenceDomain(writer, domain); });
   writer.Vector(value.bindings, [&](const auto& binding) {
     writer.Identity(binding.control_binding_id);
     writer.Optional<ControlBindingRevision>(binding.predecessor_control_binding_revision,
@@ -692,15 +815,7 @@ void PutFenceScope(Writer& writer, const ConfigurationFenceScopeDTO& value) {
   return ConfigurationFenceScopeDTO{
       reader.Vector<ControllableComponentId>(
           [&]() { return reader.Identity<ControllableComponentId>(); }),
-      reader.Vector<ConfigurationFenceDomainScopeDTO>([&]() {
-        return ConfigurationFenceDomainScopeDTO{reader.Identity<ControlDomainId>(),
-                                                reader.Optional<ControlDomainRevision>([&]() {
-                                                  return reader.Identity<ControlDomainRevision>();
-                                                }),
-                                                reader.Optional<ControlDomainRevision>([&]() {
-                                                  return reader.Identity<ControlDomainRevision>();
-                                                })};
-      }),
+      reader.Vector<ConfigurationFenceDomainScopeDTO>([&]() { return GetFenceDomain(reader); }),
       reader.Vector<ConfigurationFenceBindingScopeDTO>([&]() {
         return ConfigurationFenceBindingScopeDTO{reader.Identity<ControlBindingId>(),
                                                  reader.Optional<ControlBindingRevision>([&]() {
@@ -2309,15 +2424,16 @@ std::string SelectedComponentBringUpSemanticOfferDigest(
       writer.U64(std::bit_cast<std::uint64_t>(contact.terminal_window_start_fraction));
     });
   });
+  if (!offer.candidate_provider_domains.empty()) {
+    writer.String("provider-candidate-domains.v1");
+    writer.Vector(offer.candidate_provider_domains,
+                  [&](const auto& domain) { PutResolvedScope(writer, domain); });
+  }
   const auto& admission = offer.fence_admission;
   writer.String(admission.echoed_query.manager_runtime_epoch.value());
   const auto& scope = checked_scope.value();
   writer.Vector(scope.controllable_component_ids, [&](const auto& id) { writer.Identity(id); });
-  writer.Vector(scope.domains, [&](const auto& domain) {
-    writer.Identity(domain.control_domain_id);
-    optional_identity(domain.predecessor_control_domain_revision);
-    optional_identity(domain.candidate_control_domain_revision);
-  });
+  writer.Vector(scope.domains, [&](const auto& domain) { PutFenceDomain(writer, domain); });
   writer.Vector(scope.bindings, [&](const auto& binding) {
     writer.Identity(binding.control_binding_id);
     optional_identity(binding.predecessor_control_binding_revision);
@@ -2632,6 +2748,45 @@ RouteConfigurationFenceReleasedDTO DecodeRouteFenceReleasedRecord(std::string_vi
     throw CodecFailure("Kernel route-fence release receipt failed closed validation");
   }
   return value;
+}
+
+std::string EncodeConfigurationFenceScopeRecord(const ConfigurationFenceScopeDTO& scope) {
+  if (!scope.valid()) throw CodecFailure("configuration fence scope is invalid at codec ingress");
+  Writer writer;
+  writer.String("MF-CONFIGURATION-FENCE-SCOPE-V1");
+  PutFenceScope(writer, scope);
+  return std::move(writer).Finish();
+}
+
+ConfigurationFenceScopeDTO DecodeConfigurationFenceScopeRecord(std::string_view bytes) {
+  Reader reader(bytes);
+  if (reader.String() != "MF-CONFIGURATION-FENCE-SCOPE-V1")
+    throw CodecFailure("configuration fence scope magic is invalid");
+  auto scope = GetFenceScope(reader);
+  reader.RequireEnd();
+  if (!scope.valid()) throw CodecFailure("configuration fence scope failed closed validation");
+  return scope;
+}
+
+std::string EncodeExpectedControlDomainRevisionRecord(
+    const ExpectedControlDomainRevisionDTO& domain) {
+  if (!domain.locally_valid())
+    throw CodecFailure("expected control domain is invalid at codec ingress");
+  Writer writer;
+  writer.String("MF-EXPECTED-CONTROL-DOMAIN-V1");
+  PutExpectedDomain(writer, domain);
+  return std::move(writer).Finish();
+}
+
+ExpectedControlDomainRevisionDTO DecodeExpectedControlDomainRevisionRecord(std::string_view bytes) {
+  Reader reader(bytes);
+  if (reader.String() != "MF-EXPECTED-CONTROL-DOMAIN-V1")
+    throw CodecFailure("expected control domain magic is invalid");
+  auto domain = GetExpectedDomain(reader);
+  reader.RequireEnd();
+  if (!domain.locally_valid())
+    throw CodecFailure("expected control domain failed closed validation");
+  return domain;
 }
 
 }  // namespace manyforge::core::detail

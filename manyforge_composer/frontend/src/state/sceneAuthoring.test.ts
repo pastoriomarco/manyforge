@@ -59,7 +59,7 @@ function facts(): SceneOwnerFacts {
       api_version: 'manyforge.scene_runtime_source.v1',
       cell_id: 'cell-a',
       state: {
-        api_version: 'manyforge.scene_runtime_state.v1',
+        api_version: 'manyforge.scene_runtime_state.v2',
         active_replay_id: null,
         counters: {},
         deferred: false,

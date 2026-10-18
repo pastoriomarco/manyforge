@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Final
 
 import yaml
+from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.canonical_artifact import (
     StrictArtifactError,
     load_strict_json_yaml_bytes,
@@ -627,6 +628,7 @@ def main() -> int:
     if args.check == args.update:
         parser.error("select exactly one of --check or --update")
     root = args.workspace_root.resolve()
+    catalog = NodeCatalog(root / "manyforge_behavior/resources/node_catalog.yaml")
     deployment_tool = args.deployment_revision_tool.resolve()
     program_tool = args.program_revision_tool.resolve()
     if not deployment_tool.is_file() or not program_tool.is_file():
@@ -776,6 +778,7 @@ def main() -> int:
                 name=program["name"],
                 description=program["description"],
                 program=program,
+                catalog=catalog,
                 deployment_intent=intent,
                 assignment=assignment,
                 manyforge_version=version,

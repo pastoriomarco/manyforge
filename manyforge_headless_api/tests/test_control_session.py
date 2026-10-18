@@ -131,6 +131,7 @@ def _running_cycle(node_revision: int) -> dict[str, Any]:
         "message": "",
         "details": None,
         "origin": None,
+        "operation_failures": [],
     }
     return {
         **_cycle(),
@@ -424,6 +425,12 @@ def test_event_pump_reopens_admission_for_existing_session_without_events() -> N
 
         def events(owner_epoch, after_sequence, *, limit):
             return {
+                "owner_epoch": owner_epoch,
+                "execution_owner_ready": True,
+                "runtime_faults": {
+                    "operation_journal_write_fault": None,
+                    "program_runner_loss": None,
+                },
                 "operation_progress": [],
                 "admission_generation": admission["admission_generation"],
                 "events": [],
@@ -449,6 +456,10 @@ def test_event_pump_reopens_admission_for_existing_session_without_events() -> N
                 ingest_operation_event=lambda **row: ingested.append(row),
                 complete_operation_event_snapshot=lambda **kwargs: None,
                 mark_operation_event_source_unknown=lambda **kwargs: None,
+                observe_runtime_fault_conditions=lambda **kwargs: {
+                    "status": "observed",
+                    "changed": False,
+                },
             ),
             SimpleNamespace(
                 identity=identity,
@@ -616,6 +627,38 @@ def test_operation_progress_reuses_cached_facts_and_sends_only_progress() -> Non
             assert session._delta_message(current, previous).shell == {
                 "complete": False, "operation_progress": [sample],
             }
+        finally:
+            await source.unsubscribe(subscription)
+            ingress.close()
+    asyncio.run(exercise())
+
+
+def test_global_rules_ride_the_shell_beside_progress_without_owner_reads() -> None:
+    async def exercise() -> None:
+        ingress = _ingress([])
+        source = HeadlessControlStateSource(
+            SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=lambda **_kwargs: _facts_for_cycle(_cycle())),
+            ingress, program_runner_websocket_url=None,
+        )
+        rules = [{"rule_id": "door", "state": "latched", "keys": []}]
+        subscription = await source.subscribe()
+        try:
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            previous = source.take(subscription)
+            assert previous.shell["global_rules"] is None
+            assert previous.shell["operation_progress"] == []
+            reads = source.diagnostics()["owner_reads"]
+            source.notify_global_rules(rules)
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            current = source.take(subscription)
+            assert source.diagnostics()["owner_reads"] == reads
+            session = ExecutionControlSession(object(), source, ingress)
+            assert session._delta_message(current, previous).shell == {
+                "complete": False, "global_rules": rules,
+            }
+            source.notify_global_rules(list(rules))  # unchanged: no publication
+            await asyncio.sleep(0.05)
+            assert not subscription.wake.is_set()
         finally:
             await source.unsubscribe(subscription)
             ingress.close()
@@ -1372,7 +1415,7 @@ def test_scene_runtime_pose_only_update_does_not_wake_cold_projection(
                         "api_version": "manyforge.scene_runtime_source.v1",
                         "cell_id": "cell.1",
                         "state": {
-                            "api_version": "manyforge.scene_runtime_state.v1",
+                            "api_version": "manyforge.scene_runtime_state.v2",
                             "active_replay_id": None,
                             "counters": {"buffered": 0},
                             "deferred": False,

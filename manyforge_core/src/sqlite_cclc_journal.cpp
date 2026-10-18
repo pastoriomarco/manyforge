@@ -255,6 +255,17 @@ void Require(bool condition, std::string code, std::string message) {
   }
 }
 
+[[nodiscard]] bool CurrentComponentIncidentRecord(const std::string_view bytes) {
+  try {
+    const auto root = content_identity::parse_canonical_json(bytes);
+    const auto* version = root.find_object_member("schema_version");
+    return version && version->is_string() &&
+           version->as_string() == kComponentIncidentEventSchemaVersion;
+  } catch (const content_identity::CanonicalValueError&) {
+    return false;
+  }
+}
+
 class CellClosePrerequisiteFailure final : public std::runtime_error {
  public:
   explicit CellClosePrerequisiteFailure(ErrorDTO error)
@@ -1214,12 +1225,10 @@ WHERE retained_result=1 AND target_retirement_blob IS NOT NULL
     const auto& expected = *current.expected_domain;
     if (!current.current_scope || !current.resolved_provider_occurrence ||
         (current.action_state != Action::kReserved && current.action_state != Action::kSucceeded) ||
-        current.current_scope->control_domain_revision != expected.control_domain_revision ||
-        current.current_scope->controller_topology_id != expected.controller_topology_id ||
-        current.current_scope->topology_revision != expected.topology_revision ||
-        current.current_scope->current_control_bindings != expected.expected_control_bindings ||
+        !ExpectedDomainProofMatchesResolvedScope(expected, *current.current_scope) ||
         (prior.previous_state ? current.previous_state != prior.previous_state
-                              : current.previous_state != current.current_state)) return false;
+                              : current.previous_state != current.current_state))
+      return false;
   }
   return true;
 }
@@ -1472,6 +1481,9 @@ class SqliteCCLCJournal::Impl final {
   std::optional<ComponentLifecycleStatusDTO> LoadRetainedLifecycleStatus(
       const LifecycleTransactionId& lifecycle_transaction_id);
 
+  std::vector<ComponentLifecycleStatusDTO> LoadRetainedComponentLifecycleHistory(
+      const ControllableComponentId& controllable_component_id);
+
   ComponentLifecycleCurrentFactReadbackDTO LoadCurrentComponentLifecycleFact(
       const ControllableComponentId& controllable_component_id);
 
@@ -1556,6 +1568,7 @@ class SqliteCCLCJournal::Impl final {
                                                    std::uint64_t recovery_generation);
   std::optional<ComponentIncidentRecordDTO> LoadOpenComponentIncident(
       const ControllableComponentId& component);
+  bool HasOpenIncident();
   bool RecordComponentIncidentContainment(const std::string& incident_id,
                                           ComponentIncidentContainmentStateDTO state,
                                           const std::string& record_json,
@@ -1751,6 +1764,7 @@ class SqliteCCLCJournal::Impl final {
               "lifecycle journal metadata insert returned an unexpected row");
     }
     // Current-only development journal: earlier versions are not migrated.
+    // Version 20 uses current v2 component incident diagnostic names and payloads.
     // Version 19 distinguishes ordinary cancellation from Close on the same
     // retained target row. Version 18 added bounded target-retirement results
     // and the existing metadata singleton's observer latest-attempt value.
@@ -4897,6 +4911,39 @@ std::optional<ComponentLifecycleStatusDTO> SqliteCCLCJournal::Impl::LoadRetained
   return status;
 }
 
+std::vector<ComponentLifecycleStatusDTO>
+SqliteCCLCJournal::Impl::LoadRetainedComponentLifecycleHistory(
+    const ControllableComponentId& component) {
+  Require(!component.empty() && component.value().size() <= kMaxLifecycleIdentityBytes,
+          "component_lifecycle_journal_query_invalid", "component history identity is invalid");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  // Successful exact release removes its claim row. Reuse the existing
+  // kSettledResults predicate: a terminal row is history only when no
+  // matching unreleased claim remains. This does not invent a release ACK.
+  Statement rows(
+      database_,
+      "SELECT t.status_blob FROM lifecycle_transactions t "
+      "WHERE t.controllable_component_id=? AND t.terminal=1 "
+      "AND NOT EXISTS (SELECT 1 FROM cclc_lifecycle_cell_claims c "
+      "WHERE c.lifecycle_transaction_id=t.lifecycle_transaction_id "
+      "AND c.release_receipt_recorded=0) "
+      "ORDER BY "
+      "t.component_lifecycle_generation,t.lifecycle_transaction_generation");
+  rows.Bind(1, component.value());
+  std::vector<ComponentLifecycleStatusDTO> result;
+  while (rows.Step()) {
+    Require(result.size() < exact_result_history_capacity_, "component_lifecycle_journal_corrupt",
+            "component history exceeds retained bound");
+    auto status = detail::DecodeComponentLifecycleStatus(rows.Blob(0));
+    Require(status.locally_valid() && status.terminal_result &&
+                status.accepted_intent.controllable_component_id == component,
+            "component_lifecycle_journal_corrupt", "component history row is invalid or foreign");
+    result.push_back(std::move(status));
+  }
+  return result;
+}
+
 ComponentLifecycleCurrentFactReadbackDTO SqliteCCLCJournal::Impl::LoadCurrentComponentLifecycleFact(
     const ControllableComponentId& controllable_component_id) {
   Require(!controllable_component_id.empty() &&
@@ -5981,12 +6028,10 @@ SqliteCCLCJournal::Impl::ReadNativeApplyChildrenLocked(
         Require(domain.current_scope && domain.resolved_provider_occurrence &&
                     domain.action_state == ComponentLifecycleDomainActionStateDTO::kSucceeded &&
                     domain.current_state == status.requested_state.state &&
-                    domain.current_scope->control_domain_revision == expected.control_domain_revision &&
-                    domain.current_scope->controller_topology_id == expected.controller_topology_id &&
-                    domain.current_scope->topology_revision == expected.topology_revision &&
-                    domain.current_scope->current_control_bindings == expected.expected_control_bindings,
+                    ExpectedDomainProofMatchesResolvedScope(expected, *domain.current_scope),
                 "component_lifecycle_native_apply_unsettled",
-                "native Apply child lacks exact installed candidate scope, provider or requested postconditions");
+                "native Apply child lacks exact installed candidate scope, provider or requested "
+                "postconditions");
       }
       Statement current(database_,
           "SELECT component_lifecycle_generation,component_lifecycle_state "
@@ -6510,17 +6555,33 @@ void SqliteCCLCJournal::Impl::AdoptNativeApplyFacts(
         if (!domain.expected_domain) continue;
         const auto route = std::find_if(routes.begin(), routes.end(),
             [&](const auto& row) { return row.control_domain_id == domain.control_domain_id; });
-        Require(route != routes.end() &&
-                    route->control_domain_revision == domain.current_scope->control_domain_revision &&
-                    route->controller_topology_id == domain.current_scope->controller_topology_id &&
-                    route->topology_revision == domain.current_scope->topology_revision &&
-                    route->source_runtime_unit_id == domain.resolved_provider_occurrence->provider_runtime_unit_id &&
-                    route->source_runtime_epoch == domain.resolved_provider_occurrence->provider_runtime_epoch &&
-                    route->binding_routes.size() == domain.current_scope->current_control_bindings.size(),
-                "component_lifecycle_native_apply_unplanned", "native Apply route differs from actual installed child");
+        if (const auto* provider = domain.current_scope->provider()) {
+          Require(route == routes.end() && !provider->active_control_configuration &&
+                      ProviderDomainMatchesOccurrence(
+                          domain.control_domain_id, domain.current_scope->control_domain_revision,
+                          provider->provider, provider->provider_runtime_epoch,
+                          *domain.resolved_provider_occurrence),
+                  "component_lifecycle_native_apply_unplanned",
+                  "provider domain differs from its actual installed child or claims a controller "
+                  "route");
+          continue;
+        }
+        Require(
+            route != routes.end() &&
+                route->control_domain_revision == domain.current_scope->control_domain_revision &&
+                route->controller_topology_id ==
+                    domain.current_scope->controller().controller_topology_id &&
+                route->topology_revision == domain.current_scope->controller().topology_revision &&
+                route->source_runtime_unit_id ==
+                    domain.resolved_provider_occurrence->provider_runtime_unit_id &&
+                route->source_runtime_epoch ==
+                    domain.resolved_provider_occurrence->provider_runtime_epoch &&
+                route->binding_routes.size() == domain.current_scope->control_bindings().size(),
+            "component_lifecycle_native_apply_unplanned",
+            "native Apply route differs from actual installed child");
         for (std::size_t index = 0U; index < route->binding_routes.size(); ++index) {
           const auto& actual = route->binding_routes[index];
-          const auto& expected = domain.current_scope->current_control_bindings[index];
+          const auto& expected = domain.current_scope->control_bindings()[index];
           Require(actual.control_binding_id == expected.control_binding_id &&
                       actual.control_binding_revision == expected.control_binding_revision &&
                       actual.control_route_id == expected.control_route_id,
@@ -7398,6 +7459,8 @@ std::optional<ComponentIncidentRecordDTO> SqliteCCLCJournal::Impl::ReadOpenCompo
           "component has more than one open incident");
   Require(record.record_json.size() <= kMaxComponentIncidentRecordBytes,
           "component_lifecycle_journal_corrupt", "incident record exceeds its bound");
+  Require(CurrentComponentIncidentRecord(record.record_json),
+          "component_lifecycle_journal_corrupt", "incident record schema is not current");
   record.diagnostic_loaded = decode_diagnostic;
   if (decode_diagnostic) {
     const auto receipt = ComponentIncidentContainmentReceiptFromRecord(
@@ -7422,6 +7485,8 @@ std::string SqliteCCLCJournal::Impl::PreserveComponentIncidentDiagnosticLocked(
                 "AND incident_id=?");
   row.Bind(1, incident_id);
   if (row.Step()) {
+    Require(CurrentComponentIncidentRecord(row.Text(0)),
+            "component_lifecycle_journal_corrupt", "incident record schema is not current");
     std::shared_ptr<const content_identity::CanonicalValue> snapshot;
     const auto diagnostic = ComponentIncidentDiagnosticFromRecord(row.Text(0), &snapshot);
     if (diagnostic)
@@ -7882,6 +7947,8 @@ ComponentIncidentRecordDTO SqliteCCLCJournal::Impl::OpenComponentIncident(
               !record.record_json.empty() &&
               record.record_json.size() <= kMaxComponentIncidentRecordBytes,
           "component_lifecycle_incident_invalid", "component incident is invalid");
+  Require(CurrentComponentIncidentRecord(record.record_json),
+          "component_lifecycle_incident_invalid", "incident record schema is not current");
   std::unique_lock lock(mutex_);
   RequireOpen();
   // A detection made from facts read before the operator's Recover is not
@@ -7925,6 +7992,17 @@ std::optional<ComponentIncidentRecordDTO> SqliteCCLCJournal::Impl::LoadOpenCompo
   return ReadOpenComponentIncidentLocked(component);
 }
 
+bool SqliteCCLCJournal::Impl::HasOpenIncident() {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Statement query(database_, "SELECT EXISTS(SELECT 1 FROM cclc_component_incidents "
+                             "WHERE target_kind IN ('component','cell_observer') "
+                             "AND acknowledged=0)");
+  Require(query.Step(), "component_lifecycle_journal_storage_failure",
+          "open incident query returned no row");
+  return query.Integer(0) != 0;
+}
+
 bool SqliteCCLCJournal::Impl::RecordComponentIncidentContainment(
     const std::string& incident_id, const ComponentIncidentContainmentStateDTO state,
     const std::string& record_json, const std::int64_t occurred_at_ns) {
@@ -7932,6 +8010,8 @@ bool SqliteCCLCJournal::Impl::RecordComponentIncidentContainment(
               state != ComponentIncidentContainmentStateDTO::kPending && !record_json.empty() &&
               record_json.size() <= kMaxComponentIncidentRecordBytes && occurred_at_ns >= 0,
           "component_lifecycle_incident_invalid", "incident containment record is invalid");
+  Require(CurrentComponentIncidentRecord(record_json),
+          "component_lifecycle_incident_invalid", "incident record schema is not current");
   std::lock_guard lock(mutex_);
   RequireOpen();
   Transaction transaction(database_);
@@ -8071,6 +8151,8 @@ SqliteCCLCJournal::Impl::ReadComponentIncidentRecoveryLocked(
   ComponentIncidentRecoveryDTO recovery{row.Text(0), ControllableComponentId(row.Text(1)),
                                         static_cast<LifecycleBlockingCauseClassDTO>(row.Integer(2)),
                                         row.Text(3), row.Integer(4)};
+  Require(CurrentComponentIncidentRecord(row.Text(5)),
+          "component_lifecycle_journal_corrupt", "incident recovery record schema is not current");
   const auto evidence = content_identity::parse_canonical_json(row.Text(5));
   if (const auto* closure = evidence.find_object_member("closure_reason")) {
     Require(closure->is_string() && closure->as_string() == "cell_closed_by_operator",
@@ -8090,6 +8172,8 @@ bool SqliteCCLCJournal::Impl::UpdateOpenComponentIncident(
               vendor_codes.size() <= kMaxComponentIncidentVendorCodes && !record_json.empty() &&
               record_json.size() <= kMaxComponentIncidentRecordBytes,
           "component_lifecycle_incident_invalid", "incident update is invalid");
+  Require(CurrentComponentIncidentRecord(record_json),
+          "component_lifecycle_incident_invalid", "incident record schema is not current");
   std::lock_guard lock(mutex_);
   RequireOpen();
   Transaction transaction(database_);
@@ -8354,6 +8438,13 @@ std::vector<ComponentIncidentEventDTO> SqliteCCLCJournal::Impl::LoadComponentInc
   while (rows.Step()) {
     Require(rows.Text(4).size() <= kMaxComponentIncidentRecordBytes,
             "component_lifecycle_journal_corrupt", "incident event exceeds its bound");
+    const auto payload = content_identity::parse_canonical_json(rows.Text(4));
+    const auto* target_kind = payload.find_object_member("target_kind");
+    const bool cell_observer = !payload.find_object_member("schema_version") &&
+                               target_kind && target_kind->is_string() &&
+                               target_kind->as_string() == "cell_observer";
+    Require(cell_observer || CurrentComponentIncidentRecord(rows.Text(4)),
+            "component_lifecycle_journal_corrupt", "incident event schema is not current");
     result.push_back({Positive(rows.Integer(0), "incident event sequence"), rows.Text(1),
                       rows.Text(2), rows.Integer(3), rows.Text(4)});
   }
@@ -8650,6 +8741,12 @@ Result<std::optional<ComponentLifecycleStatusDTO>> SqliteCCLCJournal::LoadRetain
       [&]() { return impl_->LoadRetainedLifecycleStatus(lifecycle_transaction_id); });
 }
 
+Result<std::vector<ComponentLifecycleStatusDTO>>
+SqliteCCLCJournal::LoadRetainedComponentLifecycleHistory(const ControllableComponentId& component) {
+  return AsResult<std::vector<ComponentLifecycleStatusDTO>>(
+      [&]() { return impl_->LoadRetainedComponentLifecycleHistory(component); });
+}
+
 Result<ComponentLifecycleCurrentFactReadbackDTO>
 SqliteCCLCJournal::LoadCurrentComponentLifecycleFact(
     const ControllableComponentId& controllable_component_id) {
@@ -8919,6 +9016,10 @@ Result<std::optional<ComponentIncidentRecordDTO>> SqliteCCLCJournal::LoadOpenCom
     const ControllableComponentId& component) {
   return AsResult<std::optional<ComponentIncidentRecordDTO>>(
       [&]() { return impl_->LoadOpenComponentIncident(component); });
+}
+
+Result<bool> SqliteCCLCJournal::HasOpenIncident() {
+  return AsResult<bool>([&]() { return impl_->HasOpenIncident(); });
 }
 
 Result<bool> SqliteCCLCJournal::RecordComponentIncidentContainment(

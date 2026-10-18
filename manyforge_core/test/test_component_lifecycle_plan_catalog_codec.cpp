@@ -6,6 +6,7 @@
 #include <limits>
 #include <manyforge_core/build_owned_lifecycle_plan_catalog_source.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <string>
 #include <string_view>
@@ -118,7 +119,7 @@ TEST(ComponentLifecyclePlanCatalogCodec, EmitsOneExactCanonicalArtifactAndDigest
 
 TEST(ComponentLifecyclePlanCatalogCodec, SemanticChangesAndTransitionOrderRotateDigest) {
   auto changed_timeout = PreparePlan();
-  changed_timeout.timeout_duration_ns += 1;
+  std::get<std::int64_t>(changed_timeout.timeout_policy) += 1;
   const auto first = Catalog();
   const auto changed = MakeBrandLifecyclePlanCatalog(
       ProviderManifestId("provider.a"), ProviderManifestRevision(std::string(kManifestRevisionOne)),
@@ -148,6 +149,48 @@ TEST(ComponentLifecyclePlanCatalogCodec, SemanticChangesAndTransitionOrderRotate
   ASSERT_TRUE(ordered_semantic.ok());
   ASSERT_TRUE(reversed_semantic.ok());
   EXPECT_NE(ordered_semantic.value(), reversed_semantic.value());
+}
+
+TEST(ComponentLifecyclePlanCatalogCodec, IoConfiguredLimitMatchesMaintainedSemanticAndCatalogPins) {
+  const auto plans = MakeIoProviderLifecyclePlans();
+  ASSERT_TRUE(plans.ok());
+  ASSERT_EQ(plans.value().size(), 4U);
+  const auto catalog = MakeBrandLifecyclePlanCatalog(
+      ProviderManifestId(std::string(kIoProviderLifecycleManifestId)),
+      ProviderManifestRevision(
+          "sha256:980d23bd0d9015262a7dee81293121af85f8f865c29c4d37b82b081775019e36"),
+      plans.value());
+  ASSERT_TRUE(catalog.ok());
+  auto manifest = ManifestFor(catalog.value());
+  for (const auto& id : {"io.gpio.get_input", "io.gpio.set_output", "io.gpio.wait_for_input"}) {
+    const auto* definition = find_builtin_capability_definition(id);
+    ASSERT_NE(definition, nullptr);
+    manifest.offered_capabilities.push_back(
+        {CapabilityId(id),
+         CapabilityDefinitionRevision(std::string(definition->capability_definition_revision)),
+         {EndpointRoleId("io_signal_service")}});
+  }
+  ASSERT_EQ(manifest.offered_capabilities.size(), 8U);
+  EXPECT_EQ(manifest.lifecycle_plan_catalog->semantic_digest.value(),
+            "sha256:9b800748e1f4e43d14936c2cdb831e4233812ecd2bef76435b08f6d1dd5d3f2a");
+  const auto actual = MakeIoProviderLifecycleCatalog(manifest);
+  ASSERT_TRUE(actual.ok()) << actual.error().message;
+  EXPECT_EQ(actual.value().provider_manifest_revision, manifest.provider_manifest_revision);
+  EXPECT_EQ(actual.value().catalog_digest.value(),
+            "sha256:66d5b243289b84a2273cae3e5eb29734517dda91f26782a67d0bd76c7cbd34d5");
+  const auto encoded = EncodeBrandLifecyclePlanCatalog(actual.value());
+  ASSERT_TRUE(encoded.ok());
+  EXPECT_EQ(encoded.value().find("timeout_duration_ns"), std::string::npos);
+  EXPECT_NE(encoded.value().find("\"timeout_policy\":{\"kind\":\"device_configured_limit\"}"),
+            std::string::npos);
+  for (const auto& plan : actual.value().plans) {
+    EXPECT_TRUE(std::holds_alternative<DeviceConfiguredLifecycleLimitDTO>(plan.timeout_policy));
+    for (const auto& fact : plan.requested_postcondition.fact_predicates)
+      EXPECT_TRUE(fact.lifecycle_fact_id.value().starts_with("io.driver."));
+  }
+  manifest.lifecycle_plan_catalog->semantic_digest =
+      ContentDigest(std::string(kManifestRevisionOne));
+  EXPECT_FALSE(MakeIoProviderLifecycleCatalog(manifest).ok());
 }
 
 TEST(ComponentLifecyclePlanCatalogCodec, RejectsInvalidDigestAndUnsafeJsonInteger) {

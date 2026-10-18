@@ -21,6 +21,10 @@ from .models import (
     MAX_IDENTITY_BYTES,
     FullStopIntentRequest,
     GripperFeedbackObservation,
+    IoSignalObservation,
+    IoSourceCursor,
+    MockIoInputRequest,
+    MockIoPublicationError,
     OperationControlRequest,
     OperationRecoveryActionRequest,
     OperationIntentRequest,
@@ -36,11 +40,14 @@ from .models import (
     RuntimeScaleControlSelectorRequest,
     SHA256_PATTERN,
     SceneRevisionRequest,
+    GlobalIoRuleRecoveryIntentRequest,
+    GlobalIoRuleRecoverySelector,
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
     TargetObservationQuery,
 )
 from .cclc import MAX_INCIDENT_EVENT_PAGE
+from .global_rule_status import STATE_EVENT_KIND, GlobalRuleStatusModel
 from .native import HeadlessApiError, HeadlessCorePort, strict_json_object
 from manyforge_behavior.json_scalars import nonnegative_int64, nonnegative_int64_value
 from .private_transport import (
@@ -66,6 +73,9 @@ OPERATION_EVENT_KINDS = frozenset(
         "operation_prepared",
         "state_observed",
         "host_replaced",
+        # Kernel global rule state rows (contract 64): folded by the global
+        # rule status projection and ingested by the historian unchanged.
+        STATE_EVENT_KIND,
     }
 )
 
@@ -84,7 +94,7 @@ def _valid_operation_event_identity(event: dict[str, Any]) -> bool:
             and isinstance(request_id, str)
             and bool(request_id)
         )
-    if event.get("record_kind") == "stop_terminal_projected":
+    if event.get("record_kind") in {"stop_terminal_projected", STATE_EVENT_KIND}:
         return (
             operation_id is None
             and operation_revision is None
@@ -95,6 +105,51 @@ def _valid_operation_event_identity(event: dict[str, Any]) -> bool:
         and bool(operation_id)
         and type(operation_revision) is int
         and 1 <= operation_revision <= MAXIMUM_SAFE_INTEGER
+    )
+
+
+_RETRY_ELIGIBILITY_KEYS = frozenset({"eligible", "cause", "effect", "reason"})
+_RETRY_ELIGIBILITY_CAUSES = frozenset(
+    {"planning_no_effect", "collision_stop_nominal", "not_eligible"}
+)
+_RETRY_ELIGIBILITY_EFFECTS = frozenset(
+    {"known_no_effect", "effect_observed", "effect_uncertain"}
+)
+RETRY_ELIGIBILITY_REASONS = frozenset(
+    {
+        "none",
+        "not_retryable_state",
+        "failure_cause_not_retryable",
+        "dispatch_absence_unproven",
+        "effect_uncertain",
+        "effect_observed",
+        "validation_not_conclusive_collision",
+        "stop_owner_active",
+        "stronger_authority_active",
+        "queued_latch_present",
+        "latch_present",
+        "stop_not_settled",
+        "stop_not_nominal",
+        "stop_not_controlled",
+        "observation_not_qualified",
+        "collision_not_conclusive",
+        "operation_in_flight",
+        "program_scope_required",
+    }
+)
+
+
+def _valid_retry_eligibility(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == _RETRY_ELIGIBILITY_KEYS
+        and type(value["eligible"]) is bool
+        and isinstance(value["cause"], str)
+        and value["cause"] in _RETRY_ELIGIBILITY_CAUSES
+        and isinstance(value["effect"], str)
+        and value["effect"] in _RETRY_ELIGIBILITY_EFFECTS
+        and isinstance(value["reason"], str)
+        and value["reason"] in RETRY_ELIGIBILITY_REASONS
     )
 
 
@@ -188,6 +243,8 @@ class ExecutionPort(Protocol):
 
     def query_target(self, request: TargetObservationQuery) -> dict[str, Any]: ...
 
+    def set_mock_io_input(self, request: MockIoInputRequest) -> dict[str, Any]: ...
+
     def observation(self) -> dict[str, Any]: ...
 
     def open_observation_session(self) -> "ExecutionObservationSession": ...
@@ -277,7 +334,7 @@ class ExecutionPort(Protocol):
 
     def recover_stop_fault(
         self,
-        request: StopFaultRecoveryIntentRequest,
+        request: StopFaultRecoveryIntentRequest | GlobalIoRuleRecoveryIntentRequest,
     ) -> dict[str, Any]: ...
 
     def set_runtime_scale_control(
@@ -351,7 +408,8 @@ def _component_condition_facts(snapshot: dict[str, Any]) -> dict[str, Any]:
             "domains": [
                 {
                     "control_domain_id": domain["control_domain_id"],
-                    "current_resources": list(domain["current_resources"]),
+                    # Core `resource_ids()` for either domain kind.
+                    "resources": list(domain["resources"]),
                 }
                 for domain in snapshot["domains"]
             ],
@@ -768,7 +826,7 @@ class ExecutionCommandClient:
         if (
             response.get("command") != "read_stop"
             or not isinstance(status, dict)
-            or set(status)
+            or set(status) - {"terminal_projection"}
             != {
                 "request_id",
                 "schema_version",
@@ -776,6 +834,9 @@ class ExecutionCommandClient:
                 "stop_generation",
                 "stop_id",
             }
+            # The additive forensic projection state (SX-2226): one string.
+            or status.get("terminal_projection", "pending")
+            not in ("pending", "recorded", "failed")
             or status.get("schema_version") != "manyforge.execution_stop_status.v1"
             or status.get("stop_id") != stop_id
             or not isinstance(status.get("request_id"), str)
@@ -964,6 +1025,9 @@ class ExecutionCommandClient:
         if request.kind == "frame_transform":
             self._require_frame_transform(response, observation, expected)
             return response
+        if request.kind == "io_signal":
+            self._require_io_signal(response, observation, expected)
+            return response
         if (
             response.get("command") != "query_target"
             or not isinstance(observation, dict)
@@ -1007,6 +1071,106 @@ class ExecutionCommandClient:
                 "native target query returned invalid typed evidence",
             ) from error
         return response
+
+    def set_mock_io_input(self, request: MockIoInputRequest) -> dict[str, Any]:
+        """Set one installed Mock input on the ordinary command socket.
+
+        A simulation action, not a hardware command: the host contract carries
+        the internal, unverified, no-principal attribution. Success echoes the
+        same `target_observation` projection as `query_target` plus the model
+        receipt: `model_value` (the accepted value), `published_cursor` (the
+        record it was delivered as, or null while the source is not
+        publishing, e.g. Disabled) and `publication_error` only when the model
+        accepted it but ingress failed. A null cursor is not a failure.
+        """
+
+        response = self.require_success(
+            self._exchange(
+                {
+                    "api_version": EXECUTION_COMMAND_VERSION,
+                    "command": "set_mock_io_input",
+                    "attribution": {
+                        "transport": "internal",
+                        "assurance": "unverified",
+                        "principal_id": None,
+                    },
+                    "request": request.model_dump(mode="json"),
+                }
+            )
+        )
+        expected = {
+            "schema_version": "manyforge.target_observation.v1",
+            "owner_epoch": request.owner_epoch,
+            "program_binding_id": request.program_binding_id,
+            "target_role_id": request.target_role_id,
+            "kind": "io_signal",
+            "resource_role_id": request.resource_role_id,
+        }
+        self._require_io_signal(
+            response,
+            response.get("target_observation"),
+            expected,
+            command="set_mock_io_input",
+        )
+        self._require_mock_receipt(response, request)
+        return response
+
+    @staticmethod
+    def _require_mock_receipt(response: dict[str, Any], request: MockIoInputRequest) -> None:
+        try:
+            if (
+                {"model_value", "published_cursor"} - set(response)
+                or set(response) - {"api_version", "ok", "command", "target_observation",
+                                    "model_value", "published_cursor", "publication_error"}
+            ):
+                raise ValueError("Mock receipt fields are not exact")
+            if response["model_value"] is not request.value:
+                raise ValueError("Mock receipt model value is not the requested value")
+            cursor = response["published_cursor"]
+            if cursor is not None:
+                cursor = IoSourceCursor.model_validate(cursor)
+                if cursor.owner_epoch != request.owner_epoch:
+                    raise ValueError("Mock receipt cursor names another owner epoch")
+                source_id = response["target_observation"]["value"]["source_id"]
+                if source_id is not None and cursor.source_id != source_id:
+                    raise ValueError("Mock receipt cursor names another source")
+            if "publication_error" in response:
+                if cursor is not None:
+                    raise ValueError("a published Mock value carries no publication error")
+                MockIoPublicationError.model_validate(response["publication_error"])
+        except (TypeError, ValueError) as error:
+            raise HeadlessApiError(
+                "execution_target_observation_invalid",
+                "native Mock input receipt is mismatched or invalid",
+            ) from error
+
+    @staticmethod
+    def _require_io_signal(
+        response: dict[str, Any],
+        observation: Any,
+        expected: dict[str, Any],
+        *,
+        command: str = "query_target",
+    ) -> None:
+        """An I/O answer echoes its query, names the owner evaluation time and
+        carries one typed signal value; its sample identity lives in the
+        value, never at the outer level."""
+
+        try:
+            if (
+                response.get("command") != command
+                or not isinstance(observation, dict)
+                or set(observation) != set(expected) | {"evaluated_at_ns", "value"}
+                or any(observation.get(key) != value for key, value in expected.items())
+            ):
+                raise ValueError("I/O signal answer does not echo its query")
+            nonnegative_int64(observation["evaluated_at_ns"])
+            IoSignalObservation.model_validate(observation["value"])
+        except (TypeError, ValueError) as error:
+            raise HeadlessApiError(
+                "execution_target_observation_invalid",
+                "native I/O signal query returned a mismatched or invalid answer",
+            ) from error
 
     @staticmethod
     def _require_frame_transform(
@@ -1098,6 +1262,42 @@ class ExecutionCommandClient:
             cls._raise_error_response(response)
         return response
 
+    @staticmethod
+    def _event_runtime_fault_snapshot(
+        response: dict[str, Any], expected_owner_epoch: str
+    ) -> dict[str, Any]:
+        """Validate common provenance before interpreting page success/failure.
+
+        The Headless owner validates the complete closed A/B fact schema before
+        mutation. This transport never infers a condition from diagnostic text.
+        """
+        owner_epoch = response.get("owner_epoch")
+        faults = response.get("runtime_faults")
+        if (
+            response.get("command") != "events"
+            or not isinstance(owner_epoch, str)
+            or not 0 < len(owner_epoch.encode("utf-8")) <= 2_048
+            or unicodedata.normalize("NFC", owner_epoch) != owner_epoch
+            or owner_epoch != expected_owner_epoch
+            or type(response.get("execution_owner_ready")) is not bool
+            or not isinstance(faults, dict)
+            or set(faults) != {"operation_journal_write_fault", "program_runner_loss"}
+            or any(
+                fact is not None
+                and (
+                    not isinstance(fact, dict)
+                    or fact.get("request_owner_epoch") != owner_epoch
+                )
+                for fact in faults.values()
+            )
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native runtime fault snapshot has invalid provenance",
+            )
+        return {"owner_epoch": owner_epoch, "runtime_faults": faults,
+                "execution_owner_ready": response["execution_owner_ready"]}
+
     def events(
         self,
         owner_epoch: str,
@@ -1123,96 +1323,108 @@ class ExecutionCommandClient:
                 "owner_epoch": owner_epoch,
             }
         )
-        if response.get("ok") is not True:
-            self._raise_error_response(response)
-        page = response.get("event_page")
-        admission_generation = response.get("admission_generation")
-        if (
-            response.get("command") != "events"
-            or type(admission_generation) is not int
-            or not 1 <= admission_generation <= MAXIMUM_SAFE_INTEGER
-            or not isinstance(page, dict)
-            or page.get("schema_version") != "manyforge.execution_event_page.v1"
-            or page.get("owner_epoch") != owner_epoch
-            or type(page.get("next_after_sequence")) is not int
-            or not after_sequence <= page["next_after_sequence"] <= MAXIMUM_SAFE_INTEGER
-            or type(page.get("has_more")) is not bool
-            or not isinstance(page.get("events"), list)
-            or len(page["events"]) > limit
-            or (page["has_more"] and len(page["events"]) != limit)
-        ):
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "native execution event page has an invalid envelope",
-            )
-        previous = after_sequence
-        for event in page["events"]:
-            try:
-                nonnegative_int64(
-                    event.get("occurred_at_ns") if isinstance(event, dict) else None
-                )
-            except ValueError as error:
+        runtime_snapshot = self._event_runtime_fault_snapshot(response, owner_epoch)
+        try:
+            if response.get("ok") is not True:
+                self._raise_error_response(response)
+            page = response.get("event_page")
+            admission_generation = response.get("admission_generation")
+            if (
+                response.get("command") != "events"
+                or type(admission_generation) is not int
+                or not 1 <= admission_generation <= MAXIMUM_SAFE_INTEGER
+                or not isinstance(page, dict)
+                or page.get("schema_version") != "manyforge.execution_event_page.v1"
+                or page.get("owner_epoch") != owner_epoch
+                or type(page.get("next_after_sequence")) is not int
+                or not after_sequence <= page["next_after_sequence"] <= MAXIMUM_SAFE_INTEGER
+                or type(page.get("has_more")) is not bool
+                or not isinstance(page.get("events"), list)
+                or len(page["events"]) > limit
+                or (page["has_more"] and len(page["events"]) != limit)
+            ):
                 raise HeadlessApiError(
                     "execution_command_response_invalid",
-                    "native execution event timestamp is invalid",
-                ) from error
-            if (
-                not isinstance(event, dict)
-                or event.get("owner_epoch") != owner_epoch
-                or type(event.get("sequence")) is not int
-                or not previous < event["sequence"] <= MAXIMUM_SAFE_INTEGER
-                or event.get("record_kind") not in OPERATION_EVENT_KINDS
-                or (
-                    event.get("request_id") is not None
-                    and (
-                        not isinstance(event.get("request_id"), str)
-                        or not event["request_id"]
-                        or len(event["request_id"].encode("utf-8")) > 2_048
+                    "native execution event page has an invalid envelope",
+                )
+            previous = after_sequence
+            for event in page["events"]:
+                try:
+                    nonnegative_int64(
+                        event.get("occurred_at_ns") if isinstance(event, dict) else None
                     )
-                )
-                or not _valid_operation_event_identity(event)
-                or not isinstance(event.get("occurred_at_wall"), str)
-                or not event["occurred_at_wall"]
-                or len(event["occurred_at_wall"].encode("utf-8")) > 128
-                or unicodedata.normalize("NFC", event["occurred_at_wall"])
-                != event["occurred_at_wall"]
-                or type(event.get("effect_pending")) is not bool
-                or not isinstance(event.get("payload"), dict)
-                or not isinstance(event.get("payload_digest"), str)
-            ):
+                except ValueError as error:
+                    raise HeadlessApiError(
+                        "execution_command_response_invalid",
+                        "native execution event timestamp is invalid",
+                    ) from error
+                if (
+                    not isinstance(event, dict)
+                    or event.get("owner_epoch") != owner_epoch
+                    or type(event.get("sequence")) is not int
+                    or not previous < event["sequence"] <= MAXIMUM_SAFE_INTEGER
+                    or event.get("record_kind") not in OPERATION_EVENT_KINDS
+                    or (
+                        event.get("request_id") is not None
+                        and (
+                            not isinstance(event.get("request_id"), str)
+                            or not event["request_id"]
+                            or len(event["request_id"].encode("utf-8")) > 2_048
+                        )
+                    )
+                    or not _valid_operation_event_identity(event)
+                    or not isinstance(event.get("occurred_at_wall"), str)
+                    or not event["occurred_at_wall"]
+                    or len(event["occurred_at_wall"].encode("utf-8")) > 128
+                    or unicodedata.normalize("NFC", event["occurred_at_wall"])
+                    != event["occurred_at_wall"]
+                    or type(event.get("effect_pending")) is not bool
+                    or not isinstance(event.get("payload"), dict)
+                    or not isinstance(event.get("payload_digest"), str)
+                ):
+                    raise HeadlessApiError(
+                        "execution_command_response_invalid",
+                        "native execution event page contains an invalid record",
+                    )
+                previous = event["sequence"]
+            if page["next_after_sequence"] != previous:
                 raise HeadlessApiError(
                     "execution_command_response_invalid",
-                    "native execution event page contains an invalid record",
+                    "native execution event cursor does not match its records",
                 )
-            previous = event["sequence"]
-        if page["next_after_sequence"] != previous:
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "native execution event cursor does not match its records",
+            progress = response.get("operation_progress")
+            if not isinstance(progress, list) or len(progress) > MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS:
+                raise HeadlessApiError("execution_command_response_invalid", "native operation progress exceeds its bound")
+            seen: set[str] = set()
+            for row in progress:
+                if (
+                    not isinstance(row, dict)
+                    or set(row) != {"owner_epoch", "operation_id", "operation_revision", "progress"}
+                    or row["owner_epoch"] != owner_epoch
+                    or not isinstance(row["operation_id"], str)
+                    or not 0 < len(row["operation_id"].encode("utf-8")) <= 2_048
+                    or row["operation_id"] in seen
+                    or type(row["operation_revision"]) is not int
+                    or not 1 <= row["operation_revision"] <= MAXIMUM_SAFE_INTEGER
+                    or type(row["progress"]) not in (float, int)
+                    or not math.isfinite(row["progress"])
+                    or not 0 <= row["progress"] <= 1
+                ):
+                    raise HeadlessApiError("execution_command_response_invalid", "native operation progress is invalid")
+                seen.add(row["operation_id"])
+            page["operation_progress"] = progress
+            page["admission_generation"] = admission_generation
+            page["runtime_faults"] = runtime_snapshot["runtime_faults"]
+            page["execution_owner_ready"] = runtime_snapshot["execution_owner_ready"]
+            # Parsed by the global rule status projection (absent: unknown).
+            page["interrupt_rule_catalog"] = response.get("interrupt_rule_catalog")
+            page["interrupt_rule_state_baseline"] = response.get(
+                "interrupt_rule_state_baseline"
             )
-        progress = response.get("operation_progress")
-        if not isinstance(progress, list) or len(progress) > MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS:
-            raise HeadlessApiError("execution_command_response_invalid", "native operation progress exceeds its bound")
-        seen: set[str] = set()
-        for row in progress:
-            if (
-                not isinstance(row, dict)
-                or set(row) != {"owner_epoch", "operation_id", "operation_revision", "progress"}
-                or row["owner_epoch"] != owner_epoch
-                or not isinstance(row["operation_id"], str)
-                or not 0 < len(row["operation_id"].encode("utf-8")) <= 2_048
-                or row["operation_id"] in seen
-                or type(row["operation_revision"]) is not int
-                or not 1 <= row["operation_revision"] <= MAXIMUM_SAFE_INTEGER
-                or type(row["progress"]) not in (float, int)
-                or not math.isfinite(row["progress"])
-                or not 0 <= row["progress"] <= 1
-            ):
-                raise HeadlessApiError("execution_command_response_invalid", "native operation progress is invalid")
-            seen.add(row["operation_id"])
-        page["operation_progress"] = progress
-        page["admission_generation"] = admission_generation
-        return page
+            return page
+        except Exception as error:
+            error.runtime_fault_snapshot = runtime_snapshot
+            raise
 
     def submit(
         self,
@@ -1595,6 +1807,10 @@ class ExecutionCommandClient:
             or type(assessment.get("control_command_epoch")) is not int
             or type(assessment.get("execution_id")) is not int
             or not isinstance(assessment.get("allowed_actions"), list)
+            or (
+                "retry_eligibility" in assessment
+                and not _valid_retry_eligibility(assessment["retry_eligibility"])
+            )
             or type(response.get("operation_revision")) is not int
             or response["operation_revision"] < 1
             or not isinstance(participants, list)
@@ -2047,6 +2263,34 @@ class ExecutionCommandClient:
         # a named reason why recovery is unavailable; never an empty proof.
         return bool(expectations) != (unavailable_reason is not None)
 
+    @staticmethod
+    def _valid_global_rule_recovery_offers(offers: object) -> bool:
+        """SX-2206: one closed offer per actually latched global rule."""
+
+        if not isinstance(offers, list):
+            return False
+        for offer in offers:
+            if not isinstance(offer, dict) or set(offer) != {
+                "current_condition",
+                "latch_cause",
+                "post_latch_disposition",
+                "selector",
+            }:
+                return False
+            condition = offer["current_condition"]
+            if (condition is not None and type(condition) is not bool) or (
+                offer["latch_cause"] not in ("condition", "source_loss")
+            ) or offer["post_latch_disposition"] not in (
+                "auto_clear_on_signal_release",
+                "await_operator_ack",
+            ):
+                return False
+            try:
+                GlobalIoRuleRecoverySelector.model_validate(offer["selector"])
+            except ValueError:
+                return False
+        return True
+
     def stop_fault(self) -> dict[str, Any]:
         # An in-memory Stop-progression read: served on the control socket.
         response = self._exchange_control(
@@ -2058,6 +2302,9 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != "get_stop_fault"
             or not self._valid_stop_fault_offer(response.get("stop_fault"))
+            or not self._valid_global_rule_recovery_offers(
+                response.get("global_rule_recovery_offers", [])
+            )
         ):
             raise HeadlessApiError(
                 "execution_command_response_invalid",
@@ -2067,10 +2314,12 @@ class ExecutionCommandClient:
 
     def recover_stop_fault(
         self,
-        request: StopFaultRecoveryIntentRequest,
+        request: StopFaultRecoveryIntentRequest | GlobalIoRuleRecoveryIntentRequest,
     ) -> dict[str, Any]:
         request_payload = request.model_dump(mode="json")
-        if request.reason is None:
+        global_rule = isinstance(request, GlobalIoRuleRecoveryIntentRequest)
+        if request.reason is None and not global_rule:
+            # The original Stop/certificate request bytes stay unchanged.
             request_payload.pop("reason")
         response = self._exchange(
             {
@@ -2085,13 +2334,44 @@ class ExecutionCommandClient:
             or not isinstance(result, dict)
             or result.get("request_id") != request.request_context.request_id
             or type(result.get("accepted")) is not bool
-            or not isinstance(result.get("latch"), dict)
+            or (
+                not self._valid_global_rule_recovery_result(request, result)
+                if global_rule
+                else not isinstance(result.get("latch"), dict)
+            )
         ):
             raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
                 "Stop-fault recovery result does not match its request",
             )
         return response
+
+    @staticmethod
+    def _valid_global_rule_recovery_result(
+        request: GlobalIoRuleRecoveryIntentRequest, result: dict[str, Any]
+    ) -> bool:
+        if set(result) != {
+            "accepted",
+            "context",
+            "error",
+            "replay_status",
+            "request_id",
+            "rule",
+        }:
+            return False
+        # The exact requested selector context (SX-2216), also for a replay of
+        # a historical request after the current Applied context changed.
+        if result["context"] != request.selector.context.model_dump(mode="json"):
+            return False
+        rule = result["rule"]
+        if rule is None:
+            return result["accepted"] is False
+        return (
+            isinstance(rule, dict)
+            and set(rule) == {"rule_id", "state", "triggering_acquisition"}
+            and rule["rule_id"] == request.selector.rule_id
+            and rule["state"] in ("clear", "tripped", "latched")
+        )
 
     def set_runtime_scale_control(
         self,
@@ -2182,6 +2462,13 @@ class ExecutionEventPump:
         self._progress_rows: dict[str, dict[str, Any]] = {}
         self._progress_dirty = False
         self._progress_sent_at = float("-inf")
+        # Global rule states for the GUI, folded from the same pages.
+        self._global_rules = GlobalRuleStatusModel()
+        self._global_rules_observer: (
+            Callable[[list[dict[str, Any]] | None], None] | None
+        ) = None
+        self._global_rules_sent: list[dict[str, Any]] | None = None
+        self._global_rules_failing = False
         self._alarm_refresh_failing = False
         self._cclc = cclc
         self._component_condition_poll_seconds = component_condition_poll_seconds
@@ -2227,6 +2514,43 @@ class ExecutionEventPump:
                 self._progress_observer(list(self._progress_rows.values()))
             except Exception:
                 logging.getLogger(__name__).exception("Operation progress observer failed")
+
+    def set_global_rules_observer(
+        self, observer: Callable[[list[dict[str, Any]] | None], None] | None,
+    ) -> None:
+        self._global_rules_observer = observer
+
+    def _observe_global_rules(self, owner_epoch: str, page: dict[str, Any]) -> None:
+        # A malformed rule wire makes only this projection unknown; the
+        # historian feed continues (the Runner mirror's own recapture rule).
+        try:
+            self._global_rules.observe(
+                owner_epoch,
+                page.get("interrupt_rule_catalog"),
+                page.get("interrupt_rule_state_baseline"),
+                page["events"],
+            )
+            if self._global_rules_failing:
+                self._global_rules_failing = False
+                logging.getLogger(__name__).info("global rule status recovered")
+        except Exception:
+            if not self._global_rules_failing:
+                self._global_rules_failing = True
+                logging.getLogger(__name__).warning(
+                    "global rule status is unreadable", exc_info=True
+                )
+        self._publish_global_rules()
+
+    def _publish_global_rules(self) -> None:
+        rows = self._global_rules.rows()
+        if rows == self._global_rules_sent:
+            return
+        self._global_rules_sent = rows
+        if self._global_rules_observer is not None:
+            try:
+                self._global_rules_observer(rows)
+            except Exception:
+                logging.getLogger(__name__).exception("Global rule status observer failed")
 
     def set_change_observer(self, observer: Callable[[], None] | None) -> None:
         if observer is not None and not callable(observer):
@@ -2649,16 +2973,6 @@ class ExecutionEventPump:
         }
 
     @staticmethod
-    def _admission_generation(response: dict[str, Any]) -> int:
-        generation = response.get("admission_generation")
-        if type(generation) is not int or not 1 <= generation <= MAXIMUM_SAFE_INTEGER:
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "native execution identity has no valid admission generation",
-            )
-        return generation
-
-    @staticmethod
     def _idle_owner_epoch(response: dict[str, Any]) -> str | None:
         """Return the typed epoch of an idle owner, if the response proves it."""
         if response.get("ok") is not False:
@@ -2681,6 +2995,28 @@ class ExecutionEventPump:
             return None
         return owner_epoch
 
+    def _observe_runtime_fault_snapshot(
+        self, snapshot: dict[str, Any], expected_owner_epoch: str
+    ) -> None:
+        if snapshot["owner_epoch"] != expected_owner_epoch:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "runtime fault observation changed the current native owner",
+            )
+        result = self._core.observe_runtime_fault_conditions(
+            source_owner_epoch=expected_owner_epoch,
+            current_runtime_faults_json=_canonical_json(
+                snapshot["runtime_faults"]
+            ).decode("utf-8"),
+        )
+        if not isinstance(result, dict) or type(result.get("changed")) is not bool:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "runtime fault observer returned no changed decision",
+            )
+        if result["changed"]:
+            self._notify_change()
+
     def _run(self) -> None:
         owner_epoch: str | None = None
         after_sequence = 0
@@ -2693,6 +3029,7 @@ class ExecutionEventPump:
         operation_control_keys: dict[str, tuple[Any, ...]] = {}
         control_projection_changed = False
         admission_generation: int | None = None
+        source_mode = "active"
 
         def condition_snapshot_kwargs(
             source_owner_epoch: str, through_source_sequence: int
@@ -2736,44 +3073,28 @@ class ExecutionEventPump:
                 if owner_epoch is None:
                     identity_response = self._execution.identity()
                     if identity_response.get("ok") is not True:
-                        idle_epoch = self._idle_owner_epoch(identity_response)
-                        if idle_epoch is None:
-                            ExecutionCommandClient._raise_error_response(
-                                identity_response
+                        next_epoch = self._idle_owner_epoch(identity_response)
+                        if next_epoch is None:
+                            ExecutionCommandClient._raise_error_response(identity_response)
+                        # An empty product still has the stable Kernel/journal.
+                        # Keep the existing idle identity poll, then use events.
+                        source_mode = "idle"
+                    else:
+                        source_mode = "active"
+                        status = identity_response.get("identity")
+                        next_epoch = (
+                            status.get("owner_epoch") if isinstance(status, dict) else None
+                        )
+                        if not isinstance(next_epoch, str) or not next_epoch:
+                            raise HeadlessApiError(
+                                "execution_command_response_invalid",
+                                "execution status has no owner epoch",
                             )
-                        next_admission_generation = self._admission_generation(
-                            identity_response
-                        )
-                        if admission_generation != next_admission_generation:
-                            admission_generation = next_admission_generation
-                            control_projection_changed = True
-                        if source_high_water_epoch != idle_epoch:
-                            source_high_water_epoch = idle_epoch
-                            source_high_water = 0
-                        self._core.complete_operation_event_snapshot(
-                            source_owner_epoch=idle_epoch,
-                            through_source_sequence=source_high_water,
-                            **condition_snapshot_kwargs(idle_epoch, source_high_water),
-                        )
-                        publish_if_changed(idle_epoch, "idle")
-                        self._publish_progress(time.monotonic())
-                        if self._record_error(None):
-                            self._notify_change()
-                        self._stop.wait(self._poll_seconds)
-                        continue
-                    status = identity_response.get("identity")
-                    next_epoch = (
-                        status.get("owner_epoch") if isinstance(status, dict) else None
-                    )
-                    if not isinstance(next_epoch, str) or not next_epoch:
-                        raise HeadlessApiError(
-                            "execution_command_response_invalid",
-                            "execution status has no owner epoch",
-                        )
                     if source_high_water_epoch != next_epoch:
                         source_high_water_epoch = next_epoch
                         source_high_water = 0
                         after_sequence = 0
+                        self._global_rules.reset()
                         operation_control_keys.clear()
                         self._progress_rows.clear()
                         self._progress_dirty = True
@@ -2785,11 +3106,18 @@ class ExecutionEventPump:
                     after_sequence,
                     limit=self._page_limit,
                 )
+                source_mode = "active" if page["execution_owner_ready"] else "idle"
+                self._observe_runtime_fault_snapshot(
+                    {"owner_epoch": page["owner_epoch"],
+                     "runtime_faults": page["runtime_faults"]},
+                    owner_epoch,
+                )
                 next_admission_generation = page["admission_generation"]
                 if admission_generation != next_admission_generation:
                     admission_generation = next_admission_generation
                     control_projection_changed = True
                 page_had_events = bool(page["events"])
+                self._observe_global_rules(owner_epoch, page)
                 for event in page["events"]:
                     self._core.ingest_operation_event(
                         source_owner_epoch=owner_epoch,
@@ -2806,6 +3134,10 @@ class ExecutionEventPump:
                     )
                     after_sequence = event["sequence"]
                     source_high_water = after_sequence
+                    if event["record_kind"] == STATE_EVENT_KIND:
+                        # Rule state is not a control projection fact; the
+                        # global rule status model already folded it.
+                        continue
                     operation_id = event.get("operation_id")
                     if isinstance(operation_id, str):
                         key = self._control_projection_key(event)
@@ -2843,19 +3175,33 @@ class ExecutionEventPump:
                         through_source_sequence=after_sequence,
                         **condition_snapshot_kwargs(owner_epoch, after_sequence),
                     )
-                    publish_if_changed(owner_epoch, "active")
+                    publish_if_changed(owner_epoch, source_mode)
                     if self._record_error(None):
                         self._notify_change()
+                    if source_mode == "idle":
+                        owner_epoch = None
                     self._stop.wait(self._poll_seconds)
-                elif page_had_events and control_projection_changed:
+                elif page_had_events:
                     # Do not delay a sparse lifecycle/Stop/fault transition
                     # behind a larger History catch-up.  The downstream cold
                     # combiner still retains only the newest requested value.
-                    publish_if_changed(owner_epoch, "active")
+                    publish_if_changed(owner_epoch, source_mode)
             except Exception as error:
+                runtime_snapshot = getattr(error, "runtime_fault_snapshot", None)
+                if runtime_snapshot is not None and owner_epoch is not None:
+                    try:
+                        self._observe_runtime_fault_snapshot(runtime_snapshot, owner_epoch)
+                    except Exception as fault_error:
+                        error = RuntimeError(
+                            f"{type(error).__name__}: {error}; "
+                            "runtime fault observation failed: "
+                            f"{type(fault_error).__name__}: {fault_error}"
+                        )
                 self._progress_rows.clear()
                 self._progress_dirty = True
                 self._publish_progress(time.monotonic())
+                self._global_rules.unknown()
+                self._publish_global_rules()
                 if owner_epoch is not None:
                     try:
                         quality = self._core.mark_operation_event_source_unknown(

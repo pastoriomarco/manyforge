@@ -154,6 +154,21 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   PrepareParticipantResultDTO Prepare(const PreparedOperationParticipantDTO& participant,
                                       std::uint64_t execution_id) override;
   Result<void> RetirePreparedExecution(std::uint64_t execution_id) override;
+  Result<PreparedMotionReplacementSourceDTO> CaptureReplacementSource(
+      std::uint64_t execution_id, std::uint64_t execution_generation, const ExecutionGoalKey& goal,
+      const ContentDigest& digest) const override;
+  PrepareParticipantResultDTO PrepareReplacement(
+      const PreparedOperationParticipantDTO& participant, std::uint64_t candidate_id,
+      const PreparedMotionReplacementSourceDTO& source) override;
+  PreparedMotionReplacementDispatchDTO DispatchReplacement(
+      const PreparedMotionReplacementSourceDTO& source, std::uint64_t candidate_id,
+      const PreparedOperationParticipantDTO& participant, const ExecutionGoalKey& successor_goal,
+      std::int64_t preparation_deadline_ns) override;
+  Result<PreparedMotionReplacementObservationDTO> ObserveReplacement(
+      const PreparedMotionReplacementSourceDTO& source, std::uint64_t candidate_id) const override;
+  Result<void> AdoptReplacement(const PreparedMotionReplacementSourceDTO& source,
+                                std::uint64_t candidate_id,
+                                PreparedMotionReplacementCommitDTO commit) override;
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& participant,
                            const ControllerGoalId& controller_goal_id,
                            ControllerGoalGeneration controller_goal_generation) override;
@@ -186,8 +201,22 @@ class ExecutionPortParticipant final : public IExecutionBackend {
       const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
       std::stop_token cancellation) override;
 
+  [[nodiscard]] ParticipantStopStageResultDTO TranslateStopStageForTakeover(
+      const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+      std::stop_token cancellation, IStopStageSpringReturnObserver& observer) override;
+
  private:
+  [[nodiscard]] ParticipantStopStageResultDTO TranslateStopStageImpl(
+      const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+      std::stop_token cancellation, IStopStageSpringReturnObserver* observer);
+
   struct Execution;
+  struct Replacement;
+  [[nodiscard]] bool SourceMatchesLocked(const PreparedMotionReplacementSourceDTO& source) const;
+  [[nodiscard]] PreparedMotionReplacementObservationDTO ObserveReplacementLocked() const;
+  [[nodiscard]] ExecutionPortCommandResultDTO CancelExecution(Execution& execution);
+  [[nodiscard]] bool ReplacementScaleCompatibleLocked(const ExecutionControllerSampleDTO& sample,
+                                                      const TrajectoryDTO& candidate) const;
   struct PreparedGoalRecord {
     ControllerGoalId goal_id;
     ControllerGoalGeneration generation;
@@ -215,7 +244,7 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   void Finish(Execution& execution, ExecutionState state, std::optional<ErrorDTO> error);
   /// Progress and snapshot from one associated sample at `original_cursor_s`.
   void ObserveSample(Execution& execution, const ExecutionControllerSampleDTO& sample,
-                     double original_cursor_s, TimePoint now);
+                     double original_cursor_s, TimePoint now, bool publish_progress = true);
   [[nodiscard]] bool WaitForCompletion(const std::shared_ptr<Execution>& execution,
                                        std::int64_t timeout_ns);
   /// Records one timing window; returns the controller period when it is
@@ -246,6 +275,7 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   PreparedExecutionMembership prepared_membership_;
   std::optional<PreparedGoalRecord> prepared_goal_;
   std::shared_ptr<Execution> execution_;
+  std::unique_ptr<Replacement> replacement_;
   std::uint64_t next_execution_generation_{1U};
   std::uint32_t stop_stages_in_flight_{0U};
   ExecutionPortTimingMetrics timing_{};

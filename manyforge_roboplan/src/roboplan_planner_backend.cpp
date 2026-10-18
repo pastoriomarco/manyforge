@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 #include <map>
@@ -369,6 +370,7 @@ RoboPlanPlannerBackend::ReplaceRetainedModel(const RoboPlanWorkerModelDTO &model
 
 core::PlanResultDTO
 RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
+  const auto setup_started = std::chrono::steady_clock::now();
   std::shared_lock projection_lock(projection_mutex_);
   if (auto invalid = validate_plan_binding(request, projection_binding_,
                                            candidate_binding_);
@@ -406,7 +408,20 @@ RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
                                         request.per_resource_dynamics_limits,
                                         request.planning_timeout_s,
                                         request.planning_attempt_index,
-                                        request.action_span};
+                                        request.action_span,
+                                        request.moving_replacement};
+  if (candidate.moving_replacement) {
+    auto &remaining =
+        candidate.moving_replacement->remaining_preparation_budget_s;
+    remaining -= std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - setup_started)
+                     .count();
+    if (std::isfinite(remaining) && remaining <= 0.0) {
+      return plan_error(error(ErrorCode::kPlanningTimeout,
+                              "Moving replacement preparation timed out",
+                              "planning_timeout"));
+    }
+  }
   try {
     auto result = candidate_client_->compute(candidate);
     if (!result.ok()) {

@@ -239,54 +239,73 @@ core::CellAdmissionClaimReleaseDTO Release(const Value &v) {
           "cell-admission claim release is invalid");
   return result;
 }
+core::ProgramCycleStatusDTO CycleStatus(const Value &x) {
+  Exact(x, 7U);
+  return core::ProgramCycleStatusDTO{
+      core::RequestOwnerEpoch(Text(x, "program_runner_owner_epoch")),
+      Counter(x, "cycle_generation"),
+      CycleState(Text(x, "state")),
+      Optional<core::ProgramRunId>(
+          x, "program_run_id", [](const Value &n) {
+            Require(n.is_string(), "program_run_id has the wrong type");
+            return core::ProgramRunId(n.as_string());
+          }),
+      Optional<core::CellAdmissionClaimGeneration>(
+          x, "cycle_claim_generation", [](const Value &n) {
+            Require(n.is_number() && n.as_number() >= 1.0 &&
+                        std::floor(n.as_number()) == n.as_number() &&
+                        n.as_number() <= kMaximumSafeInteger,
+                    "cycle_claim_generation is out of range");
+            return core::CellAdmissionClaimGeneration(
+                static_cast<std::uint64_t>(n.as_number()));
+          }),
+      Optional<core::ContentDigest>(
+          x, "terminal_or_settlement_reference", [](const Value &n) {
+            Require(n.is_string(),
+                    "terminal_or_settlement_reference has wrong type");
+            return core::ContentDigest(n.as_string());
+          }),
+      Optional<core::AcceptedProgramResetDTO>(x, "accepted_reset", [](const Value& reset) {
+        Exact(reset, 6U);
+        return core::AcceptedProgramResetDTO{
+            core::RequestOwnerEpoch(Text(reset, "request_owner_epoch", core::kMaximumProgramResetCallerIdentityBytes)),
+            core::RequestId(Text(reset, "request_id", core::kMaximumProgramResetCallerIdentityBytes)),
+            core::ContentDigest(Text(reset, "request_payload_digest")),
+            Bool(reset, "reload_initial_scene"), Bool(reset, "reset_robot_position"),
+            Optional<core::CellAdmissionClaimGeneration>(reset, "reset_claim_generation", [](const Value& value) {
+              Require(value.is_number() && value.as_number() >= 1.0 &&
+                          std::floor(value.as_number()) == value.as_number() &&
+                          value.as_number() <= kMaximumSafeInteger,
+                      "reset_claim_generation is out of range");
+              return core::CellAdmissionClaimGeneration(static_cast<std::uint64_t>(value.as_number()));
+            })};
+      })};
+}
 core::CellAdmissionReadinessSnapshotDTO Readiness(const Value &v) {
-  Exact(v, 10U);
+  const bool has_runner_loss = v.is_object() &&
+      v.find_object_member("program_runner_loss") != nullptr;
+  Exact(v, has_runner_loss ? 11U : 10U);
   core::CellAdmissionReadinessSnapshotDTO result;
   result.program_cycle_status_current =
       Bool(v, "program_cycle_status_current");
   result.program_cycle_status = Optional<core::ProgramCycleStatusDTO>(
-      v, "program_cycle_status", [](const Value &x) {
-        Exact(x, 7U);
-        return core::ProgramCycleStatusDTO{
-            core::RequestOwnerEpoch(Text(x, "program_runner_owner_epoch")),
-            Counter(x, "cycle_generation"),
-            CycleState(Text(x, "state")),
-            Optional<core::ProgramRunId>(
-                x, "program_run_id", [](const Value &n) {
-                  Require(n.is_string(), "program_run_id has the wrong type");
-                  return core::ProgramRunId(n.as_string());
-                }),
-            Optional<core::CellAdmissionClaimGeneration>(
-                x, "cycle_claim_generation", [](const Value &n) {
-                  Require(n.is_number() && n.as_number() >= 1.0 &&
-                              std::floor(n.as_number()) == n.as_number() &&
-                              n.as_number() <= kMaximumSafeInteger,
-                          "cycle_claim_generation is out of range");
-                  return core::CellAdmissionClaimGeneration(
-                      static_cast<std::uint64_t>(n.as_number()));
-                }),
-            Optional<core::ContentDigest>(
-                x, "terminal_or_settlement_reference", [](const Value &n) {
-                  Require(n.is_string(),
-                          "terminal_or_settlement_reference has wrong type");
-                  return core::ContentDigest(n.as_string());
-                }),
-            Optional<core::AcceptedProgramResetDTO>(x, "accepted_reset", [](const Value& reset) {
-              Exact(reset, 6U);
-              return core::AcceptedProgramResetDTO{
-                  core::RequestOwnerEpoch(Text(reset, "request_owner_epoch", core::kMaximumProgramResetCallerIdentityBytes)),
-                  core::RequestId(Text(reset, "request_id", core::kMaximumProgramResetCallerIdentityBytes)),
-                  core::ContentDigest(Text(reset, "request_payload_digest")),
-                  Bool(reset, "reload_initial_scene"), Bool(reset, "reset_robot_position"),
-                  Optional<core::CellAdmissionClaimGeneration>(reset, "reset_claim_generation", [](const Value& value) {
-                    Require(value.is_number() && value.as_number() >= 1.0 &&
-                                std::floor(value.as_number()) == value.as_number() &&
-                                value.as_number() <= kMaximumSafeInteger,
-                            "reset_claim_generation is out of range");
-                    return core::CellAdmissionClaimGeneration(static_cast<std::uint64_t>(value.as_number()));
-                  })};
-            })};
-      });
+      v, "program_cycle_status", CycleStatus);
+  if (has_runner_loss) {
+    result.program_runner_loss = Optional<core::ProgramRunnerContactLossDTO>(
+        v, "program_runner_loss", [](const Value &x) {
+          Exact(x, 5U);
+          const auto predicate = Text(x, "failure_predicate", 128U);
+          Require(predicate == "program_runner_liveness_probe" ||
+                      predicate == "program_runner_liveness_renewal" ||
+                      predicate == "program_runner_reconciliation_renewal",
+                  "Program Runner loss predicate is unsupported");
+          return core::ProgramRunnerContactLossDTO{
+              core::RequestOwnerEpoch(Text(x, "manager_owner_epoch")),
+              core::RuntimeEpoch(Text(x, "manager_runtime_epoch")),
+              CycleStatus(Member(x, "established_cycle")), predicate,
+              Text(x, "message", 1024U)};
+        });
+  }
   result.required_component_status_current =
       Bool(v, "required_component_status_current");
   result.required_component_total = static_cast<std::uint32_t>(
@@ -310,8 +329,9 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(const Value &v) {
   Require(result.required_component_current_compatible_ready_converged <=
               result.required_component_total &&
               (!result.program_cycle_status.has_value() ||
-               core::ValidateProgramCycleStatus(*result.program_cycle_status)
-                   .ok()),
+               core::ValidateProgramCycleStatus(*result.program_cycle_status).ok()) &&
+              (!result.program_runner_loss.has_value() ||
+               core::ValidateProgramRunnerContactLoss(*result.program_runner_loss).ok()),
           "cell-admission readiness snapshot is invalid");
   return result;
 }
@@ -567,6 +587,32 @@ bool IsCommand(std::string_view v) {
          v == cm::kPublishOperatorAlarmAttentionCommand;
 }
 } // namespace
+
+Value ProgramRunnerLossValue(const core::ProgramRunnerContactLossDTO &loss,
+                            const core::RequestOwnerEpoch &kernel_owner_epoch) {
+  Require(core::ValidateProgramRunnerContactLoss(loss).ok(),
+          "Program Runner loss snapshot is invalid");
+  const auto &cycle = loss.established_cycle;
+  const auto optional_id = [](const auto &id) { return Value(id.value()); };
+  const auto optional_counter = [](const auto &number) {
+    return Value(static_cast<double>(number.value()));
+  };
+  return Value(Value::Object{
+      {"request_owner_epoch", Value(kernel_owner_epoch.value())},
+      {"manager_owner_epoch", Value(loss.manager_owner_epoch.value())},
+      {"manager_runtime_epoch", Value(loss.manager_runtime_epoch.value())},
+      {"failure_predicate", Value(loss.failure_predicate)},
+      {"message", Value(loss.message)},
+      {"established_cycle", Value(Value::Object{
+          {"program_runner_owner_epoch", Value(cycle.program_runner_owner_epoch.value())},
+          {"cycle_generation", Value(static_cast<double>(cycle.cycle_generation))},
+          {"state", Value(std::string(core::to_string(cycle.state)))},
+          {"program_run_id", OptionalValue(cycle.program_run_id, optional_id)},
+          {"cycle_claim_generation", OptionalValue(cycle.cycle_claim_generation, optional_counter)},
+          {"terminal_or_settlement_reference", Value(nullptr)},
+          {"accepted_reset", Value(nullptr)}})},
+  });
+}
 
 core::CellAdmissionClaimDTO DecodeCellAdmissionClaim(
     const std::string_view bytes) {

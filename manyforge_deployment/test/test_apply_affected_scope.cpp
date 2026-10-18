@@ -774,6 +774,182 @@ TEST(ApplyAffectedScope, CrossCellValuesRejectBeforeScopeProduction) {
       ApplyAffectedScopeError);
 }
 
+TEST(ApplyAffectedScope, MovingTakeoverBudgetChangeFencesEveryCellResource) {
+  const auto graph = Graph(
+      {}, {Component("component-a"), Component("component-b")},
+      {Domain("domain-a"), Domain("domain-b")},
+      {Binding("binding-a", "a-r1", "component-a", "domain-a", {"resource-a"}),
+       Binding("binding-b", "b-r1", "component-b", "domain-b",
+               {"resource-b"})});
+  const auto ordinary = Bundle(graph, Products("planning"));
+  auto selected = ordinary;
+  selected.motion_takeover_preparation_budget_s = 3.5;
+  auto changed = selected;
+  changed.motion_takeover_preparation_budget_s = 7.0;
+  for (const auto &scope :
+       {derive_apply_configuration_fence_scope_verified_values(ordinary,
+                                                               selected),
+        derive_apply_configuration_fence_scope_verified_values(selected,
+                                                               changed),
+        derive_apply_configuration_fence_scope_verified_values(selected,
+                                                               ordinary)}) {
+    ASSERT_TRUE(scope.valid());
+    EXPECT_EQ(scope.resources, (std::vector{core::ResourceId("resource-a"),
+                                            core::ResourceId("resource-b")}));
+  }
+  EXPECT_TRUE(
+      derive_apply_configuration_fence_scope_verified_values(selected, selected)
+          .resources.empty());
+}
+
+void AddIoProvider(core::CellGraphDTO &graph, std::string suffix,
+                   bool output = false) {
+  using Value = core::JsonValueDTO;
+  using Object = Value::Object;
+  using Array = Value::Array;
+  const std::string component = "device." + suffix;
+  const std::string unit = "io.host." + suffix;
+  Object row{{"controllable_component_id", Value(component)},
+             {"command_target_id", Value(std::string("gpio"))},
+             {"resource_role_id", Value(std::string("ready"))},
+             {"signal_name", Value(std::string("ready"))},
+             {"source_id", Value("source." + suffix)},
+             {"value_type", Value(std::string("bool"))},
+             {"direction", Value(std::string(output ? "output" : "input"))}};
+  if (output) {
+    row.emplace(
+        "provider",
+        Value(Object{{"profile", Value(std::string("ros_set_bool"))},
+                     {"service", Value(std::string("/shared/output"))}}));
+  } else {
+    row.emplace("update_mode", Value(std::string("change_only")));
+    row.emplace("transition_capability", Value(std::string("sampled_only")));
+    row.emplace(
+        "freshness",
+        Value(Object{{"mode", Value(std::string("provider_validity"))}}));
+    row.emplace("provider",
+                Value(Object{{"profile", Value(std::string("mock"))},
+                             {"initial_value", Value(false)},
+                             {"ingress_depth", Value(64.0)}}));
+  }
+  graph.controllable_components.push_back(
+      Component(component, {core::RuntimeUnitId(unit)}));
+  auto runtime = RuntimeUnit(unit);
+  runtime.configuration.emplace("io_signals",
+                                Value(Array{Value(std::move(row))}));
+  graph.runtime_units.push_back(std::move(runtime));
+  const auto digest = "sha256:" + std::string(64, '1');
+  graph.control_domains.emplace_back(
+      core::ControlDomainId("domain.io." + suffix),
+      core::ControlDomainRevision("io.revision.1"),
+      std::vector{core::RuntimeUnitId(unit)}, core::EndpointRoleId("io.driver"),
+      core::ContainmentGranularity::kControlDomain,
+      core::ProviderControlDomainDTO{
+          core::ControllableComponentId(component),
+          core::RuntimeUnitId(unit),
+          core::ProviderInstanceId("instance.io." + suffix),
+          core::ProviderManifestId("manyforge.provider.io_signals"),
+          core::ProviderManifestRevision(digest),
+          core::ContentDigest(digest),
+          core::ContentDigest(digest),
+          {"ready"},
+          30'000'000'000LL});
+}
+
+TEST(ApplyAffectedScope,
+     InputOnlyProviderAdditionAndRemovalRetainRealDomainProof) {
+  const auto empty = Bundle(Graph({}, {}, {}, {}), Products());
+  auto graph = empty.cell_graph;
+  AddIoProvider(graph, "a");
+  const auto installed = Bundle(graph, Products());
+  for (const bool removal : {false, true}) {
+    const auto scope =
+        removal
+            ? derive_apply_configuration_fence_scope_verified_values(installed,
+                                                                     empty)
+            : derive_apply_configuration_fence_scope_verified_values(empty,
+                                                                     installed);
+    ASSERT_TRUE(scope.valid());
+    EXPECT_EQ(scope.controllable_component_ids,
+              std::vector{core::ControllableComponentId("device.a")});
+    ASSERT_EQ(scope.domains.size(), 1U);
+    EXPECT_TRUE(scope.bindings.empty());
+    EXPECT_TRUE(scope.resources.empty());
+    const auto *proof = std::get_if<core::ProviderConfigurationFenceDomainDTO>(
+        &scope.domains[0].payload);
+    ASSERT_NE(proof, nullptr);
+    EXPECT_EQ(proof->predecessor_provider.has_value(), removal);
+    EXPECT_EQ(proof->candidate_provider.has_value(), !removal);
+  }
+  EXPECT_TRUE(derive_apply_configuration_fence_scope_verified_values(installed,
+                                                                     installed)
+                  .domains.empty());
+}
+
+TEST(ApplyAffectedScope, SharedOutputChannelFencesEveryProviderAlias) {
+  auto graph = Graph({}, {}, {}, {});
+  AddIoProvider(graph, "a", true);
+  AddIoProvider(graph, "b", true);
+  const auto predecessor = Bundle(graph, Products());
+  graph.control_domains[0].control_domain_revision =
+      core::ControlDomainRevision("io.revision.2");
+  auto changed = *graph.control_domains[0].provider();
+  ++changed.lifecycle_command_timeout_ns;
+  graph.control_domains[0].payload = std::move(changed);
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      predecessor, Bundle(graph, Products()));
+  ASSERT_TRUE(scope.valid());
+  EXPECT_EQ(scope.domains.size(), 2U);
+  EXPECT_EQ(scope.controllable_component_ids.size(), 2U);
+  EXPECT_EQ(scope.resources.size(), 1U);
+  EXPECT_TRUE(scope.bindings.empty());
+  for (const auto &domain : scope.domains) {
+    const auto *proof =
+        std::get_if<core::ProviderConfigurationFenceDomainDTO>(&domain.payload);
+    ASSERT_NE(proof, nullptr);
+    ASSERT_TRUE(proof->predecessor_provider);
+    ASSERT_TRUE(proof->candidate_provider);
+    EXPECT_EQ(proof->candidate_provider->output_resources, scope.resources);
+  }
+}
+
+TEST(ApplyAffectedScope,
+     ProviderBudgetChangeLeavesUnchangedArmDomainOutsideScope) {
+  auto graph = NativeGraph();
+  AddIoProvider(graph, "a");
+  const auto predecessor = Bundle(graph, NativeProducts());
+  const auto arm_domain = graph.control_domains.front();
+  auto &io = graph.control_domains.back();
+  io.control_domain_revision = core::ControlDomainRevision("io.revision.2");
+  auto provider = *io.provider();
+  ++provider.lifecycle_command_timeout_ns;
+  io.payload = std::move(provider);
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      predecessor, Bundle(graph, NativeProducts()));
+  ASSERT_TRUE(scope.valid());
+  EXPECT_EQ(graph.control_domains.front(), arm_domain);
+  ASSERT_EQ(scope.domains.size(), 1U);
+  EXPECT_EQ(scope.domains[0].control_domain_id, io.control_domain_id);
+  EXPECT_TRUE(scope.bindings.empty());
+  EXPECT_TRUE(scope.resources.empty());
+}
+
+TEST(ApplyAffectedScope,
+     ActualTerminalInputProviderRemovalCannotDisappearFromScope) {
+  const auto empty = Bundle(Graph({}, {}, {}, {}), Products());
+  auto graph = empty.cell_graph;
+  AddIoProvider(graph, "a");
+  const auto terminal = Bundle(graph, Products());
+  const std::vector restart{core::ControllableComponentId("device.a")};
+  const std::vector<const core::RetainedBundleDTO *> sources{&terminal};
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      empty, empty, restart, sources);
+  ASSERT_TRUE(scope.valid());
+  ASSERT_EQ(scope.domains.size(), 1U);
+  EXPECT_TRUE(scope.domains[0].predecessor_control_domain_revision);
+  EXPECT_FALSE(scope.domains[0].candidate_control_domain_revision);
+  EXPECT_TRUE(scope.resources.empty());
+}
 
 } // namespace
 } // namespace manyforge::deployment::detail

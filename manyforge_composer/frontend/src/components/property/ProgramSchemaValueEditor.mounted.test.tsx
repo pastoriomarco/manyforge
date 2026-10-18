@@ -386,3 +386,46 @@ describe('an absent motion-pose goal', () => {
     },
   );
 });
+
+describe('a mounted optional io wait timeout', () => {
+  it('omits timeout_s on an empty value and validates a number against the catalog range', async () => {
+    const { host, created } = stubDom();
+    const onCommit = vi.fn();
+    const onOmit = vi.fn();
+    const invalid: (string | null)[] = [];
+    const schema: CatalogJsonSchema = { type: 'number', minimum: 0.01, maximum: 3600 };
+    const entry: CatalogEntry = { ...setValue, id: 'io.wait_for_input', parameters: [{
+      id: 'timeout_s', required: false, schema, schemaHash: 'sha256:timeout', hasDefault: false,
+    }] };
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    const input = () => {
+      const props = created.map(reactProps)
+        .filter((props) => props?.placeholder === 'Wait forever').at(-1);
+      if (props === undefined) throw new Error('No mounted timeout input');
+      return props;
+    };
+    const type = async (text: string) => {
+      await act(() => input().onFocus!({}));
+      await act(() => input().onChange!({ target: { value: text } }));
+      await act(() => input().onBlur!({}));
+    };
+    try {
+      await act(() => root.render(<ProgramSchemaValueEditor schema={schema} value={5}
+        disabled={false} path="timeout_s"
+        context={{ entry, node: { node_id: entry.id, instance_id: 'wait_part',
+          parameters: { timeout_s: 5 }, children: [] }, parameterId: 'timeout_s', program,
+          emptyOmits: { placeholder: 'Wait forever', onOmit } }}
+        onCommit={onCommit} onInvalidChange={(message) => invalid.push(message)} />));
+      await type('');
+      expect(onOmit).toHaveBeenCalledTimes(1);
+      expect(onCommit).not.toHaveBeenCalled();
+      await type('0');
+      expect(onCommit).not.toHaveBeenCalled();
+      expect(invalid.at(-1)).toMatch(/timeout_s/);
+      await type('2.5');
+      expect(onCommit).toHaveBeenCalledWith(2.5);
+      expect(onOmit).toHaveBeenCalledTimes(1);
+    } finally { await act(() => root.unmount()); }
+  });
+});

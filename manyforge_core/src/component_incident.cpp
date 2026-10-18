@@ -791,7 +791,7 @@ std::string ComponentIncidentEventPayload(const ComponentLifecycleIncidentDTO& i
            {"provider_restart_after_acknowledgement",
             CanonicalValue(policy.provider_restart_after_acknowledgement)},
            {"recovery_steps", CanonicalValue(std::string(policy.recovery_steps))}})},
-      {"schema_version", CanonicalValue("manyforge.component_incident_event.v1")},
+      {"schema_version", CanonicalValue(std::string(kComponentIncidentEventSchemaVersion))},
       {"stop", std::move(stop)},
       {"summary", CanonicalValue(incident.summary)},
       {"timeline", CanonicalValue(CanonicalValue::Array{TimelineEntry(
@@ -903,21 +903,21 @@ bool ComponentIncidentDiagnosticSnapshotShapeIsValid(const CanonicalValue& snaps
       const auto [last, error] = std::from_chars(token.data(), token.data() + token.size(), parsed);
       return error == std::errc{} && last == token.data() + token.size();
     };
-    if (!exact(snapshot, {"exit", "context", "readiness", "settings", "generated", "output",
+    if (!exact(snapshot, {"exit", "context", "launch_readiness", "settings", "generated", "output",
                           "core_dump_link"}))
       return false;
     if (!IncidentExitAndOutputShapeIsValid(*snapshot.find_object_member("exit"),
                                            *snapshot.find_object_member("output")))
       return false;
     const auto& context = *snapshot.find_object_member("context");
-    if (!exact(context, {"component_id", "request_context", "runtime_unit_id", "runtime_epoch",
-                         "bundle_id", "graph_revision", "generator_identity", "launch_identity"}))
+    if (!exact(context, {"controllable_component_id", "request_context", "runtime_unit_id", "runtime_epoch",
+                         "retained_bundle_id", "graph_revision", "generator_identity", "launch_identity"}))
       return false;
     for (const auto& [key, value] : context.as_object())
       if (!text(value, key == "launch_identity" ? kMaximumCellAdmissionPrivateBinaryBytes
                        : key == "request_context" || key == "generator_identity" ? 1024U : 128U))
         return false;
-    const auto& readiness = *snapshot.find_object_member("readiness");
+    const auto& readiness = *snapshot.find_object_member("launch_readiness");
     if (!exact(readiness,
                {"known", "controller_manager_present", "controller_observed", "controller_loaded",
                 "controller_bound", "arm_controller_active", "hardware_ready",

@@ -1185,8 +1185,8 @@ void verify_stop_applicability(
                                  domain_id;
                         }) != 1 ||
           domain->control_domain_revision.value() != domain_revision ||
-          domain->controller_topology_id.value() != topology_id ||
-          domain->topology_revision.value() != topology_revision ||
+          domain->controller().controller_topology_id.value() != topology_id ||
+          domain->controller().topology_revision.value() != topology_revision ||
           std::find(domain->runtime_unit_ids.begin(),
                     domain->runtime_unit_ids.end(),
                     source->provider_runtime_unit_id) ==
@@ -2645,9 +2645,9 @@ void require_control_domain_control_matches_retained_bundle(
       require_digest_member(object, "control_domain_revision", "control") !=
           domain->control_domain_revision.value() ||
       require_identity_member(object, "controller_topology_id", "control") !=
-          domain->controller_topology_id.value() ||
+          domain->controller().controller_topology_id.value() ||
       require_digest_member(object, "topology_revision", "control") !=
-          domain->topology_revision.value() ||
+          domain->controller().topology_revision.value() ||
       require_identity_member(object, "control_coordinator_endpoint_role",
                               "control") !=
           domain->control_coordinator_endpoint_role.value() ||

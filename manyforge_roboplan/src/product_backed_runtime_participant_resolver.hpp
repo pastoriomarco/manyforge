@@ -37,8 +37,8 @@ struct ResolvedTargetObservation final {
 ///
 /// Programs and generated Program Bindings are loaded by the identities in
 /// each bounded operation request. The resolved semantic binding must remain
-/// inside one of the already-composed physical participant inventories; this
-/// object performs no repository enumeration, latest selection, or backend
+/// inside an already-composed physical participant or exact logical output;
+/// this object performs no repository enumeration, latest selection, or backend
 /// discovery.
 class ProductBackedRuntimeParticipantResolver final {
 public:
@@ -49,6 +49,14 @@ public:
       std::vector<core::RuntimeParticipantBinding> physical_bindings,
       std::vector<core::ProgramBindingId> intrinsic_direct_bindings,
       std::filesystem::path program_artifact_root = {});
+
+  /// Same sealed product/model-map and exact artifact sources, with a new
+  /// immutable current composition. Direct IDs are supplied by the actual
+  /// compiler; this never infers direct authority from an operation label.
+  [[nodiscard]] std::shared_ptr<ProductBackedRuntimeParticipantResolver>
+  WithComposedParticipants(std::vector<core::RuntimeParticipantBinding> current,
+                           std::vector<core::ProgramBindingId>
+                               additional_intrinsic_direct_bindings = {}) const;
 
   [[nodiscard]] core::Result<core::RuntimeParticipantBinding>
   Resolve(const core::OperationIntentDTO &operation,
@@ -70,6 +78,13 @@ public:
   [[nodiscard]] core::Result<core::ProgramRunExecutionCaptureDTO>
   ResolveProgramCapture(core::ProgramRunExecutionCaptureDTO capture) const;
 
+  /// Pure target qualification against this exact product, for an already
+  /// verified authored or compiler-direct Binding. Grants no runtime admission.
+  [[nodiscard]] core::Result<deployment::RuntimeProgramTargetBinding>
+  ResolveBoundTarget(const deployment::ProgramBinding &binding,
+                     const core::TargetRoleId &target_role_id,
+                     const core::CapabilityId &capability_id) const;
+
   /// Resolve a read against the same immutable product as admission. This
   /// neither creates an OperationIntent nor grants execution authority.
   [[nodiscard]] core::Result<ResolvedTargetObservation>
@@ -90,12 +105,24 @@ public:
   ResolveOperationTarget(const core::ProgramBindingId &program_binding_id,
                          const core::TargetRoleId &target_role_id) const;
 
+  /// Declarative qualified retained stages for the exact Applied bound route.
+  /// No current readiness, preparation or execution authority is asserted.
+  [[nodiscard]] core::Result<deployment::CanonicalValue>
+  ReadQualifiedStopResponse(
+      const core::RuntimeParticipantBinding &binding) const;
+
   ProductBackedRuntimeParticipantResolver(
       const ProductBackedRuntimeParticipantResolver &) = delete;
   ProductBackedRuntimeParticipantResolver &
   operator=(const ProductBackedRuntimeParticipantResolver &) = delete;
 
 private:
+  ProductBackedRuntimeParticipantResolver(
+      const ProductBackedRuntimeParticipantResolver &source,
+      std::vector<core::RuntimeParticipantBinding> current,
+      std::vector<core::ProgramBindingId> direct_bindings);
+  void ValidateComposition();
+
   struct ObservationSelection final {
     // This exact Binding's Program was verified when the slot was populated.
     // Changing only role/capability must not reparse the immutable Program.
@@ -110,6 +137,7 @@ private:
   LoadProgram(const core::ProgramId &program_id,
               const core::ProgramRevision &program_revision) const;
 
+  const std::filesystem::path package_root_;
   deployment::FilesystemVerifiedProgramSource programs_;
   deployment::FilesystemVerifiedProgramBindingSource bindings_;
   // Program Apply publishes immutable, content-addressed Programs and Bindings

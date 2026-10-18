@@ -48,10 +48,13 @@ endif()
 # Add manyforge_core headers (try explicit include dir, then fall back to build-dir/../include)
 if(MANYFORGE_CORE_INCLUDE_DIR)
   include_directories(${MANYFORGE_CORE_INCLUDE_DIR})
-else()
+elseif(NOT TARGET manyforge_core)
   include_directories(${MANYFORGE_CORE_DIR}/../include)
 endif()
 
+# The grouped integration graph already owns these exact production targets.
+# Standalone callers retain the established explicit archive contract below.
+if(NOT TARGET manyforge_core OR NOT TARGET manyforge_deployment)
 add_library(manyforge_deployment_archive STATIC IMPORTED)
 set_target_properties(manyforge_deployment_archive PROPERTIES
   IMPORTED_LOCATION
@@ -90,6 +93,8 @@ target_link_libraries(manyforge_deployment_archive INTERFACE
   double-conversion::double-conversion
 )
 
+endif()
+
 # Python bindings module
 pybind11_add_module(manyforge_core_py NO_EXTRAS
   bindings.cpp
@@ -107,6 +112,11 @@ pybind11_add_module(manyforge_core_py NO_EXTRAS
   bindings_strong_identity.cpp
 )
 
+# Reuse existing graph targets without rebuilding another Core/Deployment tree.
+if(TARGET manyforge_core AND TARGET manyforge_deployment)
+  target_link_libraries(manyforge_core_py PRIVATE
+    manyforge_core manyforge_deployment pybind11::module pybind11::headers)
+else()
 # Link against the manyforge_core library
 target_link_libraries(manyforge_core_py PRIVATE
   ${MANYFORGE_CORE_DIR}/libmanyforge_core.a
@@ -114,6 +124,8 @@ target_link_libraries(manyforge_core_py PRIVATE
   pybind11::module
   pybind11::headers
 )
+
+endif()
 
 target_include_directories(manyforge_core_py PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}

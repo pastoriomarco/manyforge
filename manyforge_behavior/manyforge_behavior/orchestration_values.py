@@ -19,8 +19,15 @@ from manyforge_behavior.catalog_schema import validate_value
 from manyforge_behavior.program import (
     BlackboardFieldDeclaration,
     BlackboardKeyDeclaration,
+    INTERRUPT_STATE_VALUES,
+    NODE_ENDED_OUTCOMES,
+    NODE_OUTCOME_NONE,
     Program,
     ProgramValidationError,
+    interrupt_state_key,
+    is_interrupt_state_key,
+    is_node_outcome_key,
+    node_outcome_key,
 )
 from manyforge_behavior.program_expressions import (
     CheckedExpression,
@@ -238,6 +245,21 @@ class ProgramValueRecord:
         }
 
 
+# Key types a Run may publish to its host BB source (contract 52).
+PUBLISHED_KEY_TYPES = frozenset({"bool", "int64", "float64", "string"})
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedKeyChange:
+    """One committed change of a subscribed key; ``present`` is false when a
+    reset left the key without a value."""
+
+    key: str
+    value_type: str
+    value: Any
+    present: bool
+
+
 def _matches_scalar_type(value: object, declared_type: str) -> bool:
     if declared_type == "bool":
         return type(value) is bool
@@ -396,6 +418,10 @@ class ProgramValueStore:
         self._parameters = MappingProxyType(_program_parameter_values(program))
         self._values: dict[str, ProgramValueRecord] = {}
         self._lock = RLock()
+        self._published: frozenset[str] | None = None
+        self._on_published: Callable[[PublishedKeyChange], None] | None = None
+        self._published_computed: dict[str, frozenset[str]] = {}
+        self._published_computed_last: dict[str, tuple[bool, Any]] = {}
         persistent = {
             key
             for key, declaration in self._declarations.items()
@@ -570,6 +596,162 @@ class ProgramValueStore:
                 failures[key] = failure
         return results, failures
 
+    def subscribe_published_keys(
+        self,
+        keys: tuple[str, ...],
+        *,
+        baseline: Callable[[tuple[PublishedKeyChange, ...]], None],
+        on_change: Callable[[PublishedKeyChange], None],
+    ) -> None:
+        """Fix the Run's referenced-key union once and capture its baseline.
+
+        Under the store lock ``baseline`` receives every key's current value
+        (``present`` false when it is unset, or when a computed key cannot be
+        evaluated), and the subscription is installed in the same critical
+        section, so no commit falls between them. A computed key is recomputed
+        by the existing evaluator whenever a stored key it reads commits, and
+        is reported only when its value actually changes. Both callbacks run
+        under the store lock: they may only capture and enqueue bounded data.
+        """
+
+        if not keys or keys != tuple(sorted(set(keys))):
+            raise ProgramValueError(
+                "published blackboard keys must be non-empty, unique and canonical"
+            )
+        expressions = self._program.expressions
+        computed_inputs: dict[str, frozenset[str]] = {}
+        for key in keys:
+            # Any declared key may be published, whatever its access mode
+            # (schema03 Δ2): a rule reads it, not a node.
+            declaration = self._declarations.get(key)
+            if declaration is None:
+                raise ProgramValueError(f"blackboard key {key!r} is undeclared")
+            if declaration.type not in PUBLISHED_KEY_TYPES:
+                raise ProgramValueError(
+                    f"blackboard key {key!r} of type {declaration.type!r} "
+                    "cannot be published"
+                )
+            if declaration.expression is None:
+                continue
+            # The stored keys this computed key reads, through computed keys.
+            stored: set[str] = set()
+            seen: set[str] = set()
+            pending = [key]
+            while pending:
+                name = pending.pop()
+                if name in seen:
+                    continue
+                seen.add(name)
+                for reference in key_references(expressions.computed_keys[name]):
+                    if reference in expressions.computed_keys:
+                        pending.append(reference)
+                    else:
+                        stored.add(reference)
+            computed_inputs[key] = frozenset(stored)
+        with self._lock:
+            if self._published is not None:
+                raise ProgramValueError(
+                    "the Run's published blackboard keys are already fixed"
+                )
+            self._published_computed = computed_inputs
+            computed = self._published_computed_locked(set(computed_inputs))
+            self._published_computed_last = computed
+            changes = []
+            for key in keys:
+                if key in computed:
+                    present, value = computed[key]
+                else:
+                    present = key in self._values
+                    value = (
+                        _copy_runtime_value(self._values[key].value) if present else None
+                    )
+                changes.append(
+                    PublishedKeyChange(
+                        key=key,
+                        value_type=self._declarations[key].type,
+                        value=value,
+                        present=present,
+                    )
+                )
+            baseline(tuple(changes))
+            self._published = frozenset(keys)
+            self._on_published = on_change
+
+    def _published_computed_locked(
+        self, keys: set[str]
+    ) -> dict[str, tuple[bool, Any]]:
+        results, _failures = self._evaluate_computed_locked(keys)
+        return {
+            key: (key in results, _copy_runtime_value(results.get(key)))
+            for key in keys
+        }
+
+    def _publish_locked(self, key: str, previous: ProgramValueRecord | None) -> None:
+        """Report one committed change of a subscribed key (store lock held)."""
+
+        if self._published is None:
+            return
+        current = self._values.get(key)
+        unchanged = (current is None and previous is None) or (
+            current is not None
+            and previous is not None
+            and type(current.value) is type(previous.value)
+            and current.value == previous.value
+        )
+        if unchanged:
+            return
+        if key in self._published and key not in self._published_computed:
+            self._on_published(  # type: ignore[misc]
+                PublishedKeyChange(
+                    key=key,
+                    value_type=self._declarations[key].type,
+                    value=None if current is None else _copy_runtime_value(current.value),
+                    present=current is not None,
+                )
+            )
+        dependent = {
+            name for name, inputs in self._published_computed.items() if key in inputs
+        }
+        if not dependent:
+            return
+        for name, (present, value) in sorted(
+            self._published_computed_locked(dependent).items()
+        ):
+            last = self._published_computed_last[name]
+            if last[0] == present and type(last[1]) is type(value) and last[1] == value:
+                continue
+            self._published_computed_last[name] = (present, value)
+            self._on_published(  # type: ignore[misc]
+                PublishedKeyChange(
+                    key=name,
+                    value_type=self._declarations[name].type,
+                    value=value,
+                    present=present,
+                )
+            )
+
+    def clear_run_values(self) -> None:
+        """Reset: run-only stored keys lose their values; persistent keys keep
+        theirs. Each change reaches the publication subscription."""
+
+        with self._lock:
+            for key in sorted(self._values):
+                if self._declarations[key].persistence == "persistent":
+                    continue
+                if is_interrupt_state_key(key):
+                    # System-owned and always current (contract 64).
+                    continue
+                if is_node_outcome_key(key):
+                    # System start value `none` (contract 105).
+                    previous = self._values[key]
+                    if previous.value == NODE_OUTCOME_NONE:
+                        continue
+                    self._load(self._declarations[key], NODE_OUTCOME_NONE, "initial")
+                    self._publish_locked(key, previous)
+                    continue
+                previous = self._values.pop(key)
+                self._publish_locked(key, previous)
+
     def read(self, key: str) -> Any:
         declaration = self._readable(key)
         with self._lock:
@@ -625,6 +807,7 @@ class ProgramValueStore:
                 except PersistentValueUncertainError as error:
                     # Stored, so visible: the store never contradicts the register.
                     self._values[key] = record
+                    self._publish_locked(key, current)
                     raise ProgramValueUncertainError(
                         f"blackboard key {key!r} was stored but may not be "
                         f"durable: {error}"
@@ -634,6 +817,61 @@ class ProgramValueStore:
                         f"blackboard key {key!r} could not be stored: {error}"
                     ) from error
             self._values[key] = record
+            self._publish_locked(key, current)
+
+    def write_node_outcome(
+        self,
+        node_instance_id: str,
+        outcome: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Store a motion node's outcome in its system-owned key (item 42).
+
+        The one writer of the reserved namespace: the key is read-only for
+        nodes and the operator, and it keeps this value until the node ends
+        again. A Run starts at `none` (the declared start value, contract 105).
+        """
+
+        key = node_outcome_key(node_instance_id)
+        if key not in self._declarations:
+            raise ProgramValueError(f"blackboard key {key!r} is undeclared")
+        if outcome not in NODE_ENDED_OUTCOMES:
+            raise ProgramValueError(f"{outcome!r} is not a node outcome")
+        with self._lock:
+            current = self._values.get(key)
+            self._values[key] = ProgramValueRecord(
+                status="succeeded", value=outcome, metadata=metadata or {}
+            )
+            self._publish_locked(key, current)
+
+    def write_interrupt_state(self, rule_id: str, state: str | None) -> bool:
+        """Mirror one global rule's Kernel state into its reserved key.
+
+        The one writer of the namespace (contract 64): read-only for nodes and
+        the operator. ``None`` makes the key unavailable (not clear). Only the
+        Applied global rules are declared; another rule id is ignored (False).
+        """
+
+        key = interrupt_state_key(rule_id)
+        if key not in self._declarations:
+            return False
+        if state is not None and state not in INTERRUPT_STATE_VALUES:
+            raise ProgramValueError(f"{state!r} is not an interrupt rule state")
+        with self._lock:
+            current = self._values.get(key)
+            if state is None:
+                if current is None:
+                    return True
+                self._values.pop(key)
+            elif current is not None and current.value == state:
+                return True
+            else:
+                self._values[key] = ProgramValueRecord(
+                    status="succeeded", value=state, metadata={"writer": "interrupt_state_mirror"}
+                )
+            self._publish_locked(key, current)
+        return True
 
     def reset_to_initial(
         self, key: str, *, metadata: Mapping[str, Any] | None = None
@@ -667,10 +905,12 @@ class ProgramValueStore:
                 raise ProgramValueError(
                     f"blackboard key {key!r} could not be reset: {error}"
                 ) from error
+            current = self._values.get(key)
             if declaration.has_initial:
                 self._load(declaration, declaration.initial, "initial")
             else:
                 self._values.pop(key, None)
+            self._publish_locked(key, current)
             if uncertain is not None:
                 raise ProgramValueUncertainError(
                     f"blackboard key {key!r} was reset but may not be durable: "
@@ -1187,9 +1427,11 @@ __all__ = [
     "NodeAttemptInputResolver",
     "NodeAttemptInputSnapshot",
     "NodeInputError",
+    "PUBLISHED_KEY_TYPES",
     "ProgramValueError",
     "ProgramValueRecord",
     "ProgramValueStore",
+    "PublishedKeyChange",
     "describe_input_failure",
     "input_failure_details",
     "input_failure_reason",

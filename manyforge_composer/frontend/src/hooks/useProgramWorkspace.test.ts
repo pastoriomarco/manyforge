@@ -376,7 +376,6 @@ function authoringSnapshot(
       resetPhase: null, resetOptions: null,
       resetRobotPosition: { available: false, reason: 'unsupported' },
       allowedCommands: [],
-      recoveryOffer: null,
       run: null,
       runtimeControls: null,
     },

@@ -120,7 +120,8 @@ describe('UI4 application and viewport composition', () => {
     expect(transport).toContain('Closing or reloading Composer only stops watching');
     expect(transport).toContain('program.setGroupRuntimeScale');
     expect(robotControl).toContain("sendExecutionCommand(");
-    expect(robotControl).toContain("'cell_full_stop'");
+    // The robot hook has no Cell Full Stop helper or command literal.
+    expect(robotControl).not.toMatch(/fullStop|FullStop|'cell_full_stop'/);
     expect(transport).not.toContain('setVelocityScale');
     expect(robotControl).toContain('runtimeScaleQueued.current = bounded');
     expect(robotControl).toContain('runtimeScaleInFlight.current');
@@ -159,9 +160,13 @@ describe('UI4 application and viewport composition', () => {
 
     expect(app).not.toContain('<CCLCPanel');
     expect(deployment).toContain('<CCLCPanel');
-    expect(deployment).toContain('admissionGeneration={snapshot?.authoringAdmission.admissionGeneration ?? null}');
+    // The panel uses App's shared CCLC controller; App binds it to the admission generation.
+    expect(deployment).toContain('controller={cclc}');
+    expect(app).toContain('headlessSnapshot?.authoringAdmission.admissionGeneration ?? null, configuredComponentIds');
     expect(deployment).toContain('candidate.controllable_component_id');
-    expect(lifecycle).toContain('<select');
+    // Components are selected from the list rows (pressed state), bound to Manager graph identities.
+    expect(lifecycle).toContain('aria-pressed={selected}');
+    expect(lifecycle).toContain('setControllableComponentId(id)');
     expect(lifecycle).not.toContain('placeholder="lite6-arm"');
   });
 });

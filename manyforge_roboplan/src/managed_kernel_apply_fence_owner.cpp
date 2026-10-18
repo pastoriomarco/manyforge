@@ -24,6 +24,7 @@
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -474,7 +475,13 @@ SelectConfigurations(
     const bool required =
         candidate_side ? domain.candidate_control_domain_revision.has_value()
                        : domain.predecessor_control_domain_revision.has_value();
-    if (!required) {
+    const auto *provider =
+        std::get_if<core::ProviderConfigurationFenceDomainDTO>(&domain.payload);
+    const bool provider_side =
+        provider &&
+        (candidate_side ? provider->candidate_provider.has_value()
+                        : provider->predecessor_provider.has_value());
+    if (!required || provider_side) {
       continue;
     }
     const auto found = std::lower_bound(
@@ -700,6 +707,11 @@ bool ManagedKernelAdmissionGate::exact_fence_covers(
              });
 }
 
+bool ManagedKernelAdmissionGate::has_held_configuration_fences() const {
+  std::lock_guard lock(*admission_mutex_);
+  return !held_fences_.empty();
+}
+
 bool ManagedKernelAdmissionGate::exact_fence_is_held(
     const core::ConfigurationFenceId &fence_id,
     const core::ConfigurationFenceScopeDTO &scope) const {
@@ -914,6 +926,13 @@ void ManagedKernelAdmissionGate::RunWithExactHeldFence(
 }
 
 class ManagedKernelApplyFenceOwner::Impl final {
+  struct InstalledNativeCandidateObservation final {
+    std::shared_ptr<const deployment::RetainedBundle> bundle;
+    const core::ActiveBundlePublicationReceiptDTO &predecessor;
+    const core::CellAdmissionClaimDTO &parent;
+    const std::vector<core::InstalledProviderCandidateFactsDTO> &facts;
+    std::vector<core::ProviderConfigurationFenceLineageDTO> lineages;
+  };
 public:
   Impl(ManagedKernelApplyFenceOwnerConfig config,
        ManagedKernelAdmissionGate &admission_gate)
@@ -952,7 +971,13 @@ public:
       const core::ConfigurationFenceAdmissionQueryDTO &query) const {
     std::lock_guard lock(mutex_);
     Require(query.valid(), "admission observation query is invalid");
+    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex(),
+                                    std::defer_lock);
+    if (HasProviderProof(query.affected_scope))
+      admission_lock.lock();
     const auto active = ReadActivePublication();
+    const auto provider_lineages = ValidateProviderConfigurations(
+        query.affected_scope, false, *active.bundle);
     const auto observation = admission_gate_.Observe(query.affected_scope);
     const auto configurations = SelectConfigurations(
         observation.active_control_configurations, query.affected_scope, false);
@@ -967,7 +992,8 @@ public:
         configurations,
         observation.affected_queued_operation_count,
         observation.affected_active_operation_count,
-        Digest("manyforge.kernel-fence-admission-observation.seed.v1")};
+        Digest("manyforge.kernel-fence-admission-observation.seed.v1"),
+        provider_lineages};
     snapshot.result_digest = core::ContentDigest(
         content_identity::sha256_digest(EncodeResponse(snapshot)));
     Require(snapshot.presence_valid(),
@@ -981,6 +1007,10 @@ public:
               {}) {
     std::lock_guard lock(mutex_);
     Require(intent.valid(), "Apply-fence intent is invalid");
+    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex(),
+                                    std::defer_lock);
+    if (HasProviderProof(intent.scope))
+      admission_lock.lock();
     const auto intent_bytes = EncodeRequest(intent);
     if (const auto existing =
             ReadByRequest(intent.owner_request_context.request_owner_epoch,
@@ -1003,6 +1033,10 @@ public:
         "durable fence ledger has reached its fixed record bound");
 
     const auto active = ReadActivePublication();
+    Require(
+        ValidateProviderConfigurations(intent.scope, false, *active.bundle) ==
+            intent.expected_provider_lineages,
+        "provider predecessor lineage changed before Apply fence acquisition");
     Require(active.receipt.request.candidate_retained_bundle_id ==
                     intent.expected_retained_bundle_id &&
                 active.receipt.request.candidate_graph_revision ==
@@ -1242,6 +1276,83 @@ public:
     return QueryStatusLocked(query);
   }
 
+  [[nodiscard]] core::ConfigurationFenceStatusDTO
+  QueryInstalledNativeApplyCandidateStatus(
+      const core::ConfigurationFenceStatusQueryDTO &query,
+      const core::ActiveBundlePublicationReceiptDTO &predecessor,
+      const core::CellAdmissionClaimDTO &parent,
+      const core::NativeApplyPlanDTO &plan,
+      const std::vector<core::InstalledProviderCandidateFactsDTO> &facts,
+      const std::function<void()> &revalidate_installed_attempt) const {
+    Require(query.valid() && predecessor.valid() && plan.apply.valid() &&
+                plan.apply.apply_id == query.owner_transaction.apply_id &&
+                plan.apply.apply_generation == query.owner_transaction.apply_generation &&
+                !plan.component_bring_up && revalidate_installed_attempt,
+            "installed NativeApply observation has invalid original authority");
+    // This exact ordinary identity is immutable, not a last-plan lookup.
+    // Verified product I/O and fresh facade facts precede admission locks.
+    auto bundle = bundle_source_.get_verified(plan.candidate_retained_bundle_id);
+    Require(bundle && bundle->value().cell_graph.cell_id == config_.cell_id &&
+                bundle->value().cell_graph.graph_revision == plan.candidate_graph_revision,
+            "installed NativeApply candidate product is unavailable");
+    std::set<core::ControllableComponentId> seen;
+    std::optional<core::RequestOwnerEpoch> source_owner;
+    for (const auto &fact : facts) {
+      const auto *source = std::get_if<core::InstalledNativeApplyCandidateSourceDTO>(&fact.source);
+      const auto planned = std::find_if(plan.components.begin(), plan.components.end(),
+          [&](const auto &row) { return row.component_id == fact.controllable_component_id; });
+      Require(source && source->apply == plan.apply && !source->lifecycle_owner_epoch.empty() &&
+                  (!source_owner || *source_owner == source->lifecycle_owner_epoch) &&
+                  seen.insert(fact.controllable_component_id).second &&
+                  fact.retained_bundle_id == plan.candidate_retained_bundle_id &&
+                  fact.graph_revision == plan.candidate_graph_revision &&
+                  planned != plan.components.end() && planned->generation.nonzero() &&
+                  planned->generation == fact.component_lifecycle_generation &&
+                  fact.domains.size() == fact.provider_occurrences.size(),
+              "installed NativeApply facts differ from its exact full plan");
+      source_owner = source->lifecycle_owner_epoch;
+      for (std::size_t index = 0; index < fact.domains.size(); ++index) {
+        const auto &domain = fact.domains[index];
+        const auto &occurrence = fact.provider_occurrences[index];
+        Require(domain.locally_valid() && occurrence.locally_valid() &&
+                    domain.control_domain_id == occurrence.control_domain_id &&
+                    domain.control_domain_revision == occurrence.control_domain_revision &&
+                    (!domain.provider() || core::ProviderDomainMatchesOccurrence(
+                        domain.control_domain_id, domain.control_domain_revision,
+                        domain.provider()->provider, domain.provider()->provider_runtime_epoch,
+                        occurrence)),
+                "installed NativeApply facts have a foreign provider occurrence");
+      }
+    }
+    std::vector<core::ProviderConfigurationFenceLineageDTO> lineages;
+    std::set<core::ControllableComponentId> required;
+    for (const auto &domain : query.expected_scope.domains) {
+      const auto *sides = std::get_if<core::ProviderConfigurationFenceDomainDTO>(&domain.payload);
+      if (!sides || !sides->candidate_provider) continue;
+      const auto component = sides->candidate_provider->controllable_component_id;
+      required.insert(component);
+      const auto fact = std::find_if(facts.begin(), facts.end(), [&](const auto &row) {
+        return row.controllable_component_id == component;
+      });
+      Require(fact != facts.end(), "installed NativeApply candidate coverage is incomplete");
+      const auto occurrence = std::find_if(fact->provider_occurrences.begin(), fact->provider_occurrences.end(),
+          [&](const auto &row) { return row.control_domain_id == domain.control_domain_id; });
+      Require(occurrence != fact->provider_occurrences.end(),
+              "installed NativeApply candidate domain is absent");
+      lineages.push_back({domain.control_domain_id, occurrence->provider_runtime_epoch,
+                          fact->component_lifecycle_generation});
+    }
+    Require(!required.empty() && required == seen,
+            "installed NativeApply facts have foreign or missing components");
+    InstalledNativeCandidateObservation observation{
+        std::move(bundle), predecessor, parent, facts, std::move(lineages)};
+    std::lock_guard lock(mutex_);
+    // Existing ledger->composition order. Identity comparisons only, with
+    // no SQL, Kernel calls or effects; release composition before admission.
+    revalidate_installed_attempt();
+    return QueryStatusLocked(query, &observation);
+  }
+
   void RunWithExactHeldPredecessor(
       const core::ConfigurationFenceStatusQueryDTO &query,
       const core::ActiveBundlePublicationGeneration
@@ -1249,6 +1360,10 @@ public:
       const core::ContentDigest &expected_predecessor_public_pointer_digest,
       const std::function<void()> &effect) const {
     std::lock_guard lock(mutex_);
+    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex(),
+                                    std::defer_lock);
+    if (HasProviderProof(query.expected_scope))
+      admission_lock.lock();
     Require(query.valid() &&
                 expected_predecessor_publication_generation.nonzero() &&
                 !expected_predecessor_public_pointer_digest.empty() &&
@@ -1273,6 +1388,10 @@ public:
             "runtime composition conflicts with the durable held fence");
 
     const auto active = ReadActivePublication();
+    Require(ValidateProviderConfigurations(query.expected_scope, false,
+                                           *active.bundle) ==
+                intent.expected_provider_lineages,
+            "provider predecessor lineage changed before Apply effect");
     Require(active.receipt.request.candidate_retained_bundle_id ==
                     intent.expected_retained_bundle_id &&
                 active.receipt.request.candidate_graph_revision ==
@@ -1284,7 +1403,92 @@ public:
             "runtime composition predecessor publication changed while its "
             "fence was held");
     admission_gate_.RunWithExactHeldFence(query.configuration_fence_id,
-                                          query.expected_scope, effect);
+                                          query.expected_scope, [&] {
+                                            if (admission_lock.owns_lock())
+                                              admission_lock.unlock();
+                                            effect();
+                                          });
+  }
+
+  void RunWithExactHeldOriginalApplyCandidate(
+      const core::ConfigurationFenceStatusQueryDTO &query,
+      core::ActiveBundlePublicationGeneration predecessor_generation,
+      const core::ContentDigest &predecessor_pointer_digest,
+      const core::ApplyComponentBringUpAuthorityDTO &parent,
+      const core::ProjectionRevisionDTO &candidate,
+      const std::vector<core::RuntimeProviderDomainConfigurationReadbackDTO>
+          &actual_candidate_configurations,
+      const std::function<void()> &effect) const {
+    std::unique_lock lock(mutex_);
+    Require(query.valid() && parent.valid() && candidate.valid() && effect &&
+                parent.held_fence_query == query &&
+                predecessor_generation.nonzero() &&
+                !predecessor_pointer_digest.empty(),
+            "original Apply candidate continuation has invalid authority");
+    // Verified product I/O precedes admission/state access. This does not
+    // fabricate a public successor or change the predecessor receipt.
+    const auto bundle =
+        bundle_source_.get_verified(candidate.retained_bundle_id);
+    Require(bundle && bundle->value().cell_graph.cell_id == config_.cell_id &&
+                bundle->value().cell_graph.graph_revision ==
+                    candidate.graph_revision,
+            "original Apply candidate product is unavailable");
+    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex());
+    const auto row = ReadByFence(query.configuration_fence_id,
+                                 query.configuration_fence_generation);
+    Require(row && row->state == 0 &&
+                row->owner_kind == DurableFenceOwnerKind::kApply,
+            "original Apply candidate has no durable held parent fence");
+    const auto intent = DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(
+        row->intent_bytes);
+    const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
+        row->accepted_bytes);
+    Require(intent.owner_transaction == parent.parent.owner &&
+                accepted.matches(intent) &&
+                accepted.configuration_fence_id ==
+                    query.configuration_fence_id &&
+                accepted.configuration_fence_generation ==
+                    query.configuration_fence_generation &&
+                accepted.captured_scope == query.expected_scope,
+            "original Apply candidate conflicts with its durable parent");
+    Require(static_cast<bool>(config_.selected_claim_recovery_receipt),
+            "original Apply candidate has no actual parent claim source");
+    const core::CellAdmissionRecoveryReceiptQueryDTO claim_query{
+        parent.parent_claim.intent, parent.parent_claim, std::nullopt};
+    const auto held = config_.selected_claim_recovery_receipt(claim_query);
+    Require(held.ok() &&
+                core::ValidateCellAdmissionRecoveryReceipt(held.value()).ok() &&
+                held.value().status ==
+                    core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
+                held.value().matched_claim ==
+                    std::optional(parent.parent_claim),
+            "original Apply candidate lost its exact current parent claim");
+    const auto active = ReadActivePublication();
+    Require(
+        active.receipt.publication_generation == predecessor_generation &&
+            active.receipt.durable_public_pointer_content_digest ==
+                predecessor_pointer_digest &&
+            active.receipt.request.candidate_retained_bundle_id ==
+                intent.expected_retained_bundle_id &&
+            active.receipt.request.candidate_graph_revision ==
+                intent.expected_graph_revision,
+        "original Apply candidate no longer has its exact predecessor head");
+    std::vector<core::ProviderConfigurationFenceLineageDTO> actual_lineages;
+    for (const auto &actual : actual_candidate_configurations) {
+      Require(actual.locally_valid() && actual.retained_bundle_id == candidate.retained_bundle_id &&
+                  actual.graph_revision == candidate.graph_revision,
+              "original Apply candidate observation is foreign or invalid");
+      actual_lineages.push_back({actual.domain.control_domain_id,
+          actual.provider_occurrence.provider_runtime_epoch,
+          actual.component_lifecycle_generation});
+    }
+    ValidateInstalledCandidateConfigurations(query.expected_scope, *bundle, actual_lineages);
+    admission_gate_.RunWithExactHeldFence(query.configuration_fence_id,
+                                          query.expected_scope, [&] {
+                                            admission_lock.unlock();
+                                            lock.unlock();
+                                            effect();
+                                          });
   }
 
   void RunWithExactHeldSuccessor(
@@ -1899,6 +2103,11 @@ public:
                           "durable fence record count") < kMaximumFenceRecords,
         "durable fence ledger has reached its fixed record bound");
     const auto active = ReadActivePublication();
+    Require(ValidateProviderConfigurations(intent.selected_scope, false,
+                                           *active.bundle) ==
+                intent.expected_admission.provider_lineages,
+            "selected provider predecessor lineage changed before fence "
+            "acquisition");
     const auto &expected = intent.expected_admission;
     Require(
         active.receipt.publication_generation ==
@@ -2061,6 +2270,10 @@ public:
       const core::SelectedBringUpConfigurationFenceStatusQueryDTO &query)
       const {
     Require(query.valid(), "fence status query is invalid");
+    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex(),
+                                    std::defer_lock);
+    if (HasProviderProof(query.expected_scope))
+      admission_lock.lock();
     const auto row = ReadByFence(query.configuration_fence_id,
                                  query.configuration_fence_generation);
     Require(row.has_value(), "fence status identity is unknown");
@@ -2125,6 +2338,7 @@ public:
                                                 query.expected_scope),
             "selected durable fence is absent from the admission gate");
     const auto active = ReadActivePublication();
+    ValidateProviderConfigurations(query.expected_scope, true, *active.bundle);
     const auto observation = admission_gate_.Observe(query.expected_scope);
     const auto configurations = SelectConfigurations(
         observation.active_control_configurations, query.expected_scope, true);
@@ -2203,6 +2417,10 @@ public:
             "occurrence");
     ValidateSelectedClaimLocked(intent);
     const auto active = ReadActivePublication();
+    Require(ValidateProviderConfigurations(query.expected_scope, false,
+                                           *active.bundle) ==
+                intent.expected_admission.provider_lineages,
+            "selected provider predecessor lineage changed before effect");
     Require(active.receipt.publication_generation ==
                     intent.expected_publication_generation &&
                 active.receipt.durable_public_pointer_content_digest ==
@@ -2615,6 +2833,104 @@ public:
     return core::ContentDigest(content_identity::sha256_digest(bytes));
   }
 
+  [[nodiscard]] static bool
+  HasProviderProof(const core::ConfigurationFenceScopeDTO &scope) {
+    return std::any_of(
+        scope.domains.begin(), scope.domains.end(), [](const auto &domain) {
+          return std::holds_alternative<
+              core::ProviderConfigurationFenceDomainDTO>(domain.payload);
+        });
+  }
+
+  void ValidateInstalledCandidateConfigurations(
+      const core::ConfigurationFenceScopeDTO &scope,
+      const deployment::RetainedBundle &bundle,
+      const std::vector<core::ProviderConfigurationFenceLineageDTO> &lineages) const {
+    std::size_t index = 0;
+    for (const auto &domain : scope.domains) {
+      const auto *sides = std::get_if<core::ProviderConfigurationFenceDomainDTO>(&domain.payload);
+      if (!sides) continue;
+      if (!sides->candidate_provider) {
+        const auto sealed = std::find_if(bundle.value().cell_graph.control_domains.begin(),
+            bundle.value().cell_graph.control_domains.end(), [&](const auto &row) {
+              return row.control_domain_id == domain.control_domain_id;
+            });
+        Require(sealed == bundle.value().cell_graph.control_domains.end() || !sealed->provider(),
+                "removed provider remains in the qualified candidate closure");
+        Require(static_cast<bool>(config_.provider_configuration_source),
+                "removed provider has no authoritative Kernel absence lookup");
+        const auto current = config_.provider_configuration_source(domain.control_domain_id);
+        Require(current.ok() && !current.value(),
+                "removed provider remains installed in the current Kernel");
+      } else {
+        Require(index < lineages.size() && lineages[index].control_domain_id == domain.control_domain_id,
+                "installed Apply candidate provider coverage is incomplete");
+        ++index;
+      }
+    }
+    Require(index == lineages.size() &&
+                ValidateProviderConfigurations(scope, true, bundle) == lineages,
+            "installed Apply candidate driver or lifecycle generation changed");
+  }
+
+  std::vector<core::ProviderConfigurationFenceLineageDTO>
+  ValidateProviderConfigurations(
+      const core::ConfigurationFenceScopeDTO &scope, bool candidate_side,
+      const deployment::RetainedBundle &bundle) const {
+    std::vector<core::ProviderConfigurationFenceLineageDTO> lineages;
+    for (const auto &domain : scope.domains) {
+      const auto *sides =
+          std::get_if<core::ProviderConfigurationFenceDomainDTO>(
+              &domain.payload);
+      if (!sides)
+        continue;
+      const auto &proof = candidate_side ? sides->candidate_provider
+                                         : sides->predecessor_provider;
+      if (!proof)
+        continue; // Mixed replacements may have a controller on this side.
+      Require(static_cast<bool>(config_.provider_configuration_source),
+              "provider fence has no current Kernel configuration lookup");
+      const auto current =
+          config_.provider_configuration_source(domain.control_domain_id);
+      Require(current.ok() && current.value() &&
+                  current.value()->locally_valid(),
+              "provider fence has no exact installed Kernel configuration");
+      const auto &row = *current.value();
+      const auto &revision = candidate_side
+                                 ? domain.candidate_control_domain_revision
+                                 : domain.predecessor_control_domain_revision;
+      const auto sealed = std::find_if(
+          bundle.value().cell_graph.control_domains.begin(),
+          bundle.value().cell_graph.control_domains.end(),
+          [&](const auto &entry) {
+            return entry.control_domain_id == domain.control_domain_id;
+          });
+      Require(revision && row.domain.locally_valid() &&
+                  row.retained_bundle_id == bundle.retained_bundle_id() &&
+                  row.graph_revision ==
+                      bundle.value().cell_graph.graph_revision &&
+                  row.domain.control_domain_id == domain.control_domain_id &&
+                  row.domain.control_domain_revision == *revision &&
+                  sealed != bundle.value().cell_graph.control_domains.end() &&
+                  sealed->control_domain_revision == *revision &&
+                  sealed->provider() &&
+                  *sealed->provider() == row.domain.provider()->provider &&
+                  row.domain.provider()->provider.controllable_component_id ==
+                      proof->controllable_component_id &&
+                  row.domain.provider()->provider.provider_instance_id ==
+                      proof->provider_instance_id &&
+                  row.domain.provider()->provider.signal_configuration_digest ==
+                      proof->signal_configuration_digest &&
+                  row.domain.resource_ids() == proof->output_resources,
+              "provider fence configuration differs from its exact product and "
+              "occurrence");
+      lineages.push_back({domain.control_domain_id,
+                          row.provider_occurrence.provider_runtime_epoch,
+                          row.component_lifecycle_generation});
+    }
+    return lineages;
+  }
+
   [[nodiscard]] ActivePublication ReadActivePublication() const {
     const auto integrity = publication_store_.VerifyIntegrity();
     Require(integrity.cell_id == config_.cell_id &&
@@ -2651,11 +2967,18 @@ public:
   }
 
   [[nodiscard]] core::ConfigurationFenceStatusDTO
-  QueryStatusLocked(const core::ConfigurationFenceStatusQueryDTO &query) const {
+  QueryStatusLocked(const core::ConfigurationFenceStatusQueryDTO &query,
+                    const InstalledNativeCandidateObservation *candidate = nullptr) const {
     Require(query.valid(), "fence status query is invalid");
+    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex(),
+                                    std::defer_lock);
+    if (HasProviderProof(query.expected_scope))
+      admission_lock.lock();
     const auto row = ReadByFence(query.configuration_fence_id,
                                  query.configuration_fence_generation);
     Require(row.has_value(), "fence status identity is unknown");
+    Require(!candidate || row->state == 0,
+            "installed NativeApply observation no longer has a held fence");
     Require(row->owner_kind == DurableFenceOwnerKind::kApply,
             "Apply status query names a route-configuration fence");
     const auto intent = DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(
@@ -2690,6 +3013,50 @@ public:
     }
 
     const auto active = ReadActivePublication();
+    if (candidate) {
+      Require(row->state == 0 && active.receipt == candidate->predecessor &&
+                  active.receipt.request.candidate_retained_bundle_id == intent.expected_retained_bundle_id &&
+                  active.receipt.request.candidate_graph_revision == intent.expected_graph_revision &&
+                  admission_gate_.exact_fence_is_held(query.configuration_fence_id, query.expected_scope),
+              "installed NativeApply lost its exact held predecessor");
+      const auto kind = candidate->parent.intent.claim_kind;
+      Require((kind == core::CellAdmissionClaimKindDTO::kManagerApply &&
+                   candidate->parent.intent.owner_transaction_id == query.owner_transaction.apply_id.value()) ||
+                  kind == core::CellAdmissionClaimKindDTO::kAuthoringMutation,
+              "installed NativeApply parent has another transaction");
+      Require(static_cast<bool>(config_.selected_claim_recovery_receipt),
+              "installed NativeApply has no actual held parent source");
+      const core::CellAdmissionRecoveryReceiptQueryDTO parent_query{
+          candidate->parent.intent, candidate->parent, std::nullopt};
+      const auto held = config_.selected_claim_recovery_receipt(parent_query);
+      Require(core::ValidateCellAdmissionRecoveryReceiptQuery(parent_query).ok() &&
+                  held.ok() && core::ValidateCellAdmissionRecoveryReceipt(held.value()).ok() &&
+                  held.value().status == core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
+                  held.value().matched_claim == std::optional(candidate->parent),
+              "installed NativeApply parent is no longer held exact");
+      ValidateInstalledCandidateConfigurations(query.expected_scope, *candidate->bundle, candidate->lineages);
+      // Join the actual installed records to their current Kernel rows, not
+      // just to an epoch/generation projection. Eligibility is not inferred.
+      for (const auto &fact : candidate->facts) {
+        for (std::size_t index = 0; index < fact.domains.size(); ++index) {
+          const auto &domain = fact.domains[index];
+          if (!domain.provider()) continue;
+          const auto scoped = std::find_if(query.expected_scope.domains.begin(), query.expected_scope.domains.end(),
+              [&](const auto &row) { return row.control_domain_id == domain.control_domain_id; });
+          if (scoped == query.expected_scope.domains.end()) continue;
+          const auto current = config_.provider_configuration_source(domain.control_domain_id);
+          Require(current.ok() && current.value() &&
+                      current.value()->retained_bundle_id == fact.retained_bundle_id &&
+                      current.value()->graph_revision == fact.graph_revision &&
+                      current.value()->domain == domain &&
+                      current.value()->provider_occurrence == fact.provider_occurrences[index] &&
+                      current.value()->component_lifecycle_generation == fact.component_lifecycle_generation,
+                  "installed NativeApply facts no longer match their current Kernel rows");
+        }
+      }
+    } else {
+      ValidateProviderConfigurations(query.expected_scope, true, *active.bundle);
+    }
     const auto observation = admission_gate_.Observe(query.expected_scope);
     const auto configurations = SelectConfigurations(
         observation.active_control_configurations, query.expected_scope, true);
@@ -2779,6 +3146,18 @@ core::ConfigurationFenceStatusDTO ManagedKernelApplyFenceOwner::QueryStatus(
   return impl_->QueryStatus(query);
 }
 
+core::ConfigurationFenceStatusDTO
+ManagedKernelApplyFenceOwner::QueryInstalledNativeApplyCandidateStatus(
+    const core::ConfigurationFenceStatusQueryDTO &query,
+    const core::ActiveBundlePublicationReceiptDTO &predecessor,
+    const core::CellAdmissionClaimDTO &parent,
+    const core::NativeApplyPlanDTO &plan,
+    const std::vector<core::InstalledProviderCandidateFactsDTO> &facts,
+    const std::function<void()> &revalidate_installed_attempt) const {
+  return impl_->QueryInstalledNativeApplyCandidateStatus(
+      query, predecessor, parent, plan, facts, revalidate_installed_attempt);
+}
+
 void ManagedKernelApplyFenceOwner::RunWithExactHeldPredecessor(
     const core::ConfigurationFenceStatusQueryDTO &query,
     const core::ActiveBundlePublicationGeneration
@@ -2788,6 +3167,20 @@ void ManagedKernelApplyFenceOwner::RunWithExactHeldPredecessor(
   impl_->RunWithExactHeldPredecessor(
       query, expected_predecessor_publication_generation,
       expected_predecessor_public_pointer_digest, effect);
+}
+
+void ManagedKernelApplyFenceOwner::RunWithExactHeldOriginalApplyCandidate(
+    const core::ConfigurationFenceStatusQueryDTO &query,
+    core::ActiveBundlePublicationGeneration predecessor_generation,
+    const core::ContentDigest &predecessor_pointer_digest,
+    const core::ApplyComponentBringUpAuthorityDTO &parent,
+    const core::ProjectionRevisionDTO &candidate,
+    const std::vector<core::RuntimeProviderDomainConfigurationReadbackDTO>
+        &actual_candidate_configurations,
+    const std::function<void()> &effect) const {
+  impl_->RunWithExactHeldOriginalApplyCandidate(
+      query, predecessor_generation, predecessor_pointer_digest, parent,
+      candidate, actual_candidate_configurations, effect);
 }
 
 void ManagedKernelApplyFenceOwner::RunWithExactHeldSuccessor(

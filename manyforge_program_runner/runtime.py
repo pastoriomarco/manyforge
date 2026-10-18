@@ -8,7 +8,8 @@ from dataclasses import dataclass, replace
 import hashlib
 import logging
 from pathlib import Path
-from threading import Event, RLock
+from threading import Event, Lock, RLock
+import time
 from typing import Any, Final, NoReturn
 import unicodedata
 from urllib.parse import urlsplit
@@ -47,8 +48,10 @@ from manyforge_behavior.orchestration_values import (
 from manyforge_behavior.program import (
     CANONICAL_DEFAULT_RECOVERY_POLICY,
     BlackboardKeyDeclaration,
+    INTERRUPT_STATE_NAMESPACE,
     Program,
     ProgramValidationError,
+    is_interrupt_state_key,
 )
 from manyforge_behavior.production_ports import (
     HeadlessSceneProgramPort,
@@ -67,6 +70,7 @@ from manyforge_behavior.program_run_owner import (
     build_applied_program_run_admission,
 )
 from manyforge_behavior.program_runtime import NodeInputProposalError
+from manyforge_behavior.recovery import is_non_moving_recovery
 from manyforge_behavior.program_scheduling import (
     ProgramInterventionRegistry,
     ProgramRunTickHost,
@@ -98,8 +102,16 @@ from .cycle_journal import (
     ProgramCycleJournalVersionError,
     ProgramCycleStopWon,
 )
+from .bbkey_publication import (
+    FAULT_CODE as BBKEY_PUBLICATION_FAULT_CODE,
+    ProgramBlackboardKeyPublisher,
+    ProgramBlackboardPublicationScope,
+    publisher_fault_error,
+)
 from .execution_transport import ProgramRunnerExecutionTransport
+from .interrupt_state_mirror import InterruptRuleStateMirror, RuleCatalog
 from .liveness import (
+    RENEWAL_INTERVAL_NS,
     ProgramRunnerLivenessError,
     ProgramRunnerLivenessReceiver,
 )
@@ -141,6 +153,8 @@ from .diagnostics import ProgramDiagnosticPublisher
 
 
 _LOGGER = logging.getLogger(__name__)
+# A transport without the rule-state channel has no global rules to wait for.
+_NO_GLOBAL_RULES: Final = RuleCatalog("", None, 1, "", "", (), ())
 PROGRAM_RUN_INDEX_VERSION: Final = "manyforge.program_run_index.v1"
 PERSISTENT_KEY_VALUES_VERSION: Final = "manyforge.persistent_key_values.v1"
 PERSISTENT_KEY_EDIT_VERSION: Final = "manyforge.persistent_key_edit.v1"
@@ -153,12 +167,14 @@ PROGRAM_NODE_PREVIEW_INTENT_VERSION: Final = (
 _MAX_INFLIGHT_COMMANDS: Final = 4_096
 # Recovery actions that release Program motion; the non-moving
 # acknowledge_and_continue and the Reset path stay available (spec 450 §5.2).
+# Continue releases the hold's groups by Retry's rule, so it is checked alike.
 _MOTION_PRODUCING_RECOVERY_ACTIONS: Final = frozenset(
     {
         "retry_motion_from_current_state",
         "retry_after_scene_repair",
         "replan_from_stopped_state",
         "retry_runtime_step",
+        "continue_with_failure",
     }
 )
 
@@ -407,6 +423,33 @@ class ProgramRuntime:
             raise ProgramRunnerError(
                 "program_cycle_journal_version_unsupported", str(error)
             ) from error
+        # One change-only BB key sender per captured Run (contract 52).
+        # Key None is the cell-level source between Runs (SX-2088).
+        self._bbkey_publishers: dict[str | None, ProgramBlackboardKeyPublisher] = {}
+        # SX-2182: sources whose baseline waits for the global rule catalog of
+        # their own publication: (publisher, store, Program keys, deadline ns).
+        self._bbkey_pending: dict[
+            str | None,
+            tuple[
+                ProgramBlackboardKeyPublisher,
+                ProgramValueStore,
+                tuple[str, ...],
+                tuple[str, int, str, str],
+                int,
+            ],
+        ] = {}
+        # The Applied Program's condition-key union, learned at cold Apply and
+        # Run start; empty until then.
+        self._applied_condition_keys: tuple[str, ...] = ()
+        self._bbkey_idle_store: ProgramValueStore | None = None
+        self._bbkey_publishers_lock = RLock()
+        # Contract 64: the Kernel's global rule states, mirrored into the
+        # reserved interrupt_state.<rule_id> keys of the current stores.
+        self._interrupt_state_mirror: InterruptRuleStateMirror | None = None
+        self._interrupt_state_run_id: str | None = None
+        self._interrupt_state_poll_lock = Lock()
+        self._interrupt_state_poll_due_ns = 0
+        self._interrupt_state_polling = False
         self._liveness: ProgramRunnerLivenessReceiver | None = None
         if config.manager_liveness_socket is not None:
             if self._journal is None:
@@ -420,6 +463,7 @@ class ProgramRuntime:
                 on_expiry=self._contain_manager_loss,
                 on_reconciliation=self._reconcile_manager_liveness,
                 cycle_status=self._current_cycle_status_projection,
+                publication_check=self._check_bbkey_publication_budgets,
             )
         self._owns_headless_client = headless_client is None
         self._headless = headless_client or HeadlessHttpClient(
@@ -437,6 +481,13 @@ class ProgramRuntime:
             )
         self._kernel = KernelClient(execution_transport)
         self._execution_transport = execution_transport
+        read_rule_states = getattr(execution_transport, "read_interrupt_rule_state_events", None)
+        if callable(read_rule_states):
+            self._interrupt_state_mirror = InterruptRuleStateMirror(
+                owner_epoch=self._current_kernel_owner_epoch,
+                read_events=read_rule_states,
+                on_change=self._apply_interrupt_states,
+            )
         self._reset_position_identity: dict[str, Any] | None = None
         # Starting has no bound tree yet. Retain its already-read Kernel
         # attribution so priority Stop never needs an ordinary owner read.
@@ -463,6 +514,11 @@ class ProgramRuntime:
         self._native = NativeKernelProgramPort(
             self._kernel,
             current_owner_epoch=self._current_kernel_owner_epoch,
+            stop_terminal=(
+                None
+                if self._interrupt_state_mirror is None
+                else self._interrupt_state_mirror.stop_terminal
+            ),
         )
         self._scene = HeadlessSceneProgramPort(
             self._headless, program_node_evidence=self._program_node_admission_evidence
@@ -498,6 +554,9 @@ class ProgramRuntime:
             kernel_controls=self._native.controls,
             model_queries=self._native.queries,
             gripper_status=self._native.queries,
+            io_signals=self._native.queries,
+            io_watches=self._native.io_watches,
+            mock_simulation=self._native.mock_simulation,
             scene_transactions=self._scene,
             assistant_requests=self._assistant,
             simulator_control=self._simulation_control,
@@ -577,7 +636,11 @@ class ProgramRuntime:
     def _observe_run_state(self, snapshot: Any) -> None:
         """Wake readers; selected holds do not transition the whole cycle."""
         self._notify_control_state_change()
-        record = self._owner.take_diagnostic(snapshot.capture.program_run_id)
+        program_run_id = snapshot.capture.program_run_id
+        for event in self._owner.take_node_history_events(program_run_id):
+            facts = dict(event)
+            self._controls(program_run_id).audit_value(facts.pop("kind"), **facts)
+        record = self._owner.take_diagnostic(program_run_id)
         if record is not None:
             self._diagnostics.submit(record)
 
@@ -625,13 +688,12 @@ class ProgramRuntime:
             del evidence_digest
             retained = journal.liveness()
             cycle = journal.read()
-            liveness_status = (
-                None if self._liveness is None else self._liveness.status()
-            )
+            # Manager-loss evidence only: a BB publication fault is retained
+            # separately and is never a Manager loss.
             fault_reference = (
                 None
-                if liveness_status is None
-                else liveness_status.get("fault_reference")
+                if self._liveness is None
+                else self._liveness.manager_fault_reference
             )
             if (
                 cycle.reconciliation_required
@@ -1249,6 +1311,20 @@ class ProgramRuntime:
                 or not target["command_target_id"]):
                 raise ProgramRunOwnerError("Program simulation dependency crosses its component binding")
             selected.add(component)
+        # A provider-only I/O component (provider-kind control domain and no
+        # controller binding) has no controller profile and no simulator lane;
+        # CCLC activation gates it. A component that also has a controller
+        # binding keeps the controller-profile check.
+        io_providers: set[Any] = set()
+        for domain in rows(graph.get("control_domains")):
+            if domain.get("kind") == "provider":
+                provider = domain.get("provider")
+                if not isinstance(provider, Mapping):
+                    raise ProgramRunOwnerError("Program simulation dependency has invalid provider domain")
+                io_providers.add(provider.get("controllable_component_id"))
+        io_providers -= {
+            row.get("controllable_component_id") for row in rows(graph.get("control_bindings"))
+        }
         required = False
         for component in selected:
             matches = [row for row in graph_components if row.get("controllable_component_id") == component]
@@ -1268,7 +1344,7 @@ class ProgramRuntime:
                 profile_id = unit.get("runtime_profile_id")
                 if not isinstance(profile_id, str) or not profile_id:
                     raise ProgramRunOwnerError("Program simulation dependency has no runtime profile")
-                if profile_id != "manyforge.ros2_control_execution_runtime":
+                if profile_id != "manyforge.ros2_control_execution_runtime" or component in io_providers:
                     continue
                 configuration, profiles = ros_profiles(unit)
                 matches = [row for row in profiles if row.get("controllable_component_id") == component]
@@ -1978,24 +2054,80 @@ class ProgramRuntime:
         cycle_generation: int,
         selection_scope=None,
     ) -> dict[str, Any] | None:
-        if program_run_id is None:
+        """The focused hold's offer (a failure hold first, else an operator
+        Stop hold): the single-offer field current readers use."""
+        if program_run_id is None or not self._offer_cycle_current(
+            program_run_id, cycle_generation
+        ):
             return None
+        intervention = self._owner.intervention(program_run_id)
+        if intervention is None:
+            return None
+        return self._offer_for(
+            program_run_id,
+            intervention,
+            cycle_generation=cycle_generation,
+            selection_scope=selection_scope,
+        )
+
+    def _recovery_offers(
+        self,
+        program_run_id: str | None,
+        *,
+        cycle_generation: int,
+    ) -> list[dict[str, Any]]:
+        """Every active failure hold, one offer each (contract item 39): the
+        hold's own motion groups, its captured Stop scope, and its offer."""
+        if program_run_id is None or not self._offer_cycle_current(
+            program_run_id, cycle_generation
+        ):
+            return []
+        try:
+            holds = self._owner.failure_holds(program_run_id)
+        except ProgramRunOwnerError:
+            return []
+        result = []
+        for hold in holds:
+            offer = self._offer_for(
+                program_run_id, hold, cycle_generation=cycle_generation
+            )
+            if offer is None:
+                continue
+            groups, scope = self._owner.hold_motion_groups(
+                program_run_id, hold.identity.node_instance_id
+            )
+            result.append(
+                {
+                    "motion_group_ids": list(groups),
+                    "intervention_stop_scope": scope,
+                    "offer": offer,
+                }
+            )
+        return result
+
+    def _offer_cycle_current(self, program_run_id: str, cycle_generation: int) -> bool:
         # A node-level recovery offer is valid only while its owning Program
         # cycle is current and free of unresolved control effects.  Keep this
         # check here so status, controls, results, and rejection responses
         # cannot disagree about whether the offer is actionable.
-        if self._journal is not None:
-            cycle = self._journal.read()
-            if not (
-                cycle.state == "running"
-                and not cycle.reconciliation_required
-                and cycle.program_run_id == program_run_id
-                and cycle.cycle_generation == cycle_generation
-            ):
-                return None
-        intervention = self._owner.intervention(program_run_id)
-        if intervention is None:
-            return None
+        if self._journal is None:
+            return True
+        cycle = self._journal.read()
+        return (
+            cycle.state == "running"
+            and not cycle.reconciliation_required
+            and cycle.program_run_id == program_run_id
+            and cycle.cycle_generation == cycle_generation
+        )
+
+    def _offer_for(
+        self,
+        program_run_id: str,
+        intervention,
+        *,
+        cycle_generation: int,
+        selection_scope=None,
+    ) -> dict[str, Any] | None:
         # Status projection uses the retained owner assessment. It must not
         # perform owner I/O; Resume revalidates every selected attempt before
         # releasing any hold.
@@ -2604,6 +2736,42 @@ class ProgramRuntime:
         if self._liveness is not None:
             self._liveness.start()
         self._started = True
+        self._establish_startup_bbkey_source()
+
+    def _establish_startup_bbkey_source(self) -> None:
+        """An already Applied Program gets its between-Runs source at Runner
+        start, not only at the next Apply or Run (idle cycle only)."""
+
+        if (
+            self._journal is None
+            or self._persistent_keys is None
+            or not callable(getattr(self._execution_transport, "publish_program_bbkeys", None))
+        ):
+            return  # No between-Runs source can exist here.
+
+        def establish() -> None:
+            try:
+                if self._journal.read().state != "idle_after_reset":
+                    return
+                applied = self._headless.program_applied()
+                document = applied.get("program")
+                if not isinstance(document, Mapping):
+                    return
+                program = Program.from_dict(deepcopy(dict(document)), self._environment.catalog)
+            except Exception:
+                _LOGGER.warning(
+                    "between-Run BB key source not established at start; "
+                    "the next Apply or Run establishes it",
+                    exc_info=True,
+                )
+                return
+            self._learn_condition_keys(program)
+            self._follow_cell_bbkey_source()
+
+        try:
+            self._host.submit_run_work(establish)
+        except Exception:
+            establish()
 
     def health(self) -> dict[str, Any]:
         return {
@@ -2818,6 +2986,478 @@ class ProgramRuntime:
                 snapshot=value,
             )
 
+    def _new_bbkey_publisher(
+        self, scope: ProgramBlackboardPublicationScope
+    ) -> ProgramBlackboardKeyPublisher:
+        publish = getattr(self._execution_transport, "publish_program_bbkeys", None)
+        if not callable(publish):
+            raise ProgramRunnerError(
+                "program_bbkey_publication_unavailable",
+                "the execution transport cannot publish BB keys",
+            )
+        liveness = self._liveness
+
+        def on_fault(fault: Mapping[str, Any], reference: str) -> None:
+            if liveness is not None:
+                liveness.latch_publisher_fault(fault, reference)
+
+        return ProgramBlackboardKeyPublisher(
+            scope,
+            publish=publish,
+            submit=self._host.submit_run_work,
+            stop_run=self._stop_for_bbkey_publication_fault,
+            on_fault=on_fault,
+            fault_reference=self._digest,
+            # The same bounded command budget as every execution request.
+            budget_ns=self._bbkey_budget_ns(),
+        )
+
+    def _bbkey_budget_ns(self) -> int:
+        return int(min(self.config.headless_timeout_seconds, 30.0) * 1e9)
+
+    def _start_or_defer_bbkey_source(
+        self,
+        name: str | None,
+        publisher: ProgramBlackboardKeyPublisher,
+        store: ProgramValueStore,
+        program_keys: tuple[str, ...],
+        context: tuple[str, int, str, str],
+        *,
+        deadline_ns: int | None = None,
+    ) -> None:
+        """Send the baseline of the fixed union W = Program keys ∪ the global
+        rules' keys only once the catalog of this source's full context
+        (owner epoch, publication, bundle, graph) is known (SX-2182/2184);
+        until then it waits like ``bb_source_not_ready``. A retry of the same
+        pending source keeps its original ``deadline_ns`` (SX-2209)."""
+
+        catalog = self._catalog_for_context(context)
+        if catalog is None:
+            if deadline_ns is None:
+                deadline_ns = time.monotonic_ns() + self._bbkey_budget_ns()
+            with self._bbkey_publishers_lock:
+                self._bbkey_pending[name] = (
+                    publisher, store, program_keys, context, deadline_ns,
+                )
+            return
+        keys = tuple(sorted({*program_keys, *catalog.referenced_program_blackboard_keys}))
+        if not keys:
+            # The qualified catalog proves no global rule key: nothing to send.
+            with self._bbkey_publishers_lock:
+                if self._bbkey_publishers.get(name) is publisher:
+                    self._bbkey_publishers.pop(name)
+            publisher.retire()
+            return
+        publisher.start(store, keys)
+
+    def _retry_pending_bbkey_sources(self) -> None:
+        with self._bbkey_publishers_lock:
+            pending = list(self._bbkey_pending.items())
+            self._bbkey_pending.clear()
+        for name, (publisher, store, program_keys, context, deadline_ns) in pending:
+            with self._bbkey_publishers_lock:
+                current = self._bbkey_publishers.get(name) is publisher
+            if not current:
+                continue  # Retired by a Reset, a new Run or a new publication.
+            if self._catalog_for_context(context) is None and time.monotonic_ns() >= deadline_ns:
+                publisher.fail(
+                    f"global interrupt rule catalog of publication {context[1]} is not known; "
+                    "the BB key baseline was not sent"
+                )
+                continue
+            self._start_or_defer_bbkey_source(
+                name, publisher, store, program_keys, context, deadline_ns=deadline_ns
+            )
+
+    def _retire_bbkey_publishers(self, *, idle_only: bool = False) -> None:
+        with self._bbkey_publishers_lock:
+            names = [None] if idle_only else list(self._bbkey_publishers)
+            retired = [self._bbkey_publishers.pop(name, None) for name in names]
+            if not idle_only:
+                self._bbkey_idle_store = None
+        for publisher in retired:
+            if publisher is not None:
+                publisher.retire()
+
+    def _start_bbkey_publication(
+        self,
+        program_run_id: str,
+        *,
+        owner_epoch: str,
+        claim_generation: int,
+        program_binding_id: str,
+        active_publication_generation: int,
+        cycle_generation: int,
+        keys: tuple[str, ...],
+        retained_bundle_id: str,
+        graph_revision: str,
+    ) -> ProgramBlackboardKeyPublisher | None:
+        """Subscribe the Run's fixed key union and send its baseline first."""
+
+        # Previous sources (a reset Run's, the cell-level one) end here.
+        self._retire_bbkey_publishers()
+        self._interrupt_state_run_id = program_run_id
+        context = (owner_epoch, active_publication_generation, retained_bundle_id, graph_revision)
+        if self._applied_global_rule_ids():
+            self._seed_interrupt_states(self._owner.value_store(program_run_id), context)
+        catalog = self._catalog_for_context(context)
+        if not keys and catalog is not None and not catalog.referenced_program_blackboard_keys:
+            return None  # W0: no sender, no baseline.
+        publisher = self._new_bbkey_publisher(
+            ProgramBlackboardPublicationScope(
+                owner_epoch=owner_epoch,
+                program_runner_owner_epoch=self.owner_epoch,
+                claim_generation=claim_generation,
+                program_run_id=program_run_id,
+                program_binding_id=program_binding_id,
+                active_publication_generation=active_publication_generation,
+                cycle_generation=cycle_generation,
+            )
+        )
+        with self._bbkey_publishers_lock:
+            self._bbkey_publishers[program_run_id] = publisher
+        self._start_or_defer_bbkey_source(
+            program_run_id, publisher, self._owner.value_store(program_run_id), keys, context
+        )
+        return publisher
+
+    def _start_idle_bbkey_publication(self, *, keys: tuple[str, ...]) -> None:
+        """The cell-level source between Runs (after Reset or a cold Apply).
+
+        Identity: Runner owner epoch + Applied binding and publication +
+        Program-cycle generation. Baseline: persistent keys' stored values,
+        run-only keys null, node_outcome.* `none` (contract 105). Every new
+        Applied publication is a new source; unchanged identity (a repeated
+        Apply notice) keeps the source.
+        """
+
+        if self._journal is None or self._persistent_keys is None:
+            self._retire_bbkey_publishers(idle_only=True)
+            return
+        applied = self._headless.program_applied()
+        publication_generation = self._applied_publication_generation(applied)
+        if publication_generation is None:
+            # The host does not publish this Applied occurrence yet (its
+            # Apply is still finishing): its notice establishes the source.
+            _LOGGER.info("between-Run BB key source waits for the Applied publication")
+            return
+        context = (
+            self._current_kernel_owner_epoch(),
+            publication_generation,
+            str(applied.get("retained_bundle_id")),
+            str(applied.get("graph_revision")),
+        )
+        catalog = self._catalog_for_context(context)
+        if not keys and catalog is not None and not catalog.referenced_program_blackboard_keys:
+            self._retire_bbkey_publishers(idle_only=True)  # W0: no sender, no baseline.
+            return
+        cycle_generation = self._journal.read().cycle_generation
+        with self._bbkey_publishers_lock:
+            current = self._bbkey_publishers.get(None)
+        if (
+            current is not None
+            and current.scope.program_binding_id == applied["program_binding_id"]
+            and current.scope.active_publication_generation == publication_generation
+            and current.scope.cycle_generation == cycle_generation
+        ):
+            return
+        self._retire_bbkey_publishers(idle_only=True)
+        program = self._with_global_rule_keys(
+            Program.from_dict(deepcopy(applied["program"]), self._environment.catalog),
+            retained_bundle_id=applied.get("retained_bundle_id"),
+            graph_revision=applied.get("graph_revision"),
+        )
+        persistent = {
+            key: declaration
+            for key, declaration in program.blackboard_keys.items()
+            if declaration.persistence == "persistent"
+        }
+        # Values already live in the register: this store only mirrors them.
+        store = ProgramValueStore(
+            program,
+            restored=self._persistent_keys.restore(applied["scenario_id"], persistent),
+            persistent_commit=lambda _declaration, _value, _metadata: None,
+            persistent_forget=lambda _declaration, _metadata: None,
+        )
+        store.clear_run_values()
+        publisher = self._new_bbkey_publisher(
+            ProgramBlackboardPublicationScope(
+                owner_epoch=self._current_kernel_owner_epoch(),
+                program_runner_owner_epoch=self.owner_epoch,
+                claim_generation=None,
+                program_run_id=None,
+                program_binding_id=applied["program_binding_id"],
+                active_publication_generation=publication_generation,
+                cycle_generation=cycle_generation,
+            )
+        )
+        self._seed_interrupt_states(store, context)
+        with self._bbkey_publishers_lock:
+            self._bbkey_publishers[None] = publisher
+            self._bbkey_idle_store = store
+        self._start_or_defer_bbkey_source(None, publisher, store, keys, context)
+
+    def _follow_idle_persistent_edit(self, key: str, value: Any, *, reset: bool) -> None:
+        """Mirror an operator edit between Runs into the cell-level source."""
+
+        with self._bbkey_publishers_lock:
+            store = self._bbkey_idle_store
+        if store is None:
+            return
+        try:
+            if reset:
+                store.reset_to_initial(key)
+            else:
+                store.write(key, value)
+        except ProgramValueError as error:
+            with self._bbkey_publishers_lock:
+                publisher = self._bbkey_publishers.get(None)
+            if publisher is not None:
+                publisher.fail(f"between-Run edit of {key!r} cannot be published: {error}")
+
+    def _applied_publication_generation(self, applied: Mapping[str, Any]) -> int | None:
+        """The host's existing ``active_publication_generation`` for exactly
+        this Applied occurrence, or None while the host status still names
+        another one."""
+
+        execution = self._kernel.identity()
+        status = execution.get("identity")
+        if not isinstance(status, Mapping):
+            raise ProgramRunnerError(
+                "execution_command_response_invalid",
+                "host status omitted its identity",
+            )
+        generation = status.get("active_publication_generation")
+        if type(generation) is not int or not 1 <= generation <= 9_007_199_254_740_991:
+            raise ProgramRunnerError(
+                "execution_command_response_invalid",
+                "host status omitted its Applied publication generation",
+            )
+        if (
+            status.get("retained_bundle_id") != applied.get("retained_bundle_id")
+            or status.get("graph_revision") != applied.get("graph_revision")
+        ):
+            return None
+        return generation
+
+    def _reset_bbkey_publication(self, program_run_id: str) -> None:
+        """Reset retires the Run's source locally (DX-1281): no clearing
+        frame; the between-Runs baseline that follows carries run-only keys
+        as null. Keys keep their last value while the Run is held or finished,
+        so the sender lives until here."""
+
+        with self._bbkey_publishers_lock:
+            publisher = self._bbkey_publishers.pop(program_run_id, None)
+        if self._interrupt_state_run_id == program_run_id:
+            self._interrupt_state_run_id = None
+        if publisher is not None:
+            publisher.retire()
+
+    def _learn_condition_keys(self, program: Program) -> tuple[str, ...]:
+        """Learn the Applied Program's condition keys. The source adds the
+        global rules' keys of its own publication (SX-2170/2182)."""
+
+        self._applied_condition_keys = program.interrupt_condition_keys
+        return self._applied_condition_keys
+
+    def _cell_bbkey_union(self) -> tuple[str, ...]:
+        """The Program part of the cell-level union (contract 52, SX-2088):
+        the keys the Applied Program's interrupt conditions name, as last
+        learned from a cold Apply or a Run start. The global rules'
+        ``referenced_program_blackboard_keys`` join when the source starts,
+        from the catalog of exactly its publication."""
+
+        return self._applied_condition_keys
+
+    def _follow_cell_bbkey_source(self) -> None:
+        """Start the between-Runs source (Reset already advanced the cycle).
+
+        A start failure while the Applied Program references keys is the
+        contract-52 publisher fault, not a logged success: no baseline means
+        no truthful source. With no referenced key there is nothing to fail.
+        """
+
+        keys: tuple[str, ...] = ()
+        try:
+            keys = self._cell_bbkey_union()
+            self._start_idle_bbkey_publication(keys=keys)
+        except Exception as error:
+            _LOGGER.exception("cell-level BB key source could not start")
+            catalog = self._global_rule_catalog()
+            if keys or (catalog is not None and catalog.referenced_program_blackboard_keys):
+                self._latch_bbkey_start_fault(
+                    f"between-Run BB key baseline could not start: {error}"
+                )
+
+    def _latch_bbkey_start_fault(self, message: str) -> None:
+        self._retire_bbkey_publishers(idle_only=True)
+        liveness = self._liveness
+        if liveness is None:
+            return
+        fault = publisher_fault_error(message)
+        try:
+            liveness.latch_publisher_fault(fault, self._digest(fault))
+        except Exception:
+            _LOGGER.exception("BB publication start fault could not reach liveness")
+
+    def _check_bbkey_publication_budgets(self) -> None:
+        with self._bbkey_publishers_lock:
+            publishers = tuple(self._bbkey_publishers.values())
+        for publisher in publishers:
+            publisher.check_budget()
+        self._retry_pending_bbkey_sources()
+        self._schedule_interrupt_state_poll()
+
+    # Global-rule state mirror (contract 64) ---------------------------------
+
+    def _global_rule_catalog(self) -> RuleCatalog | None:
+        """The Kernel's installed global rule catalog (``events`` reply
+        ``interrupt_rule_catalog``), independent of the state baseline."""
+
+        mirror = self._interrupt_state_mirror
+        if mirror is None:
+            return None
+        try:
+            return mirror.catalog()
+        except Exception:
+            _LOGGER.exception("interrupt rule catalog could not be read")
+            return None
+
+    def _catalog_for_context(self, context: tuple[str, int, str, str]) -> RuleCatalog | None:
+        """The catalog of exactly this full context (owner epoch, publication
+        generation, bundle, graph), or None while it is not yet known: null or
+        another context is never an empty policy (SX-2182/2184); a
+        ``verified_empty`` catalog is the proof of "no global rules". Without a
+        rule-state channel there is none to wait for."""
+
+        mirror = self._interrupt_state_mirror
+        if mirror is None:
+            return _NO_GLOBAL_RULES
+        catalog = self._global_rule_catalog()
+        if catalog is None or catalog.context != context:
+            try:
+                mirror.poll()  # One fresh events read before waiting.
+            except Exception:
+                _LOGGER.exception("interrupt rule catalog could not be read")
+            catalog = self._global_rule_catalog()
+        if catalog is None or catalog.context != context:
+            return None
+        return catalog
+
+    def _applied_global_rule_ids(
+        self, *, retained_bundle_id: str | None = None, graph_revision: str | None = None
+    ) -> tuple[str, ...]:
+        """The Applied Deployment's global rule ids: the only declared
+        ``interrupt_state.<rule_id>`` keys. Given the Program's bundle and
+        graph, a catalog of another publication declares none."""
+
+        catalog = self._global_rule_catalog()
+        if catalog is None or (
+            retained_bundle_id is not None and catalog.bundle != retained_bundle_id
+        ) or (graph_revision is not None and catalog.graph != graph_revision):
+            return ()
+        return catalog.rule_ids
+
+    def _with_global_rule_keys(
+        self, program: Program, *, retained_bundle_id: Any, graph_revision: Any
+    ) -> Program:
+        """Declare the reserved ``interrupt_state.<rule_id>`` keys (contract 64)."""
+
+        rule_ids = self._applied_global_rule_ids(
+            retained_bundle_id=str(retained_bundle_id), graph_revision=str(graph_revision)
+        )
+        return program.with_interrupt_state_keys(rule_ids) if rule_ids else program
+
+    def _schedule_interrupt_state_poll(self) -> None:
+        """Poll on the liveness cadence (renewal interval), off the watchdog
+        thread so its I/O never delays expiry checks."""
+
+        mirror = self._interrupt_state_mirror
+        if mirror is None or not self._started or self._closed:
+            return
+        now = time.monotonic_ns()
+        with self._interrupt_state_poll_lock:
+            if self._interrupt_state_polling or now < self._interrupt_state_poll_due_ns:
+                return
+            self._interrupt_state_polling = True
+            self._interrupt_state_poll_due_ns = now + RENEWAL_INTERVAL_NS
+
+        def poll() -> None:
+            try:
+                mirror.poll()
+            except Exception:
+                _LOGGER.exception("interrupt rule state mirror poll failed")
+            finally:
+                with self._interrupt_state_poll_lock:
+                    self._interrupt_state_polling = False
+
+        try:
+            self._host.submit_run_work(poll)
+        except Exception:
+            with self._interrupt_state_poll_lock:
+                self._interrupt_state_polling = False
+
+    def _interrupt_state_stores(self) -> list[ProgramValueStore]:
+        stores: list[ProgramValueStore] = []
+        with self._bbkey_publishers_lock:
+            if self._bbkey_idle_store is not None:
+                stores.append(self._bbkey_idle_store)
+        run_id = self._interrupt_state_run_id
+        if run_id is not None:
+            try:
+                stores.append(self._owner.value_store(run_id))
+            except ProgramRunOwnerError:
+                pass
+        return stores
+
+    @staticmethod
+    def _write_interrupt_states(
+        store: ProgramValueStore, states: Mapping[str, str] | None
+    ) -> None:
+        """Write every ``interrupt_state.<rule_id>`` key the store already
+        declares (its qualified Applied global rules). Unknown states (None,
+        e.g. an unknown catalog) make each of them unavailable, never clear
+        (SX-2208); a rule absent from known states is unavailable too."""
+
+        prefix = f"{INTERRUPT_STATE_NAMESPACE}."
+        for key in store.program.blackboard_keys:
+            if is_interrupt_state_key(key):
+                rule_id = key[len(prefix):]
+                store.write_interrupt_state(
+                    rule_id, None if states is None else states.get(rule_id)
+                )
+
+    def _apply_interrupt_states(self, states: Mapping[str, str] | None) -> None:
+        """Mirror the current states (None = unavailable) into every current
+        store: the Run's (also while held or finished) and the between-Runs
+        one."""
+
+        for store in self._interrupt_state_stores():
+            try:
+                self._write_interrupt_states(store, states)
+            except Exception:
+                _LOGGER.exception("interrupt rule state could not be mirrored")
+
+    def _seed_interrupt_states(
+        self, store: ProgramValueStore, context: tuple[str, int, str, str]
+    ) -> None:
+        """A new store sees the current states of exactly its full context
+        (owner epoch, publication, bundle, graph) from its first tick; states
+        of another context are unavailable for it (SX-2207)."""
+
+        mirror = self._interrupt_state_mirror
+        self._write_interrupt_states(
+            store, None if mirror is None else mirror.current(context)
+        )
+
+    def _stop_for_bbkey_publication_fault(self, program_run_id: str) -> None:
+        """The Run's own Program Stop, tried before the health failure."""
+
+        snapshot = self._host.stop_run(
+            program_run_id, reason=BBKEY_PUBLICATION_FAULT_CODE
+        )
+        self._record_terminal_snapshot(snapshot.to_dict())
+
     def _verify_required_components_active(
         self, applied: Mapping[str, Any]
     ) -> None:
@@ -2833,10 +3473,11 @@ class ProgramRuntime:
                 "program_run_binding_invalid", "Applied Program Binding is invalid"
             )
         roles = binding.get("component_role_bindings")
-        if not isinstance(roles, list) or not roles or len(roles) > 4096:
+        # An empty list is a logic-only Program: no component to check.
+        if not isinstance(roles, list) or len(roles) > 4096:
             raise ProgramRunnerError(
                 "program_run_binding_invalid",
-                "Applied Program has no bounded component requirements",
+                "Applied Program component requirements are not a bounded list",
             )
         component_ids: set[str] = set()
         for row in roles:
@@ -3030,7 +3671,26 @@ class ProgramRuntime:
                     environment=self._environment,
                     owner_availability=selected_owners,
                 )
+                declared = self._with_global_rule_keys(
+                    run_admission.program,
+                    retained_bundle_id=applied["retained_bundle_id"],
+                    graph_revision=applied["graph_revision"],
+                )
+                if declared is not run_admission.program:
+                    run_admission = replace(run_admission, program=declared)
                 self._verify_required_components_active(applied)
+                pre_claim_dropped: tuple[Any, ...] = ()
+                if self._persistent_keys is not None:
+                    # Spec 400 §7.3: Run is refused, not started, while the
+                    # register cannot be reconciled. A plain write failure
+                    # leaves no remembered fault, so storage is reconciled
+                    # here before any claim; the post-claim check below stays
+                    # as a backstop for a fault first seen after the claim.
+                    _activation, _program, pre_claim = self._reconcile_persistent_keys(
+                        self._persistent_keys,
+                        expected_record_digest=applied["source"]["record_digest"],
+                    )
+                    pre_claim_dropped = pre_claim.dropped
                 # One identity spans the synchronous Program-cycle claim,
                 # scene context, Program owner, and every Kernel operation.
                 # The Kernel can therefore fence a Run before its first
@@ -3195,7 +3855,7 @@ class ProgramRuntime:
                 if self._persistent_keys is not None:
                     # Stored values dropped when this run's committed Program
                     # no longer fits them are reported, never silent.
-                    dropped = (
+                    dropped = pre_claim_dropped + (
                         ()
                         if persistent_reconciliation is None
                         else persistent_reconciliation.dropped
@@ -3276,6 +3936,21 @@ class ProgramRuntime:
                         "program_run_superseded_by_stop",
                         "Program Stop was accepted before Run admission completed",
                     )
+                # The Run's fixed referenced-key union (contract 52): the keys
+                # its interrupt conditions name plus the installed global
+                # rules' condition keys (SX-2170). The baseline must be
+                # captured here, before the first tick.
+                self._start_bbkey_publication(
+                    program_run_id,
+                    owner_epoch=execution_identity["identity"]["owner_epoch"],
+                    claim_generation=claim["claim_generation"],
+                    program_binding_id=scene_context.program_binding_id,
+                    active_publication_generation=recovery_fences["deployment_generation"],
+                    cycle_generation=cycle.cycle_generation,
+                    keys=self._learn_condition_keys(run_admission.program),
+                    retained_bundle_id=applied["retained_bundle_id"],
+                    graph_revision=applied["graph_revision"],
+                )
                 # Capture first, then publish the durable Running owner state,
                 # and only then enable the first effectful tree tick.
                 self._host.schedule(program_run_id)
@@ -3614,8 +4289,14 @@ class ProgramRuntime:
             "run_revision": live["run_revision"],
             "runtime_controls": controls.snapshot(),
             "recovery_offer": recovery_offer,
+            "recovery_offers": self._recovery_offers(
+                program_run_id, cycle_generation=self._current_cycle_generation()
+            ),
             "execution_selections": execution_selections,
         }
+
+    def _current_cycle_generation(self) -> int:
+        return 1 if self._journal is None else self._journal.read().cycle_generation
 
     def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
         if self._closed:
@@ -3977,9 +4658,16 @@ class ProgramRuntime:
                 "unobserved_applies": [],
                 "history_changed": False,
             }
-        activation, _program, reconciliation = self._reconcile_persistent_keys(
+        activation, program, reconciliation = self._reconcile_persistent_keys(
             register, projection=projection
         )
+        # A cold Apply changes the Applied binding: the cell-level source
+        # follows it (same cycle_generation, new binding); a repeated notice
+        # keeps the current source.
+        self._applied_condition_keys = (
+            () if program is None else program.interrupt_condition_keys
+        )
+        self._follow_cell_bbkey_source()
         return {
             "schema_version": PERSISTENT_KEY_RECONCILIATION_VERSION,
             "outcome": reconciliation.outcome,
@@ -4294,6 +4982,9 @@ class ProgramRuntime:
                         register.remove(scenario_id, request.key, edit=edit)
                 except PersistentKeyRegisterError as error:
                     raise _persistent_storage_error(error) from error
+                self._follow_idle_persistent_edit(
+                    request.key, getattr(request, "value", None), reset=action != "set"
+                )
             else:
                 controls = self._controls(program_run_id)
                 controls.require_event_revisions()
@@ -4374,6 +5065,9 @@ class ProgramRuntime:
                 )
             except PersistentKeyRegisterError as error:
                 raise _persistent_storage_error(error) from error
+            for key, declaration in declarations.items():
+                if declaration.access in OPERATOR_WRITABLE_ACCESS:
+                    self._follow_idle_persistent_edit(key, None, reset=True)
             return {
                 "schema_version": PERSISTENT_KEY_EDIT_VERSION,
                 "request_id": request.request_id,
@@ -4521,11 +5215,24 @@ class ProgramRuntime:
                 )
             program_run_id = cycle.program_run_id
             selection_scope = self._owner.operator_stop_scope(program_run_id)
+            # The offer id names one hold: the focused offer or any held node's.
             offer = self._recovery_offer(
                 program_run_id,
                 cycle_generation=cycle.cycle_generation,
                 selection_scope=selection_scope,
             )
+            focused = offer is not None and offer.get("offer_id") == request.offer_id
+            if not focused:
+                offer = next(
+                    (
+                        row["offer"]
+                        for row in self._recovery_offers(
+                            program_run_id, cycle_generation=cycle.cycle_generation
+                        )
+                        if row["offer"].get("offer_id") == request.offer_id
+                    ),
+                    offer,
+                )
             action = (
                 None
                 if offer is None
@@ -4551,7 +5258,13 @@ class ProgramRuntime:
                         "recovery offer or selected action is no longer current",
                     )
                 )
-            intervention = self._owner.intervention(program_run_id)
+            intervention = (
+                self._owner.intervention(program_run_id)
+                if focused
+                else self._owner.intervention(
+                    program_run_id, node_attempt_id=offer["node_attempt_id"]
+                )
+            )
             if intervention is None:
                 reject(
                     ProgramRunnerError(
@@ -4609,17 +5322,16 @@ class ProgramRuntime:
             try:
                 owner_result = None
                 cycle_resumed = False
+                # Acknowledge, Reset and Continue count no failure Retry.
+                counts_retry = not is_non_moving_recovery(
+                    request.action_id
+                ) and request.action_id != "continue_with_failure"
                 controls.require_event_revisions(
-                    events=(
-                        1
-                        if request.action_id
-                        in {"acknowledge_and_continue", "reset_cycle"}
-                        else 2
-                    ),
+                    events=2 if counts_retry else 1,
                     reserved_after=0 if request.action_id == "reset_cycle" else 1,
                 )
                 if (
-                    request.action_id not in {"reset_cycle", "acknowledge_and_continue"}
+                    counts_retry
                     and intervention.policy_parameter != "operator_stop_policy"
                 ):
                     # The same captured-policy predicate that built the offer,
@@ -4694,13 +5406,30 @@ class ProgramRuntime:
                         "runtime_controls": None,
                         "recovery_offer": None,
                     }
-                elif (
-                    intervention.policy_parameter != "operator_stop_policy"
-                    and request.action_id != "acknowledge_and_continue"
+                elif request.action_id == "continue_with_failure":
+                    # Continue: close the held operation, release the hold's
+                    # groups like Retry; the held node returns FAILURE.
+                    effect_started = True
+                    snapshot = self._owner.continue_failure_pause(
+                        program_run_id,
+                        node_attempt_id=intervention.identity.node_attempt_id,
+                        request_id=request.request_id,
+                        reason=request.reason,
+                    )
+                    owner_effect_accepted = True
+                    snapshot = self._host.resume_recovery(
+                        program_run_id,
+                        node_attempt_id=intervention.identity.node_attempt_id,
+                        action="manual_failure",
+                    )
+                    owner_result = {"accepted": True, "action": request.action_id}
+                    cycle_resumed = True
+                elif intervention.policy_parameter != "operator_stop_policy" and not (
+                    is_non_moving_recovery(request.action_id)
                 ):
                     # Failure pause Retry: recover the interrupted tasks and
-                    # the failed step while all motion stays held, release all
-                    # Program motion, then let the tree tick again.
+                    # the failed step while the hold's motion stays held,
+                    # release its groups, then let the tree tick again.
                     effect_started = True
                     snapshot = self._owner.retry_failure_pause(
                         program_run_id,
@@ -5963,6 +6692,7 @@ class ProgramRuntime:
                 request_owner_epoch=request.request_owner_epoch, request_id=request.request_id,
                 result=result,
             )
+            self._follow_cell_bbkey_source()
             return result
         except Exception as error:
             cause = error if isinstance(error, ProgramRunnerError) else ProgramRunnerError(
@@ -6471,6 +7201,7 @@ class ProgramRuntime:
                         self._host.reset_retained_run(request.program_run_id)
                     elif retained_run is not None:
                         self._host.reset_run(request.program_run_id)
+                        self._reset_bbkey_publication(request.program_run_id)
                     controls = self._optional_controls(request.program_run_id)
                     if controls is not None:
                         controls.mark_reset(
@@ -6640,6 +7371,7 @@ class ProgramRuntime:
                     request.program_run_id,
                     None,
                 )
+            self._follow_cell_bbkey_source()
             return result
 
     def shutdown(self) -> None:
@@ -6651,6 +7383,7 @@ class ProgramRuntime:
         with self._control_state_observer_lock:
             self._control_state_observers.clear()
         errors: list[Exception] = []
+        self._retire_bbkey_publishers()
         if self._liveness is not None:
             try:
                 self._liveness.close()

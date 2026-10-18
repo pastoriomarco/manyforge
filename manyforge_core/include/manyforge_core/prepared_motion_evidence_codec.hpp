@@ -8,9 +8,10 @@
 namespace manyforge::core {
 
 [[nodiscard]] Result<std::string> EncodePreparedMotionPlanningEvidence(
-    const PreparedMotionPlanningEvidenceDTO& value);
+    const PreparedMotionPlanningEvidenceDTO& value,
+    const MovingReplacementInputDTO* replacement = nullptr);
 [[nodiscard]] Result<PreparedMotionPlanningEvidenceDTO> DecodePreparedMotionPlanningEvidence(
-    std::string_view canonical_bytes);
+    std::string_view canonical_bytes, const MovingReplacementInputDTO* replacement = nullptr);
 [[nodiscard]] Result<std::string> EncodePreparedMotionValidationEvidence(
     const PreparedMotionValidationEvidenceDTO& value);
 [[nodiscard]] Result<PreparedMotionValidationEvidenceDTO> DecodePreparedMotionValidationEvidence(

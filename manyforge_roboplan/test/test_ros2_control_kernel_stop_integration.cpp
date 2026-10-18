@@ -1264,9 +1264,9 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
       return before->state == core::OperationStateKind::kExecuting;
     })) << "Kernel operation never observed the active ros2_control goal";
     ASSERT_EQ(before->participants.size(), 1U);
-    const auto goal_id = before->participants.front().controller_goal_id;
+    const auto goal_id = before->participants.front().command_id;
     const auto goal_generation =
-        before->participants.front().controller_goal_generation;
+        before->participants.front().command_generation;
     EXPECT_EQ(server.cancel_requests(), 0U);
     EXPECT_TRUE(stop_port.results().empty());
 
@@ -1625,8 +1625,8 @@ TEST(Ros2ControlKernelStopIntegrationTest,
     const auto second_operation = ExecuteUntilActive(kernel, engine, binding, "epoch2");
     ASSERT_TRUE(fake::WaitUntil([&] { return jtc.goals_received() == goals_before + 1U; }));
     const core::ExecutionGoalKey second_key{
-        second_operation.participants.front().controller_goal_id,
-        second_operation.participants.front().controller_goal_generation};
+        second_operation.participants.front().command_id,
+        second_operation.participants.front().command_generation};
     const auto dispatched = second->ReadGoal(second_key);
     ASSERT_TRUE(dispatched.has_value());
     EXPECT_EQ(dispatched->binding_epoch, core::ExecutionBindingEpoch(2U));

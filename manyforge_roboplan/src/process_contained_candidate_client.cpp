@@ -576,10 +576,17 @@ void send_frame(int descriptor, MessageType type, std::string_view payload,
 }
 
 [[nodiscard]] Clock::time_point
-request_deadline(double timeout_s, std::chrono::milliseconds grace) {
+request_deadline(double timeout_s, std::chrono::milliseconds grace,
+                 std::optional<Clock::time_point> started) {
   if (!std::isfinite(timeout_s) || timeout_s <= 0.0) {
     throw RequestFailure(RequestFailureKind::kProtocol,
                          "worker request timeout is invalid");
+  }
+  if (started &&
+      timeout_s >
+          std::chrono::duration<double>(std::chrono::hours(24)).count()) {
+    throw RequestFailure(RequestFailureKind::kProtocol,
+                         "worker request timeout is outside its hard bound");
   }
   const auto duration = std::chrono::duration<double>(timeout_s) + grace;
   const auto bounded = std::chrono::duration_cast<Clock::duration>(duration);
@@ -587,7 +594,7 @@ request_deadline(double timeout_s, std::chrono::milliseconds grace) {
     throw RequestFailure(RequestFailureKind::kProtocol,
                          "worker request timeout is outside its hard bound");
   }
-  return Clock::now() + bounded;
+  return started.value_or(Clock::now()) + bounded;
 }
 
 [[nodiscard]] core::ErrorDTO
@@ -1039,7 +1046,9 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
   template <typename Value, typename Encode, typename Decode>
   [[nodiscard]] core::Result<Value>
   transact(MessageType request_type, MessageType response_type,
-           double timeout_s, bool ik, Encode encode, Decode decode) {
+           double timeout_s, bool ik, Encode encode, Decode decode,
+           bool whole_preparation_budget = false) {
+    const auto request_started = Clock::now();
     auto active = std::make_shared<ActiveRequest>();
     std::shared_ptr<ActiveRequest> expected;
     if (!active_request.compare_exchange_strong(expected, active,
@@ -1072,11 +1081,18 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     }
 
     try {
-      const auto deadline =
-          request_deadline(timeout_s, config.request_transport_grace);
+      const auto deadline = request_deadline(
+          timeout_s,
+          whole_preparation_budget ? std::chrono::milliseconds::zero()
+                                   : config.request_transport_grace,
+          whole_preparation_budget ? std::optional{request_started}
+                                   : std::nullopt);
       start_worker(active,
                    std::min(deadline, Clock::now() + config.startup_timeout));
-      const std::string payload = encode();
+      if (whole_preparation_budget) {
+        check_request(active, deadline);
+      }
+      const std::string payload = encode(deadline);
       send_frame(worker->socket.get(), request_type, payload,
                  config.maximum_request_bytes, active, deadline);
       auto response =
@@ -1094,7 +1110,11 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
                              "worker returned an unexpected response type");
       }
       try {
-        return decode(response.payload);
+        auto result = decode(response.payload);
+        if (whole_preparation_budget) {
+          check_request(active, deadline);
+        }
+        return result;
       } catch (const std::invalid_argument &) {
         throw RequestFailure(RequestFailureKind::kProtocol,
                              "worker response payload is malformed");
@@ -1146,12 +1166,24 @@ core::Result<core::TrajectoryDTO>
 ProcessContainedRoboPlanCandidateClient::compute(
     const RoboPlanCandidateRequestDTO &request) {
   return impl_->transact<core::TrajectoryDTO>(
-      MessageType::kPlan, MessageType::kPlanResult, request.planning_timeout_s,
+      MessageType::kPlan, MessageType::kPlanResult,
+      request.moving_replacement
+          ? request.moving_replacement->remaining_preparation_budget_s
+          : request.planning_timeout_s,
       false,
-      [&request] { return worker_protocol::encode_candidate_request(request); },
+      [&request](Clock::time_point deadline) {
+        if (!request.moving_replacement) {
+          return worker_protocol::encode_candidate_request(request);
+        }
+        auto remaining = request;
+        remaining.moving_replacement->remaining_preparation_budget_s =
+            std::chrono::duration<double>(deadline - Clock::now()).count();
+        return worker_protocol::encode_candidate_request(remaining);
+      },
       [](std::string_view bytes) {
         return worker_protocol::decode_trajectory_result(bytes);
-      });
+      },
+      request.moving_replacement.has_value());
 }
 
 core::Result<std::vector<double>>
@@ -1161,7 +1193,8 @@ ProcessContainedRoboPlanCandidateClient::solve_ik(
     const core::ControlledStateDTO &seed_state, double timeout_s) {
   return impl_->transact<std::vector<double>>(
       MessageType::kIk, MessageType::kIkResult, timeout_s, true,
-      [&goal, &base_frame, &tcp_frame, &seed_state, timeout_s] {
+      [&goal, &base_frame, &tcp_frame, &seed_state,
+       timeout_s](Clock::time_point) {
         return worker_protocol::encode_ik_request(
             worker_protocol::WorkerIkRequestDTO{goal, base_frame, tcp_frame,
                                                 seed_state, timeout_s});

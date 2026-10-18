@@ -363,3 +363,22 @@ export function previousSessionAlarmHandoff(
       || receipt.status === 'quiet')) return currentSessionId;
   return previousHandoff;
 }
+
+/** How long a brief, event-triggered notice stays presented. */
+export const BRIEF_NOTICE_MS = 8_000;
+
+/**
+ * Presents one completed-operation message briefly, then removes it from
+ * presentation. The backend keeps the durable record; nothing is stored here.
+ */
+export function useBriefNotice(notice: WorkbenchNotice | null): WorkbenchNotice | null {
+  const [visible, setVisible] = useState<string | null>(null);
+  const key = notice === null ? null : `${notice.id}\n${notice.message}`;
+  useEffect(() => {
+    setVisible(key);
+    if (key === null) return undefined;
+    const timer = window.setTimeout(() => setVisible(null), BRIEF_NOTICE_MS);
+    return () => window.clearTimeout(timer);
+  }, [key]);
+  return notice !== null && visible === key ? notice : null;
+}

@@ -11,6 +11,53 @@ _SCENE_ID = "sha256:" + ("2" * 64)
 _SCENE_CONTENT_DIGEST = "sha256:" + ("3" * 64)
 
 
+def test_provider_domain_scope_has_real_driver_identity_without_motion_fields():
+    provider = core.ProviderControlDomainDTO(
+        core.ControllableComponentId("device.io"), core.RuntimeUnitId("host.io"),
+        core.ProviderInstanceId("driver.io"), core.ProviderManifestId("manyforge.provider.io_signals"),
+        core.ProviderManifestRevision(_MANIFEST_REVISION), core.ContentDigest(_SCENE_CONTENT_DIGEST),
+        core.ContentDigest(_SCENE_ID), ["ready"], 30_000_000_000,
+    )
+    assert provider.locally_valid()
+    domain = core.ControlDomainDTO(
+        core.ControlDomainId("domain.io"), core.ControlDomainRevision(_MANIFEST_REVISION),
+        [core.RuntimeUnitId("host.io")], core.EndpointRoleId("io.driver"),
+        core.ContainmentGranularity.kControlDomain, provider,
+    )
+    expected = core.ExpectedControlDomainRevisionDTO(
+        domain.control_domain_id, domain.control_domain_revision,
+        core.ExpectedProviderDomainScopeDTO(provider, _expected_configuration()),
+    )
+    actual = core.ResolvedLifecycleControlDomainScopeDTO(
+        domain.control_domain_id, domain.control_domain_revision,
+        core.ResolvedProviderDomainScopeDTO(provider, core.RuntimeEpoch("host.epoch")),
+    )
+    assert expected.locally_valid() and actual.locally_valid()
+    assert domain.provider == provider
+    assert actual.provider.provider == provider
+    assert actual.provider.active_control_configuration is None
+    assert actual.provider.output_resources == ()
+    assert expected.provider.provider.lifecycle_command_timeout_ns == 30_000_000_000
+    proof = core.ProviderConfigurationFenceOccurrenceDTO(
+        provider.controllable_component_id, provider.provider_instance_id,
+        provider.signal_configuration_digest,
+    )
+    fenced = core.ConfigurationFenceDomainScopeDTO(
+        domain.control_domain_id, None, domain.control_domain_revision,
+        core.ProviderConfigurationFenceDomainDTO(candidate_provider=proof),
+    )
+    scope = core.ConfigurationFenceScopeDTO([provider.controllable_component_id], [fenced], [], [])
+    assert scope.valid()
+    assert fenced.provider.candidate_provider == proof
+    capability_target = core.ControlDomainCapabilityProviderTargetDTO(
+        domain.control_domain_id, domain.control_domain_revision,
+        core.ProviderControlDomainCapabilityTargetDTO(),
+    )
+    assert capability_target.is_provider
+    with pytest.raises(RuntimeError):
+        _ = domain.controller_topology_id
+
+
 def test_program_node_admission_and_no_admission_result_are_bound():
     evidence = core.ProgramNodeAdmissionEvidenceDTO(
         core.RequestOwnerEpoch("runner.1"), core.ProgramRunId("run.1"),

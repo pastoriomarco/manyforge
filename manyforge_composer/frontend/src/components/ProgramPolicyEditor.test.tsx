@@ -142,4 +142,38 @@ describe('ProgramPolicyEditor', () => {
       allow_intervention: false, max_retries: 0,
     });
   });
+
+  it('shows the intervention stop scope only while intervention is allowed', () => {
+    const off = renderToStaticMarkup(
+      <ProgramPolicyEditor node={node} busy={false} onUpdate={vi.fn()} />,
+    );
+    expect(off).not.toContain('Groups that stop');
+    const on = renderToStaticMarkup(
+      <ProgramPolicyEditor node={{ ...node, recovery_policy: { allow_intervention: true, max_retries: 0 } }}
+        busy={false} onUpdate={vi.fn()} />,
+    );
+    expect(on).toContain('Groups that stop');
+    expect(on).toContain('<option value="all" selected="">All groups</option>');
+    expect(on).toContain('<option value="own_groups">Only this node&#x27;s groups</option>');
+    expect(on).toContain('Which motion groups stop while the run waits for the operator.');
+  });
+
+  it('writes the stop scope only as the non-default own_groups while intervention is allowed', () => {
+    expect(effectiveProgramPolicy(node).intervention_stop_scope).toBe('all');
+    const scoped = effectiveProgramPolicy({
+      ...node,
+      recovery_policy: { allow_intervention: true, max_retries: 0, intervention_stop_scope: 'own_groups' },
+    });
+    expect(scoped.intervention_stop_scope).toBe('own_groups');
+    expect(programRecoveryPolicy(scoped)).toEqual({
+      allow_intervention: true, max_retries: 0, intervention_stop_scope: 'own_groups',
+    });
+    // The default is saved by omission; a hidden scope is not written while intervention is off.
+    expect(programRecoveryPolicy({ ...scoped, intervention_stop_scope: 'all' })).toEqual({
+      allow_intervention: true, max_retries: 0,
+    });
+    expect(programRecoveryPolicy({ ...scoped, allow_intervention: false })).toEqual({
+      allow_intervention: false, max_retries: 0,
+    });
+  });
 });
