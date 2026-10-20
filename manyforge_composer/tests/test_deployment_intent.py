@@ -277,7 +277,8 @@ def test_draft_session_edits_intent_target_setting_and_round_trips_state() -> No
     assert restored.retained_state() == retained
 
 
-def test_draft_session_edits_one_authored_stop_profile_by_target() -> None:
+@pytest.mark.parametrize("stop_mode", ["spring_back_hold", "spring_back_fast"])
+def test_draft_session_edits_one_authored_stop_profile_by_target(stop_mode: str) -> None:
     session = DeploymentDraftSession()
     initial = session.retained_state()
     opened = session.preview_source(json.dumps(_intent()))
@@ -291,7 +292,7 @@ def test_draft_session_edits_one_authored_stop_profile_by_target() -> None:
     current = session.retained_state()
     edited = session.preview_controlled_stop_update(
         {
-            "stop_mode": "spring_back_hold",
+            "stop_mode": stop_mode,
             "allow_natural_completion_on_short_path": False,
             "jerk_limits_enabled": False,
             "deceleration_time_s": 1.25,
@@ -319,7 +320,7 @@ def test_draft_session_edits_one_authored_stop_profile_by_target() -> None:
     stop = edited.document["components"][1]["target_settings"]["arm"][
         "controlled_stop"
     ]
-    assert stop["stop_mode"] == "spring_back_hold"
+    assert stop["stop_mode"] == stop_mode
     assert stop["per_joint_limits"] == [
         {
             "source_joint_name": "joint1",

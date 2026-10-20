@@ -805,7 +805,11 @@ WorkerInitializationDTO decode_initialization(std::string_view bytes) {
 }
 
 std::string encode_candidate_request(
-    const RoboPlanCandidateRequestDTO& value) {
+    const RoboPlanCandidateRequestDTO& value,
+    std::optional<std::int64_t> planning_deadline_ns) {
+  if (planning_deadline_ns &&
+      (!value.moving_replacement || !value.moving_replacement->remaining_planning_budget_s))
+    fail("moving planning deadline needs a planning budget");
   Encoder encoder;
   write_strong(encoder, value.controllable_component_id);
   write_strong(encoder, value.command_target_id);
@@ -847,12 +851,24 @@ std::string encode_candidate_request(
                           moving.source_speed_profile.max_tcp_linear_speed_mps);
     write_dynamics(encoder, moving.source_per_resource_dynamics_limits);
     encoder.floating(moving.remaining_preparation_budget_s);
+    // Keep legacy moving payloads byte-identical when the new cap is absent.
+    if (moving.remaining_planning_budget_s) {
+      encoder.boolean(true);
+      encoder.floating(*moving.remaining_planning_budget_s);
+      encoder.optional(planning_deadline_ns, [](Encoder& out, std::int64_t deadline) {
+        if (deadline <= 0) fail("moving planning deadline is invalid");
+        out.u64(static_cast<std::uint64_t>(deadline));
+      });
+    } else if (planning_deadline_ns) {
+      fail("moving planning deadline needs a planning budget");
+    }
   }
   return std::move(encoder).finish();
 }
 
 RoboPlanCandidateRequestDTO decode_candidate_request(
-    std::string_view bytes) {
+    std::string_view bytes, std::optional<std::int64_t>* planning_deadline_ns) {
+  if (planning_deadline_ns) planning_deadline_ns->reset();
   Decoder decoder(bytes);
   RoboPlanCandidateRequestDTO value{
       read_strong<core::ControllableComponentId>(decoder),
@@ -899,6 +915,18 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
                               read_optional_double(decoder)},
         read_dynamics(decoder),
         decoder.floating()};
+    if (!decoder.at_end()) {
+      if (!decoder.boolean()) fail("absent moving-planning extension must be omitted");
+      value.moving_replacement->remaining_planning_budget_s = decoder.floating();
+      const auto deadline = decoder.optional<std::int64_t>([](Decoder& input) {
+        const auto stamp = input.u64();
+        if (stamp == 0U || stamp > static_cast<std::uint64_t>(
+                                     std::numeric_limits<std::int64_t>::max()))
+          fail("moving planning deadline is invalid");
+        return static_cast<std::int64_t>(stamp);
+      });
+      if (planning_deadline_ns) *planning_deadline_ns = deadline;
+    }
   }
   decoder.require_end();
   return value;

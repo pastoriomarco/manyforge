@@ -523,13 +523,12 @@ measure_cartesian_frame_dynamics_envelope(
         const std::array<double, 4> acceleration_coefficients{
             2.0 * coefficients[2], 6.0 * coefficients[3],
             12.0 * coefficients[4], 20.0 * coefficients[5]};
-        group_positions[static_cast<Eigen::Index>(joint)] =
-            static_cast<double>(
-                evaluate_polynomial(coefficients, normalized_time));
+        group_positions[static_cast<Eigen::Index>(joint)] = static_cast<double>(
+            evaluate_polynomial(coefficients, normalized_time));
         group_velocities[static_cast<Eigen::Index>(joint)] =
-            static_cast<double>(evaluate_polynomial(
-                                    velocity_coefficients, normalized_time) /
-                                duration);
+            static_cast<double>(
+                evaluate_polynomial(velocity_coefficients, normalized_time) /
+                duration);
         group_accelerations[static_cast<Eigen::Index>(joint)] =
             static_cast<double>(evaluate_polynomial(
                                     acceleration_coefficients,

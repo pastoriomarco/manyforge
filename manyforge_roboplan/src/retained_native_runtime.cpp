@@ -493,9 +493,12 @@ retained_controlled_stop_profiles(
 
 // This policy belongs to the currently installed cell product, not a retained
 // component's bundle or a planner configuration captured before Apply.
-[[nodiscard]] std::optional<double>
-current_cell_takeover_budget(const RetainedNativeCellRuntime *cell,
-                             const core::RuntimeParticipantBinding &binding) {
+[[nodiscard]] std::optional<double> current_cell_takeover_budget(
+    const RetainedNativeCellRuntime *cell,
+    const core::RuntimeParticipantBinding &binding,
+    std::optional<double> core::RuntimeParticipantExecutionRegistration::*
+        field = &core::RuntimeParticipantExecutionRegistration::
+                    motion_takeover_preparation_budget_s) {
   if (cell == nullptr ||
       binding.value().capability_id.value() != "execution.trajectory.execute") {
     return std::nullopt;
@@ -506,7 +509,7 @@ current_cell_takeover_budget(const RetainedNativeCellRuntime *cell,
             binding.value().controllable_component_id &&
         source.command_target_id == binding.value().command_target_id &&
         source.capability_id == binding.value().capability_id) {
-      return row.motion_takeover_preparation_budget_s;
+      return row.*field;
     }
   }
   return std::nullopt;
@@ -582,6 +585,10 @@ runtime_registration(const RetainedNativeRuntime &owner, Args &&...args) {
   }
   registration.motion_takeover_preparation_budget_s =
       current_cell_takeover_budget(cell, registration.binding);
+  registration.motion_takeover_planning_budget_s = current_cell_takeover_budget(
+      cell, registration.binding,
+      &core::RuntimeParticipantExecutionRegistration::
+          motion_takeover_planning_budget_s);
   return registration;
 }
 
@@ -1045,6 +1052,8 @@ make_kernel_participant_resolver(
           physical->direct_control_joint_limits;
       registration.motion_takeover_preparation_budget_s =
           physical->motion_takeover_preparation_budget_s;
+      registration.motion_takeover_planning_budget_s =
+          physical->motion_takeover_planning_budget_s;
       return core::Result<core::RuntimeParticipantExecutionRegistration>::Ok(
           std::move(registration));
     } catch (const std::exception &exception) {
@@ -1109,7 +1118,9 @@ make_kernel_participant_resolver(
          predecessor.direct_control_joint_limits ==
              candidate.direct_control_joint_limits &&
          predecessor.motion_takeover_preparation_budget_s ==
-             candidate.motion_takeover_preparation_budget_s;
+             candidate.motion_takeover_preparation_budget_s &&
+         predecessor.motion_takeover_planning_budget_s ==
+             candidate.motion_takeover_planning_budget_s;
 }
 
 } // namespace
@@ -2748,6 +2759,10 @@ void RetainedNativeRuntime::BindCellRuntimeOwner(
     for (auto &row : component.participant_registrations) {
       row.motion_takeover_preparation_budget_s =
           current_cell_takeover_budget(&cell, row.binding);
+      row.motion_takeover_planning_budget_s = current_cell_takeover_budget(
+          &cell, row.binding,
+          &core::RuntimeParticipantExecutionRegistration::
+              motion_takeover_planning_budget_s);
     }
   };
   seed_current_policy(runtime);

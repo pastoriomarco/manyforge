@@ -303,3 +303,77 @@ describe('Deployment interrupt rules and output acknowledgement', () => {
     await act(() => root.unmount());
   });
 });
+
+describe('Deployment motion takeover timing', () => {
+  const enter = async (mounted: Awaited<ReturnType<typeof mountDeployment>>, label: string, value: string) => {
+    await mounted.type(label, value);
+    await act(() => (mounted.control(label).onBlur as (() => void) | undefined)?.());
+  };
+  const total = 'Takeover total preparation time';
+  const planning = 'Takeover planning budget';
+
+  it('keeps the planning budget unavailable while takeover is off', async () => {
+    const mounted = await mountDeployment({});
+    try {
+      expect(mounted.control(planning).disabled).toBe(true);
+      await enter(mounted, total, '0.5');
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(
+        ['policies', 'motion_takeover_preparation_budget_s'], 'set', 0.5);
+    } finally { await mounted.unmount(); }
+  });
+
+  it('writes the planning budget only strictly below the total', async () => {
+    const mounted = await mountDeployment({ motion_takeover_preparation_budget_s: 0.5 });
+    try {
+      await enter(mounted, planning, '0.5');
+      expect(mounted.controller.mutate).not.toHaveBeenCalled();
+      await enter(mounted, planning, '0.35');
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(
+        ['policies', 'motion_takeover_planning_budget_s'], 'set', 0.35);
+    } finally { await mounted.unmount(); }
+  });
+
+  it('refuses a total at or below the planning budget and turning takeover off before clearing planning', async () => {
+    const mounted = await mountDeployment({
+      motion_takeover_preparation_budget_s: 0.5, motion_takeover_planning_budget_s: 0.3,
+    });
+    try {
+      await enter(mounted, total, '0.3');
+      await enter(mounted, total, '');
+      expect(mounted.controller.mutate).not.toHaveBeenCalled();
+      await enter(mounted, planning, '');
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(
+        ['policies', 'motion_takeover_planning_budget_s'], 'remove');
+      await enter(mounted, total, '0.8');
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(
+        ['policies', 'motion_takeover_preparation_budget_s'], 'set', 0.8);
+    } finally { await mounted.unmount(); }
+  });
+});
+
+describe('Deployment motion takeover refusal feedback', () => {
+  it('reports an owner refusal of a well-formed value without calling it malformed', async () => {
+    const mounted = await mountDeployment({ motion_takeover_preparation_budget_s: 0.5 });
+    try {
+      vi.mocked(mounted.controller.mutate).mockResolvedValueOnce(null);
+      await mounted.type('Takeover planning budget', '0.4');
+      await act(() => (mounted.control('Takeover planning budget').onBlur as (() => void) | undefined)?.());
+      const texts = mounted.all((props) => typeof props.children === 'string').map((props) => props.children);
+      expect(texts).toContain('Value was rejected.');
+      expect(texts).toContain('The Deployment owner rejected this timing change.');
+      expect(texts.some((text) => String(text).startsWith('Enter a positive value'))).toBe(false);
+    } finally { await mounted.unmount(); }
+  });
+});
+
+describe('Deployment motion takeover default planning budget', () => {
+  it('shows the derived 80% default for an omitted planning budget and writes nothing', async () => {
+    const mounted = await mountDeployment({ motion_takeover_preparation_budget_s: 0.5 });
+    try {
+      expect(mounted.control('Takeover planning budget').placeholder).toBe('default 0.4');
+      expect(mounted.all((props) => Array.isArray(props.children)
+        && props.children.includes('Default planning budget: 0.4 s (80% of the total). '))).toHaveLength(1);
+      expect(mounted.controller.mutate).not.toHaveBeenCalled();
+    } finally { await mounted.unmount(); }
+  });
+});

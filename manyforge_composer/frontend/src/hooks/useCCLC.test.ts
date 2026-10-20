@@ -904,4 +904,56 @@ describe('mounted explicit activation API boundaries', () => {
     expect(hook!.error).toContain('applied publication changed');
   });
 
+  it('deactivates exactly the listed changed components in the given order with positive Disabled observations', async () => {
+    await mountCCLC();
+    const states: Record<string, CCLCComponentSnapshot['lifecycleState']> = {
+      'component.other': 'active', 'component.arm': 'active' };
+    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, controllableComponentId: id,
+      lifecycleState: states[id]!, readiness: readiness(states[id]!) }));
+    apiMock.cclc.submitLifecycle.mockImplementation(async (request) => {
+      states[request.controllable_component_id] = 'disabled';
+      return acceptedLifecycle(request.intent);
+    });
+    let observation!: Awaited<ReturnType<NonNullable<typeof hook>['readActivationSequence']>>;
+    await act(async () => { observation = await hook!.readActivationSequence(); });
+    let result: Awaited<ReturnType<NonNullable<typeof hook>['deactivateComponents']>> = { succeeded: false };
+    await act(async () => {
+      result = await hook!.deactivateComponents(['component.arm', 'component.other'], observation.identity);
+    });
+    expect(result.succeeded).toBe(true);
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => [request.controllable_component_id, request.intent]))
+      .toEqual([['component.arm', 'disable'], ['component.other', 'disable']]);
+    // Already inactive components are observed, never cycled.
+    apiMock.cclc.submitLifecycle.mockClear();
+    await act(async () => { observation = await hook!.readActivationSequence(); });
+    await act(async () => {
+      result = await hook!.deactivateComponents(['component.arm'], observation.identity);
+    });
+    // Nothing was disabled, so no admission was consumed.
+    expect(result).toEqual({ succeeded: true, consumedAdmissionGeneration: null });
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  });
+
+  it('stops deactivation at the first refusal and never touches the next component', async () => {
+    await mountCCLC();
+    const states: Record<string, CCLCComponentSnapshot['lifecycleState']> = {
+      'component.other': 'active', 'component.arm': 'active' };
+    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, controllableComponentId: id,
+      lifecycleState: states[id]!, readiness: readiness(states[id]!) }));
+    apiMock.cclc.submitLifecycle.mockImplementation(async (request) => ({
+      ...acceptedLifecycle(request.intent),
+      status: { ...acceptedLifecycle(request.intent).status, terminalResult: 'failed_known_no_effect' as const,
+        error: { code: 'cell_not_idle', message: 'Only while the cell is idle', details: {} } },
+    }));
+    let observation!: Awaited<ReturnType<NonNullable<typeof hook>['readActivationSequence']>>;
+    await act(async () => { observation = await hook!.readActivationSequence(); });
+    let result: Awaited<ReturnType<NonNullable<typeof hook>['deactivateComponents']>> = { succeeded: true, consumedAdmissionGeneration: null };
+    await act(async () => {
+      result = await hook!.deactivateComponents(['component.arm', 'component.other'], observation.identity);
+    });
+    expect(result.succeeded).toBe(false);
+    expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledOnce();
+    expect(hook!.error).toBe('Only while the cell is idle');
+  });
+
 });

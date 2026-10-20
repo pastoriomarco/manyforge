@@ -447,6 +447,35 @@ const RULE_FIELDS = new Set([
   'rule_id', 'condition', 'scope', 'priority', 'idle_behaviour', 'latch_release', 'stop_entry_stage_id',
 ]);
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
+/** The components whose signals a condition reads (its source providers). */
+export function conditionSignalComponents(condition: JsonValue | undefined): string[] {
+  const found = new Set<string>();
+  const walk = (value: JsonValue | undefined) => {
+    const record = objectOf(value);
+    if (record === null) return;
+    const signal = objectOf(objectOf(objectOf(record.compare)?.operand)?.signal);
+    if (typeof signal?.controllable_component_id === 'string') found.add(signal.controllable_component_id);
+    for (const child of [...(Array.isArray(record.all) ? record.all : []),
+      ...(Array.isArray(record.any) ? record.any : []), record.not]) walk(child);
+  };
+  walk(condition);
+  return [...found].sort();
+}
+
+/** Global rules that read a signal of one of these components, with the components they read. */
+export function globalRulesReadingComponents(
+  document: Record<string, JsonValue> | null,
+  componentIds: readonly string[],
+): Array<{ ruleId: string; componentIds: string[] }> {
+  return (globalRulesOf(document) ?? []).flatMap((row) => {
+    const rule = objectOf(row);
+    const sources = conditionSignalComponents(rule?.condition)
+      .filter((id) => componentIds.includes(id));
+    return typeof rule?.rule_id === 'string' && sources.length > 0
+      ? [{ ruleId: rule.rule_id, componentIds: sources }] : [];
+  });
+}
+
 const GROUP_ID = /^[a-z][a-z0-9_.-]*$/;
 
 /** The Draft's `policies.interrupt_rules` rows, verbatim (null when malformed). */

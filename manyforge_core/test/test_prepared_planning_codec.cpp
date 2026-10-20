@@ -207,6 +207,30 @@ TEST(PreparedPlanningCodecTest, RoundTripsCompletePlanRequestWithoutPrivateHandl
   EXPECT_FALSE(DecodePreparedPlanRequest(overflow).ok());
 }
 
+TEST(PreparedPlanningCodecTest, MovingPlanningBudgetIsOptionalClosedAndRoundTrips) {
+  auto request = MovingRequest();
+  const auto legacy = EncodePreparedPlanRequest(request);
+  ASSERT_TRUE(legacy.ok());
+  EXPECT_EQ(legacy.value().find("remaining_planning_budget_s"), std::string::npos);
+  EXPECT_FALSE(DecodePreparedPlanRequest(legacy.value())
+                   .value()
+                   .moving_replacement->remaining_planning_budget_s);
+  request.moving_replacement->remaining_planning_budget_s = 0.5;
+  const auto encoded = EncodePreparedPlanRequest(request);
+  ASSERT_TRUE(encoded.ok());
+  const auto decoded = DecodePreparedPlanRequest(encoded.value());
+  ASSERT_TRUE(decoded.ok());
+  EXPECT_EQ(decoded.value().moving_replacement->remaining_planning_budget_s,
+            std::optional<double>(0.5));
+  EXPECT_EQ(EncodePreparedPlanRequest(decoded.value()).value(), encoded.value());
+  for (const auto invalid : {0.0, -1.0, 2.0, std::numeric_limits<double>::infinity()}) {
+    request.moving_replacement->remaining_planning_budget_s = invalid;
+    EXPECT_FALSE(EncodePreparedPlanRequest(request).ok());
+  }
+  request.moving_replacement->remaining_planning_budget_s.reset();
+  EXPECT_EQ(EncodePreparedPlanRequest(request).value(), legacy.value());
+}
+
 TEST(PreparedPlanningCodecTest, MovingRequestBindsSourceTimeFramesAndClosedContext) {
   auto request = MovingRequest();
   std::visit([](auto& frame) { frame.compiled_frame_name += "_old"; },
@@ -237,7 +261,7 @@ TEST(PreparedPlanningCodecTest, MovingRequestBindsSourceTimeFramesAndClosedConte
     if (mutation == 3) context.suffix_start_state.control_route_id = ControlRouteId("other.route");
     if (mutation == 4)
       context.source_prefix_trajectory.runtime_scale_bounds =
-          TrajectoryRuntimeScaleBoundsDTO{2.0, 8.0};
+          TrajectoryRuntimeScaleBoundsDTO{-2.0, 8.0};
     if (mutation == 5) invalid.start_state.velocities.reset();
     if (mutation == 6) {
       context.source_cursor_s = -2.0;
@@ -260,6 +284,26 @@ TEST(PreparedPlanningCodecTest, MovingRequestBindsSourceTimeFramesAndClosedConte
   ASSERT_NE(goal, std::string::npos);
   unknown.insert(goal + std::string("\"source_goal\":{").size(), "\"unknown\":true,");
   EXPECT_FALSE(DecodePreparedPlanRequest(unknown).ok());
+
+  request.moving_replacement->source_prefix_trajectory.runtime_scale_bounds =
+      TrajectoryRuntimeScaleBoundsDTO{2.0, 8.0, 1.1, 1.2};
+  const auto retained = EncodePreparedPlanRequest(request);
+  ASSERT_TRUE(retained.ok()) << retained.error().details.at("reason");
+  const auto retained_decoded = DecodePreparedPlanRequest(retained.value());
+  ASSERT_TRUE(retained_decoded.ok());
+  const auto& bounds =
+      retained_decoded.value().moving_replacement->source_prefix_trajectory.runtime_scale_bounds;
+  ASSERT_TRUE(bounds);
+  EXPECT_EQ(bounds->max_rate_per_s, 2.0);
+  EXPECT_EQ(bounds->max_rate_change_per_s2, 8.0);
+  EXPECT_EQ(bounds->max_stop_path_rate, 1.1);
+  EXPECT_EQ(bounds->nominal_time_multiplier, 1.2);
+  EXPECT_EQ(EncodePreparedPlanRequest(retained_decoded.value()).value(), retained.value());
+  // Nonzero moving PVA is valid only in the internal retained-prefix role.
+  EXPECT_FALSE(EncodePreparedTrajectory(request.moving_replacement->source_prefix_trajectory).ok());
+  auto invalid_terminal = MovingTrajectory(request);
+  invalid_terminal.waypoints.back().velocities_rad_s[0] = 0.1;
+  EXPECT_FALSE(EncodePreparedTrajectory(invalid_terminal, &*request.moving_replacement).ok());
 
   request.moving_replacement.reset();
   const auto ordinary = EncodePreparedPlanRequest(request);

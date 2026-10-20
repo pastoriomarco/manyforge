@@ -4983,6 +4983,11 @@ NativeCellComponentRegistrations(const Composition &cell) {
                   "execution.trajectory.execute"
               ? cell.bundle->value().motion_takeover_preparation_budget_s
               : std::nullopt;
+      row.motion_takeover_planning_budget_s =
+          row.binding.value().capability_id.value() ==
+                  "execution.trajectory.execute"
+              ? cell.bundle->value().motion_takeover_planning_budget_s
+              : std::nullopt;
     }
     result.insert(result.end(), std::make_move_iterator(rows.begin()),
                   std::make_move_iterator(rows.end()));
@@ -12745,6 +12750,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                                  "Manager or publication scope");
                 Result result{value, {}};
                 bool changing = false;
+                deployment::CCLCRuntimeComposition *lifecycle_owner = nullptr;
                 struct CapturedOccurrence final {
                   core::ControllableComponentId component_id;
                   std::shared_ptr<ControllerLaunchProcess> process;
@@ -12781,6 +12787,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   std::shared_lock execution_lock(execution_composition.mutex);
                   before = roots();
                   changing = owners_changing();
+                  lifecycle_owner = current_cell_cclc();
                   std::set<const Composition *> included;
                   for (const auto *root : before) {
                     if (!root || !included.insert(root).second)
@@ -12863,10 +12870,50 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                        process->pid(), presence, cleanup.state, cleanup.receipt,
                        identity});
                 }
+                if (!changing && value.include_component_lifecycles) {
+                  const auto previous = LoadManagedBundleAtPinnedRoot(
+                      config,
+                      value.predecessor_projection_revision.retained_bundle_id);
+                  if (!previous || !previous->bundle)
+                    return failure("installed_component_lifecycle_unavailable",
+                                   "current component product is unavailable");
+                  for (const auto &component :
+                       previous->bundle->value()
+                           .cell_graph.controllable_components) {
+                    if (!lifecycle_owner)
+                      return failure(
+                          "installed_component_lifecycle_unavailable",
+                          "current component lifecycle owner is unavailable");
+                    const auto fact =
+                        lifecycle_owner->ReadCurrentComponentSnapshot(
+                            component.controllable_component_id);
+                    if (!fact.ok() || !fact.value().locally_valid() ||
+                        fact.value().controllable_component_id !=
+                            component.controllable_component_id ||
+                        !same_publication(
+                            fact.value().active_publication_receipt))
+                      return failure(
+                          "installed_component_lifecycle_unavailable",
+                          "current component lifecycle does not match the "
+                          "exact publication");
+                    result.component_lifecycles.push_back(
+                        {component.controllable_component_id,
+                         fact.value().component_lifecycle_generation,
+                         fact.value().component_lifecycle_state});
+                  }
+                  std::sort(result.component_lifecycles.begin(),
+                            result.component_lifecycles.end(),
+                            [](const auto &a, const auto &b) {
+                              return a.controllable_component_id <
+                                     b.controllable_component_id;
+                            });
+                }
                 {
                   std::lock_guard composition_lock(managed_composition_mutex);
                   std::shared_lock execution_lock(execution_composition.mutex);
-                  changing = changing || owners_changing() || roots() != before;
+                  changing = changing || owners_changing() ||
+                             roots() != before ||
+                             current_cell_cclc() != lifecycle_owner;
                   for (const auto& local : local_owners) {
                     auto* const installed_kernel = stable_addressed_kernel();
                     if (!installed_kernel)

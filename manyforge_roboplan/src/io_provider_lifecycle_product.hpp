@@ -39,6 +39,8 @@ struct IoProviderOutputChannelInstallation final {
 class IoProviderDriverRecord final
     : public std::enable_shared_from_this<IoProviderDriverRecord> {
 public:
+  using InputLifecycleHook = std::function<core::Result<void>(
+      const core::LifecycleTransactionId &, bool planned_disabled)>;
   static core::Result<std::shared_ptr<IoProviderDriverRecord>>
   Create(core::ResolvedLifecycleControlDomainScopeDTO domain,
          core::ResolvedLifecycleProviderOccurrenceDTO occurrence,
@@ -71,7 +73,8 @@ public:
   core::Result<void> InstallResourcesLocked(
       std::vector<IoProviderInputSourceInstallation> inputs,
       std::vector<IoProviderOutputChannelInstallation> outputs,
-      std::function<void()> cancel_pending_answers);
+      std::function<void()> cancel_pending_answers,
+      InputLifecycleHook input_lifecycle = {});
   core::Result<MockBooleanInputSetReceipt>
   SetMockValueLocked(const core::IoSignalId &signal, bool value);
 
@@ -80,7 +83,8 @@ public:
   // exact replay cannot reset the model or resend an acquisition.
   core::Result<void>
   RebindInputsLocked(std::vector<IoProviderInputSourceInstallation> inputs,
-                     std::function<void()> cancel_pending_answers);
+                     std::function<void()> cancel_pending_answers,
+                     InputLifecycleHook input_lifecycle = {});
 
   core::Result<RetainedExternallyManagedDomainSnapshot>
   ReadLifecycleSnapshot(const core::ControlDomainId &domain,

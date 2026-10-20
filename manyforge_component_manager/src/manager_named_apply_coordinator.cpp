@@ -120,6 +120,11 @@ LoadBundle(const deployment::IVerifiedRetainedBundleSource &source,
   return bundle;
 }
 
+class ActiveComponentApplyRefusal final : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
 [[nodiscard]] ManagerApplyFenceExpectationDTO FenceExpectation(
     const ManagerApplyIntentDTO &intent,
     const deployment::RetainedBundle &predecessor,
@@ -167,7 +172,8 @@ LoadBundle(const deployment::IVerifiedRetainedBundleSource &source,
         active_plan.active_publication.durable_public_pointer_content_digest,
         snapshot.execution_host_epoch.runtime_unit_id,
         snapshot.execution_host_epoch.runtime_epoch,
-        manager_runtime_epoch};
+        manager_runtime_epoch,
+        true};
     const auto inventory =
         runtime_composition->InspectInstalledComponentProcesses(
             inventory_request);
@@ -182,6 +188,30 @@ LoadBundle(const deployment::IVerifiedRetainedBundleSource &source,
       Fail(inventory.value().error->code + ": " +
            inventory.value().error->message +
            "; restart the workbench container");
+    // This observation runs under the held parent admission and before a
+    // fence attempt, runtime convergence or Scene staging. The host's final
+    // Prepare guard still checks the same requirement at the effect boundary.
+    const auto delta =
+        deployment::derive_apply_component_delta(predecessor, candidate);
+    for (const auto &change : delta.components) {
+      if (change.disposition !=
+              deployment::ApplyComponentDisposition::kReplace &&
+          change.disposition != deployment::ApplyComponentDisposition::kRemove)
+        continue;
+      const auto fact = std::find_if(
+          inventory.value().component_lifecycles.begin(),
+          inventory.value().component_lifecycles.end(), [&](const auto &row) {
+            return row.controllable_component_id ==
+                   change.controllable_component_id;
+          });
+      Require(fact != inventory.value().component_lifecycles.end(),
+              "actual_installed_state_unknown: changed component lifecycle is "
+              "unavailable");
+      if (fact->state == core::ComponentLifecycleStateDTO::kActive)
+        throw ActiveComponentApplyRefusal(
+            "configuration Apply cannot replace or remove Active component " +
+            change.controllable_component_id.value() + "; deactivate it first");
+    }
     std::set<core::ControllableComponentId> restart;
     for (const auto &row : inventory.value().process_occurrences) {
       const bool no_launch = row.process_owner_kind ==
@@ -1607,6 +1637,10 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
             ? &runtime_composition_port_
             : nullptr,
         retained_bundle_source_));
+  } catch (const ActiveComponentApplyRefusal &error) {
+    return retain_pre_effect_failure("apply_requires_inactive_component",
+                                     error.what(),
+                                     ManagerApplyEffectDisposition::kKnown);
   } catch (const std::exception &error) {
     return RetainTerminalFailure(
         apply_journal_, durable_intent, "apply_fence_evidence_failed",

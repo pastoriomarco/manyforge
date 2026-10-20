@@ -2617,7 +2617,7 @@ TEST(ManagerNamedApplyCoordinator,
         predecessor.durable_public_pointer_content_digest,
         kernel_fence.original_execution_host->runtime_unit_id,
         kernel_fence.original_execution_host->runtime_epoch,
-        RuntimeEpoch("manager-runtime.aggregate.1")};
+        RuntimeEpoch("manager-runtime.aggregate.1"), true};
     ASSERT_TRUE(installed_scope.valid());
     ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
               actual_scene.empty.bundle->retained_bundle_id());
@@ -3035,7 +3035,7 @@ TEST(ManagerNamedApplyCoordinator,
         predecessor.durable_public_pointer_content_digest,
         kernel_fence.original_execution_host->runtime_unit_id,
         kernel_fence.original_execution_host->runtime_epoch,
-        RuntimeEpoch("manager-runtime.failed-composition.1")};
+        RuntimeEpoch("manager-runtime.failed-composition.1"), true};
     ASSERT_TRUE(installed_scope.valid());
     ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
               actual_scene.empty.bundle->retained_bundle_id());
@@ -3332,7 +3332,7 @@ TEST(ManagerNamedApplyCoordinator,
       predecessor.durable_public_pointer_content_digest,
       kernel_fence.original_execution_host->runtime_unit_id,
       kernel_fence.original_execution_host->runtime_epoch,
-      RuntimeEpoch("manager-runtime.receipts.1")};
+      RuntimeEpoch("manager-runtime.receipts.1"), true};
   ASSERT_TRUE(installed_scope.valid());
   ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
             actual_scene.empty.bundle->retained_bundle_id());
@@ -4193,7 +4193,7 @@ TEST(ManagerNamedApplyCoordinator,
 }
 
 
-void ExerciseOriginalConfigurationScene(const bool lose_stage_response) {
+void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const int eligibility = 0) {
     ScopedPackageRoot package_root;
     ScopedPackageRoot state_root;
     auto empty = MaterializeRosRuntimePackage(package_root.path(), true);
@@ -4280,7 +4280,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response) {
         predecessor.durable_public_pointer_content_digest,
         kernel_fence.original_execution_host->runtime_unit_id,
         kernel_fence.original_execution_host->runtime_epoch,
-        RuntimeEpoch("manager-runtime.original")};
+        RuntimeEpoch("manager-runtime.original"), true};
     ASSERT_TRUE(installed_scope.valid());
     ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
               previous.bundle->retained_bundle_id());
@@ -4297,7 +4297,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response) {
     ASSERT_TRUE((ManagerComponentProcessInventoryResultDTO{
         installed_scope, installed_processes, std::nullopt}).valid());
     runtime_composition.installed_processes =
-        [installed_scope, installed_processes](
+        [installed_scope, installed_processes, component, eligibility](
             const ManagerComponentProcessInventoryRequestDTO &request) {
           if (!request.valid() || request != installed_scope) {
             return Result<ManagerComponentProcessInventoryResultDTO>::Err(
@@ -4305,7 +4305,10 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response) {
                  "installed process inspection does not name the fixture owner", {}});
           }
           return Result<ManagerComponentProcessInventoryResultDTO>::Ok(
-              {request, installed_processes, std::nullopt});
+              {request, installed_processes, std::nullopt, eligibility == 3
+                  ? std::vector<ManagerComponentLifecycleObservationDTO>{}
+                  : std::vector<ManagerComponentLifecycleObservationDTO>{{component, ComponentLifecycleGeneration(3U),
+                      eligibility == 0 ? ComponentLifecycleStateDTO::kDisabled : ComponentLifecycleStateDTO::kActive}}});
         };
     for (const auto &desired : previous.bundle->value().desired_control_configurations) {
       kernel_fence.predecessor_configurations.push_back({
@@ -4375,11 +4378,24 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response) {
         {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
         [] { return 1'000U; }, [] { return ApplyId("apply.original-configuration"); },
         [&](const auto &, const auto &) { ++authored_scene_reads; return std::vector<AddObjectRequestDTO>{}; });
+    std::optional<CellAdmissionClaimDTO> parent;
+    if (eligibility == 2) {
+      const CellAdmissionClaimIntentDTO intent{CellAdmissionClaimKindDTO::kAuthoringMutation,
+          CellAdmissionOwnerRoleDTO::kAuthoringOwner, RequestOwnerEpoch("composer-owner"),
+          "composer-confirmed-apply", RequestId("composer-confirmed-apply"), ContentDigest(std::string(kDigestOne)),
+          cell_admission.GetAuthoringAdmission().admission_generation, {}, std::nullopt, std::nullopt};
+      ASSERT_TRUE(ValidateCellAdmissionClaimIntent(intent).ok());
+      const auto acquired = cell_admission.AcquireCellAdmissionClaim(intent);
+      ASSERT_TRUE(acquired.ok());
+      parent = acquired.value();
+    }
     const ManagerNamedApplyRequestDTO request{
         prototype.request_context, package.bundle->value().deployment_artifact_id,
         package.bundle->value().deployment_revision, predecessor.request.candidate_retained_bundle_id,
         predecessor.request.candidate_graph_revision, package.bundle->retained_bundle_id(),
-        prototype.prepared_activation, cell_admission.GetAuthoringAdmission().admission_generation, std::nullopt};
+        prototype.prepared_activation, parent ? std::nullopt : std::optional(cell_admission.GetAuthoringAdmission().admission_generation), parent};
+    // The real Scene setup already settled its add/attach admission claims.
+    const auto initial_release_calls = cell_admission.release_calls;
     const auto accepted = coordinator.AcceptOrReplay(request);
     ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
     const auto stored = journal.ReadIntent(accepted.apply_id, accepted.apply_generation);
@@ -4393,6 +4409,30 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response) {
               first->terminal_outcome->failure->failure_message
         : std::string("no terminal failure");
     SCOPED_TRACE(failure_detail);
+    if (eligibility != 0) {
+      ASSERT_TRUE(first->terminal_outcome && first->terminal_outcome->failure);
+      const bool expected_active = eligibility != 3;
+      EXPECT_EQ(first->state, expected_active ? ManagerNamedApplyResultState::kFailed : ManagerNamedApplyResultState::kUnknownEffect);
+      EXPECT_EQ(first->terminal_outcome->failure->failure_code,
+          expected_active ? "apply_requires_inactive_component" : "apply_fence_evidence_failed");
+      EXPECT_EQ(first->terminal_outcome->failure->effect_disposition,
+          expected_active ? ManagerApplyEffectDisposition::kKnown : ManagerApplyEffectDisposition::kUnknown);
+      EXPECT_EQ(kernel_fence.acquire_calls, 0);
+      EXPECT_FALSE(journal.ReadFenceAttempt(accepted.apply_id, accepted.apply_generation));
+      EXPECT_EQ(runtime_ports.ensure_calls, 0);
+      EXPECT_EQ(runtime_composition.calls, 0);
+      EXPECT_EQ(scene_owner.stage_calls, 0);
+      EXPECT_EQ(scene_owner.begin_calls, 0);
+      EXPECT_EQ(publication_store.publish_calls, 0);
+      EXPECT_EQ(cell_admission.release_calls, initial_release_calls + (expected_active ? 1 : 0));
+      EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*actual_scene.LogicalSnapshot()), preserved_bytes);
+      if (parent) {
+        EXPECT_EQ(stored->intent.parent_authoring_claim, parent);
+      }
+      EXPECT_TRUE(coordinator.AcceptOrReplay(request).request_replayed);
+      EXPECT_EQ(kernel_fence.acquire_calls, 0);
+      return;
+    }
     EXPECT_EQ(scene_owner.stage_calls, 1);
     EXPECT_EQ(scene_owner.stage_read_calls, 0);
     EXPECT_EQ(runtime_composition.calls, 0);
@@ -4712,9 +4752,11 @@ TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExac
     MaintenanceSceneOwner scene_owner(predecessor.request.candidate_projection_revision);
     ScriptedRuntimeCompositionPort composition;
     composition.installed_processes = [inventory, row](const auto &request) {
-      if (request != inventory) return Result<ManagerComponentProcessInventoryResultDTO>::Err(
+      auto expected = inventory;
+      expected.include_component_lifecycles = true;
+      if (request != expected) return Result<ManagerComponentProcessInventoryResultDTO>::Err(
           {"fixture_foreign_inventory", "wrong original request", {}});
-      return Result<ManagerComponentProcessInventoryResultDTO>::Ok({request, {row}, std::nullopt});
+      return Result<ManagerComponentProcessInventoryResultDTO>::Ok({request, {row}, std::nullopt, {{row.controllable_component_id, ComponentLifecycleGeneration(1U), ComponentLifecycleStateDTO::kDisabled}}});
     };
     ScriptedCellAdmissionPort admission;
     AlwaysIdleMaintenanceGate gate;
@@ -4783,13 +4825,16 @@ TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBefore
     ScriptedRuntimeCompositionPort composition;
     composition.installed_processes = [inventory, exact, variant](const auto &request) {
       auto response = inventory;
+      response.include_component_lifecycles = request.include_component_lifecycles;
       auto row = exact;
       if (variant == 0) response.runtime_epoch = RuntimeEpoch("foreign-host");
       if (variant == 1) response.manager_runtime_epoch = RuntimeEpoch("foreign-manager");
       if (variant == 2) row.pneumatic_none_owner->control_binding_revision = ControlBindingRevision("foreign-binding");
       if (variant == 3) row.installed_runtime_identity = ContentDigest(std::string(kDigestOne));
       if (variant == 4) response.runtime_unit_id = RuntimeUnitId("foreign-source");
-      EXPECT_EQ(request, inventory);
+      auto expected = inventory;
+      expected.include_component_lifecycles = true;
+      EXPECT_EQ(request, expected);
       return Result<ManagerComponentProcessInventoryResultDTO>::Ok({response, {row}, std::nullopt});
     };
     ScriptedCellAdmissionPort admission;
@@ -4820,6 +4865,15 @@ TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBefore
     EXPECT_EQ(scene_owner.begin_calls, 0);
     EXPECT_EQ(publication.publish_calls, 0);
   }
+}
+
+TEST(ManagerNamedApplyCoordinator, ActiveChangedComponentRefusesBeforeFenceSceneOrRuntimeWithDirectOrAuthoringClaim) {
+  ExerciseOriginalConfigurationScene(false, 1);
+  ExerciseOriginalConfigurationScene(false, 2);
+}
+
+TEST(ManagerNamedApplyCoordinator, MissingChangedComponentLifecycleIsNotClaimedAsKnownActiveRefusal) {
+  ExerciseOriginalConfigurationScene(false, 3);
 }
 
 } // namespace manyforge::component_manager

@@ -1030,10 +1030,20 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
                                             continuation.value(), plan.command_path_time_s,
                                             lead_in_end);
   if (!joined.ok()) return Fail(run, stage_error(joined.error(), mode + "_join_failed"));
+  std::optional<TrajectoryDTO> resident_wire;
+  if (run.lane.supports_resident_timeline_replacement) {
+    auto resident = build_resident_timeline_replacement(run.goal.trajectory, joined.value(),
+                                                       elapsed, 0.0);
+    if (!resident.ok()) return Fail(run, stage_error(resident.error(), mode + "_join_failed"));
+    joined.value() = std::move(resident.value().resident_trajectory);
+    resident_wire = std::move(resident.value().delivery_trajectory);
+  }
   const auto sent = start.value().scheduled
-                        ? port_.ReplaceScheduled(run.goal.key, next, joined.value(),
+                        ? port_.ReplaceScheduled(run.goal.key, next,
+                                                 resident_wire ? *resident_wire : joined.value(),
                                                  *start.value().scheduled)
-                        : port_.Replace(run.goal.key, next, joined.value());
+                        : port_.Replace(run.goal.key, next,
+                                        resident_wire ? *resident_wire : joined.value());
   if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
     const auto original = port_.ReadGoal(run.goal.key);
     if (original.has_value() && original->result == ExecutionGoalResult::kSucceeded &&
@@ -1057,7 +1067,8 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   }
   std::optional<StopReplacementCursorMapDTO> cursor_map;
   if (plan.replacement_path_time_s.size() == continuation_times.size()) {
-    cursor_map = StopReplacementCursorMapDTO{elapsed, lead_in_end,
+    cursor_map = StopReplacementCursorMapDTO{
+        run.lane.supports_resident_timeline_replacement ? 0.0 : elapsed, lead_in_end,
                                              plan.command_path_time_s,
                                              std::move(continuation_times),
                                              plan.replacement_path_time_s};

@@ -8,6 +8,7 @@ import {
   programApplyScenarioReason,
   requiredComponentFaultNotices,
   authoringWorkspaceIdentity,
+  deploymentLocalFence,
   programLocalFence,
   projectFacts,
   publicationIsCurrent,
@@ -328,6 +329,22 @@ describe('authoringWorkspace', () => {
     });
     expect(projectFacts(installed)?.documentPath).toBe('/workspace/cell');
     expect(projectFacts(null)).toBeNull();
+  });
+
+  it('fences Deployment requests on the Deployment Draft, never the Program Draft', () => {
+    // The live failure: different Draft ids at the same revision.
+    const installed = published(workspaceSnapshot(5, 1, 1));
+    const state = headlessState(5);
+    expect(installed.identity.programDraftId).not.toBe(installed.identity.deploymentDraftId);
+    expect(deploymentLocalFence(installed, state, 'owner.1', 'request.3')).toEqual({
+      draftId: 'deployment-draft.1',
+      expectedDraftRevision: 1,
+      expectedWorkspaceEpoch: 'workspace.epoch.1',
+      expectedWorkspaceRevision: 5,
+      expectedAdmissionGeneration: 7,
+      requestOwnerEpoch: 'owner.1',
+      requestId: 'request.3',
+    });
   });
 
   it('never lets a lagging publication revert a just-committed projection', () => {

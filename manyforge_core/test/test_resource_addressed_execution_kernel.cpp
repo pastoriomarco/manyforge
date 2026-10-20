@@ -25652,6 +25652,43 @@ OperationIntentDTO takeover_intent(std::size_t node, std::string request) {
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     MovingTakeoverDerivesPlanningDefaultWithoutChangingExplicitBudgetOrHandoff) {
+  for (const auto planning : {std::optional<double>{}, std::optional<double>{0.125}}) {
+    SCOPED_TRACE(planning.value_or(-1.0));
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    engine.supports_motion_replacement = true;
+    auto row = registration(
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        engine);
+    row.motion_takeover_preparation_budget_s = 0.5;
+    row.motion_takeover_planning_budget_s = planning;
+    ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                  CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+    ASSERT_TRUE(claim_program_execution(kernel).ok());
+    ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+    start_program_motion(kernel);
+    const auto original = kernel.execute(takeover_intent(0U, "default.original"));
+    ASSERT_TRUE(original.ok()) << original.error().message;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    const auto candidate = kernel.execute(takeover_intent(1U, "default.candidate"));
+    ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    std::lock_guard lock(engine.prepared_motion_mutex_);
+    ASSERT_TRUE(engine.replacement_request);
+    ASSERT_TRUE(engine.replacement_request->replacement);
+    const auto& replacement = *engine.replacement_request->replacement;
+    EXPECT_EQ(replacement.preparation_budget_ns, 500'000'000);
+    EXPECT_EQ(replacement.planning_budget_ns,
+              std::optional<std::int64_t>(planning ? 125'000'000 : 400'000'000));
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      MovingTakeoverTransfersOnePhysicalOwnerAndRetainsTheOldExactFact) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -26466,15 +26503,26 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(held.value().participants.front().command_generation,
             ControllerGoalGeneration(1U));
   std::uint64_t cold_id{};
-  {
+  // Reconciliation may revisit the private reservation while the incumbent
+  // settles. Both commands must keep the same future key without publishing it.
+  for (int pass = 0; pass < 3; ++pass) {
+    static_cast<void>(kernel.reconcile_subordinate_state());
     std::lock_guard lock(engine.prepared_motion_mutex_);
     ASSERT_TRUE(engine.replacement_request);
     ASSERT_TRUE(engine.replacement_snapshot);
-    cold_id = engine.replacement_snapshot->execution_id;
-    const auto& future = engine.replacement_request->execution_request.binding;
+    if (pass == 0)
+      cold_id = engine.replacement_snapshot->execution_id;
+    else
+      EXPECT_EQ(engine.replacement_snapshot->execution_id, cold_id);
+    const auto& request = engine.replacement_request->execution_request;
+    const auto& future = request.binding;
     EXPECT_EQ(future.operation_id, candidate.value().operation_id);
     EXPECT_EQ(future.controller_goal_id, old_key);
     EXPECT_EQ(future.controller_goal_generation, ControllerGoalGeneration(2U));
+    ASSERT_TRUE(request.initial_runtime_scale.has_value());
+    EXPECT_EQ(request.initial_runtime_scale->controller_goal_id, future.controller_goal_id);
+    EXPECT_EQ(request.initial_runtime_scale->controller_goal_generation,
+              future.controller_goal_generation);
   }
   EXPECT_EQ(engine.cold_participant_preparations.load(), 0);
   EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
@@ -26493,6 +26541,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.last_execute->binding.operation_id, candidate.value().operation_id);
   EXPECT_EQ(engine.last_execute->binding.controller_goal_id, old_key);
   EXPECT_EQ(engine.last_execute->binding.controller_goal_generation, ControllerGoalGeneration(2U));
+  ASSERT_TRUE(engine.last_execute->initial_runtime_scale.has_value());
+  EXPECT_EQ(engine.last_execute->initial_runtime_scale->controller_goal_id,
+            engine.last_execute->binding.controller_goal_id);
+  EXPECT_EQ(engine.last_execute->initial_runtime_scale->controller_goal_generation,
+            engine.last_execute->binding.controller_goal_generation);
   {
     std::lock_guard lock(journal.mutex);
     EXPECT_TRUE(std::any_of(journal.states.begin(), journal.states.end(), [&](const auto& state) {
@@ -31580,14 +31633,15 @@ struct GlobalMotionRuleFixture final {
   std::uint64_t sequence{};
   std::optional<MotionInterruptStopProfileDTO> node_profile;
 
-  GlobalMotionRuleFixture(bool group = false, bool initial = true,
+  GlobalMotionRuleFixture(
+      bool group = false, bool initial = true,
       InterruptPostLatchDisposition release = InterruptPostLatchDisposition::kAwaitOperatorAck,
       IoRuleIdleBehaviourDTO idle = IoRuleIdleBehaviourDTO::kLatch,
       std::optional<int> node_priority = {}, int global_priority = 20,
       std::string global_rule_id = "global.guard", bool additional_loss_guard = false,
       bool command_sibling = false, bool waiting_program_key = false,
       std::shared_ptr<GlobalRuleCatalogObservedService>* observe_retirement = nullptr,
-      bool no_applied_program = false) {
+      bool no_applied_program = false, bool lifecycle_test_owner = false) {
     IoConditionDefinitionDTO definition;
     definition.inputs.push_back({program_io_descriptor().signal_id, IoConditionValueKind::kBoolean});
     definition.nodes.emplace_back(IoConditionCompareDTO{IoConditionComparison::kEqual,
@@ -31611,6 +31665,10 @@ struct GlobalMotionRuleFixture final {
         std::make_shared<const CheckedIoCondition>(std::move(checked.value()));
     if (waiting_program_key && no_applied_program) condition.reset();
     ResourceAddressedExecutionKernelConfig config{context.owner_epoch, CellId("cell.test"), 16U};
+    if (lifecycle_test_owner)
+      config.cell_admission_settlement_validator = [](const auto&, const auto&) {
+        return Result<void>::Ok();  // Fixture owner performs no physical lifecycle effects.
+      };
     auto managers = EmptyManagerLivenessSet();
     managers.active_bundle_id = context.retained_bundle_id;
     config.manager_liveness_required_set = managers;
@@ -33860,4 +33918,206 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_TRUE(kernel.get_operation_projection(original.value().operation_id).value().resident);
   EXPECT_EQ(engine.recovery_action_calls.load(), 0);
 }
+
+// Actual lifecycle claims fence the source applicability change. The opt-in
+// fixture owner settles only these local tests; no physical lifecycle is faked.
+Result<void> planned_global_source_change(GlobalMotionRuleFixture& fixture,
+                                          const std::string& transaction, bool disabled) {
+  const CellAdmissionClaimIntentDTO intent{
+      CellAdmissionClaimKindDTO::kComponentLifecycle,
+      CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
+      RequestOwnerEpoch("planned.source.owner"),
+      transaction,
+      RequestId(transaction),
+      ContentDigest(test_digest('e')),
+      fixture.kernel->GetAuthoringAdmission().admission_generation,
+      {},
+      {},
+      {},
+      {}};
+  const auto claim = fixture.kernel->AcquireCellAdmissionClaim(intent);
+  if (!claim.ok()) return Result<void>::Err(claim.error());
+  const std::array sources{program_io_descriptor().source_id};
+  auto changed = fixture.kernel->SetGlobalIoSourcesPlannedDisabled(
+      fixture.service, sources, LifecycleTransactionId(transaction), disabled);
+  const auto& held = claim.value();
+  const auto released = fixture.kernel->ReleaseCellAdmissionClaim(
+      {held.intent.owner_role,
+       held.intent.owner_epoch,
+       held.intent.owner_transaction_id,
+       held.intent.request_id,
+       held.intent.request_payload_digest,
+       held.acquired_admission_generation,
+       held.claim_generation,
+       {CellAdmissionSettlementKindDTO::kProvenNoEffect, held.intent.request_payload_digest}});
+  if (!released.ok()) return Result<void>::Err(released.error());
+  return changed;
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRulePlannedSourceDisableBlocksOnlyItsScopeWithoutCreatingALatch) {
+  GlobalMotionRuleFixture fixture(true, true, InterruptPostLatchDisposition::kAwaitOperatorAck,
+                                  IoRuleIdleBehaviourDTO::kLatch, {}, 20, "global.guard", false,
+                                  false, false, nullptr, false, true);
+  const auto disabled = planned_global_source_change(fixture, "planned.disable.scoped", true);
+  ASSERT_TRUE(disabled.ok()) << disabled.error().message;
+  ASSERT_TRUE(
+      fixture.service
+          ->MarkSourceUnavailable(program_io_descriptor().source_id,
+                                  IoSourceIncarnation("global.1"), fixture.sequence,
+                                  ErrorDTO{"source_disconnected", "planned provider cessation", {}})
+          .ok());
+  fixture.clock.advance(101);  // Expected cessation also outlives ordinary freshness.
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(offers.ok());
+  EXPECT_TRUE(offers.value().empty());
+  const auto blocked = fixture.kernel->execute(fixture.Intent(false, "planned.scoped.blocked"));
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_source_not_ready");
+  EXPECT_EQ(blocked.error().details.at("rule_id"), "global.guard");
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+  const auto unrelated = fixture.kernel->execute(fixture.Intent(true, "planned.scoped.other"));
+  EXPECT_TRUE(unrelated.ok()) << unrelated.error().message;
+  EXPECT_EQ(fixture.other_engine.execute_calls, 1);
+  EXPECT_EQ(fixture.journal.global_rule_recovery_calls, 0U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRulePlannedSourceEnableRequiresAnActualFreshBaselineBeforeRearming) {
+  GlobalMotionRuleFixture fixture(false, true, InterruptPostLatchDisposition::kAwaitOperatorAck,
+                                  IoRuleIdleBehaviourDTO::kLatch, {}, 20, "global.guard", false,
+                                  false, false, nullptr, false, true);
+  ASSERT_TRUE(planned_global_source_change(fixture, "planned.disable.rearm", true).ok());
+  ASSERT_TRUE(
+      fixture.service
+          ->MarkSourceUnavailable(program_io_descriptor().source_id,
+                                  IoSourceIncarnation("global.1"), fixture.sequence,
+                                  ErrorDTO{"source_disconnected", "planned provider cessation", {}})
+          .ok());
+  ASSERT_TRUE(planned_global_source_change(fixture, "planned.enable.rearm", false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto before = fixture.kernel->execute(fixture.Intent(false, "planned.before.fresh"));
+  ASSERT_FALSE(before.ok());
+  EXPECT_EQ(before.error().details.at("reason"), "global_interrupt_source_not_ready");
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  ASSERT_TRUE(fixture.service
+                  ->InstallSource(program_io_descriptor().source_id,
+                                  IoSourceIncarnation("global.2"), IoSourceIncarnation("global.1"))
+                  .ok());
+  ASSERT_TRUE(fixture.service
+                  ->Publish({program_io_descriptor().source_id,
+                             IoSourceIncarnation("global.2"),
+                             1U,
+                             fixture.clock.now(),
+                             {{program_io_descriptor().signal_id, IoSampleValidity::kValid, false,
+                               std::nullopt}}})
+                  .ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  const auto allowed = fixture.kernel->execute(fixture.Intent(false, "planned.after.fresh"));
+  EXPECT_TRUE(allowed.ok()) << allowed.error().message;
+  EXPECT_EQ(fixture.engine.execute_calls, 1);
+  EXPECT_EQ(fixture.journal.global_rule_recovery_calls, 0U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRulePlannedSourceDisableLeavesUnrelatedRuleRegistrationEffective) {
+  GlobalMotionRuleFixture fixture(false, true, InterruptPostLatchDisposition::kAwaitOperatorAck,
+                                  IoRuleIdleBehaviourDTO::kLatch, {}, 20, "global.guard", true,
+                                  false, false, nullptr, false, true);
+  ASSERT_TRUE(planned_global_source_change(fixture, "planned.disable.unrelated", true).ok());
+  ASSERT_TRUE(
+      fixture.service
+          ->MarkSourceUnavailable(program_io_descriptor().source_id,
+                                  IoSourceIncarnation("global.1"), fixture.sequence,
+                                  ErrorDTO{"source_disconnected", "planned provider cessation", {}})
+          .ok());
+  auto signal = program_io_descriptor();
+  signal.signal_id.name = "other_ready";
+  signal.source_id = InterruptSourceId("gpio.other");
+  ASSERT_TRUE(fixture.service
+                  ->Publish({signal.source_id,
+                             IoSourceIncarnation("global.other.1"),
+                             2U,
+                             fixture.clock.now(),
+                             {{signal.signal_id, IoSampleValidity::kValid, true, std::nullopt}}})
+                  .ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(offers.ok());
+  ASSERT_EQ(offers.value().size(), 1U);
+  EXPECT_EQ(offers.value().front().selector.rule_id, InterruptPolicyId("global.loss"));
+  EXPECT_EQ(offers.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kCondition);
+  EXPECT_EQ(fixture.journal.global_rule_recovery_calls, 0U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRulePlannedSourceDisablePreservesPriorAndAlreadyLatchedEvidence) {
+  for (const bool source_loss : {false, true}) {
+    for (const bool processed_before : {false, true}) {
+      SCOPED_TRACE(source_loss);
+      SCOPED_TRACE(processed_before);
+      GlobalMotionRuleFixture fixture(false, true, InterruptPostLatchDisposition::kAwaitOperatorAck,
+                                      IoRuleIdleBehaviourDTO::kLatch, {}, 20, "global.guard", false,
+                                      false, false, nullptr, false, true);
+      if (source_loss) {
+        ASSERT_TRUE(fixture.service
+                        ->MarkSourceUnavailable(
+                            program_io_descriptor().source_id, IoSourceIncarnation("global.1"),
+                            fixture.sequence,
+                            ErrorDTO{"source_disconnected", "unexpected loss before Disable", {}})
+                        .ok());
+      } else {
+        ASSERT_TRUE(fixture.Publish(true).ok());
+      }
+      std::optional<IoGlobalRuleRecoverySelectorDTO> prior;
+      if (processed_before) {
+        ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+        const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+        ASSERT_TRUE(offers.ok());
+        ASSERT_EQ(offers.value().size(), 1U);
+        prior = offers.value().front().selector;
+      }
+      const auto disabled = planned_global_source_change(fixture, "planned.disable.prior", true);
+      ASSERT_TRUE(disabled.ok()) << disabled.error().message;
+      ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+      const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+      ASSERT_TRUE(offers.ok());
+      ASSERT_EQ(offers.value().size(), 1U);
+      EXPECT_EQ(offers.value().front().latch_cause, source_loss
+                                                        ? IoGlobalRuleLatchCauseDTO::kSourceLoss
+                                                        : IoGlobalRuleLatchCauseDTO::kCondition);
+      if (prior) {
+        EXPECT_EQ(offers.value().front().selector, *prior);
+      }
+      EXPECT_EQ(fixture.journal.global_rule_recovery_calls, 0U);
+      const auto blocked = fixture.kernel->execute(fixture.Intent());
+      ASSERT_FALSE(blocked.ok());
+      EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_latched");
+    }
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleUnexpectedSourceLossStillLatchesWithoutAPlannedDisable) {
+  GlobalMotionRuleFixture fixture;
+  ASSERT_TRUE(
+      fixture.service
+          ->MarkSourceUnavailable(program_io_descriptor().source_id,
+                                  IoSourceIncarnation("global.1"), fixture.sequence,
+                                  ErrorDTO{"source_disconnected", "unexpected provider loss", {}})
+          .ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(offers.ok());
+  ASSERT_EQ(offers.value().size(), 1U);
+  EXPECT_EQ(offers.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kSourceLoss);
+  EXPECT_EQ(offers.value().front().post_latch_disposition,
+            InterruptPostLatchDisposition::kAwaitOperatorAck);
+  const auto blocked = fixture.kernel->execute(fixture.Intent());
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_latched");
+}
+
 }  // namespace

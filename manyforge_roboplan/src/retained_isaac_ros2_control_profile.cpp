@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
 
 #include <manyforge_roboplan/controller_launch_artifacts.hpp>
@@ -646,6 +647,11 @@ make_retained_mock_ros2_control_backend_config(
       profile.hard_stop_completion_timeout_s);
   // Only the generated Mock controllers enable stock JTC scheduled replacement.
   config.arm.adapter.lane_facts.supports_scheduled_replacement = true;
+  const char* resident_trial = std::getenv("MANYFORGE_EXPERIMENTAL_JTC_RESIDENT_TIMELINE");
+  config.arm.adapter.lane_facts.supports_resident_timeline_replacement =
+      resident_trial && std::string_view(resident_trial) == "1";
+  if (config.arm.adapter.lane_facts.supports_resident_timeline_replacement)
+    config.arm.adapter.lane_facts.supports_scheduled_replacement = false;
   config.arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
       runtime_namespace + "/joint_states",
       config.participant.stop.controller_state_max_age_ns,

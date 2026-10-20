@@ -786,13 +786,23 @@ TEST(ApplyAffectedScope, MovingTakeoverBudgetChangeFencesEveryCellResource) {
   selected.motion_takeover_preparation_budget_s = 3.5;
   auto changed = selected;
   changed.motion_takeover_preparation_budget_s = 7.0;
+  auto planning = selected;
+  planning.motion_takeover_planning_budget_s = 1.25;
+  auto changed_planning = planning;
+  changed_planning.motion_takeover_planning_budget_s = 2.0;
   for (const auto &scope :
        {derive_apply_configuration_fence_scope_verified_values(ordinary,
                                                                selected),
         derive_apply_configuration_fence_scope_verified_values(selected,
                                                                changed),
         derive_apply_configuration_fence_scope_verified_values(selected,
-                                                               ordinary)}) {
+                                                               ordinary),
+        derive_apply_configuration_fence_scope_verified_values(selected,
+                                                               planning),
+        derive_apply_configuration_fence_scope_verified_values(
+            planning, changed_planning),
+        derive_apply_configuration_fence_scope_verified_values(planning,
+                                                               selected)}) {
     ASSERT_TRUE(scope.valid());
     EXPECT_EQ(scope.resources, (std::vector{core::ResourceId("resource-a"),
                                             core::ResourceId("resource-b")}));

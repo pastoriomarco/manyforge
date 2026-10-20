@@ -4,8 +4,10 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <exception>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
@@ -52,6 +54,18 @@ std::optional<std::int64_t> motion_replacement_elapsed_ns(std::int64_t now,
   if (elapsed > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
     return std::nullopt;
   return static_cast<std::int64_t>(elapsed);
+}
+
+void trace_moving_core_phase(const MovingReplacementInputDTO* replacement,
+                             const char* phase, std::int64_t started,
+                             std::int64_t finished, std::size_t points) {
+  if (!replacement) return;
+  const auto written = std::fprintf(stderr,
+      "manyforge_moving_core_phase source_goal=%.160s phase=%s started_ns=%lld finished_ns=%lld elapsed_ns=%lld points=%zu\n",
+      replacement->source_goal.controller_goal_id.value().c_str(), phase,
+      static_cast<long long>(started), static_cast<long long>(finished),
+      static_cast<long long>(finished - started), points);
+  static_cast<void>(written);
 }
 
 void resolve_motion_execution_timeout(ExecuteRequestDTO& request, const TrajectoryDTO& trajectory) {
@@ -2010,12 +2024,18 @@ Result<void> ExecutionKernel::retire_prepared_motion_membership(
       const auto retired_pending = execution_backend_.RetirePreparedExecution(pending->execution_id);
       if (!retired_pending.ok()) return retired_pending;
     }
+    const auto released =
+        execution_backend_.EndReplacementPreparationScaleHold(pending->execution_id);
+    if (!released.ok()) return released;
     std::lock_guard lock(prepared_motion_session_mutex_);
     if (pending_prepared_motion_session_ == pending) pending_prepared_motion_session_.reset();
   }
   if (!session) return Result<void>::Ok();
   const auto retired = execution_backend_.RetirePreparedExecution(session->execution_id);
   if (!retired.ok()) return retired;
+  const auto released =
+      execution_backend_.EndReplacementPreparationScaleHold(session->execution_id);
+  if (!released.ok()) return released;
   std::lock_guard lock(prepared_motion_session_mutex_);
   if (active_prepared_motion_session_ == session) active_prepared_motion_session_.reset();
   return Result<void>::Ok();
@@ -3837,14 +3857,36 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     const std::stop_token stop_token,
     std::shared_ptr<CollisionCancellationToken> validation_cancellation,
     const std::optional<std::uint64_t> validation_execution_id,
-    const MovingReplacementInputDTO* replacement) {
+    const MovingReplacementInputDTO* replacement,
+    const std::optional<std::int64_t> suffix_planning_deadline_ns) {
   const auto reject = [](const ErrorCode code, std::string message, std::string reason) {
     return Result<ValidatedMotionPlan>::Err(ErrorDTO{
         std::string(to_string(code)), std::move(message), {{"reason", std::move(reason)}}});
   };
-  auto planned = plan_trajectory_with_evidence(request, projection_inventory,
-                                               planning_attempt_index, &start_state, replacement);
-  const auto planning_elapsed_ns = clock_.now() - planning_start_ns;
+  const auto failure = [&](ErrorDTO error, const char* phase) {
+    if (replacement) {
+      error.details.try_emplace("takeover_compute_phase", phase);
+      error.details.try_emplace("takeover_preparation_budget_ns",
+                                std::to_string(planning_timeout_ns));
+      error.details.try_emplace("takeover_preparation_started_ns",
+                                std::to_string(planning_start_ns));
+      if (suffix_planning_deadline_ns) {
+        error.details.try_emplace("takeover_suffix_planning_deadline_ns",
+                                  std::to_string(*suffix_planning_deadline_ns));
+        error.details.try_emplace("takeover_suffix_planning_budget_ns",
+                                  std::to_string(*suffix_planning_deadline_ns - planning_start_ns));
+      }
+    }
+    return Result<ValidatedMotionPlan>::Err(std::move(error));
+  };
+  auto planned =
+      plan_trajectory_with_evidence(request, projection_inventory, planning_attempt_index,
+                                    &start_state, replacement, suffix_planning_deadline_ns);
+  const auto planning_finished_ns = clock_.now();
+  const auto planning_elapsed_ns = planning_finished_ns - planning_start_ns;
+  trace_moving_core_phase(replacement, "candidate_return", planning_start_ns,
+      planning_finished_ns, planned.ok() && planned.value().result.trajectory
+          ? planned.value().result.trajectory->waypoints.size() : 0U);
   if (planning_elapsed_ns >= planning_timeout_ns) {
     ErrorDTO error{kErrorPlanningTimeout, "Motion preview planning timed out", {}};
     if (!planned.ok()) {
@@ -3861,13 +3903,13 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     error.details["planning_elapsed_ns"] =
         std::to_string(std::max<std::int64_t>(0, planning_elapsed_ns));
     error.details["planning_budget_ns"] = std::to_string(planning_timeout_ns);
-    return Result<ValidatedMotionPlan>::Err(std::move(error));
+    return failure(std::move(error), "candidate_compute");
   }
   if (stop_token.stop_requested()) {
     return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during planning",
                   "motion_preview_cancelled");
   }
-  if (!planned.ok()) return Result<ValidatedMotionPlan>::Err(planned.error());
+  if (!planned.ok()) return failure(planned.error(), "candidate_compute");
 
   auto validated = validate_trajectory(
       *planned.value().result.trajectory, request, projection_inventory, std::nullopt,
@@ -3876,7 +3918,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during validation",
                   "motion_preview_cancelled");
   }
-  if (!validated.ok()) return Result<ValidatedMotionPlan>::Err(validated.error());
+  if (!validated.ok()) return failure(validated.error(), "core_validation");
   return Result<ValidatedMotionPlan>::Ok(
       ValidatedMotionPlan{std::move(planned.value()), std::move(validated.value())});
 }
@@ -4405,7 +4447,10 @@ Result<std::uint64_t> ExecutionKernel::prepare_motion_replacement(
   if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire))
     return reject("worker_retirement_in_progress");
   const auto& context = *session->authority.replacement;
-  if (context.preparation_budget_ns <= 0 || session->authority.continuation)
+  if (context.preparation_budget_ns <= 0 || session->authority.continuation ||
+      (context.planning_budget_ns &&
+       (*context.planning_budget_ns <= 0 ||
+        *context.planning_budget_ns >= context.preparation_budget_ns)))
     return reject("motion_replacement_context_invalid");
   const auto& timeouts = session->authority.execution_request.timeouts;
   const double maximum_timeout_s =
@@ -4646,6 +4691,11 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
     const auto& context = *session->authority.replacement;
     if (context.spring_return) return compute_spring_motion_replacement(stop_token, session);
     const auto& captured = context.source;
+    // H already includes acquisition and confirmation of the incumbent scale.
+    // Keep the same hold through preparation failure for the existing Stop owner.
+    const auto held = execution_backend_.BeginReplacementPreparationScaleHold(
+        captured, session->execution_id, session->preparation_deadline_ns, stop_token);
+    if (!held.ok()) return held;
     std::shared_ptr<const PreparedOperationParticipantDTO> source_product;
     {
       std::lock_guard owner_lock(prepared_motion_session_mutex_);
@@ -4674,8 +4724,8 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
         !std::isfinite(captured.controller_sample.cursor_s) ||
         captured.controller_sample.cursor_s < 0.0)
       return Result<void>::Err(failed("motion_replacement_source_sample_invalid"));
-    // DX1170: this is a forecast for computation only. Actual cursor and
-    // remaining lead are rechecked at send and adoption; scale is not frozen.
+    // Actual cursor and remaining lead are rechecked at send and adoption;
+    // the backend owns the confirmed scale hold through the connector.
     const double cursor = static_cast<double>(captured.progress.trajectory_time_ns) / 1e9;
     const double divergence = cursor + static_cast<double>(context.preparation_budget_ns) / 1e9 *
                                            *captured.controller_sample.applied_factor;
@@ -4698,6 +4748,23 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
     points.push_back(TrajectoryWaypointDTO{lead, cut.value().positions_rad,
                                            cut.value().velocities_rad_s,
                                            cut.value().accelerations_rad_s2});
+    // Carry the incumbent's existing evidence only across the same accepted
+    // span-equivalence contract as the shared splice. The final cut is newly
+    // sampled; all earlier translated intervals were checked by the slice.
+    if (source->trajectory.runtime_scale_bounds) {
+      const auto cut_knot = std::lower_bound(
+          source->trajectory.waypoints.begin(), source->trajectory.waypoints.end(), divergence,
+          [](const auto& point, double time) { return point.time_from_start_s < time; });
+      if (cut_knot == source->trajectory.waypoints.begin() || points.size() < 2U)
+        return Result<void>::Err(failed("trajectory_splice_time_precision_lost"));
+      const double old_span = divergence - std::max(cursor, std::prev(cut_knot)->time_from_start_s);
+      const double new_span = lead - points[points.size() - 2U].time_from_start_s;
+      if (!(old_span > 0.0) || !(new_span > 0.0) ||
+          std::abs(old_span - new_span) >
+              std::min(1e-9, std::sqrt(std::numeric_limits<double>::epsilon()) * old_span))
+        return Result<void>::Err(failed("trajectory_splice_time_precision_lost"));
+      prefix.value().runtime_scale_bounds = source->trajectory.runtime_scale_bounds;
+    }
     // Source milestones are not successor-authored obligations. A Cartesian
     // source requiring a skipped milestone was already refused by the shared
     // slice; never fabricate a new fidelity certificate for this prefix.
@@ -4774,7 +4841,10 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
     } deadline_guard{scheduler_, deadline};
     auto computed = compute_validated_motion_plan(
         request, inventory, start_state, 0U, start_ns, context.preparation_budget_ns, stop_token,
-        session->replacement_validation_cancellation, session->execution_id, &moving);
+        session->replacement_validation_cancellation, session->execution_id, &moving,
+        context.planning_budget_ns
+            ? std::optional<std::int64_t>(start_ns + *context.planning_budget_ns)
+            : std::nullopt);
     if (!computed.ok()) return Result<void>::Err(computed.error());
     const auto completion_elapsed = motion_replacement_elapsed_ns(clock_.now(), start_ns);
     if (!completion_elapsed || *completion_elapsed >= context.preparation_budget_ns ||
@@ -4793,6 +4863,7 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
         validation.collision_decision};
     auto product =
         make_and_prepare_motion_participant(request, trajectory, planning, validated, session);
+    trace_moving_core_phase(&moving, "backend_prepared", start_ns, clock_.now(), trajectory.waypoints.size());
     if (!product.ok()) return Result<void>::Err(product.error());
     auto projection =
         build_runtime_collision_state_projection(trajectory, validation.collision_trajectory);
@@ -5486,6 +5557,10 @@ Result<bool> ExecutionKernel::RetireCancelledPreparedMotion(const std::uint64_t 
     const auto retired = execution_backend_.RetirePreparedExecution(candidate_id);
     if (!retired.ok()) return Result<bool>::Err(retired.error());
   }
+  // Preparation may have acquired the hold before any backend product existed.
+  // The worker has joined, so it cannot acquire a new hold after this release.
+  const auto released = execution_backend_.EndReplacementPreparationScaleHold(candidate_id);
+  if (!released.ok()) return Result<bool>::Err(released.error());
   std::lock_guard lock(prepared_motion_session_mutex_);
   if (pending_prepared_motion_session_ != pending)
     return Result<bool>::Err(ErrorCode::kStaleGeneration);
@@ -7871,13 +7946,24 @@ Result<PlanRequestDTO> ExecutionKernel::make_plan_request(
 Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_trajectory_with_evidence(
     const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
     std::uint32_t planning_attempt_index, const RobotStateDTO* start_state_override,
-    const MovingReplacementInputDTO* replacement) {
+    const MovingReplacementInputDTO* replacement,
+    const std::optional<std::int64_t> suffix_planning_deadline_ns) {
   auto plan_request = make_plan_request(request, projection_inventory, planning_attempt_index,
                                         start_state_override, replacement);
   if (!plan_request.ok()) {
     return Result<PlanningSuccess>::Err(plan_request.error());
   }
 
+  if (suffix_planning_deadline_ns) {
+    const auto remaining = *suffix_planning_deadline_ns - clock_.now();
+    if (remaining <= 0 || !plan_request.value().moving_replacement)
+      return Result<PlanningSuccess>::Err(
+          ErrorDTO{kErrorPlanningTimeout,
+                   "Moving suffix planning budget expired",
+                   {{"reason", "motion_replacement_planning_budget_expired"}}});
+    plan_request.value().moving_replacement->remaining_planning_budget_s =
+        static_cast<double>(remaining) / 1e9;
+  }
   auto result = planner_.plan(plan_request.value());
 
   if (result.trajectory.has_value()) {
@@ -8049,7 +8135,10 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
         compiled_frame_name(replacement->source_tcp_frame),
         compiled_frame_name(replacement->source_base_frame)};
   }
+  const auto noncollision_started = replacement ? clock_.now() : 0;
   auto val_result = trajectory_validator_.validate_non_collision(trajectory, opts, *cancel);
+  if (replacement) trace_moving_core_phase(replacement, "noncollision_return", noncollision_started,
+                                          clock_.now(), trajectory.waypoints.size());
   if (!val_result.valid) {
     if (val_result.error.has_value()) {
       return Result<CollisionValidationSuccess>::Err(std::move(*val_result.error));
@@ -8137,6 +8226,7 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     return Result<AuthoritativeValidationAttempt>::Ok(std::move(attempt));
   };
 
+  const auto collision_started = replacement ? clock_.now() : 0;
   auto attempt_result = run_authoritative_validation_once();
   if (!attempt_result.ok()) {
     return Result<CollisionValidationSuccess>::Err(attempt_result.error());
@@ -8163,6 +8253,8 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
       attempt = std::move(attempt_result.value());
     }
   }
+  if (replacement) trace_moving_core_phase(replacement, "collision_return", collision_started,
+                                          clock_.now(), collision_trajectory.waypoints.size());
   auto bundle = std::move(attempt.bundle);
   auto telemetry = attempt.telemetry;
   auto contact_policy_violation = std::move(attempt.contact_policy_violation);

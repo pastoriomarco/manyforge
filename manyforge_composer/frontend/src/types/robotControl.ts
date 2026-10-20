@@ -302,7 +302,7 @@ export interface CellStopStageSummary {
   stageIndex: number;
   actionClass: 'controlled' | 'software_hard' | 'safety_system_request';
   outcome: 'succeeded' | 'partial' | 'failed' | 'superseded_no_effect';
-  executedMode: 'soft_on_path' | 'spring_back_hold' | 'hard_deceleration' | null;
+  executedMode: 'soft_on_path' | 'spring_back_hold' | 'spring_back_fast' | 'hard_deceleration' | null;
   substitutionReason: string | null;
 }
 

@@ -219,7 +219,7 @@ def _validate_controlled_stop(value: Any, label: str) -> dict[str, Any]:
         label=label,
     )
     mode = profile["stop_mode"]
-    if mode not in {"soft_on_path", "spring_back_hold"}:
+    if mode not in {"soft_on_path", "spring_back_hold", "spring_back_fast"}:
         _fail(f"{label}.stop_mode is unsupported")
     natural = profile["allow_natural_completion_on_short_path"]
     jerk_enabled = profile["jerk_limits_enabled"]

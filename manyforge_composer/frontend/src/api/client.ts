@@ -433,6 +433,8 @@ const STALE_WORKSPACE_CODES = new Set([
   'composer_draft_id_stale',
   'composer_draft_revision_stale',
   'scenario_workspace_stale',
+  // Raised by the Deployment Draft owner before any edit is applied.
+  'deployment_draft_stale',
   ...SAVED_NOT_ADOPTED_CODES,
 ]);
 

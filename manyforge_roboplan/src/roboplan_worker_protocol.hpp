@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -54,10 +55,14 @@ struct WorkerIkRequestDTO final {
 [[nodiscard]] WorkerInitializationDTO decode_initialization(
     std::string_view bytes);
 
+// Optional absolute cap is private same-host steady-clock transport metadata;
+// it is omitted with the planning budget and never becomes planning authority.
 [[nodiscard]] std::string encode_candidate_request(
-    const RoboPlanCandidateRequestDTO& value);
+    const RoboPlanCandidateRequestDTO& value,
+    std::optional<std::int64_t> planning_deadline_ns = std::nullopt);
 [[nodiscard]] RoboPlanCandidateRequestDTO decode_candidate_request(
-    std::string_view bytes);
+    std::string_view bytes,
+    std::optional<std::int64_t>* planning_deadline_ns = nullptr);
 
 [[nodiscard]] std::string encode_trajectory_result(
     const core::Result<core::TrajectoryDTO>& value);

@@ -366,7 +366,8 @@ derive_route_readiness_projection(
              right.deployment_maximum_tcp_linear_speed_mps &&
          left.intrinsic_direct_control == right.intrinsic_direct_control &&
          left.direct_control_joint_limits == right.direct_control_joint_limits &&
-         left.motion_takeover_preparation_budget_s == right.motion_takeover_preparation_budget_s;
+         left.motion_takeover_preparation_budget_s == right.motion_takeover_preparation_budget_s &&
+         left.motion_takeover_planning_budget_s == right.motion_takeover_planning_budget_s;
 }
 
 [[nodiscard]] inline bool registration_controller_equal_after_product_reseal(
@@ -389,8 +390,7 @@ derive_route_readiness_projection(
   candidate_controller_binding.component_role_id = a.component_role_id;
   candidate_controller_binding.target_role_id = a.target_role_id;
   candidate_controller_binding.contact_grasp_bindings = a.contact_grasp_bindings;
-  if (a != candidate_controller_binding ||
-      left.engine != right.engine ||
+  if (a != candidate_controller_binding || left.engine != right.engine ||
       left.stop_execution_port != right.stop_execution_port ||
       left.prepared_motion_engine != right.prepared_motion_engine ||
       left.retained_default_stop_limits != right.retained_default_stop_limits ||
@@ -402,6 +402,7 @@ derive_route_readiness_projection(
       left.intrinsic_direct_control != right.intrinsic_direct_control ||
       left.direct_control_joint_limits != right.direct_control_joint_limits ||
       left.motion_takeover_preparation_budget_s != right.motion_takeover_preparation_budget_s ||
+      left.motion_takeover_planning_budget_s != right.motion_takeover_planning_budget_s ||
       left.participant_policy.has_value() != right.participant_policy.has_value() ||
       (left.participant_policy.has_value() &&
        left.participant_policy->value() != right.participant_policy->value()) ||
@@ -1625,6 +1626,19 @@ struct ResourceAddressedExecutionKernel::ProgramCycleClaimRun::MotionContinuatio
   return static_cast<std::int64_t>(ns);
 }
 
+[[nodiscard]] inline std::optional<std::int64_t> motion_takeover_planning_budget_ns(
+    const std::optional<double> planning_seconds,
+    const std::optional<double> preparation_seconds) noexcept {
+  if (planning_seconds) return motion_takeover_budget_ns(planning_seconds);
+  const auto preparation = motion_takeover_budget_ns(preparation_seconds);
+  if (!preparation) return std::nullopt;
+  // Derive the default only at smooth-takeover admission, preserving authored
+  // omission. Integer 4/5 avoids floating rounding (.5 s -> exactly .4 s) and
+  // multiplication overflow. A sub-2 ns total cannot represent a positive,
+  // strictly smaller cap; the existing replacement-context check rejects zero.
+  return (*preparation / 5) * 4 + ((*preparation % 5) * 4) / 5;
+}
+
 inline void bind_recovery_request(KernelRecoveryActionRequestDTO& request,
                            const KernelRecoveryAssessmentDTO& assessment) {
   request.expected_assessment_revision = assessment.assessment_revision;
@@ -1705,7 +1719,7 @@ struct ActiveOperationParticipant final {
   /// no caller-supplied priority, source curve or dispatch permission.
   std::optional<ResolvedPreparedMotionExecutionRequestDTO> takeover_preparation{};
   std::optional<std::int64_t> takeover_preparation_budget_ns{};
-
+  std::optional<std::int64_t> takeover_planning_budget_ns{};
 
   [[nodiscard]] bool non_motion_transaction() const noexcept {
     return payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&

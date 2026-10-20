@@ -1286,6 +1286,41 @@ TEST(DeploymentApplicabilityCodec, PerBindingStopTimingIsNoLongerAPolicyField) {
 }
 
 TEST(DeploymentApplicabilityCodec,
+     MotionTakeoverPlanningBudgetRequiresAStrictlyLargerPreparationBudget) {
+  const auto document_for = [](std::string_view planning,
+                               bool preparation = true) {
+    auto policies = interrupt_policy_envelope("", "");
+    policies.pop_back();
+    if (preparation)
+      policies += ",\"motion_takeover_preparation_budget_s\":3.5";
+    policies +=
+        ",\"motion_takeover_planning_budget_s\":" + std::string(planning) + "}";
+    return with_policies(minimal_document(), policies);
+  };
+  const auto ordinary = decode(
+      with_policies(minimal_document(), interrupt_policy_envelope("", "")));
+  EXPECT_FALSE(ordinary.value().motion_takeover_planning_budget_s);
+  EXPECT_EQ(ordinary.normalized_policies()->find_object_member(
+                "motion_takeover_planning_budget_s"),
+            nullptr);
+  const auto candidate = decode(document_for("1.25"));
+  EXPECT_EQ(candidate.value().motion_takeover_preparation_budget_s,
+            std::optional<double>(3.5));
+  EXPECT_EQ(candidate.value().motion_takeover_planning_budget_s,
+            std::optional<double>(1.25));
+  const auto sealed = compute_capability_provider_binding_revisions(candidate);
+  EXPECT_EQ(sealed.value().motion_takeover_planning_budget_s,
+            std::optional<double>(1.25));
+  EXPECT_EQ(canonical_json(*sealed.normalized_policies()),
+            canonical_json(*candidate.normalized_policies()));
+  for (const auto *invalid : {"0", "-1", "3.5", "4", "null", "true", "\"1\""})
+    expect_decode_error_containing(
+        document_for(invalid), "$.policies.motion_takeover_planning_budget_s");
+  expect_decode_error_containing(
+      document_for("1", false), "$.policies.motion_takeover_planning_budget_s");
+}
+
+TEST(DeploymentApplicabilityCodec,
      MotionTakeoverBudgetIsOptionalPositiveAndPreserved) {
   const auto document_for = [](std::string_view value) {
     auto policies = interrupt_policy_envelope("", "");

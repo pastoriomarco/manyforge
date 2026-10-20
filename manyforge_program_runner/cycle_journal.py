@@ -1524,6 +1524,11 @@ class ProgramCycleJournal:
             if changed != 1:
                 raise RuntimeError("Program-cycle release intent is stale")
 
+    def status_snapshot(self) -> tuple[CycleRecord, tuple[dict[str, Any], ...]]:
+        """Read cycle and unresolved command evidence under one journal lock."""
+        with self._lock:
+            return self.read(), self.pending_commands()
+
     def pending_commands(self) -> tuple[dict[str, Any], ...]:
         """Bounded current unresolved evidence, never an execution/retry queue."""
         with self._lock:

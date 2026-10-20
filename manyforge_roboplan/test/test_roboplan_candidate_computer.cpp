@@ -247,6 +247,40 @@ TEST(
   EXPECT_GT(curve.runtime_scale_bounds->max_rate_per_s, 0.0);
   EXPECT_GT(curve.runtime_scale_bounds->max_rate_change_per_s2, 0.0);
   EXPECT_GE(curve.runtime_scale_bounds->max_stop_path_rate, 1.0);
+  // Independently measure the delivered connector alone. Its fixed P/V/A
+  // must retain ordinary planning's nominal acceleration and enabled jerk
+  // reserve, rather than merely remaining infinitesimally below physical caps.
+  roboplan::JointTrajectory connector;
+  connector.joint_names = curve.joint_names;
+  for (const auto index : {prefix.waypoints.size() - 1U, prefix.waypoints.size()}) {
+    const auto& point = curve.waypoints[index];
+    connector.times.push_back(point.time_from_start_s);
+    connector.positions.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        point.positions_rad.data(), point.positions_rad.size()));
+    connector.velocities.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        point.velocities_rad_s.data(), point.velocities_rad_s.size()));
+    connector.accelerations.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        point.accelerations_rad_s2.data(), point.accelerations_rad_s2.size()));
+  }
+  const auto model_v = fixture.scene->getVelocityLimitVectors("arm");
+  const auto model_a = fixture.scene->getAccelerationLimitVectors("arm");
+  ASSERT_TRUE(model_v && model_a);
+  detail::CartesianTrajectoryContractInput contract{
+      "arm", "base", "tool0", input.speed_profile, {}};
+  const auto measured = detail::measure_cartesian_joint_dynamics_envelope(
+      contract, connector, values(model_v->second), values(model_a->second),
+      {});
+  ASSERT_TRUE(measured.ok());
+  ASSERT_TRUE(measured.value().complete);
+  for (std::size_t index = 0; index < measured.value().joint_derivatives.size();
+       ++index) {
+    const auto &derivative = measured.value().joint_derivatives[index];
+    EXPECT_LE(derivative.acceleration,
+              0.8 * model_a->second[static_cast<Eigen::Index>(index)] *
+                      input.speed_profile.acceleration_scale +
+                  1e-9);
+    EXPECT_LE(derivative.jerk, 8.0 + 1e-6);
+  }
   EXPECT_FALSE(curve.runtime_scale_bounds->nominal_time_multiplier);
   EXPECT_FALSE(curve.cartesian_fidelity_metrics);
   EXPECT_TRUE(curve.cartesian_waypoint_times_s.empty());
@@ -398,7 +432,7 @@ TEST(RoboPlanCandidateComputerTest,
   EXPECT_FALSE(computer.compute(changed).ok());
   changed = input;
   changed.moving_replacement->source_prefix_trajectory.runtime_scale_bounds =
-      TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0, 1.0};
+      TrajectoryRuntimeScaleBoundsDTO{-4.0, 16.0, 1.0};
   EXPECT_FALSE(computer.compute(changed).ok());
   changed = input;
   changed.moving_replacement->suffix_start_state.positions[0] =
@@ -408,6 +442,41 @@ TEST(RoboPlanCandidateComputerTest,
   changed.moving_replacement->source_prefix_trajectory.waypoints[1]
       .accelerations_rad_s2.clear();
   EXPECT_FALSE(computer.compute(changed).ok());
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     MovingRetainedDynamicsEvidenceComposesWithChangedBoundaryBounds) {
+  auto fixture = make_fixture();
+  auto input = moving_request(fixture);
+  input.start_state.velocities.reset();
+  input.moving_replacement->suffix_start_state = input.start_state;
+  auto &prefix = input.moving_replacement->source_prefix_trajectory;
+  for (auto &point : prefix.waypoints) {
+    point.positions_rad = values(fixture.start);
+    point.velocities_rad_s.assign(fixture.binding.resources.size(), 0.0);
+    point.accelerations_rad_s2.assign(fixture.binding.resources.size(), 0.0);
+  }
+  // Known stationary incumbent: retain its already-selected conservative box.
+  prefix.runtime_scale_bounds =
+      TrajectoryRuntimeScaleBoundsDTO{0.05, 0.2, 1.01};
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto result = computer.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().runtime_scale_bounds);
+  const auto &bounds = *result.value().runtime_scale_bounds;
+  EXPECT_GT(bounds.max_rate_per_s, 0.0);
+  EXPECT_LE(bounds.max_rate_per_s, prefix.runtime_scale_bounds->max_rate_per_s);
+  EXPECT_GT(bounds.max_rate_change_per_s2, 0.0);
+  EXPECT_LE(bounds.max_rate_change_per_s2,
+            prefix.runtime_scale_bounds->max_rate_change_per_s2);
+  EXPECT_GE(bounds.max_stop_path_rate, 1.0);
+  EXPECT_LE(bounds.max_stop_path_rate,
+            prefix.runtime_scale_bounds->max_stop_path_rate);
+  EXPECT_EQ(result.value().waypoints.back().positions_rad,
+            values(fixture.goal));
+  EXPECT_EQ(prefix.waypoints.front().positions_rad,
+            result.value().waypoints.front().positions_rad);
 }
 
 TEST(
@@ -944,6 +1013,48 @@ TEST(RoboPlanCandidateComputerTest,
       EXPECT_GT(deadline_checks, 0U);
     }
   }
+}
+
+TEST(RoboPlanCandidateComputerTest, MovingPlanningDeadlineIsSuffixOnlyAndDoesNotRestartAtCompute) {
+  auto fixture = make_fixture();
+  auto input = moving_request(fixture);
+  input.moving_replacement->remaining_planning_budget_s = 1.0;
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  std::size_t suffix_checks = 0U;
+  const RoboPlanCandidateControl control{
+      {}, [] { return false; }, [&] { ++suffix_checks; return true; }};
+  const auto expired = computer.compute(input, control);
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().details.at("reason"), "planning_timeout");
+  EXPECT_GT(suffix_checks, 0U);
+
+  // The same private suffix callback has no authority over ordinary requests.
+  const auto before = suffix_checks;
+  const auto ordinary = computer.compute(
+      request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)}), control);
+  ASSERT_TRUE(ordinary.ok()) << ordinary.error().message;
+  EXPECT_EQ(suffix_checks, before);
+}
+
+TEST(RoboPlanCandidateComputerTest, MovingPlanningBudgetRejectsInvalidOrAlreadyConsumedCaps) {
+  auto fixture = make_fixture();
+  auto input = moving_request(fixture);
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  for (const double cap : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                           std::numeric_limits<double>::quiet_NaN()}) {
+    input.moving_replacement->remaining_planning_budget_s = cap;
+    const auto result = computer.compute(input);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"), "native_moving_source_invalid");
+  }
+  // A positive cap smaller than one clock tick expires during local setup.
+  // The whole preparation budget remains available; this is the suffix cap.
+  input.moving_replacement->remaining_planning_budget_s = 1e-300;
+  const auto expired = computer.compute(input);
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().details.at("reason"), "planning_timeout");
 }
 
 } // namespace

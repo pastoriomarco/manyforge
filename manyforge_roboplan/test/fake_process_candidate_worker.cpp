@@ -9,12 +9,15 @@
 #include <array>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -278,6 +281,25 @@ int run() {
     }
     if (frame.type != MessageType::kPlan) {
       fail("fake worker received an unsupported request");
+    }
+    if (input.model.native_scene_name == "inspect-moving-planning-budget") {
+      std::optional<std::int64_t> deadline;
+      const auto request = worker_protocol::decode_candidate_request(frame.payload, &deadline);
+      if (!request.moving_replacement || !deadline ||
+          !request.moving_replacement->remaining_planning_budget_s)
+        fail("moving planning cap or same-host deadline was lost in transit");
+      const auto& moving = *request.moving_replacement;
+      const auto available = std::chrono::duration<double>(
+          std::chrono::nanoseconds(*deadline) -
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (!(available > 0.0 && available <= *moving.remaining_planning_budget_s) ||
+          std::abs(moving.remaining_preparation_budget_s -
+                   *moving.remaining_planning_budget_s - 2.0) > 1e-6)
+        fail("moving planning cap was restarted or charged a different setup interval");
+      send_frame(descriptor, MessageType::kPlanResult,
+                 worker_protocol::encode_trajectory_result(
+                     core::Result<core::TrajectoryDTO>::Ok(trajectory(request))));
+      continue;
     }
     const int marker = ::open(first_generation_marker.c_str(),
                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);

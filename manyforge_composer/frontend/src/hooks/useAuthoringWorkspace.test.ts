@@ -500,6 +500,21 @@ describe('useAuthoringWorkspace', () => {
     await act(async () => { expect(latest!.beginMutation()).toBe(true); });
   });
 
+  it('releases the Deployment Draft owner stale refusal without locking', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      // The owner refuses before any edit and its detail carries no effect marker.
+      latest!.finishMutation(null, new ApiError('Deployment Draft changed; refresh before editing', 409, {
+        detail: { code: 'deployment_draft_stale', message: 'Deployment Draft changed; refresh before editing' },
+      }));
+    });
+    expect(latest!.submissionUnconfirmed).toBe(false);
+    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+  });
+
   it('releases a refused-before-effect stale fence without locking', async () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     await mountHarness(headlessSnapshot(1));

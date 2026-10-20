@@ -350,7 +350,9 @@ Result<void> ResourceAddressedExecutionKernel::install_global_io_rule_catalog_lo
     const auto armed = arm_global_io_rule_locked(rule, candidate.context, expected_service, false);
     if (!armed.ok()) {
       const auto reason = armed.error().details.find("reason");
-      if (reason != armed.error().details.end() && reason->second == "io_rule_baseline_unavailable") {
+      if (reason != armed.error().details.end() &&
+          (reason->second == "io_rule_baseline_unavailable" ||
+           reason->second == "io_rule_source_disabled")) {
         // Catalog installation and source qualification are distinct. A real
         // first sample can arm this same row on the existing ingress schedule.
         // This neither manufactures clear-source readiness nor adds admission.
@@ -399,6 +401,15 @@ Result<void> ResourceAddressedExecutionKernel::install_global_io_rule_catalog_lo
   global_io_rule_service_ = expected_service;
   io_signal_service_ = expected_service;
   global_io_rules_ = std::move(rows);
+  std::erase_if(planned_disabled_io_sources_, [&](const auto& source) {
+    return !global_io_rule_catalog_ ||
+           std::none_of(global_io_rule_catalog_->rules.begin(),
+                        global_io_rule_catalog_->rules.end(), [&](const auto& rule) {
+                          return std::find(rule.required_signal_sources.begin(),
+                                           rule.required_signal_sources.end(),
+                                           source) != rule.required_signal_sources.end();
+                        });
+  });
   registrations.clear();  // Registration ownership moved to the active rows.
   for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
     const auto& evidence = global_io_rules_[index].evidence;
@@ -629,6 +640,12 @@ std::optional<ErrorDTO> ResourceAddressedExecutionKernel::global_io_rule_command
 Result<IoRuleRegistrationDTO> ResourceAddressedExecutionKernel::arm_global_io_rule_locked(
     const IoActivationRulePolicyBindingDTO& rule, const IoRuleStateContextDTO& context,
     const std::shared_ptr<IIoSignalService>& service, bool require_inactive) {
+  if (std::any_of(
+          rule.required_signal_sources.begin(), rule.required_signal_sources.end(),
+          [&](const auto& source) { return planned_disabled_io_sources_.contains(source); }))
+    return Result<IoRuleRegistrationDTO>::Err({kErrorMotionInterruptArmFailed,
+                                               "Input source is intentionally disabled",
+                                               {{"reason", "io_rule_source_disabled"}}});
   if (!rule.waiting_for_program_keys.empty())
     return Result<IoRuleRegistrationDTO>::Err(global_rule_error("io_global_rule_waiting_for_program"));
   auto sources = rule.required_signal_sources;
@@ -657,6 +674,93 @@ Result<IoRuleRegistrationDTO> ResourceAddressedExecutionKernel::arm_global_io_ru
        std::move(sources)});
 }
 
+Result<void> ResourceAddressedExecutionKernel::SetGlobalIoSourcesPlannedDisabled(
+    const std::shared_ptr<IIoSignalService>& expected_service,
+    std::span<const InterruptSourceId> sources,
+    const LifecycleTransactionId& actual_lifecycle_transaction, bool disabled) {
+  std::lock_guard submit_lock(submission_mutex_);
+  std::lock_guard admission_lock(*admission_mutex_);
+  std::lock_guard lock(state_mutex_);
+  if (expected_service != io_signal_service_)
+    return Result<void>::Err(global_rule_error("io_global_rule_service_identity_mismatch"));
+  const auto authority = require_held_lifecycle_claim_locked(actual_lifecycle_transaction);
+  if (!authority.ok()) return authority;
+  if (!disabled) {
+    for (const auto& source : sources) planned_disabled_io_sources_.erase(source);
+    return Result<void>::Ok();  // Only actual fresh acquisitions may rearm.
+  }
+  const auto idle = require_idle_for_component_readiness_locked();
+  if (!idle.ok()) return idle;
+  if (program_cycle_claim_run_)
+    return Result<void>::Err(global_rule_error("io_rule_source_disable_program_active"));
+  if (!global_io_rule_catalog_) return Result<void>::Ok();
+  auto next_disabled = planned_disabled_io_sources_;
+  for (const auto& source : sources) {
+    if (source.empty()) return Result<void>::Err(global_rule_error("io_rule_source_invalid"));
+    // Only dependencies of the installed global catalog need an arm fence.
+    if (std::any_of(global_io_rule_catalog_->rules.begin(), global_io_rule_catalog_->rules.end(),
+                    [&](const auto& rule) {
+                      return std::find(rule.required_signal_sources.begin(),
+                                       rule.required_signal_sources.end(),
+                                       source) != rule.required_signal_sources.end();
+                    }))
+      next_disabled.insert(source);
+  }
+  // Process already-delivered evidence before planned cessation. This invokes
+  // no automatic recovery and the existing idle proof excludes physical work.
+  const auto evaluated = global_io_rule_service_->EvaluateRules();
+  if (!evaluated.ok()) return evaluated;
+  StopWorkHandoff handoff;
+  const auto prior = process_global_io_rule_evidence_locked(handoff);
+  if (!prior.ok()) return prior;
+  if (handoff.control || handoff.projection)
+    return Result<void>::Err(global_rule_error("io_rule_source_disable_not_idle"));
+  planned_disabled_io_sources_.swap(next_disabled);
+  const auto partial_failure = [](ErrorDTO error) {
+    error.details.emplace("io_source_transition_effects", "observed");
+    return Result<void>::Err(std::move(error));
+  };
+  for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
+    auto& row = global_io_rules_[index];
+    const auto& rule = global_io_rule_catalog_->rules[index];
+    if (std::none_of(rule.required_signal_sources.begin(), rule.required_signal_sources.end(),
+                     [&](const auto& source) {
+                       return std::find(sources.begin(), sources.end(), source) != sources.end();
+                     }))
+      continue;
+    if (row.registration) {
+      const auto retired = global_io_rule_service_->RetireRule(*row.registration);
+      if (!retired.ok()) return partial_failure(retired.error());
+      row.evidence = retired.value();
+      if (row.evidence->evaluation_error && row.evidence->source_losses.empty() &&
+          !row.evidence->trip) {
+        row.registration.reset();
+        row.qualification_error = row.evidence->evaluation_error;
+        return partial_failure(*row.evidence->evaluation_error);
+      }
+      // Retire returns the final eligible evidence atomically. Preserve a loss
+      // or trip arriving after the preceding read; never erase an old latch.
+      if (!row.evidence->source_losses.empty()) {
+        row.source_loss_latch = true;
+        row.last_source_loss = row.evidence;
+        set_global_io_rule_state_locked(index, IoGlobalRuleState::kLatched);
+      } else if (row.evidence->trip && !row.response_consumed) {
+        set_global_io_rule_state_locked(index, IoGlobalRuleState::kTripped,
+                                        row.evidence->trip->triggering_acquisition);
+        if (rule.idle_behaviour == IoRuleIdleBehaviourDTO::kLatch)
+          set_global_io_rule_state_locked(index, IoGlobalRuleState::kLatched,
+                                          row.evidence->trip->triggering_acquisition);
+        row.response_consumed = true;
+      }
+      row.registration.reset();
+    }
+    row.qualification_error = ErrorDTO{kErrorMotionInterruptArmFailed,
+                                       "Input source is intentionally disabled",
+                                       {{"reason", "io_rule_source_disabled"}}};
+  }
+  return Result<void>::Ok();
+}
+
 Result<void> ResourceAddressedExecutionKernel::arm_pending_global_io_rules_locked() {
   if (!global_io_rule_catalog_) return Result<void>::Ok();
   if (!global_io_rule_service_ || global_io_rules_.size() != global_io_rule_catalog_->rules.size())
@@ -674,6 +778,7 @@ Result<void> ResourceAddressedExecutionKernel::arm_pending_global_io_rules_locke
       const auto reason = armed.error().details.find("reason");
       if (reason != armed.error().details.end() &&
           (reason->second == "io_rule_baseline_unavailable" ||
+           reason->second == "io_rule_source_disabled" ||
            (row.waiting_for_inactive && reason->second == "io_rule_active_at_arm")))
         continue;
       return Result<void>::Err(armed.error());

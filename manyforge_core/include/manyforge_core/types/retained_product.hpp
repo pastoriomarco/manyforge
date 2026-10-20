@@ -257,6 +257,8 @@ struct RetainedBundleDTO final {
   std::vector<RetainedRuntimeContractRequirementDTO> runtime_contract_requirements;
   /// Optional whole moving-takeover preparation budget from the applied cell.
   std::optional<double> motion_takeover_preparation_budget_s{};
+  /// Optional suffix-planning cap within the whole preparation/handoff budget.
+  std::optional<double> motion_takeover_planning_budget_s{};
 
   friend bool operator==(const RetainedBundleDTO&, const RetainedBundleDTO&) = default;
 };

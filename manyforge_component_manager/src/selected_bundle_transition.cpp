@@ -130,8 +130,27 @@ bool ManagerComponentProcessOccurrenceDTO::valid() const noexcept {
 bool ManagerComponentProcessInventoryResultDTO::valid() const noexcept {
   if (!request.valid() ||
       process_occurrences.size() > kMaximumComponentProcessInventoryEntries ||
+      component_lifecycles.size() > kMaximumComponentProcessInventoryEntries ||
+      !std::all_of(component_lifecycles.begin(), component_lifecycles.end(),
+                   [](const auto &row) {
+                     return !row.controllable_component_id.empty() &&
+                            row.controllable_component_id.value().size() <=
+                                manyforge::core::kMaxLifecycleIdentityBytes &&
+                            row.controllable_component_id.value().find('\0') ==
+                                std::string::npos &&
+                            static_cast<unsigned>(row.state) <=
+                                static_cast<unsigned>(
+                                    manyforge::core::
+                                        ComponentLifecycleStateDTO::kDisabled);
+                   }) ||
       !std::all_of(process_occurrences.begin(), process_occurrences.end(),
                    [](const auto &row) { return row.valid(); }))
+    return false;
+  if (std::adjacent_find(
+          component_lifecycles.begin(), component_lifecycles.end(),
+          [](const auto &a, const auto &b) {
+            return !(a.controllable_component_id < b.controllable_component_id);
+          }) != component_lifecycles.end())
     return false;
   const auto key = [](const auto &row) {
     return std::tie(row.controllable_component_id, row.launch_identity,

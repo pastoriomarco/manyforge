@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <deque>
 #include <iomanip>
 #include <limits>
@@ -702,6 +703,17 @@ void Ros2ControlExecutionBackend::ReceiveFeedback(
   sample.local_receipt_stamp_ns = state->clock.now();
   sample.cursor_s =
       static_cast<double>(nanoseconds(feedback.desired.time_from_start)) / 1e9;
+  if (state->config.motion_trace && !goal.observation.latest_feedback) {
+    const auto written = std::fprintf(
+        stderr,
+        "manyforge_goal_feedback_first goal=%.160s generation=%llu "
+        "receipt_ns=%lld source_ns=%lld cursor_s=%.17g\n",
+        key.controller_goal_id.value().c_str(),
+        static_cast<unsigned long long>(key.controller_goal_generation.value()),
+        static_cast<long long>(sample.local_receipt_stamp_ns),
+        static_cast<long long>(sample.source_stamp_ns), sample.cursor_s);
+    static_cast<void>(written);
+  }
   goal.observation.latest_feedback = std::move(sample);
   goal.handle = handle;
   goal.observation.mechanism_goal_id = id;

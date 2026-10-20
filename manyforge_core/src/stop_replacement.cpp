@@ -277,6 +277,30 @@ Result<TrajectoryDTO> build_stop_replacement_join(const TrajectoryDTO& active,
   return Result<TrajectoryDTO>::Ok(std::move(joined));
 }
 
+Result<ResidentTimelineReplacementDTO> build_resident_timeline_replacement(
+    const TrajectoryDTO& active, const TrajectoryDTO& joined, const double elapsed_s,
+    const double source_clock_offset_s) {
+  if (!finite(elapsed_s) || !finite(source_clock_offset_s) ||
+      !complete_trajectory(active) || !complete_trajectory(joined))
+    return Result<ResidentTimelineReplacementDTO>::Err(stop_error(
+        "stop_join_input_invalid", "Resident replacement needs a complete checked join"));
+  const auto attachment = sample_trajectory(active, elapsed_s);
+  if (!attachment.ok())
+    return Result<ResidentTimelineReplacementDTO>::Err(attachment.error());
+  ResidentTimelineReplacementDTO result{joined, joined};
+  const double shift = elapsed_s - source_clock_offset_s;
+  for (auto& point : result.resident_trajectory.waypoints)
+    point.time_from_start_s += shift;
+  result.delivery_trajectory.waypoints.clear();
+  result.delivery_trajectory.waypoints.push_back(
+      {shift, attachment.value().positions_rad, attachment.value().velocities_rad_s,
+       attachment.value().accelerations_rad_s2});
+  for (const auto& point : result.resident_trajectory.waypoints)
+    if (point.time_from_start_s > shift + kJoinTimeEpsilonS)
+      result.delivery_trajectory.waypoints.push_back(point);
+  return Result<ResidentTimelineReplacementDTO>::Ok(std::move(result));
+}
+
 Result<ControlledHardStopBrakeDTO> plan_controlled_hard_stop_brake(
     const ControlledHardStopBrakeInputDTO& input) {
   const auto joints = input.joint_names.size();

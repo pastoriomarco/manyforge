@@ -90,6 +90,12 @@ class ExecutionSampleAssociation final {
     return std::max<Duration>(0, anchor_->local_receipt - dispatched_at_);
   }
 
+  [[nodiscard]] TimePoint recognition_origin_ns() const noexcept { return dispatched_at_; }
+  [[nodiscard]] std::optional<TimePoint> recognition_receipt_ns() const {
+    std::lock_guard lock(mutex_);
+    return anchor_ ? std::optional(anchor_->local_receipt) : std::nullopt;
+  }
+
  private:
   struct Anchor {
     /// Feedback anchors carry its controller stamp; a result anchor has none.

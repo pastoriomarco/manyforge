@@ -262,6 +262,20 @@ export function programLocalFence(
   };
 }
 
+/** The same local fence for Deployment routes, which check the Deployment Draft. */
+export function deploymentLocalFence(
+  published: PublishedAuthoringWorkspace,
+  snapshot: ComposerHeadlessState,
+  requestOwnerEpoch: string,
+  requestId: string,
+): LocalWorkspaceFenceRequest {
+  return {
+    ...programLocalFence(published, snapshot, requestOwnerEpoch, requestId),
+    draftId: published.identity.deploymentDraftId,
+    expectedDraftRevision: published.identity.deploymentDraftRevision,
+  };
+}
+
 export function scenarioLocalFence(
   published: PublishedAuthoringWorkspace,
   snapshot: ComposerHeadlessState,

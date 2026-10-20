@@ -1156,9 +1156,12 @@ export function parseDeploymentCandidateOperationResponse(
     resultRecord.prepared_activation,
     `${path}.result.prepared_activation`,
   );
+  // An authored (intent) Draft has no compiled revision of its own: the request's
+  // Draft fence already pinned it, so only a compiled Draft must match exactly.
   if (
     workspace.draft.deploymentArtifactId !== preparedActivation.deploymentArtifactId
-    || workspace.draft.deploymentRevision !== preparedActivation.deploymentRevision
+    || (workspace.draft.deploymentRevision !== null
+      && workspace.draft.deploymentRevision !== preparedActivation.deploymentRevision)
   ) {
     return fail(`${path}.workspace`, 'the exact compiled Deployment Draft');
   }

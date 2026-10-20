@@ -458,6 +458,9 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
       deployment.applicability_inputs()
           .value()
           .motion_takeover_preparation_budget_s,
+      deployment.applicability_inputs()
+          .value()
+          .motion_takeover_planning_budget_s,
   };
 }
 
@@ -576,6 +579,13 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
                               .motion_takeover_preparation_budget_s;
       budget.has_value()) {
     root.emplace_back("motion_takeover_preparation_budget_s",
+                      CanonicalValue(*budget));
+  }
+  if (const auto budget = deployment.applicability_inputs()
+                              .value()
+                              .motion_takeover_planning_budget_s;
+      budget.has_value()) {
+    root.emplace_back("motion_takeover_planning_budget_s",
                       CanonicalValue(*budget));
   }
   return CanonicalValue(std::move(root));

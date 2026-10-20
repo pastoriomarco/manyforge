@@ -310,13 +310,16 @@ RuntimeFamilies(const RetainedBundle &bundle,
   // Preserve the historical family bytes when the optional budget is absent.
   if (const auto budget = bundle.value().motion_takeover_preparation_budget_s;
       budget.has_value()) {
-    families.emplace(
-        kApplyComponentReasonRetainedPolicies,
-        CanonicalValue(Object{
-            {"retained_policy_records",
-             CanonicalValue(MemberArray(root, "retained_policy_records"))},
-            {"motion_takeover_preparation_budget_s", CanonicalValue(*budget)},
-        }));
+    Object policies{
+        {"retained_policy_records",
+         CanonicalValue(MemberArray(root, "retained_policy_records"))},
+        {"motion_takeover_preparation_budget_s", CanonicalValue(*budget)},
+    };
+    if (const auto planning = bundle.value().motion_takeover_planning_budget_s)
+      policies.emplace_back("motion_takeover_planning_budget_s",
+                            CanonicalValue(*planning));
+    families.emplace(kApplyComponentReasonRetainedPolicies,
+                     CanonicalValue(std::move(policies)));
   } else {
     families.emplace(
         kApplyComponentReasonRetainedPolicies,

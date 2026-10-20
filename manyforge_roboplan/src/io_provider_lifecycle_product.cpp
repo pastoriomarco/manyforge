@@ -89,6 +89,7 @@ struct IoProviderDriverRecord::State final {
   std::vector<Input> inputs;
   std::vector<IoProviderOutputChannelInstallation> outputs;
   std::function<void()> cancel_pending;
+  InputLifecycleHook input_lifecycle;
   core::ComponentLifecycleStateDTO state{
       core::ComponentLifecycleStateDTO::kDeclared};
   std::uint64_t generation{1U};
@@ -282,7 +283,8 @@ IoProviderDriverRecord::brand_registration() const {
 core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
     std::vector<IoProviderInputSourceInstallation> inputs,
     std::vector<IoProviderOutputChannelInstallation> outputs,
-    std::function<void()> cancel_pending_answers) {
+    std::function<void()> cancel_pending_answers,
+    InputLifecycleHook input_lifecycle) {
   using Reply = core::Result<void>;
   if (state_->installed || state_->retired ||
       (inputs.empty() && outputs.empty()))
@@ -402,6 +404,7 @@ core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
   state_->inputs = std::move(prepared_inputs);
   state_->outputs = std::move(outputs);
   state_->cancel_pending = std::move(cancel_pending_answers);
+  state_->input_lifecycle = std::move(input_lifecycle);
   state_->installed = true;
   state_->CommitFacts();
   return Reply::Ok();
@@ -424,7 +427,8 @@ IoProviderDriverRecord::SetMockValueLocked(const core::IoSignalId &signal,
 
 core::Result<void> IoProviderDriverRecord::RebindInputsLocked(
     std::vector<IoProviderInputSourceInstallation> inputs,
-    std::function<void()> cancel_pending_answers) {
+    std::function<void()> cancel_pending_answers,
+    InputLifecycleHook input_lifecycle) {
   using Reply = core::Result<void>;
   if (state_->retired || !state_->installed || state_->fault ||
       inputs.size() != state_->inputs.size())
@@ -471,6 +475,7 @@ core::Result<void> IoProviderDriverRecord::RebindInputsLocked(
     state_->inputs[i].installation = inputs[i];
   }
   state_->cancel_pending = std::move(cancel_pending_answers);
+  state_->input_lifecycle = std::move(input_lifecycle);
   return Reply::Ok();
 }
 
@@ -543,6 +548,25 @@ RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
       (!disable && !state_->TransportReady()) ||
       ((prepare || enable) && state_->fault))
     return refused("driver_primitive_precondition_changed");
+  if (state_->generation == std::numeric_limits<std::uint64_t>::max())
+    return refused("driver_generation_exhausted");
+  if ((enable || disable) && !state_->inputs.empty() &&
+      state_->input_lifecycle) {
+    const auto planned =
+        state_->input_lifecycle(intent.lifecycle_transaction_id, disable);
+    if (!planned.ok()) {
+      if (planned.error().details.contains("io_source_transition_effects")) {
+        static_cast<void>(
+            state_->Advance()); // Capacity was checked before the callback.
+        state_->fault = planned.error();
+        state_->state = Lifecycle::kFaulted;
+        state_->CommitFacts();
+        return {Dispatch::kDispatchedKnown, Effect::kObserved, Known::kFailed,
+                planned.error()};
+      }
+      return {Dispatch::kNotDispatched, Effect::kNone, {}, planned.error()};
+    }
+  }
   if (!state_->Advance())
     return refused("driver_generation_exhausted");
   if (state_->cancel_pending)

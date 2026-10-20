@@ -49,6 +49,10 @@ constexpr std::string_view kInspectionPlanningResultMagic = "MFNSRC4-INSPECT-PLA
 constexpr std::uint8_t kPneumaticNoneOwnersTail = 4U;
 constexpr std::string_view kInstalledNoneOwnersMagic = "MFNSRC4-INSTALLED-PNEUMATIC-NONE-V1";
 constexpr std::string_view kInspectionNoneOwnersMagic = "MFNSRC4-INSPECT-PNEUMATIC-NONE-V1";
+constexpr std::uint8_t kInstalledLifecycleTail = 5U;
+constexpr std::uint8_t kInstalledLifecycleRequestTail = 6U;
+constexpr std::string_view kInstalledLifecycleMagic =
+    "MFNSRC4-INSTALLED-LIFECYCLE-V1";
 
 constexpr std::uint8_t kObserverRetirementTail = 3U;
 constexpr std::string_view kObserverRetirementMagic = "MFNSRC4-OBSERVER-RETIREMENT-V1";
@@ -450,15 +454,27 @@ void WriteInstalledInventoryRequest(
   WriteStrong(writer, request.runtime_unit_id);
   WriteStrong(writer, request.runtime_epoch);
   WriteStrong(writer, request.manager_runtime_epoch);
+  if (request.include_component_lifecycles) {
+    writer.Byte(kInstalledLifecycleRequestTail);
+    writer.String(kInstalledLifecycleMagic);
+  }
 }
 ManagerComponentProcessInventoryRequestDTO
 ReadInstalledInventoryRequest(Reader &reader) {
-  return {ReadProjectionRevision(reader),
-          ReadGeneration<core::ActiveBundlePublicationGeneration>(reader),
-          ReadStrong<core::ContentDigest>(reader),
-          ReadStrong<core::RuntimeUnitId>(reader),
-          ReadStrong<core::RuntimeEpoch>(reader),
-          ReadStrong<core::RuntimeEpoch>(reader)};
+  ManagerComponentProcessInventoryRequestDTO result{
+      ReadProjectionRevision(reader),
+      ReadGeneration<core::ActiveBundlePublicationGeneration>(reader),
+      ReadStrong<core::ContentDigest>(reader),
+      ReadStrong<core::RuntimeUnitId>(reader),
+      ReadStrong<core::RuntimeEpoch>(reader),
+      ReadStrong<core::RuntimeEpoch>(reader)};
+  if (!reader.AtEnd() && reader.Peek() == kInstalledLifecycleRequestTail) {
+    static_cast<void>(reader.Byte());
+    if (reader.String() != kInstalledLifecycleMagic)
+      Fail("installed lifecycle request extension is invalid");
+    result.include_component_lifecycles = true;
+  }
+  return result;
 }
 void WriteInstalledOccurrence(Writer &writer,
                               const ManagerComponentProcessOccurrenceDTO &row) {
@@ -740,7 +756,8 @@ void WriteInstalledNoneOwnersTail(Writer &writer,
 
 void ReadInstalledNoneOwnersTail(Reader &reader,
     std::vector<ManagerComponentProcessOccurrenceDTO> &rows) {
-  if (reader.AtEnd()) return;
+  if (reader.AtEnd() || reader.Peek() == kInstalledLifecycleTail)
+    return;
   if (reader.Byte() != kPneumaticNoneOwnersTail || reader.String() != kInstalledNoneOwnersMagic)
     Fail("installed None owner extension is not a closed supported value");
   const auto count = reader.U32();
@@ -1198,6 +1215,16 @@ std::string EncodeSelectedRuntimeCompositionRpcResponse(
           if (value.error)
             WriteError(writer, *value.error);
           WriteInstalledNoneOwnersTail(writer, value.process_occurrences);
+          if (!value.component_lifecycles.empty()) {
+            writer.Byte(kInstalledLifecycleTail);
+            writer.String(kInstalledLifecycleMagic);
+            WriteVector(writer, value.component_lifecycles,
+                        [](Writer &out, const auto &row) {
+                          WriteStrong(out, row.controllable_component_id);
+                          out.U64(row.generation.value());
+                          out.Byte(static_cast<std::uint8_t>(row.state));
+                        });
+          }
           return std::move(writer).Finish();
         } else if constexpr (std::is_same_v<
                                  Value, ManagerComponentProcessStopResultDTO>) {
@@ -1241,6 +1268,24 @@ DecodeSelectedRuntimeCompositionRpcResponse(const std::string_view bytes) {
     if (reader.Boolean())
       result.error = ReadError(reader);
     ReadInstalledNoneOwnersTail(reader, result.process_occurrences);
+    if (!reader.AtEnd()) {
+      if (reader.Byte() != kInstalledLifecycleTail ||
+          reader.String() != kInstalledLifecycleMagic)
+        Fail("installed lifecycle extension is not a closed supported value");
+      result.component_lifecycles =
+          ReadVector<ManagerComponentLifecycleObservationDTO>(
+              reader,
+              [](Reader &in) -> ManagerComponentLifecycleObservationDTO {
+                auto component = ReadStrong<core::ControllableComponentId>(in);
+                const auto generation = in.U64();
+                return {
+                    std::move(component),
+                    core::ComponentLifecycleGeneration(generation),
+                    static_cast<core::ComponentLifecycleStateDTO>(in.Byte())};
+              });
+      if (result.component_lifecycles.empty())
+        Fail("installed lifecycle extension is empty");
+    }
     reader.Finish();
     if (!result.valid())
       Fail("decoded installed process inventory is invalid");

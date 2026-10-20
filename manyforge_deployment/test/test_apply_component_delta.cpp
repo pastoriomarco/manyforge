@@ -565,16 +565,22 @@ TEST(ApplyComponentDelta, EveryRuntimeChangeOwningADomainMustBeFenced) {
 
 TEST(ApplyComponentDelta,
      MovingTakeoverBudgetChangesEveryComponentPolicyIdentity) {
-  const auto with_budget = [](const RetainedBundle &source, double budget_s) {
+  const auto with_budget = [](const RetainedBundle &source, double budget_s,
+                              std::optional<double> planning_s = std::nullopt) {
     auto root = source.normalized_root().as_object();
-    root.erase(std::remove_if(root.begin(), root.end(),
-                              [](const auto &row) {
-                                return row.first ==
-                                       "motion_takeover_preparation_budget_s";
-                              }),
+    root.erase(std::remove_if(
+                   root.begin(), root.end(),
+                   [](const auto &row) {
+                     return row.first ==
+                                "motion_takeover_preparation_budget_s" ||
+                            row.first == "motion_takeover_planning_budget_s";
+                   }),
                root.end());
     root.emplace_back("motion_takeover_preparation_budget_s",
                       CanonicalValue(budget_s));
+    if (planning_s)
+      root.emplace_back("motion_takeover_planning_budget_s",
+                        CanonicalValue(*planning_s));
     auto projection = CanonicalValue(std::move(root));
     const auto identity = detail::compute_content_identity(
         projection,
@@ -592,10 +598,15 @@ TEST(ApplyComponentDelta,
   };
   const auto selected = with_budget(RosTwoArms(), 3.5);
   const auto changed = with_budget(*selected, 7.0);
+  const auto planning = with_budget(*selected, 3.5, 1.25);
+  const auto changed_planning = with_budget(*planning, 3.5, 2.0);
   for (const auto &delta :
        {derive_apply_component_delta(RosTwoArms(), *selected),
         derive_apply_component_delta(*selected, *changed),
-        derive_apply_component_delta(*selected, RosTwoArms())}) {
+        derive_apply_component_delta(*selected, RosTwoArms()),
+        derive_apply_component_delta(*selected, *planning),
+        derive_apply_component_delta(*planning, *changed_planning),
+        derive_apply_component_delta(*planning, *selected)}) {
     ASSERT_TRUE(delta.valid());
     ASSERT_EQ(delta.components.size(), 2U);
     for (const auto &row : delta.components) {

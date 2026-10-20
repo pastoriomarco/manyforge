@@ -75,6 +75,9 @@ struct RoboPlanCandidateRequestDTO final {
 struct RoboPlanCandidateControl final {
   std::function<bool()> cancellation_requested;
   std::function<bool()> deadline_expired;
+  // Optional same-host transport deadline for the moving suffix only.
+  // Final connector validation remains under deadline_expired (whole preparation).
+  std::function<bool()> planning_deadline_expired{};
 };
 
 struct RoboPlanCandidateComputerConfig final {

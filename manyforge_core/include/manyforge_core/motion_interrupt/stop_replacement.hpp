@@ -114,6 +114,18 @@ struct StopReplacementStartDTO final {
                                                                 double continuation_origin_s,
                                                                 double trip_path_s);
 
+/// Experimental resident-timeline realization of the unchanged checked join.
+/// Keep the full logical curve for subsequent Stops; send only an exact future
+/// attachment state followed by the prepared suffix. source_clock_offset_s maps
+/// native resident cursor to the active trajectory's canonical path time.
+struct ResidentTimelineReplacementDTO final {
+  TrajectoryDTO resident_trajectory;
+  TrajectoryDTO delivery_trajectory;
+};
+[[nodiscard]] Result<ResidentTimelineReplacementDTO> build_resident_timeline_replacement(
+    const TrajectoryDTO& active, const TrajectoryDTO& joined, double elapsed_s,
+    double source_clock_offset_s);
+
 /// §3.3 cursor mapping of one on-path Stop replacement built by
 /// `build_stop_replacement_join`: the controller's cursor on the replacement
 /// back to the active (original) trajectory's path time, with the Stop

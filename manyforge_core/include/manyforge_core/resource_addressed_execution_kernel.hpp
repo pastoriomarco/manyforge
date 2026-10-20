@@ -118,6 +118,8 @@ struct RuntimeParticipantExecutionRegistration final {
   /// Server-derived overlay from the exact current captured Program node.
   /// Never copied into the public operation intent or its replay digest.
   std::optional<MotionInterruptScopeDTO> captured_node_interrupt_scope{};
+  /// Optional earlier suffix-planning deadline from the applied Deployment.
+  std::optional<double> motion_takeover_planning_budget_s{};
 };
 
 using RuntimeParticipantAdmissionResolver =
@@ -621,6 +623,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const ProgramIoWatchScopeReleaseRequestDTO& request);
   /// Existing host scheduling calls after ingress drain and at NextIoRuleExpiry.
   [[nodiscard]] Result<void> ProcessIoRuleEvidence();
+  /// Local managed I/O lifecycle boundary, before input Pause/Resume. The
+  /// existing exclusive lifecycle claim and idle checks remain authoritative.
+  [[nodiscard]] Result<void> SetGlobalIoSourcesPlannedDisabled(
+      const std::shared_ptr<IIoSignalService>& expected_service,
+      std::span<const InterruptSourceId> sources,
+      const LifecycleTransactionId& actual_lifecycle_transaction, bool disabled);
   [[nodiscard]] Result<std::optional<TimePoint>> NextIoRuleExpiry() const;
   void LatchAndContain(const ManagerLivenessLossIntentDTO& intent) noexcept override;
   /// Component-incident containment: a cell Full Stop under this Kernel's own
@@ -1242,6 +1250,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::optional<IoRuleAppliedContextDTO> global_io_rule_applied_context_;
   std::shared_ptr<IIoSignalService> global_io_rule_service_;
   std::vector<GlobalIoRuleRuntime> global_io_rules_;
+  std::set<InterruptSourceId> planned_disabled_io_sources_;
   std::unique_ptr<StagedGlobalIoRuleCatalog> staged_global_io_rule_catalog_;
   // Existing bounded forensic history budget; no second event cursor.
   std::vector<IoRuleStateChangeDTO> global_io_rule_projection_queue_;

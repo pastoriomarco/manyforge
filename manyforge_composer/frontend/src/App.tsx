@@ -1120,6 +1120,8 @@ export default function App() {
             controller={deploymentController}
             resetApply={resetApply}
             scenarioCommands={scenarioCommands}
+            cclc={cclc}
+            authoringAdmissionGeneration={headlessSnapshot?.authoringAdmission.admissionGeneration ?? null}
           />
         ) : (
           <ProgramDocumentControls

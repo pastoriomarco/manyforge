@@ -241,6 +241,11 @@
   gap: 0.65rem;
 }
 
+/* A section-level message must not open a second column and reflow the fields. */
+.deployment-focused-body > .deployment-field-error {
+  grid-column: 1 / -1;
+}
+
 .deployment-resolved-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));

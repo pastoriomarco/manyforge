@@ -348,7 +348,7 @@ function controlledStopTargets(document: Record<string, JsonValue> | null): Cont
         const natural = stop?.allow_natural_completion_on_short_path;
         const jerkEnabled = stop?.jerk_limits_enabled;
         const limits = stop?.per_joint_limits;
-        if ((mode !== 'soft_on_path' && mode !== 'spring_back_hold')
+        if ((mode !== 'soft_on_path' && mode !== 'spring_back_hold' && mode !== 'spring_back_fast')
           || deceleration === null || typeof natural !== 'boolean'
           || typeof jerkEnabled !== 'boolean' || !Array.isArray(limits)) return [];
         const normalizedLimits = limits.flatMap((limitValue) => {
@@ -459,7 +459,7 @@ function normalizedStopProfile(
     const natural = parameters?.allow_natural_completion_on_short_path;
     const limits = parameters?.per_resource_limits;
     if (
-      (mode !== 'soft_on_path' && mode !== 'spring_back_hold')
+      (mode !== 'soft_on_path' && mode !== 'spring_back_hold' && mode !== 'spring_back_fast')
       || deceleration === null
       || typeof natural !== 'boolean'
       || !Array.isArray(limits)
@@ -671,6 +671,7 @@ function OptionalNumberDraft({
   maximum,
   minimum,
   placeholder = 'model only',
+  ariaLabel,
 }: {
   label: string;
   value: number | null;
@@ -680,15 +681,19 @@ function OptionalNumberDraft({
   maximum?: number;
   minimum?: number;
   placeholder?: string;
+  ariaLabel?: string;
 }) {
   const [draft, setDraft] = useState(value === null ? '' : String(value));
   const [invalid, setInvalid] = useState(false);
+  const [rejected, setRejected] = useState(false);
   useEffect(() => {
     setDraft(value === null ? '' : String(value));
     setInvalid(false);
+    setRejected(false);
   }, [value]);
   const commit = async () => {
     const parsed = draft.trim() === '' ? null : Number(draft);
+    setRejected(false);
     if (parsed !== null && (!Number.isFinite(parsed) || parsed <= 0
       || (maximum !== undefined && parsed > maximum)
       || (minimum !== undefined && parsed < minimum))) {
@@ -697,10 +702,12 @@ function OptionalNumberDraft({
     }
     if (parsed === value) return;
     const result = await onCommit(parsed);
-    setInvalid(result === null);
+    // A well-formed value the owner refused is not an input-format error.
+    setInvalid(false);
+    setRejected(result === null);
   };
   return (
-    <label className={`deployment-focused-field${invalid ? ' invalid' : ''}`}>
+    <label className={`deployment-focused-field${invalid || rejected ? ' invalid' : ''}`}>
       <span>{label}</span>
       <span className="deployment-number-with-unit">
         <input
@@ -710,10 +717,12 @@ function OptionalNumberDraft({
           max={maximum}
           step="any"
           placeholder={placeholder}
+          aria-label={ariaLabel}
           disabled={disabled}
           onChange={(event) => {
             setDraft(event.target.value);
             setInvalid(false);
+            setRejected(false);
           }}
           onBlur={() => { void commit(); }}
           onKeyDown={(event) => {
@@ -721,12 +730,14 @@ function OptionalNumberDraft({
             if (event.key === 'Escape') {
               setDraft(value === null ? '' : String(value));
               setInvalid(false);
+              setRejected(false);
               event.currentTarget.blur();
             }
           }}
         />
         <small>{unit}</small>
       </span>
+      {rejected && <small className="deployment-field-error inline-message severity-error">Value was rejected.</small>}
       {invalid && <small className="deployment-field-error inline-message severity-error">
         {maximum === 0 ? 'Enable ordinary jerk shaping first, or leave blank.'
           : minimum !== undefined ? `Use at least ${minimum}${maximum === undefined ? '' : ` and at most ${maximum}`}, or clear the manual jerk cap first.`
@@ -1259,11 +1270,20 @@ function ControlledStopEditor({ controller, target }: {
               })}
             >
               <option value="soft_on_path">Soft on path</option>
-              <option value="spring_back_hold">Spring-back hold</option>
+              <option value="spring_back_hold">Spring-back on path</option>
+              <option value="spring_back_fast">Spring-back fast</option>
             </select>
           </label>
+          {draft.stop_mode === 'spring_back_fast' && (
+            <p className="field-help">
+              Sent at once, with no planning or checks: the robot brakes, overshoots and returns to the
+              stop-trigger position within the Stop time. Speed, acceleration and collision of that move are
+              not checked, so the robot&apos;s own safety controller may trip. Meant for searches and probes
+              stopped by an interrupt.
+            </p>
+          )}
           <NumberDraft
-            label={draft.stop_mode === 'spring_back_hold' ? 'Brake + return time' : 'Deceleration time'}
+            label={draft.stop_mode === 'soft_on_path' ? 'Deceleration time' : 'Brake + return time'}
             value={draft.deceleration_time_s}
             unit="s"
             min={0.001}
@@ -1302,7 +1322,7 @@ function ControlledStopEditor({ controller, target }: {
               }} />}
           </>}
           {draft && <>
-          <label className="deployment-focused-checkbox" title={draft.stop_mode === 'spring_back_hold'
+          <label className="deployment-focused-checkbox" title={draft.stop_mode !== 'soft_on_path'
             ? 'Off by default: brake and return to the stop-trigger position. Enabling permits a short remaining move to finish at its endpoint instead; that is not a precision return.'
             : 'On by default: a sufficiently short remaining move may finish at its endpoint, with rest confirmed within the Stop deadline.'}>
             <input
@@ -1733,10 +1753,79 @@ export function DeploymentFocusedEditor({
       )}
       <IoSignalConfigurationSection controller={controller} runtimes={ioRuntimes} />
       {document.api_version === 'manyforge.deployment_intent.v2' && (
+        <MotionTakeoverSection controller={controller} document={document} />
+      )}
+      {document.api_version === 'manyforge.deployment_intent.v2' && (
         <GlobalInterruptRulesSection controller={controller} document={document} programKeys={programKeys}
           stopChains={stopChains} executionGroupIds={executionGroupIds} />
       )}
     </section>
+  );
+}
+
+const TAKEOVER_TOTAL_KEY = 'motion_takeover_preparation_budget_s';
+const TAKEOVER_PLANNING_KEY = 'motion_takeover_planning_budget_s';
+/** The backend's frozen derived default for an omitted planning budget. */
+const TAKEOVER_DEFAULT_PLANNING_FRACTION = 0.8;
+
+/**
+ * Moving takeover timing in `policies`: the total preparation time (the
+ * handoff horizon; absent = no takeover) and an optional planning budget
+ * strictly below it (absent = derived, 80% of the total). The difference is
+ * left for validation, the join and controller delivery.
+ */
+function MotionTakeoverSection({ controller, document }: {
+  controller: DeploymentWorkspaceController;
+  document: Record<string, JsonValue>;
+}) {
+  const policies = objectValue(document.policies);
+  const total = numberValue(policies?.[TAKEOVER_TOTAL_KEY]);
+  const planning = numberValue(policies?.[TAKEOVER_PLANNING_KEY]);
+  const effectivePlanning = planning
+    ?? (total === null ? null : total * TAKEOVER_DEFAULT_PLANNING_FRACTION);
+  const [error, setError] = useState<string | null>(null);
+  const disabled = !controller.mutationAvailable || controller.busy;
+  const commit = async (key: string, value: number | null) => {
+    const nextTotal = key === TAKEOVER_TOTAL_KEY ? value : total;
+    const nextPlanning = key === TAKEOVER_PLANNING_KEY ? value : planning;
+    if (nextPlanning !== null && nextTotal === null) {
+      setError('Clear the planning budget before turning takeover off.');
+      return null;
+    }
+    if (nextPlanning !== null && nextTotal !== null && nextPlanning >= nextTotal) {
+      setError('The planning budget must be below the total preparation time.');
+      return null;
+    }
+    const result = value === null
+      ? await controller.mutate(['policies', key], 'remove')
+      : policies === null
+        ? await controller.mutate(['policies'], 'set', { [key]: value })
+        : await controller.mutate(['policies', key], 'set', value);
+    setError(result === null ? 'The Deployment owner rejected this timing change.' : null);
+    return result;
+  };
+  return (
+    <details className="dcard" open={total !== null}>
+      <summary>Motion takeover timing</summary>
+      <div className="deployment-focused-body">
+        <p className="field-help">A moving takeover replaces the running motion with a newly accepted one without stopping first; if preparation does not finish in time, the takeover fallback applies. Both times count from the start of takeover preparation. The planning budget caps planning of the new motion (left empty, it is 80% of the total); the time left after it stays available for checking the result, joining it to the running motion and sending it to the controller, but does not guarantee delivery in time.</p>
+        <OptionalNumberDraft label="Total preparation time (handoff horizon)" value={total} unit="s"
+          placeholder="takeover off" ariaLabel="Takeover total preparation time" disabled={disabled}
+          onCommit={(value) => commit(TAKEOVER_TOTAL_KEY, value)} />
+        <OptionalNumberDraft label="Planning budget" value={planning} unit="s"
+          placeholder={effectivePlanning === null ? 'takeover off' : `default ${format(effectivePlanning)}`}
+          ariaLabel="Takeover planning budget" disabled={disabled || total === null}
+          onCommit={(value) => commit(TAKEOVER_PLANNING_KEY, value)} />
+        {total === null && <p className="muted">Takeover is off: a motion requested while another one runs is refused as busy.</p>}
+        {total !== null && effectivePlanning !== null && (
+          <p className="muted">
+            {planning === null ? `Default planning budget: ${format(effectivePlanning)} s (80% of the total). ` : ''}
+            Reserved after planning: {format(total - effectivePlanning)} s.
+          </p>
+        )}
+        {error && <p className="deployment-field-error inline-message severity-error">{error}</p>}
+      </div>
+    </details>
   );
 }
 

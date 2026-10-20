@@ -637,7 +637,7 @@ export interface DeploymentCandidateOperationResponse {
 }
 
 export interface DeploymentControlledStopProfile {
-  stop_mode: 'soft_on_path' | 'spring_back_hold';
+  stop_mode: 'soft_on_path' | 'spring_back_hold' | 'spring_back_fast';
   deceleration_time_s: number;
   /** Q28/Q51 (`main`): this profile's controlled-Stop deadline from the Stop
    * request; absent uses the deceleration time + 0.5 s. */

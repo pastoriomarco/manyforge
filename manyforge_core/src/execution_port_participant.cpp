@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/execution_sample_association.hpp>
 #include <manyforge_core/motion_interrupt/stop_replacement.hpp>
@@ -25,6 +26,17 @@ ErrorDTO fault(ErrorCode code, std::string message, const std::string& reason,
   details["reason"] = reason;
   details["surface"] = "execution_port_participant";
   return ErrorDTO{std::string(to_string(code)), std::move(message), std::move(details)};
+}
+
+// One bounded diagnostic per hold transition; no per-tick logging.
+void trace_scale_hold(const char* stage, std::uint64_t owner, const ExecutionGoalKey& goal,
+                      double factor, double cursor, double rate) {
+  const auto written = std::fprintf(stderr,
+                                    "manyforge_moving_scale_hold stage=%s owner=%llu goal=%.160s "
+                                    "factor=%.17g cursor_s=%.17g rate_per_s=%.17g\n",
+                                    stage, static_cast<unsigned long long>(owner),
+                                    goal.controller_goal_id.value().c_str(), factor, cursor, rate);
+  static_cast<void>(written);
 }
 
 const char* refusal_name(ExecutionPortRefusal refusal) {
@@ -123,6 +135,7 @@ StopStageDispatchedGoalDTO stop_goal_for(const PreparedOperationParticipantDTO& 
 struct ExecutionPortParticipant::Execution {
   std::uint64_t generation{};
   ExecutionGoalKey key;
+  std::optional<double> scale_hold_until_cursor_s;
   TrajectoryDTO trajectory;
   std::shared_ptr<IExecutionPort> port;
   ExecutionBindingEpoch epoch{0U};
@@ -400,6 +413,13 @@ bool ExecutionPortParticipant::ReplacementScaleCompatibleLocked(
   std::lock_guard scale_lock(scale_mutex_);
   if (scale_frozen_) return false;
   if (!ramp_) return true;
+  if (preparation_scale_hold_ && preparation_scale_hold_->confirmed && replacement_ &&
+      preparation_scale_hold_->candidate_id == replacement_->candidate_id &&
+      preparation_scale_hold_->source_goal == execution_->key &&
+      *sample.applied_factor == preparation_scale_hold_->factor &&
+      ramp_->value == preparation_scale_hold_->factor && ramp_handle_ == 0U)
+    return true;
+
   if (!std::isfinite(ramp_->value) || ramp_->value < 0.0 || ramp_->value > 1.0 ||
       !std::isfinite(ramp_->target) || ramp_->target < 0.0 || ramp_->target > 1.0 ||
       !std::isfinite(ramp_->rate_per_s) || ramp_->rate_per_s <= 0.0 ||
@@ -454,6 +474,107 @@ Result<PreparedMotionReplacementSourceDTO> ExecutionPortParticipant::CaptureRepl
   return Result<PreparedMotionReplacementSourceDTO>::Ok(std::move(source));
 }
 
+Result<void> ExecutionPortParticipant::BeginReplacementPreparationScaleHold(
+    const PreparedMotionReplacementSourceDTO& source, const std::uint64_t candidate_id,
+    const std::int64_t deadline, const std::stop_token cancellation) {
+  const auto refuse = [](const char* reason) {
+    return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
+                                   "Moving preparation scaling hold was refused", reason));
+  };
+  {
+    std::lock_guard lock(mutex_);
+    if (cancellation.stop_requested() || clock_.now() >= deadline)
+      return refuse("motion_replacement_scale_hold_budget_expired");
+    if (!SourceMatchesLocked(source) || execution_->terminal || execution_->stopping ||
+        execution_->critical_fault || stop_stages_in_flight_ != 0U || candidate_id == 0U)
+      return refuse("motion_replacement_scale_hold_source_stale");
+    if (!lane_.supports_scale) return Result<void>::Ok();
+    const auto factor = source.controller_sample.applied_factor;
+    if (!factor || !std::isfinite(*factor) || *factor <= 0.0 || *factor > 1.0)
+      return refuse("motion_replacement_scale_hold_factor_invalid");
+    std::lock_guard scale_lock(scale_mutex_);
+    if (scale_frozen_ ||
+        (preparation_scale_hold_ && (preparation_scale_hold_->candidate_id != candidate_id ||
+                                     preparation_scale_hold_->source_goal != source.goal)))
+      return refuse("motion_replacement_scale_hold_owner_changed");
+    if (!preparation_scale_hold_) {
+      const bool tick_pending = ramp_handle_ != 0U;
+      ++ramp_generation_;
+      if (ramp_handle_ != 0U) scheduler_.cancel(ramp_handle_);
+      ramp_handle_ = 0U;
+      const bool settled = !tick_pending && ramp_ && ramp_->value == *factor &&
+                           ramp_->target == *factor && last_sent_scale_ == factor &&
+                           source.controller_sample.local_receipt_stamp_ns <= clock_.now() &&
+                           (config_.progress_freshness_budget_ns == 0 ||
+                            clock_.now() - source.controller_sample.local_receipt_stamp_ns <=
+                                config_.progress_freshness_budget_ns);
+      preparation_scale_hold_ = PreparationScaleHold{candidate_id, source.goal, *factor, settled};
+      if (settled)
+        trace_scale_hold("confirmed", candidate_id, source.goal, *factor,
+                         source.controller_sample.cursor_s, ramp_->rate_per_s);
+      if (!settled) {
+        const auto pin = port_->SetScale(*factor);
+        if (pin.dispatch == ExecutionPortDispatch::kNotDispatched)
+          return refuse("motion_replacement_scale_hold_pin_refused");
+        last_sent_scale_ = *factor;
+        if (ramp_) ramp_->value = *factor;
+      }
+    }
+    if (preparation_scale_hold_->confirmed) return Result<void>::Ok();
+  }
+  // Same existing observation/wait seam and preparation deadline; no new timer.
+  while (!cancellation.stop_requested() && clock_.now() < deadline) {
+    {
+      std::lock_guard lock(mutex_);
+      std::lock_guard scale_lock(scale_mutex_);
+      if (!preparation_scale_hold_ || preparation_scale_hold_->candidate_id != candidate_id ||
+          scale_frozen_ || !SourceMatchesLocked(source) || execution_->terminal ||
+          execution_->stopping)
+        return refuse("motion_replacement_scale_hold_owner_changed");
+      const auto sample = port_->ReadSample();
+      const auto goal = port_->ReadGoal(source.goal);
+      const auto now = clock_.now();
+      if (sample && sample->binding_epoch == source.binding_epoch &&
+          sample->source_stamp_ns > source.controller_sample.source_stamp_ns &&
+          sample->local_receipt_stamp_ns <= now &&
+          (config_.progress_freshness_budget_ns == 0 ||
+           now - sample->local_receipt_stamp_ns <= config_.progress_freshness_budget_ns) &&
+          sample->applied_factor == std::optional<double>(preparation_scale_hold_->factor) &&
+          execution_->association->Observe(*sample, goal)) {
+        preparation_scale_hold_->confirmed = true;
+        trace_scale_hold("confirmed", candidate_id, source.goal, preparation_scale_hold_->factor,
+                         sample->cursor_s, ramp_ ? ramp_->rate_per_s : 0.0);
+        return Result<void>::Ok();
+      }
+    }
+    waiter_(deadline, cancellation);
+  }
+  return refuse("motion_replacement_scale_hold_unconfirmed");
+}
+
+Result<void> ExecutionPortParticipant::EndReplacementPreparationScaleHold(
+    const std::uint64_t candidate_id) {
+  std::lock_guard lock(mutex_);
+  std::lock_guard scale_lock(scale_mutex_);
+  if (!preparation_scale_hold_ || preparation_scale_hold_->candidate_id != candidate_id)
+    return Result<void>::Ok();
+  if (!preparation_scale_hold_->confirmed && !scale_frozen_)
+    return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
+                                   "Moving scale pin has no observed confirmation",
+                                   "motion_replacement_scale_hold_unconfirmed"));
+  trace_scale_hold("retired", candidate_id, preparation_scale_hold_->source_goal,
+                   preparation_scale_hold_->factor, execution_ ? execution_->cursor_s : 0.0,
+                   ramp_ ? ramp_->rate_per_s : 0.0);
+  preparation_scale_hold_.reset();
+  if (ramp_) ramp_->target = target_scale_;
+  if (!scale_frozen_ && execution_ && !execution_->terminal && !execution_->stopping &&
+      !execution_->scale_hold_until_cursor_s && ramp_ && ramp_->value != ramp_->target) {
+    last_ramp_tick_ = clock_.now();
+    ScheduleRampTickLocked();
+  }
+  return Result<void>::Ok();
+}
+
 PrepareParticipantResultDTO ExecutionPortParticipant::PrepareReplacement(
     const PreparedOperationParticipantDTO& participant, const std::uint64_t candidate_id,
     const PreparedMotionReplacementSourceDTO& source) {
@@ -487,6 +608,12 @@ PrepareParticipantResultDTO ExecutionPortParticipant::PrepareReplacement(
   pending->divergence_cursor_s = motion.plan_request.moving_replacement->divergence_cursor_s;
   pending->execution = std::make_shared<Execution>();
   pending->execution->trajectory = motion.trajectory;
+  const auto prefix_count =
+      motion.plan_request.moving_replacement->source_prefix_trajectory.waypoints.size();
+  if (prefix_count > 0U && prefix_count < motion.trajectory.waypoints.size())
+    pending->execution->scale_hold_until_cursor_s =
+        motion.trajectory.waypoints[prefix_count].time_from_start_s;
+
   pending->stop_goal = stop_goal_for(participant, {}, motion.trajectory);
   pending->record_trajectory = motion.trajectory;
   auto accepted =
@@ -505,6 +632,11 @@ PrepareParticipantResultDTO ExecutionPortParticipant::PrepareReplacement(
       return accepted;
     return reject("motion_replacement_in_flight");
   }
+  if (preparation_scale_hold_ && preparation_scale_hold_->candidate_id == candidate_id &&
+      !pending->execution->scale_hold_until_cursor_s)
+    return reject("motion_replacement_connector_boundary_invalid");
+  if (preparation_scale_hold_ && preparation_scale_hold_->candidate_id != candidate_id)
+    return reject("motion_replacement_scale_hold_owner_changed");
   if (!helper_->ReserveReplacement(source.goal)) return reject("motion_replacement_goal_capacity");
   if (const auto invalid =
           prepared_membership_.prepare_replacement(source.execution_id, candidate_id, participant))
@@ -520,10 +652,11 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
     const PreparedMotionReplacementSourceDTO& source, const std::uint64_t candidate_id,
     const PreparedOperationParticipantDTO& participant, const ExecutionGoalKey& successor,
     const std::int64_t preparation_deadline_ns) {
-  const auto reject = [](std::string reason) {
+  const auto reject = [](std::string reason, std::map<std::string, std::string> details = {}) {
     return PreparedMotionReplacementDispatchDTO{
         {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey,
-         fault(ErrorCode::kExecutionRejected, "Motion replacement dispatch was refused", reason)},
+         fault(ErrorCode::kExecutionRejected, "Motion replacement dispatch was refused", reason,
+               std::move(details))},
         std::nullopt};
   };
   std::lock_guard lock(mutex_);
@@ -573,20 +706,73 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
       ExecutionPortDispatch::kEffectUncertain, std::nullopt,
       fault(ErrorCode::kExecutionAborted, "Motion replacement send outcome is unknown",
             "motion_replacement_send_threw")};
+  std::string source_qualification_check;
   const auto source_sample_current = [&](const auto& sample, TimePoint now) {
     const auto readiness = port_->ReadReadiness();
     const auto predecessor = port_->ReadGoal(source.goal);
-    return ready(readiness) && readiness.binding_epoch == source.binding_epoch && predecessor &&
-           predecessor->key == source.goal && predecessor->binding_epoch == source.binding_epoch &&
-           predecessor->phase != ExecutionGoalPhase::kTerminal && sample &&
-           sample->binding_epoch == source.binding_epoch && std::isfinite(sample->cursor_s) &&
-           sample->local_receipt_stamp_ns <= now &&
-           (config_.stop.controller_state_max_age_ns == 0 ||
-            now - sample->local_receipt_stamp_ns <= config_.stop.controller_state_max_age_ns) &&
-           (config_.progress_freshness_budget_ns == 0 ||
-            now - sample->local_receipt_stamp_ns <= config_.progress_freshness_budget_ns) &&
-           execution_->association->Observe(*sample, predecessor) &&
-           ReplacementScaleCompatibleLocked(*sample, candidate->trajectory);
+    const auto check = [&](bool qualified, const char* name) {
+      if (!qualified) source_qualification_check = name;
+      return qualified;
+    };
+    return check(ready(readiness) && readiness.binding_epoch == source.binding_epoch,
+                 "readiness") &&
+           check(predecessor && predecessor->key == source.goal &&
+                     predecessor->binding_epoch == source.binding_epoch &&
+                     predecessor->phase != ExecutionGoalPhase::kTerminal,
+                 "predecessor") &&
+           check(sample && sample->binding_epoch == source.binding_epoch &&
+                     std::isfinite(sample->cursor_s),
+                 "sample") &&
+           check(sample->local_receipt_stamp_ns <= now, "sample_future_stamp") &&
+           check(
+               config_.stop.controller_state_max_age_ns == 0 ||
+                   now - sample->local_receipt_stamp_ns <= config_.stop.controller_state_max_age_ns,
+               "controller_state_age") &&
+           check(config_.progress_freshness_budget_ns == 0 ||
+                     now - sample->local_receipt_stamp_ns <= config_.progress_freshness_budget_ns,
+                 "progress_age") &&
+           check(execution_->association->Observe(*sample, predecessor), "association") &&
+           check(ReplacementScaleCompatibleLocked(*sample, candidate->trajectory),
+                 "scale_compatibility");
+  };
+  // A refused dispatch already creates a structured error. Retain the exact
+  // failed qualification and configured scale state there without another
+  // controller read, retry, or change to admission.
+  const auto source_refusal = [&](const auto& sample, TimePoint now, const char* stage) {
+    const auto number = [](double value) {
+      char buffer[64];
+      std::snprintf(buffer, sizeof(buffer), "%.17g", value);
+      return std::string(buffer);
+    };
+    std::map<std::string, std::string> details{{"qualification_check", source_qualification_check},
+                                               {"qualification_stage", stage}};
+    if (sample) {
+      details["sample_cursor_s"] = number(sample->cursor_s);
+      details["sample_age_ns"] = std::to_string(now - sample->local_receipt_stamp_ns);
+      if (sample->applied_factor) details["applied_factor"] = number(*sample->applied_factor);
+    }
+    const auto bounds = [&](const char* label, const auto& trajectory) {
+      if (trajectory.runtime_scale_bounds) {
+        details[std::string(label) + "_rate_per_s"] =
+            number(trajectory.runtime_scale_bounds->max_rate_per_s);
+        details[std::string(label) + "_rate_change_per_s2"] =
+            number(trajectory.runtime_scale_bounds->max_rate_change_per_s2);
+      }
+    };
+    bounds("source", execution_->trajectory);
+    bounds("candidate", candidate->trajectory);
+    {
+      std::lock_guard scale_lock(scale_mutex_);
+      details["scale_frozen"] = scale_frozen_ ? "true" : "false";
+      details["ramp_present"] = ramp_ ? "true" : "false";
+      details["ramp_tick_pending"] = ramp_handle_ != 0U ? "true" : "false";
+      if (ramp_) {
+        details["ramp_value"] = number(ramp_->value);
+        details["ramp_target"] = number(ramp_->target);
+        details["ramp_rate_per_s"] = number(ramp_->rate_per_s);
+      }
+    }
+    return reject("motion_replacement_scale_or_source_unqualified", std::move(details));
   };
   const auto elapsed_at = [&](const ExecutionControllerSampleDTO& sample, TimePoint now,
                               double allowance) {
@@ -601,7 +787,7 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
   const auto baseline = port_->ReadSample();
   const auto join_started_at = clock_.now();
   if (!source_sample_current(baseline, join_started_at))
-    return reject("motion_replacement_scale_or_source_unqualified");
+    return source_refusal(baseline, join_started_at, "baseline");
   // Scheduled lanes pair the header with the SAME estimated source origin.
   // Moving takeover retains its existing instantaneous-factor extrapolation;
   // a compatible evolving ramp is not frozen or newly refused here.
@@ -619,7 +805,20 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
       build_stop_replacement_join(execution_->trajectory, elapsed, candidate->trajectory,
                                   pending.source_cursor_s, pending.divergence_cursor_s);
   if (!delivery.ok()) return reject("motion_replacement_delivery_join_failed");
-  candidate->delivery_clock.elapsed_s = elapsed - pending.source_cursor_s;
+  const bool resident_timeline = lane_.supports_resident_timeline_replacement &&
+                                 (!lane_.supports_scale || baseline->applied_factor.value_or(0.0) > 0.0);
+  std::optional<TrajectoryDTO> resident_wire;
+  if (resident_timeline) {
+    auto resident = build_resident_timeline_replacement(
+        execution_->trajectory, delivery.value(), elapsed, execution_->delivery_clock.elapsed_s);
+    if (!resident.ok()) return reject("motion_replacement_delivery_join_failed");
+    delivery.value() = std::move(resident.value().resident_trajectory);
+    resident_wire = std::move(resident.value().delivery_trajectory);
+    candidate->delivery_clock.elapsed_s =
+        execution_->delivery_clock.elapsed_s - pending.source_cursor_s;
+  } else {
+    candidate->delivery_clock.elapsed_s = elapsed - pending.source_cursor_s;
+  }
   // Only the delivery origin changes; canonical product/evidence stays intact.
   delivery.value().runtime_scale_bounds = candidate->trajectory.runtime_scale_bounds;
   delivery.value().cartesian_fidelity_metrics = candidate->trajectory.cartesian_fidelity_metrics;
@@ -634,7 +833,7 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
   const auto final_sample = port_->ReadSample();
   const auto final_now = clock_.now();
   if (!source_sample_current(final_sample, final_now))
-    return reject("motion_replacement_scale_or_source_unqualified");
+    return source_refusal(final_sample, final_now, "final");
   if (!elapsed_at(*final_sample, final_now, *config_.stop.replacement_start_allowance_s).ok())
     return reject("motion_replacement_delivery_lead_expired");
   pending.recognition_budget_ns.reset();
@@ -666,9 +865,11 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
   ExecutionPortCommandResultDTO command;
   try {
     command = start.value().scheduled
-                  ? port_->ReplaceScheduled(source.goal, successor, pending.record_trajectory,
+                  ? port_->ReplaceScheduled(source.goal, successor,
+                                            resident_wire ? *resident_wire : pending.record_trajectory,
                                              *start.value().scheduled)
-                  : port_->Replace(source.goal, successor, pending.record_trajectory);
+                  : port_->Replace(source.goal, successor,
+                                   resident_wire ? *resident_wire : pending.record_trajectory);
   } catch (...) {
     command = std::move(uncertain);
   }
@@ -679,6 +880,14 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
   }
   // The possible effect is already in sent_ before any reply copy can fail.
   pending.command = std::move(command);
+  const auto written = std::fprintf(stderr,
+      "manyforge_moving_dispatch owner=%llu submitted_ns=%lld origin_ns=%lld recognition_budget_ns=%lld source_cursor_s=%.17g divergence_s=%.17g factor=%.17g\n",
+      static_cast<unsigned long long>(candidate_id), static_cast<long long>(pending.submitted_at_ns.value_or(0)),
+      static_cast<long long>(join_started_at),
+      static_cast<long long>(pending.recognition_budget_ns.value_or(0)),
+      original_path_cursor(execution_->delivery_clock, final_sample->cursor_s),
+      pending.divergence_cursor_s, factor);
+  static_cast<void>(written);
   return {*pending.command, std::move(handle), pending.submitted_at_ns};
 }
 
@@ -731,15 +940,12 @@ PreparedMotionReplacementObservationDTO ExecutionPortParticipant::ObserveReplace
         fault(ErrorCode::kExecutionAborted,
               "Motion replacement lacks exact continuing predecessor/successor evidence",
               "motion_replacement_effect_uncertain");
-  } else if (superseded && observed.recognition_delay_ns) {
-    if (pending.recognition_budget_ns &&
-        *observed.recognition_delay_ns > *pending.recognition_budget_ns) {
-      observed.phase = PreparedMotionReplacementPhaseDTO::kEffectUncertain;
-      observed.error = fault(ErrorCode::kExecutionAborted,
-                             "Motion replacement recognition exceeded the remaining source lead",
-                             "motion_replacement_recognition_lead_expired");
-      return observed;
-    }
+  } else if (superseded && !observed.successor->mechanism_goal_id.empty() &&
+             (observed.successor->accepted_stamp_ns || observed.successor->latest_feedback)) {
+    // Exact acceptance authorizes the request. Delayed action feedback is
+    // not evidence that the controller failed to replace the trajectory.
+    // Keep ownership/progress pending until an actual associated sample;
+    // recognition delay remains an observation, not another source deadline.
     const auto sample = port_->ReadSample();
     const auto now = clock_.now();
     if (sample && sample->binding_epoch == pending.source.binding_epoch &&
@@ -747,20 +953,7 @@ PreparedMotionReplacementObservationDTO ExecutionPortParticipant::ObserveReplace
         (config_.progress_freshness_budget_ns == 0 ||
          now - sample->local_receipt_stamp_ns <= config_.progress_freshness_budget_ns) &&
         pending.execution->association->Observe(*sample, observed.successor)) {
-      const double factor = lane_.supports_scale ? sample->applied_factor.value_or(-1.0) : 1.0;
-      const auto lead = compute_stop_join_elapsed_s(
-          {original_path_cursor(pending.execution->delivery_clock, sample->cursor_s), factor,
-           static_cast<double>(now - sample->local_receipt_stamp_ns) / 1e9,
-           config_.stop.replacement_start_allowance_s.value_or(-1.0),
-           pending.divergence_cursor_s - pending.source_cursor_s});
-      if (lead.ok()) {
-        observed.phase = PreparedMotionReplacementPhaseDTO::kReadyToCommit;
-      } else {
-        observed.phase = PreparedMotionReplacementPhaseDTO::kEffectUncertain;
-        observed.error = fault(ErrorCode::kExecutionAborted,
-                               "Motion replacement adoption exceeded the remaining divergence lead",
-                               "motion_replacement_adoption_lead_expired");
-      }
+      observed.phase = PreparedMotionReplacementPhaseDTO::kReadyToCommit;
     }
   }
   return observed;
@@ -801,16 +994,8 @@ Result<void> ExecutionPortParticipant::AdoptReplacement(
     return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
                                    "Motion replacement has no own controller cursor",
                                    "motion_replacement_cursor_unavailable"));
-  const double factor = lane_.supports_scale ? sample->applied_factor.value_or(-1.0) : 1.0;
-  const auto lead = compute_stop_join_elapsed_s(
-      {original_path_cursor(replacement_->execution->delivery_clock, sample->cursor_s), factor,
-       static_cast<double>(now - sample->local_receipt_stamp_ns) / 1e9,
-       config_.stop.replacement_start_allowance_s.value_or(-1.0),
-       replacement_->divergence_cursor_s - replacement_->source_cursor_s});
-  if (!lead.ok())
-    return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
-                                   "Motion replacement adoption exceeded its source lead",
-                                   "motion_replacement_adoption_lead_expired"));
+  // The accepted goal is already sent. A later own feedback receipt does
+  // not prove late installation, so it cannot invalidate the accepted swap.
   if (!ReplacementScaleCompatibleLocked(*sample, replacement_->execution->trajectory))
     return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
                                    "Motion replacement cannot preserve the active scale ramp",
@@ -830,6 +1015,16 @@ Result<void> ExecutionPortParticipant::AdoptReplacement(
   execution_->snapshot.timestamp_ns = now;
   ++execution_->snapshot.sequence_number;
   execution_ = replacement_->execution;
+  {
+    std::lock_guard scale_lock(scale_mutex_);
+    if (preparation_scale_hold_ && preparation_scale_hold_->candidate_id == candidate_id) {
+      trace_scale_hold("adopted", candidate_id, execution_->key, preparation_scale_hold_->factor,
+                       *execution_->scale_hold_until_cursor_s, ramp_ ? ramp_->rate_per_s : 0.0);
+      preparation_scale_hold_.reset();
+    } else
+      execution_->scale_hold_until_cursor_s.reset();
+  }
+
   prepared_goal_.swap(replacement_->prepared_goal);
   prepared_membership_.adopt_replacement();
   helper_->AdoptReplacement(replacement_->stop_goal);
@@ -840,8 +1035,8 @@ Result<void> ExecutionPortParticipant::AdoptReplacement(
       execution_->generation, static_cast<std::int64_t>(execution_->cursor_s * 1e9),
       sample->source_stamp_ns, sample->local_receipt_stamp_ns);
   execution_->RecordProgressSample(published, std::move(published_sample));
-  // The active scale ramp, including its elapsed tick origin, continues
-  // unchanged. Its compatibility is checked before the ownership callback.
+  // Legacy compatible evolving ramps continue unchanged. A prepared hold
+  // stays pinned until this adopted execution observes its connector end.
   return Result<void>::Ok();
 }
 
@@ -1001,6 +1196,7 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
     // prepared bounds; after a Stop the frozen factor is released here.
     std::lock_guard scale_lock(scale_mutex_);
     scale_frozen_ = false;
+    preparation_scale_hold_.reset();
     // Item 28/Q11: linear slew at the trajectory's rate, at most 4/s; no
     // separate rate-change limit.
     ramp_ = ScaleRamp{last_sent_scale_.value_or(config_.initial_speed_factor), target_scale_,
@@ -1257,13 +1453,30 @@ void ExecutionPortParticipant::ObserveSample(Execution& execution,
                                              const ExecutionControllerSampleDTO& sample,
                                              const double original_cursor_s, const TimePoint now,
                                              const bool publish_progress) {
+  if (execution_ && execution_.get() == &execution && execution.scale_hold_until_cursor_s &&
+      !execution.stopping && !execution.terminal &&
+      original_cursor_s >= *execution.scale_hold_until_cursor_s) {
+    std::lock_guard scale_lock(scale_mutex_);
+    execution.scale_hold_until_cursor_s.reset();
+    if (ramp_ && execution.trajectory.runtime_scale_bounds) {
+      ramp_->rate_per_s = std::min(execution.trajectory.runtime_scale_bounds->max_rate_per_s,
+                                   kMaxRuntimeScaleSlewPerS);
+      ramp_->target = target_scale_;
+      trace_scale_hold("released", prepared_membership_.active_execution_id().value_or(0U), execution.key,
+                       ramp_->value, original_cursor_s, ramp_->rate_per_s);
+      if (!scale_frozen_ && !preparation_scale_hold_ && ramp_->value != ramp_->target) {
+        last_ramp_tick_ = now;
+        ScheduleRampTickLocked();
+      }
+    }
+  }
   const auto total = duration_s(execution.trajectory);
   execution.cursor_s = std::clamp(original_cursor_s, 0.0, total);
   if (publish_progress) {
     auto published_sample = sample;
-    const auto published = progress_.publish(
-        execution.generation, static_cast<std::int64_t>(execution.cursor_s * 1e9),
-        sample.source_stamp_ns, sample.local_receipt_stamp_ns);
+    const auto published =
+        progress_.publish(execution.generation, static_cast<std::int64_t>(execution.cursor_s * 1e9),
+                          sample.source_stamp_ns, sample.local_receipt_stamp_ns);
     execution.RecordProgressSample(published, std::move(published_sample));
   }
   execution.snapshot.timestamp_ns = now;
@@ -1616,7 +1829,8 @@ void ExecutionPortParticipant::set_runtime_velocity_scale(double scale) {
   if (!lane_.supports_scale) return;
   std::lock_guard scale_lock(scale_mutex_);
   target_scale_ = scale;
-  if (scale_frozen_) return;  // kept for the next motion (Q17)
+  if (scale_frozen_ || preparation_scale_hold_ ||
+      (execution_ && execution_->scale_hold_until_cursor_s)) return;  // target retained
   if (ramp_) {
     ramp_->target = scale;
     if (ramp_->value != ramp_->target && ramp_handle_ == 0U) {
@@ -1649,7 +1863,8 @@ void ExecutionPortParticipant::RampTick(const std::uint64_t ramp_generation) {
   std::lock_guard scale_lock(scale_mutex_);
   if (ramp_generation != ramp_generation_) return;
   ramp_handle_ = 0U;
-  if (scale_frozen_ || !ramp_) return;
+  if (scale_frozen_ || preparation_scale_hold_ ||
+      (execution_ && execution_->scale_hold_until_cursor_s) || !ramp_) return;
   // One value per host tick, computed from the time at this tick (no backlog).
   const auto now = clock_.now();
   const double step =

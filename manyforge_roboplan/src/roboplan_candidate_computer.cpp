@@ -10,12 +10,14 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unistd.h>
 #include <utility>
 #include <variant>
 
@@ -33,6 +35,8 @@ namespace {
 
 using core::ErrorCode;
 using core::ErrorDTO;
+
+constexpr double kNominalScalingHeadroom = 0.20;
 
 [[nodiscard]] ErrorDTO
 make_error(ErrorCode code, std::string message, std::string reason,
@@ -60,6 +64,23 @@ fail(ErrorCode code, std::string message, std::string reason,
 
 [[nodiscard]] bool finite_nonnegative(double value) noexcept {
   return finite(value) && value >= 0.0;
+}
+
+[[nodiscard]] bool valid_scale_evidence(const core::TrajectoryRuntimeScaleBoundsDTO &bounds) {
+  return finite_positive(bounds.max_rate_per_s) &&
+         finite_positive(bounds.max_rate_change_per_s2) &&
+         finite(bounds.max_stop_path_rate) &&
+         bounds.max_stop_path_rate >= 1.0 &&
+         (!bounds.nominal_time_multiplier ||
+          (finite(*bounds.nominal_time_multiplier) &&
+           *bounds.nominal_time_multiplier >= 1.0));
+}
+
+[[nodiscard]] bool equivalent_span(double original, double delivered) {
+  return finite_positive(original) && finite_positive(delivered) &&
+         std::abs(original - delivered) <=
+             std::min(1e-9, std::sqrt(std::numeric_limits<double>::epsilon()) *
+                                original);
 }
 
 [[nodiscard]] std::map<std::string, std::string>
@@ -195,6 +216,42 @@ control_error(const RoboPlanCandidateControl &control, std::string stage) {
                       {{"failure_stage", std::move(stage)}});
   }
   return std::nullopt;
+}
+
+void log_moving_phase(const RoboPlanCandidateRequestDTO &input,
+                      const char *phase,
+                      std::chrono::steady_clock::time_point started) noexcept {
+  if (!input.moving_replacement)
+    return;
+  const auto &moving = *input.moving_replacement;
+  const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+  const auto remaining = [&](double seconds) {
+    return static_cast<long long>(seconds * 1e9) -
+           static_cast<long long>(elapsed);
+  };
+  char line[768];
+  const int size = std::snprintf(
+      line, sizeof(line),
+      "manyforge_moving_candidate_phase pid=%ld source_goal=%.256s "
+      "generation=%llu phase=%s elapsed_ns=%lld suffix_remaining_ns=%lld "
+      "preparation_remaining_ns=%lld\n",
+      static_cast<long>(::getpid()),
+      moving.source_goal.controller_goal_id.value().c_str(),
+      static_cast<unsigned long long>(
+          moving.source_goal.controller_goal_generation.value()),
+      phase, static_cast<long long>(elapsed),
+      moving.remaining_planning_budget_s
+          ? remaining(*moving.remaining_planning_budget_s)
+          : -1LL,
+      remaining(moving.remaining_preparation_budget_s));
+  if (size > 0) {
+    // Best effort, one bounded write; diagnostics never retry or alter outcome.
+    const auto written = ::write(STDERR_FILENO, line,
+        std::min(static_cast<std::size_t>(size), sizeof(line) - 1U));
+    static_cast<void>(written);
+  }
 }
 
 [[nodiscard]] std::uint32_t
@@ -727,7 +784,8 @@ prepare_candidate_time_law(
     const Eigen::VectorXd &model_velocity_limits,
     const Eigen::VectorXd &model_acceleration_limits,
     const CartesianPlanningControl &control,
-    std::vector<double>* cartesian_waypoint_times_s = nullptr) {
+    std::vector<double>* cartesian_waypoint_times_s = nullptr,
+    bool retain_moving_evidence = false) {
   const auto incomplete = [] {
     return fail<core::TrajectoryRuntimeScaleBoundsDTO>(
         ErrorCode::kValidationLimitsViolation,
@@ -810,8 +868,8 @@ prepare_candidate_time_law(
     return incomplete();
   const std::array envelopes{core::detail::TrajectoryDynamicsEnvelope{
       derivatives, limits, std::max(1.0, frame_velocity_ratio)}};
-  const auto prepared =
-      core::detail::prepare_runtime_scaling(envelopes, 0.20, {4.0, 16.0});
+  const auto prepared = core::detail::prepare_runtime_scaling(
+      envelopes, kNominalScalingHeadroom, {4.0, 16.0});
   if (!prepared)
     return incomplete();
   // Retain velocity authority from the exact clipped/scaled limits and the
@@ -828,7 +886,14 @@ prepare_candidate_time_law(
     return incomplete();
   const double stop_path_rate =
       std::max(1.0, std::nextafter(raw_stop_path_rate, 0.0));
+  const auto original_times =
+      retain_moving_evidence ? trajectory.times : std::vector<double>{};
   scale_trajectory_time(trajectory, multiplier);
+  if (retain_moving_evidence)
+    for (std::size_t index = 1U; index < original_times.size(); ++index)
+      if (!equivalent_span((original_times[index] - original_times[index - 1U]) * multiplier,
+                           trajectory.times[index] - trajectory.times[index - 1U]))
+        return incomplete();
   if (cartesian_waypoint_times_s)
     for (auto& time : *cartesian_waypoint_times_s) time *= multiplier;
   if (!finite_positive(trajectory.times.back()))
@@ -845,6 +910,83 @@ struct FixedPieceMeasurement final {
   std::vector<core::detail::TrajectoryDerivativeLimits> limits;
   double velocity_ratio{};
   double correction_ratio{1.0};
+  double duration_ratio{1.0};
+};
+
+// Diagnostic-only worker-local counters. No curve, qualification or deadline
+// is reused or changed. A hard cap bounds stderr work even for long searches.
+struct MovingFinalizationMeasurements final {
+  const RoboPlanCandidateRequestDTO &input;
+  std::chrono::steady_clock::time_point started{
+      std::chrono::steady_clock::now()};
+  std::array<long long, 3> source_ns{}, future_ns{};
+  long long splice_ns{};
+  std::size_t entries{}, attempts{}, source_points{}, future_points{},
+      future_points_total{};
+  std::size_t records{};
+  double entry_s{}, duration_s{}, ratio{};
+  double endpoint_lower_bound_s{}, future_v_ratio{}, future_a_ratio{},
+      future_j_ratio{}, future_tcp_ratio{}, next_duration_ratio{};
+  bool source{true};
+  bool trace_stages{true};
+
+  void Record(const char *stage) noexcept {
+    if (records++ >= 24U)
+      return;
+    char line[2048];
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    const auto &goal = input.moving_replacement->source_goal;
+    const int size = std::snprintf(
+        line, sizeof(line),
+        "manyforge_moving_connector_measure pid=%ld source_goal=%.256s "
+        "generation=%llu stage=%s elapsed_ns=%lld entries=%zu attempts=%zu "
+        "entry_s=%.17g duration_s=%.17g ratio=%.17g source_points=%zu "
+        "future_points=%zu future_points_total=%zu splice_ns=%lld "
+        "source_joint_ns=%lld "
+        "source_tcp_ns=%lld source_position_ns=%lld future_joint_ns=%lld "
+        "future_tcp_ns=%lld future_position_ns=%lld "
+        "endpoint_lower_bound_s=%.17g "
+        "future_v_ratio=%.17g future_a_ratio=%.17g future_j_ratio=%.17g "
+        "future_tcp_ratio=%.17g next_duration_ratio=%.17g\n",
+        static_cast<long>(::getpid()), goal.controller_goal_id.value().c_str(),
+        static_cast<unsigned long long>(
+            goal.controller_goal_generation.value()),
+        stage, static_cast<long long>(elapsed), entries, attempts, entry_s,
+        duration_s, ratio, source_points, future_points, future_points_total,
+        splice_ns, source_ns[0], source_ns[1], source_ns[2], future_ns[0],
+        future_ns[1], future_ns[2], endpoint_lower_bound_s, future_v_ratio,
+        future_a_ratio, future_j_ratio, future_tcp_ratio, next_duration_ratio);
+    if (size > 0) {
+      const auto written =
+          ::write(STDERR_FILENO, line,
+                  std::min(static_cast<std::size_t>(size), sizeof(line) - 1U));
+      static_cast<void>(written);
+    }
+  }
+  ~MovingFinalizationMeasurements() { Record("finalizer_return"); }
+};
+
+struct MovingEnvelopeMeasurement final {
+  MovingFinalizationMeasurements &measurements;
+  std::size_t metric;
+  std::chrono::steady_clock::time_point started{
+      std::chrono::steady_clock::now()};
+  MovingEnvelopeMeasurement(MovingFinalizationMeasurements &value,
+                            std::size_t index, const char *stage)
+      : measurements(value), metric(index) {
+    if (measurements.trace_stages)
+      measurements.Record(stage);
+    started = std::chrono::steady_clock::now();
+  }
+  ~MovingEnvelopeMeasurement() {
+    auto &totals =
+        measurements.source ? measurements.source_ns : measurements.future_ns;
+    totals[metric] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - started)
+                          .count();
+  }
 };
 
 [[nodiscard]] roboplan::JointTrajectory
@@ -860,12 +1002,62 @@ native_trajectory(const core::TrajectoryDTO &trajectory) {
   return native;
 }
 
+[[nodiscard]] core::Result<void> check_fixed_piece_positions(
+    const std::string &group, const std::shared_ptr<roboplan::Scene> &scene,
+    const roboplan::JointTrajectory &trajectory, double position_tolerance,
+    const CartesianPlanningControl &control) {
+  const auto positions = scene->getPositionLimitVectors(group, false);
+  const auto width = static_cast<Eigen::Index>(trajectory.joint_names.size());
+  if (!positions || positions->first.size() != width ||
+      positions->second.size() != width)
+    return fail<void>(ErrorCode::kValidationLimitsViolation,
+                      "Moving position limits are unavailable",
+                      "native_runtime_scale_preparation_invalid");
+  const auto invalid = [] {
+    return fail<void>(ErrorCode::kValidationLimitsViolation,
+                      "Moving position bounds are not finite",
+                      "native_runtime_scale_preparation_invalid");
+  };
+  // Bernstein subdivision is bounded independently of numeric convergence.
+  // Exhaustion is inconclusive and never an acceptance of a joint limit.
+  constexpr std::size_t kMaximumPositionIntervalChecks = 4096U;
+  for (std::size_t segment = 1U; segment < trajectory.times.size(); ++segment) {
+    for (Eigen::Index joint_index = 0; joint_index < width; ++joint_index) {
+      const double lower = positions->first[joint_index];
+      const double upper = positions->second[joint_index];
+      if (!finite(lower) || !finite(upper))
+        return invalid();
+      const auto qualified = detail::check_quintic_position_bounds(
+          {trajectory.positions[segment - 1U][joint_index],
+           trajectory.velocities[segment - 1U][joint_index],
+           trajectory.accelerations[segment - 1U][joint_index]},
+          {trajectory.positions[segment][joint_index],
+           trajectory.velocities[segment][joint_index],
+           trajectory.accelerations[segment][joint_index]},
+          trajectory.times[segment] - trajectory.times[segment - 1U], lower,
+          upper, position_tolerance, kMaximumPositionIntervalChecks, control);
+      if (!qualified.ok())
+        return core::Result<void>::Err(qualified.error());
+      if (qualified.value() !=
+          detail::QuinticPositionBoundResult::kProvenWithin)
+        return fail<void>(ErrorCode::kValidationLimitsViolation,
+                          "Moving trajectory position bounds were not proved",
+                          "native_moving_position_bounds_unqualified");
+    }
+  }
+  return core::Result<void>::Ok();
+}
+
 [[nodiscard]] core::Result<FixedPieceMeasurement>
 measure_fixed_piece(const detail::CartesianTrajectoryContractInput &contract,
                     const std::shared_ptr<roboplan::Scene> &scene,
                     const roboplan::JointTrajectory &trajectory,
                     double position_tolerance,
-                    const CartesianPlanningControl &control) {
+                    const CartesianPlanningControl &control,
+                    MovingFinalizationMeasurements &measurements) {
+  if (!measurements.source)
+    measurements.future_v_ratio = measurements.future_a_ratio =
+        measurements.future_j_ratio = measurements.future_tcp_ratio = 0.0;
   const auto invalid = [] {
     return fail<FixedPieceMeasurement>(
         ErrorCode::kValidationLimitsViolation,
@@ -889,13 +1081,18 @@ measure_fixed_piece(const detail::CartesianTrajectoryContractInput &contract,
       positions->first.size() != width || positions->second.size() != width) {
     return invalid();
   }
-  auto joint = detail::measure_cartesian_joint_dynamics_envelope(
-      contract, trajectory,
-      std::span<const double>(model_velocity->second.data(),
-                              static_cast<std::size_t>(width)),
-      std::span<const double>(model_acceleration->second.data(),
-                              static_cast<std::size_t>(width)),
-      control);
+  auto joint = [&] {
+    MovingEnvelopeMeasurement timer(measurements, 0U,
+                                    measurements.source ? "source_joint_begin"
+                                                        : "future_joint_begin");
+    return detail::measure_cartesian_joint_dynamics_envelope(
+        contract, trajectory,
+        std::span<const double>(model_velocity->second.data(),
+                                static_cast<std::size_t>(width)),
+        std::span<const double>(model_acceleration->second.data(),
+                                static_cast<std::size_t>(width)),
+        control);
+  }();
   if (!joint.ok())
     return core::Result<FixedPieceMeasurement>::Err(joint.error());
   if (!joint.value().complete)
@@ -906,6 +1103,9 @@ measure_fixed_piece(const detail::CartesianTrajectoryContractInput &contract,
       contract, trajectory.joint_names, model_velocity->second,
       model_acceleration->second);
   if (contract.speed_profile.max_tcp_linear_speed_mps) {
+    MovingEnvelopeMeasurement timer(measurements, 1U,
+                                    measurements.source ? "source_tcp_begin"
+                                                        : "future_tcp_begin");
     auto frame = detail::measure_cartesian_frame_dynamics_envelope(
         contract, nullptr, scene, trajectory, control);
     if (!frame.ok())
@@ -914,7 +1114,13 @@ measure_fixed_piece(const detail::CartesianTrajectoryContractInput &contract,
       return invalid();
     result.velocity_ratio = std::max(frame.value().linear_speed_ratio,
                                      frame.value().angular_speed_ratio);
+    if (!measurements.source)
+      measurements.future_tcp_ratio = result.velocity_ratio;
   }
+  // Use the same nominal reserve as ordinary planning only for the new
+  // connector/adjacent interval. The retained source is checked as delivered.
+  const double nominal_fraction =
+      measurements.source ? 1.0 : 1.0 - kNominalScalingHeadroom;
   for (std::size_t index = 0; index < result.derivatives.size(); ++index) {
     const auto &derivative = result.derivatives[index];
     const auto &limit = result.limits[index];
@@ -926,43 +1132,46 @@ measure_fixed_piece(const detail::CartesianTrajectoryContractInput &contract,
         std::max(result.velocity_ratio, derivative.velocity / limit.velocity);
     result.correction_ratio =
         std::max({result.correction_ratio, derivative.velocity / limit.velocity,
-                  std::sqrt(derivative.acceleration / limit.acceleration)});
+                  std::sqrt(derivative.acceleration /
+                            (nominal_fraction * limit.acceleration))});
     if (limit.jerk)
       result.correction_ratio = std::max(
-          result.correction_ratio, std::cbrt(derivative.jerk / *limit.jerk));
+          result.correction_ratio,
+          std::cbrt(derivative.jerk / (nominal_fraction * *limit.jerk)));
+    // Fixed endpoint P/V/A includes 1/T terms: uniform-dilation roots are
+    // acceptance measurements, not a decisive duration search step.
+    result.duration_ratio = std::max(
+        {result.duration_ratio, derivative.velocity / limit.velocity,
+         derivative.acceleration / (nominal_fraction * limit.acceleration)});
+    if (limit.jerk)
+      result.duration_ratio =
+          std::max(result.duration_ratio,
+                   derivative.jerk / (nominal_fraction * *limit.jerk));
+    if (!measurements.source) {
+      measurements.future_v_ratio = std::max(
+          measurements.future_v_ratio, derivative.velocity / limit.velocity);
+      measurements.future_a_ratio =
+          std::max(measurements.future_a_ratio,
+                   derivative.acceleration / limit.acceleration);
+      if (limit.jerk)
+        measurements.future_j_ratio = std::max(measurements.future_j_ratio,
+                                               derivative.jerk / *limit.jerk);
+    }
   }
   result.correction_ratio =
       std::max(result.correction_ratio, result.velocity_ratio);
+  result.duration_ratio =
+      std::max(result.duration_ratio, result.velocity_ratio);
   if (!finite(result.correction_ratio) || !finite(result.velocity_ratio))
     return invalid();
-  // Bernstein subdivision is bounded independently of numeric convergence.
-  // Exhaustion is inconclusive and never an acceptance of a joint limit.
-  constexpr std::size_t kMaximumPositionIntervalChecks = 4096U;
-  for (std::size_t segment = 1U; segment < trajectory.times.size(); ++segment) {
-    for (Eigen::Index joint_index = 0; joint_index < width; ++joint_index) {
-      const double lower = positions->first[joint_index];
-      const double upper = positions->second[joint_index];
-      if (!finite(lower) || !finite(upper))
-        return invalid();
-      const auto qualified = detail::check_quintic_position_bounds(
-          {trajectory.positions[segment - 1U][joint_index],
-           trajectory.velocities[segment - 1U][joint_index],
-           trajectory.accelerations[segment - 1U][joint_index]},
-          {trajectory.positions[segment][joint_index],
-           trajectory.velocities[segment][joint_index],
-           trajectory.accelerations[segment][joint_index]},
-          trajectory.times[segment] - trajectory.times[segment - 1U], lower,
-          upper, position_tolerance, kMaximumPositionIntervalChecks, control);
-      if (!qualified.ok())
-        return core::Result<FixedPieceMeasurement>::Err(qualified.error());
-      if (qualified.value() !=
-          detail::QuinticPositionBoundResult::kProvenWithin)
-        return fail<FixedPieceMeasurement>(
-            ErrorCode::kValidationLimitsViolation,
-            "Moving trajectory position bounds were not proved",
-            "native_moving_position_bounds_unqualified");
-    }
-  }
+  MovingEnvelopeMeasurement timer(
+      measurements, 2U,
+      measurements.source ? "source_position_begin" : "future_position_begin");
+  const auto position_proof =
+      check_fixed_piece_positions(contract.compiled_group_name, scene,
+                                  trajectory, position_tolerance, control);
+  if (!position_proof.ok())
+    return core::Result<FixedPieceMeasurement>::Err(position_proof.error());
   return core::Result<FixedPieceMeasurement>::Ok(std::move(result));
 }
 
@@ -1384,7 +1593,7 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
       prefix.waypoints.size() > maximum_samples ||
       prefix.waypoints.front().time_from_start_s != 0.0 ||
       prefix.waypoints.back().time_from_start_s != divergence ||
-      prefix.runtime_scale_bounds ||
+      (prefix.runtime_scale_bounds && !valid_scale_evidence(*prefix.runtime_scale_bounds)) ||
       !prefix.cartesian_waypoint_times_s.empty() ||
       prefix.cartesian_fidelity_metrics ||
       !contains_frame(binding.permitted_frames, moving.source_base_frame) ||
@@ -1505,9 +1714,27 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
   const auto future_contract =
       cartesian_contract_input(binding, input, future_caps);
   const auto contract_control = cartesian_control(control);
+  MovingFinalizationMeasurements measurements{input};
+  if (prefix.runtime_scale_bounds) {
+    const auto positions = check_fixed_piece_positions(
+        source_contract.compiled_group_name, scene, native_trajectory(prefix),
+        input.tolerances.joint_position_tol_rad, contract_control);
+    if (!positions.ok())
+      return core::Result<core::TrajectoryDTO>::Err(positions.error());
+  }
+  auto source_piece = prefix;
+  // The Kernel's existing derived bounds cover the retained source. Only the
+  // last restricted boundary interval needs a fresh local qualification.
+  if (prefix.runtime_scale_bounds && source_piece.waypoints.size() > 2U)
+    source_piece.waypoints.erase(source_piece.waypoints.begin(),
+                                 source_piece.waypoints.end() - 2);
+  measurements.source_points = source_piece.waypoints.size();
+  measurements.Record("source_begin");
   auto source = measure_fixed_piece(
-      source_contract, scene, native_trajectory(prefix),
-      input.tolerances.joint_position_tol_rad, contract_control);
+      source_contract, scene, native_trajectory(source_piece),
+      input.tolerances.joint_position_tol_rad, contract_control, measurements);
+  measurements.Record("source_return");
+  measurements.source = false;
   if (!source.ok())
     return core::Result<core::TrajectoryDTO>::Err(source.error());
   if (source.value().correction_ratio > 1.0)
@@ -1515,8 +1742,29 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
         ErrorCode::kValidationLimitsViolation,
         "The retained source prefix violates its resolved motion limits",
         "native_moving_source_limits_violated");
-  // Derived evidence from the rest-planned suffix cannot certify a connector.
+  // Final-time-law suffix evidence certifies retained intervals, never the
+  // connector. Splice verifies literal PVA and the explicitly approved <=1ns
+  // AND relative-span equivalence for every translated interval.
+  if (!suffix.runtime_scale_bounds ||
+      !valid_scale_evidence(*suffix.runtime_scale_bounds))
+    return fail<core::TrajectoryDTO>(
+        ErrorCode::kValidationLimitsViolation,
+        "Moving suffix lacks final time-law evidence",
+        "native_runtime_scale_preparation_invalid");
+  const auto suffix_bounds = *suffix.runtime_scale_bounds;
   suffix.runtime_scale_bounds.reset();
+  const auto velocity_limits =
+      scene->getVelocityLimitVectors(binding.compiled_group_name);
+  const auto acceleration_limits =
+      scene->getAccelerationLimitVectors(binding.compiled_group_name);
+  if (!velocity_limits || !acceleration_limits)
+    return fail<core::TrajectoryDTO>(
+        ErrorCode::kUnsupportedCapability,
+        "Moving duration limits are unavailable",
+        "native_model_dynamics_limits_unavailable");
+  const auto endpoint_limits = resolved_runtime_joint_limits(
+      future_contract, suffix.joint_names, velocity_limits->second,
+      acceleration_limits->second);
   const double target_time = suffix.waypoints.back().time_from_start_s;
   std::vector<double> entries;
   for (std::size_t index = 1U; index < suffix.waypoints.size(); ++index) {
@@ -1548,6 +1796,8 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
       "No qualified moving entry exists before the first successor target",
       "native_moving_connector_unqualified");
   for (const double entry : entries) {
+    ++measurements.entries;
+    measurements.entry_s = entry;
     if (auto error = control_error(control, "moving_entry_search"))
       return core::Result<core::TrajectoryDTO>::Err(*error);
     const auto state =
@@ -1556,16 +1806,63 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
       return core::Result<core::TrajectoryDTO>::Err(state.error());
     if (moving_source && !nonzero_derivative(entry_state.velocities_rad_s))
       continue;
+    core::TrajectoryDTO retained_suffix;
+    retained_suffix.resources = suffix.resources;
+    retained_suffix.joint_names = suffix.joint_names;
+    retained_suffix.waypoints.push_back({entry, entry_state.positions_rad,
+                                         entry_state.velocities_rad_s,
+                                         entry_state.accelerations_rad_s2});
+    for (const auto &point : suffix.waypoints)
+      if (point.time_from_start_s > entry)
+        retained_suffix.waypoints.push_back(point);
+    const auto positions = check_fixed_piece_positions(
+        future_contract.compiled_group_name, scene,
+        native_trajectory(retained_suffix),
+        input.tolerances.joint_position_tol_rad, contract_control);
+    if (!positions.ok()) {
+      last = positions.error();
+      continue;
+    }
     // The ordinary suffix's elapsed timing is already derived from its limits.
     // Ratios below suggest new durations only; fixed boundary P/V/A makes the
     // feasibility function non-monotonic, so every suggestion is rebuilt.
-    double duration = entry;
+    double lower_bound = 0.0;
+    const auto &inlet = prefix.waypoints.back();
+    for (std::size_t joint = 0; joint < endpoint_limits.size(); ++joint) {
+      const auto &limit = endpoint_limits[joint];
+      lower_bound = std::max(
+          {lower_bound,
+           std::abs(entry_state.positions_rad[joint] -
+                    inlet.positions_rad[joint]) /
+               limit.velocity,
+           std::abs(entry_state.velocities_rad_s[joint] -
+                    inlet.velocities_rad_s[joint]) /
+               ((1.0 - kNominalScalingHeadroom) * limit.acceleration)});
+      if (limit.jerk)
+        lower_bound = std::max(
+            lower_bound, std::abs(entry_state.accelerations_rad_s2[joint] -
+                                  inlet.accelerations_rad_s2[joint]) /
+                             ((1.0 - kNominalScalingHeadroom) * *limit.jerk));
+    }
+    double duration = std::max(entry, lower_bound);
+    measurements.endpoint_lower_bound_s = lower_bound;
     double previous_ratio = std::numeric_limits<double>::infinity();
     for (;;) {
       if (auto error = control_error(control, "moving_duration_search"))
         return core::Result<core::TrajectoryDTO>::Err(*error);
+      ++measurements.attempts;
+      measurements.duration_s = duration;
+      measurements.trace_stages = measurements.attempts == 1U;
+      if (measurements.attempts <= 128U &&
+          (measurements.attempts & (measurements.attempts - 1U)) == 0U)
+        measurements.Record("attempt_begin");
+      const auto splice_started = std::chrono::steady_clock::now();
       auto composite = core::build_quintic_trajectory_splice(
           prefix, suffix, 0.0, divergence, entry, duration);
+      measurements.splice_ns +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - splice_started)
+              .count();
       if (!composite.ok()) {
         last = composite.error();
         break;
@@ -1583,19 +1880,29 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
       for (const auto &point : composite.value().waypoints)
         if (point.time_from_start_s >= divergence)
           future.waypoints.push_back(point);
-      auto changed = measure_fixed_piece(
-          future_contract, scene, native_trajectory(future),
-          input.tolerances.joint_position_tol_rad, contract_control);
+      // Check the connector and its adjacent restricted suffix interval only.
+      // Later knots retain the already-qualified suffix PVA/time law.
+      if (future.waypoints.size() > 3U) future.waypoints.resize(3U);
+      measurements.future_points = future.waypoints.size();
+      measurements.future_points_total += future.waypoints.size();
+      auto changed =
+          measure_fixed_piece(future_contract, scene, native_trajectory(future),
+                              input.tolerances.joint_position_tol_rad,
+                              contract_control, measurements);
+      if (measurements.trace_stages)
+        measurements.Record("future_return");
       if (!changed.ok()) {
         last = changed.error();
         break;
       }
       const double ratio = changed.value().correction_ratio;
+      measurements.ratio = ratio;
+      measurements.next_duration_ratio = changed.value().duration_ratio;
       if (ratio > 1.0) {
         if (!(ratio < previous_ratio))
           break;
         const double next = std::nextafter(
-            duration * ratio, std::numeric_limits<double>::infinity());
+            duration * changed.value().duration_ratio, std::numeric_limits<double>::infinity());
         if (!finite_positive(next) || !(next > duration))
           break;
         previous_ratio = ratio;
@@ -1625,6 +1932,18 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
           core::TrajectoryRuntimeScaleBoundsDTO{
               prepared->max_rate_per_s, prepared->max_rate_change_per_s2,
               stop_path_rate, std::nullopt};
+      auto &combined = *composite.value().runtime_scale_bounds;
+      const auto intersect = [&](const auto &retained) {
+        combined.max_rate_per_s =
+            std::min(combined.max_rate_per_s, retained.max_rate_per_s);
+        combined.max_rate_change_per_s2 = std::min(
+            combined.max_rate_change_per_s2, retained.max_rate_change_per_s2);
+        combined.max_stop_path_rate =
+            std::min(combined.max_stop_path_rate, retained.max_stop_path_rate);
+      };
+      intersect(suffix_bounds);
+      if (prefix.runtime_scale_bounds)
+        intersect(*prefix.runtime_scale_bounds);
       if (auto error = control_error(control, "moving_finalization"))
         return core::Result<core::TrajectoryDTO>::Err(*error);
       return composite;
@@ -1687,6 +2006,13 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
       return fail<core::TrajectoryDTO>(ErrorCode::kInvalidRequest,
                                        "Moving preparation budget is invalid",
                                        "native_moving_source_invalid");
+    const auto planning = input.moving_replacement->remaining_planning_budget_s;
+    if (planning &&
+        (!finite_positive(*planning) ||
+         *planning > std::chrono::duration<double>(std::chrono::hours(24)).count()))
+      return fail<core::TrajectoryDTO>(ErrorCode::kInvalidRequest,
+                                       "Moving planning budget is invalid",
+                                       "native_moving_source_invalid");
     const auto deadline =
         whole_started +
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -1706,6 +2032,7 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
     return core::Result<core::TrajectoryDTO>::Err(caps.error());
   }
 
+  log_moving_phase(input, "compute_begin", whole_started);
   std::lock_guard lock(computation_mutex_);
   try {
     std::optional<RoboPlanCandidateRequestDTO> suffix_request;
@@ -1719,7 +2046,9 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
         return core::Result<core::TrajectoryDTO>::Err(suffix.error());
       suffix_request = std::move(suffix.value());
       const double remaining =
-          input.moving_replacement->remaining_preparation_budget_s -
+          std::min(input.moving_replacement->remaining_preparation_budget_s,
+                   input.moving_replacement->remaining_planning_budget_s.value_or(
+                       input.moving_replacement->remaining_preparation_budget_s)) -
           std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                         whole_started)
               .count();
@@ -1734,15 +2063,24 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
               std::chrono::duration<double>(
                   suffix_request->planning_timeout_s));
+      if (const auto planning = input.moving_replacement->remaining_planning_budget_s)
+        suffix_deadline = std::min(
+            *suffix_deadline,
+            whole_started + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double>(*planning)));
       suffix_control.cancellation_requested =
           whole_control.cancellation_requested;
       suffix_control.deadline_expired = [deadline = *suffix_deadline,
                                          expired =
-                                             whole_control.deadline_expired] {
+                                             whole_control.deadline_expired,
+                                         planning_expired =
+                                             caller_control.planning_deadline_expired] {
         return (expired && expired()) ||
+               (planning_expired && planning_expired()) ||
                std::chrono::steady_clock::now() >= deadline;
       };
     }
+    log_moving_phase(input, "suffix_begin", whole_started);
     const auto &request = suffix_request ? *suffix_request : input;
     const auto &control = suffix_request ? suffix_control : caller_control;
     const auto remaining_planning_timeout = [&] {
@@ -1967,17 +2305,22 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
     auto prepared = prepare_candidate_time_law(
         cartesian_contract_input(binding_, request, caps.value()), nullptr,
         planning_scene, trajectory.value(), model_velocity->second,
-        model_acceleration->second, cartesian_control(control));
+        model_acceleration->second, cartesian_control(control), nullptr,
+        input.moving_replacement.has_value());
     if (!prepared.ok())
       return core::Result<core::TrajectoryDTO>::Err(prepared.error());
     auto portable = portable_trajectory(trajectory.value(), binding_,
                                         config_.maximum_trajectory_samples,
                                         prepared.value());
-    if (portable.ok() && input.moving_replacement)
-      return finalize_moving_candidate(
+    if (portable.ok() && input.moving_replacement) {
+      log_moving_phase(input, "connector_begin", whole_started);
+      auto finalized = finalize_moving_candidate(
           binding_, input, caps.value(), planning_scene,
           std::move(portable.value()), config_.maximum_trajectory_samples,
           whole_control);
+      log_moving_phase(input, "connector_return", whole_started);
+      return finalized;
+    }
     return portable;
   } catch (const std::exception &error) {
     return fail<core::TrajectoryDTO>(ErrorCode::kPlanningFailed,

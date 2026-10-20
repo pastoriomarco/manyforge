@@ -343,6 +343,8 @@ struct ExecutionLaneFactsDTO final {
   /// Qualified binding supports one atomic replacement trajectory/start stamp
   /// command. Unqualified lanes retain their existing immediate replacement.
   bool supports_scheduled_replacement{false};
+  /// Experimental Mock binding samples replacements on the resident path origin.
+  bool supports_resident_timeline_replacement{false};
 
   friend bool operator==(const ExecutionLaneFactsDTO&,
                          const ExecutionLaneFactsDTO&) = default;

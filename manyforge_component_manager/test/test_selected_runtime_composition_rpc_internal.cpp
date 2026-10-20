@@ -2609,5 +2609,43 @@ TEST(SelectedRuntimeCompositionRpcInternal,
                std::invalid_argument);
 }
 
+TEST(SelectedRuntimeCompositionRpcInternal,
+     InstalledLifecycleFactsRoundTripAndRejectAmbiguity) {
+  ManagerComponentProcessInventoryResultDTO result{
+      InstalledInventoryRequest(),
+      {},
+      std::nullopt,
+      {{ControllableComponentId("component-1"),
+        ComponentLifecycleGeneration(3U),
+        ComponentLifecycleStateDTO::kActive}}};
+  result.request.include_component_lifecycles = true;
+  ASSERT_TRUE(result.valid());
+  EXPECT_EQ(
+      std::get<ManagerComponentProcessInventoryRequestDTO>(
+          DecodeSelectedRuntimeCompositionRpcRequestVariant(
+              EncodeSelectedRuntimeCompositionRpcRequest(result.request))),
+      result.request);
+  EXPECT_EQ(std::get<ManagerComponentProcessInventoryResultDTO>(
+                DecodeSelectedRuntimeCompositionRpcResponse(
+                    EncodeSelectedRuntimeCompositionRpcResponse(result))),
+            result);
+  auto invalid = result;
+  invalid.component_lifecycles.push_back(invalid.component_lifecycles.front());
+  EXPECT_FALSE(invalid.valid());
+  invalid = result;
+  invalid.component_lifecycles.front().state =
+      static_cast<ComponentLifecycleStateDTO>(255U);
+  EXPECT_FALSE(invalid.valid());
+  EXPECT_THROW(EncodeSelectedRuntimeCompositionRpcResponse(invalid),
+               std::invalid_argument);
+  result.component_lifecycles.clear();
+  result.request.include_component_lifecycles = false;
+  const auto old_bytes = EncodeSelectedRuntimeCompositionRpcResponse(result);
+  EXPECT_EQ(EncodeSelectedRuntimeCompositionRpcResponse(
+                std::get<ManagerComponentProcessInventoryResultDTO>(
+                    DecodeSelectedRuntimeCompositionRpcResponse(old_bytes))),
+            old_bytes);
+}
+
 } // namespace
 } // namespace manyforge::component_manager::detail

@@ -1463,7 +1463,7 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
        "compiled_products", "provenance"},
       {"site_overlay_ref", "external_resources", "assistant",
        "motion_takeover_preparation_budget_s",
-       "interrupt_policy_configuration"},
+       "motion_takeover_planning_budget_s", "interrupt_policy_configuration"},
       "retained_bundle");
   if (require_string(require_member(object, "api_version", "retained_bundle"),
                      "retained_bundle.api_version") !=
@@ -1496,6 +1496,19 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
           "finite and positive");
     }
     motion_takeover_preparation_budget_s = *seconds;
+  }
+  std::optional<double> motion_takeover_planning_budget_s;
+  if (const auto *budget =
+          root.find_object_member("motion_takeover_planning_budget_s")) {
+    const auto *seconds = std::get_if<double>(&budget->storage());
+    if (seconds == nullptr || !std::isfinite(*seconds) || *seconds <= 0.0 ||
+        !motion_takeover_preparation_budget_s ||
+        *seconds >= *motion_takeover_preparation_budget_s) {
+      detail::fail_retained_bundle(
+          "retained_bundle.motion_takeover_planning_budget_s must be positive "
+          "and less than the preparation budget");
+    }
+    motion_takeover_planning_budget_s = *seconds;
   }
   const auto &catalogs =
       require_object(require_member(object, "catalogs", "retained_bundle"),
@@ -2028,6 +2041,7 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
       std::move(assistant),
       std::move(runtime_contract_requirements),
       motion_takeover_preparation_budget_s,
+      motion_takeover_planning_budget_s,
   };
 }
 

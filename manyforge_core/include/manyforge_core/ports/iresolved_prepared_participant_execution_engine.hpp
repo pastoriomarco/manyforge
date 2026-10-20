@@ -45,6 +45,9 @@ struct ResolvedPreparedMotionReplacementContextDTO final {
   /// No implicit reuse of the ordinary planning-only timeout.
   std::int64_t preparation_budget_ns{};
   std::optional<ResolvedPreparedMotionSpringReturnContextDTO> spring_return{};
+  /// Optional cap measured from the same preparation start; connector and
+  /// validation keep the whole preparation deadline.
+  std::optional<std::int64_t> planning_budget_ns{};
 };
 
 struct ResolvedMotionInterruptScopeActionDTO final {

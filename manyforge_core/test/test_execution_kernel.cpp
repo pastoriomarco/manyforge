@@ -1199,6 +1199,25 @@ class ControlledExecution : public IExecutionBackend {
   bool block_sync_observed_state = false;
   bool release_blocked_sync_observed_state = false;
 
+  std::atomic<int> replacement_hold_begins{0};
+  std::atomic<int> replacement_hold_ends{0};
+  std::atomic<std::uint64_t> replacement_hold_candidate{0};
+  std::atomic<std::uint64_t> replacement_hold_ended_candidate{0};
+  std::atomic<std::int64_t> replacement_hold_deadline_ns{0};
+  Result<void> BeginReplacementPreparationScaleHold(
+      const PreparedMotionReplacementSourceDTO&, std::uint64_t candidate_id,
+      std::int64_t preparation_deadline_ns, std::stop_token) override {
+    replacement_hold_candidate.store(candidate_id);
+    replacement_hold_deadline_ns.store(preparation_deadline_ns);
+    ++replacement_hold_begins;
+    return Result<void>::Ok();
+  }
+  Result<void> EndReplacementPreparationScaleHold(std::uint64_t candidate_id) override {
+    replacement_hold_ended_candidate.store(candidate_id);
+    ++replacement_hold_ends;
+    return Result<void>::Ok();
+  }
+
   std::atomic<int> retire_count{0};
   // Number of retirements to refuse as still winding down (item 12).
   std::atomic<int> retire_not_quiescent_refusals{0};
@@ -10446,11 +10465,90 @@ TEST_F(PortParticipantKernelTest, ReplacementDeadlineAndInheritedRampBoundsRefus
         source.value(), 2U, successor, next, pclock.now() + (expired ? 1'000'000 : 1'000'000'000));
     port->SetOnReadSample(nullptr);
     EXPECT_EQ(sent.command.dispatch, ExecutionPortDispatch::kNotDispatched);
+    if (!expired) {
+      ASSERT_TRUE(sent.command.error);
+      const auto& details = sent.command.error->details;
+      EXPECT_EQ(details.at("qualification_stage"), "baseline");
+      EXPECT_EQ(details.at("qualification_check"), "scale_compatibility");
+      EXPECT_EQ(details.at("candidate_rate_per_s"), "2");
+      EXPECT_EQ(details.at("ramp_rate_per_s"), "4");
+      EXPECT_EQ(details.at("scale_frozen"), "false");
+    }
     EXPECT_TRUE(Calls<testing::FakeExecutionPort::ReplaceCall>().empty());
     EXPECT_EQ(handle.get_snapshot().state, ExecutionState::kExecuting);
     EXPECT_TRUE(participant->RetirePreparedExecution(2U).ok());
     Reset();
   }
+}
+
+TEST_F(PortParticipantKernelTest, PreparationHoldDefersSliderThroughAdoptedConnectorThenRebinds) {
+  const auto product = DirectBackendProduct();
+  participant->set_runtime_velocity_scale(1.0);
+  Sample(0.0, 0.0, 0.0);
+  const ExecutionGoalKey old{ControllerGoalId("hold.old"), ControllerGoalGeneration(1U)};
+  const auto handle =
+      participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+  pclock.advance(10'000'000);
+  Executing(old);
+  Sample(0.5, 0.25, 0.5);
+  ASSERT_FALSE(handle.wait_for_completion(0));
+  const auto source = participant->CaptureReplacementSource(1U, handle.execution_generation, old,
+                                                            product.prepared_contract_digest);
+  ASSERT_TRUE(source.ok());
+  ASSERT_TRUE(participant
+                  ->BeginReplacementPreparationScaleHold(source.value(), 2U,
+                                                         pclock.now() + 1'000'000'000, {})
+                  .ok());
+  const auto count = Calls<testing::FakeExecutionPort::SetScaleCall>().size();
+  participant->set_runtime_velocity_scale(0.5);
+  pclock.advance(10'000'000);
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+  auto next_product = DirectSuccessor(product, source.value());
+  auto& motion = std::get<PreparedMotionExecutionDTO>(next_product.payload);
+  const auto& original = std::get<PreparedMotionExecutionDTO>(product.payload).trajectory;
+  const auto point = [&](double time) {
+    const auto sample = sample_trajectory(original, 0.5 + time);
+    if (!sample.ok()) throw std::logic_error(sample.error().message);
+    return TrajectoryWaypointDTO{time, sample.value().positions_rad,
+                                 sample.value().velocities_rad_s,
+                                 sample.value().accelerations_rad_s2};
+  };
+  motion.plan_request.moving_replacement->source_prefix_trajectory.waypoints = {point(0.0),
+                                                                                point(1.0)};
+  motion.trajectory.waypoints = {point(0.0), point(1.0), point(1.25), point(3.5)};
+  motion.trajectory.runtime_scale_bounds->max_rate_per_s = 2.0;
+  ASSERT_EQ(participant->PrepareReplacement(next_product, 2U, source.value()).state,
+            PrepareParticipantResultStateDTO::kPrepared);
+  const ExecutionGoalKey next{ControllerGoalId("hold.next"), ControllerGoalGeneration(2U)};
+  const auto sent = participant->DispatchReplacement(source.value(), 2U, next_product, next,
+                                                     pclock.now() + 1'000'000'000);
+  ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched)
+      << (sent.command.error ? sent.command.error->message : "");
+  ASSERT_TRUE(sent.handle);
+  port->FinishGoal(old, ExecutionGoalResult::kPreemptedBy, next, pclock.now());
+  pclock.advance(30'000'000);
+  Executing(next);
+  Sample(0.1, 0.3, 0.5);
+  ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
+            PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+  ASSERT_TRUE(participant
+                  ->AdoptReplacement(source.value(), 2U,
+                                     {nullptr, [](void*) noexcept { return Result<void>::Ok(); }})
+                  .ok());
+  pclock.advance(10'000'000);
+  Sample(0.4, 0.45, 0.5);
+  EXPECT_FALSE(sent.handle->wait_for_completion(0));
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+  pclock.advance(10'000'000);
+  Sample(1.4, 0.95, 0.5);
+  EXPECT_FALSE(sent.handle->wait_for_completion(0));
+  pclock.advance(10'000'000);
+  pscheduler.advance_to(pclock.now());
+  const auto scales = Calls<testing::FakeExecutionPort::SetScaleCall>();
+  ASSERT_GT(scales.size(), count);
+  EXPECT_NEAR(scales.back().value, 0.98, 1e-12);
 }
 
 TEST_F(PortParticipantKernelTest, ScheduledMovingReplacementKeepsExistingEvolvingRampAdmission) {
@@ -10641,7 +10739,8 @@ TEST_F(PortParticipantKernelTest, ScopedStopRetiresPendingOnlyWithEveryRetainedE
   }
 }
 
-TEST_F(PortParticipantKernelTest, UnknownOrLateRecognitionNeverAuthorizesAdoptionOrRetirement) {
+TEST_F(PortParticipantKernelTest,
+       AcceptedReplacementWaitsForEvidenceWithoutLateRecognitionRefusal) {
   for (const bool late : {false, true}) {
     SCOPED_TRACE(late);
     const auto product = DirectBackendProduct();
@@ -10656,7 +10755,10 @@ TEST_F(PortParticipantKernelTest, UnknownOrLateRecognitionNeverAuthorizesAdoptio
     const auto source = participant->CaptureReplacementSource(1U, handle.execution_generation, old,
                                                               product.prepared_contract_digest);
     ASSERT_TRUE(source.ok());
-    const auto successor = DirectSuccessor(product, source.value());
+    auto successor = DirectSuccessor(product, source.value());
+    std::get<PreparedMotionExecutionDTO>(successor.payload)
+        .plan_request.moving_replacement->divergence_cursor_s =
+        static_cast<double>(source.value().progress.trajectory_time_ns) / 1e9 + 0.032;
     const auto prepared = participant->PrepareReplacement(successor, 2U, source.value());
     ASSERT_EQ(prepared.state, PrepareParticipantResultStateDTO::kPrepared)
         << (prepared.error ? prepared.error->message : "no preparation error")
@@ -10669,7 +10771,32 @@ TEST_F(PortParticipantKernelTest, UnknownOrLateRecognitionNeverAuthorizesAdoptio
     EXPECT_EQ(*sent.submitted_at_ns, pclock.now());
     port->FinishGoal(old, ExecutionGoalResult::kPreemptedBy, next, pclock.now());
     if (late) {
-      pclock.advance(1'100'000'000);
+      ExecutionGoalObservationDTO accepted;
+      accepted.key = next;
+      accepted.binding_epoch = source.value().binding_epoch;
+      accepted.phase = ExecutionGoalPhase::kAccepted;
+      accepted.mechanism_goal_id = MechanismGoalId("accepted-delayed-feedback");
+      accepted.accepted_stamp_ns = pclock.now();
+      port->SetGoal(accepted);
+      const auto before = participant->execution_progress_publication()->acquire();
+      EXPECT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
+                PreparedMotionReplacementPhaseDTO::kPossiblySent);
+      int early_commits = 0;
+      EXPECT_FALSE(participant
+                       ->AdoptReplacement(source.value(), 2U,
+                                          {&early_commits,
+                                           [](void* count) noexcept {
+                                             ++*static_cast<int*>(count);
+                                             return Result<void>::Ok();
+                                           }})
+                       .ok());
+      EXPECT_EQ(early_commits, 0);
+      EXPECT_EQ(participant->execution_progress_publication()->acquire().sequence,
+                before.sequence);
+      pclock.advance(50'000'000);
+      // Elapsed source lead without contradictory evidence is still pending.
+      EXPECT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
+                PreparedMotionReplacementPhaseDTO::kPossiblySent);
       Executing(next);
       Sample(0.1, 0.31, 0.5);
     } else {
@@ -10677,17 +10804,23 @@ TEST_F(PortParticipantKernelTest, UnknownOrLateRecognitionNeverAuthorizesAdoptio
     }
     const auto observed = participant->ObserveReplacement(source.value(), 2U);
     ASSERT_TRUE(observed.ok());
-    EXPECT_EQ(observed.value().phase, PreparedMotionReplacementPhaseDTO::kEffectUncertain);
+    EXPECT_EQ(observed.value().phase, late ? PreparedMotionReplacementPhaseDTO::kReadyToCommit
+                                          : PreparedMotionReplacementPhaseDTO::kEffectUncertain);
+    if (late) {
+      ASSERT_TRUE(observed.value().recognition_delay_ns);
+      EXPECT_GE(*observed.value().recognition_delay_ns, 49'999'999);
+      EXPECT_FALSE(observed.value().error);
+    }
     int commits = 0;
-    EXPECT_FALSE(participant
-                     ->AdoptReplacement(source.value(), 2U,
-                                        {&commits,
-                                         [](void* count) noexcept {
-                                           ++*static_cast<int*>(count);
-                                           return Result<void>::Ok();
-                                         }})
-                     .ok());
-    EXPECT_EQ(commits, 0);
+    EXPECT_EQ(participant
+                  ->AdoptReplacement(source.value(), 2U,
+                                     {&commits, [](void* count) noexcept {
+                                        ++*static_cast<int*>(count);
+                                        return Result<void>::Ok();
+                                      }})
+                  .ok(),
+              late);
+    EXPECT_EQ(commits, late ? 1 : 0);
     EXPECT_FALSE(participant->RetirePreparedExecution(2U).ok());
     const auto replay = participant->DispatchReplacement(source.value(), 2U, successor, next, 0);
     EXPECT_EQ(replay.submitted_at_ns, sent.submitted_at_ns);
@@ -10989,7 +11122,8 @@ TEST_F(ExecutionKernelTest,
   newcomer_request.action_span = make_test_action_span();
   auto newcomer = prepared_motion_request(newcomer_request);
   newcomer.execution_request.binding.controller_goal_id = ControllerGoalId("replacement.new.goal");
-  newcomer.replacement = ResolvedPreparedMotionReplacementContextDTO{source.value(), 250'000'000};
+  newcomer.replacement = ResolvedPreparedMotionReplacementContextDTO{source.value(), 250'000'000,
+                                                                     std::nullopt, 100'000'000};
   const auto preparing = owner.PrepareMotion(std::move(newcomer));
   ASSERT_TRUE(preparing.ok());
   {
@@ -11003,6 +11137,21 @@ TEST_F(ExecutionKernelTest,
     EXPECT_TRUE(backend.observations_changed.wait_for(
         lock, std::chrono::seconds(2), [&]() { return backend.polls >= before + 2; }));
   }
+  // The hold precedes the planner and remains owned until explicit cleanup,
+  // even though cancellation prevents preparing a backend candidate product.
+  EXPECT_EQ(backend.replacement_hold_begins.load(), 1);
+  EXPECT_EQ(backend.replacement_hold_candidate.load(), preparing.value());
+  EXPECT_EQ(backend.replacement_hold_deadline_ns.load(), clock.now() + 250'000'000);
+  EXPECT_EQ(backend.replacement_hold_ends.load(), 0);
+  ASSERT_TRUE(planner.last_request.moving_replacement);
+  const auto& moving = *planner.last_request.moving_replacement;
+  ASSERT_TRUE(moving.remaining_planning_budget_s);
+  EXPECT_GT(*moving.remaining_planning_budget_s, 0.0);
+  EXPECT_LE(*moving.remaining_planning_budget_s, 0.1);
+  EXPECT_GT(moving.remaining_preparation_budget_s, *moving.remaining_planning_budget_s);
+  // The preparation setting, not the earlier planning cap, still chooses the cut.
+  EXPECT_NEAR(moving.divergence_cursor_s - moving.source_cursor_s,
+              0.25 * *source.value().controller_sample.applied_factor, 1e-9);
   EXPECT_EQ(owner.get_status().execution_id, started.value());
   EXPECT_FALSE(owner.get_status().fact.has_value());
   EXPECT_EQ(backend.execute_count, 1);
@@ -11021,11 +11170,14 @@ TEST_F(ExecutionKernelTest,
     ASSERT_TRUE(gate.changed.wait_for(lock, std::chrono::seconds(2),
                                       [&]() { return gate.candidate_completed; }));
   }
+  EXPECT_EQ(backend.replacement_hold_ends.load(), 0);
   // Cancellation stays observable until the owner explicitly accepts cleanup.
   ASSERT_TRUE(owner.ObservePreparedMotion(preparing.value()).ok());
   const auto retired = owner.RetireCancelledPreparedMotion(preparing.value());
   ASSERT_TRUE(retired.ok());
   EXPECT_TRUE(retired.value());
+  EXPECT_EQ(backend.replacement_hold_ends.load(), 1);
+  EXPECT_EQ(backend.replacement_hold_ended_candidate.load(), preparing.value());
   EXPECT_FALSE(owner.ObservePreparedMotion(preparing.value()).ok());
   EXPECT_TRUE(owner.ObservePreparedMotion(started.value()).ok());
   backend.complete();

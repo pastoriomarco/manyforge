@@ -1163,6 +1163,38 @@ TEST(ProcessContainedCandidateClientTest,
 }
 
 TEST(ProcessContainedCandidateClientTest,
+     MovingPlanningCapCarriesOneAbsoluteDeadlineThroughTheProcessBoundary) {
+  auto fixture = make_fixture();
+  fixture.model.native_scene_name = "inspect-moving-planning-budget";
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH));
+  auto input = moving_request(fixture, 12.0);
+  input.moving_replacement->remaining_planning_budget_s = 10.0;
+  // The fake peer checks both decremented budgets, their unchanged difference,
+  // and the absolute deadline against its own same-host steady clock.
+  const auto result = client.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().waypoints.back().positions_rad, values(fixture.goal));
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     MovingPlanningCapConsumedByLocalTransportSetupDoesNotRestartInWorker) {
+  auto fixture = make_fixture();
+  fixture.model.native_scene_name = "inspect-moving-planning-budget";
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH));
+  auto input = moving_request(fixture, 3.0);
+  input.moving_replacement->remaining_planning_budget_s = 1e-300;
+  const auto expired = client.compute(input);
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().details.at("reason"), "planning_timeout");
+}
+
+TEST(ProcessContainedCandidateClientTest,
      InvalidMovingBudgetsFailBeforeStartingWorker) {
   auto fixture = make_fixture();
   auto process_config = config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH);
@@ -1208,6 +1240,11 @@ TEST(ProcessContainedCandidateClientTest,
   const auto expired = result.get();
   ASSERT_FALSE(expired.ok());
   EXPECT_EQ(expired.error().details.at("reason"), "planning_timeout");
+  const auto &details = expired.error().details;
+  EXPECT_FALSE(details.at("moving_worker_phase").empty());
+  EXPECT_GT(std::stoll(details.at("moving_worker_request_elapsed_ns")), 0);
+  EXPECT_TRUE(details.contains("moving_worker_lock_wait_ns"));
+  EXPECT_TRUE(details.contains("moving_worker_pid"));
   std::filesystem::remove(marker, ignored);
 }
 

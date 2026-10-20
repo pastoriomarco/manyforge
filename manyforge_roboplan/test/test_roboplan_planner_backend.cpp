@@ -189,6 +189,17 @@ TEST(RoboPlanPlannerBackendTest,
             expected.source_per_resource_dynamics_limits);
   EXPECT_GT(actual.remaining_preparation_budget_s, 0.0);
   EXPECT_LT(actual.remaining_preparation_budget_s, 3.0);
+  EXPECT_FALSE(actual.remaining_planning_budget_s);
+
+  request.moving_replacement->remaining_planning_budget_s = 0.5;
+  ASSERT_TRUE(fixture.backend->plan(request).trajectory);
+  const auto& capped = *fixture.client->last_request->moving_replacement;
+  ASSERT_TRUE(capped.remaining_planning_budget_s);
+  EXPECT_GT(*capped.remaining_planning_budget_s, 0.0);
+  EXPECT_LT(*capped.remaining_planning_budget_s, 0.5);
+  // One setup interval is charged to both budgets, rather than starting P here.
+  EXPECT_NEAR(3.0 - capped.remaining_preparation_budget_s,
+              0.5 - *capped.remaining_planning_budget_s, 1e-12);
 }
 
 TEST(RoboPlanPlannerBackendTest,

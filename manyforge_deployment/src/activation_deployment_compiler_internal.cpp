@@ -1541,6 +1541,10 @@ CanonicalValue compile_activation_deployment(
       // The shared Deployment decoder below owns positive-finite validation.
       policies.emplace_back("motion_takeover_preparation_budget_s", *budget);
     }
+    if (const auto *budget = intent.policies.find_object_member(
+            "motion_takeover_planning_budget_s")) {
+      policies.emplace_back("motion_takeover_planning_budget_s", *budget);
+    }
   }
   Object authored_graph;
   for (const std::string_view name : {"runtime_units", "model_instances",

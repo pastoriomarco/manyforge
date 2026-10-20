@@ -2101,6 +2101,57 @@ describe('Deployment workspace parser', () => {
     expect((parsed.result.preparedActivation.origin as { scenarioId: string }).scenarioId).toBe('fixture');
   });
 
+  it('accepts a confirmation for an authored Draft that has no compiled revision', () => {
+    const digestA = `sha256:${'a'.repeat(64)}`;
+    const digestB = `sha256:${'b'.repeat(64)}`;
+    const digestC = `sha256:${'c'.repeat(64)}`;
+    const workspace = deploymentWorkspaceFixture();
+    Object.assign(workspace.draft as Record<string, unknown>, {
+      document: {
+        api_version: 'manyforge.deployment_intent.v2',
+        deployment_artifact_id: 'deployment.fixture',
+        name: 'Fixture',
+        components: [], attachments: [], policies: {},
+      },
+      deploymentRevision: null, graphRevision: null,
+    });
+    workspace.binding = null;
+    workspace.scenarioCandidates = [];
+    workspace.savedScenarioCandidates = [];
+    const response = (deploymentArtifactId: string) => ({
+      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
+      workspace,
+      result: {
+        status: 'confirmation_required',
+        confirmation_token: digestA,
+        prepared_activation: {
+          schema_version: 'manyforge.prepared_activation_input.v6',
+          prepared_activation_id: digestC,
+          origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA },
+          captured_input_digest: digestB,
+          deployment_artifact_id: deploymentArtifactId,
+          deployment_revision: digestA,
+          retained_bundle_id: digestB,
+          graph_revision: digestC,
+          program_id: 'fixture-program',
+          program_revision: digestB,
+          program_outcome: { kind: 'bound', program_binding_id: digestA },
+          node_environment_digest: digestC,
+          assistant_mode: 'forbidden',
+        },
+        candidate_preview: null,
+        manager_apply: null,
+        preparation: { request_owner_epoch: 'owner.1', request_id: 'request.1' },
+      },
+    });
+    const parsed = parseDeploymentCandidateOperationResponse(response('deployment.fixture'));
+    expect(parsed.result.status).toBe('confirmation_required');
+    expect(parsed.result.preparation).toEqual({ requestOwnerEpoch: 'owner.1', requestId: 'request.1' });
+    // The artifact identity is still exact.
+    expect(() => parseDeploymentCandidateOperationResponse(response('deployment.other')))
+      .toThrow(/exact compiled Deployment Draft/);
+  });
+
   it('accepts the authored graph without embedding its compiler-issued revision', () => {
     const parsed = parseDeploymentWorkspaceResponse(deploymentWorkspaceFixture());
     expect(parsed.draft.document?.graph).not.toHaveProperty('graph_revision');

@@ -216,15 +216,38 @@ void BindHostIoRuleEvidenceProcessor(
   product.io_signal_runtime->SetRuleEvidenceProcessor(
       [weak = std::weak_ptr(actual_access)]() -> core::Result<bool> {
         const auto access = weak.lock();
-        if (!access) return core::Result<bool>::Ok(false);
+        if (!access)
+          return core::Result<bool>::Ok(false);
         // Same existing pin protects every borrowed facade/component callback.
         // Neither this callback nor Core may upgrade/reenter it exclusively.
         std::shared_lock lock(access->mutex);
         auto *kernel = access->addressed_kernel.load(std::memory_order_acquire);
-        if (!kernel) return core::Result<bool>::Ok(false);
+        if (!kernel)
+          return core::Result<bool>::Ok(false);
         const auto processed = kernel->ProcessIoRuleEvidence();
-        if (!processed.ok()) return core::Result<bool>::Err(processed.error());
+        if (!processed.ok())
+          return core::Result<bool>::Err(processed.error());
         return core::Result<bool>::Ok(true);
+      },
+      [weak = std::weak_ptr(actual_access)](
+          const std::shared_ptr<core::IIoSignalService> &service,
+          std::span<const core::InterruptSourceId> sources,
+          const core::LifecycleTransactionId &transaction,
+          bool disabled) -> core::Result<void> {
+        const auto access = weak.lock();
+        if (!access)
+          return core::Result<void>::Err({"invalid_state_transition",
+                                          "Input lifecycle owner expired",
+                                          {}});
+        std::shared_lock lock(access->mutex);
+        auto *kernel = access->addressed_kernel.load(std::memory_order_acquire);
+        if (!kernel)
+          return core::Result<void>::Err(
+              {"invalid_state_transition",
+               "Input lifecycle Kernel is unavailable",
+               {}});
+        return kernel->SetGlobalIoSourcesPlannedDisabled(service, sources,
+                                                         transaction, disabled);
       });
 }
 

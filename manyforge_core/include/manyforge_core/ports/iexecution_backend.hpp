@@ -70,6 +70,17 @@ class IExecutionBackend : public IControlDomainExecutionPort {
     return Result<PreparedMotionReplacementSourceDTO>::Err(ErrorCode::kUnsupportedCapability);
   }
 
+  /// Owner-fenced host scaling hold, charged to the existing preparation
+  /// deadline. Capture remains read-only; Stop freeze remains independently owned.
+  virtual Result<void> BeginReplacementPreparationScaleHold(
+      const PreparedMotionReplacementSourceDTO&, std::uint64_t,
+      std::int64_t, std::stop_token) {
+    return Result<void>::Err(ErrorCode::kUnsupportedCapability);
+  }
+  virtual Result<void> EndReplacementPreparationScaleHold(std::uint64_t) {
+    return Result<void>::Ok();
+  }
+
   virtual PrepareParticipantResultDTO PrepareReplacement(
       const PreparedOperationParticipantDTO& participant, std::uint64_t /*candidate_id*/,
       const PreparedMotionReplacementSourceDTO& /*source*/) {

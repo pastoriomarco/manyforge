@@ -160,6 +160,10 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   Result<PreparedMotionReplacementSourceDTO> CaptureReplacementSource(
       std::uint64_t execution_id, std::uint64_t execution_generation, const ExecutionGoalKey& goal,
       const ContentDigest& digest) const override;
+  Result<void> BeginReplacementPreparationScaleHold(
+      const PreparedMotionReplacementSourceDTO& source, std::uint64_t candidate_id,
+      std::int64_t preparation_deadline_ns, std::stop_token cancellation) override;
+  Result<void> EndReplacementPreparationScaleHold(std::uint64_t candidate_id) override;
   PrepareParticipantResultDTO PrepareReplacement(
       const PreparedOperationParticipantDTO& participant, std::uint64_t candidate_id,
       const PreparedMotionReplacementSourceDTO& source) override;
@@ -288,6 +292,14 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   double target_scale_{1.0};
   std::optional<double> last_sent_scale_;
   bool scale_frozen_{false};
+  struct PreparationScaleHold {
+    std::uint64_t candidate_id;
+    ExecutionGoalKey source_goal;
+    double factor;
+    bool confirmed{false};
+  };
+  std::optional<PreparationScaleHold> preparation_scale_hold_;
+
   /// Item 28/Q11: the factor moves linearly toward its target.
   struct ScaleRamp {
     double value;

@@ -666,9 +666,8 @@ class ProgramRuntime:
         preflight only and publishes readiness after the heartbeat returns a
         stable current status.
         """
-        status = self._cycle_status_core()
-        _admission, journal = self._require_cycle_owner()
-        status["accepted_reset"] = self._accepted_reset_context(journal, journal.read())
+        status, accepted_reset = self._cycle_status_projection()
+        status["accepted_reset"] = accepted_reset
         return status
 
     def _reconcile_manager_liveness(
@@ -1681,10 +1680,12 @@ class ProgramRuntime:
                     raise RuntimeError("Reset still has an unsettled child transaction")
 
     def _cycle_status_core(self) -> dict[str, Any]:
-        """Return the closed, dependency-free Manager liveness projection."""
+        return self._cycle_status_projection()[0]
 
+    def _cycle_status_projection(self) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Project cycle and Reset context from one dependency-free snapshot."""
         _admission, journal = self._require_cycle_owner()
-        cycle = journal.read()
+        cycle, pending_commands = journal.status_snapshot()
         acquisition_pending = cycle.acquisition_pending is not None
         claimless_no_effect = bool(
             cycle.claim is None
@@ -1695,7 +1696,7 @@ class ProgramRuntime:
             and cycle.start_settlement.get("program_run_id") == cycle.program_run_id
             and self._digest(cycle.start_settlement) == cycle.terminal_reference
         )
-        idle_reset = self._idle_reset_occurrence(journal, cycle) is not None
+        idle_reset = self._idle_reset_occurrence(journal, cycle, pending_commands) is not None
         if (
             acquisition_pending
             and (
@@ -1721,7 +1722,7 @@ class ProgramRuntime:
         }
         reset_retry_phase = self._reset_retry_phase(cycle)
         recovery_stop = self._current_cycle_recovery_stop(cycle)
-        recovery_reset = self._current_cycle_recovery_reset(cycle)
+        recovery_reset = self._current_cycle_recovery_reset(cycle, pending_commands)
         allowed_by_state = {
             "program_run": cycle.state == "idle_after_reset" and not (
                 cycle.failure and cycle.failure.get("code") == "program_scene_preparation_failed"
@@ -1815,7 +1816,7 @@ class ProgramRuntime:
         ):
             pending = [
                 row
-                for row in journal.pending_commands()
+                for row in pending_commands
                 if row["cycle_generation"] == cycle.cycle_generation
             ]
             if len(pending) == 1:
@@ -1837,7 +1838,7 @@ class ProgramRuntime:
                 "current_command_kind": cycle.current_command_kind,
                 "failure": failure,
                 "reset_phase": cycle.reset_phase,
-                "reset_options": self._accepted_reset_options(journal, cycle),
+                "reset_options": self._accepted_reset_options(journal, cycle, pending_commands),
                 # Liveness must not depend on an execution/Manager round trip.
                 # The public wrapper replaces this unsampled private field.
                 "reset_robot_position": {
@@ -1847,7 +1848,8 @@ class ProgramRuntime:
                 "allowed_commands": allowed_commands,
             }
         )
-        return status.model_dump(mode="json")
+        return (status.model_dump(mode="json"),
+                self._accepted_reset_context(journal, cycle, pending_commands))
 
     def cycle_status(self) -> dict[str, Any]:
         result = self._cycle_status_core()
@@ -6335,11 +6337,14 @@ class ProgramRuntime:
         return cycle
 
     @staticmethod
-    def _accepted_reset_context(journal: Any, cycle: Any) -> dict[str, Any] | None:
-        options = ProgramRuntime._accepted_reset_options(journal, cycle)
+    def _accepted_reset_context(
+        journal: Any, cycle: Any, pending_commands: tuple[dict[str, Any], ...] | None = None,
+    ) -> dict[str, Any] | None:
+        pending = journal.pending_commands() if pending_commands is None else pending_commands
+        options = ProgramRuntime._accepted_reset_options(journal, cycle, pending)
         if options is None:
             return None
-        row = next(row for row in journal.pending_commands() if row["kind"] == "reset")
+        row = next(row for row in pending if row["kind"] == "reset")
         retained = cycle.reset_effect_claim
         claim = None if retained is None else retained["claim"]
         return {
@@ -6351,10 +6356,13 @@ class ProgramRuntime:
         }
 
     @staticmethod
-    def _accepted_reset_options(journal: Any, cycle: Any) -> dict[str, bool] | None:
+    def _accepted_reset_options(
+        journal: Any, cycle: Any, pending_commands: tuple[dict[str, Any], ...] | None = None,
+    ) -> dict[str, bool] | None:
         if cycle.state not in {"resetting", "recovery_required"}:
             return None
-        pending = [row for row in journal.pending_commands() if row["kind"] == "reset"]
+        pending = [row for row in (journal.pending_commands() if pending_commands is None else pending_commands)
+                   if row["kind"] == "reset"]
         if len(pending) != 1:
             return None
         row = pending[0]
@@ -6424,7 +6432,9 @@ class ProgramRuntime:
                 details={"cause_code": getattr(error, "code", type(error).__name__)}) from error
 
     @staticmethod
-    def _idle_reset_occurrence(journal: Any, cycle: Any) -> ProgramCycleResetRequest | None:
+    def _idle_reset_occurrence(
+        journal: Any, cycle: Any, pending_commands: tuple[dict[str, Any], ...] | None = None,
+    ) -> ProgramCycleResetRequest | None:
         """Recognize selected no-run Reset from its retained accepted intent."""
         if (
             cycle.state not in {"resetting", "recovery_required"}
@@ -6445,7 +6455,7 @@ class ProgramRuntime:
             ))
         ):
             return None
-        pending = journal.pending_commands()
+        pending = journal.pending_commands() if pending_commands is None else pending_commands
         if len(pending) != 1 or pending[0]["kind"] != "reset":
             return None
         row = pending[0]

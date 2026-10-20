@@ -388,7 +388,7 @@ def _edit_compiled_controlled_stop_profile(
             "deployment_controlled_stop_invalid",
             "Controlled Stop maximum Stop time must be positive and finite",
         )
-    if profile["stop_mode"] not in {"soft_on_path", "spring_back_hold"}:
+    if profile["stop_mode"] not in {"soft_on_path", "spring_back_hold", "spring_back_fast"}:
         _fail(
             "deployment_controlled_stop_invalid",
             "Controlled Stop mode is not supported by the current contract",

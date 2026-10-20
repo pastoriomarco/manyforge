@@ -1070,7 +1070,13 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
             std::memory_order_acquire));
       }
     } active_guard{active_request, active};
+    std::string_view diagnostic_phase = "waiting_for_client_lock";
+    std::optional<Clock::time_point> client_lock_acquired;
+    std::optional<Clock::time_point> worker_ready;
+    std::optional<Clock::time_point> send_completed;
     std::lock_guard lock(request_mutex);
+    if (whole_preparation_budget)
+      client_lock_acquired = Clock::now();
 
     if (config.require_retained_projection &&
         !selection.load(std::memory_order_acquire)) {
@@ -1087,14 +1093,21 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
                                    : config.request_transport_grace,
           whole_preparation_budget ? std::optional{request_started}
                                    : std::nullopt);
+      diagnostic_phase = "waiting_for_worker";
       start_worker(active,
                    std::min(deadline, Clock::now() + config.startup_timeout));
       if (whole_preparation_budget) {
+        worker_ready = Clock::now();
         check_request(active, deadline);
       }
+      diagnostic_phase = "encoding_request";
       const std::string payload = encode(deadline);
+      diagnostic_phase = "sending_request";
       send_frame(worker->socket.get(), request_type, payload,
                  config.maximum_request_bytes, active, deadline);
+      if (whole_preparation_budget)
+        send_completed = Clock::now();
+      diagnostic_phase = "awaiting_result";
       auto response =
           receive_frame(worker->socket.get(), config.maximum_response_bytes,
                         active, deadline);
@@ -1110,6 +1123,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
                              "worker returned an unexpected response type");
       }
       try {
+        diagnostic_phase = "decoding_result";
         auto result = decode(response.payload);
         if (whole_preparation_budget) {
           check_request(active, deadline);
@@ -1120,8 +1134,31 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
                              "worker response payload is malformed");
       }
     } catch (const RequestFailure &failure) {
+      auto diagnosed = request_failure_error(failure, ik);
+      if (whole_preparation_budget) {
+        const auto elapsed = [&](Clock::time_point stamp) {
+          return std::to_string(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  stamp - request_started)
+                  .count());
+        };
+        diagnosed.details.try_emplace("moving_worker_phase", diagnostic_phase);
+        diagnosed.details.try_emplace("moving_worker_request_elapsed_ns",
+                                      elapsed(Clock::now()));
+        if (client_lock_acquired)
+          diagnosed.details.try_emplace("moving_worker_lock_wait_ns",
+                                        elapsed(*client_lock_acquired));
+        if (worker_ready)
+          diagnosed.details.try_emplace("moving_worker_ready_after_ns",
+                                        elapsed(*worker_ready));
+        if (send_completed)
+          diagnosed.details.try_emplace("moving_worker_send_completed_after_ns",
+                                        elapsed(*send_completed));
+        diagnosed.details.try_emplace(
+            "moving_worker_pid", std::to_string(worker ? worker->pid : -1));
+      }
       terminate_worker();
-      return core::Result<Value>::Err(request_failure_error(failure, ik));
+      return core::Result<Value>::Err(std::move(diagnosed));
     } catch (...) {
       terminate_worker();
       return core::Result<Value>::Err(error(
@@ -1176,9 +1213,31 @@ ProcessContainedRoboPlanCandidateClient::compute(
           return worker_protocol::encode_candidate_request(request);
         }
         auto remaining = request;
+        const auto now = Clock::now();
         remaining.moving_replacement->remaining_preparation_budget_s =
-            std::chrono::duration<double>(deadline - Clock::now()).count();
-        return worker_protocol::encode_candidate_request(remaining);
+            std::chrono::duration<double>(deadline - now).count();
+        std::optional<std::int64_t> planning_deadline_ns;
+        if (const auto planning = request.moving_replacement->remaining_planning_budget_s) {
+          if (!std::isfinite(*planning) || *planning <= 0.0 ||
+              *planning > std::chrono::duration<double>(std::chrono::hours(24)).count())
+            throw RequestFailure(RequestFailureKind::kProtocol,
+                                 "moving planning budget is invalid");
+          // The worker shares this host's steady clock. Carry the absolute cap
+          // so socket transfer and decoding cannot restart its planning budget.
+          const auto planning_deadline = deadline -
+              std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(
+                  std::max(0.0, request.moving_replacement->remaining_preparation_budget_s -
+                                    *planning)));
+          const double available =
+              std::chrono::duration<double>(planning_deadline - now).count();
+          if (available <= 0.0)
+            throw RequestFailure(RequestFailureKind::kTimeout,
+                                 "moving planning budget expired before dispatch");
+          remaining.moving_replacement->remaining_planning_budget_s = available;
+          planning_deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     planning_deadline.time_since_epoch()).count();
+        }
+        return worker_protocol::encode_candidate_request(remaining, planning_deadline_ns);
       },
       [](std::string_view bytes) {
         return worker_protocol::decode_trajectory_result(bytes);

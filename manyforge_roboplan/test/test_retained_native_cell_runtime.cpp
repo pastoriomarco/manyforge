@@ -2109,6 +2109,8 @@ TEST(RetainedNativeCellRuntimeTest,
        {std::optional<double>{}, std::optional<double>{3.5}}) {
     auto physical = TestRegistration(binding, nullptr);
     physical.motion_takeover_preparation_budget_s = budget;
+    physical.motion_takeover_planning_budget_s =
+        budget ? std::optional<double>(1.25) : std::nullopt;
     auto resolver = make_retained_cell_kernel_participant_resolver(
         [binding](const core::OperationIntentDTO &, std::size_t) {
           return core::Result<RetainedResolvedParticipant>::Ok(
@@ -2129,6 +2131,8 @@ TEST(RetainedNativeCellRuntimeTest,
     const auto resolved = resolver(intent, 0U);
     ASSERT_TRUE(resolved.ok()) << resolved.error().message;
     EXPECT_EQ(resolved.value().motion_takeover_preparation_budget_s, budget);
+    EXPECT_EQ(resolved.value().motion_takeover_planning_budget_s,
+              physical.motion_takeover_planning_budget_s);
     EXPECT_EQ(resolved.value().binding.value(), binding.value());
   }
 }

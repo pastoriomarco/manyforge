@@ -1678,7 +1678,7 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
         `${path}.executed_mode`,
       );
       if (executedMode !== null && ![
-        'soft_on_path', 'spring_back_hold', 'hard_deceleration',
+        'soft_on_path', 'spring_back_hold', 'spring_back_fast', 'hard_deceleration',
       ].includes(executedMode)) {
         return fail(`${path}.executed_mode`, 'a controlled Stop mode');
       }
@@ -1689,7 +1689,7 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
         stageIndex: integerAt(stage.stage_index, `${path}.stage_index`),
         actionClass: actionClass as 'controlled' | 'software_hard' | 'safety_system_request',
         outcome: outcome as 'succeeded' | 'partial' | 'failed' | 'superseded_no_effect',
-        executedMode: executedMode as 'soft_on_path' | 'spring_back_hold' | 'hard_deceleration' | null,
+        executedMode: executedMode as 'soft_on_path' | 'spring_back_hold' | 'spring_back_fast' | 'hard_deceleration' | null,
         substitutionReason: nullableStringAt(
           stage.substitution_reason,
           `${path}.substitution_reason`,

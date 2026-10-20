@@ -36,9 +36,13 @@ const CanonicalValue& member(const CanonicalValue& value, std::string_view name)
   if (result == nullptr) fail("required_member_missing");
   return *result;
 }
-void exact(const CanonicalValue& value, std::initializer_list<std::string_view> names) {
+void exact(const CanonicalValue& value, std::initializer_list<std::string_view> names,
+           std::initializer_list<std::string_view> optional = {}) {
   const auto& fields = object(value);
-  if (fields.size() != names.size()) fail("unknown_or_missing_member");
+  std::size_t present = names.size();
+  for (const auto name : optional)
+    if (value.find_object_member(name)) ++present;
+  if (fields.size() != present) fail("unknown_or_missing_member");
   for (const auto name : names) {
     static_cast<void>(member(value, name));
   }
@@ -144,11 +148,12 @@ std::vector<double> get_numbers(const CanonicalValue& value) {
 }
 
 void validate_trajectory(const TrajectoryDTO& value,
-                         const MovingReplacementInputDTO* replacement = nullptr);
+                         const MovingReplacementInputDTO* replacement = nullptr,
+                         bool retained_source_prefix = false);
 
 void validate_replacement_input(const MovingReplacementInputDTO& input) {
   const auto& prefix = input.source_prefix_trajectory;
-  validate_trajectory(prefix);
+  validate_trajectory(prefix, nullptr, true);
   const auto safe_counter = [](auto value) {
     return value.nonzero() && value.value() <= 9'007'199'254'740'991ULL;
   };
@@ -159,9 +164,12 @@ void validate_replacement_input(const MovingReplacementInputDTO& input) {
       !safe_counter(input.source_binding_epoch) || !std::isfinite(input.source_cursor_s) ||
       input.source_cursor_s < 0.0 || !std::isfinite(input.divergence_cursor_s) || !positive(seam) ||
       prefix.waypoints.front().time_from_start_s != 0.0 ||
-      prefix.waypoints.back().time_from_start_s != seam || prefix.runtime_scale_bounds ||
+      prefix.waypoints.back().time_from_start_s != seam ||
       !prefix.cartesian_waypoint_times_s.empty() || prefix.cartesian_fidelity_metrics ||
       !positive(input.remaining_preparation_budget_s) ||
+      (input.remaining_planning_budget_s &&
+       (!positive(*input.remaining_planning_budget_s) ||
+        *input.remaining_planning_budget_s > input.remaining_preparation_budget_s)) ||
       !positive(input.source_speed_profile.velocity_scale) ||
       !positive(input.source_speed_profile.acceleration_scale) ||
       !input.source_speed_profile.max_tcp_linear_speed_mps ||
@@ -208,7 +216,8 @@ void validate_replacement_prefix(const TrajectoryDTO& value,
   }
 }
 
-void validate_trajectory(const TrajectoryDTO& value, const MovingReplacementInputDTO* replacement) {
+void validate_trajectory(const TrajectoryDTO& value, const MovingReplacementInputDTO* replacement,
+                         bool retained_source_prefix) {
   const auto width = value.resources.size();
   if (width == 0U || width > kMaxCoordinates || value.joint_names.size() != width ||
       value.waypoints.size() < 2U || value.waypoints.size() > kMaxWaypoints ||
@@ -271,7 +280,8 @@ void validate_trajectory(const TrajectoryDTO& value, const MovingReplacementInpu
              std::all_of(waypoint.accelerations_rad_s2.begin(), waypoint.accelerations_rad_s2.end(),
                          zero);
     };
-    if ((!replacement && !rest(value.waypoints.front())) || !rest(value.waypoints.back())) {
+    if (!retained_source_prefix &&
+        ((!replacement && !rest(value.waypoints.front())) || !rest(value.waypoints.back()))) {
       fail("trajectory_runtime_scale_rest_boundary_required");
     }
   }
@@ -281,8 +291,9 @@ void validate_trajectory(const TrajectoryDTO& value, const MovingReplacementInpu
   }
 }
 CanonicalValue trajectory_value(const TrajectoryDTO& value,
-                                const MovingReplacementInputDTO* replacement = nullptr) {
-  validate_trajectory(value, replacement);
+                                const MovingReplacementInputDTO* replacement = nullptr,
+                                bool retained_source_prefix = false) {
+  validate_trajectory(value, replacement, retained_source_prefix);
   CanonicalValue::Array waypoints;
   waypoints.reserve(value.waypoints.size());
   for (const auto& waypoint : value.waypoints) {
@@ -318,7 +329,8 @@ CanonicalValue trajectory_value(const TrajectoryDTO& value,
   return CanonicalValue(std::move(result));
 }
 TrajectoryDTO get_trajectory(const CanonicalValue& value,
-                             const MovingReplacementInputDTO* replacement = nullptr) {
+                             const MovingReplacementInputDTO* replacement = nullptr,
+                             bool retained_source_prefix = false) {
   const auto* scale = value.find_object_member("runtime_scale_bounds");
   const auto* milestones = value.find_object_member("cartesian_waypoint_times_s");
   const auto* fidelity = value.find_object_member("cartesian_fidelity_metrics");
@@ -388,7 +400,7 @@ TrajectoryDTO get_trajectory(const CanonicalValue& value,
     if (result.cartesian_waypoint_times_s.empty()) fail("trajectory_cartesian_milestones_invalid");
   }
   if (fidelity) result.cartesian_fidelity_metrics = get_cartesian_fidelity(*fidelity);
-  validate_trajectory(result, replacement);
+  validate_trajectory(result, replacement, retained_source_prefix);
   return result;
 }
 }  // namespace
@@ -888,7 +900,7 @@ void validate_replacement_request(const PlanRequestDTO& r) {
 }
 CanonicalValue replacement_value(const MovingReplacementInputDTO& m) {
   validate_replacement_input(m);
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object fields{
       {"source_goal",
        CanonicalValue(CanonicalValue::Object{
            {"controller_goal_id", CanonicalValue(m.source_goal.controller_goal_id.value())},
@@ -897,7 +909,7 @@ CanonicalValue replacement_value(const MovingReplacementInputDTO& m) {
                 static_cast<double>(m.source_goal.controller_goal_generation.value()))}})},
       {"source_binding_epoch", CanonicalValue(static_cast<double>(m.source_binding_epoch.value()))},
       {"source_cursor_s", CanonicalValue(m.source_cursor_s)},
-      {"source_prefix_trajectory", trajectory_value(m.source_prefix_trajectory)},
+      {"source_prefix_trajectory", trajectory_value(m.source_prefix_trajectory, nullptr, true)},
       {"divergence_cursor_s", CanonicalValue(m.divergence_cursor_s)},
       {"suffix_start_state", state_value(m.suffix_start_state)},
       {"source_base_frame", frame_value(m.source_base_frame)},
@@ -905,13 +917,19 @@ CanonicalValue replacement_value(const MovingReplacementInputDTO& m) {
       {"source_speed_profile", speed_value(m.source_speed_profile)},
       {"source_per_resource_dynamics_limits",
        dynamics_value(m.source_per_resource_dynamics_limits)},
-      {"remaining_preparation_budget_s", CanonicalValue(m.remaining_preparation_budget_s)}});
+      {"remaining_preparation_budget_s", CanonicalValue(m.remaining_preparation_budget_s)}};
+  if (m.remaining_planning_budget_s)
+    fields.emplace_back("remaining_planning_budget_s",
+                        CanonicalValue(*m.remaining_planning_budget_s));
+  return CanonicalValue(std::move(fields));
 }
 MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
-  exact(v, {"source_goal", "source_binding_epoch", "source_cursor_s", "source_prefix_trajectory",
-            "divergence_cursor_s", "suffix_start_state", "source_base_frame", "source_tcp_frame",
-            "source_speed_profile", "source_per_resource_dynamics_limits",
-            "remaining_preparation_budget_s"});
+  exact(v,
+        {"source_goal", "source_binding_epoch", "source_cursor_s", "source_prefix_trajectory",
+         "divergence_cursor_s", "suffix_start_state", "source_base_frame", "source_tcp_frame",
+         "source_speed_profile", "source_per_resource_dynamics_limits",
+         "remaining_preparation_budget_s"},
+        {"remaining_planning_budget_s"});
   const auto& goal = member(v, "source_goal");
   exact(goal, {"controller_goal_id", "controller_goal_generation"});
   MovingReplacementInputDTO result{
@@ -919,7 +937,7 @@ MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
        ControllerGoalGeneration(safe_unsigned(member(goal, "controller_goal_generation"), true))},
       ExecutionBindingEpoch(safe_unsigned(member(v, "source_binding_epoch"), true)),
       number(member(v, "source_cursor_s")),
-      get_trajectory(member(v, "source_prefix_trajectory")),
+      get_trajectory(member(v, "source_prefix_trajectory"), nullptr, true),
       number(member(v, "divergence_cursor_s")),
       get_state(member(v, "suffix_start_state")),
       get_frame(member(v, "source_base_frame")),
@@ -927,6 +945,8 @@ MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
       get_speed(member(v, "source_speed_profile")),
       get_dynamics(member(v, "source_per_resource_dynamics_limits"), true),
       number(member(v, "remaining_preparation_budget_s"))};
+  if (const auto* budget = v.find_object_member("remaining_planning_budget_s"))
+    result.remaining_planning_budget_s = number(*budget);
   validate_replacement_input(result);
   return result;
 }

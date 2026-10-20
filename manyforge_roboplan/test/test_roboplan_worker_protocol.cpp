@@ -266,7 +266,33 @@ TEST(RoboPlanWorkerProtocolTest,
             expected.source_per_resource_dynamics_limits);
   EXPECT_DOUBLE_EQ(actual.remaining_preparation_budget_s,
                    expected.remaining_preparation_budget_s);
+  EXPECT_FALSE(actual.remaining_planning_budget_s);
   EXPECT_EQ(encode_candidate_request(decoded), moving_bytes);
+  input.moving_replacement->remaining_planning_budget_s = 0.125;
+  const auto capped_bytes = encode_candidate_request(input);
+  EXPECT_EQ(capped_bytes.substr(0U, moving_bytes.size()), moving_bytes);
+  std::optional<std::int64_t> deadline = 99;
+  const auto capped = decode_candidate_request(capped_bytes, &deadline);
+  EXPECT_FALSE(deadline);
+  ASSERT_TRUE(capped.moving_replacement->remaining_planning_budget_s);
+  EXPECT_DOUBLE_EQ(*capped.moving_replacement->remaining_planning_budget_s, 0.125);
+  EXPECT_EQ(encode_candidate_request(capped), capped_bytes);
+  const auto timed_bytes = encode_candidate_request(input, 9'876'543'210);
+  const auto timed = decode_candidate_request(timed_bytes, &deadline);
+  ASSERT_TRUE(deadline);
+  EXPECT_EQ(*deadline, 9'876'543'210);
+  EXPECT_DOUBLE_EQ(*timed.moving_replacement->remaining_planning_budget_s, 0.125);
+  EXPECT_EQ(encode_candidate_request(timed, deadline), timed_bytes);
+  auto truncated = timed_bytes;
+  truncated.pop_back();
+  EXPECT_THROW(static_cast<void>(decode_candidate_request(truncated)), std::invalid_argument);
+  auto absent_extension = capped_bytes;
+  absent_extension[moving_bytes.size()] = '\0';
+  EXPECT_THROW(static_cast<void>(decode_candidate_request(absent_extension)), std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(encode_candidate_request(input, -1)), std::invalid_argument);
+  input.moving_replacement->remaining_planning_budget_s.reset();
+  EXPECT_EQ(encode_candidate_request(input), moving_bytes);
+  EXPECT_THROW(static_cast<void>(encode_candidate_request(input, 1)), std::invalid_argument);
   input.moving_replacement.reset();
   EXPECT_EQ(encode_candidate_request(input), ordinary_bytes);
 

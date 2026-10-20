@@ -283,6 +283,8 @@ struct DeploymentApplicabilityInputsDTO final {
   /// Whole smooth-takeover preparation budget in seconds. Absence is retained
   /// until a measured deployment default is selected; it is not a Stop budget.
   std::optional<double> motion_takeover_preparation_budget_s{};
+  /// Optional suffix-planning cap within the whole preparation/handoff budget.
+  std::optional<double> motion_takeover_planning_budget_s{};
 
   friend bool operator==(const DeploymentApplicabilityInputsDTO&,
                          const DeploymentApplicabilityInputsDTO&) = default;

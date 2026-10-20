@@ -433,7 +433,9 @@ derive_apply_configuration_fence_scope_verified_values(
       old_bundle.retained_policy_records !=
           new_bundle.retained_policy_records ||
       old_bundle.motion_takeover_preparation_budget_s !=
-          new_bundle.motion_takeover_preparation_budget_s;
+          new_bundle.motion_takeover_preparation_budget_s ||
+      old_bundle.motion_takeover_planning_budget_s !=
+          new_bundle.motion_takeover_planning_budget_s;
   if (cell_wide_product_changed) {
     MarkAllBindings(old_graph, affected_resources);
     MarkAllBindings(new_graph, affected_resources);

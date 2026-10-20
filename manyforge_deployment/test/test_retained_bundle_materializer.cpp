@@ -233,7 +233,8 @@ array_member(const CanonicalValue &value, std::string_view name) {
 
 [[nodiscard]] RetentionQualifiedDeployment
 qualify_empty(std::string_view cell_id,
-              std::optional<double> takeover_budget_s = std::nullopt) {
+              std::optional<double> takeover_budget_s = std::nullopt,
+              std::optional<double> planning_budget_s = std::nullopt) {
   auto root = parse_strict_json_model_yaml(deployment_document(cell_id))
                   .root()
                   .as_object();
@@ -259,6 +260,20 @@ qualify_empty(std::string_view cell_id,
              CanonicalValue(*takeover_budget_s)},
         }));
   }
+  if (planning_budget_s) {
+    auto *policies = [&]() -> CanonicalValue * {
+      for (auto &[name, value] : root)
+        if (name == "policies")
+          return &value;
+      return nullptr;
+    }();
+    if (!policies)
+      throw std::invalid_argument("planning fixture requires preparation");
+    auto fields = policies->as_object();
+    fields.emplace_back("motion_takeover_planning_budget_s",
+                        CanonicalValue(*planning_budget_s));
+    *policies = CanonicalValue(std::move(fields));
+  }
   const auto deployment = compute_deployment_artifact_revision(
       parse_strict_json_model_yaml(
           canonical_json(CanonicalValue(std::move(root)))),
@@ -278,8 +293,10 @@ qualify_empty(std::string_view cell_id,
 
 [[nodiscard]] std::shared_ptr<const RetainedBundle>
 materialize_empty(std::string_view cell_id, IRawArtifactStore &store,
-                  std::optional<double> takeover_budget_s = std::nullopt) {
-  const auto qualified = qualify_empty(cell_id, takeover_budget_s);
+                  std::optional<double> takeover_budget_s = std::nullopt,
+                  std::optional<double> planning_budget_s = std::nullopt) {
+  const auto qualified =
+      qualify_empty(cell_id, takeover_budget_s, planning_budget_s);
   const detail::RejectingCompilerInputArtifactSource input_source;
   detail::RejectingCatalogArtifactStore catalog_store;
   return detail::RetainedBundleMaterializer::materialize(
@@ -3740,6 +3757,44 @@ TEST(RetainedBundleMaterializer,
             canonical_json(changed))),
         RetainedBundleError);
   }
+}
+
+TEST(RetainedBundleMaterializer,
+     MovingPlanningBudgetIsSealedAndValidatedAgainstTheWholeBudget) {
+  test::InMemoryRawArtifactStoreFixture store;
+  const auto legacy = materialize_empty("i3_planning_budget_cell", store, 3.5);
+  const auto moving =
+      materialize_empty("i3_planning_budget_cell", store, 3.5, 1.25);
+  EXPECT_FALSE(legacy->value().motion_takeover_planning_budget_s);
+  EXPECT_EQ(legacy->normalized_root().find_object_member(
+                "motion_takeover_planning_budget_s"),
+            nullptr);
+  EXPECT_EQ(moving->value().motion_takeover_planning_budget_s,
+            std::optional<double>(1.25));
+  EXPECT_NE(moving->retained_bundle_id(), legacy->retained_bundle_id());
+  const auto loaded =
+      detail::RetainedBundleReloadAuthority::reload(moving->canonical_bytes());
+  EXPECT_EQ(loaded->value(), moving->value());
+  for (const auto &invalid : std::vector<CanonicalValue>{
+           CanonicalValue(nullptr), CanonicalValue(false), CanonicalValue("1"),
+           CanonicalValue(0.0), CanonicalValue(-1.0), CanonicalValue(3.5),
+           CanonicalValue(4.0)}) {
+    const auto changed = reidentify_retained_bundle(
+        replace_root_member(moving->normalized_root(),
+                            "motion_takeover_planning_budget_s", invalid));
+    EXPECT_THROW(
+        static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+            canonical_json(changed))),
+        RetainedBundleError);
+  }
+  // A freshly sealed planning-only payload cannot bypass the authored boundary.
+  const auto empty = materialize_empty("i3_planning_only_cell", store);
+  auto fields = empty->normalized_root().as_object();
+  fields.emplace_back("motion_takeover_planning_budget_s", CanonicalValue(1.0));
+  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+                   canonical_json(reidentify_retained_bundle(
+                       CanonicalValue(std::move(fields)))))),
+               RetainedBundleError);
 }
 
 } // namespace

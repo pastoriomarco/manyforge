@@ -237,6 +237,8 @@ struct ManagerComponentProcessInventoryRequestDTO final {
   manyforge::core::RuntimeUnitId runtime_unit_id;
   manyforge::core::RuntimeEpoch runtime_epoch;
   manyforge::core::RuntimeEpoch manager_runtime_epoch;
+  /// Apply-only observation; ordinary Close/process inventory is unchanged.
+  bool include_component_lifecycles{false};
   [[nodiscard]] bool valid() const noexcept;
   friend bool
   operator==(const ManagerComponentProcessInventoryRequestDTO &,
@@ -282,11 +284,22 @@ struct ManagerComponentProcessOccurrenceDTO final {
 
 /// Uses the existing MFNSRC4 collection bound, never a truncated union.
 inline constexpr std::size_t kMaximumComponentProcessInventoryEntries = 4096U;
+/// Current installed CCLC facts, bound to the inventory's exact predecessor.
+/// These are observation only, never permission to deactivate or replace.
+struct ManagerComponentLifecycleObservationDTO final {
+  manyforge::core::ControllableComponentId controllable_component_id;
+  manyforge::core::ComponentLifecycleGeneration generation;
+  manyforge::core::ComponentLifecycleStateDTO state;
+  friend bool
+  operator==(const ManagerComponentLifecycleObservationDTO &,
+             const ManagerComponentLifecycleObservationDTO &) = default;
+};
 struct ManagerComponentProcessInventoryResultDTO final {
   ManagerComponentProcessInventoryRequestDTO request;
   std::vector<ManagerComponentProcessOccurrenceDTO> process_occurrences;
   /// Retains observed rows but makes completeness/absence UNKNOWN.
   std::optional<manyforge::core::ErrorDTO> error{};
+  std::vector<ManagerComponentLifecycleObservationDTO> component_lifecycles{};
   [[nodiscard]] bool valid() const noexcept;
   friend bool
   operator==(const ManagerComponentProcessInventoryResultDTO &,

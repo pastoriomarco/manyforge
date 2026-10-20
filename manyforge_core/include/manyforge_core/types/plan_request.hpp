@@ -80,6 +80,8 @@ struct MovingReplacementInputDTO final {
   SpeedProfileDTO source_speed_profile;
   PerResourceDynamicsLimitsDTO source_per_resource_dynamics_limits;
   double remaining_preparation_budget_s{};
+  /// Remaining suffix-planning window; absent retains the legacy timeout.
+  std::optional<double> remaining_planning_budget_s{};
 };
 
 /// Kernel-produced, fully resolved planning request (spec 210 section 3.6).

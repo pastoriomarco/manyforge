@@ -441,9 +441,29 @@ int run_worker(int descriptor) {
     auto request = receive_frame(descriptor);
     switch (request.type) {
       case MessageType::kPlan: {
+        std::optional<std::int64_t> planning_deadline_ns;
         auto candidate =
-            worker_protocol::decode_candidate_request(request.payload);
+            worker_protocol::decode_candidate_request(request.payload, &planning_deadline_ns);
         RoboPlanCandidateControl control;
+        if (planning_deadline_ns) {
+          const auto deadline = std::chrono::steady_clock::time_point(
+              std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                  std::chrono::nanoseconds(*planning_deadline_ns)));
+          const double remaining = std::chrono::duration<double>(
+              deadline - std::chrono::steady_clock::now()).count();
+          if (remaining <= 0.0) {
+            send_frame(descriptor, MessageType::kPlanResult,
+                       worker_protocol::encode_trajectory_result(
+                           core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+                               "planning_timeout", "Moving suffix planning budget expired",
+                               {{"reason", "planning_timeout"}}})));
+            break;
+          }
+          candidate.moving_replacement->remaining_planning_budget_s = remaining;
+          control.planning_deadline_expired = [deadline] {
+            return std::chrono::steady_clock::now() >= deadline;
+          };
+        }
         if (candidate.moving_replacement) {
           const double remaining =
               candidate.moving_replacement->remaining_preparation_budget_s;

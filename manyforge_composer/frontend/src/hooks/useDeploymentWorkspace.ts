@@ -4,7 +4,7 @@ import { api, authoringRefusalMessage, isStaleWorkspaceError } from '../api/clie
 import { errorMessage } from '../state/structuralResource';
 import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
-  programLocalFence,
+  deploymentLocalFence,
   publicationSupersedesDeployment,
   withSharedDeploymentAuthoring,
 } from '../state/authoringWorkspace';
@@ -181,7 +181,7 @@ export function useDeploymentWorkspace(
         `The Deployment Draft changed (revision ${published.identity.deploymentDraftRevision}, expected ${expected.draftRevision}).`,
       );
     }
-    return programLocalFence(
+    return deploymentLocalFence(
       published,
       snapshot,
       ownerEpoch.current,
@@ -278,10 +278,14 @@ export function useDeploymentWorkspace(
         applyId: accepted.applyId, applyGeneration: accepted.applyGeneration,
       });
       if (mounted.current) {
-        setCompletedAdmission({
-          receiverEpoch: snapshot.receiverEpoch,
-          generation: requestFence.expectedAdmissionGeneration,
-        });
+        // A required confirmation returns before the backend takes any claim,
+        // so it consumes no admission; waiting for a newer one would never end.
+        if (response.result.status !== 'confirmation_required') {
+          setCompletedAdmission({
+            receiverEpoch: snapshot.receiverEpoch,
+            generation: requestFence.expectedAdmissionGeneration,
+          });
+        }
         refreshSequence.current += 1;
         setWorkspace(response.workspace);
         if (response.result.status === 'confirmation_required') {

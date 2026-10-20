@@ -43,6 +43,7 @@ function controller(): CCLCController {
     reconcileTransaction: vi.fn(),
     dismissError: vi.fn(),
     activate: vi.fn(async () => {}),
+    deactivateComponents: vi.fn(),
     activateSequence: vi.fn(async () => true),
     readActivationSequence: vi.fn(),
     cancelActivation: vi.fn(),

@@ -185,6 +185,45 @@ public:
       }
     };
   }
+  using InputLifecycleProcessor = std::function<core::Result<void>(
+      const std::shared_ptr<core::IIoSignalService> &,
+      std::span<const core::InterruptSourceId>,
+      const core::LifecycleTransactionId &, bool)>;
+  IoProviderDriverRecord::InputLifecycleHook
+  input_lifecycle_hook(const std::shared_ptr<IoProviderDriverRecord> &driver) {
+    std::vector<core::InterruptSourceId> sources;
+    if (const auto found = driver_inputs_.find(driver);
+        found != driver_inputs_.end())
+      for (const auto &input : found->second)
+        sources.push_back(input.rows.front().descriptor.source_id);
+    return [weak = weak_from_this(), sources = std::move(sources)](
+               const core::LifecycleTransactionId &transaction,
+               bool disabled) -> core::Result<void> {
+      const auto self = weak.lock();
+      if (!self)
+        return core::Result<void>::Err(
+            {"invalid_state_transition", "Input lifecycle owner expired", {}});
+      // The actual driver delivery barrier is held. Drain eligible prior
+      // evidence before declaring planned cessation, without a Kernel callback.
+      // Enable must also consume the prior Pause's queued loss while the old
+      // arm fence remains in place; a stale pre-Pause sample cannot rearm.
+      if (self->ingress_) {
+        const auto drained = self->ingress_->Drain(self->drain_budget_);
+        if (!drained.ok())
+          return core::Result<void>::Err(drained.error());
+        if (drained.value().blocked_error)
+          return core::Result<void>::Err(*drained.value().blocked_error);
+      }
+      InputLifecycleProcessor processor;
+      {
+        std::lock_guard lock(self->mutex_);
+        processor = self->input_lifecycle_processor_;
+      }
+      // A staged, not-yet-Applied service has no armed Kernel catalog.
+      return processor ? processor(self, sources, transaction, disabled)
+                       : core::Result<void>::Ok();
+    };
+  }
   core::Result<core::IoIngressDrainResultDTO> DrainPending() {
     Require(ingress_ != nullptr, "I/O runtime has no input ingress");
     auto drained = ingress_->Drain(drain_budget_);
@@ -194,11 +233,13 @@ public:
 
   // Installed once by the actual host. The callback acquires its existing
   // owner call lease; it never borrows a raw replaceable component lifetime.
-  void SetRuleEvidenceProcessor(std::function<core::Result<bool>()> processor) {
+  void SetRuleEvidenceProcessor(std::function<core::Result<bool>()> processor,
+                                InputLifecycleProcessor input_lifecycle = {}) {
     std::lock_guard lock(mutex_);
     Require(processor && !rule_evidence_processor_,
             "I/O rule evidence processor has no unique actual owner");
     rule_evidence_processor_ = std::move(processor);
+    input_lifecycle_processor_ = std::move(input_lifecycle);
   }
   [[nodiscard]] bool has_rule_evidence_processor() const {
     std::lock_guard lock(mutex_);
@@ -211,6 +252,7 @@ public:
   void DetachRuleEvidenceProcessor() noexcept {
     std::lock_guard lock(mutex_);
     rule_evidence_processor_ = {};
+    input_lifecycle_processor_ = {};
     if (rule_evidence_handle_) scheduler_->cancel(*rule_evidence_handle_);
     rule_evidence_handle_.reset();
     rule_evidence_deadline_.reset();
@@ -1251,6 +1293,7 @@ private:
   bool started_{};
   std::optional<core::ScheduleHandle> drain_handle_;
   std::function<core::Result<bool>()> rule_evidence_processor_;
+  InputLifecycleProcessor input_lifecycle_processor_;
   std::optional<core::ScheduleHandle> rule_evidence_handle_;
   std::optional<core::TimePoint> rule_evidence_deadline_;
   std::map<core::IoSignalId, std::string> input_profiles_;

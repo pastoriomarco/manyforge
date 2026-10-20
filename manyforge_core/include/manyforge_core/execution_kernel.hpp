@@ -471,7 +471,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   Result<PlanningSuccess> plan_trajectory_with_evidence(
       const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
       std::uint32_t planning_attempt_index = 0, const RobotStateDTO* start_state_override = nullptr,
-      const MovingReplacementInputDTO* replacement = nullptr);
+      const MovingReplacementInputDTO* replacement = nullptr,
+      std::optional<std::int64_t> suffix_planning_deadline_ns = std::nullopt);
   Result<PlanningSuccess> plan_motion_continuation(
       ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
       const detail::MotionResumeIntent& continuation);
@@ -534,7 +535,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       std::int64_t planning_start_ns, std::int64_t planning_timeout_ns, std::stop_token stop_token,
       std::shared_ptr<CollisionCancellationToken> validation_cancellation = {},
       std::optional<std::uint64_t> validation_execution_id = std::nullopt,
-      const MovingReplacementInputDTO* replacement = nullptr);
+      const MovingReplacementInputDTO* replacement = nullptr,
+      std::optional<std::int64_t> suffix_planning_deadline_ns = std::nullopt);
 
   /// Async execution worker function.
   void async_execute_worker(std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,

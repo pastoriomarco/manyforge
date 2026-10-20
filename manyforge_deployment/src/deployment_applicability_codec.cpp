@@ -1458,6 +1458,7 @@ encode_external_resources(const std::vector<ExternalResourceDTO> &values) {
     const CanonicalValue &interrupt_policies,
     const CanonicalValue &interrupt_config,
     const std::optional<double> motion_takeover_preparation_budget_s,
+    const std::optional<double> motion_takeover_planning_budget_s,
     const CanonicalValue *interrupt_rules = nullptr) {
   CanonicalValue::Object result{
       {"retained_policy_records",
@@ -1476,6 +1477,10 @@ encode_external_resources(const std::vector<ExternalResourceDTO> &values) {
   if (motion_takeover_preparation_budget_s.has_value()) {
     result.emplace_back("motion_takeover_preparation_budget_s",
                         CanonicalValue(*motion_takeover_preparation_budget_s));
+  }
+  if (motion_takeover_planning_budget_s.has_value()) {
+    result.emplace_back("motion_takeover_planning_budget_s",
+                        CanonicalValue(*motion_takeover_planning_budget_s));
   }
   return CanonicalValue(std::move(result));
 }
@@ -2618,17 +2623,19 @@ decode_deployment_applicability_inputs_candidate(
   std::vector<CommissionedStopInterfaceDTO> commissioned_stop_interfaces;
   std::vector<core::CatalogRecordRefDTO> retained_policy_records;
   std::optional<double> motion_takeover_preparation_budget_s;
+  std::optional<double> motion_takeover_planning_budget_s;
   std::optional<CanonicalValue> normalized_policies;
   const CanonicalValue *policies_value = find_member(root, "policies");
   if (policies_value != nullptr) {
     const auto &policies = require_object(*policies_value, "$.policies");
-    require_closed_fields(
-        policies,
-        {"retained_policy_records", "stop_stage_parameters",
-         "commissioned_stop_interfaces", "interrupt_sources",
-         "interrupt_policies", "interrupt_config"},
-        {"motion_takeover_preparation_budget_s", "interrupt_rules"},
-        "$.policies");
+    require_closed_fields(policies,
+                          {"retained_policy_records", "stop_stage_parameters",
+                           "commissioned_stop_interfaces", "interrupt_sources",
+                           "interrupt_policies", "interrupt_config"},
+                          {"motion_takeover_preparation_budget_s",
+                           "motion_takeover_planning_budget_s",
+                           "interrupt_rules"},
+                          "$.policies");
     if (const auto *budget =
             find_member(policies, "motion_takeover_preparation_budget_s")) {
       constexpr auto path = "$.policies.motion_takeover_preparation_budget_s";
@@ -2637,6 +2644,17 @@ decode_deployment_applicability_inputs_candidate(
         fail(path, "expected positive seconds");
       }
       motion_takeover_preparation_budget_s = seconds;
+    }
+    if (const auto *budget =
+            find_member(policies, "motion_takeover_planning_budget_s")) {
+      constexpr auto path = "$.policies.motion_takeover_planning_budget_s";
+      const auto seconds = require_finite_number(*budget, path);
+      if (seconds <= 0.0 || !motion_takeover_preparation_budget_s ||
+          seconds >= *motion_takeover_preparation_budget_s) {
+        fail(path,
+             "expected positive seconds less than the preparation budget");
+      }
+      motion_takeover_planning_budget_s = seconds;
     }
     retained_policy_records = parse_retained_policy_records(policies);
     const CanonicalValue interrupt_config = validate_interrupt_config(policies);
@@ -2684,7 +2702,8 @@ decode_deployment_applicability_inputs_candidate(
         stop_stage_parameters, commissioned_stop_interfaces,
         retained_policy_records, normalized_interrupt_sources,
         normalized_interrupt_policies, interrupt_config,
-        motion_takeover_preparation_budget_s, &normalized_interrupt_rules);
+        motion_takeover_preparation_budget_s, motion_takeover_planning_budget_s,
+        &normalized_interrupt_rules);
   }
 
   std::optional<SiteOverlayRefDTO> site_overlay_ref;
@@ -2715,6 +2734,7 @@ decode_deployment_applicability_inputs_candidate(
       std::move(commissioned_stop_interfaces),
       std::move(retained_policy_records),
       motion_takeover_preparation_budget_s,
+      motion_takeover_planning_budget_s,
   };
   CanonicalValue normalized_desired =
       encode_desired_configurations(value.desired_control_configurations);
@@ -2776,6 +2796,7 @@ compute_capability_provider_binding_revisions(
         require_normalized_policy_member("interrupt_policies"),
         require_normalized_policy_member("interrupt_config"),
         value.motion_takeover_preparation_budget_s,
+        value.motion_takeover_planning_budget_s,
         candidate.normalized_policies()->find_object_member("interrupt_rules"));
   }
 

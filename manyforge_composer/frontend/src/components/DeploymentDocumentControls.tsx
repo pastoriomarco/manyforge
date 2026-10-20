@@ -1,13 +1,27 @@
-import { useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 
+import { DEACTIVATION_REQUIRED_STATES, type CCLCController } from '../hooks/useCCLC';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { ResetApplyController } from '../hooks/useResetApply';
 import type { ManagerDeploymentImpact } from '../types/api';
 import { deploymentMatchesApplied, deploymentUnapplied, deploymentActionUnavailableReason } from '../state/documentStates';
+import { globalRulesReadingComponents } from '../utils/interruptAuthoring';
 import { OverlayPanel } from './OverlayPanel';
 import { ResetsRunWarning } from './ProgramDocumentControls';
 
 type Action = 'discard' | 'revert' | 'apply';
+
+/** Changed components a confirmed Apply must deactivate first (Q107), read fresh. */
+interface DeactivationOffer {
+  token: string;
+  phase: 'reading' | 'ready' | 'deactivating' | 'awaiting_admission' | 'applying' | 'stopped';
+  /** The admission the last Disable used; Apply waits for a newer one. */
+  consumedAdmissionGeneration?: number | null;
+  identity: string | null;
+  /** In reverse activation order: the order Deactivate runs. */
+  components: Array<{ id: string; state: string; reasons: string[] }>;
+  message: string | null;
+}
 
 const DISPOSITION_LABEL = {
   add: 'Added',
@@ -90,8 +104,14 @@ export function DeploymentDocumentControls({
   controller,
   resetApply = null,
   scenarioCommands,
+  cclc = null,
+  authoringAdmissionGeneration = null,
 }: {
   controller: DeploymentWorkspaceController;
+  /** The current authoring admission generation from the live status. */
+  authoringAdmissionGeneration?: number | null;
+  /** The ordinary component lifecycle owner: reads states and deactivates. */
+  cclc?: CCLCController | null;
   /** Apply while a Program run exists Resets it first (one confirmation). */
   resetApply?: ResetApplyController | null;
   /** The workspace-independent Scenario New/Save/Save as/Load commands. */
@@ -109,6 +129,78 @@ export function DeploymentDocumentControls({
   // Revert useful), but there is then nothing left for Discard to do.
   const hasUnappliedChanges = deploymentUnapplied(workspace);
   const pendingConfirmation = controller.pendingApplyConfirmation;
+  const [deactivation, setDeactivation] = useState<DeactivationOffer | null>(null);
+  const confirmationToken = pendingConfirmation?.result.confirmationToken ?? null;
+  const changedComponents = pendingConfirmation?.result.candidatePreview?.impact.components
+    .filter((row) => row.disposition === 'replace' || row.disposition === 'remove') ?? [];
+  const changedKey = JSON.stringify(changedComponents);
+  useEffect(() => {
+    const changed = JSON.parse(changedKey) as typeof changedComponents;
+    if (confirmationToken === null || cclc === null || changed.length === 0) {
+      setDeactivation(null);
+      return undefined;
+    }
+    const token = confirmationToken;
+    const abort = new AbortController();
+    setDeactivation({ token, phase: 'reading', identity: null, components: [], message: null });
+    cclc.readActivationSequence(abort.signal).then((observation) => {
+      if (abort.signal.aborted) return;
+      const components = observation.components
+        .filter((component) => DEACTIVATION_REQUIRED_STATES.includes(component.lifecycleState))
+        .flatMap((component) => {
+          const row = changed.find((candidate) => candidate.controllable_component_id === component.controllableComponentId);
+          return row === undefined ? [] : [{
+            id: component.controllableComponentId, state: component.lifecycleState, reasons: row.replacement_reasons,
+          }];
+        })
+        .reverse();
+      setDeactivation({ token, phase: 'ready', identity: observation.identity, components, message: null });
+    }, (reason: unknown) => {
+      if (abort.signal.aborted) return;
+      setDeactivation({ token, phase: 'stopped', identity: null, components: [], message:
+        `Component states are unavailable (${reason instanceof Error ? reason.message : 'read failed'}); `
+        + 'Apply is refused if a changed component is still active.' });
+    });
+    return () => abort.abort();
+    // The offer belongs to one exact confirmation and impact.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [confirmationToken, changedKey, cclc === null]);
+  const offer = deactivation !== null && deactivation.token === confirmationToken ? deactivation : null;
+  const deactivationNeeded = offer !== null && offer.components.length > 0;
+  // Planned deactivation leaves a rule waiting for its source, never latched.
+  const waitingRules = deactivationNeeded
+    ? globalRulesReadingComponents(workspace?.draft.document ?? null, offer.components.map((row) => row.id))
+    : [];
+  // Each Disable consumes authoring admission: the Apply must be built from the
+  // latest controller once the live status shows a newer admission generation.
+  const latestController = useRef(controller);
+  latestController.current = controller;
+  const deactivateAndApply = async () => {
+    if (cclc === null || offer === null || offer.phase !== 'ready' || offer.identity === null) return;
+    setDeactivation({ ...offer, phase: 'deactivating', message: null });
+    const result = await cclc.deactivateComponents(offer.components.map((row) => row.id), offer.identity);
+    if (!result.succeeded) {
+      setDeactivation({ ...offer, phase: 'stopped',
+        message: 'Deactivation stopped; Apply was not sent. See component lifecycle details.' });
+      return;
+    }
+    setDeactivation({ ...offer, phase: 'awaiting_admission', message: null,
+      consumedAdmissionGeneration: result.consumedAdmissionGeneration });
+  };
+  const awaitingGeneration = offer?.phase === 'awaiting_admission' ? offer.consumedAdmissionGeneration ?? null : undefined;
+  useEffect(() => {
+    if (awaitingGeneration === undefined || deactivation === null) return;
+    if (awaitingGeneration !== null && (authoringAdmissionGeneration === null
+      || authoringAdmissionGeneration <= awaitingGeneration)) return;
+    if (latestController.current.documentUnavailableReason !== null) return;
+    setDeactivation({ ...deactivation, phase: 'applying' });
+    void latestController.current.confirmApply();
+  }, [authoringAdmissionGeneration, awaitingGeneration, controller.documentUnavailableReason, deactivation]);
+  const cancelConfirmation = () => {
+    if (offer?.phase === 'deactivating') cclc?.cancelActivation();
+    setDeactivation(null);
+    controller.cancelApplyConfirmation();
+  };
   // Why authoring is blocked comes first, so every disabled control explains
   // itself the same way the Program controls do.
   const busyReason = controller.busy ? 'Another Deployment operation is in progress.' : null;
@@ -230,17 +322,42 @@ export function DeploymentDocumentControls({
       {pendingConfirmation !== null && (
         <OverlayPanel
           open
-          title="Apply Deployment configuration change?"
+          title={deactivationNeeded ? 'Deactivate components and apply?' : 'Apply Deployment configuration change?'}
           titleId="deployment-apply-confirmation-title"
-          onClose={controller.cancelApplyConfirmation}
+          kind="dialog"
+          onClose={cancelConfirmation}
           compact
         >
-          <div className="dialog-copy compact-confirmation">
+          <div className="dialog-copy transport-confirmation">
             {reasons.apply !== null && <p role="status">{reasons.apply}</p>}
-            <p>
-              Applying this exact Deployment Draft changes the cell configuration. New and changed components remain inactive; activate them separately.
-              {' '}Running operations remain protected by Manager admission.
-            </p>
+            {deactivationNeeded ? <>
+              <p>This Apply changes these components, which must be inactive first:</p>
+              <ul>{offer.components.map((row) => (
+                <li key={row.id}>
+                  {row.id} ({row.state}){row.reasons.length > 0 && ` — changed: ${row.reasons.join(', ')}`}
+                </li>
+              ))}</ul>
+              <p>
+                Deactivate disables them in reverse Deployment order, then applies this exact Deployment Draft.
+                Changed and new components stay inactive; activate them separately.
+                {' '}Running operations remain protected by Manager admission.
+              </p>
+              {waitingRules.map((rule) => (
+                <p key={rule.ruleId}>
+                  Global rule {rule.ruleId} will wait for its source ({rule.componentIds.join(', ')} inactive):
+                  {' '}motion in its scope stays blocked until {rule.componentIds.length === 1 ? 'it is' : 'they are'} active again.
+                </p>
+              ))}
+            </> : (
+              <p>
+                Applying this exact Deployment Draft changes the cell configuration. Changed or removed components must be inactive before Apply: deactivate them in Components first. New components start inactive; activate them separately.
+                {' '}Running operations remain protected by Manager admission.
+              </p>
+            )}
+            {offer?.phase === 'reading' && <p role="status">Reading component states…</p>}
+            {offer?.phase === 'deactivating' && <p role="status">{cclc?.activationProgress ?? 'Deactivating components…'}</p>}
+            {offer?.phase === 'awaiting_admission' && <p role="status">Components deactivated; waiting for updated backend authoring permissions…</p>}
+            {offer?.message != null && <p className="inline-message severity-error" role="alert">{offer.message}</p>}
             {pendingConfirmation.result.candidatePreview !== null && (
               <DeploymentApplyImpactSummary
                 impact={pendingConfirmation.result.candidatePreview.impact}
@@ -251,14 +368,29 @@ export function DeploymentDocumentControls({
               {' · '}
               <code>{pendingConfirmation.result.preparedActivation.deploymentRevision}</code>
             </p>
-            <button
-              type="button"
-              className="primary-action"
-              disabled={reasons.apply !== null}
-              title={applyReason ?? 'Apply the validated Deployment to runtime.'}
-              onClick={() => { void controller.confirmApply(); }}
-            >{controller.applying ? 'Applying Deployment'
-              : 'Confirm apply'}</button>
+            <div className="dialog-actions">
+              <button type="button" onClick={cancelConfirmation}>Cancel</button>
+              {deactivationNeeded ? (
+                <button
+                  type="button"
+                  className="danger-button"
+                  disabled={reasons.apply !== null || offer.phase !== 'ready'}
+                  title={applyReason ?? 'Deactivate the listed components, then apply the validated Deployment.'}
+                  onClick={() => { void deactivateAndApply(); }}
+                >{offer.phase === 'deactivating' ? 'Deactivating'
+                  : offer.phase === 'awaiting_admission' || offer.phase === 'applying' || controller.applying
+                    ? 'Applying Deployment' : 'Deactivate and apply'}</button>
+              ) : (
+                <button
+                  type="button"
+                  className="primary-action"
+                  disabled={reasons.apply !== null || offer?.phase === 'reading'}
+                  title={applyReason ?? 'Apply the validated Deployment to runtime.'}
+                  onClick={() => { void controller.confirmApply(); }}
+                >{controller.applying ? 'Applying Deployment'
+                  : 'Confirm apply'}</button>
+              )}
+            </div>
           </div>
         </OverlayPanel>
       )}

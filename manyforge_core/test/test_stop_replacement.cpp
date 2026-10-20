@@ -579,5 +579,108 @@ TEST(StopPathTimeConversionTest, ReproducesTheWallTimeMotionAtTheFrozenFactor) {
   EXPECT_FALSE(convert_stop_trajectory_to_path_time(wall, 1.0).ok());
 }
 
+TEST(ResidentTimelineReplacementTest, RetainsInternalPrefixAndLiteralFuturePvaOnTheResidentClock) {
+  const auto active = Curved();
+  const double elapsed = 0.73;
+  const double origin = 0.7;
+  const double trip = 1.05;
+  const auto continuation = Continuation(active, origin, 1.0, trip - origin);
+  const auto joined = build_stop_replacement_join(active, elapsed, continuation, origin, trip);
+  ASSERT_TRUE(joined.ok()) << joined.error().message;
+  ASSERT_LT(joined.value().waypoints.front().time_from_start_s, 0.0);
+  for (const double offset : {0.0, -1.073}) {
+    SCOPED_TRACE(offset);
+    const auto result =
+        build_resident_timeline_replacement(active, joined.value(), elapsed, offset);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    const auto& resident = result.value().resident_trajectory;
+    const auto& delivery = result.value().delivery_trajectory;
+    EXPECT_EQ(resident.joint_names, active.joint_names);
+    EXPECT_EQ(delivery.joint_names, active.joint_names);
+    // The retained curve keeps every past knot; only the delivery view is trimmed.
+    ASSERT_EQ(resident.waypoints.size(), joined.value().waypoints.size());
+    for (std::size_t i = 0; i < resident.waypoints.size(); ++i) {
+      const auto& expected = joined.value().waypoints[i];
+      const auto& actual = resident.waypoints[i];
+      EXPECT_DOUBLE_EQ(actual.time_from_start_s, expected.time_from_start_s + elapsed - offset);
+      EXPECT_EQ(actual.positions_rad, expected.positions_rad);
+      EXPECT_EQ(actual.velocities_rad_s, expected.velocities_rad_s);
+      EXPECT_EQ(actual.accelerations_rad_s2, expected.accelerations_rad_s2);
+    }
+    ASSERT_GE(delivery.waypoints.size(), 2U);
+    EXPECT_DOUBLE_EQ(delivery.waypoints.front().time_from_start_s, elapsed - offset);
+    std::size_t next = 1U;
+    for (const auto& point : joined.value().waypoints) {
+      if (point.time_from_start_s <= 1e-9) continue;
+      ASSERT_LT(next, delivery.waypoints.size());
+      const auto& actual = delivery.waypoints[next++];
+      EXPECT_DOUBLE_EQ(actual.time_from_start_s, point.time_from_start_s + elapsed - offset);
+      EXPECT_EQ(actual.positions_rad, point.positions_rad);
+      EXPECT_EQ(actual.velocities_rad_s, point.velocities_rad_s);
+      EXPECT_EQ(actual.accelerations_rad_s2, point.accelerations_rad_s2);
+    }
+    EXPECT_EQ(next, delivery.waypoints.size());
+    for (std::size_t i = 1U; i < delivery.waypoints.size(); ++i) {
+      EXPECT_GT(delivery.waypoints[i].time_from_start_s,
+                delivery.waypoints[i - 1U].time_from_start_s + 1e-9);
+    }
+  }
+}
+
+TEST(ResidentTimelineReplacementTest, FirstPointAndFutureLeadInKeepTheIncumbentQuintic) {
+  const auto active = Curved();
+  const double elapsed = 0.73;  // Inside the 0.55..0.9 quintic, not at a knot.
+  const double origin = 0.7;
+  const double trip = 1.05;
+  const auto continuation = Continuation(active, origin, 1.0, trip - origin);
+  const auto joined = build_stop_replacement_join(active, elapsed, continuation, origin, trip);
+  ASSERT_TRUE(joined.ok()) << joined.error().message;
+  for (const double offset : {0.0, -1.073}) {
+    SCOPED_TRACE(offset);
+    const auto result =
+        build_resident_timeline_replacement(active, joined.value(), elapsed, offset);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    const auto& delivery = result.value().delivery_trajectory;
+    ASSERT_GE(delivery.waypoints.size(), 2U);
+    for (std::size_t joint = 0; joint < active.joint_names.size(); ++joint) {
+      const auto first = Evaluate(active, joint, elapsed);
+      EXPECT_NEAR(delivery.waypoints.front().positions_rad[joint], first.p, 1e-12);
+      EXPECT_NEAR(delivery.waypoints.front().velocities_rad_s[joint], first.v, 1e-11);
+      EXPECT_NEAR(delivery.waypoints.front().accelerations_rad_s2[joint], first.a, 1e-10);
+      // Splitting at an interpolated P/V/A point preserves the polynomial,
+      // including on a second takeover whose resident origin is still unchanged.
+      for (const double time : {0.73, 0.78, 0.84, 0.9, 0.98, 1.04}) {
+        const auto expected = Evaluate(active, joint, time);
+        const auto actual = Evaluate(delivery, joint, time - offset);
+        EXPECT_NEAR(actual.p, expected.p, 1e-11);
+        EXPECT_NEAR(actual.v, expected.v, 1e-10);
+        EXPECT_NEAR(actual.a, expected.a, 1e-9);
+      }
+    }
+  }
+}
+
+TEST(ResidentTimelineReplacementTest, DoesNotDuplicateTheInsertedFirstPointAtASourceKnot) {
+  const auto active = Curved();
+  const double origin = 0.7;
+  const double trip = 1.05;
+  const auto continuation = Continuation(active, origin, 1.0, trip - origin);
+  for (const double elapsed : {0.9, 0.9 - 0.5e-9}) {
+    SCOPED_TRACE(elapsed);
+    const auto joined = build_stop_replacement_join(active, elapsed, continuation, origin, trip);
+    ASSERT_TRUE(joined.ok()) << joined.error().message;
+    const auto result =
+        build_resident_timeline_replacement(active, joined.value(), elapsed, -1.073);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    const auto& points = result.value().delivery_trajectory.waypoints;
+    ASSERT_GE(points.size(), 2U);
+    EXPECT_DOUBLE_EQ(points.front().time_from_start_s, elapsed + 1.073);
+    EXPECT_NEAR(points[1].time_from_start_s, trip + 1.073, 1e-12);
+    for (std::size_t i = 1U; i < points.size(); ++i) {
+      EXPECT_GT(points[i].time_from_start_s, points[i - 1U].time_from_start_s + 1e-9);
+    }
+  }
+}
+
 }  // namespace
 }  // namespace manyforge::core

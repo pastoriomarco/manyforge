@@ -286,13 +286,17 @@ Result<void> ResourceAddressedExecutionKernel::reserve_cold_motion_takeover_goal
     return reject<void>("Controller goal generation space is exhausted",
                         "controller_goal_generation_exhausted", ErrorCode::kInternalError);
   const ControllerGoalGeneration next(current.command_generation.value() + 1U);
-  if (future.controller_goal_generation == next) return Result<void>::Ok();
-  if (future.controller_goal_generation != current.command_generation)
+  if (future.controller_goal_generation != next &&
+      future.controller_goal_generation != current.command_generation)
     return reject<void>("Cold takeover future goal generation is stale",
                         "motion_takeover_goal_identity_mismatch", ErrorCode::kInvariantViolation);
   // Only private, not-yet-computed authority changes here. The sent goal and
   // public operation retain their exact key until the settled owner transfer.
   future.controller_goal_generation = next;
+  // The initial scale command is addressed to this same reserved future goal,
+  // including when a repeated reservation already observes the next key.
+  if (auto& scale = row.takeover_preparation->execution_request.initial_runtime_scale; scale)
+    scale->controller_goal_generation = next;
   return Result<void>::Ok();
 }
 
@@ -547,7 +551,8 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
       }
       candidate->takeover_source = captured.value();
       request->replacement = ResolvedPreparedMotionReplacementContextDTO{
-          captured.value(), *candidate->participants.front().takeover_preparation_budget_ns};
+          captured.value(), *candidate->participants.front().takeover_preparation_budget_ns,
+          std::nullopt, candidate->participants.front().takeover_planning_budget_ns};
     }
     const auto prepared = [&]() -> Result<std::uint64_t> {
       try {

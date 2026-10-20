@@ -675,6 +675,25 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toMatch(natural ? /type="checkbox"[^>]*checked/ : /type="checkbox"(?![^>]*checked)[^>]*>/);
   });
 
+  it('offers Spring-back fast and states plainly that its move is unchecked', () => {
+    const value = controller();
+    const document = value.workspace!.draft!.document as unknown as {
+      policies: { stop_stage_parameters: Array<{ default_contract_parameters: Record<string, unknown> }> };
+    };
+    const profile = document.policies.stop_stage_parameters[0].default_contract_parameters;
+    const render = () => renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
+    const soft = render();
+    expect(soft).toContain('<option value="spring_back_hold">Spring-back on path</option>');
+    expect(soft).toContain('<option value="spring_back_fast">Spring-back fast</option>');
+    expect(soft).not.toContain('Sent at once, with no planning or checks');
+    profile.stop_mode = 'spring_back_fast';
+    const fast = render();
+    expect(fast).toContain('Brake + return time');
+    expect(fast).toContain('Sent at once, with no planning or checks');
+    expect(fast).toContain('safety controller may trip');
+  });
+
   it('keeps an older unreviewed Stop contract read-only', () => {
     const value = controller();
     const document = value.workspace!.draft!.document as unknown as {

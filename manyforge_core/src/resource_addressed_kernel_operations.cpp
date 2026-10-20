@@ -1112,6 +1112,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
           retained_stop_plan, retained_fault_stop_plan, continuation});
       participant.takeover_preparation_budget_ns =
           motion_takeover_budget_ns(resolved.value().motion_takeover_preparation_budget_s);
+      participant.takeover_planning_budget_ns =
+          motion_takeover_planning_budget_ns(resolved.value().motion_takeover_planning_budget_s,
+                                             resolved.value().motion_takeover_preparation_budget_s);
     }
     prepared_operation = staging.extract(operation_id);
   } catch (...) {

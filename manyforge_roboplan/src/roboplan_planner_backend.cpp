@@ -411,12 +411,16 @@ RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
                                         request.action_span,
                                         request.moving_replacement};
   if (candidate.moving_replacement) {
+    const auto setup_elapsed = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - setup_started)
+                                   .count();
     auto &remaining =
         candidate.moving_replacement->remaining_preparation_budget_s;
-    remaining -= std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - setup_started)
-                     .count();
-    if (std::isfinite(remaining) && remaining <= 0.0) {
+    remaining -= setup_elapsed;
+    auto &planning = candidate.moving_replacement->remaining_planning_budget_s;
+    if (planning) *planning -= setup_elapsed;
+    if ((std::isfinite(remaining) && remaining <= 0.0) ||
+        (planning && std::isfinite(*planning) && *planning <= 0.0)) {
       return plan_error(error(ErrorCode::kPlanningTimeout,
                               "Moving replacement preparation timed out",
                               "planning_timeout"));

@@ -723,6 +723,9 @@ describe('Apply while a run exists', () => {
     );
     expect(hooks!.resetApply.sequence?.phase).toEqual({ kind: 'confirmation_required' });
     expect(hooks!.deployment.pendingApplyConfirmation).not.toBeNull();
+    // A required confirmation takes no claim, so the same admission generation
+    // stays current: Confirm must not wait for a newer one.
+    expect(hooks!.deployment.documentUnavailableReason).toBeNull();
 
     // The operator confirms the impact: that Apply carries the same shared
     // correlation and confirmed scope, and the chain follows it to settlement.

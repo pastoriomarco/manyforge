@@ -792,4 +792,129 @@ TEST_F(IoProviderLifecycleProductTest,
       core::LifecycleBlockingCauseClassDTO::kNone);
 }
 
+TEST_F(IoProviderLifecycleProductTest,
+       PlannedInputDisableProcessesPriorEvidenceBeforePauseAndFreshEnable) {
+  Build();
+  auto scheduler = std::make_shared<core::ManualScheduler>();
+  std::map<core::InterruptSourceId, HostIoSignalRuntime::SourceInput> sources;
+  sources.emplace(kSource,
+                  HostIoSignalRuntime::SourceInput{
+                      Input().rows, {}, driver->runtime_unit_epoch(), driver});
+  auto runtime =
+      HostIoSignalRuntime::Create(core::RequestOwnerEpoch("host"), 1U,
+                                  std::move(sources), clock, scheduler);
+  std::vector<bool> transitions;
+  runtime->SetRuleEvidenceProcessor(
+      [] { return core::Result<bool>::Ok(true); },
+      [&](const auto &service,
+          std::span<const core::InterruptSourceId> selected,
+          const core::LifecycleTransactionId &transaction, bool disabled) {
+        EXPECT_EQ(service.get(), runtime.get());
+        EXPECT_EQ(transaction, core::LifecycleTransactionId("transaction"));
+        EXPECT_EQ(selected.size(), 1U);
+        if (!selected.empty()) {
+          EXPECT_EQ(selected.front(), kSource);
+        }
+        const auto signal = runtime->ReadSignal(kSignal);
+        EXPECT_TRUE(signal.ok());
+        if (disabled) {
+          EXPECT_EQ(signal.value().availability,
+                    core::IoSignalAvailability::kFresh);
+          EXPECT_TRUE(signal.value().latest_sample);
+          if (signal.value().latest_sample) {
+            EXPECT_EQ(signal.value().latest_sample->publication.value,
+                      std::optional(true));
+          }
+        } else {
+          EXPECT_NE(signal.value().availability,
+                    core::IoSignalAvailability::kFresh);
+        }
+        transitions.push_back(disabled);
+        return core::Result<void>::Ok();
+      });
+  {
+    auto delivery = driver->AcquireDelivery();
+    ASSERT_TRUE(driver
+                    ->InstallResourcesLocked(
+                        runtime->driver_input_installations().at(driver), {},
+                        runtime->cancellation_hook(driver),
+                        runtime->input_lifecycle_hook(driver))
+                    .ok());
+  }
+  runtime->Start();
+  ASSERT_EQ(Step("prepare").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("enable").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  {
+    auto delivery = driver->AcquireDelivery();
+    ASSERT_TRUE(driver->SetMockValueLocked(kSignal, true).ok());
+  }
+  // No explicit drain: Disable must see the queued true acquisition, and
+  // immediate Enable must consume Pause loss before removing the arm fence.
+  ASSERT_EQ(Step("disable").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("enable").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(runtime->DrainPending().ok());
+  EXPECT_EQ(runtime->ReadSignal(kSignal).value().availability,
+            core::IoSignalAvailability::kFresh);
+  EXPECT_EQ(transitions, (std::vector<bool>{false, true, false}));
+}
+
+TEST_F(IoProviderLifecycleProductTest,
+       RejectedPlannedInputDisableDoesNotPauseOrChangeDriverState) {
+  for (bool partial : {false, true}) {
+    Build();
+    {
+      auto delivery = driver->AcquireDelivery();
+      ASSERT_TRUE(
+          driver
+              ->InstallResourcesLocked(
+                  {Input()}, {}, {},
+                  [partial](const auto &, bool disabled) {
+                    if (!disabled)
+                      return core::Result<void>::Ok();
+                    core::ErrorDTO error{"test_refused",
+                                         "planned source transition refused",
+                                         {}};
+                    if (partial)
+                      error.details.emplace("io_source_transition_effects",
+                                            "observed");
+                    return core::Result<void>::Err(std::move(error));
+                  })
+              .ok());
+    }
+    ASSERT_EQ(Step("prepare").known,
+              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+    ASSERT_EQ(Step("enable").known,
+              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+    const auto before =
+        driver->ReadLifecycleSnapshot(kDomain, clock->now()).value();
+    const auto refused = Step("disable");
+    EXPECT_EQ(refused.dispatch,
+              partial
+                  ? core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown
+                  : core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+    EXPECT_EQ(refused.effect, partial
+                                  ? core::LifecyclePrimitiveEffectDTO::kObserved
+                                  : core::LifecyclePrimitiveEffectDTO::kNone);
+    EXPECT_TRUE(
+        ingress->losses.empty()); // Neither outcome claims Pause happened.
+    const auto after =
+        driver->ReadLifecycleSnapshot(kDomain, clock->now()).value();
+    EXPECT_EQ(after.component_state,
+              partial ? core::ComponentLifecycleStateDTO::kFaulted
+                      : core::ComponentLifecycleStateDTO::kActive);
+    EXPECT_EQ(after.source_generation,
+              before.source_generation + (partial ? 1U : 0U));
+    driver->Shutdown();
+    driver.reset();
+    ingress->frames.clear();
+    ingress->losses.clear();
+  }
+}
+
 } // namespace manyforge::roboplan_backend::host_detail

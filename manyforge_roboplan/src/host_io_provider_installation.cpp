@@ -383,11 +383,15 @@ core::Result<void> PrepareCompositionIoProviderResources(
       auto delivery = driver->AcquireDelivery();
       auto cancel = runtime ? runtime->cancellation_hook(driver)
                             : std::function<void()>{[] {}};
+      auto lifecycle = runtime ? runtime->input_lifecycle_hook(driver)
+                               : IoProviderDriverRecord::InputLifecycleHook{};
       const auto prepared =
           installed
-              ? driver->RebindInputsLocked(std::move(inputs), std::move(cancel))
+              ? driver->RebindInputsLocked(std::move(inputs), std::move(cancel),
+                                           std::move(lifecycle))
               : driver->InstallResourcesLocked(
-                    std::move(inputs), std::move(outputs), std::move(cancel));
+                    std::move(inputs), std::move(outputs), std::move(cancel),
+                    std::move(lifecycle));
       if (!prepared.ok())
         return Reply::Err(prepared.error());
     }

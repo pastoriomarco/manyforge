@@ -6591,6 +6591,96 @@ def test_non_simulated_ros_configuration_is_explicitly_unsupported_for_m1(progra
         runtime.shutdown()
 
 
+@pytest.mark.parametrize("crossing", ["accept", "complete"])
+def test_liveness_cycle_projection_keeps_one_snapshot_across_reset(monkeypatch, tmp_path, crossing):
+    from manyforge_program_runner.liveness import (
+        ProgramRunnerLivenessError, ProgramRunnerLivenessReceiver,
+    )
+
+    class Admission(_Admission):
+        def get(self):
+            return {"admission_generation": 1, "authoring_allowed": True}
+
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.snapshot")
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.snapshot"),
+        headless_client=_Headless(), execution_transport=_Headless(),
+        admission_client=Admission(), cycle_journal=journal,
+    )
+    effect_entered, release_effect = Event(), Event()
+    errors = []
+
+    def scene_effect(_request, _authorization):
+        effect_entered.set()
+        assert release_effect.wait(5), "test did not release the Reset effect"
+
+    monkeypatch.setattr(runtime, "_prepare_scene_after_reset", scene_effect)
+    monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda _request: None)
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({
+        "request_id": "reset.snapshot", "request_owner_epoch": "caller.snapshot",
+        "source_label": "operator_ui", "correlation_id": "reset.snapshot.correlation",
+        "program_run_id": None, "expected_owner_epoch": runtime.owner_epoch,
+        "expected_cycle_generation": 1, "reload_initial_scene": True,
+    })
+
+    def reset():
+        try:
+            runtime.reset_cycle(request)
+        except BaseException as error:
+            errors.append(error)
+
+    reset_thread = Thread(target=reset)
+    read_snapshot = journal.status_snapshot
+
+    def snapshot_then_transition():
+        snapshot = read_snapshot()
+        if crossing == "accept":
+            reset_thread.start()
+            assert effect_entered.wait(2)
+        else:
+            release_effect.set()
+            reset_thread.join(2)
+            assert not reset_thread.is_alive()
+        return snapshot
+
+    try:
+        if crossing == "complete":
+            reset_thread.start()
+            assert effect_entered.wait(2)
+        monkeypatch.setattr(journal, "status_snapshot", snapshot_then_transition)
+        # Reset holds the lifecycle transition lock during its effect. This
+        # dependency-free read must stay available without taking that lock.
+        projected = runtime._current_cycle_status_projection()  # noqa: SLF001
+        monkeypatch.setattr(journal, "status_snapshot", read_snapshot)
+        receiver = object.__new__(ProgramRunnerLivenessReceiver)
+        receiver._cycle_status = lambda: projected  # noqa: SLF001
+        receiver._project_cycle_status()  # noqa: SLF001
+        if crossing == "accept":
+            assert projected["state"] == "idle_after_reset"
+            assert projected["accepted_reset"] is None
+            assert journal.read().state == "resetting"
+            # Reconstruct the former double-read result: the unchanged strict
+            # receiver rejects exactly the live failure's mixed state/context.
+            mixed = {**projected, "accepted_reset": runtime._accepted_reset_context(journal, journal.read())}
+            receiver._cycle_status = lambda: mixed  # noqa: SLF001
+            with pytest.raises(ProgramRunnerLivenessError, match="no current Reset"):
+                receiver._project_cycle_status()  # noqa: SLF001
+        else:
+            assert projected["state"] == "resetting"
+            assert projected["accepted_reset"]["request_id"] == request.request_id
+            assert journal.read().state == "idle_after_reset"
+            assert journal.read().cycle_generation == 2
+        assert not errors
+    finally:
+        release_effect.set()
+        if reset_thread.ident is not None:
+            reset_thread.join(2)
+        runtime.shutdown()
+    assert not reset_thread.is_alive()
+    assert not errors
+
+
 @pytest.mark.parametrize("idle", [False, True])
 @pytest.mark.parametrize("reload_scene,reset_position", [(False, False), (True, False), (False, True), (True, True)])
 def test_reset_selectors_order_and_plain_preservation(monkeypatch, tmp_path, idle, reload_scene, reset_position):

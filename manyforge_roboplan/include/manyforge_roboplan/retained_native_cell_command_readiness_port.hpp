@@ -239,7 +239,9 @@ class RetainedNativeCellCommandReadinessPort final
            lhs.intrinsic_direct_control == rhs.intrinsic_direct_control &&
            lhs.direct_control_joint_limits == rhs.direct_control_joint_limits &&
            lhs.motion_takeover_preparation_budget_s ==
-               rhs.motion_takeover_preparation_budget_s;
+               rhs.motion_takeover_preparation_budget_s &&
+           lhs.motion_takeover_planning_budget_s ==
+               rhs.motion_takeover_planning_budget_s;
   }
 
   [[nodiscard]] static core::Result<void> validate_generation_only_reseal(
