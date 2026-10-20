@@ -45,6 +45,9 @@ struct RetainedRos2ControlBackendConfig final {
   /// for a measured lane; retained by the existing backend handle through
   /// transport teardown. Never substitute a borrowed shared-pointer alias.
   std::shared_ptr<core::IClock> measured_receiver_clock;
+  /// Constructor-only acquisition of the native host's compatible ROS context.
+  /// Absent for standalone callers, which retain private context ownership.
+  ros2_control_execution::Ros2TransportResources::ContextProvider ros_context_provider{};
 };
 
 /// The sole addressed arm-state authority of a controller-backed runtime:

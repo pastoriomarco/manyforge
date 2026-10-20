@@ -13,6 +13,7 @@ import type {
   JsonValue,
   ProgramInterventionStopScope,
   RuntimeControlAuditEvent,
+  TakeoverFallbackAuditEvent,
 } from '../types/api';
 import type { ExecutionObservationTransportStatus } from '../types/viewerObservation';
 import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
@@ -34,7 +35,11 @@ import { incidentFacts } from '../state/componentLifecyclePresentation';
 import { PendingApplyNote, SettingsSubheading } from './SettingsScope';
 import { ProgramRunSetup, type AdmittedSpeedsView } from './ProgramRunSetup';
 import { api } from '../api/client';
-import { isAutomaticRetryAuditEvent, parseApiErrorDto } from '../api/parsers';
+import {
+  isAutomaticRetryAuditEvent,
+  isTakeoverFallbackAuditEvent,
+  parseApiErrorDto,
+} from '../api/parsers';
 import {
   BlackboardValueEditor,
   blackboardValueDraft,
@@ -167,6 +172,45 @@ function newestAutomaticRetry(
   return audit.findLast(isAutomaticRetryAuditEvent) ?? null;
 }
 
+/**
+ * "Spring-back fallback on move — planning timeout during <stage> (prep 534 of
+ * 500 ms)", the stage only when the Kernel names it: a motion
+ * takeover that did not complete as a moving replacement. Null for another event.
+ */
+export function takeoverFallbackText(event: RuntimeControlAuditEvent): string | null {
+  if (!isTakeoverFallbackAuditEvent(event)) return null;
+  const {
+    nodeInstanceId, path, code, failureStage, preparationMs, budgetMs,
+  } = event.facts;
+  const head = path === 'spring_back_hold' ? 'Spring-back fallback' : 'Stop fallback';
+  const label = [
+    code === null ? null : humanizeReasonCode(code),
+    failureStage === null ? null : `during ${failureStage}`,
+  ].filter((part) => part !== null).join(' ');
+  const reason = label === '' ? '' : ` — ${label}`;
+  return `${head} on ${nodeInstanceId}${reason} (prep ${Math.round(preparationMs)} of ${Math.round(budgetMs)} ms)`;
+}
+
+/** The brief warning for one takeover fallback (like an automatic retry's). */
+function takeoverFallbackBriefNotice(
+  programRunId: string | null,
+  event: TakeoverFallbackAuditEvent,
+): WorkbenchNotice {
+  return {
+    id: `program.takeover-fallback.${programRunId}.${event.eventRevision}`,
+    severity: 'warning',
+    domain: 'runtime',
+    title: takeoverFallbackText(event) as string,
+    message: 'Recorded in the runtime-control events.',
+  };
+}
+
+function newestTakeoverFallback(
+  audit: readonly RuntimeControlAuditEvent[],
+): TakeoverFallbackAuditEvent | null {
+  return audit.findLast(isTakeoverFallbackAuditEvent) ?? null;
+}
+
 const IO_SOURCE_UNAVAILABLE = 'program_node_io_source_unavailable';
 const IO_SOURCE_AVAILABLE = 'program_node_io_source_available';
 
@@ -297,6 +341,19 @@ export function useBriefAutomaticRetry(
     audit,
     newestAutomaticRetry,
     automaticRetryBriefNotice,
+  );
+}
+
+/** The brief warning for the newest takeover fallback (see the retry notice). */
+export function useBriefTakeoverFallback(
+  programRunId: string | null,
+  audit: readonly RuntimeControlAuditEvent[] | null,
+): WorkbenchNotice | null {
+  return useBriefNewestAuditEvent(
+    programRunId,
+    audit,
+    newestTakeoverFallback,
+    takeoverFallbackBriefNotice,
   );
 }
 
@@ -759,7 +816,10 @@ export function ProgramRuntimePanel({
                   <code>{event.eventRevision}</code>{' '}
                   {ioSourceTransition(event)?.unavailable === true ? (
                     <span className="inline-message severity-warning">{ioSourceAuditText(event)}</span>
-                  ) : automaticRetryText(event) ?? ioSourceAuditText(event) ?? actionLabel(event.kind)}
+                  ) : automaticRetryText(event)
+                    ?? takeoverFallbackText(event)
+                    ?? ioSourceAuditText(event)
+                    ?? actionLabel(event.kind)}
                 </li>
               );
             })}
@@ -1565,6 +1625,11 @@ export function ProgramTransportControls({
     program.state.run === null ? null : program.state.controls?.runtimeControls?.audit ?? null,
   );
   usePublishWorkbenchNotices('program-io-source', briefIoSource === null ? [] : [briefIoSource]);
+  const briefTakeover = useBriefTakeoverFallback(
+    program.state.run?.capture.programRunId ?? null,
+    program.state.run === null ? null : program.state.controls?.runtimeControls?.audit ?? null,
+  );
+  usePublishWorkbenchNotices('program-takeover', briefTakeover === null ? [] : [briefTakeover]);
   const globalRuleRecovery = useGlobalRuleRecovery(
     enabled,
     robot.currentStatus?.ownerEpoch ?? null,

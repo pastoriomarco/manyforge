@@ -946,6 +946,30 @@ export interface AutomaticRetryAuditEvent {
   facts: AutomaticRetryAuditFacts;
 }
 
+/**
+ * A motion takeover that did not complete as a moving replacement: the
+ * newcomer node's Kernel decision, parsed strictly from its audit event.
+ */
+export interface TakeoverFallbackAuditFacts {
+  /** The newcomer node whose takeover fell back. */
+  nodeInstanceId: string;
+  incumbentOperationId: string;
+  path: 'spring_back_hold' | 'ordinary_containment';
+  /** The Kernel's reason; null when it named none. */
+  code: string | null;
+  message: string | null;
+  /** The stage where the preparation time ran out; null when not named. */
+  failureStage: string | null;
+  preparationMs: number;
+  budgetMs: number;
+}
+
+export interface TakeoverFallbackAuditEvent {
+  eventRevision: number;
+  kind: 'program_node_takeover_fallback';
+  facts: TakeoverFallbackAuditFacts;
+}
+
 /** Every other runtime-control event: its facts are kept as the owner sent them. */
 export interface GenericRuntimeControlAuditEvent {
   eventRevision: number;
@@ -953,7 +977,10 @@ export interface GenericRuntimeControlAuditEvent {
   facts: Record<string, JsonValue>;
 }
 
-export type RuntimeControlAuditEvent = AutomaticRetryAuditEvent | GenericRuntimeControlAuditEvent;
+export type RuntimeControlAuditEvent =
+  | AutomaticRetryAuditEvent
+  | TakeoverFallbackAuditEvent
+  | GenericRuntimeControlAuditEvent;
 
 export interface ProgramRuntimeControlsSnapshot {
   schemaVersion: 'manyforge.program_runtime_controls.v3';

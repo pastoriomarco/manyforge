@@ -1,5 +1,8 @@
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include "execution_host_surface.hpp"
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+#include <manyforge_ros2_control_execution/volatile_motion_trace.hpp>
+#endif
 #include "execution_host_responses.hpp"
 #include "cell_admission_command_codec.hpp"
 #include "sealed_program_execution_capture.hpp"
@@ -3535,6 +3538,7 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
       case CommandKind::kStopProgramRun:
       case CommandKind::kStopProgramSelection:
       case CommandKind::kReadProgramExecutionScope:
+      case CommandKind::kReadVolatileMotionTrace:
       case CommandKind::kStartProgramSelection:
       case CommandKind::kReleaseProgramSelection:
       case CommandKind::kCheckProgramNodeMotionAttention:
@@ -3910,7 +3914,8 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                                ? ReadStopFault(owner)
                                : ExecuteStop(command, owner);
               } else if (lane == CommandLane::kObservation &&
-                         command.kind != CommandKind::kObservation) {
+                         command.kind != CommandKind::kObservation &&
+                         command.kind != CommandKind::kReadVolatileMotionTrace) {
                 response = ErrorResponse(
                     "execution_observation_command_unsupported",
                     "the independent observation socket accepts only "
@@ -3920,6 +3925,24 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                     "execution_ordinary_command_unsupported",
                     "Stop status and Stop-fault reads are served by the "
                     "independent Stop control socket");
+              } else if (command.kind == CommandKind::kReadVolatileMotionTrace) {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+                const auto trace = composition_access_.motion_trace;
+                auto snapshot = trace
+                    ? trace->Snapshot(owner_epoch_, command.trace_allowance_bytes)
+                    : core::Result<CanonicalValue>::Err({"volatile_motion_trace_unavailable",
+                        "this execution host has no volatile trace collector", {}});
+                response = snapshot.ok()
+                    ? CanonicalValue(CanonicalValue::Object{
+                        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+                        {"command", CanonicalValue("read_volatile_motion_trace")},
+                        {"ok", CanonicalValue(true)}, {"trace", std::move(snapshot.value())}})
+                    : ErrorResponse(snapshot.error().code, snapshot.error().message,
+                                    snapshot.error().details);
+#else
+                response = ErrorResponse("volatile_motion_trace_unavailable",
+                    "this execution host has no ROS trajectory collector");
+#endif
               } else if (command.kind == CommandKind::kEvents) {
                 response = EventsResponse(command);
               } else if (command.kind == CommandKind::kRecoverStopFault &&

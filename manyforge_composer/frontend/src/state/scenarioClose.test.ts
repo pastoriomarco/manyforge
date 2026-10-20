@@ -87,6 +87,58 @@ it('unknown process Stop leaves replacement unrequested without resending Stop',
   expect(apiMock.cclc.stopComponentProcess).toHaveBeenCalledTimes(1);
   expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
 });
+const stopUnknown = (code: string) => ({ state: 'unknown', receipt: null,
+  error: { code, message: `Stop ${code}`, details: {} } });
+it('response_unavailable Stop reads the exact result of the same request until drained', async () => {
+  apiMock.cclc.stopComponentProcess.mockResolvedValue(stopUnknown('component_process_stop_response_unavailable'));
+  const request = inputs();
+  expect(await closeScenario(request)).toEqual(empty);
+  expect(apiMock.cclc.stopComponentProcess).toHaveBeenCalledTimes(1);
+  expect(apiMock.cclc.componentProcessStopResult).toHaveBeenCalledTimes(1);
+  expect(apiMock.cclc.componentProcessStopResult.mock.calls[0][0]).toEqual(apiMock.cclc.stopComponentProcess.mock.calls[0][0]);
+  expect(request.progress).toHaveBeenCalledWith('Waiting for the exact Stop result of arm…');
+  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+});
+it('response_unavailable then stop_pending keeps reading the same Stop until drained', async () => {
+  apiMock.cclc.stopComponentProcess.mockResolvedValue(stopUnknown('component_process_stop_response_unavailable'));
+  apiMock.cclc.componentProcessStopResult.mockResolvedValueOnce(stopUnknown('component_process_stop_pending'))
+    .mockResolvedValue({ state: 'drained', receipt: { leader_pid: 42 }, error: null });
+  expect(await closeScenario(inputs())).toEqual(empty);
+  expect(apiMock.cclc.stopComponentProcess).toHaveBeenCalledTimes(1);
+  expect(apiMock.cclc.componentProcessStopResult).toHaveBeenCalledTimes(2);
+  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+});
+it('a result_unavailable read is terminal after one read', async () => {
+  apiMock.cclc.stopComponentProcess.mockResolvedValue(stopUnknown('component_process_stop_response_unavailable'));
+  apiMock.cclc.componentProcessStopResult.mockResolvedValue(stopUnknown('component_process_stop_result_unavailable'));
+  await expect(closeScenario(inputs())).rejects.toThrow('Stop component_process_stop_result_unavailable');
+  expect(apiMock.cclc.stopComponentProcess).toHaveBeenCalledTimes(1);
+  expect(apiMock.cclc.componentProcessStopResult).toHaveBeenCalledTimes(1);
+  expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
+});
+it('an abort while reading the exact Stop result rejects without Apply', async () => {
+  apiMock.cclc.stopComponentProcess.mockResolvedValue(stopUnknown('component_process_stop_response_unavailable'));
+  apiMock.cclc.componentProcessStopResult.mockResolvedValue(stopUnknown('component_process_stop_pending'));
+  const controller = new AbortController();
+  const request = { ...inputs(), signal: controller.signal };
+  request.waitForObservation.mockImplementation(async () => {
+    if (apiMock.cclc.componentProcessStopResult.mock.calls.length === 2) controller.abort();
+  });
+  await expect(closeScenario(request)).rejects.toThrow();
+  expect(apiMock.cclc.stopComponentProcess).toHaveBeenCalledTimes(1);
+  expect(apiMock.cclc.componentProcessStopResult).toHaveBeenCalledTimes(2);
+  expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
+  expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+});
+it.each(['component_process_stop_owner_unavailable', 'component_process_stop_outcome_unknown'])(
+  'a %s Stop stays terminal without result reads', async (code) => {
+    apiMock.cclc.stopComponentProcess.mockResolvedValue(stopUnknown(code));
+    await expect(closeScenario(inputs())).rejects.toThrow(`Stop ${code}`);
+    expect(apiMock.cclc.stopComponentProcess).toHaveBeenCalledTimes(1);
+    expect(apiMock.cclc.componentProcessStopResult).not.toHaveBeenCalled();
+    expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
+  },
+);
 
 function noneCloseFixture() {
   const exactScene = { scene_id: `sha256:${'3'.repeat(64)}`, revision_id: 1,

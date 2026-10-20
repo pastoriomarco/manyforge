@@ -1017,19 +1017,23 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   // `main`'s acceptance-within-lead-in rule (Q22): the mechanism must start
   // the replacement before the planned trip point.
   const auto dispatched_at = clock_.now();
-  const auto elapsed = compute_stop_join_elapsed_s(
+  const auto start = compute_stop_replacement_start(
       {trip.cursor_s, frozen_factor,
        static_cast<double>(dispatched_at - trip.local_receipt_stamp_ns) / 1e9,
-       *config_.replacement_start_allowance_s, lead_in_end});
-  if (!elapsed.ok()) {
-    return Fail(run, stage_error(mode + "_stop_delta_budget_exceeded", elapsed.error().message,
-                                 elapsed.error().details));
+       *config_.replacement_start_allowance_s, lead_in_end}, trip, run.lane);
+  if (!start.ok()) {
+    return Fail(run, stage_error(mode + "_stop_delta_budget_exceeded", start.error().message,
+                                 start.error().details));
   }
-  auto joined = build_stop_replacement_join(run.goal.trajectory, elapsed.value(),
+  const auto elapsed = start.value().elapsed_path_s;
+  auto joined = build_stop_replacement_join(run.goal.trajectory, elapsed,
                                             continuation.value(), plan.command_path_time_s,
                                             lead_in_end);
   if (!joined.ok()) return Fail(run, stage_error(joined.error(), mode + "_join_failed"));
-  const auto sent = port_.Replace(run.goal.key, next, joined.value());
+  const auto sent = start.value().scheduled
+                        ? port_.ReplaceScheduled(run.goal.key, next, joined.value(),
+                                                 *start.value().scheduled)
+                        : port_.Replace(run.goal.key, next, joined.value());
   if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
     const auto original = port_.ReadGoal(run.goal.key);
     if (original.has_value() && original->result == ExecutionGoalResult::kSucceeded &&
@@ -1053,7 +1057,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   }
   std::optional<StopReplacementCursorMapDTO> cursor_map;
   if (plan.replacement_path_time_s.size() == continuation_times.size()) {
-    cursor_map = StopReplacementCursorMapDTO{elapsed.value(), lead_in_end,
+    cursor_map = StopReplacementCursorMapDTO{elapsed, lead_in_end,
                                              plan.command_path_time_s,
                                              std::move(continuation_times),
                                              plan.replacement_path_time_s};
@@ -1061,7 +1065,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   const auto association = std::make_shared<ExecutionSampleAssociation>(
       port_.ReadReadiness().binding_epoch, baseline, dispatched_at);
   Record(SentGoal{next, joined.value(), std::move(cursor_map), association});
-  put(run.outcome->diagnostics, "join_elapsed_path_s", interrupt_structured_number(elapsed.value()));
+  put(run.outcome->diagnostics, "join_elapsed_path_s", interrupt_structured_number(elapsed));
   put(run.outcome->diagnostics, "frozen_factor", interrupt_structured_number(frozen_factor));
   put(run.outcome->diagnostics, "replacement_start_allowance_s",
       interrupt_structured_number(*config_.replacement_start_allowance_s));
@@ -1341,6 +1345,9 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
   // Q26: the join is computed immediately before the send (local time since
   // the sample measured at the dispatch itself).
   const auto dispatched_at = clock_.now();
+  // This brake starts at the captured sample, with no future shared source
+  // prefix. Keep its existing immediate delivery; scheduling it would delay
+  // onto a brake already in progress, unlike a lead-bearing replacement.
   const auto elapsed = compute_stop_join_elapsed_s(
       {sample.cursor_s, factor,
        static_cast<double>(dispatched_at - sample.local_receipt_stamp_ns) / 1e9,

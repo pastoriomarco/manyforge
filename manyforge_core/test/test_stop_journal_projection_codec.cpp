@@ -796,3 +796,107 @@ TEST(StopJournalProjectionCodecTest, RuleEvidenceRoundTripsAndOldEnvelopeCannotA
 }
 }  // namespace
 }  // namespace manyforge::core
+
+namespace manyforge::core {
+namespace {
+TEST(StopJournalProjectionCodecTest, TakeoverDecisionUsesOptionalV11AndExactInt64Times) {
+  const auto terminal = TerminalProjection();
+  OperationStateDTO operation{OperationId("winner"),
+                              OperationRevision(1U),
+                              ProgramBindingId(kDigestB),
+                              ProgramRunId("run.1"),
+                              OperationCoordinationPolicy::kIndependent,
+                              OperationStateKind::kExecuting,
+                              {},
+                              30,
+                              std::nullopt,
+                              std::nullopt,
+                              std::nullopt};
+  StopJournalAcceptanceProjectionDTO projection{terminal.stop_status.accepted, {{operation}, {}}};
+  const auto legacy = EncodeStopJournalAcceptanceProjection(projection);
+  ASSERT_TRUE(legacy.ok());
+  EXPECT_NE(legacy.value().find("acceptance-projection.v4"), std::string::npos);
+  const auto old_decoded = DecodeStopJournalAcceptanceProjection(legacy.value());
+  ASSERT_TRUE(old_decoded.ok());
+  EXPECT_FALSE(old_decoded.value().affected_state.operations.front().motion_takeover);
+  EXPECT_EQ(EncodeStopJournalAcceptanceProjection(old_decoded.value()).value(), legacy.value());
+  for (const auto path :
+       {MotionTakeoverPathDTO::kMovingReplacement, MotionTakeoverPathDTO::kSpringBackHold,
+        MotionTakeoverPathDTO::kOrdinaryContainment}) {
+    auto& decision = projection.affected_state.operations.front().motion_takeover;
+    decision = MotionTakeoverDecisionDTO{
+        OperationId("incumbent"),     path,        std::nullopt, INT64_MAX,
+        (std::int64_t{1} << 53U) + 1, 500'000'000, std::nullopt};
+    if (path != MotionTakeoverPathDTO::kMovingReplacement) {
+      decision->cause = ErrorDTO{"takeover_capture_failed",
+                                 "exact smooth failure",
+                                 {{"predicate", "progress_observation_mismatch"}}};
+      decision->stop_certificate =
+          StopCertificateRefDTO{StopCertificateId("certificate.1"), StopCertificateRevision(2U),
+                                StopId("fallback.stop"), StopGeneration(3U)};
+    }
+    const auto encoded = EncodeStopJournalAcceptanceProjection(projection);
+    ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+    EXPECT_NE(encoded.value().find("acceptance-projection.v11"), std::string::npos);
+    const auto decoded = DecodeStopJournalAcceptanceProjection(encoded.value());
+    ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+    EXPECT_EQ(decoded.value(), projection);
+    EXPECT_EQ(EncodeStopJournalAcceptanceProjection(decoded.value()).value(), encoded.value());
+    auto alias = encoded.value();
+    alias.replace(alias.find("acceptance-projection.v11"),
+                  std::string("acceptance-projection.v11").size(), "acceptance-projection.v10");
+    EXPECT_FALSE(DecodeStopJournalAcceptanceProjection(alias).ok());
+  }
+  const auto valid = projection;
+  for (const auto invalidity : {0, 1, 2, 3}) {
+    projection = valid;
+    auto& decision = *projection.affected_state.operations.front().motion_takeover;
+    if (invalidity == 0) decision.preparation_budget_ns = 0;
+    if (invalidity == 1) decision.decided_at_ns = -1;
+    if (invalidity == 2) decision.incumbent_operation_id = operation.operation_id;
+    if (invalidity == 3) decision.stop_certificate->stop_generation = StopGeneration(0U);
+    EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(projection).ok());
+  }
+}
+
+TEST(StopJournalProjectionCodecTest, ForensicTakeoverCandidateDoesNotExpandPhysicalAffectedState) {
+  const auto terminal = TerminalProjection();
+  OperationStateDTO incumbent{OperationId("incumbent"),
+                              OperationRevision(2U),
+                              ProgramBindingId(kDigestB),
+                              ProgramRunId("run.1"),
+                              OperationCoordinationPolicy::kIndependent,
+                              OperationStateKind::kStopping,
+                              {},
+                              30,
+                              std::nullopt,
+                              std::nullopt,
+                              std::nullopt};
+  auto candidate = incumbent;
+  candidate.operation_id = OperationId("candidate");
+  candidate.state = OperationStateKind::kResolving;
+  candidate.motion_takeover =
+      MotionTakeoverDecisionDTO{incumbent.operation_id,
+                                MotionTakeoverPathDTO::kSpringBackHold,
+                                ErrorDTO{"smooth_failed", "exact reason", {{"detail", "retained"}}},
+                                30,
+                                20,
+                                500'000'000,
+                                std::nullopt};
+  StopJournalAcceptanceProjectionDTO projection{terminal.stop_status.accepted,
+                                                {{incumbent}, {ResourceId("physical")}, candidate}};
+  const auto encoded = EncodeStopJournalAcceptanceProjection(projection);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  const auto decoded = DecodeStopJournalAcceptanceProjection(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), projection);
+  EXPECT_EQ(decoded.value().affected_state.operations, std::vector<OperationStateDTO>{incumbent});
+  EXPECT_EQ(decoded.value().accepted, terminal.stop_status.accepted);
+  projection.affected_state.motion_takeover_candidate_snapshot->motion_takeover
+      ->incumbent_operation_id = OperationId("absent");
+  EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(projection).ok());
+  projection.affected_state.motion_takeover_candidate_snapshot = incumbent;
+  EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(projection).ok());
+}
+}  // namespace
+}  // namespace manyforge::core

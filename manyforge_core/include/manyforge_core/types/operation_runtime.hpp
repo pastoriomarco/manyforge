@@ -151,6 +151,50 @@ struct OperationPreemptionDTO final {
   friend bool operator==(const OperationPreemptionDTO&, const OperationPreemptionDTO&) = default;
 };
 
+/// Observed physical handover choice for one accepted newcomer. This is
+/// diagnostic evidence only; it grants no Stop, dispatch or recovery authority.
+enum class MotionTakeoverPathDTO : std::uint8_t {
+  kMovingReplacement,
+  kSpringBackHold,
+  kOrdinaryContainment,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(MotionTakeoverPathDTO value) noexcept {
+  switch (value) {
+    case MotionTakeoverPathDTO::kMovingReplacement:
+      return "moving_replacement";
+    case MotionTakeoverPathDTO::kSpringBackHold:
+      return "spring_back_hold";
+    case MotionTakeoverPathDTO::kOrdinaryContainment:
+      return "ordinary_containment";
+  }
+  return {};
+}
+
+struct MotionTakeoverDecisionDTO final {
+  OperationId incumbent_operation_id;
+  MotionTakeoverPathDTO path{MotionTakeoverPathDTO::kMovingReplacement};
+  std::optional<ErrorDTO> cause{};
+  // Kernel monotonic time, never a wall-clock timestamp. Elapsed includes
+  // admission/coordination as well as planning; it is not planning-only time.
+  std::int64_t decided_at_ns{};
+  std::int64_t elapsed_since_acceptance_ns{};
+  std::int64_t preparation_budget_ns{};
+  std::optional<StopCertificateRefDTO> stop_certificate{};
+
+  [[nodiscard]] bool locally_valid() const noexcept {
+    const bool moving = path == MotionTakeoverPathDTO::kMovingReplacement;
+    return !incumbent_operation_id.empty() && !to_string(path).empty() &&
+           decided_at_ns >= 0 && elapsed_since_acceptance_ns >= 0 &&
+           elapsed_since_acceptance_ns <= decided_at_ns && preparation_budget_ns > 0 &&
+           (moving ? !cause && !stop_certificate : cause && !cause->code.empty()) &&
+           (!stop_certificate || stop_certificate->locally_valid());
+  }
+
+  friend bool operator==(const MotionTakeoverDecisionDTO&,
+                         const MotionTakeoverDecisionDTO&) = default;
+};
+
 /// Bounded observation for one Kernel-owned operation. It carries final
 /// addressed identities rather than subordinate engine handles or legacy
 /// robot/group selectors.
@@ -172,6 +216,8 @@ struct OperationStateDTO final {
   std::uint64_t journal_capture_order{};
   /// Acceptance-time logical outcome; never proves stopped/settled effects.
   std::optional<OperationPreemptionDTO> preemption{};
+  /// One accepted attempt's choice, retained with its ordinary operation history.
+  std::optional<MotionTakeoverDecisionDTO> motion_takeover{};
 
   friend bool operator==(const OperationStateDTO&, const OperationStateDTO&) = default;
 };

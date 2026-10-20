@@ -61,6 +61,7 @@ EXECUTION_CONTROL_SOCKET_FILE = "execution-control.sock"
 EXECUTION_OBSERVATION_SOCKET_FILE = "execution-observation.sock"
 EXECUTION_COMMAND_VERSION = "manyforge.execution_command.v1"
 EXECUTION_RESPONSE_VERSION = "manyforge.execution_command_response.v1"
+VOLATILE_MOTION_TRACE_VERSION = "manyforge.volatile_motion_trace.v1"
 MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 OPERATION_EVENT_KINDS = frozenset(
     {
@@ -355,6 +356,8 @@ class ExecutionPort(Protocol):
         *,
         limit: int = 16,
     ) -> dict[str, Any]: ...
+
+    def read_volatile_motion_trace(self, allowance_bytes: int) -> dict[str, Any]: ...
 
 
 def _motion_preview_scene_revision_matches(
@@ -1784,6 +1787,37 @@ class ExecutionCommandClient:
                 "execution observation has no exact residency projection",
             )
         return response
+
+    def read_volatile_motion_trace(self, allowance_bytes: int) -> dict[str, Any]:
+        """Return the native volatile motion-trace object, unchanged.
+
+        Diagnostic only: ``allowance_bytes`` caps the encoded trace object the
+        native host may return. Only the envelope, the object shape and the
+        schema version are checked; failures raise ``HeadlessApiError``.
+        """
+        if type(allowance_bytes) is not int or allowance_bytes <= 0:
+            raise ValueError("trace allowance must be a positive integer")
+        response = self.require_success(
+            self._exchange(
+                {
+                    "api_version": EXECUTION_COMMAND_VERSION,
+                    "attribution": self._request_attribution(None),
+                    "command": "read_volatile_motion_trace",
+                    "allowance_bytes": allowance_bytes,
+                }
+            )
+        )
+        trace = response.get("trace")
+        if (
+            response.get("command") != "read_volatile_motion_trace"
+            or not isinstance(trace, dict)
+            or trace.get("schema_version") != VOLATILE_MOTION_TRACE_VERSION
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "native volatile motion trace response is invalid",
+            )
+        return trace
 
     def operation_recovery(self, operation_id: str) -> dict[str, Any]:
         if not operation_id or len(operation_id.encode("utf-8")) > 256:

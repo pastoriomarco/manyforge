@@ -240,7 +240,8 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
         auto resources =
             std::make_unique<ros2_control_execution::Ros2TransportResources>(
                 selected.node_name, selected.node_namespace,
-                selected.executor_thread_count, sink, motion_group, clock);
+                selected.executor_thread_count, sink, motion_group, clock,
+                selected.ros_context_provider);
         std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend>
             gripper;
         if (gripper_binding.has_value()) {
@@ -254,6 +255,13 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
         auto *const gripper_pointer = gripper.get();
         const auto state_rate_hz = selected.arm.adapter.lane_facts.state_rate_hz;
         auto participant_config = selected.participant;
+        if (const auto trace = selected.arm.adapter.motion_trace) {
+          const auto action = selected.arm.adapter.action_name;
+          participant_config.observe_goal_context = [trace, action](const auto& key,
+              const auto& participant, const auto epoch) {
+            trace->Preregister(action, epoch, key, participant);
+          };
+        }
         const core::ExecutionPortParticipantStateAuthority state_authority{
             &motion_channel->publication().numeric_publication(),
             [] { return core::Result<void>::Ok(); }};
@@ -379,7 +387,8 @@ make_retained_ros2_control_gripper_backend(
   }
   auto sink = std::make_shared<RetainedExecutionStateSink>(clock, std::move(sinks));
   auto resources = std::make_unique<ros2_control_execution::Ros2TransportResources>(
-      config.node_name, config.node_namespace, config.executor_thread_count, sink, group, clock);
+      config.node_name, config.node_namespace, config.executor_thread_count, sink, group, clock,
+      config.ros_context_provider);
   auto gripper = std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
       *resources, sink, clock, scheduler, true);
   gripper->configure_gripper_action(binding.value().command_target_id.value(), *config.gripper);

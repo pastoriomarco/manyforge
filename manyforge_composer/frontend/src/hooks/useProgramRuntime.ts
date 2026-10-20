@@ -430,12 +430,18 @@ export function buildProgramResetRequest(
   const allowed = cycle?.allowedCommands.some(
     (command) => command.commandKind === 'program_reset' && command.allowed,
   ) ?? false;
+  // A failed Reset (recovery_required that retains its accepted occurrence)
+  // is retried with exactly that occurrence's options, run or no run.
+  const retainedReset = cycle?.state === 'recovery_required'
+    && cycle.currentCommandKind === 'program_reset'
+    ? cycle.resetOptions : null;
   if (
     cycle === undefined
     || !allowed
-    || (cycle.programRunId === null && (cycle.state !== 'idle_after_reset'
+    || (cycle.programRunId === null && retainedReset === null && (cycle.state !== 'idle_after_reset'
       || cycle.cycleClaimGeneration !== null || cycle.terminalOrSettlementReference !== null))
   ) return null;
+  const selected = retainedReset ?? options;
   return {
     request_id: requestId,
     request_owner_epoch: requestOwnerEpoch,
@@ -447,8 +453,8 @@ export function buildProgramResetRequest(
     expected_claim_generation: cycle.cycleClaimGeneration,
     terminal_reference: cycle.terminalOrSettlementReference,
     settlement_evidence_digest: cycle.terminalOrSettlementReference,
-    reload_initial_scene: options.reloadInitialScene ?? false,
-    reset_robot_position: options.resetRobotPosition ?? false,
+    reload_initial_scene: selected.reloadInitialScene ?? false,
+    reset_robot_position: selected.resetRobotPosition ?? false,
   };
 }
 

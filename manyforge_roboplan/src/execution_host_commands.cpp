@@ -1551,6 +1551,15 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
         attribution};
     return decoded;
   }
+  if (command == "read_volatile_motion_trace") {
+    RequireExactObjectSize(root, 4U, "Volatile motion trace read");
+    (void)DecodeRequestAttribution(Member(root, "attribution"));
+    Command decoded{CommandKind::kReadVolatileMotionTrace};
+    decoded.trace_allowance_bytes = Counter(root, "allowance_bytes", 1U);
+    Require(decoded.trace_allowance_bytes <= 3U * 1024U * 1024U,
+            "volatile motion trace allowance exceeds its bounded range");
+    return decoded;
+  }
   if (command == "read_program_execution_scope") {
     RequireExactObjectSize(root, 3U, "Program execution scope read");
     Command decoded{CommandKind::kReadProgramExecutionScope};

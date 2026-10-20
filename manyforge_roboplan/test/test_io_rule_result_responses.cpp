@@ -52,6 +52,77 @@ TEST(IoRuleResultResponseTest,
       core::ControllerGoalId("foreign.goal");
   EXPECT_THROW((void)OperationStateValue(state), std::exception);
 }
+TEST(OperationStateResponseTest, AbsentTakeoverKeepsLegacyShape) {
+  const auto response = OperationStateValue(core::rule_codec_test::State());
+  EXPECT_EQ(response.find_object_member("motion_takeover"), nullptr);
+}
+
+TEST(OperationStateResponseTest, TakeoverProjectsExactDecisionAndCertificate) {
+  auto state = core::rule_codec_test::State();
+  state.motion_takeover = core::MotionTakeoverDecisionDTO{
+      .incumbent_operation_id = core::OperationId("operation.incumbent"),
+      .path = core::MotionTakeoverPathDTO::kMovingReplacement,
+      .cause = std::nullopt,
+      .decided_at_ns = INT64_MAX,
+      .elapsed_since_acceptance_ns = 9007199254740993LL,
+      .preparation_budget_ns = 1500000000,
+      .stop_certificate = std::nullopt};
+  auto response = OperationStateValue(state);
+  const auto *decision = response.find_object_member("motion_takeover");
+  ASSERT_NE(decision, nullptr);
+  EXPECT_EQ(decision->as_object().size(), 7U);
+  EXPECT_EQ(decision->find_object_member("incumbent_operation_id")->as_string(),
+            "operation.incumbent");
+  EXPECT_EQ(decision->find_object_member("path")->as_string(),
+            "moving_replacement");
+  EXPECT_EQ(content_identity::canonical_json(
+                *decision->find_object_member("cause")), "null");
+  EXPECT_EQ(content_identity::canonical_json(
+                *decision->find_object_member("stop_certificate")), "null");
+  EXPECT_EQ(decision->find_object_member("decided_at_ns")->as_string(),
+            "9223372036854775807");
+  EXPECT_EQ(decision->find_object_member("elapsed_since_acceptance_ns")->as_string(),
+            "9007199254740993");
+  EXPECT_EQ(decision->find_object_member("preparation_budget_ns")->as_number(),
+            1500000000.0);
+
+  const core::ErrorDTO cause{
+      "motion_takeover_preparation_failed", "original planner failure",
+      {{"planner_detail", "preserve exact cause"}}};
+  state.motion_takeover->path = core::MotionTakeoverPathDTO::kSpringBackHold;
+  state.motion_takeover->cause = cause;
+  response = OperationStateValue(state);
+  decision = response.find_object_member("motion_takeover");
+  ASSERT_NE(decision, nullptr);
+  EXPECT_TRUE(decision->find_object_member("stop_certificate")->is_null());
+  EXPECT_EQ(content_identity::canonical_json(
+                *decision->find_object_member("cause")),
+            content_identity::canonical_json(ErrorValue(cause)));
+  state.motion_takeover->stop_certificate = core::StopCertificateRefDTO{
+      core::StopCertificateId("certificate.actual"),
+      core::StopCertificateRevision(3U), core::StopId("stop.actual"),
+      core::StopGeneration(2U)};
+  for (const auto &[path, spelling] :
+       {std::pair{core::MotionTakeoverPathDTO::kSpringBackHold,
+                  "spring_back_hold"},
+        std::pair{core::MotionTakeoverPathDTO::kOrdinaryContainment,
+                  "ordinary_containment"}}) {
+    state.motion_takeover->path = path;
+    response = OperationStateValue(state);
+    decision = response.find_object_member("motion_takeover");
+    ASSERT_NE(decision, nullptr);
+    EXPECT_EQ(decision->as_object().size(), 7U);
+    EXPECT_EQ(decision->find_object_member("path")->as_string(), spelling);
+    EXPECT_EQ(content_identity::canonical_json(
+                  *decision->find_object_member("cause")),
+              content_identity::canonical_json(ErrorValue(cause)));
+    EXPECT_EQ(content_identity::canonical_json(
+                  *decision->find_object_member("stop_certificate")),
+              "{\"stop_certificate_id\":\"certificate.actual\","
+              "\"stop_certificate_revision\":3,\"stop_generation\":2,"
+              "\"stop_id\":\"stop.actual\"}");
+  }
+}
 // Typed wire fixture only: projection status does not manufacture a
 // certificate, attempted-stage evidence, a commit sequence or a new wait budget.
 TEST(IoRuleResultResponseTest,

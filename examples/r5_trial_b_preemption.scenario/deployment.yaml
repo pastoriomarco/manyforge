@@ -137,7 +137,7 @@
                 "source_joint_name": "joint6"
               }
             ],
-            "stop_mode": "soft_on_path"
+            "stop_mode": "spring_back_hold"
           },
           "maximum_tcp_linear_speed_mps": 0.15
         }

@@ -1573,6 +1573,79 @@ describe('Program product projections', () => {
     expect(refuses({ code: '', message: '' })).toThrow(/code/);
   });
 
+  it('parses a takeover fallback audit event into typed facts, with or without its cause', () => {
+    const input = runtimeControlsProjection();
+    const controls = input.runtime_controls as Record<string, unknown>;
+    controls.runtime_control_revision = 4;
+    const fallback = {
+      event_revision: 1, kind: 'program_node_takeover_fallback', node_instance_id: 'move',
+      incumbent_operation_id: 'op.1', path: 'spring_back_hold',
+      code: 'takeover_preparation_late', message: 'late', preparation_ms: 40.5, budget_ms: 30,
+    };
+    controls.audit = [
+      fallback,
+      { ...fallback, event_revision: 2, path: 'ordinary_containment', code: null, message: null },
+      { ...fallback, event_revision: 3, failure_stage: 'spring_back_planning' },
+    ];
+    expect(parseProgramRuntimeControlProjection(input).runtimeControls.audit).toEqual([
+      {
+        eventRevision: 1,
+        kind: 'program_node_takeover_fallback',
+        facts: {
+          nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'spring_back_hold',
+          code: 'takeover_preparation_late', message: 'late', failureStage: null,
+          preparationMs: 40.5, budgetMs: 30,
+        },
+      },
+      {
+        eventRevision: 2,
+        kind: 'program_node_takeover_fallback',
+        facts: {
+          nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'ordinary_containment',
+          code: null, message: null, failureStage: null, preparationMs: 40.5, budgetMs: 30,
+        },
+      },
+      {
+        eventRevision: 3,
+        kind: 'program_node_takeover_fallback',
+        facts: {
+          nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'spring_back_hold',
+          code: 'takeover_preparation_late', message: 'late', failureStage: 'spring_back_planning',
+          preparationMs: 40.5, budgetMs: 30,
+        },
+      },
+    ]);
+  });
+
+  it('refuses a malformed takeover fallback audit event', () => {
+    const valid = {
+      event_revision: 1, kind: 'program_node_takeover_fallback', node_instance_id: 'move',
+      incumbent_operation_id: 'op.1', path: 'spring_back_hold',
+      code: null, message: null, preparation_ms: 40.5, budget_ms: 30,
+    };
+    const refuses = (patch: Record<string, unknown>) => {
+      const input = runtimeControlsProjection();
+      const controls = input.runtime_controls as Record<string, unknown>;
+      controls.runtime_control_revision = 2;
+      controls.audit = [{ ...valid, ...patch }];
+      return () => parseProgramRuntimeControlProjection(input);
+    };
+    expect(refuses({})).not.toThrow();
+    expect(refuses({ node_instance_id: undefined })).toThrow(/node_instance_id/);
+    expect(refuses({ incumbent_operation_id: '' })).toThrow(/incumbent_operation_id/);
+    expect(refuses({ path: 'moving_replacement' })).toThrow(/path/);
+    expect(refuses({ path: undefined })).toThrow(/path/);
+    expect(refuses({ code: undefined })).toThrow(/code/);
+    expect(refuses({ code: 'late' })).toThrow(/both code and message, or neither/);
+    expect(refuses({ message: 'late' })).toThrow(/both code and message, or neither/);
+    expect(refuses({ preparation_ms: undefined })).toThrow(/preparation_ms/);
+    expect(refuses({ preparation_ms: -1 })).toThrow(/preparation_ms/);
+    expect(refuses({ budget_ms: 0 })).toThrow(/budget_ms/);
+    expect(refuses({ budget_ms: '30' })).toThrow(/budget_ms/);
+    expect(refuses({ failure_stage: '' })).toThrow(/failure_stage/);
+    expect(refuses({ failure_stage: 3 })).toThrow(/failure_stage/);
+  });
+
   it('keeps retry counts an exact wire key and refuses removed override state', () => {
     const input = runtimeControlsProjection();
     const controls = input.runtime_controls as Record<string, unknown>;

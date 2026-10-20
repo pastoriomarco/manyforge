@@ -38,6 +38,8 @@
 #include <shared_mutex>
 #include <vector>
 
+namespace manyforge::ros2_control_execution { class VolatileMotionTrace; }
+
 namespace manyforge::roboplan_backend::host_detail {
 
 // Metadata classification only, on the caller's verified retained graph. A
@@ -240,6 +242,8 @@ struct Composition final : ExecutionProduct {
     const core::IoSourceIncarnation &expected_source_epoch, bool value);
 
 struct ExecutionCompositionAccess final {
+  // Stable host diagnostic owner; independent of component/rebind lifetime.
+  std::shared_ptr<ros2_control_execution::VolatileMotionTrace> motion_trace{};
   mutable std::shared_mutex mutex;
   Composition *current{};
   // Mutually exclusive with current, changed under this SAME mutex. No

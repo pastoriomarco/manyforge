@@ -62,6 +62,9 @@ using EmergencyStopProjectedIntentDTO =
 struct EmergencyStopAffectedStateSnapshotDTO final {
   std::vector<OperationStateDTO> operations;
   std::vector<ResourceId> resources;
+  /// Diagnostic observation of the accepted, unsent takeover candidate. It
+  /// confers no physical affected scope or operation-snapshot authority.
+  std::optional<OperationStateDTO> motion_takeover_candidate_snapshot{};
 
   friend bool operator==(const EmergencyStopAffectedStateSnapshotDTO&,
                          const EmergencyStopAffectedStateSnapshotDTO&) = default;

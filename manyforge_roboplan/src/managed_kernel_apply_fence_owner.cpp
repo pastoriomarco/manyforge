@@ -1410,6 +1410,74 @@ public:
                                           });
   }
 
+  void RunWithExactHeldInstalledCandidate(
+      const core::ConfigurationFenceStatusQueryDTO &query,
+      core::ActiveBundlePublicationGeneration predecessor_generation,
+      const core::ContentDigest &predecessor_pointer_digest,
+      const core::CellAdmissionClaimDTO &parent,
+      const core::ProjectionRevisionDTO &candidate,
+      const std::vector<core::RuntimeProviderDomainConfigurationReadbackDTO>
+          &actual_candidate_configurations,
+      const std::function<void()> &effect) const {
+    Require(query.valid() && candidate.valid() && effect &&
+                predecessor_generation.nonzero() &&
+                !predecessor_pointer_digest.empty(),
+            "installed candidate handoff has invalid authority");
+    const auto bundle = bundle_source_.get_verified(candidate.retained_bundle_id);
+    Require(bundle && bundle->value().cell_graph.cell_id == config_.cell_id &&
+                bundle->value().cell_graph.graph_revision == candidate.graph_revision,
+            "installed candidate handoff product is unavailable");
+    std::unique_lock lock(mutex_);
+    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex());
+    const auto row = ReadByFence(query.configuration_fence_id,
+                                 query.configuration_fence_generation);
+    Require(row && row->state == 0 && row->owner_kind == DurableFenceOwnerKind::kApply,
+            "installed candidate handoff has no durable held Apply fence");
+    const auto intent = DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(row->intent_bytes);
+    const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(row->accepted_bytes);
+    Require(intent.owner_transaction == query.owner_transaction && accepted.matches(intent) &&
+                accepted.configuration_fence_id == query.configuration_fence_id &&
+                accepted.configuration_fence_generation == query.configuration_fence_generation &&
+                accepted.captured_scope == query.expected_scope,
+            "installed candidate handoff conflicts with its durable fence");
+    const auto kind = parent.intent.claim_kind;
+    Require((kind == core::CellAdmissionClaimKindDTO::kManagerApply &&
+                 parent.intent.owner_transaction_id == query.owner_transaction.apply_id.value()) ||
+                kind == core::CellAdmissionClaimKindDTO::kAuthoringMutation,
+            "installed candidate handoff parent has another transaction");
+    Require(static_cast<bool>(config_.selected_claim_recovery_receipt),
+            "installed candidate handoff has no actual parent source");
+    const core::CellAdmissionRecoveryReceiptQueryDTO parent_query{
+        parent.intent, parent, std::nullopt};
+    const auto held = config_.selected_claim_recovery_receipt(parent_query);
+    // Keep the existing candidate-handoff consumer contract: the actual
+    // owner supplies a validated HeldExact receipt for the complete claim.
+    Require(held.ok() && core::ValidateCellAdmissionRecoveryReceipt(held.value()).ok() &&
+                held.value().status == core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
+                held.value().matched_claim == std::optional(parent),
+            "installed candidate handoff parent is no longer held exact");
+    const auto active = ReadActivePublication();
+    Require(active.receipt.publication_generation == predecessor_generation &&
+                active.receipt.durable_public_pointer_content_digest == predecessor_pointer_digest &&
+                active.receipt.request.candidate_retained_bundle_id == intent.expected_retained_bundle_id &&
+                active.receipt.request.candidate_graph_revision == intent.expected_graph_revision,
+            "installed candidate handoff lost its exact public predecessor");
+    std::vector<core::ProviderConfigurationFenceLineageDTO> lineages;
+    for (const auto &actual : actual_candidate_configurations) {
+      Require(actual.locally_valid() && actual.retained_bundle_id == candidate.retained_bundle_id &&
+                  actual.graph_revision == candidate.graph_revision,
+              "installed candidate handoff observation is foreign or invalid");
+      lineages.push_back({actual.domain.control_domain_id,
+          actual.provider_occurrence.provider_runtime_epoch, actual.component_lifecycle_generation});
+    }
+    ValidateInstalledCandidateConfigurations(query.expected_scope, *bundle, lineages);
+    admission_gate_.RunWithExactHeldFence(query.configuration_fence_id, query.expected_scope, [&] {
+      admission_lock.unlock();
+      lock.unlock();
+      effect();
+    });
+  }
+
   void RunWithExactHeldOriginalApplyCandidate(
       const core::ConfigurationFenceStatusQueryDTO &query,
       core::ActiveBundlePublicationGeneration predecessor_generation,
@@ -1419,76 +1487,12 @@ public:
       const std::vector<core::RuntimeProviderDomainConfigurationReadbackDTO>
           &actual_candidate_configurations,
       const std::function<void()> &effect) const {
-    std::unique_lock lock(mutex_);
-    Require(query.valid() && parent.valid() && candidate.valid() && effect &&
-                parent.held_fence_query == query &&
-                predecessor_generation.nonzero() &&
-                !predecessor_pointer_digest.empty(),
+    Require(parent.valid() && parent.held_fence_query == query &&
+                parent.parent.owner == query.owner_transaction,
             "original Apply candidate continuation has invalid authority");
-    // Verified product I/O precedes admission/state access. This does not
-    // fabricate a public successor or change the predecessor receipt.
-    const auto bundle =
-        bundle_source_.get_verified(candidate.retained_bundle_id);
-    Require(bundle && bundle->value().cell_graph.cell_id == config_.cell_id &&
-                bundle->value().cell_graph.graph_revision ==
-                    candidate.graph_revision,
-            "original Apply candidate product is unavailable");
-    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex());
-    const auto row = ReadByFence(query.configuration_fence_id,
-                                 query.configuration_fence_generation);
-    Require(row && row->state == 0 &&
-                row->owner_kind == DurableFenceOwnerKind::kApply,
-            "original Apply candidate has no durable held parent fence");
-    const auto intent = DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(
-        row->intent_bytes);
-    const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
-        row->accepted_bytes);
-    Require(intent.owner_transaction == parent.parent.owner &&
-                accepted.matches(intent) &&
-                accepted.configuration_fence_id ==
-                    query.configuration_fence_id &&
-                accepted.configuration_fence_generation ==
-                    query.configuration_fence_generation &&
-                accepted.captured_scope == query.expected_scope,
-            "original Apply candidate conflicts with its durable parent");
-    Require(static_cast<bool>(config_.selected_claim_recovery_receipt),
-            "original Apply candidate has no actual parent claim source");
-    const core::CellAdmissionRecoveryReceiptQueryDTO claim_query{
-        parent.parent_claim.intent, parent.parent_claim, std::nullopt};
-    const auto held = config_.selected_claim_recovery_receipt(claim_query);
-    Require(held.ok() &&
-                core::ValidateCellAdmissionRecoveryReceipt(held.value()).ok() &&
-                held.value().status ==
-                    core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
-                held.value().matched_claim ==
-                    std::optional(parent.parent_claim),
-            "original Apply candidate lost its exact current parent claim");
-    const auto active = ReadActivePublication();
-    Require(
-        active.receipt.publication_generation == predecessor_generation &&
-            active.receipt.durable_public_pointer_content_digest ==
-                predecessor_pointer_digest &&
-            active.receipt.request.candidate_retained_bundle_id ==
-                intent.expected_retained_bundle_id &&
-            active.receipt.request.candidate_graph_revision ==
-                intent.expected_graph_revision,
-        "original Apply candidate no longer has its exact predecessor head");
-    std::vector<core::ProviderConfigurationFenceLineageDTO> actual_lineages;
-    for (const auto &actual : actual_candidate_configurations) {
-      Require(actual.locally_valid() && actual.retained_bundle_id == candidate.retained_bundle_id &&
-                  actual.graph_revision == candidate.graph_revision,
-              "original Apply candidate observation is foreign or invalid");
-      actual_lineages.push_back({actual.domain.control_domain_id,
-          actual.provider_occurrence.provider_runtime_epoch,
-          actual.component_lifecycle_generation});
-    }
-    ValidateInstalledCandidateConfigurations(query.expected_scope, *bundle, actual_lineages);
-    admission_gate_.RunWithExactHeldFence(query.configuration_fence_id,
-                                          query.expected_scope, [&] {
-                                            admission_lock.unlock();
-                                            lock.unlock();
-                                            effect();
-                                          });
+    RunWithExactHeldInstalledCandidate(query, predecessor_generation,
+        predecessor_pointer_digest, parent.parent_claim, candidate,
+        actual_candidate_configurations, effect);
   }
 
   void RunWithExactHeldSuccessor(
@@ -3167,6 +3171,19 @@ void ManagedKernelApplyFenceOwner::RunWithExactHeldPredecessor(
   impl_->RunWithExactHeldPredecessor(
       query, expected_predecessor_publication_generation,
       expected_predecessor_public_pointer_digest, effect);
+}
+
+void ManagedKernelApplyFenceOwner::RunWithExactHeldInstalledCandidate(
+    const core::ConfigurationFenceStatusQueryDTO &query,
+    core::ActiveBundlePublicationGeneration predecessor_generation,
+    const core::ContentDigest &predecessor_pointer_digest,
+    const core::CellAdmissionClaimDTO &parent,
+    const core::ProjectionRevisionDTO &candidate,
+    const std::vector<core::RuntimeProviderDomainConfigurationReadbackDTO>
+        &actual_candidate_configurations,
+    const std::function<void()> &effect) const {
+  impl_->RunWithExactHeldInstalledCandidate(query, predecessor_generation,
+      predecessor_pointer_digest, parent, candidate, actual_candidate_configurations, effect);
 }
 
 void ManagedKernelApplyFenceOwner::RunWithExactHeldOriginalApplyCandidate(

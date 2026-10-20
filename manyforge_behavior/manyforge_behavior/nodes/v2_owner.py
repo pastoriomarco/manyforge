@@ -1198,6 +1198,7 @@ class MotionTaskAdapter(OwnerTaskAdapter):
         self._outcome: str | None = None
         self._outcome_written = False
         self._preempted = False
+        self._takeover_noted = False
 
     @property
     def preempted(self) -> bool:
@@ -1214,6 +1215,7 @@ class MotionTaskAdapter(OwnerTaskAdapter):
         self._outcome = None
         self._outcome_written = False
         self._preempted = False
+        self._takeover_noted = False
         super()._begin_attempt(restart_series=restart_series)
 
     def restart_retry_series(self) -> None:
@@ -1253,7 +1255,41 @@ class MotionTaskAdapter(OwnerTaskAdapter):
         if self._phase is not _TaskPhase.BACKOFF:
             super().observe_while_operator_stop_held()
 
+    def _note_takeover_fallback(self, task: OwnerTaskSnapshot) -> None:
+        """History only: this newcomer's takeover took a fallback path (not a
+        moving replacement). Once per attempt; never changes the outcome."""
+
+        takeover = task.metadata.get("motion_takeover")
+        if (
+            self._takeover_noted
+            or not isinstance(takeover, Mapping)
+            or takeover.get("path") == "moving_replacement"
+        ):
+            return
+        self._takeover_noted = True
+        if self._audit_sink is None:
+            return
+        cause = takeover.get("cause")
+        cause = cause if isinstance(cause, Mapping) else {}
+        details = cause.get("details")
+        stage = details.get("failure_stage") if isinstance(details, Mapping) else None
+        self._audit_sink(
+            {
+                "kind": "program_node_takeover_fallback",
+                "node_instance_id": self._node_instance_id,
+                "incumbent_operation_id": takeover.get("incumbent_operation_id"),
+                "path": takeover.get("path"),
+                "code": cause.get("code"),
+                "message": cause.get("message"),
+                # Where the time ran out, when the Kernel names it.
+                "failure_stage": stage if isinstance(stage, str) and stage else None,
+                "preparation_ms": takeover.get("elapsed_since_acceptance_ns", 0) / 1e6,
+                "budget_ms": takeover.get("preparation_budget_ns", 0) / 1e6,
+            }
+        )
+
     def _settle(self, task: OwnerTaskSnapshot) -> py_trees.common.Status:
+        self._note_takeover_fallback(task)
         preemption = task.metadata.get("preemption")
         if isinstance(preemption, Mapping) and self._phase is _TaskPhase.OBSERVE:
             return self._end_preempted(task, preemption)
@@ -1555,6 +1591,7 @@ class InterruptMotionTaskAdapter(MotionTaskAdapter):
         )
 
     def _settle(self, task: OwnerTaskSnapshot) -> py_trees.common.Status:
+        self._note_takeover_fallback(task)
         if (
             self._phase is not _TaskPhase.OBSERVE
             or self._interrupt is not None

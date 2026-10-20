@@ -3844,9 +3844,24 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
   };
   auto planned = plan_trajectory_with_evidence(request, projection_inventory,
                                                planning_attempt_index, &start_state, replacement);
-  if ((clock_.now() - planning_start_ns) >= planning_timeout_ns) {
-    return reject(ErrorCode::kPlanningTimeout, "Motion preview planning timed out",
-                  "motion_preview_planning_timeout");
+  const auto planning_elapsed_ns = clock_.now() - planning_start_ns;
+  if (planning_elapsed_ns >= planning_timeout_ns) {
+    ErrorDTO error{kErrorPlanningTimeout, "Motion preview planning timed out", {}};
+    if (!planned.ok()) {
+      const auto &underlying = planned.error();
+      error.details = underlying.details;
+      error.details.try_emplace("underlying_error_code", underlying.code);
+      error.details.try_emplace("underlying_error_message", underlying.message);
+      if (const auto reason = underlying.details.find("reason");
+          reason != underlying.details.end()) {
+        error.details.try_emplace("underlying_error_reason", reason->second);
+      }
+    }
+    error.details["reason"] = "motion_preview_planning_timeout";
+    error.details["planning_elapsed_ns"] =
+        std::to_string(std::max<std::int64_t>(0, planning_elapsed_ns));
+    error.details["planning_budget_ns"] = std::to_string(planning_timeout_ns);
+    return Result<ValidatedMotionPlan>::Err(std::move(error));
   }
   if (stop_token.stop_requested()) {
     return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during planning",
@@ -5645,6 +5660,10 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                                           "Execution identity space is exhausted",
                                           {{"reason", "execution_id_exhausted"}}});
   }
+  // The previous prepared membership has retired. Its addressed Stop receipt
+  // remains in the owner's history, but cannot own this new execution.
+  addressed_motion_stop_recovery_evidence_.reset();
+  addressed_participant_stop_settlement_.reset();
   addressed_stop_fence_execution_id_.store(0U, std::memory_order_release);
   if (!cold_reuse) next_execution_id_.store(exec_id + 1U, std::memory_order_relaxed);
   auto prev_state = sm_.status().state;
@@ -6805,13 +6824,15 @@ void ExecutionKernel::try_refresh_recovery_assessment(const char* trigger) {
   // ONLY callable from contexts that provably never own lifecycle_mutex_
   // (collision-tick ingest tail, stop-worker lambdas): std::mutex try_lock
   // by the owning thread is UB.
+  // Deferred callbacks may re-enter lifecycle methods. Destroy the lifecycle
+  // lock before the event scope dispatches them, as in the other owner paths.
+  EventDeferralScope event_scope(*this);
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_, std::try_to_lock);
   if (!lifecycle_lock.owns_lock()) {
     recovery_assessment_dirty_.store(true, std::memory_order_release);
     schedule_recovery_assessment_refresh(trigger);
     return;
   }
-  EventDeferralScope event_scope(*this);
   (void)refresh_recovery_assessment_locked(trigger);
 }
 
@@ -6826,8 +6847,8 @@ void ExecutionKernel::schedule_recovery_assessment_refresh(const char* trigger) 
         clock_.now(),
         [this, trigger]() {
           {
-            std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
             EventDeferralScope event_scope(*this);
+            std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
             (void)refresh_recovery_assessment_locked(trigger);
           }
           {
@@ -6898,8 +6919,8 @@ void ExecutionKernel::schedule_recovery_freshness_deadline_locked(
   recovery_freshness_deadline_handle_ = scheduler_.schedule(
       deadline_ns,
       [this]() {
-        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
         EventDeferralScope event_scope(*this);
+        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
         (void)refresh_recovery_assessment_locked("observed_state_freshness_deadline");
       },
       SchedulerPriority::Monitoring);
@@ -6922,9 +6943,9 @@ void ExecutionKernel::schedule_recovery_observation_poll_locked(
   recovery_observation_poll_handle_ = scheduler_.schedule(
       clock_.now() + config_.recovery_observation_poll_period_ns,
       [this]() {
+        EventDeferralScope event_scope(*this);
         std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
         recovery_observation_poll_handle_ = 0;
-        EventDeferralScope event_scope(*this);
         (void)refresh_recovery_assessment_locked("observed_state_publication_poll");
       },
       SchedulerPriority::Monitoring);

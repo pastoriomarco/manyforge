@@ -342,8 +342,10 @@ Result<void> ResourceAddressedExecutionKernel::commit_motion_takeover_owner_lock
                                  ParticipantEffectKnowledge::kEffectSettled, std::nullopt};
     old_state.state = OperationStateKind::kStopped;
     old_state.updated_at_ns = clock_.now();
-    stamp_operation_capture_locked(incumbent, old_state);
   }
+  // Settled handoffs also emit a new journal record, even though the source
+  // state is already terminal. Its new record contents need their own capture.
+  stamp_operation_capture_locked(incumbent, old_state);
   auto next_state = candidate.state;
   auto& next_public = next_state.participants.front();
   if (mode == ResourceSlotOwnerTransferMode::kSettled &&
@@ -378,6 +380,13 @@ Result<void> ResourceAddressedExecutionKernel::commit_motion_takeover_owner_lock
   next_public.terminal_fact.reset();
   next_state.state = next_public.state;
   next_state.updated_at_ns = clock_.now();
+  if (mode == ResourceSlotOwnerTransferMode::kMoving) {
+    next_state.motion_takeover = MotionTakeoverDecisionDTO{
+        incumbent.state.operation_id, MotionTakeoverPathDTO::kMovingReplacement, std::nullopt,
+        next_state.updated_at_ns,
+        std::max<std::int64_t>(0, next_state.updated_at_ns - candidate.accepted.accepted_at_ns),
+        next_row->takeover_preparation_budget_ns.value_or(0), std::nullopt};
+  }
   stamp_operation_capture_locked(candidate, next_state);
   captures = {old_state, next_state};
   const auto snapshot = resource_slots_->coherent_snapshot();

@@ -343,6 +343,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_EQ(adapter.lane_facts.joint_names,
             (std::vector<std::string>{"source_joint_1"}));
   EXPECT_TRUE(adapter.lane_facts.supports_scale);
+  EXPECT_FALSE(adapter.lane_facts.supports_scheduled_replacement);
   EXPECT_TRUE(adapter.lane_facts.has_measured_velocity);
   EXPECT_EQ(adapter.lane_facts.goal_tolerance_policy,
             core::ExecutionGoalTolerancePolicy::kErased);
@@ -1917,6 +1918,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_EQ(adapter.lane_facts.joint_names,
             (std::vector<std::string>{"source_joint_1"}));
   EXPECT_TRUE(adapter.lane_facts.supports_scale);
+  EXPECT_TRUE(adapter.lane_facts.supports_scheduled_replacement);
   EXPECT_TRUE(adapter.lane_facts.has_measured_velocity);
   EXPECT_EQ(adapter.lane_facts.cancel_semantics,
             core::ExecutionCancelSemantics::kDecelerate);
@@ -1990,6 +1992,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
                      100.0);
     EXPECT_DOUBLE_EQ(config.arm.adapter.lane_facts.state_rate_hz, 100.0);
     EXPECT_DOUBLE_EQ(config.arm.adapter.lane_facts.feedback_rate_hz, 20.0);
+    EXPECT_TRUE(config.arm.adapter.lane_facts.supports_scheduled_replacement);
     ASSERT_TRUE(config.participant.stop.replacement_start_allowance_s.has_value());
     EXPECT_DOUBLE_EQ(*config.participant.stop.replacement_start_allowance_s, 0.020);
     EXPECT_DOUBLE_EQ(config.participant.late_cycle_margin_s, 2.0 / 100.0);

@@ -7,6 +7,7 @@ import type { ComposerHeadlessState } from '../types/headless';
 import { api } from '../api/client';
 import { awaitActivationCompletion, browserRequestIdentity, cclcRequestOwnerEpoch, lifecycleRequestFromSnapshot, requestContext } from '../hooks/useCCLC';
 import type { JsonValue, ManagerActiveProjection, ProjectionRevision } from '../types/api';
+import type { ComponentProcessStopResult } from '../types/cclc';
 import type { ManagerApplyIdentity } from './managerApply';
 
 interface CloseInputs {
@@ -27,6 +28,11 @@ export interface ClosePreparationInputs {
   reset: (options: { correlationId: string; expected: ProgramResetExpectation }) => Promise<ProgramResetOutcome>;
 }
 const identity = () => browserRequestIdentity('composer-close');
+/** After the backend's 750 ms response wait elapsed, only these unknowns mean the exact
+ * reply of the SAME Stop may still arrive; every other unknown is terminal. */
+const awaitingExactReply = (result: ComponentProcessStopResult) => result.state === 'unknown'
+  && (result.error?.code === 'component_process_stop_response_unavailable'
+    || result.error?.code === 'component_process_stop_pending');
 
 /** Synchronization after accepted Reset is a wait; it grants no command freshness. */
 export function resetCloseSnapshot(current: Pick<HeadlessStateResult, 'snapshot' | 'transportStatus' | 'semanticStatus'>)
@@ -395,7 +401,8 @@ export async function closeScenario({ expected, signal, admissionGeneration,
           }, controllable_component_id: id, launch_identity: occurrence.launch_identity, leader_pid: occurrence.leader_pid };
           check();
           let result = await api.cclc.stopComponentProcess(request);
-          while (result.state === 'pending') {
+          while (result.state === 'pending' || awaitingExactReply(result)) {
+            if (result.state !== 'pending') progress(`Waiting for the exact Stop result of ${id}…`);
             await waitForObservation();
             signal.throwIfAborted();
             result = await api.cclc.componentProcessStopResult(request);

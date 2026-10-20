@@ -37,6 +37,7 @@ class FakeExecutionPort final : public IExecutionPort {
     ExecutionGoalKey active_key;
     ExecutionGoalKey next_key;
     TrajectoryDTO trajectory;
+    std::optional<ExecutionReplacementStartDTO> start{};
   };
   struct CancelCall {
     ExecutionGoalKey key;
@@ -70,6 +71,17 @@ class FakeExecutionPort final : public IExecutionPort {
     if (result.dispatch != ExecutionPortDispatch::kNotDispatched) {
       RegisterPendingLocked(next_key);
     }
+    return result;
+  }
+
+  ExecutionPortCommandResultDTO ReplaceScheduled(
+      const ExecutionGoalKey& active_key, const ExecutionGoalKey& next_key,
+      const TrajectoryDTO& trajectory, const ExecutionReplacementStartDTO& start) override {
+    std::lock_guard lock(mutex_);
+    commands_.emplace_back(ReplaceCall{active_key, next_key, trajectory, start});
+    if (RingFullLocked()) return NotReady();
+    const auto result = NextResultLocked();
+    if (result.dispatch != ExecutionPortDispatch::kNotDispatched) RegisterPendingLocked(next_key);
     return result;
   }
 

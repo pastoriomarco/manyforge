@@ -608,6 +608,24 @@ template <typename StrongId>
                                                {"error", ErrorValue(fact.error)}});
 }
 
+[[nodiscard]] std::optional<ErrorDTO> ErrorFromValue(const CanonicalValue& value,
+                                                     std::string_view context) {
+  if (value.is_null()) return std::nullopt;
+  const auto* code = value.find_object_member("code");
+  const auto* message = value.find_object_member("message");
+  const auto* details = value.find_object_member("details");
+  Require(value.is_object() && value.as_object().size() == 3U && code && message && details &&
+              code->is_string() && message->is_string() && details->is_object(),
+          "operation_journal_corrupt", std::string(context) + " error is invalid");
+  ErrorDTO result{code->as_string(), message->as_string(), {}};
+  for (const auto& [key, detail] : details->as_object()) {
+    Require(detail.is_string(), "operation_journal_corrupt",
+            std::string(context) + " error detail is invalid");
+    result.details.emplace(key, detail.as_string());
+  }
+  return result;
+}
+
 [[nodiscard]] ParticipantExecutionFact ParticipantFactFromValue(const CanonicalValue& value) {
   const auto* kind = value.find_object_member("kind");
   const auto* effect = value.find_object_member("effect");
@@ -629,22 +647,7 @@ template <typename StrongId>
     if (effect->as_string() == to_string(candidate)) parsed_effect = candidate;
   Require(parsed_kind && parsed_effect, "operation_journal_corrupt",
           "participant terminal fact enum is invalid");
-  std::optional<ErrorDTO> error;
-  if (!failure->is_null()) {
-    const auto* code = failure->find_object_member("code");
-    const auto* message = failure->find_object_member("message");
-    const auto* details = failure->find_object_member("details");
-    Require(failure->is_object() && failure->as_object().size() == 3U && code && message &&
-                details && code->is_string() && message->is_string() && details->is_object(),
-            "operation_journal_corrupt", "participant terminal fact error is invalid");
-    error = ErrorDTO{code->as_string(), message->as_string(), {}};
-    for (const auto& [key, detail] : details->as_object()) {
-      Require(detail.is_string(), "operation_journal_corrupt",
-              "participant terminal fact error detail is invalid");
-      error->details.emplace(key, detail.as_string());
-    }
-  }
-  return {*parsed_kind, *parsed_effect, std::move(error)};
+  return {*parsed_kind, *parsed_effect, ErrorFromValue(*failure, "participant terminal fact")};
 }
 
 [[nodiscard]] CanonicalValue PreemptionValue(const OperationPreemptionDTO& value) {
@@ -673,6 +676,82 @@ template <typename StrongId>
                                          : OperationPreemptionKind::kSupersededUnsent,
           {OperationId(operation->as_string()), ProgramNodeInstanceId(node->as_string()),
            attempt->as_string()}};
+}
+
+[[nodiscard]] CanonicalValue MotionTakeoverValue(const MotionTakeoverDecisionDTO& value) {
+  Require(value.locally_valid(), "operation_journal_record_invalid",
+          "motion takeover decision is invalid");
+  CanonicalValue certificate(nullptr);
+  if (value.stop_certificate) {
+    const auto& ref = *value.stop_certificate;
+    certificate = CanonicalValue(CanonicalValue::Object{
+        {"stop_certificate_id", CanonicalValue(ref.stop_certificate_id.value())},
+        {"stop_certificate_revision",
+         Number(ref.stop_certificate_revision.value(), "certificate revision")},
+        {"stop_id", CanonicalValue(ref.stop_id.value())},
+        {"stop_generation", Number(ref.stop_generation.value(), "Stop generation")}});
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"incumbent_operation_id", CanonicalValue(value.incumbent_operation_id.value())},
+      {"path", CanonicalValue(std::string(to_string(value.path)))},
+      {"cause", ErrorValue(value.cause)},
+      {"decided_at_ns", Timestamp(value.decided_at_ns, "takeover decision timestamp")},
+      {"elapsed_since_acceptance_ns",
+       Timestamp(value.elapsed_since_acceptance_ns, "takeover elapsed time")},
+      {"preparation_budget_ns",
+       Timestamp(value.preparation_budget_ns, "takeover preparation budget")},
+      {"stop_certificate", std::move(certificate)}});
+}
+
+[[nodiscard]] MotionTakeoverDecisionDTO MotionTakeoverFromValue(const CanonicalValue& value) {
+  const auto* incumbent = value.find_object_member("incumbent_operation_id");
+  const auto* path = value.find_object_member("path");
+  const auto* cause = value.find_object_member("cause");
+  const auto* decided = value.find_object_member("decided_at_ns");
+  const auto* elapsed = value.find_object_member("elapsed_since_acceptance_ns");
+  const auto* budget = value.find_object_member("preparation_budget_ns");
+  const auto* certificate = value.find_object_member("stop_certificate");
+  Require(value.is_object() && value.as_object().size() == 7U && incumbent &&
+              incumbent->is_string() && path && path->is_string() && cause && decided && elapsed &&
+              budget && certificate,
+          "operation_journal_corrupt", "motion takeover decision shape is invalid");
+  std::optional<MotionTakeoverPathDTO> parsed_path;
+  for (const auto candidate :
+       {MotionTakeoverPathDTO::kMovingReplacement, MotionTakeoverPathDTO::kSpringBackHold,
+        MotionTakeoverPathDTO::kOrdinaryContainment})
+    if (path->as_string() == to_string(candidate)) parsed_path = candidate;
+  Require(parsed_path.has_value(), "operation_journal_corrupt", "motion takeover path is invalid");
+  std::optional<StopCertificateRefDTO> ref;
+  if (!certificate->is_null()) {
+    const auto* id = certificate->find_object_member("stop_certificate_id");
+    const auto* revision = certificate->find_object_member("stop_certificate_revision");
+    const auto* stop = certificate->find_object_member("stop_id");
+    const auto* generation = certificate->find_object_member("stop_generation");
+    const auto valid_counter = [](const CanonicalValue* field) {
+      return field && field->is_number() && field->as_number() > 0 &&
+             field->as_number() <= static_cast<double>(kMaximumSafeInteger) &&
+             std::trunc(field->as_number()) == field->as_number();
+    };
+    Require(certificate->is_object() && certificate->as_object().size() == 4U && id &&
+                id->is_string() && stop && stop->is_string() && valid_counter(revision) &&
+                valid_counter(generation),
+            "operation_journal_corrupt", "motion takeover Stop certificate is invalid");
+    ref = StopCertificateRefDTO{
+        StopCertificateId(id->as_string()),
+        StopCertificateRevision(static_cast<std::uint64_t>(revision->as_number())),
+        StopId(stop->as_string()),
+        StopGeneration(static_cast<std::uint64_t>(generation->as_number()))};
+  }
+  auto result = MotionTakeoverDecisionDTO{OperationId(incumbent->as_string()),
+                                          *parsed_path,
+                                          ErrorFromValue(*cause, "motion takeover cause"),
+                                          content_identity::parse_nonnegative_int64(*decided),
+                                          content_identity::parse_nonnegative_int64(*elapsed),
+                                          content_identity::parse_nonnegative_int64(*budget),
+                                          std::move(ref)};
+  Require(result.locally_valid(), "operation_journal_corrupt",
+          "motion takeover decision is invalid");
+  return result;
 }
 
 [[nodiscard]] CanonicalValue RequestContextValue(const PublicRequestContextDTO& context) {
@@ -1293,6 +1372,8 @@ void AddExecutionScope(CanonicalValue::Object& row,
       {"updated_at_ns", Timestamp(state.updated_at_ns, "operation update timestamp")},
   };
   if (state.preemption) result.emplace_back("preemption", PreemptionValue(*state.preemption));
+  if (state.motion_takeover)
+    result.emplace_back("motion_takeover", MotionTakeoverValue(*state.motion_takeover));
   // Preserve legacy payload bytes on read/migration. Fresh Kernel captures
   // carry this private ordering fact; it is not part of public control DTOs.
   if (state.journal_capture_order != 0U) {
@@ -1758,10 +1839,14 @@ void AddExecutionScope(CanonicalValue::Object& row,
   for (const auto& operation : affected_state.operations) {
     operations.emplace_back(OperationStateValue(operation));
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object result{
       {"operations", CanonicalValue(std::move(operations))},
       {"resources", StringArray(affected_state.resources)},
-  });
+  };
+  if (affected_state.motion_takeover_candidate_snapshot)
+    result.emplace_back("motion_takeover_candidate_snapshot",
+                        OperationStateValue(*affected_state.motion_takeover_candidate_snapshot));
+  return CanonicalValue(std::move(result));
 }
 
 [[nodiscard]] CanonicalValue EmergencyStopAcceptanceProjectionValue(
@@ -1901,6 +1986,10 @@ void AddExecutionScope(CanonicalValue::Object& row,
         !valid_program_node_execution_scope({fact.by.node_instance_id, fact.by.node_attempt_id}))
       return false;
   }
+  if (state.motion_takeover &&
+      (!state.motion_takeover->locally_valid() ||
+       state.motion_takeover->incumbent_operation_id == state.operation_id))
+    return false;
   for (const auto& participant : state.participants) {
     if (participant.terminal_fact &&
         participant.terminal_fact->kind == ParticipantExecutionFactKind::kPreemptedByReplacement &&
@@ -2081,6 +2170,22 @@ void RequireEmergencyStopProjection(const RequestOwnerEpoch& owner_epoch,
   Require(affected_state.operations.size() == accepted.affected_operation_revisions.size(),
           "operation_journal_record_invalid",
           "affected-state snapshot does not cover every accepted operation exactly once");
+  if (affected_state.motion_takeover_candidate_snapshot) {
+    const auto& candidate = *affected_state.motion_takeover_candidate_snapshot;
+    RequireState(candidate);
+    Require(candidate.motion_takeover &&
+                std::none_of(affected_state.operations.begin(), affected_state.operations.end(),
+                             [&](const auto& operation) {
+                               return operation.operation_id == candidate.operation_id;
+                             }) &&
+                std::any_of(affected_state.operations.begin(), affected_state.operations.end(),
+                            [&](const auto& operation) {
+                              return operation.operation_id ==
+                                     candidate.motion_takeover->incumbent_operation_id;
+                            }),
+            "operation_journal_record_invalid",
+            "forensic takeover candidate requires a distinct affected incumbent");
+  }
 
   for (std::size_t index = 0U; index < affected_state.operations.size(); ++index) {
     const auto& state = affected_state.operations[index];
@@ -2265,6 +2370,19 @@ template <typename T>
   Require(field.Text(0) == "object" && !field.IsNull(1), "operation_journal_corrupt",
           "preemption capture is invalid");
   return PreemptionFromValue(content_identity::parse_canonical_json(field.Text(1)));
+}
+
+[[nodiscard]] std::optional<MotionTakeoverDecisionDTO> CapturedMotionTakeover(
+    sqlite3* database, const std::string& captured_state) {
+  Statement field(database,
+                  "SELECT json_type(?,'$.motion_takeover'),json_extract(?,'$.motion_takeover')");
+  field.Bind(1, captured_state);
+  field.Bind(2, captured_state);
+  Require(field.Step(), "operation_journal_corrupt", "motion takeover capture is missing");
+  if (field.IsNull(0)) return std::nullopt;
+  Require(field.Text(0) == "object" && !field.IsNull(1), "operation_journal_corrupt",
+          "motion takeover capture is invalid");
+  return MotionTakeoverFromValue(content_identity::parse_canonical_json(field.Text(1)));
 }
 
 std::string ValidateSnapshotCapture(sqlite3* database, const OperationId& operation_id,
@@ -2521,6 +2639,7 @@ std::string ValidateSnapshotCapture(sqlite3* database, const OperationId& operat
   }
   const auto capture = ValidateSnapshotCapture(database, operation_id, state.journal_capture_order);
   state.preemption = CapturedPreemption(database, capture);
+  state.motion_takeover = CapturedMotionTakeover(database, capture);
   Statement facts(
       database,
       "SELECT json_type(value,'$.terminal_fact'),json_extract(value,'$.terminal_fact'),"

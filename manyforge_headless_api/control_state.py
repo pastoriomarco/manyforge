@@ -1299,6 +1299,30 @@ class HeadlessControlStateSource:
         cycle = self._cycle
         if cycle is None:
             raise ControlStateUnavailableError("program_control_state_synchronizing")
+        # Position-Reset availability is a host fact that the Runner samples
+        # only when its own cycle changes. A cold reduction follows the host
+        # changes, so refresh that one field here; the stream owns the rest.
+        # The field is taken only while the Program source is current, from a
+        # read of the same owner, cycle and control revision, and while the
+        # cached cycle stayed unchanged; it never restores source currency.
+        try:
+            fresh = await _drained_owner_read(self._service.program_cycle_status)
+        except (HeadlessApiError, OSError, ValueError):
+            fresh = None
+        if (
+            fresh is not None
+            and self._program_source_current
+            and self._cycle is cycle
+            and program_cycle_control_key(fresh) == program_cycle_control_key(cycle)
+            and fresh["reset_robot_position"] != cycle["reset_robot_position"]
+        ):
+            self._accept_cycle(
+                {**cycle, "reset_robot_position": fresh["reset_robot_position"]},
+                "cold",
+            )
+        cycle = self._cycle
+        if cycle is None:
+            raise ControlStateUnavailableError("program_control_state_synchronizing")
         stop = threading.Event()
         facts = await _drained_owner_read(
             self._service.component_overview_facts,

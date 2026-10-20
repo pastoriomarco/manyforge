@@ -1982,7 +1982,9 @@ def create_app(
         query: Annotated[HistorianDebugRequest, Query()]
     ) -> JSONResponse:
         return JSONResponse(
-            content=service.debug_export(query.history_query())["normalized_trace"],
+            content=service.debug_export(
+                query.history_query(), include_volatile_motion_trace=False
+            )["normalized_trace"],
             headers={
                 "Content-Disposition": 'attachment; filename="manyforge-trace.json"'
             },

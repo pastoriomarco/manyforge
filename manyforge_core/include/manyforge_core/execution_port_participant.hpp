@@ -84,6 +84,9 @@ struct ExecutionPortParticipantConfig final {
   /// Freshness budget of the published progress cursor: positive on measured
   /// lanes; 0 (non-expiring) is admitted only on commanded lanes.
   Duration progress_freshness_budget_ns{0};
+  // Observation only: failures must never change dispatch or authorization.
+  std::function<void(const ExecutionGoalKey&, const PreparedOperationParticipantDTO&,
+                     ExecutionBindingEpoch)> observe_goal_context{};
 };
 
 /// Host-owned state authority: the addressed observed-state publication the

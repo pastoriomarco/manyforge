@@ -274,6 +274,19 @@ public:
   }
 
   core::ExecutionPortCommandResultDTO
+  ReplaceScheduled(const core::ExecutionGoalKey &active_key,
+                   const core::ExecutionGoalKey &next_key,
+                   const core::TrajectoryDTO &trajectory,
+                   const core::ExecutionReplacementStartDTO &start) override {
+    if (const auto refused = Refusal())
+      return *refused;
+    auto renamed = Rename(trajectory);
+    if (!renamed)
+      return InvalidJoints();
+    return adapter_->ReplaceScheduled(active_key, next_key, *renamed, start);
+  }
+
+  core::ExecutionPortCommandResultDTO
   Cancel(const core::ExecutionGoalKey &key) override {
     return adapter_->Cancel(key);
   }
@@ -1709,6 +1722,8 @@ RetainedRos2ControlRuntimeHandle::mock_reset_observation_wake() const noexcept {
 
 bool RetainedRos2ControlRuntimeHandle::mock_reset_successor_ready() const {
   std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> adapter;
+  std::shared_ptr<ros2_control_execution::SelectedRosEndpointFacts> activity;
+  std::optional<core::ControlDomainId> domain;
   {
     std::lock_guard lock(mutex_);
     if (!arm_ || !arm_->reset_position_pending || !arm_->bound ||
@@ -1718,10 +1733,21 @@ bool RetainedRos2ControlRuntimeHandle::mock_reset_successor_ready() const {
         arm_->reset_writer_active || arm_->reset_writer_possibly_active)
       return false;
     adapter = arm_->adapter;
+    activity = arm_->activity_endpoints;
+    domain = motion_domain_id_;
   }
+  if (!activity)
+    return false;
+  // The existing switchback wait owns endpoint discovery within its step
+  // deadline. Reset does not synthesize a separate lifecycle transport loss.
+  activity->Refresh();
+  adapter->RefreshEndpointFacts();
+  if (!ReadLifecycleHealth(*domain, clock_->now()).ok())
+    return false;
   const bool discovered = adapter->ActionServerIsReady();
   std::lock_guard lock(mutex_);
-  return discovered && arm_ && arm_->adapter == adapter && arm_->bound &&
+  return discovered && arm_ && arm_->adapter == adapter &&
+         arm_->activity_endpoints == activity && arm_->bound &&
          arm_->activity.controller_manager_present &&
          arm_->activity.hardware_active && arm_->activity.controller_active &&
          !arm_->reset_writer_active && !arm_->reset_writer_possibly_active;
@@ -2189,10 +2215,6 @@ struct RetainedRos2ControlRuntimeHandle::LifecycleHealthInputs final {
       gripper_snapshot;
   std::shared_ptr<const content_identity::CanonicalValue> diagnostic_snapshot;
   std::string diagnostic_incident_id;
-  bool reset_pending{};
-  std::optional<core::ErrorDTO> reset_endpoint_error;
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr
-      reset_publisher;
 };
 
 struct RetainedRos2ControlRuntimeHandle::LifecycleClassification final {
@@ -2230,8 +2252,6 @@ RetainedRos2ControlRuntimeHandle::CaptureLifecycleHealthInputs(
     // Operation availability is closed while the physical binding continues
     // to receive feedback; only ArmPort Submit/Replace are gated.
     inputs.bound = arm_->bound && !arm_->reset_position_pending;
-    inputs.reset_pending = arm_->reset_position_pending;
-    inputs.reset_publisher = arm_->reset_publisher;
     inputs.activation_client_discovered = arm_->activation_client_discovered;
     inputs.adapter = arm_->adapter;
   }
@@ -2255,12 +2275,6 @@ void RetainedRos2ControlRuntimeHandle::ReadLifecycleMonitorFacts(
   if (inputs.process_fault && (inputs.is_motion || inputs.is_gripper))
     return;
   if (inputs.is_motion) {
-    if (inputs.reset_pending &&
-        (!inputs.reset_publisher ||
-         inputs.reset_publisher->get_subscription_count() != 1U))
-      inputs.reset_endpoint_error = switch_error(
-          "mock_reset_writer_endpoint_unavailable",
-          "Mock reset writer does not have exactly one command subscriber");
     inputs.guard_fault = inputs.fault_hook ? inputs.fault_hook() : std::nullopt;
     const auto &activity = inputs.activity;
     if (!inputs.activation_client_discovered && inputs.bound &&
@@ -2426,20 +2440,6 @@ RetainedRos2ControlRuntimeHandle::ComputeLifecycleHealth(
     }
   }
 
-  // During a requested Reset, controller inactivity is expected; loss of the
-  // actual SDK endpoints is not. Publish that source-health distinction using
-  // the ordinary transport fact, without a Reset phase/token side channel.
-  if (is_motion && inputs.reset_pending && inputs.reset_endpoint_error) {
-    transport_ready = false;
-    ready = false;
-    if (cause == Cause::kNone || cause == Cause::kAvailability) {
-      state = State::kDegraded;
-      cause = Cause::kAvailability;
-      diagnostic = inputs.reset_endpoint_error;
-    }
-    signature += ":reset-endpoint:" + inputs.reset_endpoint_error->code;
-  }
-
   return {state,
           ready,
           loaded,
@@ -2518,9 +2518,6 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
         "ros2_control_lifecycle_domain_unknown",
         "requested lifecycle domain is not bound to this ROS runtime");
   ReadLifecycleMonitorFacts(inputs);
-  if (inputs.reset_pending)
-    if (auto endpoint_error = ReadEndpointDiagnostic())
-      inputs.reset_endpoint_error = std::move(endpoint_error);
   auto classification = ComputeLifecycleHealth(inputs);
   return CommitLifecycleObservation(domain, std::move(inputs),
                                     std::move(classification));

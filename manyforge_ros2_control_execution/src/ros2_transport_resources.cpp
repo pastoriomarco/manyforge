@@ -22,11 +22,18 @@
 namespace manyforge::ros2_control_execution {
 Ros2TransportResources::Ros2TransportResources(
     std::string node_name, std::string node_namespace,
-    std::size_t executor_thread_count) {
-  context_ = std::make_shared<rclcpp::Context>();
-  int argc = 0;
-  char **argv = nullptr;
-  context_->init(argc, argv);
+    std::size_t executor_thread_count, ContextProvider context_provider)
+    : owns_private_context_(!context_provider) {
+  if (context_provider) {
+    context_ = context_provider();
+    if (!context_ || !context_->is_valid())
+      throw std::invalid_argument("ROS transport requires a valid supplied context");
+  } else {
+    context_ = std::make_shared<rclcpp::Context>();
+    int argc = 0;
+    char **argv = nullptr;
+    context_->init(argc, argv);
+  }
   rclcpp::NodeOptions options;
   options.context(context_);
   node_ = std::make_shared<rclcpp::Node>(std::move(node_name),
@@ -42,9 +49,10 @@ Ros2TransportResources::Ros2TransportResources(
     std::string node_name, std::string node_namespace,
     std::size_t executor_thread_count,
     std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
-    std::string arm_group_id, core::IClock &clock)
+    std::string arm_group_id, core::IClock &clock,
+    ContextProvider context_provider)
     : Ros2TransportResources(std::move(node_name), std::move(node_namespace),
-                             executor_thread_count) {
+                             executor_thread_count, std::move(context_provider)) {
   scene_projection_worker_ = std::make_unique<detail::SceneProjectionWorker>(
       std::move(execution_state_sink), std::move(arm_group_id), clock);
 }
@@ -91,7 +99,11 @@ void Ros2TransportResources::quiesce() noexcept {
   if (spin_thread_.joinable())
     spin_thread_.join();
   executor_->remove_node(node_);
-  context_->shutdown("manyforge ROS transport shutdown");
+  // Standalone transports preserve their private-context shutdown. A supplied
+  // host context also serves siblings and retained node/readers; its actual
+  // last owner determines final shutdown after local callback drains.
+  if (owns_private_context_)
+    context_->shutdown("manyforge ROS transport shutdown");
   if (scene_projection_worker_ &&
       !scene_projection_worker_->stop_and_join_for(std::chrono::seconds(1))) {
     RCLCPP_FATAL(node_->get_logger(),

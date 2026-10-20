@@ -40,6 +40,7 @@ export {
   parseKnownProgramRunOutcome,
   parseProgramRunStatus,
   isAutomaticRetryAuditEvent,
+  isTakeoverFallbackAuditEvent,
   parseProgramRuntimeControlsSnapshot,
   parseProgramRuntimeControlProjection,
   parsePersistentKeyValues,

@@ -5,10 +5,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <functional>
 #include <future>
 #include <gtest/gtest.h>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -121,7 +123,7 @@ public:
   std::atomic<bool> cancel_blocked{false};
   std::atomic<bool> accepted_callback_context_valid{false};
 
-  explicit Rig(bool two_bindings = false)
+  explicit Rig(bool two_bindings = false, bool scheduled_replacement = false)
       : resources("jtc_adapter_test_" + std::to_string(++sequence_), "", 2,
                   sink, "arm", clock) {
     route_ = "/adapter_test_" + std::to_string(sequence_.load());
@@ -170,11 +172,11 @@ public:
                   ++scale_count;
                 });
     clock.set(42);
-    adapter = std::make_unique<Ros2ControlExecutionBackend>(resources, clock,
-                                                            config(1));
+    adapter = std::make_unique<Ros2ControlExecutionBackend>(
+        resources, clock, config(1, scheduled_replacement));
     if (two_bindings)
       successor = std::make_unique<Ros2ControlExecutionBackend>(
-          resources, clock, config(2));
+          resources, clock, config(2, scheduled_replacement));
     adapter->ObserveReadiness({true, true, true, ExecutionBindingEpoch{1}});
     resources.start();
   }
@@ -194,7 +196,8 @@ public:
     response_cv_.notify_all();
   }
   void remove_action_server() { server_.reset(); }
-  JtcExecutionAdapterConfig config(std::uint64_t epoch) const {
+  JtcExecutionAdapterConfig config(std::uint64_t epoch,
+                                   bool scheduled_replacement = false) const {
     JtcExecutionAdapterConfig config;
     config.action_name = route_ + "/fjt";
     config.state_topic = route_ + "/state";
@@ -202,6 +205,7 @@ public:
     config.binding_epoch = ExecutionBindingEpoch(epoch);
     config.lane_facts.joint_names = {"a", "b"};
     config.lane_facts.supports_scale = true;
+    config.lane_facts.supports_scheduled_replacement = scheduled_replacement;
     config.lane_facts.has_measured_velocity = true;
     config.lane_facts.controller_update_rate_hz = 100;
     return config;
@@ -752,6 +756,85 @@ TEST(Ros2TransportResources, TransportOnlyCanQuiesceBeforeStart) {
   resources.quiesce();
 }
 
+TEST(Ros2TransportResources, SuppliedContextSurvivesLocalQuiescenceAndRetainedNode) {
+  std::weak_ptr<rclcpp::Context> lifetime;
+  std::shared_ptr<rclcpp::Node> retained_node;
+  {
+    auto context = std::make_shared<rclcpp::Context>();
+    int argc = 0;
+    context->init(argc, nullptr);
+    lifetime = context;
+    unsigned provider_calls = 0;
+    Ros2TransportResources::ContextProvider provider = [&] {
+      ++provider_calls;
+      return context;
+    };
+    auto first = std::make_unique<Ros2TransportResources>(
+        "shared_context_first", "", 2, provider);
+    Ros2TransportResources second("shared_context_second", "", 2, provider);
+    EXPECT_EQ(provider_calls, 2U);
+    EXPECT_NE(first->node(), second.node());
+    EXPECT_EQ(first->node()->get_node_base_interface()->get_context(), context);
+    EXPECT_EQ(second.node()->get_node_base_interface()->get_context(), context);
+    auto publisher = first->node()->create_publisher<sensor_msgs::msg::JointState>(
+        "/shared_context_lifetime_samples", 1);
+    auto received = std::make_shared<std::atomic<unsigned>>(0U);
+    const auto subscription = second.node()->create_subscription<sensor_msgs::msg::JointState>(
+        "/shared_context_lifetime_samples", 1,
+        [received](sensor_msgs::msg::JointState::ConstSharedPtr) { ++*received; });
+    first->start();
+    second.start();
+    ASSERT_TRUE(wait_until([&] { return publisher->get_subscription_count() == 1U; }));
+    publisher->publish(sensor_msgs::msg::JointState{});
+    ASSERT_TRUE(wait_until([&] { return received->load() == 1U; }));
+    first->quiesce();
+    first.reset();
+    EXPECT_TRUE(context->is_valid());
+    EXPECT_TRUE(JtcExecutionPortTestPeer::executor_is_spinning(second));
+    publisher->publish(sensor_msgs::msg::JointState{});
+    ASSERT_TRUE(wait_until([&] { return received->load() == 2U; }));
+    retained_node = second.node();
+    provider = {};
+    context.reset();
+    second.quiesce();
+    EXPECT_EQ(provider_calls, 2U);
+    EXPECT_TRUE(retained_node->get_node_base_interface()->get_context()->is_valid());
+  }
+  ASSERT_FALSE(lifetime.expired());
+  EXPECT_TRUE(lifetime.lock()->is_valid());
+  retained_node.reset();
+  EXPECT_TRUE(lifetime.expired());
+}
+
+TEST(Ros2TransportResources, SuppliedContextMustAlreadyBeValid) {
+  auto context = std::make_shared<rclcpp::Context>();
+  EXPECT_THROW((Ros2TransportResources("uninitialized_context", "", 2,
+                                      [context] { return context; })),
+               std::invalid_argument);
+  EXPECT_THROW((Ros2TransportResources("null_context", "", 2,
+                                      [] { return std::shared_ptr<rclcpp::Context>{}; })),
+               std::invalid_argument);
+  int argc = 0;
+  context->init(argc, nullptr);
+  context->shutdown("test invalid supplied context");
+  EXPECT_THROW((Ros2TransportResources("shutdown_context", "", 2,
+                                      [context] { return context; })),
+               std::invalid_argument);
+}
+
+TEST(Ros2TransportResources, DefaultPrivateContextsRemainIndependent) {
+  Ros2TransportResources first("private_context_first", "", 2);
+  Ros2TransportResources second("private_context_second", "", 2);
+  const auto first_context = first.node()->get_node_base_interface()->get_context();
+  const auto second_context = second.node()->get_node_base_interface()->get_context();
+  EXPECT_NE(first_context, second_context);
+  first.quiesce();
+  EXPECT_FALSE(first_context->is_valid());
+  EXPECT_TRUE(second_context->is_valid());
+  second.quiesce();
+  EXPECT_FALSE(second_context->is_valid());
+}
+
 TEST(JtcExecutionPort, ShutdownAfterContextStoppedNeedsNoNotificationOrCommands) {
   Rig rig;
   const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
@@ -788,6 +871,94 @@ TEST(JtcExecutionPort, CancelAcknowledgementDoesNotEndGoalOrManufactureRest) {
   EXPECT_FALSE(rig.adapter->ReadSample());
 }
 
+TEST(JtcExecutionPort, ScheduledReplacementSerializesStampAndUnchangedPastPva) {
+  Rig rig(false, true);
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  auto past = trajectory();
+  past.waypoints = {{-0.125, {0.0, 0.0}, {0.2, 0.1}, {0.3, 0.4}},
+                    {-0.01, {0.02, 0.01}, {0.2, 0.1}, {0.3, 0.4}},
+                    {0.2, {0.04, 0.03}, {0.0, 0.0}, {0.0, 0.0}}};
+  const ExecutionReplacementStartDTO start{ExecutionBindingEpoch(1U),
+                                           1'234'567'890'123LL};
+  ASSERT_EQ(rig.adapter->ReplaceScheduled(key(1), key(2), past, start).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+  const auto wire = rig.handle(1)->get_goal()->trajectory;
+  EXPECT_EQ(wire.header.stamp.sec, 1234);
+  EXPECT_EQ(wire.header.stamp.nanosec, 567'890'123U);
+  EXPECT_EQ(wire.joint_names, (std::vector<std::string>{"a", "b"}));
+  ASSERT_EQ(wire.points.size(), past.waypoints.size());
+  for (std::size_t index = 0; index < wire.points.size(); ++index) {
+    const auto &actual = wire.points[index];
+    const auto &expected = past.waypoints[index];
+    const auto nanoseconds =
+        static_cast<std::int64_t>(actual.time_from_start.sec) * 1'000'000'000 +
+        actual.time_from_start.nanosec;
+    EXPECT_EQ(nanoseconds, static_cast<std::int64_t>(
+                               std::llround(expected.time_from_start_s * 1e9)));
+    EXPECT_EQ(actual.positions,
+              (std::vector<double>{expected.positions_rad[1],
+                                   expected.positions_rad[0]}));
+    EXPECT_EQ(actual.velocities,
+              (std::vector<double>{expected.velocities_rad_s[1],
+                                   expected.velocities_rad_s[0]}));
+    EXPECT_EQ(actual.accelerations,
+              (std::vector<double>{expected.accelerations_rad_s2[1],
+                                   expected.accelerations_rad_s2[0]}));
+  }
+  EXPECT_EQ(rig.adapter->ReplaceScheduled(key(1), key(3), past, start).refusal,
+            ExecutionPortRefusal::kStaleKey);
+}
+
+TEST(JtcExecutionPort,
+     ScheduledReplacementRefusesForeignEpochAndInvalidRosStampBeforeEffect) {
+  Rig rig(false, true);
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  const auto foreign = rig.adapter->ReplaceScheduled(
+      key(1), key(2), trajectory(), {ExecutionBindingEpoch(2U), 1});
+  EXPECT_EQ(foreign.dispatch, ExecutionPortDispatch::kNotDispatched);
+  EXPECT_EQ(foreign.refusal, ExecutionPortRefusal::kStaleKey);
+  for (const TimePoint stamp :
+       {TimePoint{0}, TimePoint{-1},
+        (static_cast<TimePoint>(std::numeric_limits<std::int32_t>::max()) + 1) *
+            1'000'000'000}) {
+    const auto result = rig.adapter->ReplaceScheduled(
+        key(1), key(2), trajectory(), {ExecutionBindingEpoch(1U), stamp});
+    EXPECT_EQ(result.dispatch, ExecutionPortDispatch::kNotDispatched);
+    EXPECT_EQ(result.refusal, ExecutionPortRefusal::kInvalidInput);
+  }
+  EXPECT_EQ(rig.goal_count(), 1U);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(2)));
+  // Refusals do not reserve the successor key or alter the current goal.
+  ASSERT_EQ(rig.adapter
+                ->ReplaceScheduled(key(1), key(2), trajectory(),
+                                   {ExecutionBindingEpoch(1U), 999'999'999})
+                .dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+}
+
+TEST(JtcExecutionPort,
+     UnqualifiedLaneRefusesSchedulingAndKeepsLegacyReplacement) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  const auto result = rig.adapter->ReplaceScheduled(
+      key(1), key(2), trajectory(), {ExecutionBindingEpoch(1U), 1});
+  EXPECT_EQ(result.dispatch, ExecutionPortDispatch::kNotDispatched);
+  EXPECT_EQ(result.refusal, ExecutionPortRefusal::kUnsupported);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(2)));
+  EXPECT_EQ(rig.goal_count(), 1U);
+  ASSERT_EQ(rig.adapter->Replace(key(1), key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+  const auto wire = rig.handle(1)->get_goal()->trajectory;
+  EXPECT_EQ(wire.header.stamp.sec, 0);
+  EXPECT_EQ(wire.header.stamp.nanosec, 0U);
+}
+
 TEST(JtcExecutionPort, ReplacementPreservesMultiplePastPointsAndPvaOnWire) {
   Rig rig;
   ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
@@ -800,6 +971,8 @@ TEST(JtcExecutionPort, ReplacementPreservesMultiplePastPointsAndPvaOnWire) {
             ExecutionPortDispatch::kDispatched);
   ASSERT_TRUE(rig.accepted(key(2)));
   const auto wire = rig.handle(1)->get_goal()->trajectory;
+  EXPECT_EQ(wire.header.stamp.sec, 0);
+  EXPECT_EQ(wire.header.stamp.nanosec, 0U);
   ASSERT_EQ(wire.points.size(), 3U);
   EXPECT_EQ(wire.points[0].time_from_start.sec, -1);
   EXPECT_EQ(wire.points[0].time_from_start.nanosec, 875'000'000U);

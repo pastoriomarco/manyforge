@@ -215,6 +215,20 @@ public:
           &expected_predecessor_public_pointer_digest,
       const std::function<void()> &effect) const;
 
+  /// Private post-install handoff before publication: the same parent and
+  /// public predecessor remain exact, but current provider rows/absences must
+  /// now describe the installed candidate rather than the removed predecessor.
+  void RunWithExactHeldInstalledCandidate(
+      const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
+      manyforge::core::ActiveBundlePublicationGeneration predecessor_generation,
+      const manyforge::core::ContentDigest &predecessor_pointer_digest,
+      const manyforge::core::CellAdmissionClaimDTO &parent,
+      const manyforge::core::ProjectionRevisionDTO &candidate,
+      const std::vector<
+          manyforge::core::RuntimeProviderDomainConfigurationReadbackDTO>
+          &actual_candidate_configurations,
+      const std::function<void()> &effect) const;
+
   /// The post-publication half of the same parent Apply interlock. The
   /// successor receipt must name that Apply and still be the active pointer;
   /// the parent fence remains held throughout the delegated operation.

@@ -27,7 +27,7 @@
     action_monitor_rate: 20.0
     allow_partial_joints_goal: false
     interpolate_from_desired_state: true
-    allow_trajectory_replacement: false
+    allow_trajectory_replacement: true
     constraints:
       goal_time: 0.0
       stopped_velocity_tolerance: 0.2

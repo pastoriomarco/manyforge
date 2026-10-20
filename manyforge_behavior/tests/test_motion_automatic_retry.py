@@ -1506,3 +1506,84 @@ def test_probe_search_refused_by_its_unavailable_contact_capability_fails() -> N
     assert store.writes[0][1] == "failed"
     assert len(port.starts) == 1 and port.closes == []
     assert audit == []
+
+
+def _takeover(path: str, cause: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        "incumbent_operation_id": "op.1",
+        "path": path,
+        "cause": cause,
+        "decided_at_ns": 9,
+        "elapsed_since_acceptance_ns": 40_500_000,
+        "preparation_budget_ns": 30_000_000,
+        "stop_certificate": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "path, cause, code, message, stage",
+    [
+        ("spring_back_hold", {"code": "takeover_late", "message": "late", "details": {}},
+         "takeover_late", "late", None),
+        ("spring_back_hold", {
+            "code": "planning_timeout", "message": "out of time",
+            "details": {"failure_stage": "spring_back_planning", "planning_elapsed_ns": "5"},
+        }, "planning_timeout", "out of time", "spring_back_planning"),
+        ("ordinary_containment", None, None, None, None),
+    ],
+)
+def test_a_takeover_fallback_is_recorded_once_per_attempt(path, cause, code, message, stage) -> None:
+    takeover = _takeover(path, cause)
+    port = _MotionPort(
+        [_active()],
+        observes=[_active(motion_takeover=takeover)] * 3 + [_succeeded()],
+    )
+    _time, clock = _clocked()
+    adapter = _motion(port, clock)
+    statuses = [_tick(adapter) for _ in range(5)]
+
+    assert statuses == [_RUNNING] * 4 + [_SUCCESS]  # The outcome is unchanged.
+    assert tuple(adapter.audit_events) == (
+        {
+            "kind": "program_node_takeover_fallback",
+            "node_instance_id": "motion",
+            "incumbent_operation_id": "op.1",
+            "path": path,
+            "code": code,
+            "message": message,
+            "failure_stage": stage,
+            "preparation_ms": 40.5,
+            "budget_ms": 30.0,
+        },
+    )
+
+
+def test_a_takeover_fallback_is_recorded_again_for_a_fresh_attempt() -> None:
+    fallback = _active(motion_takeover=_takeover("spring_back_hold", None))
+    port = _MotionPort([fallback], observes=[fallback, _succeeded()])
+    _time, clock = _clocked()
+    adapter = _motion(port, clock)
+    assert _tick(adapter) is _RUNNING
+    assert _tick(adapter) is _RUNNING
+    assert len(adapter.audit_events) == 1
+    adapter._begin_attempt(restart_series=True)  # A new node attempt.
+    port._observes = [fallback]
+    _tick(adapter)
+    _tick(adapter)
+    assert [event["kind"] for event in adapter.audit_events] == [
+        "program_node_takeover_fallback"
+    ] * 2
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [{}, {"motion_takeover": _takeover("moving_replacement", None)}],
+)
+def test_a_smooth_or_absent_takeover_records_nothing(metadata) -> None:
+    port = _MotionPort([_active(**metadata)], observes=[_active(**metadata), _succeeded()])
+    _time, clock = _clocked()
+    adapter = _motion(port, clock)
+    for _ in range(3):
+        _tick(adapter)
+    assert adapter.status is _SUCCESS
+    assert adapter.audit_events == []

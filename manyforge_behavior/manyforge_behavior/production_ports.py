@@ -169,6 +169,50 @@ def _preemption_fact(value: object) -> dict[str, Any]:
     return {"kind": value["kind"], "by": {key: by[key] for key in _SUCCESSOR_FIELDS}}
 
 
+_TAKEOVER_PATHS: Final = frozenset(
+    {"moving_replacement", "spring_back_hold", "ordinary_containment"}
+)
+_TAKEOVER_FIELDS: Final = frozenset({
+    "incumbent_operation_id", "path", "cause", "decided_at_ns",
+    "elapsed_since_acceptance_ns", "preparation_budget_ns", "stop_certificate",
+})
+
+
+_INT64_MAX = 2**63 - 1  # The Kernel encodes these ns fields as int64.
+
+
+def _motion_takeover_fact(value: object) -> dict[str, Any] | None:
+    """The Kernel's takeover decision on this newcomer operation, exactly;
+    None (logged) when malformed. Observability only: never an outcome."""
+
+    cause = value.get("cause") if isinstance(value, Mapping) else None
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _TAKEOVER_FIELDS
+        or not isinstance(value["incumbent_operation_id"], str)
+        or not value["incumbent_operation_id"]
+        or not isinstance(value["path"], str)
+        or value["path"] not in _TAKEOVER_PATHS
+        or type(value["decided_at_ns"]) is not int
+        or not 0 <= value["decided_at_ns"] <= _INT64_MAX
+        or type(value["elapsed_since_acceptance_ns"]) is not int
+        or not 0 <= value["elapsed_since_acceptance_ns"] <= _INT64_MAX
+        or type(value["preparation_budget_ns"]) is not int
+        or not 0 < value["preparation_budget_ns"] <= _INT64_MAX
+        or not (cause is None or (
+            isinstance(cause, Mapping)
+            and isinstance(cause.get("code"), str)
+            and bool(cause["code"])
+            and isinstance(cause.get("message"), str)
+            and bool(cause["message"])
+        ))
+        or not (value["stop_certificate"] is None or isinstance(value["stop_certificate"], Mapping))
+    ):
+        _LOGGER.warning("native operation motion_takeover fact is invalid; ignored")
+        return None
+    return deepcopy(dict(value))
+
+
 def _operation_failure_fact(
     envelope: Mapping[str, Any],
     operation: Mapping[str, Any],
@@ -2936,6 +2980,11 @@ class NativeKernelProgramPort:
             # Logical, at the newcomer's acceptance: the incumbent node ends
             # now while the Kernel still owns its physical handover.
             metadata["preemption"] = _preemption_fact(operation["preemption"])
+        if operation.get("motion_takeover") is not None:
+            # The newcomer's takeover path (spec: fallback is a brief warning).
+            takeover = _motion_takeover_fact(operation["motion_takeover"])
+            if takeover is not None:
+                metadata["motion_takeover"] = takeover
         if state in _ACTIVE_STATES:
             snapshot = OwnerTaskSnapshot(
                 task_id=task.task_id,

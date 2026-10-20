@@ -1,4 +1,6 @@
 #include "io_retained_fixture.hpp"
+#include "canonical_empty_admission_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "managed_kernel_apply_fence_owner.hpp"
 
 #include <gtest/gtest.h>
@@ -2019,6 +2021,11 @@ TEST(ManagedKernelApplyFenceOwner,
   std::sort(outputs.begin(), outputs.end());
   outputs.erase(std::unique(outputs.begin(), outputs.end()), outputs.end());
   ASSERT_FALSE(outputs.empty());
+  unsigned initial_effects = 0U;
+  EXPECT_NO_THROW(owner.RunWithExactHeldPredecessor(query,
+      observed.execution_host_epoch.publication_generation,
+      observed.active_public_pointer_digest, [&] { ++initial_effects; }));
+  EXPECT_EQ(initial_effects, 1U);
   const auto &provider = *domain->provider();
   const core::RuntimeEpoch driver_epoch("ordinary.actual.installed.driver");
   current = {candidate->retained_bundle_id(),
@@ -2081,6 +2088,38 @@ TEST(ManagedKernelApplyFenceOwner,
                 .value(),
             predecessor);
 
+  const core::ProjectionRevisionDTO candidate_projection{
+      candidate->retained_bundle_id(), graph.graph_revision,
+      predecessor.request.candidate_projection_revision.scene_revision};
+  unsigned handoffs = 0U;
+  const auto handoff = [&](const auto &selected_query, const auto &selected_parent,
+                           const auto &selected_head, const auto &rows) {
+    owner.RunWithExactHeldInstalledCandidate(selected_query,
+        predecessor.publication_generation, selected_head, selected_parent,
+        candidate_projection, rows, [&] {
+          EXPECT_TRUE(gate.exact_fence_is_held(query.configuration_fence_id, scope));
+          ++handoffs;
+        });
+  };
+  EXPECT_THROW(owner.RunWithExactHeldPredecessor(query,
+      predecessor.publication_generation, predecessor.durable_public_pointer_content_digest,
+      [&] { ++handoffs; }), std::runtime_error);
+  EXPECT_THROW(handoff(query, parent, predecessor.durable_public_pointer_content_digest,
+                       std::vector<core::RuntimeProviderDomainConfigurationReadbackDTO>{}),
+               std::runtime_error);
+  EXPECT_EQ(handoffs, 0U);
+  const std::vector installed_rows{current};
+  EXPECT_NO_THROW(handoff(query, parent, predecessor.durable_public_pointer_content_digest,
+                          installed_rows));
+  EXPECT_EQ(handoffs, 1U);
+  EXPECT_THROW(handoff(query, parent, core::ContentDigest(std::string(kSha)), installed_rows),
+               std::runtime_error);
+  auto wrong_query = query;
+  wrong_query.configuration_fence_generation = core::ConfigurationFenceGeneration(
+      query.configuration_fence_generation.value() + 1U);
+  EXPECT_THROW(handoff(wrong_query, parent, predecessor.durable_public_pointer_content_digest,
+                       installed_rows), std::runtime_error);
+  EXPECT_EQ(handoffs, 1U);
   auto wrong_parent = parent;
   wrong_parent.claim_generation =
       core::CellAdmissionClaimGeneration(parent.claim_generation.value() + 1U);
@@ -2088,6 +2127,9 @@ TEST(ManagedKernelApplyFenceOwner,
       owner.QueryInstalledNativeApplyCandidateStatus(
           query, predecessor, wrong_parent, plan, {facts}, metadata_guard),
       std::runtime_error);
+  EXPECT_THROW(handoff(query, wrong_parent, predecessor.durable_public_pointer_content_digest,
+                       installed_rows), std::runtime_error);
+  EXPECT_EQ(handoffs, 1U);
   auto stale_plan = plan;
   stale_plan.components.front().generation = core::ComponentLifecycleGeneration(
       plan.components.front().generation.value() + 1U);
@@ -2117,6 +2159,9 @@ TEST(ManagedKernelApplyFenceOwner,
   EXPECT_THROW(owner.QueryInstalledNativeApplyCandidateStatus(
                    query, predecessor, parent, plan, {facts}, metadata_guard),
                std::runtime_error);
+  EXPECT_THROW(handoff(query, parent, predecessor.durable_public_pointer_content_digest,
+                       installed_rows), std::runtime_error);
+  EXPECT_EQ(handoffs, 1U);
   current = installed;
   installed_attempt_current = false;
   EXPECT_THROW(owner.QueryInstalledNativeApplyCandidateStatus(
@@ -2133,6 +2178,102 @@ TEST(ManagedKernelApplyFenceOwner,
                 .ReadActiveBundlePublication(predecessor.publication_generation)
                 .value(),
             predecessor);
+}
+
+TEST(ManagedKernelApplyFenceOwner,
+     RemovedProviderCandidateHandoffRequiresAbsenceAndExactHeldAuthoringParent) {
+  OwnerFixture fixture(false, true);
+  const auto empty_root = fixture.state_root.path() / "empty-candidate";
+  ASSERT_TRUE(std::filesystem::create_directory(empty_root));
+  const auto admission = deployment::detail::generate_ros_empty_package(
+      empty_root, fixture.bundle->value().cell_graph.cell_id,
+      deployment::detail::ros2_control_execution_runtime_profile_document());
+  const auto &empty = admission.retained_bundle();
+  ASSERT_TRUE(empty.value().cell_graph.control_domains.empty());
+  const auto scope = deployment::derive_apply_configuration_fence_scope(*fixture.bundle, empty);
+  const auto predecessor_row = ProviderReadback(fixture);
+  std::optional<core::RuntimeProviderDomainConfigurationReadbackDTO> current = predecessor_row;
+  auto config = fixture.Config("removed-provider-handoff");
+  config.candidate_retained_package_root = empty_root;
+  config.provider_configuration_source = [&](const auto &domain) {
+    using Reply = core::Result<std::optional<core::RuntimeProviderDomainConfigurationReadbackDTO>>;
+    return Reply::Ok(current && current->domain.control_domain_id == domain ? current : std::nullopt);
+  };
+  std::optional<core::CellAdmissionClaimDTO> actual_parent;
+  config.selected_claim_recovery_receipt = [&](const auto &query) {
+    if (!actual_parent || query.expected_claim != actual_parent)
+      return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Err(
+          {"stale_generation", "actual authoring parent changed", {}});
+    return HeldSelectedReceipt(query);
+  };
+  ManagedKernelAdmissionGate gate;
+  ManagedKernelApplyFenceOwner owner(config, gate);
+  const auto observed = owner.ObserveAdmission({scope, core::RuntimeEpoch("manager.removal")});
+  const core::ApplyConfigurationFenceIntentDTO intent{
+      {core::RequestId("removal.fence"), core::RequestOwnerEpoch("manager.owner"), "test", std::nullopt},
+      {core::ApplyId("removal.apply"), core::ApplyGeneration(1U)}, scope,
+      core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+      fixture.bundle->retained_bundle_id(), fixture.bundle->value().cell_graph.graph_revision,
+      observed.operation_resource_generation, observed.configuration_fence_generation,
+      {}, "remove installed provider", observed.provider_lineages};
+  const auto accepted = owner.Acquire(intent);
+  const core::ConfigurationFenceStatusQueryDTO query{
+      intent.owner_transaction, accepted.configuration_fence_id,
+      accepted.configuration_fence_generation, scope, observed.echoed_query.manager_runtime_epoch};
+  const core::CellAdmissionClaimIntentDTO claim_intent{
+      core::CellAdmissionClaimKindDTO::kAuthoringMutation,
+      core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+      core::RequestOwnerEpoch("actual.authoring.owner"), "actual.close", core::RequestId("actual.close.parent"),
+      core::ContentDigest(std::string(kSha)), core::AdmissionGeneration(1U), {}, std::nullopt, std::nullopt};
+  actual_parent = core::CellAdmissionClaimDTO{
+      claim_intent, core::CellAdmissionClaimGeneration(1U), claim_intent.expected_admission_generation, 1};
+  const auto parent = *actual_parent;
+  core::ProjectionRevisionDTO candidate{
+      empty.retained_bundle_id(), empty.value().cell_graph.graph_revision,
+      observed.active_projection_revision.scene_revision};
+  unsigned effects = 0U;
+  const auto initial = [&] {
+    owner.RunWithExactHeldPredecessor(query, observed.execution_host_epoch.publication_generation,
+        observed.active_public_pointer_digest, [&] { ++effects; });
+  };
+  const auto handoff = [&](const auto &selected_query, const auto &selected_parent,
+                           const auto &head) {
+    owner.RunWithExactHeldInstalledCandidate(selected_query,
+        observed.execution_host_epoch.publication_generation, head, selected_parent, candidate, {}, [&] {
+          EXPECT_TRUE(gate.exact_fence_is_held(query.configuration_fence_id, scope));
+          EXPECT_THROW(gate.ReleaseFence(query.configuration_fence_id, scope), std::runtime_error);
+          ++effects;
+        });
+  };
+  EXPECT_NO_THROW(initial());
+  EXPECT_EQ(effects, 1U);
+  effects = 0U;
+  // Absence is an actual candidate fact. A still-installed predecessor must
+  // not pass merely because the candidate has no provider domains.
+  EXPECT_THROW(handoff(query, parent, observed.active_public_pointer_digest), std::runtime_error);
+  EXPECT_EQ(effects, 0U);
+  current.reset();
+  EXPECT_THROW(initial(), std::runtime_error);
+  auto wrong_scope = query;
+  wrong_scope.expected_scope.domains.clear();
+  EXPECT_THROW(handoff(wrong_scope, parent, observed.active_public_pointer_digest), std::runtime_error);
+  auto wrong_parent = parent;
+  wrong_parent.claim_generation = core::CellAdmissionClaimGeneration(2U);
+  EXPECT_THROW(handoff(query, wrong_parent, observed.active_public_pointer_digest), std::runtime_error);
+  EXPECT_THROW(handoff(query, parent, core::ContentDigest(std::string(kSha))), std::runtime_error);
+  EXPECT_EQ(effects, 0U);
+  EXPECT_NO_THROW(handoff(query, parent, observed.active_public_pointer_digest));
+  EXPECT_EQ(effects, 1U);
+  actual_parent.reset();
+  EXPECT_THROW(handoff(query, parent, observed.active_public_pointer_digest), std::runtime_error);
+  EXPECT_EQ(effects, 1U);
+  component_manager::SqliteActiveBundlePublicationStore publications(
+      fixture.state_root.path() / std::string(component_manager::kActiveBundlePublicationStoreFilename),
+      fixture.bundle->value().cell_graph.cell_id);
+  const auto head = publications.ReadActiveBundlePublication(observed.execution_host_epoch.publication_generation);
+  ASSERT_TRUE(head.ok());
+  EXPECT_EQ(head.value().request.candidate_retained_bundle_id, fixture.bundle->retained_bundle_id());
+  EXPECT_EQ(head.value().durable_public_pointer_content_digest, observed.active_public_pointer_digest);
 }
 
 TEST(ManagedKernelAdmissionGate,

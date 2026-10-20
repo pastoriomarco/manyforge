@@ -123,6 +123,12 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmis
         ProgramResetJournalReadPurpose::kAcquire, intent);
     if (!prepared.ok()) return Result<CellAdmissionClaimDTO>::Err(prepared.error());
     reset_proof.emplace(std::move(prepared).value());
+    // A preempted Runner task has already ended. Join its existing motion-free
+    // cleanup before the whole-cell work check, without holding admission or
+    // submission locks over participant calls. Actual in-flight work still
+    // refuses this claim and remains available for a later explicit retry.
+    const auto retired = retire_preempted_motion_operations();
+    if (!retired.ok()) return Result<CellAdmissionClaimDTO>::Err(retired.error());
   }
   // Lifecycle and selected idle Reset mutate the whole cell. Serialize the
   // physical work check with every command submission, then retain the

@@ -14,10 +14,12 @@ import time
 from typing import Any, Callable, Sequence
 
 import rfc8785
+from starlette.responses import JSONResponse
 
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.skill_loader import default_skills_dir, load_skill_catalog
 
+from .client import MAX_HTTP_RESPONSE_BYTES
 from .execution import ExecutionPort
 from .manager import ManagerPort
 from .history_query import HistorianCaptureRequest, HistorianQueryRequest
@@ -100,6 +102,17 @@ _PROGRAM_NODE_PREVIEW_IDENTITY_KEYS = (
     "node_instance_id",
     "node_attempt_id",
 )
+# Optional debug-export member carrying the native volatile motion trace.
+VOLATILE_MOTION_TRACE_MEMBER = "volatile_motion_trace"
+# Exact bytes the member adds to the rendered bundle, before its value.
+_VOLATILE_MOTION_TRACE_MEMBER_TEXT = f',"{VOLATILE_MOTION_TRACE_MEMBER}":'
+# Fixed slack for the {"available":true,"trace":...} wrapper around the native
+# trace object; the final render is checked against the limit regardless.
+VOLATILE_MOTION_TRACE_MARGIN_BYTES = 1024
+# Recommended native trace object cap (fits the 4 MiB execution IPC envelope).
+VOLATILE_MOTION_TRACE_MAX_BYTES = 3 * 1024 * 1024
+# Below this remaining budget no useful trace fits; skip the native read.
+VOLATILE_MOTION_TRACE_MIN_ALLOWANCE_BYTES = 4096
 PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v3"
 PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v2"
 SOURCE_MODEL_CONTEXT_VERSION = "manyforge.source_model_context.v1"
@@ -129,6 +142,15 @@ _ACTIVE_PROGRAM_RUN_STATES = frozenset(
 )
 
 _HISTORY_SUMMARY_PAGE_VERSION = "manyforge.historian_summary_page.v2"
+
+
+def _rendered_response_bytes(content: dict[str, Any]) -> int:
+    """Byte length of ``content`` exactly as the route's JSONResponse renders it."""
+    return len(JSONResponse(content=content).body)
+
+
+def _trace_unavailable(reason: str) -> dict[str, Any]:
+    return {"available": False, "reason": reason}
 
 
 def _history_page(page: dict[str, Any], schema: str) -> dict[str, Any]:
@@ -2387,7 +2409,18 @@ class HeadlessService:
             "targets": [rows[key] for key in sorted(rows)],
         }
 
-    def debug_export(self, query: HistorianQueryRequest) -> dict[str, Any]:
+    def debug_export(
+        self,
+        query: HistorianQueryRequest,
+        *,
+        include_volatile_motion_trace: bool = True,
+    ) -> dict[str, Any]:
+        """Return the forensic bundle, optionally with the volatile motion trace.
+
+        The historian bundle is unchanged. When requested, an optional
+        ``volatile_motion_trace`` member is appended (see
+        ``_attach_volatile_motion_trace``).
+        """
         from .history_diagnostics import forensic_bundle
 
         page = self.history_export(query)
@@ -2421,11 +2454,67 @@ class HeadlessService:
                     "export cursor repeated a previous page",
                 )
             events.extend(page["events"])
-        return forensic_bundle(
+        bundle = forensic_bundle(
             {**page, "events": events},
             program_run_id=current.program_run_id,
             exported_at_ns=time.time_ns(),
         )
+        if include_volatile_motion_trace:
+            self._attach_volatile_motion_trace(bundle)
+        return bundle
+
+    def _attach_volatile_motion_trace(self, bundle: dict[str, Any]) -> None:
+        """Append the optional diagnostic ``volatile_motion_trace`` member.
+
+        Member shape:
+        - ``{"available": true, "trace": <native trace, unchanged>}``, or
+        - ``{"available": false, "reason": <stable code>}`` where reason is
+          ``export_limit``, ``execution_unavailable``, the native/adapter
+          ``HeadlessApiError`` code, or ``read_failed``.
+
+        The trace receives only the HTTP budget the unchanged bundle leaves:
+        ``min(3 MiB, MAX_HTTP_RESPONSE_BYTES - baseline - member overhead)``.
+        If the final render still exceeds the limit the member becomes the
+        ``export_limit`` marker; if even that does not fit, the member is
+        omitted so the response equals the baseline. Trace goals are never
+        pruned, and a failed diagnostic read never fails the export.
+        """
+        limit = MAX_HTTP_RESPONSE_BYTES
+        baseline = _rendered_response_bytes(bundle)
+        allowance = min(
+            VOLATILE_MOTION_TRACE_MAX_BYTES,
+            limit
+            - baseline
+            - len(_VOLATILE_MOTION_TRACE_MEMBER_TEXT.encode("utf-8"))
+            - VOLATILE_MOTION_TRACE_MARGIN_BYTES,
+        )
+        if allowance < VOLATILE_MOTION_TRACE_MIN_ALLOWANCE_BYTES:
+            member = _trace_unavailable("export_limit")
+        elif self.execution is None:
+            member = _trace_unavailable("execution_unavailable")
+        else:
+            try:
+                member = {
+                    "available": True,
+                    "trace": self.execution.read_volatile_motion_trace(allowance),
+                }
+            except HeadlessApiError as error:
+                code = error.code
+                member = _trace_unavailable(
+                    code
+                    if isinstance(code, str) and 0 < len(code) <= 128
+                    else "read_failed"
+                )
+            except Exception:  # Diagnostics never fail the export.
+                logging.getLogger(__name__).warning(
+                    "volatile motion trace read failed", exc_info=True
+                )
+                member = _trace_unavailable("read_failed")
+        for candidate in (member, _trace_unavailable("export_limit")):
+            bundle[VOLATILE_MOTION_TRACE_MEMBER] = candidate
+            if _rendered_response_bytes(bundle) <= limit:
+                return
+        del bundle[VOLATILE_MOTION_TRACE_MEMBER]
 
     def record_client_incident(self, **kwargs: Any) -> dict[str, Any]:
         """Non-blockingly enqueue one strict client-incident transition."""

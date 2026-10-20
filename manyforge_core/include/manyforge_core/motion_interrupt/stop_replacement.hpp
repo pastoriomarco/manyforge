@@ -1,5 +1,6 @@
 #pragma once
 
+#include <manyforge_core/ports/iexecution_port.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 #include <map>
@@ -47,6 +48,20 @@ struct StopJoinElapsedInputDTO final {
 /// or an expected start at or beyond the lead-in end
 /// (`stop_delta_budget_exceeded`, recommended disposition hard stop).
 [[nodiscard]] Result<double> compute_stop_join_elapsed_s(const StopJoinElapsedInputDTO& input);
+
+/// The curve's shifted origin and optional controller-clock start are chosen
+/// together from one associated observation. No clock offset is estimated:
+/// local receipt age advances only the duration; the stamp stays on the
+/// controller clock. Tick alignment uses the nominal period, not an RT
+/// installation guarantee. Unqualified lanes keep the existing elapsed rule.
+struct StopReplacementStartDTO final {
+  double elapsed_path_s{0.0};
+  std::optional<ExecutionReplacementStartDTO> scheduled{};
+};
+
+[[nodiscard]] Result<StopReplacementStartDTO> compute_stop_replacement_start(
+    const StopJoinElapsedInputDTO& input, const ExecutionControllerSampleDTO& sample,
+    const ExecutionLaneFactsDTO& lane);
 
 /// Q17/Q38: express a wall-time braking trajectory (the Stop planner's output,
 /// planned at the frozen factor) in path time at that factor, so that a

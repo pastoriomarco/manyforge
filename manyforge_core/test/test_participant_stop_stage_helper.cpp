@@ -944,6 +944,41 @@ TEST(ParticipantStopStageHelperTest, JoinElapsedIsMeasuredAtTheReplacementSend) 
               -(0.5 + 0.5 * (static_cast<double>(dispatch_read - receipt) / 1e9 + 0.02)), 1e-9);
 }
 
+TEST(ParticipantStopStageHelperTest, ScheduledSoftAndSpringStopsPairTheirHeaderAndPastPrefix) {
+  for (const char* mode : {"soft_on_path", "spring_back_hold"}) {
+    SCOPED_TRACE(mode);
+    World world;
+    auto lane = world.port.ReadLaneFacts();
+    lane.supports_scheduled_replacement = true;
+    world.port.SetLaneFacts(lane);
+    const auto stage = Stage(0U, Nominal::kControlled, Parameters(mode, false));
+    world.Dispatch(stage);
+    world.Sample(0.5, 0.5, 1.0);
+    const auto source = world.port.ReadSample();
+    ASSERT_TRUE(source);
+    ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+    const auto replacements = Replaces(world.port);
+    ASSERT_EQ(replacements.size(), 1U);
+    const auto& replacement = replacements.front();
+    ASSERT_TRUE(replacement.start);
+    EXPECT_EQ(replacement.start->binding_epoch, source->binding_epoch);
+    const auto advance_ns = replacement.start->controller_start_stamp_ns - source->source_stamp_ns;
+    EXPECT_EQ(advance_ns, 20'000'000);
+    EXPECT_EQ(advance_ns % 4'000'000, 0);
+    EXPECT_EQ(replacement.active_key, kOriginal);
+    EXPECT_EQ(replacement.next_key, kSecond);
+    // The original's point at t=0 stays in the prefix. Its shift must name
+    // the SAME origin as the controller-clock header at the observed factor.
+    EXPECT_NEAR(replacement.trajectory.waypoints.front().time_from_start_s,
+                -(source->cursor_s + world.frozen * static_cast<double>(advance_ns) / 1e9), 1e-12);
+    EXPECT_EQ(replacement.trajectory.waypoints.front().positions_rad, std::vector<double>{0.0});
+    EXPECT_EQ(world.freezes, 1U);
+    EXPECT_TRUE(Cancels(world.port).empty());
+  }
+}
+
 TEST(ParticipantStopStageHelperTest, ReplacementNotAcceptedWithinTheLeadInIsCancelled) {
   World world;
   const auto stage = Stage(0U);
@@ -1388,6 +1423,29 @@ TEST(ParticipantStopStageHelperTest, ControlledHardStopBrakesFromTheLatestComman
   EXPECT_EQ(points.back().velocities_rad_s[0], 0.0);
   EXPECT_NEAR(points.back().time_from_start_s, 0.5 * 0.125 - 0.5 * 0.02, 1e-9);
   EXPECT_EQ(Text(EvidenceObject(result), "hard_stop_level"), "controlled_hard_stop");
+}
+
+TEST(ParticipantStopStageHelperTest, NoLeadControlledHardStopKeepsImmediateDeliveryOnScheduledLane) {
+  World world;
+  auto lane = world.port.ReadLaneFacts();
+  lane.supports_scheduled_replacement = true;
+  world.port.SetLaneFacts(lane);
+  const auto stage = Stage(1U);
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0);
+  const auto source = world.port.ReadSample();
+  ASSERT_TRUE(source);
+  ScriptBrake(world, kSecond);
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage, 1'800'000'000), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+  const auto replacements = Replaces(world.port);
+  ASSERT_EQ(replacements.size(), 1U);
+  // A past point does not establish shared future PVA at a scheduled handoff.
+  // This mode retains its old immediate command and elapsed-origin estimate.
+  EXPECT_FALSE(replacements.front().start);
+  EXPECT_NEAR(replacements.front().trajectory.waypoints.front().time_from_start_s, -0.51, 1e-12);
+  EXPECT_EQ(Scales(world.port), std::vector<double>{0.5});
+  EXPECT_TRUE(Cancels(world.port).empty());
 }
 
 TEST(ParticipantStopStageHelperTest, ControlledHardStopFinishesOnItsSuccessThenTheFollowingHold) {

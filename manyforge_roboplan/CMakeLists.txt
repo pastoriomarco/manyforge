@@ -1095,6 +1095,7 @@ if(BUILD_TESTING)
       manyforge::core_sqlite_cclc_journal
       manyforge_component_manager
       manyforge_deployment
+      manyforge_deployment_canonical_package_generator
       GTest::gtest_main)
 
     add_executable(fake_process_candidate_worker

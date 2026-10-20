@@ -8,6 +8,7 @@ import { PROGRAM_RESET_READINESS_MESSAGE } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type {
   AutomaticRetryAuditEvent,
+  TakeoverFallbackAuditEvent,
   CycleRecoveryOffer,
   ProgramRunStateName,
   RuntimeControlAuditEvent,
@@ -29,6 +30,7 @@ import {
   ProgramTransportControls,
   automaticRetryFailureText,
   automaticRetryText,
+  takeoverFallbackText,
   ioSourceAuditText,
   ioSourceUnavailableNodes,
   resetKeptMessage,
@@ -394,6 +396,39 @@ describe('Program runtime projection', () => {
     const markup = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={withAudit} />);
     expect(markup).toContain('Attempt 2 of 4 for move after collision Stop');
     expect(markup).toContain('Attempt 3 of 4 for move after planning failed');
+  });
+
+  it('names each takeover fallback in the runtime-control events', () => {
+    const fallback: TakeoverFallbackAuditEvent = {
+      eventRevision: 2,
+      kind: 'program_node_takeover_fallback',
+      facts: {
+        nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'ordinary_containment',
+        code: 'takeover_preparation_late', message: 'late', failureStage: null,
+        preparationMs: 12.4, budgetMs: 30,
+      },
+    };
+    expect(takeoverFallbackText(fallback))
+      .toBe('Stop fallback on move — takeover preparation late (prep 12 of 30 ms)');
+    expect(takeoverFallbackText({ eventRevision: 3, kind: 'program_node_retry', facts: {} })).toBeNull();
+    expect(takeoverFallbackText({
+      ...fallback,
+      facts: { ...fallback.facts, code: null, message: null, failureStage: 'stop_planning' },
+    })).toBe('Stop fallback on move — during stop_planning (prep 12 of 30 ms)');
+    const base = controller();
+    type RuntimeControls = NonNullable<NonNullable<ProgramRuntimeController['state']['controls']>['runtimeControls']>;
+    const withAudit: ProgramRuntimeController = {
+      ...base,
+      state: {
+        ...base.state,
+        controls: {
+          ...ordinaryMotionStopControls(),
+          runtimeControls: { audit: [fallback] } as unknown as RuntimeControls,
+        },
+      },
+    };
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={withAudit} />))
+      .toContain('Stop fallback on move — takeover preparation late (prep 12 of 30 ms)');
   });
 
   it('shows a running io wait whose input source is unavailable in amber, and both transitions as events', () => {

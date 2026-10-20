@@ -146,6 +146,22 @@ struct ExecutionPortParticipant::Execution {
   double cursor_s{0.0};
   // Same existing Stop join clock mapping, without a second progress authority.
   StopReplacementCursorMapDTO delivery_clock{};
+  // The actual associated sample of the successful progress publication.
+  // Its sequence belongs to progress_, not to a second observation owner.
+  struct PublishedProgressSample {
+    std::uint64_t sequence;
+    ExecutionControllerSampleDTO sample;
+  };
+  std::optional<PublishedProgressSample> published_progress_sample;
+
+  void RecordProgressSample(const ExecutionProgressPublishResult publication,
+                            ExecutionControllerSampleDTO sample) noexcept {
+    static_assert(std::is_nothrow_move_assignable_v<
+                  std::optional<PublishedProgressSample>>);
+    published_progress_sample.reset();
+    if (publication.published)
+      published_progress_sample = PublishedProgressSample{publication.sequence, std::move(sample)};
+  }
 };
 
 struct ExecutionPortParticipant::Replacement {
@@ -411,28 +427,30 @@ Result<PreparedMotionReplacementSourceDTO> ExecutionPortParticipant::CaptureRepl
       digest,       {},         {}};
   if (!SourceMatchesLocked(source) || execution_->terminal || execution_->stopping ||
       execution_->critical_fault || stop_stages_in_flight_ != 0U ||
-      helper_->HasPendingReplacement())
+      helper_->HasPendingReplacement() || !execution_->published_progress_sample)
+    return refuse();
+  const auto& paired = *execution_->published_progress_sample;
+  const auto& sample = paired.sample;
+  source.progress = progress_.acquire();
+  const auto hazard = progress_.hazard_authority_claimed(generation);
+  if (!source.progress.valid || source.progress.terminal || !hazard || *hazard ||
+      source.progress.sequence != paired.sequence ||
+      source.progress.execution_generation != generation ||
+      source.progress.source_timestamp_ns != sample.source_stamp_ns ||
+      source.progress.received_timestamp_ns != sample.local_receipt_stamp_ns)
     return refuse();
   const auto readiness = port_->ReadReadiness();
   const auto observed = port_->ReadGoal(goal);
-  const auto sample = port_->ReadSample();
   const auto now = clock_.now();
   if (!ready(readiness) || readiness.binding_epoch != source.binding_epoch || !observed ||
       observed->key != goal || observed->binding_epoch != source.binding_epoch ||
-      observed->phase == ExecutionGoalPhase::kTerminal || !sample ||
-      sample->binding_epoch != source.binding_epoch || !std::isfinite(sample->cursor_s) ||
-      sample->local_receipt_stamp_ns > now ||
+      observed->phase == ExecutionGoalPhase::kTerminal ||
+      sample.binding_epoch != source.binding_epoch || !std::isfinite(sample.cursor_s) ||
+      sample.local_receipt_stamp_ns > now ||
       (config_.progress_freshness_budget_ns > 0 &&
-       now - sample->local_receipt_stamp_ns > config_.progress_freshness_budget_ns) ||
-      !execution_->association->Observe(*sample, observed))
+       now - sample.local_receipt_stamp_ns > config_.progress_freshness_budget_ns))
     return refuse();
-  source.progress = progress_.acquire();
-  if (!source.progress.valid || source.progress.terminal ||
-      source.progress.execution_generation != generation ||
-      source.progress.source_timestamp_ns != sample->source_stamp_ns ||
-      source.progress.received_timestamp_ns != sample->local_receipt_stamp_ns)
-    return refuse();
-  source.controller_sample = *sample;
+  source.controller_sample = sample;
   return Result<PreparedMotionReplacementSourceDTO>::Ok(std::move(source));
 }
 
@@ -584,16 +602,24 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
   const auto join_started_at = clock_.now();
   if (!source_sample_current(baseline, join_started_at))
     return reject("motion_replacement_scale_or_source_unqualified");
-  const auto elapsed =
-      elapsed_at(*baseline, join_started_at, *config_.stop.replacement_start_allowance_s);
-  if (!elapsed.ok()) return reject("motion_replacement_delivery_lead_expired");
+  // Scheduled lanes pair the header with the SAME estimated source origin.
+  // Moving takeover retains its existing instantaneous-factor extrapolation;
+  // a compatible evolving ramp is not frozen or newly refused here.
+  const auto start = compute_stop_replacement_start(
+      {original_path_cursor(execution_->delivery_clock, baseline->cursor_s),
+       lane_.supports_scale ? baseline->applied_factor.value_or(-1.0) : 1.0,
+       static_cast<double>(join_started_at - baseline->local_receipt_stamp_ns) / 1e9,
+       *config_.stop.replacement_start_allowance_s, pending.divergence_cursor_s},
+      *baseline, lane_);
+  if (!start.ok()) return reject("motion_replacement_delivery_lead_expired");
+  const auto elapsed = start.value().elapsed_path_s;
   candidate->association =
       std::make_shared<ExecutionSampleAssociation>(source.binding_epoch, baseline, join_started_at);
   auto delivery =
-      build_stop_replacement_join(execution_->trajectory, elapsed.value(), candidate->trajectory,
+      build_stop_replacement_join(execution_->trajectory, elapsed, candidate->trajectory,
                                   pending.source_cursor_s, pending.divergence_cursor_s);
   if (!delivery.ok()) return reject("motion_replacement_delivery_join_failed");
-  candidate->delivery_clock.elapsed_s = elapsed.value() - pending.source_cursor_s;
+  candidate->delivery_clock.elapsed_s = elapsed - pending.source_cursor_s;
   // Only the delivery origin changes; canonical product/evidence stays intact.
   delivery.value().runtime_scale_bounds = candidate->trajectory.runtime_scale_bounds;
   delivery.value().cartesian_fidelity_metrics = candidate->trajectory.cartesian_fidelity_metrics;
@@ -602,6 +628,9 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
     milestone -= candidate->delivery_clock.elapsed_s;
   pending.record_trajectory = std::move(delivery.value());
   pending.stop_goal->trajectory = pending.record_trajectory;
+  if (config_.observe_goal_context) {
+    try { config_.observe_goal_context(successor, participant, source.binding_epoch); } catch (...) {}
+  }
   const auto final_sample = port_->ReadSample();
   const auto final_now = clock_.now();
   if (!source_sample_current(final_sample, final_now))
@@ -636,7 +665,10 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
   candidate->snapshot.timestamp_ns = submitted_at;
   ExecutionPortCommandResultDTO command;
   try {
-    command = port_->Replace(source.goal, successor, pending.record_trajectory);
+    command = start.value().scheduled
+                  ? port_->ReplaceScheduled(source.goal, successor, pending.record_trajectory,
+                                             *start.value().scheduled)
+                  : port_->Replace(source.goal, successor, pending.record_trajectory);
   } catch (...) {
     command = std::move(uncertain);
   }
@@ -786,6 +818,8 @@ Result<void> ExecutionPortParticipant::AdoptReplacement(
   ObserveSample(*replacement_->execution, *sample,
                 original_path_cursor(replacement_->execution->delivery_clock, sample->cursor_s),
                 now, false);
+  // Retaining the paired sample after the owner CAS must not allocate.
+  auto published_sample = *sample;
   // All proof reads/allocation precede this last-fallible ownership CAS. The
   // caller rechecks its exact gate/deadline inside the callback before CAS.
   auto accepted = commit.owner_commit(commit.context);
@@ -802,9 +836,10 @@ Result<void> ExecutionPortParticipant::AdoptReplacement(
   // The retained receipt is still the committed candidate; execution_ is its
   // only live presenter. No old handle can publish into this generation.
   progress_.invalidate();
-  (void)progress_.publish(execution_->generation,
-                          static_cast<std::int64_t>(execution_->cursor_s * 1e9),
-                          sample->source_stamp_ns, sample->local_receipt_stamp_ns);
+  const auto published = progress_.publish(
+      execution_->generation, static_cast<std::int64_t>(execution_->cursor_s * 1e9),
+      sample->source_stamp_ns, sample->local_receipt_stamp_ns);
+  execution_->RecordProgressSample(published, std::move(published_sample));
   // The active scale ramp, including its elapsed tick origin, continues
   // unchanged. Its compatibility is checked before the ownership callback.
   return Result<void>::Ok();
@@ -926,6 +961,9 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
       return RejectedHandle(participant, controller_goal_id, controller_goal_generation,
                             std::move(*refusal));
     }
+  }
+  if (config_.observe_goal_context) {
+    try { config_.observe_goal_context(key, participant, readiness.binding_epoch); } catch (...) {}
   }
   const auto dispatched_at = clock_.now();
   const auto sent = port.Submit(key, motion.trajectory);
@@ -1158,6 +1196,7 @@ bool ExecutionPortParticipant::WaitForCompletion(const std::shared_ptr<Execution
 void ExecutionPortParticipant::Finish(Execution& execution, const ExecutionState state,
                                       std::optional<ErrorDTO> error) {
   execution.terminal = true;
+  execution.published_progress_sample.reset();
   execution.snapshot.timestamp_ns = clock_.now();
   execution.snapshot.state = state;
   execution.snapshot.error = std::move(error);
@@ -1220,10 +1259,13 @@ void ExecutionPortParticipant::ObserveSample(Execution& execution,
                                              const bool publish_progress) {
   const auto total = duration_s(execution.trajectory);
   execution.cursor_s = std::clamp(original_cursor_s, 0.0, total);
-  if (publish_progress)
-    (void)progress_.publish(execution.generation,
-                            static_cast<std::int64_t>(execution.cursor_s * 1e9),
-                            sample.source_stamp_ns, sample.local_receipt_stamp_ns);
+  if (publish_progress) {
+    auto published_sample = sample;
+    const auto published = progress_.publish(
+        execution.generation, static_cast<std::int64_t>(execution.cursor_s * 1e9),
+        sample.source_stamp_ns, sample.local_receipt_stamp_ns);
+    execution.RecordProgressSample(published, std::move(published_sample));
+  }
   execution.snapshot.timestamp_ns = now;
   ++execution.snapshot.sequence_number;
   execution.snapshot.progress = total > 0.0 ? execution.cursor_s / total : 1.0;

@@ -534,6 +534,29 @@ template <typename T, typename Decode>
   return result;
 }
 
+[[nodiscard]] V motion_takeover_value(const MotionTakeoverDecisionDTO& value) {
+  if (!value.locally_valid()) bad("motion takeover decision is invalid");
+  return arr({enc(value.incumbent_operation_id), enc(value.path), opt(value.cause, error_value),
+              content_identity::nonnegative_int64_value(value.decided_at_ns),
+              content_identity::nonnegative_int64_value(value.elapsed_since_acceptance_ns),
+              content_identity::nonnegative_int64_value(value.preparation_budget_ns),
+              opt(value.stop_certificate, certificate_ref_value)});
+}
+
+[[nodiscard]] MotionTakeoverDecisionDTO motion_takeover_from(const V& value) {
+  const auto& f = exact(value, 7U, "motion takeover decision");
+  auto result =
+      MotionTakeoverDecisionDTO{did<OperationId>(f[0], "incumbent operation ID"),
+                                den<MotionTakeoverPathDTO>(f[1], 2U, "motion takeover path"),
+                                dopt<ErrorDTO>(f[2], error_from),
+                                i64(f[3], "takeover decision time"),
+                                i64(f[4], "takeover elapsed time"),
+                                i64(f[5], "takeover preparation budget"),
+                                dopt<StopCertificateRefDTO>(f[6], certificate_ref_from)};
+  (void)motion_takeover_value(result);
+  return result;
+}
+
 [[nodiscard]] V operation_state_value(const OperationStateDTO& value) {
   if (has_program_execution_scope(value) && value.journal_capture_order == 0U) {
     bad("captured Program work requires an ordered Stop snapshot");
@@ -573,17 +596,23 @@ template <typename T, typename Decode>
       bad("operation preemption requires a distinct captured Program successor");
     fields.emplace_back(preemption_value(*value.preemption));
   }
+  if (value.motion_takeover) {
+    if (value.motion_takeover->incumbent_operation_id == value.operation_id)
+      bad("motion takeover requires a distinct incumbent");
+    fields.resize(13U, V(nullptr));
+    fields.emplace_back(motion_takeover_value(*value.motion_takeover));
+  }
   return V(std::move(fields));
 }
 
 [[nodiscard]] OperationStateDTO operation_state_from(const V& value) {
-  if (!value.is_array() || (value.as_array().size() != 11U &&
-                            value.as_array().size() != 12U && value.as_array().size() != 13U)) {
+  if (!value.is_array() || (value.as_array().size() != 11U && value.as_array().size() != 12U &&
+                            value.as_array().size() != 13U && value.as_array().size() != 14U)) {
     bad("operation state has an unsupported shape");
   }
   const auto& f = value.as_array();
   std::uint64_t capture_order{};
-  if (f.size() >= 12U) {
+  if (f.size() >= 12U && !(f.size() == 14U && f[11].is_null())) {
     if (!f[11].is_string()) bad("operation journal capture order must be decimal text");
     capture_order = static_cast<std::uint64_t>(content_identity::parse_nonnegative_int64(f[11]));
     if (capture_order == 0U) bad("new operation capture order must be positive");
@@ -603,22 +632,42 @@ template <typename T, typename Decode>
       dopt<RuntimeScaleGeneration>(
           f[10], [](const V& v) { return did<RuntimeScaleGeneration>(v, "scale generation"); }),
       capture_order};
-  if (f.size() == 13U) result.preemption = preemption_from(f[12]);
+  if (f.size() == 13U || (f.size() == 14U && !f[12].is_null()))
+    result.preemption = preemption_from(f[12]);
+  if (f.size() == 14U) result.motion_takeover = motion_takeover_from(f[13]);
   (void)operation_state_value(result);
   return result;
 }
 
 [[nodiscard]] V affected_value(const EmergencyStopAffectedStateSnapshotDTO& value) {
-  return arr({vec(value.operations, operation_state_value), vec(value.resources, id_value)});
+  A fields{vec(value.operations, operation_state_value), vec(value.resources, id_value)};
+  if (value.motion_takeover_candidate_snapshot) {
+    const auto& candidate = *value.motion_takeover_candidate_snapshot;
+    if (!candidate.motion_takeover ||
+        std::any_of(value.operations.begin(), value.operations.end(),
+                    [&](const auto& operation) {
+                      return operation.operation_id == candidate.operation_id;
+                    }) ||
+        std::none_of(value.operations.begin(), value.operations.end(), [&](const auto& operation) {
+          return operation.operation_id == candidate.motion_takeover->incumbent_operation_id;
+        }))
+      bad("forensic takeover candidate requires a distinct affected incumbent");
+    fields.emplace_back(operation_state_value(candidate));
+  }
+  return V(std::move(fields));
 }
 
 [[nodiscard]] EmergencyStopAffectedStateSnapshotDTO affected_from(const V& value) {
-  const auto& f = exact(value, 2U, "affected-state snapshot");
-  return EmergencyStopAffectedStateSnapshotDTO{
+  if (!value.is_array() || (value.as_array().size() != 2U && value.as_array().size() != 3U))
+    bad("affected-state snapshot has the wrong structural arity");
+  const auto& f = value.as_array();
+  auto result = EmergencyStopAffectedStateSnapshotDTO{
       dvec<OperationStateDTO>(f[0], operation_state_from, "affected operations"),
       dvec<ResourceId>(
           f[1], [](const V& v) { return did<ResourceId>(v, "resource ID"); },
           "affected resources")};
+  if (f.size() == 3U) result.motion_takeover_candidate_snapshot = operation_state_from(f[2]);
+  return result;
 }
 
 [[nodiscard]] V artifact_value(const RetainedArtifactRefDTO& value) {
@@ -1974,6 +2023,10 @@ template <typename T, typename Decode>
 }
 
 [[nodiscard]] V acceptance_root(const StopJournalAcceptanceProjectionDTO& value) {
+  const bool takeover =
+      value.affected_state.motion_takeover_candidate_snapshot ||
+      std::any_of(value.affected_state.operations.begin(), value.affected_state.operations.end(),
+                  [](const auto& operation) { return operation.motion_takeover.has_value(); });
   const bool provider_extension = std::any_of(
       value.affected_state.operations.begin(), value.affected_state.operations.end(),
       [](const auto& operation) {
@@ -1999,12 +2052,13 @@ template <typename T, typename Decode>
                   [](const auto& row) { return row.journal_capture_order != 0U; });
   // Q51/Q53: the per-robot Stop timing changed every shape; earlier versions
   // (v1-v3) are refused, never converted.
-  return arr({V(provider_extension ? "manyforge.internal.stop-journal-acceptance-projection.v10"
-                : preemption       ? "manyforge.internal.stop-journal-acceptance-projection.v9"
-                : facts            ? "manyforge.internal.stop-journal-acceptance-projection.v8"
-                : scoped           ? "manyforge.internal.stop-journal-acceptance-projection.v6"
-                : ordered          ? "manyforge.internal.stop-journal-acceptance-projection.v5"
-                                   : "manyforge.internal.stop-journal-acceptance-projection.v4"),
+  return arr({V(takeover             ? "manyforge.internal.stop-journal-acceptance-projection.v11"
+                : provider_extension ? "manyforge.internal.stop-journal-acceptance-projection.v10"
+                : preemption         ? "manyforge.internal.stop-journal-acceptance-projection.v9"
+                : facts              ? "manyforge.internal.stop-journal-acceptance-projection.v8"
+                : scoped             ? "manyforge.internal.stop-journal-acceptance-projection.v6"
+                : ordered            ? "manyforge.internal.stop-journal-acceptance-projection.v5"
+                                     : "manyforge.internal.stop-journal-acceptance-projection.v4"),
               accepted_value(value.accepted), affected_value(value.affected_state)});
 }
 
@@ -2016,7 +2070,8 @@ template <typename T, typename Decode>
       version != "manyforge.internal.stop-journal-acceptance-projection.v6" &&
       version != "manyforge.internal.stop-journal-acceptance-projection.v8" &&
       version != "manyforge.internal.stop-journal-acceptance-projection.v9" &&
-      version != "manyforge.internal.stop-journal-acceptance-projection.v10") {
+      version != "manyforge.internal.stop-journal-acceptance-projection.v10" &&
+      version != "manyforge.internal.stop-journal-acceptance-projection.v11") {
     bad("Stop journal acceptance projection API version is unsupported");
   }
   auto result = StopJournalAcceptanceProjectionDTO{accepted_from(f[1]), affected_from(f[2])};

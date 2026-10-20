@@ -1130,6 +1130,14 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
         program_reset_position_scope_->step_deadline_ns &&
         clock_.now() < *program_reset_position_scope_->step_deadline_ns &&
         condition.control_domain_id == program_reset_position_scope_->request.domain.control_domain_id;
+    // 150: a valid in-deadline Reset step owns expected availability of its
+    // domain; genuine communication loss is reported by the Reset's own step
+    // failure/deadline. Intervention classes above stay immediate.
+    if (reset_transition &&
+        (!fresh || observed.reported == LifecycleBlockingCauseClassDTO::kAvailability)) {
+      requested_controller_absence = true;
+      continue;
+    }
     const auto boolean_fact = [&](std::string_view id, bool expected) {
       return fresh && std::any_of(observed.observation->facts.begin(),
                                  observed.observation->facts.end(), [&](const auto& fact) {
@@ -1138,9 +1146,9 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
                fact.value.boolean_value == expected;
       });
     };
-    // 142: the existing transition owner explains controller inactivity, not
-    // transport loss, unloaded hardware or an independently reported fault.
-    const bool expected_inactivity = (reset_transition || lifecycle_transition) && fresh &&
+    // 142: the accepted lifecycle transaction explains controller inactivity,
+    // not transport loss, unloaded hardware or an independently reported fault.
+    const bool expected_inactivity = lifecycle_transition && fresh &&
         observed.reported == LifecycleBlockingCauseClassDTO::kAvailability &&
         observed.cause == LifecycleBlockingCauseClassDTO::kAvailability &&
         observed.observation->observed_state == ComponentLifecycleStateDTO::kDegraded &&

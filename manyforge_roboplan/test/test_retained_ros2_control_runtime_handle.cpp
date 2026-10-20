@@ -2,6 +2,7 @@
 // the controller manager, the trajectory controller and the Isaac-side guard
 // (design R6/§7.5 CCLC activation, §3.1 binding epochs, §4.3/Q41/Q43/Q46).
 #include "ros2_control_fake_controller.hpp"
+#include "../src/program_reset_position_observation.hpp"
 
 #include <gtest/gtest.h>
 
@@ -160,7 +161,8 @@ struct ArmWorld final {
       core::RuntimeParticipantBinding initial_binding = ArmBinding(),
       std::shared_ptr<core::IClock> receiver_clock = {},
       bool mock_reset_position = false,
-      std::function<std::optional<std::string>()> process_fault = {})
+      std::function<std::optional<std::string>()> process_fault = {},
+      ros2_control_execution::Ros2TransportResources::ContextProvider context_provider = {})
       : owning_clock(receiver_clock ? std::move(receiver_clock)
                                     : std::make_shared<WallClock>()),
         clock(*owning_clock), binding(std::move(initial_binding)),
@@ -195,7 +197,7 @@ struct ArmWorld final {
     const auto bound = handle->Bind(
         std::make_unique<ros2_control_execution::Ros2TransportResources>(
             "manyforge_handle_test_" + fake::unique_suffix(), "/", 3U,
-            std::make_shared<NullSink>(), "arm", clock),
+            std::make_shared<NullSink>(), "arm", clock, std::move(context_provider)),
         clock, std::move(arm),
         [this, participant_constructions](
             std::shared_ptr<core::IExecutionPort> port) {
@@ -1199,8 +1201,13 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
               Outcome::kSucceeded);
     ASSERT_TRUE(world.WaitForState(State::kActive));
     bool checked_failure = false;
+    bool attempted_switchback = false;
     const auto reset = world.handle->ResetMockPosition(
         {}, [&](const auto &transition, const auto &) {
+      if (failure == 1 &&
+          transition.phase == MockResetPositionPhase::kSwitchingToJtc &&
+          !transition.switch_acknowledged)
+        attempted_switchback = true;
       if (transition.phase == MockResetPositionPhase::kSwitchingToWriter &&
           transition.switch_acknowledged) {
         EXPECT_TRUE(fake::WaitUntil(
@@ -1211,13 +1218,18 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
         return core::Result<void>::Ok();
       if (process_exit) exited = true;
       else if (hardware_failure) world.manager.SetHardwareActive(false);
-      else world.manager.StopAndDestroyEndpoints();
+      else {
+        world.manager.StopAndDestroyEndpoints();
+        checked_failure = true;
+        // Availability belongs to the accepted Reset step. Let the actual
+        // switchback discover the missing service or expire its SAME deadline;
+        // do not substitute a synthetic lifecycle error for that outcome.
+        return core::Result<void>::Ok();
+      }
       EXPECT_TRUE(fake::WaitUntil([&] {
         const auto snapshot = world.Snapshot();
-        return process_exit
-            ? snapshot.component_state == State::kFaulted
-            : hardware_failure ? ArmWorld::Cause(snapshot) == "unknown"
-            : ArmWorld::Fact(snapshot, "external.transport_ready") == false;
+        return process_exit ? snapshot.component_state == State::kFaulted
+                            : ArmWorld::Cause(snapshot) == "unknown";
       }));
       const auto snapshot = world.Snapshot();
       if (process_exit) {
@@ -1227,10 +1239,6 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
       } else if (hardware_failure) {
         EXPECT_EQ(ArmWorld::Cause(snapshot), "unknown");
         EXPECT_EQ(ArmWorld::Fact(snapshot, "external.controller_loaded"), false);
-      } else {
-        EXPECT_EQ(ArmWorld::Fact(snapshot, "external.transport_ready"), false);
-        EXPECT_FALSE(snapshot.exact_controller_configuration_active);
-        EXPECT_TRUE(snapshot.diagnostic.has_value());
       }
       checked_failure = true;
       return core::Result<void>::Err(
@@ -1239,6 +1247,15 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
     EXPECT_TRUE(checked_failure);
     EXPECT_NE(reset.outcome, Outcome::kSucceeded);
     EXPECT_FALSE(world.handle->current_port()->ReadReadiness().controller_bound);
+    if (failure == 1) {
+      EXPECT_TRUE(attempted_switchback);
+      ASSERT_TRUE(reset.error);
+      const auto &reason = reset.error->details.at("reason");
+      EXPECT_TRUE(reason == "ros2_control_switch_service_unavailable" ||
+                  reason == "ros2_control_switch_timeout") << reason;
+      EXPECT_EQ(world.manager.switch_requests(), 2U);
+      EXPECT_LE(world.manager.reset_commands().size(), 1U);
+    }
   }
 }
 
@@ -3202,6 +3219,71 @@ TEST(RetainedRos2ControlRuntimeHandle,
 }
 
 TEST(RetainedRos2ControlRuntimeHandle,
+     SharedContextKeepsSiblingActiveAndRetiredMeasuredReaderFrozen) {
+  std::shared_ptr<const core::IObservedStateProvider> retained_reader;
+  std::weak_ptr<rclcpp::Context> context_lifetime;
+  std::weak_ptr<core::IClock> clock_lifetime;
+  {
+    auto context = std::make_shared<rclcpp::Context>();
+    int argc = 0;
+    context->init(argc, nullptr);
+    context_lifetime = context;
+    auto clock = std::make_shared<core::FakeClock>();
+    clock->set(1000);
+    clock_lifetime = clock;
+    auto provider = [context] { return context; };
+    ArmWorld world("arm_controller", std::nullopt, nullptr, ArmBinding(),
+                   clock, false, {}, provider);
+    ros2_control_execution::Ros2TransportResources sibling(
+        "shared_context_io_" + fake::unique_suffix(), "", 2U, provider);
+    const auto descriptor = MeasuredSourceDescriptor(world);
+    const auto &query = descriptor.publication.query_context;
+    auto prepared = world.handle->StageMeasuredStateSources(
+        {descriptor}, clock, world.binding, std::nullopt);
+    ASSERT_TRUE(prepared.ok());
+    retained_reader = prepared.value()->readers().front();
+    prepared.value()->EnablePublication();
+    auto publisher = sibling.node()->create_publisher<sensor_msgs::msg::JointState>(
+        world.prefix + "/joint_states", rclcpp::QoS(1));
+    auto sibling_receipts = std::make_shared<std::atomic<unsigned>>(0U);
+    const auto subscription = sibling.node()->create_subscription<sensor_msgs::msg::JointState>(
+        world.prefix + "/joint_states", rclcpp::QoS(1),
+        [sibling_receipts](sensor_msgs::msg::JointState::ConstSharedPtr) { ++*sibling_receipts; });
+    world.handle->StartBackend();
+    sibling.start();
+    ASSERT_TRUE(fake::WaitUntil([&] { return publisher->get_subscription_count() == 2U; }));
+    sensor_msgs::msg::JointState message;
+    message.name = {"source_joint_1"};
+    message.position = {0.375};
+    publisher->publish(message);
+    ASSERT_TRUE(fake::WaitUntil([&] {
+      return retained_reader->current_state(query, 1000).ok() && sibling_receipts->load() == 1U;
+    }));
+    const auto frozen = retained_reader->current_state(query, 1000).value();
+    prepared.value().reset();
+    world.handle.reset();
+    ASSERT_TRUE(context->is_valid());
+    clock->set(1050);
+    message.position = {0.75};
+    publisher->publish(message);
+    ASSERT_TRUE(fake::WaitUntil([&] { return sibling_receipts->load() == 2U; }));
+    EXPECT_EQ(retained_reader->current_state(query, 1050).value(), frozen);
+    EXPECT_FALSE(retained_reader->current_state(query, 1101).ok());
+    sibling.quiesce();
+    EXPECT_TRUE(context->is_valid());
+    EXPECT_EQ(world.manager.switch_requests(), 0U);
+  }
+  // The frozen reader pins its actual Node/Context and receipt clock even
+  // after the host holder, both transports and the prepared lease are gone.
+  ASSERT_FALSE(context_lifetime.expired());
+  EXPECT_TRUE(context_lifetime.lock()->is_valid());
+  EXPECT_FALSE(clock_lifetime.expired());
+  retained_reader.reset();
+  EXPECT_TRUE(context_lifetime.expired());
+  EXPECT_TRUE(clock_lifetime.expired());
+}
+
+TEST(RetainedRos2ControlRuntimeHandle,
      InvalidMeasuredCandidateDoesNotAlterExistingSource) {
   auto clock = std::make_shared<core::FakeClock>();
   clock->set(1000);
@@ -3605,6 +3687,100 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
     EXPECT_TRUE(handle->ReadOwnedControllerOccurrence().domains.empty());
     EXPECT_FALSE(handle->participant());
     EXPECT_FALSE(handle->current_port());
+  }
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     MockResetEndpointChangesWaitForCurrentSuccessorWithinExistingDeadline) {
+  for (const bool restore_endpoint : {true, false}) {
+    SCOPED_TRACE(restore_endpoint);
+    ArmWorld world("arm_controller", {}, nullptr, ArmBinding(), {}, true);
+    // Production installs this observer before start; its existing sample
+    // timer refreshes endpoints and wakes Reset on new controller samples.
+    world.handle->InstallSampleObserver(
+        [](const core::ExecutionControllerSampleDTO &) {});
+    world.handle->StartBackend();
+    ASSERT_TRUE(fake::WaitUntil(
+        [&] { return world.handle->mock_reset_writer_inactive(); }));
+    ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
+              Outcome::kSucceeded);
+    ASSERT_TRUE(world.WaitForState(State::kActive));
+    rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr conflict;
+    bool checked_availability = false;
+    bool checked_successor = false;
+    const auto reset = world.handle->ResetMockPosition(
+        {}, [&](const auto &transition, const auto &deadline) -> core::Result<void> {
+      if (transition.phase == MockResetPositionPhase::kSwitchingToWriter &&
+          transition.switch_acknowledged) {
+        EXPECT_TRUE(fake::WaitUntil(
+            [&] { return world.handle->mock_reset_writer_active(); }));
+      }
+      if (transition.phase == MockResetPositionPhase::kSettingState) {
+        if (!transition.target_published) {
+          conflict = world.jtc.node()->create_publisher<
+              control_msgs::msg::JointTrajectoryControllerState>(
+              world.prefix + "/arm_controller/controller_state", rclcpp::QoS(10));
+          EXPECT_TRUE(fake::WaitUntil([&] {
+            (void)world.Snapshot();
+            const auto health = world.handle->ReadLifecycleHealth(
+                core::ControlDomainId("domain.arm"), world.clock.now());
+            return !health.ok() &&
+                   health.error().code == "duplicate_component_instance";
+          }));
+          // Reset owns this availability interval; SDK graph observation is
+          // not synthesized into a second lifecycle transport-loss condition.
+          const auto snapshot = world.Snapshot();
+          EXPECT_EQ(ArmWorld::Cause(snapshot), "availability");
+          EXPECT_EQ(ArmWorld::Fact(snapshot, "external.transport_ready"), true);
+          EXPECT_EQ(ArmWorld::Fact(snapshot, "external.fault_present"), false);
+          checked_availability = true;
+        } else {
+          EXPECT_TRUE(fake::WaitUntil(
+              [&] { return world.manager.reset_commands().size() == 1U; }));
+        }
+      }
+      if (transition.phase == MockResetPositionPhase::kSwitchingToJtc &&
+          transition.switch_acknowledged) {
+        checked_successor = true;
+        EXPECT_FALSE(world.handle->mock_reset_successor_ready());
+        const std::weak_ptr<rclcpp::Publisher<
+            control_msgs::msg::JointTrajectoryControllerState>> removed = conflict;
+        if (restore_endpoint) {
+          conflict.reset();
+          // As in the existing endpoint-removal fixture, release the peer
+          // executor's selected SDK owners before claiming endpoint removal.
+          world.jtc.node()->get_node_base_interface()
+              ->get_default_callback_group()->trigger_notify_guard_condition();
+        }
+        const auto wake = world.handle->mock_reset_observation_wake();
+        if (!wake)
+          return core::Result<void>::Err(
+              {"fixture_observation_missing", "Reset observation wake is absent", {}});
+        // Use the actual SDK deadline, exactly as the host does. A positive
+        // CM switch ACK cannot make a conflicting successor ready.
+        const auto observed = host_detail::WaitForMockResetObservation(
+            *wake, {}, deadline,
+            [&] { return core::Result<bool>::Ok(
+                world.handle->mock_reset_successor_ready()); },
+            [] { return core::Result<void>::Ok(); });
+        if (restore_endpoint) {
+          EXPECT_TRUE(removed.expired());
+        }
+        return observed;
+      }
+      return core::Result<void>::Ok();
+    });
+    EXPECT_TRUE(checked_availability);
+    EXPECT_TRUE(checked_successor);
+    EXPECT_EQ(reset.outcome, restore_endpoint ? Outcome::kSucceeded : Outcome::kFailed)
+        << SwitchFailureText(reset);
+    if (!restore_endpoint) {
+      ASSERT_TRUE(reset.error);
+      EXPECT_EQ(reset.error->details.at("reason"),
+                "reset_position_acknowledgment_timeout");
+      EXPECT_FALSE(world.handle->current_port()->ReadReadiness().controller_bound);
+    }
+    EXPECT_EQ(world.manager.reset_commands().size(), 1U);
   }
 }
 

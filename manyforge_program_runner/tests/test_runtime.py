@@ -6798,6 +6798,115 @@ def test_idle_reset_unknown_claim_outcome_retains_exact_intent_without_resend(mo
         runtime.shutdown()
 
 
+class _RefusingResetAdmission(_Admission):
+    """Kernel admission whose first program_reset acquire is refused (no claim)."""
+
+    def __init__(self, journal: ProgramCycleJournal) -> None:
+        super().__init__()
+        self.journal = journal
+        self.generation = 1
+        self.refuse = True
+
+    def get(self):
+        return {"admission_generation": self.generation, "authoring_allowed": True}
+
+    def acquire(self, intent):
+        # The exact intent sent is the one durably retained before crossing.
+        assert self.journal.read().reset_effect_claim["intent"] == intent
+        self.claims.append(deepcopy(intent))
+        if self.refuse:
+            raise CellAdmissionError("program_reset_effects_not_settled", "operations not settled")
+        return {"intent": deepcopy(intent), "claim_generation": 3,
+                "acquired_admission_generation": self.generation, "accepted_at_ns": 1}
+
+
+def _refused_idle_reset(monkeypatch, tmp_path):
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options")
+    admission = _RefusingResetAdmission(journal)
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+        headless_client=_Headless(), execution_transport=_Headless(), admission_client=admission, cycle_journal=journal)
+    effects = []
+    monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda request, _auth: effects.append(request.request_id))
+    writes = []
+    remember = journal.remember_reset_effect_claim
+    def spy(**kwargs):
+        writes.append(deepcopy(kwargs))
+        return remember(**kwargs)
+    monkeypatch.setattr(journal, "remember_reset_effect_claim", spy)
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({"request_id": "reset.refused", "request_owner_epoch": "caller.1",
+        "source_label": "operator_ui", "correlation_id": None, "program_run_id": None,
+        "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": 1, "reload_initial_scene": True})
+    with pytest.raises(ProgramRunnerError) as failed:
+        runtime.reset_cycle(request)
+    assert failed.value.details == {"cause_code": "program_reset_effects_not_settled"}
+    cycle = journal.read()
+    assert cycle.state == "recovery_required" and not cycle.reconciliation_required
+    assert cycle.reset_phase == "restoring_scene" == cycle.failure["failed_phase"]
+    retained = deepcopy(cycle.reset_effect_claim)
+    assert retained["claim"] is None and retained["intent"]["expected_admission_generation"] == 1
+    assert admission.claims == [retained["intent"]] and not effects
+    writes.clear()
+    return journal, admission, runtime, request, retained, effects, writes
+
+
+@pytest.mark.parametrize("generation_advanced", [True, False])
+def test_idle_reset_retry_after_refused_acquire_targets_current_admission_generation(
+    monkeypatch, tmp_path, generation_advanced,
+):
+    journal, admission, runtime, request, retained, effects, writes = _refused_idle_reset(monkeypatch, tmp_path)
+    try:
+        if generation_advanced:
+            admission.generation = 2  # the blocking operation closed
+        admission.refuse = False
+        runtime.reset_cycle(request.model_copy(update={"request_id": "reset.retry"}))
+        assert len(admission.claims) == 2
+        first, retry = admission.claims
+        expected = 2 if generation_advanced else 1
+        assert retry == {**first, "expected_admission_generation": expected}
+        assert retry["request_id"] == retry["owner_transaction_id"] == first["request_id"]
+        pre_acquire = [w for w in writes if w["retained"]["claim"] is None]
+        if generation_advanced:
+            assert pre_acquire == [{"expected_generation": 1, "expected": retained,
+                                    "retained": {**retained, "intent": retry}}]
+        else:
+            assert pre_acquire == []
+            assert retry == retained["intent"]
+        assert writes[len(pre_acquire)]["expected"]["intent"] == retry
+        assert effects == ["reset.refused"]
+        assert journal.read().state == "idle_after_reset"
+    finally:
+        runtime.shutdown()
+
+
+def test_idle_reset_reconciliation_replays_retained_intent_without_refresh(monkeypatch, tmp_path):
+    journal, admission, runtime, request, retained, effects, writes = _refused_idle_reset(monkeypatch, tmp_path)
+
+    class ReconcilingJournal:
+        """The cycle read by the acquire step reports an uncertain prior acquire."""
+        def __init__(self, inner):
+            self._inner = inner
+        def read(self):
+            return replace(self._inner.read(), reconciliation_required=True)
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    acquire = runtime._acquire_reset_effect_claim
+    monkeypatch.setattr(runtime, "_acquire_reset_effect_claim",
+                        lambda admission_client, inner: acquire(admission_client, ReconcilingJournal(inner)))
+    try:
+        admission.generation = 2
+        admission.refuse = False
+        runtime.reset_cycle(request.model_copy(update={"request_id": "reset.retry"}))
+        assert admission.claims == [retained["intent"], retained["intent"]]
+        assert admission.claims[1]["expected_admission_generation"] == 1
+        assert not [w for w in writes if w["retained"]["claim"] is None]
+        assert writes[0]["expected"] == retained
+        assert effects == ["reset.refused"]
+    finally:
+        runtime.shutdown()
+
+
 @pytest.mark.parametrize("fail_position", [False, True])
 def test_position_only_idle_reset_preserves_prior_scene_failure_until_selected_reload(monkeypatch, tmp_path, fail_position):
     class Admission(_Admission):

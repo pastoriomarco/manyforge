@@ -29,7 +29,7 @@
     action_monitor_rate: 20.0
     interface_name: position
     interpolate_from_desired_state: true
-    allow_trajectory_replacement: false
+    allow_trajectory_replacement: true
     constraints:
       goal_time: 0.5
       stopped_velocity_tolerance: 0.0

@@ -123,6 +123,7 @@ bool make_goal(const TrajectoryDTO &trajectory,
 struct Ros2ControlExecutionBackend::State {
   struct Goal {
     ExecutionGoalObservationDTO observation;
+    VolatileMotionTrace::TokenPtr trace_token;
     GoalHandle::SharedPtr handle;
     std::optional<ExecutionGoalKey> successor;
     bool successor_accepted{false};
@@ -347,12 +348,29 @@ void Ros2ControlExecutionBackend::shutdown() noexcept {
 ExecutionPortCommandResultDTO
 Ros2ControlExecutionBackend::Submit(const ExecutionGoalKey &key,
                                     const TrajectoryDTO &trajectory) {
+  VolatileMotionTrace::Garbage garbage;
   std::lock_guard command_lock(state_->command_mutex);
-  return SendGoal(key, trajectory, std::nullopt);
+  return SendGoal(key, trajectory, std::nullopt, garbage);
 }
 ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
     const ExecutionGoalKey &key, const TrajectoryDTO &trajectory,
-    std::optional<ExecutionGoalKey> active_key) {
+    std::optional<ExecutionGoalKey> active_key,
+    VolatileMotionTrace::Garbage &trace_garbage,
+    std::optional<ExecutionReplacementStartDTO> start) {
+  if (start) {
+    if (!state_->config.lane_facts.supports_scheduled_replacement)
+      return refused(ExecutionPortRefusal::kUnsupported,
+                     "This lane does not support scheduled replacement");
+    if (start->binding_epoch != state_->config.binding_epoch)
+      return refused(ExecutionPortRefusal::kStaleKey,
+                     "Scheduled replacement names another binding epoch");
+    if (!active_key || start->controller_start_stamp_ns <= 0 ||
+        start->controller_start_stamp_ns / 1'000'000'000 >
+            std::numeric_limits<std::int32_t>::max())
+      return refused(
+          ExecutionPortRefusal::kInvalidInput,
+          "Scheduled replacement has no representable controller start stamp");
+  }
   Action::Goal goal;
   if (key.controller_goal_id.empty() ||
       !key.controller_goal_generation.nonzero() ||
@@ -360,6 +378,12 @@ ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
                  active_key.has_value()))
     return refused(ExecutionPortRefusal::kInvalidInput,
                    "Invalid full-PVA trajectory or goal key");
+  if (start) {
+    goal.trajectory.header.stamp.sec = static_cast<std::int32_t>(
+        start->controller_start_stamp_ns / 1'000'000'000);
+    goal.trajectory.header.stamp.nanosec = static_cast<std::uint32_t>(
+        start->controller_start_stamp_ns % 1'000'000'000);
+  }
   {
     std::lock_guard facts_lock(state_->mutex);
     if (state_->goals.contains(key))
@@ -374,6 +398,7 @@ ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
   if (!action_client_ || !action_client_->action_server_is_ready())
     return refused(ExecutionPortRefusal::kNotReady,
                    "FJT action server is not discovered");
+  VolatileMotionTrace::TokenPtr trace_token;
   {
     std::lock_guard facts_lock(state_->mutex);
     if (active_key && (!state_->current || *state_->current != *active_key ||
@@ -386,6 +411,15 @@ ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
     record.observation.key = key;
     record.observation.binding_epoch = state_->config.binding_epoch;
     record.predecessor = state_->current;
+    if (state_->config.motion_trace) {
+      try {
+        const auto predecessor = active_key ? state_->goals.at(*active_key).trace_token
+                                            : VolatileMotionTrace::TokenPtr{};
+        trace_token = state_->config.motion_trace->Begin(state_->config.action_name,
+            state_->config.binding_epoch, key, predecessor, state_->clock.now(), trace_garbage);
+        record.trace_token = trace_token;
+      } catch (...) {} // Diagnostic capture never changes dispatch.
+    }
     state_->goals.emplace(key, std::move(record));
     state_->goal_order.push_back(key);
     if (state_->current) {
@@ -415,7 +449,15 @@ ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
   try {
     (void)action_client_->async_send_goal(goal, options);
   } catch (const std::exception &error) {
+    if (state_->config.motion_trace) {
+      try { state_->config.motion_trace->Attach(trace_token, std::move(goal), state_->clock.now(),
+              ExecutionPortDispatch::kEffectUncertain, trace_garbage); } catch (...) {}
+    }
     return uncertain(error.what());
+  }
+  if (state_->config.motion_trace) {
+    try { state_->config.motion_trace->Attach(trace_token, std::move(goal), state_->clock.now(),
+            ExecutionPortDispatch::kDispatched, trace_garbage); } catch (...) {}
   }
   return sent();
 }
@@ -423,6 +465,9 @@ ExecutionPortCommandResultDTO
 Ros2ControlExecutionBackend::Replace(const ExecutionGoalKey &active_key,
                                      const ExecutionGoalKey &next_key,
                                      const TrajectoryDTO &trajectory) {
+  // Declared before the guard: retained payload garbage is released only
+  // after the outer command mutex unlocks, including early returns.
+  VolatileMotionTrace::Garbage garbage;
   std::lock_guard command_lock(state_->command_mutex);
   {
     std::lock_guard facts_lock(state_->mutex);
@@ -435,7 +480,26 @@ Ros2ControlExecutionBackend::Replace(const ExecutionGoalKey &active_key,
   }
   // Core owns the approved ManyMove-shaped past samples and all correction.
   // Preserve supplied time/PVA exactly; no clamp, synthetic pin or rescaling.
-  return SendGoal(next_key, trajectory, active_key);
+  return SendGoal(next_key, trajectory, active_key, garbage);
+}
+ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::ReplaceScheduled(
+    const ExecutionGoalKey &active_key, const ExecutionGoalKey &next_key,
+    const TrajectoryDTO &trajectory,
+    const ExecutionReplacementStartDTO &start) {
+  VolatileMotionTrace::Garbage garbage;
+  std::lock_guard command_lock(state_->command_mutex);
+  {
+    std::lock_guard facts_lock(state_->mutex);
+    if (!state_->current || *state_->current != active_key ||
+        state_->goals.contains(next_key) ||
+        state_->goals.at(active_key).observation.phase ==
+            ExecutionGoalPhase::kTerminal)
+      return refused(ExecutionPortRefusal::kStaleKey,
+                     "Replacement keys do not name current and unused goals");
+  }
+  // The header and the unchanged signed-time/PVA payload cross the SDK
+  // boundary together, under the same epoch's command serialization.
+  return SendGoal(next_key, trajectory, active_key, garbage, start);
 }
 ExecutionPortCommandResultDTO
 Ros2ControlExecutionBackend::Cancel(const ExecutionGoalKey &key) {
@@ -544,6 +608,10 @@ Ros2ControlExecutionBackend::SetScale(double value) {
   } catch (const std::exception &error) {
     return uncertain(error.what());
   }
+  if (state_->config.motion_trace) {
+    try { state_->config.motion_trace->PublishedScale(state_->config.action_name,
+        state_->config.binding_epoch, state_->clock.now(), value); } catch (...) {}
+  }
   return sent(); // Published is not applied; only ReceiveState updates that
                  // fact.
 }
@@ -589,6 +657,8 @@ void Ros2ControlExecutionBackend::ReceiveResponse(
         send_cancel = true;
       }
     }
+    if (state->config.motion_trace)
+      state->config.motion_trace->Observe(goal.trace_token, goal.observation);
     for (auto &[other_key, other] : state->goals) {
       (void)other_key;
       if (handle && other.successor == key)
@@ -636,6 +706,8 @@ void Ros2ControlExecutionBackend::ReceiveFeedback(
   goal.handle = handle;
   goal.observation.mechanism_goal_id = id;
   goal.observation.phase = ExecutionGoalPhase::kExecuting;
+  if (state->config.motion_trace)
+    state->config.motion_trace->Observe(goal.trace_token, goal.observation);
 }
 void Ros2ControlExecutionBackend::ReceiveResult(
     const std::shared_ptr<State> &state, const ExecutionGoalKey &key,
@@ -658,6 +730,8 @@ void Ros2ControlExecutionBackend::ReceiveResult(
   goal.observation.terminal_local_receipt_stamp = state->clock.now();
   goal.handle.reset();
   state->classify(goal);
+  if (state->config.motion_trace)
+    state->config.motion_trace->Observe(goal.trace_token, goal.observation);
 }
 
 void Ros2ControlExecutionBackend::ReceiveState(
@@ -722,6 +796,8 @@ void Ros2ControlExecutionBackend::ReceiveState(
   state->previous_source_stamp = sample.source_stamp_ns;
   state->timing.received_samples =
       state->timing.received_samples.value_or(0U) + 1U;
+  if (state->config.motion_trace)
+    state->config.motion_trace->Sample(state->config.action_name, sample);
   state->sample = std::move(sample);
 }
 std::optional<ExecutionGoalObservationDTO>

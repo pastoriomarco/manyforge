@@ -1929,6 +1929,30 @@ struct RetainedNativeComponentSnapshot final {
   std::shared_ptr<const ComponentRuntimePins> component_runtime_pins{};
 };
 
+// One explicit native-host lifetime, shared only by resources given this
+// provider. No ROS context/participant is initialized for an empty host. The
+// provider captures only this small state, never a Composition or host pointer.
+[[nodiscard]] ros2_control_execution::Ros2TransportResources::ContextProvider
+MakeHostRosContextProvider() {
+  struct State final {
+    std::mutex mutex;
+    std::shared_ptr<rclcpp::Context> context;
+  };
+  return [state = std::make_shared<State>()] {
+    std::lock_guard lock(state->mutex);
+    if (!state->context) {
+      auto context = std::make_shared<rclcpp::Context>();
+      int argc = 0;
+      char **argv = nullptr;
+      context->init(argc, argv);
+      // Publish only a successfully initialized context. No reset, global
+      // cache, domain merge or background retry exists here.
+      state->context = std::move(context);
+    }
+    return state->context;
+  };
+}
+
 struct CompositionBuildInput final {
   std::filesystem::path package_root;
   std::filesystem::path execution_state_root;
@@ -1987,6 +2011,8 @@ struct CompositionBuildInput final {
   // Root cell selection only. Physical component construction keeps its
   // existing direct-control inputs and component ownership unchanged.
   std::optional<detail::SelectedProgramProducts> selected_program_products{};
+  ros2_control_execution::Ros2TransportResources::ContextProvider ros_context_provider{};
+  std::shared_ptr<ros2_control_execution::VolatileMotionTrace> motion_trace{};
 };
 
 [[nodiscard]] core::CellAdmissionSettlementValidator
@@ -2966,6 +2992,8 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
   configure_retained_gripper_output_mode(config, configuration, binding);
   config.defer_ros_start = input.managed_component_delta.has_value();
   config.measured_receiver_clock = input.shared_clock;
+  config.ros_context_provider = input.ros_context_provider;
+  config.arm.adapter.motion_trace = input.motion_trace;
   auto backend = make_retained_ros2_control_gripper_backend(std::move(config), binding, channel,
       *input.shared_clock, *input.shared_scheduler, handle);
   RetainedNativeGripperRuntimeInput gripper_input{
@@ -3694,6 +3722,8 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                                            ? input.shared_clock
                                            : std::make_shared<WallClock>();
   ros2_control_backend_config.measured_receiver_clock = measured_receiver_clock;
+  ros2_control_backend_config.ros_context_provider = input.ros_context_provider;
+  ros2_control_backend_config.arm.adapter.motion_trace = input.motion_trace;
   const auto measured_lane =
       ros2_control_backend_config.arm.measured_joint_state_lane;
   const bool pneumatic_gripper = ros2_control_backend_config.gripper &&
@@ -4676,7 +4706,13 @@ BuildComposition(const HostConfig &config,
                  ManagedKernelAdmissionGate *operation_admission_gate,
                  bool attach_addressed_owner = true,
                  std::shared_ptr<WallClock> shared_clock = {},
-                 std::shared_ptr<SimpleScheduler> shared_scheduler = {}) {
+                 std::shared_ptr<SimpleScheduler> shared_scheduler = {},
+                 ros2_control_execution::Ros2TransportResources::ContextProvider
+                     ros_context_provider = {}) {
+  const auto build = [&](CompositionBuildInput input) {
+    input.ros_context_provider = ros_context_provider;
+    return BuildProductComposition(std::move(input));
+  };
   component_manager::SqliteActiveBundlePublicationStore publication_store(
       config.manager_state_root /
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
@@ -4744,7 +4780,7 @@ BuildComposition(const HostConfig &config,
     // Let the component inventory choose the gripper-only owner. It creates
     // no motion engine or planner and is attached to the stable cell Kernel by
     // the same managed bootstrap path as every other component.
-    return BuildProductComposition(CompositionBuildInput{
+    return build(CompositionBuildInput{
         config.package_root,
         config.execution_state_root,
         config.execution_run_root,
@@ -4872,7 +4908,7 @@ BuildComposition(const HostConfig &config,
                     selected_motion.component().controllable_component_id)),
           "native Program aliases cross their physical component");
 
-  return BuildProductComposition(CompositionBuildInput{
+  return build(CompositionBuildInput{
       config.package_root,
       config.execution_state_root,
       config.execution_run_root,
@@ -4964,6 +5000,7 @@ NativeCellComponentRegistrations(const Composition &cell) {
 void PrepareCompositionIoResources(Composition &composition,
     RetainedNativeCellRuntime &cell,
     std::shared_ptr<ros2_control_execution::Ros2TransportResources> &shared_transport,
+    const ros2_control_execution::Ros2TransportResources::ContextProvider &ros_context_provider,
     std::span<const CompositionIoResourcePredecessor> existing = {}) {
   const auto rows = deployment::ResolveRetainedIoSignalCatalog(composition.bundle->value().cell_graph);
   Require(rows.ok(), "retained I/O source configuration is invalid");
@@ -4974,15 +5011,22 @@ void PrepareCompositionIoResources(Composition &composition,
            row.provider.profile == "ur_set_io" ||
            row.provider.profile == "ros2_control_gpio";
   });
-  if (needs_ros && !shared_transport)
-    shared_transport = std::make_shared<ros2_control_execution::Ros2TransportResources>(
-        "manyforge_generic_io", "/", 3U);
-  composition.io_transport = shared_transport;
+  auto transport = shared_transport;
+  const bool created_transport = needs_ros && !transport;
+  if (created_transport)
+    transport = std::make_shared<ros2_control_execution::Ros2TransportResources>(
+        "manyforge_generic_io", "/", 3U, ros_context_provider);
+  composition.io_transport = transport;
   const auto prepared = PrepareCompositionIoProviderResources(composition, cell,
-      shared_transport ? shared_transport->node() : nullptr, existing);
+      transport ? transport->node() : nullptr, existing);
   Require(prepared.ok(), "actual I/O resource preparation failed: " +
       (prepared.ok() ? std::string{} : prepared.error().message));
-  if (shared_transport) shared_transport->start();
+  if (created_transport) {
+    transport->start();
+    // Publish only a successfully prepared, running host transport. Later
+    // compositions reuse its executor without starting it a second time.
+    shared_transport = std::move(transport);
+  }
 }
 
 // Candidate resources may acquire real samples before successful Apply, but
@@ -8504,6 +8548,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   using component_manager::detail::NativeShutdownOwnerPhase;
   component_manager::detail::NativeShutdownProjection shutdown_projection(
       config.runtime_epoch);
+  const auto host_ros_context_provider = MakeHostRosContextProvider();
+  const auto host_motion_trace =
+      std::make_shared<ros2_control_execution::VolatileMotionTrace>();
   // These outlive every borrowed host owner and the SAME servicing lane.
   std::mutex manager_liveness_failure_mutex;
   std::exception_ptr manager_liveness_failure;
@@ -8896,6 +8943,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   std::set<std::pair<std::string, std::string>> retired_manager_epochs;
   auto execution_composition_owner =
       std::make_shared<ExecutionCompositionAccess>();
+  execution_composition_owner->motion_trace = host_motion_trace;
   auto &execution_composition = *execution_composition_owner;
   execution_composition.addressed_kernel = stable_kernel_owner;
   execution_composition.operation_journal = stable_operation_journal;
@@ -9121,29 +9169,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
 
   const auto snapshot_registration_engines = [](const Composition &composition) {
     std::set<core::IResolvedParticipantExecutionEngine *> engines;
-    const auto include = [&](const Composition &component) {
-      if (component.runtime != nullptr) {
-        for (const auto &registration :
-             component.runtime->participant_registrations) {
-          Require(registration.engine != nullptr,
-                  "composition registration has no execution engine");
-          engines.insert(registration.engine);
-        }
-      }
-      if (component.gripper_runtime != nullptr) {
-        const auto registration = component.gripper_runtime->registration();
-        Require(registration.engine != nullptr,
-                "gripper composition has no execution engine");
-        engines.insert(registration.engine);
-      }
-    };
-    include(composition);
-    for (const auto &participant : composition.participant_compositions) {
-      Require(participant != nullptr,
-              "composition has a missing component owner");
-      include(*participant);
+    // Use the same complete inventory installed in the stable Kernel. Its
+    // borrowed subscriptions include subordinate I/O output engines too.
+    for (const auto &registration : NativeCellComponentRegistrations(composition)) {
+      Require(registration.engine != nullptr,
+              "composition registration has no execution engine");
+      engines.insert(registration.engine);
     }
-    Require(!engines.empty(), "physical composition has no execution engines");
+    // A qualified input-only component legitimately has no engine.
     return engines;
   };
 
@@ -9268,6 +9301,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       }
       input->attach_addressed_owner = false;
       input->shared_clock = detached_owner_clock;
+      input->ros_context_provider = host_ros_context_provider;
+      input->motion_trace = host_motion_trace;
       input->shared_scheduler = detached_owner_scheduler;
       input->observation_wake = stable_observation_wake;
       input->managed_isaac_launch_inputs = bootstrap_isaac_inputs;
@@ -9300,7 +9335,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                            built->runtime->scheduler == detached_owner_scheduler)),
                       "current managed composition duplicated the stable addressed owner");
               PrepareCompositionIoResources(*built, *stable_cell_runtime_owner,
-                                            generic_io_transport);
+                                            generic_io_transport, host_ros_context_provider);
               auto current_registrations = NativeCellComponentRegistrations(*built);
               RetainedRuntimeParticipantResolverFactory staged_factory;
               auto current_resolver = NativeCellParticipantResolver(*built, current_registrations, &staged_factory);
@@ -9876,6 +9911,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 request.runtime_epoch.value() == config.runtime_epoch,
             "runtime-composition request names another managed child");
     bool original_configuration_finalize = false;
+    bool verified_configuration_finalize = false;
     // This classifies the exact stored configuration operation's Scene target;
     // effect authority still comes from the existing held-fence checks below.
     // Linked preparation uses only its same original sealed parent/facade.
@@ -9913,10 +9949,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     original_apply_bring_up_capture->sealed_plan.plan.apply_generation == request.apply_generation,
                 "linked runtime preparation lacks its exact original accepted child owner");
       }
-      if (!parent.value().bring_up_plan &&
-          request.phase == component_manager::ManagerSelectedRuntimeCompositionPhase::kFinalize &&
-          request.candidate_projection_revision.scene_revision ==
-              request.predecessor_projection_revision.scene_revision) {
+      if (request.phase == component_manager::ManagerSelectedRuntimeCompositionPhase::kFinalize) {
         const auto &stored = parent.value();
         const auto &intent = stored.intent.intent;
         Require(stored.fence_attempt && stored.fence_acceptance &&
@@ -9944,7 +9977,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                                       unit.runtime_epoch == request.runtime_epoch;
                                 }),
                 "preserved configuration finalization differs from its exact stored parent/fence/host");
-        original_configuration_finalize = true;
+        verified_configuration_finalize = true;
+        original_configuration_finalize = !stored.bring_up_plan &&
+            request.candidate_projection_revision.scene_revision ==
+                request.predecessor_projection_revision.scene_revision;
       }
     }
     if (request.phase == component_manager::ManagerSelectedRuntimeCompositionPhase::kPrepare &&
@@ -10096,6 +10132,43 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       request.expected_predecessor_public_pointer_digest,
               "installed runtime composition does not reconcile to its exact "
               "durable held fence and predecessor publication");
+    };
+    // Initial installation retains the strict predecessor check. Only this
+    // post-install handoff uses candidate rows (including proved absence),
+    // still under the actual original parent and unchanged public head.
+    const auto run_with_installed_candidate = [&](const std::function<void()> &effect) {
+      Require(verified_configuration_finalize && configuration_parent_claim,
+              "installed candidate handoff lacks its verified original Manager parent");
+      Composition *installed = nullptr;
+      {
+        std::lock_guard lock(managed_composition_mutex);
+        Require(installed_under_fence_composition_request == std::optional(request) &&
+                    !managed_composition_building && !current_composition_building,
+                "installed candidate handoff lost its exact current request");
+        installed = active_managed_composition.get();
+      }
+      std::vector<core::RuntimeProviderDomainConfigurationReadbackDTO> configurations;
+      for (const auto &domain : request.configuration_fence_scope.domains) {
+        const auto *sides = std::get_if<core::ProviderConfigurationFenceDomainDTO>(&domain.payload);
+        if (!sides || !sides->candidate_provider) continue;
+        const auto actual = stable_kernel_owner->current_runtime_provider_configuration(domain.control_domain_id);
+        Require(actual.ok() && actual.value(),
+                "installed candidate handoff has no actual provider row");
+        configurations.push_back(*actual.value());
+      }
+      fence_owner.RunWithExactHeldInstalledCandidate(fence_query,
+          request.expected_predecessor_publication_generation,
+          request.expected_predecessor_public_pointer_digest, *configuration_parent_claim,
+          request.candidate_projection_revision, configurations, [&] {
+            {
+              std::lock_guard lock(managed_composition_mutex);
+              Require(installed_under_fence_composition_request == std::optional(request) &&
+                          active_managed_composition.get() == installed &&
+                          !managed_composition_building && !current_composition_building,
+                      "installed candidate changed before its pinned handoff");
+            }
+            effect();
+          });
     };
     try_release_retired_composition();
     try_start_current_composition();
@@ -10260,9 +10333,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           installed_under_fence_composition_request = request;
         }
         if (current != nullptr) {
-          fence_owner.RunWithExactHeldPredecessor(
-              fence_query, request.expected_predecessor_publication_generation,
-              request.expected_predecessor_public_pointer_digest, [&] {
+          run_with_installed_candidate([&] {
                 std::unique_lock execution_lock(execution_composition.mutex);
                 Require(active_managed_composition.get() == current &&
                             final_projections.has_value(),
@@ -10278,9 +10349,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         } else {
           // Mirror the same exact final Scene handoff for the real logical
           // product; no physical projection/owner is manufactured.
-          fence_owner.RunWithExactHeldPredecessor(
-              fence_query, request.expected_predecessor_publication_generation,
-              request.expected_predecessor_public_pointer_digest, [&] {
+          run_with_installed_candidate([&] {
                 std::unique_lock execution_lock(execution_composition.mutex);
                 auto *product = execution_composition.product();
                 Require(!execution_composition.current && product &&
@@ -10588,9 +10657,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       // runtime installed; a later CCLC service attachment is not a route
       // readiness substitute. The Apply fence continues to block commands.
       if (active_managed_composition != nullptr) {
-        fence_owner.RunWithExactHeldPredecessor(
-            fence_query, request.expected_predecessor_publication_generation,
-            request.expected_predecessor_public_pointer_digest, [&] {
+        run_with_installed_candidate([&] {
               const auto candidate_package = LoadManagedBundleAtPinnedRoot(
                   config, request.candidate_projection_revision
                               .retained_bundle_id);
@@ -10863,6 +10930,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   config, projections, admission_gate, request,
                   std::move(shared_clock), std::move(shared_scheduler));
               if (input.has_value()) {
+                input->ros_context_provider = host_ros_context_provider;
+                input->motion_trace = host_motion_trace;
                 input->retained_component_snapshots =
                     std::move(retained_snapshots);
                 input->observation_wake = stable_observation_wake;
@@ -11320,7 +11389,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 config.manager_run_root);
             candidate.bundle = std::move(retained_view_input->bundle);
             PrepareCompositionIoResources(candidate, *stable_cell_runtime_owner,
-                                          generic_io_transport, io_resources);
+                                          generic_io_transport, host_ros_context_provider, io_resources);
             const auto bound_outputs = BindCompositionIoOutputParticipants(candidate, output_construction_generations);
             Require(bound_outputs.ok(), "retained output construction failed");
             DetachRetainedCCLC(candidate);
@@ -11510,7 +11579,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 candidate_stop_sources = NativeCellStopSources(*prepared);
               }
               PrepareCompositionIoResources(*prepared, *stable_cell_runtime_owner,
-                                            generic_io_transport, io_resources);
+                                            generic_io_transport, host_ros_context_provider, io_resources);
               const auto bound_outputs = BindCompositionIoOutputParticipants(*prepared, output_construction_generations);
               Require(bound_outputs.ok(), "candidate output construction failed");
               auto candidate_registrations =
@@ -12178,6 +12247,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     if (manager.state != core::ManagerLivenessStateDTO::kCurrent ||
         manager.command_fenced)
       return Reply::Ok();
+    // Private Apply installation can precede its public/CCLC handoff. The
+    // same exclusion is independently enforced by Core activation/restore.
+    if (admission_gate.has_held_configuration_fences())
+      return Reply::Ok();
     std::optional<core::ActiveBundlePublicationReceiptDTO> selected;
     deployment::CCLCRuntimeComposition *facade = nullptr;
     std::optional<component_manager::ManagerSelectedRuntimeCompositionRequestDTO> installed_request;
@@ -12198,6 +12271,31 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         &selected->request.transaction_ref);
     if (!origin)
       return Reply::Ok(); // Ordinary Bootstrap remains unknown.
+    const auto pointer = component_manager::ReadActiveBundlePublicationReadOnly(
+        config.manager_state_root /
+            std::string(component_manager::kActiveBundlePublicationStoreFilename),
+        core::CellId(config.cell_id));
+    if (!pointer.ok())
+      return Reply::Err(pointer.error());
+    if (pointer.value() != *selected)
+      return Reply::Ok(); // Proved superseded observation, no installation effect.
+    {
+      // Terminal publication can precede the existing successor heartbeat.
+      // Join that actual lease handoff before activating its logical product.
+      std::lock_guard liveness_lock(manager_liveness_servicing_mutex);
+      if (!manager_liveness_required_set ||
+          manager_liveness_required_set->active_bundle_id !=
+              selected->request.candidate_retained_bundle_id ||
+          manager_liveness_publication_generation !=
+              selected->publication_generation ||
+          manager_liveness_public_pointer_digest !=
+              selected->durable_public_pointer_content_digest)
+        return Reply::Ok();
+      const auto current = manager_liveness_receiver.get()->status();
+      if (current.state != core::ManagerLivenessStateDTO::kCurrent ||
+          current.command_fenced)
+        return Reply::Ok();
+    }
     if (installed_request &&
         (installed_request->apply_id != origin->apply_id ||
          installed_request->apply_generation != origin->apply_generation ||
@@ -12255,14 +12353,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         }
       }
     }
-    const auto pointer = component_manager::ReadActiveBundlePublicationReadOnly(
-        config.manager_state_root /
-            std::string(component_manager::kActiveBundlePublicationStoreFilename),
-        core::CellId(config.cell_id));
-    if (!pointer.ok())
-      return Reply::Err(pointer.error());
-    if (pointer.value() != *selected)
-      return Reply::Ok(); // Proved superseded observation, no installation effect.
     const auto status = component_manager::ReadManagerApplyStatusReadOnly(
         config.manager_state_root /
             std::string(component_manager::kManagerApplyJournalFilename),
@@ -14107,7 +14197,7 @@ public:
             SimpleSchedulerConfig::from_environment())),
         composition_(BuildComposition(config_, owner_epoch_, runtime_epoch_,
                                       &admission_gate_, false, fixture_clock_,
-                                      fixture_scheduler_)) {
+                                      fixture_scheduler_, ros_context_provider_)) {
     struct FixtureStartupCleanup final {
       Composition& composition;
       std::unique_ptr<RetainedNativeCellRuntime>& cell;
@@ -14192,7 +14282,7 @@ public:
     AttachProductPickPlacePlanningOwner(*composition_);
 #else
         composition_(BuildComposition(config_, owner_epoch_, runtime_epoch_,
-                                      &admission_gate_)) {
+                                      &admission_gate_, true, {}, {}, ros_context_provider_)) {
 #endif
     // Motion compositions bind this shared admission gate while constructing
     // their Kernel. The standalone gripper-only composition creates its
@@ -14244,7 +14334,7 @@ public:
 #endif
     if (composition_->cell_runtime) {
       PrepareCompositionIoResources(*composition_, *composition_->cell_runtime,
-                                    composition_->io_transport);
+                                    composition_->io_transport, ros_context_provider_);
       InstallCompositionIoSignals(*composition_, *composition_->cell_runtime);
     }
     composition_access_.current = composition_.get();
@@ -14309,6 +14399,8 @@ private:
   std::shared_ptr<WallClock> fixture_clock_;
   std::shared_ptr<SimpleScheduler> fixture_scheduler_;
 #endif
+  const ros2_control_execution::Ros2TransportResources::ContextProvider
+      ros_context_provider_ = MakeHostRosContextProvider();
   std::unique_ptr<Composition> composition_;
   // Retire the stable Kernel before the component engines it borrows.
   std::unique_ptr<RetainedNativeCellRuntime> fixture_cell_runtime_;

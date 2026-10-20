@@ -25,6 +25,8 @@ import type {
   RuntimeControlAuditEvent,
   AutomaticRetryAuditEvent,
   AutomaticRetryAuditFacts,
+  TakeoverFallbackAuditEvent,
+  TakeoverFallbackAuditFacts,
 } from '../../types/api';
 import type { RuntimeScaleControlAccepted, RuntimeScaleControlStatus, ProgramRunAdmittedSpeeds } from '../../types/robotControl';
 import type { JsonObject } from './shared';
@@ -786,6 +788,51 @@ function parseAutomaticRetryAuditFacts(
   };
 }
 
+export function isTakeoverFallbackAuditEvent(
+  event: RuntimeControlAuditEvent,
+): event is TakeoverFallbackAuditEvent {
+  return event.kind === 'program_node_takeover_fallback';
+}
+
+function parseTakeoverFallbackAuditFacts(
+  record: JsonObject,
+  path: string,
+): TakeoverFallbackAuditFacts {
+  const takeoverPath = stringAt(record.path, `${path}.path`);
+  if (takeoverPath !== 'spring_back_hold' && takeoverPath !== 'ordinary_containment') {
+    return fail(`${path}.path`, 'spring_back_hold or ordinary_containment');
+  }
+  const code = record.code === null
+    ? null
+    : nonEmptyStringAt(record.code, `${path}.code`);
+  const message = record.message === null
+    ? null
+    : stringAt(record.message, `${path}.message`);
+  if ((code === null) !== (message === null)) {
+    return fail(path, 'a Kernel cause with both code and message, or neither');
+  }
+  const failureStage = record.failure_stage === undefined || record.failure_stage === null
+    ? null
+    : nonEmptyStringAt(record.failure_stage, `${path}.failure_stage`);
+  const preparationMs = numberAt(record.preparation_ms, `${path}.preparation_ms`);
+  if (preparationMs < 0) return fail(`${path}.preparation_ms`, 'a non-negative number');
+  const budgetMs = numberAt(record.budget_ms, `${path}.budget_ms`);
+  if (budgetMs <= 0) return fail(`${path}.budget_ms`, 'a positive number');
+  return {
+    nodeInstanceId: nonEmptyStringAt(record.node_instance_id, `${path}.node_instance_id`),
+    incumbentOperationId: nonEmptyStringAt(
+      record.incumbent_operation_id,
+      `${path}.incumbent_operation_id`,
+    ),
+    path: takeoverPath,
+    code,
+    message,
+    failureStage,
+    preparationMs,
+    budgetMs,
+  };
+}
+
 function parseRuntimeControlAuditEvent(
   value: unknown,
   path: string,
@@ -801,6 +848,13 @@ function parseRuntimeControlAuditEvent(
       eventRevision,
       kind,
       facts: parseAutomaticRetryAuditFacts(record, path),
+    };
+  }
+  if (kind === 'program_node_takeover_fallback') {
+    return {
+      eventRevision,
+      kind,
+      facts: parseTakeoverFallbackAuditFacts(record, path),
     };
   }
   return {

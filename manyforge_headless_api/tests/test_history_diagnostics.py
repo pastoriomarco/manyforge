@@ -335,3 +335,168 @@ def test_invalid_native_cursor_never_drives_a_debug_export_loop(events, cursor, 
             },
             "page",
         )
+
+
+# --- volatile motion trace debug-export member -------------------------------
+
+from starlette.responses import JSONResponse
+
+from manyforge_headless_api import service as service_module
+from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.service import (
+    VOLATILE_MOTION_TRACE_MARGIN_BYTES,
+    VOLATILE_MOTION_TRACE_MAX_BYTES,
+    HeadlessService,
+)
+
+_MEMBER_OVERHEAD = len(',"volatile_motion_trace":') + VOLATILE_MOTION_TRACE_MARGIN_BYTES
+_TRACE = {
+    "schema_version": "manyforge.volatile_motion_trace.v1",
+    "volatile": True,
+    "coverage": {"truncated": False, "exported_bytes": 1},
+    "goals": [{"goal_key": "g.1", "points": [{"sec": -1, "nanosec": 5}]}],
+}
+
+
+class _TraceExecution:
+    def __init__(self, result):
+        self.result = result
+        self.allowances = []
+
+    def read_volatile_motion_trace(self, allowance_bytes):
+        self.allowances.append(allowance_bytes)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return deepcopy(self.result)
+
+
+def _export_service(monkeypatch, execution):
+    monkeypatch.setattr(service_module.time, "time_ns", lambda: 1_000)
+    service = HeadlessService(object(), object(), execution=execution)
+    service.history_export = lambda _query: {
+        "schema_version": "manyforge.historian_export_page.v1",
+        "events": [record(1)],
+        "truncated": False,
+        "next_before_sequence": None,
+        "time_window": {"start_utc_ns": None, "end_utc_ns": None},
+    }
+    return service
+
+
+def _body(content):
+    return JSONResponse(content=content).body
+
+
+def _baseline(monkeypatch):
+    service = _export_service(monkeypatch, None)
+    return _body(
+        service.debug_export(HistorianQueryRequest(), include_volatile_motion_trace=False)
+    )
+
+
+def test_debug_export_includes_native_trace_unchanged_with_capped_allowance(monkeypatch):
+    execution = _TraceExecution(_TRACE)
+    bundle = _export_service(monkeypatch, execution).debug_export(HistorianQueryRequest())
+    assert bundle["volatile_motion_trace"] == {"available": True, "trace": _TRACE}
+    assert execution.allowances == [VOLATILE_MOTION_TRACE_MAX_BYTES]
+    baseline = _baseline(monkeypatch)
+    rendered = _body(bundle)
+    # The member is appended after the unchanged historian bundle.
+    assert rendered.startswith(baseline[:-1] + b',"volatile_motion_trace":')
+
+
+def test_debug_export_allowance_is_exact_remaining_http_budget(monkeypatch):
+    baseline = len(_baseline(monkeypatch))
+    monkeypatch.setattr(service_module, "MAX_HTTP_RESPONSE_BYTES", baseline + 100_000)
+    execution = _TraceExecution(_TRACE)
+    _export_service(monkeypatch, execution).debug_export(HistorianQueryRequest())
+    assert execution.allowances == [
+        min(VOLATILE_MOTION_TRACE_MAX_BYTES, 100_000 - _MEMBER_OVERHEAD)
+    ]
+
+
+@pytest.mark.parametrize(
+    "error,reason",
+    [
+        (HeadlessApiError("unknown_command", "unsupported"), "unknown_command"),
+        (HeadlessApiError("execution_owner_unavailable", "timeout"), "execution_owner_unavailable"),
+        (RuntimeError("boom"), "read_failed"),
+    ],
+)
+def test_debug_export_survives_failed_trace_read_with_marker(monkeypatch, error, reason):
+    bundle = _export_service(monkeypatch, _TraceExecution(error)).debug_export(
+        HistorianQueryRequest()
+    )
+    assert bundle["volatile_motion_trace"] == {"available": False, "reason": reason}
+    assert bundle["schema_version"] == "manyforge.debug_export.v1"
+    without = _export_service(monkeypatch, None).debug_export(HistorianQueryRequest())
+    assert without["volatile_motion_trace"] == {
+        "available": False,
+        "reason": "execution_unavailable",
+    }
+
+
+def test_debug_export_near_limit_uses_marker_or_leaves_baseline_identical(monkeypatch):
+    baseline = _baseline(monkeypatch)
+    marker = b',"volatile_motion_trace":{"available":false,"reason":"export_limit"}'
+    monkeypatch.setattr(service_module, "MAX_HTTP_RESPONSE_BYTES", len(baseline) + 2_000)
+    execution = _TraceExecution(_TRACE)
+    bundle = _export_service(monkeypatch, execution).debug_export(HistorianQueryRequest())
+    assert execution.allowances == []
+    assert _body(bundle) == baseline[:-1] + marker + b"}"
+    for room in (0, len(marker) - 1):
+        monkeypatch.setattr(service_module, "MAX_HTTP_RESPONSE_BYTES", len(baseline) + room)
+        bundle = _export_service(monkeypatch, execution).debug_export(HistorianQueryRequest())
+        assert "volatile_motion_trace" not in bundle
+        assert _body(bundle) == baseline
+    assert execution.allowances == []
+
+
+def test_debug_export_replaces_whole_inflated_trace_by_marker(monkeypatch):
+    baseline = len(_baseline(monkeypatch))
+    limit = baseline + 20_000
+    monkeypatch.setattr(service_module, "MAX_HTTP_RESPONSE_BYTES", limit)
+    inflated = {**_TRACE, "goals": [{"goal_key": "é" * 4_000}] * 4}
+    execution = _TraceExecution(inflated)
+    bundle = _export_service(monkeypatch, execution).debug_export(HistorianQueryRequest())
+    assert execution.allowances == [20_000 - _MEMBER_OVERHEAD]
+    assert bundle["volatile_motion_trace"] == {"available": False, "reason": "export_limit"}
+    assert len(_body(bundle)) <= limit
+
+
+def _trace_client(response):
+    client = object.__new__(ExecutionCommandClient)
+    client._attribution_transport = "internal"
+    sent = []
+    client._exchange = lambda command: sent.append(command) or response
+    return client, sent
+
+
+def test_execution_client_reads_volatile_trace_with_attributed_allowance():
+    ok = {
+        "api_version": "manyforge.execution_command_response.v1",
+        "ok": True,
+        "command": "read_volatile_motion_trace",
+        "trace": _TRACE,
+    }
+    client, sent = _trace_client(ok)
+    assert client.read_volatile_motion_trace(4096) is _TRACE
+    assert sent == [
+        {
+            "api_version": "manyforge.execution_command.v1",
+            "attribution": {"transport": "internal", "assurance": "unverified", "principal_id": None},
+            "command": "read_volatile_motion_trace",
+            "allowance_bytes": 4096,
+        }
+    ]
+    for bad in (
+        {**ok, "command": "status"},
+        {**ok, "trace": []},
+        {**ok, "trace": {**_TRACE, "schema_version": "manyforge.volatile_motion_trace.v2"}},
+        {"api_version": ok["api_version"], "ok": False,
+         "error": {"code": "unknown_command", "message": "unsupported"}},
+    ):
+        with pytest.raises(HeadlessApiError):
+            _trace_client(bad)[0].read_volatile_motion_trace(4096)
+    with pytest.raises(ValueError):
+        client.read_volatile_motion_trace(0)

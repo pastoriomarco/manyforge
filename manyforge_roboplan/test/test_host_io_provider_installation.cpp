@@ -996,4 +996,45 @@ TEST_F(
   EXPECT_FALSE(Mock(*current)->model_value());
 }
 
+TEST_F(HostIoProviderInstallationTest,
+       RetiredOutputOwnerCanDieBeforeStableKernelAfterExactUnsubscribe) {
+  Build(true, true);
+  ASSERT_TRUE(Prepare(*current).ok());
+  ASSERT_EQ(Step(core::ComponentLifecycleIntentKindDTO::kPrepare).component_lifecycle_state,
+            core::ComponentLifecycleStateDTO::kPrepared);
+  ASSERT_TRUE(BindCompositionIoOutputParticipants(*current, ActualGenerations()).ok());
+  ASSERT_EQ(current->io_output_channels.size(), 1U);
+  const std::weak_ptr<HostIoOutputChannelEntry> channel = current->io_output_channels.front();
+  auto *const engine = current->io_output_channels.front()->engine.get();
+  ASSERT_NE(engine, nullptr);
+  {
+    const auto registrations = current->component_registrations();
+    ASSERT_EQ(registrations.size(), 1U);
+    ASSERT_EQ(registrations.front().engine, engine);
+    const auto product_resolver = current->target_resolver;
+    ASSERT_NE(product_resolver, nullptr);
+    const auto resolver = make_retained_cell_kernel_participant_resolver(
+        [product_resolver](const core::OperationIntentDTO &intent, std::size_t index) {
+          return product_resolver->ResolveExecutionParticipant(intent, index);
+        }, registrations);
+    ASSERT_TRUE(cell->reconfigure_runtime_product(registrations, resolver, {}).ok());
+  }
+  // A current registered engine cannot be detached early. After the actual
+  // empty inventory commit, it remains subscribed until explicit retirement.
+  EXPECT_FALSE(cell->addressed_kernel().release_retired_engine(engine).ok());
+  ASSERT_TRUE(cell->reconfigure_runtime_product({}, {}, {}).ok());
+  ASSERT_TRUE(cell->participant_registrations().empty());
+  ASSERT_TRUE(cell->addressed_kernel().release_retired_engine(engine).ok());
+  EXPECT_FALSE(cell->addressed_kernel().release_retired_engine(engine).ok());
+  coordinator.reset();
+  context.reset();
+  snapshot_source.reset();
+  port_registry.reset();
+  current.reset();
+  EXPECT_TRUE(channel.expired());
+  // Unlike the fixture's general teardown guard, no channel owner is kept
+  // alive here to hide a stale borrowed subscription in Kernel destruction.
+  cell.reset();
+}
+
 } // namespace manyforge::roboplan_backend::host_detail

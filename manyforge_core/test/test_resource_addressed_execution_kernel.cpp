@@ -25309,6 +25309,26 @@ void expect_detached_source_close(ResourceAddressedExecutionKernel& kernel,
                                   bool successor_owns_resources = true) {
   const auto before = kernel.get_operation_state(source.operation_id);
   ASSERT_TRUE(before.ok());
+  const auto residency = kernel.get_operation_projection(source.operation_id);
+  ASSERT_TRUE(residency.ok());
+  if (!residency.value().resident) {
+    // Ordinary reconciliation now owns closure of the logically ended source.
+    // Its immutable fact and the successor's actual resource ownership survive.
+    ASSERT_TRUE(before.value().preemption);
+    ASSERT_TRUE(before.value().participants.front().terminal_fact);
+    const auto effect = before.value().participants.front().terminal_fact->effect;
+    EXPECT_TRUE(effect == ParticipantEffectKnowledge::kEffectSettled ||
+                effect == ParticipantEffectKnowledge::kNoEffect);
+    for (const auto& slot : kernel.resource_snapshot()) {
+      if (!successor_owns_resources) {
+        EXPECT_FALSE(slot.owner);
+      } else {
+        ASSERT_TRUE(slot.owner);
+        EXPECT_EQ(slot.owner->operation_id, successor.operation_id);
+      }
+    }
+    return;
+  }
   const auto assessment_calls = engine.recovery_assessment_calls.load();
   const auto action_calls = engine.recovery_action_calls.load();
   const bool close_ready = wait_until([&] {
@@ -25388,7 +25408,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
+#ifdef MANYFORGE_TEST_SQLITE_OPERATION_JOURNAL
+  TemporaryOperationJournal temporary;
+  SqliteOperationJournal journal(temporary.directory / "operation.sqlite3", CellId("cell.test"),
+                                 8U);
+#else
   FakeOperationJournal journal;
+#endif
   engine.supports_motion_replacement = true;
   auto row = registration(
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
@@ -25411,6 +25437,20 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto candidate = kernel.execute(spring_fallback_intent("spring.candidate"));
   ASSERT_TRUE(candidate.ok()) << candidate.error().message;
   ASSERT_TRUE(returning.Entered());
+  const auto selecting = kernel.get_operation_state(candidate.value().operation_id);
+  ASSERT_TRUE(selecting.ok());
+  ASSERT_TRUE(selecting.value().motion_takeover);
+  const auto selected = *selecting.value().motion_takeover;
+  EXPECT_TRUE(selected.locally_valid());
+  EXPECT_EQ(selected.incumbent_operation_id, original.value().operation_id);
+  EXPECT_EQ(selected.path, MotionTakeoverPathDTO::kSpringBackHold);
+  ASSERT_TRUE(selected.cause);
+  EXPECT_EQ(*selected.cause, (ErrorDTO{"planning_failed", "smooth candidate rejected", {}}));
+  EXPECT_EQ(selected.decided_at_ns, clock.now());
+  EXPECT_EQ(selected.elapsed_since_acceptance_ns,
+            selected.decided_at_ns - candidate.value().accepted_at_ns);
+  EXPECT_EQ(selected.preparation_budget_ns, 10'000'000'000);
+  EXPECT_FALSE(selected.stop_certificate);
   ASSERT_TRUE(wait_until([&] {
     static_cast<void>(kernel.reconcile_subordinate_state());
     std::lock_guard lock(engine.prepared_motion_mutex_);
@@ -25442,6 +25482,53 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.cold_participant_preparations.load(), 1);
   EXPECT_EQ(engine.commit_replacement_calls.load(), 0);
   EXPECT_EQ(engine.prepare_motion_calls.load(), 3);
+  const auto chosen = kernel.get_operation_state(candidate.value().operation_id);
+  ASSERT_TRUE(chosen.ok());
+  ASSERT_TRUE(chosen.value().motion_takeover);
+  const auto& retained_choice = *chosen.value().motion_takeover;
+  EXPECT_TRUE(retained_choice.locally_valid());
+  EXPECT_EQ(retained_choice.incumbent_operation_id, selected.incumbent_operation_id);
+  EXPECT_EQ(retained_choice.path, selected.path);
+  EXPECT_EQ(retained_choice.cause, selected.cause);
+  EXPECT_EQ(retained_choice.decided_at_ns, selected.decided_at_ns);
+  EXPECT_EQ(retained_choice.elapsed_since_acceptance_ns, selected.elapsed_since_acceptance_ns);
+  EXPECT_EQ(retained_choice.preparation_budget_ns, selected.preparation_budget_ns);
+  ASSERT_TRUE(retained_choice.stop_certificate);
+  const auto actual_certificate = kernel.get_stop_certificate(
+      retained_choice.stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(actual_certificate.ok());
+  EXPECT_EQ(retained_choice.stop_certificate->stop_id, actual_certificate.value().stop_id);
+  EXPECT_EQ(retained_choice.stop_certificate->stop_generation,
+            actual_certificate.value().stop_generation);
+  EXPECT_EQ(retained_choice.stop_certificate->stop_certificate_revision,
+            actual_certificate.value().stop_certificate_revision);
+  EXPECT_FALSE(kernel.get_operation_journal_write_fault());
+#ifdef MANYFORGE_TEST_SQLITE_OPERATION_JOURNAL
+  // Both handoff writes precede dispatch. The journal coalesces the winner's
+  // cold state into its newer preparation/dispatch; the stopped source keeps
+  // the cold handoff capture that previously conflicted with its Stop record.
+  const auto events = journal.ReadEvents(RequestOwnerEpoch("kernel.epoch.1"), 0U, 32U);
+  ASSERT_TRUE(events.ok()) << events.error().message;
+  std::size_t source_handoff_records{};
+  bool durable_candidate_prepared{};
+  for (const auto& event : events.value().events) {
+    if (event.operation_id == candidate.value().operation_id &&
+        event.record_kind == "operation_prepared") {
+      durable_candidate_prepared = true;
+      EXPECT_NE(event.payload_json.find("\"motion_takeover\""), std::string::npos);
+      EXPECT_NE(event.payload_json.find("smooth candidate rejected"), std::string::npos);
+      EXPECT_NE(event.payload_json.find("spring_back_hold"), std::string::npos);
+    }
+    if (event.payload_json.find(
+            "\"transition_reason\":\"motion_takeover_cold_committed\"") == std::string::npos)
+      continue;
+    ASSERT_TRUE(event.operation_id);
+    EXPECT_EQ(*event.operation_id, original.value().operation_id);
+    ++source_handoff_records;
+  }
+  EXPECT_EQ(source_handoff_records, 1U);
+  EXPECT_TRUE(durable_candidate_prepared);
+#endif
   {
     std::lock_guard lock(engine.prepared_motion_mutex_);
     ASSERT_TRUE(engine.prepared_snapshot);
@@ -25499,6 +25586,35 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 1);
     EXPECT_EQ(engine.cold_participant_preparations.load(), 0);
     EXPECT_EQ(engine.commit_replacement_calls.load(), 0);
+    const auto decision = kernel.get_operation_state(candidate.value().operation_id);
+    ASSERT_TRUE(decision.ok());
+    ASSERT_TRUE(decision.value().motion_takeover);
+    EXPECT_TRUE(decision.value().motion_takeover->locally_valid());
+    EXPECT_EQ(decision.value().motion_takeover->incumbent_operation_id,
+              original.value().operation_id);
+    EXPECT_EQ(decision.value().motion_takeover->path,
+              spring_permitted ? MotionTakeoverPathDTO::kSpringBackHold
+                               : MotionTakeoverPathDTO::kOrdinaryContainment);
+    ASSERT_TRUE(decision.value().motion_takeover->cause);
+    EXPECT_EQ(decision.value().motion_takeover->cause->message, "smooth candidate rejected");
+    {
+      std::lock_guard lock(journal.mutex);
+      ASSERT_TRUE(journal.last_stop_affected_state);
+      ASSERT_EQ(journal.last_stop_affected_state->operations.size(), 1U);
+      EXPECT_EQ(journal.last_stop_affected_state->operations.front().operation_id,
+                original.value().operation_id);
+      ASSERT_TRUE(journal.last_stop_accepted);
+      ASSERT_EQ(journal.last_stop_accepted->affected_operation_revisions.size(), 1U);
+      EXPECT_EQ(journal.last_stop_accepted->affected_operation_revisions.front().operation_id,
+                original.value().operation_id);
+      const auto& forensic = journal.last_stop_affected_state->motion_takeover_candidate_snapshot;
+      ASSERT_TRUE(forensic);
+      EXPECT_EQ(forensic->operation_id, candidate.value().operation_id);
+      ASSERT_TRUE(forensic->motion_takeover);
+      EXPECT_EQ(forensic->motion_takeover->cause, decision.value().motion_takeover->cause);
+      EXPECT_FALSE(forensic->active_stop_id);  // context, never an extra Stop target
+      EXPECT_FALSE(forensic->motion_takeover->stop_certificate);  // accepted before terminal proof
+    }
     const auto source = kernel.get_operation_state(original.value().operation_id);
     ASSERT_TRUE(source.ok());
     EXPECT_EQ(source.value().state, spring_permitted ? OperationStateKind::kInterventionRequired
@@ -25591,8 +25707,16 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(old.value().participants.front().terminal_fact->effect,
             ParticipantEffectKnowledge::kEffectSettled);
   EXPECT_FALSE(old.value().participants.front().terminal_error);
-  EXPECT_EQ(kernel.get_operation_state(candidate.value().operation_id).value().state,
-            OperationStateKind::kExecuting);
+  const auto moving = kernel.get_operation_state(candidate.value().operation_id);
+  ASSERT_TRUE(moving.ok());
+  EXPECT_EQ(moving.value().state, OperationStateKind::kExecuting);
+  ASSERT_TRUE(moving.value().motion_takeover);
+  EXPECT_TRUE(moving.value().motion_takeover->locally_valid());
+  EXPECT_EQ(moving.value().motion_takeover->incumbent_operation_id, original.value().operation_id);
+  EXPECT_EQ(moving.value().motion_takeover->path, MotionTakeoverPathDTO::kMovingReplacement);
+  EXPECT_EQ(moving.value().motion_takeover->preparation_budget_ns, 1'000'000'000);
+  EXPECT_FALSE(moving.value().motion_takeover->cause);
+  EXPECT_FALSE(moving.value().motion_takeover->stop_certificate);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -25624,6 +25748,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(refused.error().details.at("winner_node_instance_id"), "move.0");
   EXPECT_EQ(refused.error().details.at("winner_node_attempt_id"), "move.0.attempt.1");
   EXPECT_EQ(engine.prepare_motion_calls, 1);
+  EXPECT_FALSE(kernel.get_operation_state(original.value().operation_id).value().motion_takeover);
   EXPECT_FALSE(kernel.get_operation_state(original.value().operation_id).value().preemption);
   const auto equal = kernel.execute(takeover_intent(2U, "priority.equal"));
   ASSERT_TRUE(equal.ok()) << equal.error().message;
@@ -25672,12 +25797,24 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(overwritten.value().operation.participants.front().terminal_fact);
   EXPECT_EQ(overwritten.value().operation.participants.front().terminal_fact->effect,
             ParticipantEffectKnowledge::kNoEffect);
+  EXPECT_FALSE(overwritten.value().operation.motion_takeover);
   engine.replacement_phase.store(PreparedMotionReplacementPhaseDTO::kReadyToCommit);
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   EXPECT_EQ(engine.replacement_owner_commits, 1);
   EXPECT_EQ(engine.prepare_motion_calls, 2);  // no nested preparation in the commit
+  const auto first_winner = kernel.get_operation_state(pending.value().operation_id);
+  ASSERT_TRUE(first_winner.ok());
+  ASSERT_TRUE(first_winner.value().motion_takeover);
+  const auto first_choice = *first_winner.value().motion_takeover;
+  EXPECT_EQ(first_choice.incumbent_operation_id, original.value().operation_id);
+  EXPECT_EQ(first_choice.path, MotionTakeoverPathDTO::kMovingReplacement);
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   EXPECT_EQ(engine.prepare_motion_calls, 3);
+  const auto retained_winner = kernel.get_operation_state(pending.value().operation_id);
+  ASSERT_TRUE(retained_winner.ok());
+  ASSERT_TRUE(retained_winner.value().motion_takeover);
+  EXPECT_EQ(*retained_winner.value().motion_takeover, first_choice);
+  EXPECT_FALSE(kernel.get_operation_state(newest.value().operation_id).value().motion_takeover);
   std::lock_guard lock(engine.prepared_motion_mutex_);
   ASSERT_TRUE(engine.replacement_request);
   EXPECT_EQ(engine.replacement_request->execution_request.binding.operation_id,
@@ -33482,4 +33619,245 @@ TEST(ResourceAddressedExecutionKernelTest,
   }
 }
 
+}  // namespace
+
+
+namespace {
+// Exercise the existing Fake participant, real addressed takeover/Stop owner,
+// and normal admission port. The injected journal source is the same existing
+// Program-cycle authority seam used by the focused Reset admission tests.
+void VerifyPreemptedMotionResetAdmission(const bool hold_terminal_publication) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  ProgramCycleStatusDTO resetting{
+      RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kResetting,
+      std::nullopt, std::nullopt, std::nullopt,
+      AcceptedProgramResetDTO{RequestOwnerEpoch("operator.reset"), RequestId("preempted.reset"),
+                              ContentDigest(test_digest('a')), true, false, std::nullopt}};
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 10.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  config.cell_admission_settlement_validator = [](const auto&, const auto&) {
+    return Result<void>::Ok();
+  };
+  config.cell_admission_program_reset_status_source = [&](const auto, const auto&, const auto&) {
+    return Result<ProgramCycleStatusDTO>::Ok(resetting);
+  };
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  const auto parent = claim_program_execution(kernel);
+  ASSERT_TRUE(parent.ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(spring_fallback_capture()).ok());
+  start_program_motion(kernel);
+  engine.supports_motion_replacement = true;
+  engine.recovery_assessment.eligible_close = true;
+  engine.recovery_action_hook = [&] {
+    ASSERT_TRUE(engine.last_recovery_request);
+    const auto& request = *engine.last_recovery_request;
+    engine.next_recovery_result =
+        KernelRecoveryActionResultDTO{request.request_id, request.action, true, {}, std::nullopt};
+  };
+  const auto original = kernel.execute(scoped_motion_operation("retirement.original"));
+  ASSERT_TRUE(original.ok()) << original.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  reject_first_smooth_preparation(engine);
+  HeldSettlementCall publication;
+  if (hold_terminal_publication) {
+    journal.record_hook = [hold = publication.Blocker()](const std::string_view kind) {
+      if (kind == "state:motion_takeover_ended") hold();
+    };
+  }
+  const auto candidate = kernel.execute(spring_fallback_intent("retirement.candidate"));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  if (hold_terminal_publication) {
+    ASSERT_TRUE(publication.Entered());
+  }
+  ASSERT_TRUE(wait_until([&] {
+    const auto current = kernel.get_operation_state(candidate.value().operation_id);
+    return current.ok() && current.value().state == OperationStateKind::kFailed;
+  }));
+  if (!hold_terminal_publication) {
+    // No reconciliation tick here: the completed failure must be cleanable by
+    // the physical Reset admission itself, including a previously lost source.
+    ASSERT_TRUE(wait_until([&] {
+      const auto current = kernel.get_operation_recovery_assessment(original.value().operation_id);
+      return current.ok() && current.value().assessment.eligible_close;
+    }));
+  }
+  const auto source_before = kernel.get_operation_projection(original.value().operation_id);
+  const auto candidate_before = kernel.get_operation_state(candidate.value().operation_id);
+  ASSERT_TRUE(source_before.ok());
+  ASSERT_TRUE(candidate_before.ok());
+  ASSERT_TRUE(source_before.value().resident);
+  EXPECT_EQ(source_before.value().operation.state, OperationStateKind::kStopped);
+  ASSERT_TRUE(source_before.value().operation.active_stop_id);
+  const auto stopped_before = kernel.get_stop_status(*source_before.value().operation.active_stop_id);
+  ASSERT_TRUE(stopped_before.ok());
+  ASSERT_TRUE(stopped_before.value().stop_certificate);
+  EXPECT_EQ(engine.recovery_action_calls.load(), 0);
+  const auto& held = parent.value();
+  ASSERT_TRUE(kernel.ReleaseCellAdmissionClaim(
+      {held.intent.owner_role, held.intent.owner_epoch, held.intent.owner_transaction_id,
+       held.intent.request_id, held.intent.request_payload_digest, held.acquired_admission_generation,
+       held.claim_generation,
+       {CellAdmissionSettlementKindDTO::kExplicitReset, ContentDigest(test_digest('2'))}}).ok());
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(
+      {true, resetting, true, 1U, 1U, true, true, 0U, 0U, 0U}).ok());
+  const auto reset_id = ProgramResetClaimRequestId(resetting);
+  ASSERT_TRUE(reset_id.ok());
+  const CellAdmissionClaimIntentDTO reset{
+      CellAdmissionClaimKindDTO::kProgramReset, CellAdmissionOwnerRoleDTO::kProgramRunner,
+      resetting.program_runner_owner_epoch, reset_id.value().value(), reset_id.value(),
+      resetting.accepted_reset->request_payload_digest,
+      kernel.GetAuthoringAdmission().admission_generation, {}, std::nullopt, std::nullopt};
+  if (hold_terminal_publication) {
+    const auto refused = kernel.AcquireCellAdmissionClaim(reset);
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"), "program_reset_effects_not_settled");
+    EXPECT_TRUE(kernel.get_operation_projection(original.value().operation_id).value().resident);
+    EXPECT_EQ(engine.recovery_action_calls.load(), 0);
+    publication.Release();
+    ASSERT_TRUE(wait_until([&] {
+      const auto current = kernel.get_operation_recovery_assessment(original.value().operation_id);
+      return current.ok() && current.value().assessment.eligible_close;
+    }));
+  }
+  const auto acquired = kernel.AcquireCellAdmissionClaim(reset);
+  ASSERT_TRUE(acquired.ok()) << acquired.error().message;
+  EXPECT_FALSE(kernel.get_operation_projection(original.value().operation_id).value().resident);
+  EXPECT_FALSE(kernel.get_operation_projection(candidate.value().operation_id).value().resident);
+  EXPECT_EQ(kernel.get_operation_state(original.value().operation_id).value(),
+            source_before.value().operation);
+  EXPECT_EQ(kernel.get_operation_state(candidate.value().operation_id).value(),
+            candidate_before.value());
+  EXPECT_EQ(kernel.get_stop_status(*source_before.value().operation.active_stop_id)
+                .value().stop_certificate,
+            stopped_before.value().stop_certificate);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    EXPECT_FALSE(slot.owner);
+    EXPECT_EQ(slot.state, ResourceSlotState::kFree);
+  }
+  EXPECT_EQ(engine.recovery_action_calls.load(), 1);
+  EXPECT_EQ(engine.certified_reset_calls.load(), 0);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 1);
+  EXPECT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_TRUE(kernel.AcquireCellAdmissionClaim(reset).ok());
+  EXPECT_EQ(engine.recovery_action_calls.load(), 1);
+  journal.record_hook = {};
+  engine.prepare_motion_hook = {};
+  engine.recovery_action_hook = {};
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreemptedMotionResetAdmissionRetiresCompletedFailedTakeoverWithoutCadence) {
+  VerifyPreemptedMotionResetAdmission(false);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreemptedMotionResetAdmissionRefusesInFlightPublicationThenExplicitRetryCloses) {
+  VerifyPreemptedMotionResetAdmission(true);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ReconciliationRetiresDetachedPreemptedSourceWithoutTouchingSuccessor) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "retirement.moving.original"));
+  ASSERT_TRUE(original.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto candidate = kernel.execute(takeover_intent(1U, "retirement.moving.candidate"));
+  ASSERT_TRUE(candidate.ok());
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_TRUE(kernel.get_operation_projection(original.value().operation_id).value().resident);
+  engine.replacement_phase.store(PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+  const auto actions_before = engine.recovery_action_calls.load();
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto source = kernel.get_operation_projection(original.value().operation_id);
+  ASSERT_TRUE(source.ok());
+  EXPECT_FALSE(source.value().resident);
+  ASSERT_TRUE(source.value().operation.participants.front().terminal_fact);
+  EXPECT_EQ(source.value().operation.participants.front().terminal_fact->kind,
+            ParticipantExecutionFactKind::kPreemptedByReplacement);
+  EXPECT_TRUE(kernel.get_operation_projection(candidate.value().operation_id).value().resident);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, candidate.value().operation_id);
+    EXPECT_EQ(slot.state, ResourceSlotState::kDispatched);
+  }
+  EXPECT_EQ(engine.recovery_action_calls.load(), actions_before);
+  const auto historical = source.value().operation;
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(kernel.get_operation_state(original.value().operation_id).value(), historical);
+  EXPECT_EQ(engine.recovery_action_calls.load(), actions_before);
+  EXPECT_EQ(engine.certified_reset_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PreemptedMotionRetirementKeepsQueuedAndLocallyBlockedSourcesResident) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "retirement.blocked.original"));
+  ASSERT_TRUE(original.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto candidate = kernel.execute(takeover_intent(1U, "retirement.blocked.candidate"));
+  ASSERT_TRUE(candidate.ok());
+  // Establish a sent pending replacement; otherwise the next acceptance
+  // correctly retires this candidate as superseded before dispatch.
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  ASSERT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+  const auto next = kernel.execute(takeover_intent(2U, "retirement.blocked.next"));
+  ASSERT_TRUE(next.ok());
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  for (const auto& accepted : {original.value(), candidate.value(), next.value()}) {
+    EXPECT_TRUE(kernel.get_operation_projection(accepted.operation_id).value().resident);
+  }
+  EXPECT_EQ(engine.recovery_action_calls.load(), 0);
+  const auto stopped = kernel.stop(stop_request("retirement.blocked.stop", original.value(), 1U));
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    return !kernel.get_operation_projection(candidate.value().operation_id).value().resident;
+  }));
+  EXPECT_TRUE(kernel.get_operation_projection(original.value().operation_id).value().resident);
+  EXPECT_EQ(engine.recovery_action_calls.load(), 0);
+  engine.recovery_assessment.eligible_close = true;
+  engine.recovery_assessment.stronger_authority_active = true;
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_TRUE(kernel.get_operation_projection(original.value().operation_id).value().resident);
+  EXPECT_EQ(engine.recovery_action_calls.load(), 0);
+}
 }  // namespace

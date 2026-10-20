@@ -101,6 +101,17 @@ struct ExecutionPortCommandResultDTO final {
                          const ExecutionPortCommandResultDTO&) = default;
 };
 
+/// One replacement's start on the SAME controller clock as its associated
+/// source sample. The shifted trajectory's time zero and this stamp are one
+/// command; this is neither a local-clock timestamp nor installation proof.
+struct ExecutionReplacementStartDTO final {
+  ExecutionBindingEpoch binding_epoch{0U};
+  TimePoint controller_start_stamp_ns{0};
+
+  friend bool operator==(const ExecutionReplacementStartDTO&,
+                         const ExecutionReplacementStartDTO&) = default;
+};
+
 // ---------------------------------------------------------------------------
 // Observation
 // ---------------------------------------------------------------------------
@@ -329,6 +340,9 @@ struct ExecutionLaneFactsDTO final {
   /// this rate (Q11).
   double controller_update_rate_hz{0.0};
   ExecutionGoalTolerancePolicy goal_tolerance_policy{ExecutionGoalTolerancePolicy::kErased};
+  /// Qualified binding supports one atomic replacement trajectory/start stamp
+  /// command. Unqualified lanes retain their existing immediate replacement.
+  bool supports_scheduled_replacement{false};
 
   friend bool operator==(const ExecutionLaneFactsDTO&,
                          const ExecutionLaneFactsDTO&) = default;
@@ -364,6 +378,16 @@ class IExecutionPort {
   virtual ExecutionPortCommandResultDTO Replace(const ExecutionGoalKey& active_key,
                                                 const ExecutionGoalKey& next_key,
                                                 const TrajectoryDTO& trajectory) = 0;
+
+  /// Same identity/prefix contract as Replace, with its time-zero anchored to
+  /// the named binding's controller clock. Refusal is explicit; silently
+  /// falling back to an immediate send would change the chosen curve origin.
+  virtual ExecutionPortCommandResultDTO ReplaceScheduled(
+      const ExecutionGoalKey& /*active_key*/, const ExecutionGoalKey& /*next_key*/,
+      const TrajectoryDTO& /*trajectory*/, const ExecutionReplacementStartDTO& /*start*/) {
+    return {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kUnsupported,
+            std::nullopt};
+  }
 
   /// The lane's hard stop (Q2). The acknowledgement never implies rest: the
   /// finish is decided by Core (Q5, Q35; see the cancel

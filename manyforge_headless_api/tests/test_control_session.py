@@ -43,6 +43,7 @@ from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlLane,
 )
+from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.service import HeadlessService
 from manyforge_headless_api import control_state as control_state_module
 from manyforge_headless_api.program_cycle import (
@@ -1647,9 +1648,10 @@ def test_program_source_recovers_same_current_cycle_after_malformed_identity(
         monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
         source = HeadlessControlStateSource(
             SimpleNamespace(
+                program_cycle_status=_cycle,
                 component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(
                     program_cycle
-                )
+                ),
             ),
             ingress,
             program_runner_websocket_url="ws://runner.test/state",
@@ -1718,12 +1720,20 @@ def test_fallback_read_recovers_and_bursts_use_one_existing_task(monkeypatch) ->
             await asyncio.wait_for(subscription.wake.wait(), 1)
             assert source.semantic_context().status == "current"
             source.take(subscription)
-            assert calls == 2
+            # Failed read, recovered read, and the cold reduction's direct
+            # reset_robot_position read.
+            assert calls == 3
+            # Let a startup cold wake that landed in the combine window settle.
+            await asyncio.sleep(0.2)
+            before = calls
             recovered_read.clear()
             for _ in range(1000):
                 source.notify_control()
             await asyncio.wait_for(recovered_read.wait(), 1)
-            assert calls == 3  # the burst is one bit, not 1000 read tasks
+            await asyncio.sleep(0.2)
+            # The burst is one Program read plus one cold-reduction read, not
+            # 1000 read tasks.
+            assert calls == before + 2
             assert source._runner_task is task and not task.done()  # noqa: SLF001
             assert source.diagnostics()["source_failures"] == 1
         finally:
@@ -2590,6 +2600,177 @@ def test_settled_motion_publishes_rest_pose_that_samples_alone_do_not() -> None:
             source.notify_motion_settled()
             await asyncio.wait_for(reduced(reductions + 1), 1)
             assert not subscription.wake.is_set()
+        finally:
+            await source.unsubscribe(subscription)
+            ingress.close()
+
+    asyncio.run(exercise())
+
+
+def test_cold_reduction_refreshes_only_reset_robot_position_from_direct_read() -> None:
+    async def exercise() -> None:
+        mode = "initial"
+        admission = {"admission_generation": 29, "allowed": False}
+        available = {"available": True, "reason": None}
+
+        def read() -> dict[str, Any]:
+            if mode == "fail":
+                raise HeadlessApiError("program_runner_unavailable", "down")
+            cycle = _cycle()
+            if mode == "foreign":
+                cycle["reset_robot_position"] = available
+                cycle["execution_control_revision"] = 5
+            elif mode == "same":
+                cycle["reset_robot_position"] = available
+                cycle["causal_correlation_id"] = "corr.direct"  # never taken
+            return cycle
+
+        def facts(*, program_cycle, cancelled=None):
+            return replace(
+                _facts_for_cycle(program_cycle), authoring_admission=dict(admission)
+            )
+
+        ingress = _ingress([])
+        source = HeadlessControlStateSource(
+            SimpleNamespace(program_cycle_status=read, component_overview_facts=facts),
+            ingress,
+            program_runner_websocket_url=None,
+        )
+        subscription = await source.subscribe()
+
+        async def cold() -> ControlStateFrame:
+            source.notify_cold()
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            frame = source.take(subscription)
+            await asyncio.sleep(0.2)  # let any follow-up reduction settle
+            if subscription.wake.is_set():
+                frame = source.take(subscription)
+            assert frame.event_class == "cold"
+            return frame
+
+        try:
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            cached = source.take(subscription).shell["program_cycle"]
+            assert cached["reset_robot_position"]["available"] is False
+
+            # A read of another control revision is foreign: nothing is taken.
+            mode = "foreign"
+            admission = {"admission_generation": 30, "allowed": True}
+            frame = await cold()
+            assert frame.shell["authoring_admission"] == admission
+            assert frame.shell["program_cycle"] == cached
+
+            # Same identity: only the host fact is refreshed.
+            mode = "same"
+            cycle = (await cold()).shell["program_cycle"]
+            assert cycle == {**cached, "reset_robot_position": available}
+
+            # A failed direct read keeps the cached value; cold still publishes.
+            mode = "fail"
+            admission = {"admission_generation": 31, "allowed": False}
+            frame = await cold()
+            assert frame.shell["authoring_admission"] == admission
+            assert frame.shell["program_cycle"] == cycle
+        finally:
+            await source.unsubscribe(subscription)
+            ingress.close()
+
+    asyncio.run(exercise())
+
+
+def test_cold_reduction_drops_direct_reset_read_overtaken_by_the_stream() -> None:
+    async def exercise() -> None:
+        mode = "initial"
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        release = threading.Event()
+
+        def read() -> dict[str, Any]:
+            nonlocal mode
+            if mode == "fail":
+                raise HeadlessApiError("program_runner_unavailable", "down")
+            cycle = _cycle()
+            if mode == "late":
+                mode = "fail"
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(1)
+                cycle["reset_robot_position"] = {"available": True, "reason": None}
+            return cycle
+
+        ingress = _ingress([])
+        source = HeadlessControlStateSource(
+            SimpleNamespace(
+                program_cycle_status=read,
+                component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(
+                    program_cycle
+                ),
+            ),
+            ingress,
+            program_runner_websocket_url=None,
+        )
+        subscription = await source.subscribe()
+        try:
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            source.take(subscription)
+            mode = "late"
+            source.notify_cold()
+            await asyncio.wait_for(entered.wait(), 1)
+            # The stream delivers a newer cycle (same control key) mid-read.
+            newer = {**_cycle(), "causal_correlation_id": "corr.newer"}
+            source._accept_cycle(newer, "critical")  # noqa: SLF001
+            release.set()
+            reductions = source.diagnostics()["reductions"]
+            while source.diagnostics()["reductions"] <= reductions:
+                await asyncio.sleep(0.005)
+            await asyncio.sleep(0.1)
+            assert source._cycle == newer  # noqa: SLF001
+            assert source.take(subscription).shell["program_cycle"] == newer
+        finally:
+            release.set()
+            await source.unsubscribe(subscription)
+            ingress.close()
+
+    asyncio.run(exercise())
+
+
+def test_cold_reduction_does_not_revive_an_invalidated_program_source() -> None:
+    async def exercise() -> None:
+        mode = "initial"
+        loop = asyncio.get_running_loop()
+        direct_read = asyncio.Event()
+
+        def read() -> dict[str, Any]:
+            cycle = _cycle()
+            if mode == "same":
+                loop.call_soon_threadsafe(direct_read.set)
+                cycle["reset_robot_position"] = {"available": True, "reason": None}
+            return cycle
+
+        ingress = _ingress([])
+        source = HeadlessControlStateSource(
+            SimpleNamespace(
+                program_cycle_status=read,
+                component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(
+                    program_cycle
+                ),
+            ),
+            ingress,
+            program_runner_websocket_url=None,
+        )
+        subscription = await source.subscribe()
+        try:
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            source.take(subscription)
+            source._invalidate_source("program")  # noqa: SLF001  stream failed
+            mode = "same"
+            source.notify_cold()
+            await asyncio.wait_for(direct_read.wait(), 1)
+            await asyncio.sleep(0.2)
+            assert source._program_source_current is False  # noqa: SLF001
+            assert source._cycle == _cycle()  # noqa: SLF001
+            assert source.semantic_context().status != "current"
+            assert not subscription.wake.is_set()
+            assert source.take(subscription) is None
         finally:
             await source.unsubscribe(subscription)
             ingress.close()

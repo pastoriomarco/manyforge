@@ -191,6 +191,7 @@ enum class CommandKind {
   kStopProgramRun,
   kStopProgramSelection,
   kReadProgramExecutionScope,
+  kReadVolatileMotionTrace,
   kStartProgramSelection,
   kReleaseProgramSelection,
   kCheckProgramNodeMotionAttention,
@@ -334,6 +335,7 @@ struct Command final {
   std::optional<core::RequestOwnerEpoch> event_owner_epoch{};
   std::uint64_t after_sequence{};
   std::size_t event_limit{};
+  std::size_t trace_allowance_bytes{};
   std::optional<core::RequestOwnerEpoch> observation_after_owner_epoch;
   std::optional<std::string> observation_after_source_epoch;
   std::optional<std::uint64_t> observation_after_source_sequence;

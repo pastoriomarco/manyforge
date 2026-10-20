@@ -2402,6 +2402,8 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
     const auto advanced = advance_motion_takeover(id);
     if (!advanced.ok() && !takeover_error) takeover_error = advanced.error();
   }
+  const auto retired_preempted = retire_preempted_motion_operations();
+  if (!retired_preempted.ok() && !takeover_error) takeover_error = retired_preempted.error();
   struct ReconcileTarget final {
     OperationId operation_id;
     IResolvedParticipantExecutionEngine* engine{};

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <manyforge_core/motion_interrupt/stop_replacement.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <string>
@@ -471,6 +472,92 @@ TEST(StopJoinElapsedTest, RefusesAStartAtOrAfterTheLeadInEnd) {
   EXPECT_FALSE(compute_stop_join_elapsed_s({1.0, 0.5, -0.01, 0.02, std::nullopt}).ok());
   EXPECT_FALSE(compute_stop_join_elapsed_s({1.0, 0.5, 0.01, -0.02, std::nullopt}).ok());
   EXPECT_FALSE(compute_stop_join_elapsed_s({1.0, 1.5, 0.01, 0.02, std::nullopt}).ok());
+}
+
+TEST(StopReplacementStartTest, AlignsControllerHeaderAndCurveOriginTogetherAtTheAppliedFactor) {
+  ExecutionLaneFactsDTO lane;
+  lane.supports_scheduled_replacement = true;
+  lane.supports_scale = true;
+  lane.controller_update_rate_hz = 100.0;
+  ExecutionControllerSampleDTO sample;
+  sample.binding_epoch = ExecutionBindingEpoch(7U);
+  sample.source_stamp_ns = 9'000'000'000;
+  // Deliberately unrelated clock origins: receipt time is not a ROS stamp.
+  sample.local_receipt_stamp_ns = 600'000'000;
+  sample.cursor_s = 1.0;
+  for (const double factor : {1.0, 0.5, 0.25, 0.0}) {
+    sample.applied_factor = factor;
+    const auto start = compute_stop_replacement_start(
+        {sample.cursor_s, factor, 0.003, 0.02, 1.2}, sample, lane);
+    ASSERT_TRUE(start.ok());
+    ASSERT_TRUE(start.value().scheduled);
+    EXPECT_EQ(start.value().scheduled->binding_epoch, sample.binding_epoch);
+    EXPECT_EQ(start.value().scheduled->controller_start_stamp_ns, 9'030'000'000);
+    EXPECT_NEAR(start.value().elapsed_path_s, 1.0 + factor * 0.03, 1e-12);
+    if (factor == 0.0) continue;  // Stop itself retains Q45's cancel-only path.
+    const auto active = Curved();
+    const auto continuation = Continuation(active, 1.0, factor, 0.2);
+    const auto joined = build_stop_replacement_join(active, start.value().elapsed_path_s,
+                                                    continuation, 1.0, 1.0 + factor * 0.2);
+    ASSERT_TRUE(joined.ok());
+    EXPECT_LT(joined.value().waypoints.front().time_from_start_s, 0.0);
+    for (std::size_t joint = 0; joint < active.joint_names.size(); ++joint) {
+      const auto before = Evaluate(active, joint, start.value().elapsed_path_s);
+      const auto after = Evaluate(joined.value(), joint, 0.0);
+      EXPECT_NEAR(before.p, after.p, 1e-12);
+      EXPECT_NEAR(before.v, after.v, 1e-11);
+      EXPECT_NEAR(before.a, after.a, 1e-10);
+    }
+  }
+}
+
+TEST(StopReplacementStartTest, KeepsExactTicksAndUsesTheControllersIntegerPeriod) {
+  ExecutionLaneFactsDTO lane;
+  lane.supports_scheduled_replacement = true;
+  lane.controller_update_rate_hz = 100.0;
+  ExecutionControllerSampleDTO sample;
+  sample.binding_epoch = ExecutionBindingEpoch(1U);
+  sample.source_stamp_ns = 1'000'000'000;
+  const auto exact = compute_stop_replacement_start({1.0, 1.0, 0.0, 0.02, {}}, sample, lane);
+  ASSERT_TRUE(exact.ok());
+  ASSERT_TRUE(exact.value().scheduled);
+  EXPECT_EQ(exact.value().scheduled->controller_start_stamp_ns, 1'020'000'000);
+  lane.controller_update_rate_hz = 150.0;
+  const auto truncated = compute_stop_replacement_start({1.0, 1.0, 0.0, 0.02, {}}, sample, lane);
+  ASSERT_TRUE(truncated.ok());
+  ASSERT_TRUE(truncated.value().scheduled);
+  // Three integer periods are 19,999,998ns, strictly short of the allowance.
+  EXPECT_EQ(truncated.value().scheduled->controller_start_stamp_ns, 1'026'666'664);
+  EXPECT_NEAR(truncated.value().elapsed_path_s, 1.026666664, 1e-12);
+}
+
+TEST(StopReplacementStartTest, PreservesLegacyTimingAndRejectsInvalidOrExpiredScheduledStarts) {
+  ExecutionLaneFactsDTO lane;
+  ExecutionControllerSampleDTO sample;
+  const auto legacy = compute_stop_replacement_start({1.0, 0.5, 0.003, 0.02, {}}, sample, lane);
+  ASSERT_TRUE(legacy.ok());
+  EXPECT_FALSE(legacy.value().scheduled);
+  EXPECT_NEAR(legacy.value().elapsed_path_s, 1.0115, 1e-12);
+  lane.supports_scheduled_replacement = true;
+  lane.controller_update_rate_hz = 100.0;
+  sample.binding_epoch = ExecutionBindingEpoch(1U);
+  sample.source_stamp_ns = 1'000'000'000;
+  // Legacy estimate is inside; advancing BOTH fields to the next tick is not.
+  const auto expired = compute_stop_replacement_start({1.0, 0.5, 0.003, 0.02, 1.014}, sample, lane);
+  ASSERT_FALSE(expired.ok());
+  EXPECT_EQ(expired.error().details.at("reason"), "stop_delta_budget_exceeded");
+  for (int invalid = 0; invalid < 6; ++invalid) {
+    auto bad_sample = sample;
+    auto bad_lane = lane;
+    auto input = StopJoinElapsedInputDTO{1.0, 0.5, 0.003, 0.02, {}};
+    if (invalid == 0) bad_sample.binding_epoch = ExecutionBindingEpoch(0U);
+    if (invalid == 1) bad_sample.source_stamp_ns = 0;
+    if (invalid == 2) bad_sample.source_stamp_ns = std::numeric_limits<TimePoint>::max();
+    if (invalid == 3) bad_lane.controller_update_rate_hz = 0.0;
+    if (invalid == 4) input.frozen_factor = -0.1;
+    if (invalid == 5) { bad_lane.supports_scale = true; bad_sample.applied_factor = 0.7; }
+    EXPECT_FALSE(compute_stop_replacement_start(input, bad_sample, bad_lane).ok()) << invalid;
+  }
 }
 
 // --- Q17/Q38 path-time conversion ----------------------------------------------

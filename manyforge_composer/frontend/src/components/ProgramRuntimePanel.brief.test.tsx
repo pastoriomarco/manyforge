@@ -2,8 +2,16 @@ import { act, useEffect } from 'react';
 import { afterEach, expect, it, vi } from 'vitest';
 
 import { BRIEF_NOTICE_MS, type WorkbenchNotice } from '../state/workbenchNotices';
-import type { AutomaticRetryAuditEvent, RuntimeControlAuditEvent } from '../types/api';
-import { useBriefAutomaticRetry, useBriefIoSourceUnavailable } from './ProgramRuntimePanel';
+import type {
+  AutomaticRetryAuditEvent,
+  RuntimeControlAuditEvent,
+  TakeoverFallbackAuditEvent,
+} from '../types/api';
+import {
+  useBriefAutomaticRetry,
+  useBriefIoSourceUnavailable,
+  useBriefTakeoverFallback,
+} from './ProgramRuntimePanel';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -155,6 +163,67 @@ it('shows a brief warning when an io wait source becomes unavailable, not when i
     domain: 'runtime',
     title: 'Input source unavailable on wait_part — still waiting',
   });
+  await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
+  expect(shown).toBeNull();
+  await act(() => root.unmount());
+});
+
+it('shows a brief warning for a new takeover fallback on either path', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const host = stubDom();
+  let shown = null as WorkbenchNotice | null;
+  function Probe({ audit }: { audit: RuntimeControlAuditEvent[] | null }) {
+    const notice = useBriefTakeoverFallback('run.1', audit);
+    useEffect(() => { shown = notice; });
+    return null;
+  }
+  const fallback = (
+    eventRevision: number,
+    path: TakeoverFallbackAuditEvent['facts']['path'],
+    code: string | null,
+    failureStage: string | null = null,
+  ): TakeoverFallbackAuditEvent => ({
+    eventRevision,
+    kind: 'program_node_takeover_fallback',
+    facts: {
+      nodeInstanceId: 'move', incumbentOperationId: 'op.1', path,
+      code, message: code === null ? null : 'late', failureStage, preparationMs: 40.5, budgetMs: 30,
+    },
+  });
+  const { createRoot } = await import('react-dom/client');
+  const root = createRoot(host as unknown as Element);
+  const render = (audit: RuntimeControlAuditEvent[] | null) => act(() => {
+    root.render(<Probe audit={audit} />);
+  });
+  // A smooth takeover records no event, so the history alone shows nothing.
+  await render([]);
+  expect(shown).toBeNull();
+  await render([fallback(2, 'spring_back_hold', 'takeover_preparation_late')]);
+  expect(shown).toMatchObject({
+    severity: 'warning',
+    domain: 'runtime',
+    title: 'Spring-back fallback on move — takeover preparation late (prep 41 of 30 ms)',
+    message: 'Recorded in the runtime-control events.',
+  });
+  await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
+  expect(shown).toBeNull();
+  await render([
+    fallback(2, 'spring_back_hold', 'takeover_preparation_late'),
+    fallback(3, 'ordinary_containment', null),
+  ]);
+  expect(shown?.title).toBe('Stop fallback on move (prep 41 of 30 ms)');
+  expect(shown?.severity).toBe('warning');
+  await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
+  expect(shown).toBeNull();
+  // The stage where the time ran out, when the Kernel names it.
+  await render([
+    fallback(2, 'spring_back_hold', 'takeover_preparation_late'),
+    fallback(3, 'ordinary_containment', null),
+    fallback(4, 'spring_back_hold', 'planning_timeout', 'spring_back_planning'),
+  ]);
+  expect(shown?.title).toBe(
+    'Spring-back fallback on move — planning timeout during spring_back_planning (prep 41 of 30 ms)',
+  );
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
   expect(shown).toBeNull();
   await act(() => root.unmount());

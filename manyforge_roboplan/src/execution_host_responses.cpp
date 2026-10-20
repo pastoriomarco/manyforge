@@ -2372,6 +2372,29 @@ OperationStateValue(const core::OperationStateDTO &value) {
             {"node_instance_id", CanonicalValue(fact.by.node_instance_id.value())},
             {"node_attempt_id", CanonicalValue(fact.by.node_attempt_id)}})}}));
   }
+  if (value.motion_takeover) {
+    const auto &decision = *value.motion_takeover;
+    operation_value.emplace_back(
+        "motion_takeover",
+        CanonicalValue(CanonicalValue::Object{
+            {"incumbent_operation_id",
+             CanonicalValue(decision.incumbent_operation_id.value())},
+            {"path", CanonicalValue(std::string(core::to_string(decision.path)))},
+            {"cause", decision.cause ? ErrorValue(*decision.cause)
+                                     : CanonicalValue(nullptr)},
+            {"decided_at_ns", content_identity::nonnegative_int64_value(
+                                  decision.decided_at_ns)},
+            {"elapsed_since_acceptance_ns",
+             content_identity::nonnegative_int64_value(
+                 decision.elapsed_since_acceptance_ns)},
+            {"preparation_budget_ns", content_identity::nonnegative_int64_value(
+                                          decision.preparation_budget_ns)},
+            {"stop_certificate",
+             decision.stop_certificate
+                 ? StopCertificateRefValue(*decision.stop_certificate)
+                 : CanonicalValue(nullptr)},
+        }));
+  }
   return CanonicalValue(std::move(operation_value));
 }
 

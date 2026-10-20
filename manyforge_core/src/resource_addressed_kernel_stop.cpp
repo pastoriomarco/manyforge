@@ -1900,6 +1900,14 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         }
       }
       affected_state.resources = acceptance_resolution.resources;
+      if (takeover_selection != nullptr) {
+        const auto* candidate = find_pending_motion_operation_locked(takeover_selection->candidate_id);
+        if (candidate != nullptr) {
+          // This accepted newcomer's decision is forensic context only. It
+          // adds no affected operation, resource, revision or Stop authority.
+          affected_state.motion_takeover_candidate_snapshot = candidate->state;
+        }
+      }
 
       auto& transaction = *stop_transactions_[outcome.work_token.slot];
       transaction = StopTransaction{
@@ -3033,8 +3041,17 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
             operation->pending_motion_takeover.key() == *transaction.motion_takeover_candidate_id) {
           auto& fallback = operation->pending_motion_takeover.mapped()->motion_takeover_spring_fallback;
           if (fallback && fallback->stop_id == certificate.stop_id &&
-              fallback->stop_generation == certificate.stop_generation)
+              fallback->stop_generation == certificate.stop_generation) {
             fallback->certificate = std::make_shared<const StopCertificateDTO>(certificate);
+            auto& decision = operation->pending_motion_takeover.mapped()->state.motion_takeover;
+            if (decision) {
+              decision->stop_certificate = StopCertificateRefDTO{
+                  certificate.stop_certificate_id, certificate.stop_certificate_revision,
+                  certificate.stop_id, certificate.stop_generation};
+              auto& candidate = *operation->pending_motion_takeover.mapped();
+              stamp_operation_capture_locked(candidate, candidate.state);
+            }
+          }
         }
         // Retain only the exact qualification needed by recovery. Diagnostic
         // certificate rotation and later disjoint Stops cannot change this fact.

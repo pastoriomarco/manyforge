@@ -644,6 +644,8 @@ make_retained_mock_ros2_control_backend_config(
       runtime_namespace, profile.arm_controller_name,
       profile.hardware_component_name, transport_joints, rates,
       profile.hard_stop_completion_timeout_s);
+  // Only the generated Mock controllers enable stock JTC scheduled replacement.
+  config.arm.adapter.lane_facts.supports_scheduled_replacement = true;
   config.arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
       runtime_namespace + "/joint_states",
       config.participant.stop.controller_state_max_age_ns,

@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <memory>
@@ -34,14 +35,22 @@ class SceneProjectionWorker;
 /// destroying either adapter. This holder contains no command or Stop policy.
 class Ros2TransportResources final {
 public:
+  /// Optional host-owned context, acquired only during construction. The
+  /// provider may initialize it on first use; it must return a valid context.
+  /// Nodes/executors remain local and quiesce() never shuts a supplied context
+  /// down. The provider itself is not retained by this transport holder.
+  using ContextProvider = std::function<std::shared_ptr<rclcpp::Context>()>;
+
   /// Transport-only resources for adapters without a scene projection.
   Ros2TransportResources(std::string node_name, std::string node_namespace,
-                         std::size_t executor_thread_count);
+                         std::size_t executor_thread_count,
+                         ContextProvider context_provider = {});
   Ros2TransportResources(
       std::string node_name, std::string node_namespace,
       std::size_t executor_thread_count,
       std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
-      std::string arm_group_id, core::IClock &clock);
+      std::string arm_group_id, core::IClock &clock,
+      ContextProvider context_provider = {});
   ~Ros2TransportResources();
   Ros2TransportResources(const Ros2TransportResources &) = delete;
   Ros2TransportResources &operator=(const Ros2TransportResources &) = delete;
@@ -58,6 +67,7 @@ public:
 private:
   friend class JtcExecutionPortTestPeer;
   std::shared_ptr<rclcpp::Context> context_;
+  bool owns_private_context_ = true;
   rclcpp::Node::SharedPtr node_;
   std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
   std::unique_ptr<detail::SceneProjectionWorker> scene_projection_worker_;

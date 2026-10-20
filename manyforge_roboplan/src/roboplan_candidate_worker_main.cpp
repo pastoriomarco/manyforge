@@ -462,10 +462,20 @@ int run_worker(int descriptor) {
         }
         auto result = computer.compute(candidate, control);
         if (control.deadline_expired && control.deadline_expired()) {
-          result = core::Result<core::TrajectoryDTO>::Err(
-              core::ErrorDTO{"planning_timeout",
-                             "Moving replacement preparation timed out",
-                             {{"reason", "planning_timeout"}}});
+          core::ErrorDTO error{"planning_timeout",
+                               "Moving replacement preparation timed out", {}};
+          if (!result.ok()) {
+            const auto &underlying = result.error();
+            error.details = underlying.details;
+            error.details.try_emplace("underlying_error_code", underlying.code);
+            error.details.try_emplace("underlying_error_message", underlying.message);
+            if (const auto reason = underlying.details.find("reason");
+                reason != underlying.details.end()) {
+              error.details.try_emplace("underlying_error_reason", reason->second);
+            }
+          }
+          error.details["reason"] = "planning_timeout";
+          result = core::Result<core::TrajectoryDTO>::Err(std::move(error));
         }
         send_frame(descriptor, MessageType::kPlanResult,
                    worker_protocol::encode_trajectory_result(result));

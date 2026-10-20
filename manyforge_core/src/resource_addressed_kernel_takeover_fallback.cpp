@@ -55,10 +55,31 @@ Result<void> ResourceAddressedExecutionKernel::begin_motion_takeover_fallback(
                        std::string("motion_takeover_fallback"),
                        RequestAttributionDTO{RequestTransportDTO::kInternal,
                                              RequestAssuranceDTO::kUnverified, std::nullopt}};
+  const auto decided_at_ns = clock_.now();
+  const auto previous_capture_order = candidate.state.journal_capture_order;
+  auto previous_decision = std::move(candidate.state.motion_takeover);
+  candidate.state.motion_takeover = MotionTakeoverDecisionDTO{
+      incumbent_id,
+      spring ? MotionTakeoverPathDTO::kSpringBackHold
+             : MotionTakeoverPathDTO::kOrdinaryContainment,
+      cause,
+      decided_at_ns,
+      std::max<std::int64_t>(0, decided_at_ns - candidate.accepted.accepted_at_ns),
+      candidate.participants.front().takeover_preparation_budget_ns.value_or(0),
+      std::nullopt};
+  stamp_operation_capture_locked(candidate, candidate.state);
+  bool fallback_accepted = false;
+  const ScopeExit restore_unaccepted_decision([&] {
+    if (!fallback_accepted) {
+      candidate.state.motion_takeover = std::move(previous_decision);
+      candidate.state.journal_capture_order = previous_capture_order;
+    }
+  });
   const auto stopped =
-      accept_stop_locked(EmergencyStopProjectedIntentDTO{std::move(intent)}, handoff, clock_.now(),
+      accept_stop_locked(EmergencyStopProjectedIntentDTO{std::move(intent)}, handoff, decided_at_ns,
                          nullptr, nullptr, std::nullopt, &selection);
   if (!stopped.ok()) return Result<void>::Err(stopped.error());
+  fallback_accepted = true;
   candidate.motion_takeover_spring_fallback.emplace(
       MotionTakeoverSpringFallbackDTO{stopped.value().stop_id,
                                       stopped.value().stop_generation,

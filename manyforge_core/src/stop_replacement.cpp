@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <manyforge_core/motion_interrupt/stop_replacement.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_core/types/error_code.hpp>
@@ -105,6 +106,49 @@ Result<double> compute_stop_join_elapsed_s(const StopJoinElapsedInputDTO& input)
          {"start_allowance_s", format(input.start_allowance_s)}}));
   }
   return Result<double>::Ok(elapsed);
+}
+
+Result<StopReplacementStartDTO> compute_stop_replacement_start(
+    const StopJoinElapsedInputDTO& input, const ExecutionControllerSampleDTO& sample,
+    const ExecutionLaneFactsDTO& lane) {
+  const auto legacy = compute_stop_join_elapsed_s(input);
+  if (!legacy.ok()) return Result<StopReplacementStartDTO>::Err(legacy.error());
+  if (!lane.supports_scheduled_replacement)
+    return Result<StopReplacementStartDTO>::Ok({legacy.value(), std::nullopt});
+  const auto invalid = [] {
+    return Result<StopReplacementStartDTO>::Err(stop_error(
+        "stop_replacement_start_invalid", "The associated controller start cannot be represented"));
+  };
+  if (!sample.binding_epoch.nonzero() || sample.source_stamp_ns <= 0 ||
+      !finite(lane.controller_update_rate_hz) || lane.controller_update_rate_hz <= 0.0 ||
+      (lane.supports_scale && (!sample.applied_factor ||
+                              *sample.applied_factor != input.frozen_factor)))
+    return invalid();
+  // Match the controller's integer-nanosecond nominal period. Convert the
+  // requested duration to wire nanoseconds BEFORE rounding to the grid, so
+  // floating representation of an exact tick cannot add a spurious tick.
+  const double period = 1e9 / lane.controller_update_rate_hz;
+  const long double duration =
+      (static_cast<long double>(input.wall_since_sample_s) + input.start_allowance_s) * 1e9L;
+  const auto maximum = std::numeric_limits<TimePoint>::max();
+  if (!finite(period) || period < 1.0 || static_cast<long double>(period) > maximum ||
+      !std::isfinite(duration) || duration < 0.0L || duration > maximum - 0.5L)
+    return invalid();
+  const auto period_ns = static_cast<TimePoint>(period);
+  const auto requested_ns = static_cast<TimePoint>(std::llround(duration));
+  auto ticks = requested_ns / period_ns;
+  if (requested_ns % period_ns != 0) ++ticks;
+  if (ticks > (maximum - sample.source_stamp_ns) / period_ns) return invalid();
+  const auto advance_ns = ticks * period_ns;
+  auto aligned = input;
+  aligned.wall_since_sample_s = static_cast<double>(advance_ns) / 1e9;
+  aligned.start_allowance_s = 0.0;
+  const auto elapsed = compute_stop_join_elapsed_s(aligned);
+  if (!elapsed.ok()) return Result<StopReplacementStartDTO>::Err(elapsed.error());
+  if (!finite(elapsed.value())) return invalid();
+  return Result<StopReplacementStartDTO>::Ok(
+      {elapsed.value(), ExecutionReplacementStartDTO{
+                            sample.binding_epoch, sample.source_stamp_ns + advance_ns}});
 }
 
 Result<TrajectoryDTO> convert_stop_trajectory_to_path_time(const TrajectoryDTO& wall_time_trajectory,

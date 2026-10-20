@@ -3767,3 +3767,195 @@ TEST(SqliteOperationJournalTest,
                   .ok());  // Retained loss, no fabricated trip.
 }
 }  // namespace
+
+namespace {
+TEST(SqliteOperationJournalTest, TakeoverDecisionSurvivesCoalescingAndReopenWithExactCause) {
+  for (const auto path :
+       {MotionTakeoverPathDTO::kMovingReplacement, MotionTakeoverPathDTO::kSpringBackHold,
+        MotionTakeoverPathDTO::kOrdinaryContainment}) {
+    ScopedTemporaryDirectory directory;
+    const auto database = directory.path() / "takeover-history.sqlite3";
+    const RequestOwnerEpoch owner("owner.takeover");
+    const std::vector<ResourceId> resources{ResourceId("robot.gripper")};
+    auto state = OperationState("operation.winner", OperationStateKind::kExecuting, 10);
+    state.journal_capture_order = 1U;
+    const ErrorDTO cause{"takeover_capture_failed",
+                         "exact smooth refusal",
+                         {{"expected_revision", "7"}, {"observed_revision", "8"}}};
+    {
+      SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
+      ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U, resources).ok());
+      const auto intent = CommandIntent("request.winner", owner.value());
+      ASSERT_TRUE(
+          journal.RecordOperationAccepted(owner, intent, Acceptance(intent, state), state).ok());
+      state.motion_takeover = MotionTakeoverDecisionDTO{OperationId("operation.incumbent"),
+                                                        path,
+                                                        std::nullopt,
+                                                        30,
+                                                        20,
+                                                        500'000'000,
+                                                        std::nullopt};
+      if (path != MotionTakeoverPathDTO::kMovingReplacement) {
+        state.motion_takeover->cause = cause;
+        state.motion_takeover->stop_certificate = StopCertificateRefDTO{
+            StopCertificateId("certificate.fallback"), StopCertificateRevision(1U),
+            StopId("stop.fallback"), StopGeneration(2U)};
+      }
+      for (const auto at : {30, 40}) {
+        state.updated_at_ns = at;
+        ++state.journal_capture_order;
+        if (at == 40) {
+          state.state = OperationStateKind::kCompleted;
+          state.participants.front().state = OperationStateKind::kCompleted;
+        }
+        ASSERT_TRUE(journal.RecordOperationState(owner, state, nullptr, "takeover_observed").ok());
+      }
+      const auto events = journal.ReadEvents(owner, 0U, 8U);
+      ASSERT_TRUE(events.ok());
+      ASSERT_EQ(events.value().events.size(), 2U);
+      const auto accepted = manyforge::content_identity::parse_canonical_json(
+          events.value().events.front().payload_json);
+      EXPECT_EQ(
+          accepted.find_object_member("operation_state")->find_object_member("motion_takeover"),
+          nullptr);
+      const auto latest = manyforge::content_identity::parse_canonical_json(
+          events.value().events.back().payload_json);
+      const auto* decision =
+          latest.find_object_member("operation_state")->find_object_member("motion_takeover");
+      ASSERT_NE(decision, nullptr);
+      EXPECT_EQ(decision->find_object_member("path")->as_string(), to_string(path));
+      EXPECT_EQ(decision->find_object_member("cause")->is_null(),
+                path == MotionTakeoverPathDTO::kMovingReplacement);
+      if (path != MotionTakeoverPathDTO::kMovingReplacement) {
+        EXPECT_EQ(decision->find_object_member("cause")
+                      ->find_object_member("details")
+                      ->find_object_member("observed_revision")
+                      ->as_string(),
+                  "8");
+      }
+    }
+    SqliteOperationJournal reopened(database, CellId("cell.test"), 8U);
+    const auto recovered =
+        reopened.BeginOwnerEpoch(RequestOwnerEpoch("owner.takeover.2"), 50, 8U, resources);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+    EXPECT_EQ(recovered.value().historical_operations.front().motion_takeover,
+              state.motion_takeover);
+    EXPECT_EQ(recovered.value().historical_operations.front().state,
+              OperationStateKind::kCompleted);
+  }
+}
+
+TEST(SqliteOperationJournalTest, ForensicTakeoverCandidateNeverBecomesAPhysicalSnapshot) {
+  ScopedTemporaryDirectory directory;
+  const auto database = directory.path() / "takeover-candidate.sqlite3";
+  const RequestOwnerEpoch owner("owner.candidate");
+  const std::vector<ResourceId> resources{ResourceId("robot.gripper")};
+  auto incumbent = OperationState("operation.incumbent", OperationStateKind::kExecuting, 10);
+  auto candidate = OperationState("operation.candidate", OperationStateKind::kResolving, 11);
+  incumbent.journal_capture_order = 1U;
+  candidate.journal_capture_order = 2U;
+  EmergencyStopAffectedStateSnapshotDTO affected;
+  {
+    SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U, resources).ok());
+    const auto first = CommandIntent("request.incumbent", owner.value());
+    const auto second = CommandIntent("request.candidate", owner.value());
+    ASSERT_TRUE(
+        journal.RecordOperationAccepted(owner, first, Acceptance(first, incumbent), incumbent)
+            .ok());
+    ASSERT_TRUE(
+        journal.RecordOperationAccepted(owner, second, Acceptance(second, candidate), candidate)
+            .ok());
+    incumbent.state = OperationStateKind::kStopping;
+    incumbent.participants.front().state = OperationStateKind::kStopping;
+    incumbent.active_stop_id = StopId("stop.fallback");
+    incumbent.active_stop_generation = StopGeneration(1U);
+    incumbent.journal_capture_order = 3U;
+    incumbent.updated_at_ns = 30;
+    candidate.journal_capture_order = 4U;
+    candidate.updated_at_ns = 30;
+    candidate.participants.front().resources = {ResourceId("diagnostic.only")};
+    candidate.motion_takeover = MotionTakeoverDecisionDTO{
+        incumbent.operation_id,
+        MotionTakeoverPathDTO::kSpringBackHold,
+        ErrorDTO{"smooth_failed", "exact fallback cause", {{"predicate", "captured"}}},
+        30,
+        19,
+        500'000'000,
+        std::nullopt};
+    affected = StopAffectedState({incumbent}, resources);
+    affected.motion_takeover_candidate_snapshot = candidate;
+    const FullStopIntentDTO intent{
+        {RequestId("request.fallback"), owner, "test", {}}, StopGeneration(0U), {}};
+    const auto acceptance =
+        StopAcceptanceRecord(owner, "request.fallback", "stop.fallback", 1U, 30);
+    const auto projected = ProjectStopAccepted(journal, owner, acceptance, intent, affected);
+    ASSERT_EQ(projected.projection_state, EmergencyStopProjectionStateDTO::kRecorded);
+    const auto events = journal.ReadEvents(owner, 0U, 8U);
+    ASSERT_TRUE(events.ok());
+    ASSERT_EQ(events.value().events.size(), 3U);
+    const auto payload = manyforge::content_identity::parse_canonical_json(
+        events.value().events.back().payload_json);
+    const auto* physical = payload.find_object_member("affected_state");
+    EXPECT_EQ(physical->find_object_member("operations")->as_array().size(), 1U);
+    EXPECT_EQ(payload.find_object_member("accepted")
+                  ->find_object_member("affected_operation_revisions")
+                  ->as_array()
+                  .size(),
+              1U);
+    ASSERT_NE(physical->find_object_member("motion_takeover_candidate_snapshot"), nullptr);
+  }
+  SqliteOperationJournal reopened(database, CellId("cell.test"), 8U);
+  const auto recovered =
+      reopened.BeginOwnerEpoch(RequestOwnerEpoch("owner.candidate.2"), 40, 8U, resources);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().historical_operations.size(), 2U);
+  const auto stored_candidate =
+      std::find_if(recovered.value().historical_operations.begin(),
+                   recovered.value().historical_operations.end(),
+                   [&](const auto& state) { return state.operation_id == candidate.operation_id; });
+  ASSERT_NE(stored_candidate, recovered.value().historical_operations.end());
+  EXPECT_FALSE(stored_candidate->motion_takeover);
+  EXPECT_EQ(stored_candidate->participants.front().resources, resources);
+  ASSERT_EQ(recovered.value().recovered_stops.size(), 1U);
+  EXPECT_EQ(recovered.value().recovered_stops.front().affected_state, affected);
+  EXPECT_EQ(recovered.value().recovered_stops.front().accepted.affected_operation_revisions.size(),
+            1U);
+  EXPECT_EQ(recovered.value().unreconciled_resources, resources);
+}
+}  // namespace
+
+namespace {
+TEST(SqliteOperationJournalTest, InvalidTakeoverMetadataDoesNotAppendARecord) {
+  ScopedTemporaryDirectory directory;
+  const RequestOwnerEpoch owner("owner.takeover.invalid");
+  const std::vector<ResourceId> resources{ResourceId("robot.gripper")};
+  SqliteOperationJournal journal(directory.path() / "takeover-invalid.sqlite3", CellId("cell.test"),
+                                 8U);
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 1, 8U, resources).ok());
+  auto state = OperationState("operation.invalid", OperationStateKind::kExecuting, 10);
+  const auto intent = CommandIntent("request.invalid", owner.value());
+  ASSERT_TRUE(
+      journal.RecordOperationAccepted(owner, intent, Acceptance(intent, state), state).ok());
+  for (const auto invalidity : {0, 1, 2, 3}) {
+    state.motion_takeover = MotionTakeoverDecisionDTO{OperationId("incumbent"),
+                                                      MotionTakeoverPathDTO::kSpringBackHold,
+                                                      ErrorDTO{"smooth_failed", "exact reason", {}},
+                                                      30,
+                                                      20,
+                                                      500'000'000,
+                                                      std::nullopt};
+    if (invalidity == 0) state.motion_takeover->preparation_budget_ns = 0;
+    if (invalidity == 1) state.motion_takeover->elapsed_since_acceptance_ns = 31;
+    if (invalidity == 2) state.motion_takeover->incumbent_operation_id = state.operation_id;
+    if (invalidity == 3) state.motion_takeover->cause.reset();
+    const auto rejected = journal.RecordOperationState(owner, state, nullptr, "invalid_takeover");
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.error().code, "operation_journal_record_invalid");
+    const auto events = journal.ReadEvents(owner, 0U, 8U);
+    ASSERT_TRUE(events.ok());
+    EXPECT_EQ(events.value().events.size(), 1U);
+  }
+}
+}  // namespace

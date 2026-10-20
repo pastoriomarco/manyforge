@@ -7,6 +7,7 @@
 #include <manyforge_core/ports/iexecution_port.hpp>
 #include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 #include <memory>
+#include <manyforge_ros2_control_execution/volatile_motion_trace.hpp>
 #include <mutex>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <string>
@@ -19,6 +20,7 @@ struct JtcExecutionAdapterConfig {
   std::string scale_topic;
   core::ExecutionBindingEpoch binding_epoch{0U};
   core::ExecutionLaneFactsDTO lane_facts;
+  std::shared_ptr<VolatileMotionTrace> motion_trace{};
 };
 
 /// Transport and facts for one owner-verified controller binding. No planner,
@@ -53,6 +55,11 @@ public:
           const core::ExecutionGoalKey &next_key,
           const core::TrajectoryDTO &trajectory) override;
   core::ExecutionPortCommandResultDTO
+  ReplaceScheduled(const core::ExecutionGoalKey &active_key,
+                   const core::ExecutionGoalKey &next_key,
+                   const core::TrajectoryDTO &trajectory,
+                   const core::ExecutionReplacementStartDTO &start) override;
+  core::ExecutionPortCommandResultDTO
   Cancel(const core::ExecutionGoalKey &key) override;
   core::ExecutionPortCommandResultDTO SetScale(double value) override;
   std::optional<core::ExecutionGoalObservationDTO>
@@ -74,10 +81,11 @@ private:
   using Action = control_msgs::action::FollowJointTrajectory;
   using GoalHandle = rclcpp_action::ClientGoalHandle<Action>;
   struct State;
-  core::ExecutionPortCommandResultDTO
-  SendGoal(const core::ExecutionGoalKey &key,
-           const core::TrajectoryDTO &trajectory,
-           std::optional<core::ExecutionGoalKey> active_key);
+  core::ExecutionPortCommandResultDTO SendGoal(
+      const core::ExecutionGoalKey &key, const core::TrajectoryDTO &trajectory,
+      std::optional<core::ExecutionGoalKey> active_key,
+      VolatileMotionTrace::Garbage &trace_garbage,
+      std::optional<core::ExecutionReplacementStartDTO> start = std::nullopt);
   static void ReceiveState(
       const std::shared_ptr<State> &state,
       const control_msgs::msg::JointTrajectoryControllerState &message);

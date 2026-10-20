@@ -952,6 +952,47 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
   return Result<KernelRecoveryActionResultDTO>::Ok(std::move(result));
 }
 
+Result<void> ResourceAddressedExecutionKernel::retire_preempted_motion_operations() {
+  std::vector<OperationId> sources;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    for (const auto& [id, operation] : active_operations_) {
+      if (!operation->manual && operation->state.preemption &&
+          operation->state.state == OperationStateKind::kStopped &&
+          operation->participants.size() == 1U &&
+          operation->participants.front().payload_kind == OperationParticipantPayloadKind::kMotion)
+        sources.push_back(id);
+    }
+  }
+  for (const auto& id : sources) {
+    // Logical preemption already ended the Runner task. The existing closure
+    // owner alone decides when its remaining physical/local work can retire.
+    const auto projection = get_operation_recovery_assessment(id);
+    if (!projection.ok() || !projection.value().assessment.eligible_close) continue;
+    const auto& assessment = projection.value().assessment;
+    KernelRecoveryActionRequestDTO request;
+    request.request_id = content_identity::sha256_digest(
+        config_.request_owner_epoch.value() + "\npreempted-motion-close\n" + id.value() + "\n" +
+        std::to_string(projection.value().operation_revision.value()) + "\n" +
+        std::to_string(assessment.assessment_revision));
+    request.action = RecoveryAction::kCloseOperation;
+    request.principal_id = "kernel.motion_takeover";
+    request.reason = "retire_preempted_motion";
+    bind_recovery_request(request, assessment);
+    const auto closed = close_operation(id, projection.value().operation_revision, request);
+    if (!closed.ok()) {
+      // A newer Stop or another exact cleanup can win between the read and
+      // closure. Its ownership remains authoritative; never bypass it.
+      const auto reason = closed.error().details.find("reason");
+      if (reason != closed.error().details.end() &&
+          reason->second == "operation_recovery_stale")
+        continue;
+      return Result<void>::Err(closed.error());
+    }
+  }
+  return Result<void>::Ok();
+}
+
 Result<KernelRecoveryActionResultDTO> ResourceAddressedExecutionKernel::close_operation(
     const OperationId& operation_id, const OperationRevision expected_operation_revision,
     const KernelRecoveryActionRequestDTO& request) {

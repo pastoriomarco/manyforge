@@ -5022,6 +5022,71 @@ def test_a_logical_preemption_is_read_from_the_operation_state_exactly() -> None
         fixture.port.operations.observe(fixture.started.task_id)
 
 
+def _takeover(**overrides: Any) -> dict[str, Any]:
+    fact = {
+        "incumbent_operation_id": "op.1",
+        "path": "spring_back_hold",
+        "cause": {"code": "takeover_preparation_late", "message": "late", "details": {}},
+        "decided_at_ns": 123,
+        "elapsed_since_acceptance_ns": 40_500_000,
+        "preparation_budget_ns": 30_000_000,
+        "stop_certificate": None,
+    }
+    fact.update(overrides)
+    return fact
+
+
+def test_a_motion_takeover_is_read_from_the_newcomer_operation_state_exactly() -> None:
+    fixture = _stopped_motion_for_recovery()
+    operation = fixture.transport.operations[fixture.started.task_id]
+    operation["state"] = "executing"
+    observed = fixture.port.operations.observe(fixture.started.task_id)
+    assert "motion_takeover" not in observed.metadata  # Omitted when absent.
+
+    for fact in (
+        _takeover(),
+        _takeover(path="moving_replacement", cause=None),
+        _takeover(path="ordinary_containment", stop_certificate={"stop_certificate_id": "c"}),
+        _takeover(cause={
+            "code": "planning_timeout", "message": "out of time",
+            "details": {"failure_stage": "spring_back_planning", "planning_budget_ns": "500"},
+        }),
+    ):
+        operation["motion_takeover"] = fact
+        observed = fixture.port.operations.observe(fixture.started.task_id)
+        assert observed.state is OwnerTaskState.ACTIVE
+        assert observed.metadata["motion_takeover"] == fact
+
+
+@pytest.mark.parametrize(
+    "fact",
+    [
+        _takeover(path="other"),
+        _takeover(path=[]),
+        _takeover(path={}),
+        _takeover(cause={"code": "", "message": "empty code", "details": {}}),
+        _takeover(cause={"code": "planning_timeout", "message": "", "details": {}}),
+        _takeover(elapsed_since_acceptance_ns=-1),
+        _takeover(elapsed_since_acceptance_ns=10**400),
+        _takeover(preparation_budget_ns=2**63),
+        _takeover(decided_at_ns=-1),
+        _takeover(preparation_budget_ns=0),
+        _takeover(decided_at_ns=1.5),
+        _takeover(cause={"message": "no code"}),
+        _takeover(incumbent_operation_id=""),
+        _takeover(extra=1),
+        {key: value for key, value in _takeover().items() if key != "stop_certificate"},
+    ],
+)
+def test_a_malformed_motion_takeover_is_ignored_and_never_fails_the_node(fact) -> None:
+    fixture = _stopped_motion_for_recovery()
+    operation = fixture.transport.operations[fixture.started.task_id]
+    operation.update({"state": "executing", "motion_takeover": fact})
+    observed = fixture.port.operations.observe(fixture.started.task_id)
+    assert observed.state is OwnerTaskState.ACTIVE
+    assert "motion_takeover" not in observed.metadata
+
+
 def test_a_newcomer_refused_by_priority_names_the_winner() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))

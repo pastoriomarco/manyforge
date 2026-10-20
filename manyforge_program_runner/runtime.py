@@ -6531,6 +6531,20 @@ class ProgramRuntime:
         if intent["owner_epoch"] != self.owner_epoch:
             raise ProgramRunnerError("program_cycle_reconciliation_required", "Idle Reset claim belongs to a previous owner")
         if retained["claim"] is None:
+            # As Run's refresh_pending_acquire: a Reset retry after a refused
+            # acquire (which left no claim) targets the current admission
+            # generation. An uncertain acquire (reconciliation) replays exactly.
+            generation = self._admission_generation(admission.get())
+            if (
+                not cycle.reconciliation_required
+                and intent["expected_admission_generation"] != generation
+            ):
+                refreshed = {**retained, "intent": {**intent, "expected_admission_generation": generation}}
+                journal.remember_reset_effect_claim(
+                    expected_generation=cycle.cycle_generation, expected=retained, retained=refreshed,
+                )
+                retained = refreshed
+                intent = refreshed["intent"]
             try:
                 claim = admission.acquire(intent)
                 if claim.get("intent") != intent:

@@ -865,6 +865,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<KernelRecoveryActionResultDTO> close_operation(
       const OperationId& operation_id, OperationRevision expected_operation_revision,
       const KernelRecoveryActionRequestDTO& request);
+  [[nodiscard]] Result<void> retire_preempted_motion_operations();
   [[nodiscard]] Result<void> retire_operation_ownership_locked(
       const OperationId& operation_id, bool clear_continuation,
       bool discard_node_continuations = false);

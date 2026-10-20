@@ -380,5 +380,25 @@ TEST(ProgramMockRunPauseCodecTest, RequiresExplicitCanonicalHeldNodeMaskInExisti
   EXPECT_THROW(DecodeMockRunPause(Replace(MockRunPauseRequest(), "selection_revision", Value("1"))),
                std::exception);
 }
+TEST(VolatileMotionTraceCommandTest, OrdinaryReadHasBoundedAllowanceAndNoControlLaneEffects) {
+  const auto request = [](double allowance) {
+    return content_identity::canonical_json(Value(Value::Object{
+        {"api_version", Value("manyforge.execution_command.v1")},
+        {"command", Value("read_volatile_motion_trace")},
+        {"allowance_bytes", Value(allowance)},
+        {"attribution", Value(Value::Object{
+            {"transport", Value("internal")}, {"assurance", Value("unverified")},
+            {"principal_id", Value(nullptr)}})}}));
+  };
+  const auto command = DecodeCommand(request(3145728.0));
+  EXPECT_EQ(command.kind, CommandKind::kReadVolatileMotionTrace);
+  EXPECT_EQ(command.trace_allowance_bytes, 3145728U);
+  EXPECT_FALSE(IsSubmissionOrdered(command.kind));
+  EXPECT_FALSE(ReadsManagerScene(command.kind));
+  EXPECT_FALSE(IsStopLaneRead(command.kind));
+  EXPECT_FALSE(PreemptsPlanning(command.kind));
+  for (const double invalid : {0.0, -1.0, 0.5, 3145729.0})
+    EXPECT_THROW((void)DecodeCommand(request(invalid)), std::exception);
+}
 }  // namespace
 }  // namespace manyforge::roboplan_backend::host_detail
